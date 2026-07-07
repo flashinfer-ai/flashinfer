@@ -75,7 +75,13 @@ DEFAULT_KERNELS = "cuda-incr,cuda-incr-2k,incremental,triton-replay,triton-repla
 # Kernels that honor Philox stochastic rounding on the gmem state writeback
 # (the FlashInfer / baseline rows silently ignore rand_seed).  Includes the new
 # 5D persistent paths (triton-replay = persistent_dynamic, -pm = persistent_main).
-_PHILOX_KERNELS = ("cuda-incr", "incremental", "triton-replay", "triton-replay-pm")
+_PHILOX_KERNELS = (
+    "cuda-incr",
+    "cuda-incr-2k",
+    "incremental",
+    "triton-replay",
+    "triton-replay-pm",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +312,8 @@ def run_in_process_bench(
     ``state_dtype_spec`` follows the bench_checkpointing_ssu convention:
     plain dtype name (e.g. ``"e4m3"``) for philox_rounds=0, or
     ``"<dtype>-philox-<N>"`` to enable Philox-<N> stochastic rounding on
-    gmem state writeback (cuda-incr / Triton incremental only).
+    gmem state writeback (the CUDA kernels + Triton incremental/replay;
+    see _PHILOX_KERNELS).
 
     When *with_conv1d* is True, each kernel iteration prepends a
     causal_conv1d_update call and measures the total span (conv1d + SSU),
@@ -324,16 +331,17 @@ def run_in_process_bench(
     state_dtype, philox_rounds, state_label = bench_ssu.parse_state_spec(
         state_dtype_spec
     )
-    # The two-kernel split ("cuda-incr-2k") routes to precompute+main only for
-    # 2-byte (fp16/bf16) state + input; the launcher won't take it for fp8 /
-    # quantized state.  Drop it there (matches bench_checkpointing_ssu.py:1644).
+    # The two-kernel split ("cuda-incr-2k") takes 2-byte (fp16/bf16, LDSM) and
+    # 4-byte (f32, LDS.64 + in-register narrow) state; only quantized
+    # (fp8/int8) state has no split (matches bench_checkpointing_ssu.py).
     if "cuda-incr-2k" in kernels and state_dtype not in (
         torch.float16,
         torch.bfloat16,
+        torch.float32,
     ):
         print(
-            f"NOTE: dropping cuda-incr-2k — two-kernel split needs 2-byte state, "
-            f"got {state_label}.",
+            f"NOTE: dropping cuda-incr-2k — two-kernel split needs 2- or 4-byte "
+            f"state, got {state_label}.",
             file=sys.stderr,
         )
         kernels = [k for k in kernels if k != "cuda-incr-2k"]
@@ -343,7 +351,7 @@ def run_in_process_bench(
         else None
     )
     if philox_rounds > 0:
-        # Philox is only honored by cuda-incr / Triton "incremental"; the
+        # Philox is honored by the kernels in _PHILOX_KERNELS; the
         # FlashInfer / baseline kernels silently ignore it.  Warn so users
         # don't think their philox setting affected those rows.
         ignoring = [k for k in kernels if k not in _PHILOX_KERNELS]
@@ -432,7 +440,7 @@ def run_in_process_bench(
             for k in range(K):
                 pt = pnats_i64[k] if kernel == "fi-replay" else pnats_i32[k]
                 tag = f"mixed_b{batch}_T{T}_W{window}_{kernel}_s{k}"
-                # philox is only meaningful for cuda-incr / incremental.
+                # philox applies only to the kernels in _PHILOX_KERNELS.
                 kernel_philox = philox_rounds if kernel in _PHILOX_KERNELS else 0
                 kernel_rand_seed = rand_seed if kernel_philox > 0 else None
                 if with_conv1d:

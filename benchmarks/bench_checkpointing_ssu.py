@@ -1677,9 +1677,14 @@ def _bench_config(
         # Monolithic ("cuda-incr") + the two-kernel split ("cuda-incr-2k", when
         # --two-kernel) as separate rows in one run, for a direct comparison.
         cuda_variants = ["cuda-incr"]
-        # Two-kernel split is bf16/fp16 only (precompute + main require 2-byte
-        # input + state); skip the 2k row for fp32 / quantized (fp8/int8) state.
-        if args.two_kernel and state_dtype in (torch.float16, torch.bfloat16):
+        # Two-kernel split takes 2-byte (bf16/fp16, LDSM) and 4-byte (f32,
+        # LDS.64 + in-register narrow) state; skip the 2k row only for
+        # quantized (fp8/int8) state, which has no split.
+        if args.two_kernel and state_dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
             cuda_variants.append("cuda-incr-2k")
         for kname in cuda_variants:
             for pnat in pnats:
