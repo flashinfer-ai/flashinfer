@@ -639,6 +639,7 @@ def _test_trtllm_batch_decode(
     uses_shared_paged_kv_idx: bool = True,
     return_lse: bool | None = None,
     provide_lse: bool = False,
+    use_bmm1_scale_log2: bool = False,
 ) -> None:
     """
     Common function for testing trtllm-gen decode.
@@ -838,6 +839,27 @@ def _test_trtllm_batch_decode(
         bmm2_scale = bmm2_scale.item()
     elif not isinstance(bmm2_scale, torch.Tensor) and device_scale:
         bmm2_scale = torch.tensor(bmm2_scale, device=GPU_DEVICE, dtype=torch.float32)
+    bmm1_scale_log2 = None
+    if use_bmm1_scale_log2:
+        if backend != "trtllm-gen":
+            pytest.skip("bmm1_scale_log2 is only supported by trtllm-gen")
+        raw_bmm1_scale = (
+            float(bmm1_scale.item())
+            if isinstance(bmm1_scale, torch.Tensor)
+            else float(bmm1_scale)
+        )
+        bmm1_scale_workspace = torch.tensor(
+            [raw_bmm1_scale, raw_bmm1_scale * math.log2(math.e)],
+            device=GPU_DEVICE,
+            dtype=torch.float32,
+        )
+        bmm1_scale_log2 = bmm1_scale_workspace.narrow(0, 1, 1)
+        if isinstance(bmm1_scale, torch.Tensor):
+            # Poison the tensor bmm1_scale so precedence is output-observable: the
+            # result only matches the reference (computed from sm_scale above) if the
+            # log2 override takes priority over this tensor. Safe because bmm1_scale
+            # has no consumer after the API call under test.
+            bmm1_scale = bmm1_scale * 7.0
 
     # Optionally make query non-contiguous for testing stride support
     if non_contiguous_query:
@@ -915,6 +937,7 @@ def _test_trtllm_batch_decode(
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         lse=provided_lse,
         return_lse=effective_return_lse,
+        bmm1_scale_log2=bmm1_scale_log2,
     )
     if expects_lse:
         if effective_return_lse:
@@ -1192,6 +1215,40 @@ def test_trtllm_batch_decode_lse_contract(return_lse, provide_lse):
         uses_shared_paged_kv_idx=True,
         return_lse=return_lse,
         provide_lse=provide_lse,
+    )
+
+
+# device_scale=True exercises the precedence branch where a tensor ``bmm1_scale``
+# is also supplied and the log2 override must take priority. kv_dtype="fp8" covers
+# the motivating FP8 KV use case (#3500).
+@pytest.mark.parametrize("device_scale", [False, True])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("bf16", "fp8", "bf16"),
+    ],
+)
+def test_trtllm_batch_decode_bmm1_scale_log2(q_dtype, kv_dtype, o_dtype, device_scale):
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        2,
+        1,
+        16,
+        2,
+        2,
+        -1,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        False,
+        False,
+        128,
+        128,
+        device_scale=device_scale,
+        uses_shared_paged_kv_idx=True,
+        use_bmm1_scale_log2=True,
     )
 
 
