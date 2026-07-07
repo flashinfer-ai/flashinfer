@@ -1171,3 +1171,20 @@ def test_tensor_core_decode_rejects_mismatched_q_len():
     )
     with pytest.raises(ValueError, match="q_len_per_req"):
         wrapper.run(q, kv_data)
+
+    cuda_core_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=False
+    )
+    with pytest.raises(ValueError, match="use_tensor_cores"):
+        cuda_core_wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )

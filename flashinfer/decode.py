@@ -858,7 +858,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if use_tensor_cores:
             if use_cuda_graph:
-                # NOTE(Zihao): if once created, no need to update it in plan/run
+                # Created once; plan() rewrites the values when
+                # q_len_per_req > 1.
                 self._qo_indptr_buf = torch.arange(
                     self._fixed_batch_size + 1,
                     dtype=torch.int32,
@@ -1281,8 +1282,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
+        if q_len_per_req < 1:
+            raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
+            if not self.use_tensor_cores:
+                raise ValueError(
+                    "q_len_per_req > 1 requires tensor-core decode "
+                    "(use_tensor_cores=True or the trtllm-gen/cute-dsl backend)."
+                )
             qo_indptr_host = qo_indptr_host * q_len_per_req
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
@@ -1770,6 +1778,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # Infer runtime q_len from q.size(0). Doesn't need to match planned q_len
             q_len_per_req = q.size(0) // actual_batch_size
 
+        if not self.use_tensor_cores and q_len_per_req > 1:
+            raise ValueError(
+                f"q implies q_len_per_req={q_len_per_req}, but the "
+                "non-tensor-core decode kernel only supports q_len_per_req=1."
+            )
         planned_q_len = getattr(self, "_q_len_per_req", 1) or 1
         if (
             self.use_tensor_cores
@@ -3456,6 +3469,13 @@ def fast_decode_plan(
     - Remove unnecessary host-to-device copy for the metadata buffers.
     """
     batch_size = len(last_page_len)
+    if q_len_per_req < 1:
+        raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
+    if q_len_per_req > 1 and not self.use_tensor_cores:
+        raise ValueError(
+            "q_len_per_req > 1 requires tensor-core decode "
+            "(use_tensor_cores=True or the trtllm-gen/cute-dsl backend)."
+        )
     self._q_len_per_req = q_len_per_req
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
