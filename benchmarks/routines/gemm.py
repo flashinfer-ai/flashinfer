@@ -1645,10 +1645,7 @@ def testMmMxfp8(args):
 
         if not is_sf_swizzled_layout:
             sf_layout_input = flashinfer.SfLayout.layout_linear
-        elif (
-            backend in ("cutlass", "cute-dsl", "cudnn")
-            or args.use_128x4_sf_layout
-        ):
+        elif backend in ("cutlass", "cute-dsl", "cudnn") or args.use_128x4_sf_layout:
             # CUTLASS, CuTe DSL, and cuDNN use the F8_128x4 swizzled scale
             # layout here.
             sf_layout_input = flashinfer.SfLayout.layout_128x4

@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 from enum import Enum
 from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple
+from typing import Callable, List, Literal, Optional, Tuple
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
@@ -4606,7 +4606,7 @@ def _compile_block_scaled_gemm(
     sf_n,
     sf_k,
     batch_size,
-    split_k_slices=1,
+    cluster_shape_k=1,
 ):
     """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
 
@@ -4651,18 +4651,7 @@ def _compile_block_scaled_gemm(
         stride_order=(1, 0),
         assumed_align=ab_assumed_align,
     )
-    if split_k_slices > 1:
-        if not swap_ab:
-            raise ValueError("split-K block-scaled GEMM requires swap_ab=True")
-        # Runtime storage is contiguous [split_k, public_m, public_n].
-        # With swap_ab, sym_n is public M and sym_m is public N.
-        c_fake = cute.runtime.make_fake_compact_tensor(
-            c_cutlass_dtype,
-            (split_k_slices, sym_n, sym_m),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
-    elif swap_ab:
+    if swap_ab:
         c_fake = cute.runtime.make_fake_compact_tensor(
             c_cutlass_dtype,
             (sym_n, sym_m),
@@ -4683,9 +4672,8 @@ def _compile_block_scaled_gemm(
         cutlass.Float32, (1,), assumed_align=4
     )
 
-    max_active_clusters = get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
+    launch_cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1] * cluster_shape_k
+    max_active_clusters = get_max_active_clusters(launch_cluster_size)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     compiled_gemm = cute.compile(
@@ -4733,35 +4721,28 @@ def _prepare_alpha_for_launch(alpha_tensor, device):
 
 _CUTE_DSL_MM_MXFP8_KERNEL_CACHE: dict[tuple, tuple] = {}
 
-_SM100_SPLIT_K_MAX_M = 32
-_SM100_SPLIT_K_MMA_INST_BITS_K = 256
-_SM100_SPLIT_K_MMA_INST_TILE_K = 4
-_SM100_SPLIT_K_CANDIDATES = (2, 4)
+_SM100_MXFP8_SPLIT_K_MAX_M = 32
+_SM100_MXFP8_SPLIT_K_MMA_INST_BITS_K = 256
+_SM100_MXFP8_SPLIT_K_MMA_INST_TILE_K = 4
+_SM100_MXFP8_SPLIT_K_CANDIDATES = (2, 4)
 
 
 def _is_sm100_split_k_valid(
     m: int,
-    n: int,
     k: int,
     ab_dtype,
     split_k_slices: int,
-    workspace_bytes: int,
 ) -> bool:
-    """Check shared SM100 block-scaled split-K policy and storage constraints.
-
-    ``k`` is the logical, unpacked K. The logical operand dtype determines the
-    kernel tile-K: 128 elements for FP8 and 256 elements for FP4.
-    """
-    if ab_dtype.width not in (4, 8):
+    """Check the specialized low-M split-K shape constraints."""
+    if ab_dtype.width != 8:
         return False
     tile_k = (
-        _SM100_SPLIT_K_MMA_INST_BITS_K * _SM100_SPLIT_K_MMA_INST_TILE_K
+        _SM100_MXFP8_SPLIT_K_MMA_INST_BITS_K * _SM100_MXFP8_SPLIT_K_MMA_INST_TILE_K
     ) // ab_dtype.width
     return (
-        0 < m <= _SM100_SPLIT_K_MAX_M
-        and split_k_slices in _SM100_SPLIT_K_CANDIDATES
+        m <= _SM100_MXFP8_SPLIT_K_MAX_M
+        and split_k_slices in _SM100_MXFP8_SPLIT_K_CANDIDATES
         and k % (tile_k * split_k_slices) == 0
-        and split_k_slices * m * n * 4 <= workspace_bytes
     )
 
 
@@ -4791,7 +4772,9 @@ def _cute_dsl_gemm_mxfp8_runner(
     from .kernels.dense_blockscaled_gemm_sm100 import (
         Sm100BlockScaledPersistentDenseGemmKernel,
     )
-    from .kernels.split_k_reduction import get_compiled_split_k_reduction
+    from .kernels.dense_blockscaled_gemm_sm100_splitk import (
+        Sm100BlockScaledSplitKGemmKernel,
+    )
 
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
@@ -4806,25 +4789,24 @@ def _cute_dsl_gemm_mxfp8_runner(
             "Supported: torch.bfloat16, torch.float16."
         )
     c_cutlass_dtype = getattr(cutlass, cutlass_dtype_attr)
-    sm_version = sm_major * 10 + sm_minor
+    _ = sm_major, sm_minor
 
     class CuteDSLMxfp8GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
-            # Invalidate eager/hot-L2 results created before graph+cold-L2 tuning.
-            return (str(out.dtype), enable_pdl, "graph_cold_l2_v1")
+            return (str(out.dtype), enable_pdl)
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> list:
-            (a, b, a_descale, b_descale, _, out, workspace_buffer) = inputs
+            (a, b, a_descale, b_descale, _, out, _) = inputs
             m = a.shape[0]
             n = b.shape[1]
             real_k = a.shape[1]
             ab_dtype = cutlass.Float8E4M3FN
-            valid_tactics = _get_sm100_block_scaled_tactics(
+            base_tactics = _get_sm100_block_scaled_tactics(
                 m=m,
                 n=n,
                 real_k=real_k,
@@ -4834,34 +4816,26 @@ def _cute_dsl_gemm_mxfp8_runner(
                 c_cutlass_dtype=c_cutlass_dtype,
                 device=a.device,
             )
+            valid_tactics = [(*tactic, 1) for tactic in base_tactics]
             if not out.is_contiguous():
                 return valid_tactics
 
-            valid_split_k_slices = [
-                split_k_slices
-                for split_k_slices in _SM100_SPLIT_K_CANDIDATES
+            for split_k_slices in _SM100_MXFP8_SPLIT_K_CANDIDATES:
                 if _is_sm100_split_k_valid(
                     m,
-                    n,
                     real_k,
                     ab_dtype,
                     split_k_slices,
-                    workspace_buffer.numel(),
-                )
-            ]
-
-            # The SM100 capability check's only C-dtype-dependent shape
-            # constraint is 16-byte output alignment. Any BF16/FP16 tactic
-            # accepted above is also valid for FP32 partials because FP32 has
-            # the weaker alignment requirement and N is divisible by 8.
-            for base_tactic in tuple(valid_tactics):
-                _, cluster_shape_mn, swap_ab, _ = base_tactic
-                if not swap_ab or cluster_shape_mn != (1, 1):
-                    continue
-                valid_tactics.extend(
-                    (*base_tactic, split_k_slices)
-                    for split_k_slices in valid_split_k_slices
-                )
+                ):
+                    valid_tactics.append(
+                        (
+                            _sm100_mxfp8_low_m_tile(m),
+                            (1, 1),
+                            True,
+                            False,
+                            split_k_slices,
+                        )
+                    )
             return valid_tactics
 
         def forward(
@@ -4871,7 +4845,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             do_preparation: bool = False,
             **kwargs,
         ):
-            (a, b, a_descale, b_descale, _, out, workspace_buffer) = inputs
+            (a, b, a_descale, b_descale, _, out, _) = inputs
             m = a.shape[0]
             real_k = a.shape[1]
             n = b.shape[1]
@@ -4881,8 +4855,8 @@ def _cute_dsl_gemm_mxfp8_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                if 0 < m <= _SM100_SPLIT_K_MAX_M and out.is_contiguous():
-                    # Untuned low-M execution is deliberately split_k=1.
+                if m <= _SM100_MXFP8_SPLIT_K_MAX_M and out.is_contiguous():
+                    # Untuned low-M execution uses the corresponding base tactic.
                     tactic = (
                         _sm100_mxfp8_low_m_tile(m),
                         (1, 1),
@@ -4896,34 +4870,35 @@ def _cute_dsl_gemm_mxfp8_runner(
                         _SM100_DEFAULT_CLUSTER_SHAPE_MN,
                         False,
                         False,
+                        1,
                     )
 
-            split_k_slices = 1
-            if len(tactic) == 5:
-                (
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    swap_ab,
-                    use_prefetch,
-                    split_k_slices,
-                ) = tactic
-            else:
-                (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch) = tactic
-
-            if split_k_slices > 1 and (
-                not swap_ab
-                or cluster_shape_mn != (1, 1)
-                or not out.is_contiguous()
-                or not _is_sm100_split_k_valid(
-                    m,
-                    n,
-                    real_k,
-                    cutlass.Float8E4M3FN,
-                    split_k_slices,
-                    workspace_buffer.numel(),
-                )
-            ):
+            (
+                mma_tiler_mn,
+                cluster_shape_mn,
+                swap_ab,
+                use_prefetch,
+                split_k_slices,
+            ) = tactic
+            if split_k_slices < 1:
                 raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
+            is_split_k = split_k_slices > 1
+
+            if is_split_k:
+                if (
+                    cluster_shape_mn != (1, 1)
+                    or not swap_ab
+                    or use_prefetch
+                    or not out.is_contiguous()
+                    or mma_tiler_mn != _sm100_mxfp8_low_m_tile(m)
+                    or not _is_sm100_split_k_valid(
+                        m,
+                        real_k,
+                        cutlass.Float8E4M3FN,
+                        split_k_slices,
+                    )
+                ):
+                    raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
@@ -4941,9 +4916,6 @@ def _cute_dsl_gemm_mxfp8_runner(
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            kernel_c_cutlass_dtype = (
-                cutlass.Float32 if split_k_slices > 1 else c_cutlass_dtype
-            )
             cache_key = (
                 sf_vec_size,
                 mma_tiler_mn,
@@ -4955,20 +4927,31 @@ def _cute_dsl_gemm_mxfp8_runner(
                 split_k_slices,
             )
 
-            compiled_gemm, _ = _compile_block_scaled_gemm(
-                _CUTE_DSL_MM_MXFP8_KERNEL_CACHE,
-                cache_key,
-                lambda: Sm100BlockScaledPersistentDenseGemmKernel(
+            make_kernel: Callable[[], object]
+            kernel_cache = _CUTE_DSL_MM_MXFP8_KERNEL_CACHE
+            if is_split_k:
+                make_kernel = lambda: Sm100BlockScaledSplitKGemmKernel(
+                    sf_vec_size,
+                    mma_tiler_mn,
+                    split_k_slices,
+                    enable_pdl,
+                )
+            else:
+                make_kernel = lambda: Sm100BlockScaledPersistentDenseGemmKernel(
                     sf_vec_size,
                     mma_tiler_mn,
                     cluster_shape_mn,
                     use_prefetch,
                     enable_pdl,
-                    split_k_slices,
-                ),
+                )
+
+            compiled_gemm, _ = _compile_block_scaled_gemm(
+                kernel_cache,
+                cache_key,
+                make_kernel,
                 ab_cutlass_dtype=cutlass.Float8E4M3FN,
                 sf_dtype=sf_dtype,
-                c_cutlass_dtype=kernel_c_cutlass_dtype,
+                c_cutlass_dtype=c_cutlass_dtype,
                 ab_assumed_align=16,
                 cluster_shape_mn=cluster_shape_mn,
                 swap_ab=swap_ab,
@@ -4976,25 +4959,14 @@ def _cute_dsl_gemm_mxfp8_runner(
                 sf_n=sf_n,
                 sf_k=sf_k,
                 batch_size=batch_size,
-                split_k_slices=split_k_slices,
+                cluster_shape_k=split_k_slices,
             )
 
             alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
 
-            partial_out = None
-            if split_k_slices > 1:
-                partial_numel = split_k_slices * m * n
-                partial_bytes = partial_numel * 4
-                partial_out = (
-                    workspace_buffer[:partial_bytes]
-                    .view(torch.float32)
-                    .view(split_k_slices, m, n)
-                )
-                launch_out = partial_out
-            else:
-                launch_out = (
-                    out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
-                )
+            launch_out = (
+                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
+            )
 
             compiled_gemm(
                 kernel_a,
@@ -5007,19 +4979,6 @@ def _cute_dsl_gemm_mxfp8_runner(
                 kernel_b_sf.data_ptr(),
                 alpha_for_launch,
             )
-
-            if partial_out is not None:
-                compiled_reduce = get_compiled_split_k_reduction(
-                    c_cutlass_dtype,
-                    split_k_slices,
-                    enable_pdl,
-                    sm_version,
-                )
-                compiled_reduce(
-                    partial_out.view(-1),
-                    out.view(-1),
-                    m * n,
-                )
             return out
 
     return CuteDSLMxfp8GemmRunner()
