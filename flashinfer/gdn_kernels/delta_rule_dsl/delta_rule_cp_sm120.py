@@ -2674,11 +2674,11 @@ def cp_delta_rule_fixup_dsl_sm120(
         else:
             _kernel_kind = "hmma"
     if _kernel_kind == "simt_row4":
-        kernel = CPDeltaRuleFixupSimtSm120(needs_initial_state, 4)
+        kernel = CPDeltaRuleFixupSimtSm120(needs_initial_state, 4)  # type: ignore
     elif _kernel_kind == "simt_row8":
-        kernel = CPDeltaRuleFixupSimtSm120(needs_initial_state, 8)
+        kernel = CPDeltaRuleFixupSimtSm120(needs_initial_state, 8)  # type: ignore
     elif _kernel_kind == "hmma":
-        kernel = CPDeltaRuleFixupHmmaSm120(needs_initial_state)
+        kernel = CPDeltaRuleFixupHmmaSm120(needs_initial_state)  # type: ignore
     else:
         raise ValueError(f"Unsupported fixup kernel kind: {_kernel_kind}")
     kernel_args = (
