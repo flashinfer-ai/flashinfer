@@ -418,38 +418,31 @@ def cute_dsl_fmha_ragged_prefill(
                 use_pdl=enable_pdl,
             )
         except (RuntimeError, FileNotFoundError) as e:
-            # Cubin variant not published / repo unreachable: JIT-compile the
-            # vendored kernel from source instead.
-            logger.info(
-                f"DSL FMHA cubin unavailable ({e}); falling back to JIT runner."
-            )
-            from flashinfer.cute_dsl.attention.fmha.runner import (
-                cute_dsl_fmha_prefill as jit_runner,
+            # Cubin variant not available / repo unreachable.
+            # JIT-compile the trtllm kernel instead.
+            logger.info(f"DSL FMHA cubin unavailable ({e}); JIT-compiling the kernel.")
+            from flashinfer.cute_dsl.attention.fmha.compile import (
+                compile_cute_dsl_fmha_kernel,
             )
 
-            jit_runner(
-                q,
-                k,
-                v,
-                o,
-                qo_indptr,
-                kv_indptr,
-                is_causal=is_causal,
-                sm_scale=sm_scale,
-                window_left=window_left,
-                window_right=window_right,
-                lse=lse,
-                attention_sinks=attention_sinks,
-                scale_q=scale_q,
-                scale_k=scale_k,
-                scale_v=scale_v,
-                scale_o=scale_o,
-                max_qo_len=max_qo_len,
-                max_kv_len=max_kv_len,
-                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-                enable_pdl=enable_pdl,
+            kernel_fn = compile_cute_dsl_fmha_kernel(
+                q.dtype,
+                v.dtype,
+                o.dtype,
+                H_q,
+                H_k,
+                D,
+                D_v,
+                is_causal,
+                lse is not None,
+                attention_sinks is not None,
+                use_skip_softmax,
+                enable_pdl,
+                q.device,
             )
-            return
+            # JIT kernels are compiled with --enable-tvm-ffi; the CuTe-native branch
+            # would not accept them.
+            enable_tvm_ffi = True
 
     # Compute scale factors
     if sm_scale is None:

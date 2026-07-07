@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness tests for the JIT-compiled CuTe DSL FMHA kernels vendored into
-flashinfer/cute_dsl/attention/fmha/ (copied from trtllm-oss).
+"""Correctness tests for the JIT-compiled TRTLLM CuTe DSL FMHA kernels.
 
 The kernels are compiled in-process via cute.compile (CuTe native ABI) and checked
 against a torch reference. Covers non-block-scaled (bf16, fp8, split-BMM bf16-QK/E4M3-V,
@@ -186,7 +185,7 @@ _NONBS_MODES = {
 @pytest.mark.parametrize("mode", list(_NONBS_MODES))
 @pytest.mark.parametrize("causal", [False, True])
 def test_cute_dsl_fmha_jit(mode, causal):
-    """Non-block-scaled varlen prefill, JIT-compiled from the vendored kernel."""
+    """Non-block-scaled varlen prefill, JIT-compiled."""
     torch.manual_seed(0)
     qk_dt, v_dt, out_dt, out_torch_dt, atol = _NONBS_MODES[mode]
     d = dv = 128
@@ -328,7 +327,7 @@ def _sf_ref_5d(ref_flat, s, b, h_k, h_r, d):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("with_lse", [False, True])
 def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
-    """Block-scaled (MXFP8 / NVFP4) non-varlen prefill, JIT-compiled from the vendored kernel."""
+    """Block-scaled (MXFP8 / NVFP4) non-varlen prefill, JIT-compiled."""
     torch.manual_seed(0)
     qk_dt, sf_dt, sf_vec = _BS_MODES[qk_mode]
     d = dv = 128

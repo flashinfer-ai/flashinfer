@@ -1,36 +1,32 @@
-# Copyright (c) 2026 by FlashInfer team.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#   http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch runner for the trtllm CuTe DSL FMHA kernels (JIT-compiled).
+"""JIT-compilers for the trtllm CuTe DSL FMHA kernels.
 
-JIT-compiles the trtllm BlackwellFusedMultiHead[BlockScaled]AttentionForward classes and exposes
-PyTorch-friendly ragged/batched prefill entry points. This is the JIT runner invoked by
-flashinfer.attention.cute_dsl.fmha
+``compile_cute_dsl_fmha_kernel`` / ``compile_cute_dsl_fmha_blockscaled_kernel``
+``cute.compile`` (and cache) the trtllm ``BlackwellFusedMultiHead[BlockScaled]AttentionForward``
+classes with symbolic batch/seqlen dims, returning a TVM-FFI-callable kernel handle.
 """
 
 import functools
 import math
-from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32
-
-from .fmha import BlackwellFusedMultiHeadAttentionForward
-from .fmha_blockscaled import BlackwellFusedMultiHeadBlockScaledAttentionForward
-from .helpers import fmha_helpers as fmha_utils
 
 # torch dtype -> cutlass dtype
 _CUTLASS_DTYPE = {
@@ -47,6 +43,8 @@ _BLOCKSCALED_MODES = {
 
 
 def _mask_type(is_causal: bool):
+    from .helpers import fmha_helpers as fmha_utils
+
     # Bottom-right aligned causal, matching FlashInfer convention.
     return (
         fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
@@ -67,7 +65,7 @@ def _ex2_emulation_enabled(device: torch.device) -> bool:
 
 
 @functools.cache
-def _get_compiled_fmha(
+def compile_cute_dsl_fmha_kernel(
     qk_dtype: torch.dtype,
     v_dtype: torch.dtype,
     out_dtype: torch.dtype,
@@ -80,13 +78,17 @@ def _get_compiled_fmha(
     enable_sink: bool,
     enable_skip_softmax: bool,
     use_pdl: bool,
-    enable_ex2_emulation: bool,
+    device: torch.device,
 ):
-    """Compile (and cache) the vendored FMHA kernel for a static config.
+    """Compile (and cache) the trtllm FMHA kernel for a static config.
 
-    Uses symbolic batch/seqlen dims (TVM-FFI ABI) so a single compile serves all
-    shapes with the given dtypes / head counts / head_dim / mask.
+    Compiles with the TVM-FFI ABI (the handle takes ``torch.Tensor`` args on the env
+    stream) and symbolic batch/seqlen dims, so a single compile serves all shapes for the
+    given dtypes / head counts / head_dim / mask.
     """
+    from .fmha import BlackwellFusedMultiHeadAttentionForward
+
+    enable_ex2_emulation = _ex2_emulation_enabled(device)
     qk = _CUTLASS_DTYPE[qk_dtype]
     pv = _CUTLASS_DTYPE[v_dtype]
     out = _CUTLASS_DTYPE[out_dtype]
@@ -187,119 +189,13 @@ def _get_compiled_fmha(
     )
 
 
-def cute_dsl_fmha_prefill(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    o: torch.Tensor,
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    *,
-    is_causal: bool = False,
-    sm_scale: Optional[float] = None,
-    window_left: int = -1,
-    window_right: int = -1,
-    lse: Optional[torch.Tensor] = None,
-    attention_sinks: Optional[torch.Tensor] = None,
-    scale_q: float | torch.Tensor = 1.0,
-    scale_k: float | torch.Tensor = 1.0,
-    scale_v: float | torch.Tensor = 1.0,
-    scale_o: float | torch.Tensor = 1.0,
-    max_qo_len: Optional[int] = None,
-    max_kv_len: Optional[int] = None,
-    skip_softmax_threshold_scale_factor: Optional[float] = None,
-    enable_pdl: bool = False,
-) -> None:
-    """Ragged (varlen) prefill via the JIT-compiled vendored FMHA kernel."""
-    total_q, H_q, D = q.shape
-    total_kv, H_k, _ = k.shape
-    D_v = v.shape[-1]
-    h_r = H_q // H_k
-    batch_size = len(qo_indptr) - 1
-
-    use_skip = (
-        skip_softmax_threshold_scale_factor is not None
-        and skip_softmax_threshold_scale_factor > 0
-    )
-    kernel_fn = _get_compiled_fmha(
-        q.dtype,
-        v.dtype,
-        o.dtype,
-        H_q,
-        H_k,
-        D,
-        D_v,
-        is_causal,
-        lse is not None,
-        attention_sinks is not None,
-        use_skip,
-        enable_pdl,
-        _ex2_emulation_enabled(q.device),
-    )
-
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(D)
-    scale_q, scale_k, scale_v, scale_o = map(
-        lambda x: x.item() if isinstance(x, torch.Tensor) else x,
-        (scale_q, scale_k, scale_v, scale_o),
-    )
-    scale_softmax = scale_q * scale_k * sm_scale
-    scale_softmax_log2 = scale_softmax * math.log2(math.e)
-    scale_output = scale_v / scale_o
-
-    if max_qo_len is None:
-        max_qo_len = int((qo_indptr[1:] - qo_indptr[:-1]).max().item())
-    if max_kv_len is None:
-        max_kv_len = int((kv_indptr[1:] - kv_indptr[:-1]).max().item())
-    problem_size = (batch_size, max_qo_len, total_q, max_kv_len, H_q, H_k, D, D_v)
-
-    skip_threshold_log2 = None
-    if use_skip:
-        skip_threshold_log2 = Float32(
-            math.log2(skip_softmax_threshold_scale_factor / max_kv_len)
-        )
-
-    ws_left = None if window_left == -1 else Int32(window_left)
-    ws_right = None if window_right == -1 else Int32(window_right)
-    if is_causal and ws_right is None:
-        ws_right = Int32(0)
-
-    q_5d = q.view(1, total_q, H_k, h_r, D)
-    k_5d = k.view(1, total_kv, H_k, 1, D)
-    v_5d = v.view(1, total_kv, H_k, 1, D_v)
-    assert o.data_ptr() % 32 == 0, "o must be 32-byte aligned (256-bit stores)"
-    o_5d = o.view(1, total_q, H_k, h_r, D_v)
-    lse_4d = lse.view(1, total_q, H_k, h_r) if lse is not None else None
-
-    kernel_fn(
-        q_5d,
-        k_5d,
-        v_5d,
-        o_5d,
-        problem_size,
-        qo_indptr.to(torch.int32),
-        kv_indptr.to(torch.int32),
-        lse_4d,
-        attention_sinks,
-        Float32(scale_softmax_log2),
-        Float32(scale_softmax),
-        Float32(scale_output),
-        skip_threshold_log2,
-        ws_left,
-        ws_right,
-        None,  # skip_softmax_count
-        None,  # total_softmax_count
-        enable_pdl,
-    )
-
-
 # =============================================================================
 # Block-scaled (MXFP8 / NVFP4)
 # =============================================================================
 
 
 @functools.cache
-def _get_compiled_fmha_blockscaled(
+def compile_cute_dsl_fmha_blockscaled_kernel(
     qk_mode: str,
     out_dtype: torch.dtype,
     num_qo_heads: int,
@@ -309,9 +205,12 @@ def _get_compiled_fmha_blockscaled(
     with_lse: bool,
     enable_skip_softmax: bool,
     use_pdl: bool,
-    enable_ex2_emulation: bool,
+    device: torch.device,
 ):
-    """Compile (and cache) the vendored block-scaled FMHA kernel (batched, non-varlen)."""
+    """Compile (and cache) the trtllm block-scaled FMHA kernel (batched, non-varlen)."""
+    from .fmha_blockscaled import BlackwellFusedMultiHeadBlockScaledAttentionForward
+
+    enable_ex2_emulation = _ex2_emulation_enabled(device)
     qk, sf_dt, sf_vec = _BLOCKSCALED_MODES[qk_mode]
     out = _CUTLASS_DTYPE[out_dtype]
     d = dv = head_dim
@@ -408,114 +307,4 @@ def _get_compiled_fmha_blockscaled(
         stream_fake,
         use_pdl,
         options="--enable-tvm-ffi --opt-level 2",
-    )
-
-
-def cute_dsl_fmha_blockscaled_prefill(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_sf: torch.Tensor,
-    k_sf: torch.Tensor,
-    v: torch.Tensor,
-    o: torch.Tensor,
-    *,
-    qk_mode: str,
-    is_causal: bool = False,
-    sm_scale: Optional[float] = None,
-    window_left: int = -1,
-    window_right: int = -1,
-    lse: Optional[torch.Tensor] = None,
-    scale_q: float | torch.Tensor = 1.0,
-    scale_k: float | torch.Tensor = 1.0,
-    scale_v: float | torch.Tensor = 1.0,
-    scale_o: float | torch.Tensor = 1.0,
-    skip_softmax_threshold_scale_factor: Optional[float] = None,
-    enable_pdl: bool = False,
-) -> None:
-    """Batched (non-varlen) block-scaled prefill via the JIT-compiled vendored kernel.
-
-    Inputs are batched:
-    - q (b, s_q, H_q, D), q_sf (quantized block-scaled format)
-    - k (b, s_k, H_k, D), k_sf (quantized block-scaled format)
-    - v/o: (b, s, H, D_v)
-    """
-    if qk_mode not in _BLOCKSCALED_MODES:
-        raise ValueError(
-            f"qk_mode must be one of {tuple(_BLOCKSCALED_MODES)}, got {qk_mode!r}"
-        )
-    batch_size, s_q, H_q, _ = q.shape
-    _, s_k, H_k, _ = k.shape
-    D = D_v = v.shape[-1]
-    h_r = H_q // H_k
-
-    use_skip = (
-        skip_softmax_threshold_scale_factor is not None
-        and skip_softmax_threshold_scale_factor > 0
-    )
-    kernel_fn = _get_compiled_fmha_blockscaled(
-        qk_mode,
-        o.dtype,
-        H_q,
-        H_k,
-        D,
-        is_causal,
-        lse is not None,
-        use_skip,
-        enable_pdl,
-        _ex2_emulation_enabled(q.device),
-    )
-
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(D)
-    # The block-scale quantizer returns scales as 0-d tensors (no ``.item()`` sync, so it
-    # stays torch.compile-friendly); materialize to floats here at the eager boundary.
-    scale_q, scale_k, scale_v, scale_o = map(
-        lambda x: x.item() if isinstance(x, torch.Tensor) else x,
-        (scale_q, scale_k, scale_v, scale_o),
-    )
-    scale_softmax = scale_q * scale_k * sm_scale
-    scale_softmax_log2 = scale_softmax * math.log2(math.e)
-    scale_output = scale_v / scale_o
-    problem_size = (batch_size, s_q, s_q, s_k, H_q, H_k, D, D_v)
-
-    skip_threshold_log2 = None
-    if use_skip:
-        skip_threshold_log2 = Float32(
-            math.log2(skip_softmax_threshold_scale_factor / s_k)
-        )
-
-    ws_left = None if window_left == -1 else Int32(window_left)
-    ws_right = None if window_right == -1 else Int32(window_right)
-    if is_causal and ws_right is None:
-        ws_right = Int32(0)
-
-    q_5d = q.reshape(batch_size, s_q, H_k, h_r, q.shape[-1])
-    k_5d = k.reshape(batch_size, s_k, H_k, 1, k.shape[-1])
-    v_5d = v.reshape(batch_size, s_k, H_k, 1, D_v)
-    assert o.data_ptr() % 32 == 0, "o must be 32-byte aligned (256-bit stores)"
-    o_5d = o.reshape(batch_size, s_q, H_k, h_r, D_v)
-    lse_4d = lse.reshape(batch_size, s_q, H_k, h_r) if lse is not None else None
-
-    kernel_fn(
-        q_5d,
-        k_5d,
-        q_sf.reshape(-1),
-        k_sf.reshape(-1),
-        v_5d,
-        o_5d,
-        problem_size,
-        None,  # cum_seqlen_q
-        None,  # cum_seqlen_k
-        lse_4d,
-        None,  # attention_sinks
-        Float32(scale_softmax_log2),
-        Float32(scale_softmax),
-        Float32(scale_output),
-        None,  # scale_v_channels
-        skip_threshold_log2,
-        ws_left,
-        ws_right,
-        None,  # skip_softmax_count
-        None,  # total_softmax_count
-        enable_pdl,
     )

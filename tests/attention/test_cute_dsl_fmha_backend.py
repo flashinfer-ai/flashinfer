@@ -161,9 +161,10 @@ def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, causal):
     assert lse.shape == (total, Hq)
 
 
-def test_cute_dsl_jit_fallback(monkeypatch):
+def test_cute_dsl_jit_case(monkeypatch):
     """When the cubin variant is unavailable, cute_dsl_fmha_ragged_prefill must
-    fall back to the JIT runner and still produce correct results."""
+    JIT-compile the kernel and still produce correct results.
+    """
     import flashinfer.attention.cute_dsl.fmha as cubin_mod
 
     def _raise(*args, **kwargs):
@@ -198,8 +199,8 @@ def test_cute_dsl_jit_fallback(monkeypatch):
     torch.testing.assert_close(o.float(), ref.float(), atol=3e-2, rtol=3e-2)
 
 
-def test_batch_prefill_cute_dsl_alibi_fallback():
-    """ALiBi is unsupported by the vendored kernel; must fall back to prefill.py."""
+def test_batch_prefill_cute_dsl_alibi():
+    """ALiBi is unsupported by the trtllm kernel; must use prefill.py instead."""
     torch.manual_seed(0)
     b, s, H, D = 2, 256, 8, 128
     qo = _indptr([s] * b)
@@ -279,7 +280,7 @@ def _blockscaled_dequant(x_bshd, qk_mode):
 def test_blockscaled_quantize_and_prefill(qk_mode, causal):
     """End-to-end block-scaled path: fused quantizer -> SF -> FMHA kernel."""
     from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
-    from flashinfer.cute_dsl.attention.fmha.runner import (
+    from flashinfer.attention.cute_dsl.fmha_blockscaled import (
         cute_dsl_fmha_blockscaled_prefill,
     )
 
