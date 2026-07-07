@@ -547,7 +547,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
                                    uint32_t page_size, uint32_t max_batch_size_if_split,
                                    bool enable_cuda_graph, int32_t window_left,
-                                   int32_t fixed_split_size, bool disable_split_kv) {
+                                   int32_t fixed_split_size, bool disable_split_kv,
+                                   bool fp8_kv_no_vo_split = false, int max_smem_per_block = 0) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -583,7 +584,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     // the CUDA graph is created fixes the maximum number of tokens.
     const uint64_t max_seq_len = total_num_rows - batch_size + 1;
     uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
-    cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim);
+    cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim, fp8_kv_no_vo_split, max_smem_per_block);
 
     // Find an upper bound for the number of tiles, derived from the total
     // number of rows and the batch size.  The sum of qo lengths rounded
@@ -596,7 +597,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
       sum_packed_qo_len += packed_qo_len_arr[i];
     }
     const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
-    cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim);
+    cta_tile_q =
+        FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim, fp8_kv_no_vo_split, max_smem_per_block);
 
     total_num_tiles_q = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
@@ -751,7 +753,7 @@ inline cudaError_t PrefillPlanImpl(
     bool disable_split_kv,
     int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                  // splits by #colocated decode CTAs
-    cudaStream_t stream) {
+    cudaStream_t stream, bool fp8_kv_no_vo_split = false) {
   (void)head_dim_qk;
   (void)sizeof_dtype_o;
   if (num_qo_heads % num_kv_heads != 0) {
@@ -770,13 +772,19 @@ inline cudaError_t PrefillPlanImpl(
   int64_t available_ctas = static_cast<int64_t>(num_blocks_per_sm) * num_sm - num_colocated_ctas;
   int max_grid_size = static_cast<int>(std::max<int64_t>(0, available_ctas));
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
+  int max_smem_per_block = 0;
+  if (fp8_kv_no_vo_split) {
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_block,
+                                                cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
+  }
 
   // step 2: determine kv_chunk_size
   auto [split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size, request_indices_vec,
         qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
-                             enable_cuda_graph, window_left, fixed_split_size, disable_split_kv);
+                             enable_cuda_graph, window_left, fixed_split_size, disable_split_kv,
+                             fp8_kv_no_vo_split, max_smem_per_block);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
@@ -884,15 +892,16 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                int32_t fixed_split_size, bool disable_split_kv,
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
-                               cudaStream_t stream) {
+                               cudaStream_t stream, bool fp8_kv_no_vo_split = false) {
   size_t used_float_workspace_size = 0;
   size_t used_int_workspace_size = 0;
-  return PrefillPlanImpl<true>(
-      used_float_workspace_size, used_int_workspace_size, float_buffer,
-      float_workspace_size_in_bytes, int_buffer, page_locked_int_buffer,
-      int_workspace_size_in_bytes, plan_info, qo_indptr_h, kv_indptr_h, total_num_rows, batch_size,
-      num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-      sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv, num_colocated_ctas, stream);
+  return PrefillPlanImpl<true>(used_float_workspace_size, used_int_workspace_size, float_buffer,
+                               float_workspace_size_in_bytes, int_buffer, page_locked_int_buffer,
+                               int_workspace_size_in_bytes, plan_info, qo_indptr_h, kv_indptr_h,
+                               total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk,
+                               head_dim_vo, page_size, enable_cuda_graph, sizeof_dtype_o,
+                               window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
+                               stream, fp8_kv_no_vo_split);
 }
 
 template <typename IdType>
@@ -901,7 +910,8 @@ inline cudaError_t PrefillPlanWorkspaceSize(
     IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
-    bool disable_split_kv, int64_t num_colocated_ctas, cudaStream_t stream) {
+    bool disable_split_kv, int64_t num_colocated_ctas, cudaStream_t stream,
+    bool fp8_kv_no_vo_split = false) {
   PrefillPlanInfo plan_info;
   return PrefillPlanImpl<false>(float_workspace_size_in_bytes, int_workspace_size_in_bytes,
                                 /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
@@ -910,7 +920,7 @@ inline cudaError_t PrefillPlanWorkspaceSize(
                                 kv_indptr_h, total_num_rows, batch_size, num_qo_heads, num_kv_heads,
                                 head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
                                 sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
-                                num_colocated_ctas, stream);
+                                num_colocated_ctas, stream, fp8_kv_no_vo_split);
 }
 
 inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }

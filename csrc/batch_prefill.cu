@@ -44,13 +44,22 @@ using namespace flashinfer;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-Array<int64_t> BatchPrefillWithKVCachePlan(
+// FP8 KV runs the ragged (and single-prefill) kernels on the non-VO-split
+// SharedStorage whose cross-warp output-merge buffer cannot fit CTA_TILE_Q=32 at
+// head_dim>=512 on ~99KB-smem GPUs; the paged kernel's SharedStoragePaged is
+// VO-split and unaffected. FA2DetermineCtaTileQ needs this distinction, so the
+// ragged wrapper plans through a separate `ragged_plan` export instead of the
+// shared `plan` (whose signature and paged semantics stay unchanged).
+constexpr bool kFp8KvNoVOSplit =
+    std::is_same_v<DTypeKV, __nv_fp8_e4m3> || std::is_same_v<DTypeKV, __nv_fp8_e5m2>;
+
+static Array<int64_t> BatchPrefillWithKVCachePlanImpl(
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
     TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
-    TensorView kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
-    int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
-    bool disable_split_kv, int64_t num_colocated_ctas = 0) {
+    int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
+    int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo,
+    int64_t window_left, int64_t fixed_split_size, bool disable_split_kv,
+    int64_t num_colocated_ctas, bool fp8_kv_no_vo_split) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -67,12 +76,40 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
       static_cast<IdType*>(kv_indptr.data_ptr()), total_num_rows, batch_size, num_qo_heads,
       num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
       /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
-      stream);
+      stream, fp8_kv_no_vo_split);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan prefill with error: " << cudaGetErrorString(status);
 
   return Array(plan_info.ToVector());
+}
+
+Array<int64_t> BatchPrefillWithKVCachePlan(
+    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
+    TensorView kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
+    int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
+    int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
+    bool disable_split_kv, int64_t num_colocated_ctas = 0) {
+  return BatchPrefillWithKVCachePlanImpl(
+      float_workspace_buffer, int_workspace_buffer, page_locked_int_workspace_buffer, qo_indptr,
+      kv_indptr, total_num_rows, batch_size, num_qo_heads, num_kv_heads, page_size,
+      enable_cuda_graph, head_dim_qk, head_dim_vo, window_left, fixed_split_size, disable_split_kv,
+      num_colocated_ctas, /*fp8_kv_no_vo_split=*/false);
+}
+
+Array<int64_t> BatchPrefillWithRaggedKVCachePlan(
+    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
+    TensorView kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
+    int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
+    int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
+    bool disable_split_kv, int64_t num_colocated_ctas = 0) {
+  return BatchPrefillWithKVCachePlanImpl(
+      float_workspace_buffer, int_workspace_buffer, page_locked_int_workspace_buffer, qo_indptr,
+      kv_indptr, total_num_rows, batch_size, num_qo_heads, num_kv_heads, page_size,
+      enable_cuda_graph, head_dim_qk, head_dim_vo, window_left, fixed_split_size, disable_split_kv,
+      num_colocated_ctas, /*fp8_kv_no_vo_split=*/kFp8KvNoVOSplit);
 }
 
 Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(

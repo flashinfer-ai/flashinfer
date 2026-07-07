@@ -2393,7 +2393,19 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   int64_t packed_qo_len = qo_len * group_size;
-  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO);
+  // FP8 KV single prefill also runs on the non-VO-split SharedStorage (see
+  // kLargeHeadWarpSplit below), so its CTA_TILE_Q must honor the same
+  // large-head shared-memory clamp as the ragged batch path.
+  constexpr bool kFp8KvNoVOSplit = sizeof(DTypeKV) == 1 && !is_fp4_type_v<DTypeKV>;
+  int max_smem_per_block_for_clamp = 0;
+  if constexpr (kFp8KvNoVOSplit && HEAD_DIM_VO >= 512) {
+    int dev_id_for_clamp = 0;
+    FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id_for_clamp));
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
+        &max_smem_per_block_for_clamp, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id_for_clamp));
+  }
+  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO, kFp8KvNoVOSplit,
+                                             max_smem_per_block_for_clamp);
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
     // hd512 uses the 2-Q x 2-KV-warp layout at CTA_TILE_Q=32. FP4 large-head

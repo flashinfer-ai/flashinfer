@@ -281,6 +281,150 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
     torch.testing.assert_close(o_decode_fp8, o_fp8, atol=1e-2, rtol=1e-2)
 
 
+# ---------------------------------------------------------------------------
+# CTA_TILE_Q selection for FP8-KV head_dim=512 (gh #3843)
+#
+# The fp8-KV ragged/single kernels use the non-VO-split SharedStorage whose
+# CTA_TILE_Q=32 cross-warp merge buffer cannot fit the ~99KB per-block opt-in
+# limit of SM86/89/120/121-class GPUs, so the planner clamps them to 16 there;
+# the paged kernel is VO-split, fits at 32, and must never be clamped.
+# ---------------------------------------------------------------------------
+
+_PLAN_INFO_CTA_TILE_Q_IDX = 3  # PrefillPlanInfo::ToVector layout (scheduler.cuh)
+
+# Mirrors the feasibility bound in FA2DetermineCtaTileQ
+# (include/flashinfer/utils.cuh): merge buffer + m/d entries + tail slack.
+_H512_CTA32_FP8_RAGGED_SMEM_BYTES = 4 * 32 * (256 * 4 + 8) + 256
+
+
+def _smem_per_block_optin() -> int:
+    props = torch.cuda.get_device_properties(torch.device("cuda:0"))
+    optin = getattr(props, "shared_memory_per_block_optin", None)
+    if optin is None:
+        pytest.skip("torch does not expose shared_memory_per_block_optin")
+    return optin
+
+
+def test_ragged_fp8_h512_long_q_plan_clamps_cta_tile_q():
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(42)
+    batch_size = 2
+    qo_len = kv_len = 128  # packed qo len 128 > 32: the unclamped plan picks 32
+    num_qo_heads = num_kv_heads = 4
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    k_fp8 = (
+        torch.randn(batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16)
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    v_fp8 = (
+        torch.randn(batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16)
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+    )
+    expected = 16 if _smem_per_block_optin() < _H512_CTA32_FP8_RAGGED_SMEM_BYTES else 32
+    assert wrapper._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == expected
+    # The planned config must actually launch: before the clamp this raised
+    # "Required shared memory (132176 bytes) ... exceeds this GPU's per-block
+    # limit" on 99KB-smem GPUs.
+    o = wrapper.run(q, k_fp8, v_fp8)
+    assert torch.isfinite(o).all()
+
+
+def test_paged_fp8_h512_long_q_plan_keeps_cta32():
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(42)
+    batch_size = 2
+    qo_len = kv_len = 128
+    page_size = 16
+    num_qo_heads = num_kv_heads = 4
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_data_fp8 = (
+        torch.randn(
+            total_num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16
+        )
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
+    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    ).to(0)
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+    )
+    # SharedStoragePaged is VO-split and fits CTA_TILE_Q=32 on every supported
+    # GPU; the ragged clamp must not leak into paged plans (that would be a
+    # silent perf regression).
+    assert wrapper._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == 32
+    o = wrapper.run(q, kv_data_fp8)
+    assert torch.isfinite(o).all()
+
+
+def test_single_prefill_fp8_h512_long_q():
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(42)
+    qo_len = kv_len = 128  # packed qo len > 32: exercises the CTA32-or-clamp path
+    num_qo_heads = num_kv_heads = 4
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.float16).to(0)
+    k_fp8 = (
+        torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16)
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    v_fp8 = (
+        torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16)
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    o_ref = flashinfer.single_prefill_with_kv_cache(
+        q, k_fp8.to(torch.float16), v_fp8.to(torch.float16)
+    )
+    o_fp8 = flashinfer.single_prefill_with_kv_cache(q, k_fp8, v_fp8)
+    torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
+
+
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
         12, 7, 54, 1, 4, 4, 128, "NHD", torch.float8_e5m2
