@@ -120,3 +120,109 @@ def test_deepseek_cute_dsl(dtype_qk, dtype_vo, Dqk, Dvo):
     ref = _ragged_ref(qr, kr, vr, qo, kv, sm, causal=False)
     atol = 4e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
     torch.testing.assert_close(o.float(), ref.float(), atol=atol, rtol=atol)
+
+
+# =============================================================================
+# BatchPrefillWithRaggedKVCacheWrapper(backend="cute-dsl")
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "dtype_qk,dtype_vo",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, causal):
+    torch.manual_seed(0)
+    b, s, Hq, Hk, D = 2, 1024, 8, 8, 128
+    qo = _indptr([s] * b)
+    kv = qo.clone()
+    total = b * s
+    sm = 1.0 / math.sqrt(D)
+    q, k, v, qr, kr, vr = _make_qkv(total, total, Hq, Hk, dtype_qk, dtype_vo, D, D)
+    ws = torch.empty(128 * 1024 * 1024, device=DEVICE, dtype=torch.uint8)
+
+    w = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        ws, kv_layout="NHD", backend="cute-dsl"
+    )
+    w.plan(qo, kv, Hq, Hk, D, causal=causal, q_data_type=dtype_qk)
+    o = w.run(q, k, v)
+    ref = _ragged_ref(qr, kr, vr, qo, kv, sm, causal=causal)
+    atol = 4e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
+    torch.testing.assert_close(o.float(), ref.float(), atol=atol, rtol=atol)
+
+    # LSE is now supported for standard attention.
+    o2, lse = w.run(q, k, v, return_lse=True)
+    torch.testing.assert_close(o2.float(), o.float(), atol=1e-2, rtol=1e-2)
+    assert lse.shape == (total, Hq)
+
+
+def test_cute_dsl_jit_fallback(monkeypatch):
+    """When the cubin variant is unavailable, cute_dsl_fmha_ragged_prefill must
+    fall back to the JIT runner and still produce correct results."""
+    import flashinfer.attention.cute_dsl.fmha as cubin_mod
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("forced: cubin unavailable")
+
+    monkeypatch.setattr(cubin_mod, "get_cute_dsl_fmha_kernel", _raise)
+
+    torch.manual_seed(0)
+    b, s, H, D = 2, 256, 4, 128
+    qo = _indptr([s] * b)
+    kv = qo.clone()
+    total = b * s
+    sm = 1.0 / math.sqrt(D)
+    q, k, v, qr, kr, vr = _make_qkv(
+        total, total, H, H, torch.bfloat16, torch.bfloat16, D, D
+    )
+    o = torch.empty(total, H, D, device=DEVICE, dtype=torch.bfloat16)
+
+    cubin_mod.cute_dsl_fmha_ragged_prefill(
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        qo_indptr=qo,
+        kv_indptr=kv,
+        is_causal=False,
+        sm_scale=sm,
+        max_qo_len=s,
+        max_kv_len=s,
+    )
+    ref = _ragged_ref(qr, kr, vr, qo, kv, sm, causal=False)
+    torch.testing.assert_close(o.float(), ref.float(), atol=3e-2, rtol=3e-2)
+
+
+def test_batch_prefill_cute_dsl_alibi_fallback():
+    """ALiBi is unsupported by the vendored kernel; must fall back to prefill.py."""
+    torch.manual_seed(0)
+    b, s, H, D = 2, 256, 8, 128
+    qo = _indptr([s] * b)
+    kv = qo.clone()
+    total = b * s
+    q = torch.randn(total, H, D, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(total, H, D, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(total, H, D, device=DEVICE, dtype=torch.bfloat16)
+    ws = torch.empty(128 * 1024 * 1024, device=DEVICE, dtype=torch.uint8)
+
+    w = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        ws, kv_layout="NHD", backend="cute-dsl"
+    )
+    w.plan(
+        qo,
+        kv,
+        H,
+        H,
+        D,
+        causal=False,
+        pos_encoding_mode="ALIBI",
+        q_data_type=torch.bfloat16,
+    )
+    o = w.run(q, k, v)
+    assert o.shape == (total, H, D)
+    assert torch.isfinite(o.float()).all()
