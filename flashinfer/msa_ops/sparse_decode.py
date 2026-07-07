@@ -217,7 +217,7 @@ def msa_sparse_decode_attention(
         single chunk at high batch. A single chunk is the *fused* path: one CTA
         per (token, kv-head) writes the final output directly (no GMEM partials,
         no combine). ``True``/``False`` force fused/split on; ``None`` (default)
-        adapts. Fused is unavailable for NVFP4 KV.
+        adapts.
 
     Returns
     -------
@@ -348,12 +348,8 @@ def msa_sparse_decode_attention(
 
     # Adaptive split-K: num_chunks fills the (chunk x token x kv-head) grid at low
     # batch; num_chunks==1 is the fused path (no GMEM partials/combine) at high
-    # batch. NVFP4 keeps the per-block split.
-    if force_fused and kv_nvfp4:
-        raise ValueError("force_fused is not supported with NVFP4 KV")
-    if kv_nvfp4:
-        fused, num_chunks = False, topk
-    elif force_fused is True:
+    # batch.
+    if force_fused is True:
         fused, num_chunks = True, 1
     elif force_fused is False:
         fused, num_chunks = False, topk

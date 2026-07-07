@@ -723,6 +723,90 @@ def test_sparse_decode_nvfp4():
     assert torch.equal(out_g, fresh)
 
 
+@pytest.mark.parametrize("paged", [False, True])
+def test_sparse_decode_fused_nvfp4(paged):
+    """Fused decode with packed NVFP4 KV must match the split+combine path
+    (output and LSE) and the dequant torch oracle."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    B, sq, Hq, Hkv, topk = 8, 1, 8, 2, 16
+    q, k_flat, v_flat, idx, seqused, cu_k, pg, ptab = _make_decode_case(
+        B, sq, Hq, Hkv, topk, torch.bfloat16, paged, seed=115
+    )
+    total_q, total_k = B * sq, k_flat.shape[0]
+    scale = 1.0 / math.sqrt(128)
+
+    # The paged cache is a page permutation of the flat rows, so both share one
+    # global amax and quantize identically row-for-row; the flat dequant serves
+    # as the oracle for either layout.
+    kq, ksf, kg = _nvfp4_quant(k_flat.reshape(-1, 128))
+    vq, vsf, vg = _nvfp4_quant(v_flat.reshape(-1, 128))
+    if paged:
+        npages = pg[0].shape[0]
+        kq_p, ksf_p, kg_p = _nvfp4_quant(pg[0].reshape(-1, 128))
+        vq_p, vsf_p, vg_p = _nvfp4_quant(pg[1].reshape(-1, 128))
+
+    def run(force_fused):
+        kw = dict(
+            seqlen_q=sq,
+            causal=True,
+            softmax_scale=scale,
+            return_softmax_lse=True,
+            force_fused=force_fused,
+        )
+        if paged:
+            return msa_sparse_decode_attention(
+                q,
+                kq_p.reshape(npages, Hkv, BLK_KV, 64),
+                vq_p.reshape(npages, Hkv, BLK_KV, 64),
+                idx,
+                page_table=ptab,
+                seqused_k=seqused,
+                k_scale=ksf_p,
+                v_scale=vsf_p,
+                k_global_scale=kg_p,
+                v_global_scale=vg_p,
+                **kw,
+            )
+        return msa_sparse_decode_attention(
+            q,
+            kq.reshape(total_k, Hkv, 64),
+            vq.reshape(total_k, Hkv, 64),
+            idx,
+            cu_seqlens_k=cu_k,
+            k_scale=ksf,
+            v_scale=vsf,
+            k_global_scale=kg,
+            v_global_scale=vg,
+            **kw,
+        )
+
+    out_split, lse_split = run(False)
+    out_fused, lse_fused = run(True)
+    torch.cuda.synchronize()
+
+    k_deq = (
+        _msa_nvfp4_dequant(kq, ksf, kg, total_k * Hkv, 128)
+        .reshape(total_k, Hkv, 128)
+        .to(torch.bfloat16)
+    )
+    v_deq = (
+        _msa_nvfp4_dequant(vq, vsf, vg, total_k * Hkv, 128)
+        .reshape(total_k, Hkv, 128)
+        .to(torch.bfloat16)
+    )
+    cu_q = torch.arange(0, total_q + 1, sq, dtype=torch.int32)
+    ref = _ref_sparse_attention(
+        q.cpu(), k_deq.cpu(), v_deq.cpu(), idx.cpu(), cu_q, cu_k.cpu(), True, scale
+    )
+    assert (out_fused.float().cpu() - ref).abs().max().item() < 2.5e-2
+    # Fused must agree with the split path to ~bf16 precision.
+    assert (out_fused.float() - out_split.float()).abs().max().item() < 5e-3
+    finite = torch.isfinite(lse_split) & torch.isfinite(lse_fused)
+    assert (lse_fused[finite] - lse_split[finite]).abs().max().item() < 5e-3
+
+
 # ---------------------------------------------------------------------------
 # top-k selection and edge-case coverage
 # ---------------------------------------------------------------------------
