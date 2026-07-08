@@ -2222,6 +2222,8 @@ def _build_mla_decode_tuning_config(
                 tensor_initializers=[None, init_block_tables, init_seq_lens, None],
             ),
         ),
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
     )
 
 

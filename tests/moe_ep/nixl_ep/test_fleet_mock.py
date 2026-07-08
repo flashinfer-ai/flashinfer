@@ -21,6 +21,27 @@ from unittest import mock
 import pytest
 
 
+def _skip_unless_ep_capable():
+    """Skip on hosts that can't construct an EP Fleet even with mocks.
+
+    ``create_fleet`` runs ``validate_arch_for_backend``, which requires a
+    CUDA device and a CUDA-13 torch build (the EP runtime wheels ship
+    CUDA-13 binaries only), so on older stacks these tests would fail in
+    validation before reaching the mocked Buffer.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    cuda_ver = torch.version.cuda
+    try:
+        cuda_major = int(cuda_ver.split(".")[0]) if cuda_ver else None
+    except ValueError:
+        cuda_major = None
+    if cuda_major is not None and cuda_major < 13:
+        pytest.skip(f"moe_ep requires a CUDA-13 torch build (got CUDA {cuda_ver})")
+
+
 @pytest.fixture
 def fake_buffer_cls():
     """Build a `Buffer` class that records ctor + method calls."""
@@ -119,10 +140,7 @@ def patched_loader(fake_nixl_ep_module):
 
 
 def test_fleet_init_calls_update_memory_and_connect(patched_loader, fake_buffer_cls):
-    import torch
-
-    if not torch.cuda.is_available():
-        pytest.skip("needs CUDA")
+    _skip_unless_ep_capable()
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -163,8 +181,7 @@ def test_fleet_init_calls_update_memory_and_connect(patched_loader, fake_buffer_
 def test_handle_combine_requires_topk_weights(patched_loader, fake_buffer_cls):
     import torch
 
-    if not torch.cuda.is_available():
-        pytest.skip("needs CUDA")
+    _skip_unless_ep_capable()
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -198,10 +215,7 @@ def test_handle_combine_requires_topk_weights(patched_loader, fake_buffer_cls):
 
 
 def test_update_topology_diffs_ranks(patched_loader, fake_buffer_cls):
-    import torch
-
-    if not torch.cuda.is_available():
-        pytest.skip("needs CUDA")
+    _skip_unless_ep_capable()
 
     from flashinfer.moe_ep import (
         BootstrapConfig,

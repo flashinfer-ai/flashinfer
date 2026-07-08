@@ -26,25 +26,15 @@ license-files = ["LICENSE", "LICENSE*.txt"]
 [project.optional-dependencies]
 cu12 = ["nvidia-cutlass-dsl>=4.5.0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
-# Runtime deps for the moe_ep transport backends. Pair with the BUILD_NVEP=1
-# env var at install time: `BUILD_NVEP=1 pip install -e ".[nvep]"`. The env var
-# triggers the NIXL-EP submodule build (meson); the build_backend.py hook also
-# pip-installs `nixl-cu13>=1.0.1` with --no-deps (matching SGLang's Dockerfile
-# pattern) so it doesn't drag transitive constraints that downgrade torch.
-#
-# NCCL-EP is NO LONGER built from the in-tree submodule: it is provided by the
-# released `nccl4py` wheel (>=0.3.1), which ships the `nccl.ep` Pythonic API and
-# bundles libnccl_ep.so (loaded via cuda-pathfinder, so no LD_LIBRARY_PATH hack).
-# `flashinfer.moe_ep.nccl_ep` imports `nccl.ep`; availability is probed via
-# `find_spec("nccl.ep")`.
-nvep = [
-  "cuda-python>=13.0",
-  "nccl4py>=0.3.1",
-  # NCCL-EP group-create fails on B200 with older NCCL (2.27.x/2.29.x); >=2.30.7
-  # carries the B200 EP support. Ensure this wheel's libnccl is loaded (first on
-  # LD_LIBRARY_PATH) rather than a base-image system NCCL.
-  "nvidia-nccl-cu13>=2.30.7",
-]
+# DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
+# working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
+# BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
+# default (best-effort) on `pip install .` — see the moe_ep section at the top
+# of build_backend.py. libnccl comes from torch's own nvidia-nccl-cu13 pin;
+# the >=2.30.7 B200 floor is enforced at runtime (moe_ep/_validators.py) and
+# upgraded --no-deps by the build hook on source installs. Opt out of the
+# native build with BUILD_NVEP=0 (or BUILD_NIXL_EP=0 / BUILD_NCCL_EP=0).
+nvep = []
 
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"
@@ -94,9 +84,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]
 "flashinfer.data.cccl" = ["cub/cub/**", "libcudacxx/include/**", "thrust/thrust/**"]
-# EP backend shared libraries built in-tree from 3rdparty/{nixl,nccl} when
-# BUILD_NVEP=1 is set during `pip install`. The .so files live under
-# flashinfer/moe_ep/{nixl_ep,nccl_ep}/_libs/ (gitignored; populated by
+# EP backend shared libraries built in-tree from 3rdparty/nixl by default
+# during `pip install` (opt out with BUILD_NIXL_EP=0). The .so files live
+# under flashinfer/moe_ep/{nixl_ep,nccl_ep}/_libs/ (gitignored; populated by
 # build_backend._build_nvep_if_enabled).
 "flashinfer.moe_ep.nixl_ep" = ["_libs/**"]
 "flashinfer.moe_ep.nccl_ep" = ["_libs/*.so*"]

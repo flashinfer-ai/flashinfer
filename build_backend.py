@@ -29,18 +29,31 @@ _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
 
 
-# moe_ep build infra. Three opt-in switches, all `0` by default:
-#   BUILD_NCCL_EP=1   → enable NCCL-EP (provided by the `nccl4py>=0.3.1` wheel;
-#                       NO in-tree build — see the `[nvep]` extra in pyproject)
-#   BUILD_NIXL_EP=1   → build NIXL-EP from 3rdparty/nixl (meson)
-#   BUILD_NVEP=1      → legacy alias: turns BOTH on (back-compat with earlier docs)
+# moe_ep build infra. Both EP backends are ON BY DEFAULT since the moe_ep
+# runtime deps moved into the base dependencies (`pip install .` is enough):
+#   NCCL-EP  — provided by the `nccl4py>=0.3.1` wheel (a base dep now); NO
+#              in-tree build.
+#   NIXL-EP  — built in-tree from 3rdparty/nixl (meson). Missing build deps
+#              (meson/ninja/nvcc/UCX/...) skip the backend with a warning
+#              instead of failing the install (best-effort).
 #
-# Only NIXL-EP is built in-tree (it needs DOCA gpunetio + UCX 1.21.x). NCCL-EP is
-# a pure pip dependency (`nccl4py`, which ships the `nccl.ep` API + bundled
-# libnccl_ep.so). Hosts that only have one backend's deps should opt in with the
-# matching flag instead of BUILD_NVEP.
+# Env switches (tri-state; unset means "default on, best-effort"):
+#   BUILD_NIXL_EP=0   → skip the NIXL-EP submodule build
+#   BUILD_NIXL_EP=1   → strict: a missing build dep FAILS the install
+#   BUILD_NCCL_EP=0/1 → same idea for NCCL-EP (no build step; only affects
+#                       the informational logging)
+#   BUILD_NVEP=0      → legacy alias: turns BOTH off
+#   BUILD_NVEP=1      → legacy alias: both on, best-effort (back-compat)
 def _flag(name: str) -> bool:
     v = os.environ.get(name, "")
+    return v == "1" or v.lower() in ("true", "yes", "on")
+
+
+def _tri_flag(name: str) -> bool | None:
+    """Tri-state env flag: True / False when set, None when unset/empty."""
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return None
     return v == "1" or v.lower() in ("true", "yes", "on")
 
 
@@ -61,22 +74,49 @@ def _time_phase(label: str):
         print(f"[BUILD_NVEP] {label}: done in {dt:.1f}s", flush=True)
 
 
-_BUILD_NVEP = _flag("BUILD_NVEP")
-_BUILD_NCCL_EP = _flag("BUILD_NCCL_EP") or _BUILD_NVEP
-_BUILD_NIXL_EP = _flag("BUILD_NIXL_EP") or _BUILD_NVEP
+# Resolution order per backend: explicit BUILD_{NIXL,NCCL}_EP, then the
+# legacy BUILD_NVEP alias, then the default (ON).
+_BUILD_NVEP = _tri_flag("BUILD_NVEP")
 
-# Was the user opting in via the legacy "give me everything possible" alias
-# (BUILD_NVEP=1) AND NOT explicitly via the per-backend switches? If yes,
-# treat a missing build-time dep as "skip that backend with a warning"
-# instead of "abort the entire install". When the user explicitly asks for
-# BUILD_NCCL_EP=1 / BUILD_NIXL_EP=1, a missing dep is a hard error — they
-# asked for that backend specifically.
-_BUILD_NVEP_BEST_EFFORT = _BUILD_NVEP and not (
-    _flag("BUILD_NCCL_EP") or _flag("BUILD_NIXL_EP")
-)
+
+def _backend_enabled(name: str) -> bool:
+    explicit = _tri_flag(name)
+    if explicit is not None:
+        return explicit
+    if _BUILD_NVEP is not None:
+        return _BUILD_NVEP
+    return True
+
+
+_BUILD_NCCL_EP = _backend_enabled("BUILD_NCCL_EP")
+_BUILD_NIXL_EP = _backend_enabled("BUILD_NIXL_EP")
+
+# Missing build-time deps skip the backend with a warning instead of aborting
+# the install — EXCEPT when the user explicitly asked for the NIXL-EP build
+# with BUILD_NIXL_EP=1; then a missing dep is a hard error. Only NIXL-EP goes
+# through _gate_backend (NCCL-EP has no build step), so strictness is keyed
+# solely off the NIXL-EP flag — an explicit BUILD_NCCL_EP=1 must not force
+# NIXL-EP into strict mode. The default-on install and the legacy
+# BUILD_NVEP=1 alias are both best-effort.
+_BUILD_NVEP_BEST_EFFORT = _tri_flag("BUILD_NIXL_EP") is not True
 
 _nvep_build_root = _root / "build_nvep"
 _moe_ep_pkg = _root / "flashinfer" / "moe_ep"
+
+
+def _in_isolated_build_env() -> bool:
+    """Heuristic: are we running inside a PEP 517 isolated build env?
+
+    pip's isolated build envs live in a ``pip-build-env-*`` temp dir injected
+    on sys.path; uv's ephemeral build envs live under a ``builds-v0`` cache
+    dir. In such an env, wheels installed by this hook (nixl-cu13) vanish
+    when the build finishes and never reach the user's target environment —
+    and the env usually has no ``pip`` module at all, so the installs fail
+    outright. The moe_ep build path therefore needs --no-build-isolation.
+    """
+    markers = ("pip-build-env-", f"{os.sep}builds-v0{os.sep}")
+    paths = [sys.prefix, *sys.path]
+    return any(m in p for m in markers for p in paths)
 
 
 def _detect_cuda_major() -> int:
@@ -201,10 +241,9 @@ def _build_nixl_ep() -> None:
         wheel_lib_dir = _find_nixl_wheel_lib_dir()
         if wheel_lib_dir is None:
             raise RuntimeError(
-                "BUILD_NIXL_EP requires nixl-cu13 to be pre-installed.\n"
+                "The NIXL-EP build requires the nixl-cu13 wheel (the build "
+                "hook normally pre-installs it; see _ensure_nixl_wheel).\n"
                 "Run: uv pip install --no-deps 'nixl-cu13>=1.0.1'\n"
-                "(the FlashInfer Dockerfile does this automatically; bare-host\n"
-                "installs need to do it before `pip install -e .[nvep]`).\n"
                 "Or set BUILD_NIXL_EP_HERMETIC=1 to build the full NIXL tree."
             )
         setup_args += [
@@ -307,6 +346,75 @@ def _fix_rpaths() -> None:
             print(f"[BUILD_NVEP] WARNING: patchelf failed on {so.name}: {err}")
 
 
+def _ensure_nixl_wheel() -> None:
+    """Pre-install the nixl-cu* wheel the NIXL-EP build links against.
+
+    The default (non-hermetic) NIXL-EP build links nixl_ep_cpp.so against the
+    libnixl.so shipped by the `nixl-cu13` pip wheel. Since the EP build now
+    runs by default on `pip install .`, install that wheel up front instead of
+    requiring users to pre-install it. `--no-deps` for the same reason as
+    _install_nvep_runtime_wheels: the wheel's transitive constraints downgrade
+    torch. Best-effort: on failure the _nixl_buildable probe reports the
+    missing wheel and the backend is gated as usual (skip or hard error).
+    """
+    if _find_nixl_wheel_lib_dir() is not None:
+        return
+    cuda_major = _detect_cuda_major()
+    wheel = f"nixl-cu{cuda_major}>=1.0.1"
+    print(f"[BUILD_NVEP] pre-installing NIXL wheel --no-deps: {wheel}")
+
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        cmd = [uv_bin, "pip", "install", "--python", sys.executable, "--no-deps", wheel]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "--no-deps", wheel]
+    print(f"[BUILD_NVEP] $ {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(
+            f"[BUILD_NVEP] WARNING: could not pre-install {wheel} ({e}); "
+            "the NIXL-EP pre-flight probe will decide whether to skip or fail."
+        )
+
+
+def _ensure_nccl_floor() -> None:
+    """Best-effort upgrade of nvidia-nccl-cu13 to the B200 EP floor (>=2.30.7).
+
+    Deliberately NOT a base dependency: torch's cu13 wheels pin
+    nvidia-nccl-cu13 EXACTLY (e.g. ==2.29.7), so declaring a >=2.30.7 floor
+    in package metadata makes pip's resolver evict torch — on aarch64 it
+    backtracks to the CPU-only torch wheel. Installing here with --no-deps
+    (mirroring the nixl-cu13 pattern) upgrades the wheel without ever
+    entering the resolver. Failures only warn: torch's own NCCL is
+    sufficient everywhere except NCCL-EP group-create on B200, and
+    moe_ep/_validators.py enforces the floor at runtime with an actionable
+    error where it actually matters.
+    """
+    cuda_major = _detect_cuda_major()
+    if cuda_major < 13:
+        return  # EP is CUDA-13-only; nothing to upgrade on cu12 hosts.
+    wheel = "nvidia-nccl-cu13>=2.30.7"
+    print(f"[BUILD_NVEP] ensuring NCCL-EP floor --no-deps: {wheel}")
+
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        cmd = [uv_bin, "pip", "install", "--python", sys.executable, "--no-deps", wheel]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "--no-deps", wheel]
+    print(f"[BUILD_NVEP] $ {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(
+            f"[BUILD_NVEP] WARNING: could not install {wheel} ({e}). "
+            "NCCL-EP on B200 needs NCCL >= 2.30.7 (group-create fails on "
+            "older releases); the runtime validator will raise there. "
+            "Install manually if needed: pip install --no-deps "
+            f"'{wheel}'"
+        )
+
+
 def _nixl_buildable() -> tuple[bool, str]:
     """Probe for hard NIXL-EP build-time deps. Returns (ok, reason_if_not).
 
@@ -349,15 +457,16 @@ def _nixl_buildable() -> tuple[bool, str]:
     return True, ""
 
 
-def _install_nvep_runtime_wheels(built_nixl: bool, built_nccl: bool) -> None:
-    """Install the EP-related runtime wheels with --no-deps, gated per backend.
+def _install_nvep_runtime_wheels(built_nixl: bool) -> None:
+    """Install the NIXL runtime wheel with --no-deps when NIXL-EP was built.
 
-    These wheels supply the BASE libraries (libnccl.so.2, libnixl.so) that the
-    EP plugins (libnccl_ep.so, nixl_ep_cpp.so) dynamically load at runtime.
-    We do NOT stage the base libs into the FlashInfer package tree — relying
-    on these pip wheels keeps the wheel small and avoids the duplication.
+    The wheel supplies the BASE libraries (libnixl.so + siblings) that the
+    nixl_ep_cpp.so plugin dynamically loads at runtime. We do NOT stage the
+    base libs into the FlashInfer package tree — relying on the pip wheel
+    keeps the wheel small and avoids the duplication. (NCCL-EP's libnccl
+    comes from torch's own nvidia-nccl-cu13 pin; see _ensure_nccl_floor.)
 
-    The wheels carry transitive constraints (e.g. an nvidia-nccl-cu12 pin via
+    The wheel carries transitive constraints (e.g. an nvidia-nccl-cu12 pin via
     the `nixl` meta-package) that conflict with a recent torch and force a
     downgrade when resolved normally. SGLang's Dockerfile mirrors this with
     `pip install nixl nixl-cu13 --no-deps`; we do the same.
@@ -367,21 +476,18 @@ def _install_nvep_runtime_wheels(built_nixl: bool, built_nccl: bool) -> None:
          no pip module). This is the path most users hit.
       2. `python -m pip install` — for venvs with pip seeded.
 
-    Each wheel is gated on what was ACTUALLY built (not what was requested),
-    so `pip list` stays honest when a backend was skipped due to missing
-    build-time deps in best-effort mode.
+    Gated on what was ACTUALLY built (not what was requested), so `pip list`
+    stays honest when the backend was skipped due to missing build-time deps
+    in best-effort mode.
 
-    This step is now FATAL on failure. Since we no longer stage the base
-    libs, a half-installed env where the wheels failed to install would
-    leave the EP plugins unable to load at runtime. Better to fail loudly
-    at install time.
+    This step is FATAL on failure. Since we no longer stage the base libs, a
+    half-installed env where the wheel failed to install would leave the EP
+    plugin unable to load at runtime. Better to fail loudly at install time.
     """
     cuda_major = _detect_cuda_major()
     wheels: list[str] = []
     if built_nixl:
         wheels.append(f"nixl-cu{cuda_major}>=1.0.1")
-    if built_nccl:
-        wheels.append(f"nvidia-nccl-cu{cuda_major}>=2.30.4")
     if not wheels:
         return
 
@@ -524,9 +630,9 @@ def _gate_backend(name: str, requested: bool, probe) -> bool:
     # User opted in explicitly (BUILD_NCCL_EP=1 or BUILD_NIXL_EP=1) — fail hard.
     raise RuntimeError(
         f"{name} build requested but a hard dep is missing: {reason}. "
-        "Either install the missing dependency, or use BUILD_NVEP=1 "
-        "(best-effort mode) to skip this backend with a warning instead "
-        "of failing the install."
+        "Either install the missing dependency, unset the BUILD_*_EP flag "
+        "(the default build is best-effort and skips this backend with a "
+        "warning), or set it to 0 to skip the backend entirely."
     )
 
 
@@ -542,16 +648,38 @@ def _build_nvep_if_enabled() -> None:
     mode = "best-effort" if _BUILD_NVEP_BEST_EFFORT else "strict"
     print(f"[BUILD_NVEP] requested: {', '.join(requested)} (mode: {mode})")
 
-    # NCCL-EP is no longer built from the submodule — it is provided by the
-    # released `nccl4py` wheel (>=0.3.1, the `nccl.ep` API + bundled
-    # libnccl_ep.so), declared in the `[nvep]` extra. So BUILD_NCCL_EP requires
-    # no in-tree build step; we only note it here.
+    if _BUILD_NIXL_EP and _in_isolated_build_env():
+        print(
+            "[BUILD_NVEP] WARNING: PEP 517 build isolation detected. Wheels "
+            "installed by this hook (nixl-cu13) land in the throwaway build "
+            "env — the NIXL-EP build will most likely be skipped, and even "
+            "if it succeeds its runtime wheel will NOT persist into the "
+            "target environment. To enable NIXL-EP when installing from "
+            "source, disable isolation:\n"
+            "    pip install --no-build-isolation .\n"
+            "If NIXL-EP libs were still staged, install the runtime wheel "
+            "manually afterwards: pip install --no-deps 'nixl-cu13>=1.0.1'.",
+            flush=True,
+        )
+
+    # NCCL-EP is not built from source — it is provided by the released
+    # `nccl4py` wheel (>=0.3.1, the `nccl.ep` API + bundled libnccl_ep.so),
+    # which is a base dependency now. So BUILD_NCCL_EP requires no in-tree
+    # build step; we only note it here.
     if _BUILD_NCCL_EP:
         print(
-            "[BUILD_NVEP] NCCL-EP is provided by the nccl4py wheel (>=0.3.1); "
-            "no submodule build. Ensure it is installed (e.g. `pip install "
-            "\".[nvep]\"` or `pip install 'nccl4py>=0.3.1'`)."
+            "[BUILD_NVEP] NCCL-EP is provided by the nccl4py wheel (>=0.3.1), "
+            "a base dependency of flashinfer-python; no in-tree build."
         )
+        # torch's cu13 wheels pin nvidia-nccl-cu13 exactly (< the B200 EP
+        # floor), so upgrade it out-of-band; best-effort by design.
+        _ensure_nccl_floor()
+
+    # The default (non-hermetic) NIXL-EP build links against the nixl-cu13
+    # wheel's libnixl.so — install it up front so plain `pip install .` works
+    # without a manual pre-install step.
+    if _BUILD_NIXL_EP and not _flag("BUILD_NIXL_EP_HERMETIC"):
+        _ensure_nixl_wheel()
 
     # Pre-flight gating — probe the NIXL-EP build-time deps (NCCL-EP needs none).
     will_build_nixl = _gate_backend("NIXL-EP", _BUILD_NIXL_EP, _nixl_buildable)
@@ -598,7 +726,7 @@ def _build_nvep_if_enabled() -> None:
         with _time_phase("_fix_rpaths"):
             _fix_rpaths()
         with _time_phase("_install_nvep_runtime_wheels"):
-            _install_nvep_runtime_wheels(built_nixl=built_nixl, built_nccl=False)
+            _install_nvep_runtime_wheels(built_nixl=built_nixl)
 
     print(
         f"[BUILD_NVEP] total build phase wall time: "
