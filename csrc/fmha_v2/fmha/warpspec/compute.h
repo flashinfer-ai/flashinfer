@@ -253,8 +253,10 @@ struct Compute {
     // Mutex between two compute groups.
     OrderedMutexAccessor mutex_accessor(shared->compute_mutex, warpgroup_id, SYNC_BARRIER);
     // Bootstrap the ordered-mbarrier: WG1 pre-arrives so WG0's first wait() does not deadlock.
-    if (ENABLE_MUTEX && warpgroup_id == 1) {
-      mutex_accessor.arrive();
+    if constexpr (ENABLE_MUTEX) {
+      if (warpgroup_id == 1) {
+        mutex_accessor.arrive();
+      }
     }
 
     // While loop for different heads.
