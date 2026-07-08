@@ -33,6 +33,7 @@ gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
+kda_prefill_qk4_v4_d128.json
 layernorm_h768.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
@@ -556,6 +557,19 @@ with contextlib.suppress(Exception):
     flashinfer.gdn_prefill.chunk_gated_delta_rule(
         gp_q, gp_k, gp_v, cu_seqlens=cu_seqlens
     )
+
+# ── KDA prefill (channel-wise log gate, per-token scalar beta) ───────────────
+with contextlib.suppress(Exception):
+    import flashinfer.kda_prefill  # noqa: PLC0415
+
+    kd_T, kd_H, kd_K = 256, 4, 128
+    kd_cu = torch.tensor([0, 64, 128, 192, 256], dtype=torch.int64, device=device)
+    kd_q = torch.randn(kd_T, kd_H, kd_K, dtype=torch.bfloat16, device=device)
+    kd_k = torch.randn(kd_T, kd_H, kd_K, dtype=torch.bfloat16, device=device)
+    kd_v = torch.randn(kd_T, kd_H, kd_K, dtype=torch.bfloat16, device=device)
+    kd_g = -torch.rand(kd_T, kd_H, kd_K, dtype=torch.float32, device=device)
+    kd_b = torch.rand(kd_T, kd_H, device=device).sigmoid().to(torch.bfloat16)
+    flashinfer.kda_prefill.chunk_kda(kd_q, kd_k, kd_v, kd_g, kd_b, cu_seqlens=kd_cu)
 
 # ── GDN decode (Qwen3-Next TP=4, qk=4/v=8/d=128) ────────────────────────────
 B, H, HV, K = 4, 4, 8, 128

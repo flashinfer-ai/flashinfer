@@ -21,6 +21,7 @@ instead of GDN's scalar broadcast.
 
 Exported:
 - run_recurrent_kda: Recurrent KDA standard decode and speculative decode backend
+- chunk_kda_sm100: Chunked KDA prefill kernel (Blackwell SM100)
 """
 
 try:
@@ -34,7 +35,13 @@ except (ImportError, RuntimeError):
     run_recurrent_kda = None  # type: ignore
     recurrent_kda = None  # type: ignore
 
+try:
+    from .blackwell import chunk_kda_sm100
+except (ImportError, RuntimeError):
+    chunk_kda_sm100 = None  # type: ignore
+
 __all__ = [
     "recurrent_kda",
     "run_recurrent_kda",
+    "chunk_kda_sm100",
 ]
