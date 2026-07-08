@@ -491,7 +491,10 @@ def test_moe_alltoall_compact_ep4_dispatch(top_k):
         total_tokens * top_k, dtype=torch.int32, device=torch.device("cuda")
     ).reshape(total_tokens, top_k)
     token_selected_experts = (
-        expert_ids * 7 + torch.arange(total_tokens, device="cuda").unsqueeze(1)
+        expert_ids * 7
+        + torch.arange(
+            total_tokens, dtype=torch.int32, device=torch.device("cuda")
+        ).unsqueeze(1)
     ).remainder(num_experts)
 
     output_tensors, _, _, _ = dispatch_from_single_rank(
