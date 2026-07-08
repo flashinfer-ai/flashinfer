@@ -2333,9 +2333,14 @@ def get_trtllm_moe_sm100_module():
                 "either topk_ids or routing_logits must be provided."
             )
             assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
-            routing_dtype = torch.bfloat16
-        else:
-            routing_dtype = routing_logits.dtype
+        # The trtllm-gen routing kernel always emits expert weights as bfloat16
+        # (routingData.mDtypeOutput is hard-set to Bfloat16 for every routing
+        # method in csrc/trtllm_fused_moe_runner.cu), independent of the
+        # routing_logits dtype. This buffer is returned verbatim to the caller
+        # when do_finalize=False, so it must be bfloat16 regardless of
+        # routing_logits.dtype (e.g. fp32 DeepSeekV3 logits); otherwise the
+        # returned expert_weights mislabels bf16 data as fp32. See #3595.
+        routing_dtype = torch.bfloat16
         hidden_size = hidden_states.shape[-1]
         if hidden_states.dtype == torch.uint8:
             hidden_size = hidden_size * 2
@@ -2349,6 +2354,14 @@ def get_trtllm_moe_sm100_module():
             )
             assert topk_weights is not None, (
                 "topk_weights must be provided for UnpackedPrecomputed mode"
+            )
+            # The finalize kernel reads the expert weights as args.mDtypeExpW,
+            # which is bfloat16 for this op (see runner.h: expert_weights is
+            # "[num_tokens, top_k] in bfloat16 = mDtypeExpW"). A user-provided
+            # fp32 buffer would be reinterpreted as bf16, so reject it up front.
+            assert topk_weights.dtype == torch.bfloat16, (
+                "topk_weights must be bfloat16 for UnpackedPrecomputed mode, got "
+                f"{topk_weights.dtype}"
             )
         else:
             # For Mode 1 (FromLogits) and Mode 2 (PackedPrecomputed), allocate OUTPUT buffers
@@ -3964,6 +3977,10 @@ def trtllm_fp4_block_scale_moe(
     List[torch.Tensor]
         ``[output]`` when ``do_finalize`` is ``True``, otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
+        The ``expert_weights`` tensor is always ``bfloat16`` (the routing
+        kernel emits bf16 weights for every routing method), regardless of
+        the ``routing_logits`` dtype — including the ``do_finalize=False``
+        path and fp32 ``DeepSeekV3`` logits.
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(

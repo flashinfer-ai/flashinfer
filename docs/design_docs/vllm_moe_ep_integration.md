@@ -31,10 +31,32 @@ FlashInfer run from the branch. All checks below **pass**:
 | vLLM e2e smoke (OLMoE, coherent output) | ✅ | ✅ |
 | **GSM8K 5-shot, Qwen3-30B-A3B** (flex / strict) | **0.852 / 0.894** | **0.858 / 0.897** |
 
-Both backends clear the GSM8K ≥ 0.80 gate (reference ~0.88).
+Both backends clear the GSM8K ≥ 0.80 gate (reference ~0.88). Correctness above (GAP tests +
+`--validate` transport round-trip) directly exercises the dispatch/combine path.
 
-**Throughput vs DeepEP** (`vllm bench throughput --dataset-name random`, Qwen3-30B-A3B, 8-GPU
-EP, 1000 prompts; total tok/s):
+**Transport-exercised results (DP-EP — the numbers that matter):**
+GSM8K through a real DP-EP server: **LL 0.856/0.898, HT 0.857/0.898** (flex/strict).
+DP-EP eager throughput vs DeepEP after the perf iteration (Qwen3-30B-A3B, 8×GPU, total tok/s,
+128/128 · 2048/128 · 128/2048): **FI-LL 9,088/23,106/5,825 (0.90/0.96/0.88× of DeepEP-LL)**;
+**FI-HT 6,797/45,224/3,795 (1.19/1.27/0.84× of DeepEP-HT — ahead on 2 of 3 shapes)**.
+The initial DP-EP pass was 2–6× behind; the closure came from three root-cause fixes:
+`flashinfer_ep_low_latency` added to vLLM's `use_batched_dp_moe` (batched-DP 256-token scheduler
+cap, matching `deepep_low_latency`), the HT recv-count compute trim (§2 GAP 3), and fleet-level
+host-path caches in `nccl_ep/handle.py`.
+
+> 🛑 **The throughput/GSM8K/memory numbers below are historical and do NOT compare the two
+> transports.** They were run with `--tensor-parallel-size 8` (`dp_size=1`), so vLLM took the
+> `MoEPrepareAndFinalizeNoDPEPMonolithic` path — experts computed locally, reconciled by TP
+> all-reduce — and **`--all2all-backend` was a no-op** (confirmed by nsys: identical kernels, only
+> TP all-reduce, no dispatch/combine, for both FI-EP and DeepEP). The all2all transport is only
+> selected when `dp_size > 1` (`fused_moe/config.py::use_all2all_kernels`). The tables above use
+> `--data-parallel-size 8 --enable-expert-parallel` (verify the log says
+> `Using FlashInferEPLL/HT…PrepareAndFinalize`, not `…Monolithic`). Note offline
+> `vllm bench throughput` rejects `--data-parallel-size` directly — launch it under
+> `torchrun --nproc_per_node=8` with `--distributed-executor-backend external_launcher`.
+
+**Throughput vs DeepEP** *(provisional — monolithic path, transport not exercised)*
+(`vllm bench throughput --dataset-name random`, Qwen3-30B-A3B, 8-GPU, 1000 prompts; total tok/s):
 
 | ISL/OSL | FI-EP LL | FI-EP HT | DeepEP LL | DeepEP HT |
 |---|---|---|---|---|
@@ -42,15 +64,13 @@ EP, 1000 prompts; total tok/s):
 | 2048 / 128 | 140,823 | 141,744 | 141,786 | 143,238 |
 | 128 / 2048 | 18,515 | 18,461 | 18,891 | 18,764 |
 
-GSM8K accuracy is within noise across all four backends; **throughput is within ~1–2% of
-DeepEP** across all three shapes. **Memory footprint is identical** across all four
-(150.45 GiB / 6.57M-token KV cache at `--gpu-memory-utilization 0.9`) — EP backend choice is
-memory-neutral. See
-[`vllm_moe_ep_results_prenyx.md`](vllm_moe_ep_results_prenyx.md) for the full method,
-per-backend req/s, GSM8K-vs-DeepEP table, multi-node (2-node/16-GPU), and reproduction.
+All four numbers land within ~1–2% — but that is because all four ran the *same* monolithic
+TP-all-reduce path, not because the transports are equivalent. GSM8K accuracy likewise within
+noise (monolithic path — end-to-end accuracy, not transport). Memory identical across all four
+(150.45 GiB / 6.57M-token KV cache at `--gpu-memory-utilization 0.9`; monolithic path).
 **Not measured:** raw NCCL-EP (N/A upstream), TTFT/TPOT via `bench serve`. **2-node/16-GPU:**
 Ray+TP=16 plumbing comes up but cross-node engine init stalls — reproduced with plain TP=16
-(no EP), so it's a cluster cross-node NCCL/fabric issue, not the EP integration (see results doc §1.4).
+(no EP), so it's a cluster cross-node NCCL/fabric issue, not the EP integration.
 
 ---
 
@@ -144,7 +164,8 @@ srun -A coreai_libraries_cudnn -p batch -N1 --time=03:00:00 \
 
 # 2. vLLM (from source) and 3. DeepEP images are layered on the base the same way
 #    (srun --container-image=<base>.sqsh --container-save=<new>.sqsh ...).
-#    Full recipes: see vllm_moe_ep_results_prenyx.md §3.2 (vLLM) and §3.3 (DeepEP).
+#    The canonical build spec is docker/Dockerfile.vllm-flashinfer-ep (directly usable
+#    on a Docker host; on pyxis clusters run its steps inside srun --container-save).
 ```
 
 Notes: whole-node allocations only (**no `--gres`** on this cluster). `--container-writable` is
@@ -188,7 +209,7 @@ GAP 3 HT `recv_total_counter` binding + `DispatchOutput` surfacing — all again
 ### 5.2 FlashInfer 8-GPU EP round-trip (single node, 8 GPU)
 Validate dispatch+combine correctness at world=8 via the **comm-matrix `--validate`** path
 (`srun --ntasks-per-node=8`, `file://` rendezvous, `NCCL_GIN_TYPE=3`; whole-node — **no
-`--gres`** on this cluster). See `vllm_moe_ep_results_prenyx.md` §4.2 for the exact runner:
+`--gres`** on this cluster). The exact runner:
 ```bash
 srun --ntasks-per-node=8 --container-image=$RW/flashinfer-ep-pt2605.sqsh --container-mounts=$RW:/host \
   bash -lc 'EP_SYNC=/host/sync_ht NCCL_GIN_TYPE=3 bash /host/<checkout>/benchmarks/run_ep_matrix_one_pt.sh \
@@ -196,8 +217,7 @@ srun --ntasks-per-node=8 --container-image=$RW/flashinfer-ep-pt2605.sqsh --conta
 # LL: --algorithm ll --layout em --tokens 128 --validate
 ```
 > The pytest `tests/moe_ep/test_moe_ep_ht_correctness.py` launched via `torchrun` **hangs** on a
-> default-PG collective on this image — use the comm-matrix `--validate` path above instead
-> (results doc §1.4).
+> default-PG collective on this image — use the comm-matrix `--validate` path above instead.
 
 ### 5.3 vLLM smoke (single node, 8 GPU) — both backends
 ```bash
@@ -216,10 +236,18 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
 Pass criterion **≥ 0.80** (reference ~0.88). Run for each backend, LL and HT:
 ```bash
 lm_eval --model vllm \
-  --model_args "pretrained=Qwen/Qwen3-30B-A3B,data_parallel_size=8,enable_expert_parallel=True,all2all_backend=flashinfer_ep_low_latency,trust_remote_code=True" \
+  --model_args "pretrained=Qwen/Qwen3-30B-A3B,tensor_parallel_size=8,enable_expert_parallel=True,all2all_backend=flashinfer_ep_low_latency,trust_remote_code=True" \
   --tasks gsm8k --num_fewshot 5 --batch_size auto
 # temperature 0, seed 42 (harness defaults for gsm8k are greedy)
 ```
+> **Accuracy gate only — does not exercise the transport.** lm_eval's `data_parallel_size` spawns
+> independent replica engines (each `dp_size=1` ⇒ monolithic path), so it can't drive a unified EP
+> group; keep `tensor_parallel_size=8`. The dispatch/combine transport is validated by §5.2
+> (`--validate`) and by an nsys kernel capture of a DP-EP run (look for the
+> `nccl_ep::internode_ll` / `nccl_ep_jit_ht_*` dispatch+combine kernels). To exercise the
+> transport end-to-end in vLLM, use the **server** path (§5.3, `vllm serve
+> --data-parallel-size 8 --enable-expert-parallel`, which *does* build a real DP-EP deployment)
+> or offline via `torchrun --nproc_per_node=8 … --distributed-executor-backend external_launcher`.
 
 ### 5.5 Multi-node (2 nodes, 16 GPU)
 Repeat 5.2–5.4 across 2 nodes. FlashInfer tests: `srun --nodes=2 --ntasks-per-node=1
@@ -263,7 +291,10 @@ torchrun --nproc_per_node=8 benchmarks/bench_moe_ep.py \
 
 ### 7.2 End-to-end serving perf (the comparison matrix)
 Fixed load: **Qwen3-30B-A3B BF16, ISL/OSL 128/128, `max_concurrency=32`,
-`NUM_PROMPTS=1000`**. For each cell, start `vllm serve` with the backend, then:
+`NUM_PROMPTS=1000`**. Launch each `vllm serve` with **`--data-parallel-size 8
+--enable-expert-parallel`** (NOT TP-only) so the all2all transport is actually on the path —
+otherwise every cell collapses to the identical monolithic path (§0 caveat). For
+each cell, start `vllm serve` with the backend, then:
 ```bash
 vllm bench serve \
     --model Qwen/Qwen3-30B-A3B \

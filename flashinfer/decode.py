@@ -1000,6 +1000,65 @@ class BatchDecodeWithPagedKVCacheWrapper:
         device/stream selector for the underlying module query.  This method
         does not allocate buffers and does not mutate cached plan state.
 
+        Parameters
+        ----------
+        indptr : torch.Tensor
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``, dtype: ``torch.int32``
+        indices : torch.Tensor
+            The page indices of the paged kv cache, shape: ``[indptr[-1]]``, dtype: ``torch.int32``
+        last_page_len : torch.Tensor
+            The number of entries in the last page of each request in the paged kv
+            cache, shape: ``[batch_size]``, dtype: ``torch.int32``
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim : int
+            The dimension of the heads.
+        page_size : int
+            The page size of the paged kv cache.
+        pos_encoding_mode : str
+            The position encoding applied inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+            Defaults to ``NONE``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
+            provided, will be set to ``0``.
+        q_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the query tensor, defaults to ``torch.float16``.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If ``None``, will be set to ``q_data_type``.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If ``None``, will be set to ``q_data_type``.
+        data_type : Optional[Union[str, torch.dtype]]
+            Deprecated alias — sets both ``q_data_type`` and ``kv_data_type`` when
+            they are not provided explicitly.
+        sm_scale : Optional[float]
+            Softmax scale. If ``None``, defaults to ``1 / sqrt(head_dim)``.
+        rope_scale : Optional[float]
+            Scale factor applied during RoPE interpolation. Defaults to ``1.0`` when ``None``.
+        rope_theta : Optional[float]
+            Base value for the RoPE frequencies. Defaults to ``1e4`` when ``None``.
+        block_tables : Optional[torch.Tensor]
+            Unused by this method; accepted for signature compatibility with :meth:`plan`.
+        seq_lens : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt,
+            shape: ``[batch_size]``.
+        fixed_split_size : Optional[int]
+            The fixed split size for FA2 split-kv decode, in pages.
+        disable_split_kv : bool
+            Whether to disable the split-kv for determinism in CUDA Graph. Defaults to ``False``.
+        q_len_per_req : int
+            The number of query tokens per request. Defaults to ``1``.
+
+        Returns
+        -------
+        Tuple[int, int]
+            ``(float_workspace_size, int_workspace_size)`` in bytes.
+
         Example
         -------
         >>> float_bytes, int_bytes = wrapper.workspace_size(...)
@@ -1171,7 +1230,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         indptr : torch.Tensor
             The indptr of the paged kv cache, shape: ``[batch_size + 1]``, dtype: ``torch.int32``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[kv_indptr[-1]]``, dtype: ``torch.int32``
+            The page indices of the paged kv cache, shape: ``[indptr[-1]]``, dtype: ``torch.int32``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
             cache, shape: ``[batch_size]``, dtype: ``torch.int32``
@@ -2561,6 +2620,31 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
     run_return_lse = functools.partialmethod(run, return_lse=True)
 
 
+def _get_trtllm_gen_bmm1_scale_arg(
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm1_scale_log2: Optional[torch.Tensor],
+    device: torch.device,
+) -> Union[float, torch.Tensor]:
+    if bmm1_scale_log2 is not None:
+        if not isinstance(bmm1_scale_log2, torch.Tensor):
+            raise TypeError("bmm1_scale_log2 must be a torch.Tensor")
+        if bmm1_scale_log2.dtype != torch.float32:
+            raise TypeError("bmm1_scale_log2 tensor must have dtype torch.float32")
+        if bmm1_scale_log2.device != device:
+            raise ValueError("bmm1_scale_log2 must be on the same device as query")
+        if bmm1_scale_log2.numel() != 1:
+            raise ValueError(
+                "bmm1_scale_log2 must be a single-element tensor "
+                "(e.g. a narrow(0, i, 1) view of the precomputed scale workspace)"
+            )
+        return bmm1_scale_log2
+    if isinstance(bmm1_scale, torch.Tensor):
+        if bmm1_scale.dtype != torch.float32:
+            raise TypeError("bmm1_scale tensor must have dtype torch.float32")
+        return bmm1_scale * log2e
+    return bmm1_scale
+
+
 class TrtllmGenDecodeModule:
     def __init__(self) -> None:
         self._sm_count: Optional[int] = None
@@ -2597,9 +2681,7 @@ class TrtllmGenDecodeModule:
         if self._sm_count is None:
             self._sm_count = get_device_sm_count(query.device)
 
-        if isinstance(bmm1_scale, torch.Tensor):
-            assert bmm1_scale.dtype == torch.float32
-            bmm1_scale = bmm1_scale * log2e
+        bmm1_scale = _get_trtllm_gen_bmm1_scale_arg(bmm1_scale, None, query.device)
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
@@ -2829,6 +2911,7 @@ def trtllm_batch_decode_with_kv_cache(
     uses_shared_paged_kv_idx: bool = True,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    bmm1_scale_log2: Optional[torch.Tensor] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -2868,6 +2951,11 @@ def trtllm_batch_decode_with_kv_cache(
     bmm1_scale : Union[float, torch.Tensor]
         fused scale for bmm1 input.
         when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+
+    bmm1_scale_log2 : Optional[torch.Tensor] = None
+        Optional precomputed log2-form bmm1 scale for ``trtllm-gen``. When provided,
+        this single-element FP32 device tensor is passed directly to the FFI and takes precedence over
+        tensor ``bmm1_scale``, avoiding the internal ``bmm1_scale * log2e`` CUDA kernel.
 
     bmm2_scale : Union[float, torch.Tensor]
         fused scale for bmm2 input.
@@ -3025,6 +3113,9 @@ def trtllm_batch_decode_with_kv_cache(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
+    if backend != "trtllm-gen" and bmm1_scale_log2 is not None:
+        raise ValueError("bmm1_scale_log2 is only supported by the trtllm-gen backend")
+
     if backend == "xqa":
         # xqa backend doesn't support nvfp4 output
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
@@ -3161,9 +3252,9 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
-        if isinstance(bmm1_scale, torch.Tensor):
-            assert bmm1_scale.dtype == torch.float32
-            bmm1_scale = bmm1_scale * log2e
+        bmm1_scale = _get_trtllm_gen_bmm1_scale_arg(
+            bmm1_scale, bmm1_scale_log2, query.device
+        )
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 

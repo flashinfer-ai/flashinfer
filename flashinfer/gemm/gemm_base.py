@@ -1284,6 +1284,8 @@ def get_mm_bf16_cublaslt_module():
 
 
 _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index

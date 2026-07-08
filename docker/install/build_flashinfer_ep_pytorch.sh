@@ -41,8 +41,8 @@ python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep + 
 
 echo "== build & install FlashInfer (NCCL-EP only) =="
 cd "${FI_SRC}"
-BUILD_NVEP=0 BUILD_NCCL_EP=1 BUILD_NIXL_EP=0 \
-    pip install --no-cache-dir --no-build-isolation -e ".[nvep]"
+BUILD_NCCL_EP=1 BUILD_NIXL_EP=0 \
+    pip install --no-cache-dir --no-build-isolation -e .
 
 echo "== smoke probe =="
 python -c "\
