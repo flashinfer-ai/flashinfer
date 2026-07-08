@@ -284,55 +284,61 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
 # ---------------------------------------------------------------------------
 # CTA_TILE_Q selection for FP8-KV head_dim=512 (gh #3843)
 #
-# The fp8-KV ragged/single kernels use the non-VO-split SharedStorage whose
-# CTA_TILE_Q=32 cross-warp merge buffer cannot fit the ~99KB per-block opt-in
-# limit of SM86/89/120/121-class GPUs, so the planner clamps them to 16 there;
-# the paged kernel is VO-split, fits at 32, and must never be clamped.
+# FP8 h512 ragged/single prefill run on the non-VO-split SharedStorage; only
+# the 2-Q x 2-KV-warp layout keeps its cross-warp merge buffer within the
+# 101376B per-block limit of SM120/121-class GPUs at CTA_TILE_Q=32 (the 1x4
+# layout needs 132176B and cannot launch there, and clamping to CTA_TILE_Q=16
+# doubles the KV traversal).
 # ---------------------------------------------------------------------------
 
 _PLAN_INFO_CTA_TILE_Q_IDX = 3  # PrefillPlanInfo::ToVector layout (scheduler.cuh)
 
-# Mirrors the feasibility bound in FA2DetermineCtaTileQ
-# (include/flashinfer/utils.cuh): merge buffer + m/d entries + tail slack.
-_H512_CTA32_FP8_RAGGED_SMEM_BYTES = 4 * 32 * (256 * 4 + 8) + 256
 
-
-def _smem_per_block_optin() -> int:
-    props = torch.cuda.get_device_properties(torch.device("cuda:0"))
-    optin = getattr(props, "shared_memory_per_block_optin", None)
-    if optin is None:
-        pytest.skip("torch does not expose shared_memory_per_block_optin")
-    return optin
-
-
-def test_ragged_fp8_h512_long_q_plan_clamps_cta_tile_q():
+# 128: full Q tiles; 53: partial tail tile of 21 rows (the second Q-warp of
+# the 2x2 layout gets a partial slice -- the failure mode of the old generic
+# 2x2 layout removed in gh #523); 40: partial tail tile of 8 rows (the second
+# Q-warp gets no rows).
+@pytest.mark.parametrize("qo_len", [128, 53, 40])
+def test_ragged_fp8_h512_long_q_keeps_cta32(qo_len):
     head_dim = 512
     skip_if_head_dim_unsupported(head_dim)
     torch.manual_seed(42)
     batch_size = 2
-    qo_len = kv_len = 128  # packed qo len 128 > 32: the unclamped plan picks 32
+    kv_len = 128
     num_qo_heads = num_kv_heads = 4
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim, dtype=torch.float16
     ).to(0)
-    k_fp8 = (
-        torch.randn(batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16)
-        .to(0)
-        .to(torch.float8_e4m3fn)
-    )
-    v_fp8 = (
-        torch.randn(batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16)
-        .to(0)
-        .to(torch.float8_e4m3fn)
-    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    v = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    k_fp8 = k.to(torch.float8_e4m3fn)
+    v_fp8 = v.to(torch.float8_e4m3fn)
     qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+    wrapper_ref = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace_buffer, "NHD", backend="fa2"
     )
-    wrapper.plan(
+    wrapper_ref.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    o_ref = wrapper_ref.run(q, k_fp8.to(torch.float16), v_fp8.to(torch.float16))
+
+    wrapper_f8 = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper_f8.plan(
         qo_indptr,
         kv_indptr,
         num_qo_heads,
@@ -341,16 +347,15 @@ def test_ragged_fp8_h512_long_q_plan_clamps_cta_tile_q():
         q_data_type=torch.float16,
         kv_data_type=torch.float8_e4m3fn,
     )
-    expected = 16 if _smem_per_block_optin() < _H512_CTA32_FP8_RAGGED_SMEM_BYTES else 32
-    assert wrapper._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == expected
-    # The planned config must actually launch: before the clamp this raised
-    # "Required shared memory (132176 bytes) ... exceeds this GPU's per-block
-    # limit" on 99KB-smem GPUs.
-    o = wrapper.run(q, k_fp8, v_fp8)
-    assert torch.isfinite(o).all()
+    # Long q must keep CTA_TILE_Q=32: 16 would double the KV traversal, and a
+    # regression to the 1x4 layout at 32 fails to launch on 99KB-smem GPUs
+    # ("Required shared memory (132176 bytes) exceeds ...").
+    assert wrapper_f8._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == 32
+    o_fp8 = wrapper_f8.run(q, k_fp8, v_fp8)
+    torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
 
 
-def test_paged_fp8_h512_long_q_plan_keeps_cta32():
+def test_paged_fp8_h512_long_q_keeps_cta32():
     head_dim = 512
     skip_if_head_dim_unsupported(head_dim)
     torch.manual_seed(42)
@@ -393,9 +398,6 @@ def test_paged_fp8_h512_long_q_plan_keeps_cta32():
         q_data_type=torch.float16,
         kv_data_type=torch.float8_e4m3fn,
     )
-    # SharedStoragePaged is VO-split and fits CTA_TILE_Q=32 on every supported
-    # GPU; the ragged clamp must not leak into paged plans (that would be a
-    # silent perf regression).
     assert wrapper._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == 32
     o = wrapper.run(q, kv_data_fp8)
     assert torch.isfinite(o).all()
@@ -405,7 +407,8 @@ def test_single_prefill_fp8_h512_long_q():
     head_dim = 512
     skip_if_head_dim_unsupported(head_dim)
     torch.manual_seed(42)
-    qo_len = kv_len = 128  # packed qo len > 32: exercises the CTA32-or-clamp path
+    qo_len = 100  # 3 full CTA_TILE_Q=32 tiles plus a 4-row partial tile
+    kv_len = 128
     num_qo_heads = num_kv_heads = 4
     q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.float16).to(0)
     k_fp8 = (

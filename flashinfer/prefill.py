@@ -451,10 +451,6 @@ def get_batch_prefill_module(backend, *args):
         workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
-    # Only the fa2 binding exports ragged_plan (a plan that may pick a
-    # different CTA_TILE_Q for the ragged kernel's shared-memory layout);
-    # other backends plan ragged and paged identically.
-    ragged_plan_func = getattr(module, "ragged_plan", plan_func)
 
     # torch library for ragged_run
 
@@ -871,7 +867,6 @@ def get_batch_prefill_module(backend, *args):
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
     return SimpleNamespace(
         plan=plan_func,
-        ragged_plan=ragged_plan_func,
         workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
@@ -881,7 +876,6 @@ def get_batch_prefill_module(backend, *args):
 @functools.cache
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     plan_func = jit_module.plan
-    ragged_plan_func = getattr(jit_module, "ragged_plan", plan_func)
     workspace_size_func = getattr(jit_module, "workspace_size", None)
     ragged_run_func = jit_module.ragged_run
     paged_run_func = jit_module.paged_run
@@ -1024,7 +1018,6 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
     return SimpleNamespace(
         plan=plan_func,
-        ragged_plan=ragged_plan_func,
         workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
@@ -3457,10 +3450,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
-            # ragged_plan may clamp CTA_TILE_Q for configs whose ragged-kernel
-            # shared-memory layout cannot launch (FP8 KV at large head dims);
-            # the paged kernel keeps planning through `plan`.
-            self._plan_info = self._cached_module.ragged_plan(
+            self._plan_info = self._cached_module.plan(
                 *args,
             )
 

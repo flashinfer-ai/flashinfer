@@ -386,33 +386,10 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
   std::cout << std::endl;
 }
 
-// max_smem_per_block is the device's cudaDevAttrMaxSharedMemoryPerBlockOptin,
-// queried (and error-checked) by the caller; it is only consulted when
-// fp8_kv_no_vo_split is true. Passing 0 clamps -- conservative but launchable.
-inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim,
-                                     bool fp8_kv_no_vo_split = false, int max_smem_per_block = 0) {
+inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
   if (head_dim >= 512) {
     if (avg_packed_qo_len <= 32) {
       return 16;  // decode / short-q (incl. speculative decode): lean CTA16
-    }
-    if (fp8_kv_no_vo_split) {
-      // FP8 KV stays on the split-KV merge path (USE_SOFTMAX_VO_SPLIT covers only
-      // 16-bit and FP4 KV), whose non-paged SharedStorage carries a cross-warp
-      // output-merge buffer of NUM_WARPS_KV(4) x CTA_TILE_Q x min(head_dim, 256)
-      // floats plus a float2 m/d entry per row. At CTA_TILE_Q=32 that is 132KB
-      // regardless of NUM_MMA_KV -- beyond the ~99KB per-block opt-in limit of
-      // SM86/89/120/121-class GPUs -- so the dispatch would fail; CTA_TILE_Q=16
-      // halves the buffer and fits. The 256-byte tail covers the storage's
-      // trailing alignas(16) stub members (80B today) with slack, so an opt-in
-      // limit between the merge arm and the true sizeof(SharedStorage) can only
-      // over-clamp (still launchable), never under-clamp; the exact
-      // sizeof(SharedStorage) check at the dispatch site remains the
-      // authoritative guard.
-      const uint32_t merge_smem_bytes =
-          4 * 32 * (min(head_dim, 256U) * sizeof(float) + sizeof(float2)) + 256;
-      if (merge_smem_bytes > static_cast<uint32_t>(max_smem_per_block)) {
-        return 16;
-      }
     }
     return 32;  // Long-q prefill use CTA_TILE_Q=32
   }

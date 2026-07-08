@@ -2393,25 +2393,16 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   int64_t packed_qo_len = qo_len * group_size;
-  // FP8 KV single prefill also runs on the non-VO-split SharedStorage (see
-  // kLargeHeadWarpSplit below), so its CTA_TILE_Q must honor the same
-  // large-head shared-memory clamp as the ragged batch path.
-  constexpr bool kFp8KvNoVOSplit = sizeof(DTypeKV) == 1 && !is_fp4_type_v<DTypeKV>;
-  int max_smem_per_block_for_clamp = 0;
-  if constexpr (kFp8KvNoVOSplit && HEAD_DIM_VO >= 512) {
-    int dev_id_for_clamp = 0;
-    FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id_for_clamp));
-    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
-        &max_smem_per_block_for_clamp, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id_for_clamp));
-  }
-  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO, kFp8KvNoVOSplit,
-                                             max_smem_per_block_for_clamp);
+  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO);
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
-    // hd512 uses the 2-Q x 2-KV-warp layout at CTA_TILE_Q=32. FP4 large-head
-    // single-prefill additionally uses VO-split output so it avoids the
-    // cta_sync_o_smem traffic that exceeds SM86 shared memory.
-    constexpr bool kLargeHeadWarpSplit = ((sizeof(DTypeKV) == 2) || is_fp4_type_v<DTypeKV>) &&
+    // hd512 uses the 2-Q x 2-KV-warp layout at CTA_TILE_Q=32. FP8 must take it
+    // too: it stays on the split-D merge path whose cta_sync_o_smem buffer
+    // (NUM_WARPS_KV x CTA_TILE_Q x 256 floats) only fits ~99KB-per-block parts
+    // (SM120/121) with NUM_WARPS_KV=2. FP4 large-head single-prefill
+    // additionally uses VO-split output so it avoids that cta_sync_o_smem
+    // traffic entirely.
+    constexpr bool kLargeHeadWarpSplit = ((sizeof(DTypeKV) <= 2) || is_fp4_type_v<DTypeKV>) &&
                                          (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
     constexpr uint32_t NUM_WARPS_Q = kLargeHeadWarpSplit ? 2 : get_num_warps_q(CTA_TILE_Q);
     constexpr uint32_t NUM_WARPS_KV = kLargeHeadWarpSplit ? 2 : get_num_warps_kv(CTA_TILE_Q);
@@ -3993,13 +3984,16 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
   // Large-head CTA_TILE_Q=32 uses a 2-Q x 2-KV-warp layout to keep the per-warp
-  // output fragment bounded. The 16-bit and NVFP4 softmax paths also use the
-  // VO-split P/V helpers below; FP8 keeps the existing split-D merge path.
-  constexpr bool kBf16VOSplit = ((sizeof(DTypeKV) == 2) || is_fp4_type_v<DTypeKV>) &&
-                                (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
-  constexpr uint32_t NUM_MMA_Q = kBf16VOSplit ? 1 : get_num_mma_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_Q = kBf16VOSplit ? 2 : get_num_warps_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_KV = kBf16VOSplit ? 2 : get_num_warps_kv(CTA_TILE_Q);
+  // output fragment bounded. FP8 must take it too: it stays on the split-D
+  // merge path whose cta_sync_o_smem buffer (NUM_WARPS_KV x CTA_TILE_Q x 256
+  // floats) only fits ~99KB-per-block parts (SM120/121) with NUM_WARPS_KV=2.
+  // The 16-bit and NVFP4 softmax paths additionally use the VO-split P/V
+  // helpers below, which avoid that buffer entirely.
+  constexpr bool kLargeHeadWarpSplit = ((sizeof(DTypeKV) <= 2) || is_fp4_type_v<DTypeKV>) &&
+                                       (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
+  constexpr uint32_t NUM_MMA_Q = kLargeHeadWarpSplit ? 1 : get_num_mma_q(CTA_TILE_Q);
+  constexpr uint32_t NUM_WARPS_Q = kLargeHeadWarpSplit ? 2 : get_num_warps_q(CTA_TILE_Q);
+  constexpr uint32_t NUM_WARPS_KV = kLargeHeadWarpSplit ? 2 : get_num_warps_kv(CTA_TILE_Q);
 
   if (padded_batch_size == 0) {
     // No request, skip
