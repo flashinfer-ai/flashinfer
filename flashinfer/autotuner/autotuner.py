@@ -878,9 +878,7 @@ class AutoTunerStatistics:
     tuned_op_successful_configs: dict[str, int] = field(default_factory=dict[str, int])
     # Maps "custom_op::RunnerClass" to sets of tactic values that failed.
     # Used by the offline blocklist generator to extract per-tactic pass/fail.
-    failed_tactics: dict[str, set[Any]] = field(
-        default_factory=dict[str, set[Any]]
-    )
+    failed_tactics: dict[str, set[Any]] = field(default_factory=dict[str, set[Any]])
 
     def __str__(self) -> str:
         """Return a string representation of collected statistics."""
