@@ -128,14 +128,15 @@ def _validate(tester, *, atol: float, rtol: float) -> bool:
 
 def _free_tester_sym_tensors(tester) -> None:
     """Release NVSHMEM symmetric tensors owned by a ``MegaMoETester``."""
-    for tensor in (
-        tester.my_activation,
-        tester.my_activation_sf,
-        tester.my_topk_idx,
-        tester.my_topk_weights,
-        tester.combine_output,
-        tester.shared_workspace,
+    for name in (
+        "my_activation",
+        "my_activation_sf",
+        "my_topk_idx",
+        "my_topk_weights",
+        "combine_output",
+        "shared_workspace",
     ):
+        tensor = getattr(tester, name, None)
         free_sym_tensor(tensor)
 
 

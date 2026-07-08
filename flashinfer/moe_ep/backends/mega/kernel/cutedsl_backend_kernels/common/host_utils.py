@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: BSD-3-Clause OR Apache-2.0
 """Host utility helpers shared across NVFP4 and MXFP8 runners."""
 
 import argparse
@@ -151,7 +151,7 @@ def compare_and_report_mismatches(
     # Compute differences
     diff = _torch.abs(gpu_data.float() - ref_data.float())
     threshold = atol + rtol * _torch.abs(ref_data.float())
-    mismatch_mask = diff > threshold
+    mismatch_mask = (diff > threshold) | _torch.isnan(diff)
 
     # Find all mismatch indices
     mismatch_indices = _torch.nonzero(mismatch_mask, as_tuple=False)
