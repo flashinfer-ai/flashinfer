@@ -796,3 +796,195 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                 cute.autovec_copy(frag, sQ_chunk)
             else:
                 sQ_chunk.fill(0)
+
+
+class MsaProxyScoreDecodeStreamSm12x:
+    """Single-token decode schedule: at one query token the score tile is only
+    group_size rows, too skinny for the MMA atom, so K streams straight from
+    GMEM to registers (no smem, no tensor cores) and dim-parallel lanes reduce
+    each key's dot products with warp shuffles."""
+
+    _NUM_WARPS = 8
+    _KEYS_PER_ITER = 2  # 32 lanes = 2 keys x 16 dim-slice lanes
+
+    def __init__(
+        self,
+        head_dim: int = 128,
+        group_size: int = 4,
+        is_causal: bool = True,
+        paged: bool = False,
+        qoff_default: bool = True,
+    ):
+        if head_dim != 128:
+            raise ValueError("only head_dim == 128 is supported")
+        # Q and the running maxes live in registers per lane; past 8 heads the
+        # footprint approaches the spill point, so larger groups keep the
+        # packed MMA schedule.
+        if not 1 <= group_size <= 8:
+            raise ValueError("group_size must be in [1, 8]")
+        self._head_dim = head_dim
+        self._G = group_size
+        self._is_causal = is_causal
+        self._paged = paged
+        # Right-aligned decode (q_offset=None): the single query sits at
+        # seqlen_k - 1, so the causal limit is just seqlen_k and no offset
+        # tensor is needed.
+        self._qoff_default = qoff_default
+        self._blk_kv = 128
+        self._num_threads = self._NUM_WARPS * 32
+        self._keys_per_warp = self._blk_kv // self._NUM_WARPS
+        self._num_iters = self._keys_per_warp // self._KEYS_PER_ITER
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,  # (total_q, Hq, d)
+        mK: cute.Tensor,  # (total_k, Hkv, d) flat | (pages, Hkv, 128, d) paged
+        mPageTable: cute.Tensor,  # (B, max_pages) int32 (dummy if flat)
+        mMaxScore: cute.Tensor,  # (Hq, max_k_tiles, total_q) f32
+        mCuQ: cute.Tensor,  # (B + 1,) int32 (unused: one q token per request)
+        mCuK: cute.Tensor,  # (B + 1,) int32
+        mQOffset: cute.Tensor,  # (B,) int32 causal offset (MSA q_offset)
+        max_seqlen_q: cutlass.Int32,  # 1 (kept for signature parity)
+        batch_size: cutlass.Int32,
+        num_qo_heads: cutlass.Int32,
+        max_k_tiles: cutlass.Int32,
+        num_splits: cutlass.Int32,  # unused: the grid is already per KV block
+        stream: cuda.CUstream,
+    ):
+        if cutlass.const_expr(
+            not (
+                mQ.element_type == cutlass.Float16
+                or mQ.element_type == cutlass.BFloat16
+            )
+        ):
+            raise TypeError("Only Float16 or BFloat16 q is supported")
+        self._dtype: Type[cutlass.Numeric] = mQ.element_type
+        self.kernel(mQ, mK, mPageTable, mMaxScore, mCuK, mQOffset).launch(
+            grid=(max_k_tiles, batch_size, num_qo_heads // self._G),
+            block=[self._num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mPageTable: cute.Tensor,
+        mMaxScore: cute.Tensor,
+        mCuK: cute.Tensor,
+        mQOffset: cute.Tensor,
+    ):
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
+        tile, qi, kv_head = cute.arch.block_idx()
+
+        G = self._G
+        k_start = mCuK[qi]
+        seqlen_k = mCuK[qi + 1] - k_start
+        if cutlass.const_expr(self._is_causal and not self._qoff_default):
+            col_limit = cutlass.min(mQOffset[qi] + 1, seqlen_k)
+        else:
+            col_limit = seqlen_k
+        tile_base = tile * self._blk_kv
+
+        lane_key = lane >> 4  # which of the warp's two keys this half-warp owns
+        lane_grp = lane & 15  # this lane's 8-dim slice index within its key
+
+        mfrag = cute.make_rmem_tensor((G,), cutlass.Float32)
+        mfrag.fill(-cutlass.Float32.inf)
+
+        # tile/qi are CTA-uniform, so the whole block skips dead tiles together
+        # (their output stays -inf) and the shuffles below stay full-warp.
+        if tile_base < col_limit:
+            qfrags = [
+                cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
+                for _ in range(G)
+            ]
+            for g in cutlass.range_constexpr(G):
+                q_chunk = cute.local_tile(
+                    mQ[qi, kv_head * G + g, None], (8,), (lane_grp,)
+                )
+                cute.autovec_copy(q_chunk, qfrags[g])
+            qs = [[cutlass.Float32(qfrags[g][i]) for i in range(8)] for g in range(G)]
+
+            if cutlass.const_expr(self._paged):
+                page = mPageTable[qi, tile]
+                mK_blk = mK[page, kv_head, None, None]  # (128, d)
+            else:
+                mK_h = mK[None, kv_head, None]  # (total_k, d)
+
+            # Keep this loop separate from the compute loop below: issuing all
+            # loads before any consumption is the latency hiding.
+            kfrag = cute.make_rmem_tensor(
+                cute.make_layout(self._num_iters * 8), self._dtype
+            )
+            for it in cutlass.range_constexpr(self._num_iters):
+                off = warp * self._keys_per_warp + it * self._KEYS_PER_ITER + lane_key
+                # Tail keys clamp to the tile's first row (always in range for a
+                # live tile) so loads stay unpredicated; the max step masks them.
+                ld_off = off if tile_base + off < col_limit else 0
+                if cutlass.const_expr(self._paged):
+                    k_row = mK_blk[ld_off, None]
+                else:
+                    k_row = mK_h[k_start + tile_base + ld_off, None]
+                k_chunk = cute.local_tile(k_row, (8,), (lane_grp,))
+                dst = cute.make_tensor(kfrag.iterator + it * 8, cute.make_layout(8))
+                cute.autovec_copy(k_chunk, dst)
+
+            for it in cutlass.range_constexpr(self._num_iters):
+                ks = [cutlass.Float32(kfrag[it * 8 + i]) for i in range(8)]
+                es = [
+                    qs[g][0] * ks[0]
+                    + qs[g][1] * ks[1]
+                    + qs[g][2] * ks[2]
+                    + qs[g][3] * ks[3]
+                    + qs[g][4] * ks[4]
+                    + qs[g][5] * ks[5]
+                    + qs[g][6] * ks[6]
+                    + qs[g][7] * ks[7]
+                    for g in range(G)
+                ]
+                # Butterfly-add over the 16 dim-slice lanes of this key.
+                for s in cutlass.range_constexpr(4):
+                    off_r = 8 >> s
+                    es = [
+                        es[g] + cute.arch.shuffle_sync_bfly(es[g], off_r)
+                        for g in range(G)
+                    ]
+                pos = (
+                    tile_base
+                    + warp * self._keys_per_warp
+                    + it * self._KEYS_PER_ITER
+                    + lane_key
+                )
+                if pos < col_limit:
+                    for g in cutlass.range_constexpr(G):
+                        mfrag[g] = cute.arch.fmax(mfrag[g], es[g])
+
+            # Max-combine the two half-warps' keys.
+            for g in cutlass.range_constexpr(G):
+                mfrag[g] = cute.arch.fmax(
+                    mfrag[g], cute.arch.shuffle_sync_bfly(mfrag[g], 16)
+                )
+
+        @cute.struct
+        class SharedStorage:
+            s_max: cute.struct.MemRange[cutlass.Float32, self._NUM_WARPS * G]
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        s_max = storage.s_max.get_tensor(
+            cute.make_layout((self._NUM_WARPS, G), stride=(G, 1))
+        )
+        if lane == 0:
+            for g in cutlass.range_constexpr(G):
+                s_max[warp, g] = mfrag[g]
+        cute.arch.sync_threads()
+
+        if warp == 0 and lane < G:
+            r = s_max[0, lane]
+            for w in cutlass.range_constexpr(1, self._NUM_WARPS):
+                r = cute.arch.fmax(r, s_max[w, lane])
+            mMaxScore[kv_head * G + lane, tile, qi] = r

@@ -1215,6 +1215,91 @@ def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
         assert (got[fin] - ref[fin]).abs().max().item() < 1e-2
 
 
+@pytest.mark.parametrize(
+    "Hq,Hkv,paged,explicit_qoff",
+    [
+        (4, 1, False, False),  # M3 shape, ragged flat
+        (8, 2, False, False),  # multi kv-head
+        (1, 1, False, False),  # group 1 (below the packed gate)
+        (8, 1, True, False),  # group 8 (stream upper gate), paged
+        (4, 1, False, True),  # explicit q_offset masks mid-sequence
+        (4, 1, True, True),
+    ],
+)
+def test_msa_proxy_score_decode_stream(Hq, Hkv, paged, explicit_qoff):
+    """Single-token decode dispatches the stream kernel; cover ragged varlen
+    with non-128 tails, an empty sequence, multi kv-head, group sizes 1-8,
+    paged KV, and an explicit causal q_offset."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_proxy_score
+
+    torch.manual_seed(190 + Hq + Hkv)
+    dev = "cuda"
+    seqs_k = [700, 2048, 129, 0, 4096]
+    B = len(seqs_k)
+    cu_k = torch.tensor(
+        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    cu_q = torch.arange(B + 1, dtype=torch.int32, device=dev)
+    total_k = int(cu_k[-1])
+    q = torch.randn(B, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
+    qoff = None
+    if explicit_qoff:
+        # Positions strictly inside each sequence so the causal limit bites.
+        qoff = torch.tensor(
+            [max(0, s // 2) for s in seqs_k], dtype=torch.int32, device=dev
+        )
+
+    if paged:
+        npg = [-(-s // BLK_KV) for s in seqs_k]
+        perm = torch.randperm(sum(npg))
+        k_pg = torch.zeros(sum(npg), Hkv, BLK_KV, 128, dtype=torch.bfloat16, device=dev)
+        ptab = torch.full((B, max(max(npg), 1)), -1, dtype=torch.int32, device=dev)
+        pi = 0
+        for b in range(B):
+            for blk in range(npg[b]):
+                pg = int(perm[pi])
+                pi += 1
+                ptab[b, blk] = pg
+                lo = int(cu_k[b]) + blk * BLK_KV
+                hi = min(lo + BLK_KV, int(cu_k[b + 1]))
+                k_pg[pg, :, : hi - lo] = k[lo:hi].transpose(0, 1)
+        seqused = torch.tensor(seqs_k, dtype=torch.int32, device=dev)
+        out = msa_proxy_score(
+            q,
+            k_pg,
+            cu_q,
+            page_table=ptab,
+            seqused_k=seqused,
+            causal=True,
+            q_offset=qoff,
+        )
+    else:
+        out = msa_proxy_score(q, k, cu_q, cu_k, causal=True, q_offset=qoff)
+    torch.cuda.synchronize()
+
+    mkt = out.shape[1]
+    G = Hq // Hkv
+    ref = torch.full((Hq, mkt, B), float("-inf"), dtype=torch.float32)
+    for b in range(B):
+        sk = seqs_k[b]
+        if sk == 0:
+            continue
+        lim = min((int(qoff[b]) if qoff is not None else sk - 1) + 1, sk)
+        for h in range(Hq):
+            kb = k[int(cu_k[b]) : int(cu_k[b + 1]), h // G].float().cpu()
+            s = q[b, h].float().cpu() @ kb.T
+            s[lim:] = float("-inf")
+            for t in range(-(-sk // BLK_KV)):
+                blk = s[t * BLK_KV : (t + 1) * BLK_KV]
+                ref[h, t, b] = blk.amax()
+    got = out.cpu()
+    assert ((got == float("-inf")) == (ref == float("-inf"))).all(), "-inf pattern"
+    fin = ref != float("-inf")
+    assert (got[fin] - ref[fin]).abs().max().item() < 1e-2
+
+
 @pytest.mark.parametrize("Hq,Hkv", [(4, 1), (8, 2)])
 def test_msa_proxy_score_reduce_heads(Hq, Hkv):
     """reduce_heads=True must equal amax(dim=0) over the per-head output

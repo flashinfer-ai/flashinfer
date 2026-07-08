@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import functools
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -224,6 +224,17 @@ def _run_proxy_autotuned(
 
 
 @flashinfer_api(trace=msa_proxy_score_trace)
+@functools.cache
+def _proxy_dummies(device_index: int):
+    # Signature fillers for paths that never read them; cached so repeat decode
+    # calls do not launch fill kernels.
+    dev = torch.device("cuda", device_index)
+    return (
+        torch.zeros((1, 1), dtype=torch.int32, device=dev),
+        torch.zeros(1, dtype=torch.int32, device=dev),
+    )
+
+
 def msa_proxy_score(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -250,8 +261,10 @@ def msa_proxy_score(
 
     There is no softmax and no V: this is MSA pipeline stage 1.
 
-    Short-q decode (any ``group_size`` dividing the 64-row q-tile with
-    ``q_len <= 64 // group_size``, e.g. MiniMax-M3's group_size 4 at
+    Single-token decode (``q_len == 1`` for every request, ``group_size <= 8``)
+    uses a dim-parallel scalar schedule that streams index-K straight to
+    registers. Short-q decode (any ``group_size`` dividing the 64-row q-tile
+    with ``q_len <= 64 // group_size``, e.g. MiniMax-M3's group_size 4 at
     ``q_len <= 16``) uses a head-fused packed schedule that scores all
     ``group_size`` heads of a kv_head from one shared index-K read
     (``group_size`` x less K traffic). fp8 K and prefill use the general schedule.
@@ -301,6 +314,7 @@ def msa_proxy_score(
 
     from .cute_dsl.proxy_score_sm12x import (
         MsaProxyScoreDecodePackedSm12x,
+        MsaProxyScoreDecodeStreamSm12x,
         MsaProxyScoreSm12x,
     )
     from ._common import (
@@ -343,11 +357,10 @@ def msa_proxy_score(
         if k.ndim != 3:
             raise ValueError("flat k must be (total_k, num_kv_heads, head_dim)")
         cu_k = cu_seqlens_k.to(dev)
-        pt_dev = torch.zeros((1, 1), dtype=torch.int32, device=dev)
+        pt_dev = _proxy_dummies(dev.index)[0]
         batch_size = cu_k.numel() - 1
 
     cu_q_dev = cu_seqlens_q.to(dev)
-    qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k, dev)
     max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
         cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output
     )
@@ -367,22 +380,47 @@ def msa_proxy_score(
     else:
         per_head = output
 
+    group_size = num_qo_heads // num_kv_heads
+    # Single-token decode uses the dim-parallel stream schedule (see
+    # MsaProxyScoreDecodeStreamSm12x). total_q == batch_size guarantees exactly
+    # one q token per request, which its token == batch indexing relies on.
+    use_stream = (
+        not kv_fp8 and max_seqlen_q == 1 and total_q == batch_size and group_size <= 8
+    )
+    # Right-aligned decode on the stream path computes the causal limit
+    # in-kernel, so no offset tensor (and its build kernels) is needed.
+    qoff_default = q_offset is None
+    if use_stream and qoff_default:
+        qoff_dev = _proxy_dummies(dev.index)[1]
+    else:
+        qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k, dev)
+
     # Head-fused decode path: pack group_size heads x pack_q_len q-tokens into one
     # 64-row MMA tile so index-K is read once per (batch, kv_head). Outside the regime
     # (prefill, fp8 K, group_size not dividing 64) use the general schedule.
     _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
-    group_size = num_qo_heads // num_kv_heads
     use_packed = (
-        not kv_fp8
+        not use_stream
+        and not kv_fp8
         and group_size >= 2
         and _PACK_ROWS % group_size == 0
         and max_seqlen_q <= _PACK_ROWS // group_size
     )
     pack_q_len = _PACK_ROWS // group_size if use_packed else 0
 
-    # group_size keys the packed schedule: pack_q_len = 64 // group_size is
-    # constexpr-baked into the gather/epilogue, so each factorization is its own kernel.
-    key = ("proxy", str(q.dtype), causal, paged, kv_fp8, use_packed, pack_q_len)
+    # group_size keys the packed/stream schedules: it is constexpr-baked into
+    # the gather/epilogue, so each factorization is its own kernel.
+    key = (
+        "proxy",
+        str(q.dtype),
+        causal,
+        paged,
+        kv_fp8,
+        use_stream,
+        use_packed,
+        group_size if use_stream else pack_q_len,
+        qoff_default if use_stream else None,
+    )
     compiled = _compile_cache.get(key)
     if compiled is None:
         cdt = _cutlass_dtype(q.dtype)
@@ -394,8 +432,16 @@ def msa_proxy_score(
         )
         k_shape = (s_tk, s_hkv, _BLK_KV, head_dim) if paged else (s_tk, s_hkv, head_dim)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel_obj: "MsaProxyScoreSm12x"
-        if use_packed:
+        kernel_obj: Union["MsaProxyScoreDecodeStreamSm12x", "MsaProxyScoreSm12x"]
+        if use_stream:
+            kernel_obj = MsaProxyScoreDecodeStreamSm12x(
+                head_dim=head_dim,
+                group_size=group_size,
+                is_causal=causal,
+                paged=paged,
+                qoff_default=qoff_default,
+            )
+        elif use_packed:
             kernel_obj = MsaProxyScoreDecodePackedSm12x(
                 head_dim=head_dim,
                 m_block_size=64,
@@ -462,19 +508,24 @@ def msa_proxy_score(
         )
         return ph_
 
-    _run_proxy_autotuned(
-        "msa_proxy_score",
-        _call,
-        [q, k, pt_dev, per_head, cu_q_dev, cu_k, qoff_dev],
-        max_seqlen_q=max_seqlen_q,
-        max_k_tiles=max_k_tiles,
-        base_ctas=base_ctas,
-        device=dev,
-        heuristic=_proxy_split_k_bf16,
-        causal=causal,
-        paged=paged,
-        reduce_heads=reduce_heads,
-    )
+    if use_stream:
+        # One CTA per (KV block, token, kv_head): the grid is already maximally
+        # split, so there is no split factor to tune.
+        _call([q, k, pt_dev, per_head, cu_q_dev, cu_k, qoff_dev], 1)
+    else:
+        _run_proxy_autotuned(
+            "msa_proxy_score",
+            _call,
+            [q, k, pt_dev, per_head, cu_q_dev, cu_k, qoff_dev],
+            max_seqlen_q=max_seqlen_q,
+            max_k_tiles=max_k_tiles,
+            base_ctas=base_ctas,
+            device=dev,
+            heuristic=_proxy_split_k_bf16,
+            causal=causal,
+            paged=paged,
+            reduce_heads=reduce_heads,
+        )
 
     if not reduce_heads:
         return per_head
