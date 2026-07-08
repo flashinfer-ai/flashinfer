@@ -420,9 +420,9 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
 
   __syncthreads();
 
-  // ceil(blockDim.x / 32): a trailing partial warp still contributes a value
-  // to shared[] and must be included in the final reduction.
-  bool is_mask = threadIdx.x < ((blockDim.x + 31) >> 5);
+  // A trailing partial warp still contributes a value to shared[]; round the
+  // warp count up so its slot is included in the final reduction.
+  bool is_mask = threadIdx.x < ceil_div(blockDim.x, 32);
 #pragma unroll
   for (int i = 0; i < NUM; i++) {
     val[i] = is_mask ? shared[i][lane] : (T)(0.0f);
@@ -460,9 +460,9 @@ __inline__ __device__ T blockReduceMaxV2(T* val) {
 
   __syncthreads();
 
-  // ceil(blockDim.x / 32): a trailing partial warp still contributes a value
-  // to shared[] and must be included in the final reduction.
-  bool is_mask = threadIdx.x < ((blockDim.x + 31) >> 5);
+  // A trailing partial warp still contributes a value to shared[]; round the
+  // warp count up so its slot is included in the final reduction.
+  bool is_mask = threadIdx.x < ceil_div(blockDim.x, 32);
 #pragma unroll
   for (int i = 0; i < NUM; i++) {
     val[i] = is_mask ? shared[i][lane]
