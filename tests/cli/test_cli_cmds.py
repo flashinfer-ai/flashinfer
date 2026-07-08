@@ -342,7 +342,13 @@ def test_download_jit_cache_alias_cmd_mocked(monkeypatch):
     monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
 
     out = _test_cmd_helper(
-        ["download-jit-cache", "--cuda-version", "12.8", "--flashinfer-version", "0.4.2"]
+        [
+            "download-jit-cache",
+            "--cuda-version",
+            "12.8",
+            "--flashinfer-version",
+            "0.4.2",
+        ]
     )
 
     _assert_output_contains_all(
@@ -407,6 +413,32 @@ def test_download_kernels_cmd_mocked(monkeypatch):
             False,
         ),
     ]
+
+
+def test_download_kernels_cmd_allows_local_flashinfer_version(monkeypatch):
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run should not be called for dry-run")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    out = _test_cmd_helper(
+        [
+            "download-kernels",
+            "--cuda-version",
+            "12.9",
+            "--flashinfer-version",
+            "0.4.1+cu124",
+            "--dry-run",
+        ]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "FlashInfer version: 0.4.1+cu124",
+        "flashinfer-cubin==0.4.1",
+        "flashinfer-jit-cache==0.4.1+cu129",
+        "Dry run requested; pip install was not executed.",
+    )
 
 
 class MockJitSpec:

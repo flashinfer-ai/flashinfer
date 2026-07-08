@@ -71,9 +71,7 @@ def _parse_cuda_version(cuda_version: str | None) -> Version:
     if normalized.startswith("cu"):
         digits = normalized[2:]
         if not digits.isdigit() or len(digits) < 3:
-            raise click.ClickException(
-                "CUDA version must look like '12.9' or 'cu129'."
-            )
+            raise click.ClickException("CUDA version must look like '12.9' or 'cu129'.")
         normalized = f"{int(digits[:2])}.{int(digits[2:])}"
 
     try:
@@ -88,7 +86,7 @@ def _cuda_version_to_index_label(cuda_version: Version) -> str:
     return f"cu{cuda_version.major}{cuda_version.minor}"
 
 
-def _get_public_flashinfer_version(flashinfer_version: str, package_name: str) -> str:
+def _get_public_flashinfer_version(flashinfer_version: str) -> str:
     if flashinfer_version == "0.0.0+unknown":
         raise click.ClickException(
             "Could not determine the installed FlashInfer version."
@@ -101,27 +99,16 @@ def _get_public_flashinfer_version(flashinfer_version: str, package_name: str) -
             f"Invalid FlashInfer version '{flashinfer_version}'."
         ) from e
 
-    if parsed_version.local is not None:
-        raise click.ClickException(
-            "FlashInfer versions with a local version suffix are not supported for "
-            f"automatic {package_name} installation. Pass "
-            "--flashinfer-version with a public version such as '0.4.1'."
-        )
-
     return parsed_version.public
 
 
 def _build_jit_cache_requirement(flashinfer_version: str, cuda_index_label: str) -> str:
-    public_version = _get_public_flashinfer_version(
-        flashinfer_version, "flashinfer-jit-cache"
-    )
+    public_version = _get_public_flashinfer_version(flashinfer_version)
     return f"flashinfer-jit-cache=={public_version}+{cuda_index_label}"
 
 
 def _build_cubin_requirement(flashinfer_version: str) -> str:
-    public_version = _get_public_flashinfer_version(
-        flashinfer_version, "flashinfer-cubin"
-    )
+    public_version = _get_public_flashinfer_version(flashinfer_version)
     return f"flashinfer-cubin=={public_version}"
 
 
