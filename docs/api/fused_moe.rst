@@ -90,3 +90,20 @@ The CuteDSL backends are conditionally available when the
     :show-inheritance:
 
     .. automethod:: __init__
+
+MonoMoE (Single-Kernel Block-FP8, SM90a)
+-----------------------------------------
+
+Single-kernel top-K Mixture-of-Experts implementation specialized for the
+Qwen3.5-35B block-FP8 shape on Hopper (SM90a). The full pipeline — routing,
+up-projection, SiLU, down-projection and reduction — runs inside one kernel
+launch. Use :func:`has_monomoe` to check availability before calling.
+
+.. autosummary::
+    :toctree: ../generated
+
+    has_monomoe
+    get_scratchpad_size_bytes
+    alloc_scratchpad
+    interleave_for_tma_wgmma_up
+    mono_moe
