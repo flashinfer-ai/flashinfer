@@ -1,3 +1,8 @@
+import csv
+import contextlib
+import importlib
+import json
+import math
 import random
 import tracemalloc
 from unittest.mock import MagicMock, patch
@@ -7,6 +12,7 @@ import torch
 
 import flashinfer.fused_moe.core as core_mod
 from flashinfer import autotune
+from flashinfer.autotuner import autotuner as autotuner_module
 from flashinfer.autotuner.initializers import autotuner_initializer_randn
 from flashinfer.fused_moe.core import MoeRunnerInputs, _moe_topk_ids_init
 from flashinfer.fused_moe.utils import (
@@ -31,6 +37,8 @@ from flashinfer.autotuner import (
     AutoTuner,
     ConstraintSpec,
     DynamicTensorSpec,
+    DynamicValueSpec,
+    _ValueAwareInputArena,
     TuningConfig,
     TunableRunner,
     make_bucket_mapper,
@@ -69,6 +77,387 @@ class DummyRunner(TunableRunner):
 
     def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
         return inputs[0]
+
+
+def test_value_aware_input_arena_reuses_lane_storage_across_token_profiles():
+    """Arena views reuse each cold-L2 lane while keeping lanes physically distinct."""
+    tuner = reset_autotuner()
+    inputs = [
+        torch.empty((4, 8), dtype=torch.float32),
+        torch.empty((16, 16), dtype=torch.float32),
+    ]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(4, 8),
+                map_to_tuning_buckets=lambda size: size,
+                tensor_initializers=[
+                    lambda shape, dtype, device: torch.zeros(
+                        shape, dtype=dtype, device=device
+                    )
+                ],
+            ),
+        ),
+        use_cold_l2_cache=True,
+        use_cuda_graph=True,
+    )
+    profiles = tuner._generate_optimization_profiles(config, inputs)
+
+    arena = _ValueAwareInputArena.create(tuner, profiles, inputs, lane_count=2)
+    small_batches = arena.batches_for(profiles[0])
+    large_batches = arena.batches_for(profiles[1])
+
+    assert tuple(small_batches[0][0].shape) == (4, 8)
+    assert tuple(large_batches[0][0].shape) == (8, 8)
+    assert small_batches[0][0].data_ptr() == large_batches[0][0].data_ptr()
+    assert small_batches[0][1].data_ptr() == large_batches[0][1].data_ptr()
+    assert small_batches[0][1].data_ptr() != small_batches[1][1].data_ptr()
+    assert arena.diagnostics()["input_arena_reused"] is True
+    assert arena.diagnostics()["cold_l2_lane_count"] == 2
+
+
+def test_value_aware_tuning_reuses_arena_lanes_for_each_profile(monkeypatch):
+    """Value-aware graph profiling binds every profile to one reusable lane ring."""
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4096)
+    inputs = [
+        torch.empty((4, 8), dtype=torch.float32),
+        torch.empty((16, 16), dtype=torch.float32),
+    ]
+    route_stager = object()
+    sample_indices = []
+
+    def _sample_generator(value, tensor, _original, _inputs, sample_idx):
+        sample_indices.append(sample_idx)
+        return torch.full_like(tensor, value + 2)
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(4, 8),
+                map_to_tuning_buckets=lambda size: size,
+                tensor_initializers=[
+                    lambda shape, dtype, device: torch.zeros(
+                        shape, dtype=dtype, device=device
+                    )
+                ],
+                value_specs=(
+                    DynamicValueSpec(
+                        input_idx=0,
+                        gen_value_buckets=(0, 1),
+                        map_to_value_bucket=lambda _tensor: 0,
+                        tensor_value_generator=lambda value, tensor: torch.full_like(
+                            tensor, value
+                        ),
+                        sample_value_generator=_sample_generator,
+                        sample_value_stager=route_stager,
+                    ),
+                ),
+            ),
+        ),
+        use_cold_l2_cache=True,
+        use_cuda_graph=True,
+    )
+    captures = []
+
+    class _FakeSession:
+        def measure(self, _value_inputs):
+            return 1.0
+
+        def diagnostics(self):
+            return self._diagnostics
+
+    def _capture(
+        _cls,
+        _tuner,
+        _runner,
+        _inputs,
+        _initial_value_inputs,
+        _tactic,
+        _config,
+        _mutable_indices,
+        *,
+        input_batches,
+        arena_diagnostics,
+        value_stagers,
+        **_kwargs,
+    ):
+        captures.append((input_batches, arena_diagnostics, value_stagers))
+        session = _FakeSession()
+        session._diagnostics = arena_diagnostics
+        return session
+
+    monkeypatch.setattr(
+        autotuner_module._GraphProfileSession, "capture", classmethod(_capture)
+    )
+
+    with autotune(tune_mode=True):
+        tuner.choose_one("arena_value_tuning", [DummyRunner((0,))], config, inputs)
+
+    assert len(captures) == 4
+    static_ptrs = [batches[0][1].data_ptr() for batches, _, _ in captures]
+    assert len(set(static_ptrs)) == 1
+    assert all(len(batches) == 5 for batches, _, _ in captures)
+    assert all(
+        all(
+            len({batch[input_idx].data_ptr() for batch in batches}) == len(batches)
+            for input_idx in range(len(inputs))
+        )
+        for batches, _, _ in captures
+    )
+    assert all(diagnostics["input_arena_reused"] for _, diagnostics, _ in captures)
+    assert all(diagnostics["cold_l2_target_met"] for _, diagnostics, _ in captures)
+    assert all(
+        (diagnostics["cold_l2_lane_count"] - 1)
+        * diagnostics["cold_l2_active_bytes_per_lane"]
+        > diagnostics["cold_l2_l2_bytes"]
+        for _, diagnostics, _ in captures
+    )
+    assert all(value_stagers == {0: route_stager} for _, _, value_stagers in captures)
+    assert sample_indices == list(range(tuner.repeat)) * len(captures)
+
+
+def test_value_aware_input_arena_preserves_exact_static_aliases():
+    """Each lane keeps repeated static input views aliased to one clone."""
+    tuner = reset_autotuner()
+    dynamic = torch.empty((4, 8))
+    shared = torch.empty((16, 16))
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(4,),
+                map_to_tuning_buckets=lambda size: size,
+            ),
+        ),
+        use_cold_l2_cache=True,
+    )
+    profile = tuner._generate_optimization_profiles(config, [dynamic, shared, shared])[
+        0
+    ]
+    arena = _ValueAwareInputArena.create(
+        tuner, [profile], [dynamic, shared, shared], config, lane_count=2
+    )
+    batches = arena.batches_for(profile)
+    assert batches[0][1].data_ptr() == batches[0][2].data_ptr()
+    assert batches[1][1].data_ptr() == batches[1][2].data_ptr()
+    assert batches[0][1].data_ptr() != batches[1][1].data_ptr()
+
+
+def test_value_aware_input_arena_bounds_zero_and_tiny_profiles(monkeypatch):
+    """Zero/tiny profiles must not create an unbounded cold-L2 graph ring."""
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4096)
+    zero_profile = autotuner_module.OptimizationProfile(
+        shapes=[[autotuner_module.DynamicDim(0, 0, 0)]],
+        tensor_initializers=[lambda shape, dtype, device: torch.empty(shape)],
+    )
+    zero_arena = _ValueAwareInputArena.create(
+        tuner,
+        [zero_profile],
+        [torch.empty(1)],
+        TuningConfig(use_cold_l2_cache=True),
+    )
+    zero_diagnostics = zero_arena.diagnostics()
+    assert zero_diagnostics["cold_l2_lane_count"] == 1
+    assert zero_diagnostics["cold_l2_required_lane_count"] == 1
+    assert zero_diagnostics["cold_l2_target_met"] is False
+    assert zero_diagnostics["cold_l2_method"] == "empty"
+    assert zero_diagnostics["cold_l2_unmet_reason"] == "zero_active_profile_bytes"
+    assert zero_diagnostics["arena_fallback_reason"] == ""
+
+    tiny_profile = autotuner_module.OptimizationProfile(
+        shapes=[[autotuner_module.DynamicDim(1, 1, 1)]],
+        tensor_initializers=[lambda shape, dtype, device: torch.empty(shape)],
+    )
+    tiny_arena = _ValueAwareInputArena.create(
+        tuner,
+        [tiny_profile],
+        [torch.empty(1)],
+        TuningConfig(use_cold_l2_cache=True),
+    )
+    tiny_diagnostics = tiny_arena.diagnostics()
+    assert tiny_diagnostics["cold_l2_required_lane_count"] == 1026
+    assert tiny_diagnostics["cold_l2_lane_count"] == tuner.repeat + 1
+    assert tiny_diagnostics["cold_l2_ring_target_met"] is False
+    assert tiny_diagnostics["cold_l2_target_met"] is True
+    assert tiny_diagnostics["cold_l2_method"] == "memcpy_then_ring"
+    assert tiny_diagnostics["cold_l2_unmet_reason"] == "lane_limit"
+    assert tiny_diagnostics["cold_l2_flush_bytes_per_sample"] == 8192
+    assert tiny_diagnostics["arena_fallback_reason"] == ""
+
+
+def test_value_aware_fallback_diagnostics_match_captured_batches(monkeypatch):
+    """Arena fallback reports the conventional ring it actually captures."""
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4096)
+    batches = [[torch.empty(512)] for _ in range(4)]
+    diagnostics = _ValueAwareInputArena.fallback_diagnostics(
+        tuner,
+        batches,
+        TuningConfig(use_cold_l2_cache=True),
+        "ValueError",
+    )
+    assert diagnostics["input_arena_reused"] is False
+    assert diagnostics["cold_l2_lane_count"] == len(batches)
+    assert diagnostics["cold_l2_rotation_active"] is True
+    assert diagnostics["cold_l2_active_bytes_per_lane"] == 2048
+    assert diagnostics["cold_l2_ring_target_met"] is True
+    assert diagnostics["cold_l2_method"] == "ring"
+    assert diagnostics["arena_fallback_reason"] == "ValueError"
+
+
+@pytest.mark.parametrize(
+    ("repeat", "lane_count", "expected_replays", "expected_calls"),
+    ((10, 1, 10, 10), (10, 4, 3, 12), (10, 11, 1, 11)),
+)
+def test_value_aware_graph_session_rounds_to_actual_measured_calls(
+    repeat,
+    lane_count,
+    expected_replays,
+    expected_calls,
+):
+    """Graph replay arithmetic must divide by calls actually captured and run."""
+    tuner = MagicMock(repeat=repeat)
+    tuner._use_global_timer = False
+    session = autotuner_module._GraphProfileSession(
+        tuner,
+        MagicMock(),
+        0,
+        TuningConfig(),
+        [[torch.empty(1)] for _ in range(lane_count)],
+        (0,),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        0.0,
+    )
+    assert session.measurement_graph_replays == expected_replays
+    assert session.measured_calls_per_sample == expected_calls
+
+
+def test_value_aware_graph_session_uses_globaltimer(monkeypatch):
+    session = object.__new__(autotuner_module._GraphProfileSession)
+    session.tuner = MagicMock(
+        _use_global_timer=True,
+        repeat=6,
+        _CUDA_GRAPH_DELAY_MICRO_SECS=100,
+    )
+    session.start = torch.tensor([1_000_000], dtype=torch.int64)
+    session.end = torch.tensor([7_000_000], dtype=torch.int64)
+    session.stream = MagicMock()
+    session.graph = MagicMock()
+    session.calls_per_graph = 2
+    session.measurement_graph_replays = 3
+    session.measured_calls_per_sample = 6
+    session.replay_count = 0
+    session.cold_l2_flush_source = None
+    session.cold_l2_flush_destination = None
+    session.cold_l2_flush_count = 0
+    events = []
+    session._stage_values = MagicMock(
+        side_effect=lambda _values: events.append("stage")
+    )
+    session.graph.replay.side_effect = lambda: events.append("replay")
+    session.tuner._record_global_timer.side_effect = lambda timer: events.append(
+        "start" if timer is session.start else "end"
+    )
+
+    monkeypatch.setattr(
+        autotuner_module, "_profile_measurement_scope", contextlib.nullcontext
+    )
+    monkeypatch.setattr(
+        autotuner_module,
+        "_autotune_nvtx_range",
+        lambda *_args: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(autotuner_module.torch.cuda, "stream", contextlib.nullcontext)
+    delay = MagicMock(side_effect=lambda _duration: events.append("delay"))
+    monkeypatch.setattr(autotuner_module, "delay_kernel", delay)
+
+    assert session.measure([]) == pytest.approx(1.0)
+    assert session.tuner._record_global_timer.call_count == 2
+    assert session.tuner._record_global_timer.call_args_list[0].args[0] is session.start
+    assert session.tuner._record_global_timer.call_args_list[1].args[0] is session.end
+    assert session.graph.replay.call_count == 3
+    delay.assert_called_once_with(100)
+    assert events == ["stage", "delay", "start", "replay", "replay", "replay", "end"]
+    assert session.replay_count == 1
+
+
+def test_value_aware_graph_session_rejects_sample_lane_alias():
+    """Generated samples must not share storage with the captured graph lane."""
+    lane = torch.zeros(4)
+    session = object.__new__(autotuner_module._GraphProfileSession)
+    session.mutable_input_indices = (0,)
+    session.input_batches = [[lane]]
+    session.value_stagers = {}
+    session.staging_copy_count = 0
+    session.mutable_route_h2d_copy_count = 0
+
+    with pytest.raises(RuntimeError, match="shares storage"):
+        session._stage_values([lane])
+
+    with pytest.raises(RuntimeError, match="shares storage"):
+        session._stage_values([lane[1:]])
+
+
+def test_value_aware_graph_session_memcpy_flush_precedes_timing(monkeypatch):
+    """A cap-bound ring evicts L2 by D2D copy before its single timed replay."""
+    session = object.__new__(autotuner_module._GraphProfileSession)
+    session.tuner = MagicMock(
+        _use_global_timer=True,
+        _CUDA_GRAPH_DELAY_MICRO_SECS=100,
+    )
+    session.start = torch.tensor([1_000_000], dtype=torch.int64)
+    session.end = torch.tensor([2_000_000], dtype=torch.int64)
+    session.stream = MagicMock()
+    session.graph = MagicMock()
+    session.measurement_graph_replays = 1
+    session.measured_calls_per_sample = 1
+    session.replay_count = 0
+    session.cold_l2_flush_count = 0
+    events = []
+    session._stage_values = MagicMock(
+        side_effect=lambda _values: events.append("stage")
+    )
+    session.cold_l2_flush_source = MagicMock()
+    session.cold_l2_flush_source.numel.return_value = 8192
+    session.cold_l2_flush_destination = MagicMock()
+    session.cold_l2_flush_destination.copy_.side_effect = lambda _source: events.append(
+        "memcpy"
+    )
+    session.graph.replay.side_effect = lambda: events.append("replay")
+    session.tuner._record_global_timer.side_effect = lambda timer: events.append(
+        "start" if timer is session.start else "end"
+    )
+
+    monkeypatch.setattr(
+        autotuner_module, "_profile_measurement_scope", contextlib.nullcontext
+    )
+    monkeypatch.setattr(
+        autotuner_module,
+        "_autotune_nvtx_range",
+        lambda *_args: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(autotuner_module.torch.cuda, "stream", contextlib.nullcontext)
+    monkeypatch.setattr(
+        autotuner_module,
+        "delay_kernel",
+        lambda _duration: events.append("delay"),
+    )
+
+    assert session.measure([]) == pytest.approx(1.0)
+    assert session.cold_l2_flush_count == 1
+    assert events == ["stage", "memcpy", "delay", "start", "replay", "end"]
 
 
 def test_find_nearest_profile_passthrough_without_specs():
@@ -417,6 +806,162 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
 
 
+class NumericalValueProfileRunner(TunableRunner):
+    """Execute numerically equivalent CUDA tactics for value-profile tuning."""
+
+    def __init__(self):
+        self.captured_input_outputs = []
+
+    def get_valid_tactics(self, inputs, profile):
+        return (0, 1)
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        if do_preparation:
+            return inputs[0]
+        if tactic not in (0, 1):
+            raise ValueError(f"unsupported tactic: {tactic}")
+        output = torch.sin(inputs[0])
+        if torch.cuda.is_current_stream_capturing():
+            self.captured_input_outputs.append((inputs[0], output))
+        return output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_value_profile_autotune_replays_cuda_values_numerically(monkeypatch, tmp_path):
+    """Tune shape/value products with cold-L2 staging and replay numerically."""
+    autotuner_module = importlib.import_module("flashinfer.autotuner.autotuner")
+    dynamic_value_spec = getattr(autotuner_module, "DynamicValueSpec", None)
+    assert dynamic_value_spec is not None, "value-profile autotuning is unavailable"
+
+    class HostValueStager:
+        def prepare(self, input_batches, input_idx):
+            assert all(batch[input_idx].is_cuda for batch in input_batches)
+
+        def stage(self, source, input_batches, input_idx, state):
+            assert state is None
+            assert source.device.type == "cpu"
+            for batch in input_batches:
+                batch[input_idx].copy_(source)
+            copies = len(input_batches)
+            return copies, copies
+
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    profile_dump = tmp_path / "value-profile.csv"
+    monkeypatch.setattr(autotuner_module, "_AUTOTUNE_DUMP_PATH", str(profile_dump))
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4096)
+    runner = NumericalValueProfileRunner()
+
+    def sample_value_generator(bucket, profiled, _original, _inputs, sample_index):
+        return torch.full_like(
+            profiled,
+            bucket + sample_index / 8,
+            device="cpu",
+        )
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8, 16),
+                map_to_tuning_buckets=lambda size: size,
+                tensor_initializers=[
+                    lambda shapes, dtype, device: torch.empty(
+                        shapes, dtype=dtype, device=device
+                    )
+                ],
+                value_specs=(
+                    dynamic_value_spec(
+                        input_idx=0,
+                        gen_value_buckets=(0, 1),
+                        map_to_value_bucket=lambda tensor: int(tensor[0].item()),
+                        tensor_value_generator=lambda bucket, profiled: torch.full_like(
+                            profiled, bucket
+                        ),
+                        sample_value_generator=sample_value_generator,
+                        sample_value_stager=HostValueStager(),
+                    ),
+                ),
+            ),
+        ),
+        use_cold_l2_cache=True,
+        use_cuda_graph=True,
+    )
+
+    tuning_input = torch.zeros(16, device="cuda")
+    with autotune(tune_mode=True):
+        tuner.choose_one("value_profile_numerical", [runner], config, [tuning_input])
+
+    assert runner.captured_input_outputs
+    for captured_input, captured_output in runner.captured_input_outputs:
+        torch.testing.assert_close(captured_output, torch.sin(captured_input))
+    assert {
+        float(captured_input[0].item())
+        for captured_input, _ in runner.captured_input_outputs
+    } == {1.125, 2.125}
+
+    with profile_dump.open(newline="") as profile_file:
+        records = list(csv.DictReader(profile_file))
+    assert {
+        (int(record["num_tokens"]), record["value_buckets"]) for record in records
+    } == {(8, "(0,)"), (8, "(1,)"), (16, "(0,)"), (16, "(1,)")}
+    assert all(record["input_arena_reused"] == "True" for record in records)
+    assert all(int(record["cold_l2_lane_count"]) > 1 for record in records)
+    assert all(record["cold_l2_method"] == "memcpy_then_ring" for record in records)
+    assert all(record["cold_l2_ring_target_met"] == "False" for record in records)
+    assert all(record["cold_l2_target_met"] == "True" for record in records)
+    assert all(
+        int(record["cold_l2_flush_bytes_per_sample"]) == 8192 for record in records
+    )
+    assert all(
+        int(record["cold_l2_flush_count"]) == int(record["value_sample_count"])
+        for record in records
+    )
+    assert all(int(record["mutable_route_h2d_copies"]) > 0 for record in records)
+    assert all(int(record["graph_warmup_replays"]) == 1 for record in records)
+    assert all(
+        int(record["graph_calls_per_replay"]) == int(record["cold_l2_lane_count"])
+        for record in records
+    )
+    assert all(
+        int(record["graph_measurement_replays_per_sample"])
+        == (tuner.repeat + int(record["graph_calls_per_replay"]) - 1)
+        // int(record["graph_calls_per_replay"])
+        for record in records
+    )
+    assert all(
+        int(record["graph_measured_calls_per_sample"])
+        == int(record["graph_calls_per_replay"])
+        * int(record["graph_measurement_replays_per_sample"])
+        for record in records
+    )
+    assert all(
+        len(json.loads(record["value_times_ms"])) == int(record["value_sample_count"])
+        for record in records
+    )
+    assert all(math.isfinite(float(record["time_ms"])) for record in records)
+    assert all(
+        float(record["value_time_median_ms"])
+        == pytest.approx(
+            autotuner_module.statistics.median(json.loads(record["value_times_ms"]))
+        )
+        for record in records
+    )
+
+    for num_tokens in (8, 16):
+        for value in (0.0, 1.0):
+            runtime_input = torch.full((num_tokens,), value, device="cuda")
+            selected_runner, tactic = tuner.choose_one(
+                "value_profile_numerical", [runner], config, [runtime_input]
+            )
+            assert tactic in (0, 1)
+            torch.testing.assert_close(
+                selected_runner([runtime_input], tactic=tactic),
+                torch.sin(runtime_input),
+            )
+
+
 def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
     """Profiles apply constraints, dynamic inputs are recreated, static inputs are reused."""
     tuner = reset_autotuner()
@@ -485,6 +1030,275 @@ def test_tuning_config_tensor_initializers_apply_by_input_index():
     assert prepared[1] is inputs[1]
     assert tuple(prepared[2].shape) == (8, 1)
     assert torch.all(prepared[2] == 7)
+
+
+def test_value_specs_are_attached_to_dynamic_tensor_spec(monkeypatch):
+    """Value-bucket profiling should share ownership with dynamic tensor specs."""
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    tuner = reset_autotuner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(4, 8),
+                map_to_tuning_buckets=lambda x: x,
+                value_specs=(
+                    DynamicValueSpec(
+                        input_idx=0,
+                        gen_value_buckets=(10, 20),
+                        map_to_value_bucket=lambda tensor: int(tensor[0].item()),
+                        tensor_value_generator=lambda bucket, profiled: torch.full_like(
+                            profiled, bucket
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    inputs = [torch.zeros((2,), dtype=torch.int32)]
+
+    profiles = tuner._generate_optimization_profiles(config, inputs)
+    assert {
+        (profile.get_opt_shapes()[0][0], profile.value_buckets) for profile in profiles
+    } == {
+        (4, (10,)),
+        (4, (20,)),
+        (8, (10,)),
+        (8, (20,)),
+    }
+
+    prepared = tuner._prepare_input_tensors(profiles[0], inputs, config)
+    assert tuple(prepared[0].shape) == (4,)
+    assert torch.all(prepared[0] == profiles[0].value_buckets[0])
+
+
+def test_empty_profile_dependent_value_spec_does_not_create_partial_key(monkeypatch):
+    """A profile unsupported by one value axis remains shape-only."""
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    tuner = reset_autotuner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(1, 8),
+                map_to_tuning_buckets=lambda x: x,
+                value_specs=(
+                    DynamicValueSpec(
+                        input_idx=0,
+                        gen_value_buckets=lambda profile: (
+                            (16, 32) if profile.get_opt_shapes()[0][0] >= 8 else ()
+                        ),
+                        map_to_value_bucket=lambda _tensor: 16,
+                        tensor_value_generator=lambda _bucket, tensor: tensor,
+                    ),
+                    DynamicValueSpec(
+                        input_idx=0,
+                        gen_value_buckets=(0, 1),
+                        map_to_value_bucket=lambda _tensor: 0,
+                        tensor_value_generator=lambda _bucket, tensor: tensor,
+                    ),
+                ),
+            ),
+        )
+    )
+
+    profiles = tuner._generate_optimization_profiles(
+        config, [torch.zeros((8,), dtype=torch.int32)]
+    )
+
+    assert {
+        (profile.get_opt_shapes()[0][0], profile.value_buckets) for profile in profiles
+    } == {
+        (1, ()),
+        (8, (16, 0)),
+        (8, (16, 1)),
+        (8, (32, 0)),
+        (8, (32, 1)),
+    }
+
+
+def test_default_value_profile_uses_original_values_and_publishes_shape_cache(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    marker = (-1,)
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8,),
+                map_to_tuning_buckets=lambda _size: 8,
+                tensor_initializers=[
+                    lambda shape, dtype, device: torch.zeros(
+                        shape, dtype=dtype, device=device
+                    )
+                ],
+                value_specs=(
+                    DynamicValueSpec(
+                        input_idx=0,
+                        gen_value_buckets=(0, 1),
+                        map_to_value_bucket=lambda _tensor: 0,
+                        tensor_value_generator=lambda bucket,
+                        profiled,
+                        original,
+                        _inputs: (
+                            original
+                            if bucket == -1
+                            else torch.full_like(profiled, bucket)
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        default_value_buckets=marker,
+    )
+    inputs = [torch.arange(1, 9, dtype=torch.float32)]
+    profiles = tuner._generate_optimization_profiles(config, inputs)
+    assert [profile.value_buckets for profile in profiles] == [marker, (0,), (1,)]
+
+    def fake_profile(_self, _runner, profile_inputs, tactic, _config, **_kwargs):
+        is_default = bool(torch.equal(profile_inputs[0], inputs[0]))
+        return 1.0 if tactic == (1 if is_default else 0) else 2.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        tuner.choose_one("default_value_profile", [runner], config, inputs)
+
+    shape_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8,),
+                map_to_tuning_buckets=lambda _size: 8,
+                tensor_initializers=config.dynamic_tensor_specs[0].tensor_initializers,
+            ),
+        )
+    )
+    _, tactic = tuner.choose_one(
+        "default_value_profile", [runner], shape_config, inputs
+    )
+    assert tactic == 1
+
+    cache_path = tmp_path / "default-profile-cache.json"
+    tuner.save_configs(str(cache_path))
+    tuner.clear_cache()
+    assert tuner.load_configs(str(cache_path))
+    assert (
+        tuner.choose_one("default_value_profile", [runner], shape_config, inputs)[1]
+        == 1
+    )
+    assert tuner.choose_one("default_value_profile", [runner], config, inputs)[1] == 0
+    tuner.clear_cache()
+    tuner._override_config_cache.clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
+
+
+def test_factorized_value_profile_retains_fixed_default_tactic_timing(monkeypatch):
+    """Fixed NoDA and composed DA tactics retain their authoritative timings."""
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    tuner = reset_autotuner()
+
+    class FactorizedRunner(DummyRunner):
+        def __init__(self):
+            super().__init__(valid_tactics=((32, 66), (32, 1), (32, 2), (32, 3)))
+
+        def get_tactic_groups(self, _inputs, profile):
+            if profile.value_buckets == (-1,):
+                return None
+            return [[(32, 3), (32, 1)], [(32, 2)]]
+
+        def compose_tactics(self, _group_winners, _inputs, profile):
+            if profile.value_buckets == (64,):
+                raise ValueError("force exhaustive fallback")
+            return (32, 3)
+
+    runner = FactorizedRunner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8,),
+                map_to_tuning_buckets=lambda _size: 8,
+                value_specs=(
+                    DynamicValueSpec(
+                        input_idx=0,
+                        gen_value_buckets=(32, 64),
+                        map_to_value_bucket=lambda _tensor: 32,
+                        tensor_value_generator=lambda bucket, profiled, original: (
+                            original
+                            if bucket == -1
+                            else torch.full_like(profiled, bucket)
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        default_value_buckets=(-1,),
+        value_sample_count=lambda _buckets, _repeat: 3,
+    )
+    inputs = [torch.zeros((8,), dtype=torch.float32)]
+
+    tactic_calls = {}
+
+    def fake_profile(_self, _runner, profile_inputs, tactic, _config, **_kwargs):
+        profile_value = int(profile_inputs[0][0])
+        if profile_value == 0:
+            return 0.5 if tuple(tactic) == (32, 66) else 1.0
+        key = (profile_value, tuple(tactic))
+        tactic_calls[key] = tactic_calls.get(key, 0) + 1
+        if tuple(tactic) == (32, 3):
+            return 0.6 if tactic_calls[key] <= 3 else 0.75
+        return {
+            (32, 1): 0.8,
+            (32, 2): 0.85 if profile_value == 64 else 0.7,
+            (32, 66): 0.9,
+        }[tuple(tactic)]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        tuner.choose_one("factorized_default_timing", [runner], config, inputs)
+
+    for value_bucket in ((32,), (64,)):
+        generated_entries = [
+            (cache_key, tactic, time_ms)
+            for (
+                cache_key,
+                tactic,
+            ), time_ms in tuner.profiling_tactic_time_cache.items()
+            if len(cache_key.nearest_profile) == 2
+            and cache_key.nearest_profile[1] == value_bucket
+        ]
+        assert any(
+            tactic == (32, 66) and time_ms == 0.9
+            for _, tactic, time_ms in generated_entries
+        ), generated_entries
+        assert any(
+            tactic == (32, 3) and time_ms == 0.75
+            for _, tactic, time_ms in generated_entries
+        ), generated_entries
+        generated_winner = next(
+            tactic
+            for cache_key, (tactic, _profile) in tuner.profiling_cache.items()
+            if len(cache_key.nearest_profile) == 2
+            and cache_key.nearest_profile[1] == value_bucket
+        )
+        assert tuple(generated_winner) == (32, 3)
+        generated_winner_time = next(
+            time_ms
+            for cache_key, time_ms in tuner.profiling_time_cache.items()
+            if len(cache_key.nearest_profile) == 2
+            and cache_key.nearest_profile[1] == value_bucket
+        )
+        assert generated_winner_time == 0.75
+    assert tactic_calls[(32, (32, 3))] == 6
+    assert tactic_calls[(64, (32, 3))] == 6
 
 
 class TileTacticDummyRunner(TunableRunner):
