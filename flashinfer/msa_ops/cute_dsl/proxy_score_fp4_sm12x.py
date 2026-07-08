@@ -15,6 +15,10 @@ limitations under the License.
 
 NVFP4 tensor-core MSA proxy-score kernels for SM120/SM121: same contract as
 :mod:`proxy_score_sm12x`, with a general split-K and a packed-decode schedule.
+
+No scalar stream schedule here (unlike the bf16 decode path): at 4-bit K the
+MMA pipeline hides the small tile's load latency, and the per-lane fp4 decode
+chain makes a scalar port slower, not faster.
 """
 
 import cuda.bindings.driver as cuda

@@ -80,16 +80,40 @@ def _proxy_split_k(
     return max(1, min(splits, max_k_tiles))
 
 
-# Split-K heuristics, tuned empirically. fp4: fill two SM-waves and ceil to the
-# target (4-bit K reads make over-splitting cheap).
-_proxy_split_k_fp4 = functools.partial(
-    _proxy_split_k, wave_target=2.0, gate_factor=2.0, ceil_to_target=True
-)
-# bf16: target ~1.5 waves and round (the Q reload per split makes over-splitting
-# regress).
+# bf16 split-K heuristic, tuned empirically: target ~1.5 waves and round (the
+# Q reload per split makes over-splitting regress).
 _proxy_split_k_bf16 = functools.partial(
     _proxy_split_k, wave_target=1.5, gate_factor=1.0, ceil_to_target=False
 )
+
+
+@functools.lru_cache(maxsize=None)
+def _split_k_makespan_argmin(
+    base_ctas: int, max_k_tiles: int, resident_ctas: int
+) -> int:
+    """Split factor minimizing a makespan model: full resident-CTA waves times
+    per-split work, with ~one KV block of fixed per-CTA overhead (launch + Q
+    load). Ties break to the smaller split (fewer Q reloads). A model rather
+    than a wave target because the optimum shifts between filling residency
+    exactly (moderate batch), max split (batch 1), and no split (large batch,
+    short kv) -- no single target covers all three regimes."""
+    best_ns, best_cost = 1, None
+    for ns in range(1, min(max_k_tiles, 4096) + 1):
+        waves = -(-(base_ctas * ns) // resident_ctas)
+        cost = waves * (-(-max_k_tiles // ns) + 1)
+        if best_cost is None or cost < best_cost:
+            best_ns, best_cost = ns, cost
+    return best_ns
+
+
+def _proxy_split_k_fp4(base_ctas: int, max_k_tiles: int, device) -> int:
+    """fp4 split-K: 4-bit K reads make splits cheap, so pick by the makespan
+    model at the kernel's 2-CTA/SM residency (see _MIN_BLOCKS_PER_MP)."""
+    if base_ctas <= 0 or max_k_tiles <= 1:
+        return 1
+    return _split_k_makespan_argmin(
+        base_ctas, max_k_tiles, 2 * get_device_sm_count(device)
+    )
 
 
 class _ProxySplitKRunner(TunableRunner):
@@ -261,13 +285,11 @@ def msa_proxy_score(
 
     There is no softmax and no V: this is MSA pipeline stage 1.
 
-    Single-token decode (``q_len == 1`` for every request, ``group_size <= 8``)
-    uses a dim-parallel scalar schedule that streams index-K straight to
-    registers. Short-q decode (any ``group_size`` dividing the 64-row q-tile
-    with ``q_len <= 64 // group_size``, e.g. MiniMax-M3's group_size 4 at
-    ``q_len <= 16``) uses a head-fused packed schedule that scores all
-    ``group_size`` heads of a kv_head from one shared index-K read
-    (``group_size`` x less K traffic). fp8 K and prefill use the general schedule.
+    Single-token decode uses a dim-parallel scalar schedule that streams
+    index-K straight to registers. Short multi-token decode (MTP) uses a
+    head-fused packed schedule that scores all ``group_size`` heads of a
+    kv_head from one shared index-K read. fp8 K and prefill use the general
+    schedule; see the dispatch below for the exact regime bounds.
 
     Parameters
     ----------
@@ -589,15 +611,16 @@ def msa_proxy_score_fp4(
     read is the dominant decode-step cost, so this is the bandwidth-saving
     path; :func:`msa_proxy_score` stays as the bf16 precision reference.
 
-    The kernel computes ``Q K^T`` on the SM120 fp4 tensor cores
-    (``MmaMXF4NVF4Op``), so numerics equal a torch dequant of the same packed
-    inputs (not the bf16 reference, which differs by fp4 rounding). The two global
-    scales are folded into the logits as ``q_global_scale * k_global_scale`` before
-    the block-max. Short-q decode (any ``group_size`` dividing the 128-row tile with
-    ``q_len <= 128 // group_size``, e.g. MiniMax-M3's group_size 4 at ``q_len<=32``,
-    or the 16-head deployment at ``q_len<=8``) uses a head-fused packed schedule that
-    scores all ``group_size`` heads of a kv_head from one shared index-K read. Both
-    flat and paged K are supported.
+    Numerics equal a torch dequant of the same packed inputs (not the bf16
+    reference, which differs by fp4 rounding). The two global scales are folded
+    into the logits as ``q_global_scale * k_global_scale`` before the block-max.
+    Single-token decode uses a dim-parallel scalar schedule that streams packed
+    K straight to registers and decodes with cvt instructions. Short multi-token
+    decode uses a head-fused packed schedule on the fp4 tensor cores
+    (``MmaMXF4NVF4Op``) that scores all ``group_size`` heads of a kv_head from
+    one shared index-K read. Longer q uses the general tensor-core schedule.
+    Both flat and paged K are supported; see the dispatch below for the exact
+    regime bounds.
 
     Parameters
     ----------

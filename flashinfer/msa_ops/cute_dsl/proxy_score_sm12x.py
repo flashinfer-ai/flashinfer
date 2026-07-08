@@ -802,7 +802,13 @@ class MsaProxyScoreDecodeStreamSm12x:
     """Single-token decode schedule: at one query token the score tile is only
     group_size rows, too skinny for the MMA atom, so K streams straight from
     GMEM to registers (no smem, no tensor cores) and dim-parallel lanes reduce
-    each key's dot products with warp shuffles."""
+    each key's dot products with warp shuffles.
+
+    Deliberately q_len == 1 only: a pack_q > 1 (MTP) variant reusing the K
+    registers across tokens measured 0.67-0.99x of the packed-MMA schedule
+    (5080, Sq 2-8) -- the shuffle+FMA phase scales with Sq while the K loads
+    don't, and the rising arithmetic intensity at m = Sq * group_size rows is
+    exactly what starts paying for the tensor cores. MTP stays packed-MMA."""
 
     _NUM_WARPS = 8
     _KEYS_PER_ITER = 2  # 32 lanes = 2 keys x 16 dim-slice lanes
