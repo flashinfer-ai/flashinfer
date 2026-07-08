@@ -15,7 +15,7 @@ limitations under the License.
 
 KDA (Kimi Delta Attention) prefill tests.  Mirrors test_prefill_delta_rule2.py with
 the KDA interface: channel-wise LOG-space forget gate ``g`` plus a per-token
-scalar update gate ``beta`` (fla.ops.kda.chunk_kda conventions).
+scalar update gate ``beta``.
 
 Notes vs the GDN-2 tests:
   - beta/w collapse into the single per-token scalar ``beta``; there is no
