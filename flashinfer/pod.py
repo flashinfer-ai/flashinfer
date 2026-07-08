@@ -1111,6 +1111,7 @@ class BatchPODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             num_colocated_ctas,
+            0,  # uniform_q_len
         )
         self._indptr_type = kv_indptr_p.dtype
         self._pos_encoding_mode = pos_encoding_mode
