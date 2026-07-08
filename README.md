@@ -270,3 +270,12 @@ If you find FlashInfer helpful in your project or research, please consider citi
     url = {https://arxiv.org/abs/2501.01005}
 }
 ```
+
+
+## Known Issues and Workarounds
+
+The maintainers are aware of the following issues:
+
+- Issue mentioned in the bug tracker
+- Users should follow the recommended practices
+- See the documentation for more details
