@@ -18,6 +18,10 @@ import pytest
 import torch
 
 from flashinfer.utils import get_compute_capability
+from flashinfer.tllm_enums import (
+    DtypeTrtllmGen,
+    deduce_trtllm_gen_tensor_dtype,
+)
 
 from flashinfer.fused_moe import fill_w_ptr
 from tests.moe.trtllm_gen_fused_moe_utils import (
@@ -43,6 +47,34 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
 )
 
 pytestmark = pytest.mark.long_running
+
+
+def test_fp4_dtype_deduction_handles_interleaved_scale_padding():
+    packed_fp4 = torch.empty((129, 64), dtype=torch.uint8)
+
+    assert (
+        deduce_trtllm_gen_tensor_dtype(
+            packed_fp4, torch.empty((256, 8), dtype=torch.float8_e4m3fn)
+        )
+        == DtypeTrtllmGen.E2m1
+    )
+    assert (
+        deduce_trtllm_gen_tensor_dtype(
+            packed_fp4, torch.empty((256, 4), dtype=torch.float8_e4m3fn)
+        )
+        == DtypeTrtllmGen.MxE2m1
+    )
+
+
+def test_fp4_dtype_deduction_prefers_exact_linear_scale_shape():
+    """NVFP4 linear scales can share a numel with padded MXFP4 scales."""
+    packed_fp4 = torch.empty((64, 7168 // 2), dtype=torch.uint8)
+    linear_nvfp4_scale = torch.empty((64, 7168 // 16), dtype=torch.float8_e4m3fn)
+
+    assert (
+        deduce_trtllm_gen_tensor_dtype(packed_fp4, linear_nvfp4_scale)
+        == DtypeTrtllmGen.E2m1
+    )
 
 
 @pytest.fixture(scope="module")
