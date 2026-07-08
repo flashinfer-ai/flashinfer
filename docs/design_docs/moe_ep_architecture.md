@@ -1,5 +1,8 @@
 # moe_ep Design
 
+> For build/test/how-to-extend instructions, see the
+> [moe_ep runbook](./moe_ep_runbook.md).
+
 Expert-Parallel MoE with two execution modes:
 
 | Mode | Flow | When to use |
@@ -147,11 +150,15 @@ Raw megakernel or split-kernel configs cannot be passed as `backend=`; wrap in `
 
 ## Extending
 
+See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-mega-kernel-backend) for a step-by-step example (frontend contract, config, registration).
+
 1. **Split kernel** — `backends/split/kernel/<name>/`: subclass `SplitKernelBackend`, `@register_split_kernel`, import in `backends/split/kernel/__init__.py`.
 2. **Mega kernel** — `backends/mega/kernel/<name>/`: subclass `MegaKernelBackend`, implement `compute` / `_allocate_workspace` / `stage_inputs`, override `runtime_requirements()` if needed, `@register_mega_kernel`, import in `backends/mega/kernel/__init__.py`.
 3. **Comm backend** (split only) — `backends/split/comm/<name>/` with `config.py`, `fleet.py`, `handle.py`; import fleet from `moe_ep.__init__.py`.
 
 ## Tests
+
+See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environment) for the container setup and per-target requirements.
 
 `tests/moe_ep/run_tests.sh [unit|multirank|split_path_correctness_bf16|mega|smoke|all]`:
 
