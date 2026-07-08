@@ -645,6 +645,11 @@ class TuningConfig:
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = False
     value_sample_count: Optional[Callable[[Tuple[Any, ...], int], int]] = None
+    # Optional explicit value-bucket tuple representing the unmodified/default
+    # input profile.  Its winner is also published under the ordinary
+    # shape-only cache key, allowing one value-aware sweep to serve eager and
+    # value-aware execution without conflating the two cache contracts.
+    default_value_buckets: Optional[Tuple[Any, ...]] = None
     # Optional callback invoked once per profile bucket, after dynamic
     # tensors are synthesized but before the per-tactic profile loop.
     # Receives the full list of tensors and returns a (possibly modified)
@@ -738,6 +743,26 @@ class TunableRunner(ABC):
         per-tensor content).
         """
         return ()
+
+    def get_tactic_groups(
+        self, inputs: List[torch.Tensor], profile: OptimizationProfile
+    ) -> Optional[List[List[Any]]]:
+        """Return independently tunable tactic groups, or ``None`` for exhaustive search.
+
+        Each group is profiled independently. The tuner passes the fastest tactic
+        from every group to :meth:`compose_tactics` and profiles the composed tactic
+        once before caching it.
+        """
+        return None
+
+    def compose_tactics(
+        self,
+        group_winners: List[Any],
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> Any:
+        """Compose independently selected group winners into an executable tactic."""
+        raise NotImplementedError
 
     def __call__(self, inputs, **kwargs):
         return self.forward(inputs, **kwargs)
@@ -1242,9 +1267,10 @@ class _ValueAwareInputArena:
             for input_idx in range(len(inputs))
         ]
         max_inputs: List[Optional[torch.Tensor]] = []
-        default_initializer = lambda shapes, dtype, device: (
-            torch.rand(shapes, device=device) * 10 - 5
-        ).to(dtype)
+
+        def default_initializer(shapes, dtype, device):
+            return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
+
         for input_idx, input_tensor in enumerate(inputs):
             if input_tensor is None:
                 max_inputs.append(None)
@@ -1577,8 +1603,8 @@ class _GraphProfileSession:
         mutable_input_indices: Tuple[int, ...],
         graph: torch.cuda.CUDAGraph,
         graph_pool: object,
-        start: torch.cuda.Event,
-        end: torch.cuda.Event,
+        start: Union[torch.cuda.Event, torch.Tensor],
+        end: Union[torch.cuda.Event, torch.Tensor],
         stream: torch.cuda.Stream,
         setup_host_time_s: float,
         arena_diagnostics: Optional[Dict[str, Any]] = None,
@@ -1680,8 +1706,12 @@ class _GraphProfileSession:
         stream = torch.cuda.current_stream()
         graph_pool = torch.cuda.graph_pool_handle()
         graph = torch.cuda.CUDAGraph()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        if tuner._use_global_timer:
+            start = torch.empty(1, dtype=torch.int64, device="cuda")
+            end = torch.empty(1, dtype=torch.int64, device="cuda")
+        else:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
         session = cls(
             tuner,
             runner,
@@ -2014,6 +2044,12 @@ class AutoTuner:
             ProfilingCacheKey, tuple[Any, OptimizationProfile | None]
         ] = {}
         self.profiling_time_cache: dict[ProfilingCacheKey, float] = {}
+        # Retain every measured tactic, not only the winner. Post-selection
+        # policies can compare fixed tactics on identical value profiles
+        # without launching a second profiling sweep.
+        self.profiling_tactic_time_cache: dict[
+            tuple[ProfilingCacheKey, Any], float
+        ] = {}
         self.last_selection: Optional[dict[str, Any]] = None
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
@@ -2399,6 +2435,7 @@ class AutoTuner:
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
             value_sample_count=tuning_config.value_sample_count,
+            default_value_buckets=tuning_config.default_value_buckets,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
@@ -2472,6 +2509,9 @@ class AutoTuner:
                         int(x) if isinstance(x, (int, float)) else x for x in tactic
                     )
                 return tactic
+
+            def _tactic_key(tactic: Any) -> Any:
+                return _json_to_tactic(_tactic_to_json(tactic))
 
             value_specs = AutoTuner._get_value_specs(tuning_config)
             if (
@@ -2768,7 +2808,75 @@ class AutoTuner:
                         )
                         skipped_count = 0
                         for r_id, r in enumerate(runners):
-                            valid_tactics = r.get_valid_tactics(tensors, p)
+                            # TODO: use FakeTensor here.
+                            tactic_groups = r.get_tactic_groups(tensors, p)
+                            candidate_stages: Dict[Any, List[str]] = {}
+                            if tactic_groups is None:
+                                # Exhaustive runners profile every valid tactic directly.
+                                valid_tactics = r.get_valid_tactics(tensors, p)
+                            else:
+                                # Factorized runners deduplicate overlapping group candidates.
+                                valid_tactics = []
+                                seen_tactics = set()
+                                for group_id, group in enumerate(tactic_groups):
+                                    for candidate in group:
+                                        candidate_key = _tactic_key(candidate)
+                                        candidate_stages.setdefault(
+                                            candidate_key, []
+                                        ).append(f"group_{group_id}")
+                                        if candidate_key not in seen_tactics:
+                                            seen_tactics.add(candidate_key)
+                                            valid_tactics.append(candidate)
+                            runner_profile_cache_key = AutoTuner._get_cache_key(
+                                custom_op,
+                                r,
+                                p.get_opt_shapes(),
+                                tuning_config,
+                                r.get_cache_key_extras(tensors),
+                                value_buckets=p.value_buckets,
+                            )
+                            # The explicit default-profile winner is the fixed
+                            # NoDA fallback.  Factorized value profiles would
+                            # not necessarily measure that exact composed
+                            # tactic, so include it as a measurement-only
+                            # candidate for the matching tile.  It is not part
+                            # of either factorized group and therefore cannot
+                            # change their winners or the composed DA tactic.
+                            if (
+                                tactic_groups is not None
+                                and tuning_config.default_value_buckets is not None
+                                and p.value_buckets
+                                != tuning_config.default_value_buckets
+                                and p.value_buckets
+                            ):
+                                shape_cache_key = AutoTuner._get_cache_key(
+                                    custom_op,
+                                    r,
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    r.get_cache_key_extras(tensors),
+                                )
+                                default_entry = self.profiling_cache.get(
+                                    shape_cache_key
+                                )
+                                if default_entry is not None:
+                                    default_tactic, _ = default_entry
+                                    try:
+                                        matches_profile_tile = int(
+                                            default_tactic[0]
+                                        ) == int(p.value_buckets[0])
+                                    except (IndexError, TypeError, ValueError):
+                                        matches_profile_tile = False
+                                    default_key = _tactic_key(default_tactic)
+                                    if (
+                                        matches_profile_tile
+                                        and default_key not in seen_tactics
+                                    ):
+                                        seen_tactics.add(default_key)
+                                        valid_tactics.append(default_tactic)
+                                        candidate_stages.setdefault(
+                                            default_key, []
+                                        ).append("default_profile_baseline")
                             valid_tactics = self._blocklist.filter(
                                 custom_op, r, valid_tactics
                             )
@@ -2778,6 +2886,7 @@ class AutoTuner:
                                 and len(valid_tactics) > 0
                             ):
                                 r(tensors, tactic=-1, do_preparation=True, **kwargs)
+
                             def profile_tactic(
                                 tac,
                                 selection_stage,
@@ -2794,7 +2903,7 @@ class AutoTuner:
                                     if value_input_sets is not None:
                                         if tuning_config.use_cuda_graph:
                                             with _autotune_nvtx_range(
-                                                "da-candidate:"
+                                                "profile-tactic:"
                                                 f"op={custom_op}, tokens={num_tokens}, "
                                                 f"value-buckets={p.value_buckets}, "
                                                 f"runner={r_id}, tactic={tac}"
@@ -3045,7 +3154,7 @@ class AutoTuner:
 
                         if runner_id is not None:
                             if _AUTOTUNE_DUMP_PATH and profile_records:
-                                for rec in profile_records:
+                                for rec in reversed(profile_records):
                                     if (
                                         rec["tactic"] == _serialize_tactic(tactic)
                                         and rec["runner"]
@@ -3065,6 +3174,25 @@ class AutoTuner:
                             )
                             self.profiling_cache[cache_key] = (tactic, p)
                             self.profiling_time_cache[cache_key] = min_time
+                            if (
+                                tuning_config.default_value_buckets is not None
+                                and p.value_buckets
+                                == tuning_config.default_value_buckets
+                            ):
+                                default_profile = copy.deepcopy(p)
+                                default_profile.value_buckets = ()
+                                shape_cache_key = AutoTuner._get_cache_key(
+                                    custom_op,
+                                    runners[runner_id],
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    runners[runner_id].get_cache_key_extras(tensors),
+                                )
+                                self.profiling_cache[shape_cache_key] = (
+                                    tactic,
+                                    default_profile,
+                                )
+                                self.profiling_time_cache[shape_cache_key] = min_time
                             self._dirty = True
                             self._dirty_seq += 1
                             self.stats.tuned_op_successful_configs[custom_op] = (
@@ -3441,6 +3569,17 @@ class AutoTuner:
         if _is_value_aware_autotune() and value_specs:
             expanded_profiles = []
             for profile in generated_profiles:
+                if tuning_config.default_value_buckets is not None:
+                    if len(tuning_config.default_value_buckets) != len(value_specs):
+                        raise ValueError(
+                            "default_value_buckets must provide one marker for "
+                            "each DynamicValueSpec"
+                        )
+                    default_profile = copy.deepcopy(profile)
+                    default_profile.value_buckets = tuple(
+                        tuning_config.default_value_buckets
+                    )
+                    expanded_profiles.append(default_profile)
                 value_bucket_lists = []
                 has_empty_value_spec = False
                 for value_spec in value_specs:
@@ -4008,6 +4147,7 @@ class AutoTuner:
         with self._lock:
             self.profiling_cache.clear()
             self.profiling_time_cache.clear()
+            self.profiling_tactic_time_cache.clear()
             self.last_selection = None
             self._profiling_records.clear()
             self._file_configs.clear()

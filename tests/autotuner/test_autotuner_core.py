@@ -38,12 +38,12 @@ from flashinfer.autotuner import (
     ConstraintSpec,
     DynamicTensorSpec,
     DynamicValueSpec,
-    _ValueAwareInputArena,
     TuningConfig,
     TunableRunner,
     make_bucket_mapper,
     round_to_nearest_bucket,
 )
+from flashinfer.autotuner.autotuner import _ValueAwareInputArena
 
 from flashinfer.utils import last_positive_power_of_2
 
@@ -802,6 +802,7 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert chosen_runner is runner
     assert tactic == 1
     assert len(tuner.profiling_cache) >= 1
+    assert sorted(tuner.profiling_tactic_time_cache.values()) == [1.0, 3.0, 5.0]
     assert tuner.stats.tuned_op_total_configs["dummy_tune"] >= 1
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
 
