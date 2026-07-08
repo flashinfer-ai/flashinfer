@@ -136,9 +136,11 @@ _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 _MODEL_TYPE_DSV3_2 = 0
 _MODEL_TYPE_DSV4 = 1
 _MODEL_TYPE_GLM_NSA = 2
-_KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
+_MODEL_TYPE_DSV4_NVFP4 = 3
+_KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32", "nvfp4"})
 _BPT_DSV3_2 = 656
 _BPT_DSV4 = 584
+_BPT_DSV4_NVFP4 = 360
 
 
 def _require_d_v_512(d_v: int) -> None:
@@ -170,6 +172,8 @@ def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
             return _MODEL_TYPE_GLM_NSA
         return _MODEL_TYPE_DSV3_2
     if d_qk == 512:
+        if fmt == "nvfp4":
+            return _MODEL_TYPE_DSV4_NVFP4
         if fmt != "auto":
             raise ValueError(
                 "kv_scale_format is only configurable for d_qk=576; "
@@ -184,6 +188,8 @@ def _bytes_per_token_for_model_type(model_type: int) -> int:
         return _BPT_DSV3_2
     if model_type == _MODEL_TYPE_DSV4:
         return _BPT_DSV4
+    if model_type == _MODEL_TYPE_DSV4_NVFP4:
+        return _BPT_DSV4_NVFP4
     raise ValueError(f"Unsupported SM120 sparse-MLA model_type={model_type}")
 
 
@@ -331,7 +337,7 @@ def get_sparse_mla_sm120_module():
         )
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
         if (
-            model_type == _MODEL_TYPE_DSV4
+            model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DSV4_NVFP4)
             and kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
             and _decode_dsv4_dispatchable(
                 num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
@@ -360,6 +366,7 @@ def get_sparse_mla_sm120_module():
                 extra_kv_cache=extra_kv_cache,
                 extra_indices=extra_indices,
                 extra_topk_length=extra_topk_length,
+                model_type=model_type,
             )
             return
 
@@ -871,6 +878,7 @@ def _get_sparse_mla_decode_dsv4_module():
             sm_scale = kwargs["sm_scale"]
             kv_cache = kwargs["kv_cache"]
             extra_kv_cache = kwargs.get("extra_kv_cache")
+            model_type = kwargs.get("model_type", _MODEL_TYPE_DSV4)
             if len(inputs) > 6:
                 (
                     topk_length,
@@ -903,6 +911,7 @@ def _get_sparse_mla_decode_dsv4_module():
                 extra_indices,
                 extra_topk_length,
                 cpb_override,
+                int(model_type),
             )
             return output
 
@@ -1226,6 +1235,7 @@ def sparse_mla_sm120_decode_dsv4(
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     chunks_per_block: Optional[int] = None,
+    model_type: int = _MODEL_TYPE_DSV4,
 ) -> torch.Tensor:
     r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM120.
 
@@ -1294,6 +1304,7 @@ def sparse_mla_sm120_decode_dsv4(
         "sm_scale": sm_scale,
         "kv_cache": kv_cache,
         "extra_kv_cache": extra_kv_cache,
+        "model_type": int(model_type),
     }
 
     if chunks_per_block is not None:
