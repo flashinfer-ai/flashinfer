@@ -63,6 +63,23 @@ def _json_to_tactic(val):
     return val
 
 
+def _tactic_to_json_hashable(tactic):
+    """Convert a tactic to a hashable form suitable for storing in a set.
+
+    Like ``_tactic_to_json`` but returns tuples instead of lists so the
+    result can be added to a ``set`` or used as a dict key.
+    """
+    if isinstance(tactic, (tuple, list)):
+        return tuple(_tactic_to_json_hashable(v) for v in tactic)
+    if hasattr(tactic, "__iter__") and not isinstance(tactic, (str, bytes, dict)):
+        return tuple(_tactic_to_json_hashable(v) for v in tactic)
+    if isinstance(tactic, bool):
+        return tactic
+    if isinstance(tactic, int):
+        return int(tactic)
+    return tactic
+
+
 _METADATA_KEY = "_metadata"
 
 
@@ -745,6 +762,9 @@ class AutoTunerStatistics:
     ] = field(default_factory=dict)
     tuned_op_total_configs: Dict[str, int] = field(default_factory=dict)
     tuned_op_successful_configs: Dict[str, int] = field(default_factory=dict)
+    # Maps "custom_op::RunnerClass" to sets of tactic values that failed.
+    # Used by the offline blocklist generator to extract per-tactic pass/fail.
+    failed_tactics: Dict[str, Set[Any]] = field(default_factory=dict)
 
     def __str__(self) -> str:
         """Return a string representation of collected statistics."""
@@ -828,6 +848,21 @@ class AutoTuner:
         self.stats = AutoTunerStatistics()
 
         self.profiling_debug = True
+
+        # Offline tactics blocklist (loaded via env var or explicit call).
+        # Lazy import to avoid circular dependency (tactics_blocklist
+        # imports _METADATA_KEY / _collect_metadata from this module).
+        from .tactics_blocklist import TacticsBlocklist
+
+        self._blocklist = TacticsBlocklist()
+        _bl_path = os.environ.get("FLASHINFER_TACTICS_BLOCKLIST")
+        if _bl_path:
+            if os.path.isfile(_bl_path):
+                self._blocklist.load(_bl_path)
+            else:
+                logger.warning(
+                    f"[Autotuner]: Tactics blocklist file not found at {_bl_path}"
+                )
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: Dict[str, Tuple] = {}
@@ -1287,6 +1322,9 @@ class AutoTuner:
                         for r_id, r in enumerate(runners):
                             # TODO: use FakeTensor here.
                             valid_tactics = r.get_valid_tactics(tensors, p)
+                            valid_tactics = self._blocklist.filter(
+                                custom_op, r, valid_tactics
+                            )
                             runner_arg_names = runner_arg_names_map[r]
                             if (
                                 "do_preparation" in runner_arg_names
@@ -1321,6 +1359,12 @@ class AutoTuner:
                                         torch.cuda.synchronize()
                                     with contextlib.suppress(Exception):
                                         torch.cuda.cudart().cudaGetLastError()
+
+                                    # Record the failed tactic value for the
+                                    # blocklist generator.
+                                    self.stats.failed_tactics.setdefault(
+                                        f"{custom_op}::{r.__class__.__name__}", set()
+                                    ).add(_tactic_to_json_hashable(tac))
 
                                     # Record the failed profiling combinations
                                     if (
