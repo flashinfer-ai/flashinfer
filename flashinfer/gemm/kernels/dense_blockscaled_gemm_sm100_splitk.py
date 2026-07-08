@@ -187,6 +187,43 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
     and two or four K slices.
     """
 
+    MAX_M = 32
+    MMA_INST_BITS_K = 256
+    MMA_INST_TILE_K = 4
+    SUPPORTED_MMA_TILER_MN = ((128, 8), (128, 16), (128, 32))
+    SUPPORTED_SPLIT_K_SLICES = (2, 4)
+
+    @classmethod
+    def supports_m(cls, m: int) -> bool:
+        """Return whether the specialized low-M policy supports M."""
+        return m <= cls.MAX_M
+
+    @classmethod
+    def mma_tiler_mn_for_m(cls, m: int) -> Tuple[int, int]:
+        """Return the specialized MMA tile selected for M."""
+        if not cls.supports_m(m):
+            raise ValueError(f"MXFP8 split-K requires M <= {cls.MAX_M}, got {m}")
+        tile_n = 8 if m <= 8 else 16 if m <= 16 else 32
+        return (128, tile_n)
+
+    @classmethod
+    def is_valid_tactic(
+        cls,
+        m: int,
+        k: int,
+        ab_dtype,
+        split_k_slices: int,
+    ) -> bool:
+        """Return whether the MXFP8 shape satisfies this kernel's K tiling."""
+        if ab_dtype.width != 8:
+            return False
+        tile_k = (cls.MMA_INST_BITS_K * cls.MMA_INST_TILE_K) // ab_dtype.width
+        return (
+            cls.supports_m(m)
+            and split_k_slices in cls.SUPPORTED_SPLIT_K_SLICES
+            and k % (tile_k * split_k_slices) == 0
+        )
+
     def __init__(
         self,
         sf_vec_size: int,
@@ -210,12 +247,12 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 f"MXFP8 split-K requires sf_vec_size=32, got {sf_vec_size}"
             )
         self.sf_vec_size = sf_vec_size
-        if mma_tiler_mn not in ((128, 8), (128, 16), (128, 32)):
+        if mma_tiler_mn not in self.SUPPORTED_MMA_TILER_MN:
             raise ValueError(
                 "MXFP8 split-K requires mma_tiler_mn=(128, 8/16/32), "
                 f"got {mma_tiler_mn}"
             )
-        if split_k_slices not in (2, 4):
+        if split_k_slices not in self.SUPPORTED_SPLIT_K_SLICES:
             raise ValueError(f"split_k_slices must be 2 or 4, got {split_k_slices}")
         self.cluster_shape_mn = (1, 1)
         self.cluster_shape_mnk = (1, 1, split_k_slices)
@@ -261,7 +298,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         - Computing tensor memory allocation columns
         """
         # Compute mma instruction shapes
-        mma_inst_bits_k = 256
+        mma_inst_bits_k = self.MMA_INST_BITS_K
         # (MMA_Tile_Shape_M, MMA_Tile_Shape_N, MMA_Inst_Shape_K)
         self.mma_inst_shape_mnk = (
             self.mma_tiler[0],
@@ -298,7 +335,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         )
 
         # Compute mma/cluster/tile shapes
-        mma_inst_tile_k = 4
+        mma_inst_tile_k = self.MMA_INST_TILE_K
         self.mma_tiler = (
             self.mma_inst_shape_mnk[0],
             self.mma_inst_shape_mnk[1],

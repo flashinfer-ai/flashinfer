@@ -262,58 +262,24 @@ def test_mm_mxfp8_small_m(m, n, k):
 
 
 @pytest.mark.parametrize(
-    "m,k,split_k_slices",
+    "m,k",
     [
-        (1, 768, 2),
-        (16, 1536, 4),
-        (32, 2048, 4),
+        (1, 768),
+        (16, 1536),
+        (32, 2048),
     ],
 )
-def test_mm_mxfp8_cute_dsl_split_k(m, k, split_k_slices):
-    _skip_if_unsupported("cute-dsl")
-    major, minor = get_compute_capability(torch.device("cuda"))
-    if major != 10:
-        pytest.skip("MXFP8 split-K requires an SM10x GPU")
-
-    from flashinfer.gemm.gemm_base import (
-        DEFAULT_WORKSPACE_SIZE,
-        _cute_dsl_gemm_mxfp8_runner,
-    )
-
-    n = 256
-    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
-    input_mxfp8, mat2_mxfp8, input_descale, mat2_descale = _prepare_mxfp8_tensors(
-        input,
-        mat2,
-        SfLayout.layout_128x4,
-        SfLayout.layout_128x4,
-        backend="cute-dsl",
-    )
-    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
-    workspace = torch.empty(DEFAULT_WORKSPACE_SIZE, device="cuda", dtype=torch.uint8)
-    runner = _cute_dsl_gemm_mxfp8_runner(major, minor, False, torch.bfloat16)
-    tile_n = 8 if m <= 8 else 16 if m <= 16 else 32
-    runner(
-        inputs=[
-            input_mxfp8,
-            mat2_mxfp8.T,
-            input_descale,
-            mat2_descale,
-            torch.bfloat16,
-            out,
-            workspace,
-        ],
-        tactic=((128, tile_n), (1, 1), True, False, split_k_slices),
-    )
-
-    reference = torch.mm(input, mat2.T)
-    _assert_cosine_similarity(
-        reference,
-        out,
+def test_mm_mxfp8_cute_dsl_low_m(m, k):
+    _run_mm_mxfp8(
+        m,
+        256,
+        k,
+        torch.bfloat16,
         True,
-        use_float=True,
-        context=f"M={m}, N={n}, K={k}, split-K={split_k_slices}:",
+        torch.bfloat16,
+        "cute-dsl",
+        auto_tuning=True,
+        provide_out=True,
     )
 
 

@@ -4722,35 +4722,6 @@ def _prepare_alpha_for_launch(alpha_tensor, device):
 
 _CUTE_DSL_MM_MXFP8_KERNEL_CACHE: dict[tuple, tuple] = {}
 
-_SM100_MXFP8_SPLIT_K_MAX_M = 32
-_SM100_MXFP8_SPLIT_K_MMA_INST_BITS_K = 256
-_SM100_MXFP8_SPLIT_K_MMA_INST_TILE_K = 4
-_SM100_MXFP8_SPLIT_K_CANDIDATES = (2, 4)
-
-
-def _is_sm100_split_k_valid(
-    m: int,
-    k: int,
-    ab_dtype,
-    split_k_slices: int,
-) -> bool:
-    """Check the specialized low-M split-K shape constraints."""
-    if ab_dtype.width != 8:
-        return False
-    tile_k = (
-        _SM100_MXFP8_SPLIT_K_MMA_INST_BITS_K * _SM100_MXFP8_SPLIT_K_MMA_INST_TILE_K
-    ) // ab_dtype.width
-    return (
-        m <= _SM100_MXFP8_SPLIT_K_MAX_M
-        and split_k_slices in _SM100_MXFP8_SPLIT_K_CANDIDATES
-        and k % (tile_k * split_k_slices) == 0
-    )
-
-
-def _sm100_mxfp8_low_m_tile(m: int) -> tuple[int, int]:
-    tile_n = 8 if m <= 8 else 16 if m <= 16 else 32
-    return (128, tile_n)
-
 
 def _check_cute_dsl_availability():
     try:
@@ -4776,6 +4747,8 @@ def _cute_dsl_gemm_mxfp8_runner(
     from .kernels.dense_blockscaled_gemm_sm100_splitk import (
         Sm100BlockScaledSplitKGemmKernel,
     )
+
+    split_k_kernel_cls = Sm100BlockScaledSplitKGemmKernel
 
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
@@ -4821,8 +4794,8 @@ def _cute_dsl_gemm_mxfp8_runner(
             if not out.is_contiguous():
                 return valid_tactics
 
-            for split_k_slices in _SM100_MXFP8_SPLIT_K_CANDIDATES:
-                if _is_sm100_split_k_valid(
+            for split_k_slices in split_k_kernel_cls.SUPPORTED_SPLIT_K_SLICES:
+                if split_k_kernel_cls.is_valid_tactic(
                     m,
                     real_k,
                     ab_dtype,
@@ -4830,7 +4803,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                 ):
                     valid_tactics.append(
                         (
-                            _sm100_mxfp8_low_m_tile(m),
+                            split_k_kernel_cls.mma_tiler_mn_for_m(m),
                             (1, 1),
                             True,
                             False,
@@ -4856,10 +4829,10 @@ def _cute_dsl_gemm_mxfp8_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                if m <= _SM100_MXFP8_SPLIT_K_MAX_M and out.is_contiguous():
+                if split_k_kernel_cls.supports_m(m) and out.is_contiguous():
                     # Untuned low-M execution uses the corresponding base tactic.
                     tactic = (
-                        _sm100_mxfp8_low_m_tile(m),
+                        split_k_kernel_cls.mma_tiler_mn_for_m(m),
                         (1, 1),
                         True,
                         False,
@@ -4891,13 +4864,13 @@ def _cute_dsl_gemm_mxfp8_runner(
                     or not swap_ab
                     or use_prefetch
                     or not out.is_contiguous()
-                    or mma_tiler_mn != _sm100_mxfp8_low_m_tile(m)
-                    or not _is_sm100_split_k_valid(
+                    or not split_k_kernel_cls.is_valid_tactic(
                         m,
                         real_k,
                         cutlass.Float8E4M3FN,
                         split_k_slices,
                     )
+                    or mma_tiler_mn != split_k_kernel_cls.mma_tiler_mn_for_m(m)
                 ):
                     raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
 
@@ -4931,7 +4904,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             make_kernel: Callable[[], object]
             kernel_cache = _CUTE_DSL_MM_MXFP8_KERNEL_CACHE
             if is_split_k:
-                make_kernel = lambda: Sm100BlockScaledSplitKGemmKernel(
+                make_kernel = lambda: split_k_kernel_cls(
                     sf_vec_size,
                     mma_tiler_mn,
                     split_k_slices,
