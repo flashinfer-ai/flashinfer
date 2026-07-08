@@ -136,6 +136,8 @@ def chunk_gated_delta_rule2(
 
     Notes
     -----
+    - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
+      (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
     - Requires SM100 (Blackwell) architecture and ``head_size == 128``,
       with ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
@@ -176,16 +178,13 @@ def chunk_gated_delta_rule2(
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
 
-    if num_k_heads != num_q_heads:
+    is_gva = num_k_heads == num_q_heads and num_v_heads >= num_q_heads
+    is_gqa = num_q_heads > num_k_heads and num_k_heads == num_v_heads
+    if not (is_gva or is_gqa):
         raise NotImplementedError(
-            f"GDN-2 requires num_k_heads == num_q_heads (q/k/g/beta share the "
-            f"key-axis head layout), got q={num_q_heads}, k={num_k_heads}"
-        )
-    if num_q_heads > num_v_heads:
-        raise NotImplementedError(
-            f"GDN-2 does not support GQA (num_q_heads > num_v_heads): the kernel "
-            f"loads one channel-wise gate slice per value head, so grouped query "
-            f"heads would share it. Got q={num_q_heads}, v={num_v_heads}"
+            f"GDN-2 supports GQA (num_q_heads > num_k_heads == num_v_heads) and "
+            f"dense/GVA (num_k_heads == num_q_heads, num_v_heads >= num_q_heads), "
+            f"got q={num_q_heads}, k={num_k_heads}, v={num_v_heads}"
         )
 
     if checkpoint_every_n_tokens > 0:
@@ -227,7 +226,6 @@ def chunk_gated_delta_rule2(
                 f"got {list(state_checkpoints.shape)}"
             )
 
-    # Allocate output if not provided
     if output is None:
         output = torch.empty(
             (total_seq_len, num_o_heads, head_size),
@@ -248,18 +246,14 @@ def chunk_gated_delta_rule2(
         if chunk_gated_delta_rule2_sm100 is None:
             raise NotImplementedError("Blackwell GDN-2 prefill kernel is unavailable")
 
-        # Blackwell SM100 and SM103 path (CuTe DSL kernel)
         assert head_size == 128, (
             f"Blackwell GDN-2 prefill requires head_size=128, got {head_size}"
         )
-        if q.dtype != torch.bfloat16:
+        if q.dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(
-                f"GDN-2 prefill currently supports bfloat16 io only, got {q.dtype} "
-                f"(float16 overflows the kernel's K/cumprod anti-decay intermediates "
-                f"and its io pipeline is unvalidated for fp16)"
+                f"GDN-2 prefill supports bfloat16/float16 io, got {q.dtype}"
             )
 
-        # Allocate output_state only when needed
         if not output_final_state:
             output_state = None
         elif output_state is None:
@@ -301,7 +295,6 @@ def chunk_gated_delta_rule2(
         if _w.dtype != q.dtype:
             _w = _w.to(q.dtype)
 
-        # Convert checkpoint_cu_starts from int64 cu_starts to int32 cu_checkpoints
         _cu_checkpoints = None
         if checkpoint_every_n_tokens > 0 and checkpoint_cu_starts is not None:
             _cu_checkpoints = checkpoint_cu_starts.to(torch.int32)

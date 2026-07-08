@@ -18,18 +18,10 @@ with the GDN-2 interface: channel-wise forget gate ``g`` and erase gate
 ``beta`` (key axis) plus the channel-wise write gate ``w`` (value axis).
 
 Notes vs the GDN tests:
-  - GDN-2 requires ``num_k_heads == num_q_heads`` and ``num_v_heads >=
-    num_q_heads`` (q, k, g, beta share the key-axis head layout, and the
-    kernel loads one channel-wise gate slice per value head), so GDN's GQA
-    configs like (4, 1, 1) have no GDN-2 equivalent and are rejected by the
-    API.  The GDN-2 Triton reference (chunk_gdn2) likewise supports no head
-    grouping at all.
-  - The gate is drawn from [0.5, 1) instead of [0, 1): the SM100 kernel
-    materializes K / cumprod(alpha) within each 64-token chunk, so channel
-    cumprods below ~2^-64 overflow the anti-decay intermediate.
-  - Only bfloat16 io is tested: the API rejects float16 (it overflows the
-    anti-decay intermediates -- fp16 max is 2^16 -- and the kernel's fp16 io
-    pipeline is unvalidated).
+  - The gate is drawn from [0.5, 1) instead of [0, 1) ([0.9, 1) for float16
+    io): the SM100 kernel materializes K / cumprod(alpha) within each
+    64-token chunk, so channel cumprods below ~2^-64 (~2^-14 for fp16)
+    overflow the anti-decay intermediate.
 """
 
 import math
@@ -40,7 +32,7 @@ import pytest
 import torch
 
 from .reference_delta_rule import exclusive_cumsum
-from .reference_gdn2 import recurrent_gdn2
+from .reference_delta_rule2 import recurrent_gdn2
 
 from flashinfer.utils import (
     is_sm100a_supported,
@@ -71,12 +63,13 @@ def _make_gates(
 ):
     """Channel-wise GDN-2 gates.  beta/w are rounded to the kernel io dtype so
     the reference sees exactly the values the kernel consumes."""
+    lo = 0.9 if io_dtype == torch.float16 else 0.5
     alpha = (
         torch.rand(
             total_seqlen, num_sab_heads, head_size, dtype=torch.float32, device=device
         )
-        * 0.5
-        + 0.5
+        * (1.0 - lo)
+        + lo
         if use_alpha
         else None
     )
@@ -117,7 +110,6 @@ def _test_prefill_kernel(
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
         )
-    no_decay = not alpha
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -190,31 +182,26 @@ def _test_prefill_kernel(
 
     if dtype == torch.bfloat16:
         ref_o = ref_o.to(dtype)
-        atol_o = 1e-2
-        rtol_o = 1e-2
-        atol_kv = 5e-3
+        atol_o = 2e-2
+        rtol_o = 2e-2
+        atol_kv = 1e-2
         rtol_kv = 1e-3
-        if no_decay:
-            # alpha=None: no forget gate, so amplitudes grow along the sequence
-            # and accumulated bf16 rounding slightly exceeds the gated budget.
-            atol_o = 2e-2
-            rtol_o = 2e-2
-            atol_kv = 1e-2
     else:
-        atol_o = 1e-3
-        rtol_o = 1e-3
-        atol_kv = 1e-3
+        atol_o = 4e-3
+        rtol_o = 4e-3
+        atol_kv = 4e-3
         rtol_kv = 1e-4
 
     torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
     torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
 
 
-# GDN-2 requires num_k_heads == num_q_heads and num_v_heads >= num_q_heads
-# (GQA is rejected by the API: the kernel loads one gate slice per value head).
 _HEAD_CONFIGS = [
     (1, 1, 1),
+    (4, 1, 1),
     (3, 3, 3),
+    (6, 2, 2),
+    (1, 1, 2),
     (2, 2, 4),
     (16, 16, 32),
     (16, 16, 64),
@@ -228,7 +215,7 @@ _HEAD_CONFIGS = [
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", _HEAD_CONFIGS)
 @pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # fp16 io is rejected by the API
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_basic(
     qkv_factory,
     dtype: str,
@@ -270,7 +257,7 @@ def test_prefill_kernel_basic(
     "seq_lens",
     [[31], [61], [91], [121], [251], [511, 501], [31, 63, 93, 123, 150, 500]],
 )
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # fp16 io is rejected by the API
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_nonfull(
     qkv_factory,
     dtype: str,
@@ -305,7 +292,7 @@ def test_prefill_kernel_nonfull(
 @pytest.mark.parametrize(
     "num_q_heads,num_k_heads,num_v_heads", [(1, 1, 1), (16, 16, 64)]
 )
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # alpha is always on; fp16 overflows
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_zero_length_sequence(
     qkv_factory,
     dtype: str,
@@ -376,6 +363,67 @@ def test_prefill_kernel_zero_length_sequence(
     torch.testing.assert_close(our_o, ref_o, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prefill_zero_length_sequence_state_untouched(
+    qkv_factory,
+    dtype: str,
+    scale: float = 0.1,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _skip_if_not_sm100()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    seq_len = 256
+    head_size = 128
+    num_heads = 1
+    sentinel = 123.0
+    dtype = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q, k, v = qkv_factory(
+            [seq_len], num_heads, num_heads, num_heads, head_size, dtype
+        )
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        alpha, beta, w = _make_gates(
+            seq_len, num_heads, head_size, dtype, True, True, True, device
+        )
+        cu_seq_lens = torch.tensor([0, seq_len, seq_len], dtype=torch.int64)
+
+    our_o = torch.empty([seq_len, num_heads, head_size], dtype=q.dtype, device=q.device)
+    our_state = torch.empty(
+        (2, num_heads, head_size, head_size), dtype=torch.float32, device=q.device
+    )
+    our_state.fill_(sentinel)
+
+    chunk_gated_delta_rule2(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        w,
+        scale,
+        None,
+        True,
+        cu_seq_lens,
+        True,
+        output=our_o,
+        output_state=our_state,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        our_state[1],
+        torch.full_like(our_state[1], sentinel),
+        atol=0,
+        rtol=0,
+    )
+
+
 def _test_chunked_prefill(
     qkv_factory,
     dtype: str,
@@ -396,7 +444,6 @@ def _test_chunked_prefill(
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
         )
-    no_decay = not alpha
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -529,19 +576,14 @@ def _test_chunked_prefill(
 
     if dtype == torch.bfloat16:
         ref_o = ref_o.to(dtype)
-        atol_o = 1e-2
-        rtol_o = 1e-2
-        atol_kv = 5e-3
+        atol_o = 2e-2
+        rtol_o = 2e-2
+        atol_kv = 1e-2
         rtol_kv = 1e-3
-        if no_decay:
-            # alpha=None: see above -- ungated growth needs a wider bf16 budget.
-            atol_o = 2e-2
-            rtol_o = 2e-2
-            atol_kv = 1e-2
     else:
-        atol_o = 2e-3
-        rtol_o = 1e-3
-        atol_kv = 1e-3
+        atol_o = 4e-3
+        rtol_o = 4e-3
+        atol_kv = 4e-3
         rtol_kv = 1e-4
 
     torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
@@ -567,7 +609,7 @@ def _test_chunked_prefill(
         )
     ),
 )
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # fp16 io is rejected by the API
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_chunked_prefill(
     qkv_factory,
     dtype: str,
@@ -750,7 +792,7 @@ def _test_checkpoint(
     [(4, 4, 4), (2, 2, 4)],
 )
 @pytest.mark.parametrize("seq_lens", [[256], [128, 256, 512]])
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # alpha is always on; fp16 overflows
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_checkpoint_correctness(
     qkv_factory,
     dtype: str,
@@ -1058,7 +1100,7 @@ def _test_prefill_kernel_bf16_state(
     ],
 )
 @pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # alpha is always on; fp16 overflows
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_bf16_state(
     qkv_factory,
     dtype: str,

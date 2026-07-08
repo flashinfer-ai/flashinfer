@@ -51,8 +51,6 @@ from .gated_delta_net_chunked2 import GatedDeltaNetChunkedKernel2
 # ---------------------------------------------------------------------------
 
 
-# Keyed on static kernel configuration. Head counts (HQ, HV) are part of
-# the key because the tile scheduler and GQA reshape logic bake them in.
 @functools.cache
 def _get_compiled_cache(
     io_dtype_str: str,
@@ -140,7 +138,6 @@ def chunk_gated_delta_rule2_sm100(
     enable_checkpoints = checkpoint_every_n_tokens > 0
     io_dtype = _cutlass_io_dtype(q.dtype)
 
-    # Auto-detect state dtype from initial_state, default to float32
     if initial_state is not None:
         state_torch_dtype = initial_state.dtype
     elif output_state is not None:
@@ -165,7 +162,6 @@ def chunk_gated_delta_rule2_sm100(
     )
 
     if "compiled" not in cache:
-        # --- First call: compile the kernel ---
         num_sm = get_num_sm(q.device)
         max_active_clusters = num_sm
 
@@ -186,9 +182,6 @@ def chunk_gated_delta_rule2_sm100(
             is_persistent=True,
         )
 
-        # Convert PyTorch tensors to CuTe tensors for compilation.
-        # Token dimension (dim 0) must be dynamic to handle varying seq lengths.
-        # Head and head_dim dimensions stay static (part of cache key).
         q_cute = from_dlpack(q, assumed_align=16)
         q_cute.mark_compact_shape_dynamic(
             mode=0, stride_order=(0, 1, 2), divisibility=1
@@ -201,7 +194,6 @@ def chunk_gated_delta_rule2_sm100(
         v_cute.mark_compact_shape_dynamic(
             mode=0, stride_order=(0, 1, 2), divisibility=1
         )
-        # GDN-2: gate, beta and w are all channel-wise (3D) tensors.
         gate_cute = from_dlpack(gate, assumed_align=16)
         gate_cute.mark_compact_shape_dynamic(
             mode=0, stride_order=(0, 1, 2), divisibility=1
@@ -248,8 +240,6 @@ def chunk_gated_delta_rule2_sm100(
         workspace_size = GatedDeltaNetChunkedKernel2.get_workspace_size(
             num_sm, B, HQ, HV, True
         )
-        # Zero-initialized: the kernel expects pristine scheduler/barrier state on
-        # first use (dirty torch.empty contents can NaN the run).
         workspace = torch.zeros(workspace_size, dtype=torch.int8, device=q.device)
         workspace_cute = from_dlpack(workspace, assumed_align=16)
 
@@ -279,7 +269,6 @@ def chunk_gated_delta_rule2_sm100(
         cache["compiled"] = compiled
         cache["num_sm"] = num_sm
 
-    # --- Execute ---
     compiled = cache["compiled"]
     num_sm = cache["num_sm"]
 
