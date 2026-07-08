@@ -18,15 +18,15 @@ kernel = module.my_kernel   # tvm_ffi.Function, same calling convention
 
 ## 2. Design
 
-The cache deliberately mirrors the existing nvcc kernel cache (`JitSpec`): the same two-level scheme (in-process `functools.cache` + on-disk artifact), the same `cached_ops/` root with one directory per op family, invalidation at the same module granularity as ninja rebuilds, and the same lock conventions. It diverges only where the DSL toolchain forces it — artifacts are single-arch object files rather than multi-arch fatbin `.so`s.
+The cache shares its lifecycle with the existing nvcc kernel cache through a common abstract base class. `JitSpec` (`flashinfer/jit/core.py`) defines the contract — `try_load()` / `build()` / `load()` — and implements the shared policy once in a concrete `build_and_load()` template method: cached-artifact fast path, cross-process locking with a double-check, and `FLASHINFER_DISABLE_JIT` enforcement. `JitSpecNvcc` (the former `JitSpec` dataclass) implements it for nvcc/ninja modules; `JitSpecCuteDsl` implements it for CuTe-DSL kernels; future DSLs (e.g. cutile) follow the same shape.
+
+The on-disk conventions also match the nvcc cache: the same two-level scheme (in-process `functools.cache` + on-disk artifact), the same `cached_ops/` root with one directory per op family, invalidation at the same module granularity as ninja rebuilds. It diverges only where the DSL toolchain forces it — artifacts are single-arch object files rather than multi-arch fatbin `.so`s.
+
+One contract nuance: `try_load()` returns the cached artifact only when it is present *and known-valid*, and may conservatively return `None` even when artifacts exist. `JitSpecCuteDsl` decides validity itself (`.o` present + `meta.json` match); `JitSpecNvcc` returns only the AOT artifact, routing the JIT path through `build()` where ninja's dependency scan owns freshness. On a miss, `JitSpecCuteDsl.build()` keeps the freshly compiled kernel in memory and `load()` returns it directly — a build is never followed by a redundant JITLink reload from disk.
 
 ### 2.1 Internal interface for kernel authors
 
-`build_and_load_cute_dsl_kernel` is the CuTe-DSL analogue of `gen_jit_spec()`
-on the nvcc side: an internal helper called from FlashInfer's kernel modules,
-not part of the public API. Users never interact with the cache directly —
-they only observe that CuTe-DSL kernels load in milliseconds after the first
-run. A kernel module wires it up as:
+`build_and_load_cute_dsl_kernel` is a thin wrapper that constructs a `JitSpecCuteDsl` and runs its `build_and_load()`. It is an internal helper called from FlashInfer's kernel modules, not part of the public API. Users never interact with the cache directly — they only observe that CuTe-DSL kernels load in milliseconds after the first run. A kernel module wires it up as:
 
 ```python
 from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
@@ -123,7 +123,7 @@ compiles on the first run and is compile-free on every subsequent run.
 ## 5. Limitations and future work
 
 - **Rollout**: only nvfp4_quantize is currently wired up. Other cute-dsl call sites should follow the same pattern: wrap the existing `cute.compile` call in a closure and name the specialization.
-- **No `JitSpecRegistry` / AOT integration**: cute-dsl kernels are invisible to `flashinfer aot` and `flashinfer-jit-cache` packaging, and do not honor `FLASHINFER_DISABLE_JIT`. AOT support would prebuild the module directories (or link them into `.so`s, see 3.1).
+- **No `JitSpecRegistry` / AOT integration**: cute-dsl kernels are not registered in `JitSpecRegistry` and are invisible to `flashinfer aot` / `flashinfer-jit-cache` packaging. (`FLASHINFER_DISABLE_JIT` *is* honored — it comes free from the shared `build_and_load()` template method.) AOT support would additionally require the spec to become declarative data (a factory reference + parameters) instead of a compile closure, so specs can be enumerated and prebuilt offline; then prebuild the module directories or link them into `.so`s (see 3.1).
 - **Cross-compile keying**: the arch key mirrors `CUTE_DSL_ARCH`-else-device, but a per-compile `gpu_arch` override passed through `cute.compile` options would not be reflected. No current call site does this.
 - **Single-target-arch assumption (heterogeneous multi-GPU)**: the cache key records what `cute.compile` actually compiles for — the DSL's resolved target (`CUTE_DSL_ARCH`, else the *current* device). Compiling for a non-current device in a mixed-arch process is not supported: it would require steering the compilation itself (per-compile `gpu_arch`) together with the key, not just parameterizing the key. The in-process `@functools.cache` level has the same current-device assumption today, so the disk cache does not regress multi-GPU behavior.
 - **Module-granular wipes**: a single source edit recompiles every cached specialization of that module on next use. Acceptable for development (matches nvcc behavior); irrelevant for deployments with immutable packages.

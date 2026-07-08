@@ -21,12 +21,10 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Callable, Sequence
-
-from filelock import FileLock
+from typing import Any, Callable, Optional, Sequence
 
 from . import env as jit_env
-from .core import logger
+from .core import JitSpec, get_tmpdir, logger
 
 _META_FILENAME = "meta.json"
 
@@ -78,6 +76,152 @@ def sanitize_symbol_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z_]", "_", name)
 
 
+class JitSpecCuteDsl(JitSpec):
+    """JitSpec for one CuTe-DSL kernel specialization.
+
+    One instance represents a single compiled kernel (nvcc specs represent a
+    whole module); instances of the same op family share a module directory
+    and its module-level ``meta.json``. The shared lifecycle (cached fast
+    path, locking, ``FLASHINFER_DISABLE_JIT``) comes from the base class's
+    ``build_and_load()`` template method.
+    """
+
+    def __init__(
+        self,
+        module_name: str,
+        kernel_name: str,
+        compile_fn: Callable[[], Any],
+        source_sha256: str,
+    ):
+        self.module_name = module_name
+        self.kernel_name = sanitize_symbol_name(kernel_name)
+        self.compile_fn = compile_fn
+        self.module_dir_name = sanitize_symbol_name(
+            f"{module_name}_{_get_compile_arch()}_cute_dsl"
+        )
+        self.name = f"{self.module_dir_name}/{self.kernel_name}"
+        self.module_dir = jit_env.FLASHINFER_JIT_DIR / self.module_dir_name
+        self.object_path = self.module_dir / f"{self.kernel_name}.o"
+        self.symbol = f"{module_name}_{self.kernel_name}"
+        self.expected_meta = {
+            "module": self.module_dir_name,
+            "arch": _get_compile_arch(),
+            "cute_dsl_version": _get_cute_dsl_version(),
+            "source_sha256": source_sha256,
+        }
+        # Set by build(): the freshly compiled in-process kernel, returned by
+        # load() so a build is never followed by a redundant JITLink reload.
+        self._compiled_kernel: Optional[Any] = None
+
+    @property
+    def lock_path(self) -> Path:
+        # Module-level lock: kernels of one op family serialize their builds
+        # (meta.json wipes/writes must not race sibling kernel exports).
+        return get_tmpdir() / f"{self.module_dir_name}.lock"
+
+    @property
+    def meta_path(self) -> Path:
+        return self.module_dir / _META_FILENAME
+
+    @property
+    def is_compiled(self) -> bool:
+        return (
+            self.object_path.exists()
+            and _read_meta(self.meta_path) == self.expected_meta
+        )
+
+    def get_library_path(self) -> Path:
+        return self.object_path
+
+    def try_load(self) -> Optional[Any]:
+        """The cached kernel iff its ``.o`` exists and meta.json matches."""
+        if not self.object_path.exists():
+            return None
+        if _read_meta(self.meta_path) != self.expected_meta:
+            return None
+        try:
+            kernel = self._load_from_disk()
+            logger.debug(f"Loaded cached CuTe-DSL kernel from {self.object_path}")
+            return kernel
+        except Exception as e:
+            logger.warning(
+                f"Failed to load cached CuTe-DSL kernel from {self.object_path}: "
+                f"{e}. Recompiling."
+            )
+            return None
+
+    def build(self) -> None:
+        """Compile via ``cute.compile`` and export the ``.o`` artifact.
+
+        Runs under ``lock_path`` when invoked via ``build_and_load()``.
+        Persistence failures degrade gracefully: the in-process kernel is
+        kept for load(); only the disk write is lost.
+        """
+        # Stale module (dsl version / source change): wipe it, like a ninja
+        # rebuild of the whole module. Open .o files stay mapped (POSIX).
+        # Also wipes a module with missing meta.json (crash before the meta
+        # write): an orphaned .o must not be adopted by fresh metadata.
+        if (
+            self.module_dir.exists()
+            and _read_meta(self.meta_path) != self.expected_meta
+        ):
+            logger.info(f"Invalidating stale CuTe-DSL module {self.module_dir_name}")
+            shutil.rmtree(self.module_dir, ignore_errors=True)
+
+        logger.info(f"Compiling CuTe-DSL kernel {self.name}")
+        self._compiled_kernel = self.compile_fn()
+        try:
+            self._export()
+        except Exception as e:
+            logger.warning(
+                f"Failed to persist CuTe-DSL kernel {self.name} to "
+                f"{self.object_path}: {e}. The kernel will be recompiled next run."
+            )
+
+    def load(self) -> Any:
+        """The kernel compiled by build(), or the on-disk artifact."""
+        if self._compiled_kernel is not None:
+            return self._compiled_kernel
+        return self._load_from_disk()
+
+    def _load_from_disk(self) -> Any:
+        import cutlass.cute as cute
+
+        module = cute.runtime.load_module(str(self.object_path), enable_tvm_ffi=True)
+        return getattr(module, self.symbol)
+
+    def _export(self) -> None:
+        self.module_dir.mkdir(parents=True, exist_ok=True)
+        tmp_object_path = self.object_path.with_suffix(f".o.tmp.{os.getpid()}")
+        tmp_meta_path = self.meta_path.with_suffix(f".json.tmp.{os.getpid()}")
+        try:
+            self._compiled_kernel.export_to_c(
+                str(tmp_object_path), function_name=self.symbol
+            )
+            os.replace(tmp_object_path, self.object_path)
+            # meta.json is the module's commit marker: written after the
+            # object file is in place so a crash never leaves a loadable
+            # partial entry. Kernels added to an already-committed module
+            # skip the rewrite.
+            if _read_meta(self.meta_path) != self.expected_meta:
+                with open(tmp_meta_path, "w") as f:
+                    json.dump(self.expected_meta, f, indent=2)
+                os.replace(tmp_meta_path, self.meta_path)
+            logger.info(f"Persisted CuTe-DSL kernel to {self.object_path}")
+        finally:
+            for tmp in (tmp_object_path, tmp_meta_path):
+                if tmp.exists():
+                    tmp.unlink()
+
+
+def _read_meta(meta_path: Path) -> Any:
+    try:
+        with open(meta_path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def build_and_load_cute_dsl_kernel(
     module_name: str,
     kernel_name: str,
@@ -86,9 +230,10 @@ def build_and_load_cute_dsl_kernel(
 ) -> Any:
     """Compile a CuTe-DSL kernel with a persistent on-disk cache.
 
-    On a cache hit the kernel is reloaded from the exported object file
-    without recompilation; on a miss ``compile_fn`` runs, and the result is
-    stored in the on-disk module directory.
+    Convenience wrapper constructing a :class:`JitSpecCuteDsl` and running
+    its ``build_and_load()``. On a cache hit the kernel is reloaded from the
+    exported object file without recompilation; on a miss ``compile_fn``
+    runs, and the result is stored in the on-disk module directory.
 
     Parameters
     ----------
@@ -112,6 +257,9 @@ def build_and_load_cute_dsl_kernel(
     if cute_dsl_cache_disabled():
         return compile_fn()
 
+    # If any key source is unreadable (missing file, __file__ unavailable
+    # under exotic packaging), bypass the disk cache rather than skipping the
+    # file from the hash: a weakened key could serve stale artifacts.
     try:
         source_sha256 = _hash_source_files(tuple(extra_key_files))
     except (OSError, TypeError) as e:
@@ -121,108 +269,5 @@ def build_and_load_cute_dsl_kernel(
         )
         return compile_fn()
 
-    kernel_name = sanitize_symbol_name(kernel_name)
-    module_dir_name = sanitize_symbol_name(
-        f"{module_name}_{_get_compile_arch()}_cute_dsl"
-    )
-    module_dir = jit_env.FLASHINFER_JIT_DIR / module_dir_name
-    object_path = module_dir / f"{kernel_name}.o"
-    symbol = f"{module_name}_{kernel_name}"
-    expected_meta = {
-        "module": module_dir_name,
-        "arch": _get_compile_arch(),
-        "cute_dsl_version": _get_cute_dsl_version(),
-        "source_sha256": source_sha256,
-    }
-
-    kernel = _try_load_cached_kernel(module_dir, object_path, symbol, expected_meta)
-    if kernel is not None:
-        return kernel
-
-    from .core import get_tmpdir
-
-    with FileLock(get_tmpdir() / f"{module_dir_name}.lock", thread_local=False):
-        # Another process may have built the artifact while we waited.
-        kernel = _try_load_cached_kernel(module_dir, object_path, symbol, expected_meta)
-        if kernel is not None:
-            return kernel
-
-        # Stale module (dsl version / source change): wipe it, like a ninja
-        # rebuild of the whole module. Open .o files stay mapped (POSIX).
-        # Also wipes a module with missing meta.json (crash before the meta
-        # write): an orphaned .o must not be adopted by fresh metadata.
-        meta_path = module_dir / _META_FILENAME
-        if module_dir.exists() and _read_meta(meta_path) != expected_meta:
-            logger.info(f"Invalidating stale CuTe-DSL module {module_dir_name}")
-            shutil.rmtree(module_dir, ignore_errors=True)
-
-        logger.info(f"Compiling CuTe-DSL kernel {module_dir_name}/{kernel_name}")
-        compiled_kernel = compile_fn()
-        try:
-            _export_kernel(
-                compiled_kernel, module_dir, object_path, symbol, expected_meta
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed to persist CuTe-DSL kernel {module_dir_name}/{kernel_name} "
-                f"to {object_path}: {e}. The kernel will be recompiled next run."
-            )
-        return compiled_kernel
-
-
-def _read_meta(meta_path: Path) -> Any:
-    try:
-        with open(meta_path) as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _try_load_cached_kernel(
-    module_dir: Path, object_path: Path, symbol: str, expected_meta: dict
-) -> Any:
-    if not object_path.exists():
-        return None
-    if _read_meta(module_dir / _META_FILENAME) != expected_meta:
-        return None
-    try:
-        import cutlass.cute as cute
-
-        module = cute.runtime.load_module(str(object_path), enable_tvm_ffi=True)
-        kernel = getattr(module, symbol)
-        logger.debug(f"Loaded cached CuTe-DSL kernel from {object_path}")
-        return kernel
-    except Exception as e:
-        logger.warning(
-            f"Failed to load cached CuTe-DSL kernel from {object_path}: {e}. "
-            "Recompiling."
-        )
-        return None
-
-
-def _export_kernel(
-    compiled_kernel: Any,
-    module_dir: Path,
-    object_path: Path,
-    symbol: str,
-    meta: dict,
-) -> None:
-    module_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = module_dir / _META_FILENAME
-    tmp_object_path = object_path.with_suffix(f".o.tmp.{os.getpid()}")
-    tmp_meta_path = meta_path.with_suffix(f".json.tmp.{os.getpid()}")
-    try:
-        compiled_kernel.export_to_c(str(tmp_object_path), function_name=symbol)
-        os.replace(tmp_object_path, object_path)
-        # meta.json is the module's commit marker: written after the object
-        # file is in place so a crash never leaves a loadable partial entry.
-        # Kernels added to an already-committed module skip the rewrite.
-        if _read_meta(meta_path) != meta:
-            with open(tmp_meta_path, "w") as f:
-                json.dump(meta, f, indent=2)
-            os.replace(tmp_meta_path, meta_path)
-        logger.info(f"Persisted CuTe-DSL kernel to {object_path}")
-    finally:
-        for tmp in (tmp_object_path, tmp_meta_path):
-            if tmp.exists():
-                tmp.unlink()
+    spec = JitSpecCuteDsl(module_name, kernel_name, compile_fn, source_sha256)
+    return spec.build_and_load()

@@ -1,3 +1,4 @@
+import abc
 import dataclasses
 import functools
 import logging
@@ -5,7 +6,7 @@ import os
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union, Hashable
+from typing import Any, Dict, List, Optional, Sequence, Union, Hashable
 
 import tvm_ffi
 from filelock import FileLock
@@ -158,10 +159,15 @@ class JitSpecStatus:
 
 
 class JitSpecRegistry:
-    """Global registry to track all JitSpecs"""
+    """Global registry to track all JitSpecs.
+
+    Accepts any JitSpec backend; in practice only nvcc modules register
+    today (via gen_jit_spec). Backs the ``flashinfer`` CLI's module
+    listing / status / compile-commands export.
+    """
 
     def __init__(self):
-        self._specs: Dict[str, JitSpec] = {}
+        self._specs: Dict[str, "JitSpec"] = {}
         self._creation_times: Dict[str, datetime] = {}
 
     def register(self, spec: "JitSpec") -> None:
@@ -181,14 +187,21 @@ class JitSpecRegistry:
 
         spec = self._specs[name]
         library_path = spec.get_library_path() if spec.is_compiled else None
+        # nvcc-specific report fields; other backends have no source list.
+        if isinstance(spec, JitSpecNvcc):
+            sources = spec.sources
+            needs_device_linking = spec.needs_device_linking
+        else:
+            sources = []
+            needs_device_linking = False
 
         return JitSpecStatus(
             name=spec.name,
             created_at=self._creation_times[name],
             is_compiled=spec.is_compiled,
             library_path=library_path,
-            sources=spec.sources,
-            needs_device_linking=spec.needs_device_linking,
+            sources=sources,
+            needs_device_linking=needs_device_linking,
         )
 
     def get_all_statuses(self) -> List[JitSpecStatus]:
@@ -214,8 +227,83 @@ class JitSpecRegistry:
 jit_spec_registry = JitSpecRegistry()
 
 
+class JitSpec(abc.ABC):
+    """Abstract base for JIT-compiled kernel modules.
+
+    Concrete subclasses implement one compilation toolchain each
+    (``JitSpecNvcc`` for nvcc/ninja modules, ``JitSpecCuteDsl`` for CuTe-DSL
+    kernels; future DSLs follow the same shape). The shared lifecycle policy
+    lives in the concrete :meth:`build_and_load` template method: cached-
+    artifact fast path, cross-process locking with a double-check, and
+    ``FLASHINFER_DISABLE_JIT`` enforcement.
+
+    Subclass contract:
+
+    - :meth:`try_load` returns the cached artifact only when it is present
+      AND known-valid; it may conservatively return ``None`` even when
+      artifacts exist (e.g. nvcc delegates JIT-path freshness to ninja, so
+      only the AOT artifact is returned here).
+    - :meth:`build` produces or refreshes on-disk artifacts. It must be
+      idempotent and may be internally incremental. It runs under the
+      ``lock_path`` lock when invoked via :meth:`build_and_load`, so it must
+      not re-acquire that lock.
+    - :meth:`load` loads the artifact that :meth:`build` produced. It may
+      return an object retained in memory by :meth:`build` instead of
+      re-reading from disk.
+    """
+
+    name: str
+
+    @property
+    @abc.abstractmethod
+    def lock_path(self) -> Path: ...
+
+    @property
+    @abc.abstractmethod
+    def is_compiled(self) -> bool:
+        """Whether a valid on-disk artifact exists for this spec."""
+        ...
+
+    @abc.abstractmethod
+    def get_library_path(self) -> Path:
+        """Path of the primary on-disk artifact (.so / .o)."""
+        ...
+
+    @abc.abstractmethod
+    def try_load(self) -> Optional[Any]: ...
+
+    @abc.abstractmethod
+    def build(self) -> None: ...
+
+    @abc.abstractmethod
+    def load(self) -> Any: ...
+
+    def build_and_load(self) -> Any:
+        cached = self.try_load()
+        if cached is not None:
+            return cached
+
+        with FileLock(self.lock_path, thread_local=False):
+            # Another process may have built the artifact while we waited.
+            cached = self.try_load()
+            if cached is not None:
+                return cached
+
+            if os.environ.get("FLASHINFER_DISABLE_JIT"):
+                raise MissingJITCacheError(
+                    "JIT compilation is disabled via FLASHINFER_DISABLE_JIT "
+                    "environment variable, but the required module is not "
+                    "found in the JIT cache. Please add the missing module "
+                    "to the JIT cache build configuration.",
+                    spec=self,
+                )
+
+            self.build()
+            return self.load()
+
+
 @dataclasses.dataclass
-class JitSpec:
+class JitSpecNvcc(JitSpec):
     name: str
     sources: List[Path]
     extra_cflags: Optional[List[str]]
@@ -286,7 +374,16 @@ class JitSpec:
     def is_ninja_generated(self) -> bool:
         return self.ninja_path.exists()
 
-    def build(self, verbose: bool, need_lock: bool = True) -> None:
+    def try_load(self) -> Optional[Any]:
+        # Only the AOT artifact is known-valid without building: freshness of
+        # the JIT-path .so is owned by ninja's dependency scan, so a cache
+        # miss here routes build_and_load() through build(), where ninja
+        # no-ops if everything is up to date.
+        if self.is_aot:
+            return self.load(self.aot_path)
+        return None
+
+    def build(self, verbose: Optional[bool] = None, need_lock: bool = False) -> None:
         if os.environ.get("FLASHINFER_DISABLE_JIT"):
             raise MissingJITCacheError(
                 "JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
@@ -294,6 +391,10 @@ class JitSpec:
                 "Please add the missing module to the JIT cache build configuration.",
                 spec=self,
             )
+        if verbose is None:
+            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+        # need_lock is for direct callers; build_and_load() already holds the
+        # lock_path lock (FileLock is not reentrant across instances).
         lock = (
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
@@ -301,22 +402,8 @@ class JitSpec:
             self.write_ninja()
             run_ninja(self.build_dir, self.ninja_path, verbose)
 
-    def load(self, so_path: Path):
-        return tvm_ffi.load_module(str(so_path))
-
-    def build_and_load(self):
-        if self.is_aot:
-            return self.load(self.aot_path)
-
-        # Guard both build and load with the same lock to avoid race condition
-        # where another process is building the library and removes the .so file.
-        with FileLock(self.lock_path, thread_local=False):
-            so_path = self.jit_library_path
-            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
-            self.build(verbose, need_lock=False)
-            result = self.load(so_path)
-
-        return result
+    def load(self, so_path: Optional[Path] = None):
+        return tvm_ffi.load_module(str(so_path or self.jit_library_path))
 
     def get_compile_commands(self) -> List[dict]:
         """
@@ -464,7 +551,7 @@ def gen_jit_spec(
     if extra_cuda_cflags is not None:
         cuda_cflags += extra_cuda_cflags
 
-    spec = JitSpec(
+    spec = JitSpecNvcc(
         name=name,
         sources=[Path(x) for x in sources],
         extra_cflags=cflags,
@@ -499,6 +586,13 @@ def build_jit_specs(
 ) -> None:
     lines: List[str] = []
     for spec in specs:
+        # Batch ninja builds only apply to nvcc modules; other JitSpec
+        # backends (e.g. CuTe-DSL) compile in-process at first use.
+        if not isinstance(spec, JitSpecNvcc):
+            raise TypeError(
+                f"build_jit_specs only supports nvcc modules, got "
+                f"{type(spec).__name__} for {spec.name}"
+            )
         if skip_prebuilt and spec.aot_path.exists():
             continue
         lines.append(f"subninja {spec.ninja_path}")

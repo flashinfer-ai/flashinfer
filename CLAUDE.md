@@ -185,11 +185,17 @@ FlashInfer's JIT system has three layers:
 
 ### Layer 1: JitSpec (flashinfer/jit/core.py)
 
-`JitSpec` defines compilation metadata:
+`JitSpec` is an abstract base class defining the kernel-module lifecycle
+(`try_load()` / `build()` / `load()`, with the shared `build_and_load()`
+template method handling caching, locking, and `FLASHINFER_DISABLE_JIT`).
+One subclass per compilation toolchain:
 
-- `name`: Unique identifier (URI hash from parameters)
-- `sources`: List of .cu/.cpp files to compile
-- `extra_cuda_cflags`, `extra_cflags`, `extra_ldflags`: Compiler flags
+- `JitSpecNvcc` (nvcc/ninja modules, returned by `gen_jit_spec()`) defines:
+  - `name`: Unique identifier (URI hash from parameters)
+  - `sources`: List of .cu/.cpp files to compile
+  - `extra_cuda_cflags`, `extra_cflags`, `extra_ldflags`: Compiler flags
+- `JitSpecCuteDsl` (flashinfer/jit/cute_dsl_core.py) caches CuTe-DSL kernels
+  (see "CuTe-DSL kernels" under Module Caching below)
 
 ### JIT Directory Rules
 
@@ -250,7 +256,7 @@ def gen_some_module(dtype_in, dtype_out, ...):
 
 ### Layer 3: Compilation and Loading
 
-`JitSpec` methods:
+`JitSpecNvcc` methods:
 
 - `write_ninja()` - Generates `build.ninja` file
 - `build()` - Executes `ninja` to compile sources
@@ -386,7 +392,8 @@ URI computed as: `hash(operation_type + parameters + source_hashes + flags + cud
 - Override location: `export FLASHINFER_WORKSPACE_BASE="/scratch"`
 
 **CuTe-DSL kernels** (`flashinfer/jit/cute_dsl_core.py`): `cute.compile()` has no
-persistent cache, so `build_and_load_cute_dsl_kernel()` exports compiled kernels as
+persistent cache, so `JitSpecCuteDsl` (a `JitSpec` subclass, wrapped by the
+`build_and_load_cute_dsl_kernel()` helper) exports compiled kernels as
 object files (`export_to_c()`) and reloads them with `cute.runtime.load_module(...,
 enable_tvm_ffi=True)`. Artifacts live in `cached_ops/` next to the nvcc modules, one
 directory per op family — `cached_ops/<module>_<arch>_cute_dsl/` (e.g.
