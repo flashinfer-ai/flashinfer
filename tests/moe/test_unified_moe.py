@@ -886,6 +886,9 @@ class TestTrtllmEPOffset:
             + local_expert_offset
         )
         final_scales = torch.rand(num_tokens, top_k, device=device)
+        # One negative weight makes the low-16-bit check below sensitive to a
+        # dropped & 0xFFFF mask (bf16 sign bit would smear into the id field).
+        final_scales[0, 0] = -final_scales[0, 0]
         act_pack = MoEActivationPack(
             hidden_states_q=torch.zeros(
                 num_tokens, hidden_size // 2, dtype=torch.uint8, device=device
@@ -925,7 +928,13 @@ class TestTrtllmEPOffset:
         # Global ids land inside this rank's shard; the kernel maps them to
         # [0, local_num_experts) by subtracting local_expert_offset.
         assert int(decoded_ids.min()) >= local_expert_offset
-        assert int(decoded_ids.max()) < local_expert_offset + local_num_experts
+        # Low 16 bits hold the bf16 gate-weight bits.
+        expected_bits = (
+            final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
+        )
+        assert torch.equal(topk_ids & 0xFFFF, expected_bits)
+        # The offset travels to the kernel as a separate argument.
+        assert runner._static_kwargs["local_expert_offset"] == local_expert_offset
 
     @pytest.mark.parametrize("local_expert_offset", [32, 96])
     def test_ep_shard_forward_matches_offset_zero(self, local_expert_offset):
