@@ -44,6 +44,7 @@ from ..algo_knobs import (
     HandleAlgoKnobUserStream,
     _index_knobs,
 )
+from .._validators import MoEEpConfigError
 from ..config import (
     CombineInputParams,
     CombineOutput,
@@ -129,8 +130,20 @@ class NcclEpHandle(Handle):
 
         from ..config import EpAlgorithm, EpLayout
 
+        _t = _pc() if _HP else None
         self._fleet = fleet
         self._ep = fleet.nccl_ep
+        # Cross-handle host-path cache (declared on NcclEpFleet). vLLM creates
+        # a fresh Handle every MoE layer x step (routing binds at
+        # create_handle), so per-handle caches never hit; anchoring them on the
+        # long-lived Fleet makes the recv buffers, counter tensors and FFI
+        # descriptor objects reusable across forwards. Tensor wrappers are
+        # memoized by (data_ptr, dtype, shape), so an entry can only ever
+        # describe the same memory layout it was built for; the dict is cleared
+        # when it grows past a bound (entries are then rebuilt, which is always
+        # safe — each handle only needs address stability within its own
+        # lifetime).
+        self._hot = fleet._hot_cache
         self._handle_knobs = _index_knobs(algo_knobs)
         self._stream = self._knob_stream()
         self._staged = HandleAlgoKnobSplitOperation in self._handle_knobs
@@ -162,15 +175,22 @@ class NcclEpHandle(Handle):
         self._topk_idx = topk_idx  # keepalive
         self._num_tokens_in = topk_idx.shape[0]
         self._top_k = topk_idx.shape[1]
-        self._topk_idx_t = self._ep.Tensor(topk_idx)
+        self._topk_idx_t = self._wrap(topk_idx)
 
         # Per-source counter the library writes at dispatch (LL): EXPERT_MAJOR
         # gets per-local-expert recv counts [num_local_experts]; RANK_MAJOR gets
-        # per-source-rank token counts [world].
+        # per-source-rank token counts [world]. Fleet-cached; NOT re-zeroed
+        # across forwards — the dispatch metadata fully overwrites every entry
+        # (the same contract the NV_FI_EP_FAST_PATH per-handle reuse relies on).
         recv_count_len = world_size if self._is_rank_major else self._num_local_experts
-        self._recv_count_t = torch.zeros(
-            recv_count_len, dtype=torch.int32, device=topk_idx.device
-        )
+        ck = ("recv_count", recv_count_len, topk_idx.device)
+        self._recv_count_t = self._hot.get(ck)
+        if self._recv_count_t is None:
+            self._recv_count_t = torch.zeros(
+                recv_count_len, dtype=torch.int32, device=topk_idx.device
+            )
+            self._hot[ck] = self._recv_count_t
+        _t = _hp("hinit.setup", _t)
 
         if self._is_ht:
             layout = self._ep.Layout.FLAT
@@ -216,12 +236,45 @@ class NcclEpHandle(Handle):
             config=None,
             stream=self._stream,
         )
+        _t = _hp("hinit.create_handle_c", _t)
 
     # ----------------------------------------------------------------- knobs
 
     def _knob_stream(self) -> int:
         k = self._handle_knobs.get(HandleAlgoKnobUserStream)
         return int(k.stream) if k is not None else self._fleet.stream  # type: ignore[attr-defined]
+
+    # Only memoize wrappers of SMALL tensors: the wrapper keeps the torch tensor
+    # alive, so caching wraps of large activations (e.g. 8k-token prefill inputs,
+    # the [num_recv, hidden] combine views) pins GBs across allocator addresses
+    # and OOMs at high --gpu-memory-utilization. Small tensors (weights, topk,
+    # counters, decode-sized activations) are exactly the host-bound decode path
+    # this cache exists for. 2 MiB * 256 entries caps pinning at 512 MiB worst
+    # case (steady-state decode reuses a handful of addresses).
+    _WRAP_MEMO_MAX_BYTES = 2 << 20
+    _WRAP_MEMO_MAX_ENTRIES = 256
+
+    def _wrap(self, t):
+        """Memoized ``nccl.ep.Tensor`` wrapper (fleet-level, address-keyed).
+
+        Building an FFI Tensor descriptor costs ~10us of host time; vLLM's
+        allocator recycles workspace addresses across decode steps, so keying
+        by (data_ptr, dtype, shape) hits almost always after warmup. A hit can
+        never alias the wrong layout — a reused address with a different
+        shape/dtype misses and builds a fresh wrapper. Large tensors are
+        wrapped per call (see _WRAP_MEMO_MAX_BYTES).
+        """
+        if t.numel() * t.element_size() > self._WRAP_MEMO_MAX_BYTES:
+            return self._ep.Tensor(t)
+        hot = self._hot
+        key = (t.data_ptr(), t.dtype, tuple(t.shape))
+        w = hot.get(key)
+        if w is None:
+            if len(hot) > self._WRAP_MEMO_MAX_ENTRIES:
+                hot.clear()
+            w = self._ep.Tensor(t)
+            hot[key] = w
+        return w
 
     # ----------------------------------------------------------------- dispatch
 
@@ -243,25 +296,30 @@ class NcclEpHandle(Handle):
         max_per_rank = self._fleet.params.max_tokens_per_rank
         hidden = self._fleet.params.token_hidden_size
 
-        # (3) cache the recv buffer instead of torch.empty() every dispatch.
-        out_t = getattr(self, "_ll_recv_buf", None) if _FAST else None
-        if out_t is None:
-            out_t = torch.empty(
-                self._num_local_experts,
-                max_per_rank * world_size,
-                hidden,
-                dtype=x.dtype,
-                device=x.device,
-            )
-            if _FAST:
-                self._ll_recv_buf = out_t
+        # Fleet-cached recv buffer (a fresh Handle is created every forward, so
+        # per-handle caching never hits; the fleet persists).
+        shape = (self._num_local_experts, max_per_rank * world_size, hidden)
+        out_t = self._hot.get("ll_recv_buf")
+        if (
+            out_t is None
+            or out_t.shape != shape
+            or out_t.dtype != x.dtype
+            or out_t.device != x.device
+        ):
+            out_t = torch.empty(*shape, dtype=x.dtype, device=x.device)
+            self._hot["ll_recv_buf"] = out_t
         _t = _hp("ll_disp.alloc", _t)
 
-        # (2) cache the FFI wrapper objects over STABLE tensors (out_t / recv_count /
-        # config). Only the input-token wrap is rebuilt each call (x may alias a new
-        # tensor). On the slow path everything is rebuilt as before.
-        cache = getattr(self, "_ll_disp_cache", None) if _FAST else None
-        if cache is None:
+        # Fleet-cached FFI descriptor objects over the STABLE tensors (recv
+        # buffer / counters / config). Only the input-token wrap varies per call
+        # (memoized by address in _wrap).
+        cache = self._hot.get("ll_disp_ffi")
+        if (
+            cache is None
+            or cache[0] is not out_t
+            or cache[1] is not self._recv_count_t
+            or cache[2] != self._staged
+        ):
             outputs = self._ep.DispatchOutputs(tokens=self._ep.Tensor(out_t))
             layout_info = self._ep.LayoutInfo(
                 expert_counters=self._ep.Tensor(self._recv_count_t)
@@ -269,11 +327,17 @@ class NcclEpHandle(Handle):
             config = self._ep.DispatchConfig(
                 send_only=int(self._staged), round_scales=0
             )
-            if _FAST:
-                self._ll_disp_cache = (outputs, layout_info, config)
+            self._hot["ll_disp_ffi"] = (
+                out_t,
+                self._recv_count_t,
+                self._staged,
+                outputs,
+                layout_info,
+                config,
+            )
         else:
-            outputs, layout_info, config = cache
-        inputs = self._ep.DispatchInputs(tokens=self._ep.Tensor(x))
+            outputs, layout_info, config = cache[3], cache[4], cache[5]
+        inputs = self._ep.DispatchInputs(tokens=self._wrap(x))
         _t = _hp("ll_disp.build_ffi_objs", _t)
 
         self._handle.dispatch(
@@ -414,6 +478,21 @@ class NcclEpHandle(Handle):
         world = self._fleet.params.num_experts // self._num_local_experts
         num_recv = max_per_rank * world
 
+        # The HT staging buffers (and this recv buffer) are sized to max_per_rank,
+        # which the fleet clamps to the library's MAX_SUPPORTED_TOKENS_PER_RANK. A
+        # forward that dispatches more than that per rank would overflow the staging
+        # buffers (and previously hit a C++ abort at group-create for the un-clamped
+        # value). Fail with an actionable error instead of corrupting memory.
+        n_tokens = x.shape[0]
+        if n_tokens > max_per_rank:
+            raise MoEEpConfigError(
+                f"nccl_ep HT dispatch received {n_tokens} tokens on this rank, "
+                f"exceeding max_tokens_per_rank ({max_per_rank} = the library's "
+                "MAX_SUPPORTED_TOKENS_PER_RANK). Reduce the per-forward token count "
+                "per rank (e.g. vLLM --max-num-batched-tokens <= "
+                f"{max_per_rank}), or use the low-latency algorithm."
+            )
+
         tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
         if tw is None:
             raise ValueError(
@@ -435,8 +514,14 @@ class NcclEpHandle(Handle):
         # first dispatch. Fresh torch.empty buffers each call gave the cached
         # dispatch new addresses and deadlocked the next collective.
         _t = _pc() if _HP else None
-        cached = getattr(self, "_ht_recv_bufs", None)
-        if cached is None or cached[0].shape[0] != num_recv:
+        cached = self._hot.get("ht_recv_bufs")
+        if (
+            cached is None
+            or cached[0].shape[0] != num_recv
+            or cached[1].shape[1] != self._top_k
+            or cached[0].dtype != x.dtype
+            or cached[0].device != x.device
+        ):
             out_t = torch.empty(num_recv, hidden, dtype=x.dtype, device=x.device)
             out_w = torch.empty(
                 num_recv, self._top_k, dtype=torch.float32, device=x.device
@@ -444,15 +529,15 @@ class NcclEpHandle(Handle):
             out_idx = torch.empty(
                 num_recv, self._top_k, dtype=torch.int64, device=x.device
             )
-            self._ht_recv_bufs = (out_t, out_w, out_idx)
+            self._hot["ht_recv_bufs"] = (out_t, out_w, out_idx)
         else:
             out_t, out_w, out_idx = cached
         _t = _hp("ht_disp.alloc_cached", _t)
 
-        # (2) cache the output wraps (over cached recv bufs) + weights wrap + config;
-        # rebuild only the per-call input-token wrap.
-        cache = getattr(self, "_ht_disp_cache", None) if _FAST else None
-        if cache is None:
+        # Fleet-cached output wraps (over the cached recv bufs) + config; the
+        # per-call input-token and weights wraps go through the _wrap memo.
+        cache = self._hot.get("ht_disp_ffi")
+        if cache is None or cache[0] is not out_t or cache[1] != self._staged:
             outputs = self._ep.DispatchOutputs(
                 tokens=self._ep.Tensor(out_t),
                 topk_weights=self._ep.Tensor(out_w),
@@ -461,13 +546,11 @@ class NcclEpHandle(Handle):
             config = self._ep.DispatchConfig(
                 send_only=int(self._staged), round_scales=0
             )
-            weights_t = self._ep.Tensor(weights)
-            if _FAST:
-                self._ht_disp_cache = (outputs, config, weights_t)
+            self._hot["ht_disp_ffi"] = (out_t, self._staged, outputs, config)
         else:
-            outputs, config, weights_t = cache
+            outputs, config = cache[2], cache[3]
         inputs = self._ep.DispatchInputs(
-            tokens=self._ep.Tensor(x), topk_weights=weights_t
+            tokens=self._wrap(x), topk_weights=self._wrap(weights)
         )
         _t = _hp("ht_disp.build_ffi_objs", _t)
 
@@ -528,15 +611,13 @@ class NcclEpHandle(Handle):
             x2d = x.reshape(-1, hidden)
             # (2) cache output wrap + config (guarded by out_t identity); rebuild
             # only the per-call input wrap (x2d is a fresh view each call).
-            cache = getattr(self, "_ht_comb_cache", None) if _FAST else None
-            if cache is None or cache[2] is not out_t:
-                outputs = self._ep.CombineOutputs(tokens=self._ep.Tensor(out_t))
+            ck = ("ht_comb_cfg", self._staged)
+            config = self._hot.get(ck)
+            if config is None:
                 config = self._ep.CombineConfig(send_only=int(self._staged))
-                if _FAST:
-                    self._ht_comb_cache = (outputs, config, out_t)
-            else:
-                outputs, config, _ = cache
-            inputs = self._ep.CombineInputs(tokens=self._ep.Tensor(x2d))
+                self._hot[ck] = config
+            outputs = self._ep.CombineOutputs(tokens=self._wrap(out_t))
+            inputs = self._ep.CombineInputs(tokens=self._wrap(x2d))
             _t = _hp("ht_comb.build_ffi_objs", _t)
             self._handle.combine(inputs, outputs, config=config, stream=self._stream)
             _t = _hp("ht_comb.ffi_combine", _t)
@@ -568,31 +649,29 @@ class NcclEpHandle(Handle):
             self._combine_outputs = outputs
             return CombineOutput(x=out_t)
 
-        # LL EXPERT_MAJOR combine: weights applied on the receive side.
-        # (2) cache the stable weights wrap + config; rebuild only the per-call
-        # token wraps (x / out_t may alias new tensors).
-        cache = getattr(self, "_ll_comb_cache", None) if _FAST else None
-        if cache is None:
-            tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
-            if tw is None:
-                raise ValueError(
-                    "NcclEpHandle.combine requires HandleAlgoKnobTopKWeights set "
-                    "at handle creation; NCCL EP LL needs per-token weights to "
-                    "reweight on combine."
-                )
-            weights = tw.weights  # type: ignore[attr-defined]
-            if weights.dtype != torch.float32:
-                weights = weights.to(torch.float32)
-            weights_t = self._ep.Tensor(weights)
+        # LL EXPERT_MAJOR combine: weights applied on the receive side. The
+        # weights tensor changes every forward (per-step routing), but its
+        # allocator address recycles across decode steps — the _wrap memo makes
+        # the descriptor build ~free. The config is static per staged-mode.
+        tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
+        if tw is None:
+            raise ValueError(
+                "NcclEpHandle.combine requires HandleAlgoKnobTopKWeights set "
+                "at handle creation; NCCL EP LL needs per-token weights to "
+                "reweight on combine."
+            )
+        weights = tw.weights  # type: ignore[attr-defined]
+        if weights.dtype != torch.float32:
+            weights = weights.to(torch.float32)
+        weights_t = self._wrap(weights)
+        ck = ("ll_comb_cfg", self._staged)
+        config = self._hot.get(ck)
+        if config is None:
             config = self._ep.CombineConfig(send_only=int(self._staged))
-            if _FAST:
-                self._ll_comb_cache = (weights, weights_t, config)
-        else:
-            weights, weights_t, config = cache
-
-        inputs = self._ep.CombineInputs(tokens=self._ep.Tensor(x))
+            self._hot[ck] = config
+        inputs = self._ep.CombineInputs(tokens=self._wrap(x))
         outputs = self._ep.CombineOutputs(
-            tokens=self._ep.Tensor(out_t),
+            tokens=self._wrap(out_t),
             topk_weights=weights_t,
         )
         _t = _hp("ll_comb.build_ffi_objs", _t)
@@ -621,9 +700,11 @@ class NcclEpHandle(Handle):
 
     def destroy(self) -> None:
         if not self._destroyed:
+            _t = _pc() if _HP else None
             with contextlib.suppress(Exception):
                 self._handle.destroy()
             self._destroyed = True
+            _hp("hdestroy.destroy_c", _t)
 
     def __del__(self) -> None:
         self.destroy()
