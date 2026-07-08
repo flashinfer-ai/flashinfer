@@ -306,6 +306,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_da_heuristic.cu",
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",

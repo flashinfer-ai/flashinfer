@@ -58,10 +58,14 @@ GEN_PHASE_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]
 
 # Expert Parallelism configurations
 # EP=1: all 256 experts on single GPU
+# EP=2: 128 experts per GPU (256/2)
+# EP=4: 64 experts per GPU (256/4)
 # EP=8: 32 experts per GPU (256/8)
 # EP=16: 16 experts per GPU (256/16)
 EP_CONFIGS = {
     1: {"num_local_experts": 256, "local_expert_offset": 0},
+    2: {"num_local_experts": 128, "local_expert_offset": 0},
+    4: {"num_local_experts": 64, "local_expert_offset": 0},
     8: {"num_local_experts": 32, "local_expert_offset": 0},
     16: {"num_local_experts": 16, "local_expert_offset": 0},
 }

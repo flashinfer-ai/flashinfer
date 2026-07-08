@@ -3043,6 +3043,16 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "return_full_output": kwargs.get("return_full_output", False),
     }
 
+    execution_observer = kwargs.get("execution_observer")
+    if execution_observer is not None:
+        execution_observer(
+            moe_impl,
+            static_data,
+            kwargs["hidden_states_orig"],
+            args.hidden_states_scale_global,
+            kernel_kwargs,
+        )
+
     return moe_impl.call_moe(
         static_data,
         kwargs["hidden_states_orig"],
@@ -3295,6 +3305,8 @@ def run_moe_test(
     check_intermediate_output=False,
     gemm1_lora_args=None,
     verify_unfinalized_weight_dtype=False,
+    expert_logits_transform=None,
+    execution_observer=None,
 ):
     """Common test logic for all routing methods.
 
@@ -3348,6 +3360,8 @@ def run_moe_test(
     expert_logits = torch.randn((num_tokens, num_experts), device="cuda").to(
         routing_logits_dtype
     )
+    if expert_logits_transform is not None:
+        expert_logits = expert_logits_transform(expert_logits)
 
     if routing_config["has_routing_bias"]:
         bias_dtype = (
@@ -3523,6 +3537,7 @@ def run_moe_test(
         num_fused_shared_experts=num_fused_shared_experts,
         norm_topk_prob=norm_topk_prob,
         return_full_output=check_intermediate_output,
+        execution_observer=execution_observer,
     )
 
     # When a lora delta is set, the kernel returns the post-activation FC1 output
