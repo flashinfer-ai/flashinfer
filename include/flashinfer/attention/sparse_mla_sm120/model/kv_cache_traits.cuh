@@ -80,6 +80,10 @@ struct KVCacheTraits<ModelType::DSV3_2> {
   // V = pure nope (no rope component)
   static constexpr bool V_HAS_ROPE = false;
 
+  // true => nope stored as packed NVFP4; false => full-width fp8.
+  static constexpr bool KV_IS_NVFP4 = false;
+  static constexpr int NOPE_STORAGE_BYTES = D_NOPE;  // gmem bytes for the nope region
+
   // FP32→UE8M0 scale conversion for block-scaled MMA
   // FlashMLA stores power-of-2 FP32 scales → bit-shift gives exact UE8M0
   __device__ static __forceinline__ uint8_t scale_to_ue8m0(float scale) {
@@ -137,8 +141,32 @@ struct KVCacheTraits<ModelType::DSV4> {
   // XV rope: CUDA core scalar FMA from global (zero smem, M5b verified)
   static constexpr bool V_HAS_ROPE = true;
 
+  // true => nope stored as packed NVFP4; false => full-width fp8.
+  static constexpr bool KV_IS_NVFP4 = false;
+  static constexpr int NOPE_STORAGE_BYTES = D_NOPE;  // 448
+
   // UE8M0 scales are native — no conversion needed
   __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale) { return scale; }
+};
+
+// DSV4 with the NoPE region packed as NVFP4. Inherits DSV4's dims, smem layout,
+// per-64 UE8M0 scale format, Q strides, and compute traits; only the gmem NoPE
+// storage differs (448 E2M1 nibbles packed 2/byte = 224B vs 448B fp8), expanded
+// to the 448B fp8 smem row on IO load. Logical page = 224 + 128 + 8 = 360 B/token.
+template <>
+struct KVCacheTraits<ModelType::DSV4_NVFP4> : KVCacheTraits<ModelType::DSV4> {
+  static constexpr bool KV_IS_NVFP4 = true;
+  static constexpr int NOPE_STORAGE_BYTES = D_NOPE / 2;  // 224 (E2M1, 2 nibbles/byte)
+  // TMA copies only the packed nope bytes; the consumer expands them to the full
+  // 448B fp8 row in smem.
+  static constexpr int KV_SMEM_COPY_BYTES = NOPE_STORAGE_BYTES;  // 224
+  // FOOTER layout, 360 logical bytes/token:
+  //   data slot (IO stride): [0:224) E2M1 nope, [224:352) bf16 rope  = 352B (16B aligned)
+  //   footer: 8B/token (7 UE8M0 per-64 + 1 pad)
+  static constexpr int KV_GMEM_STRIDE =
+      NOPE_STORAGE_BYTES + D_ROPE * sizeof(bf16) + SCALE_BYTES_PER_TOKEN;  // 360
+  static constexpr int KV_ROPE_GMEM_OFFSET = NOPE_STORAGE_BYTES;                 // 224
+  static constexpr int KV_SCALE_GMEM_OFFSET = NOPE_STORAGE_BYTES + D_ROPE * sizeof(bf16);  // 352
 };
 
 // ============================================================================
@@ -156,6 +184,10 @@ static_assert(KVCacheTraits<ModelType::DSV3_2>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::DSV3_2>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::DSV4>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::DSV4>::D_V == D_V);
+static_assert(KVCacheTraits<ModelType::DSV4_NVFP4>::D_ROPE == D_ROPE);
+static_assert(KVCacheTraits<ModelType::DSV4_NVFP4>::D_V == D_V);
+static_assert(KVCacheTraits<ModelType::DSV4_NVFP4>::NOPE_STORAGE_BYTES == 224);
+static_assert(KVCacheTraits<ModelType::DSV4_NVFP4>::KV_GMEM_STRIDE == 360);
 static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_V == D_V);
 

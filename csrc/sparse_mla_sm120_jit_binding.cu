@@ -90,7 +90,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
                               Optional<TensorView> extra_kv_cache,
                               Optional<TensorView> extra_indices,
                               Optional<TensorView> extra_topk_length,
-                              int64_t chunks_per_block_override) {
+                              int64_t chunks_per_block_override, int64_t model_type) {
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
   TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2);
   // indices may be 2D [T, topk] or 3D [T, s_q=1, topk] (some callers keep
@@ -108,12 +108,14 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   const int num_heads = static_cast<int>(q.size(1));
   const int topk = static_cast<int>(indices.size(-1));
   const int d_qk = static_cast<int>(q.size(2));
-  ModelType mt = (d_qk == 512) ? ModelType::DSV4 : ModelType::DSV3_2;
-  // Currently the kernel only supports DSV4.
-  TVM_FFI_ICHECK_EQ(static_cast<int>(mt), static_cast<int>(ModelType::DSV4))
-      << "decode-dsv4 currently DSV4-only";
+  // model_type is the ModelType enum int from Python (DSV4=1, DSV4_NVFP4=3).
+  ModelType mt = static_cast<ModelType>(model_type);
+  TVM_FFI_ICHECK(mt == ModelType::DSV4 || mt == ModelType::DSV4_NVFP4)
+      << "decode-dsv4 handles DSV4 / DSV4_NVFP4; got model_type=" << model_type;
+  TVM_FFI_ICHECK_EQ(d_qk, 512) << "decode-dsv4 expects d_qk=512; got " << d_qk;
 
-  constexpr int BPT_DSV4 = 584;
+  // fp8 page = 584 B/token, NVFP4 page = 360 B/token (224 E2M1 + 128 bf16 rope + 8 UE8M0).
+  const int BPT_DSV4 = (mt == ModelType::DSV4_NVFP4) ? 360 : 584;
   const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, BPT_DSV4, "kv_cache");
   const int page_block_size = kv_layout.page_block_size;
 
