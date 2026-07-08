@@ -7,7 +7,7 @@ GPUs.
 """
 
 try:
-    from .kda_prefill2 import chunk_kda_sm100
+    from .kda_prefill import chunk_kda_sm100
 except (ImportError, RuntimeError):
     chunk_kda_sm100 = None  # type: ignore
 

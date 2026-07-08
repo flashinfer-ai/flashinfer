@@ -13,18 +13,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-KDA (Kimi Delta Attention) prefill tests.  Mirrors test_prefill_gdn2.py with
+KDA (Kimi Delta Attention) prefill tests.  Mirrors test_prefill_delta_rule2.py with
 the KDA interface: channel-wise LOG-space forget gate ``g`` plus a per-token
 scalar update gate ``beta`` (fla.ops.kda.chunk_kda conventions).
 
 Notes vs the GDN-2 tests:
   - beta/w collapse into the single per-token scalar ``beta``; there is no
     channel-wise erase/write gate.
-  - The gate is drawn from log([0.5, 1)): the SM100 kernel materializes
-    K / cumprod(exp(g)) within each 64-token chunk, so channel cumprods below
-    ~2^-64 overflow the anti-decay intermediate.
-  - Only bfloat16 io is tested (same anti-decay fp16 range limitation as
-    GDN-2).
+  - The gate is drawn from log([0.5, 1)) (log([0.9, 1)) for float16 io):
+    the SM100 kernel materializes K / cumprod(exp(g)) within each 64-token
+    chunk, so channel cumprods below ~2^-64 (~2^-14 for fp16) overflow the
+    anti-decay intermediate.
 """
 
 import math
@@ -57,6 +56,7 @@ def _make_gates(
     total_seqlen: int,
     num_sab_heads: int,
     head_size: int,
+    io_dtype: torch.dtype,
     use_g: bool,
     use_beta: bool,
     device,
@@ -64,6 +64,7 @@ def _make_gates(
     """KDA gates: g channel-wise log-space fp32, beta per-token scalar fp32
     (post-sigmoid space).  Both consumed by the kernel in fp32, so the
     reference sees exactly the values the kernel consumes."""
+    lo = 0.9 if io_dtype == torch.float16 else 0.5
     g = (
         (
             torch.rand(
@@ -73,8 +74,8 @@ def _make_gates(
                 dtype=torch.float32,
                 device=device,
             )
-            * 0.5
-            + 0.5
+            * (1.0 - lo)
+            + lo
         ).log()
         if use_g
         else None
@@ -105,7 +106,6 @@ def _test_prefill_kernel(
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
         )
-    no_decay = not use_g
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -127,7 +127,7 @@ def _test_prefill_kernel(
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
         cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
         g, beta = _make_gates(
-            total_seqlen, num_sab_heads, head_size, use_g, use_beta, device
+            total_seqlen, num_sab_heads, head_size, dtype, use_g, use_beta, device
         )
 
     our_o = torch.empty(
@@ -176,31 +176,26 @@ def _test_prefill_kernel(
 
     if dtype == torch.bfloat16:
         ref_o = ref_o.to(dtype)
-        atol_o = 1e-2
-        rtol_o = 1e-2
-        atol_kv = 5e-3
+        atol_o = 2e-2
+        rtol_o = 2e-2
+        atol_kv = 1e-2
         rtol_kv = 1e-3
-        if no_decay:
-            # g=None: no forget gate, so amplitudes grow along the sequence
-            # and accumulated bf16 rounding slightly exceeds the gated budget.
-            atol_o = 2e-2
-            rtol_o = 2e-2
-            atol_kv = 1e-2
     else:
-        atol_o = 1e-3
-        rtol_o = 1e-3
-        atol_kv = 1e-3
+        atol_o = 4e-3
+        rtol_o = 4e-3
+        atol_kv = 4e-3
         rtol_kv = 1e-4
 
     torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
     torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
 
 
-# KDA requires num_k_heads == num_q_heads and num_v_heads >= num_q_heads
-# (same head contract as GDN-2).
 _HEAD_CONFIGS = [
     (1, 1, 1),
+    (4, 1, 1),
     (3, 3, 3),
+    (6, 2, 2),
+    (1, 1, 2),
     (2, 2, 4),
     (16, 16, 32),
     (16, 16, 64),
@@ -213,7 +208,7 @@ _HEAD_CONFIGS = [
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", _HEAD_CONFIGS)
 @pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # fp16 io overflows the anti-decay
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_basic(
     qkv_factory,
     dtype: str,
@@ -252,7 +247,7 @@ def test_prefill_kernel_basic(
     "seq_lens",
     [[31], [61], [91], [121], [251], [511, 501], [31, 63, 93, 123, 150, 500]],
 )
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # fp16 io overflows the anti-decay
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_nonfull(
     qkv_factory,
     dtype: str,
@@ -285,7 +280,7 @@ def test_prefill_kernel_nonfull(
 @pytest.mark.parametrize(
     "num_q_heads,num_k_heads,num_v_heads", [(1, 1, 1), (16, 16, 64)]
 )
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # g is always on; fp16 overflows
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_zero_length_sequence(
     qkv_factory,
     dtype: str,
@@ -313,7 +308,9 @@ def test_prefill_kernel_zero_length_sequence(
             [seq_len], num_q_heads, num_k_heads, num_v_heads, head_size, dtype
         )
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
-        g, beta = _make_gates(seq_len, num_sab_heads, head_size, True, True, device)
+        g, beta = _make_gates(
+            seq_len, num_sab_heads, head_size, dtype, True, True, device
+        )
         cu_seq_lens = torch.tensor([0, seq_len], dtype=torch.int64)
         cu_seq_lens_with_empty = torch.tensor([0, seq_len, seq_len], dtype=torch.int64)
 
@@ -352,6 +349,64 @@ def test_prefill_kernel_zero_length_sequence(
     torch.testing.assert_close(our_o, ref_o, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prefill_zero_length_sequence_state_untouched(
+    qkv_factory,
+    dtype: str,
+    scale: float = 0.1,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _skip_if_not_sm100()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    seq_len = 256
+    head_size = 128
+    num_heads = 1
+    sentinel = 123.0
+    dtype = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q, k, v = qkv_factory(
+            [seq_len], num_heads, num_heads, num_heads, head_size, dtype
+        )
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        g, beta = _make_gates(seq_len, num_heads, head_size, dtype, True, True, device)
+        cu_seq_lens = torch.tensor([0, seq_len, seq_len], dtype=torch.int64)
+
+    our_o = torch.empty([seq_len, num_heads, head_size], dtype=q.dtype, device=q.device)
+    our_state = torch.empty(
+        (2, num_heads, head_size, head_size), dtype=torch.float32, device=q.device
+    )
+    our_state.fill_(sentinel)
+
+    chunk_kda(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seq_lens,
+        True,
+        output=our_o,
+        output_state=our_state,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        our_state[1],
+        torch.full_like(our_state[1], sentinel),
+        atol=0,
+        rtol=0,
+    )
+
+
 def _test_chunked_prefill(
     qkv_factory,
     dtype: str,
@@ -371,7 +426,6 @@ def _test_chunked_prefill(
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
         )
-    no_decay = not use_g
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -400,10 +454,10 @@ def _test_chunked_prefill(
         cu_seq_lens1 = torch.tensor(exclusive_cumsum(seq_lens1), dtype=torch.int64)
         cu_seq_lens2 = torch.tensor(exclusive_cumsum(seq_lens2), dtype=torch.int64)
         g1, beta1 = _make_gates(
-            total_seqlen1, num_sab_heads, head_size, use_g, use_beta, device
+            total_seqlen1, num_sab_heads, head_size, dtype, use_g, use_beta, device
         )
         g2, beta2 = _make_gates(
-            total_seqlen2, num_sab_heads, head_size, use_g, use_beta, device
+            total_seqlen2, num_sab_heads, head_size, dtype, use_g, use_beta, device
         )
 
     our_o1 = torch.empty(
@@ -500,19 +554,14 @@ def _test_chunked_prefill(
 
     if dtype == torch.bfloat16:
         ref_o = ref_o.to(dtype)
-        atol_o = 1e-2
-        rtol_o = 1e-2
-        atol_kv = 5e-3
+        atol_o = 2e-2
+        rtol_o = 2e-2
+        atol_kv = 1e-2
         rtol_kv = 1e-3
-        if no_decay:
-            # g=None: see above -- ungated growth needs a wider bf16 budget.
-            atol_o = 2e-2
-            rtol_o = 2e-2
-            atol_kv = 1e-2
     else:
-        atol_o = 2e-3
-        rtol_o = 1e-3
-        atol_kv = 1e-3
+        atol_o = 4e-3
+        rtol_o = 4e-3
+        atol_kv = 4e-3
         rtol_kv = 1e-4
 
     torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
@@ -537,7 +586,7 @@ def _test_chunked_prefill(
         )
     ),
 )
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # fp16 io overflows the anti-decay
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_chunked_prefill(
     qkv_factory,
     dtype: str,
@@ -603,7 +652,7 @@ def _test_checkpoint(
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
         cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
         g, beta = _make_gates(
-            total_seqlen, num_sab_heads, head_size, True, True, device
+            total_seqlen, num_sab_heads, head_size, dtype, True, True, device
         )
 
     # Compute per-sequence checkpoint counts and cu_starts
@@ -715,7 +764,7 @@ def _test_checkpoint(
     [(4, 4, 4), (2, 2, 4)],
 )
 @pytest.mark.parametrize("seq_lens", [[256], [128, 256, 512]])
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # g is always on; fp16 overflows
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_checkpoint_correctness(
     qkv_factory,
     dtype: str,
@@ -768,7 +817,7 @@ def test_checkpoint_noop(qkv_factory):
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
         cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
         g, beta = _make_gates(
-            total_seqlen, num_sab_heads, head_size, True, True, device
+            total_seqlen, num_sab_heads, head_size, torch.bfloat16, True, True, device
         )
 
     # Run without checkpointing
@@ -943,7 +992,7 @@ def _test_prefill_kernel_bf16_state(
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
         cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
         g, beta = _make_gates(
-            total_seqlen, num_sab_heads, head_size, True, True, device
+            total_seqlen, num_sab_heads, head_size, dtype, True, True, device
         )
 
     our_o = torch.empty(
@@ -1012,7 +1061,7 @@ def _test_prefill_kernel_bf16_state(
     ],
 )
 @pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
-@pytest.mark.parametrize("dtype", ["bfloat16"])  # g is always on; fp16 overflows
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_bf16_state(
     qkv_factory,
     dtype: str,
