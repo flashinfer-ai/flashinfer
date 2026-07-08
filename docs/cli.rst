@@ -80,7 +80,7 @@ Manage pre-compiled CUDA binaries:
 
 .. code-block:: bash
 
-   # Download pre-compiled cubins
+   # Download raw pre-compiled cubin artifacts to the local cache
    flashinfer download-cubin
 
    # List downloaded cubins
@@ -88,6 +88,25 @@ Manage pre-compiled CUDA binaries:
 
    # Clear downloaded cubins
    flashinfer clear-cubin
+
+Install Cubin Wheel
+-------------------
+
+Install the matching ``flashinfer-cubin`` wheel for the current FlashInfer
+environment:
+
+.. code-block:: bash
+
+   # Detect the FlashInfer version automatically
+   flashinfer install-cubin-wheel
+
+   # Use the nightly wheel index
+   flashinfer install-cubin-wheel --nightly
+
+   # Show the pip command without running it
+   flashinfer install-cubin-wheel --dry-run
+
+This command installs from the flat FlashInfer wheel index.
 
 Install JIT Cache Wheel
 -----------------------
@@ -111,6 +130,30 @@ and CUDA environment:
 
 This command installs from the FlashInfer wheel index instead of PyPI because
 ``flashinfer-jit-cache`` wheels are too large for PyPI hosting.
+
+Download Kernels
+----------------
+
+Install both optional kernel wheels for the current FlashInfer and CUDA
+environment. This combines ``install-cubin-wheel`` and
+``install-jit-cache-wheel``.
+
+.. code-block:: bash
+
+   # Install flashinfer-cubin and flashinfer-jit-cache
+   flashinfer download-kernels
+
+   # Override CUDA version detection for the jit-cache wheel
+   flashinfer download-kernels --cuda-version 12.9
+
+   # Use nightly wheel indexes
+   flashinfer download-kernels --nightly
+
+   # Show both pip commands without running them
+   flashinfer download-kernels --dry-run
+
+``flashinfer-cubin`` is installed from the flat FlashInfer wheel index, while
+``flashinfer-jit-cache`` is installed from the CUDA-specific wheel index.
 
 Cache Management
 ----------------
