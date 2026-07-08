@@ -109,6 +109,8 @@ from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
+from .gemm import MmBf16Plan as MmBf16Plan
+from .gemm import plan_mm_bf16 as plan_mm_bf16
 from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_bf16_fp4 as mm_bf16_fp4
 from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
