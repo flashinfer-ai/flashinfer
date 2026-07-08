@@ -327,6 +327,56 @@ def test_install_jit_cache_wheel_cmd_nightly_dry_run(monkeypatch):
     )
 
 
+def test_install_jit_cache_wheel_cmd_floors_newer_cuda_minor(monkeypatch):
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run should not be called for dry-run")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    out = _test_cmd_helper(
+        [
+            "install-jit-cache-wheel",
+            "--cuda-version",
+            "13.3",
+            "--dry-run",
+        ]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "CUDA version: 13.3",
+        "Wheel CUDA label: cu130",
+        "https://flashinfer.ai/whl/cu130",
+        "flashinfer-jit-cache==0.4.1+cu130",
+    )
+
+
+def test_install_jit_cache_wheel_cmd_rejects_unsupported_cuda_floor():
+    from click.testing import CliRunner
+
+    from flashinfer.__main__ import cli
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "install-jit-cache-wheel",
+            "--cuda-version",
+            "12.7",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    _assert_output_contains_all(
+        result.output,
+        "No compatible flashinfer-jit-cache wheel found for CUDA 12.7",
+        "Supported wheel labels: cu128, cu129, cu130",
+    )
+
+
 def test_download_jit_cache_alias_cmd_mocked(monkeypatch):
     recorded = {}
 

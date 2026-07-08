@@ -37,6 +37,10 @@ from .jit.cpp_ext import get_cuda_path, get_cuda_version
 # Import __version__ from centralized version module
 from .version import __version__
 
+_SUPPORTED_JIT_CACHE_CUDA_VERSIONS = tuple(
+    Version(version) for version in ("12.8", "12.9", "13.0")
+)
+
 
 def _download_cubin():
     """Helper function to download cubin artifacts into FLASHINFER_CUBIN_DIR."""
@@ -84,6 +88,25 @@ def _parse_cuda_version(cuda_version: str | None) -> Version:
 
 def _cuda_version_to_index_label(cuda_version: Version) -> str:
     return f"cu{cuda_version.major}{cuda_version.minor}"
+
+
+def _resolve_jit_cache_cuda_version(cuda_version: Version) -> Version:
+    compatible_versions = [
+        supported_version
+        for supported_version in _SUPPORTED_JIT_CACHE_CUDA_VERSIONS
+        if supported_version.major == cuda_version.major
+        and supported_version <= cuda_version
+    ]
+    if not compatible_versions:
+        supported_labels = ", ".join(
+            _cuda_version_to_index_label(version)
+            for version in _SUPPORTED_JIT_CACHE_CUDA_VERSIONS
+        )
+        raise click.ClickException(
+            f"No compatible flashinfer-jit-cache wheel found for CUDA {cuda_version}. "
+            f"Supported wheel labels: {supported_labels}."
+        )
+    return max(compatible_versions)
 
 
 def _get_public_flashinfer_version(flashinfer_version: str) -> str:
@@ -185,8 +208,9 @@ def _install_jit_cache_wheel(
     nightly: bool,
     dry_run: bool,
 ) -> None:
-    resolved_cuda_version = _parse_cuda_version(cuda_version)
-    cuda_index_label = _cuda_version_to_index_label(resolved_cuda_version)
+    detected_cuda_version = _parse_cuda_version(cuda_version)
+    wheel_cuda_version = _resolve_jit_cache_cuda_version(detected_cuda_version)
+    cuda_index_label = _cuda_version_to_index_label(wheel_cuda_version)
     resolved_flashinfer_version = flashinfer_version or __version__
     requirement = _build_jit_cache_requirement(
         resolved_flashinfer_version, cuda_index_label
@@ -200,7 +224,9 @@ def _install_jit_cache_wheel(
     click.secho("FlashInfer version:", fg="magenta", nl=False)
     click.secho(f" {resolved_flashinfer_version}", fg="cyan")
     click.secho("CUDA version:", fg="magenta", nl=False)
-    click.secho(f" {resolved_cuda_version}", fg="cyan")
+    click.secho(f" {detected_cuda_version}", fg="cyan")
+    click.secho("Wheel CUDA label:", fg="magenta", nl=False)
+    click.secho(f" {cuda_index_label}", fg="cyan")
     click.secho("Wheel index:", fg="magenta", nl=False)
     click.secho(f" {resolved_index_url}", fg="cyan")
     click.secho("Requirement:", fg="magenta", nl=False)
