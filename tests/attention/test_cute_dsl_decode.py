@@ -127,6 +127,7 @@ def _decode_reference_contiguous(
     k: torch.Tensor,
     v: torch.Tensor,
     sm_scale: float,
+    sinks: torch.Tensor | None = None,
 ):
     """Ragged (contiguous KV) GQA decode reference; q has shape [b, 1, h_q, d]."""
     batch_size, q_len, num_qo_heads, head_dim = q.shape
@@ -137,7 +138,13 @@ def _decode_reference_contiguous(
     values = v.repeat_interleave(group, dim=2).float()
     q_f32 = q.float()
     logits = torch.einsum("bqhd,bnhd->bhqn", q_f32, keys) * sm_scale
+    if sinks is not None:
+        sink_logits = sinks.float().view(1, num_qo_heads, 1, 1)
+        sink_logits = sink_logits.expand(batch_size, -1, q_len, -1)
+        logits = torch.cat([logits, sink_logits], dim=-1)
     probs = torch.softmax(logits, dim=-1)
+    if sinks is not None:
+        probs = probs[:, :, :, :-1]
     out = torch.einsum("bhqn,bnhd->bqhd", probs, values)
     return out.to(q.dtype)
 
@@ -468,6 +475,16 @@ def test_ragged_cute_run_deprecated_positional_args_warn_and_bind(monkeypatch):
     assert captured["kwargs"]["enable_pdl"] is False
 
 
+def test_ragged_cute_run_deprecation_sinks_is_keyword_only(monkeypatch):
+    wrapper, captured = _capture_ragged_cute_run_impl(monkeypatch)
+
+    wrapper.run("q", "k", "v", sinks="sinks")
+    assert captured["kwargs"]["sinks"] == "sinks"
+
+    with pytest.raises(TypeError, match="at most 5"):
+        wrapper.run("q", "k", "v", *(None,) * 6)
+
+
 def test_ragged_cute_run_duplicate_deprecated_positional_arg_rejected(monkeypatch):
     wrapper, _ = _capture_ragged_cute_run_impl(monkeypatch)
 
@@ -553,6 +570,35 @@ def test_cute_dsl_decode_ragged(batch_size, kv_len, dtype):
     ret = wrapper.run(q, k, v, out=out_buf)
     assert ret.data_ptr() == out_buf.data_ptr()
     torch.testing.assert_close(out_buf, ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_cute_dsl_decode_ragged_attention_sinks(dtype):
+    torch.manual_seed(0)
+    batch_size, kv_len = 4, 1024
+    q = torch.randn(batch_size, 1, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    k = torch.randn(
+        batch_size, kv_len, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    sinks = torch.randn(NUM_QO_HEADS, device=DEVICE, dtype=torch.float32)
+
+    wrapper = BatchDecodeCuteDSLWrapper(
+        torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+    )
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    wrapper.plan(
+        batch_size=batch_size,
+        max_kv_len=kv_len,
+        num_qo_heads=NUM_QO_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+    )
+    out = wrapper.run(q, k, v, sinks=sinks)
+    ref = _decode_reference_contiguous(q, k, v, sm_scale, sinks=sinks)
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
 
 
 # ---------------------------------------------------------------------------

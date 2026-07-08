@@ -334,6 +334,7 @@ def _get_compiled_decode_kernel(
     window_left: Optional[int],
     window_right: Optional[int],
     use_lse: bool,
+    use_sink: bool,
 ):
     """Compile and cache the ragged (contiguous-KV) GQA decode kernel."""
     grouped_head_tile, prediction_tile = _pick_tile_shape(
@@ -430,6 +431,12 @@ def _get_compiled_decode_kernel(
             assumed_align=16,
         )
 
+    sink_fake = None
+    if use_sink:
+        sink_fake = cute.runtime.make_fake_compact_tensor(
+            acc_dtype, (num_qo_heads,), assumed_align=16
+        )
+
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     return cute.compile(
@@ -444,7 +451,7 @@ def _get_compiled_decode_kernel(
         o_partial_fake,
         l_partial_fake,
         m_partial_fake,
-        None,  # sink_h
+        sink_fake,
         mask_config,
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
@@ -870,8 +877,8 @@ class BatchDecodeCuteDSLWrapper:
             self._l_partial = l_partial
             self._m_partial = m_partial
 
-        # Always compile the no-LSE variant at plan() time; the LSE variant
-        # is lazily fetched at run() time when needed (compile cache hit).
+        # Always compile the no-LSE/no-sink variant at plan() time; optional
+        # feature variants are lazily fetched at run() time when needed.
         self._compile_args = (
             in_dtype,
             out_dtype,
@@ -884,7 +891,7 @@ class BatchDecodeCuteDSLWrapper:
             window_right,
         )
         self._compiled_fmha_std = _get_compiled_decode_kernel(
-            *self._compile_args, False
+            *self._compile_args, False, False
         )
         self._planned = True
 
@@ -918,6 +925,11 @@ class BatchDecodeCuteDSLWrapper:
             Output scale applied to the final O before it is written. The
             cute-dsl kernel folds this in for free in the reduction
             epilogue (no separate post-kernel multiply). Defaults to 1.0.
+        sinks : Optional[torch.Tensor]
+            Contiguous float32 per-head attention sink logits on the query
+            device, shape ``(num_qo_heads,)``. When provided, the sink logit
+            is included in the softmax denominator and receives no output
+            value contribution.
         lse : Optional[torch.Tensor]
             Pre-allocated float32 buffer of shape
             ``(batch_size, q_len_per_req, num_qo_heads)`` to receive the
@@ -936,6 +948,7 @@ class BatchDecodeCuteDSLWrapper:
         Optional arguments after ``v`` are accepted positionally for backward
         compatibility, but that calling convention is deprecated and scheduled
         for removal in a future release. Pass them by keyword instead.
+        ``sinks`` is keyword-only.
         """
         if not deprecated_positional_args:
             return self._run_impl(q, k, v, **kwargs)
@@ -958,6 +971,7 @@ class BatchDecodeCuteDSLWrapper:
         out: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
         o_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
     ) -> torch.Tensor:
@@ -1029,6 +1043,7 @@ class BatchDecodeCuteDSLWrapper:
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
         use_lse = lse is not None
+        use_sink = sinks is not None
         if use_lse:
             if lse.dtype != torch.float32:
                 raise ValueError(
@@ -1040,11 +1055,28 @@ class BatchDecodeCuteDSLWrapper:
                     f"lse shape {tuple(lse.shape)} must equal {expected_lse_shape}"
                 )
 
-        fmha = (
-            self._compiled_fmha_std
-            if not use_lse
-            else _get_compiled_decode_kernel(*self._compile_args, True)
-        )
+        if use_sink:
+            if sinks.ndim != 1 or sinks.shape[0] != self._num_qo_heads:
+                raise ValueError(
+                    f"sinks tensor must have shape (num_qo_heads,) = "
+                    f"({self._num_qo_heads},), got shape {tuple(sinks.shape)}"
+                )
+            if sinks.dtype != torch.float32:
+                raise ValueError(f"sinks must be float32, got {sinks.dtype}")
+            if sinks.device != device:
+                raise ValueError(
+                    f"sinks must be on device {device}, got {sinks.device}"
+                )
+            if not sinks.is_contiguous():
+                raise ValueError(
+                    f"sinks tensor must be contiguous, got strides {sinks.stride()} "
+                    f"for shape {sinks.shape}"
+                )
+
+        if use_lse or use_sink:
+            fmha = _get_compiled_decode_kernel(*self._compile_args, use_lse, use_sink)
+        else:
+            fmha = self._compiled_fmha_std
 
         scale_o = 1.0 if o_scale is None else o_scale
         # Stream is bound from the TVM-FFI env stream at runtime
@@ -1060,7 +1092,7 @@ class BatchDecodeCuteDSLWrapper:
             o_partial,
             l_partial,
             m_partial,
-            None,  # sink_h
+            sinks,
             self._mask_config,
             Float32(scale_s),
             Float32(scale_o),
