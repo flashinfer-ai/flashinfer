@@ -2073,8 +2073,12 @@ def _build_w_ptr_table(weights, num_experts):
     [pytest.param(ActivationType.Swiglu, id="Swiglu")],
 )
 @pytest.mark.parametrize(
-    "real_delta",
-    [pytest.param(False, id="fake_delta"), pytest.param(True, id="real_delta")],
+    "delta_mode",
+    [
+        pytest.param("fake", id="fake_delta"),
+        pytest.param("real", id="real_delta"),
+        pytest.param("performant", id="performant_delta"),
+    ],
 )
 def test_moe_lora_delta(
     num_tokens,
@@ -2084,20 +2088,27 @@ def test_moe_lora_delta(
     routing_config,
     weight_processing,
     activation_type,
-    real_delta,
+    delta_mode,
     cache_permute_indices,
 ):
     """MoE reference/kernel comparison with `gemm1_lora_delta` threaded through
-    run_moe_test. `real_delta` selects:
-      * False: zero vs constant delta, so the test fails if LoRA is silently dropped;
-      * True: delta built by bgmv_moe_gemm1_lora_delta inside run_moe_test, whose
-        kernel-vs-reference check validates the injected delta end-to-end."""
+    run_moe_test. `delta_mode` selects:
+      * "fake": zero vs constant delta, so the test fails if LoRA is silently dropped;
+      * "real": regular 2-slice delta built by bgmv_moe_gemm1_lora_delta inside run_moe_test;
+      * "performant": shared-A + horizontally-fused-B delta via 1D [E] w_ptr tables."""
+    if delta_mode == "performant" and not (
+        num_tokens == 128
+        and weight_processing["layout"] == WeightLayout.BlockMajorK
+        and isinstance(moe_impl, (BF16Moe, FP8BlockScaleMoe))
+    ):
+        pytest.skip("performant LoRA is covered on a reduced matrix")
+
     top_k = routing_config["top_k"]
     zero_delta = torch.zeros(
         num_tokens, top_k, 2 * intermediate_size, dtype=torch.bfloat16, device="cuda"
     )
 
-    # Zero-delta baseline shared by both modes (proves the delta changes the output).
+    # Zero-delta baseline shared by all modes (proves the delta changes the output).
     zero_reference, _, _ = run_moe_test(
         num_tokens,
         hidden_size,
@@ -2110,7 +2121,7 @@ def test_moe_lora_delta(
         gemm1_lora_delta=zero_delta,
     )
 
-    if not real_delta:
+    if delta_mode == "fake":
         delta = torch.full_like(zero_delta, 4)
         delta_reference, _, delta_args_dequant = run_moe_test(
             num_tokens,
@@ -2127,40 +2138,71 @@ def test_moe_lora_delta(
         assert (delta_reference - zero_reference).abs().max().item() > 0.05
         return
 
-    # Real delta: built inside run_moe_test from the generated hidden states + routing.
+    # Real / performant delta: built inside run_moe_test from the generated hidden + routing.
     num_experts = routing_config["num_experts"]
     rank, num_loras, lora_scale = 16, 4, 0.5
     torch.manual_seed(1234)
-    lora_a = [
-        torch.randn(
-            num_loras,
-            num_experts,
-            rank,
-            hidden_size,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        * 0.02
-        for _ in range(2)
-    ]
-    lora_b = [
-        torch.randn(
-            num_loras,
-            num_experts,
-            intermediate_size,
-            rank,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        * 0.02
-        for _ in range(2)
-    ]
     lora_ids = torch.randint(
         0, num_loras, (num_tokens,), dtype=torch.int64, device="cuda"
     )
     lora_ids[num_tokens // 2 :] = -1  # some tokens have no adapter
-    w_ptr_a, stride_a = _build_w_ptr_table(lora_a, num_experts)
-    w_ptr_b, stride_b = _build_w_ptr_table(lora_b, num_experts)
+
+    if delta_mode == "performant":
+        a_shared = (
+            torch.randn(
+                num_loras,
+                num_experts,
+                rank,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            * 0.02
+        )
+        b_fused = (
+            torch.randn(
+                num_loras,
+                num_experts,
+                2 * intermediate_size,
+                rank,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            * 0.02
+        )
+        w_ptr_a, stride_a = _build_w_ptr_table([a_shared], num_experts)
+        w_ptr_b, stride_b = _build_w_ptr_table([b_fused], num_experts)
+        w_ptr_a, w_ptr_b = (
+            w_ptr_a.reshape(-1),
+            w_ptr_b.reshape(-1),
+        )  # drop slice dim -> [E]
+    else:
+        lora_a = [
+            torch.randn(
+                num_loras,
+                num_experts,
+                rank,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            * 0.02
+            for _ in range(2)
+        ]
+        lora_b = [
+            torch.randn(
+                num_loras,
+                num_experts,
+                intermediate_size,
+                rank,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            * 0.02
+            for _ in range(2)
+        ]
+        w_ptr_a, stride_a = _build_w_ptr_table(lora_a, num_experts)
+        w_ptr_b, stride_b = _build_w_ptr_table(lora_b, num_experts)
 
     real_reference, real_actual, real_args = run_moe_test(
         num_tokens,

@@ -16,53 +16,17 @@ limitations under the License.
 ------------------------------------------------------------------------------
 Multi-LoRA delta builders for the routed TRT-LLM fused MoE (single node).
 
-These produce the per-(token,expert) LoRA deltas for the two layers of a SwiGLU
-MoE expert FFN by driving the BGMV ``shrink``/``expand`` kernels (``bgmv_moe.py``)
-in their proper modes -- no host-side index tricks:
+They compute the per-(token, expert) LoRA deltas for a SwiGLU MoE expert FFN by driving
+the BGMV shrink/expand kernels (``bgmv_moe.py``):
 
-  * FC1 (gate_up, the GLU) -> ``bgmv_moe_gemm1_lora_delta`` -> ``[T, k, 2I]`` bf16,
-    fed INTO ``trtllm_*_moe`` as ``gemm1_lora_delta`` (added pre-SwiGLU). Uses the
-    expand kernel's ``finalize=False`` mode (per-pair, unweighted, plain store).
-  * FC2 (down_proj)        -> ``bgmv_moe_gemm2_lora_delta`` -> ``[T, H]``, ADDED to
-    the MoE output. Uses the shrink kernel's ``per_pair_input=True`` mode (the
-    gathered post-SwiGLU activation is per-pair) + the normal finalize expand.
+  * FC1 (gate_up) -> ``bgmv_moe_gemm1_lora_delta`` -> ``[T, k, 2I]``, fed into
+    ``trtllm_*_moe`` as ``gemm1_lora_delta`` (added pre-SwiGLU).
+  * FC2 (down)    -> ``bgmv_moe_gemm2_lora_delta`` -> ``[T, H]``, added to the MoE output.
 
-This is the "compute" half of multi-tenant MoE LoRA (PR #3249); the "inject" half
-is the ``gemm1_lora_delta`` parameter of the ``trtllm_*_moe`` routed APIs (PR #3153).
-
-The LoRA weights are **managed by the caller**: the builders take the
-``[num_slices, num_experts]`` int64 base-pointer tables (``w_ptr``) and the element
-``lora_stride`` between adapters — built once with :func:`flashinfer.fused_moe.fill_w_ptr`
-over weight banks of layout ``[max_loras, num_experts, *, *]`` — not the weight tensors
-themselves. This lets a serving stack build the pointer tables once and reuse them across
-layers / steps.
-
-Caller wiring (single node)::
-
-    # build the pointer tables once (weights live in the caller's LoRA manager):
-    wpa1 = torch.zeros(2, E, dtype=torch.int64, device=dev); s_a1 = 0
-    for s, w in enumerate([A_gate, A_up]):  s_a1 = fill_w_ptr(wpa1, w, E, s)
-    wpb1 = torch.zeros(2, E, dtype=torch.int64, device=dev); s_b1 = 0
-    for s, w in enumerate([B_gate, B_up]):  s_b1 = fill_w_ptr(wpb1, w, E, s)
-
-    delta1 = bgmv_moe_gemm1_lora_delta(h_bf16, wpa1, s_a1, wpb1, s_b1,
-                                       topk_ids, lora_ids, rank, intermediate_size,
-                                       scale=alpha / rank)
-    out, exp2perm, act = trtllm_fp8_block_scale_moe(
-        topk_ids_packed, ..., gemm1_lora_delta=delta1, do_finalize=True,
-        fp8_quantization_type=Fp8QuantizationType.MxFp8)
-
-    # likewise wpa2/wpb2 for [A_down] / [B_down] (num_slices == 1):
-    delta2 = bgmv_moe_gemm2_lora_delta(act, exp2perm, wpa2, s_a2, wpb2, s_b2,
-                                       topk_ids, topk_weights, lora_ids, rank, hidden_size,
-                                       scale=alpha / rank)
-    out = out + delta2
-
-``topk_ids`` here is the **unpacked** expert id per (token, slot); the ``trtllm_*_moe``
-call needs the packed ``(expert_id << 16) | weight_bf16`` form (pack it separately).
-``topk_weights`` fed to the FC2 builder must be the *effective* per-(token,expert)
-weights the kernel combined with (post-normalization / ``routed_scaling_factor``).
-``num_experts`` is taken from ``w_ptr.shape[1]`` by the kernel, so it is not a builder arg.
+LoRA weights are caller-managed: the builders take the ``[num_slices, num_experts]`` int64
+base-pointer tables (``w_ptr``) and the per-adapter ``lora_stride``, built once with
+:func:`flashinfer.fused_moe.fill_w_ptr` over banks ``[max_loras, num_experts, *, *]``.
+``topk_ids`` is the UNPACKED expert id per (token, slot).
 """
 
 from typing import Tuple
@@ -119,21 +83,28 @@ def bgmv_moe_gemm1_lora_delta(
     Unweighted and kept per-(token, slot) (it is added before the nonlinear SwiGLU, so it
     must not be summed over experts nor scaled by routing weights).
 
+    **Performant (shared-A) LoRA** is selected by passing 1D ``[num_experts]`` pointer tables
+    (no slice dim): a single shared ``A`` feeds both slices and ``B`` is fused horizontally
+    into one ``[2I, rank]`` matrix, so the delta is ``scale * B_fused @ (A_shared @ x[t])`` —
+    one shrink + one fused expand instead of two of each.
+
     Parameters
     ----------
     hidden_states : torch.Tensor
         ``[T, H]`` FFN input. Cast to ``lora_dtype`` for the LoRA path, independent of the
         FP8/MXFP8 base weights.
     w_ptr_a : torch.Tensor
-        ``[2, num_experts]`` int64 base-pointer table for the LoRA-A weights ``[A_gate, A_up]``
-        (each bank ``[max_loras, num_experts, rank, H]``), from :func:`fill_w_ptr`.
+        LoRA-A int64 base-pointer table, from :func:`fill_w_ptr`. ``[2, num_experts]``
+        (regular) points to ``[A_gate, A_up]``; ``[num_experts]`` 1D (no slice dim) selects
+        **performant LoRA** (one shared A).
     lora_stride_a : int
-        Element stride between adapters in the A banks (the ``fill_w_ptr`` return value).
+        Element stride between adapters in the A bank(s) (the ``fill_w_ptr`` return value).
     w_ptr_b : torch.Tensor
-        ``[2, num_experts]`` int64 base-pointer table for the LoRA-B weights ``[B_gate, B_up]``
-        (each bank ``[max_loras, num_experts, I, rank]``).
+        LoRA-B int64 base-pointer table. ``[2, num_experts]`` (regular) points to
+        ``[B_gate, B_up]``; ``[num_experts]`` 1D selects performant LoRA (B fused as
+        ``[2I, rank]``: gate rows ``0:I``, up rows ``I:2I``).
     lora_stride_b : int
-        Element stride between adapters in the B banks.
+        Element stride between adapters in the B bank(s).
     topk_ids : torch.Tensor
         ``[T, top_k]`` int — UNPACKED routed expert id per (token, slot).
     lora_ids : torch.Tensor
@@ -154,9 +125,19 @@ def bgmv_moe_gemm1_lora_delta(
     torch.Tensor
         ``[T, top_k, 2*I]`` in ``out_dtype``. Pass as ``gemm1_lora_delta``.
     """
-    assert w_ptr_a.shape[0] == 2 and w_ptr_b.shape[0] == 2, (
-        "FC1 LoRA is a 2-slice (gate, up) GLU projection"
-    )
+    if w_ptr_a.dim() != w_ptr_b.dim():
+        raise ValueError(
+            "w_ptr_a and w_ptr_b must have the same rank (both 2D or both 1D)"
+        )
+    performant = w_ptr_a.dim() == 1
+    if performant:
+        w_ptr_a = w_ptr_a.reshape(1, -1)
+        w_ptr_b = w_ptr_b.reshape(1, -1)
+    else:
+        assert w_ptr_a.shape[0] == 2 and w_ptr_b.shape[0] == 2, (
+            "regular FC1 LoRA is a 2-slice (gate, up) GLU projection"
+        )
+
     T, _ = hidden_states.shape
     k = topk_ids.shape[1]
     P = T * k
@@ -167,8 +148,10 @@ def bgmv_moe_gemm1_lora_delta(
     lora_idx = lora_ids.to(torch.int64)
     x = hidden_states.to(lora_dtype)
 
-    # Shrink: x @ A -> [2, P, rank]. Per-token input read (default mode).
-    shrink_out = torch.zeros(2, P, rank, dtype=lora_dtype, device=device)
+    num_slices = 1 if performant else 2
+
+    # Shrink: x @ A -> [num_slices, P, rank]. Per-token input read (default mode).
+    shrink_out = torch.zeros(num_slices, P, rank, dtype=lora_dtype, device=device)
     bgmv_moe_shrink(
         shrink_out,
         x,
@@ -180,8 +163,13 @@ def bgmv_moe_gemm1_lora_delta(
         per_pair_input=False,
     )
 
-    # Expand: shrink_out @ B -> [P, 2I], per-pair unweighted store; zeroed so skipped pairs stay 0.
-    slice_start_loc = torch.tensor([0, inter], dtype=torch.int64, device=device)
+    # Expand: shrink_out @ B = [P, 2I], per-pair unweighted store; zeroed so skipped pairs stay 0.
+    if performant:
+        slice_start_loc = torch.tensor([0], dtype=torch.int64, device=device)
+        output_slices = [2 * inter]
+    else:
+        slice_start_loc = torch.tensor([0, inter], dtype=torch.int64, device=device)
+        output_slices = [inter, inter]
     unit_w = torch.ones(P, dtype=torch.float32, device=device)  # ignored by the kernel
     y = torch.zeros(P, 2 * inter, dtype=torch.float32, device=device)
     bgmv_moe_expand(
@@ -193,7 +181,7 @@ def bgmv_moe_gemm1_lora_delta(
         unit_w,
         lora_idx,
         slice_start_loc,
-        [inter, inter],
+        output_slices,
         lora_stride_b,
         finalize=False,
     )
@@ -240,18 +228,15 @@ def bgmv_moe_gemm2_lora_delta(
         ``[T*top_k]`` int — maps expanded index ``token*top_k+slot`` to the permuted row
         (trtllm return); ``< 0`` marks an inactive slot.
     w_ptr_a : torch.Tensor
-        ``[1, num_experts]`` int64 base-pointer table for ``[A_down]`` (bank
-        ``[max_loras, num_experts, rank, I]``), from :func:`fill_w_ptr`.
+        ``[1, num_experts]`` int64 base-pointer table for ``[A_down]``, from :func:`fill_w_ptr`.
     lora_stride_a : int
         Element stride between adapters in the A_down bank.
     w_ptr_b : torch.Tensor
-        ``[1, num_experts]`` int64 base-pointer table for ``[B_down]`` (bank
-        ``[max_loras, num_experts, H, rank]``).
+        ``[1, num_experts]`` int64 base-pointer table for ``[B_down]``.
     lora_stride_b : int
         Element stride between adapters in the B_down bank.
     topk_ids, topk_weights : torch.Tensor
-        ``[T, top_k]`` routed expert ids (int) and the *effective* routing weights (f32)
-        the kernel combined with.
+        ``[T, top_k]`` routed expert ids (int) and per-expert combine weights (f32).
     lora_ids : torch.Tensor
         ``[T]`` int adapter id per token (``-1`` = none).
     rank : int

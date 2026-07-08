@@ -87,6 +87,25 @@ def _ref_fc1_delta(hidden, lora_a, lora_b, topk_ids, lora_ids, scale):
     return out
 
 
+def _ref_fc1_delta_fused(hidden, a_shared, b_fused, topk_ids, lora_ids, scale):
+    """delta[t, j, :] = scale * B_fused[l,e] @ (A_shared[l,e] @ x[t]), unweighted."""
+    T, _ = hidden.shape
+    k = topk_ids.shape[1]
+    two_i = b_fused.shape[2]
+    out = torch.zeros(T, k, two_i, dtype=torch.float32, device=hidden.device)
+    hf = hidden.float()
+    for t in range(T):
+        lid = int(lora_ids[t])
+        if lid < 0:
+            continue
+        for j in range(k):
+            e = int(topk_ids[t, j])
+            a = a_shared[lid, e].float()  # [r, H]
+            b = b_fused[lid, e].float()  # [2I, r]
+            out[t, j] = scale * (b @ (a @ hf[t]))
+    return out
+
+
 def _ref_fc2_delta(
     act_perm, perm, lora_a, lora_b, topk_ids, topk_weights, lora_ids, scale
 ):
@@ -129,7 +148,9 @@ def _make_routing(T, k, num_experts, max_loras, device):
 @pytest.mark.parametrize("inter", [768])
 @pytest.mark.parametrize("rank", [16, 32])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gemm1_lora_delta(T, hidden, inter, rank, dtype):
+@pytest.mark.parametrize("performant", [False, True])
+def test_gemm1_lora_delta(T, hidden, inter, rank, dtype, performant):
+    """Regular (2-slice, 2D w_ptr) and performant (shared-A + fused-B, 1D w_ptr) FC1 delta."""
     _skip_if_unsupported_sm()
     device = torch.device("cuda")
     torch.manual_seed(1)
@@ -137,20 +158,47 @@ def test_gemm1_lora_delta(T, hidden, inter, rank, dtype):
     scale = 0.5
 
     hidden_states = torch.randn(T, hidden, dtype=dtype, device=device) * 0.1
-    lora_a = [
-        torch.randn(max_loras, num_experts, rank, hidden, dtype=dtype, device=device)
-        * 0.02
-        for _ in range(2)
-    ]
-    lora_b = [
-        torch.randn(max_loras, num_experts, inter, rank, dtype=dtype, device=device)
-        * 0.02
-        for _ in range(2)
-    ]
     topk_ids, _, lora_ids = _make_routing(T, k, num_experts, max_loras, device)
 
-    w_ptr_a, stride_a = _build_w_ptr(lora_a, num_experts)
-    w_ptr_b, stride_b = _build_w_ptr(lora_b, num_experts)
+    if performant:
+        a_shared = (
+            torch.randn(
+                max_loras, num_experts, rank, hidden, dtype=dtype, device=device
+            )
+            * 0.02
+        )
+        b_fused = (
+            torch.randn(
+                max_loras, num_experts, 2 * inter, rank, dtype=dtype, device=device
+            )
+            * 0.02
+        )
+        w_ptr_a, stride_a = _build_w_ptr([a_shared], num_experts)
+        w_ptr_b, stride_b = _build_w_ptr([b_fused], num_experts)
+        w_ptr_a, w_ptr_b = (
+            w_ptr_a.reshape(-1),
+            w_ptr_b.reshape(-1),
+        )  # drop slice dim -> [E]
+        ref = _ref_fc1_delta_fused(
+            hidden_states, a_shared, b_fused, topk_ids, lora_ids, scale
+        )
+    else:
+        lora_a = [
+            torch.randn(
+                max_loras, num_experts, rank, hidden, dtype=dtype, device=device
+            )
+            * 0.02
+            for _ in range(2)
+        ]
+        lora_b = [
+            torch.randn(max_loras, num_experts, inter, rank, dtype=dtype, device=device)
+            * 0.02
+            for _ in range(2)
+        ]
+        w_ptr_a, stride_a = _build_w_ptr(lora_a, num_experts)
+        w_ptr_b, stride_b = _build_w_ptr(lora_b, num_experts)
+        ref = _ref_fc1_delta(hidden_states, lora_a, lora_b, topk_ids, lora_ids, scale)
+
     out = bgmv_moe_gemm1_lora_delta(
         hidden_states,
         w_ptr_a,
@@ -165,7 +213,6 @@ def test_gemm1_lora_delta(T, hidden, inter, rank, dtype):
         scale=scale,
         out_dtype=dtype,
     )
-    ref = _ref_fc1_delta(hidden_states, lora_a, lora_b, topk_ids, lora_ids, scale)
 
     assert out.shape == (T, k, 2 * inter)
     torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
