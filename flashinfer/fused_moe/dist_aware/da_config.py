@@ -80,6 +80,10 @@ class DAConfig:
     enabled: bool = field(
         default_factory=lambda: _env_bool("FLASHINFER_DIST_AWARE_AUTOTUNE", False)
     )
+    # Enables combined-index M+N tactic search for DA profiling.
+    factorized_autotune: bool = field(
+        default_factory=lambda: _env_bool("FLASHINFER_DA_FACTORIZED_AUTOTUNE", True)
+    )
     # Synthetic routing distributions used for value-aware autotuning.
     distributions: tuple[DADistributionSpec, ...] = field(
         default_factory=lambda: get_da_distribution_specs(

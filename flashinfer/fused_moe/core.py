@@ -1242,6 +1242,7 @@ def get_trtllm_moe_sm100_module():
         # Cache valid tactics to reduce the overhead of re-querying the kernel.
         # TODO(siyuan): directly cache the runners
         valid_tactics_dict = dict()
+        factorized_tactics_dict = dict()
 
         def __init__(
             self,
@@ -1259,6 +1260,7 @@ def get_trtllm_moe_sm100_module():
             use_per_token_scaling: bool = False,
             num_experts: Optional[int] = None,
             num_fused_shared_experts: int = 0,
+            factorized_da_enabled: bool = False,
         ):
             self.num_local_experts = num_local_experts
             self.top_k = top_k
@@ -1279,6 +1281,30 @@ def get_trtllm_moe_sm100_module():
             self.use_per_token_scaling = use_per_token_scaling
             self.num_experts = (
                 num_experts if num_experts is not None else num_local_experts
+            )
+            self.factorized_da_enabled = factorized_da_enabled
+
+        def _tactics_instance_key(
+            self, moe_inputs: "MoEInputs", profile: OptimizationProfile
+        ) -> tuple:
+            num_tokens = int(
+                profile.get_opt_shapes()[MoEInputs.idx("hidden_states")][0]
+            )
+            nfse = self.num_fused_shared_experts
+            return (
+                self.dtype_act,
+                self.dtype_weights,
+                self.fp8_quantization_type,
+                self.top_k + nfse,
+                self.hidden_size,
+                self.intermediate_size,
+                self.num_local_experts + nfse,
+                self.activation_type,
+                self.use_shuffled_weight,
+                self.weight_layout,
+                self.use_per_token_scaling,
+                num_tokens,
+                moe_inputs.gemm1_lora_delta is not None,
             )
 
         def _make_tuning_config(
@@ -1381,7 +1407,6 @@ def get_trtllm_moe_sm100_module():
             num_tokens = int(
                 profile.get_opt_shapes()[MoeRunnerInputs.idx("hidden_states")][0]
             )
-
             major, _ = get_compute_capability(moe_inputs.hidden_states.device)
             if (
                 num_tokens * (self.top_k + self.num_fused_shared_experts)
@@ -1389,30 +1414,7 @@ def get_trtllm_moe_sm100_module():
                 and major == 10
             ):
                 return []
-
-            has_gemm1_lora_delta = moe_inputs.gemm1_lora_delta is not None
-
-            # Enumerate valid tactics for the fused (routed + shared) expert
-            # dimensions so they match what prepare_moe() validates against at
-            # runtime (effectiveTopK / effectiveLocalExperts). nfse defaults to 0,
-            # so non-shared-expert paths are unaffected. Including nfse in the key
-            # also prevents cache collisions across different shared-expert counts.
-            nfse = self.num_fused_shared_experts
-            instance_key = (
-                self.dtype_act,
-                self.dtype_weights,
-                self.fp8_quantization_type,
-                self.top_k + nfse,
-                self.hidden_size,
-                self.intermediate_size,
-                self.num_local_experts + nfse,
-                self.activation_type,
-                self.use_shuffled_weight,
-                self.weight_layout,
-                self.use_per_token_scaling,
-                num_tokens,
-                has_gemm1_lora_delta,
-            )
+            instance_key = self._tactics_instance_key(moe_inputs, profile)
             if instance_key not in MoERunner.valid_tactics_dict:
                 try:
                     valid_tactics = moe_op.trtllm_get_valid_moe_configs(*instance_key)
@@ -1430,6 +1432,92 @@ def get_trtllm_moe_sm100_module():
                     if len(tactic) > 0 and int(tactic[0]) == target_tile
                 ]
             return MoERunner.valid_tactics_dict[instance_key]
+
+        def get_tactic_groups(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> Optional[List[List[Any]]]:
+            if not self.factorized_da_enabled or not profile.value_buckets:
+                return None
+
+            moe_inputs = MoEInputs.from_list(inputs)
+            instance_key = self._tactics_instance_key(moe_inputs, profile)
+            if instance_key not in MoERunner.factorized_tactics_dict:
+                try:
+                    rows = moe_op.trtllm_get_valid_moe_factorized_configs(*instance_key)
+                    normalized_rows = tuple(
+                        tuple(int(value) for value in row) for row in rows
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "[Autotuner]: Failed to get factorized TRT-LLM MoE "
+                        f"tactics for {instance_key}: {e}"
+                    )
+                    return None
+                MoERunner.factorized_tactics_dict[instance_key] = normalized_rows
+
+            target_tile = int(profile.value_buckets[0])
+            all_rows = MoERunner.factorized_tactics_dict[instance_key]
+            if any(len(row) != 5 or row[4] not in (0, 1) for row in all_rows):
+                logger.debug(
+                    "[Autotuner]: Invalid factorized TRT-LLM MoE metadata for "
+                    f"{instance_key}"
+                )
+                return None
+            rows = [row for row in all_rows if row[0] == target_tile]
+            default_rows = [row for row in rows if row[4] == 1]
+            if len(default_rows) != 1:
+                logger.debug(
+                    "[Autotuner]: Expected one default factorized tactic for "
+                    f"tile {target_tile}, found {len(default_rows)}"
+                )
+                return None
+
+            default_fc1, default_fc2 = default_rows[0][2:4]
+            combined_configs = {(row[0], row[1]) for row in rows}
+            component_configs = {(row[0], row[2], row[3]) for row in rows}
+            if len(combined_configs) != len(rows) or len(component_configs) != len(
+                rows
+            ):
+                logger.debug(
+                    "[Autotuner]: Non-bijective factorized TRT-LLM MoE metadata "
+                    f"for tile {target_tile}"
+                )
+                return None
+            fc1_group = [[row[0], row[1]] for row in rows if row[3] == default_fc2]
+            fc2_group = [[row[0], row[1]] for row in rows if row[2] == default_fc1]
+            if not fc1_group or not fc2_group:
+                return None
+            return [fc1_group, fc2_group]
+
+        def compose_tactics(
+            self,
+            group_winners: List[Any],
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> Any:
+            if len(group_winners) != 2:
+                raise ValueError(
+                    "TRT-LLM factorized MoE tuning requires FC1 and FC2 winners"
+                )
+            moe_inputs = MoEInputs.from_list(inputs)
+            instance_key = self._tactics_instance_key(moe_inputs, profile)
+            rows = MoERunner.factorized_tactics_dict[instance_key]
+            by_combined = {(row[0], row[1]): row for row in rows}
+            fc1_tile, fc1_combined = group_winners[0]
+            fc2_tile, fc2_combined = group_winners[1]
+            fc1_winner = (int(fc1_tile), int(fc1_combined))
+            fc2_winner = (int(fc2_tile), int(fc2_combined))
+            if fc1_winner[0] != fc2_winner[0]:
+                raise ValueError("FC1 and FC2 winners must use the same tile size")
+
+            fc1_config = by_combined[fc1_winner][2]
+            fc2_config = by_combined[fc2_winner][3]
+            by_components = {(row[0], row[2], row[3]): row[1] for row in rows}
+            tile = fc1_winner[0]
+            combined_config = by_components[(tile, fc1_config, fc2_config)]
+            return [tile, combined_config]
 
         def forward(
             self,
@@ -1792,6 +1880,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=use_shuffled_weight,
             activation_type=activation_type,
             num_experts=num_experts,
+            factorized_da_enabled=da_config.factorized_autotune,
         )
 
         moe_inputs = MoeRunnerInputs(
@@ -2212,6 +2301,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=True,
             activation_type=activation_type,
             num_experts=num_experts,
+            factorized_da_enabled=da_config.factorized_autotune,
         )
 
         moe_inputs = MoeRunnerInputs(
@@ -2665,6 +2755,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=use_shuffled_weight,
             num_experts=num_experts,
             num_fused_shared_experts=num_fused_shared_experts,
+            factorized_da_enabled=da_config.factorized_autotune,
         )
 
         moe_inputs = MoeRunnerInputs(
@@ -3185,6 +3276,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=True,
             use_per_token_scaling=per_token_scale is not None,
             num_experts=num_experts,
+            factorized_da_enabled=da_config.factorized_autotune,
         )
         moe_inputs = MoeRunnerInputs(
             output=output,
@@ -3940,6 +4032,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.BlockMajorK,
             use_shuffled_weight=True,
             num_experts=num_experts,
+            factorized_da_enabled=da_config.factorized_autotune,
         )
 
         moe_inputs = MoeRunnerInputs(

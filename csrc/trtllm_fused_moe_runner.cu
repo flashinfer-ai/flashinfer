@@ -790,6 +790,13 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
   return std::distance(mPassingConfigs.begin(), it);
 }
 
+MoEConfig Runner::getConfigComponents(int64_t configIndex) const {
+  FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+                   "Invalid MoE config index ", configIndex, ", valid range is [0, ",
+                   static_cast<int64_t>(mPassingConfigs.size()) - 1, "].");
+  return mPassingConfigs[configIndex];
+}
+
 void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
                  cudaStream_t stream, int64_t configIndex, bool enable_pdl) {
   FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),

@@ -448,6 +448,8 @@ class Runner {
                                                    int32_t numLocalExperts,
                                                    int32_t numTokens) const;
 
+  [[nodiscard]] MoEConfig getConfigComponents(int64_t configIndex) const;
+
  private:
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, bool const enablePdl,
                   moe::dev::convertsf::Data& convertSfData,

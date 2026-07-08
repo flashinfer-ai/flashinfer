@@ -654,6 +654,26 @@ class TunableRunner(ABC):
         """
         return ()
 
+    def get_tactic_groups(
+        self, inputs: List[torch.Tensor], profile: OptimizationProfile
+    ) -> Optional[List[List[Any]]]:
+        """Return independently tunable tactic groups, or ``None`` for exhaustive search.
+
+        Each group is profiled independently. The tuner passes the fastest tactic
+        from every group to :meth:`compose_tactics` and profiles the composed tactic
+        once before caching it.
+        """
+        return None
+
+    def compose_tactics(
+        self,
+        group_winners: List[Any],
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> Any:
+        """Compose independently selected group winners into an executable tactic."""
+        raise NotImplementedError
+
     def __call__(self, inputs, **kwargs):
         return self.forward(inputs, **kwargs)
 
@@ -1569,6 +1589,7 @@ class AutoTuner:
             "value_time_min_ms",
             "value_time_median_ms",
             "value_time_max_ms",
+            "selection_stage",
             "is_best",
             "value_sample_count",
             "graph_captures",
@@ -1902,6 +1923,9 @@ class AutoTuner:
                     )
                 return tactic
 
+            def _tactic_key(tactic: Any) -> Any:
+                return _json_to_tactic(_tactic_to_json(tactic))
+
             value_specs = AutoTuner._get_value_specs(tuning_config)
             if (
                 _is_value_aware_autotune()
@@ -2160,7 +2184,24 @@ class AutoTuner:
                         skipped_count = 0
                         for r_id, r in enumerate(runners):
                             # TODO: use FakeTensor here.
-                            valid_tactics = r.get_valid_tactics(tensors, p)
+                            tactic_groups = r.get_tactic_groups(tensors, p)
+                            candidate_stages: Dict[Any, List[str]] = {}
+                            if tactic_groups is None:
+                                # Exhaustive runners profile every valid tactic directly.
+                                valid_tactics = r.get_valid_tactics(tensors, p)
+                            else:
+                                # Factorized runners deduplicate overlapping group candidates.
+                                valid_tactics = []
+                                seen_tactics = set()
+                                for group_id, group in enumerate(tactic_groups):
+                                    for candidate in group:
+                                        candidate_key = _tactic_key(candidate)
+                                        candidate_stages.setdefault(
+                                            candidate_key, []
+                                        ).append(f"group_{group_id}")
+                                        if candidate_key not in seen_tactics:
+                                            seen_tactics.add(candidate_key)
+                                            valid_tactics.append(candidate)
                             valid_tactics = self._blocklist.filter(
                                 custom_op, r, valid_tactics
                             )
@@ -2170,7 +2211,9 @@ class AutoTuner:
                                 and len(valid_tactics) > 0
                             ):
                                 r(tensors, tactic=-1, do_preparation=True, **kwargs)
-                            for tac in valid_tactics:
+
+                            def profile_tactic(tac, selection_stage):
+                                nonlocal skipped_count
                                 session_diagnostics = None
                                 value_time_min_ms = None
                                 value_time_median_ms = None
@@ -2179,7 +2222,7 @@ class AutoTuner:
                                     if value_input_sets is not None:
                                         if tuning_config.use_cuda_graph:
                                             with _autotune_nvtx_range(
-                                                "da-candidate:"
+                                                "profile-tactic:"
                                                 f"op={custom_op}, tokens={num_tokens}, "
                                                 f"value-buckets={p.value_buckets}, "
                                                 f"runner={r_id}, tactic={tac}"
@@ -2326,13 +2369,85 @@ class AutoTuner:
                                             "value_time_min_ms": value_time_min_ms,
                                             "value_time_median_ms": value_time_median_ms,
                                             "value_time_max_ms": value_time_max_ms,
+                                            "selection_stage": selection_stage,
                                             "is_best": False,
                                             **(session_diagnostics or {}),
                                         }
                                     )
-                                if time_measured < min_time:
-                                    min_time = time_measured
-                                    runner_id, tactic = r_id, tac
+                                return time_measured
+
+                            measured_tactics = {}
+                            # Profile every unique exhaustive or grouped candidate once.
+                            for tac in valid_tactics:
+                                if tactic_groups is None:
+                                    time_measured = profile_tactic(tac, "exhaustive")
+                                    if time_measured < min_time:
+                                        min_time = time_measured
+                                        runner_id, tactic = r_id, tac
+                                    continue
+
+                                tactic_key = _tactic_key(tac)
+                                time_measured = profile_tactic(
+                                    tac, "+".join(candidate_stages[tactic_key])
+                                )
+                                measured_tactics[tactic_key] = (time_measured, tac)
+
+                            # Resolve factorized groups only after all shared candidates run.
+                            if tactic_groups is not None:
+                                factorized_selection_succeeded = False
+                                group_winners: List[Any] = []
+                                # Pick the fastest candidate from each anchored component sweep.
+                                for group in tactic_groups:
+                                    measured_group = [
+                                        measured_tactics[_tactic_key(candidate)]
+                                        for candidate in group
+                                        if _tactic_key(candidate) in measured_tactics
+                                        and measured_tactics[_tactic_key(candidate)][0]
+                                        < float("inf")
+                                    ]
+                                    if not measured_group:
+                                        group_winners = []
+                                        break
+                                    group_winners.append(
+                                        min(
+                                            measured_group, key=lambda result: result[0]
+                                        )[1]
+                                    )
+                                # Compose the component winners and measure the executable tactic.
+                                if group_winners:
+                                    try:
+                                        composed_tactic = r.compose_tactics(
+                                            group_winners, tensors, p
+                                        )
+                                        composed_time = profile_tactic(
+                                            composed_tactic, "composed"
+                                        )
+                                        if composed_time < min_time:
+                                            min_time = composed_time
+                                            runner_id, tactic = r_id, composed_tactic
+                                        factorized_selection_succeeded = (
+                                            composed_time < float("inf")
+                                        )
+                                    except Exception as e:
+                                        skipped_count += 1
+                                        logger.debug(
+                                            "[Autotuner]: Failed to compose factorized "
+                                            f"tactics for {r}: {e}"
+                                        )
+
+                                # Fall back to the complete search if composition cannot succeed.
+                                if not factorized_selection_succeeded:
+                                    logger.debug(
+                                        "[Autotuner]: Factorized tactic selection failed for "
+                                        f"{r}; falling back to exhaustive tactics"
+                                    )
+                                    for tac in r.get_valid_tactics(tensors, p):
+                                        time_measured = profile_tactic(
+                                            tac, "exhaustive_fallback"
+                                        )
+                                        if time_measured < min_time:
+                                            min_time = time_measured
+                                            runner_id, tactic = r_id, tac
 
                         if skipped_count > 0:
                             logger.info(
@@ -2342,7 +2457,7 @@ class AutoTuner:
 
                         if runner_id is not None:
                             if _AUTOTUNE_DUMP_PATH and profile_records:
-                                for rec in profile_records:
+                                for rec in reversed(profile_records):
                                     if (
                                         rec["tactic"] == _serialize_tactic(tactic)
                                         and rec["runner"]
