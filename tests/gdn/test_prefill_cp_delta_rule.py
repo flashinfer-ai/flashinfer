@@ -59,6 +59,7 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 FIXUP_TF32_ATOL = 2e-3
 FIXUP_TF32_RTOL = 2e-3
+FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
 
 
 def _skip_if_cp_unsupported():
@@ -375,6 +376,7 @@ def test_cp_delta_rule_mn_precompute(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("kernel_kind", FIXUP_KERNEL_KINDS)
 @pytest.mark.parametrize("use_initial_state", [False, True])
 @pytest.mark.parametrize("num_heads", [1, 3])
 @pytest.mark.parametrize(
@@ -385,6 +387,7 @@ def test_cp_delta_rule_fixup(
     cp_chunk_len,
     num_heads,
     use_initial_state,
+    kernel_kind,
     seed=int(os.environ.get("SEED", "0")),
 ):
     _skip_if_cp_unsupported()
@@ -442,6 +445,7 @@ def test_cp_delta_rule_fixup(
         total_seqlen,
         cp_chunk_len=cp_chunk_len,
         initial_state=initial_state,
+        _kernel_kind=kernel_kind,
     )
     torch.cuda.synchronize()
 
