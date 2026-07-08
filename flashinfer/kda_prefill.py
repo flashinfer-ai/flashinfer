@@ -59,8 +59,7 @@ def chunk_kda(
         S_t &\mathrel{+}= k_t \otimes v^{new}_t \\
         o_t &= \mathrm{scale} \cdot q_t^\top S_t
 
-    Gate and beta conventions match ``fla.ops.kda.chunk_kda``: ``g`` is in
-    log space and ``beta`` is in post-sigmoid space.
+    ``g`` is in log space and ``beta`` is in post-sigmoid space.
 
     Parameters
     ----------
@@ -135,8 +134,7 @@ def chunk_kda(
     -----
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
-    - The final state layout is ``[N, H, V, K]`` (k-last), the transpose of
-      ``fla.ops.kda.chunk_kda``'s ``[N, H, K, V]``.
+    - The final state layout is ``[N, H, V, K]`` (k-last).
     - float16 io: the kernel forms ``K * exp2(-cumsum(g/ln 2))`` anti-decay
       intermediates per 64-token chunk, so the gate sums within each chunk
       must stay within fp16 range; bfloat16 io is safe for the full gate

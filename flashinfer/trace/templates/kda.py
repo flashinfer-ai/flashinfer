@@ -97,8 +97,7 @@ def _kda_prefill_init(
 
     Same Q/K/V distributions as the GDN prefill init (``multidist_randu`` +
     L2-normalized k); ``g`` is a channel-wise log-space decay in [-1, 0)
-    float32 (matching ``fla.ops.kda.chunk_kda``), ``beta`` is a per-token
-    scalar in [0, 1] (post-sigmoid space).
+    float32, ``beta`` is a per-token scalar in [0, 1] (post-sigmoid space).
     """
     del len_cu_seqlens
     torch.manual_seed(seed)
@@ -198,10 +197,7 @@ kda_prefill_trace = TraceTemplate(
         "g": Tensor(
             ["total_seq_len", "num_v_heads", "head_size"],
             dtype="float32",
-            description=(
-                "Channel-wise forget gate on the key axis in LOG space "
-                "(matching fla.ops.kda.chunk_kda)."
-            ),
+            description=("Channel-wise forget gate on the key axis in LOG space."),
         ),
         "b": Tensor(
             ["total_seq_len", "num_v_heads"],
