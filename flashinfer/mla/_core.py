@@ -927,10 +927,10 @@ def _check_dsv4_sparse_mla_inputs(
             swa_kv_cache, kv_layout, "swa_kv_cache"
         )
     if allow_sm120_packed_kv and swa_kv_cache.dtype == torch.uint8:
-        if swa_kv_cache.size(-1) != 584:
+        if swa_kv_cache.size(-1) not in (584, 360):
             raise ValueError(
-                "Expected packed SM120 DSV4 swa_kv_cache head dim 584, got "
-                f"{swa_kv_cache.size(-1)}"
+                "Expected packed SM120 DSV4 swa_kv_cache head dim 584 (fp8) or "
+                f"360 (nvfp4), got {swa_kv_cache.size(-1)}"
             )
     elif swa_kv_cache.dtype != query.dtype:
         raise ValueError(
@@ -951,10 +951,10 @@ def _check_dsv4_sparse_mla_inputs(
             compressed_kv_cache, kv_layout, "compressed_kv_cache"
         )
     if allow_sm120_packed_kv and compressed_kv_cache.dtype == torch.uint8:
-        if compressed_kv_cache.size(-1) != 584:
+        if compressed_kv_cache.size(-1) not in (584, 360):
             raise ValueError(
-                "Expected packed SM120 DSV4 compressed_kv_cache head dim 584, got "
-                f"{compressed_kv_cache.size(-1)}"
+                "Expected packed SM120 DSV4 compressed_kv_cache head dim 584 (fp8) "
+                f"or 360 (nvfp4), got {compressed_kv_cache.size(-1)}"
             )
     elif compressed_kv_cache.dtype != query.dtype:
         raise ValueError(
@@ -1039,6 +1039,7 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     bmm2_scale: float,
     sinks: Optional[torch.Tensor],
     kv_layout: Literal["HND", "NHD"],
+    kv_scale_format: str = "auto",
 ) -> torch.Tensor:
     if bmm2_scale != 1.0:
         raise ValueError("SM120 DSv4 sparse MLA does not support bmm2_scale")
@@ -1064,10 +1065,10 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
         swa_kv_cache, kv_layout, "swa_kv_cache"
     )
     if swa_kv_cache.dtype == torch.uint8:
-        if swa_kv_cache.size(-1) != 584:
+        if swa_kv_cache.size(-1) not in (584, 360):
             raise ValueError(
-                "Expected packed SM120 DSV4 swa_kv_cache head dim 584, got "
-                f"{swa_kv_cache.size(-1)}"
+                "Expected packed SM120 DSV4 swa_kv_cache head dim 584 (fp8) or "
+                f"360 (nvfp4), got {swa_kv_cache.size(-1)}"
             )
     elif swa_kv_cache.dtype != query.dtype:
         raise ValueError(
@@ -1099,10 +1100,10 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             compressed_kv_cache, kv_layout, "compressed_kv_cache"
         )
         if compressed_kv_cache.dtype == torch.uint8:
-            if compressed_kv_cache.size(-1) != 584:
+            if compressed_kv_cache.size(-1) not in (584, 360):
                 raise ValueError(
-                    "Expected packed SM120 DSV4 compressed_kv_cache head dim 584, "
-                    f"got {compressed_kv_cache.size(-1)}"
+                    "Expected packed SM120 DSV4 compressed_kv_cache head dim 584 "
+                    f"(fp8) or 360 (nvfp4), got {compressed_kv_cache.size(-1)}"
                 )
         elif compressed_kv_cache.dtype != query.dtype:
             raise ValueError(
@@ -1134,7 +1135,7 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             sinks=sinks,
             lse=None,
             return_lse=False,
-            kv_scale_format="auto",
+            kv_scale_format=kv_scale_format,
         ),
     )
     if query.ndim == 3:
@@ -1161,6 +1162,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     swa_topk_lens: Optional[torch.Tensor] = None,
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
+    kv_scale_format: str = "auto",
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -1270,6 +1272,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             bmm2_scale=float(bmm2_scale),
             sinks=sinks,
             kv_layout=kv_layout,
+            kv_scale_format=kv_scale_format,
         )
 
     if (

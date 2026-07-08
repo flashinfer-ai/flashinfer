@@ -29,10 +29,11 @@
 #pragma once
 
 // ModelType determines KV cache layout, dimensions, and scale format.
-//   DSV3_2:  d_nope=512, power-of-2 FP32 scale inline, 656B/token
-//   DSV4:    d_nope=448, UE8M0 scale footer, 584B/token
-//   GLM_NSA: d_nope=512, arbitrary FP32 scale inline, 656B/token
-enum class ModelType { DSV3_2, DSV4, GLM_NSA };
+//   DSV3_2:     d_nope=512, power-of-2 FP32 scale inline, 656B/token
+//   DSV4:       d_nope=448, UE8M0 scale footer, 584B/token
+//   DSV4_NVFP4: d_nope=448 stored E2M1 (4-bit), per-64 UE8M0 scale footer, 360B/token
+//   GLM_NSA:    d_nope=512, arbitrary FP32 scale inline, 656B/token
+enum class ModelType { DSV3_2, DSV4, GLM_NSA, DSV4_NVFP4 };
 
 enum class ScaleFormat { POW2_FP32, UE8M0_BYTE, ARBITRARY_FP32 };
 
