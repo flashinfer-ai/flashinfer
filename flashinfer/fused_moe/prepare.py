@@ -42,6 +42,9 @@ from ..utils import get_compute_capability
 _TRTLLM_PERMUTE_CACHE: dict = {}
 
 
+# The E8M0 range clamp and residual-scale factorization are adapted from
+# Humming's HummingLayer.may_process_fused_e8m0_scale:
+# https://github.com/inclusionAI/humming/blob/f6241bba8d507c19ca9ce4e5958a5d0641fc8eb4/humming/layer.py#L322-L362
 def _preprocess_humming_e8m0_weight_scale(
     raw_scale: torch.Tensor,
     max_range: int = 11,
@@ -86,6 +89,9 @@ def _preprocess_humming_e8m0_weight_scale(
     )
 
 
+# The delta-scale FP4 payload rewrite semantics are adapted from Humming's
+# process_mxfp4_w4a8 implementation:
+# https://github.com/inclusionAI/humming/blob/f6241bba8d507c19ca9ce4e5958a5d0641fc8eb4/humming/include/humming/kernel/process_mxfp4.cuh#L6-L69
 @functools.cache
 def _humming_mxfp4_w4a8_rewrite_lut_cpu() -> torch.Tensor:
     def float_from_bits(bits: int) -> float:
@@ -202,6 +208,11 @@ def preprocess_moe_weights_for_sm90_mixed_gemm_humming(
         logical processed packed weight and logical offset scale.  ``residual``
         is one FP32 value per expert and should be folded into the routed-token
         activation scale together with Humming's fixed ``2^6`` compensation.
+
+    Notes
+    -----
+    The E8M0 range clamp, residual-scale factorization, and FP4 payload-rewrite
+    scheme are adapted from `Humming <https://github.com/inclusionAI/humming>`_.
     """
     if weight.dim() != 3:
         raise ValueError(
