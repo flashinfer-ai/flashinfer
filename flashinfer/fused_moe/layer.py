@@ -39,7 +39,11 @@ from .api import (
     TrtllmBf16Config,
     TrtllmFp4Config,
 )
-from .runners import CuteDslNvfp4Runner, TrtllmBf16RoutedRunner, TrtllmFp4RoutedRunner
+from .runners import (
+    CuteDslNvfp4Runner,
+    TrtllmBf16RoutedRunner,
+    TrtllmFp4RoutedRunner,
+)
 from .utils import map_to_hybrid_bucket
 
 
@@ -102,7 +106,7 @@ class MoELayer:
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
-                f"arch sm{arch}. Supported backends: [{mvp}]."
+                f"arch sm{arch}. The MVP supports only NVFP4 via [{mvp}]."
             )
 
         # Cross-backend winner cache, keyed by the num_tokens tuning bucket.
