@@ -130,6 +130,9 @@ and CUDA environment:
 
 This command installs from the FlashInfer wheel index instead of PyPI because
 ``flashinfer-jit-cache`` wheels are too large for PyPI hosting.
+Automatic CUDA detection uses the CUDA runtime version reported by PyTorch
+(``torch.version.cuda``), falling back to toolkit detection only if PyTorch does
+not report a CUDA version.
 If the detected CUDA minor version is newer than the latest available
 ``flashinfer-jit-cache`` wheel in the same major version, the command uses the
 newest compatible wheel label. For example, CUDA 13.3 resolves to ``cu130``

@@ -21,6 +21,7 @@ import sys
 
 import click
 from tabulate import tabulate  # type: ignore[import-untyped]
+import torch
 
 from .artifacts import (
     ArtifactPath,
@@ -69,7 +70,7 @@ def _ensure_modules_registered():
 
 def _parse_cuda_version(cuda_version: str | None) -> Version:
     if cuda_version is None:
-        return get_cuda_version()
+        return _detect_cuda_version()
 
     normalized = cuda_version.strip().lower()
     if normalized.startswith("cu"):
@@ -84,6 +85,18 @@ def _parse_cuda_version(cuda_version: str | None) -> Version:
         raise click.ClickException(
             f"Invalid CUDA version '{cuda_version}'. Use formats like '12.9' or 'cu129'."
         ) from e
+
+
+def _detect_cuda_version() -> Version:
+    if torch.version.cuda is not None:
+        try:
+            return Version(torch.version.cuda)
+        except InvalidVersion as e:
+            raise click.ClickException(
+                f"Invalid PyTorch CUDA version '{torch.version.cuda}'."
+            ) from e
+
+    return get_cuda_version()
 
 
 def _cuda_version_to_index_label(cuda_version: Version) -> str:

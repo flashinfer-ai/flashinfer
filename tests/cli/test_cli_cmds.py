@@ -262,6 +262,8 @@ def test_clear_cubin_cmd_real(monkeypatch, tmp_path):
 
 
 def test_install_jit_cache_wheel_cmd_mocked(monkeypatch):
+    import flashinfer.__main__ as flashinfer_main
+
     recorded = {}
 
     def mock_run(cmd, check=False):
@@ -273,7 +275,11 @@ def test_install_jit_cache_wheel_cmd_mocked(monkeypatch):
 
         return Result()
 
-    monkeypatch.setattr("flashinfer.__main__.get_cuda_version", lambda: Version("12.9"))
+    def fail_get_cuda_version():
+        raise AssertionError("get_cuda_version should not be called")
+
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "12.9")
+    monkeypatch.setattr("flashinfer.__main__.get_cuda_version", fail_get_cuda_version)
     monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
     monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
 
@@ -299,6 +305,28 @@ def test_install_jit_cache_wheel_cmd_mocked(monkeypatch):
         "flashinfer-jit-cache==0.4.1+cu129",
     ]
     assert recorded["check"] is False
+
+
+def test_install_jit_cache_wheel_cmd_falls_back_without_torch_cuda(monkeypatch):
+    import flashinfer.__main__ as flashinfer_main
+
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", None)
+    monkeypatch.setattr("flashinfer.__main__.get_cuda_version", lambda: Version("12.9"))
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run should not be called for dry-run")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    out = _test_cmd_helper(["install-jit-cache-wheel", "--dry-run"])
+
+    _assert_output_contains_all(
+        out,
+        "CUDA version: 12.9",
+        "Wheel CUDA label: cu129",
+        "flashinfer-jit-cache==0.4.1+cu129",
+    )
 
 
 def test_install_jit_cache_wheel_cmd_nightly_dry_run(monkeypatch):
