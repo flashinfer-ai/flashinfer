@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import bisect
 import functools
 from enum import Enum
 from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
@@ -39,6 +40,7 @@ from ..trace.templates.attention import segment_gemm_run_trace
 from ..trace.templates.page import tgv_gemm_sm100_trace
 from ..autotuner import (
     AutoTuner,
+    autotune,
     ConstraintSpec,
     DynamicTensorSpec,
     OptimizationProfile,
@@ -1159,6 +1161,7 @@ def get_gemm_sm100_module_cutlass_bf16():
 
     return SimpleNamespace(
         cutlass_bf16_gemm_runner=cutlass_bf16_gemm_runner,
+        module=module,
     )
 
 
@@ -1172,6 +1175,16 @@ def get_mm_bf16_cublaslt_module():
                 self._algo_cache: dict = {}
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                # Must be synthesis-invariant: including a.shape (dynamic M)
+                # makes the runtime key miss the bucketed profile key, so the
+                # tuned tactic is dropped for tactic=-1. Shapes are already in
+                # the autotuner's input_shapes; add only dtypes.
+                a, b, _, _, out, _ = inputs
+                return (a.dtype, b.dtype, self._compute_dtype(out.dtype))
+
+            def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
+                # Internal cuBLASLt algo-enumeration cache: this one is
+                # shape-specific, so key on full shapes (incl. M).
                 a, b, _, _, out, _ = inputs
                 return (
                     a.shape[0],
@@ -1192,7 +1205,7 @@ def get_mm_bf16_cublaslt_module():
             def _get_algos(self, inputs):
                 a, b, _, _, out, workspace_buffer = inputs
                 compute_dt = self._compute_dtype(out.dtype)
-                key = self.get_cache_key_extras(inputs)
+                key = self._algo_cache_key(inputs)
                 cached = self._algo_cache.get(key)
                 if cached is not None:
                     return cached
@@ -1255,13 +1268,11 @@ def get_mm_bf16_cublaslt_module():
                         f"dtype={compute_out.dtype}. "
                         "This shape/dtype combination may not be supported."
                     )
-                if tactic >= count:
-                    raise ValueError(
-                        f"Requested tactic {tactic} but only {count} algorithms "
-                        f"available for M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
-                        f"dtype={compute_out.dtype}."
-                    )
-                if tactic < 0:
+                # The cuBLASLt algo list is enumerated per-shape, so a tactic
+                # tuned at a different (bucketed) M may be out of range here.
+                # Fall back to the heuristic-best algo (index 0) rather than
+                # raising.
+                if tactic < 0 or tactic >= count:
                     tactic = 0
                 module.mm_bf16_cublaslt_run_with_algo(
                     a,
@@ -1280,6 +1291,7 @@ def get_mm_bf16_cublaslt_module():
 
     return SimpleNamespace(
         cublaslt_bf16_gemm_runner=cublaslt_bf16_gemm_runner,
+        module=module,
     )
 
 
@@ -1298,6 +1310,11 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
             -2,
             lambda shapes: shapes[0][-2],
         ),
+        ConstraintSpec(
+            5,  # workspace_buffer index: scratch buffer that a backend may
+            0,  # resize during profiling. Wildcard its size out of the cache
+            lambda shapes: shapes[5][0],  # key so a mid-tune resize never
+        ),  # changes the key (would otherwise cause a silent cache miss).
     ),
 )
 
@@ -1449,6 +1466,223 @@ def bf16_gemm_sm100(
     )
 
     runner(inputs=inputs, tactic=tactic)
+
+
+# Shared tuned tables for MmBf16Plan: weights with the same problem signature
+# reuse one (buckets, [(runner, tactic)]) table, so tuning runs once per
+# unique shape rather than once per layer.
+_MM_BF16_PLAN_TABLES: Dict[tuple, tuple] = {}
+
+
+def _mm_bf16_plan_runners(dtype, device, has_bias: bool):
+    runners = []
+    builders = [
+        lambda: _cudnn_gemm_bf16_runner(is_a_k_major=True, is_b_k_major=True),
+    ]
+    if not has_bias:
+        # The cuBLASLt / CUTLASS BF16 runners do not apply bias.
+        builders += [
+            lambda: get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner(),
+            lambda: get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner(),
+        ]
+    builders.append(lambda: _tgv_gemm_runner(dtype, is_sm100f_supported(device)))
+    for build in builders:
+        try:
+            runners.append(build())
+        except Exception:  # pragma: no cover - backend unavailable on this arch
+            continue
+    return runners
+
+
+def _mm_bf16_plan_table(n, k, dtype, device, has_bias, pdl, out_dtype, max_m):
+    key = (n, k, dtype, device.index, has_bias, pdl, out_dtype, max_m)
+    cached = _MM_BF16_PLAN_TABLES.get(key)
+    if cached is not None:
+        return cached
+    buckets = tuple(get_hybrid_num_tokens_buckets(max_m))
+    b_proxy = torch.empty(n, k, dtype=dtype, device=device).transpose(-2, -1)
+    bias_proxy = torch.zeros(n, dtype=dtype, device=device) if has_bias else None
+    ws = _get_cache_buf("mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, device)
+    runners = _mm_bf16_plan_runners(dtype, device, has_bias)
+    tuner = AutoTuner.get()
+    cfg = _BF16_GEMM_SM100_TUNING_CONFIG
+    # Tuning the largest bucket profiles every smaller bucket in the same
+    # pass; the per-bucket queries below read the winners back.
+    with autotune(True):
+        a = torch.empty(buckets[-1], k, dtype=dtype, device=device)
+        out = torch.empty(buckets[-1], n, dtype=out_dtype, device=device)
+        tuner.choose_one(
+            "bf16_gemm", runners, cfg, [a, b_proxy, bias_proxy, pdl, out, ws]
+        )
+    table = []
+    for bucket in buckets:
+        a = torch.empty(bucket, k, dtype=dtype, device=device)
+        out = torch.empty(bucket, n, dtype=out_dtype, device=device)
+        table.append(
+            tuner.choose_one(
+                "bf16_gemm", runners, cfg, [a, b_proxy, bias_proxy, pdl, out, ws]
+            )
+        )
+    result = (buckets, table)
+    _MM_BF16_PLAN_TABLES[key] = result
+    return result
+
+
+class MmBf16Plan:
+    r"""Tuned execution plan for repeated BF16 GEMMs against a fixed weight.
+
+    Create via :func:`plan_mm_bf16` (tunes every M bucket up to ``max_m``
+    once, outside of any CUDA graph capture); afterwards :meth:`run` is a
+    bucket lookup plus a prebound kernel launch -- no per-call backend
+    selection, autotuner lookup, or wrapper overhead. Mirrors the
+    ``plan()``/``run()`` contract of the attention wrappers.
+    """
+
+    def __init__(
+        self,
+        b: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        pdl: bool,
+        out_dtype: torch.dtype,
+        max_m: int,
+    ) -> None:
+        if b.dim() != 2:
+            raise ValueError(f"expected 2-D weight, got {b.dim()}-D")
+        k, n = b.shape
+        self._b = b
+        self._b_t = b.transpose(-2, -1)
+        self._bias = bias
+        self._pdl = pdl
+        self._out_dtype = out_dtype
+        self._n = n
+        self._max_m = max_m
+        self._workspace = _get_cache_buf(
+            "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, b.device
+        )
+        buckets, table = _mm_bf16_plan_table(
+            n, k, b.dtype, b.device, bias is not None, pdl, out_dtype, max_m
+        )
+        self._buckets = buckets
+        self._lanes = [self._make_lane(runner, tactic) for runner, tactic in table]
+
+    def _make_lane(self, runner: TunableRunner, tactic: int):
+        name = type(runner).__name__
+        b, b_t, ws = self._b, self._b_t, self._workspace
+        if name == "CutlassBf16GemmRunner":
+            module = get_gemm_sm100_module_cutlass_bf16().module
+
+            def lane(a, out):
+                module.bf16_gemm(a, b_t, out, ws, tactic)
+
+            return lane
+        if name == "CublasltBf16GemmRunner":
+            module = get_mm_bf16_cublaslt_module().module
+            clamped = max(tactic, 0)
+            get_algos = runner._get_algos
+            algo_cache: dict = {}
+
+            def lane(a, out):
+                m = a.shape[0]
+                entry = algo_cache.get(m)
+                if entry is None:
+                    algo_buf, count = get_algos([a, b, None, False, out, ws])
+                    entry = algo_cache[m] = (
+                        algo_buf,
+                        clamped if clamped < count else 0,
+                    )
+                with torch.cuda.device(a.device):
+                    handle = torch.cuda.current_blas_handle()
+                module.mm_bf16_cublaslt_run_with_algo(
+                    a, b_t, out, ws, handle, entry[0], entry[1]
+                )
+
+            return lane
+        if name == "CudnnBf16GemmRunner" and runner._use_override_shape:
+            clamped = max(tactic, 0)
+            get_graph = runner._get_override_graph
+            bias = self._bias
+            graph_cache: dict = {}
+
+            def lane(a, out):
+                m = a.shape[0]
+                graph = graph_cache.get(m)
+                if graph is None:
+                    graph = graph_cache[m] = get_graph(a, b, bias, out)
+                execute_cudnn_gemm_bf16_graph_override_shape(
+                    graph, a, b, bias, out, ws, tactic=clamped
+                )
+
+            return lane
+
+        bias, pdl = self._bias, self._pdl
+
+        def lane(a, out):
+            runner(inputs=[a, b, bias, pdl, out, ws], tactic=tactic)
+
+        return lane
+
+    def run(self, a: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+        r"""Run the planned GEMM: ``a @ b (+ bias)``.
+
+        Parameters
+        ----------
+        a: torch.Tensor
+            Input tensor, shape ``(m, k)``, same dtype as the planned weight.
+        out: Optional[torch.Tensor]
+            Preallocated output, shape ``(m, n)``; allocated when ``None``.
+        """
+        m = a.shape[0]
+        if out is None:
+            out = torch.empty((m, self._n), dtype=self._out_dtype, device=a.device)
+        if m == 0:
+            return out
+        if m > self._max_m:
+            # Outside the tuned bucket range: use the auto-dispatch path
+            # rather than a tactic tuned for a much smaller shape.
+            return mm_bf16(
+                a,
+                self._b,
+                bias=self._bias,
+                pdl=self._pdl,
+                out=out,
+                out_dtype=self._out_dtype,
+                backend="auto",
+            )
+        lane = self._lanes[bisect.bisect_left(self._buckets, m)]
+        lane(a, out)
+        return out
+
+
+def plan_mm_bf16(
+    b: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    out_dtype: torch.dtype = torch.bfloat16,
+    max_m: int = 4096,
+) -> MmBf16Plan:
+    r"""Build a tuned :class:`MmBf16Plan` for repeated ``mm_bf16`` calls.
+
+    Tunes every M bucket up to ``max_m`` for the weight's problem shape (the
+    tuned table is shared across weights with the same shape/dtype), then
+    :meth:`MmBf16Plan.run` dispatches with a prebound launch per bucket.
+    Must not be called during CUDA graph capture.
+
+    Parameters
+    ----------
+    b: torch.Tensor
+        Weight tensor, shape ``(k, n)``, bf16 in column-major layout (same
+        layout as :func:`mm_bf16`).
+    bias: Optional[torch.Tensor]
+        Optional bias, shape ``(n,)``, bound into the plan.
+    pdl: bool
+        Whether to use Programmatic Dependent Launch (backend permitting).
+    out_dtype: torch.dtype
+        Output dtype. Defaults to ``torch.bfloat16``.
+    max_m: int
+        Largest expected number of rows; larger calls fall back to
+        :func:`mm_bf16` auto dispatch.
+    """
+    return MmBf16Plan(b, bias, pdl, out_dtype, max_m)
 
 
 def fp8_gemm_sm100(
