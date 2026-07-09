@@ -2162,8 +2162,7 @@ def _build_mla_decode_tuning_config(
     page reads give correct timing measurements. ``seq_lens`` is filled
     homogeneously with ``min(max_seq_len, provisioned_max_seq_len)``.
     """
-    from ..autotuner import DynamicTensorSpec, TuningConfig
-    from ..fused_moe.utils import make_bucket_mapper
+    from ..autotuner import DynamicTensorSpec, TuningConfig, make_bucket_mapper
 
     # kv_cache may be 3D [num_pages, page_size, D] or 4D
     # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
