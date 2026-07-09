@@ -90,6 +90,61 @@ from .utils import (
 )
 
 
+_BATCH_DECODE_PLAN_LEGACY_POS_ARGS = (
+    "pos_encoding_mode",
+    "window_left",
+    "logits_soft_cap",
+    "q_data_type",
+    "kv_data_type",
+    "o_data_type",
+    "data_type",
+    "sm_scale",
+    "rope_scale",
+    "rope_theta",
+    "non_blocking",
+    "block_tables",
+    "seq_lens",
+    "fixed_split_size",
+    "disable_split_kv",
+    "q_len_per_req",
+)
+
+
+def _merge_deprecated_plan_kwargs(
+    api_name: str,
+    deprecated_positional_args: Tuple[Any, ...],
+    legacy_positional_names: Tuple[str, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    if len(deprecated_positional_args) > len(legacy_positional_names):
+        raise TypeError(
+            f"{api_name}.plan() accepts at most {len(legacy_positional_names)} "
+            "deprecated optional positional arguments after page_size; got "
+            f"{len(deprecated_positional_args)}"
+        )
+
+    merged_kwargs = dict(kwargs)
+    for name, value in zip(
+        legacy_positional_names, deprecated_positional_args, strict=False
+    ):
+        if name in merged_kwargs:
+            raise TypeError(
+                f"{api_name}.plan() got multiple values for argument {name!r}"
+            )
+        merged_kwargs[name] = value
+    return merged_kwargs
+
+
+def _warn_deprecated_plan_positional_args(api_name: str) -> None:
+    warnings.warn(
+        f"Passing optional arguments to {api_name}.plan() positionally is "
+        "deprecated; pass them as keyword arguments instead. Scheduled for "
+        "removal in a future release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
 @functools.cache
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)
@@ -776,7 +831,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL GQA decode kernel for Blackwell
             (SM100+) and only supports a subset of features (equal head_dim_qk/vo,
-            no RoPE/ALiBi/soft-cap/sliding window).
+            no RoPE/ALiBi/soft-cap).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -1168,22 +1223,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
-        pos_encoding_mode: str = "NONE",
-        window_left: int = -1,
-        logits_soft_cap: Optional[float] = None,
-        q_data_type: Optional[Union[str, torch.dtype]] = "float16",
-        kv_data_type: Optional[Union[str, torch.dtype]] = None,
-        o_data_type: Optional[Union[str, torch.dtype]] = None,
-        data_type: Optional[Union[str, torch.dtype]] = None,
-        sm_scale: Optional[float] = None,
-        rope_scale: Optional[float] = None,
-        rope_theta: Optional[float] = None,
-        non_blocking: bool = True,
-        block_tables: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        fixed_split_size: Optional[int] = None,
-        disable_split_kv: bool = False,
-        q_len_per_req: int = 1,
+        *deprecated_positional_args: Any,
+        **kwargs: Any,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -1211,6 +1252,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+        window_right : int
+            The right (inclusive) window size for the attention window.
+            ``-1`` disables the right bound. Defaults to ``0``. Currently ``window_right != 0``
+            only supported by the ``cute-dsl`` backend.
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -1265,7 +1310,70 @@ class BatchDecodeWithPagedKVCacheWrapper:
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
+
+        Optional arguments after ``page_size`` are accepted positionally for
+        backward compatibility, but that calling convention is deprecated and
+        scheduled for removal in a future release. Pass them by keyword instead.
+        ``window_right`` is keyword-only.
         """
+        if not deprecated_positional_args:
+            return self._plan_impl(
+                indptr,
+                indices,
+                last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                **kwargs,
+            )
+
+        plan_kwargs = _merge_deprecated_plan_kwargs(
+            "BatchDecodeWithPagedKVCacheWrapper",
+            deprecated_positional_args,
+            _BATCH_DECODE_PLAN_LEGACY_POS_ARGS,
+            kwargs,
+        )
+        _warn_deprecated_plan_positional_args("BatchDecodeWithPagedKVCacheWrapper")
+        return self._plan_impl(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            **plan_kwargs,
+        )
+
+    def _plan_impl(
+        self,
+        indptr: torch.Tensor,
+        indices: torch.Tensor,
+        last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        *,
+        pos_encoding_mode: str = "NONE",
+        window_left: int = -1,
+        window_right: int = 0,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: Optional[Union[str, torch.dtype]] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
+        data_type: Optional[Union[str, torch.dtype]] = None,
+        sm_scale: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+        non_blocking: bool = True,
+        block_tables: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
+        q_len_per_req: int = 1,
+    ) -> None:
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -1280,6 +1388,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+        if window_right != 0 and self._backend != "cute-dsl":
+            raise NotImplementedError(
+                "BatchDecodeWithPagedKVCacheWrapper only supports window_right != 0 "
+                "with backend='cute-dsl'"
+            )
 
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if self.is_cuda_graph_enabled:
@@ -1357,10 +1470,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "cute-dsl decode backend does not support logits_soft_cap"
                 )
-            if window_left >= 0:
-                raise NotImplementedError(
-                    "cute-dsl decode backend does not support sliding window"
-                )
             if pos_encoding_mode != "NONE":
                 raise NotImplementedError(
                     f"cute-dsl decode backend does not support "
@@ -1397,7 +1506,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 kv_splits=kv_splits,
                 reduction="none" if disable_split_kv else "auto",
                 q_len_per_req=q_len_per_req,
-                is_causal=True,
+                window_left=(None if window_left < 0 else window_left),
+                window_right=(None if window_right < 0 else window_right),
                 max_kv_len=self._max_kv_len,
                 non_blocking=non_blocking,
             )
@@ -1552,6 +1662,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -1697,8 +1808,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             provided, ``sinks[head_idx]`` is appended to each row of the
             softmax denominator (Streaming-LLM / Attention-Sinks). The dtype
             requirement is backend-specific and validated by the underlying
-            kernel; pass ``None`` to disable. Not supported by the
-            ``cute-dsl`` backend.
+            kernel; pass ``None`` to disable.
         q_len_per_req : Optional[int]
             DEPRECATED — pass to :meth:`plan` instead. When provided here, emits
             a :class:`DeprecationWarning` and is used to validate the run-time value
@@ -1841,10 +1951,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             check_shape_dtype_device(out, q.shape, out_dtype, q.device, "out")
 
         if self._backend == "cute-dsl":
-            if sinks is not None:
-                raise NotImplementedError(
-                    "cute-dsl decode backend does not support attention sinks"
-                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "cute-dsl decode backend does not support NVFP4 KV cache"
@@ -1867,6 +1973,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 out=out,
                 sm_scale=sm_scale,
                 o_scale=o_scale,
+                sinks=sinks,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 lse=lse if return_lse else None,
                 enable_pdl=enable_pdl,

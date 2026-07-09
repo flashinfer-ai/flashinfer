@@ -679,12 +679,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       activation_dtype = isNvfp4Quant() ? dl_int64 : activation_dtype;
       int64_t const unpadded_hidden_size_profiler = hidden_size;  // HACK no padding by default
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-      mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
-                      DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
-                      DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
-                      hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
-                      activation_type, USE_BIAS, USE_LORA, min_latency_mode,
-                      /*need_weights*/ false, parallelism_config, enable_alltoall);
+      mProfiler->init(
+          *mKernelRunner.get(), mProfiler->mGemmToProfile, DtypeUtils::dataType(activation_dtype),
+          DtypeUtils::dataType(mWeightDtype), DtypeUtils::dataType(mOutputDtype), num_experts,
+          static_cast<int>(top_k), hidden_size, unpadded_hidden_size_profiler, inter_size,
+          group_size, activation_type, USE_BIAS, USE_LORA, min_latency_mode,
+          /*need_weights*/ false, parallelism_config, enable_alltoall, mUseMxfp8ActScaling);
 #else
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                       DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),

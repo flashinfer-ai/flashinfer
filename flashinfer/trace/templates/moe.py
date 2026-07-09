@@ -3436,3 +3436,115 @@ b12x_moe_wrapper_run_trace = TraceTemplate(
     tags=b12x_fused_moe_trace.tags,
     reference=_b12x_fused_moe_reference,
 )
+
+
+# ---------------------------------------------------------------------------
+# DSv4 hash-based MoE routing (MOE-01-HASH)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def _hash_topk_reference(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: float = 1.0,
+    **_unused,
+):
+    """Reference for DSv4 hash-based MoE routing.
+
+    1. Look up routed experts from the table: ``tid2eid[input_ids]``.
+    2. Score the selected logits with ``sqrt(softplus(.))``.
+    3. Normalize routed weights by their sum.
+    4. Append a shared-expert slot (id ``num_routed_experts``, weight
+       ``1 / routed_scaling_factor``) when ``num_fused_shared_experts == 1``.
+
+    Returns ``(topk_weights, topk_ids)``.
+    """
+    num_tokens, num_routed_experts = router_logits.shape
+    topk = tid2eid.shape[1]
+    topk_fused = topk + int(num_fused_shared_experts)
+
+    scores = torch.sqrt(torch.nn.functional.softplus(router_logits.to(torch.float32)))
+    expert_ids = tid2eid[input_ids].to(torch.int64)
+    gathered = torch.gather(scores, 1, expert_ids)
+    routed_sum = gathered.sum(dim=-1, keepdim=True)
+
+    weights = torch.empty(
+        num_tokens, topk_fused, dtype=torch.float32, device=router_logits.device
+    )
+    ids = torch.empty(
+        num_tokens, topk_fused, dtype=torch.int32, device=router_logits.device
+    )
+    weights[:, :topk] = gathered / routed_sum
+    ids[:, :topk] = expert_ids.to(torch.int32)
+    for s in range(int(num_fused_shared_experts)):
+        ids[:, topk + s] = num_routed_experts + s
+        weights[:, topk + s] = 1.0 / float(routed_scaling_factor)
+    return weights, ids
+
+
+def _hash_topk_init(
+    *,
+    num_tokens: int,
+    num_routed_experts: int = 256,
+    topk: int = 8,
+    vocab: int = 1024,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for DSv4 hash-based MoE routing.
+
+    The trace covers the routed path (``num_fused_shared_experts == 0``); the
+    optional shared-expert slot only appends one constant column and does not
+    change the kernel's per-token work.
+    """
+    torch.manual_seed(seed)
+    router_logits = torch.randn(
+        num_tokens, num_routed_experts, dtype=torch.float32, device=device
+    )
+    input_ids = torch.randint(0, vocab, (num_tokens,), dtype=torch.int64, device=device)
+    tid2eid = torch.empty((vocab, topk), dtype=torch.int32, device=device)
+    for v in range(vocab):
+        tid2eid[v] = torch.randperm(num_routed_experts, device=device)[:topk].to(
+            torch.int32
+        )
+    return {
+        "router_logits": router_logits,
+        "input_ids": input_ids,
+        "tid2eid": tid2eid,
+        "num_fused_shared_experts": 0,
+        "routed_scaling_factor": 1.0,
+    }
+
+
+hash_topk_trace = TraceTemplate(
+    op_type="moe_routing",
+    name_prefix="hash_topk",
+    description=(
+        "DSv4 hash-based MoE routing: tid2eid[input_ids] table lookup -> "
+        "sqrt(softplus) score -> normalize -> optional fused shared expert. "
+        "Returns (topk_weights, topk_ids)."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_routed_experts": Const(abbrev="e"),
+        "topk": Const(abbrev="k"),
+        "vocab": Const(abbrev="v"),
+    },
+    inputs={
+        "router_logits": Tensor(["num_tokens", "num_routed_experts"]),
+        "input_ids": Tensor(["num_tokens"], dtype="int64"),
+        "tid2eid": Tensor(["vocab", "topk"], dtype="int32"),
+        "num_fused_shared_experts": Scalar("int32"),
+        "routed_scaling_factor": Scalar("float32"),
+    },
+    outputs={
+        "topk_weights": Tensor(["num_tokens", "topk"], dtype="float32"),
+        "topk_ids": Tensor(["num_tokens", "topk"], dtype="int32"),
+    },
+    tags=["status:verified", "moe"],
+    reference=_hash_topk_reference,
+    init=_hash_topk_init,
+)

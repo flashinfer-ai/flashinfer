@@ -71,6 +71,10 @@ from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
 )
 
+from .hash_topk import (  # noqa: F401
+    hash_topk as hash_topk,
+)
+
 from .bgmv_moe import (  # noqa: F401
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
@@ -146,6 +150,7 @@ __all__ = [
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
+    "hash_topk",
     "bgmv_moe",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",
