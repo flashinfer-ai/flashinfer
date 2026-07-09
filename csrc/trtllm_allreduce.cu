@@ -127,6 +127,9 @@ void trtllm_custom_all_reduce(TensorView in, TensorView out, int64_t tp_size, in
         intermediate_buffer.has_value() ? intermediate_buffer.value().data_ptr() : nullptr;
 
     // add ipc buffer pointers
+    TVM_FFI_ICHECK(tp_size <= static_cast<int64_t>(MAX_RANKS_PER_NODE))
+        << "tp_size (" << tp_size << ") cannot exceed MAX_RANKS_PER_NODE (" << MAX_RANKS_PER_NODE
+        << ")";
     for (int i = 0; i < tp_size; ++i) {
       params.peer_comm_buffer_ptrs[i] =
           reinterpret_cast<void*>(static_cast<int64_t*>(peer_comm_buffer_ptrs.data_ptr())[i]);
