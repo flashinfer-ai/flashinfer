@@ -1,7 +1,7 @@
 """MoE Expert-Parallel benchmark: dispatch → compute → combine.
 
 Canonical cases mirror the NCCL-EP ``ep_bench`` reference
-(``3rdparty/nccl/contrib/nccl_ep/README.md``): **128 tokens/rank, hidden 7168,
+(``contrib/nccl_ep/README.md`` in the NCCL repo): **128 tokens/rank, hidden 7168,
 top-k 8, 256 experts, BF16**, swept over **8/16/32/64 GPUs** and over the two EP
 **algorithms — Low-Latency (LL) and High-Throughput (HT)** (one table each).
 Select that geometry with ``--reference`` and the algorithm with

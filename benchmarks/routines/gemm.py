@@ -1636,12 +1636,18 @@ def testMmMxfp8(args):
     for backend in backends:
         ## Prepare input tensors
         # Use swizzled layout for optimal performance
-        is_sf_swizzled_layout = backend in ["cutlass", "trtllm", "cudnn"]
+        is_sf_swizzled_layout = backend in [
+            "cutlass",
+            "cute-dsl",
+            "trtllm",
+            "cudnn",
+        ]
 
         if not is_sf_swizzled_layout:
             sf_layout_input = flashinfer.SfLayout.layout_linear
-        elif backend in ("cutlass", "cudnn") or args.use_128x4_sf_layout:
-            # CUTLASS and cuDNN use the F8_128x4 swizzled scale layout here.
+        elif backend in ("cutlass", "cute-dsl", "cudnn") or args.use_128x4_sf_layout:
+            # CUTLASS, CuTe DSL, and cuDNN use the F8_128x4 swizzled scale
+            # layout here.
             sf_layout_input = flashinfer.SfLayout.layout_128x4
         elif backend == "trtllm":
             if not args.use_128x4_sf_layout:

@@ -2331,6 +2331,222 @@ cutlass_fused_moe_trace.axes["gemm1_out_size"] = Const(
     abbrev="", description="FC1 output size (typically 2 * intermediate_size)."
 )
 
+
+# ---------------------------------------------------------------------------
+# mono_moe (monomoe) — single-kernel block-FP8 top-K MoE, Qwen3.5-35B shape
+# ---------------------------------------------------------------------------
+# Fixed-shape Hopper (SM90a) MonoMoe kernel: routing is FUSED in-kernel from
+# router_logits, so unlike cutlass_fused_moe this template takes the logits
+# (not precomputed selections).  Weights are block-FP8 (128x128):
+#   activations_in     : [seq_len, hidden_size]                 bf16
+#   router_logits      : [seq_len, num_experts]                 bf16
+#   expert_weights_up  : [num_experts, gemm1_out_size, hidden_size]   fp8 (gate||up)
+#   expert_scales_up   : [num_experts, num_gemm1_out_blocks, num_hidden_blocks] fp32
+#   expert_weights_down: [num_experts, hidden_size, intermediate_size]    fp8
+#   expert_scales_down : [num_experts, num_hidden_blocks, num_intermediate_blocks] fp32
+
+
+@torch.no_grad()
+def _mono_moe_reference(
+    activations_in,
+    router_logits,
+    expert_weights_up,
+    expert_scales_up,
+    expert_weights_down,
+    expert_scales_down,
+    top_k,
+    scoring_func="softmax",
+    renormalize=True,
+    **_unused,
+):
+    """Reference for mono_moe: in-kernel softmax/sigmoid routing + block-FP8 SwiGLU.
+
+    Mirrors the monomoe math: score router_logits (softmax or sigmoid),
+    take top-k, optionally renormalize the selected weights to sum to 1,
+    then run the shared block-FP8 dequant + SwiGLU + GEMM helper.  The
+    up-projection weights use the [gate || up] half ordering (monomoe's
+    convention), which `_fp8_moe_run_experts` already assumes (X1=gate,
+    X2=up with silu on X2).
+    """
+    E_global = router_logits.shape[1]
+    TOP_K = int(top_k)
+    logits = router_logits.to(torch.float32)
+    if scoring_func == "sigmoid":
+        scores = torch.sigmoid(logits)
+    else:
+        scores = torch.softmax(logits, dim=-1)
+    topk_vals, topk_idx = torch.topk(scores, k=TOP_K, dim=1, largest=True, sorted=False)
+    if renormalize:
+        weights = topk_vals / (topk_vals.sum(dim=1, keepdim=True) + 1e-20)
+    else:
+        weights = topk_vals
+    # hidden_states_scale: the helper expects [H/128, T] (block-wise act
+    # scale).  monomoe quantizes activations internally, so for the
+    # reference we treat the bf16 input as already-dequantized by passing a
+    # unit scale of the right shape and an fp8 round-trip of the input.
+    T, H = activations_in.shape
+    BLOCK = 128
+    hs_fp8, hs_scale_TxNb = fp8_block_quant_1d(
+        activations_in.to(torch.bfloat16), block=BLOCK
+    )
+    hs_scale = hs_scale_TxNb.transpose(0, 1).contiguous()  # [H/128, T]
+    return _fp8_moe_run_experts(
+        hs_fp8,
+        hs_scale,
+        expert_weights_up,
+        expert_scales_up,
+        expert_weights_down,
+        expert_scales_down,
+        weights,
+        topk_idx,
+        local_expert_offset=0,
+        E_global=E_global,
+    )
+
+
+def _mono_moe_init(
+    *,
+    seq_len: int,
+    num_experts: int = 256,
+    top_k: int = 8,
+    hidden_size: int = 2048,
+    intermediate_size: int = 512,
+    gemm1_out_size: int = 0,  # derived: 2 * intermediate_size
+    num_hidden_blocks: int = 0,  # derived: hidden_size / 128
+    num_intermediate_blocks: int = 0,  # derived: intermediate_size / 128
+    num_gemm1_out_blocks: int = 0,  # derived: gemm1_out_size / 128
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``mono_moe`` (fixed Qwen3.5-35B block-FP8 shape).
+
+    The monomoe kernel is hard-specialized to E=256, N=512, K=2048, BS<=8,
+    so the defaults match that shape (``seq_len`` is the only Var, capped at
+    8 by the kernel).  Weights are block-FP8 (128×128) quantized via the
+    shared ``fp8_block_quant_2d`` helper; activations / router_logits are
+    bf16 (the kernel quantizes activations internally).
+    """
+    del gemm1_out_size, num_hidden_blocks, num_intermediate_blocks
+    del num_gemm1_out_blocks
+    torch.manual_seed(seed)
+    BLOCK = 128
+    activations_in = torch.randn(
+        seq_len, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    router_logits = torch.randn(
+        seq_len, num_experts, dtype=torch.bfloat16, device=device
+    )
+    w13_bf16 = 0.1 * torch.randn(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w2_bf16 = 0.1 * torch.randn(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w13, w13s = fp8_block_quant_2d(w13_bf16, block=BLOCK)
+    w2, w2s = fp8_block_quant_2d(w2_bf16, block=BLOCK)
+    return {
+        "activations_in": activations_in,
+        "router_logits": router_logits,
+        "expert_weights_up": w13,
+        "expert_scales_up": w13s,
+        "expert_weights_down": w2,
+        "expert_scales_down": w2s,
+        "top_k": int(top_k),
+        "scoring_func": "softmax",
+        "renormalize": True,
+    }
+
+
+mono_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="mono_moe",
+    description=(
+        "Single-kernel (monomoe) block-FP8 top-K MoE for the Qwen3.5-35B shape "
+        "on Hopper (SM90a). Routing (softmax/sigmoid top-K + renormalize) is "
+        "fused in-kernel from router_logits; weights are block-FP8 (128x128)."
+    ),
+    axes={
+        "seq_len": Var(description="Sequence length (number of tokens, <= 8)."),
+        "num_experts": Const(description="Total number of experts.", abbrev=""),
+        "top_k": Const(
+            description="Number of experts to route to per token.", abbrev="topk"
+        ),
+        "hidden_size": Const(description="Hidden dimension size (K).", abbrev="h"),
+        "intermediate_size": Const(
+            description="MoE intermediate layer size (N).", abbrev="i"
+        ),
+        "gemm1_out_size": Const(
+            description="Up-projection output rows (2 * intermediate_size, gate||up).",
+            abbrev="",
+        ),
+        "num_hidden_blocks": Const(
+            description="Quantized blocks along hidden_size (block_size=128).",
+            abbrev="",
+        ),
+        "num_intermediate_blocks": Const(
+            description="Quantized blocks along intermediate_size (block_size=128).",
+            abbrev="",
+        ),
+        "num_gemm1_out_blocks": Const(
+            description="Quantized blocks along gemm1_out_size (block_size=128).",
+            abbrev="",
+        ),
+    },
+    inputs={
+        "activations_in": Tensor(
+            ["seq_len", "hidden_size"],
+            dtype="bfloat16",
+            description="Input activations (bf16; quantized to FP8 in-kernel).",
+        ),
+        "router_logits": Tensor(
+            ["seq_len", "num_experts"],
+            dtype="bfloat16",
+            description="Router logits for in-kernel expert selection.",
+        ),
+        "expert_weights_up": Tensor(
+            ["num_experts", "gemm1_out_size", "hidden_size"],
+            description="Up/gate projection weights (FP8, [gate || up] rows).",
+        ),
+        "expert_scales_up": Tensor(
+            ["num_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
+            dtype="float32",
+            description="Block-wise (128x128) FP8 scales for up/gate weights.",
+        ),
+        "expert_weights_down": Tensor(
+            ["num_experts", "hidden_size", "intermediate_size"],
+            description="Down projection weights (FP8, raw row-major).",
+        ),
+        "expert_scales_down": Tensor(
+            ["num_experts", "num_hidden_blocks", "num_intermediate_blocks"],
+            dtype="float32",
+            description="Block-wise (128x128) FP8 scales for down weights.",
+        ),
+        "top_k": Scalar(
+            "int32",
+            description="Number of experts to route to per token (1..8).",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["seq_len", "hidden_size"],
+            dtype="bfloat16",
+            description="Final MoE output tensor (also the return value).",
+        ),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn", "arch:sm90a"],
+    reference=_mono_moe_reference,
+    init=_mono_moe_init,
+)
+
+
 # Shared factory for the remaining trtllm_* variants
 _TRTLLM_MOE_COMMON_INPUTS: dict[str, Tensor | Scalar] = {
     "routing_logits": Tensor(

@@ -84,8 +84,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]
 "flashinfer.data.cccl" = ["cub/cub/**", "libcudacxx/include/**", "thrust/thrust/**"]
-# EP backend shared libraries built in-tree from 3rdparty/{nixl,nccl} when
-# BUILD_NVEP=1 is set during `pip install`. The .so files live under
+# EP backend shared libraries built in-tree from 3rdparty/nixl by default
+# during `pip install` (opt out with BUILD_NIXL_EP=0). The .so files live under
 # flashinfer/moe_ep/backends/split/comm/{nccl,nixl}_ep/_libs/ (gitignored;
 # populated by build_backend._build_nvep_if_enabled).
 "flashinfer.moe_ep.backends.split.comm.nixl_ep" = ["_libs/**", "_vendored/**"]

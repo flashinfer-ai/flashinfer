@@ -5,8 +5,8 @@ Two pieces matter for import-time success:
 1. The base NIXL runtime libraries (``libnixl.so``, ``libnixl_capi.so``,
    ``libnixl_common.so``, ``libserdes.so``, etc.) — *not* shipped inside this
    package. They're expected to come from the ``nixl-cu13`` pip wheel,
-   installed automatically when the user runs ``BUILD_NVEP=1 pip install ...``
-   (see ``build_backend._install_nvep_runtime_wheels``).
+   installed automatically by the default ``pip install .`` build (see
+   ``build_backend._ensure_nixl_wheel`` / ``_install_nvep_runtime_wheels``).
 
 2. The EP torch extension, ``nixl_ep_cpp*.so`` — built in-tree from
    ``3rdparty/nixl/examples/device/ep`` and staged into ``_libs/`` here.
@@ -150,9 +150,11 @@ def _load_nixl_ep_cpp() -> ctypes.CDLL:
     so_files = list(_libs_dir.glob("nixl_ep_cpp*.so"))
     if not so_files:
         raise MoEEpNotBuiltError(
-            f"nixl_ep_cpp*.so is not staged under {_libs_dir}. Rebuild with:\n"
-            '    BUILD_NVEP=1 pip install -e ".[nvep]"\n'
-            "or BUILD_NIXL_EP=1 for a NIXL-EP-only build."
+            f"nixl_ep_cpp*.so is not staged under {_libs_dir}. It builds by "
+            "default; rebuild with:\n"
+            "    pip install -e .\n"
+            "(BUILD_NIXL_EP=1 makes missing build deps a hard error instead "
+            "of skip-with-warning)."
         )
     _preload_libnixl()
     try:
