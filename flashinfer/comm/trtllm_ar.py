@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 import logging
-from ctypes import c_void_p, cast
+from ctypes import c_void_p, cast, create_string_buffer
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
 from typing_extensions import deprecated
@@ -571,7 +571,9 @@ def _initialize_allreduce_fusion_protocol(
     )
 
     cudart.cudaMemset(c_void_p(control_flag_ptr), 0, 5 * 4)
-    lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder="little")
+    lamport_comm_size_bytes = create_string_buffer(
+        lamport_comm_size.to_bytes(4, byteorder="little"), 4
+    )
     cudart.cudaMemcpy(
         c_void_p(control_flag_ptr + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
     )
