@@ -75,16 +75,9 @@ __device__ __forceinline__ unsigned int get_power_of_2_value(unsigned int n) {
 }
 
 __device__ __forceinline__ int da_knn_decode_local_id(int32_t raw, int local_expert_offset,
-                                                      int max_local_expert, int num_local_experts) {
-  int expert_id = raw;
-  if (expert_id < local_expert_offset || expert_id >= max_local_expert) {
-    int hi = (raw >> 16) & 0xFFFF;
-    if (hi >= local_expert_offset && hi < max_local_expert) {
-      expert_id = hi;
-    } else {
-      expert_id = raw & 0xFFFF;
-    }
-  }
+                                                      int max_local_expert, int num_local_experts,
+                                                      bool topk_ids_are_packed) {
+  int const expert_id = topk_ids_are_packed ? ((raw >> 16) & 0xFFFF) : raw;
   int const local_id = expert_id - local_expert_offset;
   return (local_id >= 0 && local_id < num_local_experts) ? local_id : -1;
 }
@@ -481,7 +474,8 @@ template <bool UsePdl>
 __global__ void da_knn_histogram_counts_graph_kernel(const int32_t* __restrict__ topk_ids,
                                                      int num_elements,
                                                      const DAKnnParams* __restrict__ params,
-                                                     int32_t* __restrict__ counts) {
+                                                     int32_t* __restrict__ counts,
+                                                     bool topk_ids_are_packed) {
   __shared__ unsigned int cub_counts[kKnnSelectorHistogramBins];
 
   using BlockHistogram = cub::BlockHistogram<unsigned short, kKnnSplitHistogramBlockThreads,
@@ -538,8 +532,8 @@ __global__ void da_knn_histogram_counts_graph_kernel(const int32_t* __restrict__
         v1.w = (lane_base1 + 3 < num_elements) ? topk_ids[lane_base1 + 3] : -1;
       }
       auto enc = [&](int32_t raw) {
-        int local_id =
-            da_knn_decode_local_id(raw, local_expert_offset, max_local_expert, num_local_experts);
+        int local_id = da_knn_decode_local_id(raw, local_expert_offset, max_local_expert,
+                                              num_local_experts, topk_ids_are_packed);
         return static_cast<unsigned short>(local_id >= 0 ? local_id : kMaxKnnExperts);
       };
       items[0] = enc(v0.x);
@@ -563,7 +557,7 @@ __global__ void da_knn_histogram_counts_graph_kernel(const int32_t* __restrict__
         int local_id = -1;
         if (idx < num_elements) {
           local_id = da_knn_decode_local_id(topk_ids[idx], local_expert_offset, max_local_expert,
-                                            num_local_experts);
+                                            num_local_experts, topk_ids_are_packed);
         }
         items[item] = static_cast<unsigned short>(local_id >= 0 ? local_id : kMaxKnnExperts);
       }
@@ -762,7 +756,7 @@ __global__ void da_fused_hist_decision_graph_kernel(
     const int32_t* __restrict__ topk_ids, int num_elements, const DAKnnParams* __restrict__ params,
     int32_t* __restrict__ counts, unsigned int* __restrict__ d_block_done,
     int32_t* __restrict__ selected_tile_idx, int32_t* __restrict__ selected_tile_n,
-    cudaGraphConditionalHandle switch_handle) {
+    cudaGraphConditionalHandle switch_handle, bool topk_ids_are_packed) {
   __shared__ unsigned int cub_counts[kKnnSelectorHistogramBins];
   using BlockHistogram = cub::BlockHistogram<unsigned short, kKnnSplitHistogramBlockThreads,
                                              kKnnSplitHistogramItemsPerThread,
@@ -828,8 +822,8 @@ __global__ void da_fused_hist_decision_graph_kernel(
         v1.w = (lane_base1 + 3 < num_elements) ? topk_ids[lane_base1 + 3] : -1;
       }
       auto enc = [&](int32_t raw) {
-        int local_id =
-            da_knn_decode_local_id(raw, local_expert_offset, max_local_expert, num_local_experts);
+        int local_id = da_knn_decode_local_id(raw, local_expert_offset, max_local_expert,
+                                              num_local_experts, topk_ids_are_packed);
         return static_cast<unsigned short>(local_id >= 0 ? local_id : kMaxKnnExperts);
       };
       items[0] = enc(v0.x);
@@ -853,7 +847,7 @@ __global__ void da_fused_hist_decision_graph_kernel(
         int local_id = -1;
         if (idx < num_elements) {
           local_id = da_knn_decode_local_id(topk_ids[idx], local_expert_offset, max_local_expert,
-                                            num_local_experts);
+                                            num_local_experts, topk_ids_are_packed);
         }
         items[item] = static_cast<unsigned short>(local_id >= 0 ? local_id : kMaxKnnExperts);
       }
@@ -889,12 +883,10 @@ __global__ void da_fused_hist_decision_graph_kernel(
 // ||counts|| is constant across exemplars. One warp per exemplar dot product.
 // Launch: 1 block, 256 threads.
 // ---------------------------------------------------------------------------
-__global__ void da_knn_select_tile_graph_kernel(const int32_t* __restrict__ topk_ids,
-                                                int num_elements,
-                                                const DAKnnParams* __restrict__ params,
-                                                int32_t* __restrict__ selected_tile_idx,
-                                                int32_t* __restrict__ selected_tile_n,
-                                                cudaGraphConditionalHandle switch_handle) {
+__global__ void da_knn_select_tile_graph_kernel(
+    const int32_t* __restrict__ topk_ids, int num_elements, const DAKnnParams* __restrict__ params,
+    int32_t* __restrict__ selected_tile_idx, int32_t* __restrict__ selected_tile_n,
+    cudaGraphConditionalHandle switch_handle, bool topk_ids_are_packed) {
   __shared__ int counts_int[kMaxKnnExperts];
   __shared__ unsigned int cub_counts[kKnnSelectorHistogramBins];
   __shared__ float sims[kMaxExemplars];
@@ -930,7 +922,7 @@ __global__ void da_knn_select_tile_graph_kernel(const int32_t* __restrict__ topk
       int local_id = -1;
       if (idx < num_elements) {
         local_id = da_knn_decode_local_id(topk_ids[idx], local_expert_offset, max_local_expert,
-                                          num_local_experts);
+                                          num_local_experts, topk_ids_are_packed);
       }
       items[item] = static_cast<unsigned short>(local_id >= 0 ? local_id : kMaxKnnExperts);
     }

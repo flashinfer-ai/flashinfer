@@ -72,8 +72,8 @@ class DAInvocation:
     dtype_act: DtypeTrtllmGen
     norm_topk_prob: bool
     use_routing_scales_on_input: bool
-    precomputed_topk_ids_are_packed: bool
     routing_input_mode: int
+    internal_routing_mode: int
     enable_pdl: bool
 
 
@@ -493,7 +493,6 @@ def try_capture_dispatch(
     run_from_routing_metadata: Callable[
         [da_capture.RoutingMetadataBundle, Sequence[int]], None
     ],
-    direct_body: Optional[Callable[[Sequence[int], dict[str, Any]], None]] = None,
 ) -> Optional[list[torch.Tensor]]:
     """Delegate capture dispatch with the execution's immutable configuration."""
 
@@ -510,9 +509,8 @@ def try_capture_dispatch(
         debug_log=lambda message: debug_log(message, execution.config),
         da_context=call.da_context,
         run_from_routing_metadata=run_from_routing_metadata,
-        direct_body=direct_body,
-        precomputed_topk_ids_are_packed=call.precomputed_topk_ids_are_packed,
         routing_input_mode=call.routing_input_mode,
+        internal_routing_mode=call.internal_routing_mode,
         hidden_states=call.hidden_states,
         hidden_states_scale=call.hidden_states_scale,
         routing_logits=call.routing_logits,

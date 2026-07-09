@@ -30,6 +30,7 @@
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
+#include "flashinfer/trtllm/fused_moe/da_heuristic_constants.cuh"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "nv_internal/tensorrt_llm/kernels/quantization.h"
 #include "nv_internal/tensorrt_llm/thop/utils.h"
@@ -46,29 +47,6 @@ __global__ void packRoutingWeights(int32_t* packed_topk_ids, uint16_t const* exp
     auto const expert_id_bits = static_cast<uint32_t>(packed_topk_ids[index]) & 0xffff0000U;
     packed_topk_ids[index] =
         static_cast<int32_t>(expert_id_bits | static_cast<uint32_t>(expert_weights[index]));
-  }
-}
-
-__global__ void packUnpackedRoutingFromBfloat16(int32_t const* expert_ids,
-                                                uint16_t const* expert_weights,
-                                                int32_t* packed_topk_ids, int64_t numel) {
-  int64_t const index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index < numel) {
-    packed_topk_ids[index] = static_cast<int32_t>((static_cast<uint32_t>(expert_ids[index]) << 16) |
-                                                  expert_weights[index]);
-  }
-}
-
-__global__ void packUnpackedRoutingFromFloat(int32_t const* expert_ids, float const* expert_weights,
-                                             int32_t* packed_topk_ids, int64_t numel) {
-  int64_t const index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index < numel) {
-    union {
-      __nv_bfloat16 value;
-      uint16_t bits;
-    } quantized{__float2bfloat16_rn(expert_weights[index])};
-    packed_topk_ids[index] =
-        static_cast<int32_t>((static_cast<uint32_t>(expert_ids[index]) << 16) | quantized.bits);
   }
 }
 
@@ -1007,7 +985,8 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
                   TensorView const& gemm1_weights, TensorView const& gemm2_weights,
                   Optional<TensorView> const& gemm1_bias)
       : Bf16MoeLauncher(routing_logits, routing_bias, hidden_states, hidden_states, hidden_states,
-                        gemm1_weights, gemm2_weights, gemm1_bias) {}
+                        gemm1_weights, gemm2_weights, gemm1_bias, Optional<TensorView>(),
+                        Optional<TensorView>(), Optional<TensorView>()) {}
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
@@ -1421,9 +1400,10 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                         TensorView const& gemm2_weights_scale,
                         Fp8QuantizationType quantization_type)
       : Fp8BlockScaleLauncher(routing_logits, routing_bias, hidden_states, hidden_states_scale,
-                              gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm2_weights,
-                              gemm2_weights_scale, hidden_states, hidden_states,
-                              quantization_type) {}
+                              gemm1_weights, gemm1_weights_scale, gemm1_bias,
+                              Optional<TensorView>(), Optional<TensorView>(),
+                              Optional<TensorView>(), gemm2_weights, gemm2_weights_scale,
+                              hidden_states, hidden_states, quantization_type) {}
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
@@ -1458,7 +1438,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
 
   void check_routing() const override {
     // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
-    if (expert_indices.ndim() == 2 && expert_indices.size(0) > 0) {
+    bool const has_precomputed_routing = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
+    if (has_precomputed_routing) {
       // Pre-computed routing: expert_indices is a packed tensor
       // Format: (expert_id << 16) | (weight_bf16.view(int16))
       TVM_FFI_ICHECK_EQ(expert_indices.ndim(), 2) << "expert_indices must be 2D.";
@@ -1496,8 +1477,10 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
           << "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.";
       TVM_FFI_ICHECK_LE(args->topk_group, args->n_group)
           << "n_group must not be smaller than topk_group.";
-      TVM_FFI_ICHECK_LT(args->top_k, (args->topk_group * args->num_experts / args->n_group))
-          << "top_k must be less than total number of experts in selected groups";
+      if (!has_precomputed_routing) {
+        TVM_FFI_ICHECK_LT(args->top_k, (args->topk_group * args->num_experts / args->n_group))
+            << "top_k must be less than total number of experts in selected groups";
+      }
     } else if (static_cast<RoutingMethodType>(routing_method_type) ==
                    RoutingMethodType::Renormalize ||
                static_cast<RoutingMethodType>(routing_method_type) ==
@@ -1514,7 +1497,13 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
 
     TVM_FFI_ICHECK_EQ(args->num_experts % 4, 0)
         << "Routing kernel expects that num_experts must be divisible by 4";
-    TVM_FFI_ICHECK_GT(args->num_experts, args->top_k) << "num_experts must be greater than top_k";
+    if (has_precomputed_routing) {
+      TVM_FFI_ICHECK_GE(args->num_experts, args->top_k)
+          << "num_experts must be greater than or equal to top_k for precomputed routing";
+    } else {
+      TVM_FFI_ICHECK_GT(args->num_experts, args->top_k)
+          << "num_experts must be greater than top_k for logits routing";
+    }
     TVM_FFI_ICHECK_LE(args->local_num_experts + args->local_expert_offset, args->num_experts)
         << "num_experts must be greater or equal to local_num_experts + local_expert_offset";
   }
@@ -3459,16 +3448,35 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata(
     TensorView topk_ids, Optional<TensorView> routing_bias, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t local_expert_offset,
     int64_t local_num_experts, Optional<double> routed_scaling_factor, int64_t routing_method_type,
-    int64_t tile_tokens_dim) {
+    int64_t tile_tokens_dim, int64_t routing_input_mode, Optional<TensorView> topk_weights) {
   TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dim must be positive.";
   TVM_FFI_ICHECK_EQ(topk_ids.ndim(), 2) << "topk_ids must be 2D.";
   TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32) << "topk_ids must be int32.";
   TVM_FFI_ICHECK_EQ(topk_ids.size(1), top_k) << "topk_ids dim1 must match top_k.";
-  TVM_FFI_ICHECK_GT(num_experts, top_k) << "num_experts must be greater than top_k.";
+  TVM_FFI_ICHECK_GE(num_experts, top_k)
+      << "num_experts must be greater than or equal to top_k for precomputed routing.";
   TVM_FFI_ICHECK(local_num_experts > 0 && local_num_experts <= num_experts)
       << "local_num_experts must be between 1 and num_experts";
   TVM_FFI_ICHECK(local_expert_offset >= 0 && local_expert_offset + local_num_experts <= num_experts)
       << "expert offset and count must be within valid range";
+  auto const input_mode = static_cast<RoutingInputMode>(routing_input_mode);
+  TVM_FFI_ICHECK(input_mode == RoutingInputMode::PackedPrecomputed ||
+                 input_mode == RoutingInputMode::UnpackedPrecomputed)
+      << "routing metadata requires packed or unpacked precomputed routing; got "
+      << routing_input_mode;
+  if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
+    TVM_FFI_ICHECK(topk_weights.has_value()) << "unpacked routing metadata requires topk_weights.";
+    auto const& weights = topk_weights.value();
+    TVM_FFI_ICHECK_EQ(weights.dtype(), dl_bfloat16) << "unpacked topk_weights must be bfloat16.";
+    TVM_FFI_ICHECK(weights.ndim() == 2 && weights.size(0) == topk_ids.size(0) &&
+                   weights.size(1) == top_k)
+        << "unpacked topk_weights must match topk_ids shape.";
+    TVM_FFI_ICHECK(weights.IsContiguous()) << "unpacked topk_weights must be contiguous.";
+    TVM_FFI_ICHECK_EQ(weights.device().device_type, kDLCUDA)
+        << "unpacked topk_weights must be a CUDA tensor.";
+    TVM_FFI_ICHECK_EQ(weights.device().device_id, topk_ids.device().device_id)
+        << "unpacked topk_weights must be on the same device as topk_ids.";
+  }
   if (routing_bias.has_value()) {
     TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
                    routing_bias.value().dtype() == dl_float32)
@@ -3515,15 +3523,26 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata(
 
   tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
   cudaStream_t routing_stream = get_stream(topk_ids.device());
+  int32_t* unpacked_expert_ids = nullptr;
+  if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
+    unpacked_expert_ids = static_cast<int32_t*>(const_cast<void*>(topk_ids.data_ptr()));
+    auto const& weights = topk_weights.value();
+    TVM_FFI_ICHECK_EQ(cudaMemcpyAsync(expert_weights.data_ptr(), weights.data_ptr(),
+                                      static_cast<size_t>(weights.numel()) * sizeof(__nv_bfloat16),
+                                      cudaMemcpyDeviceToDevice, routing_stream),
+                      cudaSuccess)
+        << "failed to preserve unpacked topk_weights.";
+  }
   routing_runner.run(nullptr, routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr,
-                     num_tokens, num_experts, top_k, n_group.value_or(0), topk_group.value_or(0),
-                     local_expert_offset, local_num_experts, routed_scaling_factor.value_or(1.0),
+                     num_tokens, num_experts, top_k, 0 /* num_fused_shared_experts */,
+                     n_group.value_or(0), topk_group.value_or(0), local_expert_offset,
+                     local_num_experts, routed_scaling_factor.value_or(1.0),
                      static_cast<int*>(const_cast<void*>(topk_ids.data_ptr())),
                      static_cast<int*>(expert_count_histogram.data_ptr()),
                      static_cast<int*>(total_num_padded_tokens.data_ptr()),
                      static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
                      nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
-                     static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), nullptr /*expertIds*/,
+                     static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), unpacked_expert_ids,
                      expert_weights.data_ptr(), static_cast<int*>(num_tokens_per_expert.data_ptr()),
                      static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
                      static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
@@ -3536,48 +3555,6 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata(
   return {total_num_padded_tokens, expanded_idx_to_permuted_idx, permuted_idx_to_token_idx,
           expert_weights,          expert_count_histogram,       num_tokens_per_expert,
           cta_idx_xy_to_batch_idx, cta_idx_xy_to_mn_limit,       num_non_exiting_ctas};
-}
-
-void trtllm_moe_pack_unpacked_routing(TensorView expert_ids, TensorView expert_weights,
-                                      TensorView packed_topk_ids_out) {
-  TVM_FFI_ICHECK_EQ(expert_ids.dtype(), dl_int32) << "expert_ids must be int32.";
-  TVM_FFI_ICHECK(expert_weights.dtype() == dl_bfloat16 || expert_weights.dtype() == dl_float32)
-      << "expert_weights must be bfloat16 or float32.";
-  TVM_FFI_ICHECK_EQ(packed_topk_ids_out.dtype(), dl_int32) << "packed_topk_ids_out must be int32.";
-  TVM_FFI_ICHECK_EQ(expert_ids.ndim(), 2) << "expert_ids must be 2D.";
-  TVM_FFI_ICHECK(expert_weights.ndim() == 2 && expert_weights.size(0) == expert_ids.size(0) &&
-                 expert_weights.size(1) == expert_ids.size(1))
-      << "expert_weights must match expert_ids shape.";
-  TVM_FFI_ICHECK(packed_topk_ids_out.ndim() == 2 &&
-                 packed_topk_ids_out.size(0) == expert_ids.size(0) &&
-                 packed_topk_ids_out.size(1) == expert_ids.size(1))
-      << "packed_topk_ids_out must match expert_ids shape.";
-  TVM_FFI_ICHECK(expert_ids.IsContiguous() && expert_weights.IsContiguous() &&
-                 packed_topk_ids_out.IsContiguous())
-      << "routing tensors must be contiguous.";
-  TVM_FFI_ICHECK(expert_ids.device().device_type == kDLCUDA &&
-                 expert_weights.device().device_type == kDLCUDA &&
-                 packed_topk_ids_out.device().device_type == kDLCUDA)
-      << "routing tensors must be CUDA tensors.";
-  TVM_FFI_ICHECK(expert_ids.device().device_id == expert_weights.device().device_id &&
-                 expert_ids.device().device_id == packed_topk_ids_out.device().device_id)
-      << "routing tensors must be on the same CUDA device.";
-
-  int64_t const num_assignments = expert_ids.numel();
-  constexpr int threads = 256;
-  cudaStream_t stream = get_stream(expert_ids.device());
-  if (expert_weights.dtype() == dl_bfloat16) {
-    packUnpackedRoutingFromBfloat16<<<(num_assignments + threads - 1) / threads, threads, 0,
-                                      stream>>>(
-        static_cast<int32_t const*>(expert_ids.data_ptr()),
-        static_cast<uint16_t const*>(expert_weights.data_ptr()),
-        static_cast<int32_t*>(packed_topk_ids_out.data_ptr()), num_assignments);
-  } else {
-    packUnpackedRoutingFromFloat<<<(num_assignments + threads - 1) / threads, threads, 0, stream>>>(
-        static_cast<int32_t const*>(expert_ids.data_ptr()),
-        static_cast<float const*>(expert_weights.data_ptr()),
-        static_cast<int32_t*>(packed_topk_ids_out.data_ptr()), num_assignments);
-  }
 }
 
 // Run the canonical TRT-LLM router once and retain the routing metadata for an
@@ -3660,8 +3637,9 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_from_logits(
   routing_runner.run(
       const_cast<void*>(routing_logits.data_ptr()),
       routing_bias.has_value() ? const_cast<void*>(routing_bias.value().data_ptr()) : nullptr,
-      num_tokens, num_experts, top_k, n_group.value_or(0), topk_group.value_or(0),
-      local_expert_offset, local_num_experts, routed_scaling_factor.value_or(1.0),
+      num_tokens, num_experts, top_k, 0 /* num_fused_shared_experts */, n_group.value_or(0),
+      topk_group.value_or(0), local_expert_offset, local_num_experts,
+      routed_scaling_factor.value_or(1.0),
       static_cast<int*>(const_cast<void*>(packed_topk_ids.data_ptr())),
       static_cast<int*>(expert_count_histogram.data_ptr()),
       static_cast<int*>(total_num_padded_tokens.data_ptr()),
@@ -3722,8 +3700,9 @@ void trtllm_moe_populate_routing_metadata_from_logits(
   routing_runner.run(
       const_cast<void*>(routing_logits.data_ptr()),
       routing_bias.has_value() ? const_cast<void*>(routing_bias.value().data_ptr()) : nullptr,
-      num_tokens, num_experts, top_k, n_group.value_or(0), topk_group.value_or(0),
-      local_expert_offset, local_num_experts, routed_scaling_factor.value_or(1.0),
+      num_tokens, num_experts, top_k, 0 /* num_fused_shared_experts */, n_group.value_or(0),
+      topk_group.value_or(0), local_expert_offset, local_num_experts,
+      routed_scaling_factor.value_or(1.0),
       static_cast<int*>(const_cast<void*>(packed_topk_ids.data_ptr())),
       static_cast<int*>(routing_metadata[kExpertCountHistogram].data_ptr()),
       static_cast<int*>(routing_metadata[kTotalNumPaddedTokens].data_ptr()),
@@ -3761,6 +3740,10 @@ void trtllm_moe_populate_routing_metadata_from_logits(
 //     ``routingIndicesClusterKernel`` for its selected tile, which reads the
 //     packed weight back out of ``mPtrTopKPacked`` — guaranteeing the same
 //     bf16 value is written into the body's ``mPtrTopKWeights``.
+//   - TODO: Fuse this top-k-only producer with multi-tile metadata
+//     population, or let routingMainKernel directly feed every candidate tile.
+//     The current path does not discard single-tile metadata, but it still pays
+//     for a second launch and a global-memory handoff through packed IDs/weights.
 //   - For ``num_tokens > 1024`` the runImpl ``FLASHINFER_CHECK`` requires
 //     ``mPtrExpertCounts`` to be non-null even though we do not run the
 //     two-step path; allocate a small scratch buffer for that case.
@@ -3840,9 +3823,11 @@ void trtllm_deepseek_moe_compute_routing_packed_only(
   data.mPtrRoutingBias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
   data.mNumTokens = static_cast<int32_t>(num_tokens);
   data.mNumExperts = static_cast<int32_t>(num_experts);
+  data.mNumFusedSharedExperts = 0;
   data.mNumExpertGroups = static_cast<int32_t>(n_group.value_or(0));
   data.mNumLimitedGroups = static_cast<int32_t>(topk_group.value_or(0));
   data.mTopK = static_cast<int32_t>(top_k);
+  data.mTotalExpertsPerToken = static_cast<int32_t>(top_k);
   data.mPaddingLog2 = 0;    // unused without cluster kernel.
   data.mTileTokensDim = 0;  // unused without cluster kernel.
   data.mLocalExpertsStartIdx = static_cast<int32_t>(local_expert_offset);
@@ -3870,12 +3855,14 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
     TensorView topk_ids, Optional<TensorView> routing_bias, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t local_expert_offset,
     int64_t local_num_experts, Optional<double> routed_scaling_factor, int64_t routing_method_type,
-    Array<int64_t> tile_tokens_dims) {
+    Array<int64_t> tile_tokens_dims, int64_t routing_input_mode,
+    Optional<TensorView> topk_weights) {
   TVM_FFI_ICHECK_GT(tile_tokens_dims.size(), 0) << "tile_tokens_dims must be non-empty.";
   TVM_FFI_ICHECK_EQ(topk_ids.ndim(), 2) << "topk_ids must be 2D.";
   TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32) << "topk_ids must be int32.";
   TVM_FFI_ICHECK_EQ(topk_ids.size(1), top_k) << "topk_ids dim1 must match top_k.";
-  TVM_FFI_ICHECK_GT(num_experts, top_k) << "num_experts must be greater than top_k.";
+  TVM_FFI_ICHECK_GE(num_experts, top_k)
+      << "num_experts must be greater than or equal to top_k for precomputed routing.";
   TVM_FFI_ICHECK(local_num_experts > 0 && local_num_experts <= num_experts)
       << "local_num_experts must be between 1 and num_experts";
   TVM_FFI_ICHECK(local_expert_offset >= 0 && local_expert_offset + local_num_experts <= num_experts)
@@ -3897,8 +3884,17 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
                                   "device has SM "
                                << major << minor;
 
-  constexpr int64_t kMaxMultiTileRoutingTiles = 8;
   int64_t const num_tokens = topk_ids.size(0);
+  auto const input_mode = static_cast<RoutingInputMode>(routing_input_mode);
+  TVM_FFI_ICHECK(input_mode == RoutingInputMode::PackedPrecomputed ||
+                 input_mode == RoutingInputMode::UnpackedPrecomputed)
+      << "routing metadata requires packed or unpacked precomputed routing; got "
+      << routing_input_mode;
+  TensorView const* unpacked_weights = nullptr;
+  if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
+    TVM_FFI_ICHECK(topk_weights.has_value()) << "unpacked routing metadata requires topk_weights.";
+    unpacked_weights = &topk_weights.value();
+  }
   auto const routing_bias_dtype =
       routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
   auto const mRoutingBiasDtype =
@@ -3910,7 +3906,7 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
   bool const can_use_multi_cluster =
       num_tokens <= moe::dev::routing::routingDeepSeek::maxTokensMultiTileCluster(num_experts) &&
       static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3 &&
-      tile_tokens_dims.size() <= kMaxMultiTileRoutingTiles &&
+      tile_tokens_dims.size() <= da_heuristic::kMaxTiles &&
       mRoutingBiasDtype == btg::Dtype::Bfloat16 && n_group.value_or(0) > 1 && num_experts <= 256 &&
       top_k <= 8 && all_tiles_power_of_two;
   if (!can_use_multi_cluster) {
@@ -3920,7 +3916,8 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
           flat_metadata,
           trtllm_moe_allocate_routing_metadata(
               topk_ids, routing_bias, num_experts, top_k, n_group, topk_group, local_expert_offset,
-              local_num_experts, routed_scaling_factor, routing_method_type, tile_tokens_dims[i]));
+              local_num_experts, routed_scaling_factor, routing_method_type, tile_tokens_dims[i],
+              routing_input_mode, topk_weights));
     }
     return flat_metadata;
   }
@@ -3963,13 +3960,20 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
     // order it after that pack kernel, so the routing metadata kernel should
     // run as a normal graph node instead of waiting on a PDL primary grid.
     data.mUsePdl = false;
-    data.mPtrTopKPacked = const_cast<void*>(topk_ids.data_ptr());
+    data.mPtrTopKPacked = input_mode == RoutingInputMode::PackedPrecomputed
+                              ? const_cast<void*>(topk_ids.data_ptr())
+                              : nullptr;
+    data.mPtrTopKIds = input_mode == RoutingInputMode::UnpackedPrecomputed
+                           ? static_cast<int32_t*>(const_cast<void*>(topk_ids.data_ptr()))
+                           : nullptr;
     data.mPtrExpertCounts = static_cast<int*>(expert_count_histogram.data_ptr());
     data.mPtrPermutedIdxSize = static_cast<int*>(total_num_padded_tokens.data_ptr());
     data.mPtrExpandedIdxToPermutedIdx = static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
     data.mPtrPermutedIdxToExpandedIdx = nullptr;
     data.mPtrPermutedIdxToTokenIdx = static_cast<int*>(permuted_idx_to_token_idx.data_ptr());
-    data.mPtrTopKWeights = expert_weights.data_ptr();
+    data.mPtrTopKWeights = input_mode == RoutingInputMode::UnpackedPrecomputed
+                               ? const_cast<void*>(unpacked_weights->data_ptr())
+                               : expert_weights.data_ptr();
     data.mPtrCtaIdxXyToBatchIdx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
     data.mPtrCtaIdxXyToMnLimit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
     data.mPtrNumNonExitingCtas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
@@ -4010,13 +4014,33 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
     TensorView topk_ids, Optional<TensorView> routing_bias, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t local_expert_offset,
     int64_t local_num_experts, Optional<double> routed_scaling_factor, int64_t routing_method_type,
-    Array<int64_t> tile_tokens_dims, Array<Tensor> flat_routing_metadata) {
+    Array<int64_t> tile_tokens_dims, Array<Tensor> flat_routing_metadata,
+    int64_t routing_input_mode, Optional<TensorView> topk_weights,
+    bool allow_packed_multi_cluster) {
   TVM_FFI_ICHECK_GT(tile_tokens_dims.size(), 0) << "tile_tokens_dims must be non-empty.";
   TVM_FFI_ICHECK_EQ(flat_routing_metadata.size(), tile_tokens_dims.size() * kNumTensors)
       << "flat_routing_metadata must contain nine tensors per tile.";
   TVM_FFI_ICHECK_EQ(topk_ids.ndim(), 2) << "topk_ids must be 2D.";
   TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32) << "topk_ids must be int32.";
   TVM_FFI_ICHECK_EQ(topk_ids.size(1), top_k) << "topk_ids dim1 must match top_k.";
+  auto const input_mode = static_cast<RoutingInputMode>(routing_input_mode);
+  TVM_FFI_ICHECK(input_mode == RoutingInputMode::PackedPrecomputed ||
+                 input_mode == RoutingInputMode::UnpackedPrecomputed)
+      << "routing metadata requires packed or unpacked precomputed routing; got "
+      << routing_input_mode;
+  if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
+    TVM_FFI_ICHECK(topk_weights.has_value()) << "unpacked routing metadata requires topk_weights.";
+    auto const& weights = topk_weights.value();
+    TVM_FFI_ICHECK_EQ(weights.dtype(), dl_bfloat16) << "unpacked topk_weights must be bfloat16.";
+    TVM_FFI_ICHECK(weights.ndim() == 2 && weights.size(0) == topk_ids.size(0) &&
+                   weights.size(1) == top_k)
+        << "unpacked topk_weights must match topk_ids shape.";
+    TVM_FFI_ICHECK(weights.IsContiguous()) << "unpacked topk_weights must be contiguous.";
+    TVM_FFI_ICHECK_EQ(weights.device().device_type, kDLCUDA)
+        << "unpacked topk_weights must be a CUDA tensor.";
+    TVM_FFI_ICHECK_EQ(weights.device().device_id, topk_ids.device().device_id)
+        << "unpacked topk_weights must be on the same device as topk_ids.";
+  }
 
   int64_t const num_tokens = topk_ids.size(0);
   auto const routing_bias_dtype =
@@ -4024,6 +4048,88 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
   auto const mRoutingBiasDtype =
       routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
   cudaStream_t routing_stream = get_stream(topk_ids.device());
+
+  bool all_tiles_power_of_two = true;
+  for (int64_t i = 0; i < tile_tokens_dims.size(); ++i) {
+    all_tiles_power_of_two = all_tiles_power_of_two && computeRoutingLog2(tile_tokens_dims[i]) > 0;
+  }
+  bool const can_use_multi_cluster =
+      (input_mode == RoutingInputMode::UnpackedPrecomputed ||
+       (allow_packed_multi_cluster && input_mode == RoutingInputMode::PackedPrecomputed)) &&
+      num_tokens <= moe::dev::routing::routingDeepSeek::maxTokensMultiTileCluster(num_experts) &&
+      static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3 &&
+      tile_tokens_dims.size() <= da_heuristic::kMaxTiles &&
+      mRoutingBiasDtype == btg::Dtype::Bfloat16 && n_group.value_or(0) > 1 && num_experts <= 256 &&
+      top_k <= 8 && all_tiles_power_of_two;
+
+  if (can_use_multi_cluster) {
+    std::vector<moe::dev::routing::routingDeepSeek::Data> routing_data;
+    routing_data.reserve(tile_tokens_dims.size());
+    for (int64_t i = 0; i < tile_tokens_dims.size(); ++i) {
+      int64_t const tile_tokens_dim = tile_tokens_dims[i];
+      Array<Tensor> metadata;
+      for (int64_t j = 0; j < kNumTensors; ++j) {
+        metadata.push_back(flat_routing_metadata[i * kNumTensors + j]);
+      }
+      check_routing_metadata(metadata, num_tokens, top_k, num_experts, tile_tokens_dim);
+
+      if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
+        auto const& weights = topk_weights.value();
+        if (metadata[kExpertWeights].data_ptr() != weights.data_ptr()) {
+          TVM_FFI_ICHECK_EQ(
+              cudaMemcpyAsync(metadata[kExpertWeights].data_ptr(), weights.data_ptr(),
+                              static_cast<size_t>(weights.numel()) * sizeof(__nv_bfloat16),
+                              cudaMemcpyDeviceToDevice, routing_stream),
+              cudaSuccess)
+              << "failed to preserve unpacked topk_weights.";
+        }
+      }
+
+      moe::dev::routing::routingDeepSeek::Data data;
+      data.mDtypeOutput = btg::Dtype::Bfloat16;
+      data.mDtypeBias = mRoutingBiasDtype;
+      data.mDtypeInput = btg::Dtype::Fp32;
+      data.mUsePdl = false;
+      data.mPtrTopKPacked = input_mode == RoutingInputMode::PackedPrecomputed
+                                ? const_cast<void*>(topk_ids.data_ptr())
+                                : nullptr;
+      data.mPtrTopKIds = input_mode == RoutingInputMode::UnpackedPrecomputed
+                             ? static_cast<int32_t*>(const_cast<void*>(topk_ids.data_ptr()))
+                             : nullptr;
+      data.mPtrExpertCounts = static_cast<int*>(metadata[kExpertCountHistogram].data_ptr());
+      data.mPtrPermutedIdxSize = static_cast<int*>(metadata[kTotalNumPaddedTokens].data_ptr());
+      data.mPtrExpandedIdxToPermutedIdx =
+          static_cast<int*>(metadata[kExpandedIdxToPermutedIdx].data_ptr());
+      data.mPtrPermutedIdxToExpandedIdx = nullptr;
+      data.mPtrPermutedIdxToTokenIdx =
+          static_cast<int*>(metadata[kPermutedIdxToTokenIdx].data_ptr());
+      data.mPtrTopKWeights = metadata[kExpertWeights].data_ptr();
+      data.mPtrCtaIdxXyToBatchIdx = static_cast<int*>(metadata[kCtaIdxXyToBatchIdx].data_ptr());
+      data.mPtrCtaIdxXyToMnLimit = static_cast<int*>(metadata[kCtaIdxXyToMnLimit].data_ptr());
+      data.mPtrNumNonExitingCtas = static_cast<int*>(metadata[kNumNonExitingCtas].data_ptr());
+      data.mPtrRoutingBias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
+      data.mPtrScores = nullptr;
+      data.mNumTokens = num_tokens;
+      data.mNumExperts = num_experts;
+      data.mNumFusedSharedExperts = 0;
+      data.mNumExpertGroups = n_group.value_or(0);
+      data.mNumLimitedGroups = topk_group.value_or(0);
+      data.mTopK = top_k;
+      data.mTotalExpertsPerToken = top_k;
+      data.mPaddingLog2 = computeRoutingLog2(tile_tokens_dim);
+      data.mTileTokensDim = tile_tokens_dim;
+      data.mLocalExpertsStartIdx = local_expert_offset;
+      data.mLocalExpertsStrideLog2 = 0;
+      data.mNumLocalExperts = local_num_experts;
+      data.mRouteScale = routed_scaling_factor.value_or(1.0);
+      data.mUseRoutingSoftmax = false;
+      routing_data.push_back(data);
+    }
+
+    moe::dev::routing::routingDeepSeek::runMultiTileCluster(
+        routing_data.data(), static_cast<int32_t>(routing_data.size()), routing_stream);
+    return;
+  }
 
   for (int64_t i = 0; i < tile_tokens_dims.size(); ++i) {
     int64_t const tile_tokens_dim = tile_tokens_dims[i];
@@ -4033,16 +4139,31 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
     }
     check_routing_metadata(metadata, num_tokens, top_k, num_experts, tile_tokens_dim);
 
+    int32_t* unpacked_expert_ids = nullptr;
+    if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
+      unpacked_expert_ids = static_cast<int32_t*>(const_cast<void*>(topk_ids.data_ptr()));
+      auto const& weights = topk_weights.value();
+      if (metadata[kExpertWeights].data_ptr() != weights.data_ptr()) {
+        TVM_FFI_ICHECK_EQ(
+            cudaMemcpyAsync(metadata[kExpertWeights].data_ptr(), weights.data_ptr(),
+                            static_cast<size_t>(weights.numel()) * sizeof(__nv_bfloat16),
+                            cudaMemcpyDeviceToDevice, routing_stream),
+            cudaSuccess)
+            << "failed to preserve unpacked topk_weights.";
+      }
+    }
+
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
     routing_runner.run(
         nullptr, routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr, num_tokens,
-        num_experts, top_k, n_group.value_or(0), topk_group.value_or(0), local_expert_offset,
-        local_num_experts, routed_scaling_factor.value_or(1.0),
+        num_experts, top_k, 0 /* num_fused_shared_experts */, n_group.value_or(0),
+        topk_group.value_or(0), local_expert_offset, local_num_experts,
+        routed_scaling_factor.value_or(1.0),
         static_cast<int*>(const_cast<void*>(topk_ids.data_ptr())),
         static_cast<int*>(metadata[kExpertCountHistogram].data_ptr()),
         static_cast<int*>(metadata[kTotalNumPaddedTokens].data_ptr()),
         static_cast<int*>(metadata[kExpandedIdxToPermutedIdx].data_ptr()), nullptr,
-        static_cast<int*>(metadata[kPermutedIdxToTokenIdx].data_ptr()), nullptr,
+        static_cast<int*>(metadata[kPermutedIdxToTokenIdx].data_ptr()), unpacked_expert_ids,
         metadata[kExpertWeights].data_ptr(),
         static_cast<int*>(metadata[kNumTokensPerExpert].data_ptr()),
         static_cast<int*>(metadata[kCtaIdxXyToBatchIdx].data_ptr()),
@@ -4074,7 +4195,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_populate_routing_metadata_multi_tile,
                               trtllm_moe_populate_routing_metadata_multi_tile);
 
 // DA routing representation helpers.
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_pack_unpacked_routing, trtllm_moe_pack_unpacked_routing);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_deepseek_moe_compute_routing_packed_only,
                               trtllm_deepseek_moe_compute_routing_packed_only);
 

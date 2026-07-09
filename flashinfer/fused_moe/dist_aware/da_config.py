@@ -124,14 +124,6 @@ class DAConfig:
     max_knn_tile: Optional[int] = field(
         default_factory=lambda: _env_optional_positive_int("FLASHINFER_DA_KNN_MAX_TILE")
     )
-    # Allows capture to consume precomputed packed routing metadata.
-    use_precomputed_route: bool = field(
-        default_factory=lambda: _env_bool("FLASHINFER_DA_USE_PRECOMPUTED_ROUTE", True)
-    )
-    # Overlaps routing metadata construction with capture preparation.
-    overlap_routing: bool = field(
-        default_factory=lambda: _env_bool("FLASHINFER_DA_OVERLAP_ROUTING", False)
-    )
     # Selects a DA body using routing counts rather than synthesized routing.
     select_from_routing_counts: bool = field(
         default_factory=lambda: _env_bool(

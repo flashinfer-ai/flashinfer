@@ -1953,16 +1953,12 @@ def get_trtllm_moe_sm100_module():
                     dtype_act=dtype_act,
                     norm_topk_prob=norm_topk_prob,
                     use_routing_scales_on_input=False,
-                    precomputed_topk_ids_are_packed=(
-                        routing_logits is not None
-                        or da_expert_weights is None
-                        or da_expert_weights.numel() == 0
-                    ),
                     routing_input_mode=(
                         int(RoutingInputMode.FromLogits)
                         if routing_logits is not None
                         else int(RoutingInputMode.PackedPrecomputed)
                     ),
+                    internal_routing_mode=int(RoutingInputMode.PackedPrecomputed),
                     enable_pdl=bool(enable_pdl),
                 ),
                 da_config,
@@ -2370,8 +2366,8 @@ def get_trtllm_moe_sm100_module():
                     dtype_act=dtype_act,
                     norm_topk_prob=norm_topk_prob,
                     use_routing_scales_on_input=use_routing_scales_on_input,
-                    precomputed_topk_ids_are_packed=True,
                     routing_input_mode=int(RoutingInputMode.FromLogits),
+                    internal_routing_mode=int(RoutingInputMode.PackedPrecomputed),
                     enable_pdl=bool(enable_pdl),
                 ),
                 da_config,
@@ -2783,11 +2779,6 @@ def get_trtllm_moe_sm100_module():
             da_topk_ids: Optional[torch.Tensor],
             da_expert_weights: Optional[torch.Tensor],
         ) -> da_core.DAExecution:
-            precomputed_topk_ids_are_packed = (
-                routing_logits is not None
-                or da_expert_weights is None
-                or da_expert_weights.numel() == 0
-            )
             return da_core.create_execution(
                 _da_backend(),
                 da_core.DAInvocation(
@@ -2833,12 +2824,12 @@ def get_trtllm_moe_sm100_module():
                     dtype_act=dtype_act,
                     norm_topk_prob=norm_topk_prob,
                     use_routing_scales_on_input=False,
-                    precomputed_topk_ids_are_packed=precomputed_topk_ids_are_packed,
                     routing_input_mode=(
                         int(RoutingInputMode.FromLogits)
                         if routing_logits is not None
                         else int(RoutingInputMode.PackedPrecomputed)
                     ),
+                    internal_routing_mode=int(RoutingInputMode.PackedPrecomputed),
                     enable_pdl=bool(enable_pdl),
                 ),
                 da_config,
@@ -3336,12 +3327,13 @@ def get_trtllm_moe_sm100_module():
                     dtype_act=dtype_act,
                     norm_topk_prob=norm_topk_prob,
                     use_routing_scales_on_input=False,
-                    precomputed_topk_ids_are_packed=(
-                        routing_logits is not None
-                        or int(routing_input_mode)
-                        == int(RoutingInputMode.PackedPrecomputed)
-                    ),
                     routing_input_mode=int(routing_input_mode),
+                    internal_routing_mode=(
+                        int(RoutingInputMode.UnpackedPrecomputed)
+                        if int(routing_input_mode)
+                        == int(RoutingInputMode.UnpackedPrecomputed)
+                        else int(RoutingInputMode.PackedPrecomputed)
+                    ),
                     enable_pdl=bool(enable_pdl),
                 ),
                 da_config,
@@ -3353,7 +3345,6 @@ def get_trtllm_moe_sm100_module():
 
         # DA-MoE: replay prepared routing metadata and tactic bodies during graph capture.
         if da_state.is_dist_aware_autotune(da_config) and do_finalize:
-            from .dist_aware.da_single_graph import capture_safe_trtllm_fp4_moe
 
             def _run_fp4_from_routing_metadata(
                 routing_metadata: da_capture.RoutingMetadataBundle,
@@ -3417,20 +3408,9 @@ def get_trtllm_moe_sm100_module():
                         list(tactic),
                     )
 
-            def _run_fp4_direct_body(
-                tactic: Sequence[int],
-                body_kwargs: Dict[str, Any],
-            ) -> None:
-                capture_safe_trtllm_fp4_moe(
-                    ffi_moe_op=moe_op.ffi_moe_op,
-                    tactic=tactic,
-                    **body_kwargs,
-                )
-
             fast_result = da_core.try_capture_dispatch(
                 da_execution,
                 _run_fp4_from_routing_metadata,
-                _run_fp4_direct_body,
             )
             if fast_result is not None:
                 return fast_result
@@ -3681,6 +3661,8 @@ def get_trtllm_moe_sm100_module():
             routed_scaling_factor,
             routing_method_type,
             tile_tokens_dim,
+            int(RoutingInputMode.PackedPrecomputed),
+            None,
         )
 
     @register_custom_op(
@@ -3749,6 +3731,8 @@ def get_trtllm_moe_sm100_module():
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         tile_tokens_dim: int,
+        routing_input_mode: int,
+        topk_weights: Optional[torch.Tensor],
     ) -> List[torch.Tensor]:
         assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
         assert topk_ids.ndim == 2, "topk_ids must be a 2D tensor."
@@ -3765,6 +3749,8 @@ def get_trtllm_moe_sm100_module():
             routed_scaling_factor,
             routing_method_type,
             tile_tokens_dim,
+            routing_input_mode,
+            topk_weights,
         )
         return [torch.from_dlpack(tensor) for tensor in metadata]
 
@@ -3781,6 +3767,8 @@ def get_trtllm_moe_sm100_module():
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         tile_tokens_dim: int,
+        routing_input_mode: int,
+        topk_weights: Optional[torch.Tensor],
     ) -> List[torch.Tensor]:
         num_tokens = topk_ids.shape[0]
         expanded_tokens = num_tokens * top_k
@@ -3794,7 +3782,15 @@ def get_trtllm_moe_sm100_module():
             topk_ids.new_empty((expanded_tokens,)),
             topk_ids.new_empty((max_num_padded_tokens,)),
             torch.empty(
-                (num_tokens, top_k), dtype=torch.bfloat16, device=topk_ids.device
+                (num_tokens, top_k),
+                dtype=(
+                    topk_weights.dtype
+                    if int(routing_input_mode)
+                    == int(RoutingInputMode.UnpackedPrecomputed)
+                    and topk_weights is not None
+                    else torch.bfloat16
+                ),
+                device=topk_ids.device,
             ),
             topk_ids.new_empty((histogram_size,)),
             topk_ids.new_empty((num_experts,)),
@@ -3819,6 +3815,8 @@ def get_trtllm_moe_sm100_module():
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         tile_tokens_dims: List[int],
+        routing_input_mode: int,
+        topk_weights: Optional[torch.Tensor],
     ) -> List[torch.Tensor]:
         assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
         assert topk_ids.ndim == 2, "topk_ids must be a 2D tensor."
@@ -3835,8 +3833,17 @@ def get_trtllm_moe_sm100_module():
             routed_scaling_factor,
             routing_method_type,
             tile_tokens_dims,
+            routing_input_mode,
+            topk_weights,
         )
-        return [torch.from_dlpack(tensor) for tensor in metadata]
+        flat = [torch.from_dlpack(tensor) for tensor in metadata]
+        if (
+            int(routing_input_mode) == int(RoutingInputMode.UnpackedPrecomputed)
+            and topk_weights is not None
+        ):
+            for expert_weights_idx in range(3, len(flat), 9):
+                flat[expert_weights_idx] = topk_weights
+        return flat
 
     @register_fake_op("flashinfer::trtllm_moe_allocate_routing_metadata_multi_tile")
     def _fake_trtllm_moe_allocate_routing_metadata_multi_tile(
@@ -3851,24 +3858,32 @@ def get_trtllm_moe_sm100_module():
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         tile_tokens_dims: List[int],
+        routing_input_mode: int,
+        topk_weights: Optional[torch.Tensor],
     ) -> List[torch.Tensor]:
         flat: List[torch.Tensor] = []
         for tile_tokens_dim in tile_tokens_dims:
-            flat.extend(
-                _fake_trtllm_moe_allocate_routing_metadata(
-                    topk_ids,
-                    routing_bias,
-                    num_experts,
-                    top_k,
-                    n_group,
-                    topk_group,
-                    local_expert_offset,
-                    local_num_experts,
-                    routed_scaling_factor,
-                    routing_method_type,
-                    int(tile_tokens_dim),
-                )
+            metadata = _fake_trtllm_moe_allocate_routing_metadata(
+                topk_ids,
+                routing_bias,
+                num_experts,
+                top_k,
+                n_group,
+                topk_group,
+                local_expert_offset,
+                local_num_experts,
+                routed_scaling_factor,
+                routing_method_type,
+                int(tile_tokens_dim),
+                routing_input_mode,
+                topk_weights,
             )
+            if (
+                int(routing_input_mode) == int(RoutingInputMode.UnpackedPrecomputed)
+                and topk_weights is not None
+            ):
+                metadata[3] = topk_weights
+            flat.extend(metadata)
         return flat
 
     # DA-MoE: group the flat per-tile metadata returned by the multi-tile FFI.
@@ -3884,6 +3899,8 @@ def get_trtllm_moe_sm100_module():
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         tile_tokens_dims: Sequence[int],
+        routing_input_mode: int = int(RoutingInputMode.PackedPrecomputed),
+        topk_weights: Optional[torch.Tensor] = None,
     ) -> List[List[torch.Tensor]]:
         """Build routing metadata for every candidate capture tile."""
         flat = trtllm_moe_allocate_routing_metadata_multi_tile_op(
@@ -3898,6 +3915,8 @@ def get_trtllm_moe_sm100_module():
             routed_scaling_factor,
             routing_method_type,
             list(tile_tokens_dims),
+            routing_input_mode,
+            topk_weights,
         )
         return [list(flat[i : i + 9]) for i in range(0, len(flat), 9)]
 
@@ -4060,11 +4079,6 @@ def get_trtllm_moe_sm100_module():
             da_topk_ids: Optional[torch.Tensor],
             da_expert_weights: Optional[torch.Tensor],
         ) -> da_core.DAExecution:
-            precomputed_topk_ids_are_packed = (
-                routing_logits is not None
-                or da_expert_weights is None
-                or da_expert_weights.numel() == 0
-            )
             return da_core.create_execution(
                 _da_backend(),
                 da_core.DAInvocation(
@@ -4110,12 +4124,12 @@ def get_trtllm_moe_sm100_module():
                     dtype_act=dtype_act,
                     norm_topk_prob=norm_topk_prob,
                     use_routing_scales_on_input=False,
-                    precomputed_topk_ids_are_packed=precomputed_topk_ids_are_packed,
                     routing_input_mode=(
                         int(RoutingInputMode.FromLogits)
                         if routing_logits is not None
                         else int(RoutingInputMode.PackedPrecomputed)
                     ),
+                    internal_routing_mode=int(RoutingInputMode.PackedPrecomputed),
                     enable_pdl=bool(enable_pdl),
                 ),
                 da_config,
@@ -4515,12 +4529,15 @@ def trtllm_moe_allocate_routing_metadata(
     routed_scaling_factor: Optional[float],
     routing_method_type: int,
     tile_tokens_dim: int,
+    routing_input_mode: int = int(RoutingInputMode.PackedPrecomputed),
+    topk_weights: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """Allocate TRT-LLM MoE routing metadata for one candidate tile.
 
-    ``topk_ids`` must be the packed TRT-LLM top-k assignment tensor in
-    ``(expert_id << 16) | bf16(weight)`` format. The returned list is
-    intentionally opaque;
+    ``topk_ids`` may contain packed TRT-LLM assignments or raw expert IDs when
+    ``routing_input_mode`` is ``UnpackedPrecomputed``. Unpacked routing also
+    requires the caller's separate BF16 ``topk_weights`` tensor. The returned
+    list is intentionally opaque;
     pass the matching list to the corresponding routing-metadata MoE runner.
     """
     return get_trtllm_moe_sm100_module().trtllm_moe_allocate_routing_metadata(
@@ -4535,6 +4552,8 @@ def trtllm_moe_allocate_routing_metadata(
         routed_scaling_factor,
         routing_method_type,
         tile_tokens_dim,
+        routing_input_mode,
+        topk_weights,
     )
 
 
@@ -4551,6 +4570,8 @@ def trtllm_moe_allocate_routing_metadata_multi_tile(
     routed_scaling_factor: Optional[float],
     routing_method_type: int,
     tile_tokens_dims: Sequence[int],
+    routing_input_mode: int = int(RoutingInputMode.PackedPrecomputed),
+    topk_weights: Optional[torch.Tensor] = None,
 ) -> List[List[torch.Tensor]]:
     """Allocate TRT-LLM MoE routing metadata for all candidate tiles."""
     flat = (
@@ -4566,9 +4587,18 @@ def trtllm_moe_allocate_routing_metadata_multi_tile(
             routed_scaling_factor,
             routing_method_type,
             list(tile_tokens_dims),
+            routing_input_mode,
+            topk_weights,
         )
     )
-    return [list(flat[i : i + 9]) for i in range(0, len(flat), 9)]
+    grouped = [list(flat[i : i + 9]) for i in range(0, len(flat), 9)]
+    if (
+        int(routing_input_mode) == int(RoutingInputMode.UnpackedPrecomputed)
+        and topk_weights is not None
+    ):
+        for metadata in grouped:
+            metadata[3] = topk_weights
+    return grouped
 
 
 @flashinfer_api(trace=trtllm_bf16_moe_trace)

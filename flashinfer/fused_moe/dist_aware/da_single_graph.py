@@ -1,8 +1,8 @@
 """CUDA graph helpers for DAKNNv2 MoE dispatch.
 
-This module provides the capture-safe pieces used by
-``flashinfer.fused_moe.core`` when it injects a DAKNNv2 decision + SWITCH +
-TRT-LLM FP4 MoE bodies into an existing CUDA graph capture.
+This module provides the precision-agnostic capture structure used to inject a
+DAKNNv2 decision, conditional bodies, and routing work into an existing CUDA
+graph capture. Precision-owned modules supply the body closures.
 """
 
 from __future__ import annotations
@@ -14,104 +14,8 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import torch
 
 __all__ = [
-    "capture_safe_trtllm_fp4_moe",
     "DAInlineGraphInjector",
 ]
-
-
-def capture_safe_trtllm_fp4_moe(
-    *,
-    ffi_moe_op: Any,
-    routing_input_mode: int,
-    hidden_states: torch.Tensor,
-    hidden_states_scale: Optional[torch.Tensor],
-    routing_logits: Optional[torch.Tensor],
-    topk_ids: Optional[torch.Tensor],
-    expert_weights: torch.Tensor,
-    output: torch.Tensor,
-    routing_bias: Optional[torch.Tensor],
-    gemm1_weights: torch.Tensor,
-    gemm1_weights_scale: torch.Tensor,
-    gemm1_bias: Optional[torch.Tensor],
-    gemm1_alpha: Optional[torch.Tensor],
-    gemm1_beta: Optional[torch.Tensor],
-    gemm1_clamp_limit: Optional[torch.Tensor],
-    gemm2_weights: torch.Tensor,
-    gemm2_weights_scale: torch.Tensor,
-    gemm2_bias: Optional[torch.Tensor],
-    output1_scale_scalar: Optional[torch.Tensor],
-    output1_scale_gate_scalar: Optional[torch.Tensor],
-    output2_scale_scalar: Optional[torch.Tensor],
-    num_experts: int,
-    top_k: int,
-    n_group: Optional[int],
-    topk_group: Optional[int],
-    intermediate_size: int,
-    local_expert_offset: int,
-    num_local_experts: int,
-    routed_scaling_factor: Optional[float],
-    routing_method_type: int,
-    do_finalize: bool,
-    enable_pdl: bool,
-    activation_type: int,
-    tactic: Sequence[int],
-) -> None:
-    """Capture-safe direct call to the TRT-LLM FP4 block-scale MoE launcher.
-
-    This bypasses :func:`trtllm_fp4_block_scale_moe_op`'s Python wrapper so
-    the call does **not** allocate tensors (``torch.empty``) or consult the
-    AutoTuner — both of which would break ``cudaStreamBeginCaptureToGraph``
-    capture. All tensor arguments must be pre-allocated persistent buffers
-    whose addresses should be baked into the captured graph; ``tactic`` must
-    be the pre-selected ``[tile_n, config]`` pair. Pass ``[-1, -1]`` to
-    request the TRT-LLM default tactic.
-
-    The call writes into ``output`` in-place; this function returns ``None``
-    because callers capturing a graph only care about the kernel side-effects.
-
-    See ``csrc/trtllm_fused_moe_kernel_launcher.cu`` for the C++ entry point
-    (``trtllm_fp4_block_scale_moe`` in namespace scope, TVM-FFI exported).
-    """
-    tactic_list = [int(tactic[0]), int(tactic[1])]
-
-    ffi_moe_op.trtllm_fp4_block_scale_moe(
-        int(routing_input_mode),
-        routing_logits,
-        topk_ids,
-        expert_weights,
-        routing_bias,
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm1_bias,
-        gemm1_alpha,
-        gemm1_beta,
-        gemm1_clamp_limit,
-        gemm2_weights,
-        gemm2_weights_scale,
-        gemm2_bias,
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        None,
-        int(num_experts),
-        int(top_k),
-        n_group,
-        topk_group,
-        int(intermediate_size),
-        int(local_expert_offset),
-        int(num_local_experts),
-        routed_scaling_factor,
-        int(routing_method_type),
-        bool(do_finalize),
-        bool(enable_pdl),
-        int(activation_type),
-        output,
-        tactic_list,
-        True,
-        None,
-    )
 
 
 # Per-device caches. `inject()` is invoked from inside vLLM's CUDA graph
@@ -150,10 +54,7 @@ class DAInlineGraphInjector:
             # carry distinct (tile, config) pairs for the same tile.
             for i in range(ctx.num_bodies):
                 with ctx.body(i):
-                    capture_safe_trtllm_fp4_moe(
-                        ffi_moe_op=ffi_moe_op,
-                        tactic=per_body_tactics[i], ...
-                    )
+                    capture_preallocated_precision_body(per_body_tactics[i])
         # On __exit__: SWITCH gets wired into the outer capture's dependency
         # chain so whatever vLLM captures next depends on SWITCH completion.
 
@@ -170,6 +71,7 @@ class DAInlineGraphInjector:
         *,
         selector_handle: int = 0,
         topk_ids: torch.Tensor,
+        routing_input_mode: int,
         tile_sizes: Sequence[int],
         num_tokens_bucket: int,
         num_local_experts: int,
@@ -231,6 +133,7 @@ class DAInlineGraphInjector:
                 self._ffi.da_inline_switch_begin_with_handle(
                     int(selector_handle),
                     topk_ids,
+                    int(routing_input_mode),
                     int(num_tokens_bucket),
                     int(top_k),
                     int(num_local_experts),
@@ -245,6 +148,7 @@ class DAInlineGraphInjector:
                     int(selector_handle),
                     topk_ids,
                     expert_counts,
+                    int(routing_input_mode),
                     int(num_tokens_bucket),
                     int(top_k),
                     int(num_local_experts),

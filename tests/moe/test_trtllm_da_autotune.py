@@ -54,6 +54,7 @@ from flashinfer.fused_moe.dist_aware.da_utils import (
 )
 from flashinfer.utils import get_compute_capability
 from tests.moe import test_trtllm_gen_fused_moe as gen_moe_tests
+from tests.moe import trtllm_gen_fused_moe_utils as gen_moe_utils
 from tests.moe.test_trtllm_gen_fused_moe import (
     BF16Moe,
     FP4Moe,
@@ -877,7 +878,7 @@ def _warmup_matrix_fp4_da(execution) -> None:
             routed_scaling_factor=kwargs["routed_scaling"],
             routing_method_type=kwargs["routing_method_type"],
             activation_type=kwargs["activation_type"],
-            tune_max_num_tokens=gen_moe_tests.TUNE_MAX_NUM_TOKENS,
+            tune_max_num_tokens=gen_moe_utils.TUNE_MAX_NUM_TOKENS,
             norm_topk_prob=kwargs["norm_topk_prob"],
         )
 
@@ -1062,6 +1063,9 @@ def _run_matrix_same_tactic(precision, execution, replay: bool = False) -> None:
             static_data["gemm1_weights"],
             static_data["gemm2_weights"],
             None,
+            None,
+            None,
+            None,
             monolithic,
             *common,
             use_shuffled_weight,
@@ -1147,10 +1151,15 @@ def _run_matrix_same_tactic(precision, execution, replay: bool = False) -> None:
             static_data["gemm1_weights"],
             static_data["gemm1_scales"],
             None,
+            None,
+            None,
+            None,
             static_data["gemm2_weights"],
             static_data["gemm2_scales"],
             monolithic,
-            *common,
+            *common[:2],
+            0,
+            *common[2:],
             use_shuffled_weight,
             weight_layout,
             True,
@@ -1393,7 +1402,7 @@ def test_fp4_unpacked_public_wrapper_da_graph_is_numerically_stable(
 ):
     """Every supported FP4 activation mode captures raw routing numerically."""
     _require_sm100()
-    monkeypatch.setattr(gen_moe_tests, "TUNE_MAX_NUM_TOKENS", 64)
+    monkeypatch.setattr(gen_moe_utils, "TUNE_MAX_NUM_TOKENS", 64)
     tuner = _reset_tuner_and_da(monkeypatch)
     graph = None
     try:
@@ -1575,7 +1584,7 @@ def test_fp4_monolithic_from_logits_matches_independent_reference(precision):
 def test_fp4_logits_da_graph_replays_packed_metadata(monkeypatch, precision):
     """DA routes near-tie logits once and replays every FP4 body from metadata."""
     _require_sm100()
-    monkeypatch.setattr(gen_moe_tests, "TUNE_MAX_NUM_TOKENS", 64)
+    monkeypatch.setattr(gen_moe_utils, "TUNE_MAX_NUM_TOKENS", 64)
     tuner = _reset_tuner_and_da(monkeypatch)
     graph = None
     try:
@@ -1638,8 +1647,11 @@ def test_fp4_logits_da_graph_replays_packed_metadata(monkeypatch, precision):
         da_context = config_key[1]
         tactics_by_tile = {}
         for cache_key, (_, tactic, _) in tuner.profiling_cache.items():
+            op_name = (
+                cache_key.custom_op if hasattr(cache_key, "custom_op") else cache_key[0]
+            )
             if (
-                cache_key[0] == precision.op_name
+                op_name == precision.op_name
                 and hasattr(tactic, "__getitem__")
                 and len(tactic) >= 2
             ):
@@ -1958,6 +1970,45 @@ def test_nvfp4_per_token_metadata_path_is_same_tactic_bit_exact():
     assert (monolithic_output - split_output).abs().max().item() == 0
 
 
+def test_precomputed_all_expert_route_prepares_multi_tile_metadata():
+    """Precomputed routing may select every expert; logits routing may not."""
+    _require_sm100()
+    num_tokens = 16
+    num_experts = top_k = 8
+    expert_ids = torch.arange(num_experts, dtype=torch.int32, device="cuda").repeat(
+        num_tokens, 1
+    )
+    expert_weights = torch.full(
+        (num_tokens, top_k),
+        1.0 / top_k,
+        dtype=torch.bfloat16,
+        device=expert_ids.device,
+    )
+
+    metadata_by_tile = fused_moe_api.trtllm_moe_allocate_routing_metadata_multi_tile(
+        expert_ids,
+        None,
+        num_experts,
+        top_k,
+        8,
+        4,
+        0,
+        num_experts,
+        None,
+        int(RoutingMethodType.DeepSeekV3),
+        [16, 32],
+        int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+        expert_weights,
+    )
+    torch.cuda.synchronize()
+
+    assert len(metadata_by_tile) == 2
+    for tile_tokens, metadata in zip((16, 32), metadata_by_tile, strict=True):
+        assert metadata[3].data_ptr() == expert_weights.data_ptr()
+        assert metadata[0].item() == num_experts * tile_tokens
+        assert torch.all(metadata[1] >= 0)
+
+
 def test_nvfp4_unpacked_public_wrapper_metadata_replay_is_bit_exact():
     """Raw FP4 routing IDs and weights survive metadata preparation unchanged."""
     _require_sm100()
@@ -2178,7 +2229,12 @@ def _clear_da_test_state(tuner: AutoTuner) -> None:
 def _collect_profile_latencies(tuner: AutoTuner) -> dict[int, dict[int, float]]:
     out: dict[int, dict[int, float]] = {}
     for cache_key, (_runner_id, tactic, _profile) in tuner.profiling_cache.items():
-        op_name, runner_name, _runner_hash, profile_key, *_extras = cache_key
+        if hasattr(cache_key, "custom_op"):
+            op_name = cache_key.custom_op
+            runner_name = cache_key.runner_class_name
+            profile_key = cache_key.nearest_profile
+        else:
+            op_name, runner_name, _runner_hash, profile_key, *_extras = cache_key
         if op_name != "flashinfer::trtllm_fp4_block_scale_moe":
             continue
         if runner_name != "MoERunner":
@@ -2840,8 +2896,8 @@ def _run_factorized_public_reference_case(monkeypatch, tmp_path, precision):
     """Tune one public precision and return its independent reference and call."""
     _require_sm100()
     monkeypatch.delenv("FLASHINFER_DA_FACTORIZED_AUTOTUNE", raising=False)
-    monkeypatch.setattr(gen_moe_tests, "TUNE_MAX_NUM_TOKENS", 64)
-    autotuner_module = importlib.import_module("flashinfer.autotuner")
+    monkeypatch.setattr(gen_moe_utils, "TUNE_MAX_NUM_TOKENS", 64)
+    autotuner_module = importlib.import_module("flashinfer.autotuner.autotuner")
     profile_dump = tmp_path / f"factorized-{precision.name}.csv"
     monkeypatch.setattr(autotuner_module, "_AUTOTUNE_DUMP_PATH", str(profile_dump))
 

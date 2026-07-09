@@ -246,6 +246,7 @@ void da_upload_knn_exemplars(tvm::ffi::Tensor exemplar_norm_flat,
 struct DecisionKernelArgs {
   const int32_t* topk_ids_ptr;
   int num_elements;
+  bool topk_ids_are_packed;
   DAKnnParams* d_params;
   int32_t* d_selected_tile_idx;
   int32_t* d_selected_tile_n;
@@ -255,6 +256,7 @@ struct DecisionKernelArgs {
 struct HistogramCountsKernelArgs {
   const int32_t* topk_ids_ptr;
   int num_elements;
+  bool topk_ids_are_packed;
   DAKnnParams* d_params;
   int32_t* counts;
 };
@@ -283,6 +285,7 @@ struct SelectFromGlobalCountsKernelArgs {
 struct FusedHistDecisionKernelArgs {
   const int32_t* topk_ids_ptr;
   int num_elements;
+  bool topk_ids_are_packed;
   DAKnnParams* d_params;
   int32_t* counts;
   unsigned int* d_block_done;
@@ -400,9 +403,9 @@ static int64_t g_next_inline_ctx = 1;
 
 static int64_t da_inline_switch_begin_impl(TensorView topk_ids_tv,
                                            const TensorView* expert_counts_tv,
-                                           int64_t selector_handle, int64_t num_tokens_bucket,
-                                           int64_t top_k, int64_t num_local_experts,
-                                           int64_t local_expert_offset,
+                                           int64_t routing_input_mode, int64_t selector_handle,
+                                           int64_t num_tokens_bucket, int64_t top_k,
+                                           int64_t num_local_experts, int64_t local_expert_offset,
                                            tvm::ffi::Array<int64_t> tile_sizes_arr,
                                            int64_t side_stream_handle) {
   cudaStream_t outer_stream = get_stream(topk_ids_tv.device());
@@ -430,6 +433,9 @@ static int64_t da_inline_switch_begin_impl(TensorView topk_ids_tv,
       validate_knn_state_topology(*knn_state, top_k, num_local_experts, local_expert_offset),
       "DAKNNv2 selector topology does not match the uploaded state.");
   const bool use_global_counts = expert_counts_tv != nullptr;
+  FLASHINFER_CHECK(routing_input_mode == 1 || routing_input_mode == 2,
+                   "DA selector requires packed or unpacked precomputed routing mode.");
+  bool const topk_ids_are_packed = routing_input_mode == 1;
   if (expert_counts_tv != nullptr) {
     FLASHINFER_CHECK(expert_counts_tv->dtype() == dl_int32, "expert_counts must have dtype int32.");
     FLASHINFER_CHECK(expert_counts_tv->ndim() == 1, "expert_counts must be a 1D tensor.");
@@ -546,16 +552,18 @@ static int64_t da_inline_switch_begin_impl(TensorView topk_ids_tv,
       auto* fused_ka = ctx->fused_hist_decision_kargs.get();
       fused_ka->topk_ids_ptr = static_cast<const int32_t*>(topk_ids_tv.data_ptr());
       fused_ka->num_elements = num_elements;
+      fused_ka->topk_ids_are_packed = topk_ids_are_packed;
       fused_ka->d_params = knn_state->d_params;
       fused_ka->counts = knn_state->d_counts;
       fused_ka->d_block_done = knn_state->d_block_done;
       fused_ka->d_selected_tile_idx = knn_state->d_selected_tile_idx;
       fused_ka->d_selected_tile_n = knn_state->d_selected_tile_n;
       fused_ka->switch_handle = ctx->switch_handle;
-      void* fused_args[] = {&fused_ka->topk_ids_ptr,      &fused_ka->num_elements,
-                            &fused_ka->d_params,          &fused_ka->counts,
-                            &fused_ka->d_block_done,      &fused_ka->d_selected_tile_idx,
-                            &fused_ka->d_selected_tile_n, &fused_ka->switch_handle};
+      void* fused_args[] = {&fused_ka->topk_ids_ptr,       &fused_ka->num_elements,
+                            &fused_ka->d_params,           &fused_ka->counts,
+                            &fused_ka->d_block_done,       &fused_ka->d_selected_tile_idx,
+                            &fused_ka->d_selected_tile_n,  &fused_ka->switch_handle,
+                            &fused_ka->topk_ids_are_packed};
 
       cudaKernelNodeParams fused_kp{};
       fused_kp.func =
@@ -588,10 +596,11 @@ static int64_t da_inline_switch_begin_impl(TensorView topk_ids_tv,
       auto* hist_ka = ctx->histogram_counts_kargs.get();
       hist_ka->topk_ids_ptr = static_cast<const int32_t*>(topk_ids_tv.data_ptr());
       hist_ka->num_elements = num_elements;
+      hist_ka->topk_ids_are_packed = topk_ids_are_packed;
       hist_ka->d_params = knn_state->d_params;
       hist_ka->counts = knn_state->d_counts;
       void* hist_args[] = {&hist_ka->topk_ids_ptr, &hist_ka->num_elements, &hist_ka->d_params,
-                           &hist_ka->counts};
+                           &hist_ka->counts, &hist_ka->topk_ids_are_packed};
       cudaKernelNodeParams hist_kp{};
       hist_kp.func =
           use_split_knn_pdl
@@ -646,12 +655,14 @@ static int64_t da_inline_switch_begin_impl(TensorView topk_ids_tv,
       auto* ka = ctx->decision_kargs.get();
       ka->topk_ids_ptr = static_cast<const int32_t*>(topk_ids_tv.data_ptr());
       ka->num_elements = num_elements;
+      ka->topk_ids_are_packed = topk_ids_are_packed;
       ka->d_params = knn_state->d_params;
       ka->d_selected_tile_idx = knn_state->d_selected_tile_idx;
       ka->d_selected_tile_n = knn_state->d_selected_tile_n;
       ka->switch_handle = ctx->switch_handle;
       void* args[] = {&ka->topk_ids_ptr,        &ka->num_elements,      &ka->d_params,
-                      &ka->d_selected_tile_idx, &ka->d_selected_tile_n, &ka->switch_handle};
+                      &ka->d_selected_tile_idx, &ka->d_selected_tile_n, &ka->switch_handle,
+                      &ka->topk_ids_are_packed};
       cudaKernelNodeParams kp{};
       kp.func = reinterpret_cast<void*>(da_heuristic::da_knn_select_tile_graph_kernel);
       kp.gridDim = {1, 1, 1};
@@ -686,42 +697,44 @@ static int64_t da_inline_switch_begin_impl(TensorView topk_ids_tv,
   return ctx_id;
 }
 
-int64_t da_inline_switch_begin(TensorView topk_ids_tv, int64_t num_tokens_bucket, int64_t top_k,
-                               int64_t num_local_experts, int64_t local_expert_offset,
-                               tvm::ffi::Array<int64_t> tile_sizes_arr,
+int64_t da_inline_switch_begin(TensorView topk_ids_tv, int64_t routing_input_mode,
+                               int64_t num_tokens_bucket, int64_t top_k, int64_t num_local_experts,
+                               int64_t local_expert_offset, tvm::ffi::Array<int64_t> tile_sizes_arr,
                                int64_t side_stream_handle) {
-  return da_inline_switch_begin_impl(topk_ids_tv, nullptr, kDefaultSelectorHandle,
-                                     num_tokens_bucket, top_k, num_local_experts,
-                                     local_expert_offset, tile_sizes_arr, side_stream_handle);
+  return da_inline_switch_begin_impl(
+      topk_ids_tv, nullptr, routing_input_mode, kDefaultSelectorHandle, num_tokens_bucket, top_k,
+      num_local_experts, local_expert_offset, tile_sizes_arr, side_stream_handle);
 }
 
 int64_t da_inline_switch_begin_with_handle(int64_t selector_handle, TensorView topk_ids_tv,
-                                           int64_t num_tokens_bucket, int64_t top_k,
-                                           int64_t num_local_experts, int64_t local_expert_offset,
+                                           int64_t routing_input_mode, int64_t num_tokens_bucket,
+                                           int64_t top_k, int64_t num_local_experts,
+                                           int64_t local_expert_offset,
                                            tvm::ffi::Array<int64_t> tile_sizes_arr,
                                            int64_t side_stream_handle) {
-  return da_inline_switch_begin_impl(topk_ids_tv, nullptr, selector_handle, num_tokens_bucket,
-                                     top_k, num_local_experts, local_expert_offset, tile_sizes_arr,
-                                     side_stream_handle);
+  return da_inline_switch_begin_impl(topk_ids_tv, nullptr, routing_input_mode, selector_handle,
+                                     num_tokens_bucket, top_k, num_local_experts,
+                                     local_expert_offset, tile_sizes_arr, side_stream_handle);
 }
 
 int64_t da_inline_switch_begin_from_counts(TensorView topk_ids_tv, TensorView expert_counts_tv,
-                                           int64_t num_tokens_bucket, int64_t top_k,
-                                           int64_t num_local_experts, int64_t local_expert_offset,
+                                           int64_t routing_input_mode, int64_t num_tokens_bucket,
+                                           int64_t top_k, int64_t num_local_experts,
+                                           int64_t local_expert_offset,
                                            tvm::ffi::Array<int64_t> tile_sizes_arr,
                                            int64_t side_stream_handle) {
-  return da_inline_switch_begin_impl(topk_ids_tv, &expert_counts_tv, kDefaultSelectorHandle,
-                                     num_tokens_bucket, top_k, num_local_experts,
-                                     local_expert_offset, tile_sizes_arr, side_stream_handle);
+  return da_inline_switch_begin_impl(
+      topk_ids_tv, &expert_counts_tv, routing_input_mode, kDefaultSelectorHandle, num_tokens_bucket,
+      top_k, num_local_experts, local_expert_offset, tile_sizes_arr, side_stream_handle);
 }
 
 int64_t da_inline_switch_begin_from_counts_with_handle(
     int64_t selector_handle, TensorView topk_ids_tv, TensorView expert_counts_tv,
-    int64_t num_tokens_bucket, int64_t top_k, int64_t num_local_experts,
+    int64_t routing_input_mode, int64_t num_tokens_bucket, int64_t top_k, int64_t num_local_experts,
     int64_t local_expert_offset, tvm::ffi::Array<int64_t> tile_sizes_arr,
     int64_t side_stream_handle) {
-  return da_inline_switch_begin_impl(topk_ids_tv, &expert_counts_tv, selector_handle,
-                                     num_tokens_bucket, top_k, num_local_experts,
+  return da_inline_switch_begin_impl(topk_ids_tv, &expert_counts_tv, routing_input_mode,
+                                     selector_handle, num_tokens_bucket, top_k, num_local_experts,
                                      local_expert_offset, tile_sizes_arr, side_stream_handle);
 }
 

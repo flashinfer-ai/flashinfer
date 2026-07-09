@@ -58,9 +58,10 @@ class DACaptureResources:
     num_tokens: int
     num_tokens_bucket: int
     routing_method_type: int
-    routing_input_mode: int
+    input_routing_mode: int
+    internal_routing_mode: int
     topk_ids: torch.Tensor
-    expert_weights_bf16: torch.Tensor
+    topk_weights: torch.Tensor
     routing_metadata_by_tile: Tuple[Tuple[int, RoutingMetadataBundle], ...]
     candidate_tile_sizes: Tuple[int, ...]
     per_body_tactics: Tuple[Tuple[int, int], ...]
@@ -97,7 +98,7 @@ def store_capture_resources(resources: DACaptureResources) -> None:
             resources.num_tokens_bucket,
             resources.num_tokens,
             resources.routing_method_type,
-            resources.routing_input_mode,
+            resources.input_routing_mode,
         )
     ] = resources
 
@@ -108,9 +109,10 @@ def prepare_capture_resources(
     num_tokens: int,
     num_tokens_bucket: int,
     routing_method_type: int,
-    routing_input_mode: int,
+    input_routing_mode: int,
+    internal_routing_mode: int,
     topk_ids: torch.Tensor,
-    expert_weights_bf16: torch.Tensor,
+    topk_weights: torch.Tensor,
     routing_metadata_by_tile: Sequence[Tuple[int, RoutingMetadataBundle]],
     candidate_tile_sizes: Sequence[int],
     per_body_tactics: Sequence[Sequence[int]],
@@ -125,9 +127,10 @@ def prepare_capture_resources(
             num_tokens=int(num_tokens),
             num_tokens_bucket=int(num_tokens_bucket),
             routing_method_type=int(routing_method_type),
-            routing_input_mode=int(routing_input_mode),
+            input_routing_mode=int(input_routing_mode),
+            internal_routing_mode=int(internal_routing_mode),
             topk_ids=topk_ids,
-            expert_weights_bf16=expert_weights_bf16,
+            topk_weights=topk_weights,
             routing_metadata_by_tile=tuple(routing_metadata_by_tile),
             candidate_tile_sizes=tuple(int(tile) for tile in candidate_tile_sizes),
             per_body_tactics=tuple(
@@ -139,7 +142,7 @@ def prepare_capture_resources(
         )
     store_capture_resources(resources)
     da_state.retain_capture_tensor(da_context, resources.topk_ids)
-    da_state.retain_capture_tensor(da_context, resources.expert_weights_bf16)
+    da_state.retain_capture_tensor(da_context, resources.topk_weights)
     for _, bundle in resources.routing_metadata_by_tile:
         for tensor in bundle.tensors:
             da_state.retain_capture_tensor(da_context, tensor)
@@ -176,10 +179,10 @@ def lookup_capture_resources(
             "DA capture resources are not prepared: "
             f"topk_ids shape={tuple(resources.topk_ids.shape)} expected={expected_topk_shape}"
         )
-    if tuple(resources.expert_weights_bf16.shape) != expected_topk_shape:
+    if tuple(resources.topk_weights.shape) != expected_topk_shape:
         raise RuntimeError(
-            "DA capture resources are not prepared: expert_weights_bf16 shape="
-            f"{tuple(resources.expert_weights_bf16.shape)} expected={expected_topk_shape}"
+            "DA capture resources are not prepared: topk_weights shape="
+            f"{tuple(resources.topk_weights.shape)} expected={expected_topk_shape}"
         )
     for tile_size, bundle in resources.routing_metadata_by_tile:
         try:
@@ -193,7 +196,7 @@ def lookup_capture_resources(
                 local_expert_offset=da_context.local_expert_offset,
                 tile_size=tile_size,
                 routing_method_type=routing_method_type,
-                routing_input_mode=routing_input_mode,
+                routing_input_mode=resources.internal_routing_mode,
             )
         except ValueError as error:
             raise RuntimeError(
@@ -342,19 +345,6 @@ class CaptureRoutingPlan:
     anchor_metadata: Optional[List[torch.Tensor]] = None
 
 
-def pack_unpacked_routing_out(
-    backend: DACaptureBackend,
-    expert_ids: torch.Tensor,
-    expert_weights: torch.Tensor,
-    packed_topk_ids_out: torch.Tensor,
-) -> None:
-    backend.ffi_moe_op.trtllm_moe_pack_unpacked_routing(
-        expert_ids,
-        expert_weights,
-        packed_topk_ids_out,
-    )
-
-
 def prepare_capture_routing(
     *,
     backend: DACaptureBackend,
@@ -498,9 +488,8 @@ def try_trtllm_capture_aware_da(
     debug_log: Callable[[str], None],
     da_context: da_state.DAMoeContext,
     run_from_routing_metadata: Callable[[RoutingMetadataBundle, Sequence[int]], None],
-    direct_body: Optional[Callable[[Sequence[int], Dict[str, Any]], None]] = None,
-    precomputed_topk_ids_are_packed: bool = True,
     routing_input_mode: int,
+    internal_routing_mode: int,
     hidden_states,
     hidden_states_scale,
     routing_logits,
@@ -577,31 +566,32 @@ def try_trtllm_capture_aware_da(
     bucket = upload_bucket(num_tokens, tune_max_num_tokens)
     capture_resources = None
     if is_capturing:
-        capture_resources = lookup_capture_resources(
-            da_context,
-            bucket,
-            num_tokens=num_tokens,
-            routing_method_type=routing_method_type,
-            routing_input_mode=routing_input_mode,
-        )
+        try:
+            capture_resources = lookup_capture_resources(
+                da_context,
+                bucket,
+                num_tokens=num_tokens,
+                routing_method_type=routing_method_type,
+                routing_input_mode=routing_input_mode,
+            )
+        except RuntimeError as error:
+            return _skip(f"routing metadata replay is not prepared: {error}")
         if int(routing_input_mode) == _routing_input_mode("UnpackedPrecomputed"):
             if unpacked_expert_ids is None or unpacked_expert_weights is None:
                 return _skip("unpacked routing requires both expert IDs and weights")
-            if callable(backend):
-                backend = backend()
-            pack_unpacked_routing_out(
-                backend,
-                unpacked_expert_ids,
-                unpacked_expert_weights,
-                capture_resources.topk_ids,
-            )
-            precomputed_topk_ids_are_packed = True
+            topk_ids = unpacked_expert_ids
+            expert_weights = unpacked_expert_weights
+            da_state.retain_capture_tensor(da_context, topk_ids)
+            da_state.retain_capture_tensor(da_context, expert_weights)
         elif int(routing_input_mode) == _routing_input_mode("PackedPrecomputed"):
             if topk_ids is None:
                 return _skip("packed routing requires packed top-k IDs")
             capture_resources.topk_ids.copy_(topk_ids)
-        topk_ids = capture_resources.topk_ids
-        expert_weights = capture_resources.expert_weights_bf16
+            topk_ids = capture_resources.topk_ids
+            expert_weights = capture_resources.topk_weights
+        elif int(routing_input_mode) == _routing_input_mode("FromLogits"):
+            topk_ids = capture_resources.topk_ids
+            expert_weights = capture_resources.topk_weights
     elif topk_ids is None or expert_weights is None:
         return _skip(
             f"topk_ids is None={topk_ids is None}, "
@@ -683,56 +673,52 @@ def try_trtllm_capture_aware_da(
         f"tiles={candidate_tile_sizes} tactics={per_tile_tactics}"
     )
 
-    base_kwargs = dict(
-        routing_input_mode=int(routing_input_mode),
-        hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
-        routing_logits=routing_logits,
-        topk_ids=topk_ids,
-        expert_weights=expert_weights,
-        output=output,
-        routing_bias=routing_bias,
-        gemm1_weights=gemm1_weights,
-        gemm1_weights_scale=gemm1_weights_scale,
-        gemm1_bias=gemm1_bias,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_beta=gemm1_beta,
-        gemm1_clamp_limit=gemm1_clamp_limit,
-        gemm2_weights=gemm2_weights,
-        gemm2_weights_scale=gemm2_weights_scale,
-        gemm2_bias=gemm2_bias,
-        output1_scale_scalar=output1_scale_scalar,
-        output1_scale_gate_scalar=output1_scale_gate_scalar,
-        output2_scale_scalar=output2_scale_scalar,
-        num_experts=int(num_experts),
-        top_k=int(top_k),
-        n_group=n_group,
-        topk_group=topk_group,
-        intermediate_size=int(intermediate_size),
-        local_expert_offset=int(local_expert_offset),
-        num_local_experts=int(num_local_experts),
-        routed_scaling_factor=routed_scaling_factor,
-        routing_method_type=int(routing_method_type),
-        do_finalize=True,
-        enable_pdl=bool(enable_pdl) if enable_pdl is not None else False,
-        activation_type=int(activation_type),
-    )
-
     # Consume the pre-router's packed IDs and BF16 weights by default. Both the
     # generic runner and the DeepSeek fast path produce the same routing values
     # as the original body before tactic selection.
-    use_precomputed_route = config.use_precomputed_route
-
-    if capture_resources is None:
-        if int(routing_input_mode) == _routing_input_mode("UnpackedPrecomputed"):
-            if topk_ids is None or expert_weights is None:
-                return _skip("unpacked routing requires both expert IDs and weights")
-            packed_topk_ids = torch.empty_like(topk_ids)
-            pack_unpacked_routing_out(
-                backend, topk_ids, expert_weights, packed_topk_ids
+    metadata_routing_input_mode = int(internal_routing_mode)
+    metadata_topk_weights = (
+        expert_weights
+        if metadata_routing_input_mode == _routing_input_mode("UnpackedPrecomputed")
+        else None
+    )
+    if capture_resources is not None:
+        if capture_resources.internal_routing_mode != metadata_routing_input_mode:
+            raise RuntimeError(
+                "DA capture resources use internal_routing_mode="
+                f"{capture_resources.internal_routing_mode}, but the invocation uses "
+                f"internal_routing_mode={metadata_routing_input_mode}"
             )
-            topk_ids = packed_topk_ids
-            precomputed_topk_ids_are_packed = True
+        metadata_topk_weights = (
+            expert_weights
+            if metadata_routing_input_mode == _routing_input_mode("UnpackedPrecomputed")
+            else None
+        )
+
+    def _bundle_routing_metadata(
+        metadata: Sequence[torch.Tensor], tile_size: int
+    ) -> RoutingMetadataBundle:
+        if (
+            metadata_routing_input_mode == _routing_input_mode("UnpackedPrecomputed")
+            and metadata_topk_weights is not None
+        ):
+            metadata = list(metadata)
+            metadata[3] = metadata_topk_weights
+        return make_routing_metadata_bundle(
+            metadata,
+            da_context=da_context,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            tile_size=tile_size,
+            routing_method_type=routing_method_type,
+            routing_input_mode=metadata_routing_input_mode,
+        )
+
+    populate_candidate_routing_metadata: Optional[Callable[[], None]] = None
+    if capture_resources is None:
         routing_plan = prepare_capture_routing(
             backend=backend,
             routing_logits=routing_logits,
@@ -749,18 +735,84 @@ def try_trtllm_capture_aware_da(
             anchor_tile=int(per_tile_tactics[0][0]),
             norm_topk_prob=norm_topk_prob,
             use_routing_scales_on_input=use_routing_scales_on_input,
-            pack_for_trtllm=use_precomputed_route,
+            # Honor the actual representation chosen by the caller. The
+            # current FP4 logits router exposes packed IDs only, so its
+            # internal mode is explicitly PackedPrecomputed.
+            pack_for_trtllm=(
+                int(internal_routing_mode) == _routing_input_mode("PackedPrecomputed")
+            ),
         )
     else:
-        prepared_by_tile = dict(capture_resources.routing_metadata_by_tile)
+        prepared_by_tile = {
+            int(tile): _bundle_routing_metadata(bundle.tensors, int(tile))
+            for tile, bundle in capture_resources.routing_metadata_by_tile
+        }
         first_tile = int(candidate_tile_sizes[0])
         first_bundle = prepared_by_tile[first_tile]
         ffi_moe_op = backend.ffi_moe_op
-        if routing_logits is not None and (
-            use_precomputed_route or len(per_tile_tactics) > 1
-        ):
-            # A multi-body selector always needs assignments for the current
-            # logits, even when the selected body will rerun routing itself.
+        use_packed_logits_multi_tile = (
+            routing_logits is not None
+            and metadata_routing_input_mode == _routing_input_mode("PackedPrecomputed")
+            and int(routing_method_type) == 2
+        )
+        remaining_tiles: Tuple[int, ...]
+        if use_packed_logits_multi_tile:
+            # TODO: Fuse the logits top-k producer below with the
+            # multi-tile metadata population callback. The C++ helper already
+            # suppresses single-tile permutation metadata; the remaining cost
+            # is the extra launch and packed-ID/weight global-memory handoff.
+            # Run the shared logits producer on the outer stream before the
+            # selector is injected. The multi-tile metadata consumer is
+            # deferred to the routing branch below so it and the raw packed-ID
+            # selector are sibling graph branches after this producer.
+            ffi_moe_op.trtllm_deepseek_moe_compute_routing_packed_only(
+                routing_logits,
+                routing_bias,
+                int(num_experts),
+                int(top_k),
+                n_group,
+                topk_group,
+                int(local_expert_offset),
+                int(num_local_experts),
+                routed_scaling_factor,
+                int(routing_method_type),
+                topk_ids,
+                expert_weights,
+            )
+
+            def _populate_packed_candidate_routing_metadata() -> None:
+                ffi_moe_op.trtllm_moe_populate_routing_metadata_multi_tile(
+                    topk_ids,
+                    routing_bias,
+                    int(num_experts),
+                    int(top_k),
+                    n_group,
+                    topk_group,
+                    int(local_expert_offset),
+                    int(num_local_experts),
+                    routed_scaling_factor,
+                    int(routing_method_type),
+                    [int(tile) for tile in candidate_tile_sizes],
+                    [
+                        tensor
+                        for tile in candidate_tile_sizes
+                        for tensor in prepared_by_tile[int(tile)].tensors
+                    ],
+                    metadata_routing_input_mode,
+                    metadata_topk_weights,
+                    True,
+                )
+
+            if len(candidate_tile_sizes) > 1 and not config.select_from_routing_counts:
+                populate_candidate_routing_metadata = (
+                    _populate_packed_candidate_routing_metadata
+                )
+            else:
+                # A counts-based selector consumes metadata produced by this
+                # kernel and therefore has a real dependency on it.
+                _populate_packed_candidate_routing_metadata()
+            remaining_tiles = ()
+        elif routing_logits is not None:
             ffi_moe_op.trtllm_moe_populate_routing_metadata_from_logits(
                 routing_logits,
                 routing_bias,
@@ -778,59 +830,52 @@ def try_trtllm_capture_aware_da(
                 topk_ids,
                 first_bundle.public_metadata(),
             )
-            remaining_tiles = (
-                tuple(
-                    int(tile)
-                    for tile in candidate_tile_sizes
-                    if int(tile) != first_tile
-                )
-                if use_precomputed_route
-                else ()
+            remaining_tiles = tuple(
+                int(tile) for tile in candidate_tile_sizes if int(tile) != first_tile
             )
-        elif use_precomputed_route:
-            remaining_tiles = tuple(int(tile) for tile in candidate_tile_sizes)
         else:
-            remaining_tiles = ()
+            remaining_tiles = tuple(int(tile) for tile in candidate_tile_sizes)
         if remaining_tiles:
-            ffi_moe_op.trtllm_moe_populate_routing_metadata_multi_tile(
-                topk_ids,
-                routing_bias,
-                int(num_experts),
-                int(top_k),
-                n_group,
-                topk_group,
-                int(local_expert_offset),
-                int(num_local_experts),
-                routed_scaling_factor,
-                int(routing_method_type),
-                list(remaining_tiles),
-                [
-                    tensor
-                    for tile in remaining_tiles
-                    for tensor in prepared_by_tile[tile].tensors
-                ],
-            )
-        routing_plan = CaptureRoutingPlan(
-            use_precomputed_route,
-            first_bundle.tensors[3] if use_precomputed_route else None,
-            first_tile if use_precomputed_route else None,
-            first_bundle.public_metadata() if use_precomputed_route else None,
-        )
+            deferred_tiles = tuple(remaining_tiles)
 
-    def _bundle_routing_metadata(
-        metadata: Sequence[torch.Tensor], tile_size: int
-    ) -> RoutingMetadataBundle:
-        return make_routing_metadata_bundle(
-            metadata,
-            da_context=da_context,
-            num_tokens=num_tokens,
-            top_k=top_k,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            local_expert_offset=local_expert_offset,
-            tile_size=tile_size,
-            routing_method_type=routing_method_type,
-            routing_input_mode=routing_input_mode,
+            def _populate_remaining_candidate_routing_metadata() -> None:
+                ffi_moe_op.trtllm_moe_populate_routing_metadata_multi_tile(
+                    topk_ids,
+                    routing_bias,
+                    int(num_experts),
+                    int(top_k),
+                    n_group,
+                    topk_group,
+                    int(local_expert_offset),
+                    int(num_local_experts),
+                    routed_scaling_factor,
+                    int(routing_method_type),
+                    list(deferred_tiles),
+                    [
+                        tensor
+                        for tile in deferred_tiles
+                        for tensor in prepared_by_tile[tile].tensors
+                    ],
+                    metadata_routing_input_mode,
+                    metadata_topk_weights,
+                    False,
+                )
+
+            if len(candidate_tile_sizes) > 1 and not config.select_from_routing_counts:
+                # Precomputed IDs/weights are already ready before the fork.
+                # Populate all candidate metadata on the routing branch while
+                # the selector reads the same immutable IDs on the outer branch.
+                populate_candidate_routing_metadata = (
+                    _populate_remaining_candidate_routing_metadata
+                )
+            else:
+                # Counts-based selection consumes the populated metadata.
+                _populate_remaining_candidate_routing_metadata()
+        routing_plan = CaptureRoutingPlan(
+            True,
+            first_bundle.tensors[3],
+            first_tile,
+            first_bundle.public_metadata(),
         )
 
     def _dispatch_routing_metadata(
@@ -848,7 +893,7 @@ def try_trtllm_capture_aware_da(
             local_expert_offset=local_expert_offset,
             tile_size=int(tactic[0]),
             routing_method_type=routing_method_type,
-            routing_input_mode=routing_input_mode,
+            routing_input_mode=metadata_routing_input_mode,
         )
 
     precomputed_route_ready = routing_plan.precomputed_route_ready
@@ -860,21 +905,8 @@ def try_trtllm_capture_aware_da(
             for _tensor in routing_plan.anchor_metadata:
                 da_state.retain_capture_tensor(da_context, _tensor)
 
-    if (
-        routing_logits is None
-        and use_precomputed_route
-        and precomputed_route_ready
-        and not precomputed_topk_ids_are_packed
-    ):
-        if direct_body is None:
-            return _skip(
-                "precomputed topk_ids are unpacked; routing metadata replay requires "
-                "TRT-LLM packed topk_ids"
-            )
-        precomputed_route_ready = False
-
-    if not (use_precomputed_route and precomputed_route_ready) and direct_body is None:
-        return _skip("precomputed routing metadata is unavailable for this precision")
+    if not precomputed_route_ready:
+        return _skip("routing metadata replay is unavailable for this precision")
 
     if not is_capturing:
         metadata_by_tile: Dict[int, RoutingMetadataBundle] = {}
@@ -904,6 +936,8 @@ def try_trtllm_capture_aware_da(
                 routed_scaling_factor,
                 int(routing_method_type),
                 missing_tiles,
+                metadata_routing_input_mode,
+                metadata_topk_weights,
             )
             metadata_by_tile.update(
                 (
@@ -920,14 +954,22 @@ def try_trtllm_capture_aware_da(
             if expert_weights_bf16 is not None
             else prepared_metadata[0][1].tensors[3]
         )
+        prepared_topk_ids = topk_ids
+        prepared_topk_weights = prepared_expert_weights
+        if int(routing_input_mode) == _routing_input_mode("UnpackedPrecomputed"):
+            if expert_weights is None:
+                return _skip("unpacked routing requires caller-provided top-k weights")
+            prepared_topk_ids = topk_ids
+            prepared_topk_weights = expert_weights
         prepare_capture_resources(
             da_context=da_context,
             num_tokens=num_tokens,
             num_tokens_bucket=bucket,
             routing_method_type=routing_method_type,
-            routing_input_mode=routing_input_mode,
-            topk_ids=topk_ids,
-            expert_weights_bf16=prepared_expert_weights,
+            input_routing_mode=routing_input_mode,
+            internal_routing_mode=metadata_routing_input_mode,
+            topk_ids=prepared_topk_ids,
+            topk_weights=prepared_topk_weights,
             routing_metadata_by_tile=prepared_metadata,
             candidate_tile_sizes=candidate_tile_sizes,
             per_body_tactics=per_tile_tactics,
@@ -938,45 +980,45 @@ def try_trtllm_capture_aware_da(
     # candidate tiles remain. Capture it directly so replay pays neither the
     # kNN selector kernel nor the CUDA conditional SWITCH node.
     if len(per_tile_tactics) == 1:
-        if use_precomputed_route and precomputed_route_ready:
-            body_tile = int(per_tile_tactics[0][0])
-            if capture_resources is not None:
-                prepared_by_tile = dict(capture_resources.routing_metadata_by_tile)
-                routing_bundle = prepared_by_tile.get(body_tile)
-                if routing_bundle is None:
-                    raise RuntimeError(
-                        "DA capture resources are not prepared for single-body "
-                        f"tile {body_tile}"
-                    )
-            else:
-                if routing_plan.anchor_tile == body_tile:
-                    routing_metadata = routing_plan.anchor_metadata
-                else:
-                    routing_metadata = None
-                if routing_metadata is None:
-                    routing_metadata = backend.prepare_routing_metadata_multi_tile(
-                        topk_ids,
-                        routing_bias,
-                        int(num_experts),
-                        int(top_k),
-                        n_group,
-                        topk_group,
-                        int(local_expert_offset),
-                        int(num_local_experts),
-                        routed_scaling_factor,
-                        int(routing_method_type),
-                        (body_tile,),
-                    )[0]
-                routing_bundle = _bundle_routing_metadata(routing_metadata, body_tile)
-                for _tensor in routing_bundle.tensors:
-                    da_state.retain_capture_tensor(da_context, _tensor)
-            _dispatch_routing_metadata(routing_bundle, per_tile_tactics[0])
-            globals().setdefault("_TRTLLM_DA_PRECOMPUTED_ROUTE_COUNT", 0)
-            globals()["_TRTLLM_DA_PRECOMPUTED_ROUTE_COUNT"] += 1
+        body_tile = int(per_tile_tactics[0][0])
+        if capture_resources is not None:
+            prepared_by_tile = {
+                int(tile): _bundle_routing_metadata(bundle.tensors, int(tile))
+                for tile, bundle in capture_resources.routing_metadata_by_tile
+            }
+            routing_bundle = prepared_by_tile.get(body_tile)
+            if routing_bundle is None:
+                raise RuntimeError(
+                    "DA capture resources are not prepared for single-body "
+                    f"tile {body_tile}"
+                )
         else:
-            if direct_body is None:
-                return _skip("direct capture body is unavailable for this precision")
-            direct_body(per_tile_tactics[0], base_kwargs)
+            if routing_plan.anchor_tile == body_tile:
+                routing_metadata = routing_plan.anchor_metadata
+            else:
+                routing_metadata = None
+            if routing_metadata is None:
+                routing_metadata = backend.prepare_routing_metadata_multi_tile(
+                    topk_ids,
+                    routing_bias,
+                    int(num_experts),
+                    int(top_k),
+                    n_group,
+                    topk_group,
+                    int(local_expert_offset),
+                    int(num_local_experts),
+                    routed_scaling_factor,
+                    int(routing_method_type),
+                    (body_tile,),
+                    metadata_routing_input_mode,
+                    metadata_topk_weights,
+                )[0]
+            routing_bundle = _bundle_routing_metadata(routing_metadata, body_tile)
+            for _tensor in routing_bundle.tensors:
+                da_state.retain_capture_tensor(da_context, _tensor)
+        _dispatch_routing_metadata(routing_bundle, per_tile_tactics[0])
+        globals().setdefault("_TRTLLM_DA_PRECOMPUTED_ROUTE_COUNT", 0)
+        globals()["_TRTLLM_DA_PRECOMPUTED_ROUTE_COUNT"] += 1
         globals().setdefault("_TRTLLM_DA_CAPTURE_DISPATCH_COUNT", 0)
         globals()["_TRTLLM_DA_CAPTURE_DISPATCH_COUNT"] += 1
         return [output]
@@ -985,30 +1027,11 @@ def try_trtllm_capture_aware_da(
     # the selector reads them. Body metadata is then derived from those packed
     # IDs, so logits-based top-k selection runs only once.
 
-    switch_body_kwargs = base_kwargs
-    if use_precomputed_route and precomputed_route_ready:
-        switch_body_kwargs = dict(base_kwargs)
-        switch_body_kwargs["routing_logits"] = None
-        switch_body_kwargs["routing_input_mode"] = int(
-            _routing_input_mode("PackedPrecomputed")
-        )
-        # The body's routing runner reads `mPtrTopKWeights` as bfloat16. With
-        # routing_logits=None the runner skips the score+weight computation
-        # block in routingMainKernel, so the buffer the body sees must already
-        # contain valid bf16 weights at bf16 stride. Substitute the dedicated
-        # bf16 buffer the pack kernel just populated.
-        if expert_weights_bf16 is not None:
-            switch_body_kwargs["expert_weights"] = expert_weights_bf16
-        globals().setdefault("_TRTLLM_DA_PRECOMPUTED_ROUTE_COUNT", 0)
-        globals()["_TRTLLM_DA_PRECOMPUTED_ROUTE_COUNT"] += 1
+    globals().setdefault("_TRTLLM_DA_PRECOMPUTED_ROUTE_COUNT", 0)
+    globals()["_TRTLLM_DA_PRECOMPUTED_ROUTE_COUNT"] += 1
 
-    overlap_routing_requested = config.overlap_routing
-    overlap_routing = precomputed_route_ready and (
-        overlap_routing_requested or direct_body is None
-    )
     select_from_routing_counts = (
         config.select_from_routing_counts
-        and use_precomputed_route
         and precomputed_route_ready
         and len(candidate_tile_sizes) > 1
     )
@@ -1043,6 +1066,8 @@ def try_trtllm_capture_aware_da(
                 routed_scaling_factor,
                 int(routing_method_type),
                 missing_tiles,
+                metadata_routing_input_mode,
+                metadata_topk_weights,
             )
             metadata_by_tile.update(
                 (
@@ -1055,9 +1080,7 @@ def try_trtllm_capture_aware_da(
 
     routing_metadata_by_tile = (
         [bundle for _, bundle in capture_resources.routing_metadata_by_tile]
-        if capture_resources is not None
-        and use_precomputed_route
-        and precomputed_route_ready
+        if capture_resources is not None and precomputed_route_ready
         else None
     )
     if select_from_routing_counts and routing_metadata_by_tile is None:
@@ -1070,9 +1093,11 @@ def try_trtllm_capture_aware_da(
                 da_state.retain_capture_tensor(da_context, _tensor)
 
     injector = da_single_graph.DAInlineGraphInjector(backend.ffi_moe_op)
+    selector_routing_input_mode = capture_resources.internal_routing_mode
     with injector.inject(
         selector_handle=da_state.selector_handle(da_context),
         topk_ids=topk_ids,
+        routing_input_mode=selector_routing_input_mode,
         tile_sizes=candidate_tile_sizes,
         num_tokens_bucket=bucket,
         num_local_experts=int(num_local_experts),
@@ -1089,7 +1114,10 @@ def try_trtllm_capture_aware_da(
         routing_stream=capture_resources.routing_stream,
         pool_handle=capture_resources.pool_handle,
     ) as ctx:
-        if overlap_routing and routing_metadata_by_tile is None:
+        if populate_candidate_routing_metadata is not None:
+            with ctx.routing_branch():
+                populate_candidate_routing_metadata()
+        elif routing_metadata_by_tile is None:
             # Build routing metadata for every candidate tile on a graph branch
             # that starts from the same pre-SWITCH dependencies as the selector.
             # CUDA conditional body graphs cannot depend directly on parent-graph
@@ -1127,16 +1155,13 @@ def try_trtllm_capture_aware_da(
                 )
             with ctx.body(i):
                 if routing_metadata_by_tile is None:
-                    if direct_body is None:
-                        raise RuntimeError(
-                            "direct capture body is unavailable for this precision"
-                        )
-                    direct_body(per_tile_tactics[i], switch_body_kwargs)
-                else:
-                    ri = tile_to_routing_idx[per_tile_tactics[i][0]]
-                    _dispatch_routing_metadata(
-                        routing_metadata_by_tile[ri], per_tile_tactics[i]
+                    raise RuntimeError(
+                        "DA metadata replay resources disappeared before body capture"
                     )
+                ri = tile_to_routing_idx[per_tile_tactics[i][0]]
+                _dispatch_routing_metadata(
+                    routing_metadata_by_tile[ri], per_tile_tactics[i]
+                )
 
     # Diagnostic counter (module-global) for integration tests to assert that
     # the capture-aware path actually fired rather than silently falling back.

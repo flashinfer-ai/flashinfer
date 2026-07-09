@@ -11,6 +11,7 @@ the row fails instead of silently measuring the original path.
 from __future__ import annotations
 
 import argparse
+import gc
 import pickle
 import csv
 import os
@@ -46,13 +47,17 @@ from flashinfer.fused_moe import (
     WeightLayout,
     convert_to_block_layout,
     trtllm_bf16_moe,
+    trtllm_bf16_routed_moe,
     trtllm_fp4_block_scale_moe,
+    trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
+    trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_mxint4_block_scale_moe,
+    trtllm_mxint4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe import core as moe_core
-from flashinfer.fused_moe.dist_aware import da_core, da_profile, da_state
+from flashinfer.fused_moe.dist_aware import da_capture, da_core, da_profile, da_state
 from flashinfer.fused_moe.core import (
     _maybe_get_cached_w3_w1_permute_indices,
     get_w2_permute_indices_with_cache,
@@ -76,6 +81,11 @@ BENCHMARK_MODES = {
     "mxfp4_bf16": 0.92,
     "mxint4": 0.925,
 }
+# Keep these capability sets synchronized with the routed wrapper contracts in
+# flashinfer/fused_moe/core.py. FP8 per-tensor has no public routed wrapper;
+# only the FP4 wrapper accepts separate raw IDs and BF16 weights.
+ROUTED_API_PRECISION_MODES = frozenset(BENCHMARK_MODES) - {"fp8_per_tensor"}
+UNPACKED_PRECOMPUTED_PRECISION_MODES = frozenset({"nvfp4", "mxfp4_mxfp8", "mxfp4_bf16"})
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +152,7 @@ class PrecisionCase:
     use_shuffled_weight: bool
     use_per_token_scaling: bool
     match_ratio: float
-    call: Callable[[torch.Tensor], torch.Tensor]
+    call: Callable[[Any], torch.Tensor]
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +530,7 @@ def _make_precision_case(
     hidden_bf16: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
+    routing_input_mode: str,
 ) -> PrecisionCase:
     routing_method = RoutingMethodType(
         int(
@@ -548,20 +559,40 @@ def _make_precision_case(
     if name == "bf16":
         gemm1, gemm2 = _prepare_bf16_weights(w1, w2)
 
-        def call(routing_logits):
-            with autotune(False):
-                return _as_tensor(
-                    trtllm_bf16_moe(
-                        routing_logits,
-                        None,
-                        hidden_bf16,
-                        gemm1,
-                        gemm2,
-                        use_shuffled_weight=True,
-                        weight_layout=WeightLayout.BlockMajorK,
-                        **common,
+        if routing_input_mode == "routed":
+            routed_common = dict(common)
+            routed_common.pop("norm_topk_prob")
+
+            def call(routing_input):
+                with autotune(False):
+                    return _as_tensor(
+                        trtllm_bf16_routed_moe(
+                            routing_input,
+                            hidden_bf16,
+                            gemm1,
+                            gemm2,
+                            use_shuffled_weight=True,
+                            weight_layout=WeightLayout.BlockMajorK,
+                            **routed_common,
+                        )
                     )
-                )
+
+        else:
+
+            def call(routing_input):
+                with autotune(False):
+                    return _as_tensor(
+                        trtllm_bf16_moe(
+                            routing_input,
+                            None,
+                            hidden_bf16,
+                            gemm1,
+                            gemm2,
+                            use_shuffled_weight=True,
+                            weight_layout=WeightLayout.BlockMajorK,
+                            **common,
+                        )
+                    )
 
         return PrecisionCase(
             name,
@@ -621,24 +652,49 @@ def _make_precision_case(
         gemm1, gemm1_scale = _fp8_block_quantize(w1, 128, 128)
         gemm2, gemm2_scale = _fp8_block_quantize(w2, 128, 128)
 
-        def call(routing_logits):
-            with autotune(False):
-                return _as_tensor(
-                    trtllm_fp8_block_scale_moe(
-                        routing_logits,
-                        None,
-                        hidden_fp8,
-                        hidden_scale,
-                        gemm1,
-                        gemm1_scale,
-                        gemm2,
-                        gemm2_scale,
-                        use_shuffled_weight=False,
-                        weight_layout=WeightLayout.MajorK,
-                        fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
-                        **common,
+        if routing_input_mode == "routed":
+            routed_common = dict(common)
+            routed_common.pop("norm_topk_prob")
+
+            def call(routing_input):
+                with autotune(False):
+                    return _as_tensor(
+                        trtllm_fp8_block_scale_routed_moe(
+                            routing_input,
+                            None,
+                            hidden_fp8,
+                            hidden_scale,
+                            gemm1,
+                            gemm1_scale,
+                            gemm2,
+                            gemm2_scale,
+                            use_shuffled_weight=False,
+                            weight_layout=WeightLayout.MajorK,
+                            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+                            **routed_common,
+                        )
                     )
-                )
+
+        else:
+
+            def call(routing_input):
+                with autotune(False):
+                    return _as_tensor(
+                        trtllm_fp8_block_scale_moe(
+                            routing_input,
+                            None,
+                            hidden_fp8,
+                            hidden_scale,
+                            gemm1,
+                            gemm1_scale,
+                            gemm2,
+                            gemm2_scale,
+                            use_shuffled_weight=False,
+                            weight_layout=WeightLayout.MajorK,
+                            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+                            **common,
+                        )
+                    )
 
         return PrecisionCase(
             name,
@@ -658,24 +714,49 @@ def _make_precision_case(
         hidden_scale = hidden_scale.view(torch.uint8).reshape(cfg.num_tokens, -1)
         gemm1, gemm1_scale, gemm2, gemm2_scale = _prepare_fp8_mxfp8_weights(w1, w2, cfg)
 
-        def call(routing_logits):
-            with autotune(False):
-                return _as_tensor(
-                    trtllm_fp8_block_scale_moe(
-                        routing_logits,
-                        None,
-                        hidden_fp8,
-                        hidden_scale,
-                        gemm1,
-                        gemm1_scale,
-                        gemm2,
-                        gemm2_scale,
-                        use_shuffled_weight=True,
-                        weight_layout=WeightLayout.MajorK,
-                        fp8_quantization_type=Fp8QuantizationType.MxFp8,
-                        **common,
+        if routing_input_mode == "routed":
+            routed_common = dict(common)
+            routed_common.pop("norm_topk_prob")
+
+            def call(routing_input):
+                with autotune(False):
+                    return _as_tensor(
+                        trtllm_fp8_block_scale_routed_moe(
+                            routing_input,
+                            None,
+                            hidden_fp8,
+                            hidden_scale,
+                            gemm1,
+                            gemm1_scale,
+                            gemm2,
+                            gemm2_scale,
+                            use_shuffled_weight=True,
+                            weight_layout=WeightLayout.MajorK,
+                            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+                            **routed_common,
+                        )
                     )
-                )
+
+        else:
+
+            def call(routing_input):
+                with autotune(False):
+                    return _as_tensor(
+                        trtllm_fp8_block_scale_moe(
+                            routing_input,
+                            None,
+                            hidden_fp8,
+                            hidden_scale,
+                            gemm1,
+                            gemm1_scale,
+                            gemm2,
+                            gemm2_scale,
+                            use_shuffled_weight=True,
+                            weight_layout=WeightLayout.MajorK,
+                            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+                            **common,
+                        )
+                    )
 
         return PrecisionCase(
             name,
@@ -739,29 +820,59 @@ def _make_precision_case(
             global_sf=global_sf,
         )
 
-        def call(routing_logits):
-            with autotune(False):
-                return _as_tensor(
-                    trtllm_fp4_block_scale_moe(
-                        routing_logits,
-                        None,
-                        hidden_states,
-                        hidden_states_scale,
-                        gemm1,
-                        gemm1_scale,
-                        None,
-                        None,
-                        None,
-                        None,
-                        gemm2,
-                        gemm2_scale,
-                        None,
-                        output_scale,
-                        output_scale,
-                        output_scale,
-                        **common,
+        if routing_input_mode == "routed":
+            routed_common = dict(common)
+            routed_common.pop("norm_topk_prob")
+
+            def call(routing_input):
+                with autotune(False):
+                    return _as_tensor(
+                        trtllm_fp4_block_scale_routed_moe(
+                            routing_input,
+                            None,
+                            hidden_states,
+                            hidden_states_scale,
+                            gemm1,
+                            gemm1_scale,
+                            None,
+                            None,
+                            None,
+                            None,
+                            gemm2,
+                            gemm2_scale,
+                            None,
+                            output_scale,
+                            output_scale,
+                            output_scale,
+                            **routed_common,
+                        )
                     )
-                )
+
+        else:
+
+            def call(routing_input):
+                with autotune(False):
+                    return _as_tensor(
+                        trtllm_fp4_block_scale_moe(
+                            routing_input,
+                            None,
+                            hidden_states,
+                            hidden_states_scale,
+                            gemm1,
+                            gemm1_scale,
+                            None,
+                            None,
+                            None,
+                            None,
+                            gemm2,
+                            gemm2_scale,
+                            None,
+                            output_scale,
+                            output_scale,
+                            output_scale,
+                            **common,
+                        )
+                    )
 
         return PrecisionCase(
             name,
@@ -780,24 +891,45 @@ def _make_precision_case(
         gemm1, gemm1_scale, gemm2, gemm2_scale = _prepare_mxint4_weights(w1, w2, cfg)
         mx_common = dict(common)
         mx_common.pop("activation_type")
+        if routing_input_mode == "routed":
+            mx_common.pop("norm_topk_prob")
 
-        def call(routing_logits):
-            with autotune(False):
-                return _as_tensor(
-                    trtllm_mxint4_block_scale_moe(
-                        routing_logits,
-                        None,
-                        hidden_bf16,
-                        gemm1,
-                        gemm1_scale,
-                        None,
-                        None,
-                        None,
-                        gemm2,
-                        gemm2_scale,
-                        **mx_common,
+            def call(routing_input):
+                with autotune(False):
+                    return _as_tensor(
+                        trtllm_mxint4_block_scale_routed_moe(
+                            routing_input,
+                            hidden_bf16,
+                            gemm1,
+                            gemm1_scale,
+                            None,
+                            None,
+                            None,
+                            gemm2,
+                            gemm2_scale,
+                            **mx_common,
+                        )
                     )
-                )
+
+        else:
+
+            def call(routing_input):
+                with autotune(False):
+                    return _as_tensor(
+                        trtllm_mxint4_block_scale_moe(
+                            routing_input,
+                            None,
+                            hidden_bf16,
+                            gemm1,
+                            gemm1_scale,
+                            None,
+                            None,
+                            None,
+                            gemm2,
+                            gemm2_scale,
+                            **mx_common,
+                        )
+                    )
 
         return PrecisionCase(
             name,
@@ -820,11 +952,13 @@ def _make_precision_case(
 # ---------------------------------------------------------------------------
 
 
-def _make_routing_logits(
+def _make_routing_input(
+    routing_input_mode: str,
+    precision: str,
     distribution: str,
     cfg: BenchConfig,
     device: torch.device,
-) -> torch.Tensor:
+) -> Any:
     specs = get_da_distribution_specs(distribution)
     ids = generate_da_distribution_assignments(
         specs[0],
@@ -833,14 +967,29 @@ def _make_routing_logits(
         cfg.num_experts,
         cfg.top_k,
         0,
-    ).to(torch.long)
+    ).to(torch.int32)
+    if routing_input_mode == "routed":
+        weights = torch.linspace(
+            1.0,
+            0.5,
+            steps=max(cfg.top_k, 1),
+            dtype=torch.float32,
+            device=device,
+        )
+        weights = weights / weights.sum()
+        weights = (weights * cfg.routed_scaling_factor).to(torch.bfloat16)
+        weights = weights.expand(cfg.num_tokens, -1).contiguous()
+        if _supports_unpacked_precomputed(precision):
+            return ids.contiguous(), weights
+        return (ids << 16) | (weights.view(torch.int16).to(torch.int32) & 0xFFFF)
+
     logits = torch.full(
         (cfg.num_tokens, cfg.num_experts), -30.0, dtype=torch.float32, device=device
     )
     vals = torch.linspace(
         30.0, 29.0, steps=max(cfg.top_k, 1), dtype=torch.float32, device=device
     ).reshape(1, cfg.top_k)
-    logits.scatter_(1, ids, vals.expand(cfg.num_tokens, -1))
+    logits.scatter_(1, ids.to(torch.long), vals.expand(cfg.num_tokens, -1))
     return logits
 
 
@@ -1000,6 +1149,7 @@ def _run_real_autotune(
     case: PrecisionCase,
     cfg: BenchConfig,
     device: torch.device,
+    routing_input_mode: str,
 ) -> dict:
     tuner = AutoTuner.get()
     tuner.clear_cache()
@@ -1008,7 +1158,9 @@ def _run_real_autotune(
     da_state.PER_BODY_TACTICS.clear()
     da_state.STATIC_FALLBACK_TACTICS.clear()
 
-    tuning_logits = _make_routing_logits("uniform", cfg, device)
+    tuning_input = _make_routing_input(
+        routing_input_mode, case.name, "uniform", cfg, device
+    )
     # Tune every runtime bucket through the declared maximum, not only the
     # shape that happened to trigger this benchmark invocation.
     tuning_buckets = get_hybrid_num_tokens_buckets(cfg.tune_max_num_tokens, 1)
@@ -1020,7 +1172,7 @@ def _run_real_autotune(
         nvtx_range(f"phase=static-autotune, precision={case.name}"),
         autotune(True, tuning_buckets=tuning_buckets, round_up=True),
     ):
-        case.call(tuning_logits)
+        case.call(tuning_input)
     torch.cuda.synchronize()
     static_tune_seconds = time.perf_counter() - tune_start
     static_profiles = len(tuner.profiling_cache)
@@ -1033,7 +1185,7 @@ def _run_real_autotune(
         nvtx_range(f"phase=da-autotune, precision={case.name}"),
         autotune(True, tuning_buckets=tuning_buckets, round_up=True),
     ):
-        case.call(tuning_logits)
+        case.call(tuning_input)
     torch.cuda.synchronize()
     da_tune_seconds = time.perf_counter() - da_tune_start
     tune_seconds = time.perf_counter() - tune_start
@@ -1193,6 +1345,26 @@ def _parse_precision_modes(value: str) -> list[str]:
     return modes
 
 
+def _validate_routing_input_mode(mode: str, precisions: list[str]) -> list[str]:
+    if mode == "routed":
+        unsupported = sorted(set(precisions) - ROUTED_API_PRECISION_MODES)
+        if unsupported:
+            raise ValueError(
+                "--routing-input-mode routed requires a public routed MoE API; "
+                "unsupported precision mode(s): " + ", ".join(unsupported)
+            )
+    return precisions
+
+
+def _supports_unpacked_precomputed(precision: str) -> bool:
+    """Mirror which routed wrappers accept ``UnpackedPrecomputed`` in core.py."""
+    return precision in UNPACKED_PRECOMPUTED_PRECISION_MODES
+
+
+def _reported_internal_routing_mode(mode: str) -> str:
+    return "routed" if mode == "routed" else "packed"
+
+
 def _resolve_local_num_experts(num_experts: int, local_num_experts: int | None) -> int:
     """Default to no expert parallelism unless local experts are explicit."""
     return num_experts if local_num_experts is None else local_num_experts
@@ -1216,6 +1388,14 @@ def _row_status(row: dict) -> str:
     return "PASS"
 
 
+def _release_benchmark_capture_memory() -> None:
+    """Drop graph-lifetime tensors after a completed benchmark configuration."""
+    da_capture.CAPTURE_RESOURCES.clear()
+    da_state.CAPTURE_KEEPALIVE.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _run_precision_sweep(
     args,
     configs: list[BenchConfig],
@@ -1230,7 +1410,14 @@ def _run_precision_sweep(
         print(f"[precision] {precision}", flush=True)
         try:
             hidden, w1, w2 = _make_base_tensors(tuning_cfg, device, args.seed)
-            tuning_case = _make_precision_case(precision, tuning_cfg, hidden, w1, w2)
+            tuning_case = _make_precision_case(
+                precision,
+                tuning_cfg,
+                hidden,
+                w1,
+                w2,
+                args.routing_input_mode,
+            )
             bundle_path = _bundle_path_for_precision(
                 args.bundle_output, precision, len(precisions) > 1
             )
@@ -1240,7 +1427,9 @@ def _run_precision_sweep(
                     tuning_case, tuning_cfg, device, bundle_path
                 )
             else:
-                tune_result = _run_real_autotune(tuning_case, tuning_cfg, device)
+                tune_result = _run_real_autotune(
+                    tuning_case, tuning_cfg, device, args.routing_input_mode
+                )
             if not args.skip_autotune:
                 print(
                     "  [autotune] "
@@ -1280,10 +1469,15 @@ def _run_precision_sweep(
             )
             continue
 
+        tuning_case = hidden = w1 = w2 = None
+        _release_benchmark_capture_memory()
+
         for cfg in configs:
             try:
                 hidden, w1, w2 = _make_base_tensors(cfg, device, args.seed)
-                case = _make_precision_case(precision, cfg, hidden, w1, w2)
+                case = _make_precision_case(
+                    precision, cfg, hidden, w1, w2, args.routing_input_mode
+                )
                 tactics = _runtime_tactics(case, cfg, device)
                 print(
                     f"  [tokens={cfg.num_tokens}] [DA bodies] {tactics}",
@@ -1308,6 +1502,10 @@ def _run_precision_sweep(
                     "precision": precision,
                     "distribution": distribution,
                     "execution_mode": args.execution_mode,
+                    "input_routing_mode": args.routing_input_mode,
+                    "internal_routing_mode": _reported_internal_routing_mode(
+                        args.routing_input_mode
+                    ),
                     "num_tokens": cfg.num_tokens,
                     "num_experts": cfg.num_experts,
                     "local_num_experts": cfg.local_num_experts,
@@ -1325,10 +1523,16 @@ def _run_precision_sweep(
                     "bundle_output": bundle_path,
                 }
                 try:
-                    routing_logits = _make_routing_logits(distribution, cfg, device)
+                    routing_input = _make_routing_input(
+                        args.routing_input_mode,
+                        precision,
+                        distribution,
+                        cfg,
+                        device,
+                    )
 
                     os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "0"
-                    ref = case.call(routing_logits).detach().clone()
+                    ref = case.call(routing_input).detach().clone()
                     torch.cuda.synchronize()
                     time_call = (
                         _capture_and_time
@@ -1340,7 +1544,7 @@ def _run_precision_sweep(
                         f"distribution={distribution}, method=NoDA"
                     ):
                         noda_out, noda_ms, noda_count = time_call(
-                            lambda: case.call(routing_logits),
+                            lambda: case.call(routing_input),
                             args.warmup,
                             args.iters,
                         )
@@ -1352,7 +1556,7 @@ def _run_precision_sweep(
                         f"distribution={distribution}, method=DA"
                     ):
                         da_out, da_ms, da_count = time_call(
-                            lambda: case.call(routing_logits),
+                            lambda: case.call(routing_input),
                             args.warmup,
                             args.iters,
                         )
@@ -1403,6 +1607,8 @@ def _run_precision_sweep(
                     row["error"] = repr(exc)
                     print(f"    FAIL_RUN {exc}", flush=True)
                 rows.append(row)
+            case = hidden = w1 = w2 = None
+            _release_benchmark_capture_memory()
     return rows
 
 
@@ -1435,6 +1641,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated precision labels, or 'all'. Labels: bf16, "
             "fp8_per_tensor, fp8_block, mxfp8, nvfp4, "
             "mxfp4_mxfp8, mxfp4_bf16, mxint4"
+        ),
+    )
+    parser.add_argument(
+        "--routing-input-mode",
+        choices=("routed", "logits"),
+        default="routed",
+        help=(
+            "Public API routing input: the precision's established routed format "
+            "(default), or routing logits. FP4 routed APIs receive raw IDs plus "
+            "BF16 weights; other routed APIs receive packed int32 routing."
         ),
     )
     parser.add_argument(
@@ -1501,7 +1717,9 @@ def main() -> int:
     args = parser.parse_args()
     try:
         token_counts = [int(value) for value in args.num_tokens.split(",") if value]
-        precisions = _parse_precision_modes(args.precision)
+        precisions = _validate_routing_input_mode(
+            args.routing_input_mode, _parse_precision_modes(args.precision)
+        )
     except ValueError as error:
         parser.error(str(error))
     if not token_counts:
@@ -1525,7 +1743,6 @@ def main() -> int:
         print(
             "[legacy] --skip-noda-autotune uses the current AutoTuner cache", flush=True
         )
-    os.environ.setdefault("FLASHINFER_DA_USE_PRECOMPUTED_ROUTE", "1")
 
     configs = []
     for num_tokens in token_counts:

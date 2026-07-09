@@ -516,8 +516,14 @@ static void launchRoutingDeepSeekMultiTileCluster(Data* data, int32_t numTiles, 
   FLASHINFER_CHECK(!data[0].mUsePdl,
                    "multi-tile DeepSeek routing currently captures as a normal graph node");
 
-  using Params = KernelParams<float, __nv_bfloat16, NumDeepseekExperts, NumTop8Experts, true>;
-  launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+  if (data[0].mNumExperts <= topk::MaxNumExpertsUnit) {
+    using Params =
+        KernelParams<float, __nv_bfloat16, topk::MaxNumExpertsUnit, NumTop8Experts, true>;
+    launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+  } else {
+    using Params = KernelParams<float, __nv_bfloat16, NumDeepseekExperts, NumTop8Experts, true>;
+    launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+  }
 }
 
 static void launchClusterKernel(Data& data, int numThreadsHist, void* stream) {
