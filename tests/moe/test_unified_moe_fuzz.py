@@ -750,7 +750,7 @@ def _master(cfg, handler):
         logits = -logits.abs() - 1.0
     logits = logits.to(_LOGITS_DTYPE[cfg.logits_dtype])
 
-    # Bias for bias-aware methods (affects SELECTION only); same dtype as logits per the kernel.
+    # Bias for bias-aware methods (affects SELECTION only); dtype follows logits here for simplicity (the kernel accepts bf16 or fp32 independently of logits dtype).
     routing_bias = None
     if cfg.routing_method in _BIAS_METHODS:
         routing_bias = torch.randn(E_local, device="cuda", generator=g).to(logits.dtype)

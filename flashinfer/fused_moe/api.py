@@ -536,7 +536,7 @@ class MoEActivationPack:
     )  # [M, num_experts] float32 or bfloat16
     routing_bias: Optional[Tensor] = field(
         default=None, kw_only=True
-    )  # [num_experts] (same dtype as logits)
+    )  # [num_experts] bfloat16 or float32 (independent of logits dtype)
 
     @property
     def num_tokens(self) -> int:

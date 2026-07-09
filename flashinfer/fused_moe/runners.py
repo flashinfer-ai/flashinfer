@@ -309,6 +309,17 @@ class TrtllmFp4RoutedRunner(TunableRunner):
                 f"routing_logits must be float32 or bfloat16, "
                 f"got {act.routing_logits.dtype}."
             )
+            # Bias dtype is independent of logits dtype (the launcher derives
+            # mRoutingBiasDtype and mRoutingLogitsDtype separately; mixed
+            # combinations are supported — see test_routing_dtype_flexibility).
+            # But the launcher maps bf16 -> Bfloat16 and ANYTHING ELSE -> Fp32
+            # with no dtype ICHECK, so e.g. an fp16 bias would be silently
+            # reinterpreted as fp32 bits. Reject non-{bf16, fp32} here.
+            if act.routing_bias is not None:
+                assert act.routing_bias.dtype in (torch.bfloat16, torch.float32), (
+                    f"routing_bias must be bfloat16 or float32, "
+                    f"got {act.routing_bias.dtype}."
+                )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
             topk_ids = act.hidden_states_q.new_empty(
