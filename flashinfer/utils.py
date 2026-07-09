@@ -538,6 +538,7 @@ def determine_attention_backend(
     return "fa2"
 
 
+@functools.lru_cache(maxsize=None)
 def version_at_least(version: str, base_version: str) -> bool:
     from packaging import version as pkg_version
 
