@@ -143,6 +143,14 @@ __global__ void prepare_fmha_v2_inputs_kernel(
 // tile_id_counter         : uint32 [1]  (optional; zeroed if provided)
 // scale_bmm1_d / scale_bmm2_d : uint32 [1] (optional; set_alpha-encoded scalars)
 //
+// Note on scale_bmm1_d layout: this buffer is length 1, not the length-2
+// {scale, scale*log2e} pair described in fmha_v2_fused_prep_kernel.md §1.
+// The Python caller pre-multiplies log2e on the host for the warp-spec path
+// (prefill.py plan()) and encodes a single FP32 word here.  compute.h:312
+// and epilogue.h:973 both do a single __ldg/reinterpret_cast<float>, so
+// length-1 is the correct contract.  Do not expand to length-2 without
+// updating those read sites.
+//
 // scale_bmm{1,2}_dtype_code follows the FmhaV2DType enum above (same numeric
 // values as Data_type in fused_multihead_attention_utils.h). When the caller
 // wants the warp-specialized "fused log2e" path for BMM1, it should pass

@@ -2087,6 +2087,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "trtllm-fmhav2 does not apply RoPE; pre-apply it to Q/K and pass NONE or ALIBI."
                 )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise NotImplementedError(
+                    "trtllm-fmhav2 does not support logits_soft_cap."
+                )
 
             fmhav2_layout = (
                 "Q_PAGED_KV_HND" if self._kv_layout == "HND" else "Q_PAGED_KV_NHD"
@@ -2094,42 +2098,60 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             # Use prepare_paged to fill block_tables/kv_lens/seq_lens_q on device
             # instead of the host-side for-loop.
-            _pages_per_seq = (paged_kv_indptr[1:batch_size+1] - paged_kv_indptr[:batch_size])
-            max_num_blocks_per_seq = int(_pages_per_seq.max().item())
+            # Size block_tables off kv_lens_arr_host (already on CPU, same as the
+            # trtllm-gen arm above) so plan() stays free of device round-trips;
+            # ceil(kv_len / page_size) == pages per sequence since
+            # last_page_len ∈ [1, page_size].
+            if max_sequence_kv is None:
+                max_num_blocks_per_seq = max(
+                    (int(kv_len) + page_size - 1) // page_size
+                    for kv_len in kv_lens_arr_host
+                )
+            else:
+                # kv_lens_arr_host was not materialized; fall back to one D2H copy.
+                _paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+                max_num_blocks_per_seq = int(
+                    max(
+                        _paged_kv_indptr_host[1 : batch_size + 1]
+                        - _paged_kv_indptr_host[:batch_size]
+                    )
+                )
 
+            # Resize _kv_lens_buffer before prepare_paged so it can be written directly.
+            if batch_size > self._kv_lens_buffer.shape[0]:
+                self._kv_lens_buffer = torch.empty(
+                    (batch_size,), dtype=torch.int32, device=self.device
+                )
             self._block_tables = torch.zeros(
                 (batch_size, max_num_blocks_per_seq),
                 dtype=torch.int32,
                 device=self.device,
             )
-            fmhav2_seq_lens_q = torch.empty(batch_size, dtype=torch.int32, device=self.device)
-            fmhav2_kv_lens = torch.empty(batch_size, dtype=torch.int32, device=self.device)
+            fmhav2_seq_lens_q = torch.empty(
+                batch_size, dtype=torch.int32, device=self.device
+            )
 
-            self._cached_module = get_trtllm_fmhav2_prefill_module(
+            fmhav2_module = get_trtllm_fmhav2_prefill_module(
                 fmhav2_layout,
                 q_data_type,
                 o_data_type if q_data_type == torch.float8_e4m3fn else None,
             )
+            self._cached_module = fmhav2_module
 
-            # Materialize kv_lens, seq_lens_q, block_tables on device
-            self._cached_module.prepare_paged(
+            # Materialize kv_lens, seq_lens_q, block_tables on device.
+            # Write kv_lens directly into _kv_lens_buffer to avoid a redundant D2D copy.
+            fmhav2_module.prepare_paged(
                 qo_indptr,
                 paged_kv_indptr,
                 paged_kv_last_page_len,
                 paged_kv_indices,
                 fmhav2_seq_lens_q,
-                fmhav2_kv_lens,
+                self._kv_lens_buffer[:batch_size],
                 self._block_tables,
                 page_size,
                 batch_size,
                 max_num_blocks_per_seq,
             )
-            # Keep kv_lens_buffer in sync for run()
-            if batch_size > self._kv_lens_buffer.shape[0]:
-                self._kv_lens_buffer = torch.empty(
-                    (batch_size,), dtype=torch.int32, device=self.device
-                )
-            self._kv_lens_buffer[:batch_size].copy_(fmhav2_kv_lens)
 
             # (re)alloc cum_seq_lens / scale / tile_counter if needed
             need_alloc = (
@@ -2189,9 +2211,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 scale_bmm2_dtype_code = _fmhav2_dtype_code(torch.float32)
 
             # Scan into cum_seq_lens + encode scales
-            self._cached_module.prepare(
+            fmhav2_module.prepare(
                 fmhav2_seq_lens_q,
-                fmhav2_kv_lens,
+                self._kv_lens_buffer[:batch_size],
                 batch_size,
                 scale_bmm1_dtype_code,
                 scale_bmm2_dtype_code,
@@ -2520,6 +2542,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # FMHAv2 has its own run signature; bypasses paged_run/ragged_run completely.
             # cum_seq_lens_*/scales/tile_id_counter were populated in plan() by the prep kernel.
             assert self._cached_module is not None, "trtllm-fmhav2 module is not loaded"
+            # Re-zero tile_id_counter before every run: atomicAdd in dma.h leaves it at
+            # num_tiles after each launch, so plan-once/run-many would read a stale value
+            # on run #2+. zero_() is async on the current stream — no D2H sync.
+            self._fmhav2_tile_id_counter.zero_()
             input_layout = (
                 "q_paged_kv_hnd" if self._kv_layout == "HND" else "q_paged_kv_nhd"
             )
@@ -2545,7 +2571,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 scale_softmax,
                 self._fmhav2_bmm1_scale,
                 self._fmhav2_bmm2_scale,
-                window_left,
+                window_left if window_left is not None else -1,
                 0,  # chunked_attention_size
                 self._fmhav2_has_alibi,
                 float(self._logits_soft_cap or 0.0),
@@ -3308,11 +3334,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "trtllm-fmhav2 does not apply RoPE; pre-apply it to Q/K and pass NONE or ALIBI."
                 )
 
-            self._cached_module = get_trtllm_fmhav2_prefill_module(
+            fmhav2_module = get_trtllm_fmhav2_prefill_module(
                 "SEPARATE_Q_K_V",
                 q_data_type,
                 o_data_type if q_data_type == torch.float8_e4m3fn else None,
             )
+            self._cached_module = fmhav2_module
 
             # Compute max_q_len / max_kv_len if the caller did not pass them. The wrapper does not
             # cache these for the ragged plan path the way the paged plan does, so derive here.
@@ -3403,7 +3430,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._fmhav2_seq_lens_kv = fmhav2_seq_lens_kv
             self._fmhav2_batch_size = batch_size
 
-            self._cached_module.prepare(
+            fmhav2_module.prepare(
                 fmhav2_seq_lens_q,
                 fmhav2_seq_lens_kv,
                 batch_size,
@@ -3723,6 +3750,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         elif self._backend == "trtllm-fmhav2":
             # SEPARATE_Q_K_V FMHAv2 path. Prep ran in plan(); run is a single kernel launch.
             assert self._cached_module is not None, "trtllm-fmhav2 module is not loaded"
+            # Re-zero tile_id_counter before every run (see paged arm comment above).
+            self._fmhav2_tile_id_counter.zero_()
             mask_str = "causal" if self._causal else "padding"
             scale_softmax = 1.0
             self._cached_module.run(
