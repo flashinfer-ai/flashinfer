@@ -364,7 +364,7 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
       cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
   static constexpr bool UseInt4ToFP8LookupTable =
       KernelConversionMode == ConversionMode::ConvertAndScale &&
-      cute::is_same_v<ElementA, cutlass::int4_t> &&
+      cute::is_same_v<ElementA, cutlass::int4b_t> &&
       cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
   static_assert(UseFP4ToFP8LookupTable && cute::is_same_v<ElementScale, cutlass::float_ue8m0_t>,
                 "Fused e8m0 pre-MMA scale is only implemented for MXFP4 x FP8 with folded scalar "

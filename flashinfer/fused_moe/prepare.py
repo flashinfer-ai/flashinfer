@@ -35,6 +35,11 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.moe import (
+    sm90_mixed_gemm_humming_weight_preprocess_trace_dispatch,
+    sm90_mixed_gemm_scale_interleave_trace,
+    sm90_mixed_gemm_weight_interleave_trace,
+)
 from ..utils import get_compute_capability
 
 # Module-level permute-index cache.  Permute indices depend only on weight
@@ -173,7 +178,7 @@ def _process_humming_mxfp4_w4a8_payload(
     return processed.contiguous()
 
 
-@flashinfer_api
+@flashinfer_api(trace=sm90_mixed_gemm_humming_weight_preprocess_trace_dispatch)
 def preprocess_moe_weights_for_sm90_mixed_gemm_humming(
     weight: torch.Tensor,
     raw_scale: torch.Tensor,
@@ -246,7 +251,7 @@ def preprocess_moe_weights_for_sm90_mixed_gemm_humming(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=sm90_mixed_gemm_scale_interleave_trace)
 def interleave_moe_scales_for_sm90_mixed_gemm(
     scales: torch.Tensor,
     group_size: int = 32,
@@ -323,7 +328,7 @@ def interleave_moe_scales_for_sm90_mixed_gemm(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=sm90_mixed_gemm_weight_interleave_trace)
 def interleave_moe_weights_for_sm90_mixed_gemm(
     weight: torch.Tensor,
     quant_type: str = "fp4",
