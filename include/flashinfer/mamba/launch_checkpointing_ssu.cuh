@@ -294,7 +294,7 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
                                           VARLEN, NGROUPS, MAIN_STAGES>;
         constexpr size_t msmem =
             sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
-                                               DSTATE, MAIN_STAGES>);
+                                               DSTATE, MAIN_STAGES, VARLEN>);
         if constexpr (msmem > 0) {
           FLASHINFER_CUDA_CHECK(
               cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));

@@ -70,7 +70,7 @@ namespace flashinfer::mamba::checkpointing {
 // consecutive work-units are different groups, so there's no same-group C/old_B reuse to preserve.
 // STATE_PIPE=1 ⇒ single slot == the original layout, bit-identical (the monolith's use).
 template <typename input_t, typename state_t, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA,
-          int DSTATE, int STATE_PIPE = 1>
+          int DSTATE, int STATE_PIPE = 1, bool VARLEN = false>
 struct CheckpointingSsuMainStorage {
   static constexpr int NPREDICTED = NPREDICTED_;
   static constexpr int MAX_WINDOW = MAX_WINDOW_;
@@ -121,6 +121,15 @@ struct CheckpointingSsuMainStorage {
   int32_t meta_buf_read[META_RING];
   float meta_D[META_RING];
   int32_t meta_cache_slot[META_RING];
+  // Varlen row geometry, batched into the ring like pnat/buf_read so is_valid / mc_of /
+  // derive_head never touch cu_seqlens per unit (up to ~12 __ldg/unit across their re-derivation
+  // sites — measured +5-7% at b=1024 before this).  bos and seq_len are PACKED into one int32
+  // ((bos << SEQLEN_BITS) | seq_len): one STS/LDS on the meta path instead of two, half the
+  // ring bytes; unpack is 2 ALU into the register queue.  seq_len fits SEQLEN_BITS by the
+  // static_assert; bos < 2^23 tokens is asserted by the Python wrapper.  Dense: one 4 B dummy.
+  static constexpr int SEQLEN_BITS = 8;
+  static_assert(MAX_WINDOW <= (1 << SEQLEN_BITS) - 1, "seq_len must fit SEQLEN_BITS");
+  int32_t meta_cu[VARLEN ? META_RING : 1];  // (cu[seq] << 8) | (cu[seq+1] - cu[seq])
 };
 
 // -----------------------------------------------------------------------------
@@ -924,6 +933,9 @@ struct HeadMetaSSU {
                            // int32 like the ring slot: no widening SHF on the LDS critical path;
                            // consumers promote inside their int64 address math (native IMAD.WIDE).
   float D_val{0.f};        // params.D[head] skip coeff
+  int32_t seq_len{0};      // varlen only: cu[seq+1]-cu[seq], batched at fill_meta.  Dense never
+                           // reads/writes these two — SROA drops the dead registers.
+  int32_t bos{0};          // varlen only: cu[seq] (packed token offset)
 };
 
 // Working scalars derived from a meta-ring entry (derive_head output).
@@ -932,11 +944,11 @@ struct HeadCoords {
   int64_t outer;
 };
 
-// derive_head: expand the ring entry into the working scalars.  Pure ALU for non-varlen — the
-// tile unflatten is constexpr divides and pnat / buf_read were batched into the ring at
-// fill_meta — so re-deriving at a use site costs no memory traffic.
+// derive_head: expand the ring entry into the working scalars.  Pure ALU for BOTH layouts — the
+// tile unflatten is constexpr divides and pnat / buf_read (varlen: + seq_len / bos) were batched
+// into the ring at fill_meta — so re-deriving at a use site costs no memory traffic.
 template <int NHEADS, int HEADS_PER_GROUP, int D_SPLIT, int NPREDICTED, bool VARLEN>
-__device__ __forceinline__ HeadCoords derive_head(CheckpointingSsuParams const& params,
+__device__ __forceinline__ HeadCoords derive_head(CheckpointingSsuParams const& /*params*/,
                                                   HeadMetaSSU const& meta) {
   HeadCoords coords;
   coords.first_head = meta.tile % NHEADS;                  // compile-time NHEADS divisor
@@ -946,10 +958,8 @@ __device__ __forceinline__ HeadCoords derive_head(CheckpointingSsuParams const& 
   coords.buf_read = meta.buf_read;
   coords.prev_k = meta.pnat;
   if constexpr (VARLEN) {
-    auto const* __restrict__ cu = reinterpret_cast<int32_t const*>(params.cu_seqlens);
-    int const bos = __ldg(&cu[coords.seq]);
-    coords.seq_len = __ldg(&cu[coords.seq + 1]) - bos;
-    coords.outer = (int64_t)bos;
+    coords.seq_len = meta.seq_len;
+    coords.outer = (int64_t)meta.bos;
   } else {
     coords.seq_len = NPREDICTED;  // keep the compile-time constant
     coords.outer = (int64_t)coords.seq;
@@ -1175,7 +1185,7 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
   }
 
   using SmemT = CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
-                                            DSTATE, NUM_STAGES>;
+                                            DSTATE, NUM_STAGES, VARLEN>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
@@ -1232,6 +1242,7 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
     int const ring_slot = unit & (META_RING - 1);
     int32_t cache_slot = -1;  // canonical pad / past-the-end sentinel
     int pnat = 0, buf_read = 0;
+    int32_t seq_len = 0, bos = 0;
     float D_val = 0.f;
     if (work_unit < total_work) {
       int const seq = (work_unit / NHEADS) / D_SPLIT;  // compile-time NHEADS, D_SPLIT divisors
@@ -1242,11 +1253,18 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
         buf_read = __ldg(cbi + raw_slot);
       }
       D_val = D_ptr ? toFloat(D_ptr[work_unit % NHEADS]) : 0.f;
+      if constexpr (VARLEN) {
+        bos = __ldg(&cu[seq]);
+        seq_len = __ldg(&cu[seq + 1]) - bos;
+      }
     }
     smem.meta_cache_slot[ring_slot] = cache_slot;
     smem.meta_pnat[ring_slot] = pnat;
     smem.meta_buf_read[ring_slot] = buf_read;
     smem.meta_D[ring_slot] = D_val;
+    if constexpr (VARLEN) {
+      smem.meta_cu[ring_slot] = (bos << SmemT::SEQLEN_BITS) | seq_len;
+    }
     __syncwarp();
   };
   auto load_meta = [&](int unit) -> HeadMetaSSU {
@@ -1257,22 +1275,25 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
     meta.pnat = smem.meta_pnat[ring_slot];
     meta.buf_read = smem.meta_buf_read[ring_slot];
     meta.D_val = smem.meta_D[ring_slot];
+    if constexpr (VARLEN) {
+      int32_t const packed = smem.meta_cu[ring_slot];  // one LDS for both fields
+      meta.seq_len = packed & ((1 << SmemT::SEQLEN_BITS) - 1);
+      meta.bos = packed >> SmemT::SEQLEN_BITS;  // bos < 2^23 ⇒ packed ≥ 0, arithmetic >> safe
+    }
     return meta;
   };
-  // valid / must_checkpoint from the ring entry — non-varlen reads only the entry (cache_slot
-  // for validity, pnat for mc); varlen also touches cu_seqlens for the row length.
+  // valid / must_checkpoint from the ring entry alone — varlen's row length rides the ring
+  // (batched at fill_meta), so neither touches cu_seqlens per unit.
   auto is_valid = [&](HeadMetaSSU const& meta) -> bool {
     if (meta.cache_slot < 0) return false;  // canonical pad / past-the-end sentinel (fill_meta)
     if constexpr (VARLEN) {
-      int const seq = (meta.tile / NHEADS) / D_SPLIT;
-      return __ldg(&cu[seq + 1]) - __ldg(&cu[seq]) > 0;  // empty varlen row ⇒ skip
+      return meta.seq_len > 0;  // empty varlen row ⇒ skip
     }
     return true;
   };
   auto mc_of = [&](HeadMetaSSU const& meta) -> bool {
     if constexpr (VARLEN) {
-      int const seq = (meta.tile / NHEADS) / D_SPLIT;
-      return meta.pnat + (__ldg(&cu[seq + 1]) - __ldg(&cu[seq])) > MAX_WINDOW;
+      return meta.pnat + meta.seq_len > MAX_WINDOW;
     }
     return meta.pnat + NPREDICTED > MAX_WINDOW;
   };

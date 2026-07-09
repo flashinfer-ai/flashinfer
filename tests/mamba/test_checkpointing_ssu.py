@@ -5045,9 +5045,16 @@ def _run_varlen_and_compare(
     state_dtype,
     dtype=torch.bfloat16,
     use_z=False,
+    two_kernel=False,
 ):
     """Shared body: run the kernel in varlen mode and per-batch padded
-    non-varlen mode, then compare slices."""
+    non-varlen mode, then compare slices.
+
+    ``two_kernel=True`` routes the VARLEN call through the two-kernel split
+    (forced via the scratch's algorithm="two-kernel" — batch*nheads here is
+    far below the auto threshold); the padded reference stays monolithic.
+    This is the only coverage of the 2k main's varlen meta path (seq_len /
+    bos batched through fill_meta's ring)."""
     device = "cuda"
     s = _setup_varlen_inputs(
         seq_lens=seq_lens,
@@ -5112,6 +5119,11 @@ def _run_varlen_and_compare(
         state_batch_indices=None,
         state_scale=state_scale_varlen,
         cu_seqlens=cu_seqlens,
+        **(
+            _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+            if two_kernel
+            else {}
+        ),
     )
 
     # ── 2. Per-batch padded reference (non-varlen) ──
@@ -5251,12 +5263,15 @@ def _run_varlen_and_compare(
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_checkpointing_ssu_varlen_mixed_no_checkpoint(state_dtype):
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
+def test_checkpointing_ssu_varlen_mixed_no_checkpoint(state_dtype, two_kernel):
     """Mixed seq_lens, prev_k chosen so that prev_k + NPREDICTED <= MAX_WINDOW
     for every batch (no-checkpoint regime).  Tests that the varlen masking
     of T-rows >= seq_len matches the non-varlen reference where those rows
     contain zero-padded inputs (which compute_CB_scaled / matmul should
     zero-propagate)."""
+    if two_kernel and state_dtype in (torch.int8, torch.float8_e4m3fn):
+        pytest.skip("two-kernel split takes 2/4-byte state only")
     npredicted = 4
     max_window = 16
     seq_lens = [3, 1, 4, 2, 4]  # < NPREDICTED for some batches
@@ -5267,14 +5282,18 @@ def test_checkpointing_ssu_varlen_mixed_no_checkpoint(state_dtype):
         npredicted=npredicted,
         max_window=max_window,
         state_dtype=state_dtype,
+        two_kernel=two_kernel,
     )
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_checkpointing_ssu_varlen_mixed_checkpoint(state_dtype):
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
+def test_checkpointing_ssu_varlen_mixed_checkpoint(state_dtype, two_kernel):
     """Mixed seq_lens, prev_k large enough that prev_k + min(seq_lens) > MAX_WINDOW
     — forces every batch (varlen and non-varlen) to checkpoint.  Exercises
     the replay + state-write path under varlen indexing."""
+    if two_kernel and state_dtype in (torch.int8, torch.float8_e4m3fn):
+        pytest.skip("two-kernel split takes 2/4-byte state only")
     npredicted = 8
     max_window = 16
     seq_lens = [3, 5, 8, 6, 7]
@@ -5286,6 +5305,7 @@ def test_checkpointing_ssu_varlen_mixed_checkpoint(state_dtype):
         npredicted=npredicted,
         max_window=max_window,
         state_dtype=state_dtype,
+        two_kernel=two_kernel,
     )
 
 

@@ -1214,6 +1214,52 @@ recovers the uniform-bench optimum for isolated-path experiments.  This also
 closes the 07-06 CAVEAT (batch-aware stages): with the split auto-gated at
 ≥1 unit/SM and stg1 universal, the small-batch stages question is moot.
 
+### Varlen A/B baseline — the per-unit cu_seqlens fetch costs ~5-7% at saturation (B200, 2026-07-09)
+
+The mixed bench grew `--varlen` (neither bench layer had cu_seqlens before; the
+tests did).  It packs the SAME dense work as (1, batch*T, ...) VIEWS + uniform
+`cu_seqlens` (max_seqlen = T) — identical bytes/FLOPs, only the VARLEN
+addressing path differs (per-work-unit `__ldg(cu[seq])`/`__ldg(cu[seq+1])` +
+int64 `outer`, kernel_checkpointing_ssu_main.cuh ~L888; the monolith has the
+per-CTA equivalent).  SSU-only (conv1d ref has no cu_seqlens), CUDA kernels
+only, same .so (VARLEN is runtime dispatch → warm cache).
+
+varlen − dense, µs (nh16, K=8, CUPTI):
+
+    b:        1     8    16    32    64   128   256   512   1024
+    f32  mono +0.6  +0.6  +0.6  +0.5  +1.4  +0.3  +1.1  +4.6  +12.2
+    f32  2k   +0.4  +0.6  +0.5  +0.8  +0.8  +1.4  +2.1  +2.8   +6.8
+    bf16 mono +0.8  +0.9  +0.8  +0.7  +0.8  +1.6  +1.9  +3.0   +5.7
+    bf16 2k   +0.5  +0.4  +0.6  +0.1  +0.9  +1.0  +1.2  +2.9   +5.0
+
+Shape: a flat ~+0.5-0.9 µs latency add below saturation (the fetch chain sits
+in each unit's setup critical path), growing to ~5% (2k) / 5-7% (mono f32
++12.2 µs = 6.8%) at b=1024.  Mono/2k crossover is unchanged under varlen.
+FIX LATER (per Igor): cache the (bos, seq_len) pair across a CTA's grid-stride
+iterations, or precompute a per-slot table on the precompute→main meta path
+instead of re-fetching cu[] per unit.
+
+### LANDED: varlen row geometry through the meta ring — packed meta_cu (B200, 2026-07-09)
+
+Igor's fix, same day: the ring batches (bos, seq_len) at fill_meta (two
+warp-wide __ldg that coalesce to ~3 distinct words per 32-unit window) and
+is_valid / mc_of / derive_head become pure-register — before, they re-fetched
+the cu[] pair at EVERY call = up to ~12 __ldg/unit.  Packed as ONE int32 per
+unit (`meta_cu = (bos << 8) | seq_len`, storage SEQLEN_BITS=8): one STS/LDS on
+the meta path instead of two, half the ring bytes; seq_len ≤ 255 static_assert,
+bos < 2^23 wrapper-asserted (total packed tokens).  Storage takes `bool VARLEN`
+(dense: one 4 B dummy + SROA-dead HeadMetaSSU fields — measured free).
+
+2k varlen − dense, µs (was → now):  b=512 f32 +2.8 → +0.5, bf16 +2.9 → +0.7;
+b=1024 f32 +6.8 → **+1.6** (1.1%), bf16 +5.0 → **+1.6** (1.7%).  Dense
+post-vs-pre = noise at every batch (b=1024 f32 140.69 vs 140.67).  Igor's
+packed-vs-padded rule ("if perf drops, single-load padded ring"): perf didn't
+drop — packed stands.  Residual ~1.6 µs at saturation: fill_meta's own loads +
+unpack ALU + the PRECOMPUTE kernel's per-CTA cu[] reads (untouched — the next
+varlen lever if we care).  Coverage: 2k+varlen was previously UNTESTED
+anywhere; `test_checkpointing_ssu_varlen_mixed_*[two_kernel-*]` now runs the
+split against the padded monolith reference (93 passed / 4 quantized skips).
+
 ## TODO
 
 - [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs

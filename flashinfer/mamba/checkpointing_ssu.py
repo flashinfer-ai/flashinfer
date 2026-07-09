@@ -429,6 +429,13 @@ def checkpointing_ssu(
             f"{tuple(cu_seqlens.shape)} dtype {cu_seqlens.dtype}"
         )
         assert cu_seqlens.is_cuda, "cu_seqlens must be a CUDA tensor"
+        # The persistent main's meta ring packs (bos << 8 | seq_len) into one
+        # int32 (kernel_checkpointing_ssu_main.cuh meta_cu), capping the packed
+        # token offset at 2^23 - 1.
+        assert x.size(1) < (1 << 23), (
+            f"varlen total_tokens={x.size(1)} exceeds the packed meta_cu bos "
+            f"capacity (must be < {1 << 23})"
+        )
         npredicted = max_seqlen if max_seqlen is not None else max_window
     else:
         assert max_seqlen is None, (
