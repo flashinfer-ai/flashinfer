@@ -143,12 +143,15 @@ void trtllm_custom_all_reduce(TensorView in, TensorView out, int64_t tp_size, in
       TVM_FFI_ICHECK(lamport_peer_comm_buffer_ptrs_2.has_value())
           << "lamport_peer_comm_buffer_ptrs_2 is required if lamport_peer_comm_buffer_ptrs_0 "
              "is provided";
+      // Kernels read the triple-buffered lamport pointers at stride
+      // MAX_RANKS_PER_NODE, not tp_size.
       for (int i = 0; i < tp_size; ++i) {
         params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = reinterpret_cast<void*>(
             static_cast<int64_t*>(lamport_peer_comm_buffer_ptrs_0.value().data_ptr())[i]);
-        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size] = reinterpret_cast<void*>(
-            static_cast<int64_t*>(lamport_peer_comm_buffer_ptrs_1.value().data_ptr())[i]);
-        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size * 2] =
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + MAX_RANKS_PER_NODE] =
+            reinterpret_cast<void*>(
+                static_cast<int64_t*>(lamport_peer_comm_buffer_ptrs_1.value().data_ptr())[i]);
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + MAX_RANKS_PER_NODE * 2] =
             reinterpret_cast<void*>(
                 static_cast<int64_t*>(lamport_peer_comm_buffer_ptrs_2.value().data_ptr())[i]);
       }
