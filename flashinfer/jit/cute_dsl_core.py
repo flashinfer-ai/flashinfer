@@ -114,7 +114,6 @@ class JitSpecCuteDsl(JitSpec):
         self.object_path = self.module_dir / f"{self.kernel_name}.o"
         self.symbol = f"{module_name}_{self.kernel_name}"
         self.expected_meta = {
-            "module": self.module_dir_name,
             "arch": _get_compile_arch(),
             "cute_dsl_version": _get_cute_dsl_version(),
             "source_sha256": source_sha256,

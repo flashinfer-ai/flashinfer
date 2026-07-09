@@ -18,7 +18,32 @@ kernel = module.my_kernel   # tvm_ffi.Function, same calling convention
 
 ## 2. Design
 
-The cache shares its lifecycle with the existing nvcc kernel cache through a common abstract base class. `JitSpec` (`flashinfer/jit/core.py`) defines the contract — `try_load()` / `build()` / `load()`, plus the status members `is_compiled` and `get_library_path()` — and implements the shared policy once in a concrete `build_and_load()` template method: cached-artifact fast path, cross-process locking with a double-check, and `FLASHINFER_DISABLE_JIT` enforcement. `JitSpecNvcc` (the former `JitSpec` dataclass) implements it for nvcc/ninja modules; `JitSpecCuteDsl` implements it for CuTe-DSL kernels; future DSLs (e.g. cutile) follow the same shape.
+The cache shares its lifecycle with the existing nvcc kernel cache through a common abstract base class: `JitSpec` (`flashinfer/jit/core.py`) defines the contract — `try_load()` / `build()` / `load()`, plus the status members `is_compiled` and `get_library_path()` — and implements the shared policy once in a concrete `build_and_load()` template method:
+
+```text
+build_and_load()                     JitSpec ABC — shared policy, written once
+      │
+      ▼
+  try_load() ────── hit ────────────►  return cached kernel        (fast path)
+      │ miss
+      ▼
+  FileLock(lock_path)                cross-process lock
+      │
+      ▼
+  try_load() ────── hit ────────────►  return   (another process just built it)
+      │ miss
+      ▼
+  FLASHINFER_DISABLE_JIT set? ─ yes ►  raise MissingJITCacheError
+      │ no
+      ▼
+  build()                            backend-specific compile:
+      │                                nvcc: write_ninja + ninja  (host toolchain)
+      ▼                                cute-dsl: cute.compile + export_to_c  (GPU)
+  load()                             nvcc: dlopen the .so
+                                     cute-dsl: in-memory kernel, or JITLink the .o
+```
+
+`JitSpecNvcc` (the former `JitSpec` dataclass) implements the abstract methods for nvcc/ninja modules; `JitSpecCuteDsl` implements them for CuTe-DSL kernels; future DSLs (e.g. cutile) follow the same shape.
 
 Callers depend on the interface, not the implementation: `gen_jit_spec()` and the `gen_*_module()` generators keep returning `JitSpec`, and only code that genuinely needs nvcc internals narrows to `JitSpecNvcc` (`build_jit_specs()` rejects non-nvcc specs with a `TypeError`; `JitSpecRegistry` accepts any backend and reports nvcc-only fields with fallbacks, though in practice only nvcc modules register today).
 
@@ -79,24 +104,29 @@ Invalidation is **module-granular**, mirroring ninja's module rebuilds. The per-
 |---|---|
 | `cute_dsl_version` | any `nvidia-cutlass-dsl*` package changes — the fingerprint covers the whole compiler stack (`nvidia-cutlass-dsl==X;...-libs-base==X;...-libs-cu13==X`), since the codegen backend lives in the libs packages and the CUDA-family variant is encoded in the package *name* |
 | `source_sha256` | any file in `extra_key_files` changes (kernel-defining sources) |
-| `arch` / `module` | compile target changes (usually also changes the dir name) |
+| `arch` | never, through normal operation — the compile target is already encoded in the directory name, so a target change routes to a different module dir. Kept as a tripwire against out-of-band directory copies across architectures (a cross-arch `.o` JITLinks fine and would otherwise only fail at kernel launch). |
 
 A kernel artifact is valid if and only if its `.o` exists **and** the module `meta.json` matches the expected values. On mismatch the whole module directory is wiped and repopulated lazily. FlashInfer version and nvcc-arch-list changes are already handled by the workspace path.
 
-The system CUDA toolkit and driver versions deliberately do **not** participate in the key: `cute.compile` compiles with the DSL's bundled toolchain (the libs packages above), not with `CUDA_HOME`/`nvcc` — keying on them would spuriously invalidate on per-shell environment changes while catching no real staleness. (`apache-tvm-ffi` is also excluded: the exported `.o` speaks TVM-FFI's stable C ABI.)
+The system CUDA toolkit and driver versions deliberately do **not** participate in the key. CUDA-toolkit-tied components absolutely exist in the DSL's IR stack — the NVVM dialects and ptxas itself (statically linked into `_cutlass_ir.so` via the nvPTXCompiler library) come from a specific CUDA release — but they are **vendored inside the `nvidia-cutlass-dsl*` wheels**, so the fingerprint above already tracks the toolkit that actually compiles the kernels. A toolkit upgrade reaches the DSL only as a new package version (or a new `-cuXX` libs package), which changes the fingerprint. `CUDA_HOME`/`CUDA_TOOLKIT_PATH` are referenced by the DSL only in error diagnostics, never in codegen; keying on them would spuriously invalidate on per-shell environment changes while catching no real staleness. (`apache-tvm-ffi` is also excluded: the exported `.o` speaks TVM-FFI's stable C ABI.)
 
 Hashing whole source files means any edit (even a docstring) invalidates. This is deliberate: it is the same granularity ninja uses, and the alternative (hashing traced MLIR) requires tracing, which defeats the purpose.
 
 ### 2.4 Concurrency and crash safety
 
-- A per-module `FileLock` (same `cached_ops/tmp/` convention as `JitSpec`) serializes compilation; the lock is re-checked after acquisition so a process that waited behind a builder loads the fresh artifact instead of recompiling.
+- A per-module `FileLock` (same `cached_ops/tmp/` convention as `JitSpec`) makes each kernel compile **at most once across processes**: the cache is re-checked after acquisition, so a process that waited behind a builder loads the fresh artifact instead of recompiling. The lock is per-module rather than per-kernel — *different* kernels of one op family also serialize their builds — deliberately: `build()` may wipe the whole module directory and rewrite the module-level `meta.json`, which must not interleave with a sibling kernel's export. (Per-kernel compile locks with a module lock only around wipe/meta-commit would allow parallel cold starts; not worth the complexity today.)
+- Lock recovery: a crashed holder releases the `flock` automatically (kernel behavior), and a leftover lock *file* is harmless. If a lock is truly wedged (e.g. NFS lock-manager state after a node hang), deleting `cached_ops/tmp/<module>.lock` is safe — artifact commits are atomic and idempotent, so breaking the lock risks at most one duplicated compilation, never a corrupt artifact. `rm -rf ~/.cache/flashinfer/` remains the universal reset.
 - `.o` files are written to a pid-suffixed temp name and committed with atomic `os.replace`, so an `.o` at its final path is always complete.
 - `meta.json` is written **after** the first successful export. A crash between the two leaves an `.o` without matching metadata, which reads as a miss and is recompiled/overwritten — never loaded.
 - Wiping a stale module while another process has its `.o` mapped is safe on POSIX (the inode survives the unlink).
 - Persistence failures degrade gracefully: the freshly compiled in-process kernel is still returned; only the disk write is lost.
 
-`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` bypasses the cache entirely (always
-compile, never touch disk).
+`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` disables the **on-disk** layer only:
+kernels compile fresh in every new process and nothing is read from or
+written to `cached_ops/`. The **in-process** layer (the `@functools.cache`
+memoization at call sites, level 1 of the two-level scheme) is unaffected —
+within one process each specialization still compiles at most once and is
+reused from memory thereafter.
 
 ### 2.5 From the former `JitSpec` class to the `JitSpec` ABC
 
@@ -104,15 +134,9 @@ Before this change, `JitSpec` was a single concrete dataclass designed around nv
 
 ```text
 JitSpec (ABC)                          # flashinfer/jit/core.py
-│  build_and_load()                    # concrete template method (shared policy):
-│      cached = try_load()             #   1. fast path
-│      if cached: return cached
-│      with FileLock(lock_path):       #   2. cross-process lock
-│          cached = try_load()         #   3. double-check (another process built?)
-│          if cached: return cached
-│          if FLASHINFER_DISABLE_JIT: raise MissingJITCacheError
-│          build()                     #   4. backend-specific compile
-│          return load()
+│    build_and_load()                  # concrete template method (§2 diagram)
+│    try_load() / build() / load()     # abstract, per toolchain
+│    is_compiled / get_library_path()  # abstract, status reporting
 │
 ├── JitSpecNvcc                        # the former JitSpec dataclass
 └── JitSpecCuteDsl                     # flashinfer/jit/cute_dsl_core.py
