@@ -41,10 +41,18 @@ from ...autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ...tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+)
 from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
+from ._inputs_helper import CuteDslMoEInputsHelper
+from .moe_utils import normalize_cute_dsl_moe_activation_type
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +160,11 @@ def get_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
 # - gemm2_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 
 
+# Canonical list of tile_sizes the autotuner is allowed to pick.  Used by
+# ``get_moe_valid_tactics`` for tactic enumeration.
+VALID_TILE_SIZES: Tuple[int, ...] = (128, 256)
+
+
 def get_moe_valid_tactics() -> List[Tuple]:
     """Get all valid MoE tactic combinations.
 
@@ -170,7 +183,7 @@ def get_moe_valid_tactics() -> List[Tuple]:
     # use_2cta_instrs=True) variants; the autotuner picks per shape.
     # tile_size=256 typically wins at large batch where 2-CTA throughput
     # exceeds 1-CTA.
-    for tile_size in [128, 256]:
+    for tile_size in VALID_TILE_SIZES:
         gemm1_tactics = get_gemm1_valid_tactics(tile_size)
         gemm2_tactics = get_gemm2_valid_tactics(tile_size)
 
@@ -261,7 +274,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         use_fused_finalize: bool = True,
         output_dtype: torch.dtype = torch.bfloat16,
         enable_pdl: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     ):
+        activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -270,6 +288,20 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.output_dtype = output_dtype
         self.enable_pdl = enable_pdl
+        self.activation_type = activation_type
+        self.gated = gated
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
+
+        # Helper that builds a deterministic balanced approx-max-load
+        # assignment for token_selected_experts during autotune profiling.
+        # See _inputs_helper.py for rationale -- the random tensor_initializer
+        # for input #2 produces non-deterministic and unrealistic per-expert
+        # load distributions, biasing autotune picks at marginal cells.
+        self._inputs_helper = CuteDslMoEInputsHelper(
+            num_experts, top_k, num_local_experts, local_expert_offset
+        )
 
         # Instance-level so dummy expert IDs span all local experts
         # (randint(0, num_experts)) for realistic profiling.
@@ -285,25 +317,48 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     gen_tuning_buckets=get_hybrid_num_tokens_buckets,
                     map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
                     tensor_initializers=[
-                        # 0: x — FP4 quantized input (uint8 packed)
+                        # 0: x — FP4 quantized input (uint8 packed). Seeded
+                        # for cross-process determinism of autotune picks
+                        # (matches trt-llm's seed=515 convention).
                         lambda shapes, dtype, device: torch.randint(
-                            0, 256, shapes, dtype=torch.uint8, device=device
+                            0,
+                            256,
+                            shapes,
+                            dtype=torch.uint8,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 1: x_sf — FP8 scale factors (uint8)
+                        # 1: x_sf — FP8 scale factors (uint8). Seeded.
                         lambda shapes, dtype, device: torch.randint(
-                            1, 128, shapes, dtype=torch.uint8, device=device
+                            1,
+                            128,
+                            shapes,
+                            dtype=torch.uint8,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 2: token_selected_experts — expert indices [0, num_experts)
+                        # 2: token_selected_experts — output is overwritten
+                        # by inputs_pre_hook (CuteDslMoEInputsHelper), but
+                        # seed the initializer too in case the hook is ever
+                        # disabled.
                         lambda shapes, dtype, device: torch.randint(
                             0,
                             max(num_experts, 1),
                             shapes,
                             dtype=torch.int32,
                             device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 3: token_final_scales — routing weights (softmax normalized)
+                        # 3: token_final_scales — softmax-normalized. Seeded.
                         lambda shapes, dtype, device: torch.softmax(
-                            torch.randn(shapes, device=device), dim=-1
+                            torch.randn(
+                                shapes,
+                                device=device,
+                                generator=torch.Generator(device=device).manual_seed(
+                                    515
+                                ),
+                            ),
+                            dim=-1,
                         ).to(torch.float32),
                         # 11: moe_output — output buffer
                         lambda shapes, dtype, device: torch.empty(
@@ -312,6 +367,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     ],
                 ),
             ),
+            inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
+            # Cold-L2 measurement matches TRT-LLM's
+            # CuteDslFusedMoENvfp4Runner.tuning_config; flushing L2
+            # between profile iterations yields autotune timings
+            # representative of production cold-cache conditions.
+            use_cold_l2_cache=True,
         )
 
     def __hash__(self):
@@ -323,7 +384,19 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.local_expert_offset,
                 self.use_fused_finalize,
                 self.output_dtype,
+                int(self.activation_type),
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.swiglu_limit,
             )
+        )
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (
+            int(self.activation_type),
+            self.swiglu_alpha,
+            self.swiglu_beta,
+            self.swiglu_limit,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -360,10 +433,14 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         x = inputs[0]
         w1_weight = inputs[4]
 
+        gated = self.gated
         num_tokens = x.shape[0]
         hidden_size = x.shape[1] * 2  # FP4 packed
         num_local_experts = w1_weight.shape[0]
-        intermediate_size = w1_weight.shape[1] // 2  # gate+up fused
+        # Gated SwiGLU fuses gate+up (2*intermediate rows); non-gated ReLU^2
+        # has a single intermediate-row projection.
+        gemm1_n = w1_weight.shape[1]
+        intermediate_size = gemm1_n // 2 if gated else gemm1_n
 
         # Fixed dtypes/layouts for NVFP4 MoE
         ab_dtype = cutlass.Float4E2M1FN
@@ -372,6 +449,14 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
         gemm1_c_dtype = cutlass.Float4E2M1FN
         gemm2_out_dtype = cutlass.BFloat16
+
+        token_final_scales = inputs[3]
+        if token_final_scales.dtype == torch.float32:
+            final_scale_dtype = cutlass.Float32
+        elif token_final_scales.dtype == torch.bfloat16:
+            final_scale_dtype = cutlass.BFloat16
+        else:
+            final_scale_dtype = cutlass.Float16
 
         valid_tactics = []
         for tactic in ALL_MOE_TACTICS:
@@ -393,7 +478,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 mma_tiler_mn=gemm1_mma_tiler_mn,
                 cluster_shape_mn=gemm1_cluster_shape_mn,
                 m=permuted_m,
-                n=2 * intermediate_size,
+                n=gemm1_n,
                 k=hidden_size,
                 l=num_local_experts,
                 a_major="k",
@@ -407,6 +492,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
                     out_dtype=gemm2_out_dtype,
+                    final_scale_dtype=final_scale_dtype,
                     mma_tiler_mn=gemm2_mma_tiler_mn,
                     cluster_shape_mn=gemm2_cluster_shape_mn,
                     m=permuted_m,
@@ -508,6 +594,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             use_fused_finalize=self.use_fused_finalize,
             moe_output=moe_output,
             enable_pdl=self.enable_pdl,
+            activation_type=int(self.activation_type),
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
             **kwargs,
         )
 

@@ -92,6 +92,31 @@ Unified AllReduce Fusion API
     TRTLLMAllReduceFusionWorkspace
     MNNVLAllReduceFusionWorkspace
 
+All-reduce workspaces backed by ``SymmDeviceMemory`` preserve their CUDA
+virtual addresses across process checkpoint/restore.  After quiescing all
+work, release the physical handles and restore them with a fresh communication
+backend before replaying a captured CUDA graph:
+
+.. code-block:: python
+
+    workspace.checkpoint_prepare()
+    workspace.checkpoint_restore(comm_backend)
+
+Both methods are collective.  Every rank must call them in the same order, and
+``comm_backend`` must reproduce the original rank and world size.  Repeated
+calls are no-ops after the workspace reaches the requested state.  If an
+exception occurs after detach or reattach begins, do not retry or reuse the
+workspace; restart the affected rank.  Workspaces backed by torch symmetric
+memory do not support this lifecycle.
+
+.. autosummary::
+    :toctree: ../generated
+
+    TRTLLMAllReduceFusionWorkspace.checkpoint_prepare
+    TRTLLMAllReduceFusionWorkspace.checkpoint_restore
+    MNNVLAllReduceFusionWorkspace.checkpoint_prepare
+    MNNVLAllReduceFusionWorkspace.checkpoint_restore
+
 vLLM AllReduce
 --------------
 
@@ -120,15 +145,6 @@ Core Classes
     MnnvlMemory
     McastGPUBuffer
 
-Utility Functions
-~~~~~~~~~~~~~~~~~
-
-.. autosummary::
-    :toctree: ../generated
-
-    create_tensor_from_cuda_memory
-    alloc_and_copy_to_cuda
-
 TensorRT-LLM MNNVL AllReduce
 ----------------------------
 
@@ -138,6 +154,9 @@ TensorRT-LLM MNNVL AllReduce
     :toctree: ../generated
 
     trtllm_mnnvl_all_reduce
+    trtllm_mnnvl_allreduce
+    trtllm_mnnvl_fused_allreduce_add_rmsnorm
+    trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant
     trtllm_mnnvl_fused_allreduce_rmsnorm
     mpi_barrier
 
@@ -149,10 +168,65 @@ MNNVL A2A (Throughput Backend)
 .. autosummary::
     :toctree: ../generated
 
-    MoeAlltoAll
     moe_a2a_initialize
     moe_a2a_dispatch
     moe_a2a_combine
     moe_a2a_sanitize_expert_ids
     moe_a2a_get_workspace_size_per_rank
     moe_a2a_wrap_payload_tensor_in_workspace
+
+.. autoclass:: MoeAlltoAll
+    :members:
+    :inherited-members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+``MoeAlltoAll`` preserves its CUDA virtual addresses across process
+checkpoint/restore.  After quiescing all work, call ``checkpoint_prepare`` to
+release the non-checkpointable physical MNNVL handles.  Then call
+``checkpoint_restore`` with a fresh communication backend before replaying a
+captured CUDA graph:
+
+.. code-block:: python
+
+    moe_alltoall.checkpoint_prepare()
+    moe_alltoall.checkpoint_restore(comm_backend)
+
+Both methods are collective.  Every rank must call them in the same order, and
+``comm_backend`` must reproduce the original rank and world size.
+Repeated calls are no-ops after the workspace reaches the requested state.
+If an exception occurs after physical handle unmapping or remapping begins,
+do not retry or reuse the workspace; restart the affected rank.
+
+.. autosummary::
+    :toctree: ../generated
+
+    MoeAlltoAll.checkpoint_prepare
+    MoeAlltoAll.checkpoint_restore
+
+DCP All-to-All (Context-Parallel Attention Reduction)
+-----------------------------------------------------
+
+.. currentmodule:: flashinfer.comm
+
+.. autosummary::
+    :toctree: ../generated
+
+    decode_cp_a2a_workspace_size
+    decode_cp_a2a_allocate_mnnvl_workspace
+    decode_cp_a2a_init_workspace
+    decode_cp_a2a_alltoall
+
+Mixed Communication
+-------------------
+
+.. currentmodule:: flashinfer.comm.mixed_comm
+
+.. autosummary::
+    :toctree: ../generated
+
+    MixedCommOp
+    MixedCommMode
+    MixedCommHandler
+    run_mixed_comm

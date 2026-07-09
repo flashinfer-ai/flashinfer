@@ -272,32 +272,55 @@ def cudnn_batch_decode_with_kv_cache(
     batch_offsets_v: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Performs batched decode attention with paged KV cache using cuDNN.
+    r"""Batched decode attention with paged KV cache, backed by cuDNN SDPA.
 
-    Args:
-        q: Query tensor of shape (batch_size, num_heads_qo, head_dim), seq_len_q is the maximum sequence length of queries in the batch
-        k_cache: Key cache tensor of shape   (total_num_pages, num_heads_kv, page_size, head_dim)
-        v_cache: Value cache tensor of shape (total_num_pages, num_heads_kv, page_size, head_dim)
-        scale: Scaling factor for attention scores, typically 1/sqrt(head_dim)
-        workspace_buffer: Workspace buffer for cuDNN operations. Scales with batch size. 128 MB should be sufficient for most cases
-        max_sequence_kv: Maximum number of tokens per key/value sequence (s_kv_max)
-        actual_seq_lens_kv: Actual sequence lengths for key/values per batch, shape (batch_size,) on CPU
-        block_tables: Page table mapping for KV cache, shape (batch_size, num_pages_per_seq) on GPU
-        is_cuda_graph_compatible: Whether the decode operation is compatible with CUDA graph
-        batch_offsets: Optional batch offsets tensor of shape (batch_size,) on GPU
-        out: Optional pre-allocated output tensor
-        batch_offsets_q: Optional batch offsets for query tensor of shape (batch_size,) on GPU
-        batch_offsets_o: Optional batch offsets for output tensor of shape (batch_size,) on GPU
-        batch_offsets_k: Optional batch offsets for key tensor of shape (batch_size,) on GPU
-        batch_offsets_v: Optional batch offsets for value tensor of shape (batch_size,) on GPU
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor of shape ``(batch_size, num_heads_qo, head_dim)``.
+    k_cache : torch.Tensor
+        Key cache, shape ``(total_num_pages, num_heads_kv, page_size, head_dim)``.
+    v_cache : torch.Tensor
+        Value cache, shape ``(total_num_pages, num_heads_kv, page_size, head_dim)``.
+    scale : float
+        Softmax scaling factor, typically ``1 / sqrt(head_dim)``.
+    workspace_buffer : torch.Tensor
+        Workspace buffer for cuDNN.  Scales with batch size; 128 MB is sufficient
+        for typical decode workloads.
+    max_sequence_kv : int
+        Maximum number of tokens per KV sequence in the batch (``s_kv_max``).
+    actual_seq_lens_kv : Optional[torch.Tensor]
+        Per-request KV lengths, shape ``(batch_size,)``.  When cuDNN is
+        available (the default backend) this tensor must reside on the
+        same CUDA device as ``q``.  Only the fallback non-cuDNN path
+        accepts (and internally copies) a CPU tensor.
+    block_tables : Optional[torch.Tensor]
+        Page-table mapping for the paged KV cache, shape
+        ``(batch_size, num_pages_per_seq)`` on GPU.
+    is_cuda_graph_compatible : bool
+        Whether to plan the operation in a CUDA-graph-capture-safe mode.
+    batch_offsets_q : Optional[torch.Tensor]
+        Per-request offsets into the query tensor, shape ``(batch_size,)`` on GPU.
+    batch_offsets_o : Optional[torch.Tensor]
+        Per-request offsets into the output tensor, shape ``(batch_size,)`` on GPU.
+    batch_offsets_k : Optional[torch.Tensor]
+        Per-request offsets into the key tensor, shape ``(batch_size,)`` on GPU.
+    batch_offsets_v : Optional[torch.Tensor]
+        Per-request offsets into the value tensor, shape ``(batch_size,)`` on GPU.
+    out : Optional[torch.Tensor]
+        Pre-allocated output tensor, shape ``(batch_size, num_heads_qo, head_dim)``;
+        allocated internally when ``None``.
 
-    Returns:
-        Output tensor of shape (batch_size, num_heads_qo, head_dim)
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape ``(batch_size, num_heads_qo, head_dim)``.
 
-    Note:
-        Currently only supports causal attention (causal must be True)
-        All tensors must be contiguous and on the same CUDA device
-        Query and KV heads can have different sizes (num_heads_qo >= num_heads_kv)
+    Note
+    ----
+    Currently only supports causal attention; all tensors must be contiguous and
+    on the same CUDA device.  Query and KV heads may differ
+    (``num_heads_qo >= num_heads_kv``, multi-query / grouped-query attention).
     """
 
     bs = q.shape[0]

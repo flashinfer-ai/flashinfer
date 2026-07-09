@@ -23,6 +23,7 @@ gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
+gemm_fp8_nt_groupwise_n1536_k7168.json
 gemm_mxfp8_N4096_K4096.json
 gemma_fused_add_rmsnorm_h4608.json
 gemma_rmsnorm_h4608.json
@@ -38,6 +39,9 @@ merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
+mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
+mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
+mono_moe_topk8_h2048_i512.json
 moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
 moe_fp4_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
@@ -50,6 +54,9 @@ moe_fp8_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
+mxfp8_grouped_quantize_k4096.json
+nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
+nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -216,10 +223,14 @@ flashinfer.apply_rope_with_cos_sin_cache_inplace(
 # generated on any GPU — runtime failures are suppressed.
 from flashinfer.quantization.fp4_quantization import (
     fp4_quantize,
+    nvfp4_kv_dequantize_paged,
     mxfp4_quantize,
     nvfp4_quantize,
 )
-from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+from flashinfer.quantization.fp8_quantization import (
+    mxfp8_grouped_quantize,
+    mxfp8_quantize,
+)
 
 quant_M, quant_K = 128, 4096
 quant_input_bf16 = torch.randn(quant_M, quant_K, dtype=torch.bfloat16, device=device)
@@ -233,6 +244,85 @@ with contextlib.suppress(Exception):
     mxfp4_quantize(quant_input_bf16)
 with contextlib.suppress(Exception):
     mxfp8_quantize(quant_input_bf16)
+
+# Paged NVFP4 KV dequantization helper: NHD and HND cache layouts.
+with contextlib.suppress(Exception):
+    deq_b, deq_s, deq_h, deq_kd, deq_vd, deq_ps = 2, 8, 2, 64, 128, 4
+    deq_pages = deq_b * ((deq_s + deq_ps - 1) // deq_ps)
+    deq_k_cache_nhd = torch.randint(
+        0,
+        256,
+        (deq_pages, deq_ps, deq_h, deq_kd // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    deq_v_cache_nhd = torch.randint(
+        0,
+        256,
+        (deq_pages, deq_ps, deq_h, deq_vd // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    deq_k_scales_nhd = torch.randint(
+        1,
+        120,
+        (deq_pages, deq_ps, deq_h, deq_kd // 16),
+        dtype=torch.uint8,
+        device=device,
+    ).view(torch.float8_e4m3fn)
+    deq_v_scales_nhd = torch.randint(
+        1,
+        120,
+        (deq_pages, deq_ps, deq_h, deq_vd // 16),
+        dtype=torch.uint8,
+        device=device,
+    ).view(torch.float8_e4m3fn)
+    deq_block_tables = torch.arange(
+        deq_pages, dtype=torch.int32, device=device
+    ).reshape(deq_b, -1)
+    deq_seq_lens = torch.full((deq_b,), deq_s, dtype=torch.int32, device=device)
+    deq_k_scale = torch.ones(1, dtype=torch.float32, device=device)
+    deq_v_scale = torch.ones(1, dtype=torch.float32, device=device)
+    deq_out_k = torch.empty(
+        deq_b, deq_s, deq_h, deq_kd, dtype=torch.bfloat16, device=device
+    )
+    deq_out_v = torch.empty(
+        deq_b, deq_s, deq_h, deq_vd, dtype=torch.bfloat16, device=device
+    )
+    nvfp4_kv_dequantize_paged(
+        (deq_k_cache_nhd, deq_v_cache_nhd),
+        (deq_k_scales_nhd, deq_v_scales_nhd),
+        deq_block_tables,
+        deq_seq_lens,
+        deq_k_scale,
+        deq_v_scale,
+        deq_out_k,
+        deq_out_v,
+        kv_layout="NHD",
+    )
+    nvfp4_kv_dequantize_paged(
+        (
+            deq_k_cache_nhd.permute(0, 2, 1, 3).contiguous(),
+            deq_v_cache_nhd.permute(0, 2, 1, 3).contiguous(),
+        ),
+        (
+            deq_k_scales_nhd.permute(0, 2, 1, 3).contiguous(),
+            deq_v_scales_nhd.permute(0, 2, 1, 3).contiguous(),
+        ),
+        deq_block_tables,
+        deq_seq_lens,
+        deq_k_scale,
+        deq_v_scale,
+        deq_out_k,
+        deq_out_v,
+        kv_layout="HND",
+    )
+
+# Grouped MXFP8 (cuTile, SM100+): [B, M, K] -> masked grouped GEMM layout.
+with contextlib.suppress(Exception):
+    grouped_a = torch.randn(2, 256, quant_K, dtype=torch.bfloat16, device=device)
+    grouped_mask = torch.full((2,), 256, dtype=torch.int32, device=device)
+    mxfp8_grouped_quantize(grouped_a, grouped_mask)
 
 # ── Single-request attention (non-batched) ───────────────────────────────────
 sa_Hq, sa_Hk, sa_D, sa_KV = 32, 8, 128, 256
@@ -272,6 +362,22 @@ with contextlib.suppress(Exception):
     alpha_fp8 = torch.tensor(1.0, dtype=torch.float32, device=device)
     flashinfer.mm_fp8(a_fp8, b_fp8, alpha_fp8)
 
+# ── GEMM fp8 nt groupwise (DeepSeek-V3 q_proj trtllm path: M×7168 @ [1536, 7168]) ─
+# trtllm canonical layout: a_scale = [M, K//bs], b_scale = [N//bs, K//bs]; bs=128.
+# (b_scale is transposed vs flashinfer's gemm_base.py docstring — see
+# tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129 which does
+# `b_scale.t().contiguous()` for the trtllm path.)
+# Trace is dumped before kernel launch; suppress SM-specific runtime failures.
+with contextlib.suppress(Exception):
+    M, K, N, BS = 128, 7168, 1536, 128
+    a_g = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=device)
+    b_g = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
+    a_scale_g = torch.ones(M, K // BS, dtype=torch.float32, device=device)
+    b_scale_g = torch.ones(N // BS, K // BS, dtype=torch.float32, device=device)
+    flashinfer.gemm.gemm_fp8_nt_groupwise(
+        a_g, b_g, a_scale_g, b_scale_g, backend="trtllm"
+    )
+
 # ── GEMM mxfp8 (Blackwell SM100+: M×4096@4096×4096, block=32) ────────────────
 try:
     M, K, N = 128, 4096, 4096
@@ -291,6 +397,32 @@ try:
     a_d4 = torch.ones(M, K // BS4, dtype=torch.float8_e4m3fn, device=device)
     b_d4 = torch.ones(K, N // BS4, dtype=torch.float8_e4m3fn, device=device)
     flashinfer.gemm.mm_fp4(a_fp4, b_fp4, a_d4, b_d4, block_size=BS4)
+except Exception:
+    pass  # Requires Blackwell (SM100+)
+
+# ── GEMM bf16 x fp4: mm_bf16_fp4 (weight-only) ──────────────────────────────
+# Blackwell SM100+: M×7168@2048×7168, block=16. b/b_descale shapes are the
+# *prepared* layouts (prepare_bf16_fp4_weights).
+try:
+    M, K, N, BSW = 128, 7168, 2048, 16
+    a_w4 = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
+    alpha_w4 = torch.ones(1, dtype=torch.float32, device=device)
+    # cuDNN layout: canonical packed weight + linear fp8 scales.
+    b_w4 = torch.zeros(N, K // 2, dtype=torch.uint8, device=device)
+    sf_w4 = torch.ones(N, K // BSW, dtype=torch.float8_e4m3fn, device=device)
+    flashinfer.mm_bf16_fp4(a_w4, b_w4, sf_w4, alpha_w4, backend="cudnn", block_size=BSW)
+except Exception:
+    pass  # Requires Blackwell (SM100+) and cuDNN >= 9.23.1
+try:
+    M, K, N, BSW = 128, 7168, 2048, 16
+    a_w4 = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
+    alpha_w4 = torch.ones(1, dtype=torch.float32, device=device)
+    # cute-DSL layout: tile-packed int32 weight + S0E5M3 uint8 scales.
+    b_w4 = torch.zeros(K // 16, N * 2, dtype=torch.int32, device=device)
+    sf_w4 = torch.ones(K // BSW, N, dtype=torch.uint8, device=device)
+    flashinfer.mm_bf16_fp4(
+        a_w4, b_w4, sf_w4, alpha_w4, backend="cute-dsl", block_size=BSW
+    )
 except Exception:
     pass  # Requires Blackwell (SM100+)
 
@@ -451,6 +583,46 @@ b_m = torch.zeros(B, T_mtp, HV, dtype=torch.bfloat16, device=device)
 flashinfer.gdn_decode.gated_delta_rule_mtp(
     q_m, k_m, v_m, init_state, init_idx, A_log_m, a_m, dt_bias_m, b_m
 )
+
+# ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────
+# Fixed shape: E=256, N(intermediate)=512, K(hidden)=2048, BS<=8 tokens.
+# Routing is fused in-kernel from router_logits.  SM90a-only and JIT-built,
+# so wrapped in suppress(): the trace JSON dumps before the kernel launches,
+# so the definition file appears even when the kernel can't run here.
+with contextlib.suppress(Exception):
+    _mm_E, _mm_N, _mm_K, _mm_M = 256, 512, 2048, 8
+    _mm_BLK = 128
+    _mm_act = torch.randn(_mm_M, _mm_K, dtype=torch.bfloat16, device=device)
+    _mm_logits = torch.randn(_mm_M, _mm_E, dtype=torch.bfloat16, device=device)
+    _mm_w13 = torch.zeros(
+        _mm_E, 2 * _mm_N, _mm_K, dtype=torch.float8_e4m3fn, device=device
+    )
+    _mm_s13 = torch.ones(
+        _mm_E,
+        (2 * _mm_N) // _mm_BLK,
+        _mm_K // _mm_BLK,
+        dtype=torch.float32,
+        device=device,
+    )
+    _mm_w2 = torch.zeros(_mm_E, _mm_K, _mm_N, dtype=torch.float8_e4m3fn, device=device)
+    _mm_s2 = torch.ones(
+        _mm_E,
+        _mm_K // _mm_BLK,
+        _mm_N // _mm_BLK,
+        dtype=torch.float32,
+        device=device,
+    )
+    flashinfer.fused_moe.mono_moe(
+        _mm_act,
+        _mm_logits,
+        _mm_w13,
+        _mm_s13,
+        _mm_w2,
+        _mm_s2,
+        top_k=8,
+        scoring_func="softmax",
+        renormalize=True,
+    )
 
 # ── MoE FP8 (256 experts, 32 local, h=7168, i=2048) ─────────────────────────
 # routing_method_type: 0=Default, 1=Renormalize, 2=DeepSeekV3,
@@ -745,6 +917,84 @@ with contextlib.suppress(Exception):
         _last,
     )
 
+# nvfp4_quantize_append_paged_kv_cache: tuple packed cache plus scale cache.
+with contextlib.suppress(Exception):
+    from flashinfer import nvfp4_quantize_append_paged_kv_cache
+
+    _nqap_B, _nqap_H, _nqap_D, _nqap_PS = 2, 2, 64, 4
+    _nqap_nnz = 4
+    _nqap_k_cache = torch.zeros(
+        4, _nqap_PS, _nqap_H, _nqap_D // 2, dtype=torch.uint8, device=device
+    )
+    _nqap_v_cache = torch.zeros_like(_nqap_k_cache)
+    _nqap_k_sf = torch.zeros(
+        4,
+        _nqap_PS,
+        _nqap_H,
+        _nqap_D // 16,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _nqap_v_sf = torch.zeros_like(_nqap_k_sf)
+    _nqap_k = torch.randn(
+        _nqap_nnz, _nqap_H, _nqap_D, dtype=torch.bfloat16, device=device
+    )
+    _nqap_v = torch.randn_like(_nqap_k)
+    _nqap_bidx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
+    _nqap_pos = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
+    _nqap_kv_idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    _nqap_kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    _nqap_last = torch.tensor([2, 2], dtype=torch.int32, device=device)
+    nvfp4_quantize_append_paged_kv_cache(
+        _nqap_k,
+        _nqap_v,
+        _nqap_bidx,
+        _nqap_pos,
+        (_nqap_k_cache, _nqap_v_cache),
+        (_nqap_k_sf, _nqap_v_sf),
+        _nqap_kv_idx,
+        _nqap_kv_indptr,
+        _nqap_last,
+        1.0,
+        1.0,
+    )
+
+# nvfp4_quantize_append_paged_kv_cache_with_slot_mapping: flat slot mapping.
+with contextlib.suppress(Exception):
+    from flashinfer import nvfp4_quantize_append_paged_kv_cache_with_slot_mapping
+
+    _nqsm_H, _nqsm_D, _nqsm_PS = 2, 64, 4
+    _nqsm_nnz = 4
+    _nqsm_k_cache = torch.zeros(
+        4, _nqsm_PS, _nqsm_H, _nqsm_D // 2, dtype=torch.uint8, device=device
+    )
+    _nqsm_v_cache = torch.zeros_like(_nqsm_k_cache)
+    _nqsm_k_sf = torch.zeros(
+        4,
+        _nqsm_PS,
+        _nqsm_H,
+        _nqsm_D // 16,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _nqsm_v_sf = torch.zeros_like(_nqsm_k_sf)
+    _nqsm_k = torch.randn(
+        _nqsm_nnz, _nqsm_H, _nqsm_D, dtype=torch.bfloat16, device=device
+    )
+    _nqsm_v = torch.randn_like(_nqsm_k)
+    _nqsm_slots = torch.tensor([0, 1, 4, 5], dtype=torch.int32, device=device)
+    _nqsm_k_scale = torch.ones(1, dtype=torch.float32, device=device)
+    _nqsm_v_scale = torch.ones(1, dtype=torch.float32, device=device)
+    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        _nqsm_k,
+        _nqsm_v,
+        _nqsm_slots,
+        (_nqsm_k_cache, _nqsm_v_cache),
+        (_nqsm_k_sf, _nqsm_v_sf),
+        _nqsm_k_scale,
+        _nqsm_v_scale,
+    )
+
 # SegmentGEMMWrapper: small per-segment matmul.
 with contextlib.suppress(Exception):
     ws = torch.empty(WORKSPACE, dtype=torch.uint8, device=device)
@@ -801,7 +1051,7 @@ with contextlib.suppress(Exception):
     )
     flashinfer.chain_speculative_sampling(_draft_p, _draft_ids, _target_p)
 
-# rope_quantize_fp8 (GQA layout) + mla_rope_quantize_fp8 (MLA: num_k_heads=1).
+# rope_quantize_fp8 (GQA layout) + mla_rope_quantize_fp8 (MLA 2D latents).
 with contextlib.suppress(Exception):
     _rqf_nnz = 32
     _rqf_Hq, _rqf_Hk = 8, 2
@@ -843,7 +1093,7 @@ with contextlib.suppress(Exception):
         _rqf_k_nope,
         _rqf_cache,
         _rqf_pos,
-        is_neox=True,
+        is_neox=False,
     )
 
 with contextlib.suppress(Exception):
@@ -886,7 +1136,7 @@ with contextlib.suppress(Exception):
         _mrqf_k_nope,
         _mrqf_cache,
         _mrqf_pos,
-        is_neox=True,
+        is_neox=False,
     )
 
 # trtllm_batch_decode_with_kv_cache_mla (DeepSeek MLA decode, SM100/103 only).
@@ -1095,7 +1345,7 @@ with contextlib.suppress(Exception):
         _rqfap_kv_indptr,
         _rqfap_batch_indices,
         _rqfap_positions,
-        is_neox=True,
+        is_neox=False,
         page_size=_rqfap_PS,
         kv_layout="NHD",
     )

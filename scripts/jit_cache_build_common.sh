@@ -130,12 +130,13 @@ setup_sccache() {
   # Avoid leaking AWS credentials under set -x.
   local _sccache_xtrace=0
   case $- in *x*) _sccache_xtrace=1; set +x ;; esac
-  if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-    export SCCACHE_S3_NO_CREDENTIALS=true
-    echo "sccache mode: read-only (public bucket, no credentials)"
-  else
+  if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
     unset SCCACHE_S3_NO_CREDENTIALS
     echo "sccache mode: read-write"
+  else
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+    export SCCACHE_S3_NO_CREDENTIALS=true
+    echo "sccache mode: read-only (public bucket, no credentials)"
   fi
   (( _sccache_xtrace )) && set -x
 

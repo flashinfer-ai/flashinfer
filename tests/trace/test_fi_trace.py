@@ -17,6 +17,10 @@ limitations under the License.
 """Tests for flashinfer.fi_trace: definition JSON generation."""
 
 import json
+from contextlib import suppress
+from pathlib import Path
+
+import pytest
 import torch
 
 from flashinfer.fi_trace import fi_trace
@@ -39,6 +43,125 @@ def _check_defn(defn, op_type, fi_api_substr):
     )
     # Must be round-trippable through JSON
     json.dumps(defn)
+
+
+def test_trace_default_check():
+    from flashinfer.trace import default_check, default_tolerances, standard_check
+
+    assert default_tolerances(torch.bfloat16) == (1e-2, 1e-2)
+
+    ref = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    actual = ref + 1e-6
+    assert default_check([ref], [actual])
+    assert default_check({"out": ref}, {"out": actual})
+
+    opposite = -ref
+    assert not default_check(
+        [ref],
+        [opposite],
+        rtol=10.0,
+        atol=10.0,
+        max_mismatch_pct=100.0,
+        min_cos_sim=0.99,
+    )
+
+    ref_int = torch.tensor([1, 2, 3], dtype=torch.int32)
+    actual_int = torch.tensor([1, 2, 0], dtype=torch.int32)
+    assert default_check([ref_int], [actual_int], max_mismatch_pct=34.0)
+    assert standard_check([ref], [actual])
+
+
+def test_all_registered_trace_templates_have_check():
+    from flashinfer.api_logging import _TRACE_REGISTRY
+
+    import flashinfer.activation  # noqa: F401
+    import flashinfer.cascade  # noqa: F401
+    import flashinfer.decode  # noqa: F401
+    import flashinfer.fused_moe  # noqa: F401
+    import flashinfer.gdn_decode  # noqa: F401
+    import flashinfer.gdn_prefill  # noqa: F401
+    import flashinfer.gemm  # noqa: F401
+    import flashinfer.norm  # noqa: F401
+    import flashinfer.page  # noqa: F401
+    import flashinfer.prefill  # noqa: F401
+    import flashinfer.quantization  # noqa: F401
+    import flashinfer.rope  # noqa: F401
+    import flashinfer.sampling  # noqa: F401
+
+    with suppress(Exception):
+        import flashinfer.cudnn  # noqa: F401
+
+    missing = [
+        getattr(template, "name_prefix", None) or template.op_type
+        for _, template, _ in _TRACE_REGISTRY
+        if template.check is None
+    ]
+    assert not missing
+
+
+def test_norm_trace_check_tolerances_match_unit_tests():
+    from flashinfer.trace.templates.norm import (
+        fused_add_rmsnorm_quant_trace,
+        layernorm_trace,
+        rmsnorm_quant_trace,
+        rmsnorm_trace,
+    )
+
+    ref = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    assert rmsnorm_trace.check([ref], [ref + 5e-4])
+    assert not rmsnorm_trace.check([ref], [ref + 5e-3])
+
+    assert layernorm_trace.check([ref], [ref + 5e-3])
+    assert not layernorm_trace.check([ref], [ref + 5e-2])
+
+    assert rmsnorm_quant_trace.check([ref], [ref + 0.5])
+    assert not rmsnorm_quant_trace.check([ref], [ref + 4.0])
+
+    residual = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    assert fused_add_rmsnorm_quant_trace.check(
+        [ref, residual],
+        [ref + 0.5, residual + 5e-4],
+    )
+    assert not fused_add_rmsnorm_quant_trace.check(
+        [ref, residual],
+        [ref + 0.5, residual + 5e-3],
+    )
+
+
+def test_gemm_trace_check_tolerances_match_unit_tests():
+    from flashinfer.trace.templates.gemm import (
+        bmm_mxfp8_trace,
+        mm_bf16_trace,
+        mm_fp4_trace,
+        mm_mxfp8_trace,
+    )
+
+    ref = torch.tensor([1.0, 0.0], dtype=torch.float32)
+    assert mm_bf16_trace.check([ref], [torch.tensor([1.0, 0.05])])
+    assert not mm_bf16_trace.check([ref], [torch.tensor([0.0, 1.0])])
+
+    assert mm_mxfp8_trace.check([ref], [torch.tensor([1.0, 0.6])])
+    assert not mm_mxfp8_trace.check([ref], [torch.tensor([1.0, 0.7])])
+
+    assert mm_fp4_trace.check([ref], [torch.tensor([1.0, 0.2])])
+    assert not mm_fp4_trace.check([ref], [torch.tensor([1.0, 0.3])])
+
+    assert bmm_mxfp8_trace.check([ref], [torch.tensor([1.0, 0.45])])
+    assert not bmm_mxfp8_trace.check([ref], [torch.tensor([1.0, 0.6])])
+
+
+def test_attention_trace_check_tolerances_match_unit_tests():
+    from flashinfer.trace.templates.attention import (
+        single_decode_with_kv_cache_trace,
+        single_prefill_with_kv_cache_trace,
+    )
+
+    ref = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    assert single_decode_with_kv_cache_trace.check([ref], [ref + 5e-4])
+    assert not single_decode_with_kv_cache_trace.check([ref], [ref + 5e-3])
+
+    assert single_prefill_with_kv_cache_trace.check([ref], [ref + 5e-4])
+    assert not single_prefill_with_kv_cache_trace.check([ref], [ref + 5e-3])
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +188,8 @@ def test_rmsnorm_fi_trace():
     assert defn["inputs"]["weight"]["shape"] == ["hidden_size"]
     assert defn["outputs"]["output"]["shape"] == ["batch_size", "hidden_size"]
     assert defn["outputs"]["output"]["dtype"] == "bfloat16"
+    assert "check" in defn
+    assert "def _norm_check" in defn["check"]
 
 
 def test_rmsnorm_fi_trace_via_helper():
@@ -162,6 +287,135 @@ def test_mm_bf16_fi_trace():
     assert defn["inputs"]["A"]["shape"] == ["M", "K"]
     assert defn["inputs"]["B"]["shape"] == ["K", "N"]
     assert defn["outputs"]["C"]["shape"] == ["M", "N"]
+
+
+# ---------------------------------------------------------------------------
+# quantization
+# ---------------------------------------------------------------------------
+
+
+def test_nvfp4_kv_dequantize_paged_fi_trace():
+    import flashinfer
+
+    batch_size = 2
+    max_seq_len = 7
+    num_pages = 8
+    page_size = 4
+    num_heads = 2
+    k_head_dim = 64
+    v_head_dim = 128
+
+    for kv_layout in ("NHD", "HND"):
+        if kv_layout == "NHD":
+            k_cache_shape = (num_pages, page_size, num_heads, k_head_dim // 2)
+            v_cache_shape = (num_pages, page_size, num_heads, v_head_dim // 2)
+            k_scale_shape = (num_pages, page_size, num_heads, k_head_dim // 16)
+            v_scale_shape = (num_pages, page_size, num_heads, v_head_dim // 16)
+            expected_cache_shape = [
+                "num_pages",
+                "page_size",
+                "num_heads",
+                "k_packed_dim",
+            ]
+            expected_name = "nvfp4_kv_dequantize_paged"
+            expected_init_name = "_nvfp4_kv_dequantize_paged_nhd_init"
+        else:
+            k_cache_shape = (num_pages, num_heads, page_size, k_head_dim // 2)
+            v_cache_shape = (num_pages, num_heads, page_size, v_head_dim // 2)
+            k_scale_shape = (num_pages, num_heads, page_size, k_head_dim // 16)
+            v_scale_shape = (num_pages, num_heads, page_size, v_head_dim // 16)
+            expected_cache_shape = [
+                "num_pages",
+                "num_heads",
+                "page_size",
+                "k_packed_dim",
+            ]
+            expected_name = "nvfp4_kv_dequantize_paged_hnd"
+            expected_init_name = "_nvfp4_kv_dequantize_paged_hnd_init"
+
+        k_cache = torch.empty(k_cache_shape, dtype=torch.uint8)
+        v_cache = torch.empty(v_cache_shape, dtype=torch.uint8)
+        k_scales = torch.empty(k_scale_shape, dtype=torch.uint8).view(
+            torch.float8_e4m3fn
+        )
+        v_scales = torch.empty(v_scale_shape, dtype=torch.uint8).view(
+            torch.float8_e4m3fn
+        )
+        block_tables = torch.zeros(batch_size, 2, dtype=torch.int32)
+        seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32)
+        k_scale = torch.ones(1, dtype=torch.float32)
+        v_scale = torch.ones(1, dtype=torch.float32)
+        output_k = torch.empty(
+            batch_size, max_seq_len, num_heads, k_head_dim, dtype=torch.bfloat16
+        )
+        output_v = torch.empty(
+            batch_size, max_seq_len, num_heads, v_head_dim, dtype=torch.bfloat16
+        )
+
+        defn = flashinfer.nvfp4_kv_dequantize_paged.fi_trace(
+            paged_kv_cache=(k_cache, v_cache),
+            kv_cache_sf=(k_scales, v_scales),
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            output_k=output_k,
+            output_v=output_v,
+            kv_layout=kv_layout,
+        )
+        _check_defn(defn, "dequantize_fp4", "nvfp4_kv_dequantize_paged")
+        assert defn["name"].startswith(expected_name)
+        axes = defn["axes"]
+        assert axes["num_heads"]["value"] == num_heads
+        assert axes["k_head_dim"]["value"] == k_head_dim
+        assert axes["v_head_dim"]["value"] == v_head_dim
+        assert axes["page_size"]["value"] == page_size
+        assert axes["batch_size"]["type"] == "var"
+
+        assert defn["inputs"]["paged_k_cache"]["shape"] == expected_cache_shape
+        assert defn["outputs"]["output_k"]["dtype"] == "bfloat16"
+        assert "block_table_stride * page_size >= max_seq_len" in defn["constraints"]
+        assert "init" in defn
+
+        init_namespace = {}
+        exec(defn["init"], init_namespace)
+        dumped_init = init_namespace[expected_init_name]
+        dumped_init_inputs = dumped_init(
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            num_heads=num_heads,
+            k_head_dim=k_head_dim,
+            v_head_dim=v_head_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            device="cpu",
+        )
+        dumped_init_k_cache, dumped_init_v_cache = dumped_init_inputs["paged_kv_cache"]
+        dumped_init_k_scales, dumped_init_v_scales = dumped_init_inputs["kv_cache_sf"]
+        assert dumped_init_inputs["kv_layout"] == kv_layout
+        assert dumped_init_k_cache.shape == k_cache_shape
+        assert dumped_init_v_cache.shape == v_cache_shape
+        assert dumped_init_k_scales.shape == k_scale_shape
+        assert dumped_init_v_scales.shape == v_scale_shape
+
+        init_inputs = flashinfer.nvfp4_kv_dequantize_paged.fi_init(
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            num_heads=num_heads,
+            k_head_dim=k_head_dim,
+            v_head_dim=v_head_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            kv_layout=kv_layout,
+            device="cpu",
+        )
+        init_k_cache, init_v_cache = init_inputs["paged_kv_cache"]
+        init_k_scales, init_v_scales = init_inputs["kv_cache_sf"]
+        assert init_inputs["kv_layout"] == kv_layout
+        assert init_k_cache.shape == k_cache_shape
+        assert init_v_cache.shape == v_cache_shape
+        assert init_k_scales.shape == k_scale_shape
+        assert init_v_scales.shape == v_scale_shape
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +748,68 @@ def test_usecase_sampling_vocab_discovery():
     assert parsed["outputs"]["samples"]["dtype"] == "int64"
 
 
+def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
+    import flashinfer.mla
+
+    common = {
+        "kv_cache": torch.empty(4, 64, 576, dtype=torch.bfloat16),
+        "workspace_buffer": torch.empty(1024, dtype=torch.int8),
+        "qk_nope_head_dim": 512,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "block_tables": torch.zeros(2, 1, dtype=torch.int32),
+        "seq_lens": torch.full((2,), 64, dtype=torch.int32),
+        "max_seq_len": 64,
+    }
+
+    dense = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla.fi_trace(
+        query=torch.empty(2, 3, 128, 576, dtype=torch.bfloat16),
+        **common,
+    )
+    _check_defn(
+        dense,
+        "mla_paged",
+        "flashinfer.mla._core.trtllm_batch_decode_with_kv_cache_mla",
+    )
+    assert dense["name"].startswith("trtllm_batch_decode_mla_dense")
+    assert dense["inputs"]["query"]["shape"] == [
+        "batch_size",
+        "q_len_per_request",
+        "num_heads",
+        "head_dim_qk",
+    ]
+    assert dense["outputs"]["output"]["shape"] == [
+        "batch_size",
+        "q_len_per_request",
+        "num_heads",
+        "kv_lora_rank",
+    ]
+
+    ragged = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla.fi_trace(
+        query=torch.empty(5, 128, 576, dtype=torch.bfloat16),
+        cum_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
+        max_q_len=3,
+        **common,
+    )
+    _check_defn(
+        ragged,
+        "mla_paged",
+        "flashinfer.mla._core.trtllm_batch_decode_with_kv_cache_mla",
+    )
+    assert ragged["name"].startswith("trtllm_batch_decode_mla_ragged")
+    assert ragged["inputs"]["query"]["shape"] == [
+        "num_tokens",
+        "num_heads",
+        "head_dim_qk",
+    ]
+    assert ragged["outputs"]["output"]["shape"] == [
+        "num_tokens",
+        "num_heads",
+        "kv_lora_rank",
+    ]
+    assert ragged["inputs"]["max_q_len"]["shape"] is None
+
+
 # ---------------------------------------------------------------------------
 # JSON file output
 # ---------------------------------------------------------------------------
@@ -594,3 +910,30 @@ def test_fi_trace_filename_matches_definition_name(tmp_path):
     expected_file = tmp_path / f"{expected_name}.json"
     assert expected_file.exists()
     assert json.loads(expected_file.read_text())["name"] == expected_name
+
+
+def test_nvfp4_append_trace_json_init_is_self_contained():
+    trace_dir = Path(__file__).parent / "fi_trace_out"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cases = [
+        (
+            "nvfp4_quantize_append_paged_kv_cache_kv2_d64_pd32_sd4_ps4.json",
+            "_nvfp4_quantize_append_paged_kv_cache_init",
+        ),
+        (
+            "nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kv2_d64_pd32_sd4_ps4.json",
+            "_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init",
+        ),
+    ]
+    for filename, init_name in cases:
+        source = json.loads((trace_dir / filename).read_text())["init"]
+        namespace = {}
+        exec(source, namespace)
+        assert init_name in namespace
+        try:
+            result = namespace[init_name](nnz_kv=1, device=device)
+        except (RuntimeError, NotImplementedError, ValueError, ImportError) as exc:
+            if device == "cpu":
+                pytest.skip(f"{filename} init unsupported on CPU: {exc}")
+            raise
+        assert isinstance(result, dict)

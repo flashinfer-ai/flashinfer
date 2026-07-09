@@ -21,7 +21,6 @@ import torch
 from ..api_logging import flashinfer_api
 from ..utils import backend_requirement, supported_compute_capability
 from .cudnn import (
-    _CUDNN_MOE_BLOCK_SCALE_MIN_VERSION,
     _CUDNN_MOE_MIN_VERSION,
     _check_cudnn_version,
     _run_cudnn_moe_block_scale_grouped_gemm_fp4,
@@ -115,6 +114,9 @@ def grouped_mm_bf16(
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
         Backend selector.  Currently only ``"cudnn"`` is supported.
+    tactic : int
+        cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
+        plan; non-negative values select a specific plan.
 
     Returns
     -------
@@ -389,6 +391,9 @@ def grouped_mm_mxfp8(
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
         Backend selector.  Currently only ``"cudnn"`` is supported.
+    tactic : int
+        cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
+        plan; non-negative values select a specific plan.
 
     Returns
     -------
@@ -400,7 +405,7 @@ def grouped_mm_mxfp8(
         out_dtype = out.dtype
 
     if backend == "cudnn":
-        _check_cudnn_version(_CUDNN_MOE_BLOCK_SCALE_MIN_VERSION, "grouped_mm_mxfp8")
+        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_mxfp8")
         return _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
             a,
             b,
@@ -548,8 +553,15 @@ def grouped_mm_fp4(
         Pre-allocated output ``(m_out, n)``.
     out_dtype : torch.dtype
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
+    block_size : int
+        Block size used for the FP4 scale layout.  ``16`` selects NVFP4 (with
+        ``float8_e4m3fn`` scales) and ``32`` selects MXFP4 (with ``uint8``
+        scales).  Defaults to ``16``.
     backend : str
         Backend selector.  Currently only ``"cudnn"`` is supported.
+    tactic : int
+        cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
+        plan; non-negative values select a specific plan.
 
     Returns
     -------
@@ -561,7 +573,7 @@ def grouped_mm_fp4(
         out_dtype = out.dtype
 
     if backend == "cudnn":
-        _check_cudnn_version(_CUDNN_MOE_BLOCK_SCALE_MIN_VERSION, "grouped_mm_fp4")
+        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_fp4")
         return _run_cudnn_moe_block_scale_grouped_gemm_fp4(
             a,
             b,

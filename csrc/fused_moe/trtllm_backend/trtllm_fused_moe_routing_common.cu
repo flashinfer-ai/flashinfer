@@ -97,13 +97,14 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
                             (data.mPtrPermutedIdxSize != nullptr) &&
                             (data.mPtrExpertCounts != nullptr);
     bool useCoop = false;
+    CoopLaunchSMCounts coopLaunchSMCounts{0, 0};
     int numBlocksCoop = 0;
 
     if (canUseCoop) {
       // Number of blocks we can use in the cooperative kernel
       static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-      // WAR: Reserve 8 SMs for overlapping kernels.
-      numBlocksCoop = smCount - kReservedSMsForOverlapping;
+      coopLaunchSMCounts = getCoopLaunchSMCounts(smCount);
+      numBlocksCoop = coopLaunchSMCounts.moeSms;
       // Maximum number of tokens supported by the kernel using a cooperative launch.
       // The number of blocks must be:
       //   >= ⌈(numTokens * topK) / (MaxExpandedIdxPerThread * NumThreads)⌉
@@ -115,6 +116,7 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
     if (useCoop) {
       // Coop path: cooperative launch fuses histogram + offsets (more efficient).
       // The coop kernel atomicAdds to mPtrExpertCounts, so we must zero it first.
+      logCoopLaunchSMCounts(coopLaunchSMCounts);
       routingCustom::launchInitExpertCounts(customData, numThreadsHist, stream);
       routingCustom::launchCoopKernel(customData, numBlocksCoop, numThreadsHist, stream);
     } else {

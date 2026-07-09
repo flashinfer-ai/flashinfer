@@ -59,16 +59,19 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
+    _check_workspace_buffer_alignment,
     check_shape_dtype_device,
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
+    _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
     get_compute_capability,
     get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
     is_float8,
     is_sm100a_supported,
     is_sm110a_supported,
@@ -243,15 +246,47 @@ def get_trtllm_gen_prefill_module():
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
         is_causal: bool = True,
+        lse: Optional[torch.Tensor] = None,
+        multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
             out = torch.empty_like(query)
+        required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, query.size(1), sm_count
+        )
+        if multi_ctas_kv_counter_buffer is None:
+            multi_ctas_kv_counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+                batch_size, query.size(1), sm_count, query.device
+            )
+        elif multi_ctas_kv_counter_buffer.device != query.device:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer must be on the same device as query"
+            )
+        else:
+            counter_buffer_bytes = (
+                multi_ctas_kv_counter_buffer.numel()
+                * multi_ctas_kv_counter_buffer.element_size()
+            )
+            if counter_buffer_bytes < required_counter_bytes:
+                raise ValueError(
+                    "multi_ctas_kv_counter_buffer is too small: got "
+                    f"{counter_buffer_bytes} bytes, need {required_counter_bytes} bytes"
+                )
         if isinstance(bmm1_scale, torch.Tensor):
             assert bmm1_scale.dtype == torch.float32
             bmm1_scale = bmm1_scale * log2e
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
+        if lse is not None:
+            check_shape_dtype_device(
+                lse, (query.size(0), query.size(1)), torch.float32, query.device, "lse"
+            )
+            lse_stride_tokens = lse.stride(0)
+            lse_stride_heads = lse.stride(1)
+        else:
+            lse_stride_tokens = 0
+            lse_stride_heads = 0
         op.trtllm_paged_attention_context(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -259,6 +294,7 @@ def get_trtllm_gen_prefill_module():
             k_cache,
             v_cache,
             workspace_buffer,
+            multi_ctas_kv_counter_buffer,
             block_tables,
             seq_lens,
             max_q_len,
@@ -281,6 +317,9 @@ def get_trtllm_gen_prefill_module():
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
             is_causal,
+            lse,
+            lse_stride_tokens,
+            lse_stride_heads,
         )
         return out
 
@@ -428,12 +467,14 @@ def get_batch_prefill_module(backend, *args):
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
         plan_func = module.plan
+        workspace_size_func = None
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
         uri = get_batch_prefill_uri(backend, *args)
         module = gen_batch_prefill_module(backend, *args).build_and_load()
         plan_func = module.plan
+        workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
 
@@ -611,6 +652,7 @@ def get_batch_prefill_module(backend, *args):
         mutates_args=(
             "float_workspace_buffer",
             "int_workspace_buffer",
+            "multi_ctas_kv_counter_buffer",
             "paged_k_cache",
             "paged_v_cache",
             "o",
@@ -664,9 +706,9 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
-            assert maybe_lse is None
             assert num_qo_heads is not None
             assert num_kv_heads is not None
             assert block_tables is not None
@@ -677,6 +719,7 @@ def get_batch_prefill_module(backend, *args):
             assert cum_seq_lens_q is not None
             assert cum_seq_lens_kv is not None
             assert enable_pdl is not None
+            assert multi_ctas_kv_counter_buffer is not None
             assert workspace_size > 0, "workspace_size must be greater than 0"
             o = paged_run_func(
                 q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
@@ -702,6 +745,8 @@ def get_batch_prefill_module(backend, *args):
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
                 is_causal=mask_mode != MaskMode.NON_CAUSAL.value,
+                lse=maybe_lse,
+                multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -843,6 +888,7 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -852,6 +898,7 @@ def get_batch_prefill_module(backend, *args):
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
     return SimpleNamespace(
         plan=plan_func,
+        workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
     )
@@ -860,6 +907,7 @@ def get_batch_prefill_module(backend, *args):
 @functools.cache
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     plan_func = jit_module.plan
+    workspace_size_func = getattr(jit_module, "workspace_size", None)
     ragged_run_func = jit_module.ragged_run
     paged_run_func = jit_module.paged_run
 
@@ -1001,6 +1049,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
     return SimpleNamespace(
         plan=plan_func,
+        workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
     )
@@ -1018,6 +1067,45 @@ def single_prefill_with_kv_cache_with_jit_module(
     window_left: int = -1,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    r"""Single-request prefill / append attention using a pre-compiled JIT module.
+
+    Low-level entry point used by :func:`single_prefill_with_kv_cache` after backend
+    dispatch; user code should normally call ``single_prefill_with_kv_cache`` directly.
+    Exposed for advanced users who already hold a compiled JIT module (for example to
+    customize the attention variant via extra kernel arguments).
+
+    Parameters
+    ----------
+    jit_module : Any
+        Compiled JIT module returned by one of the ``gen_*_module`` factories.
+    q : torch.Tensor
+        Query tensor, shape ``[qo_len, num_qo_heads, head_dim_qk]``.
+    k : torch.Tensor
+        Key tensor, shape ``[kv_len, num_kv_heads, head_dim_qk]`` (``NHD``) or
+        ``[num_kv_heads, kv_len, head_dim_qk]`` (``HND``).
+    v : torch.Tensor
+        Value tensor, layout matches ``k``; last dimension may differ when
+        ``head_dim_vo != head_dim_qk``.
+    *args
+        Extra positional arguments forwarded to the JIT module's ``run`` symbol
+        (e.g. soft-cap, sink, or custom-mask buffers required by the chosen variant).
+    kv_layout : str
+        Layout of ``k`` and ``v``, either ``"NHD"`` or ``"HND"``.  Defaults to ``"NHD"``.
+    mask_mode : int
+        Mask mode, one of the values defined by :class:`~flashinfer.utils.MaskMode`.
+        Defaults to ``MaskMode.NON_CAUSAL.value``.
+    window_left : int
+        Left window size for sliding-window attention; ``-1`` disables it.
+    return_lse : bool
+        Whether to allocate and return the log-sum-exp tensor.  Defaults to ``False``.
+
+    Returns
+    -------
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If ``return_lse`` is ``False``, the attention output tensor.  Otherwise the
+        ``(output, lse)`` pair, where ``lse`` has shape
+        ``[qo_len, num_qo_heads]`` and dtype ``float32``.
+    """
     device = q.device
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
@@ -1296,6 +1384,9 @@ def single_prefill_with_kv_cache(
         if scale_v is None:
             scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
 
+    # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim.
+    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+
     if backend == "auto":
         backend = determine_attention_backend(
             q.device,
@@ -1304,6 +1395,8 @@ def single_prefill_with_kv_cache(
             packed_custom_mask is not None,  # use_custom_mask
             q.dtype,
             k.dtype,
+            head_dim_qk=q.shape[-1],
+            head_dim_vo=out_head_dim,
         )
 
     # Unpack NVFP4 scale factors
@@ -1317,8 +1410,6 @@ def single_prefill_with_kv_cache(
     # o_dtype should be provided for FP8 attention
     if o_dtype is None:
         o_dtype = q.dtype
-    # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim
-    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
     out = torch.empty(q.shape[:-1] + (out_head_dim,), dtype=o_dtype, device=q.device)
 
     module = get_single_prefill_module(
@@ -1372,6 +1463,21 @@ def single_prefill_with_kv_cache(
 single_prefill_with_kv_cache_return_lse = functools.partial(
     single_prefill_with_kv_cache, return_lse=True
 )
+single_prefill_with_kv_cache_return_lse.__doc__ = """Convenience wrapper for :func:`single_prefill_with_kv_cache` that always returns LSE.
+
+    Equivalent to calling
+    :func:`single_prefill_with_kv_cache` with ``return_lse=True``; accepts the
+    same arguments and forwards them unchanged. See
+    :func:`single_prefill_with_kv_cache` for the full parameter list (including
+    FP8 / NVFP4 quantization scales such as ``scale_q``, ``scale_k``,
+    ``scale_v``, ``o_dtype``, ``kv_cache_sf``, ``k_scale``, and ``v_scale``).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        A pair ``(output, lse)`` where ``output`` is the attention output and
+        ``lse`` is the log-sum-exp tensor used for cascade merging.
+    """
 
 
 def _compute_page_mask_indptr(
@@ -1522,7 +1628,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         float_workspace_buffer : torch.Tensor
             The user reserved workspace buffer used to store intermediate attention results in
             split-k algorithm. The recommended size is 128MB, the device of the workspace buffer
-            should be the same as the device of the input tensors.
+            should be the same as the device of the input tensors. The buffer must be 16-byte
+            aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
@@ -1579,6 +1686,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
         """
+        _check_workspace_buffer_alignment(
+            float_workspace_buffer, "float_workspace_buffer"
+        )
         _check_kv_layout(kv_layout)
 
         if backend == "cute-dsl":
@@ -1610,6 +1720,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             * self._float_workspace_buffer.element_size()
         )
         self.device = float_workspace_buffer.device
+        self._trtllm_gen_multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
         self._kv_lens_buffer = torch.empty(
             (32768,), dtype=torch.int32, device=self.device
@@ -1695,6 +1806,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The new int workspace buffer, the device of the new int workspace buffer should
             be the same as the device of the input tensors.
         """
+        _check_workspace_buffer_alignment(
+            float_workspace_buffer, "float_workspace_buffer"
+        )
+        _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
@@ -1703,6 +1818,273 @@ class BatchPrefillWithPagedKVCacheWrapper:
             device="cpu",
             pin_memory=True,
         )
+
+    @flashinfer_api
+    def workspace_size(
+        self,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        page_size: int,
+        head_dim_vo: Optional[int] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal: bool = False,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+        q_data_type: Union[str, torch.dtype] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
+        prefix_len_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_len: int = 0,
+        max_item_len_ptr: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        seq_lens_q: Optional[torch.Tensor] = None,
+        block_tables: Optional[torch.Tensor] = None,
+        max_token_per_sequence: Optional[int] = None,
+        max_sequence_kv: Optional[int] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
+    ) -> Tuple[int, int]:
+        r"""Return the caller-owned workspace size required by :meth:`plan`.
+
+        The returned tuple is ``(float_workspace_size, int_workspace_size)`` in
+        bytes.  The inputs follow :meth:`plan`; host-side planning tensors such
+        as ``qo_indptr`` and ``paged_kv_indptr`` are copied to CPU in the same
+        way as :meth:`plan`.  The wrapper's float workspace buffer is only used
+        as the device/stream selector for the underlying module query.  This
+        method does not allocate buffers and does not mutate cached plan state.
+
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+        paged_kv_indptr : torch.Tensor
+            The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
+        paged_kv_indices : torch.Tensor
+            The page indices of the paged kv-cache, shape: ``[paged_kv_indptr[-1]]``.
+        paged_kv_last_page_len : torch.Tensor
+            The number of entries in the last page of each request in the paged
+            kv-cache, shape: ``[batch_size]``.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim_qk : int
+            The dimension of the query/key heads.
+        page_size : int
+            The size of each page in the paged kv-cache.
+        head_dim_vo : Optional[int]
+            The dimension of the value/output heads. If not provided, defaults to
+            ``head_dim_qk``.
+        custom_mask : Optional[torch.Tensor]
+            The flattened boolean mask tensor; when provided the packed mask is
+            generated internally. See :meth:`plan` for the full description.
+        packed_custom_mask : Optional[torch.Tensor]
+            The 1D packed uint8 mask tensor. If provided, ``custom_mask`` is ignored.
+        causal : bool
+            Whether to apply a causal mask. Defaults to ``False``.
+        pos_encoding_mode : str
+            The position encoding applied inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+            Defaults to ``NONE``.
+        use_fp16_qk_reduction : bool
+            Whether to use fp16 for qk reduction. Defaults to ``False``.
+        sm_scale : Optional[float]
+            Softmax scale. If ``None``, defaults to ``1.0 / sqrt(head_dim_qk)``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.),
+            if not provided, will be set to ``0``.
+        rope_scale : Optional[float]
+            Scale factor applied during RoPE interpolation. Defaults to ``1.0`` when ``None``.
+        rope_theta : Optional[float]
+            Base value for the RoPE frequencies. Defaults to ``1e4`` when ``None``.
+        q_data_type : Union[str, torch.dtype]
+            The data type of the query tensor. Defaults to ``torch.float16``.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If ``None``, will be set to ``q_data_type``.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If ``None``, will be set to ``q_data_type``.
+        prefix_len_ptr : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the prefix length of each prompt,
+            shape: ``[batch_size]``.
+        token_pos_in_items_ptr : Optional[torch.Tensor]
+            A uint16 1D tensor indicating the token position of each item within its item.
+        token_pos_in_items_len : int
+            Zero-padding length for ``token_pos_in_items_ptr``. Defaults to ``0``.
+        max_item_len_ptr : Optional[torch.Tensor]
+            A uint16 vector containing the max token length of all items for each prompt.
+        seq_lens : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt,
+            shape: ``[batch_size]``.
+        seq_lens_q : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the q sequence length of each prompt,
+            shape: ``[batch_size]``.
+        block_tables : Optional[torch.Tensor]
+            A uint32 2D tensor indicating the block table of each prompt,
+            shape: ``[batch_size, max_num_blocks_per_seq]``.
+        max_token_per_sequence : Optional[int]
+            Required for cuDNN backend. The scalar max token length of each sequence.
+        max_sequence_kv : Optional[int]
+            Maximum number of KV tokens per sequence for cuDNN backend.
+        fixed_split_size : Optional[int]
+            The fixed split size for split-kv prefill, in pages.
+        disable_split_kv : bool
+            Whether to disable the split-kv. Defaults to ``False``.
+
+        Returns
+        -------
+        Tuple[int, int]
+            ``(float_workspace_size, int_workspace_size)`` in bytes.
+
+        Example
+        -------
+        >>> float_bytes, int_bytes = wrapper.workspace_size(...)
+        >>> wrapper.reset_workspace_buffer(
+        ...     torch.empty(float_bytes, dtype=torch.uint8, device="cuda"),
+        ...     torch.empty(int_bytes, dtype=torch.uint8, device="cuda"),
+        ... )
+        >>> wrapper.plan(...)
+        """
+        _check_workspace_buffer_alignment(
+            self._float_workspace_buffer, "float_workspace_buffer"
+        )
+        del (
+            block_tables,
+            max_item_len_ptr,
+            max_token_per_sequence,
+            prefix_len_ptr,
+            rope_scale,
+            rope_theta,
+            seq_lens_q,
+            sm_scale,
+            token_pos_in_items_len,
+            token_pos_in_items_ptr,
+        )
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        if head_dim_vo is None:
+            head_dim_vo = head_dim_qk
+        if fixed_split_size is None:
+            fixed_split_size = -1
+
+        batch_size = len(qo_indptr) - 1
+        qo_indptr_host = qo_indptr.to("cpu")
+        total_num_rows = int(qo_indptr_host[-1])
+        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+        paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
+        if seq_lens is None:
+            kv_lens_arr_host = get_seq_lens(
+                paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
+            )
+        else:
+            kv_lens_arr_host = seq_lens.cpu().flatten()
+
+        if self.is_cuda_graph_enabled:
+            if batch_size != self._fixed_batch_size:
+                raise ValueError(
+                    "The batch size should be fixed during the lifecycle of the wrapper in "
+                    "cuda graph mode, the runtime batch size {} mismatches the batch size {} "
+                    " set during initialization.".format(
+                        batch_size, self._fixed_batch_size
+                    )
+                )
+            if len(paged_kv_indices) > len(self._paged_kv_indices_buf):
+                raise ValueError(
+                    "The length of paged_kv_indices exceeds the allocated buffer size."
+                )
+            if (
+                self._max_total_num_rows is not None
+                and total_num_rows > self._max_total_num_rows
+            ):
+                raise ValueError(
+                    "The total number of rows in qo_indptr {} in cuda graph mode cannot "
+                    "exceed the number of rows set during initialization {}.".format(
+                        total_num_rows, self._max_total_num_rows
+                    )
+                )
+
+        use_custom_mask = custom_mask is not None or packed_custom_mask is not None
+        backend = self._backend
+        if self._jit_module is not None:
+            module = self._jit_module
+        else:
+            if backend == "auto":
+                backend = determine_attention_backend(
+                    self.device,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    use_fp16_qk_reduction,
+                    use_custom_mask,
+                    q_data_type,
+                    kv_data_type,
+                )
+            if backend == "cudnn":
+                raise NotImplementedError(
+                    "workspace_size is not available for cudnn prefill backend"
+                )
+            module = get_batch_prefill_module(
+                backend,
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+                paged_kv_indptr.dtype,
+                head_dim_qk,
+                head_dim_vo,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left >= 0,
+                logits_soft_cap > 0,
+                use_fp16_qk_reduction,
+            )
+        if module.workspace_size is None:
+            raise NotImplementedError(
+                f"workspace_size is not available for prefill backend {backend!r}"
+            )
+
+        del max_sequence_kv
+        total_num_rows_for_plan = self._max_total_num_rows or total_num_rows
+        args = [
+            self._float_workspace_buffer,
+            qo_indptr_host,
+            paged_kv_indptr_host,
+            kv_lens_arr_host,
+            total_num_rows_for_plan,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            self.is_cuda_graph_enabled,
+            head_dim_qk,
+            head_dim_vo,
+            causal,
+            window_left,
+        ]
+        if backend == "fa2":
+            args.append(fixed_split_size)
+            args.append(disable_split_kv)
+            args.append(0)  # num_colocated_ctas
+        float_workspace_size, int_workspace_size = module.workspace_size(*args)
+        return int(float_workspace_size), int(int_workspace_size)
 
     @flashinfer_api
     def plan(
@@ -1865,6 +2247,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_workspace_buffer_alignment(
+            self._float_workspace_buffer, "float_workspace_buffer"
+        )
+        _check_workspace_buffer_alignment(
+            self._int_workspace_buffer, "int_workspace_buffer"
+        )
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -2021,6 +2409,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
                 )
             if self._backend not in ("cudnn", "trtllm-fmhav2"):
                 # trtllm-fmhav2 has its own module accessor; the generic batch_prefill module
@@ -2044,6 +2434,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
+            # Allocated once per plan and reused across run() launches; the
+            # trtllm-gen kernel self-resets the counters after each launch.
+            self._trtllm_gen_multi_ctas_kv_counter_buffer = (
+                _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+                    batch_size,
+                    num_qo_heads,
+                    get_device_sm_count(self.device),
+                    self.device,
+                )
+            )
             if logits_soft_cap != 0.0:
                 raise ValueError(
                     "logits_soft_cap must be 0.0 for trtllm-gen paged KV cache"
@@ -2392,6 +2792,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        window_left : Optional[int]
+            Per-call override for the left (inclusive) sliding-window size.  When
+            ``None``, the value supplied to :meth:`plan` is used.  Pass ``-1`` to
+            disable the sliding window for this call.
+        sinks : Optional[torch.Tensor]
+            Per-head attention-sink logits.  When provided, the kernel applies the
+            attention-with-sink variant: an additional virtual token whose logit is
+            ``sinks[head_idx]`` is appended to each row of the softmax denominator.
+            Shape: ``[num_qo_heads]``, dtype ``float32``.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV cache. Accepts the same formats as
             ``paged_kv_cache``:
@@ -2414,6 +2823,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             to HND internally (incurring a copy). Use ``HND`` for better performance.
 
             Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
+        skip_softmax_threshold_scale_factor : Optional[float]
+            Threshold scale factor for skipping softmax operations.  Providing a
+            value enables skip-softmax sparsity as described in
+            https://arxiv.org/abs/2512.12087.  Defaults to ``None`` (standard
+            attention).  Higher values yield faster kernels at the cost of accuracy;
+            the effective threshold equals the supplied factor divided by the
+            context length.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2689,8 +3105,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     value_block_scales,
                     skip_softmax_threshold_scale_factor,
                     True,  # uses_shared_paged_kv_idx
+                    self._trtllm_gen_multi_ctas_kv_counter_buffer,
                 ]
 
+            if self._backend == "trtllm-gen":
+                assert self._trtllm_gen_multi_ctas_kv_counter_buffer is not None
             assert self._cached_module is not None, "cached module is not initialized"
             self._cached_module.paged_run(*run_args)
 
@@ -2863,7 +3282,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         float_workspace_buffer : torch.Tensor
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
-            buffer should be the same as the device of the input tensors.
+            buffer should be the same as the device of the input tensors. The buffer must be
+            16-byte aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
@@ -3455,6 +3875,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
                 )
 
             get_module_args = (
@@ -3630,6 +4052,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
+            Per-block scale factors for NVFP4 KV input.  Accepts either a single
+            packed scale tensor or a ``(k_scales, v_scales)`` tuple matching the
+            structure expected by the chosen backend.  When ``None`` (default), the
+            kernel runs without NVFP4 KV scaling.  See
+            :func:`flashinfer.fp4_quantization.nvfp4_quantize` for layout details.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4200,6 +4628,10 @@ def trtllm_ragged_attention_deepseek(
         enable pdl
     is_causal : bool
         is causal
+    return_lse : bool
+        Whether to allocate and return the log-sum-exp tensor in addition to the
+        attention output.  When ``True`` the function returns
+        ``(out, lse)``; when ``False`` only ``out`` is returned.
     attention_sinks : Optional[torch.Tensor]
         attention sinks
     skip_softmax_threshold_scale_factor : Optional[float]
@@ -4212,6 +4644,16 @@ def trtllm_ragged_attention_deepseek(
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+    sage_attn_sfs : Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]
+        SageAttention scale-factor tensors for the four sub-blocks
+        ``(q_sf, k_sf, v_block_sum, p_block_sum)``.  Defaults to ``(None, None,
+        None, None)`` which disables SageAttention.  Currently only consulted by
+        the ``trtllm-gen`` backend.
+    num_elts_per_sage_attn_blk : Tuple[int, int, int, int]
+        Per-block element counts for the SageAttention scale-factor tensors,
+        matching the order of ``sage_attn_sfs``.  Defaults to ``(0, 0, 0, 0)``,
+        which disables SageAttention.  Only consulted when ``sage_attn_sfs``
+        contains non-``None`` tensors.
     backend : str
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
 
@@ -4406,7 +4848,12 @@ def trtllm_batch_context_with_kv_cache(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     uses_shared_paged_kv_idx: bool = True,
     causal: bool = True,
-) -> Union[torch.Tensor, FP4Tensor]:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+) -> Union[
+    torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
+]:
     """
     Parameters
     ----------
@@ -4423,8 +4870,8 @@ def trtllm_batch_context_with_kv_cache(
 
         - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint
         - The head and batch/page dims can have arbitrary strides.
-    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
-        workspace
+    workspace_buffer : torch.Tensor
+        Workspace used for trtllm-gen softmax stats/scratch.
     block_tables : torch.Tensor
         Page table of kv cache.
         When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
@@ -4507,13 +4954,29 @@ def trtllm_batch_context_with_kv_cache(
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
     causal : bool = True
-        Whether to apply a causal mask. This trailing parameter preserves existing positional
-        callers. Set to ``False`` to request dense / bidirectional attention. For the TRTLLM-gen
-        paged context path, non-causal currently requires ``window_left == -1``.
+        Whether to apply a causal mask. Set to ``False`` to request dense / bidirectional
+        attention. For the TRTLLM-gen paged context path, non-causal currently requires
+        ``window_left == -1``.
+    lse : Optional[torch.Tensor] = None
+        Optional pre-allocated buffer for Log-Sum-Exp values. Must have shape
+        ``[num_tokens, num_qo_heads]`` with dtype ``torch.float32``. If provided,
+        the tensor is filled regardless of :attr:`return_lse`. If ``return_lse`` is
+        True and this is None, a buffer will be allocated.
+    return_lse : bool = False
+        Whether to return Log-Sum-Exp values. When True, returns ``(out, lse)``.
+    multi_ctas_kv_counter_buffer : Optional[torch.Tensor] = None
+        Optional separate trtllm-gen multi-CTA KV counter buffer. If not provided,
+        FlashInfer creates a fresh zeroed internal buffer. When provided, it must be
+        zero-initialized at allocation (e.g. via ``torch.zeros``); the kernel
+        self-resets the counters after each launch, so it does not need to be
+        re-zeroed between calls.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
         output torch.Tensor or FP4Tensor.
+    lse : torch.Tensor, optional
+        Only returned when ``return_lse`` is True. Shape
+        ``[num_tokens, num_qo_heads]`` with dtype ``torch.float32``.
     """
 
     if enable_pdl is None:
@@ -4644,6 +5107,42 @@ def trtllm_batch_context_with_kv_cache(
         assert bmm2_scale.dtype == torch.float32
     _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+
+    num_qo_heads = query.size(1)
+    required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    if multi_ctas_kv_counter_buffer is None:
+        multi_ctas_kv_counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+            batch_size, num_qo_heads, sm_count, query.device
+        )
+    elif multi_ctas_kv_counter_buffer.device != query.device:
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer must be on the same device as query"
+        )
+    else:
+        counter_buffer_bytes = (
+            multi_ctas_kv_counter_buffer.numel()
+            * multi_ctas_kv_counter_buffer.element_size()
+        )
+        if counter_buffer_bytes < required_counter_bytes:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is too small: got "
+                f"{counter_buffer_bytes} bytes, need {required_counter_bytes} bytes"
+            )
+    lse_shape = (query.size(0), num_qo_heads)
+    if lse is not None:
+        check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+        lse_stride_tokens = lse.stride(0)
+        lse_stride_heads = lse.stride(1)
+    elif return_lse:
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+        lse_stride_tokens = lse.stride(0)
+        lse_stride_heads = lse.stride(1)
+    else:
+        lse_stride_tokens = 0
+        lse_stride_heads = 0
+
     run_func(
         out,
         out_scale_factor,
@@ -4651,6 +5150,7 @@ def trtllm_batch_context_with_kv_cache(
         k_cache,
         v_cache,
         workspace_buffer,
+        multi_ctas_kv_counter_buffer,
         block_tables,
         seq_lens,
         max_q_len,
@@ -4673,12 +5173,18 @@ def trtllm_batch_context_with_kv_cache(
         skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx,
         causal,
+        lse,
+        lse_stride_tokens,
+        lse_stride_heads,
     )
-    return (
+    result_out = (
         out
         if out_dtype != "nvfp4"
         else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
     )
+    if return_lse:
+        return result_out, lse
+    return result_out
 
 
 @functools.cache
@@ -4856,7 +5362,7 @@ def trtllm_fmha_v2_prefill(
           ``[num_tokens, num_heads, head_dim]`` and K, V have shape
           ``[num_tokens, num_kv_heads, head_dim]``.
     workspace_buffer
-        The workspace buffer. Must be initialized to 0 for its first use.
+        The workspace buffer used for trtllm-gen softmax stats/scratch.
     seq_lens
         The KV sequence length of each request, shape: ``[batch_size]``.
     max_q_len
@@ -4897,6 +5403,9 @@ def trtllm_fmha_v2_prefill(
     chunked_attention_size
         The chunked attention size. Defaults to ``0``, which means no chunked attention.
         Only effective when :attr:`mask_mode` is ``chunked``. Must be a power of 2.
+        Chunked-causal masking is implemented only by the warp-specialized SM90
+        (Hopper) kernels; it is **not supported on SM120 (Blackwell)**, where the
+        tiled kernels honor sliding-window causal (``window_left``) only.
     save_softmax_stats
         Whether to save the softmax statistics. Defaults to ``False``.
     skip_softmax_threshold_scale_factor
@@ -4996,18 +5505,24 @@ def trtllm_fmha_v2_prefill(
     uses_chunked = chunked_attention_size is not None and chunked_attention_size > 0
     is_non_causal = mask_mode is not None and mask_mode.lower() == "padding"
 
-    if (uses_sliding_window or uses_chunked) and is_sm12x_supported(query.device):
-        feature = "Sliding window" if uses_sliding_window else "Chunked"
-        raise ValueError(
-            f"{feature} attention is not yet supported for FMHAv2 on SM120 (Blackwell). "
-            "Only CAUSAL masks are available. "
-        )
-
     if (uses_sliding_window or uses_chunked) and is_non_causal:
         feature = "Sliding window" if uses_sliding_window else "Chunked"
         raise ValueError(
             f"{feature} attention requires causal masking. "
             f"The underlying kernel only supports SLIDING_OR_CHUNKED_CAUSAL mode. "
+        )
+
+    # Chunked-causal masking is only implemented by the warp-specialized (SM90)
+    # kernels. The non-warp-specialized "tiled" kernels used on SM120 honor
+    # ``sliding_window_size`` only and silently ignore ``chunked_attention_size``,
+    # so reject chunked attention here rather than returning wrong results.
+    # Sliding-window causal (``window_left``) IS supported on SM120.
+    if uses_chunked and is_sm12x_supported(query.device):
+        raise ValueError(
+            "Chunked-causal attention (chunked_attention_size > 0) is not "
+            "supported for FMHAv2 on SM120 (Blackwell). The SM120 tiled kernels "
+            "implement sliding-window causal only. Use window_left for "
+            "sliding-window masking, or run chunked attention on SM90 (Hopper)."
         )
 
     # Determine output dtype
@@ -5031,22 +5546,11 @@ def trtllm_fmha_v2_prefill(
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
     if is_e4m3:
-        logging.warning("The FP8 (e4m3) kernels are currently known to hang on SM90.")
         if is_sm12x_supported(query.device):
             raise ValueError(
                 "FP8 (e4m3) is not yet supported for FMHAv2 on SM120 (Blackwell). "
                 "Use fp16 or bf16 instead."
             )
-        if uses_sliding_window and input_layout in ("PACKED_QKV", "CONTIGUOUS_Q_KV"):
-            _num_kv_heads = (
-                num_qo_heads if input_layout == "PACKED_QKV" else k_cache.shape[2]
-            )
-            if batch_size == 16 and _num_kv_heads == 4 and head_dim_v == 256:
-                raise ValueError(
-                    "FP8 (e4m3) sliding window attention with batch_size=16, "
-                    "num_kv_heads=4, head_dim=256 is not supported for "
-                    f"{input_layout} layout due to a known issue."
-                )
     # Always pass 1.0: the C++ auto-detect (scale_softmax == 0.0) handles FP16/INT8/E4M3
     # but has no branch for BF16, where 0.0 would zero out the softmax output.
     scale_softmax = 1.0

@@ -22,6 +22,7 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import (
     is_sm90a_supported,
     is_sm100a_supported,
@@ -36,10 +37,17 @@ from flashinfer import (
     mxfp8_quantize,
     mxfp4_dequantize_host,
 )
+from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
+
+from . import utils as moe_utils
+
+pytestmark = pytest.mark.solo
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
+
+set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 
 def dynamic_per_tensor_fp8_quant(x: torch.tensor) -> tuple[torch.tensor, torch.tensor]:
@@ -168,7 +176,9 @@ def compute_routing(
     return routing_weights, selected_experts
 
 
-def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, activation_type):
+def torch_moe_nvfp4(
+    a, w1, w2, topk, topk_weight, topk_ids, activation_type, swiglu_limit=None
+):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -185,6 +195,20 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, activation_type):
             assert m % 2 == 0
             w1_expert, w3_expert = weight[m // 2 :, :], weight[: m // 2, :]
             return F.silu(a[mask] @ w1_expert.t()) * (a[mask] @ w3_expert.t())
+
+    elif activation_type == ActivationType.SwigluStep:
+        # Step-3 clipped SwiGLU: min(silu(gate), limit) * clamp(up, -limit, limit).
+        # Matches vLLM's SwigluStepAndMul reference (limit defaults to 7.0).
+        assert swiglu_limit is not None, "SwigluStep requires swiglu_limit"
+        limit = float(swiglu_limit)
+
+        def act(weight, mask):
+            m = weight.shape[0]
+            assert m % 2 == 0
+            w1_expert, w3_expert = weight[m // 2 :, :], weight[: m // 2, :]
+            gate = F.silu(a[mask] @ w1_expert.t()).clamp(max=limit)
+            up = (a[mask] @ w3_expert.t()).clamp(min=-limit, max=limit)
+            return gate * up
 
     elif activation_type == ActivationType.Relu2:
 
@@ -295,6 +319,7 @@ def compute_with_experts(
     alpha=None,
     beta=None,
     limit=None,
+    activation_type=ActivationType.Swiglu,
 ):
     results = torch.zeros_like(x)
     for expert_id in range(num_experts):
@@ -309,7 +334,20 @@ def compute_with_experts(
         w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
 
         expert_inputs = x[batch_idx]
-        if alpha is not None and limit is not None and beta is not None:
+        if activation_type == ActivationType.SwigluStep:
+            # Step-3 clipped SwiGLU: min(silu(gate), limit) * clamp(up, -limit, limit).
+            # Defaults to the kernel's default limit (7.0) when not otherwise specified.
+            # swiglu_limit is per-expert, so index by expert_id when a tensor/list is given.
+            if limit is None:
+                step_limit = 7.0
+            elif hasattr(limit, "__getitem__"):
+                step_limit = limit[expert_id]
+            else:
+                step_limit = limit
+            x1 = F.silu(expert_inputs @ w1_expert.t()).clamp(max=step_limit)
+            x2 = (expert_inputs @ w3_expert.t()).clamp(min=-step_limit, max=step_limit)
+            inter = x1 * x2
+        elif alpha is not None and limit is not None and beta is not None:
             # SwiGLUBias
             x1 = expert_inputs @ w1_expert.t()
             x1 = x1.clamp_(min=None, max=limit)
@@ -348,8 +386,168 @@ EP_TOP_K = [2]
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
-def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Swiglu, ActivationType.SwigluStep],
+    ids=["swiglu", "swiglustep"],
+)
+def test_moe(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size, activation_type
+):
     # Skip invalid configurations
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    # SwigluStep clamps silu(gate) and up at limit=7.0. Use larger (seeded, deterministic)
+    # activations for that case so the clamp actually engages — this validates the clamp math
+    # and the default-limit (Option B) behavior, not just the activation wiring. Standard SwiGLU
+    # keeps the usual small inputs.
+    x_scale = 3.5 if activation_type == ActivationType.SwigluStep else 1.0 / 5
+    x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda() * x_scale
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = (
+        torch.randn(
+            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.float16
+        ).cuda()
+        / 5
+    )
+    w2_weight = (
+        torch.randn(
+            num_experts, hidden_size, intermediate_size, dtype=torch.float16
+        ).cuda()
+        / 5
+    )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output = compute_with_experts(
+        num_experts,
+        x,
+        w31_weight,
+        w2_weight,
+        selected_experts,
+        routing_weights,
+        activation_type=activation_type,
+    )
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        flash_output.dtype,
+        output=flash_output,
+        quant_scales=None,
+        activation_type=activation_type,
+    )
+
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
+def compute_with_experts_gelu_tanh(
+    num_experts,
+    x,
+    w31_weight,
+    w2_weight,
+    selected_experts,
+    routing_weights,
+):
+    """Reference for gated tanh-GELU MoE.
+
+    Mirrors ``compute_with_experts`` (the SwiGLU reference) exactly, including
+    the gated weight split convention: ``w31`` is split along dim 0 into
+    ``(w3, w1)`` where ``w3`` is the first half and ``w1`` is the second half.
+    The gate branch (``w1``) is activated and multiplied by the linear branch
+    (``w3``). The only difference vs SwiGLU is the activation:
+    ``F.gelu(gate, approximate="tanh")`` instead of ``F.silu(gate)``.
+    """
+    results = torch.zeros_like(x)
+    for expert_id in range(num_experts):
+        mask = selected_experts == expert_id
+        if not mask.sum():
+            continue
+        batch_idx, nth_expert = torch.where(mask)
+        w31_expert = w31_weight[expert_id]  # [2 * intermediate_size, hidden_size]
+        w2_expert = w2_weight[expert_id]  # [hidden_size, intermediate_size]
+
+        # Same split as compute_with_experts: w3 = first half, w1 = second half.
+        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+
+        expert_inputs = x[batch_idx]
+        gate = expert_inputs @ w1_expert.t()
+        linear = expert_inputs @ w3_expert.t()
+        inter = F.gelu(gate, approximate="tanh") * linear
+        output = inter @ w2_expert.t()
+        results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+    return results.view_as(x)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate_size):
+    """Gated tanh-GELU activation (ActivationType.GegluTanh) on the bf16 CUTLASS
+    MoE path. Same shapes / weight-split convention as the SwiGLU ``test_moe``,
+    but activation = GELU_tanh(gate) * linear, compared against a torch
+    ``F.gelu(..., approximate="tanh")`` gated reference.
+    """
+    # Skip invalid configurations
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    x = torch.randn(batch_size, hidden_size, dtype=dtype).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=dtype).cuda()
+        / 5
+    )
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda() / 5
+    )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output = compute_with_experts_gelu_tanh(
+        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
+    )
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        flash_output.dtype,
+        output=flash_output,
+        quant_scales=None,
+        activation_type=ActivationType.GegluTanh,
+    )
+
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+def test_moe_unfused_finalize(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size
+):
+    """``use_fused_finalize=False`` selects the non-fused finalize path.
+
+    Unlike the fused GEMM2 epilogue (which reduces expert outputs via non-associative
+    atomics), this path must be bit-wise reproducible run-to-run while still matching
+    the reference.
+    """
     if top_k > num_experts:
         pytest.skip(
             f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
@@ -373,21 +571,35 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
     ref_output = compute_with_experts(
-        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
-    )
-    flash_output = torch.empty_like(ref_output)
-    flash_output = fused_moe.cutlass_fused_moe(
+        num_experts,
         x,
-        selected_experts.to(torch.int),
-        routing_weights,
         w31_weight,
         w2_weight,
-        flash_output.dtype,
-        output=flash_output,
-        quant_scales=None,
+        selected_experts,
+        routing_weights,
     )
 
-    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+    def run_unfused():
+        out = torch.empty_like(ref_output)
+        return fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            out.dtype,
+            output=out,
+            quant_scales=None,
+            use_fused_finalize=False,
+        )[0]
+
+    out1 = run_unfused()
+    out2 = run_unfused()
+
+    torch.testing.assert_close(ref_output, out1, rtol=1e-2, atol=1e-2)
+    assert torch.equal(out1, out2), (
+        "non-fused finalize path must produce deterministic results"
+    )
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -396,8 +608,20 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("otype, wtype", [(torch.float16, torch.float8_e4m3fn)])
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Swiglu, ActivationType.SwigluStep],
+    ids=["swiglu", "swiglustep"],
+)
 def test_moe_fp8(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size, otype, wtype
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    otype,
+    wtype,
+    activation_type,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -442,6 +666,7 @@ def test_moe_fp8(
         w2_dequantized,
         selected_experts,
         routing_weights,
+        activation_type=activation_type,
     )
     flash_output = torch.empty_like(ref_output)
     # For fp8, the hidden_state expects quantized.
@@ -464,6 +689,7 @@ def test_moe_fp8(
         otype,
         quant_scales=quant_scales,
         output=flash_output,
+        activation_type=activation_type,
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
@@ -480,9 +706,10 @@ def test_moe_fp8(
 @pytest.mark.parametrize("quantized_input", [False, True])
 @pytest.mark.parametrize(
     "activation_type",
-    [ActivationType.Swiglu, ActivationType.Relu2],
-    ids=["swiglu", "relu2"],
+    [ActivationType.Swiglu, ActivationType.SwigluStep, ActivationType.Relu2],
+    ids=["swiglu", "swiglustep", "relu2"],
 )
+@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
@@ -497,6 +724,7 @@ def test_moe_nvfp4(
     wtype,
     quantized_input,
     activation_type,
+    use_4over6,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -512,8 +740,14 @@ def test_moe_nvfp4(
     n = intermediate_size
     k = hidden_size
 
-    w1_n = 2 * n if activation_type == ActivationType.Swiglu else n
+    gated = activation_type in (ActivationType.Swiglu, ActivationType.SwigluStep)
+    w1_n = 2 * n if gated else n
     w1 = torch.randn((e, w1_n, k), device="cuda", dtype=otype) / 10
+
+    # SwigluStep clamps to a per-expert limit. We intentionally do NOT pass swiglu_limit here so
+    # that the kernel's default (7.0, the Step-3 model value) is exercised; the reference below
+    # uses the same 7.0. Passing an explicit per-expert tensor reuses the SwigluBias limit path.
+    swiglu_limit = None
 
     sf_w1_2n = round_up(w1_n, 128)
     sf_w1_k = round_up(k // quant_blocksize, 4)
@@ -535,12 +769,13 @@ def test_moe_nvfp4(
     w2_q = torch.empty((e, k, n // 2), device="cuda", dtype=torch.uint8)
     w1_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
     w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
+    nvfp4_4over6_config = NVFP44Over6Config() if use_4over6 else None
 
     for expert in range(e):
-        w1_amax = torch.abs(w1).max().to(torch.float32)
-        w2_amax = torch.abs(w2).max().to(torch.float32)
-        w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
-        w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
+        w1_amax = torch.abs(w1[expert]).max().to(torch.float32)
+        w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
+        w1_gs[expert] = nvfp4_global_encode_scale_te(w1_amax, nvfp4_4over6_config)
+        w2_gs[expert] = nvfp4_global_encode_scale_te(w2_amax, nvfp4_4over6_config)
 
         w1_q[expert], w1_blockscale[expert] = fp4_quantize(w1[expert], w1_gs[expert])
 
@@ -591,6 +826,7 @@ def test_moe_nvfp4(
         input_sf=input_sf,
         output=flash_output,
         activation_type=activation_type,
+        swiglu_limit=swiglu_limit,
     )
 
     # Ref check
@@ -634,6 +870,7 @@ def test_moe_nvfp4(
         routing_weights,
         selected_experts,
         activation_type,
+        swiglu_limit=7.0 if activation_type == ActivationType.SwigluStep else None,
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
 
@@ -1391,6 +1628,10 @@ def test_moe_mxfp8_mxfp4(
 @pytest.mark.parametrize(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
+# use_autotune=True is the regression coverage for issue #3558: the gemm
+# profiler used to prepare per-tensor FP8 quant params and a null
+# activation-SF buffer for MXFP8xMXFP8, crashing the tuning pass.
+@pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10],
     reason="MXFP8xMXFP8 is only supported on SM100 for now",
@@ -1405,6 +1646,7 @@ def test_moe_mxfp8_mxfp8(
     alpha,
     beta,
     limit,
+    use_autotune,
 ):
     """Test MoE with MXFP8 activations and MXFP8 weights."""
     if top_k > num_experts:
@@ -1450,21 +1692,22 @@ def test_moe_mxfp8_mxfp8(
         limit_t = None
         beta_t = None
 
-    _ = fused_moe.cutlass_fused_moe(
-        mxfp8_x,
-        selected_experts.to(torch.int),
-        routing_weights,
-        mxfp8_w1.contiguous(),
-        mxfp8_w2.contiguous(),
-        otype,
-        swiglu_alpha=alpha_t,
-        swiglu_limit=limit_t,
-        swiglu_beta=beta_t,
-        quant_scales=quant_scales,
-        input_sf=mxfp8_x_sf,
-        use_mxfp8_act_scaling=True,
-        output=flash_output,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            mxfp8_x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            mxfp8_w1.contiguous(),
+            mxfp8_w2.contiguous(),
+            otype,
+            swiglu_alpha=alpha_t,
+            swiglu_limit=limit_t,
+            swiglu_beta=beta_t,
+            quant_scales=quant_scales,
+            input_sf=mxfp8_x_sf,
+            use_mxfp8_act_scaling=True,
+            output=flash_output,
+        )
 
     dq_mxfp8_x = (
         mxfp8_dequantize_host(
@@ -1978,6 +2221,7 @@ def test_moe_nvfp4_unswizzled_input_sf():
     [ActivationType.Swiglu],
     ids=["swiglu"],
 )
+@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.skipif(
     not is_sm100a_supported(torch.device("cuda"))
     and not is_sm12x_supported(torch.device("cuda")),
@@ -1993,6 +2237,7 @@ def test_moe_nvfp4_unaligned_hidden_size(
     wtype,
     quantized_input,
     activation_type,
+    use_4over6,
 ):
     """Test NVFP4 MoE with hidden_size not aligned to sf_block_size * 4.
 
@@ -2035,12 +2280,13 @@ def test_moe_nvfp4_unaligned_hidden_size(
     w2_q = torch.empty((e, k, n // 2), device="cuda", dtype=torch.uint8)
     w1_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
     w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
+    nvfp4_4over6_config = NVFP44Over6Config() if use_4over6 else None
 
     for expert in range(e):
         w1_amax = torch.abs(w1[expert]).max().to(torch.float32)
         w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
-        w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
-        w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
+        w1_gs[expert] = nvfp4_global_encode_scale_te(w1_amax, nvfp4_4over6_config)
+        w2_gs[expert] = nvfp4_global_encode_scale_te(w2_amax, nvfp4_4over6_config)
 
         w1_q[expert], w1_blockscale[expert] = fp4_quantize(w1[expert], w1_gs[expert])
         w2_q[expert], w2_blockscale[expert] = fp4_quantize(w2[expert], w2_gs[expert])

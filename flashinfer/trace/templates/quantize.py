@@ -14,13 +14,18 @@
 
 """TraceTemplates for FP4 / FP8 quantization APIs."""
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 _AxisT = Union[Var, Const]
+
+
+def _bind_trace_init_dependencies(wrapper: Any, *dependencies: Any) -> Any:
+    wrapper._trace_init_dependencies = dependencies
+    return wrapper
 
 
 # ── Reference helpers ────────────────────────────────────────────────────────
@@ -104,7 +109,14 @@ def _quantize_fp4_block_scale(
         torch.ones_like(actual_scale),
     )
     # Broadcast block scale back to element granularity and quantize.
-    scaled = blocks / actual_scale.unsqueeze(-1)
+    if global_scale is not None:
+        scaled = (
+            blocks
+            * global_scale.to(torch.float32).reshape(())
+            / actual_scale.unsqueeze(-1)
+        )
+    else:
+        scaled = blocks / actual_scale.unsqueeze(-1)
     nibbles = _fp4_e2m1_quantize_block(scaled, amax)
     nibbles = nibbles.reshape(M, K)
     packed = _pack_fp4_pairs(nibbles)
@@ -230,6 +242,36 @@ _FP4_AXES: Dict[str, _AxisT] = {
     "one": Var(description="Placeholder for shape [1] scalar tensors."),
 }
 
+
+def _fp4_quantize_init(
+    *,
+    M: int,
+    K: int = 4096,
+    K_packed: int = 0,
+    num_scale_elems: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.fp4_quantize`` (generic NvFP4 path).
+
+    Sourced from ``tests/utils/test_fp4_quantize.py``: ``input`` is
+    ``randn`` (bf16); ``global_scale`` is computed as
+    ``FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax(input)`` per the test
+    fixture. Default ``K=4096`` matches the example call.
+    """
+    del K_packed, num_scale_elems, one  # derived
+    torch.manual_seed(seed)
+    inp = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    amax = inp.float().abs().nan_to_num().max().clamp(min=1e-12)
+    global_scale = (448.0 * 6.0 / amax).reshape(1).contiguous()
+    return {
+        "input": inp,
+        "global_scale": global_scale,
+        "sf_vec_size": 16,
+    }
+
+
 fp4_quantize_trace = TraceTemplate(
     op_type="quantization",
     name_prefix="fp4_quantize",
@@ -268,7 +310,35 @@ fp4_quantize_trace = TraceTemplate(
     constraints=["K_packed == K // 2"],
     tags=["status:verified", "quantization:fp4"],
     reference=_fp4_quantize_reference,
+    init=_fp4_quantize_init,
 )
+
+
+def _nvfp4_quantize_init(
+    *,
+    M: int,
+    K: int = 4096,
+    K_packed: int = 0,
+    num_scale_elems: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.nvfp4_quantize``.
+
+    Sourced from ``tests/utils/test_fp4_quantize.py`` /
+    ``test_mm_fp4.py``: ``a_global_sf`` is computed from the input
+    absmax as ``448 * 6 / amax(a)``.
+    """
+    del K_packed, num_scale_elems, one
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    amax = a.float().abs().nan_to_num().max().clamp(min=1e-12)
+    return {
+        "a": a,
+        "a_global_sf": (448.0 * 6.0 / amax).reshape(1).contiguous(),
+    }
+
 
 # ── NVFP4 quantization ────────────────────────────────────────────────────────
 nvfp4_quantize_trace = TraceTemplate(
@@ -304,7 +374,25 @@ nvfp4_quantize_trace = TraceTemplate(
     constraints=["K_packed == K // 2"],
     tags=["status:verified", "quantization:nvfp4"],
     reference=_nvfp4_quantize_reference,
+    init=_nvfp4_quantize_init,
 )
+
+
+def _mxfp4_quantize_init(
+    *,
+    M: int,
+    K: int = 4096,
+    K_packed: int = 0,
+    num_scale_elems: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mxfp4_quantize`` (no global scale)."""
+    del K_packed, num_scale_elems, one
+    torch.manual_seed(seed)
+    return {"a": torch.randn(M, K, dtype=torch.bfloat16, device=device)}
+
 
 # ── MXFP4 quantization ────────────────────────────────────────────────────────
 mxfp4_quantize_trace = TraceTemplate(
@@ -330,7 +418,23 @@ mxfp4_quantize_trace = TraceTemplate(
     constraints=["K_packed == K // 2"],
     tags=["status:verified", "quantization:mxfp4"],
     reference=_mxfp4_quantize_reference,
+    init=_mxfp4_quantize_init,
 )
+
+
+def _mxfp8_quantize_init(
+    *,
+    M: int,
+    K: int = 4096,
+    num_scale_elems: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mxfp8_quantize``."""
+    del num_scale_elems
+    torch.manual_seed(seed)
+    return {"input": torch.randn(M, K, dtype=torch.bfloat16, device=device)}
+
 
 # ── MXFP8 quantization ────────────────────────────────────────────────────────
 
@@ -366,6 +470,7 @@ mxfp8_quantize_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:mxfp8"],
     reference=_mxfp8_quantize_reference,
+    init=_mxfp8_quantize_init,
 )
 
 
@@ -387,6 +492,354 @@ def _nvfp4_kv_quantize_reference(
         sf_vec_size=16,
         sf_use_ue8m0=False,
     )
+
+
+def _nvfp4_kv_quantize_init(
+    *,
+    M: int,
+    K: int = 128,
+    K_div_2: int = 0,
+    K_div_16: int = 0,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.nvfp4_kv_quantize``.
+
+    Default ``K=128`` matches a typical KV head dim. ``global_scale`` is
+    computed from input absmax (``448 * 6 / amax``) — same principled
+    formula used by ``fp4_quantize`` / ``nvfp4_quantize``.
+
+    Note: ``tests/utils/test_fp4_kv_quantization.py`` parametrizes over
+    multiple ``global_scale`` values (0.5, 1.0) — the 1.0 case
+    specifically guards against FP8 E4M3 block-scale underflow at very
+    small KV head_dim. The amax-derived scale here matches the
+    activation/weight quantize pipeline; callers who want the underflow
+    guard can override with ``global_scale=torch.tensor([1.0])`` after
+    calling ``init``.
+    """
+    del K_div_2, K_div_16, scalar
+    torch.manual_seed(seed)
+    inp = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    amax = inp.float().abs().nan_to_num().max().clamp(min=1e-12)
+    return {
+        "input": inp,
+        "global_scale": (448.0 * 6.0 / amax).reshape(1).contiguous(),
+    }
+
+
+def _nvfp4_kv_dequantize_paged_init(
+    *,
+    batch_size: int,
+    max_seq_len: int,
+    num_heads: int,
+    k_head_dim: int = 128,
+    v_head_dim: int = 128,
+    k_packed_dim: int = 0,
+    v_packed_dim: int = 0,
+    k_scale_dim: int = 0,
+    v_scale_dim: int = 0,
+    num_pages: int = 0,
+    page_size: int = 16,
+    block_table_stride: int = 0,
+    scalar: int = 1,
+    kv_layout: str = "NHD",
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build tuple-cache inputs for ``flashinfer.nvfp4_kv_dequantize_paged``."""
+    del k_packed_dim, v_packed_dim, k_scale_dim, v_scale_dim, scalar
+    torch.manual_seed(seed)
+    k_packed = k_head_dim // 2
+    v_packed = v_head_dim // 2
+    k_scales_dim = k_head_dim // 16
+    v_scales_dim = v_head_dim // 16
+    pages_per_request = (max_seq_len + page_size - 1) // page_size
+    if block_table_stride == 0:
+        block_table_stride = pages_per_request
+    if num_pages == 0:
+        num_pages = batch_size * block_table_stride
+    if kv_layout == "NHD":
+        k_cache_shape = (num_pages, page_size, num_heads, k_packed)
+        v_cache_shape = (num_pages, page_size, num_heads, v_packed)
+        k_scales_shape = (num_pages, page_size, num_heads, k_scales_dim)
+        v_scales_shape = (num_pages, page_size, num_heads, v_scales_dim)
+    elif kv_layout == "HND":
+        k_cache_shape = (num_pages, num_heads, page_size, k_packed)
+        v_cache_shape = (num_pages, num_heads, page_size, v_packed)
+        k_scales_shape = (num_pages, num_heads, page_size, k_scales_dim)
+        v_scales_shape = (num_pages, num_heads, page_size, v_scales_dim)
+    else:
+        raise ValueError(f"kv_layout must be 'NHD' or 'HND', got {kv_layout!r}")
+
+    k_cache = torch.randint(
+        0,
+        256,
+        k_cache_shape,
+        dtype=torch.uint8,
+        device=device,
+    )
+    v_cache = torch.randint(
+        0,
+        256,
+        v_cache_shape,
+        dtype=torch.uint8,
+        device=device,
+    )
+    k_scales = torch.randint(
+        1,
+        120,
+        k_scales_shape,
+        dtype=torch.uint8,
+        device=device,
+    ).view(torch.float8_e4m3fn)
+    v_scales = torch.randint(
+        1,
+        120,
+        v_scales_shape,
+        dtype=torch.uint8,
+        device=device,
+    ).view(torch.float8_e4m3fn)
+    block_tables = (
+        torch.arange(batch_size * block_table_stride, dtype=torch.int32, device=device)
+        .reshape(batch_size, block_table_stride)
+        .remainder(num_pages)
+    )
+    seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
+    output_k = torch.empty(
+        (batch_size, max_seq_len, num_heads, k_head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    output_v = torch.empty(
+        (batch_size, max_seq_len, num_heads, v_head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    return {
+        "paged_kv_cache": (k_cache, v_cache),
+        "kv_cache_sf": (k_scales, v_scales),
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "k_scale": torch.tensor([1.0], dtype=torch.float32, device=device),
+        "v_scale": torch.tensor([1.0], dtype=torch.float32, device=device),
+        "output_k": output_k,
+        "output_v": output_v,
+        "kv_layout": kv_layout,
+    }
+
+
+def _nvfp4_kv_dequantize_paged_nhd_init(
+    *,
+    batch_size: int,
+    max_seq_len: int,
+    num_heads: int,
+    k_head_dim: int = 128,
+    v_head_dim: int = 128,
+    k_packed_dim: int = 0,
+    v_packed_dim: int = 0,
+    k_scale_dim: int = 0,
+    v_scale_dim: int = 0,
+    num_pages: int = 0,
+    page_size: int = 16,
+    block_table_stride: int = 0,
+    scalar: int = 1,
+    kv_layout: str = "NHD",
+    device: str = "cuda",
+    seed: int = 0,
+):
+    del kv_layout
+    return _nvfp4_kv_dequantize_paged_init(
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_heads=num_heads,
+        k_head_dim=k_head_dim,
+        v_head_dim=v_head_dim,
+        k_packed_dim=k_packed_dim,
+        v_packed_dim=v_packed_dim,
+        k_scale_dim=k_scale_dim,
+        v_scale_dim=v_scale_dim,
+        num_pages=num_pages,
+        page_size=page_size,
+        block_table_stride=block_table_stride,
+        scalar=scalar,
+        kv_layout="NHD",
+        device=device,
+        seed=seed,
+    )
+
+
+def _nvfp4_kv_dequantize_paged_hnd_init(
+    *,
+    batch_size: int,
+    max_seq_len: int,
+    num_heads: int,
+    k_head_dim: int = 128,
+    v_head_dim: int = 128,
+    k_packed_dim: int = 0,
+    v_packed_dim: int = 0,
+    k_scale_dim: int = 0,
+    v_scale_dim: int = 0,
+    num_pages: int = 0,
+    page_size: int = 16,
+    block_table_stride: int = 0,
+    scalar: int = 1,
+    kv_layout: str = "HND",
+    device: str = "cuda",
+    seed: int = 0,
+):
+    del kv_layout
+    return _nvfp4_kv_dequantize_paged_init(
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_heads=num_heads,
+        k_head_dim=k_head_dim,
+        v_head_dim=v_head_dim,
+        k_packed_dim=k_packed_dim,
+        v_packed_dim=v_packed_dim,
+        k_scale_dim=k_scale_dim,
+        v_scale_dim=v_scale_dim,
+        num_pages=num_pages,
+        page_size=page_size,
+        block_table_stride=block_table_stride,
+        scalar=scalar,
+        kv_layout="HND",
+        device=device,
+        seed=seed,
+    )
+
+
+_nvfp4_kv_dequantize_paged_nhd_init = _bind_trace_init_dependencies(
+    _nvfp4_kv_dequantize_paged_nhd_init,
+    _nvfp4_kv_dequantize_paged_init,
+)
+_nvfp4_kv_dequantize_paged_hnd_init = _bind_trace_init_dependencies(
+    _nvfp4_kv_dequantize_paged_hnd_init,
+    _nvfp4_kv_dequantize_paged_init,
+)
+
+
+def _make_nvfp4_kv_dequantize_paged_trace(
+    *, kv_layout: str, name_prefix: str
+) -> TraceTemplate:
+    if kv_layout == "NHD":
+        k_cache_dims = ["num_pages", "page_size", "num_heads", "k_packed_dim"]
+        v_cache_dims = ["num_pages", "page_size", "num_heads", "v_packed_dim"]
+        k_scales_dims = ["num_pages", "page_size", "num_heads", "k_scale_dim"]
+        v_scales_dims = ["num_pages", "page_size", "num_heads", "v_scale_dim"]
+    elif kv_layout == "HND":
+        k_cache_dims = ["num_pages", "num_heads", "page_size", "k_packed_dim"]
+        v_cache_dims = ["num_pages", "num_heads", "page_size", "v_packed_dim"]
+        k_scales_dims = ["num_pages", "num_heads", "page_size", "k_scale_dim"]
+        v_scales_dims = ["num_pages", "num_heads", "page_size", "v_scale_dim"]
+    else:
+        raise ValueError(f"kv_layout must be 'NHD' or 'HND', got {kv_layout!r}")
+
+    init = (
+        _nvfp4_kv_dequantize_paged_nhd_init
+        if kv_layout == "NHD"
+        else _nvfp4_kv_dequantize_paged_hnd_init
+    )
+
+    return TraceTemplate(
+        op_type="dequantize_fp4",
+        name_prefix=name_prefix,
+        description=(
+            "Gather and dequantize a paged NVFP4 KV cache through block tables "
+            "into caller-owned contiguous K/V output buffers."
+        ),
+        axes={
+            "batch_size": Var(),
+            "max_seq_len": Var(),
+            "num_heads": Const(abbrev="h"),
+            "k_head_dim": Const(abbrev="dk"),
+            "v_head_dim": Const(abbrev="dv"),
+            "k_packed_dim": Var(description="k_head_dim // 2."),
+            "v_packed_dim": Var(description="v_head_dim // 2."),
+            "k_scale_dim": Var(description="k_head_dim // 16."),
+            "v_scale_dim": Var(description="v_head_dim // 16."),
+            "num_pages": Var(),
+            "page_size": Const(abbrev="ps"),
+            "block_table_stride": Var(),
+            "scalar": Var(description="Global scale tensor length, normally 1."),
+        },
+        inputs={
+            "paged_k_cache": Tensor(
+                k_cache_dims,
+                param="paged_kv_cache",
+                tuple_idx=0,
+            ),
+            "paged_v_cache": Tensor(
+                v_cache_dims,
+                param="paged_kv_cache",
+                tuple_idx=1,
+            ),
+            "k_scales": Tensor(
+                k_scales_dims,
+                param="kv_cache_sf",
+                tuple_idx=0,
+            ),
+            "v_scales": Tensor(
+                v_scales_dims,
+                param="kv_cache_sf",
+                tuple_idx=1,
+            ),
+            "block_tables": Tensor(["batch_size", "block_table_stride"], dtype="int32"),
+            "seq_lens": Tensor(["batch_size"], dtype="int32"),
+            "k_scale": Tensor(["scalar"], dtype="float32"),
+            "v_scale": Tensor(["scalar"], dtype="float32"),
+            "output_k": Tensor(
+                ["batch_size", "max_seq_len", "num_heads", "k_head_dim"]
+            ),
+            "output_v": Tensor(
+                ["batch_size", "max_seq_len", "num_heads", "v_head_dim"]
+            ),
+        },
+        outputs={
+            "output_k": Tensor(
+                ["batch_size", "max_seq_len", "num_heads", "k_head_dim"],
+                dtype_from="output_k",
+            ),
+            "output_v": Tensor(
+                ["batch_size", "max_seq_len", "num_heads", "v_head_dim"],
+                dtype_from="output_v",
+            ),
+        },
+        constraints=[
+            "k_head_dim == k_packed_dim * 2",
+            "v_head_dim == v_packed_dim * 2",
+            "k_head_dim == k_scale_dim * 16",
+            "v_head_dim == v_scale_dim * 16",
+            "block_table_stride * page_size >= max_seq_len",
+            "scalar == 1",
+        ],
+        tags=["status:verified", "quantization:fp4"],
+        init=init,
+    )
+
+
+_nvfp4_kv_dequantize_paged_nhd_trace = _make_nvfp4_kv_dequantize_paged_trace(
+    kv_layout="NHD", name_prefix="nvfp4_kv_dequantize_paged"
+)
+_nvfp4_kv_dequantize_paged_hnd_trace = _make_nvfp4_kv_dequantize_paged_trace(
+    kv_layout="HND", name_prefix="nvfp4_kv_dequantize_paged_hnd"
+)
+
+
+def nvfp4_kv_dequantize_paged_trace(**kwargs):
+    """Return a layout-specific trace template for paged NVFP4 KV dequant."""
+    kv_layout = kwargs.get("kv_layout", "NHD")
+    if kv_layout == "NHD":
+        return _nvfp4_kv_dequantize_paged_nhd_trace
+    if kv_layout == "HND":
+        return _nvfp4_kv_dequantize_paged_hnd_trace
+    raise ValueError(f"kv_layout must be 'NHD' or 'HND', got {kv_layout!r}")
+
+
+nvfp4_kv_dequantize_paged_trace.templates = [  # type: ignore[attr-defined]
+    _nvfp4_kv_dequantize_paged_nhd_trace,
+    _nvfp4_kv_dequantize_paged_hnd_trace,
+]
 
 
 nvfp4_kv_quantize_trace = TraceTemplate(
@@ -414,4 +867,87 @@ nvfp4_kv_quantize_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:fp4"],
     reference=_nvfp4_kv_quantize_reference,
+    init=_nvfp4_kv_quantize_init,
+)
+
+
+# ── Grouped MXFP8 quantization (cuTile, SM100+) ──────────────────────────────
+
+
+def _mxfp8_grouped_quantize_init(
+    *,
+    B,
+    M,
+    K=4096,
+    padded_K=0,
+    rm=0,
+    rk=0,
+    m32=32,
+    m4=4,
+    k4=4,
+    device="cuda",
+    seed=0,
+):
+    """Build inputs for ``flashinfer.mxfp8_grouped_quantize``.
+
+    Every group uses the full ``M`` valid rows (``mask = M``) so the trace
+    exercises the dense path with no uninitialized output rows; callers may
+    shrink ``mask`` afterwards.
+    """
+    del padded_K, rm, rk, m32, m4, k4  # output-only / derived axes
+    torch.manual_seed(seed)
+    a = torch.randn(B, M, K, dtype=torch.bfloat16, device=device)
+    mask = torch.full((B,), M, dtype=torch.int32, device=device)
+    return {"a": a, "mask": mask}
+
+
+mxfp8_grouped_quantize_trace = TraceTemplate(
+    op_type="quantization",
+    name_prefix="mxfp8_grouped_quantize",
+    description=(
+        "Grouped MXFP8 quantization (cuTile, SM100+): [B, M, K] bf16/fp16 -> "
+        "fp8_e4m3fn activations + UE8M0 block scales, laid out for the masked "
+        "grouped GEMM. K is padded up to a multiple of 128 for the kernel."
+    ),
+    axes={
+        "B": Var(description="Number of groups."),
+        "M": Var(description="Rows per group."),
+        "K": Const(abbrev="k", description="Input columns (divisible by 32)."),
+        "padded_K": Var(description="K rounded up to a multiple of 128."),
+        "rm": Var(description="padded_M // 128 (row scale tiles)."),
+        "rk": Var(description="padded_K // 128 (column scale tiles)."),
+        "m32": Var(description="MXFP8 scale swizzle dim (32)."),
+        "m4": Var(description="MXFP8 scale swizzle dim (4)."),
+        "k4": Var(description="MXFP8 scale swizzle dim (4)."),
+    },
+    inputs={
+        "a": Tensor(["B", "M", "K"], description="Input tensor, fp16/bf16."),
+        "mask": Tensor(
+            ["B"],
+            dtype="int32",
+            description="Valid rows per group (int32).",
+        ),
+    },
+    outputs={
+        "x_q": Tensor(
+            ["M", "padded_K", "B"],
+            dtype="float8_e4m3fn",
+            description="Quantized activations, permuted for the grouped GEMM.",
+        ),
+        "sf": Tensor(
+            ["m32", "m4", "rm", "k4", "rk", "B"],
+            dtype="uint8",
+            description="UE8M0 swizzled block scales (1 byte per 32-element block).",
+        ),
+    },
+    constraints=[
+        "padded_K == ((K + 127) // 128) * 128",
+        "rm == (M + 127) // 128",
+        "rk == padded_K // 128",
+        "m32 == 32",
+        "m4 == 4",
+        "k4 == 4",
+    ],
+    tags=["status:verified", "quantization:mxfp8"],
+    init=_mxfp8_grouped_quantize_init,
 )

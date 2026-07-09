@@ -134,6 +134,9 @@ echo "Cache cleaned."
 echo ""
 echo "Detecting CUDA architecture list..."
 export FLASHINFER_CUDA_ARCH_LIST=$(python3 -c '
+import os
+import platform
+
 import torch
 cuda_ver = torch.version.cuda
 arches = ["7.5", "8.0", "8.9", "9.0a"]
@@ -143,7 +146,9 @@ if cuda_ver is not None:
         if (major, minor) >= (13, 0):
             arches.append("10.0a")
             arches.append("10.3a")
-            arches.append("11.0a")
+            machine = (os.environ.get("ARCH") or platform.machine()).lower()
+            if machine in ("aarch64", "arm64"):
+                arches.append("11.0a")
             arches.append("12.0f")
         elif (major, minor) >= (12, 9):
             arches.append("10.0a")

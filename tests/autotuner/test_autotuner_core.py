@@ -10,12 +10,12 @@ from flashinfer.autotuner import (
     DynamicTensorSpec,
     TuningConfig,
     TunableRunner,
-)
-from flashinfer.fused_moe.utils import (
-    last_positive_power_of_2,
     make_bucket_mapper,
     round_to_nearest_bucket,
 )
+
+from flashinfer.utils import last_positive_power_of_2
+
 from .utils import reset_autotuner
 
 
@@ -838,3 +838,296 @@ def test_choose_one_with_none_input_no_crash():
     )
     assert chosen_runner is runner
     assert tactic == -1
+
+
+# ---------------------------------------------------------------------------
+# Tests: skip_ops
+# ---------------------------------------------------------------------------
+
+
+def test_skip_ops_prevents_profiling(monkeypatch):
+    """Skipped ops should return fallback immediately without profiling."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True, skip_ops={"skip_me"}):
+        chosen_runner, tactic = tuner.choose_one("skip_me", [runner], config, inputs)
+
+    assert chosen_runner is runner
+    assert tactic == -1
+    assert len(profile_calls) == 0
+
+
+def test_skip_ops_does_not_affect_other_ops(monkeypatch):
+    """Non-skipped ops should still be profiled normally."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        return {0: 5.0, 1: 1.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True, skip_ops={"some_other_op"}):
+        chosen_runner, tactic = tuner.choose_one("tune_me", [runner], config, inputs)
+
+    assert chosen_runner is runner
+    assert tactic == 1  # best tactic selected via profiling
+
+
+def test_skip_ops_nested_union(monkeypatch):
+    """Nested autotune contexts should union their skip_ops sets."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    config = TuningConfig()
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True, skip_ops={"op_a"}):
+        # op_a should be skipped
+        _, tactic_a = tuner.choose_one("op_a", [runner], config, inputs)
+        assert tactic_a == -1
+
+        with autotune(tune_mode=True, skip_ops={"op_b"}):
+            # Both op_a and op_b should be skipped in inner context
+            _, tactic_a2 = tuner.choose_one("op_a", [runner], config, inputs)
+            assert tactic_a2 == -1
+            _, tactic_b = tuner.choose_one("op_b", [runner], config, inputs)
+            assert tactic_b == -1
+
+        # After inner context exits, only op_a should still be skipped
+        _, tactic_a3 = tuner.choose_one("op_a", [runner], config, inputs)
+        assert tactic_a3 == -1
+
+
+def test_skip_ops_returns_first_runner():
+    """Skipped ops should always return runners[0], even with multiple runners."""
+    tuner = reset_autotuner()
+    runner_a = DummyRunner(valid_tactics=(0,))
+    runner_b = DummyRunner(valid_tactics=(1,))
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    config = TuningConfig()
+
+    with autotune(tune_mode=True, skip_ops={"multi_runner_op"}):
+        chosen, tactic = tuner.choose_one(
+            "multi_runner_op", [runner_a, runner_b], config, inputs
+        )
+
+    assert chosen is runner_a
+    assert tactic == -1
+
+
+def test_skip_ops_empty_set_is_noop(monkeypatch):
+    """skip_ops=set() should not skip anything."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        return {0: 5.0, 1: 1.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True, skip_ops=set()):
+        chosen, tactic = tuner.choose_one("should_tune", [runner], config, inputs)
+
+    assert tactic == 1  # profiled and selected best
+
+
+def test_skip_ops_nested_inner_op_resumes_after_exit(monkeypatch):
+    """op_b added by inner context should be profiled again after inner exits."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    config = TuningConfig()
+
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(1)
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True, skip_ops={"op_a"}):
+        with autotune(tune_mode=True, skip_ops={"op_b"}):
+            _, tactic_b = tuner.choose_one("op_b", [runner], config, inputs)
+            assert tactic_b == -1  # skipped in inner
+
+        # After inner exits, op_b should be profiled
+        profile_calls.clear()
+        _, tactic_b2 = tuner.choose_one("op_b", [runner], config, inputs)
+        assert len(profile_calls) > 0  # was profiled
+
+
+def test_skip_ops_does_not_pollute_cache():
+    """Skipped ops should not create entries in profiling_cache."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    config = TuningConfig()
+
+    cache_before = len(tuner.profiling_cache)
+
+    with autotune(tune_mode=True, skip_ops={"no_cache_op"}):
+        tuner.choose_one("no_cache_op", [runner], config, inputs)
+
+    assert len(tuner.profiling_cache) == cache_before
+
+
+def test_skip_ops_restored_after_context():
+    """skip_ops should be fully cleared after context exits."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    config = TuningConfig()
+
+    with autotune(tune_mode=False, skip_ops={"some_op"}):
+        _, tactic = tuner.choose_one("some_op", [runner], config, inputs)
+        assert tactic == -1
+
+    # After context, skip_ops should be empty — op goes through normal path
+    assert tuner._effective_skip_ops == frozenset()
+
+
+def _build_num_tokens_tuning_config(mapper):
+    """Build a TuningConfig that buckets dim 0 of input 0 using *mapper*.
+
+    Two configs built with the *same* ``mapper`` object are equal and hash-equal
+    (see ``DynamicTensorSpec.__hash__``/``__eq__``), so they collapse to a single
+    ``_find_nearest_profile`` lru_cache key.  Built with distinct ``mapper``
+    objects (e.g. fresh lambdas) they are distinct keys.
+    """
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(512, 1024, 2048, 4096, 8192),
+                map_to_tuning_buckets=mapper,
+            ),
+        ),
+    )
+
+
+def test_find_nearest_profile_cache_dedups_equivalent_configs():
+    """Regression test for the _find_nearest_profile lru_cache memory leak.
+
+    ``_find_nearest_profile`` is ``@lru_cache(maxsize=None)`` keyed on
+    ``(shapes, tuning_config)``.  ``TuningConfig`` hashes and compares its
+    ``DynamicTensorSpec`` via the *identity* of the ``map_to_tuning_buckets``
+    callable.  Production callers (e.g. fused MoE) rebuild a ``TuningConfig`` on
+    every inference call; as long as ``map_to_tuning_buckets`` is a *stable*
+    callable, every rebuilt-but-equivalent config collapses to the same cache
+    key and the cache stays bounded.
+
+    This test holds the input shape FIXED and rebuilds an equivalent config on
+    every iteration, then asserts the cache does NOT grow.  Contrast with
+    ``test_find_nearest_profile_cache_grows_with_fresh_callable`` below, which
+    shows the unbounded growth when the callable identity changes per call —
+    the exact bug this guards against.
+    """
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    shapes = ((1024, 128),)
+
+    # Warm up with one equivalent config so the single expected entry exists.
+    AutoTuner._find_nearest_profile(
+        shapes, _build_num_tokens_tuning_config(last_positive_power_of_2)
+    )
+    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+    # Rebuild an *equivalent* config on every call, same shape every time.
+    # With a stable callable these all map to one cache key -> no growth.
+    N = 5_000
+    for _ in range(N):
+        config = _build_num_tokens_tuning_config(last_positive_power_of_2)
+        AutoTuner._find_nearest_profile(shapes, config)
+
+    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    assert cache_growth == 0, (
+        f"Cache grew by {cache_growth} entries across {N} calls with equivalent "
+        "configs for a fixed shape. Equivalent TuningConfigs must collapse to a "
+        "single cache key — a per-call lambda/closure for map_to_tuning_buckets "
+        "reintroduces the unbounded-growth leak."
+    )
+
+
+def test_find_nearest_profile_cache_grows_with_fresh_callable():
+    """Negative control: a fresh callable identity per call leaks one entry/call.
+
+    This documents the failure mode that
+    ``test_find_nearest_profile_cache_dedups_equivalent_configs`` guards against
+    and proves the methodology is sound (the cache genuinely *can* grow per call).
+    A new ``lambda`` each iteration gives each config a distinct cache key even
+    though the shape and bucketing logic are identical, so the cache grows by
+    exactly N — the original memory leak.
+    """
+    import tracemalloc
+
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    shapes = ((1024, 128),)
+
+    # Warm up with one fresh-lambda config.
+    AutoTuner._find_nearest_profile(
+        shapes, _build_num_tokens_tuning_config(lambda x: last_positive_power_of_2(x))
+    )
+    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+    tracemalloc.start()
+    snapshot_before = tracemalloc.take_snapshot()
+
+    # Fresh lambda each iteration -> distinct cache key each call -> leak.
+    N = 5_000
+    for _ in range(N):
+        config = _build_num_tokens_tuning_config(lambda x: last_positive_power_of_2(x))
+        AutoTuner._find_nearest_profile(shapes, config)
+
+    snapshot_after = tracemalloc.take_snapshot()
+    tracemalloc.stop()
+
+    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+    stats = snapshot_after.compare_to(snapshot_before, "lineno")
+    allocated_bytes = sum(s.size_diff for s in stats if s.size_diff > 0)
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    assert cache_growth == N, (
+        f"Expected {N} new cache entries (one per fresh callable), got {cache_growth}."
+    )
+    assert allocated_bytes > 0, "Expected Python allocation growth from the leak"
+
+    print(
+        f"\nFresh-callable leak: cache grew by {cache_growth} entries, "
+        f"Python allocations grew by {allocated_bytes / 1024:.1f} KB "
+        f"({allocated_bytes / N:.0f} B/call)."
+    )

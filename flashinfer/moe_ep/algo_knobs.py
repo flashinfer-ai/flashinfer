@@ -1,0 +1,139 @@
+"""Typed AlgoKnob hierarchy.
+
+Knobs are frozen dataclasses keyed by their own class — _index_knobs() lets
+backends look up the value with ``knobs.get(KnobClass)`` rather than scanning
+a list. Fleet-level knobs (set once at Fleet construction) and Handle-level
+knobs (set per dispatch/combine) live in the same namespace; each backend's
+constructor inspects the relevant set.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, FrozenSet, Sequence
+
+if TYPE_CHECKING:
+    import torch
+
+from .config import QuantType
+
+
+class AlgoKnob:
+    """Base marker for both Fleet and Handle knobs."""
+
+
+# ---------------------------------------------------------------- Fleet-level
+
+
+@dataclass(frozen=True)
+class FleetAlgoKnobQuantization(AlgoKnob):
+    """Enable per-Fleet quantization features."""
+
+    quants: FrozenSet[QuantType] = field(default_factory=frozenset)
+
+
+@dataclass(frozen=True)
+class FleetAlgoKnobNumChannelsPerRank(AlgoKnob):
+    n: int
+
+
+@dataclass(frozen=True)
+class FleetAlgoKnobNumQpsPerRank(AlgoKnob):
+    n: int
+
+
+@dataclass(frozen=True)
+class FleetAlgoKnobRdmaBufferSize(AlgoKnob):
+    bytes_: int
+
+
+@dataclass(frozen=True)
+class FleetAlgoKnobTopologyCapacity(AlgoKnob):
+    """Reserve transport state for up to this many ranks (grow/shrink later)."""
+
+    n: int
+
+
+@dataclass(frozen=True)
+class FleetAlgoKnobAllocator(AlgoKnob):
+    """Route NCCL-EP device buffers through a custom allocator.
+
+    Without this knob the group uses NCCL-EP's default ``cudaMalloc`` /
+    ``cudaFree``. Two mutually-exclusive modes:
+
+    * ``torch_caching=True`` — FlashInfer installs allocator trampolines
+      backed by torch's CUDA caching allocator, so EP transport buffers draw
+      from the same pool as the rest of the process (e.g. vLLM's memory
+      budget) instead of a second, invisible cudaMalloc arena. FlashInfer
+      owns the trampoline lifetime (anchored on the Fleet).
+    * ``alloc_fn`` / ``free_fn`` addresses — use these C-callable addresses
+      directly (``ncclEpAllocFn_t`` / ``ncclEpFreeFn_t``; see
+      ``nccl.ep.allocator``). The CALLER owns their lifetime and MUST keep
+      them alive at least as long as the Fleet.
+    """
+
+    torch_caching: bool = False
+    alloc_fn: int = 0
+    free_fn: int = 0
+    context: int = 0
+
+    def __post_init__(self) -> None:
+        if self.torch_caching and (self.alloc_fn or self.free_fn):
+            raise ValueError(
+                "FleetAlgoKnobAllocator: set either torch_caching=True OR "
+                "explicit alloc_fn/free_fn addresses, not both."
+            )
+        if (self.alloc_fn == 0) != (self.free_fn == 0):
+            raise ValueError(
+                "FleetAlgoKnobAllocator: alloc_fn and free_fn must be provided "
+                "together (both non-zero) or both left 0."
+            )
+
+
+# --------------------------------------------------------------- Handle-level
+
+
+@dataclass(frozen=True)
+class HandleAlgoKnobUserStream(AlgoKnob):
+    """Run the dispatch/combine on a non-default CUDA stream.
+
+    The stream is passed as an int (cudaStream_t) since dataclasses with
+    torch.cuda.Stream fields aren't hashable.
+    """
+
+    stream: int
+
+
+@dataclass(frozen=True)
+class HandleAlgoKnobSplitOperation(AlgoKnob):
+    """Marker: enable send_only=1 + ncclEpComplete staging."""
+
+
+@dataclass(frozen=True)
+class HandleAlgoKnobTopKWeights(AlgoKnob):
+    """Carries the topk_weights tensor for combine to reweight by."""
+
+    weights: "torch.Tensor"
+
+
+@dataclass(frozen=True)
+class HandleAlgoKnobNumReceivedTokens(AlgoKnob):
+    """Where to write the recv-count from ncclEpHandleGetNumRecvTokens."""
+
+    target: "torch.Tensor"
+
+
+def _index_knobs(knobs: Sequence[AlgoKnob]) -> "dict[type, AlgoKnob]":
+    """Build a dict keyed by knob class so backends can ``.get(KnobClass)``.
+
+    If the same knob class appears twice in the sequence, the later entry
+    wins (mirrors dict() over key-value pairs). Knobs with class identity
+    only (e.g. SplitOperation) act as flags: their presence in the dict
+    signals "set"; the stored instance is the marker itself.
+    """
+    out: dict[type, AlgoKnob] = {}
+    for k in knobs:
+        if not isinstance(k, AlgoKnob):
+            raise TypeError(f"expected AlgoKnob, got {type(k).__name__}")
+        out[type(k)] = k
+    return out

@@ -278,7 +278,7 @@ class TestSearchCacheFallbackChain:
         _populate_cache(self.tuner, runner, "op1", profile, tactic=99)
 
         cache_key = AutoTuner._get_cache_key("op1", runner, profile, _TUNING_CONFIG)
-        file_key = str((cache_key[0], cache_key[1], cache_key[3]))
+        file_key = cache_key.file_key
         self.tuner._file_configs[file_key] = ("FakeRunnerA", 55)
 
         is_hit, runner_id, tactic, _ = self.tuner.search_cache(
@@ -293,7 +293,7 @@ class TestSearchCacheFallbackChain:
         profile = ((10, 20),)
 
         cache_key = AutoTuner._get_cache_key("op1", runner, profile, _TUNING_CONFIG)
-        file_key = str((cache_key[0], cache_key[1], cache_key[3]))
+        file_key = cache_key.file_key
         self.tuner._file_configs[file_key] = ("FakeRunnerA", 42)
 
         is_hit, runner_id, tactic, _ = self.tuner.search_cache(
@@ -311,7 +311,7 @@ class TestSearchCacheFallbackChain:
 
         # File config says FakeRunnerB won
         cache_key = AutoTuner._get_cache_key("op1", runner_b, profile, _TUNING_CONFIG)
-        file_key = str((cache_key[0], cache_key[1], cache_key[3]))
+        file_key = cache_key.file_key
         self.tuner._file_configs[file_key] = ("FakeRunnerB", 11)
 
         # Pass runners in order [A, B] — B is at index 1
@@ -393,7 +393,7 @@ class TestEndToEnd:
         runner_b = FakeRunnerB(value=2)
 
         # Simulate loaded file configs
-        self.tuner._file_configs["('old_op', 'FakeRunnerA', ((1, 2),))"] = (
+        self.tuner._file_configs["('old_op', 'FakeRunnerA', ((1, 2),), ())"] = (
             "FakeRunnerA",
             10,
         )
@@ -414,8 +414,8 @@ class TestEndToEnd:
             assert len(_config_entries(data)) == 2
 
             # Verify old loaded config is included
-            assert "('old_op', 'FakeRunnerA', ((1, 2),))" in data
-            old_entry = data["('old_op', 'FakeRunnerA', ((1, 2),))"]
+            assert "('old_op', 'FakeRunnerA', ((1, 2),), ())" in data
+            old_entry = data["('old_op', 'FakeRunnerA', ((1, 2),), ())"]
             assert old_entry == ["FakeRunnerA", 10]
         finally:
             os.unlink(tmp_path)
@@ -427,7 +427,7 @@ class TestEndToEnd:
 
         # Simulate a loaded config for this key
         cache_key = AutoTuner._get_cache_key("op1", runner, profile, _TUNING_CONFIG)
-        file_key = str((cache_key[0], cache_key[1], cache_key[3]))
+        file_key = cache_key.file_key
         self.tuner._file_configs[file_key] = ("FakeRunnerA", 99)
 
         # Add a newer in-memory result for the same op/runner/profile
@@ -452,6 +452,93 @@ class TestEndToEnd:
 
 
 # ---------------------------------------------------------------------------
+# Tests: file cache key collision (reproduces GitHub issue #3363)
+# ---------------------------------------------------------------------------
+
+
+class TestFileCacheKeyCollision:
+    """Verify that runners differing only in extras do not collide in file cache.
+
+    This reproduces the bug where TrtllmGemmRunner with use_8x4_sf_layout=True
+    and use_8x4_sf_layout=False produce the same file cache key, causing the
+    wrong tactic to be loaded from a persistent cache file.
+    """
+
+    def setup_method(self):
+        AutoTuner._instance = None
+        self.tuner = AutoTuner.get()
+
+    def teardown_method(self):
+        AutoTuner._instance = None
+
+    def test_different_extras_produce_different_file_keys(self):
+        """Two entries with same op/runner/profile but different extras must not collide."""
+        runner = FakeRunnerA(value=1)
+        profile = ((128, 3584), (3584, 7168))
+
+        # Simulate two cache entries that differ only in extras
+        # (e.g. use_8x4_sf_layout=True vs False)
+        cache_key_a = AutoTuner._get_cache_key(
+            "fp4_gemm", runner, profile, _TUNING_CONFIG, extras=(True,)
+        )
+        cache_key_b = AutoTuner._get_cache_key(
+            "fp4_gemm", runner, profile, _TUNING_CONFIG, extras=(False,)
+        )
+        self.tuner.profiling_cache[cache_key_a] = (0, 42, None)
+        self.tuner.profiling_cache[cache_key_b] = (0, 17, None)
+        self.tuner._dirty = True
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            tmp_path = f.name
+
+        try:
+            self.tuner.save_configs(tmp_path)
+
+            with open(tmp_path, "r") as f:
+                data = json.load(f)
+
+            configs = _config_entries(data)
+            # BUG: without fix, only 1 entry (collision). With fix, 2 entries.
+            assert len(configs) == 2, (
+                f"Expected 2 distinct file cache entries but got {len(configs)}. "
+                f"Entries with different extras collided in the file key."
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def test_save_load_roundtrip_with_extras(self):
+        """Save two entries with different extras, load them back, verify both are found."""
+        runner = FakeRunnerA(value=1)
+        profile = ((128, 3584), (3584, 7168))
+
+        cache_key_a = AutoTuner._get_cache_key(
+            "fp4_gemm", runner, profile, _TUNING_CONFIG, extras=(True,)
+        )
+        cache_key_b = AutoTuner._get_cache_key(
+            "fp4_gemm", runner, profile, _TUNING_CONFIG, extras=(False,)
+        )
+        self.tuner.profiling_cache[cache_key_a] = (0, 42, None)
+        self.tuner.profiling_cache[cache_key_b] = (0, 17, None)
+        self.tuner._dirty = True
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            tmp_path = f.name
+
+        try:
+            self.tuner.save_configs(tmp_path)
+            self.tuner.clear_cache()
+            self.tuner.load_configs(tmp_path)
+
+            # Both entries should be in _file_configs, not just one
+            assert len(self.tuner._file_configs) == 2, (
+                f"Expected 2 file_configs entries but got {len(self.tuner._file_configs)}. "
+                f"One entry was overwritten due to key collision."
+            )
+        finally:
+            os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # Tests: autotune(cache=...) context manager
 # ---------------------------------------------------------------------------
 
@@ -466,7 +553,7 @@ class TestAutotuneCache:
     def test_autotune_cache_loads_on_entry(self):
         """autotune(cache=path) should load configs from the file on entry."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump({"('op1', 'FakeRunnerA', ((1, 2),))": ["FakeRunnerA", 7]}, f)
+            json.dump({"('op1', 'FakeRunnerA', ((1, 2),), ())": ["FakeRunnerA", 7]}, f)
             tmp_path = f.name
 
         try:

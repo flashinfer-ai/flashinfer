@@ -136,16 +136,17 @@ class Runner {
   explicit Runner(int32_t tileTokensDim);
 
   void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts,
-           int32_t topK, int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset,
-           int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
-           int32_t* expertCountHistogram, int32_t* permutedIdxSize,
+           int32_t topK, int32_t numFusedSharedExpert, int32_t nGroups, int32_t topkGroups,
+           int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor,
+           int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
            int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-           int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert,
-           int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
-           batchedGemm::trtllm::gen::Dtype dtypeElt, batchedGemm::trtllm::gen::Dtype dtypeBias,
-           bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType,
-           cudaStream_t stream, batchedGemm::trtllm::gen::Dtype dtypeLogits,
-           bool normTopkProb = true, int16_t* routing_replay_out = nullptr);
+           int32_t* permutedIdxToTokenIdx, int32_t* expertIds, void* expertWeights,
+           int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
+           int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt,
+           batchedGemm::trtllm::gen::Dtype dtypeBias, bool useRoutingScalesOnInput,
+           bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
+           batchedGemm::trtllm::gen::Dtype dtypeLogits, bool normTopkProb = true,
+           int16_t* routing_replay_out = nullptr, bool enable_pdl = true);
 
  private:
   friend class MoE::Runner;
@@ -164,8 +165,10 @@ enum class ActivationType : int64_t {
   Geglu = 4,
   SwigluBias = 5,
   Relu2 = 6,
-  Identity = 7,
-  InvalidType = 8,  // Must be last
+  SwigluStep = 7,
+  GegluTanh = 8,
+  Identity = 9,
+  InvalidType = 10,  // Must be last
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -186,6 +189,10 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "Relu2";
     case ActivationType::Identity:
       return "Identity";
+    case ActivationType::SwigluStep:
+      return "SwigluStep";
+    case ActivationType::GegluTanh:
+      return "GegluTanh";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
@@ -193,7 +200,9 @@ inline std::string serializeActivationType(ActivationType activationType) {
 
 inline bool isGatedActivation(ActivationType activationType) {
   return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
-         activationType == ActivationType::SwigluBias;
+         activationType == ActivationType::SwigluBias ||
+         activationType == ActivationType::SwigluStep ||
+         activationType == ActivationType::GegluTanh;
 }
 
 }  // namespace MoE
@@ -205,7 +214,8 @@ class Runner {
                   batchedGemm::trtllm::gen::Dtype dtypeWeights,
                   batchedGemm::trtllm::gen::Dtype dtypeOutput, bool useDeepSeekFp8,
                   int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrix,
-                  batchedGemm::gemm::MatrixLayout weight_layout, bool usePerTokenScaling,
+                  batchedGemm::gemm::MatrixLayout weight_layout,
+                  batchedGemm::gemm::BiasType biasType, bool usePerTokenScaling,
                   bool usePerChannelScaling);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -223,10 +233,11 @@ class Runner {
 
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* perTokenScales, void* perChannelScales, float* outputScalesScalar,
-           float* outputScalesGateScalar, float* ptrBias, float* ptrGatedActAlpha,
-           float* ptrGatedActBeta, float* ptrClampLimit, void* output, void* outputScale,
-           int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
-           int32_t numTokens, int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
+           float* outputScalesGateScalar, void* ptrBias, float* ptrGatedActAlpha,
+           float* ptrGatedActBeta, float* ptrClampLimit, int32_t* permutedIdxToBiasRowIdx,
+           void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
+           int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
+           int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
            int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
@@ -239,6 +250,7 @@ class Runner {
   int32_t mTileTokensDim;
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
   tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType mActType;
+  batchedGemm::gemm::BiasType mBiasType{batchedGemm::gemm::BiasType::None};
 };
 }  // namespace PermuteGemm1
 
@@ -301,7 +313,8 @@ struct MoERunnerArgs {
   void* gemm2_weights = nullptr;
   void* gemm2_weights_scale = nullptr;
 
-  float* gemm1_bias = nullptr;
+  void* gemm1_bias = nullptr;
+  batchedGemm::gemm::BiasType gemm1_bias_type{batchedGemm::gemm::BiasType::None};
   float* gemm1_alpha = nullptr;
   float* gemm1_beta = nullptr;
   float* gemm1_clamp_limit = nullptr;
@@ -311,6 +324,7 @@ struct MoERunnerArgs {
 
   int32_t num_tokens{0};
   int32_t num_experts{0};
+  int32_t num_fused_shared_experts{0};
   // Hidden dimension input of MoE block. It might be padded.
   int32_t hidden_size{0};
   // Hidden dimension output of MoE block. It is not padded.
@@ -407,11 +421,11 @@ class Runner {
  public:
   // FIXME: tileTokensDim is hardcoded for now
   Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
-         bool useDeepSeekFp8, int tileTokensDim = 8,
-         ActivationType activationType = ActivationType::Swiglu, bool useShuffledMatrix = false,
-         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
-         bool usePerTokenScalingGemm1 = false, bool usePerTokenScalingGemm2 = false,
-         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false);
+         bool useDeepSeekFp8, int tileTokensDim, ActivationType activationType,
+         bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weight_layout,
+         batchedGemm::gemm::BiasType gemm1BiasType, bool usePerTokenScalingGemm1 = false,
+         bool usePerTokenScalingGemm2 = false, bool usePerChannelScalingGemm1 = false,
+         bool usePerChannelScalingGemm2 = false);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrix = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
@@ -435,7 +449,7 @@ class Runner {
                                                    int32_t numTokens) const;
 
  private:
-  void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
+  void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, bool const enablePdl,
                   moe::dev::convertsf::Data& convertSfData,
                   moe::dev::activation::Data& activationData,
                   moe::dev::finalize::Data& finalizeData);

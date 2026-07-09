@@ -675,7 +675,9 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
     constexpr uint32_t num_threads =
         std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeKV)), bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
-    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U;
+    // For HEAD_DIM >= 512, halve the KV tile to fit in smem.
+    constexpr uint32_t tile_size_per_bdx =
+        GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : (HEAD_DIM >= 512 ? 4U : 8U)) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
       const uint32_t smem_size =
           2U * NUM_STAGES_SMEM * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeKV) +

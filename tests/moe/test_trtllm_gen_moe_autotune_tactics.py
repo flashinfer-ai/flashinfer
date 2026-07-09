@@ -38,9 +38,13 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe.core import Fp8QuantizationType, MoEInputs
 from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 from flashinfer.tllm_enums import DtypeTrtllmGen
-from flashinfer.utils import device_support_pdl, get_compute_capability
+from flashinfer.utils import (
+    device_support_pdl,
+    get_compute_capability,
+    last_positive_power_of_2,
+)
 
-from .test_trtllm_gen_fused_moe import (
+from .trtllm_gen_fused_moe_utils import (
     FP8BlockScaleMoe,
     QuantMode,
     routing_reference_renormalize,
@@ -51,14 +55,6 @@ from .test_trtllm_gen_fused_moe import (
 
 Fp4QuantMode = Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"]
 Fp8QuantMode = Literal["DeepSeekFp8", "MxFp8"]
-
-
-def _last_positive_power_of_2(n: int) -> int:
-    n = max(int(n), 1)
-    p = 1
-    while p * 2 <= n:
-        p *= 2
-    return p
 
 
 def _moe_profile_shapes(
@@ -82,6 +78,7 @@ def _moe_profile_shapes(
         "expert_weights": _bucket(inputs["expert_weights"]),
         "hidden_states": _bucket(inputs["hidden_states"]),
         "hidden_states_scale": _bucket(inputs["hidden_states_scale"], dim=scale_dim),
+        "gemm1_lora_delta": (0,),
         "per_token_scale": (0,),
     }
     return tuple(by_name[name] for name in MoEInputs._FIELDS)
@@ -99,7 +96,7 @@ def _force_tactic_in_autotuner_cache(
     tactic: list[int] | None,
     custom_op: str,
 ) -> None:
-    file_key = str((custom_op, _TEST_RUNNER, profile_shapes))
+    file_key = str((custom_op, _TEST_RUNNER, profile_shapes, ()))
     tuner = AutoTuner.get()
     tuner.profiling_cache.clear()
     tuner._file_configs.clear()
@@ -331,6 +328,7 @@ def _enumerate_valid_tactics(
             WeightLayout.MajorK.value,
             False,  # use_per_token_scaling
             num_tokens,
+            False,  # has_gemm1_lora_delta
         )
     )
 
@@ -378,8 +376,8 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         device=device,
     )
     # Pin the autotuner bucket so cache-write and runtime cache-lookup match.
-    tune_max_num_tokens = max(_last_positive_power_of_2(num_tokens), 16)
-    bucket_m = min(_last_positive_power_of_2(num_tokens), tune_max_num_tokens)
+    tune_max_num_tokens = max(last_positive_power_of_2(num_tokens), 16)
+    bucket_m = min(last_positive_power_of_2(num_tokens), tune_max_num_tokens)
     profile_shapes = _moe_profile_shapes(inputs, num_tokens, bucket_m)
 
     def _run_kernel_with_tactic(tactic: list[int] | None) -> torch.Tensor:
@@ -683,6 +681,7 @@ def _enumerate_fp8_valid_tactics(
             cfg["weight_layout"],
             False,  # use_per_token_scaling
             num_tokens,
+            False,  # has_gemm1_lora_delta
         )
     )
 
@@ -723,8 +722,8 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
         routing_method_type=routing_method_type,
         device=device,
     )
-    tune_max_num_tokens = max(_last_positive_power_of_2(num_tokens), 16)
-    bucket_m = min(_last_positive_power_of_2(num_tokens), tune_max_num_tokens)
+    tune_max_num_tokens = max(last_positive_power_of_2(num_tokens), 16)
+    bucket_m = min(last_positive_power_of_2(num_tokens), tune_max_num_tokens)
     profile_shapes = _moe_profile_shapes(
         inputs, num_tokens, bucket_m, scale_dim=cfg["scale_dim"]
     )
