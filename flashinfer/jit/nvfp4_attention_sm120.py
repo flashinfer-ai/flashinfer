@@ -18,7 +18,7 @@ import functools
 from pathlib import Path
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, sm120a_nvcc_flags
+from .core import JitSpec, current_compilation_context, gen_jit_spec
 
 
 _NVFP4_ATTENTION_SM120_MODULE_NAME = "nvfp4_attention_sm120"
@@ -89,9 +89,12 @@ def gen_nvfp4_attention_sm120_module() -> JitSpec:
     ]
     include_paths: list[str | Path] = []
     include_paths.extend(_nvfp4_attention_sm120_include_paths())
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
     return gen_jit_spec(
         _NVFP4_ATTENTION_SM120_MODULE_NAME,
         source_paths,
-        extra_cuda_cflags=sm120a_nvcc_flags + _NVFP4_ATTENTION_SM120_CUDA_FLAGS,
+        extra_cuda_cflags=nvcc_flags + _NVFP4_ATTENTION_SM120_CUDA_FLAGS,
         extra_include_paths=include_paths,
     )

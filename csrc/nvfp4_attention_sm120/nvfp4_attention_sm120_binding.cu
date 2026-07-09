@@ -231,8 +231,8 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   cudaError_t status = cudaGetDeviceProperties(&props, q_fp4.device().device_id);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "cudaGetDeviceProperties failed: " << cudaGetErrorString(status);
-  TVM_FFI_ICHECK(props.major == 12 && props.minor == 0)
-      << "NVFP4 attention SM120 kernel requires compute capability 12.0";
+  TVM_FFI_ICHECK(props.major == 12 && (props.minor == 0 || props.minor == 1))
+      << "NVFP4 attention SM120 kernel requires compute capability 12.0 or 12.1";
 
   const int64_t batch = q_fp4.size(0);
   const int64_t num_heads = q_fp4.size(1);
