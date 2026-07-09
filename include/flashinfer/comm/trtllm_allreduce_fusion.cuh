@@ -390,7 +390,8 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 
 namespace utils {
 
-#define FINAL_MASK 0xffffffff
+static constexpr int kWarpSize = 32;
+static constexpr unsigned int kFullWarpMask = 0xffffffffU;
 
 template <typename T, int NUM>
 __inline__ __device__ T warpReduceSumV2(T* val) {
@@ -398,7 +399,24 @@ __inline__ __device__ T warpReduceSumV2(T* val) {
   for (int i = 0; i < NUM; i++) {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
-      val[i] += __shfl_xor_sync(FINAL_MASK, val[i], mask, 32);
+      val[i] += __shfl_xor_sync(kFullWarpMask, val[i], mask, kWarpSize);
+  }
+  return (T)(0.0f);
+}
+
+template <typename T, int NUM>
+__inline__ __device__ T warpReduceSumPartialV2(T* val, int active_lanes) {
+  int lane = threadIdx.x & (kWarpSize - 1);
+  unsigned int active_mask = active_lanes == kWarpSize ? kFullWarpMask : (1U << active_lanes) - 1;
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      T other = __shfl_xor_sync(active_mask, val[i], mask, kWarpSize);
+      if ((lane ^ mask) < active_lanes) {
+        val[i] += other;
+      }
+    }
   }
   return (T)(0.0f);
 }
@@ -408,8 +426,15 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
   static __shared__ T shared[NUM][33];
   int lane = threadIdx.x & 0x1f;
   int wid = threadIdx.x >> 5;
+  int warp_count = ceil_div(blockDim.x, kWarpSize);
+  int tail_lanes = blockDim.x & (kWarpSize - 1);
+  bool is_partial_warp = tail_lanes != 0 && wid == warp_count - 1;
 
-  warpReduceSumV2<T, NUM>(val);
+  if (is_partial_warp) {
+    warpReduceSumPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceSumV2<T, NUM>(val);
+  }
 
   if (lane == 0) {
 #pragma unroll
@@ -420,12 +445,16 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
 
   __syncthreads();
 
-  bool is_mask = threadIdx.x < (blockDim.x >> 5);
+  bool is_mask = threadIdx.x < warp_count;
 #pragma unroll
   for (int i = 0; i < NUM; i++) {
     val[i] = is_mask ? shared[i][lane] : (T)(0.0f);
   }
-  warpReduceSumV2<T, NUM>(val);
+  if (is_partial_warp) {
+    warpReduceSumPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceSumV2<T, NUM>(val);
+  }
   return (T)0.0f;
 }
 
@@ -435,7 +464,24 @@ __inline__ __device__ T warpReduceMaxV2(T* val) {
   for (int i = 0; i < NUM; i++) {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
-      val[i] = fmaxf(val[i], __shfl_xor_sync(FINAL_MASK, val[i], mask, 32));
+      val[i] = fmaxf(val[i], __shfl_xor_sync(kFullWarpMask, val[i], mask, kWarpSize));
+    }
+  }
+  return (T)(0.0f);
+}
+
+template <typename T, int NUM>
+__inline__ __device__ T warpReduceMaxPartialV2(T* val, int active_lanes) {
+  int lane = threadIdx.x & (kWarpSize - 1);
+  unsigned int active_mask = active_lanes == kWarpSize ? kFullWarpMask : (1U << active_lanes) - 1;
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      T other = __shfl_xor_sync(active_mask, val[i], mask, kWarpSize);
+      if ((lane ^ mask) < active_lanes) {
+        val[i] = fmaxf(val[i], other);
+      }
     }
   }
   return (T)(0.0f);
@@ -446,8 +492,15 @@ __inline__ __device__ T blockReduceMaxV2(T* val) {
   static __shared__ T shared[NUM][33];
   int lane = threadIdx.x & 0x1f;
   int wid = threadIdx.x >> 5;
+  int warp_count = ceil_div(blockDim.x, kWarpSize);
+  int tail_lanes = blockDim.x & (kWarpSize - 1);
+  bool is_partial_warp = tail_lanes != 0 && wid == warp_count - 1;
 
-  warpReduceMaxV2<T, NUM>(val);
+  if (is_partial_warp) {
+    warpReduceMaxPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceMaxV2<T, NUM>(val);
+  }
 
   if (lane == 0) {
 #pragma unroll
@@ -458,13 +511,17 @@ __inline__ __device__ T blockReduceMaxV2(T* val) {
 
   __syncthreads();
 
-  bool is_mask = threadIdx.x < (blockDim.x >> 5);
+  bool is_mask = threadIdx.x < warp_count;
 #pragma unroll
   for (int i = 0; i < NUM; i++) {
     val[i] = is_mask ? shared[i][lane]
                      : maths::cuda_cast<T>(-cuda::std::numeric_limits<float>::infinity());
   }
-  warpReduceMaxV2<T, NUM>(val);
+  if (is_partial_warp) {
+    warpReduceMaxPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceMaxV2<T, NUM>(val);
+  }
   return (T)0.0f;
 }
 

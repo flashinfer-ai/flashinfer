@@ -202,7 +202,7 @@ cython_debug/
 docs/tutorials/generated/
 docs/sg_execution_times.rst
 
-# moe_ep build artifacts (BUILD_NVEP=1 in-tree build of NIXL-EP + NCCL-EP)
+# moe_ep build artifacts (default in-tree build of NIXL-EP)
 build_nvep/
 flashinfer/moe_ep/*/_libs/
 flashinfer/moe_ep/*/_vendored/

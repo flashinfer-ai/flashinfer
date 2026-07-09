@@ -2108,3 +2108,43 @@ def test_moe_lora_delta(
 
     torch.testing.assert_close(delta_args_dequant.gemm1_lora_delta, delta)
     assert (delta_reference - zero_reference).abs().max().item() > 0.05
+
+
+def test_fp4_block_scale_deepseekv3_unfinalized_weight_dtype(cache_permute_indices):
+    """Regression for #3595.
+
+    With fp32 DeepSeekV3 routing logits and ``do_finalize=False``, the returned
+    ``expert_weights`` must be bfloat16: the trtllm-gen routing kernel always
+    emits bf16 expert weights, and the FP4 op returns that buffer verbatim.
+    Before the fix the buffer was allocated with ``routing_logits.dtype`` (fp32),
+    so callers received bf16 data mislabeled as fp32.
+    """
+    run_moe_test(
+        num_tokens=128,
+        hidden_size=1024,
+        intermediate_size=1024,
+        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
+        routing_config={
+            "num_experts": 256,
+            "top_k": 8,
+            "padding": 8,
+            "n_groups": 8,
+            "top_k_groups": 4,
+            "routed_scaling": 2.5,
+            "has_routing_bias": True,
+            "routing_method_type": RoutingMethodType.DeepSeekV3,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [1024],
+            "compatible_activation_types": [ActivationType.Swiglu],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe],
+        },
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.float32,
+        verify_unfinalized_weight_dtype=True,
+    )

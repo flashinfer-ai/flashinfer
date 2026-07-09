@@ -28,12 +28,10 @@ DTYPE_MAP = {
 GPU_DEVICE = "cuda:0"
 
 global_workspace_buffer = None  # can.be empty initialized
-global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
+global_trtllm_gen_fmha_workspace_buffer = None
 workspace_size = 256 * 1024 * 1024
 
-# Counter slab at the head of the generation workspace: 8192 batches * 256 heads * 4 bytes/int32.
-TRTLLM_GEN_COUNTER_BYTES = 8192 * 256 * 4
-# Size of the guard region we zero past the softmax slab (or counter slab when LSE is off).
+# Size of the guard region we zero past the softmax slab.
 TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
 
 
@@ -63,10 +61,8 @@ def trtllm_gen_workspace_softmax_end_bytes_context(
 def trtllm_gen_workspace_softmax_end_bytes_decode(
     num_qo_heads: int, batch_size: int, max_q_len: int
 ) -> int:
-    """End offset of the softmax slab in the generation-mode workspace layout [counter|softmax|scratch]."""
-    return TRTLLM_GEN_COUNTER_BYTES + _trtllm_gen_softmax_slab_bytes(
-        num_qo_heads, batch_size, max_q_len
-    )
+    """End offset of the softmax slab in the generation-mode workspace layout [softmax|scratch]."""
+    return _trtllm_gen_softmax_slab_bytes(num_qo_heads, batch_size, max_q_len)
 
 
 def _skip_if_not_blackwell() -> None:
@@ -370,7 +366,7 @@ def create_workspace_buffers(device: torch.device):
             workspace_size, dtype=torch.int8, device=device
         )
     if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+        global_trtllm_gen_fmha_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
     return global_trtllm_gen_fmha_workspace_buffer, global_workspace_buffer
@@ -971,11 +967,6 @@ def _test_trtllm_batch_decode(
     else:
         output = output_and_lse
 
-    if backend == "trtllm-gen":
-        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4] == 0).all().item()
-
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
             output, output_ref, o_sf_scale, o_sf_vec_size
@@ -1091,9 +1082,6 @@ def _test_trtllm_batch_decode(
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
-        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4] == 0).all().item()
 
 
 @pytest.mark.parametrize("backend", ["trtllm-gen"])
