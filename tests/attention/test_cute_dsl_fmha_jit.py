@@ -44,6 +44,7 @@ from flashinfer.cute_dsl.attention.fmha.fmha_blockscaled import (
     create_scale_factor_tensor,
 )
 from flashinfer.cute_dsl.attention.fmha.helpers import fmha_helpers as fmha_utils
+from flashinfer.cute_dsl.attention.fmha.compile import _ex2_emulation_enabled
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
@@ -53,6 +54,7 @@ pytestmark = pytest.mark.skipif(
 DEVICE = "cuda"
 MMA_TILER = (128, 128)
 LOG2_E = math.log2(math.e)
+ENABLE_EX2 = _ex2_emulation_enabled(torch.device(DEVICE))
 
 
 def _make_cute(shape, cutlass_dtype, *, zero_out=False):
@@ -238,7 +240,7 @@ def test_cute_dsl_fmha_jit(mode, causal):
         head_dim=d,
         is_persistent=False,
         mask_type=mask_type,
-        enable_ex2_emulation=True,
+        enable_ex2_emulation=ENABLE_EX2,
         enable_skip_correction=True,
         use_tma_store=False,  # varlen
     )
@@ -365,7 +367,7 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
         head_dim=d,
         is_persistent=False,
         mask_type=mask_type,
-        enable_ex2_emulation=True,
+        enable_ex2_emulation=ENABLE_EX2,
         enable_skip_correction=True,
         qk_sf_vec_size=sf_vec,
         use_tma_store=True,  # non-varlen
