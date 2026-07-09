@@ -204,6 +204,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tmem_alloc_sync_bar_id=self.schedule.tmem_alloc_sync_bar_id,
             threads_per_warp=self.schedule.threads_per_warp,
             has_logits_transform=self.has_logits_transform,
+            has_statistics_update=self.fusion.variant.has_statistics_update,
         )
         self.mma_role.set_dtypes(
             self.q_dtype,

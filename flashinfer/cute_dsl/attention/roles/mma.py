@@ -32,7 +32,7 @@ from cutlass.cute.typing import Int32, Float32
 from cutlass.pipeline import PipelineProducer, PipelineConsumer
 
 from ..config import AttentionConfig
-from ..fusion.mask import get_trip_count
+from ..fusion.mask import get_kv_block_range, get_trip_count
 from ..scheduler.persistent import (
     FmhaStaticTileScheduler,
     FmhaStaticTileSchedulerParams,
@@ -53,6 +53,7 @@ class MmaRole:
         tmem_alloc_sync_bar_id,
         threads_per_warp,
         has_logits_transform: bool = False,
+        has_statistics_update: bool = False,
     ):
         self.cta_tiler = config.cta_tiler
         self.mask_spec = config.mask_spec
@@ -60,6 +61,7 @@ class MmaRole:
         self.tmem_alloc_sync_bar_id = tmem_alloc_sync_bar_id
         self.threads_per_warp = threads_per_warp
         self.has_logits_transform = has_logits_transform
+        self.has_statistics_update = has_statistics_update
         # Used to (re)construct local TiledMma instances inside gemm_qk /
         # gemm_pv so the helper's .set(ACCUMULATE, ...) mutations don't
         # leak SSA values into the caller's persistent loop.
@@ -264,7 +266,60 @@ class MmaRole:
                     cuseqlen_k = cum_seqlen_k[batch_coord]
                     seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
+                # Per-stage 128-row bands (mirrors SoftmaxRole.run()): QK
+                # gemms for KV blocks outside a stage's band are skipped —
+                # the softmax dead_step never reads that S tile, and
+                # committing a handle without a gemm is the same pattern as
+                # the tile-end commits below.  PV gemms are NOT skipped:
+                # PV1's ACCUMULATE overwrite->accumulate transition happens
+                # at the first trip, exactly where stage 1's dead block
+                # sits, and the softmax dead_step stores a zero P for them.
+                kv_start_block = 0
+                stage0_lo = 0
+                stage0_hi = 0
+                stage1_lo = 0
+                stage1_hi = 0
+                qk1_live_prologue = True
+                if cutlass.const_expr(
+                    not self.has_logits_transform and not self.has_statistics_update
+                ):
+                    stage_tiler = (self.cta_tiler[0] // 2, self.cta_tiler[1])
+                    kv_start_block, _ = get_kv_block_range(
+                        self.mask_spec,
+                        curr_block_coord,
+                        self.cta_tiler,
+                        seqlen_k,
+                        seqlen_q_,
+                    )
+                    stage0_lo, stage0_hi = get_kv_block_range(
+                        self.mask_spec,
+                        (
+                            curr_block_coord[0] * 2,
+                            curr_block_coord[1],
+                            curr_block_coord[2],
+                        ),
+                        stage_tiler,
+                        seqlen_k,
+                        seqlen_q_,
+                    )
+                    stage1_lo, stage1_hi = get_kv_block_range(
+                        self.mask_spec,
+                        (
+                            curr_block_coord[0] * 2 + 1,
+                            curr_block_coord[1],
+                            curr_block_coord[2],
+                        ),
+                        stage_tiler,
+                        seqlen_k,
+                        seqlen_q_,
+                    )
+                    qk1_live_prologue = not (
+                        kv_start_block < stage1_lo or kv_start_block >= stage1_hi
+                    )
+
                 # GEMM_QK00 (Q0 * K0 -> S0)
+                # Never dead: lo(q) is non-decreasing in q, so the union's
+                # start block always lies inside stage 0's band.
                 q0_handle_consumer = load_q_consumer.wait_and_advance()
                 tSrQ0 = tSrQ[None, None, None, q0_handle_consumer.index]
                 k_handle_consumer = load_kv_consumer.wait_and_advance()
@@ -277,7 +332,8 @@ class MmaRole:
                 q1_handle_consumer = load_q_consumer.wait_and_advance()
                 tSrQ1 = tSrQ[None, None, None, q1_handle_consumer.index]
                 s1_handle_producer = mma_s1_producer.acquire_and_advance()
-                self.gemm_qk(tStS1, tSrQ1, tSrK0)
+                if qk1_live_prologue:
+                    self.gemm_qk(tStS1, tSrQ1, tSrK0)
                 s1_handle_producer.commit()
                 k_handle_consumer.release()
 
@@ -312,10 +368,19 @@ class MmaRole:
                 # be demoted to a runtime register through the kv loop.
                 pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
+                    qk0_live = True
+                    qk1_live = True
+                    if cutlass.const_expr(
+                        not self.has_logits_transform and not self.has_statistics_update
+                    ):
+                        blk = kv_start_block + _i + 1
+                        qk0_live = not (blk < stage0_lo or blk >= stage0_hi)
+                        qk1_live = not (blk < stage1_lo or blk >= stage1_hi)
                     # GEMM_QK0i
                     k_handle_consumer = load_kv_consumer.wait_and_advance()
                     tSrKi = tSrK[None, None, None, k_handle_consumer.index]
-                    self.gemm_qk(tStS0, tSrQ0, tSrKi)
+                    if qk0_live:
+                        self.gemm_qk(tStS0, tSrQ0, tSrKi)
                     s0_handle_producer.commit()
 
                     # GEMM_PV1(i-1) — read the constant-folded ACCUMULATE
@@ -331,7 +396,8 @@ class MmaRole:
                     v_handle_consumer.release()
 
                     # GEMM_QK1i
-                    self.gemm_qk(tStS1, tSrQ1, tSrKi)
+                    if qk1_live:
+                        self.gemm_qk(tStS1, tSrQ1, tSrKi)
                     s1_handle_producer.commit()
                     k_handle_consumer.release()
 
