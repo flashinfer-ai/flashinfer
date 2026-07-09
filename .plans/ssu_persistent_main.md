@@ -1185,6 +1185,12 @@ For the record: without conv1d the mono wins to 2048u (bf16 +0.9) and the split
 takes over by 4096u (−4.3); f32-stg1 split already wins at 2048u (−3.2).
 Cross-GPU: the sm_count scaling is physics-plausible but B200-only (TODO below).
 
+Follow-up (2026-07-09): the last raw-batch heuristic — precompute head-tiling
+`batch >= 8 → hc=8` — generalized to "the hc=8 grid (batch·ngroups·HPG/8 CTAs)
+covers ≥ ~1/10 of the SMs" (`hc8_grid * 10 >= num_sms`).  Reproduces the
+measured b=8 boundary exactly at TP8 on the 148-SM B200 and scales with
+ngroups (TP) and GPU size.  Every SSU launch heuristic is now SM-scaled.
+
 ### LANDED: stg1/cps16 becomes the universal main default (B200, 2026-07-09)
 
 Igor's sweep request — is there a stages 1↔2 crossover on the 2k below b=1024?

@@ -156,20 +156,32 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
             pcfg.numAttrs = 1;
             FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&pcfg, pfunc, params));
           };
+      static int const num_sms = [] {
+        int dev = 0, n = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        return n;
+      }();
+
       // ── Head-tiling default: heads/CTA == warps/CTA (1 head/warp), coupled in
       // launch_precompute (PRECOMPUTE_NUM_WARPS = max(hc, 4)).  hc=8 (→ 8 warps) measured as
-      // the robust optimum for batch >= 8 on B200, across BOTH the cliff and large batch:
+      // the robust optimum on B200, across BOTH the cliff and large batch:
       //   • small batch: the precompute is latency-bound + under-occupied — 8 warps double
       //     the resident warps (occ 6%→12%, matching triton's _dynamic_precompute) to hide
       //     the load latency (no-issue 93%→88%, b=16 11.3µs→10.7µs).
       //   • large batch: fewer head-tiles per group HALVE the redundant per-group C·B matmul
       //     (b=1024: hc=8 136µs vs the old hc=2 143µs — now beats triton-replay-pm).
-      // Below b=8 the precompute is so under-occupied that spreading into MORE, smaller CTAs
-      // (hc=4 → 4 tiles vs hc=8 → 2) lights up more SMs and edges ahead (b≤4: hc=8 is +0.1–0.2µs),
-      // so back off there.  hc=16 regressed small batch (too few CTAs, 512 thr) without helping
-      // large — not worth a 3rd tier.  Tunable via precompute_heads_per_cta / the env below;
+      // At tiny grids the precompute is so under-occupied that spreading into MORE, smaller
+      // CTAs (hc=4 → 4 tiles vs hc=8 → 2) lights up more SMs and edges ahead (+0.1–0.2µs),
+      // so back off there.  The boundary — measured as b=8 at ng=1/HPG=16 on the 148-SM B200 —
+      // is the hc=8 grid (batch·ngroups·HPG/8 CTAs) covering ≥ ~1/10 of the SMs; expressing it
+      // that way (instead of raw `batch >= 8`) scales it with ngroups (TP) and GPU size.
+      // hc=16 regressed small batch (too few CTAs, 512 thr) without helping large — not worth
+      // a 3rd tier.  Tunable via precompute_heads_per_cta / the env below;
       // dispatch_heads_per_cta snaps to the HEADS_PER_GROUP>>k chain (clamps to HPG).
-      int const hc_ideal = (params.batch >= 8) ? 8 : 4;
+      int64_t const hc8_grid = static_cast<int64_t>(params.batch) * params.ngroups *
+                               (HEADS_PER_GROUP >= 8 ? HEADS_PER_GROUP / 8 : 1);
+      int const hc_ideal = (hc8_grid * 10 >= num_sms) ? 8 : 4;
       int hc = HEADS_PER_GROUP;
       while (hc > 1 && hc > hc_ideal) hc >>= 1;
       // Overrides (both snap to the HEADS_PER_GROUP>>k chain in dispatch_heads_per_cta):
@@ -212,12 +224,6 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
           main_heads_per_cta;  // MHC knob ditched — the main runs MHC=1 (kernel template default).
       constexpr int MAIN_NUM_WARPS = 4;
 
-      static int const main_num_sms = [] {
-        int dev = 0, n = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
-        return n;
-      }();
       int const main_total_work =
           D_SPLIT * static_cast<int>(params.batch) * static_cast<int>(params.nheads);
 
@@ -252,7 +258,7 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
         int const v = e ? std::atoi(e) : 0;  // unset/<=0 → regime default
         return v > 0 ? v : regime.cta_per_sm;
       }();
-      int64_t const main_grid_ll = static_cast<int64_t>(main_cta_per_sm) * main_num_sms;
+      int64_t const main_grid_ll = static_cast<int64_t>(main_cta_per_sm) * num_sms;
       int const main_grid =
           static_cast<int>(main_grid_ll < main_total_work ? main_grid_ll : main_total_work);
 
