@@ -1015,3 +1015,71 @@ def test_skip_ops_restored_after_context():
 
     # After context, skip_ops should be empty — op goes through normal path
     assert tuner._effective_skip_ops == frozenset()
+
+
+def test_find_nearest_profile_cache_stable_with_reused_callable():
+    """Reusing the same map_to_tuning_buckets callable should not grow the lru_cache.
+
+    This verifies the fix for the unbounded lru_cache leak: when the same lambda
+    object is reused (via _get_map_to_hybrid_bucket), id() stays stable, so
+    DynamicTensorSpec.__hash__ produces the same hash, and _find_nearest_profile's
+    lru_cache hits instead of creating a new entry every call.
+    """
+    map_fn = lambda x: min(x, 8192)
+    shapes = (torch.Size([128, 64]),)
+    buckets = (512, 1024, 2048, 4096, 8192)
+
+    # Warm up: first call creates one cache entry
+    config0 = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                (0,),
+                (0,),
+                buckets,
+                map_fn,
+            ),
+        ),
+    )
+    AutoTuner._find_nearest_profile(shapes, config0)
+    before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+    for _ in range(100):
+        config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    (0,),
+                    (0,),
+                    buckets,
+                    map_fn,
+                ),
+            ),
+        )
+        AutoTuner._find_nearest_profile(shapes, config)
+    after = AutoTuner._find_nearest_profile.cache_info().currsize
+    assert after == before, f"cache grew from {before} to {after}"
+
+
+def test_find_nearest_profile_cache_grows_with_fresh_callable():
+    """Creating a new lambda each call causes the lru_cache to grow (the bug).
+
+    This is the negative control: without the fix (fresh lambda each call),
+    the cache grows by one entry per call because id() differs.
+    """
+    shapes = (torch.Size([128, 64]),)
+    buckets = (512, 1024, 2048, 4096, 8192)
+
+    before = AutoTuner._find_nearest_profile.cache_info().currsize
+    for _ in range(10):
+        config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    (0,),
+                    (0,),
+                    buckets,
+                    lambda x: min(x, 8192),
+                ),
+            ),
+        )
+        AutoTuner._find_nearest_profile(shapes, config)
+    after = AutoTuner._find_nearest_profile.cache_info().currsize
+    assert after == before + 10, f"cache should grow by 10, got {after - before}"
