@@ -159,12 +159,7 @@ class JitSpecStatus:
 
 
 class JitSpecRegistry:
-    """Global registry to track all JitSpecs.
-
-    Accepts any JitSpec backend; in practice only nvcc modules register
-    today (via gen_jit_spec). Backs the ``flashinfer`` CLI's module
-    listing / status / compile-commands export.
-    """
+    """Global registry to track all JitSpecs"""
 
     def __init__(self):
         self._specs: Dict[str, "JitSpec"] = {}
@@ -187,11 +182,11 @@ class JitSpecRegistry:
 
         spec = self._specs[name]
         library_path = spec.get_library_path() if spec.is_compiled else None
-        # nvcc-specific report fields; other backends have no source list.
         if isinstance(spec, JitSpecNvcc):
             sources = spec.sources
             needs_device_linking = spec.needs_device_linking
         else:
+            # other backends have no source list.
             sources = []
             needs_device_linking = False
 
@@ -233,22 +228,22 @@ class JitSpec(abc.ABC):
     Concrete subclasses implement one compilation toolchain each
     (``JitSpecNvcc`` for nvcc/ninja modules, ``JitSpecCuteDsl`` for CuTe-DSL
     kernels; future DSLs follow the same shape). The shared lifecycle policy
-    lives in the concrete :meth:`build_and_load` template method: cached-
+    lives in the concrete `build_and_load` template method: cached-
     artifact fast path, cross-process locking with a double-check, and
     ``FLASHINFER_DISABLE_JIT`` enforcement.
 
     Subclass contract:
 
-    - :meth:`try_load` returns the cached artifact only when it is present
+    - `try_load` returns the cached artifact only when it is present
       AND known-valid; it may conservatively return ``None`` even when
       artifacts exist (e.g. nvcc delegates JIT-path freshness to ninja, so
       only the AOT artifact is returned here).
-    - :meth:`build` produces or refreshes on-disk artifacts. It must be
+    - `build` produces or refreshes on-disk artifacts. It must be
       idempotent and may be internally incremental. It runs under the
-      ``lock_path`` lock when invoked via :meth:`build_and_load`, so it must
+      ``lock_path`` lock when invoked via `build_and_load`, so it must
       not re-acquire that lock.
-    - :meth:`load` loads the artifact that :meth:`build` produced. It may
-      return an object retained in memory by :meth:`build` instead of
+    - `load` loads the artifact that `build` produced. It may
+      return an object retained in memory by `build` instead of
       re-reading from disk.
     """
 
@@ -375,10 +370,10 @@ class JitSpecNvcc(JitSpec):
         return self.ninja_path.exists()
 
     def try_load(self) -> Optional[Any]:
-        # Only the AOT artifact is known-valid without building: freshness of
-        # the JIT-path .so is owned by ninja's dependency scan, so a cache
-        # miss here routes build_and_load() through build(), where ninja
-        # no-ops if everything is up to date.
+        # Only the AOT artifact is known-valid without building.
+        # The freshness of the JIT-path .so is owned by ninja's dependency scan,
+        # so a cache miss here routes build_and_load() through build(),
+        # where ninja no-ops if everything is up to date.
         if self.is_aot:
             return self.load(self.aot_path)
         return None
@@ -393,8 +388,6 @@ class JitSpecNvcc(JitSpec):
             )
         if verbose is None:
             verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
-        # need_lock is for direct callers; build_and_load() already holds the
-        # lock_path lock (FileLock is not reentrant across instances).
         lock = (
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
@@ -586,8 +579,6 @@ def build_jit_specs(
 ) -> None:
     lines: List[str] = []
     for spec in specs:
-        # Batch ninja builds only apply to nvcc modules; other JitSpec
-        # backends (e.g. CuTe-DSL) compile in-process at first use.
         if not isinstance(spec, JitSpecNvcc):
             raise TypeError(
                 f"build_jit_specs only supports nvcc modules, got "

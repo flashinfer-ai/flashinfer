@@ -81,9 +81,7 @@ class JitSpecCuteDsl(JitSpec):
 
     One instance represents a single compiled kernel (nvcc specs represent a
     whole module); instances of the same op family share a module directory
-    and its module-level ``meta.json``. The shared lifecycle (cached fast
-    path, locking, ``FLASHINFER_DISABLE_JIT``) comes from the base class's
-    ``build_and_load()`` template method.
+    and its module-level ``meta.json``.
     """
 
     def __init__(
@@ -156,11 +154,8 @@ class JitSpecCuteDsl(JitSpec):
         Runs under ``lock_path`` when invoked via ``build_and_load()``.
         Persistence failures degrade gracefully: the in-process kernel is
         kept for load(); only the disk write is lost.
+        Stale modules (dsl version / source change) are wiped like a ninja rebuild.
         """
-        # Stale module (dsl version / source change): wipe it, like a ninja
-        # rebuild of the whole module. Open .o files stay mapped (POSIX).
-        # Also wipes a module with missing meta.json (crash before the meta
-        # write): an orphaned .o must not be adopted by fresh metadata.
         if (
             self.module_dir.exists()
             and _read_meta(self.meta_path) != self.expected_meta
