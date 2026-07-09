@@ -270,7 +270,7 @@ def get_gemm_module():
 
     # Register the module
     _gemm_module = SimpleNamespace(
-        cublas_fp8_gemm_runner=cublas_fp8_gemm_runner,
+        cublas_fp8_gemm_runner=functools.cache(cublas_fp8_gemm_runner),
         cutlass_segment_gemm=cutlass_segment_gemm,
     )
 
@@ -1159,7 +1159,7 @@ def get_gemm_sm100_module_cutlass_bf16():
         return CutlassBf16GemmRunner()
 
     return SimpleNamespace(
-        cutlass_bf16_gemm_runner=cutlass_bf16_gemm_runner,
+        cutlass_bf16_gemm_runner=functools.cache(cutlass_bf16_gemm_runner),
     )
 
 
@@ -1280,7 +1280,7 @@ def get_mm_bf16_cublaslt_module():
         return CublasltBf16GemmRunner()
 
     return SimpleNamespace(
-        cublaslt_bf16_gemm_runner=cublaslt_bf16_gemm_runner,
+        cublaslt_bf16_gemm_runner=functools.cache(cublaslt_bf16_gemm_runner),
     )
 
 
@@ -3431,6 +3431,7 @@ def _cudnn_gemm_fp8(
     return out
 
 
+@functools.cache
 def _cudnn_gemm_fp8_runner():
     m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
         _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
@@ -3870,6 +3871,7 @@ def _cudnn_gemm_bf16(
     return out
 
 
+@functools.cache
 def _cudnn_gemm_bf16_runner(
     is_a_k_major: Optional[bool] = None,
     is_b_k_major: Optional[bool] = None,

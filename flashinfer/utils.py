@@ -1255,11 +1255,38 @@ def backend_requirement(
 
         # @brief: Wrapper function that calls the orignal, decorated function, after applying a number of checks.
         # @note that here we manually apply defaults to the arguments in the wrapper function when doing validation.
+        _auto_memo: dict = {}
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # skip_check is an optional argument that the decorator adds to any API function.
             # It prevents the performance overhead of checking.
             skip_check = kwargs.pop("skip_check", False)
+
+            # Memoize backend="auto" resolution per call signature
+            # (shapes/dtypes/scalars): validation + heuristic run once per
+            # distinct signature instead of on every call.
+            _mkey = None
+            if kwargs.get("backend") == "auto" and heuristic_func is not None:
+                _parts = []
+                _hashable = True
+                for _v in args + tuple(kwargs.values()):
+                    if isinstance(_v, torch.Tensor):
+                        _parts.append((tuple(_v.shape), _v.dtype, _v.device.index))
+                    elif (
+                        isinstance(_v, (str, bool, int, float, torch.dtype))
+                        or _v is None
+                    ):
+                        _parts.append(_v)
+                    else:
+                        _hashable = False
+                        break
+                if _hashable:
+                    _mkey = tuple(_parts)
+                    _hit = _auto_memo.get(_mkey)
+                    if _hit is not None:
+                        wrapper.suitable_auto_backends = _hit
+                        return func(*args, **kwargs)
 
             if not skip_check:
                 # Apply defaults from the function signature for validation
@@ -1312,6 +1339,10 @@ def backend_requirement(
                     capability = _get_capability(*args, **kwargs)
                     suitable_auto_backends(capability, *args, **kwargs)
 
+            if _mkey is not None:
+                _resolved = getattr(wrapper, "suitable_auto_backends", None)
+                if _resolved:
+                    _auto_memo[_mkey] = _resolved
             return func(*args, **kwargs)
 
         wrapper.is_backend_supported = is_backend_supported
