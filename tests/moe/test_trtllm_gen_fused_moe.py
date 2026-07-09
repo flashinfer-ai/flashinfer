@@ -40,6 +40,8 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     trtllm_fp8_block_scale_routed_moe,
 )
 
+pytestmark = pytest.mark.long_running
+
 
 @pytest.fixture(scope="module")
 def cache_permute_indices():
@@ -246,6 +248,42 @@ def test_sigmoid_routing(
                 "enable_autotune": True,
             },
             id="DSv3",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "num_fused_shared_experts": 1,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "compatible_activation_types": [ActivationType.Swiglu],
+                "enable_autotune": False,
+            },
+            id="DSv3_fused_shared_1",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "num_fused_shared_experts": 2,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "compatible_activation_types": [ActivationType.Swiglu],
+                "enable_autotune": False,
+            },
+            id="DSv3_fused_shared_2",
         ),
         pytest.param(
             {
@@ -1734,6 +1772,49 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
         )
 
 
+def test_fp8_block_scale_moe_fused_shared_experts_reject_ep():
+    """Fused shared experts must reject expert-parallel (EP) configurations.
+
+    The routing kernel maps a shared expert's global id ``num_experts + k`` to a
+    weight row as ``global_id - local_expert_offset``, which only lands at the
+    intended local slot when all routed experts are local. EP configurations
+    (non-zero ``local_expert_offset`` or ``local_num_experts < num_experts``)
+    must therefore raise instead of silently producing wrong results. The guard
+    is a cheap host-side check, so this test does not require a GPU.
+    """
+    num_experts = 4
+    base_kwargs = {
+        "routing_logits": torch.empty((1, num_experts), dtype=torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": torch.empty((1, 1), dtype=torch.bfloat16),
+        "hidden_states_scale": torch.empty((1, 1), dtype=torch.float32),
+        "gemm1_weights": torch.empty((1, 2, 1), dtype=torch.bfloat16),
+        "gemm1_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+        "gemm2_weights": torch.empty((1, 1, 1), dtype=torch.bfloat16),
+        "gemm2_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+        "num_experts": num_experts,
+        "top_k": 1,
+        "n_group": None,
+        "topk_group": None,
+        "intermediate_size": 1,
+        "routed_scaling_factor": None,
+        "routing_method_type": RoutingMethodType.DeepSeekV3.value,
+        "num_fused_shared_experts": 1,
+    }
+
+    # Non-zero local_expert_offset (this rank does not own the first expert).
+    with pytest.raises(ValueError, match="expert parallelism"):
+        trtllm_fp8_block_scale_moe(
+            **base_kwargs, local_expert_offset=2, local_num_experts=num_experts
+        )
+
+    # Sharded experts: local_num_experts < num_experts.
+    with pytest.raises(ValueError, match="expert parallelism"):
+        trtllm_fp8_block_scale_moe(
+            **base_kwargs, local_expert_offset=0, local_num_experts=num_experts // 2
+        )
+
+
 def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):
     """TRT-LLM Gen MxFp8 MoE applies raw fused FC1 SwiGLU OA params."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -1921,6 +2002,10 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
             FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
             id="MxFp8",
         ),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="DSFp8",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -1955,7 +2040,11 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.BlockMajorK,
-                "compatible_moe_impls": [BF16Moe, MxInt4BlockScaleMoe],
+                "compatible_moe_impls": [
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                    FP8BlockScaleMoe,
+                ],
             },
             id="Shuffled_BlockMajorK",
         ),
@@ -1965,7 +2054,7 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
                 "layout": WeightLayout.MajorK,
                 "compatible_moe_impls": [FP8BlockScaleMoe],
             },
-            id="Shuffled_MajorK_MxFp8",
+            id="Shuffled_MajorK",
         ),
     ],
 )
@@ -2019,3 +2108,43 @@ def test_moe_lora_delta(
 
     torch.testing.assert_close(delta_args_dequant.gemm1_lora_delta, delta)
     assert (delta_reference - zero_reference).abs().max().item() > 0.05
+
+
+def test_fp4_block_scale_deepseekv3_unfinalized_weight_dtype(cache_permute_indices):
+    """Regression for #3595.
+
+    With fp32 DeepSeekV3 routing logits and ``do_finalize=False``, the returned
+    ``expert_weights`` must be bfloat16: the trtllm-gen routing kernel always
+    emits bf16 expert weights, and the FP4 op returns that buffer verbatim.
+    Before the fix the buffer was allocated with ``routing_logits.dtype`` (fp32),
+    so callers received bf16 data mislabeled as fp32.
+    """
+    run_moe_test(
+        num_tokens=128,
+        hidden_size=1024,
+        intermediate_size=1024,
+        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
+        routing_config={
+            "num_experts": 256,
+            "top_k": 8,
+            "padding": 8,
+            "n_groups": 8,
+            "top_k_groups": 4,
+            "routed_scaling": 2.5,
+            "has_routing_bias": True,
+            "routing_method_type": RoutingMethodType.DeepSeekV3,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [1024],
+            "compatible_activation_types": [ActivationType.Swiglu],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe],
+        },
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.float32,
+        verify_unfinalized_weight_dtype=True,
+    )

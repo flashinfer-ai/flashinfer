@@ -678,6 +678,17 @@ def gated_delta_rule_mtp(
         (first dim is indexed per-batch, not per-pool-slot — buffer must
         be at least ``B`` rows and contiguous; must be float32 when
         provided). When ``None``, intermediate states are not cached.
+        Mutually exclusive with ``ssm_state_indices``.
+    ssm_state_indices : torch.Tensor, optional
+        Per-token pool scatter indices of shape ``[B, T]`` and dtype
+        ``torch.int32``.  When provided, the kernel writes each intermediate
+        hidden state ``h_{t+1}`` directly to
+        ``initial_state[ssm_state_indices[i, t]]`` instead of accumulating
+        into a dense ``intermediate_states_buffer``.  Useful for FLA-style
+        speculative-decoding flows where each draft token needs its own pool
+        slot.  Constraints: ``T >= 2``, ``disable_state_update=False``,
+        mutually exclusive with ``intermediate_states_buffer``.
+        Default: ``None``.
     disable_state_update : bool, optional
         If ``True``, the initial state is not updated.  Currently defaults
         to ``True``; pass this argument explicitly to silence the

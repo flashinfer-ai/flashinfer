@@ -97,6 +97,7 @@ from flashinfer.cute_dsl.fp4_common import (
 from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
     Sm120B12xBlockScaledDenseGemmKernel as DenseGemmKernel,
 )
+from .moe_activation import gated_activation_f32, is_gated_activation
 
 
 _SF_VEC_SIZE = 16
@@ -276,9 +277,12 @@ class MoEDynamicKernel:
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
+        swiglu_alpha: float = 1.702,
+        swiglu_beta: float = 1.0,
+        swiglu_limit: float | None = None,
         share_input_across_experts: bool = False,
     ):
-        if activation not in {"silu", "relu2"}:
+        if activation not in {"silu", "relu2", "gelu_tanh", "swigluoai_uninterleave"}:
             raise ValueError(f"unsupported activation {activation!r}")
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
@@ -286,7 +290,10 @@ class MoEDynamicKernel:
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
         self.activation = activation
-        self.is_gated = activation == "silu"
+        self.is_gated = is_gated_activation(activation)
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
+        self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
         self.share_input_across_experts = share_input_across_experts
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
@@ -380,6 +387,11 @@ class MoEDynamicKernel:
             self.smem_capacity,
             self.occupancy,
         )
+        # The gated path stages a second weight pipeline (sB_up / sSFB_up) that
+        # _compute_stages doesn't model. Extra smem usage requires capping at 2
+        # to stay within the SM12x smem budget.
+        if self.is_gated:
+            self.ab_stage = max(1, min(self.ab_stage, 2))
         # ab_stage must divide k_tile_cnt evenly to avoid pipeline phase mismatch.
         # _compute_stages returns the max that fits in smem, but it may not
         # divide k_tile_cnt. Round down to the nearest divisor.
@@ -2189,13 +2201,17 @@ class MoEDynamicKernel:
                                         ):
                                             g = alpha_value * gate_slice[elem_idx]
                                             u = alpha_value * up_slice[elem_idx]
-                                            sigmoid_g = cute.arch.rcp_approx(
-                                                cutlass.Float32(1.0)
-                                                + cute.math.exp(
-                                                    -g, fastmath=self.fast_math
-                                                ),
+                                            tRS_rD_slice[elem_idx] = (
+                                                gated_activation_f32(
+                                                    g,
+                                                    u,
+                                                    activation=self.activation,
+                                                    limit=self.swiglu_limit,
+                                                    alpha=self.swiglu_alpha,
+                                                    beta=self.swiglu_beta,
+                                                    fast_math=self.fast_math,
+                                                )
                                             )
-                                            tRS_rD_slice[elem_idx] = g * sigmoid_g * u
                                     else:
                                         for elem_idx in cutlass.range_constexpr(
                                             cute.size(tRS_rD_slice)

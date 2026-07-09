@@ -42,6 +42,8 @@ def setup_test_environment():
     yield
 
 
+NUM_LORA_ADAPTERS = 8
+
 # Single GPU test parameters
 SINGLE_GPU_PARAMS = [
     (902, 7168, 256, 8),  # Large data
@@ -96,6 +98,44 @@ QUANT_PARAMS = [
     (CombineQuantMode.MXFP8, SfLayout.layout_8x4),
     (CombineQuantMode.MXFP4, SfLayout.layout_128x4),
     (CombineQuantMode.NVFP4, SfLayout.layout_128x4),
+]
+
+
+LORA_COMBINE_PARAMS = [
+    # (world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace, quant_mode, sf_layout, use_lora)
+    (
+        8,
+        16,
+        7168,
+        8,
+        torch.bfloat16,
+        True,
+        CombineQuantMode.NONE,
+        SfLayout.layout_linear,
+        True,
+    ),  # DeepSeek-V3 with LoRA
+    (
+        4,
+        16,
+        4096,
+        2,
+        torch.bfloat16,
+        True,
+        CombineQuantMode.NONE,
+        SfLayout.layout_linear,
+        True,
+    ),  # Mixtral-8x7B with LoRA
+    (
+        8,
+        16,
+        4096,
+        8,
+        torch.bfloat16,
+        False,
+        CombineQuantMode.NONE,
+        SfLayout.layout_linear,
+        True,
+    ),  # LoRA + payload not in workspace
 ]
 
 
@@ -166,7 +206,7 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
     """Test MOE alltoall communication on single GPU."""
     torch.cuda.set_device(0)
     # Create a random input tensor
-    dtypes = [torch.bfloat16, torch.float16, torch.int32, torch.uint8]
+    dtypes = [torch.bfloat16, torch.float16, torch.int32, torch.uint8, torch.int32]
     hidden_state_index = 0
     input_tensors = [
         make_payload(num_tokens, vector_dim * (i + 1), dtype)
@@ -393,7 +433,8 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
         f"should run with world_size at most {max_world_size}"
     )
 
-    dtypes = [torch.float16, torch.bfloat16, torch.int32, torch.uint8]
+    # 5 payloads (max): the trailing int32 represents the LoRA adapter ID slot.
+    dtypes = [torch.float16, torch.bfloat16, torch.int32, torch.uint8, torch.int32]
     # Create a random input tensor
     input_tensors = [
         make_payload(num_tokens * world_size, vector_dim * (i + 1), dtype)
@@ -529,13 +570,13 @@ def fake_moe(
     is_ep: bool = False,
     ep_rank: int | None = None,
     num_experts_per_rank: int | None = None,
+    lora_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Apply a deterministic fake MoE transformation for validation.
 
     Each expert applies a predictable scale: (expert_id + 1.0) / num_experts + 0.5
-    This allows verifying that communication correctly routes tokens to experts
-    and combines results.
+    When lora_ids is provided, the LoRA adapter ID adds an integer step: scale += lora_id + 1.0
 
     Args:
         hidden_states: Input tensor [num_tokens, hidden_size] or [world_size, num_tokens, hidden_size]
@@ -544,6 +585,7 @@ def fake_moe(
         is_ep: If True, only process experts assigned to this rank
         ep_rank: Rank for expert parallel filtering
         num_experts_per_rank: Number of experts per rank
+        lora_ids: Per-token LoRA adapter IDs [num_tokens] int32, or None
 
     Returns:
         Processed tensor with same shape as hidden_states
@@ -573,6 +615,8 @@ def fake_moe(
                 continue
 
             scale = (expert_id + 1.0) / num_experts + 0.5
+            if lora_ids is not None:
+                scale += lora_ids[token_idx].item() + 1.0
             results.append(hidden_states[token_idx] * scale)
 
         # Summing the results after is closer to the actual implementation as we do a tree reduction.
@@ -584,8 +628,9 @@ def fake_moe(
 
 
 @pytest.mark.parametrize(
-    "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace,quant_mode,sf_layout",
-    [(*x, *y) for x, y in itertools.product(COMBINE_PARAMS, QUANT_PARAMS)],
+    "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace,quant_mode,sf_layout,use_lora",
+    [(*x, *y, False) for x, y in itertools.product(COMBINE_PARAMS, QUANT_PARAMS)]
+    + LORA_COMBINE_PARAMS,
 )
 def test_moe_combine_multi_rank_single_gpu(
     world_size,
@@ -596,6 +641,7 @@ def test_moe_combine_multi_rank_single_gpu(
     payload_in_workspace,
     quant_mode,
     sf_layout,
+    use_lora,
 ):
     torch.cuda.set_device(0)
     compute_capability = get_compute_capability(torch.device("cuda"))
@@ -612,15 +658,16 @@ def test_moe_combine_multi_rank_single_gpu(
     )
 
     num_experts = world_size * top_k
+    total_tokens = num_tokens * world_size
 
     token_selected_experts_index = 0
     hidden_state_index = 1
 
     token_selected_experts = torch.empty(
-        num_tokens * world_size, top_k, dtype=torch.int32, device=torch.device("cuda")
+        total_tokens, top_k, dtype=torch.int32, device=torch.device("cuda")
     )
 
-    for i in range(num_tokens * world_size):
+    for i in range(total_tokens):
         # Include one extra expert to represent invalid expert IDs
         token_selected_experts[i] = torch.randperm(
             num_experts, dtype=torch.int32, device=torch.device("cuda")
@@ -628,14 +675,28 @@ def test_moe_combine_multi_rank_single_gpu(
     token_selected_experts = token_selected_experts.contiguous()
 
     # Create a random input tensor
-    reference_tensor = make_payload(num_tokens * world_size, vector_dim, dtype)
+    reference_tensor = make_payload(total_tokens, vector_dim, dtype)
     input_tensors = [
         token_selected_experts,
         reference_tensor,
         make_payload(
-            num_tokens * world_size, 1, torch.uint8
+            total_tokens, 1, torch.uint8
         ),  # Some extra payload to test combine alignment logic
     ]
+
+    lora_ids = None
+    lora_id_payload_index = None
+    if use_lora:
+        lora_ids = torch.randint(
+            0,
+            NUM_LORA_ADAPTERS,
+            (total_tokens,),
+            dtype=torch.int32,
+            device=torch.device("cuda"),
+        )
+        lora_id_payload_index = len(input_tensors)
+        # Dispatch kernel requires 2D payloads [num_tokens, elements_per_token]
+        input_tensors.append(lora_ids.unsqueeze(-1))
 
     output_tensors, all_workspaces, metainfo, combine_payload_offsets = (
         dispatch_from_single_rank(
@@ -683,6 +744,9 @@ def test_moe_combine_multi_rank_single_gpu(
             )
 
     for rank in range(world_size):
+        recv_lora_ids = None
+        if use_lora:
+            recv_lora_ids = output_tensors[rank][lora_id_payload_index].flatten()
         inplace_combine_tensors[rank].copy_(
             fake_moe(
                 output_tensors[rank][hidden_state_index],
@@ -691,6 +755,7 @@ def test_moe_combine_multi_rank_single_gpu(
                 is_ep=True,
                 ep_rank=rank,
                 num_experts_per_rank=num_experts // world_size,
+                lora_ids=recv_lora_ids,
             )
         )
 
@@ -750,7 +815,10 @@ def test_moe_combine_multi_rank_single_gpu(
 
     if quant_mode == CombineQuantMode.NONE:
         reference_result = fake_moe(
-            input_tensors[hidden_state_index], token_selected_experts, num_experts
+            input_tensors[hidden_state_index],
+            token_selected_experts,
+            num_experts,
+            lora_ids=lora_ids,
         )
         for rank in range(world_size):
             torch.testing.assert_close(

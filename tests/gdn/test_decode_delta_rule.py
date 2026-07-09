@@ -24,6 +24,8 @@ import random
 import torch
 import pytest
 
+pytestmark = pytest.mark.long_running
+
 
 try:
     from .reference_delta_rule import decode_delta_rule, verify_delta_rule
