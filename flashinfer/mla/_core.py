@@ -1586,7 +1586,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_indices : torch.IntTensor
             The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]`` or larger.
         kv_len_arr : torch.IntTensor
-            The query length of each request, shape: ``[batch_size]``.
+            The KV length of each request, shape: ``[batch_size]``.
         num_heads : int
             The number of heads in query/output tensor.
         head_dim_ckv : int
@@ -1773,7 +1773,7 @@ class BatchMLAPagedAttentionWrapper:
         profiler_buffer : Optional[torch.Tensor]
             The buffer to store the profiler data.
         kv_len : Optional[torch.Tensor]
-            The query length of each request, shape: ``[batch_size]``. Required when ``backend`` is ``cutlass``.
+            The KV length of each request, shape: ``[batch_size]``. Required when ``backend`` is ``cutlass``.
         page_table : Optional[torch.Tensor]
             The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
         return_lse_base_on_e : bool, optional
