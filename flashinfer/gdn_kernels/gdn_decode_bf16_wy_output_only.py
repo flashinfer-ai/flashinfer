@@ -31,6 +31,7 @@ Other features inherited from Path 1:
 
 import torch
 import math
+import weakref
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -1936,11 +1937,23 @@ _BF16_CACHE: dict = {}
 def _cached_bf16(t):
     if t.dtype == torch.bfloat16 and t.is_contiguous():
         return t
-    key = (t.data_ptr(), tuple(t.shape), str(t.dtype))
+    # Key by the SOURCE TENSOR OBJECT's identity, evicted when the object dies —
+    # NOT by data_ptr: the caching allocator recycles freed storage, so a
+    # data_ptr key can return a STALE cast for a brand-new tensor that landed on
+    # a recycled allocation (silent wrong A_log/dt_bias whenever the caller
+    # recreates them, e.g. benches/tests). id() is safe here because the
+    # weakref.finalize pop runs during the referent's destruction, before CPython
+    # can reuse the id. Serving keeps the fast path: per-layer weights are
+    # persistent objects, so hits return the same bf16 tensor (stable address —
+    # required for CUDA-graph replay). In-place mutation of a cached source
+    # tensor is not detected (same limitation as the previous key; these are
+    # frozen inference weights).
+    key = id(t)
     c = _BF16_CACHE.get(key)
     if c is None:
         c = t.to(torch.bfloat16).contiguous()
         _BF16_CACHE[key] = c
+        weakref.finalize(t, _BF16_CACHE.pop, key, None)
     return c
 
 
@@ -2012,6 +2025,12 @@ def gated_delta_rule_mtp(
         f"softplus_threshold={softplus_threshold} not supported (kernel ignores "
         "the threshold; pass 20.0 for signature compatibility)."
     )
+    # The kernel always applies Q/K L2 normalization internally; reject False
+    # rather than silently returning un-normalized-semantics results.
+    assert use_qk_l2norm_in_kernel, (
+        "gdn_decode_bf16_wy_output_only: use_qk_l2norm_in_kernel=False is not supported "
+        "(the kernel always applies Q/K L2 normalization)."
+    )
     assert initial_state_source.dtype == torch.bfloat16, (
         f"initial_state_source must be bf16 (pool, HV, V, K); got {initial_state_source.dtype}."
     )
@@ -2029,6 +2048,8 @@ def gated_delta_rule_mtp(
         scale = 1.0 / math.sqrt(K_dim)
     if initial_state_indices is None:
         initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
+    else:
+        initial_state_indices = initial_state_indices.contiguous()
     _io_dtype = q.dtype
     HK = k.shape[2]
 
@@ -2137,7 +2158,6 @@ def gated_delta_rule_mtp(
                 bb[:, :T].copy_(b)
             q, k, v, a, b = qb, kb, vb, ab, bb
 
-    pool_size = h0.shape[0]
     _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     # One CTA per (b, hv) — full V tile per CTA. Per-CTA SMEM ~51.5 KB -> <=4 CTAs/SM.
     _total_ctas = HV * B
@@ -2147,17 +2167,34 @@ def gated_delta_rule_mtp(
     t_disc = 4 if T <= 4 else (8 if T <= 8 else 16)
     # n_valid in the key: native (n_valid<T) vs staged (n_valid=T_KERNEL) compile to
     # different kernels (different q/k batch stride + the smem-tail-zero path).
-    cache_key = (
+    # B / pool_size are NOT in the key: the batch (mode-0) dim of every per-batch
+    # tensor is marked shape-dynamic below, so one cubin serves all batch and pool
+    # sizes (grid derives B from gH0idx at launch; the H0 TMA descriptor takes the
+    # pool extent at launch). mbp still varies with B, but only over <=4 buckets.
+    # Exception: the strided-qkv opt-in path passes non-compact q/k/v whose
+    # descriptors stay fully static, so it keeps B/pool in the key (fallback).
+    cache_key: tuple = (
         str(device),
-        B,
-        pool_size,
         mbp,
         t_disc,
         n_valid,
         _qkv_rs,
         _ab_native_flag,
     )
+    if _qkv_rs > 0:
+        cache_key = cache_key + (B, h0.shape[0])
     mk = from_dlpack
+
+    def mk_dyn(t):
+        # Batch/pool-dynamic compact marking: mode-0 (leading) dim dynamic, inner
+        # dims static so the kernel keeps constexpr tile geometry. Requires a
+        # compact (contiguous) tensor — every tensor below is either staged into
+        # a contiguous buffer or .contiguous()'d by this wrapper.
+        if _qkv_rs > 0:
+            return mk(t, 16)  # strided fallback: fully static descriptor
+        return mk(t, 16).mark_compact_shape_dynamic(
+            mode=0, stride_order=tuple(range(t.dim())), divisibility=1
+        )
 
     # The kernel always writes a full T=16 output tile. If the caller did not
     # provide `output`, write into a fresh [B,16,HV,V] buffer and return a
@@ -2176,16 +2213,16 @@ def gated_delta_rule_mtp(
 
     stream = cuda.CUstream(torch.cuda.current_stream(device=device).cuda_stream)
     args = [
-        mk(q, 16),
-        mk(k, 16),
-        mk(v, 16),
-        mk(a, 16),
-        mk(b, 16),
+        mk_dyn(q),
+        mk_dyn(k),
+        mk_dyn(v),
+        mk_dyn(a),
+        mk_dyn(b),
         mk(A_log, 16),
         mk(dt_bias, 16),
-        mk(h0, 16),
-        mk(initial_state_indices, 16),
-        mk(out16, 16),
+        mk_dyn(h0),
+        mk_dyn(initial_state_indices),
+        mk_dyn(out16),
         scale,
         HV,
         V_dim,
