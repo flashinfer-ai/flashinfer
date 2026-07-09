@@ -757,6 +757,34 @@ def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def get_trtllm_gen_multi_ctas_kv_counter_bytes(
+    batch_size: int, num_qo_heads: int, sm_count: int
+) -> int:
+    """Return bytes needed by trtllm-gen multi-CTA KV counter semaphores."""
+    num_semaphores = round_up(max(batch_size * num_qo_heads, sm_count), 8)
+    return num_semaphores * 4
+
+
+def _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+    batch_size: int,
+    num_qo_heads: int,
+    sm_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate a fresh, zero-initialized multi-CTA KV counter buffer.
+
+    The trtllm-gen kernel resets these semaphores back to zero at the end of
+    every launch, so the buffer only needs to be zeroed once at allocation and
+    can then be reused across launches without re-zeroing. Callers that reuse a
+    buffer should hold it on their own instance (e.g. a wrapper/runner) rather
+    than a module-global cache, so its lifetime is tied to the owner.
+    """
+    counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    return torch.zeros(counter_bytes, dtype=torch.uint8, device=device)
+
+
 class FP4Tensor:
     """Wrapper class for FP4 tensors.
 

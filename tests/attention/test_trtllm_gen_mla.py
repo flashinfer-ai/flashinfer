@@ -12,11 +12,9 @@ from flashinfer.mla import (
 from flashinfer.utils import get_compute_capability
 
 global_workspace_buffer = None  # can.be empty initialized
-global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
+global_trtllm_gen_fmha_workspace_buffer = None
 workspace_size = 128 * 1024 * 1024
 
-# Generation-mode workspace prefix: 8192 batches * 256 heads * 4 bytes/int32 counter slab.
-TRTLLM_GEN_COUNTER_BYTES = 8192 * 256 * 4
 # Guard region we zero past the softmax slab so we can detect OOB writes.
 TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
 
@@ -24,7 +22,7 @@ TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
 def trtllm_gen_workspace_softmax_end_bytes_decode(
     num_qo_heads: int, batch_size: int, max_q_len: int
 ) -> int:
-    """End offset of the softmax slab in the generation-mode workspace [counter|softmax|scratch].
+    """End offset of the softmax slab in the generation-mode workspace [softmax|scratch].
 
     The C++ launcher allocates ``sizeof(float2) * softmax_slots`` bytes, i.e. 8 bytes per
     slot, where ``softmax_slots = num_qo_heads * batch_size * round_up(max_q_len, 256)``.
@@ -33,7 +31,7 @@ def trtllm_gen_workspace_softmax_end_bytes_decode(
     softmax_slab = (
         8 * num_qo_heads * batch_size * rounded_max_q_len
     )  # sizeof(float2) == 8
-    return TRTLLM_GEN_COUNTER_BYTES + softmax_slab
+    return softmax_slab
 
 
 def generate_sparse_indices(
@@ -424,12 +422,9 @@ def trtllm_batch_decode_mla(
             workspace_size, dtype=torch.int8, device=device
         )
     if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+        global_trtllm_gen_fmha_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
-    # trtllm-gen requires zero-initialized workspace (counter region);
-    # re-zero each time since other backends (e.g. cute-dsl) may share and dirty it.
-    global_trtllm_gen_fmha_workspace_buffer.zero_()
     workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
@@ -438,11 +433,10 @@ def trtllm_batch_decode_mla(
 
     def maybe_get_lse_guard_end(softmax_end: int) -> int | None:
         # The C++ launcher carves the workspace as
-        #     [counter (8 MB) | softmax_slab | guard (1 MB) | scratch],
+        #     [softmax_slab | guard (1 MB) | scratch],
         # where ``softmax_slab = 8 * num_heads * batch * round_up(max_q_len, 256)``
-        # bytes. ``softmax_end`` already includes the counter prefix, so the LSE
-        # guard subcheck is only meaningful when ``softmax_end + 1 MB`` still fits
-        # in the test workspace. For the largest parametrized shapes
+        # bytes. The LSE guard subcheck is only meaningful when
+        # ``softmax_end + 1 MB`` still fits in the test workspace. For the largest parametrized shapes
         # (e.g. batch=1024 * num_heads=128 * q_len=2 -> softmax_slab > 256 MB)
         # the slab alone overruns the 128 MB workspace; in that case we skip
         # the LSE subcheck and only exercise the output path (which does not
@@ -525,10 +519,6 @@ def trtllm_batch_decode_mla(
         )
     else:
         output = output_and_lse
-    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-    if backend == "trtllm-gen":
-        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     # Run reference attention and align output
     sm_scale = scale / (
@@ -796,7 +786,7 @@ def trtllm_batch_decode_mla_sparse(
             workspace_size, dtype=torch.int8, device=device
         )
     if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+        global_trtllm_gen_fmha_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
     workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
@@ -847,9 +837,6 @@ def trtllm_batch_decode_mla_sparse(
         cum_seq_lens_q=cum_seq_lens_q,
         max_q_len=max_q_len,
     )
-
-    # Check workspace buffer is zeroed
-    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     # For now, just check that output has correct shape and no NaNs
     assert output.shape == expected_shape, (
@@ -1153,7 +1140,7 @@ def test_trtllm_batch_decode_mla_preallocated_out(
 
     global global_trtllm_gen_fmha_workspace_buffer
     if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+        global_trtllm_gen_fmha_workspace_buffer = torch.empty(
             workspace_size,
             dtype=torch.int8,
             device=device,

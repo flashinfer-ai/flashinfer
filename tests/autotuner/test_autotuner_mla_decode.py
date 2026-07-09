@@ -58,9 +58,8 @@ def _make_inputs(batch_size: int = 4, dtype: torch.dtype = torch.bfloat16):
         (batch_size,), _MAX_SEQ_LEN // 2, dtype=torch.int32, device=device
     )
 
-    # trtllm-gen requires the workspace's counter region (8 MB) to be zero;
-    # cute-dsl wants int8 dtype.
-    workspace_buffer = torch.zeros(_WORKSPACE_SIZE, dtype=torch.int8, device=device)
+    # cute-dsl wants int8 dtype; trtllm-gen counters use a separate internal buffer.
+    workspace_buffer = torch.empty(_WORKSPACE_SIZE, dtype=torch.int8, device=device)
 
     return query, kv_cache, block_tables, seq_lens, workspace_buffer
 

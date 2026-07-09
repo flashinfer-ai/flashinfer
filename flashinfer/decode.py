@@ -70,12 +70,14 @@ from .utils import (
     check_shape_dtype_device,
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
+    _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
     get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
     is_float8,
     register_custom_op,
     register_fake_op,
@@ -825,6 +827,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._kv_lens_buffer = torch.empty(
                 (32768,), dtype=torch.int32, device=self.device
             )
+        self._trtllm_gen_multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
         if use_cuda_graph:
             if not torch.is_tensor(paged_kv_indptr_buffer):
@@ -1401,6 +1404,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
         elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
             self._max_kv_len = max(kv_lens_arr_host).item()
+            # Allocated once per plan and reused across run() launches. The
+            # trtllm-gen kernel self-resets the counters at the end of each
+            # launch, so no per-launch re-zeroing is needed.
+            self._trtllm_gen_multi_ctas_kv_counter_buffer = (
+                _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+                    batch_size,
+                    num_qo_heads,
+                    get_device_sm_count(self.device),
+                    self.device,
+                )
+            )
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
                 self._kv_lens_buffer = torch.empty(
@@ -1863,8 +1877,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
         if self.use_tensor_cores:
-            run_args = [
-                self._float_workspace_buffer,
+            run_args = [self._float_workspace_buffer]
+            if self._backend == "trtllm-gen":
+                assert self._trtllm_gen_multi_ctas_kv_counter_buffer is not None
+                run_args.append(self._trtllm_gen_multi_ctas_kv_counter_buffer)
+            run_args += [
                 self._int_workspace_buffer,
                 self._plan_info,
                 q,
@@ -2553,6 +2570,7 @@ class TrtllmGenDecodeModule:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         workspace_buffer: torch.Tensor,
+        multi_ctas_kv_counter_buffer: torch.Tensor,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         max_seq_len: int,
@@ -2600,6 +2618,7 @@ class TrtllmGenDecodeModule:
             k_cache,
             v_cache,
             workspace_buffer,
+            multi_ctas_kv_counter_buffer,
             block_tables,
             seq_lens,
             max_q_len,
@@ -2640,6 +2659,7 @@ def get_trtllm_gen_decode_module(*args):
         f"flashinfer::{uri}_ragged_run",
         mutates_args=(
             "float_workspace_buffer",
+            "multi_ctas_kv_counter_buffer",
             "int_workspace_buffer",
             "o",
             "maybe_lse",
@@ -2647,6 +2667,7 @@ def get_trtllm_gen_decode_module(*args):
     )
     def paged_run(
         float_workspace_buffer: torch.Tensor,
+        multi_ctas_kv_counter_buffer: torch.Tensor,
         int_workspace_buffer: torch.Tensor,
         plan_info_vec: List[int],
         q: torch.Tensor,
@@ -2704,6 +2725,7 @@ def get_trtllm_gen_decode_module(*args):
             paged_k_cache,
             paged_v_cache,
             float_workspace_buffer,
+            multi_ctas_kv_counter_buffer,
             block_tables,
             kv_lens_buffer,
             max_kv_len,
@@ -2724,6 +2746,7 @@ def get_trtllm_gen_decode_module(*args):
     @register_fake_op(f"flashinfer::{uri}_paged_run")
     def _fake_paged_run(
         float_workspace_buffer: torch.Tensor,
+        multi_ctas_kv_counter_buffer: torch.Tensor,
         int_workspace_buffer: torch.Tensor,
         plan_info_vec: List[int],
         q: torch.Tensor,
@@ -2747,9 +2770,13 @@ def get_trtllm_gen_decode_module(*args):
         maybe_max_item_len_ptr: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
+        scale_q: Optional[torch.Tensor],
+        scale_k: Optional[torch.Tensor],
+        scale_v: Optional[torch.Tensor],
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        workspace_size: int,
         paged_kv_cache: Optional[torch.Tensor] = None,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
@@ -2805,6 +2832,7 @@ def trtllm_batch_decode_with_kv_cache(
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     bmm1_scale_log2: Optional[torch.Tensor] = None,
+    multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -2826,8 +2854,8 @@ def trtllm_batch_decode_with_kv_cache(
         - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint
         - The head and batch/page dims can have arbitrary strides.
 
-    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
-        workspace
+    workspace_buffer : torch.Tensor
+        Workspace used for trtllm-gen softmax stats/scratch or xqa scratch.
 
     block_tables : torch.Tensor
         Page table of kv cache.
@@ -2950,6 +2978,13 @@ def trtllm_batch_decode_with_kv_cache(
         ``trtllm-gen`` backend. When True, the function returns a tuple
         ``(out, lse)`` where ``lse`` has shape ``[num_tokens, num_qo_heads]`` and
         dtype ``torch.float32``.
+
+    multi_ctas_kv_counter_buffer : Optional[torch.Tensor] = None
+        Optional separate counter buffer for ``trtllm-gen`` multi-CTA KV mode.
+        When omitted, FlashInfer creates a fresh zeroed internal buffer. When
+        provided, it must be zero-initialized at allocation (e.g. via
+        ``torch.zeros``); the kernel self-resets the counters at the end of each
+        launch, so it does not need to be re-zeroed between calls.
 
     Returns
     -------
@@ -3161,6 +3196,27 @@ def trtllm_batch_decode_with_kv_cache(
         _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
 
         num_qo_heads = query.size(1)
+        required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_qo_heads, sm_count
+        )
+        if multi_ctas_kv_counter_buffer is None:
+            multi_ctas_kv_counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+                batch_size, num_qo_heads, sm_count, query.device
+            )
+        elif multi_ctas_kv_counter_buffer.device != query.device:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer must be on the same device as query"
+            )
+        else:
+            counter_buffer_bytes = (
+                multi_ctas_kv_counter_buffer.numel()
+                * multi_ctas_kv_counter_buffer.element_size()
+            )
+            if counter_buffer_bytes < required_counter_bytes:
+                raise ValueError(
+                    "multi_ctas_kv_counter_buffer is too small: got "
+                    f"{counter_buffer_bytes} bytes, need {required_counter_bytes} bytes"
+                )
         lse_shape = (query.size(0), num_qo_heads)
         if lse is not None:
             check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
@@ -3181,6 +3237,7 @@ def trtllm_batch_decode_with_kv_cache(
             k_cache,
             v_cache,
             workspace_buffer,
+            multi_ctas_kv_counter_buffer,
             block_tables,
             seq_lens,
             max_q_len,
