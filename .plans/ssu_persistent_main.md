@@ -1265,6 +1265,21 @@ precompute 14.02 → 15.74 µs (+1.72 = the whole residual).  Stall MIX is
 unchanged (long_scoreboard 18.7 → 17.2%) — a uniform slowdown, i.e. intrinsic
 per-CTA varlen work (row masking, int64 outer addressing), not one hot fetch.
 
+ncu v34 (bf16 b=1024 mtp=8 UNIFORM paths, `ssu_2k_v34_*{,_varlen}`): the
+write/no-write split Igor asked for.  Δ(varlen−dense) µs: precompute +0.51
+(nw) / +1.15 (write — less other latency to hide under); main +1.25 (nw) /
++1.31 (write) — BOTH paths equally.  The main's cost is invisible in the
+mixed f32 run (+0.26) because the straggler tail hides it; uniform exposes
+it.  Root cause is INSTRUCTIONS, not memory: main pnat4 executes 22.34M →
+23.06M (+3.2%, ~44 instr/unit) at identical regs (77, no spill), occupancy,
+and long_scoreboard profile — the runtime seq_len keeps `row < seq_len`
+predicates + packed-unpack + register-bos addressing live where dense
+constant-folds seq_len = NPREDICTED through the inlined loader chain.
+Recovery lever (not implemented): a uniform `seq_len == NPREDICTED` branch
+per unit selecting the dense constant-folded loader path — full-length rows
+(the common MTP case) would run dense-identical code, ragged rows keep the
+masked path.
+
 **Tried + REJECTED: precompute cu-pair hoist above the pad branch (2026-07-09).**
 Premise: the pair, sitting behind `if (cache_slot == pad) return`, serializes a
 gmem round-trip into each CTA prologue.  Measured: dense bit-identical; varlen
