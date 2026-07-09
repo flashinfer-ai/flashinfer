@@ -157,6 +157,29 @@ MNNVL A2A (Throughput Backend)
 
     .. automethod:: __init__
 
+``MoeAlltoAll`` preserves its CUDA virtual addresses across process
+checkpoint/restore.  After quiescing all work, call ``checkpoint_prepare`` to
+release the non-checkpointable physical MNNVL handles.  Then call
+``checkpoint_restore`` with a fresh communication backend before replaying a
+captured CUDA graph:
+
+.. code-block:: python
+
+    moe_alltoall.checkpoint_prepare()
+    moe_alltoall.checkpoint_restore(comm_backend)
+
+Both methods are collective.  Every rank must call them in the same order, and
+``comm_backend`` must reproduce the original rank and world size.
+Repeated calls are no-ops after the workspace reaches the requested state.
+If an exception occurs after physical handle unmapping or remapping begins,
+do not retry or reuse the workspace; restart the affected rank.
+
+.. autosummary::
+    :toctree: ../generated
+
+    MoeAlltoAll.checkpoint_prepare
+    MoeAlltoAll.checkpoint_restore
+
 DCP All-to-All (Context-Parallel Attention Reduction)
 -----------------------------------------------------
 

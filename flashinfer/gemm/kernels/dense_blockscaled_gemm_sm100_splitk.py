@@ -26,11 +26,10 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# This file is ported from TensorRT-LLM's dense_blockscaled_gemm_persistent.py
-# with modifications for FlashInfer integration.
-# Original: https://github.com/NVIDIA/TensorRT-LLM
+# This kernel keeps FlashInfer's block-scaled MXFP8 mainloop and adapts the
+# cluster-local reduction protocol from NVIDIA DKG's FP8 split-K tutorial.
 
-from typing import Optional, Tuple, Type, Union
+from typing import Optional, Tuple, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -41,82 +40,227 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from .dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
-
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from cutlass import Float32, Int32
+from cutlass._mlir.dialects import llvm
+from .dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
+
+from cutlass.cutlass_dsl import (
+    T,
+    dsl_user_op,
+    extract_mlir_values,
+    new_from_mlir_values,
+)
 
 
-class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
-    """Implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
-    and Blackwell GPU architectural features, including persistent tile scheduling and warp specialization.
+@dsl_user_op
+def _map_shared_rank(
+    smem_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Map a local shared-memory pointer to a peer CTA in the cluster."""
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
-    Notes:
-        - In the current version, tensors A and B must have the same data type.
-          For example, using Float8E4M3FN for A and Float8E5M2 for B is not supported.
-        - Supported combinations of A/B data types, scale factor (SF) data types, and SF vector size:
-            * MXF8:   A/B: Float8E5M2/Float8E4M3FN, SF: Float8E8M0FNU, sf_vec_size: 32
-            * MXF4:   A/B: Float4E2M1FN,            SF: Float8E8M0FNU, sf_vec_size: 32
-            * NVF4:   A/B: Float4E2M1FN,            SF: Float8E8M0FNU/Float8E4M3FN, sf_vec_size: 16
-        - Supported accumulator data types:
-            * Float32
-        - Supported C data types:
-            * Float32
-            * Float16/BFloat16
-            * Float8E4M3FN/Float8E5M2
-        - Constraints:
-            * MMA tiler M must be 128 or 256 (use_2cta_instrs).
-            * MMA tiler N must be 64/128/192/256
-            * Cluster shape M must be a multiple of 2 if MMA tiler M is 256.
-            * Cluster shape M/N must be positive and a power of 2, with total cluster size <= 16.
-            * Cluster shape M/N must be <= 4 for scale factor multicasts due to limited scale factor size.
 
-    Example:
-        >>> gemm = Sm100BlockScaledPersistentDenseGemmKernel(
-        ...     sf_vec_size=16,
-        ...     mma_tiler_mn=(256, 128),
-        ...     cluster_shape_mn=(2, 1)
-        ... )
-        >>> gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, max_active_clusters, stream)
+@dsl_user_op
+def _store_shared_remote_v4(
+    value0: Float32,
+    value1: Float32,
+    value2: Float32,
+    value3: Float32,
+    smem_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store four FP32 values to peer SMEM and complete 16 mbarrier bytes."""
+    remote_smem_ptr = _map_shared_rank(
+        smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    remote_mbar_ptr = _map_shared_rank(
+        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    values = [
+        value0.bitcast(Int32).ir_value(loc=loc, ip=ip),
+        value1.bitcast(Int32).ir_value(loc=loc, ip=ip),
+        value2.bitcast(Int32).ir_value(loc=loc, ip=ip),
+        value3.bitcast(Int32).ir_value(loc=loc, ip=ip),
+    ]
+    llvm.inline_asm(
+        None,
+        [remote_smem_ptr, *values, remote_mbar_ptr],
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 "
+        "[$0], {$1, $2, $3, $4}, [$5];",
+        "r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+class _SplitKOneTileScheduler:
+    """One-work-item scheduler for a physical K-cluster.
+
+    Grid X/Y identify the output tile. Every CTA in grid Z belongs to the same
+    physical cluster and uses its cluster rank as the logical K-slice index.
     """
+
+    def __init__(self, tile_idx, num_tiles_executed):
+        self._tile_idx = tile_idx
+        self._num_tiles_executed = num_tiles_executed
+        self._tile_idx_num_values = None
+
+    @staticmethod
+    @cute.jit
+    def create(block_idx, cta_rank_in_cluster):
+        tile_idx = (
+            cutlass.Int32(block_idx[0]),
+            cutlass.Int32(block_idx[1]),
+            cutlass.Int32(cta_rank_in_cluster),
+        )
+        return _SplitKOneTileScheduler(tile_idx, cutlass.Int32(0))
+
+    def __extract_mlir_values__(self):
+        tile_idx_values = extract_mlir_values(self._tile_idx)
+        self._tile_idx_num_values = len(tile_idx_values)
+        return tile_idx_values + extract_mlir_values(self._num_tiles_executed)
+
+    def __new_from_mlir_values__(self, values):
+        if self._tile_idx_num_values is None:
+            raise ValueError("Split-K scheduler tile width was not recorded")
+        width = self._tile_idx_num_values
+        tile_idx = new_from_mlir_values(self._tile_idx, values[:width])
+        num_tiles_executed = new_from_mlir_values(
+            self._num_tiles_executed, values[width:]
+        )
+        return _SplitKOneTileScheduler(tile_idx, num_tiles_executed)
+
+    @cute.jit
+    def get_current_work(self):
+        return utils.WorkTileInfo(
+            self._tile_idx,
+            self._num_tiles_executed < cutlass.Int32(1),
+        )
+
+    @cute.jit
+    def initial_work_tile_info(self):
+        return self.get_current_work()
+
+    @cute.jit
+    def advance_to_next_work(self):
+        self._num_tiles_executed += cutlass.Int32(1)
+
+    @property
+    @cute.jit
+    def num_tiles_executed(self):
+        return self._num_tiles_executed
+
+
+class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
+    """Low-M MXFP8 GEMM with an in-kernel split-K reduction.
+
+    The kernel is specialized for the swap_ab=True dense MXFP8 path with
+    R128C4 scale-factor layout. A physical (1, 1, split_k_slices) cluster
+    computes one output tile. Each CTA accumulates a disjoint K slice in FP32;
+    peer CTAs send their partials through distributed shared memory, and the
+    owner CTA writes the final BF16/FP16 output without a global workspace or
+    second reduction kernel.
+
+    The supported tactics use an MMA-M tile of 128, MMA-N tiles of 8/16/32,
+    and two or four K slices.
+    """
+
+    MAX_M = 32
+    MMA_INST_BITS_K = 256
+    MMA_INST_TILE_K = 4
+    SUPPORTED_MMA_TILER_MN = ((128, 8), (128, 16), (128, 32))
+    SUPPORTED_SPLIT_K_SLICES = (2, 4)
+
+    @classmethod
+    def supports_m(cls, m: int) -> bool:
+        """Return whether the specialized low-M policy supports M."""
+        return m <= cls.MAX_M
+
+    @classmethod
+    def mma_tiler_mn_for_m(cls, m: int) -> Tuple[int, int]:
+        """Return the specialized MMA tile selected for M."""
+        if not cls.supports_m(m):
+            raise ValueError(f"MXFP8 split-K requires M <= {cls.MAX_M}, got {m}")
+        tile_n = 8 if m <= 8 else 16 if m <= 16 else 32
+        return (128, tile_n)
+
+    @classmethod
+    def is_valid_tactic(
+        cls,
+        m: int,
+        k: int,
+        ab_dtype,
+        split_k_slices: int,
+    ) -> bool:
+        """Return whether the MXFP8 shape satisfies this kernel's K tiling."""
+        if ab_dtype.width != 8:
+            return False
+        tile_k = (cls.MMA_INST_BITS_K * cls.MMA_INST_TILE_K) // ab_dtype.width
+        return (
+            cls.supports_m(m)
+            and split_k_slices in cls.SUPPORTED_SPLIT_K_SLICES
+            and k % (tile_k * split_k_slices) == 0
+        )
 
     def __init__(
         self,
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-        use_prefetch: bool = False,
+        split_k_slices: int,
         enable_pdl: bool = True,
     ):
-        """Initializes the configuration for a Blackwell dense GEMM kernel.
-
-        This configuration includes several key aspects:
-
-        1.  MMA Instruction Settings (tcgen05):
-            - acc_dtype: Data types for MMA accumulator, always set to Float32
-            - sf_vec_size: Scalefactor A/B vector size.
-            - mma_tiler_mn: The (M, N) shape of the MMA instruction tiler.
-
-        2.  Cluster Shape:
-            - cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster.
+        """Configure one low-M split-K tactic.
 
         Args:
-            sf_vec_size (int): Scalefactor vector size.
-            mma_tiler_mn (Tuple[int, int]): Shape of the Matrix Multiply-Accumulate (MMA) tile (M, N).
-            cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N) for parallel processing.
+            sf_vec_size: MXFP8 scale-factor vector size; must be 32.
+            mma_tiler_mn: MMA tile shape; supported values are (128, 8),
+                (128, 16), and (128, 32).
+            split_k_slices: Physical cluster-K size; must be 2 or 4.
+            enable_pdl: Whether to enable programmatic dependent launch.
         """
 
         self.acc_dtype = cutlass.Float32
+        if sf_vec_size != 32:
+            raise ValueError(
+                f"MXFP8 split-K requires sf_vec_size=32, got {sf_vec_size}"
+            )
         self.sf_vec_size = sf_vec_size
-        self.use_2cta_instrs = mma_tiler_mn[0] == 256
-        self.cluster_shape_mn = cluster_shape_mn
+        if mma_tiler_mn not in self.SUPPORTED_MMA_TILER_MN:
+            raise ValueError(
+                "MXFP8 split-K requires mma_tiler_mn=(128, 8/16/32), "
+                f"got {mma_tiler_mn}"
+            )
+        if split_k_slices not in self.SUPPORTED_SPLIT_K_SLICES:
+            raise ValueError(f"split_k_slices must be 2 or 4, got {split_k_slices}")
+        self.cluster_shape_mn = (1, 1)
+        self.cluster_shape_mnk = (1, 1, split_k_slices)
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
-        self.use_prefetch = use_prefetch
         self.enable_pdl = enable_pdl
-        self.cta_group = (
-            tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
-        )
+        self.split_k_slices = split_k_slices
+        self.cta_group = tcgen05.CtaGroup.ONE
 
         self.occupancy = 1
         # Set specialized warp ids
@@ -154,7 +298,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         - Computing tensor memory allocation columns
         """
         # Compute mma instruction shapes
-        mma_inst_bits_k = 256
+        mma_inst_bits_k = self.MMA_INST_BITS_K
         # (MMA_Tile_Shape_M, MMA_Tile_Shape_N, MMA_Inst_Shape_K)
         self.mma_inst_shape_mnk = (
             self.mma_tiler[0],
@@ -163,7 +307,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         )
         # (CTA_Tile_Shape_M, Round_Up(MMA_Tile_Shape_N, 128), MMA_Inst_Shape_K)
         self.mma_inst_shape_mnk_sfb = (
-            self.mma_inst_shape_mnk[0] // (2 if self.use_2cta_instrs else 1),
+            self.mma_inst_shape_mnk[0],
             cute.round_up(self.mma_inst_shape_mnk[1], 128),
             self.mma_inst_shape_mnk[2],
         )
@@ -191,7 +335,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         )
 
         # Compute mma/cluster/tile shapes
-        mma_inst_tile_k = 4
+        mma_inst_tile_k = self.MMA_INST_TILE_K
         self.mma_tiler = (
             self.mma_inst_shape_mnk[0],
             self.mma_inst_shape_mnk[1],
@@ -215,11 +359,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout((*self.cluster_shape_mn, 1)),
+            cute.make_layout(self.cluster_shape_mnk),
             (tiled_mma.thr_id.shape,),
         )
         self.cluster_layout_sfb_vmnk = cute.tiled_divide(
-            cute.make_layout((*self.cluster_shape_mn, 1)),
+            cute.make_layout(self.cluster_shape_mnk),
             (tiled_mma_sfb.thr_id.shape,),
         )
 
@@ -234,12 +378,30 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         # Compute epilogue subtile
         self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
             self.cta_tile_shape_mnk,
-            self.use_2cta_instrs,
+            False,
             self.c_layout,
             self.c_dtype,
         )
 
         self.epi_tile_n = cute.size(self.epi_tile[1])
+        self.num_epilogue_subtiles = (
+            self.cta_tile_shape_mnk[0]
+            * self.cta_tile_shape_mnk[1]
+            // (cute.size(self.epi_tile[0]) * cute.size(self.epi_tile[1]))
+        )
+        self.num_epilogue_threads = 32 * len(self.epilog_warp_id)
+        self.reduce_values_per_thread = (
+            cute.size(self.epi_tile[0]) * cute.size(self.epi_tile[1])
+        ) // (self.num_epilogue_threads)
+        self.reduce_mailbox_elements = (
+            (self.split_k_slices - 1)
+            * self.cta_tile_shape_mnk[0]
+            * self.cta_tile_shape_mnk[1]
+        )
+        self.reduce_smem_bytes = (
+            self.reduce_mailbox_elements * cutlass.Float32.width // 8
+            + self.num_epilogue_subtiles * 8
+        )
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
@@ -256,7 +418,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             self.sf_vec_size,
             self.smem_capacity,
             self.occupancy,
-            1024,
+            1024 + self.reduce_smem_bytes,
         )
 
         # Compute A/B/SFA/SFB/C shared memory layout
@@ -310,9 +472,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         self.iter_acc_early_release_in_epilogue = (
             self.num_sf_tmem_cols // self.epi_tile_n
         )
-
-        # TODO: [alel] Currently set prefetch dist to num_ab_stage, we may have more options for prefetch dist auto tuning
-        self.prefetch_dist = self.num_ab_stage
 
     @cute.jit
     def __call__(
@@ -369,12 +528,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         )
 
         # Compute grid size
-        self.tile_sched_params, grid = self._compute_grid(
-            c_tensor,
-            self.cta_tile_shape_mnk,
-            self.cluster_shape_mn,
-            max_active_clusters,
-        )
+        grid = self._compute_grid(c_tensor, self.cta_tile_shape_mnk)
 
         self.buffer_align_bytes = 1024
 
@@ -385,8 +539,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
-            tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
+            reduce_full_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.num_epilogue_subtiles
+            ]
+            reduce_mailbox: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.reduce_mailbox_elements],
+                128,
+            ]
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sC: cute.struct.Align[
                 cute.struct.MemRange[
@@ -448,13 +608,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             self.sfb_smem_layout_staged,
             self.c_smem_layout_staged,
             self.epi_tile,
-            self.tile_sched_params,
             epilogue_op,
             alpha,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
-            cluster=(*self.cluster_shape_mn, 1),
+            cluster=self.cluster_shape_mnk,
             smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
             min_blocks_per_mp=1,
             stream=stream,
@@ -486,7 +645,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
     ):
@@ -510,8 +668,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             cpasync.prefetch_descriptor(tma_atom_sfa)
             cpasync.prefetch_descriptor(tma_atom_sfb)
             cpasync.prefetch_descriptor(tma_atom_c)
-
-        use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
         #
         # Setup cta/thread coordinates
@@ -538,8 +694,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr
         tmem_holding_buf = storage.tmem_holding_buf.ptr
+        reduce_full_mbar_ptr = storage.reduce_full_mbar_ptr.data_ptr()
 
         # Initialize mainloop ab_pipeline (barrier) and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -558,9 +714,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
         # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (
-            2 if use_2cta_instrs else 1
-        )
+        num_acc_consumer_threads = len(self.epilog_warp_id)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
@@ -572,22 +726,21 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
-        # Tensor memory dealloc barrier init
-        if use_2cta_instrs:
-            if warp_idx == self.tma_warp_id:
-                num_tmem_dealloc_threads = 32
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_init(
-                        tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads
-                    )
+        if warp_idx == self.tma_warp_id:
+            with cute.arch.elect_one():
+                for subtile_idx in cutlass.range_constexpr(self.num_epilogue_subtiles):
+                    cute.arch.mbarrier_init(reduce_full_mbar_ptr + subtile_idx, 1)
         cute.arch.mbarrier_init_fence()
 
         # Cluster arrive after barrier init
-        if cute.size(self.cluster_shape_mn) > 1:
+        if cute.size(self.cluster_shape_mnk) > 1:
             cute.arch.cluster_arrive_relaxed(aligned=True)
 
         #
         # Setup smem tensor A/B/SFA/SFB/C
+        reduce_mailbox = storage.reduce_mailbox.get_tensor(
+            cute.make_layout((self.reduce_mailbox_elements,))
+        )
         #
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         sC = storage.sC.get_tensor(
@@ -613,7 +766,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         b_full_mcast_mask = None
         sfa_full_mcast_mask = None
         sfb_full_mcast_mask = None
-        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
+        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast):
             a_full_mcast_mask = cpasync.create_tma_multicast_mask(
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
             )
@@ -652,7 +805,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
-        k_block_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
+        total_k_block_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
+        k_block_cnt = total_k_block_cnt
+        if cutlass.const_expr(self.split_k_slices > 1):
+            k_block_cnt = total_k_block_cnt // self.split_k_slices
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -767,7 +923,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         #
         # Cluster wait before tensor memory alloc
         #
-        if cute.size(self.cluster_shape_mn) > 1:
+        if cute.size(self.cluster_shape_mnk) > 1:
             cute.arch.cluster_wait()
         else:
             cute.arch.barrier(
@@ -787,8 +943,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            tile_sched = _SplitKOneTileScheduler.create(
+                cute.arch.block_idx(), cta_rank_in_cluster
             )
             work_tile = tile_sched.initial_work_tile_info()
 
@@ -805,49 +961,28 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                     cur_tile_coord[2],
                 )
 
+                input_l = mma_tile_coord_mnl[2]
+                k_block_start = cutlass.Int32(0)
+                if cutlass.const_expr(self.split_k_slices > 1):
+                    # C L is the split-K index; dense inputs always use L=0.
+                    input_l = cutlass.Int32(0)
+                    k_block_start = cutlass.Int32(mma_tile_coord_mnl[2]) * k_block_cnt
+
                 #
                 # Slice to per mma tile index
                 #
                 # ((atom_v, rest_v), RestK)
-                tAgA_slice = tAgA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
-                ]
+                tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, input_l)]
                 # ((atom_v, rest_v), RestK)
-                tBgB_slice = tBgB[
-                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
-                ]
+                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, input_l)]
 
                 # ((atom_v, rest_v), RestK)
-                tAgSFA_slice = tAgSFA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
-                ]
+                tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None, input_l)]
                 slice_n = mma_tile_coord_mnl[1]
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     slice_n = mma_tile_coord_mnl[1] // 2
                 # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
-
-                if cutlass.const_expr(self.use_prefetch):
-                    # Prefetch both A and B (default behavior)
-                    for pf_k_block in cutlass.range(
-                        0, min(self.prefetch_dist, k_block_cnt), unroll=1
-                    ):
-                        cute.prefetch(
-                            tma_atom_a,
-                            tAgA_slice[(None, pf_k_block)],
-                        )
-                        cute.prefetch(
-                            tma_atom_b,
-                            tBgB_slice[(None, pf_k_block)],
-                        )
-                        cute.prefetch(
-                            tma_atom_sfa,
-                            tAgSFA_slice[(None, pf_k_block)],
-                        )
-                        cute.prefetch(
-                            tma_atom_sfb,
-                            tBgSFB_slice[(None, pf_k_block)],
-                        )
+                tBgSFB_slice = tBgSFB[(None, slice_n, None, input_l)]
 
                 # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
                 ab_producer_state.reset_count()
@@ -859,7 +994,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 #
                 # Tma load loop
                 #
-                for k_block in cutlass.range(0, k_block_cnt, 1, unroll=1):
+                for _k_block in cutlass.range(0, k_block_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
@@ -868,56 +1003,32 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                     # TMA load A/B/SFA/SFB
                     cute.copy(
                         tma_atom_a,
-                        tAgA_slice[(None, ab_producer_state.count)],
+                        tAgA_slice[(None, k_block_start + ab_producer_state.count)],
                         tAsA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=a_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_b,
-                        tBgB_slice[(None, ab_producer_state.count)],
+                        tBgB_slice[(None, k_block_start + ab_producer_state.count)],
                         tBsB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=b_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_sfa,
-                        tAgSFA_slice[(None, ab_producer_state.count)],
+                        tAgSFA_slice[(None, k_block_start + ab_producer_state.count)],
                         tAsSFA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfa_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_sfb,
-                        tBgSFB_slice[(None, ab_producer_state.count)],
+                        tBgSFB_slice[(None, k_block_start + ab_producer_state.count)],
                         tBsSFB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfb_full_mcast_mask,
                     )
-
-                    # Prefetch: Rolling prefetch for next tiles
-                    if cutlass.const_expr(self.use_prefetch):
-                        if k_block < k_block_cnt - self.prefetch_dist:
-                            future_k_block = (
-                                ab_producer_state.count + self.prefetch_dist
-                            )
-                            # Prefetch both A and B (default behavior)
-                            cute.prefetch(
-                                tma_atom_a,
-                                tAgA_slice[(None, future_k_block)],
-                            )
-                            cute.prefetch(
-                                tma_atom_b,
-                                tBgB_slice[(None, future_k_block)],
-                            )
-                            cute.prefetch(
-                                tma_atom_sfa,
-                                tAgSFA_slice[(None, future_k_block)],
-                            )
-                            cute.prefetch(
-                                tma_atom_sfb,
-                                tBgSFB_slice[(None, future_k_block)],
-                            )
 
                     # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt + k_block + 1
                     ab_producer_state.advance()
@@ -1003,8 +1114,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            tile_sched = _SplitKOneTileScheduler.create(
+                cute.arch.block_idx(), cta_rank_in_cluster
             )
             work_tile = tile_sched.initial_work_tile_info()
 
@@ -1183,7 +1294,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 cute.arch.alloc_tmem(
                     self.num_tmem_alloc_cols,
                     tmem_holding_buf,
-                    is_two_cta=use_2cta_instrs,
+                    is_two_cta=False,
                 )
 
             #
@@ -1212,7 +1323,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             epi_tidx = tidx
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
                 self.epilog_tmem_copy_and_partition(
-                    epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
+                    epi_tidx, tCtAcc_base, tCgC, epi_tile, False
                 )
             )
 
@@ -1229,8 +1340,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            tile_sched = _SplitKOneTileScheduler.create(
+                cute.arch.block_idx(), cta_rank_in_cluster
             )
             work_tile = tile_sched.initial_work_tile_info()
 
@@ -1266,7 +1377,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         None,
                         None,
                         None,
-                        *mma_tile_coord_mnl,
+                        mma_tile_coord_mnl[0],
+                        mma_tile_coord_mnl[1],
+                        0,
                     )
                 ]
 
@@ -1298,7 +1411,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 # Store accumulator to global memory in sub-tiles
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
 
                 for subtile_idx in cutlass.range(subtile_cnt):
                     real_subtile_idx = subtile_idx
@@ -1325,51 +1437,98 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                             with cute.arch.elect_one():
                                 acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
-                    #
-                    # Convert to C type
-                    #
-                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    # Multiply alpha in FP32 before converting to c_dtype to
-                    # avoid overflow when c_dtype is FP16 and acc values are large.
-                    acc_vec = epilogue_op((alpha_value * acc_vec).to(self.c_dtype))
-                    tRS_rC.store(acc_vec)
+                    # Retile the FP32 accumulator fragment into the same register
+                    # order used by the existing shared-memory epilogue.
+                    tRS_rAcc = tiled_copy_r2s.retile(tTR_rAcc)
+                    owner_rank = cutlass.Int32(real_subtile_idx % self.split_k_slices)
+                    peer_count = self.split_k_slices - 1
+                    values_per_thread = self.reduce_values_per_thread
+                    values_per_peer = self.num_epilogue_threads * values_per_thread
+                    subtile_mailbox_base = (
+                        real_subtile_idx * peer_count * values_per_peer
+                    )
+                    reduce_mbar_ptr = reduce_full_mbar_ptr + real_subtile_idx
 
-                    #
-                    # Store C to shared memory
-                    #
-                    c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
-                    cute.copy(
-                        tiled_copy_r2s,
-                        tRS_rC,
-                        tRS_sC[(None, None, None, c_buffer)],
-                    )
-                    # Fence and barrier to make sure shared memory store is visible to TMA store
-                    cute.arch.fence_proxy(
-                        "async.shared",
-                        space="cta",
-                    )
-                    epilog_threads = 32 * len(self.epilog_warp_id)
-                    cute.arch.barrier(
-                        barrier_id=self.epilog_sync_bar_id,
-                        number_of_threads=epilog_threads,
-                    )
-
-                    #
-                    # TMA store C to global memory
-                    #
-                    if warp_idx == self.epilog_warp_id[0]:
-                        cute.copy(
-                            tma_atom_c,
-                            bSG_sC[(None, c_buffer)],
-                            bSG_gC[(None, real_subtile_idx)],
+                    if cta_rank_in_cluster != owner_rank:
+                        peer_slot = cta_rank_in_cluster
+                        if cta_rank_in_cluster > owner_rank:
+                            peer_slot = cta_rank_in_cluster - cutlass.Int32(1)
+                        remote_thread_base = (
+                            subtile_mailbox_base
+                            + peer_slot * values_per_peer
+                            + epi_tidx * values_per_thread
                         )
-                        # Fence and barrier to make sure shared memory store is visible to TMA store
-                        c_pipeline.producer_commit()
-                        c_pipeline.producer_acquire()
-                    cute.arch.barrier(
-                        barrier_id=self.epilog_sync_bar_id,
-                        number_of_threads=epilog_threads,
-                    )
+                        for value_idx in cutlass.range_constexpr(
+                            0, values_per_thread, 4
+                        ):
+                            _store_shared_remote_v4(
+                                tRS_rAcc[value_idx],
+                                tRS_rAcc[value_idx + 1],
+                                tRS_rAcc[value_idx + 2],
+                                tRS_rAcc[value_idx + 3],
+                                reduce_mailbox.iterator
+                                + remote_thread_base
+                                + value_idx,
+                                reduce_mbar_ptr,
+                                owner_rank,
+                            )
+                    else:
+                        if warp_idx == self.epilog_warp_id[0]:
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(
+                                    reduce_mbar_ptr,
+                                    peer_count
+                                    * (cute.size(epi_tile[0]) * cute.size(epi_tile[1]))
+                                    * 4,
+                                )
+                        cute.arch.mbarrier_wait(reduce_mbar_ptr, phase=0)
+
+                        local_thread_base = (
+                            subtile_mailbox_base + epi_tidx * values_per_thread
+                        )
+                        for peer_slot in cutlass.range_constexpr(peer_count):
+                            peer_thread_base = (
+                                local_thread_base + peer_slot * values_per_peer
+                            )
+                            for value_idx in cutlass.range_constexpr(values_per_thread):
+                                tRS_rAcc[value_idx] = (
+                                    tRS_rAcc[value_idx]
+                                    + reduce_mailbox[peer_thread_base + value_idx]
+                                )
+
+                        # Apply alpha and cast only after the FP32 cluster sum.
+                        acc_vec = tRS_rAcc.load()
+                        acc_vec = epilogue_op((alpha_value * acc_vec).to(self.c_dtype))
+                        tRS_rC.store(acc_vec)
+
+                        c_buffer = subtile_idx % self.num_c_stage
+                        cute.copy(
+                            tiled_copy_r2s,
+                            tRS_rC,
+                            tRS_sC[(None, None, None, c_buffer)],
+                        )
+                        cute.arch.fence_proxy(
+                            "async.shared",
+                            space="cta",
+                        )
+                        epilog_threads = 32 * len(self.epilog_warp_id)
+                        cute.arch.barrier(
+                            barrier_id=self.epilog_sync_bar_id,
+                            number_of_threads=epilog_threads,
+                        )
+
+                        if warp_idx == self.epilog_warp_id[0]:
+                            cute.copy(
+                                tma_atom_c,
+                                bSG_sC[(None, c_buffer)],
+                                bSG_gC[(None, real_subtile_idx)],
+                            )
+                            c_pipeline.producer_commit()
+                            c_pipeline.producer_acquire()
+                        cute.arch.barrier(
+                            barrier_id=self.epilog_sync_bar_id,
+                            number_of_threads=epilog_threads,
+                        )
 
                 #
                 # Async arrive accumulator buffer empty
@@ -1389,19 +1548,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             # Dealloc the tensor memory buffer
             #
             if warp_idx == self.epilog_warp_id[0]:
-                cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
+                cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
             epilog_threads = 32 * len(self.epilog_warp_id)
             cute.arch.barrier(
                 barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads
             )
             if warp_idx == self.epilog_warp_id[0]:
-                if use_2cta_instrs:
-                    cute.arch.mbarrier_arrive(
-                        tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1
-                    )
-                    cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
                 cute.arch.dealloc_tmem(
-                    acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs
+                    acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=False
                 )
             #
             # Wait for C store complete
@@ -1410,266 +1564,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
         griddepcontrol_launch_dependents()
 
-    @staticmethod
     def _compute_grid(
+        self,
         c: cute.Tensor,
         cta_tile_shape_mnk: Tuple[int, int, int],
-        cluster_shape_mn: Tuple[int, int],
-        max_active_clusters: cutlass.Constexpr,
-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
-        """Computes the grid size for the kernel launch.
-
-        This method uses a persistent tile scheduler to determine the grid
-        dimensions based on the output tensor shape and hardware constraints.
-
-        Args:
-            c (cute.Tensor): The output tensor C.
-            cta_tile_shape_mnk (Tuple[int, int, int]): The shape (M, N, K) of the
-                CTA tile.
-            cluster_shape_mn (Tuple[int, int]): The shape of a CTA cluster.
-            max_active_clusters (cutlass.Constexpr): The maximum number of
-                active clusters supported by the hardware.
-
-        Returns:
-            A tuple containing the tile scheduler parameters and the computed
-            grid shape.
-        """
+    ) -> Tuple[int, int, int]:
+        """Return one physical K-cluster for every output tile."""
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
-        cluster_shape_mnl = (*cluster_shape_mn, 1)
-
-        tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, cluster_shape_mnl
-        )
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
-            tile_sched_params, max_active_clusters
-        )
-
-        return tile_sched_params, grid
-
-    @staticmethod
-    def is_valid_dtypes_and_scale_factor_vec_size(
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        c_dtype: Type[cutlass.Numeric],
-    ) -> bool:
-        """Checks if the data types and scale factor vector size are a valid combination.
-
-        Args:
-            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
-            sf_dtype (Type[cutlass.Numeric]): Data type of the scale factors.
-            sf_vec_size (int): Vector size of the scale factors.
-            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
-
-        Returns:
-            bool: True if the combination is valid, False otherwise.
-        """
-        is_valid = True
-
-        # Check valid ab_dtype
-        if ab_dtype not in {
-            cutlass.Float4E2M1FN,
-            cutlass.Float8E5M2,
-            cutlass.Float8E4M3FN,
-        }:
-            is_valid = False
-
-        # Check valid sf_vec_size
-        if sf_vec_size not in {16, 32}:
-            is_valid = False
-
-        # Check valid sf_dtype
-        if sf_dtype not in {cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN}:
-            is_valid = False
-
-        # Check valid sf_dtype and sf_vec_size combinations
-        if sf_dtype == cutlass.Float8E4M3FN and sf_vec_size == 32:
-            is_valid = False
-        if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
-            is_valid = False
-
-        # Check valid c_dtype
-        if c_dtype not in {
-            cutlass.Float32,
-            cutlass.Float16,
-            cutlass.BFloat16,
-            cutlass.Float8E5M2,
-            cutlass.Float8E4M3FN,
-        }:
-            is_valid = False
-
-        return is_valid
-
-    @staticmethod
-    def is_valid_layouts(
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """Checks if the tensor layouts are valid for the given data types.
-
-        Args:
-            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
-            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
-            a_major (str): The major layout of tensor A ('k' or 'm').
-            b_major (str): The major layout of tensor B ('k' or 'n').
-            c_major (str): The major layout of tensor C ('n' or 'm').
-
-        Returns:
-            bool: True if the layouts are valid, False otherwise.
-        """
-        is_valid = True
-
-        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
-            is_valid = False
-        return is_valid
-
-    @staticmethod
-    def is_valid_mma_tiler_and_cluster_shape(
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-    ) -> bool:
-        """Checks if the MMA tiler and cluster shape are a valid combination.
-
-        Args:
-            mma_tiler_mn (Tuple[int, int]): The (M, N) shape of the MMA tiler.
-            cluster_shape_mn (Tuple[int, int]): The (M, N) shape of the CTA cluster.
-
-        Returns:
-            bool: True if the combination is valid, False otherwise.
-        """
-        is_valid = True
-        # Skip invalid mma tile shape
-        if mma_tiler_mn[0] not in [128, 256]:
-            is_valid = False
-        if mma_tiler_mn[1] not in [8, 16, 32, 64, 128, 192, 256]:
-            is_valid = False
-        # Skip illegal cluster shape
-        if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
-            is_valid = False
-        # Skip invalid cluster shape
-        _is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
-        if (
-            cluster_shape_mn[0] * cluster_shape_mn[1] > 16
-            or cluster_shape_mn[0] <= 0
-            or cluster_shape_mn[1] <= 0
-            # Special cluster shape check for scale factor multicasts.
-            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
-            or cluster_shape_mn[0] > 4
-            or cluster_shape_mn[1] > 4
-            or not _is_power_of_2(cluster_shape_mn[0])
-            or not _is_power_of_2(cluster_shape_mn[1])
-        ):
-            is_valid = False
-        return is_valid
-
-    @staticmethod
-    def is_valid_tensor_alignment(
-        m: cutlass.Int64,
-        n: cutlass.Int64,
-        k: cutlass.Int64,
-        l: cutlass.Int64,
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """Checks if the tensor dimensions are valid for memory alignment.
-
-        Args:
-            m (cutlass.Int64): The M dimension of the GEMM problem.
-            n (cutlass.Int64): The N dimension of the GEMM problem.
-            k (cutlass.Int64): The K dimension of the GEMM problem.
-            l (cutlass.Int64): The batch dimension (L) of the GEMM problem.
-            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
-            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
-            a_major (str): The major layout of tensor A ('k' or 'm').
-            b_major (str): The major layout of tensor B ('k' or 'n').
-            c_major (str): The major layout of tensor C ('n' or 'm').
-
-        Returns:
-            bool: True if the tensor alignment is valid, False otherwise.
-        """
-        is_valid = True
-
-        def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
-            major_mode_idx = 0 if is_mode0_major else 1
-            num_major_elements = tensor_shape[major_mode_idx]
-            num_contiguous_elements = 16 * 8 // dtype.width
-            return num_major_elements % num_contiguous_elements == 0
-
-        if (
-            not check_contigous_16B_alignment(ab_dtype, a_major == "m", (m, k, l))
-            or not check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, l))
-            or not check_contigous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
-        ):
-            is_valid = False
-        return is_valid
-
-    @classmethod
-    def can_implement(
-        cls,
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        c_dtype: Type[cutlass.Numeric],
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-        m: cutlass.Int64,
-        n: cutlass.Int64,
-        k: cutlass.Int64,
-        l: cutlass.Int64,
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """Checks if the kernel can implement the given GEMM problem.
-
-        This method aggregates checks for data types, layouts, tile shapes,
-        and alignment to determine if the configuration is supported.
-
-        Args:
-            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
-            sf_dtype (Type[cutlass.Numeric]): Data type of the scale factors.
-            sf_vec_size (int): Vector size of the scale factors.
-            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
-            mma_tiler_mn (Tuple[int, int]): The (M, N) shape of the MMA tiler.
-            cluster_shape_mn (Tuple[int, int]): The (M, N) shape of the CTA
-                cluster.
-            m (cutlass.Int64): The M dimension of the GEMM problem.
-            n (cutlass.Int64): The N dimension of the GEMM problem.
-            k (cutlass.Int64): The K dimension of the GEMM problem.
-            l (cutlass.Int64): The batch dimension (L) of the GEMM problem.
-            a_major (str): The major layout of tensor A ('k' or 'm').
-            b_major (str): The major layout of tensor B ('k' or 'n').
-            c_major (str): The major layout of tensor C ('n' or 'm').
-
-        Returns:
-            bool: True if the configuration is supported, False otherwise.
-        """
-        can_implement = True
-        # Skip unsupported types
-        if not cls.is_valid_dtypes_and_scale_factor_vec_size(
-            ab_dtype, sf_dtype, sf_vec_size, c_dtype
-        ):
-            can_implement = False
-        # Skip unsupported layouts
-        if not cls.is_valid_layouts(ab_dtype, c_dtype, a_major, b_major, c_major):
-            can_implement = False
-        # Skip invalid mma tile shape and cluster shape
-        if not cls.is_valid_mma_tiler_and_cluster_shape(mma_tiler_mn, cluster_shape_mn):
-            can_implement = False
-        # Skip illegal problem shape for load/store alignment
-        if not cls.is_valid_tensor_alignment(
-            m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
-        ):
-            can_implement = False
-
-        if mma_tiler_mn[1] < 64 and (n > mma_tiler_mn[1] or cluster_shape_mn[1] > 1):
-            can_implement = False
-        return can_implement
+        return (num_ctas_mnl[0], num_ctas_mnl[1], self.split_k_slices)
