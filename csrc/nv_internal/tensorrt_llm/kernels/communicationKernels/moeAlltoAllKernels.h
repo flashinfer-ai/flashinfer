@@ -24,6 +24,9 @@ namespace tensorrt_llm::kernels::moe_alltoall {
 static constexpr int kMaxTopK = 22;     // Maximum supported top-k experts per token
 static constexpr int kMaxPayloads = 6;  // Maximum number of different payload types
 static constexpr int kMaxRanks = 64;    // Maximum supported EP size
+// uint64 words needed to hold the active-rank bitmask (kRankMaskWords * 64 must be >= kMaxRanks).
+static constexpr int kRankMaskWords = (kMaxRanks + 63) / 64;
+static_assert(kRankMaskWords * 64 >= kMaxRanks, "active_rank_mask too small for kMaxRanks");
 
 // Describes a single payload type to be communicated
 struct PayloadDescriptor {
@@ -59,6 +62,11 @@ struct DispatchKernelPointers {
   // Optional: statistics for EPLB
   int const* eplb_local_stats;          // [eplb_stats_num_experts]
   int* eplb_gathered_stats[kMaxRanks];  // [ep_size, eplb_stats_num_experts] per rank
+
+  // Active-rank bitmask: bit i set => rank i is alive and participates in this collective.
+  // Tokens routed to a masked rank are dropped (topk_*[k] = -1); flag writes/waits to/from
+  // masked peers are skipped. The local rank's own bit must always be set (checked at launch).
+  uint64_t active_rank_mask[kRankMaskWords];
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -77,6 +85,11 @@ struct CombineKernelPointers {
   // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
   int const* topk_target_ranks;  // target rank per k, -1 for duplicates
   int const* topk_send_indices;  // dst index per k, -1 for duplicates
+
+  // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips flag
+  // writes/waits to/from masked peers and also skips per-token accumulation for ranks that
+  // become inactive between dispatch and combine.
+  uint64_t active_rank_mask[kRankMaskWords];
 };
 
 // Dispatch phase parameters
@@ -123,6 +136,11 @@ struct MoeA2ADispatchParams {
   int eplb_stats_num_experts;           // Number of experts for EPLB stats
   int const* eplb_local_stats;          // [eplb_stats_num_experts]
   int* eplb_gathered_stats[kMaxRanks];  // [ep_size, eplb_stats_num_experts] per rank
+
+  // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Defaults to all-ones
+  // for backwards-compatible "no masking" behavior. NOTE: this initializer list must have
+  // exactly kRankMaskWords elements; update it alongside any change to kMaxRanks.
+  uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}};
 
   // CUDA stream
   cudaStream_t stream;
@@ -194,6 +212,11 @@ struct MoeA2ACombineParams {
       completion_flags[kMaxRanks];  // If completion_flags[target_rank][source_rank] == *flag_val,
                                     // then source rank has signaled the target rank
   void const* recv_buffers[kMaxRanks];  // Per-rank receive buffers (only for single payload)
+
+  // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Defaults to all-ones
+  // for backwards-compatible "no masking" behavior. NOTE: this initializer list must have
+  // exactly kRankMaskWords elements; update it alongside any change to kMaxRanks.
+  uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}};
 
   // CUDA stream
   cudaStream_t stream;

@@ -52,6 +52,37 @@ inline size_t alignOffset(size_t offset, size_t alignment = kCachelineAlignment)
   return (offset + alignment - 1) & ~(alignment - 1);
 }
 
+// Resolve an optional rank-mask tensor into a fixed-width uint64 array.
+// If the caller did not provide a mask, default to "all ranks active" (all bits set), which
+// reproduces the pre-fault-tolerance behavior bit-for-bit.
+inline void resolveActiveRankMask(Optional<TensorView> maskTensor, int64_t epRank,
+                                  uint64_t (&out)[tl_throughput::kRankMaskWords]) {
+  using tl_throughput::kMaxRanks;
+  using tl_throughput::kRankMaskWords;
+  TVM_FFI_ICHECK(epRank >= 0 && epRank < kMaxRanks)
+      << "epRank must be in the range [0, " << kMaxRanks << ") for active_rank_mask";
+  if (!maskTensor.has_value()) {
+    for (int w = 0; w < kRankMaskWords; ++w) {
+      out[w] = ~uint64_t{0};
+    }
+    return;
+  }
+  TensorView const& t = maskTensor.value();
+  CHECK_CPU(t);
+  CHECK_CONTIGUOUS(t);
+  CHECK_INPUT_TYPE(t, dl_uint64);
+  TVM_FFI_ICHECK_EQ(t.ndim(), 1) << "active_rank_mask must be a 1D tensor";
+  TVM_FFI_ICHECK_EQ(t.size(0), kRankMaskWords)
+      << "active_rank_mask must have exactly " << kRankMaskWords << " uint64 elements";
+  auto const* src = static_cast<uint64_t const*>(t.data_ptr());
+  for (int w = 0; w < kRankMaskWords; ++w) {
+    out[w] = src[w];
+  }
+  // Local rank's bit must be set; otherwise the kernel would be running on a "dead" rank.
+  TVM_FFI_ICHECK((out[epRank >> 6] >> (epRank & 63)) & 1ULL)
+      << "active_rank_mask must mark the local ep_rank (" << epRank << ") as active";
+}
+
 fi_throughput::MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens,
                                                   int eplbStatsNumExperts) {
   fi_throughput::MoeA2ADataOffsets offsets{};
@@ -131,7 +162,8 @@ Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
 Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchOp(
     TensorView tokenSelectedExperts, Array<Tensor> inputPayloads, TensorView workspace,
     TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
-    int64_t topK, int64_t numExperts, bool enablePdl, Optional<TensorView> eplbLocalStats) {
+    int64_t topK, int64_t numExperts, bool enablePdl, Optional<TensorView> eplbLocalStats,
+    Optional<TensorView> activeRankMask) {
   using tl_throughput::PayloadDescriptor;
 
   CHECK_INPUT(tokenSelectedExperts);
@@ -167,6 +199,8 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
   CHECK_INPUT_TYPE(workspace, dl_uint8);
   TVM_FFI_ICHECK_EQ(workspace.ndim(), 2);
   TVM_FFI_ICHECK_EQ(workspace.size(0), epSize);
+  TVM_FFI_ICHECK(epSize > 0 && epSize <= tl_throughput::kMaxRanks)
+      << "epSize must be in the range (0, " << tl_throughput::kMaxRanks << "]";
   TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize);
   TVM_FFI_ICHECK(runtimeMaxTokensPerRank > 0);
   // Non-divisible num_experts % ep_size is supported via ceil/floor expert-to-rank partitioning.
@@ -243,6 +277,10 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
   params.num_payloads = numPayloads;
   std::copy(payloadDescriptors.begin(), payloadDescriptors.end(), params.payloads);
 
+  // Resolve the optional active-rank mask. Default (no mask) = all bits set, which exactly
+  // reproduces the pre-fault-tolerance kernel behavior.
+  resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+
   params.flag_val =
       reinterpret_cast<uint32_t*>(rankWorkspacePtr + offsets[fi_throughput::FLAG_VAL_OFFSET_INDEX]);
   params.local_token_counter = reinterpret_cast<int*>(
@@ -316,9 +354,6 @@ nvinfer1::DataType toNvDataType(DLDataType dtype) {
   if (code == float32_code) {
     return nvinfer1::DataType::kFLOAT;
   }
-  if (code == float8_e4m3fn_code) {
-    return nvinfer1::DataType::kFP8;
-  }
   TVM_FFI_LOG_AND_THROW(TypeError) << "Unsupported dtype for MoE combine";
   return nvinfer1::DataType::kFLOAT;
 }
@@ -328,7 +363,8 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
                        int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
                        bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
                        Optional<TensorView> outputScales, double outputScalarScale,
-                       int64_t sfLayout, bool useLowPrecision, bool enablePdl) {
+                       int64_t sfLayout, bool useLowPrecision, bool enablePdl,
+                       Optional<TensorView> activeRankMask) {
   using tl_throughput::MoeA2ACombineParams;
   using tl_throughput::MoeA2ACombineQuantMode;
   using tl_throughput::MoeA2ACombineSwizzleSFMode;
@@ -337,6 +373,8 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
       << "payload must be [ep_size, runtime_max_tokens_per_rank, hidden]";
   TVM_FFI_ICHECK_EQ(payload.size(0), epSize);
   TVM_FFI_ICHECK_EQ(payload.size(1), runtimeMaxTokensPerRank);
+  TVM_FFI_ICHECK(epSize > 0 && epSize <= tl_throughput::kMaxRanks)
+      << "epSize must be in the range (0, " << tl_throughput::kMaxRanks << "]";
   TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize);
   TVM_FFI_ICHECK(topK > 0 && topK <= tl_throughput::kMaxTopK);
   TVM_FFI_ICHECK(localNumTokens >= 0);
@@ -455,6 +493,10 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
         targetWorkspacePtr + offsets[fi_throughput::COMBINE_COMPLETION_FLAGS_OFFSET_INDEX]);
     params.recv_buffers[targetRank] = targetWorkspacePtr + combinePayloadOffset;
   }
+
+  // Resolve the optional active-rank mask. Default (no mask) = all bits set.
+  resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+
   params.stream = stream;
 
   tl_throughput::moe_a2a_prepare_combine_launch(params);

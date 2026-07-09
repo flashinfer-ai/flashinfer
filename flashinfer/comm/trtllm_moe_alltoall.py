@@ -7,7 +7,7 @@ supporting multiple payloads per collective operation.
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import functools
@@ -19,6 +19,42 @@ from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
 from ..utils import register_custom_op, device_support_pdl
 from ..tllm_enums import SfLayout
+
+# Number of uint64 words in the active_rank_mask ABI (must match kRankMaskWords in
+# csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h, which is
+# derived from kMaxRanks there). A single word covers up to 64 ranks.
+MOE_A2A_RANK_MASK_WORDS = 1
+
+
+def moe_a2a_active_rank_mask(active_ranks: Sequence[int], ep_size: int) -> torch.Tensor:
+    r"""Build a CPU ``uint64`` active-rank bitmask for :func:`moe_a2a_dispatch` /
+    :func:`moe_a2a_combine`'s ``active_rank_mask`` argument.
+
+    Parameters
+    ----------
+    active_ranks : Sequence[int]
+        Ranks that are alive and should participate in the collective, e.g. ``[0, 1, 3]``
+        for a 4-rank job where rank 2 has failed.  Also accepts a 1D ``torch.Tensor`` of
+        rank indices.
+    ep_size : int
+        Total expert-parallel world size (all ranks outside ``[0, ep_size)`` are ignored).
+
+    Returns
+    -------
+    torch.Tensor
+        ``[MOE_A2A_RANK_MASK_WORDS]`` ``uint64`` CPU tensor with bit ``i`` set for each
+        active rank ``i``.
+    """
+    mask = 0
+    for rank in active_ranks:
+        rank = int(rank)
+        assert 0 <= rank < ep_size, f"rank {rank} out of range [0, {ep_size})"
+        mask |= 1 << rank
+    words = [
+        (mask >> (64 * word)) & 0xFFFFFFFFFFFFFFFF
+        for word in range(MOE_A2A_RANK_MASK_WORDS)
+    ]
+    return torch.tensor(words, dtype=torch.uint64, device="cpu")
 
 
 @dataclass
@@ -67,6 +103,7 @@ def get_moe_alltoall_module():
         num_experts: int,
         enable_pdl: bool,
         eplb_local_stats: Optional[torch.Tensor] = None,
+        active_rank_mask: Optional[torch.Tensor] = None,
     ):
         """
         Dispatch tokens and payloads to expert ranks.
@@ -84,6 +121,10 @@ def get_moe_alltoall_module():
             enable_pdl: Whether to use programmatic dependent launch
             eplb_local_stats: Optional [eplb_stats_num_experts] int32 tensor of
                 this rank's local EPLB statistics to all-gather during dispatch
+            active_rank_mask: Optional CPU uint64 tensor of shape [MOE_A2A_RANK_MASK_WORDS]
+                (see :func:`moe_a2a_active_rank_mask`). Bit i set means rank i is alive and
+                participates in this collective; tokens routed to a masked-off rank are
+                dropped. Defaults to all-active (no masking) when omitted.
 
         Returns:
             recv_offsets: List of offsets for each payload in the workspace
@@ -106,6 +147,7 @@ def get_moe_alltoall_module():
             num_experts,
             enable_pdl,
             eplb_local_stats,
+            active_rank_mask,
         )
 
     @register_custom_op(
@@ -129,6 +171,7 @@ def get_moe_alltoall_module():
         sf_layout: Optional[SfLayout] = None,
         use_low_precision: bool = False,
         enable_pdl: bool = True,
+        active_rank_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Combine expert outputs back to originating tokens.
@@ -156,6 +199,9 @@ def get_moe_alltoall_module():
             sf_layout: Output swizzle layout. Defaults to linear.
             use_low_precision: If True, quantize payload to FP8 before combine
             enable_pdl: Whether to use programmatic dependent launch
+            active_rank_mask: Optional CPU uint64 tensor of shape [MOE_A2A_RANK_MASK_WORDS]
+                (see :func:`moe_a2a_active_rank_mask`). Should match the mask passed to the
+                corresponding :func:`moe_a2a_dispatch` call (or be omitted from both).
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
         """
@@ -176,6 +222,7 @@ def get_moe_alltoall_module():
             sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
             use_low_precision,
             enable_pdl,
+            active_rank_mask,
         )
 
     @register_custom_op(
@@ -353,6 +400,7 @@ def moe_a2a_dispatch(
     num_experts: int,
     enable_pdl: Optional[bool] = None,
     eplb_local_stats: Optional[torch.Tensor] = None,
+    active_rank_mask: Optional[torch.Tensor] = None,
 ):
     r"""Dispatch tokens and payloads to their target expert ranks.
 
@@ -386,6 +434,12 @@ def moe_a2a_dispatch(
         across ranks and returns the result as ``eplb_gathered_stats``.  The
         length must match the ``eplb_stats_num_experts`` passed to
         :func:`moe_a2a_initialize`.
+    active_rank_mask : Optional[torch.Tensor]
+        Optional CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]`` (see
+        :func:`moe_a2a_active_rank_mask`).  Bit ``i`` set means rank ``i`` is alive and
+        participates in this collective; tokens routed to a masked-off rank are dropped
+        instead of hanging the collective.  Defaults to all-active (no masking) when
+        omitted.  The local ``ep_rank``'s own bit must always be set.
 
     Returns
     -------
@@ -419,6 +473,7 @@ def moe_a2a_dispatch(
         num_experts,
         enable_pdl,
         eplb_local_stats,
+        active_rank_mask,
     )
 
     output_payloads = []
@@ -467,6 +522,7 @@ def moe_a2a_combine(
     sf_layout: SfLayout = SfLayout.layout_linear,
     use_low_precision: bool = False,
     enable_pdl: Optional[bool] = None,
+    active_rank_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Combine per-expert outputs back to the originating ranks.
 
@@ -519,6 +575,10 @@ def moe_a2a_combine(
     enable_pdl : Optional[bool]
         Whether to use programmatic dependent launch.  ``None`` auto-detects
         from the device.
+    active_rank_mask : Optional[torch.Tensor]
+        Optional CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]`` (see
+        :func:`moe_a2a_active_rank_mask`).  Should match the mask passed to the
+        corresponding :func:`moe_a2a_dispatch` call (or be omitted from both).
 
     Returns
     -------
@@ -544,6 +604,7 @@ def moe_a2a_combine(
         sf_layout,
         use_low_precision,
         enable_pdl,
+        active_rank_mask,
     )
 
 
@@ -556,7 +617,8 @@ def moe_a2a_sanitize_expert_ids(
     invalid_expert_id: int,
     enable_pdl: Optional[bool] = None,
 ):
-    r"""Replace expert IDs not owned by this rank with ``invalid_expert_id``.
+    r"""Sanitize invalid slots that contain no token routed to this rank by
+    setting their expert IDs to ``invalid_expert_id``.
 
     Parameters
     ----------
@@ -570,8 +632,8 @@ def moe_a2a_sanitize_expert_ids(
     ep_rank : int
         Current expert-parallel rank.
     invalid_expert_id : int
-        Value to write where the original expert lies outside this rank's
-        local range.
+        Value to write into slots that received no token (per
+        ``recv_counters``, e.g. padding beyond a source rank's valid count).
     enable_pdl : Optional[bool]
         Whether to use programmatic dependent launch.  ``None`` auto-detects
         from the device.
@@ -976,6 +1038,7 @@ class MoeAlltoAll:
         invalid_token_expert_id: Optional[int] = None,
         expert_id_payload_index: Optional[int] = None,
         eplb_local_stats: Optional[torch.Tensor] = None,
+        active_rank_mask: Optional[torch.Tensor] = None,
     ) -> list[torch.Tensor]:
         r"""Run the MoE all-to-all dispatch phase.
 
@@ -1001,6 +1064,10 @@ class MoeAlltoAll:
             instance to have been constructed with ``eplb_stats_num_experts``
             set.  The gathered result is available afterwards via
             :attr:`eplb_gathered_stats`.
+        active_rank_mask : torch.Tensor, optional
+            CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]`` (see
+            :func:`moe_a2a_active_rank_mask`).  Tokens routed to a masked-off rank are
+            dropped instead of hanging the collective.  Defaults to all-active.
 
         Returns
         -------
@@ -1035,6 +1102,7 @@ class MoeAlltoAll:
             self.top_k,
             self.num_experts,
             eplb_local_stats=eplb_local_stats,
+            active_rank_mask=active_rank_mask,
         )
 
         # Update state
@@ -1070,6 +1138,7 @@ class MoeAlltoAll:
         output_scalar_scale: float = 1.0,
         sf_layout: SfLayout = SfLayout.layout_linear,
         use_low_precision: bool = False,
+        active_rank_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the MoE all-to-all combine phase.
 
@@ -1099,6 +1168,9 @@ class MoeAlltoAll:
         use_low_precision : bool
             If ``True``, quantize the recv-buffer payload to FP8 (e4m3) before
             accumulating; the combine upcasts to a bf16 output.
+        active_rank_mask : torch.Tensor, optional
+            CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]``. Should match the
+            mask passed to the preceding :meth:`dispatch` call (or be omitted from both).
 
         Returns
         -------
@@ -1130,6 +1202,7 @@ class MoeAlltoAll:
             output_scalar_scale,
             sf_layout,
             use_low_precision,
+            active_rank_mask=active_rank_mask,
         )
 
         # Reset state for next round
