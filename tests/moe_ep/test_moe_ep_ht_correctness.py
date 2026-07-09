@@ -11,8 +11,14 @@ Launch (4 GPU):
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import pytest
+
+# First-use JIT compile of reference kernels (e.g. fused_moe_trtllm_sm100)
+# can exceed torch's 10-min default watchdog while other ranks wait in a
+# collective; a cold cache is not a hang.
+_PG_TIMEOUT = timedelta(minutes=60)
 
 HIDDEN = 7168
 INTERMEDIATE = 2048
@@ -209,7 +215,7 @@ def test_moe_ep_ht_matches_dense_reference(per_rank):
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=_PG_TIMEOUT)
     rank, rel = _run_ht(per_rank)
     dist.barrier()
     print(f"rank {rank}: HT t/rank={per_rank} OK (rel-err={rel:.4f})")
@@ -219,7 +225,7 @@ def _main():
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=_PG_TIMEOUT)
     for per_rank in PER_RANK_SIZES:
         r, rel = _run_ht(per_rank)
         dist.barrier()

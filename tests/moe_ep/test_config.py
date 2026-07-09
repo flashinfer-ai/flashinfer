@@ -11,6 +11,7 @@ from flashinfer.moe_ep import (
     BootstrapConfig,
     EpAlgorithm,
     EpLayout,
+    FleetAlgoKnobAllocator,
     FleetAlgoKnobNumChannelsPerRank,
     FleetAlgoKnobQuantization,
     FleetParams,
@@ -140,6 +141,21 @@ class TestAlgoKnobs:
     def test_reject_non_knob(self) -> None:
         with pytest.raises(TypeError, match="AlgoKnob"):
             _index_knobs(["not a knob"])  # type: ignore[list-item]
+
+    def test_allocator_knob_rejects_torch_caching_with_addresses(self) -> None:
+        with pytest.raises(ValueError, match="not both"):
+            FleetAlgoKnobAllocator(torch_caching=True, alloc_fn=0x1234, free_fn=0x5678)
+
+    def test_allocator_knob_rejects_unpaired_addresses(self) -> None:
+        with pytest.raises(ValueError, match="together"):
+            FleetAlgoKnobAllocator(alloc_fn=0x1234)
+        with pytest.raises(ValueError, match="together"):
+            FleetAlgoKnobAllocator(free_fn=0x5678)
+
+    def test_allocator_knob_accepts_valid_modes(self) -> None:
+        FleetAlgoKnobAllocator()  # default cudaMalloc path
+        FleetAlgoKnobAllocator(torch_caching=True)
+        FleetAlgoKnobAllocator(alloc_fn=0x1234, free_fn=0x5678, context=0x9ABC)
 
 
 class TestSplitConfig:

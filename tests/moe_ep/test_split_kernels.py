@@ -7,8 +7,14 @@
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import pytest
+
+# First-use JIT compile of reference kernels (e.g. fused_moe_trtllm_sm100)
+# can exceed torch's 10-min default watchdog while other ranks wait in a
+# collective; a cold cache is not a hang.
+_PG_TIMEOUT = timedelta(minutes=60)
 
 
 class TestKernelRequiresWeights:
@@ -29,7 +35,13 @@ class TestIdentitySplitKernel:
     def test_passes_expert_tensors_through_unchanged(self) -> None:
         import torch
 
-        from flashinfer.moe_ep import FleetParams, dummy_moe_weights, IdentityConfig, SplitKernelContext, run_split_kernel
+        from flashinfer.moe_ep import (
+            FleetParams,
+            dummy_moe_weights,
+            IdentityConfig,
+            SplitKernelContext,
+            run_split_kernel,
+        )
 
         expert = torch.randn(8, 128)
         ctx = SplitKernelContext(
@@ -60,7 +72,12 @@ class TestSplitKernelRegistry:
     def test_unknown_kernel_raises(self) -> None:
         import torch
 
-        from flashinfer.moe_ep import FleetParams, dummy_moe_weights, SplitKernelContext, run_split_kernel
+        from flashinfer.moe_ep import (
+            FleetParams,
+            dummy_moe_weights,
+            SplitKernelContext,
+            run_split_kernel,
+        )
 
         class _UnknownKernel:
             kernel_name = "unknown"
@@ -210,6 +227,7 @@ def test_identity_split_kernel_multirank_roundtrip(comm_backend):
         dist.init_process_group(
             backend=backend_name,
             device_id=torch.device(f"cuda:{local_rank}"),
+            timeout=_PG_TIMEOUT,
         )
     rank = dist.get_rank()
     world_size = dist.get_world_size()

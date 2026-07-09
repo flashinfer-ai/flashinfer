@@ -12,8 +12,14 @@ within bf16 tolerance.
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import pytest
+
+# First-use JIT compile of reference kernels (e.g. fused_moe_trtllm_sm100)
+# can exceed torch's 10-min default watchdog while other ranks wait in a
+# collective; a cold cache is not a hang.
+_PG_TIMEOUT = timedelta(minutes=60)
 
 
 def pytest_generate_tests(metafunc):
@@ -59,6 +65,7 @@ def test_moe_ep_roundtrip_ll_bf16_h4096(comm_backend):
         dist.init_process_group(
             backend=backend_name,
             device_id=torch.device(f"cuda:{local_rank}"),
+            timeout=_PG_TIMEOUT,
         )
     rank = dist.get_rank()
     world_size = dist.get_world_size()

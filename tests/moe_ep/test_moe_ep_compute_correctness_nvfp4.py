@@ -12,8 +12,14 @@ Launch (4 GPU, SM100+):
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import pytest
+
+# First-use JIT compile of reference kernels (e.g. fused_moe_trtllm_sm100)
+# can exceed torch's 10-min default watchdog while other ranks wait in a
+# collective; a cold cache is not a hang.
+_PG_TIMEOUT = timedelta(minutes=60)
 
 NUM_EXPERTS = 16
 TOP_K = 8
@@ -215,7 +221,7 @@ def test_moe_ep_nvfp4_compute_matches_dense_reference(layout):
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=_PG_TIMEOUT)
     world_size = dist.get_world_size()
     if NUM_EXPERTS % world_size != 0:
         pytest.skip(

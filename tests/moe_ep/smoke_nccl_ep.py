@@ -9,15 +9,21 @@ pass. Asserts the output has the same shape as the input. With
 softmax-normalized topk_weights, the output approximates the input within
 bf16 tolerance.
 
-Requires ``nccl.ep`` (nccl4py) and ``libnccl_ep.so`` staged under
-``flashinfer/moe_ep/backends/split/comm/nccl_ep/_libs/`` — install via
-``bash fast_install.sh`` or ``BUILD_NCCL_EP=1 pip install -e ".[nvep]"``.
+Requires ``nccl.ep``, which is available by default: it ships in the
+``nccl4py`` wheel, a base dependency of flashinfer-python (a plain
+``pip install -e .`` is enough).
 """
 
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 import sys
+
+# First-use JIT compile of reference kernels (e.g. fused_moe_trtllm_sm100)
+# can exceed torch's 10-min default watchdog while other ranks wait in a
+# collective; a cold cache is not a hang.
+_PG_TIMEOUT = timedelta(minutes=60)
 
 # When launched as `torchrun tests/moe_ep/smoke_nccl_ep.py`, Python inserts
 # this script's directory (tests/moe_ep/) at sys.path[0]. That dir holds the
@@ -34,7 +40,7 @@ def main() -> int:
 
     # Initialize the process group; srun/torchrun sets RANK/WORLD_SIZE.
     backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(backend=backend, timeout=_PG_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if torch.cuda.is_available():

@@ -67,9 +67,31 @@ PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
 )
 
 echo "== build & install FlashInfer (NCCL-EP + Mega path) =="
+# The EP backends are ON by default now: NCCL-EP needs no build step (nccl4py
+# is a base dependency of flashinfer-python), so only NIXL-EP is opted out.
+# PIP_CONSTRAINT= so the build hook's --no-deps NCCL floor upgrade
+# (_ensure_nccl_floor, nvidia-nccl-cu13>=2.30.7) isn't blocked by the base
+# image's constraint file — a no-op here since 2.30.7 is already pinned above.
 cd "${FI_SRC}"
-BUILD_NVEP=0 BUILD_NCCL_EP=1 BUILD_NIXL_EP=0 \
-    pip install --no-cache-dir --no-build-isolation -e ".[nvep]"
+PIP_CONSTRAINT="" BUILD_NIXL_EP=0 \
+    pip install --no-cache-dir --no-build-isolation -e .
+
+echo "== pre-warm FlashInfer JIT cache (trtllm fused-MoE reference kernels) =="
+# First-use JIT of fused_moe_trtllm_sm100 costs ~25 min of nvcc. Compiled
+# lazily under torchrun, that outlives torch's 10-min NCCL watchdog and
+# SIGABRTs the job (rank 0 compiles while the others wait in a collective).
+# Bake the compiled modules into the image instead: they land in
+# ~/.cache/flashinfer, which --container-save captures.
+FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-10.0a}" python - <<'PYEOF'
+from flashinfer.jit.fp4_quantization import gen_fp4_quantization_sm100_module
+from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
+
+for gen in (gen_trtllm_gen_fused_moe_sm100_module, gen_fp4_quantization_sm100_module):
+    spec = gen()
+    print(f"[prewarm] building {spec.name} ...", flush=True)
+    spec.build_and_load()
+    print(f"[prewarm] {spec.name} OK", flush=True)
+PYEOF
 
 echo "== smoke probe =="
 python -c "\

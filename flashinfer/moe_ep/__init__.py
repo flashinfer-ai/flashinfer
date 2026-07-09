@@ -174,10 +174,12 @@ __all__ = [
 
 _pkg_dir = Path(__file__).parent
 _REBUILD_HINT = (
-    "flashinfer.moe_ep transport libs are not built. Rebuild with:\n"
-    '    BUILD_NVEP=1 pip install -e ".[nvep]"\n'
-    "from the FlashInfer source tree (libs stage under "
-    "flashinfer/moe_ep/backends/split/comm/*/_libs/)."
+    "flashinfer.moe_ep transport libs are not built. They build by default;\n"
+    "rebuild with:\n"
+    "    pip install -e .\n"
+    "from the FlashInfer source tree (use BUILD_NIXL_EP=1 to turn missing\n"
+    "build deps into hard errors instead of skip-with-warning; libs stage\n"
+    "under flashinfer/moe_ep/backends/split/comm/*/_libs/)."
 )
 
 

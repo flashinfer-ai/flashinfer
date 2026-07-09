@@ -12,7 +12,13 @@ for the NIXL Buffer rendezvous. Requires ``FI_BUILD_NIXL_EP=1`` /
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 import sys
+
+# First-use JIT compile of reference kernels (e.g. fused_moe_trtllm_sm100)
+# can exceed torch's 10-min default watchdog while other ranks wait in a
+# collective; a cold cache is not a hang.
+_PG_TIMEOUT = timedelta(minutes=60)
 
 # See smoke_nccl_ep.py: drop this script's dir from sys.path so the installed
 # `nccl_ep` / `nixl_ep` ctypes modules aren't shadowed by the test subpackages
@@ -26,7 +32,7 @@ def main() -> int:
     import torch.distributed as dist
 
     backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(backend=backend, timeout=_PG_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if torch.cuda.is_available():

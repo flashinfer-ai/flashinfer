@@ -36,14 +36,16 @@ srun --jobid="$SLURM_JOB_ID" \
   --container-workdir="$ROOT/flashinfer" \
   --pty bash -l
 
-# 3. (Re)build just the EP transport libs in editable mode
-BUILD_NVEP=0 BUILD_NCCL_EP=1 BUILD_NIXL_EP=0 \
-    pip install --no-cache-dir --no-build-isolation -e ".[nvep]"
+# 3. (Re)build FlashInfer in editable mode (EP backends are on by default;
+#    NCCL-EP needs no build step — nccl4py is a base dependency)
+BUILD_NIXL_EP=0 \
+    pip install --no-cache-dir --no-build-isolation -e .
 ```
 
-Build flags: `BUILD_NCCL_EP=1` builds NCCL-EP, `BUILD_NIXL_EP=1` adds NIXL-EP,
-`BUILD_NVEP=1` builds all transport backends. Probe availability at runtime with
-`have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
+Build flags (tri-state; unset = on, best-effort): `BUILD_NIXL_EP=0` skips the
+NIXL-EP meson build, `BUILD_NIXL_EP=1` makes its missing build deps a hard
+error, `BUILD_NVEP=0` turns both backends off. Probe availability at runtime
+with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 
 ### Run tests
 
