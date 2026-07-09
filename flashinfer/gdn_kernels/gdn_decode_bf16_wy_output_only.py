@@ -2160,10 +2160,20 @@ def gated_delta_rule_mtp(
             q, k, v, a, b = qb, kb, vb, ab, bb
 
     _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    # One CTA per (b, hv) — full V tile per CTA. Per-CTA SMEM ~51.5 KB -> <=4 CTAs/SM.
+    # One CTA per (b, hv) — full V tile per CTA. Per-CTA SMEM ~29.8 KB -> <=7 CTAs/SM (ncu, B200).
     _total_ctas = HV * B
     _needed = math.ceil(_total_ctas / _num_sms)
-    mbp = max(1, min(_needed + 1, 4))
+    # Cap raised 4 -> 8 (measured on B200, T=16/HV=64): launch bounds mbp=8 makes the
+    # compiler fit 64 regs/thread (was 73 -> 80 allocated -> 6-CTA register limit),
+    # unlocking the 7-CTA SMEM limit (29.8 KB/CTA): theoretical occupancy 37.5% -> 43.75%,
+    # ~1-7% faster across BS=16..256 with bit-identical output. mbp=12 (40 regs) gains no
+    # further occupancy (SMEM-capped at 7 CTAs) and is slower — do not raise past 8.
+    mbp = max(1, min(_needed + 1, 8))
+    # GDN_WY_MBP overrides min_blocks_per_mp (launch bounds) for perf experiments.
+    # mbp is part of cache_key, so each value compiles its own kernel.
+    _mbp_env = _os.environ.get("GDN_WY_MBP")
+    if _mbp_env:
+        mbp = int(_mbp_env)
     # T-aware Phase-2 squaring depth.
     t_disc = 4 if T <= 4 else (8 if T <= 8 else 16)
     # n_valid in the key: native (n_valid<T) vs staged (n_valid=T_KERNEL) compile to
