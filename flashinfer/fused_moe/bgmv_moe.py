@@ -60,6 +60,7 @@ def bgmv_moe_shrink(
     expert_ids: torch.Tensor,
     lora_indices: torch.Tensor,
     lora_stride: int,
+    *,
     per_pair_input: bool = False,
 ) -> None:
     """
@@ -112,6 +113,7 @@ def bgmv_moe_expand(
     slice_start_loc: torch.Tensor,
     output_slices: List[int],
     lora_stride: int,
+    *,
     finalize: bool = True,
 ) -> None:
     """
