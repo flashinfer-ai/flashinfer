@@ -23,7 +23,7 @@ from cutlass.pipeline import PipelineProducer, PipelineConsumer
 
 from ..config import AttentionConfig, AttentionFusion
 from ..tmem_layout import TmemLayout
-from ..fusion.mask import get_trip_count
+from ..fusion.mask import get_kv_block_range, get_trip_count
 from ..scheduler.persistent import (
     FmhaStaticTileScheduler,
     FmhaStaticTileSchedulerParams,
@@ -63,6 +63,7 @@ class CorrectionRole:
         self.variant = fusion.variant
         self.has_logits_transform = fusion.variant.has_logits_transform
         self.has_output_transform = fusion.variant.has_output_transform
+        self.has_statistics_update = fusion.variant.has_statistics_update
 
         # Warp config
         self.correction_warp_ids = correction_warp_ids
@@ -367,7 +368,59 @@ class CorrectionRole:
                     )
                     - 1
                 )
+                # Per-stage 128-row bands, mirroring SoftmaxRole.run(): for
+                # trips outside a stage's band the softmax dead_step()
+                # published a no-change vec (rescale factor exactly 1), so
+                # the O rescale is skipped.  Same variant gating as the
+                # softmax dead path.
+                kv_start_block = 0
+                stage0_lo = 0
+                stage0_hi = 0
+                stage1_lo = 0
+                stage1_hi = 0
+                if cutlass.const_expr(
+                    not self.has_logits_transform and not self.has_statistics_update
+                ):
+                    kv_start_block, _ = get_kv_block_range(
+                        self.mask_spec,
+                        curr_block_coord,
+                        self.cta_tiler,
+                        seqlen_k,
+                        seqlen_q_,
+                    )
+                    stage0_lo, stage0_hi = get_kv_block_range(
+                        self.mask_spec,
+                        (
+                            curr_block_coord[0] * 2,
+                            curr_block_coord[1],
+                            curr_block_coord[2],
+                        ),
+                        (self.qk_mma_tiler[0], self.cta_tiler[1]),
+                        seqlen_k,
+                        seqlen_q_,
+                    )
+                    stage1_lo, stage1_hi = get_kv_block_range(
+                        self.mask_spec,
+                        (
+                            curr_block_coord[0] * 2 + 1,
+                            curr_block_coord[1],
+                            curr_block_coord[2],
+                        ),
+                        (self.qk_mma_tiler[0], self.cta_tiler[1]),
+                        seqlen_k,
+                        seqlen_q_,
+                    )
                 for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
+                    # Iteration _i consumes the vec of KV trip _i + 1 (the
+                    # first trip's vec was released above, pre-loop).
+                    live0 = True
+                    live1 = True
+                    if cutlass.const_expr(
+                        not self.has_logits_transform and not self.has_statistics_update
+                    ):
+                        blk = kv_start_block + _i + 1
+                        live0 = not (blk < stage0_lo or blk >= stage0_hi)
+                        live1 = not (blk < stage1_lo or blk >= stage1_hi)
                     # wait for vec0 (row_wise current max & previous max)
                     vec0_handle = s0_corr_consumer.wait_and_advance()
                     tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
@@ -382,7 +435,8 @@ class CorrectionRole:
                     # wait for o0
                     o0_handle_consumer = mma_corr_consumer.wait_and_advance()
                     if cutlass.const_expr(not self.has_logits_transform):
-                        self.rescale(pv_thr_mma, tOtO0, scale)
+                        if live0:
+                            self.rescale(pv_thr_mma, tOtO0, scale)
                     # release vec1 & o0
                     vec1_handle.release()
                     cute.arch.fence_view_async_tmem_store()
@@ -398,7 +452,8 @@ class CorrectionRole:
 
                     o1_handle_consumer = mma_corr_consumer.wait_and_advance()
                     if cutlass.const_expr(not self.has_logits_transform):
-                        self.rescale(pv_thr_mma, tOtO1, scale)
+                        if live1:
+                            self.rescale(pv_thr_mma, tOtO1, scale)
                     vec0_handle.release()
                     cute.arch.fence_view_async_tmem_store()
                     o1_handle_consumer.release()
