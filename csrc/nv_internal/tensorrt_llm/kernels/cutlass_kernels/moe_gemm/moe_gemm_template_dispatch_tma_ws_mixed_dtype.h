@@ -63,8 +63,8 @@ namespace tensorrt_llm::kernels::cutlass_kernels_oss {
 using tensorrt_llm::kernels::cutlass_kernels::Fp4Type;
 #endif
 using tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput;
+using tensorrt_llm::kernels::cutlass_kernels::Sm90Wfp4Afp8ScaleMode;
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
-using tensorrt_llm::kernels::cutlass_kernels::Wfp4Afp8ScaleMode;
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
@@ -226,7 +226,8 @@ void sm90_dispatch_moe_mixed_dtype_gemm_small_k_only(
 }
 
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
-          int UnusedScalePackFactor, Wfp4Afp8ScaleMode Wfp4Afp8Mode = Wfp4Afp8ScaleMode::kNone>
+          int UnusedScalePackFactor,
+          Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode = Sm90Wfp4Afp8ScaleMode::kDisabled>
 void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
     GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
@@ -241,7 +242,7 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
 #endif
   static_cast<void>(UnusedScalePackFactor);
   static constexpr auto ScaleMode =
-      Wfp4Afp8Mode == Wfp4Afp8ScaleMode::kHummingPreMmaE8M0
+      Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0
           ? cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0
           : cutlass::gemm::collective::MixedInputScaleMode::kPostMma;
 
@@ -255,7 +256,7 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
 
 #define DISPATCH_MIXED_DTYPE_MOE_TILE_WITH_SMALL_K(ENUM_NAME, TILE_M, TILE_N, TILE_K)          \
   case tkc::CutlassTileConfigSM90::ENUM_NAME:                                                  \
-    if constexpr (Wfp4Afp8Mode == Wfp4Afp8ScaleMode::kHummingPreMmaE8M0) {                     \
+    if constexpr (Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0) {             \
       sm90_dispatch_moe_mixed_dtype_gemm_with_small_k<                                         \
           T, WeightType, GemmOutputType, EpilogueTag,                                          \
           Shape<Int<TILE_M>, Int<TILE_N>, Int<TILE_K>>, ScaleMode>(inputs, hopper_inputs,      \
@@ -270,7 +271,7 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
 
 #define DISPATCH_MIXED_DTYPE_MOE_SMALL_K_TILE(ENUM_NAME, TILE_M, TILE_N, TILE_K)               \
   case tkc::CutlassTileConfigSM90::ENUM_NAME:                                                  \
-    if constexpr (Wfp4Afp8Mode == Wfp4Afp8ScaleMode::kHummingPreMmaE8M0) {                     \
+    if constexpr (Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0) {             \
       sm90_dispatch_moe_mixed_dtype_gemm_small_k_only<                                         \
           T, WeightType, GemmOutputType, EpilogueTag,                                          \
           Shape<Int<TILE_M>, Int<TILE_N>, Int<TILE_K>>, ScaleMode>(inputs, hopper_inputs,      \
@@ -338,7 +339,7 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
 }
 
 template <typename T, typename WeightType, typename OutputType,
-          Wfp4Afp8ScaleMode Wfp4Afp8Mode = Wfp4Afp8ScaleMode::kNone>
+          Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode = Sm90Wfp4Afp8ScaleMode::kDisabled>
 size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_count_) {
   size_t count = 0;
 #if defined(ENABLE_FP4)
@@ -348,7 +349,7 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_
 #endif
   using _Ktile = Int<Ktile>;
   static constexpr auto ScaleMode =
-      Wfp4Afp8Mode == Wfp4Afp8ScaleMode::kHummingPreMmaE8M0
+      Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0
           ? cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0
           : cutlass::gemm::collective::MixedInputScaleMode::kPostMma;
 

@@ -83,8 +83,9 @@ class DtypeUtils {
 
 class FusedMoeRunner : public tvm::ffi::ModuleObj {
  public:
-  template <typename TypeAct, typename TypeWeight, bool NeedQuant = false, bool IsMXFPX = false,
-            kernels::Wfp4Afp8ScaleMode Wfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kNone>
+  template <
+      typename TypeAct, typename TypeWeight, bool NeedQuant = false, bool IsMXFPX = false,
+      kernels::Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kDisabled>
   std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(DLDataType output_type) {
     switch (encode_dlpack_dtype(output_type)) {
       case int64_code:  // INT64 == FP4
@@ -97,20 +98,21 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       case float16_code:
         if constexpr (NeedQuant) {
           return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half, half,
-                                                              IsMXFPX, Wfp4Afp8Mode>>();
+                                                              IsMXFPX, Sm90Wfp4Afp8Mode>>();
         } else {
           return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct,
-                                                              half, IsMXFPX, Wfp4Afp8Mode>>();
+                                                              half, IsMXFPX, Sm90Wfp4Afp8Mode>>();
         }
 #ifdef ENABLE_BF16
       case bfloat16_code:
         if constexpr (NeedQuant) {
           return std::make_unique<
               kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16, __nv_bfloat16,
-                                          __nv_bfloat16, IsMXFPX, Wfp4Afp8Mode>>();
+                                          __nv_bfloat16, IsMXFPX, Sm90Wfp4Afp8Mode>>();
         } else {
-          return std::make_unique<kernels::CutlassMoeFCRunner<
-              TypeAct, TypeWeight, __nv_bfloat16, TypeAct, __nv_bfloat16, IsMXFPX, Wfp4Afp8Mode>>();
+          return std::make_unique<
+              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16, TypeAct,
+                                          __nv_bfloat16, IsMXFPX, Sm90Wfp4Afp8Mode>>();
         }
 #endif
       default:
@@ -134,12 +136,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     mUseMxfp8ActScaling = use_mxfp8_act_scaling;
     mUseFusedFinalize = use_fused_finalize;
     mUseWfp4Afp8Humming = use_wfp4afp8_humming;
-    mWfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kNone;
+    mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kDisabled;
     mInnerDimMultiplier = 1;
 
     auto make_humming_runner = [&] {
       mInnerDimMultiplier = 2;
-      mWfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
+      mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
       TVM_FFI_ICHECK(mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16)
           << "Humming-style MXFP4 x FP8 requires FP16/BF16 inputs and online FP8 activation "
              "quantization.";
@@ -148,7 +150,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
              "activation dtype and output dtype to match.";
       mKernelRunner =
           switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, true, false,
-                             kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
+                             kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
     };
 
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
@@ -174,28 +176,36 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     }
 #endif
 #ifdef ENABLE_FP4
-#if 0
-    // PHASE3_POST_MMA_PLACEHOLDER: keep these post-MMA MXFP4 routes as a
-    // reminder for future Hopper mixed-input integration, but do not expose the
-    // dl_int64 FP4 placeholder. The real Hopper mixed-input paths should use
-    // the same uint8-packed MXFP4 storage as the Humming-style path and select a
-    // different Wfp4Afp8ScaleMode explicitly.
-    if (isWMxfp4AFp8Quant()) {
+    int const sm = common::getSMVersion();
+    if (sm >= 100 && (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant())) {
       mInnerDimMultiplier = 16;  // 16 FP4 -> 1 LONG
-      mKernelRunner = switch_output_type<
-          __nv_fp8_e4m3, kernels::Fp4Type, false, false,
-          kernels::Wfp4Afp8ScaleMode::kPostMmaFp8Act>(mOutputDtype);
+      mKernelRunner = switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type>(mOutputDtype);
     }
 
-    if (isWMxfp4AMxfp8Quant()) {
-      mInnerDimMultiplier = 16;  // 16 FP4 -> 1 LONG
+#if 0
+    // PHASE3_POST_MMA_PLACEHOLDER: future SM90 post-MMA MXFP4 paths should use
+    // uint8-packed MXFP4 storage and select their Sm90Wfp4Afp8ScaleMode explicitly.
+    // Enabling these paths also requires updating the shared predicates for
+    // the SM90 uint8-packed input contract.
+    if (sm == 90 && isWMxfp4AFp8Quant()) {
+      mInnerDimMultiplier = 2;
+      mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaFp8Act;
       mKernelRunner = switch_output_type<
           __nv_fp8_e4m3, kernels::Fp4Type, false, false,
-          kernels::Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>(mOutputDtype);
+          kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaFp8Act>(mOutputDtype);
+    }
+
+    if (sm == 90 && isWMxfp4AMxfp8Quant()) {
+      mInnerDimMultiplier = 2;
+      mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act;
+      mKernelRunner = switch_output_type<
+          __nv_fp8_e4m3, kernels::Fp4Type, false, false,
+          kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>(mOutputDtype);
     }
 #endif
 
     if (isWMxfp4AFp8HummingQuant()) {
+      TVM_FFI_ICHECK_EQ(sm, 90) << "Humming-style MXFP4 x FP8 is only supported on SM90.";
       make_humming_runner();
     }
 
@@ -722,21 +732,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       activation_dtype = isNvfp4Quant() ? dl_int64 : activation_dtype;
       int64_t const unpadded_hidden_size_profiler = hidden_size;  // HACK no padding by default
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-      mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
-                      DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
-                      DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
-                      hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
-                      activation_type, USE_BIAS, USE_LORA, min_latency_mode,
-                      /*need_weights*/ false, parallelism_config, enable_alltoall,
-                      mUseMxfp8ActScaling, mWfp4Afp8Mode);
+      mProfiler->init(
+          *mKernelRunner.get(), mProfiler->mGemmToProfile, DtypeUtils::dataType(activation_dtype),
+          DtypeUtils::dataType(mWeightDtype), DtypeUtils::dataType(mOutputDtype), num_experts,
+          static_cast<int>(top_k), hidden_size, unpadded_hidden_size_profiler, inter_size,
+          group_size, activation_type, USE_BIAS, USE_LORA, min_latency_mode,
+          /*need_weights*/ false, parallelism_config, enable_alltoall, mSm90Wfp4Afp8Mode);
 #else
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                       DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
                       DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                       hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
                       activation_type, USE_BIAS, USE_LORA, min_latency_mode,
-                      /*need_weights*/ false, parallelism_config, mUseMxfp8ActScaling,
-                      /*enable_alltoall*/ false, mWfp4Afp8Mode);
+                      /*need_weights*/ false, parallelism_config,
+                      /*enable_alltoall*/ false, mSm90Wfp4Afp8Mode);
 #endif
 
       size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
@@ -864,7 +873,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   bool mUseWfp4Afp8Humming = false;
   bool mUsePackedWeights = false;
   bool mUseFusedFinalize = true;
-  kernels::Wfp4Afp8ScaleMode mWfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kNone;
+  kernels::Sm90Wfp4Afp8ScaleMode mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kDisabled;
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   std::vector<Profile> mAllProfiles;
@@ -1489,19 +1498,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   bool isWMxfp4AFp8Quant() const {
-    // PHASE3_POST_MMA_PLACEHOLDER: disabled until this path is wired to
-    // uint8-packed MXFP4 storage instead of the dl_int64 FP4 placeholder.
-    // return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 &&
-    //        !mUseMxfp8ActScaling;
-    return false;
+    return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 && !mUseMxfp8ActScaling;
   }
 
   bool isWMxfp4AMxfp8Quant() const {
-    // PHASE3_POST_MMA_PLACEHOLDER: disabled until this path is wired to
-    // uint8-packed MXFP4 storage instead of the dl_int64 FP4 placeholder.
-    // return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 &&
-    //        mUseMxfp8ActScaling;
-    return false;
+    return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 && mUseMxfp8ActScaling;
   }
 };
 

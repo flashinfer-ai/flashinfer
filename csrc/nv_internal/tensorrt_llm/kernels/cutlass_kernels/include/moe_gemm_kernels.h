@@ -247,8 +247,9 @@ constexpr bool isGatedActivation(ActivationType activation_type) {
          activation_type == ActivationType::GegluTanh;
 }
 
-enum class Wfp4Afp8ScaleMode : uint8_t {
-  kNone = 0,
+enum class Sm90Wfp4Afp8ScaleMode : uint8_t {
+  // Native SM100+ FP8 x FP4 paths leave this SM90-only mode disabled.
+  kDisabled = 0,
   kHummingPreMmaE8M0,
   kPostMmaFp8Act,
   kPostMmaMxfp8Act,
@@ -258,7 +259,8 @@ template <typename T,                          /*The type used for activations/s
           typename WeightType,                 /* The type for the MoE weights */
           typename OutputType,                 /* The output type for the GEMM */
           typename ScaleBiasType = OutputType, /* The type for the scales/bias */
-          bool IsMXFPX = false, Wfp4Afp8ScaleMode Wfp4Afp8Mode = Wfp4Afp8ScaleMode::kNone>
+          bool IsMXFPX = false,
+          Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode = Sm90Wfp4Afp8ScaleMode::kDisabled>
 class MoeGemmRunner {
  public:
   MoeGemmRunner();
@@ -297,14 +299,16 @@ class MoeGemmRunner {
   static constexpr bool use_wfp4afp8 = false;
 #endif
   static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
-  static_assert(Wfp4Afp8Mode == Wfp4Afp8ScaleMode::kNone || use_wfp4afp8,
-                "Wfp4Afp8ScaleMode is only valid for FP8 activation x FP4 weight.");
-  static_assert(!use_wfp4afp8 || Wfp4Afp8Mode != Wfp4Afp8ScaleMode::kNone,
-                "FP8 activation x FP4 weight must select an explicit Wfp4Afp8ScaleMode.");
-  static_assert(!use_wfp4afp8 || !IsMXFPX,
-                "FP8 activation x FP4 weight uses Wfp4Afp8ScaleMode, not generic IsMXFPX.");
+  static constexpr bool use_sm90_wfp4afp8 =
+      use_wfp4afp8 && Sm90Wfp4Afp8Mode != Sm90Wfp4Afp8ScaleMode::kDisabled;
+  static constexpr bool use_sm90_humming_pre_mma =
+      use_sm90_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
+  static_assert(Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kDisabled || use_wfp4afp8,
+                "Sm90Wfp4Afp8ScaleMode is only valid for FP8 activation x FP4 weight.");
+  static_assert(!use_sm90_wfp4afp8 || !IsMXFPX,
+                "FP8 activation x FP4 weight uses Sm90Wfp4Afp8ScaleMode, not generic IsMXFPX.");
 
-  static constexpr bool use_sm90_mixed_input_gemm = use_w4afp8 || use_wfp4a16 || use_wfp4afp8;
+  static constexpr bool use_sm90_mixed_input_gemm = use_w4afp8 || use_wfp4a16 || use_sm90_wfp4afp8;
 
   void moeGemmBiasAct(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
                       TmaWarpSpecializedGroupedGemmInput hopper_inputs);
