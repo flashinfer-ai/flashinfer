@@ -508,21 +508,32 @@ class MoEActivationPack:
       computes expert selection on the host and passes ``topk_ids`` + ``topk_weights``.
     * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
-      itself per ``RoutingConfig.method``, and ``topk_ids`` / ``topk_weights`` are OUTPUT buffers
-      (left ``None`` by the caller).
+      itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
+      runner allocates internal kernel-filled buffers, and the routing result is not surfaced
+      back through the pack (routing replay is a separate, future capability).
 
-    ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425).
+    ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
+    keep the field positions of the former ``selected_experts`` / ``final_scales``, so
+    positional construction of pre-routed packs is unchanged.  The in-kernel routing fields
+    are keyword-only.
     """
 
     hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4)
     hidden_states_scale: Tensor  # [M, H//16] float8_e4m3fn
-    routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed
-    # Pre-routed top-k selection (Packed/Unpacked modes); kernel-filled OUTPUT buffers under FromLogits.
+    # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     topk_weights: Optional[Tensor] = None  # [M, top_k] float32 (routing weights)
-    # In-kernel routing inputs (FromLogits):
-    routing_logits: Optional[Tensor] = None  # [M, num_experts] float32 or bfloat16
-    routing_bias: Optional[Tensor] = None  # [num_experts] (same dtype as logits)
+    # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
+    # call site fails loudly instead of silently binding a tensor to the mode.
+    routing_input_mode: RoutingInputMode = field(
+        default=RoutingInputMode.PackedPrecomputed, kw_only=True
+    )
+    routing_logits: Optional[Tensor] = field(
+        default=None, kw_only=True
+    )  # [M, num_experts] float32 or bfloat16
+    routing_bias: Optional[Tensor] = field(
+        default=None, kw_only=True
+    )  # [num_experts] (same dtype as logits)
 
     @property
     def num_tokens(self) -> int:
