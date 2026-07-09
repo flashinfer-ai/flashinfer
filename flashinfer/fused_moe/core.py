@@ -947,6 +947,10 @@ def cutlass_fused_moe(
         non-associative atomics, so results are not deterministic run-to-run. Set to
         False to use the non-fused, deterministic finalize path.
 
+    profile_ids : Optional[List[int]]
+        Optional ``[gemm1_profile, gemm2_profile]`` override. Both values are absolute indices in
+        the runner's combined tactic list; ``-1`` keeps the default tactic for that GEMM.
+
     Returns
     -------
     out: torch.Tensor

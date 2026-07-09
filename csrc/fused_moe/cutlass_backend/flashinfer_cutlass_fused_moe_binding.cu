@@ -1005,7 +1005,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         best_gemm1_profile = mAllProfiles.at(id1);
       }
 
-      // GEMM2 index: accept absolute index and raise error if out of GEMM2 range
+      // GEMM2 profiles use absolute indices in the combined profile array.
       auto id2 = profile_ids.value()[1];
       if (id2 != -1) {
         TVM_FFI_ICHECK(id2 >= mGemm1TacticCount && id2 < mGemm1TacticCount + mGemm2TacticCount)
