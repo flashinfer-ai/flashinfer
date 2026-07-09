@@ -2138,7 +2138,7 @@ def gated_delta_rule_mtp(
             q, k, v, a, b = qb, kb, vb, ab, bb
 
     pool_size = h0.shape[0]
-    _num_sms = 148  # B200
+    _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     # One CTA per (b, hv) — full V tile per CTA. Per-CTA SMEM ~51.5 KB -> <=4 CTAs/SM.
     _total_ctas = HV * B
     _needed = math.ceil(_total_ctas / _num_sms)
