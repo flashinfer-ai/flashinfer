@@ -77,11 +77,13 @@ Invalidation is **module-granular**, mirroring ninja's module rebuilds. The per-
 
 | Field | Invalidates when |
 |---|---|
-| `cute_dsl_version` | nvidia-cutlass-dsl is upgraded |
+| `cute_dsl_version` | any `nvidia-cutlass-dsl*` package changes — the fingerprint covers the whole compiler stack (`nvidia-cutlass-dsl==X;...-libs-base==X;...-libs-cu13==X`), since the codegen backend lives in the libs packages and the CUDA-family variant is encoded in the package *name* |
 | `source_sha256` | any file in `extra_key_files` changes (kernel-defining sources) |
 | `arch` / `module` | compile target changes (usually also changes the dir name) |
 
 A kernel artifact is valid if and only if its `.o` exists **and** the module `meta.json` matches the expected values. On mismatch the whole module directory is wiped and repopulated lazily. FlashInfer version and nvcc-arch-list changes are already handled by the workspace path.
+
+The system CUDA toolkit and driver versions deliberately do **not** participate in the key: `cute.compile` compiles with the DSL's bundled toolchain (the libs packages above), not with `CUDA_HOME`/`nvcc` — keying on them would spuriously invalidate on per-shell environment changes while catching no real staleness. (`apache-tvm-ffi` is also excluded: the exported `.o` speaks TVM-FFI's stable C ABI.)
 
 Hashing whole source files means any edit (even a docstring) invalidates. This is deliberate: it is the same granularity ninja uses, and the alternative (hashing traced MLIR) requires tracing, which defeats the purpose.
 
@@ -98,13 +100,53 @@ compile, never touch disk).
 
 ### 2.5 From the former `JitSpec` class to the `JitSpec` ABC
 
-Before this change, `JitSpec` was a single concrete dataclass wedded to one compilation model: a fixed list of `.cu`/`.cpp` source files plus compiler flags, built by writing a `build.ninja` and running ninja/nvcc into a linked multi-arch `.so`, with freshness owned by ninja's dependency scan. None of that maps onto a CuTe-DSL kernel — there are no source files (the input is a live Python kernel object compiled by `cute.compile()` in-process, requiring a GPU), specializations are runtime constructor arguments so a module's artifact set grows dynamically, and the output is a single-arch `.o` for the DSL's JITLink loader rather than a dlopen-able fatbin. So the concrete class could not be reused; what *was* reusable is its lifecycle, which the refactor extracts into the abstract base.
+Before this change, `JitSpec` was a single concrete dataclass designed around nvcc compilation: source files + compiler flags in, ninja-built fatbin `.so` out, freshness owned by ninja. None of the existing design is applicable to CuTe-DSL kernel, but the *lifecycle* around it does;  the refactor extracts the lifecycle into an abstract base and leaves each toolchain to its own build model:
 
-Refactor mechanics and decisions:
+```text
+JitSpec (ABC)                          # flashinfer/jit/core.py
+│  build_and_load()                    # concrete template method (shared policy):
+│      cached = try_load()             #   1. fast path
+│      if cached: return cached
+│      with FileLock(lock_path):       #   2. cross-process lock
+│          cached = try_load()         #   3. double-check (another process built?)
+│          if cached: return cached
+│          if FLASHINFER_DISABLE_JIT: raise MissingJITCacheError
+│          build()                     #   4. backend-specific compile
+│          return load()
+│
+├── JitSpecNvcc                        # the former JitSpec dataclass
+└── JitSpecCuteDsl                     # flashinfer/jit/cute_dsl_core.py
+    (future: JitSpecCutile, ...)
+```
 
-- **The ABC keeps the `JitSpec` name**; the concrete class became `JitSpecNvcc`. Since every annotation and `isinstance` check refers to the base, nothing downstream changes; only direct constructions of the class needed the new name (one test).
-- **No separate `validate()` method.** Validity checking is folded into `try_load()` (return the artifact iff known-valid, else `None`), because the two backends need opposite control flow: cute-dsl is load-first (validity is a metadata check; build is expensive), nvcc is build-first (a stale `.so` loads fine; only ninja can judge freshness). A separate validate/load pair would read the same metadata twice or be unimplementable for nvcc.
-- **Instance granularity differs by backend**: one `JitSpecNvcc` = one module (many symbols in one `.so`); one `JitSpecCuteDsl` = one kernel specialization, with specializations of an op family sharing a module directory, its `meta.json`, and its lock.
+The abstract methods, side by side:
+
+| Contract | `JitSpecNvcc` | `JitSpecCuteDsl` |
+|---|---|---|
+| one instance = | one **module** (many symbols in one `.so`) | one **kernel specialization** (`.o`; op family shares a module dir, `meta.json`, and lock) |
+| compilation input | `.cu`/`.cpp` paths + flags (pure data) | live kernel object in a `compile_fn` closure |
+| `try_load()` | AOT `.so` only — deliberately ignores the JIT-path `.so`, so `build()` always runs and **ninja judges freshness** | `.o` exists **and** `meta.json` matches → JITLink it; else `None` |
+| `build()` | `write_ninja()` + run ninja (no-op if up to date); needs only a host toolchain | wipe module if meta stale, `cute.compile()` (needs a GPU), `export_to_c()`; keeps the compiled kernel in memory |
+| `load()` | `dlopen` the `.so` via `tvm_ffi.load_module` | return the in-memory kernel from `build()`, else JITLink the `.o` |
+| invalidation authority | ninja dependency scan, at build time | `meta.json` (DSL-stack fingerprint + source SHA-256), at load time |
+| `is_compiled` / `get_library_path()` | `.so` exists / `.so` path | `.o` + meta match / `.o` path |
+
+Example — the same lifecycle call, two backends:
+
+```python
+gen_jit_spec("fp4_quantization_100", sources, flags).build_and_load()
+#   miss → ninja → dlopen fp4_quantization_100.so   (module with many functions)
+
+JitSpecCuteDsl("nvfp4_quantize", "swizzled_bf16_k4096_sf0_pdl0",
+               compile_fn, source_sha256).build_and_load()
+#   miss → cute.compile → export swizzled_bf16_k4096_sf0_pdl0.o → return in-memory kernel
+#   hit  → JITLink the .o (~ms)
+```
+
+Remaining notes on the refactor:
+
+- **The ABC keeps the `JitSpec` name**; annotations and `isinstance` checks are undisturbed. Only direct constructions needed the new `JitSpecNvcc` name (one test in-repo).
+- **No separate `validate()` method** — folded into `try_load()`, because the backends need opposite control flow (cute-dsl: load-first, validity is a cheap metadata check; nvcc: build-first, only ninja can judge freshness).
 - **AOT is outside the ABC contract** for now: `aot_path`/`is_aot` remain nvcc-specific, because a cute-dsl spec holds a compile closure that cannot be enumerated offline (see Limitations).
 
 ## 3. Alternatives considered
