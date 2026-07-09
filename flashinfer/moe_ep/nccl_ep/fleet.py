@@ -11,12 +11,15 @@ are gone.  We now build an ``nccl.core.Communicator`` (via
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import logging
 from typing import TYPE_CHECKING, Sequence
 
 from .. import MoEEpNotBuiltError, _require_built
 from .._validators import validate_arch_for_backend, validate_fleet_params
 from ..algo_knobs import (
     AlgoKnob,
+    FleetAlgoKnobAllocator,
     FleetAlgoKnobNumChannelsPerRank,
     FleetAlgoKnobNumQpsPerRank,
     FleetAlgoKnobQuantization,
@@ -33,8 +36,49 @@ if TYPE_CHECKING:
     from ..handle import Handle
 
 
+logger = logging.getLogger(__name__)
+
 # ``GroupConfig`` fields left at 0 forward as NCCL_EP_AUTO.
 NCCL_EP_AUTO = 0
+
+# nccl_ep HT hard limit: ``ncclEpCreateGroup`` *asserts* (SIGABRT, nccl_ep.cc:1253)
+# when a HIGH_THROUGHPUT group is created with
+# ``max_dispatch_tokens_per_rank > MAX_SUPPORTED_TOKENS_PER_RANK``. The constant is
+# a build-time template bound in the wheel
+# (``nccl/ep/include/nccl_ep/common.hpp``: ``#define MAX_SUPPORTED_TOKENS_PER_RANK
+# 8192``). We mirror it here to *clamp* the HT dispatch budget (graceful) rather
+# than let a large caller value (e.g. vLLM ``max_num_batched_tokens``) hit the C++
+# assert. LL has no such cap. Kept in sync with the nccl4py wheel.
+_HT_MAX_SUPPORTED_TOKENS_PER_RANK = 8192
+
+
+def _clamp_ht_max_tokens(params: FleetParams) -> FleetParams:
+    """Clamp a HT fleet's ``max_tokens_per_rank`` to the nccl_ep build-time cap.
+
+    HT's ``ncclEpCreateGroup`` aborts when ``max_dispatch_tokens_per_rank`` exceeds
+    ``MAX_SUPPORTED_TOKENS_PER_RANK`` (8192). We return a clamped copy so group
+    creation succeeds; a single forward that actually dispatches more than the cap
+    per rank is caught with a clear error at dispatch (see ``NcclEpHandle._dispatch_ht``)
+    rather than silently truncated. No-op for LL (unbounded) or when already within cap.
+    """
+    if (
+        params.algorithm is EpAlgorithm.HIGH_THROUGHPUT
+        and params.max_tokens_per_rank > _HT_MAX_SUPPORTED_TOKENS_PER_RANK
+    ):
+        logger.warning(
+            "nccl_ep HT caps max_dispatch_tokens_per_rank at %d "
+            "(MAX_SUPPORTED_TOKENS_PER_RANK); requested %d — clamping to avoid the "
+            "ncclEpCreateGroup abort. Ensure the per-forward token count per rank "
+            "stays <= %d (e.g. vLLM --max-num-batched-tokens); a larger dispatch "
+            "will raise at forward time.",
+            _HT_MAX_SUPPORTED_TOKENS_PER_RANK,
+            params.max_tokens_per_rank,
+            _HT_MAX_SUPPORTED_TOKENS_PER_RANK,
+        )
+        return dataclasses.replace(
+            params, max_tokens_per_rank=_HT_MAX_SUPPORTED_TOKENS_PER_RANK
+        )
+    return params
 
 
 def _import_nccl_ep():
@@ -45,24 +89,44 @@ def _import_nccl_ep():
         return nccl_ep
     except ImportError as e:  # pragma: no cover - exercised only without build
         raise MoEEpNotBuiltError(
-            "nccl.ep (nccl-ep-v0.1.0) python package unavailable. Rebuild with "
-            "BUILD_NCCL_EP=1 (which builds the nccl4py bindings), or install the "
-            "nccl4py wheel that ships nccl.ep."
+            "nccl.ep (nccl-ep-v0.1.0) python package unavailable. It ships in "
+            "the nccl4py wheel, a base dependency of flashinfer-python — "
+            "install with `pip install 'nccl4py>=0.3.1'`."
         ) from e
 
 
 def _resolve_comm(bootstrap: "BootstrapConfig"):
-    """Return an ``nccl.core.Communicator`` mirroring the default torch PG.
+    """Return an ``nccl.core.Communicator`` for the EP Fleet.
 
-    ``nccl.ep.interop.torch.get_nccl_comm_from_group`` always creates a fresh
-    communicator (vLLM's robust-across-torch-versions pattern), so we ignore the
-    legacy ``bootstrap.nccl_comm`` int.
+    Resolution order (see :class:`BootstrapConfig`):
+
+    1. ``bootstrap.nccl_comm`` set — *adopt* that existing ``ncclComm_t``.
+       We wrap it with ``nccl.core.Communicator(ptr=...)``, which does NOT
+       register a finalizer, and the Fleet only ever destroys the *group*
+       (never the comm), so the adopted communicator's lifetime stays with
+       its real owner (e.g. vLLM's process group). This lets a host share
+       the exact communicator it already owns instead of paying for a second
+       NCCL bootstrap.
+    2. ``bootstrap.process_group`` set — mirror that torch group by creating
+       a fresh communicator over its membership.
+    3. neither — mirror the default process group.
+
+    ``get_nccl_comm_from_group`` always *creates* a fresh communicator
+    (vLLM's robust-across-torch-versions pattern); adoption (case 1) is the
+    only path that reuses an existing one.
     """
+    if bootstrap.nccl_comm is not None:
+        from nccl.core import Communicator  # type: ignore[import-not-found]
+
+        # Wrap-without-own: Communicator(ptr) has no __del__, and the Fleet
+        # never calls .destroy()/.abort() on the comm — only on the group.
+        return Communicator(ptr=int(bootstrap.nccl_comm))
+
     from nccl.ep.interop.torch import (  # type: ignore[import-not-found]
         get_nccl_comm_from_group,
     )
 
-    return get_nccl_comm_from_group(group=None)
+    return get_nccl_comm_from_group(group=bootstrap.process_group)
 
 
 def _map_algorithm(algo: EpAlgorithm):
@@ -87,6 +151,10 @@ class NcclEpFleet(Fleet):
         _require_built("nccl_ep")
         validate_arch_for_backend("nccl_ep")
 
+        # HT: clamp the per-rank dispatch budget to the library's build-time cap so
+        # ncclEpCreateGroup doesn't abort; must clamp the stored params (not just the
+        # GroupConfig) so the handle's recv-buffer sizing agrees.
+        params = _clamp_ht_max_tokens(params)
         self._params = params
         self._fleet_knobs = _index_knobs(algo_knobs)
         validate_fleet_params(
@@ -99,6 +167,12 @@ class NcclEpFleet(Fleet):
         self._stream = bootstrap.stream
         self._nccl_ep = _import_nccl_ep()
         self._comm = _resolve_comm(bootstrap)  # keepalive: Group borrows it
+
+        # Cross-handle host-path cache (recv buffers, counter tensors, FFI
+        # descriptor memos), populated and consumed by NcclEpHandle. Anchored on
+        # the Fleet because callers (e.g. vLLM) create a fresh Handle every
+        # forward while the Fleet persists — per-handle caches never hit.
+        self._hot_cache: dict = {}
 
         self._group = self._nccl_ep.Group.create(self._comm, self._build_group_config())
         self._destroyed = False
@@ -131,7 +205,69 @@ class NcclEpFleet(Fleet):
         if p.algorithm == EpAlgorithm.HIGH_THROUGHPUT:
             world = self._bootstrap.world_size
             kwargs["max_recv_tokens_per_rank"] = p.max_tokens_per_rank * world
+        alloc = self._build_alloc_config()
+        if alloc is not None:
+            kwargs["alloc"] = alloc
         return self._nccl_ep.GroupConfig(**kwargs)
+
+    def _build_alloc_config(self):
+        """Build an ``nccl.ep.AllocConfig`` from FleetAlgoKnobAllocator, or None.
+
+        None → leave ``GroupConfig.alloc`` at its default (cudaMalloc/cudaFree).
+        """
+        knob = self._fleet_knobs.get(FleetAlgoKnobAllocator)
+        if knob is None:
+            return None
+        if knob.torch_caching:  # type: ignore[attr-defined]
+            alloc_addr, free_addr = self._install_torch_allocator()
+            return self._nccl_ep.AllocConfig(alloc_fn=alloc_addr, free_fn=free_addr)
+        # Explicit caller-owned addresses (may be 0 → default path).
+        return self._nccl_ep.AllocConfig(
+            alloc_fn=int(knob.alloc_fn),  # type: ignore[attr-defined]
+            free_fn=int(knob.free_fn),  # type: ignore[attr-defined]
+            context=int(knob.context),  # type: ignore[attr-defined]
+        )
+
+    def _install_torch_allocator(self):
+        """Install alloc/free trampolines backed by torch's CUDA caching
+        allocator and return their (alloc_addr, free_addr) C addresses.
+
+        The trampolines are anchored on ``self`` (``_alloc_trampolines``) so
+        they outlive the Group per :mod:`nccl.ep.allocator`'s lifetime rule —
+        if GC'd while NCCL-EP still holds the pointer, the next C-side call
+        lands in freed memory. NcclEpFleet outlives its Group, so this anchor
+        is sufficient.
+        """
+        import ctypes
+
+        import torch
+        from nccl.ep import AllocFn, FreeFn  # type: ignore[import-not-found]
+
+        _CUDA_SUCCESS = 0
+        _CUDA_ERROR_MEMORY_ALLOCATION = 2
+
+        @AllocFn
+        def _alloc(out_ptr, size, context):  # cudaError_t (void**, size_t, void*)
+            try:
+                ptr = torch.cuda.caching_allocator_alloc(int(size))
+                out_ptr[0] = ctypes.c_void_p(int(ptr))
+                return _CUDA_SUCCESS
+            except Exception:
+                return _CUDA_ERROR_MEMORY_ALLOCATION
+
+        @FreeFn
+        def _free(ptr, context):  # cudaError_t (void*, void*)
+            try:
+                if ptr:
+                    torch.cuda.caching_allocator_delete(int(ptr))
+                return _CUDA_SUCCESS
+            except Exception:
+                return _CUDA_ERROR_MEMORY_ALLOCATION
+
+        self._alloc_trampolines = (_alloc, _free)  # keepalive (lifetime rule)
+        alloc_addr = ctypes.cast(_alloc, ctypes.c_void_p).value
+        free_addr = ctypes.cast(_free, ctypes.c_void_p).value
+        return alloc_addr, free_addr
 
     # @flashinfer_api  # disabled per PR #3453 review
     def create_handle(
@@ -158,6 +294,9 @@ class NcclEpFleet(Fleet):
         self._bootstrap = bootstrap
         self._stream = bootstrap.stream
         self._comm = _resolve_comm(bootstrap)
+        # Topology (world size) changed — drop the cross-handle host caches so
+        # recv buffers / counters / FFI descriptors are rebuilt at the new sizes.
+        self._hot_cache.clear()
         self._group = self._nccl_ep.Group.create(self._comm, self._build_group_config())
         self._destroyed = False
 

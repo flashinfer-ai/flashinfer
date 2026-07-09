@@ -83,20 +83,18 @@ print('nccl.ep OK; libnccl', v.value); assert v.value>=23007"
 
 # Build & install FlashInfer with the NCCL-EP backend only.
 # --no-build-isolation uses the base image's python/torch for the build hook
-# (so meson/torch are found); BUILD_NCCL_EP=1 + BUILD_NIXL_EP=0 selects the
-# NCCL-EP path, which links contrib's Makefile against the nvidia-nccl-cu13
-# wheel (no in-tree NCCL build). The [nvep] extra pulls nccl4py (already pinned
-# above; the >= constraint no-ops).
+# (so meson/torch are found); BUILD_NIXL_EP=0 opts out of the (default-on)
+# NIXL-EP submodule build. NCCL-EP needs no build step — the nccl4py wheel is
+# a base dependency (already pinned above; the >= constraint no-ops).
 ARG BUILD_NCCL_EP=1
 ARG BUILD_NIXL_EP=0
 ARG FLASHINFER_SRC=/workspace/flashinfer
 COPY . ${FLASHINFER_SRC}
 WORKDIR ${FLASHINFER_SRC}
 # Submodule trees are copied as-is (see .dockerignore); no `git submodule update`.
-RUN BUILD_NVEP=0 \
-    BUILD_NCCL_EP=${BUILD_NCCL_EP} \
+RUN BUILD_NCCL_EP=${BUILD_NCCL_EP} \
     BUILD_NIXL_EP=${BUILD_NIXL_EP} \
-    pip install --no-cache-dir --no-build-isolation -e ".[nvep]"
+    pip install --no-cache-dir --no-build-isolation -e .
 
 # Smoke probe — fail the build if NCCL-EP didn't actually come up.
 RUN python -c "\

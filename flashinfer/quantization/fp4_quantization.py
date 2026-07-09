@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -24,6 +24,7 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.quantize import (
     fp4_quantize_trace,
     mxfp4_quantize_trace,
+    nvfp4_kv_dequantize_paged_trace,
     nvfp4_kv_quantize_trace,
     nvfp4_quantize_trace,
 )
@@ -50,6 +51,8 @@ from ..utils import (
     register_fake_op,
     supported_compute_capability,
     round_up,
+    _check_kv_layout,
+    _unpack_paged_kv_cache,
 )
 from ..tllm_enums import SfLayout
 
@@ -1825,7 +1828,57 @@ def get_fp4_kv_dequantization_module():
     ) -> None:
         pass
 
-    return SimpleNamespace(nvfp4_kv_dequant=nvfp4_kv_dequant)
+    @register_custom_op(
+        "flashinfer::nvfp4_paged_kv_dequant",
+        mutates_args=("output_k", "output_v"),
+    )
+    def nvfp4_paged_kv_dequant(
+        paged_k_cache: torch.Tensor,
+        paged_v_cache: torch.Tensor,
+        k_scales: torch.Tensor,
+        v_scales: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_global_scale: torch.Tensor,
+        v_global_scale: torch.Tensor,
+        output_k: torch.Tensor,
+        output_v: torch.Tensor,
+        kv_layout: int,
+    ) -> None:
+        module.nvfp4_paged_kv_dequant(
+            paged_k_cache,
+            paged_v_cache,
+            k_scales,
+            v_scales,
+            block_tables,
+            seq_lens,
+            k_global_scale,
+            v_global_scale,
+            output_k,
+            output_v,
+            kv_layout,
+        )
+
+    @register_fake_op("flashinfer::nvfp4_paged_kv_dequant")
+    def _fake_nvfp4_paged_kv_dequant(
+        paged_k_cache: torch.Tensor,
+        paged_v_cache: torch.Tensor,
+        k_scales: torch.Tensor,
+        v_scales: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_global_scale: torch.Tensor,
+        v_global_scale: torch.Tensor,
+        output_k: torch.Tensor,
+        output_v: torch.Tensor,
+        kv_layout: int,
+    ) -> None:
+        pass
+
+    return SimpleNamespace(
+        nvfp4_kv_dequant=nvfp4_kv_dequant,
+        nvfp4_paged_kv_dequant=nvfp4_paged_kv_dequant,
+    )
 
 
 @functools.cache
@@ -1906,6 +1959,115 @@ def nvfp4_kv_dequantize(
         fp4_data, block_scales, global_scale, output
     )
     return output
+
+
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
+def _nvfp4_paged_kv_dequant_check(*args, **kwargs):
+    return True
+
+
+@backend_requirement({}, common_check=_nvfp4_paged_kv_dequant_check)
+@flashinfer_api(trace=nvfp4_kv_dequantize_paged_trace)
+def nvfp4_kv_dequantize_paged(
+    paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    kv_cache_sf: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    output_k: torch.Tensor,
+    output_v: torch.Tensor,
+    kv_layout: str = "NHD",
+) -> None:
+    r"""Dequantize a paged NVFP4 KV cache into caller-owned contiguous outputs.
+
+    Requires SM80+. This helper gathers pages through ``block_tables`` and
+    writes dequantized K/V tensors in ``[batch, max_seq_len, num_heads,
+    head_dim]`` layout. Tokens at positions ``>= seq_lens[batch]`` are left
+    unchanged.
+
+    Parameters
+    ----------
+    paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        The packed NVFP4 paged KV cache. Accepts the same tuple or stacked
+        cache format as paged attention APIs. For tuple input, each tensor has
+        shape ``[num_pages, page_size, num_kv_heads, head_dim // 2]`` when
+        ``kv_layout="NHD"`` and ``[num_pages, num_kv_heads, page_size,
+        head_dim // 2]`` when ``kv_layout="HND"``.
+    kv_cache_sf : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Per-block FP8 E4M3 scales with the same tuple or stacked cache format
+        as ``paged_kv_cache``, replacing ``head_dim // 2`` with
+        ``head_dim // 16``.
+    block_tables : torch.Tensor
+        Physical page table of shape ``[batch, max_pages_per_request]`` with
+        dtype ``int32`` or ``int64``.
+    seq_lens : torch.Tensor
+        Sequence lengths of shape ``[batch]`` with dtype ``int32``.
+    k_scale, v_scale : torch.Tensor
+        Global dequantization scale tensors of dtype ``float32`` on the same
+        CUDA device as the cache.
+    output_k, output_v : torch.Tensor
+        Caller-owned output tensors in ``[batch, max_seq_len, num_heads,
+        head_dim]`` layout. Each must be contiguous and have dtype
+        ``torch.float16`` or ``torch.bfloat16``.
+    kv_layout : str
+        Layout of the paged input cache, either ``"NHD"`` or ``"HND"``.
+
+    Returns
+    -------
+    None
+        This function writes dequantized K/V values into ``output_k`` and
+        ``output_v`` in place.
+    """
+    _check_kv_layout(kv_layout)
+    paged_k_cache, paged_v_cache = _unpack_paged_kv_cache(paged_kv_cache, kv_layout)
+    k_scales, v_scales = _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
+
+    if seq_lens.dtype != torch.int32:
+        raise ValueError(f"seq_lens must have dtype torch.int32, got {seq_lens.dtype}")
+    if block_tables.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"block_tables must have dtype torch.int32 or torch.int64, got {block_tables.dtype}"
+        )
+    if k_scale.dtype != torch.float32 or v_scale.dtype != torch.float32:
+        raise ValueError("k_scale and v_scale must have dtype torch.float32")
+    if k_scale.numel() != 1 or v_scale.numel() != 1:
+        raise ValueError("k_scale and v_scale must be scalar tensors")
+    if output_k.dtype != output_v.dtype:
+        raise ValueError("output_k and output_v must have the same dtype")
+    if output_k.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"output dtype must be torch.float16 or torch.bfloat16, got {output_k.dtype}"
+        )
+    if output_k.ndim != 4 or output_v.ndim != 4:
+        raise ValueError("output_k and output_v must be 4D tensors")
+    if output_k.shape[:3] != output_v.shape[:3]:
+        raise ValueError(
+            "output_k and output_v must share batch, sequence, and head dims"
+        )
+    if output_k.shape[3] % _NVFP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"output_k head_dim ({output_k.shape[3]}) must be divisible by {_NVFP4_BLOCK_SIZE}"
+        )
+    if output_v.shape[3] % _NVFP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"output_v head_dim ({output_v.shape[3]}) must be divisible by {_NVFP4_BLOCK_SIZE}"
+        )
+
+    layout_code = 0 if kv_layout == "NHD" else 1
+    get_fp4_kv_dequantization_module().nvfp4_paged_kv_dequant(
+        paged_k_cache,
+        paged_v_cache,
+        k_scales,
+        v_scales,
+        block_tables,
+        seq_lens,
+        k_scale,
+        v_scale,
+        output_k,
+        output_v,
+        layout_code,
+    )
 
 
 @supported_compute_capability([100, 103, 110, 120, 121])

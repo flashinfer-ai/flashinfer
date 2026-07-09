@@ -278,7 +278,7 @@ class TestSearchCacheFallbackChain:
         _populate_cache(self.tuner, runner, "op1", profile, tactic=99)
 
         cache_key = AutoTuner._get_cache_key("op1", runner, profile, _TUNING_CONFIG)
-        file_key = str((cache_key[0], cache_key[1], cache_key[3], cache_key[4]))
+        file_key = cache_key.file_key
         self.tuner._file_configs[file_key] = ("FakeRunnerA", 55)
 
         is_hit, runner_id, tactic, _ = self.tuner.search_cache(
@@ -293,7 +293,7 @@ class TestSearchCacheFallbackChain:
         profile = ((10, 20),)
 
         cache_key = AutoTuner._get_cache_key("op1", runner, profile, _TUNING_CONFIG)
-        file_key = str((cache_key[0], cache_key[1], cache_key[3], cache_key[4]))
+        file_key = cache_key.file_key
         self.tuner._file_configs[file_key] = ("FakeRunnerA", 42)
 
         is_hit, runner_id, tactic, _ = self.tuner.search_cache(
@@ -311,7 +311,7 @@ class TestSearchCacheFallbackChain:
 
         # File config says FakeRunnerB won
         cache_key = AutoTuner._get_cache_key("op1", runner_b, profile, _TUNING_CONFIG)
-        file_key = str((cache_key[0], cache_key[1], cache_key[3], cache_key[4]))
+        file_key = cache_key.file_key
         self.tuner._file_configs[file_key] = ("FakeRunnerB", 11)
 
         # Pass runners in order [A, B] — B is at index 1
@@ -427,7 +427,7 @@ class TestEndToEnd:
 
         # Simulate a loaded config for this key
         cache_key = AutoTuner._get_cache_key("op1", runner, profile, _TUNING_CONFIG)
-        file_key = str((cache_key[0], cache_key[1], cache_key[3], cache_key[4]))
+        file_key = cache_key.file_key
         self.tuner._file_configs[file_key] = ("FakeRunnerA", 99)
 
         # Add a newer in-memory result for the same op/runner/profile

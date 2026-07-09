@@ -3292,6 +3292,7 @@ def run_moe_test(
     norm_topk_prob=True,
     check_reference=True,
     check_intermediate_output=False,
+    verify_unfinalized_weight_dtype=False,
 ):
     """Common test logic for all routing methods."""
     if gemm1_lora_delta is not None:
@@ -3516,6 +3517,70 @@ def run_moe_test(
             atol=tolerances["atol"],
             rtol=tolerances["rtol"],
             percent=tolerances["percent"],
+        )
+
+    # Regression for #3595: the trtllm-gen routing kernel always writes the
+    # expert weights in bfloat16 (routingData.mDtypeOutput is hard-set to
+    # Bfloat16 for every routing method in trtllm_fused_moe_runner.cu). The FP4
+    # op returns this buffer verbatim when do_finalize=False, so the returned
+    # expert_weights must be bf16 even when routing_logits is fp32 (the common
+    # DeepSeekV3 case) — otherwise it mislabels bf16 data as fp32.
+    if verify_unfinalized_weight_dtype:
+        assert isinstance(moe_impl, FP4Moe), (
+            "verify_unfinalized_weight_dtype only applies to the FP4 op"
+        )
+        static_data = moe_impl.prepare_static_weights_for_kernel(
+            args_dequant,
+            args,
+            gemm1_weights,
+            gemm2_weights,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            weight_processing,
+        )
+        # Re-quantize inputs the same way the kernel call path does
+        # (is_swizzling=False), mirroring CUDAGraphMoE._run_moe_computation.
+        input_quantized = moe_impl.quantize_inputs(
+            hidden_states,
+            weights_data["hidden_states_scale_global"],
+            is_swizzling=False,
+        )
+        unfinalized = trtllm_fp4_block_scale_moe(
+            routing_logits=expert_logits,
+            routing_bias=routing_bias,
+            hidden_states=input_quantized["hidden_states"],
+            hidden_states_scale=input_quantized["hidden_states_scale"],
+            gemm1_weights=static_data["gemm1_weights_fp4_shuffled"],
+            gemm1_weights_scale=static_data["gemm1_scales_fp4_shuffled"],
+            gemm1_bias=static_data["gemm1_bias_shuffled"],
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=static_data["gemm2_weights_fp4_shuffled"],
+            gemm2_weights_scale=static_data["gemm2_scales_fp4_shuffled"],
+            gemm2_bias=static_data["gemm2_bias_shuffled"],
+            output1_scale_scalar=static_data["scale_c_fc1"],
+            output1_scale_gate_scalar=static_data["scale_gate_fc1"],
+            output2_scale_scalar=static_data["scale_c_fc2"],
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=n_groups,
+            topk_group=top_k_groups,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=routed_scaling,
+            routing_method_type=routing_method_type,
+            activation_type=activation_type,
+            do_finalize=False,
+            tune_max_num_tokens=8192,
+            norm_topk_prob=norm_topk_prob,
+        )
+        # unfinalized == [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
+        assert unfinalized[1].dtype == torch.bfloat16, (
+            "do_finalize=False expert_weights must be bfloat16, got "
+            f"{unfinalized[1].dtype} for routing_logits dtype {routing_logits_dtype}"
         )
 
     return output_dequant_reference, output_dequant_actual, args_dequant
