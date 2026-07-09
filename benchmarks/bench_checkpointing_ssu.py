@@ -1606,6 +1606,7 @@ def _bench_config(
         d_state=args.d_state,
         ngroups=args.tp_ngroups,
         two_kernel=args.two_kernel,
+        varlen=args.varlen,
     )
 
     # Reuse args directly as the TimingOptions duck — it carries .warmup,
@@ -1665,7 +1666,8 @@ def _bench_config(
     pns_values = _parse_sweep(args.precompute_num_stages)
 
     # --- Triton incremental kernel, one row per pnat × autotune-point ---
-    for pnat in pnats:
+    # (skipped under --varlen: the Triton reference takes no cu_seqlens)
+    for pnat in pnats if not args.varlen else []:
         pt_uniform_i32.fill_(pnat)
         tag = (
             f"incr_b{batch}_mtp{mtp_len}_k{pnat}_s{state_dtype_name}_a{act_dtype_name}"
@@ -2172,6 +2174,15 @@ def _parse_args() -> argparse.Namespace:
         help="Run FlashInfer dynamic-dump scenario: write state only at pnat "
         "via dst_state_batch_indices (default: on).",
     )
+    parser.add_argument(
+        "--varlen",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pack inputs into the varlen (1, batch*T, ...) + cu_seqlens layout "
+        "with uniform seq_len = T — exact A/B against dense (same work, only the "
+        "VARLEN addressing path differs).  Forces the CUDA rows only: the "
+        "Triton/dump/baseline impls take no cu_seqlens.",
+    )
     return parser.parse_args()
 
 
@@ -2218,6 +2229,27 @@ def _spec_tag(args) -> str:
 
 if __name__ == "__main__":
     _args = _parse_args()
+
+    if _args.varlen:
+        _forced_off = [
+            f
+            for f, on in [
+                ("--triton-replay", _args.triton_replay),
+                ("--triton-replay-pm", _args.triton_replay_pm),
+                ("--flashinfer-dump", _args.flashinfer_dump),
+            ]
+            if on
+        ]
+        if _forced_off:
+            print(
+                f"NOTE: --varlen keeps only the CUDA rows (the other impls take no "
+                f"cu_seqlens); forcing off {_forced_off}.",
+                file=sys.stderr,
+            )
+        _args.triton_replay = _args.triton_replay_pm = _args.flashinfer_dump = False
+        assert _args.baseline is None, (
+            f"--varlen is incompatible with --baseline (got {_args.baseline!r})"
+        )
 
     _out_path = None
     if _args.output != "-":
