@@ -261,6 +261,10 @@ def _checkpointing_precompute_kernel(
     # Checkpointing flag — selects target buffer + offset for new-token
     # cache writes.  See "Cache write semantics" block below.
     WRITE_CHECKPOINT: tl.constexpr,
+    # Window capacity (= old_x.shape[1]); a slot must checkpoint when
+    # PNAT + seq_len would overflow it.  Used only for the per-slot
+    # branch-mismatch early exit below.
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
     pid_hg = tl.program_id(axis=1)  # head-group index
@@ -317,6 +321,17 @@ def _checkpointing_precompute_kernel(
     #       kernel behavior exactly.
     buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
     prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
+    # Heterogeneous-batch partitioning: a batch can mix write / no-write slots.
+    # Callers launch (up to) one kernel per branch over the FULL batch and each
+    # slot is processed only by the launch whose WRITE_CHECKPOINT matches its
+    # own overflow decision.  Without this exit the WRITE_CHECKPOINT=False
+    # launch appends at write_offset = PNAT for write slots too — rows
+    # [PNAT, PNAT+T) run past the window into the neighbouring slot's cache
+    # (IMA at the allocation edge; b=512 f16-philox mixed-bench repro,
+    # 2026-07-02).
+    slot_needs_write = (prev_num_accepted_tokens + seq_len) > MAX_REPLAY_BUFFER_LENGTH
+    if slot_needs_write != WRITE_CHECKPOINT:
+        return
     if WRITE_CHECKPOINT:
         write_buf = 1 - buf_active
         write_offset = 0
@@ -1470,6 +1485,9 @@ def _checkpointing_main_kernel(
     QUANT_MAX: tl.constexpr,
     # Checkpointing flags
     WRITE_CHECKPOINT: tl.constexpr,  # When True: quantize+write post-replay state to HBM (checkpoint step).
+    # Window capacity (= old_x.shape[1]) for the per-slot branch-mismatch
+    # early exit (heterogeneous batches run one launch per branch).
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
     # When False: skip state write entirely (non-checkpoint step).
     RECTANGLE: tl.constexpr,  # Reserved for the rectangle non-checkpoint optimization path.
     # Currently asserted False at the wrapper; kernel takes the
@@ -1517,6 +1535,12 @@ def _checkpointing_main_kernel(
     # block in the precompute kernel for the full rationale.
     active_buf = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
     prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
+    # Per-slot branch-mismatch early exit — see _checkpointing_precompute_kernel
+    # for the rationale (heterogeneous batches run one launch per branch; the
+    # mismatched launch must not touch this slot).
+    slot_needs_write = (prev_num_accepted_tokens + seq_len) > MAX_REPLAY_BUFFER_LENGTH
+    if slot_needs_write != WRITE_CHECKPOINT:
+        return
     if WRITE_CHECKPOINT:
         write_buf = 1 - active_buf  # noqa: F841 — old_x is single-buffered (no use here)
         write_offset = 0
@@ -3592,6 +3616,7 @@ def checkpointing_state_update(
             LAUNCH_DEPENDENT_KERNELS=use_internal_pdl,
             HEADS_PER_BLOCK=heads_per_block,
             WRITE_CHECKPOINT=write_checkpoint,
+            MAX_REPLAY_BUFFER_LENGTH=max_window,
             num_warps=precompute_num_warps,
             **(
                 {"num_stages": _precompute_num_stages} if _precompute_num_stages else {}
@@ -3706,6 +3731,7 @@ def checkpointing_state_update(
             PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
             QUANT_MAX=quant_max,
             WRITE_CHECKPOINT=write_checkpoint,
+            MAX_REPLAY_BUFFER_LENGTH=max_window,
             RECTANGLE=rectangle,
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
