@@ -637,8 +637,14 @@ class GdnDecodeKernel:
     """CuTeDSL GDN MTP decode (noprepack) — WY-parallel, inference only."""
 
     def __init__(
-        self, disable_state_update=False, min_blocks_per_mp=2, t_input=16, bv=None,
-        n_valid=16, qkv_row_stride=0, ab_native=False,
+        self,
+        disable_state_update=False,
+        min_blocks_per_mp=2,
+        t_input=16,
+        bv=None,
+        n_valid=16,
+        qkv_row_stride=0,
+        ab_native=False,
     ):
         assert disable_state_update, "State update not implemented in CuTeDSL kernel"
         # `bv` is accepted only for bench-script signature compatibility — the
@@ -1908,6 +1914,7 @@ _RESTAGE = True
 # copies. v/a/b stay staged (v is already minimized by _v_iters=1 at t_input<=8;
 # a/b feed the per-lane gamma path). Off by default (full staging) for safety.
 import os as _os
+
 _NATIVE_T = _os.environ.get("SGLANG_GDN_WY_NATIVE_T", "0") != "0"
 # (strided-qkv) read q/k/v directly from the fused conv-output column slices (token
 # stride = conv_dim) instead of .contiguous()-materializing them. Removes the 3 big
@@ -1924,6 +1931,8 @@ _NATIVE_AB = _os.environ.get("SGLANG_GDN_WY_NATIVE_AB", "0") != "0"
 # call; caching turns the per-call `.to(bf16)` into a one-time (warm-up) cast that does
 # not appear in the captured CUDA graph. Safe for inference (weights never change).
 _BF16_CACHE: dict = {}
+
+
 def _cached_bf16(t):
     if t.dtype == torch.bfloat16 and t.is_contiguous():
         return t
@@ -2044,7 +2053,9 @@ def gated_delta_rule_mtp(
     # Contiguity: tensors the kernel reads DIRECTLY from gmem need canonical-compact
     # strides for the CuTe descriptor; staged tensors get this for free from .copy_().
     _qkv_rs = 0  # >0 => strided q/k/v read (token stride = conv_dim); see _STRIDED_QKV
-    _ab_native_flag = False  # True => a/b read native [B,n_valid,HV] (no staging); _NATIVE_AB
+    _ab_native_flag = (
+        False  # True => a/b read native [B,n_valid,HV] (no staging); _NATIVE_AB
+    )
     if T == T_KERNEL:
         q = q.contiguous()
         k = k.contiguous()
@@ -2078,7 +2089,7 @@ def gated_delta_rule_mtp(
             _ab_native_flag = True
             # q, k, v and a, b all stay native [B, T, ...].
         elif _native:
-            skey = (str(device), B, HV, str(_io_dtype), T, "ab")
+            skey: tuple = (str(device), B, HV, str(_io_dtype), T, "ab")
             buf = _STAGE.get(skey)
             _fresh = buf is None
             if _fresh:
@@ -2104,9 +2115,15 @@ def gated_delta_rule_mtp(
                 # sglang CUDA-graph capture ("Inplace update to inference tensor").
                 with torch.inference_mode(False):
                     buf = (
-                        torch.zeros(B, T_KERNEL, H, K_dim, dtype=_io_dtype, device=device),
-                        torch.zeros(B, T_KERNEL, HK, K_dim, dtype=_io_dtype, device=device),
-                        torch.zeros(B, T_KERNEL, HV, V_dim, dtype=_io_dtype, device=device),
+                        torch.zeros(
+                            B, T_KERNEL, H, K_dim, dtype=_io_dtype, device=device
+                        ),
+                        torch.zeros(
+                            B, T_KERNEL, HK, K_dim, dtype=_io_dtype, device=device
+                        ),
+                        torch.zeros(
+                            B, T_KERNEL, HV, V_dim, dtype=_io_dtype, device=device
+                        ),
                         torch.zeros(B, T_KERNEL, HV, dtype=_io_dtype, device=device),
                         torch.zeros(B, T_KERNEL, HV, dtype=_io_dtype, device=device),
                     )
@@ -2130,7 +2147,16 @@ def gated_delta_rule_mtp(
     t_disc = 4 if T <= 4 else (8 if T <= 8 else 16)
     # n_valid in the key: native (n_valid<T) vs staged (n_valid=T_KERNEL) compile to
     # different kernels (different q/k batch stride + the smem-tail-zero path).
-    cache_key = (str(device), B, pool_size, mbp, t_disc, n_valid, _qkv_rs, _ab_native_flag)
+    cache_key = (
+        str(device),
+        B,
+        pool_size,
+        mbp,
+        t_disc,
+        n_valid,
+        _qkv_rs,
+        _ab_native_flag,
+    )
     mk = from_dlpack
 
     # The kernel always writes a full T=16 output tile. If the caller did not
@@ -2170,8 +2196,12 @@ def gated_delta_rule_mtp(
     if cache_key not in _CACHE:
         _CACHE[cache_key] = cute.compile(
             GdnDecodeKernel(
-                disable_state_update=True, min_blocks_per_mp=mbp, t_input=t_disc,
-                n_valid=n_valid, qkv_row_stride=_qkv_rs, ab_native=_ab_native_flag,
+                disable_state_update=True,
+                min_blocks_per_mp=mbp,
+                t_input=t_disc,
+                n_valid=n_valid,
+                qkv_row_stride=_qkv_rs,
+                ab_native=_ab_native_flag,
             ),
             *args,
         )
