@@ -30,7 +30,7 @@ from typing import Any, List
 import torch
 
 from ..autotuner import TunableRunner
-from .api import MoEActivationPack, MoEConfig, MoEWeightPack
+from .api import MoEActivationPack, MoEConfig, MoEWeightPack, RoutingInputMode
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +43,8 @@ class CuteDslNvfp4Runner(TunableRunner):
     List[Tensor] convention."""
 
     backend_key = "cute_dsl_nvfp4"
+    # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from .cute_dsl.fused_moe import _cute_dsl_fused_moe_nvfp4_impl
@@ -152,6 +154,10 @@ class TrtllmFp4RoutedRunner(TunableRunner):
     """
 
     backend_key = "trtllm_fp4_routed"
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.FromLogits,
+    )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
@@ -285,6 +291,12 @@ class TrtllmFp4RoutedRunner(TunableRunner):
             assert act.topk_ids is None and act.topk_weights is None, (
                 "FromLogits computes topk_ids/topk_weights in-kernel; leave them None."
             )
+            # Validate here: the launcher enforces this with a C++ ICHECK whose
+            # failure message doesn't name the offending Python-side input.
+            assert act.routing_logits.dtype in (torch.float32, torch.bfloat16), (
+                f"routing_logits must be float32 or bfloat16, "
+                f"got {act.routing_logits.dtype}."
+            )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
             topk_ids = act.hidden_states_q.new_empty(
@@ -404,6 +416,8 @@ class TrtllmBf16RoutedRunner(TunableRunner):
     """
 
     backend_key = "trtllm_bf16_routed"
+    # The bf16 kernel supports FromLogits too; wiring it here is a follow-up.
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType

@@ -430,9 +430,14 @@ _ROUTING_METHODS = [
 # Routing logits dtype axis: fp32 router logits are the #2796 class; bf16 is the common case.
 _LOGITS_DTYPE = {"bf16": torch.bfloat16, "fp32": torch.float32}
 
-# Backend config classes whose runner can do in-kernel routing (RoutingInputMode.FromLogits).
-# CuteDSL is pre-routed-only, so a fromlogits config restricts the candidate list to these.
-_FROMLOGITS_BACKENDS = {TrtllmFp4Config}
+# Backend config classes whose runner can do in-kernel routing (RoutingInputMode.FromLogits),
+# derived from the runners' own capability declaration so this can't drift from the layer's
+# dispatch filtering. CuteDSL is pre-routed-only, so a fromlogits config restricts to these.
+_FROMLOGITS_BACKENDS = {
+    cfg_cls
+    for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
+    if RoutingInputMode.FromLogits in runner_cls.supported_routing_modes
+}
 
 # Methods whose routing uses an additive bias (selection only -- weights stay unbiased). DeepSeekV3
 # REQUIRES a bias; MiniMax2's is optional but we always supply one to exercise the bias path.
