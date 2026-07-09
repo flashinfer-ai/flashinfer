@@ -2256,6 +2256,13 @@ def gated_delta_rule_mtp(
     # pool extent at launch). mbp still varies with B, but only over <=4 buckets.
     # Exception: the strided-qkv opt-in path passes non-compact q/k/v whose
     # descriptors stay fully static, so it keeps B/pool in the key (fallback).
+    # HV/H/V_dim MUST be in the key: they are runtime Int32 kernel args, but the
+    # compiled artifact bakes in the captured tensors' layouts (H0 TMA descriptor,
+    # q/k/v/out head+feature strides — only the batch mode-0 dim is dynamic). A
+    # process mixing HV values (e.g. HV=32 then HV=64) previously reused the first
+    # compile and read H0 with the wrong strides -> ~3e-01 garbage outputs. Found
+    # by the intense correctness sweep; invisible to the tests/benches, which use
+    # one HV per process.
     cache_key: tuple = (
         str(device),
         mbp,
@@ -2263,6 +2270,9 @@ def gated_delta_rule_mtp(
         n_valid,
         _qkv_rs,
         _ab_native_flag,
+        HV,
+        H,
+        V_dim,
     )
     if _qkv_rs > 0:
         cache_key = cache_key + (B, h0.shape[0])
