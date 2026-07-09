@@ -85,12 +85,12 @@ def _ragged_block_scaled_bmm_kernel(
 
         # Only process if this tile is within valid M range
         if pid_m * BLOCK_M < valid_m:
-            # Create sliced views for A and C using Array.slice
-            Ai = a.slice(axis=0, start=m_start, stop=m_end)
-            Ci = c.slice(axis=0, start=m_start, stop=m_end)
-
-            if HAS_A_SCALE == 1:
-                a_scale_i = a_scale.slice(axis=0, start=m_start, stop=m_end)
+            # Compute tile-level offset into the flattened global A/C tensors.
+            # m_start is always BLOCK_M-aligned (the caller pads each segment to
+            # BLOCK_M), so integer division is exact.  We avoid Array.slice()
+            # because cuTile's dynamic TMA descriptor path for slice has a bug
+            # that causes illegal-memory-access for runtime-computed offsets.
+            m_tile_start = m_start // BLOCK_M
 
             # Initialize accumulator
             acc = ct.full((BLOCK_M, BLOCK_N), 0.0, dtype=ct.float32)
@@ -106,10 +106,10 @@ def _ragged_block_scaled_bmm_kernel(
             for k in range(num_k_tiles):
                 k_offset = k * BLOCK_K
 
-                # Load A block using TMA
+                # Load A block using TMA (direct global index, no slice)
                 a_block = ct.load(
-                    Ai,
-                    index=(pid_m, k),
+                    a,
+                    index=(m_tile_start + pid_m, k),
                     shape=(BLOCK_M, BLOCK_K),
                     padding_mode=ct.PaddingMode.ZERO,
                 )
@@ -131,10 +131,10 @@ def _ragged_block_scaled_bmm_kernel(
 
                 # Load and apply scales
                 if HAS_A_SCALE == 1:
-                    # Load a_scale for this block using TMA
+                    # Load a_scale for this block using TMA (direct global index)
                     a_scale_block = ct.load(
-                        a_scale_i,
-                        index=(pid_m, k),
+                        a_scale,
+                        index=(m_tile_start + pid_m, k),
                         shape=(BLOCK_M, 1),
                         padding_mode=ct.PaddingMode.ZERO,
                     )
@@ -170,8 +170,8 @@ def _ragged_block_scaled_bmm_kernel(
             # Convert to output dtype
             c_block = ct.astype(acc, c.dtype)
 
-            # Store to output C using TMA
-            ct.store(Ci, index=(pid_m, pid_n), tile=c_block)
+            # Store to output C using TMA (direct global index, no slice)
+            ct.store(c, index=(m_tile_start + pid_m, pid_n), tile=c_block)
 
 
 @ct.kernel
@@ -229,12 +229,10 @@ def _ragged_block_scaled_bmm_swap_ab_kernel(
         valid_m = m_end - m_start
 
         if pid_m * BLOCK_M < valid_m:
-            # Create sliced views for A and C using Array.slice
-            Ai = a.slice(axis=0, start=m_start, stop=m_end)
-            Ci = c.slice(axis=0, start=m_start, stop=m_end)
-
-            if HAS_A_SCALE == 1:
-                a_scale_i = a_scale.slice(axis=0, start=m_start, stop=m_end)
+            # Compute tile-level offset into the flattened global A/C tensors.
+            # m_start is BLOCK_M-aligned, so the division is exact.
+            # Avoids Array.slice() to sidestep the dynamic TMA descriptor bug.
+            m_tile_start = m_start // BLOCK_M
 
             acc = ct.full((BLOCK_M, BLOCK_N), 0.0, dtype=ct.float32)
 
@@ -247,10 +245,10 @@ def _ragged_block_scaled_bmm_swap_ab_kernel(
             for k in range(num_k_tiles):
                 k_offset = k * BLOCK_K
 
-                # Load A block using TMA
+                # Load A block using TMA (direct global index, no slice)
                 a_block = ct.load(
-                    Ai,
-                    index=(pid_m, k),
+                    a,
+                    index=(m_tile_start + pid_m, k),
                     shape=(BLOCK_M, BLOCK_K),
                     padding_mode=ct.PaddingMode.ZERO,
                 )
@@ -272,9 +270,10 @@ def _ragged_block_scaled_bmm_swap_ab_kernel(
 
                 # Load and apply scales
                 if HAS_A_SCALE == 1:
+                    # Load a_scale (direct global index, no slice)
                     a_scale_block = ct.load(
-                        a_scale_i,
-                        index=(pid_m, k),
+                        a_scale,
+                        index=(m_tile_start + pid_m, k),
                         shape=(BLOCK_M, 1),
                         padding_mode=ct.PaddingMode.ZERO,
                     )
@@ -304,8 +303,8 @@ def _ragged_block_scaled_bmm_swap_ab_kernel(
 
             c_block = ct.astype(acc, c.dtype)
 
-            # Store to output C using TMA
-            ct.store(Ci, index=(pid_m, pid_n), tile=c_block)
+            # Store to output C using TMA (direct global index, no slice)
+            ct.store(c, index=(m_tile_start + pid_m, pid_n), tile=c_block)
 
 
 def _ragged_block_scaled_bmm_autotune_configs():
@@ -471,7 +470,12 @@ def ragged_block_scaled_bmm(
     # Determine output dtype
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    c = torch.empty((total_m, N), device=a.device, dtype=out_dtype)
+
+    # The cuTile kernel has an OOB bug on sm100 (B200) when the output tensor is
+    # non-float32 (e.g. bfloat16). The ct.store tile-index path computes wrong
+    # addresses for 2-byte element types. Work around by accumulating into a
+    # float32 intermediate buffer and casting after the kernel.
+    c_internal = torch.empty((total_m, N), device=a.device, dtype=torch.float32)
 
     # Materialize fallback max_m_device if the caller didn't pass one. The
     # kernel always reads its grid bound from a device tensor (defense-in-depth).
@@ -525,7 +529,7 @@ def ragged_block_scaled_bmm(
             b,
             a_scale,
             b_scale,
-            c,
+            c_internal,
             m_indptr,
             Q,
             max_m,
@@ -539,4 +543,6 @@ def ragged_block_scaled_bmm(
         ),
     )
 
+    # Cast from float32 intermediate to the requested output dtype
+    c = c_internal.to(out_dtype) if out_dtype != torch.float32 else c_internal
     return c
