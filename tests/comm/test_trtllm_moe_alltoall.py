@@ -194,6 +194,54 @@ def make_payload(num_tokens, vector_dim, dtype):
         )
 
 
+def test_moe_a2a_combine_rejects_cpu_output_before_jit(monkeypatch):
+    monkeypatch.setattr(
+        trtllm_moe_alltoall,
+        "get_moe_alltoall_module",
+        lambda: pytest.fail("invalid output should be rejected before JIT loading"),
+    )
+    payload = torch.empty((1, 1, 1))
+
+    with pytest.raises(ValueError, match="output must be a CUDA tensor"):
+        trtllm_moe_alltoall.moe_a2a_combine(
+            payload,
+            1,
+            torch.empty(0),
+            torch.empty(0),
+            1,
+            0,
+            1,
+            1,
+            0,
+            output=torch.empty((1, 1)),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_moe_a2a_combine_rejects_noncontiguous_output_before_jit(monkeypatch):
+    monkeypatch.setattr(
+        trtllm_moe_alltoall,
+        "get_moe_alltoall_module",
+        lambda: pytest.fail("invalid output should be rejected before JIT loading"),
+    )
+    payload = torch.empty((1, 1, 2), device="cuda")
+    output = torch.empty((2, 2), device="cuda").T
+
+    with pytest.raises(ValueError, match="output must be contiguous"):
+        trtllm_moe_alltoall.moe_a2a_combine(
+            payload,
+            1,
+            torch.empty(0, device="cuda"),
+            torch.empty(0),
+            1,
+            0,
+            1,
+            1,
+            0,
+            output=output,
+        )
+
+
 @pytest.mark.parametrize(
     "num_tokens,vector_dim,num_experts,top_k",
     SINGLE_GPU_PARAMS,

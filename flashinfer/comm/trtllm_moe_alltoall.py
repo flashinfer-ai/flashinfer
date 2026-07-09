@@ -497,6 +497,14 @@ def moe_a2a_combine(
     torch.Tensor
         ``[local_num_tokens, *]`` tensor with the combined outputs.
     """
+    if output is not None:
+        if not output.is_cuda:
+            raise ValueError(
+                f"output must be a CUDA tensor, got device={output.device}"
+            )
+        if not output.is_contiguous():
+            raise ValueError(f"output must be contiguous, got stride={output.stride()}")
+
     module = get_moe_alltoall_module()
     args = (
         payload,
