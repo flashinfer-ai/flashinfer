@@ -1059,6 +1059,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
             kv_lens_arr_host = seq_lens.cpu()
+        if q_len_per_req > 1:
+            min_kv_len = int(kv_lens_arr_host.min())
+            if min_kv_len < q_len_per_req:
+                raise ValueError(
+                    f"q_len_per_req={q_len_per_req} requires kv_len >= "
+                    "q_len_per_req for every request (the verified tokens "
+                    "must already be appended to the KV cache), but got a "
+                    f"request with kv_len={min_kv_len}: its earlier rows "
+                    "would attend to an empty KV range."
+                )
 
         backend = self._backend
         if backend in ("cute-dsl", "trtllm-gen"):
@@ -1387,6 +1397,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
             kv_lens_arr_host = seq_lens.cpu()
+        if q_len_per_req > 1:
+            min_kv_len = int(kv_lens_arr_host.min())
+            if min_kv_len < q_len_per_req:
+                raise ValueError(
+                    f"q_len_per_req={q_len_per_req} requires kv_len >= "
+                    "q_len_per_req for every request (the verified tokens "
+                    "must already be appended to the KV cache), but got a "
+                    f"request with kv_len={min_kv_len}: its earlier rows "
+                    "would attend to an empty KV range."
+                )
         if self._backend == "cute-dsl":
             if logits_soft_cap is not None and logits_soft_cap > 0:
                 raise NotImplementedError(
