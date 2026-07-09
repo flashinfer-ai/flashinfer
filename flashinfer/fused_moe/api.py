@@ -32,8 +32,7 @@ from typing import ClassVar, Dict, Optional, Tuple, Union
 
 from torch import Tensor
 
-from ..tllm_enums import ActivationType, RoutingMethodType
-from .core import RoutingInputMode  # ABI enum; core does not import api (no cycle)
+from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -504,13 +503,17 @@ class MoEActivationPack:
 
     ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
 
-    * ``PackedPrecomputed`` (default) / ``UnpackedPrecomputed`` — **pre-routed**: the caller
-      computes expert selection on the host and passes ``topk_ids`` + ``topk_weights``.
+    * ``PackedPrecomputed`` (default) — **pre-routed**: the caller computes expert
+      selection on the host and passes ``topk_ids`` + ``topk_weights``.
+      (``UnpackedPrecomputed`` exists at the kernel enum level but is not currently
+      supported by the unified runners.)
     * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
       runner allocates internal kernel-filled buffers, and the routing result is not surfaced
-      back through the pack (routing replay is a separate, future capability).
+      back through the pack (routing replay is a separate, future capability).  Currently only
+      the TRTLLM FP4 runner supports this mode; ``MoELayer`` dispatches a logits pack only to
+      capable backends (see each runner's ``supported_routing_modes``).
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so

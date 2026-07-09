@@ -17,7 +17,6 @@ limitations under the License.
 import functools
 import math
 from dataclasses import dataclass
-from enum import IntEnum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -66,6 +65,7 @@ from ..tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
     Fp8QuantizationType,
+    RoutingInputMode,
     WeightLayout,
     deduce_trtllm_gen_tensor_dtype,
     trtllm_gen_dtype_has_scale,
@@ -86,26 +86,9 @@ from .utils import (
 )
 
 
-# Routing input modes for FusedMoE launcher
-# Please keep this in sync with the counterpart defined in csrc/trtllm_fused_moe_kernel_launcher.cu
-class RoutingInputMode(IntEnum):
-    # Mode 1: Compute routing from logits
-    # - Input: routing_logits tensor provided
-    # - topk_ids: OUTPUT buffer for computed expert indices
-    # - topk_weights: OUTPUT buffer for computed weights
-    FromLogits = 0
-    # Mode 2: Pre-computed routing with packed format
-    # - Input: topk_ids contains packed ``(expert_id << 16) | weight`` (high
-    #   16 bits = int16 expert id, low 16 bits = float16/bfloat16 weight, see
-    #   PackedScoreIdx in include/flashinfer/trtllm/fused_moe/RoutingKernel.h)
-    # - topk_ids: INPUT with packed values
-    # - topk_weights: OUTPUT buffer for extracted weights
-    PackedPrecomputed = 1
-    # Mode 3: Pre-computed routing with separate tensors
-    # - Input: separate topk_ids (expert indices) and topk_weights (routing weights)
-    # - topk_ids: INPUT - pre-computed expert indices
-    # - topk_weights: INPUT - pre-computed routing weights
-    UnpackedPrecomputed = 2
+# RoutingInputMode (the FusedMoE launcher's routing-input ABI enum) lives in
+# flashinfer.tllm_enums with the other kernel-ABI enums; it is imported above
+# and re-exported here for compatibility (``core.RoutingInputMode``).
 
 
 @functools.cache

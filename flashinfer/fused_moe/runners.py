@@ -97,6 +97,18 @@ class CuteDslNvfp4Runner(TunableRunner):
         present for the autotuner profiling path to assign it a per-bucket
         initializer.
         """
+        # MoELayer already filters by supported_routing_modes; this guards the
+        # direct-runner path (tests/benchmarks) against silently forwarding a
+        # logits pack's None topk tensors into the kernel launch.
+        if act.routing_input_mode not in self.supported_routing_modes:
+            raise NotImplementedError(
+                f"CuteDslNvfp4Runner does not support "
+                f"routing_input_mode={act.routing_input_mode!r} "
+                "(only PackedPrecomputed is wired; CuteDSL has no in-kernel router)."
+            )
+        assert act.topk_ids is not None and act.topk_weights is not None, (
+            "routing_input_mode=PackedPrecomputed requires topk_ids + topk_weights."
+        )
         v = weights.get_view(self.backend_key)
         num_tokens = act.hidden_states_q.shape[0]
         hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
