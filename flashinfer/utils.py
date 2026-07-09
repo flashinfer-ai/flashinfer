@@ -539,7 +539,9 @@ def determine_attention_backend(
 
 
 @functools.lru_cache(maxsize=None)
-def version_at_least(version: str, base_version: str) -> bool:
+def version_at_least(version: Optional[str], base_version: Optional[str]) -> bool:
+    if version is None or base_version is None:
+        return False
     from packaging import version as pkg_version
 
     return pkg_version.parse(version) >= pkg_version.parse(base_version)
