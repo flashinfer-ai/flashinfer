@@ -39,12 +39,19 @@ from flashinfer.cute_dsl.attention.gqa_decode import (
     warpgroup_threads,
     max_reduction_iters,
     # Math helpers
+    min_f32,
     log2_e,
     exp2,
     warp_fmax,
     smem_fmax,
     # Kernel code
     GroupedQueryAttentionDecode as GqaDecode,
+)
+from flashinfer.cute_dsl.attention.fusion.mask import (
+    AttentionMask,
+    DenseMask,
+    CausalMask,
+    SlidingWindowMask,
 )
 
 # Math helpers
@@ -65,8 +72,6 @@ class GroupedQueryAttentionDecodePaged:
         sequence_tile=256,
         reduction_mode: Literal["kernel", "atomic", "none"] = "kernel",
         softmax_warpgroups=1,
-        *,
-        tma_mask=False,
     ):
         """
         Parameters
@@ -88,9 +93,6 @@ class GroupedQueryAttentionDecodePaged:
               - ``"none"``: no split-K, flash decoding disabled.
         softmax_warpgroups
             Number of softmax warpgroups (1 or 2).
-        tma_mask
-            Disable causal masking. KV lanes beyond the per-request sequence
-            length are masked to ``-inf`` by the boundary-mask loop.
         """
         self.headdim = headdim
         self.grouped_head_tile = grouped_head_tile
@@ -100,7 +102,6 @@ class GroupedQueryAttentionDecodePaged:
         self.do_kernel_red = reduction_mode == "kernel"
         self.do_atomic_red = reduction_mode == "atomic"
         self.do_none_red = reduction_mode == "none" or reduction_mode is None
-        self.tma_mask = tma_mask
         self.softmax_warpgroups = softmax_warpgroups
         self.threads_per_cta = (2 + softmax_warpgroups) * warpgroup_threads
 
@@ -112,9 +113,18 @@ class GroupedQueryAttentionDecodePaged:
         assert self.do_kernel_red ^ self.do_atomic_red ^ self.do_none_red
 
     def can_implement(
-        self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype, threshold_scale_factor
+        self,
+        kv_splits,
+        qo_shape,
+        kv_shape,
+        qkv_dtype,
+        o_dtype,
+        mask_config,
+        threshold_scale_factor,
     ):
-        GqaDecode.can_implement(self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype)
+        GqaDecode.can_implement(
+            self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype, mask_config
+        )
 
         if threshold_scale_factor is not None and not threshold_scale_factor > 0:
             raise ValueError(
@@ -141,6 +151,8 @@ class GroupedQueryAttentionDecodePaged:
         o_partial_bshd: Optional[cute.Tensor],
         l_partial_bsh: Optional[cute.Tensor],
         m_partial_bsh: Optional[cute.Tensor],
+        sink_h: Optional[cute.Tensor],
+        mask_config,  # duck-typed AttentionMask, TVM FFI conversion breaks if we annotate with base class for now
         scale_s: Float32,
         scale_o: Float32,
         threshold_scale_factor: Optional[Float32],
@@ -175,10 +187,14 @@ class GroupedQueryAttentionDecodePaged:
             Partial ``colsum_p`` per kv split (kernel-red workspace).
         m_partial_bsh
             Partial ``colmax_s`` per kv split (kernel-red workspace).
+        sink_h
+            Pre-scaled attention sink logits per head
         scale_s
             Softmax scale.
         scale_o
             Output scale, applied in the reduction epilogue.
+        mask_config
+            Attention logit masking configuration.
         threshold_scale_factor
             BLASST per-batch skip-softmax threshold scale factor. The kernel
             divides this by each batch's KV seqlen to obtain the effective
@@ -409,6 +425,17 @@ class GroupedQueryAttentionDecodePaged:
             mM_partial_nl = GqaDecode.gemm_view_bsh(m_partial_bsh, h_k)
             mL_partial_nl = GqaDecode.gemm_view_bsh(l_partial_bsh, h_k)
 
+        if cutlass.const_expr(sink_h is not None):
+            assert sink_h.dtype == acc_dtype
+
+            h_g = sink_h.shape[0] // h_k
+            mSink = cute.make_tensor(
+                sink_h.iterator,
+                cute.make_layout((h_g, h_k), stride=(1, h_g)),
+            )
+        else:
+            mSink = None
+
         ##############################
         # Launch kernel(s)
         ##############################
@@ -464,6 +491,8 @@ class GroupedQueryAttentionDecodePaged:
             mM_nl,
             mL_partial_nl,
             mM_partial_nl,
+            mSink,
+            mask_config,
             scale_s_log2_e,
             scale_o,
             log2_threshold_scale_factor,
@@ -485,6 +514,7 @@ class GroupedQueryAttentionDecodePaged:
                 o_partial_bshd,
                 l_partial_bsh,
                 m_partial_bsh,
+                sink_h,
                 scale_o,
                 stream,
                 enable_pdl,
@@ -527,6 +557,8 @@ class GroupedQueryAttentionDecodePaged:
         mM: Optional[cute.Tensor],
         mL_partial: Optional[cute.Tensor],
         mM_partial: Optional[cute.Tensor],
+        mSink: Optional[cute.Tensor],  # (h_g, h_k)
+        mask_config: AttentionMask,
         scale_s_log2_e: Float32,
         scale_o: Float32,
         log2_threshold_scale_factor: Optional[Float32],
@@ -567,9 +599,9 @@ class GroupedQueryAttentionDecodePaged:
         do_atomic_red = self.do_atomic_red
         do_none_red = self.do_none_red
         store_lse = mL is not None
-        tma_mask = self.tma_mask
         is_varlen = isinstance(seqlens_iter, cute.Pointer)
         enable_blasst = log2_threshold_scale_factor is not None
+        use_sink = mSink is not None
 
         ##############################
         # Warp specialization
@@ -884,6 +916,19 @@ class GroupedQueryAttentionDecodePaged:
                 if i + lane_idx < cute.size(sL):
                     sL[i + lane_idx] = Float32(0)
         init_warp += 1
+
+        # Sink
+        if cutlass.const_expr(use_sink and not do_kernel_red):
+            sSink_layout = cute.make_layout((blk_tile_hp,), stride=((1, 0),))
+            sSink = smem.allocate_tensor(acc_dtype, sSink_layout, svector_align)
+            gSink = cute.local_tile(mSink, (blk_tile_h,), (coord_hg, coord_hk))
+            sSink_lane = cute.local_tile(sSink[((None, 0),)], (1,), (lane_idx,))
+            gSink_lane = cute.local_tile(gSink, (1,), (lane_idx,))
+            if warp_idx == reduction_warp_id and lane_idx < blk_tile_h:
+                cute.copy(cpasync_atom, gSink_lane, sSink_lane)
+            init_warp += 1
+        else:
+            sSink = None
 
         # per-thread colsum
         # (MMA_MN, #MMA_M=1, #MMA_N=1, o_stages)
@@ -1410,46 +1455,20 @@ class GroupedQueryAttentionDecodePaged:
             tStL = tStL[None, 0, 0, 0, None]
             tSrL_shape = thr_load_l.partition_D(tCtL_phase).shape[:1]
 
-            # Boundary mask setup for causal and non-causal decode paths.
-            masked_iters_s = masked_start_s = masked_coord_s = 0
-            check_safe_max = False
-            if cutlass.const_expr(not tma_mask):
-                is_last_split = kv_split_idx == (tiles_s - 1) % kv_splits
-                is_prev_split = kv_split_idx == (tiles_s - 2) % kv_splits
-                is_last_phase = softmax_phase == (iters_s - 1) % softmax_warpgroups
-                is_prev_phase = softmax_phase == (iters_s - 2) % softmax_warpgroups
-                # 2 masked tiles
-                if 0 < seqlen % blk_tile_s < prediction:
-                    # 1 split masks 2 tiles
-                    if kv_splits == 1:
-                        masked_start_s = 0 if is_prev_phase else 1
-                        masked_iters_s = 2
-                        masked_coord_s = tiles_s - 2
-                    # 2 splits mask 1 tile each
-                    elif (is_last_split or is_prev_split) and is_last_phase:
-                        masked_start_s = 0
-                        masked_iters_s = 1
-                        masked_coord_s = (
-                            (tiles_s - 1) if is_last_split else (tiles_s - 2)
-                        )
-                        # if last split only has 1 tile then some cols will never
-                        # see inbounds values, so P = exp(-inf + inf) -> nan
-                        check_safe_max = is_last_split and iters_s == 1
-                # 1 masked tile
-                elif prediction > 1 or seqlen % blk_tile_s != 0:
-                    # 1 split masks 1 tile
-                    if is_last_split and is_last_phase:
-                        masked_start_s = 0
-                        masked_iters_s = 1
-                        masked_coord_s = tiles_s - 1
-            else:
-                # Non-causal boundary mask.
-                is_last_split = kv_split_idx == (tiles_s - 1) % kv_splits
-                is_last_phase = softmax_phase == (iters_s - 1) % softmax_warpgroups
-                if seqlen % blk_tile_s != 0 and is_last_split and is_last_phase:
-                    masked_start_s = 0
-                    masked_iters_s = 1
-                    masked_coord_s = tiles_s - 1
+            # Mask configuration loop args
+            range_args = mask_config.get_range_args(
+                prediction,
+                seqlen,
+                blk_tile_p,
+                blk_tile_s,
+                tiles_s,
+                iters_s,
+                kv_splits,
+                kv_split_idx,
+                softmax_warpgroups,
+                softmax_phase,
+            )
+            num_mask_phases = len(range_args)
 
             if cutlass.const_expr(enable_blasst):
                 # Tile skip tracking
@@ -1460,15 +1479,12 @@ class GroupedQueryAttentionDecodePaged:
                     Float32(seqlen)
                 )
 
-            # Loop 1 applies the boundary mask.
-            num_loops = 2
-            for loop in cutlass.range_constexpr(num_loops):
-                is_masked_loop = loop == 1
-                for s in cutlass.range(
-                    masked_start_s if is_masked_loop else softmax_phase,
-                    masked_iters_s if is_masked_loop else (iters_s - masked_iters_s),
-                    softmax_warpgroups,
-                ):
+            # Masking phase loop over all sequence tiles
+            loop_idx = 0
+            for mask_phase in cutlass.range_constexpr(num_mask_phases):
+                # Sequence tile loop per masking phase
+                start, stop, step, is_masked = range_args[mask_phase]
+                for coord_s in cutlass.range(start, stop, step):
                     # Load S from tmem and notify BMM1
                     s_token = s_consumer.try_wait()
                     s_handle = s_consumer.wait_and_advance(s_token)
@@ -1478,23 +1494,23 @@ class GroupedQueryAttentionDecodePaged:
                     cute.arch.fence_view_async_tmem_load()
                     s_handle.release()
 
-                    # Apply boundary mask (causal or non-causal).
-                    if cutlass.const_expr(is_masked_loop):
+                    # Apply mask
+                    if cutlass.const_expr(is_masked):
                         masked = cute.make_rmem_tensor(
                             (blk_tile_h, blk_tile_p, tiles_sm), acc_dtype
                         )
                         masked.store(tSrS_s.load().reshape(masked.shape))
-                        offset_s = (masked_coord_s + s) * blk_tile_s + warpgroup_tidx
-                        offset_p = seqlen - prediction + coord_p * blk_tile_p
+                        offset_p = coord_p * blk_tile_p
+                        offset_s = coord_s * blk_tile_s + warpgroup_tidx
                         for sm in cutlass.range_constexpr(tiles_sm):
                             for p in cutlass.range_constexpr(blk_tile_p):
+                                idx_q = offset_p + p
+                                idx_kv = offset_s + sm * mma_tile_m
+                                is_oob_kv = mask_config.is_oob_kv(
+                                    idx_q, idx_kv, prediction, seqlen
+                                )
+                                mask = -Float32.inf if is_oob_kv else Float32(0)
                                 masked_p = masked[None, p, sm]
-                                key_pos = offset_s + sm * mma_tile_m
-                                if cutlass.const_expr(not tma_mask):
-                                    is_oob = key_pos > offset_p + p
-                                else:
-                                    is_oob = key_pos >= seqlen
-                                mask = -Float32.inf if is_oob else Float32(0)
                                 masked_p.store(masked_p.load() + mask)
                         scores = masked.load().reshape((blk_tile_n, tiles_sm))
                     else:
@@ -1505,7 +1521,8 @@ class GroupedQueryAttentionDecodePaged:
                     rM.store(
                         scores.reduce(
                             cute.ReductionOp.MAX,
-                            init_val=-Float32.inf,
+                            # prevent nan accumulations with masking, see explanation in gqa_decode.py
+                            init_val=min_f32,
                             reduction_profile=(None, 0),
                         )
                     )
@@ -1525,8 +1542,9 @@ class GroupedQueryAttentionDecodePaged:
                         # warp reduction
                         lane_keep_tile = rM_lane - sM_lane_prev >= log2_threshold_p
                         lane_keep_tile &= lane_store_max  # oob lanes skip
-                        lane_keep_tile |= s < o_stages  # correction loop is s-2
+                        lane_keep_tile |= loop_idx < o_stages  # correction loop is s-2
                         warp_keep_tile = warp_or(Int32(lane_keep_tile))
+                        loop_idx += 1
 
                         # warpgroup reduction
                         sp_handle = sp_producer.acquire_and_advance()
@@ -1561,16 +1579,6 @@ class GroupedQueryAttentionDecodePaged:
                                 sM_lane_prev = sM[lane_idx]
                         if cutlass.const_expr(softmax_warpgroups == 2):
                             sM_release_nbar.arrive()
-
-                        # Handle if we never saw any in-bounds values
-                        if cutlass.const_expr(is_masked_loop and do_atomic_red):
-                            if check_safe_max:
-                                rM = cute.make_rmem_tensor_like(colmax)
-                                rM.store(colmax)
-                                for n in cutlass.range_constexpr(blk_tile_n):
-                                    if rM[n] == -Float32.inf:
-                                        rM[n] = Float32(0)
-                                colmax = rM.load()
 
                         # Compute online softmax
                         probs = exp2(scale_s_log2_e * scores - colmax)
@@ -1740,11 +1748,6 @@ class GroupedQueryAttentionDecodePaged:
             if not keep_tile or iters_s <= o_stages:
                 sM_final_nbar.arrive()
 
-            # Handle if we never saw any in-bounds values
-            if cutlass.const_expr(not tma_mask and do_atomic_red):
-                if sM_lane_prev == -Float32.inf:
-                    sM_lane_prev = Float32(0)
-
             # Compute correction of s-1
             correction_lane = exp2(sM_lane_prev_prev - sM_lane_prev)
             correction = cute.make_rmem_tensor_like(sM)
@@ -1817,6 +1820,11 @@ class GroupedQueryAttentionDecodePaged:
         # Reduction Dispatch
         ##############################
         if warp_idx == reduction_warp_id:
+            if cutlass.const_expr(sSink is not None):
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_warp()
+
             if cutlass.const_expr(do_kernel_red):
                 GqaDecode.reduction_epilogue(
                     blk_tile_hp,
@@ -1848,6 +1856,7 @@ class GroupedQueryAttentionDecodePaged:
                     sL,
                     sR,
                     gL,
+                    sSink,
                     scale_o,
                 )
             elif cutlass.const_expr(do_none_red):
@@ -1862,6 +1871,7 @@ class GroupedQueryAttentionDecodePaged:
                     sM,
                     sL,
                     gL,
+                    sSink,
                     scale_o,
                 )
             cute.arch.griddepcontrol_launch_dependents()
@@ -1889,6 +1899,9 @@ def run(
     skip_ref_check: bool = False,
     use_warm_l2: bool = False,
     quiet: bool = False,
+    window_left=None,
+    window_right=0,
+    sink: bool = False,
     **kwargs,
 ):
     # Example-only imports deferred here so importing the kernel module
@@ -1968,6 +1981,21 @@ def run(
         else:
             tolerance = 0.1
 
+    mask_config: AttentionMask
+    if window_left is None and window_right is None:
+        mask_config = DenseMask()
+        window_cli_args = " --window_left None --window_right None"
+        window_summary = "\tmask: dense\n"
+    elif window_left is None and window_right == 0:
+        mask_config = DenseMask() if prediction == 1 else CausalMask()
+        window_cli_args = " --window_left None --window_right 0"
+        window_summary = "\tmask: causal\n"
+    else:
+        # pass int for compile-time config, pass Int32 for runtime config
+        mask_config = SlidingWindowMask(window_left, window_right)
+        window_cli_args = f" --window_left {window_left} --window_right {window_right}"
+        window_summary = f"\tmask: sliding window ({window_left}, {window_right})\n"
+
     print(
         f"Command: python {__file__.split('/')[-1]}"
         f" --d {headdim} --h_q {heads_q} --h_k {heads_k}"
@@ -1978,6 +2006,8 @@ def run(
         f" --atol {tolerance}{' --skip_ref_check' if skip_ref_check else ''}"
         f" --scale {scale_s} --threshold {threshold_scale_factor}"
         f" --iterations {iterations} --warmups {warmup_iterations}{' --use_warm_l2' if use_warm_l2 else ''}"
+        f"{window_cli_args}"
+        f"{' --sink' if sink else ''}"
         f"{' --quiet' if quiet else ''}"
     )
 
@@ -1994,6 +2024,8 @@ def run(
             f"\tatol: {tolerance if not skip_ref_check else 'skip'}"
             f"\tscale_s: {f'1 / sqrt({headdim})' if scale_s == 0 else scale_s}"
             f"\tthreshold_scale_factor: {threshold_scale_factor}\n"
+            f"{window_summary}"
+            f"\tsink: {sink}\n"
             f"\titerations: {iterations}\twarmups: {warmup_iterations}\twarm L2: {use_warm_l2}"
         )
 
@@ -2031,8 +2063,6 @@ def run(
             )
             else 1
         ),
-        # perf optimization for non-causal
-        tma_mask=(prediction == 1),
     )
 
     max_seqlen, min_seqlen = max(seqlens), min(seqlens)
@@ -2045,6 +2075,7 @@ def run(
         kv_shape,
         qkv_dtype,
         o_dtype,
+        mask_config,
         threshold_scale_factor,
     )
 
@@ -2122,6 +2153,11 @@ def run(
         _, o_partial_cute, o_partial_torch = create_tensor(qo_shape, acc_dtype)
         _, m_partial_cute, m_partial_torch = create_tensor(qo_shape[:-1], acc_dtype)
         _, l_partial_cute, l_partial_torch = create_tensor(qo_shape[:-1], acc_dtype)
+
+    # No sink refcheck for now, just test exec path
+    sink_cute = None
+    if sink:
+        _, sink_cute, _ = create_tensor((heads_q,), acc_dtype, init=-math.inf)
 
     # Initialize reference KV tensors
     max_pages_per_batch = math.ceil(max_seqlen / page_size)
@@ -2232,10 +2268,13 @@ def run(
         o_partial_cute,
         l_partial_cute,
         m_partial_cute,
+        sink_cute,
+        mask_config,
         scale_s,
         1.0,  # scale_o
         threshold_scale_factor,
         current_stream,
+        True,  # enable_pdl
     )
     print("Finished Compiling")
 
@@ -2246,24 +2285,30 @@ def run(
         with sdpa_kernel(
             [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH], set_priority=True
         ):
-            # bottom right causal mask
-            decode_mask = torch.empty(
+            attn_mask = torch.empty(
                 batches,
                 1,
                 prediction,
                 ref_seqlen,
                 dtype=torch.bool,
             )
-            for batch, seq in enumerate(seqlens):
-                batch_mask = torch.ones(prediction, ref_seqlen, dtype=torch.bool).tril(
-                    diagonal=seq - prediction
-                )
-                decode_mask[batch, 0, ...] = batch_mask if seq > 0 else False
+            for batch, seq in enumerate(seqlens[:batches]):
+                batch_mask = torch.ones(prediction, ref_seqlen, dtype=torch.bool)
+                batch_mask[:, seq:] = False
+                if window_right is not None:
+                    batch_mask = batch_mask.tril(
+                        diagonal=(seq - prediction + window_right)
+                    )
+                if window_left is not None:
+                    batch_mask = batch_mask.triu(
+                        diagonal=(seq - prediction - window_left)
+                    )
+                attn_mask[batch, 0, ...] = batch_mask if seq > 0 else False
             o_bshd = scaled_dot_product_attention(
                 q_bshd.transpose(1, 2),
                 k_bshd.transpose(1, 2),
                 v_bshd.transpose(1, 2),
-                attn_mask=decode_mask,
+                attn_mask=attn_mask,
                 dropout_p=0.0,
                 scale=scale_s,
                 is_causal=False,  # built-in is upper left causal
@@ -2288,10 +2333,13 @@ def run(
             o_partial_cute,
             l_partial_cute,
             m_partial_cute,
+            sink_cute,
+            mask_config,
             scale_s,
             1.0,  # scale_o
             threshold_scale_factor,
             current_stream,
+            True,  # enable_pdl
         )
         if debug_blasst:
             tiles_skipped = seqlens_torch[batches]
@@ -2350,8 +2398,11 @@ def run(
             _, o_partial_cute, _ = create_tensor(qo_shape, acc_dtype)
             _, m_partial_cute, _ = create_tensor(qo_shape[:-1], acc_dtype)
             _, l_partial_cute, _ = create_tensor(qo_shape[:-1], acc_dtype)
+        sink_cute = None
+        if sink:
+            _, sink_cute, _ = create_tensor((heads_q,), acc_dtype, init=-math.inf)
 
-        return testing.JitArguments(
+        args = testing.JitArguments(
             kv_splits,
             seqlens_cute,
             table_offsets_cute,
@@ -2365,11 +2416,17 @@ def run(
             o_partial_cute,
             l_partial_cute,
             m_partial_cute,
+            sink_cute,
+            mask_config,
             scale_s,
             1.0,  # scale_o
             threshold_scale_factor,
             profile_stream,
+            True,  # enable_pdl
         )
+        args.add_to_scope([mask_config])
+
+        return args
 
     workspace_count = 1
     qo_bytes = q_torch.nbytes + o_torch.nbytes
@@ -2420,6 +2477,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Example of paged MHA/GQA decode on Blackwell."
     )
+
+    def parse_none_or_int(value):
+        if value.lower() == "none":
+            return None
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("expected an integer, or none") from exc
 
     parser.add_argument(
         "--batches",
@@ -2524,6 +2589,26 @@ if __name__ == "__main__":
         type=float,
         default=0,
         help="score (Q*K) scale factor; if zero, defaults to 1/sqrt(D)",
+    )
+
+    parser.add_argument(
+        "--window_left",
+        type=parse_none_or_int,
+        default=argparse.SUPPRESS,
+        help="sliding window left bound; use none for unbounded/causal/dense",
+    )
+
+    parser.add_argument(
+        "--window_right",
+        type=parse_none_or_int,
+        default=argparse.SUPPRESS,
+        help="sliding window right bound; use none for unbounded/dense, use 0 for causal",
+    )
+
+    parser.add_argument(
+        "--sink",
+        action="store_true",
+        help="compile and run with an attention sink tensor",
     )
 
     parser.add_argument(
