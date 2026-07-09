@@ -71,6 +71,10 @@ from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
 )
 
+from .hash_topk import (  # noqa: F401
+    hash_topk as hash_topk,
+)
+
 from .bgmv_moe import (  # noqa: F401
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
@@ -81,6 +85,13 @@ from .bgmv_moe import (  # noqa: F401
 from .moe_lora_delta import (  # noqa: F401
     bgmv_moe_gemm1_lora_delta as bgmv_moe_gemm1_lora_delta,
     bgmv_moe_gemm2_lora_delta as bgmv_moe_gemm2_lora_delta,
+)
+from .monomoe import (  # noqa: F401
+    mono_moe as mono_moe,
+    has_monomoe as has_monomoe,
+    alloc_scratchpad as alloc_scratchpad,
+    get_scratchpad_size_bytes as get_scratchpad_size_bytes,
+    interleave_for_tma_wgmma_up as interleave_for_tma_wgmma_up,
 )
 
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
@@ -143,6 +154,7 @@ __all__ = [
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
+    "hash_topk",
     "bgmv_moe",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",
@@ -150,6 +162,11 @@ __all__ = [
     "bgmv_moe_gemm2_lora_delta",
     "fill_w_ptr",
     "has_bgmv_moe",
+    "mono_moe",
+    "has_monomoe",
+    "alloc_scratchpad",
+    "get_scratchpad_size_bytes",
+    "interleave_for_tma_wgmma_up",
 ]
 
 # Add CuteDSL exports if available

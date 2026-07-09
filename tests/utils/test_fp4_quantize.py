@@ -36,6 +36,8 @@ from flashinfer.utils import (
     is_sm12x_supported,
 )
 
+pytestmark = pytest.mark.long_running
+
 
 def _is_fp4_supported(device: torch.device) -> bool:
     """Check if FP4 quantization is supported on this device."""

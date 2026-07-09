@@ -16,6 +16,8 @@ from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 import flashinfer
 from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
 
+pytestmark = pytest.mark.long_running
+
 DTYPE_MAP = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
@@ -26,12 +28,10 @@ DTYPE_MAP = {
 GPU_DEVICE = "cuda:0"
 
 global_workspace_buffer = None  # can.be empty initialized
-global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
+global_trtllm_gen_fmha_workspace_buffer = None
 workspace_size = 256 * 1024 * 1024
 
-# Counter slab at the head of the generation workspace: 8192 batches * 256 heads * 4 bytes/int32.
-TRTLLM_GEN_COUNTER_BYTES = 8192 * 256 * 4
-# Size of the guard region we zero past the softmax slab (or counter slab when LSE is off).
+# Size of the guard region we zero past the softmax slab.
 TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
 
 
@@ -61,10 +61,8 @@ def trtllm_gen_workspace_softmax_end_bytes_context(
 def trtllm_gen_workspace_softmax_end_bytes_decode(
     num_qo_heads: int, batch_size: int, max_q_len: int
 ) -> int:
-    """End offset of the softmax slab in the generation-mode workspace layout [counter|softmax|scratch]."""
-    return TRTLLM_GEN_COUNTER_BYTES + _trtllm_gen_softmax_slab_bytes(
-        num_qo_heads, batch_size, max_q_len
-    )
+    """End offset of the softmax slab in the generation-mode workspace layout [softmax|scratch]."""
+    return _trtllm_gen_softmax_slab_bytes(num_qo_heads, batch_size, max_q_len)
 
 
 def _skip_if_not_blackwell() -> None:
@@ -368,7 +366,7 @@ def create_workspace_buffers(device: torch.device):
             workspace_size, dtype=torch.int8, device=device
         )
     if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+        global_trtllm_gen_fmha_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
     return global_trtllm_gen_fmha_workspace_buffer, global_workspace_buffer
@@ -637,6 +635,7 @@ def _test_trtllm_batch_decode(
     uses_shared_paged_kv_idx: bool = True,
     return_lse: bool | None = None,
     provide_lse: bool = False,
+    use_bmm1_scale_log2: bool = False,
 ) -> None:
     """
     Common function for testing trtllm-gen decode.
@@ -836,6 +835,27 @@ def _test_trtllm_batch_decode(
         bmm2_scale = bmm2_scale.item()
     elif not isinstance(bmm2_scale, torch.Tensor) and device_scale:
         bmm2_scale = torch.tensor(bmm2_scale, device=GPU_DEVICE, dtype=torch.float32)
+    bmm1_scale_log2 = None
+    if use_bmm1_scale_log2:
+        if backend != "trtllm-gen":
+            pytest.skip("bmm1_scale_log2 is only supported by trtllm-gen")
+        raw_bmm1_scale = (
+            float(bmm1_scale.item())
+            if isinstance(bmm1_scale, torch.Tensor)
+            else float(bmm1_scale)
+        )
+        bmm1_scale_workspace = torch.tensor(
+            [raw_bmm1_scale, raw_bmm1_scale * math.log2(math.e)],
+            device=GPU_DEVICE,
+            dtype=torch.float32,
+        )
+        bmm1_scale_log2 = bmm1_scale_workspace.narrow(0, 1, 1)
+        if isinstance(bmm1_scale, torch.Tensor):
+            # Poison the tensor bmm1_scale so precedence is output-observable: the
+            # result only matches the reference (computed from sm_scale above) if the
+            # log2 override takes priority over this tensor. Safe because bmm1_scale
+            # has no consumer after the API call under test.
+            bmm1_scale = bmm1_scale * 7.0
 
     # Optionally make query non-contiguous for testing stride support
     if non_contiguous_query:
@@ -913,6 +933,7 @@ def _test_trtllm_batch_decode(
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         lse=provided_lse,
         return_lse=effective_return_lse,
+        bmm1_scale_log2=bmm1_scale_log2,
     )
     if expects_lse:
         if effective_return_lse:
@@ -945,11 +966,6 @@ def _test_trtllm_batch_decode(
         )
     else:
         output = output_and_lse
-
-    if backend == "trtllm-gen":
-        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4] == 0).all().item()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -1066,9 +1082,6 @@ def _test_trtllm_batch_decode(
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
-        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4] == 0).all().item()
 
 
 @pytest.mark.parametrize("backend", ["trtllm-gen"])
@@ -1190,6 +1203,40 @@ def test_trtllm_batch_decode_lse_contract(return_lse, provide_lse):
         uses_shared_paged_kv_idx=True,
         return_lse=return_lse,
         provide_lse=provide_lse,
+    )
+
+
+# device_scale=True exercises the precedence branch where a tensor ``bmm1_scale``
+# is also supplied and the log2 override must take priority. kv_dtype="fp8" covers
+# the motivating FP8 KV use case (#3500).
+@pytest.mark.parametrize("device_scale", [False, True])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("bf16", "fp8", "bf16"),
+    ],
+)
+def test_trtllm_batch_decode_bmm1_scale_log2(q_dtype, kv_dtype, o_dtype, device_scale):
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        2,
+        1,
+        16,
+        2,
+        2,
+        -1,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        False,
+        False,
+        128,
+        128,
+        device_scale=device_scale,
+        uses_shared_paged_kv_idx=True,
+        use_bmm1_scale_log2=True,
     )
 
 

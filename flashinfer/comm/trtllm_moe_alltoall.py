@@ -14,7 +14,7 @@ import functools
 
 from ..api_logging import flashinfer_api
 
-from .mnnvl import MnnvlMemory, MnnvlConfig
+from .mnnvl import CommBackend, MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
 from ..utils import register_custom_op
@@ -758,8 +758,76 @@ class MoeAlltoAll:
         self.metainfo = self._WORKSPACE["metainfo"]
         self._state = _A2AState()
 
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Unmap MNNVL handles for checkpointing; repeated calls are no-ops."""
+        record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
+        if not record.mapped:
+            return
+        if self._state.phase != "idle":
+            raise RuntimeError(
+                "Cannot unmap MNNVL handles during an active all-to-all phase"
+            )
+
+        # Every rank must stop using the workspace before releasing its backing.
+        torch.cuda.synchronize()
+        record.comm.barrier()
+        MnnvlMemory._unmap_and_release_handles(record)
+        record.mem_handles = [None] * record.comm_size
+        record.mapped = False
+        # Do not return until every rank has released its handles.
+        record.comm.barrier()
+
+    @flashinfer_api
+    def checkpoint_restore(
+        self,
+        comm_backend: CommBackend,
+    ) -> None:
+        """Remap MNNVL handles after restore; repeated calls are no-ops."""
+        record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
+        if record.mapped:
+            return
+
+        comm_size = comm_backend.Get_size()
+        comm_rank = comm_backend.Get_rank()
+        if comm_size != record.comm_size or comm_rank != record.comm_rank:
+            raise RuntimeError(
+                "Cannot remap MNNVL handles because the communicator does not "
+                "match the graph-visible allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{record.comm_rank}/{record.comm_size}"
+            )
+        # CUDA work must quiesce before the workspace is remapped.
+        torch.cuda.synchronize()
+        record.mem_handles = MnnvlMemory._create_and_map_handles(
+            comm_backend,
+            record.aligned_size,
+            record.start_address,
+            record.rank_stride,
+            record.address_offset,
+        )
+        record.comm = comm_backend
+        MnnvlMemory.comm = comm_backend
+        record.mapped = True
+        refreshed_metainfo = moe_a2a_initialize(
+            self.workspace,
+            self.ep_rank,
+            self.ep_size,
+            self.max_num_tokens,
+        )
+        if not torch.equal(refreshed_metainfo, self.metainfo):
+            raise RuntimeError(
+                "MoeAlltoAll metainfo changed during MNNVL handle remap; "
+                "existing CUDA graphs are not safe to replay"
+            )
+        torch.cuda.synchronize()
+        comm_backend.barrier()
+        self._state = _A2AState()
+
     def _reset_workspace(self):
         """Reset the workspace to free up its state. This is mainly used for testing. Use this with caution. This object is no longer usable after this."""
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         torch.cuda.synchronize()
         del self._WORKSPACE
         del self._WORKSPACE_CACHE[
@@ -806,6 +874,8 @@ class MoeAlltoAll:
             Workspace-backed receive tensors, one per ``input_payloads``
             entry, each shaped ``[ep_size, runtime_max_tokens_per_rank, *]``.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "idle", "dispatch called twice without combine"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "runtime_max_tokens_per_rank exceeds max_num_tokens"
@@ -886,6 +956,8 @@ class MoeAlltoAll:
         torch.Tensor
             ``[local_num_tokens, elements_per_token]`` combined tensor.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "dispatched", (
             "combine called before successful dispatch"
         )
@@ -949,6 +1021,8 @@ class MoeAlltoAll:
         RuntimeError
             If called before a successful :meth:`dispatch`.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         if self._state.phase != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before successful dispatch"

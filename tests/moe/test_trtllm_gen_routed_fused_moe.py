@@ -42,7 +42,6 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.core import Fp8QuantizationType
 from flashinfer.utils import device_support_pdl, get_compute_capability
-
 from .trtllm_gen_fused_moe_utils import (
     FP8BlockScaleMoe,
     QuantMode,
@@ -50,6 +49,8 @@ from .trtllm_gen_fused_moe_utils import (
     routing_reference_renormalize_naive,
     routing_reference_topk,
 )
+
+pytestmark = pytest.mark.solo
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])

@@ -41,6 +41,7 @@ mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
+mono_moe_topk8_h2048_i512.json
 moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
 moe_fp4_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
@@ -54,6 +55,8 @@ moe_fp8_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
 mxfp8_grouped_quantize_k4096.json
+nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
+nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -220,6 +223,7 @@ flashinfer.apply_rope_with_cos_sin_cache_inplace(
 # generated on any GPU — runtime failures are suppressed.
 from flashinfer.quantization.fp4_quantization import (
     fp4_quantize,
+    nvfp4_kv_dequantize_paged,
     mxfp4_quantize,
     nvfp4_quantize,
 )
@@ -240,6 +244,79 @@ with contextlib.suppress(Exception):
     mxfp4_quantize(quant_input_bf16)
 with contextlib.suppress(Exception):
     mxfp8_quantize(quant_input_bf16)
+
+# Paged NVFP4 KV dequantization helper: NHD and HND cache layouts.
+with contextlib.suppress(Exception):
+    deq_b, deq_s, deq_h, deq_kd, deq_vd, deq_ps = 2, 8, 2, 64, 128, 4
+    deq_pages = deq_b * ((deq_s + deq_ps - 1) // deq_ps)
+    deq_k_cache_nhd = torch.randint(
+        0,
+        256,
+        (deq_pages, deq_ps, deq_h, deq_kd // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    deq_v_cache_nhd = torch.randint(
+        0,
+        256,
+        (deq_pages, deq_ps, deq_h, deq_vd // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    deq_k_scales_nhd = torch.randint(
+        1,
+        120,
+        (deq_pages, deq_ps, deq_h, deq_kd // 16),
+        dtype=torch.uint8,
+        device=device,
+    ).view(torch.float8_e4m3fn)
+    deq_v_scales_nhd = torch.randint(
+        1,
+        120,
+        (deq_pages, deq_ps, deq_h, deq_vd // 16),
+        dtype=torch.uint8,
+        device=device,
+    ).view(torch.float8_e4m3fn)
+    deq_block_tables = torch.arange(
+        deq_pages, dtype=torch.int32, device=device
+    ).reshape(deq_b, -1)
+    deq_seq_lens = torch.full((deq_b,), deq_s, dtype=torch.int32, device=device)
+    deq_k_scale = torch.ones(1, dtype=torch.float32, device=device)
+    deq_v_scale = torch.ones(1, dtype=torch.float32, device=device)
+    deq_out_k = torch.empty(
+        deq_b, deq_s, deq_h, deq_kd, dtype=torch.bfloat16, device=device
+    )
+    deq_out_v = torch.empty(
+        deq_b, deq_s, deq_h, deq_vd, dtype=torch.bfloat16, device=device
+    )
+    nvfp4_kv_dequantize_paged(
+        (deq_k_cache_nhd, deq_v_cache_nhd),
+        (deq_k_scales_nhd, deq_v_scales_nhd),
+        deq_block_tables,
+        deq_seq_lens,
+        deq_k_scale,
+        deq_v_scale,
+        deq_out_k,
+        deq_out_v,
+        kv_layout="NHD",
+    )
+    nvfp4_kv_dequantize_paged(
+        (
+            deq_k_cache_nhd.permute(0, 2, 1, 3).contiguous(),
+            deq_v_cache_nhd.permute(0, 2, 1, 3).contiguous(),
+        ),
+        (
+            deq_k_scales_nhd.permute(0, 2, 1, 3).contiguous(),
+            deq_v_scales_nhd.permute(0, 2, 1, 3).contiguous(),
+        ),
+        deq_block_tables,
+        deq_seq_lens,
+        deq_k_scale,
+        deq_v_scale,
+        deq_out_k,
+        deq_out_v,
+        kv_layout="HND",
+    )
 
 # Grouped MXFP8 (cuTile, SM100+): [B, M, K] -> masked grouped GEMM layout.
 with contextlib.suppress(Exception):
@@ -506,6 +583,46 @@ b_m = torch.zeros(B, T_mtp, HV, dtype=torch.bfloat16, device=device)
 flashinfer.gdn_decode.gated_delta_rule_mtp(
     q_m, k_m, v_m, init_state, init_idx, A_log_m, a_m, dt_bias_m, b_m
 )
+
+# ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────
+# Fixed shape: E=256, N(intermediate)=512, K(hidden)=2048, BS<=8 tokens.
+# Routing is fused in-kernel from router_logits.  SM90a-only and JIT-built,
+# so wrapped in suppress(): the trace JSON dumps before the kernel launches,
+# so the definition file appears even when the kernel can't run here.
+with contextlib.suppress(Exception):
+    _mm_E, _mm_N, _mm_K, _mm_M = 256, 512, 2048, 8
+    _mm_BLK = 128
+    _mm_act = torch.randn(_mm_M, _mm_K, dtype=torch.bfloat16, device=device)
+    _mm_logits = torch.randn(_mm_M, _mm_E, dtype=torch.bfloat16, device=device)
+    _mm_w13 = torch.zeros(
+        _mm_E, 2 * _mm_N, _mm_K, dtype=torch.float8_e4m3fn, device=device
+    )
+    _mm_s13 = torch.ones(
+        _mm_E,
+        (2 * _mm_N) // _mm_BLK,
+        _mm_K // _mm_BLK,
+        dtype=torch.float32,
+        device=device,
+    )
+    _mm_w2 = torch.zeros(_mm_E, _mm_K, _mm_N, dtype=torch.float8_e4m3fn, device=device)
+    _mm_s2 = torch.ones(
+        _mm_E,
+        _mm_K // _mm_BLK,
+        _mm_N // _mm_BLK,
+        dtype=torch.float32,
+        device=device,
+    )
+    flashinfer.fused_moe.mono_moe(
+        _mm_act,
+        _mm_logits,
+        _mm_w13,
+        _mm_s13,
+        _mm_w2,
+        _mm_s2,
+        top_k=8,
+        scoring_func="softmax",
+        renormalize=True,
+    )
 
 # ── MoE FP8 (256 experts, 32 local, h=7168, i=2048) ─────────────────────────
 # routing_method_type: 0=Default, 1=Renormalize, 2=DeepSeekV3,
@@ -798,6 +915,84 @@ with contextlib.suppress(Exception):
         _kv_idx,
         _kv_indptr,
         _last,
+    )
+
+# nvfp4_quantize_append_paged_kv_cache: tuple packed cache plus scale cache.
+with contextlib.suppress(Exception):
+    from flashinfer import nvfp4_quantize_append_paged_kv_cache
+
+    _nqap_B, _nqap_H, _nqap_D, _nqap_PS = 2, 2, 64, 4
+    _nqap_nnz = 4
+    _nqap_k_cache = torch.zeros(
+        4, _nqap_PS, _nqap_H, _nqap_D // 2, dtype=torch.uint8, device=device
+    )
+    _nqap_v_cache = torch.zeros_like(_nqap_k_cache)
+    _nqap_k_sf = torch.zeros(
+        4,
+        _nqap_PS,
+        _nqap_H,
+        _nqap_D // 16,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _nqap_v_sf = torch.zeros_like(_nqap_k_sf)
+    _nqap_k = torch.randn(
+        _nqap_nnz, _nqap_H, _nqap_D, dtype=torch.bfloat16, device=device
+    )
+    _nqap_v = torch.randn_like(_nqap_k)
+    _nqap_bidx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
+    _nqap_pos = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
+    _nqap_kv_idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    _nqap_kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    _nqap_last = torch.tensor([2, 2], dtype=torch.int32, device=device)
+    nvfp4_quantize_append_paged_kv_cache(
+        _nqap_k,
+        _nqap_v,
+        _nqap_bidx,
+        _nqap_pos,
+        (_nqap_k_cache, _nqap_v_cache),
+        (_nqap_k_sf, _nqap_v_sf),
+        _nqap_kv_idx,
+        _nqap_kv_indptr,
+        _nqap_last,
+        1.0,
+        1.0,
+    )
+
+# nvfp4_quantize_append_paged_kv_cache_with_slot_mapping: flat slot mapping.
+with contextlib.suppress(Exception):
+    from flashinfer import nvfp4_quantize_append_paged_kv_cache_with_slot_mapping
+
+    _nqsm_H, _nqsm_D, _nqsm_PS = 2, 64, 4
+    _nqsm_nnz = 4
+    _nqsm_k_cache = torch.zeros(
+        4, _nqsm_PS, _nqsm_H, _nqsm_D // 2, dtype=torch.uint8, device=device
+    )
+    _nqsm_v_cache = torch.zeros_like(_nqsm_k_cache)
+    _nqsm_k_sf = torch.zeros(
+        4,
+        _nqsm_PS,
+        _nqsm_H,
+        _nqsm_D // 16,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _nqsm_v_sf = torch.zeros_like(_nqsm_k_sf)
+    _nqsm_k = torch.randn(
+        _nqsm_nnz, _nqsm_H, _nqsm_D, dtype=torch.bfloat16, device=device
+    )
+    _nqsm_v = torch.randn_like(_nqsm_k)
+    _nqsm_slots = torch.tensor([0, 1, 4, 5], dtype=torch.int32, device=device)
+    _nqsm_k_scale = torch.ones(1, dtype=torch.float32, device=device)
+    _nqsm_v_scale = torch.ones(1, dtype=torch.float32, device=device)
+    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        _nqsm_k,
+        _nqsm_v,
+        _nqsm_slots,
+        (_nqsm_k_cache, _nqsm_v_cache),
+        (_nqsm_k_sf, _nqsm_v_sf),
+        _nqsm_k_scale,
+        _nqsm_v_scale,
     )
 
 # SegmentGEMMWrapper: small per-segment matmul.
