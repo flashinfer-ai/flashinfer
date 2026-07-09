@@ -224,15 +224,23 @@ def preprocess_moe_weights_for_sm90_mixed_gemm_humming(
             "weight must be 3D (num_experts, rows, K/2); "
             f"got shape {tuple(weight.shape)}"
         )
+    k = weight.shape[2] * 2
+    if k % 32 != 0:
+        raise ValueError(f"weight K dimension must be divisible by 32; got K={k}")
     expected_scale_shape = (
         weight.shape[0],
         weight.shape[1],
-        weight.shape[2] * 2 // 32,
+        k // 32,
     )
     if tuple(raw_scale.shape) != expected_scale_shape:
         raise ValueError(
             f"raw_scale must have shape {expected_scale_shape}; "
             f"got {tuple(raw_scale.shape)}"
+        )
+    if raw_scale.device != weight.device:
+        raise ValueError(
+            "raw_scale and weight must be on the same device; "
+            f"got {raw_scale.device} and {weight.device}"
         )
 
     offset, residual, delta_scale_offsets = _preprocess_humming_e8m0_weight_scale(
