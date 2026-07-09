@@ -351,6 +351,49 @@ def _sts_bf16x2_f32(smem_addr_i32, lo_f32, hi_f32):
     return Int32(r)
 
 
+def _lds_v4_b32(smem_addr_i32):
+    """LDS.128: 16 B (8 bf16) from SMEM. Address must be 16-B aligned."""
+    r = llvm.inline_asm(
+        llvm.StructType.get_literal(
+            [mlir_T.i32(), mlir_T.i32(), mlir_T.i32(), mlir_T.i32()]
+        ),
+        [smem_addr_i32.ir_value()],
+        "ld.shared.v4.b32 {$0,$1,$2,$3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        Int32(llvm.extractvalue(mlir_T.i32(), r, [0])),
+        Int32(llvm.extractvalue(mlir_T.i32(), r, [1])),
+        Int32(llvm.extractvalue(mlir_T.i32(), r, [2])),
+        Int32(llvm.extractvalue(mlir_T.i32(), r, [3])),
+    )
+
+
+def _st_global_v4_b32(base_addr_i64, bf16_elem_offset, v0, v1, v2, v3):
+    """STG.128: 16 B (8 bf16) to global. Offset in bf16 elements, 16-B aligned."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [
+            base_addr_i64.ir_value(),
+            bf16_elem_offset.ir_value(),
+            v0.ir_value(),
+            v1.ir_value(),
+            v2.ir_value(),
+            v3.ir_value(),
+        ],
+        "{ .reg .u64 _a; mad.wide.u32 _a, $2, 2, $1;"
+        " st.global.v4.b32 [_a], {$3,$4,$5,$6}; mov.u32 $0, 0; }",
+        "=r,l,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
 def _fused_ab_1mma(a_addr, b_addr, c0, c1, c2, c3):
     """ldmatrix.x4 A + ldmatrix.x2.trans B + 1 MMA."""
     r = llvm.inline_asm(
@@ -1814,6 +1857,10 @@ class GdnDecodeKernel:
         _gOut_base = gOut.iterator.toint()
         _out_base = pid_b * so_b + pid_hv * so_hv
         _v_off_base = Int32(0)  # full V in one tile
+        # Output staging tile [T, V_PADDED] bf16 aliased onto h_buf (16 KiB;
+        # needs 4.25 KiB). sH's last read is the half-1 H GEMM; every warp is
+        # past it once the sync below (before QT@V) has run.
+        _sOutStage_base = sH.iterator.toint()
 
         # 4 V-groups per warp at 8 V-cols each → byte stride = 8*2 = 16 within a warp,
         # warp_id stride in V-cols = 32 → 64 bytes between warps.
@@ -1852,31 +1899,48 @@ class GdnDecodeKernel:
             if h_iter == 3:
                 for j in cutlass.range_constexpr(4):
                     acc.iterator[j] = acc.iterator[j] + wh_acc_3.iterator[j]
+            # SMEM-staged epilogue (NCU B=256 mbp8: the 8 fragment-direct 4-B
+            # STG.32s were the top uncoalesced-global source — 50% of each
+            # 32-B sector wasted, 2.1M of 2.6M excessive L2 sectors). Stage
+            # the [T,128] tile in SMEM (h_buf — sH is dead after the half-1 H
+            # GEMM; the sync at the QT@V wait above orders all warps past it),
+            # then flush with fully-coalesced 16-B STGs below. STS pattern
+            # (word = 68*r + 4*h + lane%4) is bank-conflict-free.
             _out_r0 = lane_id // 4
             _out_c0 = (lane_id & 3) * 2
-            _out_v0 = _v_off_base + h * 8 + _out_c0
-            if const_expr(self._t_input >= 8):
-                _st_global_bf16x2_f32(
-                    _gOut_base,
-                    _out_base + _out_r0 * so_t + _out_v0,
-                    acc.iterator[0],
-                    acc.iterator[1],
-                )
-            else:
-                if _out_r0 < Int32(self._t_input):
-                    _st_global_bf16x2_f32(
-                        _gOut_base,
-                        _out_base + _out_r0 * so_t + _out_v0,
-                        acc.iterator[0],
-                        acc.iterator[1],
-                    )
+            _stg_col = h * 8 + _out_c0
+            _sts_bf16x2_f32(
+                _sOutStage_base + (_out_r0 * V_PADDED + _stg_col) * 2,
+                acc.iterator[0],
+                acc.iterator[1],
+            )
             if const_expr(self._t_input > 8):
-                _st_global_bf16x2_f32(
-                    _gOut_base,
-                    _out_base + (_out_r0 + 8) * so_t + _out_v0,
+                _sts_bf16x2_f32(
+                    _sOutStage_base + ((_out_r0 + 8) * V_PADDED + _stg_col) * 2,
                     acc.iterator[2],
                     acc.iterator[3],
                 )
+
+        # Coalesced flush: consecutive lanes write consecutive 16-B chunks
+        # (16 chunks per 256-B row), so each warp covers 512 B contiguous —
+        # 100% sector utilization. LDS.128 quarter-warps read 32 consecutive
+        # SMEM words (pos*4 spans a full bank period) — conflict-free.
+        sync_threads()
+        for _fl_pass in cutlass.range_constexpr(2 if self._t_input > 8 else 1):
+            _fl_chunk = _fl_pass * 128 + tidx
+            _fl_row = _fl_chunk // 16
+            _fl_pos = _fl_chunk & 15
+            _fl_lds = _sOutStage_base + _fl_row * Int32(V_PADDED * 2) + _fl_pos * 16
+            _fl_off = _out_base + _fl_row * so_t + _v_off_base + _fl_pos * 8
+            # LDS hoisted out of the runtime guard: tuple-unpack inside an
+            # if-region trips a DSL region-type error, and reading staged
+            # garbage rows (>= t_input) is harmless — only the STG is gated.
+            _v0, _v1, _v2, _v3 = _lds_v4_b32(_fl_lds)
+            if const_expr(self._t_input >= 8):
+                _st_global_v4_b32(_gOut_base, _fl_off, _v0, _v1, _v2, _v3)
+            else:
+                if _fl_row < Int32(self._t_input):
+                    _st_global_v4_b32(_gOut_base, _fl_off, _v0, _v1, _v2, _v3)
 
 
 # ============================================================================
