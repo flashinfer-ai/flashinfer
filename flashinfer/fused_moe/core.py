@@ -2872,8 +2872,8 @@ def trtllm_bf16_moe(
         ``[seq_len, num_experts]`` tensor of routing logits.  ``float32`` or
         ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        Optional ``[num_experts]`` tensor of routing bias.  Must be
-        ``bfloat16`` if provided.
+        Optional ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
+        ``float32``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` tensor of input hidden states.  Must be
         ``bfloat16``.
@@ -3270,11 +3270,14 @@ def trtllm_fp8_per_tensor_scale_moe(
     Parameters
     ----------
     routing_logits : torch.Tensor
-        ``[seq_len, num_experts]`` tensor of routing logits.
+        ``[seq_len, num_experts]`` tensor of routing logits, ``float32`` or
+        ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` tensor of routing bias.
+        ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
+        ``float32``.  May be ``None``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` tensor of input hidden states.
+        ``float8_e4m3fn``, ``float16``, or ``bfloat16``.
     gemm1_weights : torch.Tensor
         ``[num_experts, M, hidden_size]`` first-layer weights.  ``M`` is
         ``2 * intermediate_size`` for gated activations and ``intermediate_size``
@@ -3430,11 +3433,15 @@ def trtllm_fp8_block_scale_moe(
     Parameters
     ----------
     routing_logits : torch.Tensor
-        ``[seq_len, num_experts]`` tensor of routing logits.
+        ``[seq_len, num_experts]`` tensor of routing logits, ``float32`` or
+        ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` tensor of routing bias.
+        ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
+        ``float32``.  May be ``None``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` tensor of input hidden states.
+        ``float16``, ``bfloat16``, or ``float8_e4m3fn`` (block scale must
+        match: see ``hidden_states_scale``).
     hidden_states_scale : torch.Tensor
         ``[hidden_size // 128, seq_len]`` tensor of hidden-states block scales.
     gemm1_weights : torch.Tensor
@@ -3662,9 +3669,12 @@ def trtllm_fp8_block_scale_routed_moe(
         ``[seq_len, top_k]`` int32 tensor of packed expert indices and weights
         with format ``(expert_id << 16) | (weight_bf16.view(int16))``.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` tensor of routing bias (may be ``None``).
+        ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
+        ``float32``.  May be ``None``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` tensor of input hidden states.
+        ``float16``, ``bfloat16``, or ``float8_e4m3fn`` (block scale must
+        match: see ``hidden_states_scale``).
     hidden_states_scale : torch.Tensor
         ``[hidden_size // (32 if mxfp8 else 128), seq_len]`` block scales for
         the hidden states.
@@ -3875,8 +3885,9 @@ def trtllm_fp4_block_scale_moe(
         ``[seq_len, num_experts]`` tensor of routing logits.  ``float32`` or
         ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` tensor of routing bias.  Same dtype as
-        ``routing_logits``; may be ``None``.
+        ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
+        ``float32`` (independent of ``routing_logits``'s dtype).  May be
+        ``None``.
     hidden_states : torch.Tensor
         Hidden states of shape ``[seq_len, hidden_size // 2]`` (NVFP4) or
         ``[seq_len, hidden_size]`` (MXFP8 / bfloat16).  Supports bfloat16,
@@ -4075,10 +4086,12 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[seq_len, top_k]`` (plain expert indices) and ``weights`` is
         ``bfloat16`` of the same shape (routing weights).
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` routing bias.  May be ``None``.
+        ``[num_experts]`` routing bias, ``bfloat16`` or ``float32``.  May be
+        ``None``.
     hidden_states : torch.Tensor
         Hidden states of shape ``[seq_len, hidden_size // 2]`` (NVFP4) or
-        ``[seq_len, hidden_size]`` (MXFP8 / bfloat16).
+        ``[seq_len, hidden_size]`` (MXFP8 / bfloat16).  Supports bfloat16,
+        MXFP8 (``float8_e4m3fn``), and NVFP4 (packed into ``uint8``).
     hidden_states_scale : Optional[torch.Tensor]
         ``[seq_len, hidden_size // (32 if mxfp8 else 16)]`` block scales of
         the hidden states, float8.
@@ -4251,7 +4264,8 @@ def trtllm_mxint4_block_scale_moe(
     routing_logits : torch.Tensor
         ``[seq_len, num_experts]`` routing logits, ``float32`` or ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` routing bias, ``bfloat16``.  May be ``None``.
+        ``[num_experts]`` routing bias, ``bfloat16`` or ``float32``.  May be
+        ``None``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` input hidden states, ``bfloat16``.
     gemm1_weights : torch.Tensor

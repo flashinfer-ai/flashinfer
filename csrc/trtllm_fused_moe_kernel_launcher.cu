@@ -328,6 +328,9 @@ class FusedMoeLauncher {
   // Routing bias [num_experts]
   void check_routing_bias_shape() const {
     if (routing_bias.has_value()) {
+      TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
+                     routing_bias.value().dtype() == dl_float32)
+          << "routing_bias must be bfloat16 or float.";
       TVM_FFI_ICHECK_EQ(routing_bias.value().ndim(), 1) << "routing_bias must be 1D.";
       TVM_FFI_ICHECK_EQ(routing_bias.value().size(0), args->num_experts)
           << "routing_bias has incorrect shape.";
@@ -2602,7 +2605,9 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
         << "routing_logits has incorrect shape.";
   }
   if (routing_bias.has_value()) {
-    TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16) << "routing_bias must be bfloat16.";
+    TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
+                   routing_bias.value().dtype() == dl_float32)
+        << "routing_bias must be bfloat16 or float.";
     TVM_FFI_ICHECK_EQ(routing_bias.value().ndim(), 1) << "routing_bias must be 1D.";
     TVM_FFI_ICHECK_EQ(routing_bias.value().size(0), num_experts)
         << "routing_bias has incorrect shape.";
