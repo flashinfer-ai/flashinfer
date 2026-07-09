@@ -1978,10 +1978,16 @@ _RESTAGE = True
 # real [B,T,...] tensors (no host staging copy) and the kernel loads only those T
 # rows + zeros its sK/sQ smem tail. Removes the two big q/k gmem->gmem staging
 # copies. v/a/b stay staged (v is already minimized by _v_iters=1 at t_input<=8;
-# a/b feed the per-lane gamma path). Off by default (full staging) for safety.
+# a/b feed the per-lane gamma path).
+# ON by default since the _BF16_CACHE stale-cast fix: the earlier "unsafe"
+# accuracy signal traced to that host-side bug, not this path. Validated on B200
+# (T=4 and T=8, BS=1..256): max|d| <= 9.77e-04 vs branch kernel and vs the torch
+# reference, full wy_output_only pytest green with native forced, and 2-6%
+# faster kernel time at BS>=8 plus 2 fewer host staging copies per call.
+# Set SGLANG_GDN_WY_NATIVE_T=0 to restore full staging.
 import os as _os
 
-_NATIVE_T = _os.environ.get("SGLANG_GDN_WY_NATIVE_T", "0") != "0"
+_NATIVE_T = _os.environ.get("SGLANG_GDN_WY_NATIVE_T", "1") != "0"
 # (strided-qkv) read q/k/v directly from the fused conv-output column slices (token
 # stride = conv_dim) instead of .contiguous()-materializing them. Removes the 3 big
 # q/k/v copies from the verify region. Only valid on the native path (T in {4,8}).
@@ -1991,7 +1997,9 @@ _STRIDED_QKV = _os.environ.get("SGLANG_GDN_WY_STRIDED_QKV", "0") != "0"
 # the compact [B,T] output: gamma is a causal prefix-sum, so the unloaded tail rows (which get
 # log_alpha=0 instead of the staged-zero value) cannot affect rows 0..n_valid-1, and the tail
 # output is discarded. Native path only (T in {4,8}).
-_NATIVE_AB = _os.environ.get("SGLANG_GDN_WY_NATIVE_AB", "0") != "0"
+# ON by default alongside _NATIVE_T (same validation); SGLANG_GDN_WY_NATIVE_AB=0
+# restores a/b staging.
+_NATIVE_AB = _os.environ.get("SGLANG_GDN_WY_NATIVE_AB", "1") != "0"
 # Cache the bf16 cast of the per-layer CONSTANT weights A_log/dt_bias, keyed by
 # storage identity (data_ptr, shape). They are persistent tensors passed every verify
 # call; caching turns the per-call `.to(bf16)` into a one-time (warm-up) cast that does
