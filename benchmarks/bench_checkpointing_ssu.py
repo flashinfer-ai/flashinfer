@@ -872,9 +872,17 @@ def _make_run_closure(
             x_flat, B_flat, C_flat = torch.split(
                 xbc_flat, [d_inner, ngroups * d_state, ngroups * d_state], dim=-1
             )
-            x_conv = x_flat.view(batch, mtp_len, nheads, head_dim)
-            B_conv = B_flat.view(batch, mtp_len, ngroups, d_state)
-            C_conv = C_flat.view(batch, mtp_len, ngroups, d_state)
+            if inputs.cu_seqlens is not None:
+                # Uniform varlen: the conv1d runs in its dense per-slot layout
+                # (every row is full-length, so its output IS the packed layout)
+                # and the SSU consumes packed views of the same buffer.
+                x_conv = x_flat.view(1, batch * mtp_len, nheads, head_dim)
+                B_conv = B_flat.view(1, batch * mtp_len, ngroups, d_state)
+                C_conv = C_flat.view(1, batch * mtp_len, ngroups, d_state)
+            else:
+                x_conv = x_flat.view(batch, mtp_len, nheads, head_dim)
+                B_conv = B_flat.view(batch, mtp_len, ngroups, d_state)
+                C_conv = C_flat.view(batch, mtp_len, ngroups, d_state)
             return x_conv, B_conv, C_conv
 
     if kernel in ("cuda-incr", "cuda-incr-2k"):
@@ -885,10 +893,6 @@ def _make_run_closure(
         _cb = inputs.cb_scaled if _two else None
         _ca = inputs.cumAdt_vec if _two else None
         _cbo = inputs.cb_old if _two else None
-        assert not (inputs.cu_seqlens is not None and with_conv1d), (
-            "varlen inputs measure SSU-only — the conv1d reference has no "
-            "cu_seqlens path; got varlen=True with_conv1d=True"
-        )
         # Pin the path: "auto" would route small batches to the monolith even
         # with scratch present, silently merging the two rows.
         _algo = "two-kernel" if _two else "monolith"
@@ -945,6 +949,8 @@ def _make_run_closure(
                     cumAdt_vec=_ca,
                     cb_old=_cbo,
                     algorithm=_algo,
+                    cu_seqlens=inputs.cu_seqlens,
+                    max_seqlen=inputs.max_seqlen,
                 )
         else:
 

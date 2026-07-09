@@ -798,17 +798,12 @@ def main() -> None:
         help=(
             "Pack inputs into the varlen (1, batch*T, ...) + cu_seqlens layout "
             "with uniform seq_len = T — an exact A/B against dense (same work, "
-            "only the VARLEN addressing path differs).  CUDA kernels only; "
-            "incompatible with --with-conv1d (SSU-only measurement)."
+            "only the VARLEN addressing path differs).  CUDA kernels only.  "
+            "Composes with --with-conv1d: uniform rows mean the conv1d's dense "
+            "output IS the packed layout (the SSU consumes packed views of it)."
         ),
     )
     args = parser.parse_args()
-
-    if args.varlen and args.with_conv1d:
-        parser.error(
-            "--varlen measures SSU-only (the conv1d reference has no cu_seqlens "
-            "path); drop --with-conv1d"
-        )
 
     if args.window <= args.T:
         parser.error(f"--T ({args.T}) must be < --window ({args.window})")
