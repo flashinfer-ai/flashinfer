@@ -123,7 +123,7 @@ class MLA {
     // reduction width, costing up to ~2x MLA decode latency at DeepSeek
     // shapes (measured on B200/B300).
     int ctas_per_split = cute::size<0>(typename Kernel::ClusterShape{});
-    int sms_per_batch = max(1, sm_count / (B * ctas_per_split));
+    int sms_per_batch = max(1, sm_count / max(1, B * ctas_per_split));
     int split_heur = min(max_splits, sms_per_batch);
     int k_waves = ceil_div(max_splits, split_heur);
     int split_wave_aware = ceil_div(max_splits, k_waves);
