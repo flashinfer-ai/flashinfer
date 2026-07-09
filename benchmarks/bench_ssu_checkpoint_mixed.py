@@ -306,6 +306,7 @@ def run_in_process_bench(
     with_conv1d: bool = False,
     external_pdl: bool = True,
     cuda_graph: bool = True,
+    varlen: bool = False,
 ) -> tuple[list[dict], dict]:
     """Collect rows for one full sweep.  Returns ``(rows, meta)``.
 
@@ -345,6 +346,15 @@ def run_in_process_bench(
             file=sys.stderr,
         )
         kernels = [k for k in kernels if k != "cuda-incr-2k"]
+    if varlen:
+        dropped = [k for k in kernels if k not in ("cuda-incr", "cuda-incr-2k")]
+        if dropped:
+            print(
+                f"NOTE: --varlen keeps only the CUDA kernels (the Triton "
+                f"references take no cu_seqlens); dropping {dropped}.",
+                file=sys.stderr,
+            )
+            kernels = [k for k in kernels if k in ("cuda-incr", "cuda-incr-2k")]
     rand_seed = (
         torch.tensor([0xDECAFBAD], device="cuda", dtype=torch.int64)
         if philox_rounds > 0
@@ -398,6 +408,11 @@ def run_in_process_bench(
         )
     else:
         print("conv1d: disabled — measuring SSU kernel only")
+    if varlen:
+        print(
+            "varlen: ENABLED — packed (1, batch*T) layout + uniform cu_seqlens; "
+            "same work as dense, only the VARLEN addressing path differs"
+        )
 
     # Pre-init L2 flush buffer (bench_checkpointing_ssu's CUDA-graph timing
     # path assumes this is set up when TimingOptions.l2_flush is True).
@@ -432,6 +447,7 @@ def run_in_process_bench(
             head_dim=head_dim,
             d_state=d_state,
             ngroups=ngroups,
+            varlen=varlen,
         )
 
         for kernel in kernels:
@@ -474,6 +490,7 @@ def run_in_process_bench(
                         "sample_idx": k,
                         "state_dtype": state_label,
                         "act_dtype": str(act_dtype).split(".")[-1],
+                        "varlen": varlen,
                         "median_us": median_us,
                         "p95_us": p95_us,
                         "p99_us": p99_us,
@@ -492,6 +509,7 @@ def run_in_process_bench(
                     "sample_idx": AGG_SENTINEL,
                     "state_dtype": state_label,
                     "act_dtype": str(act_dtype).split(".")[-1],
+                    "varlen": varlen,
                     "median_us": agg_median,
                     "p95_us": agg_p95,
                     "p99_us": agg_p99,
@@ -535,6 +553,7 @@ _CSV_FIELDNAMES = [
     "sample_idx",
     "state_dtype",
     "act_dtype",
+    "varlen",
     "median_us",
     "p95_us",
     "p99_us",
@@ -772,7 +791,24 @@ def main() -> None:
             "Only relevant with --with-conv1d.  --no-external-pdl disables."
         ),
     )
+    parser.add_argument(
+        "--varlen",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Pack inputs into the varlen (1, batch*T, ...) + cu_seqlens layout "
+            "with uniform seq_len = T — an exact A/B against dense (same work, "
+            "only the VARLEN addressing path differs).  CUDA kernels only; "
+            "incompatible with --with-conv1d (SSU-only measurement)."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.varlen and args.with_conv1d:
+        parser.error(
+            "--varlen measures SSU-only (the conv1d reference has no cu_seqlens "
+            "path); drop --with-conv1d"
+        )
 
     if args.window <= args.T:
         parser.error(f"--T ({args.T}) must be < --window ({args.window})")
@@ -786,6 +822,7 @@ def main() -> None:
         f"_b{'_'.join(str(b) for b in args.batch_sizes)}"
         f"_{args.state_dtype}_K{args.num_pnat_samples}"
         f"{'_conv1d' if args.with_conv1d else ''}"
+        f"{'_varlen' if args.varlen else ''}"
     )
     csv_path = CSV_DIR / f"{prefix}.csv"
     png_path = IMG_DIR / f"{prefix}.png"
@@ -824,6 +861,7 @@ def main() -> None:
         with_conv1d=args.with_conv1d,
         external_pdl=args.external_pdl,
         cuda_graph=args.cuda_graph,
+        varlen=args.varlen,
     )
 
     if not rows:

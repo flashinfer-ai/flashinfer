@@ -476,6 +476,12 @@ class KernelInputs:
     cumAdt_vec: torch.Tensor | None = None  # (batch, nheads, T_pad) f32
     cb_old: torch.Tensor | None = None  # (batch, nheads, 32, K_old//2) act_dtype
 
+    # Varlen (packed) mode: x/dt/B/C/out_incr above are (1, batch*T, ...) VIEWS
+    # of the same dense buffers, plus this boundary vector — identical work to
+    # dense, only the kernels' VARLEN addressing path differs.  None ⇒ dense.
+    cu_seqlens: torch.Tensor | None = None  # (batch+1,) int32, uniform steps of T
+    max_seqlen: int | None = None  # = mtp_len (JIT NPREDICTED key)
+
     def reset(self) -> None:
         """Restore ``*_work`` tensors to their pristine state."""
         self.state_work.copy_(self.state0)
@@ -562,8 +568,14 @@ def build_kernel_inputs(
     d_state: int,
     ngroups: int,
     two_kernel: bool = True,
+    varlen: bool = False,
 ) -> KernelInputs:
-    """Build a fresh tensor bundle for one benchmark configuration."""
+    """Build a fresh tensor bundle for one benchmark configuration.
+
+    ``varlen=True`` packs x/dt/B/C/out into the (1, batch*T, ...) cu_seqlens
+    layout as VIEWS of the dense build (uniform seq_len = T) — an exact A/B
+    against dense: same bytes and FLOPs, only the VARLEN addressing differs.
+    CUDA kernels only (the Triton references take no cu_seqlens)."""
     (
         state0,
         state_scale0,
@@ -602,6 +614,27 @@ def build_kernel_inputs(
     old_x0_5d = _old_x_to_5d(old_x0, cache_buf_idx0)
     d_inner = nheads * head_dim
     _conv_dim = d_inner + 2 * ngroups * d_state
+
+    cu_seqlens = None
+    if varlen:
+        total = batch * mtp_len
+        assert dt.stride(0) == mtp_len * dt.stride(1), (
+            f"dt (b,T) dims not row-major packed: stride(0)={dt.stride(0)}, "
+            f"expected {mtp_len * dt.stride(1)} — can't view as (1, total, ...)"
+        )
+        x = x.view(1, total, nheads, head_dim)
+        B = B.view(1, total, ngroups, d_state)
+        C = C.view(1, total, ngroups, d_state)
+        # tie_hdim dt has stride[-1]=0 (einops expand) — .view() rejects it,
+        # as_strided merges (b, T) while preserving the 0-stride head_dim.
+        dt = dt.as_strided(
+            (1, total, nheads, head_dim),
+            (0, dt.stride(1), dt.stride(2), dt.stride(3)),
+        )
+        out_incr = out_incr.view(1, total, nheads, head_dim)
+        cu_seqlens = torch.arange(
+            0, total + 1, mtp_len, device=x.device, dtype=torch.int32
+        )
 
     # Two-kernel split scratch (graph-safe; overwritten by the precompute each
     # iter).  fragA-native: cb_scaled m16n8k16 (8 regs/lane); cb_old m16n8k{K_old}
@@ -663,6 +696,8 @@ def build_kernel_inputs(
         cb_scaled=cb_scaled,
         cumAdt_vec=cumAdt_vec,
         cb_old=cb_old,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=mtp_len if varlen else None,
     )
 
 
@@ -850,6 +885,10 @@ def _make_run_closure(
         _cb = inputs.cb_scaled if _two else None
         _ca = inputs.cumAdt_vec if _two else None
         _cbo = inputs.cb_old if _two else None
+        assert not (inputs.cu_seqlens is not None and with_conv1d), (
+            "varlen inputs measure SSU-only — the conv1d reference has no "
+            "cu_seqlens path; got varlen=True with_conv1d=True"
+        )
         # Pin the path: "auto" would route small batches to the monolith even
         # with scratch present, silently merging the two rows.
         _algo = "two-kernel" if _two else "monolith"
@@ -942,6 +981,8 @@ def _make_run_closure(
                     cumAdt_vec=_ca,
                     cb_old=_cbo,
                     algorithm=_algo,
+                    cu_seqlens=inputs.cu_seqlens,
+                    max_seqlen=inputs.max_seqlen,
                 )
 
         return _run
