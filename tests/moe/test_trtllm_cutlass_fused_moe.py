@@ -1628,6 +1628,10 @@ def test_moe_mxfp8_mxfp4(
 @pytest.mark.parametrize(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
+# use_autotune=True is the regression coverage for issue #3558: the gemm
+# profiler used to prepare per-tensor FP8 quant params and a null
+# activation-SF buffer for MXFP8xMXFP8, crashing the tuning pass.
+@pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10],
     reason="MXFP8xMXFP8 is only supported on SM100 for now",
@@ -1642,6 +1646,7 @@ def test_moe_mxfp8_mxfp8(
     alpha,
     beta,
     limit,
+    use_autotune,
 ):
     """Test MoE with MXFP8 activations and MXFP8 weights."""
     if top_k > num_experts:
@@ -1687,21 +1692,22 @@ def test_moe_mxfp8_mxfp8(
         limit_t = None
         beta_t = None
 
-    _ = fused_moe.cutlass_fused_moe(
-        mxfp8_x,
-        selected_experts.to(torch.int),
-        routing_weights,
-        mxfp8_w1.contiguous(),
-        mxfp8_w2.contiguous(),
-        otype,
-        swiglu_alpha=alpha_t,
-        swiglu_limit=limit_t,
-        swiglu_beta=beta_t,
-        quant_scales=quant_scales,
-        input_sf=mxfp8_x_sf,
-        use_mxfp8_act_scaling=True,
-        output=flash_output,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            mxfp8_x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            mxfp8_w1.contiguous(),
+            mxfp8_w2.contiguous(),
+            otype,
+            swiglu_alpha=alpha_t,
+            swiglu_limit=limit_t,
+            swiglu_beta=beta_t,
+            quant_scales=quant_scales,
+            input_sf=mxfp8_x_sf,
+            use_mxfp8_act_scaling=True,
+            output=flash_output,
+        )
 
     dq_mxfp8_x = (
         mxfp8_dequantize_host(
