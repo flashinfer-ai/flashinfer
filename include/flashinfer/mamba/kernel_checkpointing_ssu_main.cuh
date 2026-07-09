@@ -431,69 +431,9 @@ __device__ __forceinline__ void add_init_out_ring(SmemT const& smem, TiledMma co
 }
 
 // ── OPERAND-SWAP output helpers ([DIM,NPRED]) ────────────────────────────────
-// x / old_x are the A-operands (transpose ldmatrix from the [token,d] smem via the [d,token]
-// view); CB / CB_old are the B-operands (fragB, in registers).  Kept separate from the shared
-// add_cb_x / add_D_skip / compute_z_gating (the monolith + 8-bit still use those, unswapped).
-
-// OUT.2/3 (swap): frag_y[d,t] += Σ_c operand[c,d]·CB[t,c].  A = operand [M=d, K=c] via transpose
-// LDSM (operand smem is [token,d]; smem_trans is the [d,token] view), B = CB (fragB).  Single
-// K-tile (K = NPREDICTED_PAD_MMA_M for new, MAX_WINDOW_PAD_MMA_K for old).  n = output N-tile (t).
-template <typename MmaT, int M_TILE, int K_CONTRACT, typename FragY, typename FragCB,
-          typename SmemTrans, typename S2RA, typename S2RThrA, typename ThrMma, typename TiledMma>
-__device__ __forceinline__ void add_cbx_swapped(FragY& frag_y, FragCB const& frag_CB,
-                                                SmemTrans const& smem_trans, S2RA const& s2r_A,
-                                                S2RThrA const& s2r_thr_A, ThrMma const& thr_mma,
-                                                TiledMma const& tiled_mma, int n) {
-  using namespace cute;
-  Tensor a_tile =
-      local_tile(smem_trans, make_tile(Int<M_TILE>{}, Int<K_CONTRACT>{}), make_coord(_0{}, _0{}));
-  auto a_s2r = s2r_thr_A.partition_S(a_tile);
-  auto frag_A = thr_mma.partition_fragment_A(
-      make_tensor((MmaT*)0x0, make_shape(Int<M_TILE>{}, Int<K_CONTRACT>{})));
-  auto frag_A_view = s2r_thr_A.retile_D(frag_A);
-  cute::copy(s2r_A, a_s2r, frag_A_view);
-  // frag_CB is the caller's pre-selected output-N-tile B-fragment (frag_CB_new[n]/frag_CB_old[n]);
-  // x (frag_A) is the same for all output N-tiles, so n only selects which t-tile accumulates here.
-  (void)n;
-  cute::gemm(tiled_mma, frag_y, frag_A, frag_CB, frag_y);
-}
-
-// OUT.4 (swap): frag_y[d,t] += D·x[t,d].  Read x at the output (d,t) via the transpose view
-// smem_x_trans[d,token] (== x[token,d]).  Scalar: adjacent frag elems are adjacent tokens (strided
-// by out_stride_token / D_SMEM_COLS), so no float2.
-template <typename input_t, int M_TILE, int N_TILE, typename FragY, typename SmemXTrans,
-          typename ThrMma>
-__device__ __forceinline__ void add_D_skip_swapped(FragY& frag_y, SmemXTrans const& smem_x_trans,
-                                                   ThrMma const& thr_mma, float D_val, int n) {
-  using namespace cute;
-  static_assert(sizeof(input_t) == 2, "swapped D_skip requires 2-byte input_t");
-  if (D_val == 0.f) return;
-  Tensor x_tile =
-      local_tile(smem_x_trans, make_tile(Int<M_TILE>{}, Int<N_TILE>{}), make_coord(_0{}, n));
-  Tensor x_part = thr_mma.partition_C(x_tile);
-#pragma unroll
-  for (int i = 0; i < size(frag_y); ++i) frag_y(i) += D_val * static_cast<float>(x_part(i));
-}
-
-// z-gate (swap): frag_y[d,t] *= z·sigmoid(z), z read at (d,t) via smem_z_trans[d,token].  Scalar.
-template <typename input_t, int M_TILE, int N_TILE, typename FragY, typename SmemZTrans,
-          typename ThrMma>
-__device__ __forceinline__ void compute_z_gating_swapped(FragY& frag_y,
-                                                         SmemZTrans const& smem_z_trans,
-                                                         ThrMma const& thr_mma, void const* z_ptr,
-                                                         int n) {
-  using namespace cute;
-  static_assert(sizeof(input_t) == 2, "swapped z-gate requires 2-byte input_t");
-  if (!z_ptr) return;
-  Tensor z_tile =
-      local_tile(smem_z_trans, make_tile(Int<M_TILE>{}, Int<N_TILE>{}), make_coord(_0{}, n));
-  Tensor z_part = thr_mma.partition_C(z_tile);
-#pragma unroll
-  for (int i = 0; i < size(frag_y); ++i) {
-    float const z = static_cast<float>(z_part(i));
-    frag_y(i) *= z * __fdividef(1.f, (1.f + __expf(-z)));
-  }
-}
+// add_cbx_swapped / add_D_skip_swapped / compute_z_gating_swapped moved to
+// kernel_checkpointing_ssu_common.cuh — shared with the monolith's swapped
+// output path.
 
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS, bool MUST_CHECKPOINT,

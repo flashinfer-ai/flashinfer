@@ -1679,6 +1679,107 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
       tiled_mma, thr_mma, tid, smem_C_ktiled, smem_state, frag_y...);
 }
 
+// ── Matmul 3 (OPERAND SWAP): init_out^T = state @ C^T ────────────────────────
+// frag_y[d, t] = Σ_n state[d,n]·C[t,n].  A = state (K-major smem; 2-byte via
+// LDSM, 4-byte f32 via LDS.64 — dispatched inside pipelined_kloop_gemm by
+// make_a_s2r), B = C (aliased swizzled view, LDSM_N, broadcast across the
+// M-warps).  The monolith counterpart of the main's add_init_out_ring; the
+// caller's tiled_mma splits M = D_PER_CTA across warps (Shape<M_WARPS, 1>).
+// NumStages = 2 (not the main's 3): the monolith's register context is fatter
+// (replay + CB compute inline, no maxnreg cap), and the f32 wide-A staging at
+// depth 3 (3×8 f32 + 3×4 u32 per thread) tips it over — depth 2 halves that.
+template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
+          typename TiledMma, typename ThrMma, typename... FragY>
+__device__ __forceinline__ void add_init_out_swapped(SmemT const& smem, TiledMma const& tiled_mma,
+                                                     ThrMma const& thr_mma, int tid, int state_buf,
+                                                     FragY&... frag_y) {
+  using namespace cute;
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
+  constexpr int NUM_K_TILES = DSTATE / K_TILE;
+  constexpr int M_TILE = cute::tile_size<0>(TiledMma{});
+  static_assert(sizeof(state_t) != 1, "8-bit state goes through the dedicated 8-bit kernel");
+  using AView = std::conditional_t<sizeof(state_t) == 2, MMA_prop::operand_t, state_t>;
+  auto const layout_state = make_swizzled_layout_rc<AView, D_PER_CTA, DSTATE>();
+  Tensor smem_state = make_tensor(
+      make_smem_ptr(reinterpret_cast<AView const*>(reinterpret_cast<state_t const*>(smem.state) +
+                                                   state_buf * D_PER_CTA * DSTATE)),
+      layout_state);
+  Tensor smem_state_ktiled =
+      local_tile(smem_state, make_tile(Int<M_TILE>{}, Int<K_TILE>{}), make_coord(_0{}, _));
+  auto const layout_C =
+      make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, SmemT::NPREDICTED>();
+  Tensor smem_C =
+      make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.C)), layout_C);
+  pipelined_kloop_gemm<2, NUM_K_TILES, state_t, input_t, MMA_prop::operand_t>(
+      tiled_mma, thr_mma, tid, smem_state_ktiled, smem_C, frag_y...);
+}
+
+// ── OPERAND-SWAP output helpers ([DIM,NPRED]) ────────────────────────────────
+// x / old_x are the A-operands (transpose ldmatrix from the [token,d] smem via the [d,token]
+// view); CB / CB_old are the B-operands (fragB, in registers).  Kept separate from the shared
+// add_cb_x / add_D_skip / compute_z_gating (the 8-bit kernel still uses those, unswapped).
+
+// OUT.2/3 (swap): frag_y[d,t] += Σ_c operand[c,d]·CB[t,c].  A = operand [M=d, K=c] via transpose
+// LDSM (operand smem is [token,d]; smem_trans is the [d,token] view), B = CB (fragB).  Single
+// K-tile (K = NPREDICTED_PAD_MMA_M for new, MAX_WINDOW_PAD_MMA_K for old).  n = output N-tile (t).
+template <typename MmaT, int M_TILE, int K_CONTRACT, typename FragY, typename FragCB,
+          typename SmemTrans, typename S2RA, typename S2RThrA, typename ThrMma, typename TiledMma>
+__device__ __forceinline__ void add_cbx_swapped(FragY& frag_y, FragCB const& frag_CB,
+                                                SmemTrans const& smem_trans, S2RA const& s2r_A,
+                                                S2RThrA const& s2r_thr_A, ThrMma const& thr_mma,
+                                                TiledMma const& tiled_mma, int n) {
+  using namespace cute;
+  Tensor a_tile =
+      local_tile(smem_trans, make_tile(Int<M_TILE>{}, Int<K_CONTRACT>{}), make_coord(_0{}, _0{}));
+  auto a_s2r = s2r_thr_A.partition_S(a_tile);
+  auto frag_A = thr_mma.partition_fragment_A(
+      make_tensor((MmaT*)0x0, make_shape(Int<M_TILE>{}, Int<K_CONTRACT>{})));
+  auto frag_A_view = s2r_thr_A.retile_D(frag_A);
+  cute::copy(s2r_A, a_s2r, frag_A_view);
+  // frag_CB is the caller's pre-selected output-N-tile B-fragment (frag_CB_new[n]/frag_CB_old[n]);
+  // x (frag_A) is the same for all output N-tiles, so n only selects which t-tile accumulates here.
+  (void)n;
+  cute::gemm(tiled_mma, frag_y, frag_A, frag_CB, frag_y);
+}
+
+// OUT.4 (swap): frag_y[d,t] += D·x[t,d].  Read x at the output (d,t) via the transpose view
+// smem_x_trans[d,token] (== x[token,d]).  Scalar: adjacent frag elems are adjacent tokens (strided
+// by out_stride_token / D_SMEM_COLS), so no float2.
+template <typename input_t, int M_TILE, int N_TILE, typename FragY, typename SmemXTrans,
+          typename ThrMma>
+__device__ __forceinline__ void add_D_skip_swapped(FragY& frag_y, SmemXTrans const& smem_x_trans,
+                                                   ThrMma const& thr_mma, float D_val, int n) {
+  using namespace cute;
+  static_assert(sizeof(input_t) == 2, "swapped D_skip requires 2-byte input_t");
+  if (D_val == 0.f) return;
+  Tensor x_tile =
+      local_tile(smem_x_trans, make_tile(Int<M_TILE>{}, Int<N_TILE>{}), make_coord(_0{}, n));
+  Tensor x_part = thr_mma.partition_C(x_tile);
+#pragma unroll
+  for (int i = 0; i < size(frag_y); ++i) frag_y(i) += D_val * static_cast<float>(x_part(i));
+}
+
+// z-gate (swap): frag_y[d,t] *= z·sigmoid(z), z read at (d,t) via smem_z_trans[d,token].  Scalar.
+template <typename input_t, int M_TILE, int N_TILE, typename FragY, typename SmemZTrans,
+          typename ThrMma>
+__device__ __forceinline__ void compute_z_gating_swapped(FragY& frag_y,
+                                                         SmemZTrans const& smem_z_trans,
+                                                         ThrMma const& thr_mma, void const* z_ptr,
+                                                         int n) {
+  using namespace cute;
+  static_assert(sizeof(input_t) == 2, "swapped z-gate requires 2-byte input_t");
+  if (!z_ptr) return;
+  Tensor z_tile =
+      local_tile(smem_z_trans, make_tile(Int<M_TILE>{}, Int<N_TILE>{}), make_coord(_0{}, n));
+  Tensor z_part = thr_mma.partition_C(z_tile);
+#pragma unroll
+  for (int i = 0; i < size(frag_y); ++i) {
+    float const z = static_cast<float>(z_part(i));
+    frag_y(i) *= z * __fdividef(1.f, (1.f + __expf(-z)));
+  }
+}
+
 // store_state: vectorized smem → gmem state writeback (128 threads).
 // Defined here (rather than alongside the other Phase 3 store helpers
 // below) because compute_and_store_output calls it inline — issued right
