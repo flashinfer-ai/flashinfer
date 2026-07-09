@@ -218,41 +218,50 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
         cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
         return n;
       }();
-      int const main_cta_per_sm = [] {
-        char const* e = std::getenv("FLASHINFER_SSU_MAIN_CTA_PER_SM");
-        if (e) return std::atoi(e);
-        // 2-byte state: 16 ⇒ grid = 16·NUM_SMS (≈2× the 8-block/SM resident set, so each CTA
-        // grid-strides and there are ~2 launch-waves).  Measured best at b=1024 bf16 (133.6µs) —
-        // slightly oversubscribed schedules better than exactly-resident (cps=8: 139.6).  Below
-        // occupancy (8) under-occupies and is catastrophic.
-        // 4-byte state runs STAGES=2 (below), where only ~2 blocks/SM are smem-resident and the
-        // deep ring wants LONG-LIVED CTAs, not churn: small grid wins, monotonically (b=1024 f32
-        // no-write: cps=4 122.8µs, 8: 126.3, 16: 132.0, 32: 136.9; write path same ordering).
-        // Heuristic refined later (small batches cap the grid at total_work anyway).
-        return sizeof(state_t) == 4 ? 4 : 16;
-      }();
       int const main_total_work =
           D_SPLIT * static_cast<int>(params.batch) * static_cast<int>(params.nheads);
+
+      // ── Launch-regime defaults: {NUM_STAGES, cta_per_sm} per (state width, total work) ──
+      // THE tuning table — the defaults here must stand on their own; the
+      // FLASHINFER_SSU_MAIN_{PIPELINE_STAGES,CTA_PER_SM} envs are optional overrides for
+      // experiments, never required.  Tuned on the production-shaped workload (mixed PNATs +
+      // conv1d/PDL, bench_ssu_checkpoint_mixed.py):
+      //   • 2-byte state → {1, 16} at every work level.  Occupancy regime: ~29 KB/block → 6
+      //     blocks/SM at the derived reg cap; depth 2 loses b=1024 bf16 (94.0 vs 79.6 µs
+      //     no-write).  cps=16 slightly oversubscribed beats exactly-resident (133.6 vs 139.6);
+      //     below-occupancy grids are catastrophic.
+      //   • 4-byte state → {1, 16} at every work level.  In mixed batches stg1/cps16 beats
+      //     stg2/cps4 at EVERY batch (b=32: 14.05 vs 17.22; b=1024: 154.9 vs 163.3 µs e2e):
+      //     the cps=4 grid's long-lived CTAs eat a binomial write-count straggler tail
+      //     (~9.5 µs, slot-order experiment) and can't co-reside with conv1d.  The ONE regime
+      //     preferring {2, 4} is UNIFORM-PNAT kernel isolation at work ≳ 8·SMs, where depth 2
+      //     covers the doubled state prefetch (122.8 vs 150.5 µs b=1024 no-write) — that mix
+      //     is undetectable at launch (per-slot PNATs live on device) and isn't production-
+      //     shaped, so it is NOT a default; the envs can pin it for such experiments.
+      // `total_work` parameterizes the table for future batch-dependent entries (none today:
+      // small batches self-cap the grid at total_work, so cps needs no small-batch entry).
+      struct MainRegime {
+        int stages, cta_per_sm;
+      };
+      auto const regime = [](int /*total_work*/) -> MainRegime { return {1, 16}; }(main_total_work);
+
+      // Envs are read PER LAUNCH (getenv is ~ns against a launch): tests monkeypatch them
+      // per-case, and a static latch would pin the first-seen value for the whole process.
+      int const main_cta_per_sm = [&] {
+        char const* e = std::getenv("FLASHINFER_SSU_MAIN_CTA_PER_SM");
+        int const v = e ? std::atoi(e) : 0;  // unset/<=0 → regime default
+        return v > 0 ? v : regime.cta_per_sm;
+      }();
       int64_t const main_grid_ll = static_cast<int64_t>(main_cta_per_sm) * main_num_sms;
       int const main_grid =
           static_cast<int>(main_grid_ll < main_total_work ? main_grid_ll : main_total_work);
 
-      // Ring depth (NUM_STAGES) — default is state-width-aware:
-      //   2-byte state: 1 — the OCCUPANCY regime (~29 KB/block → 6 blocks/SM at the derived reg
-      //   cap).  Depth 2 (~57 KB → 4 blocks) loses at b=1024 bf16: 94.0 vs 79.6 µs no-write.
-      //   4-byte state: 2 — the LATENCY regime.  f32 doubles the state prefetch (the largest
-      //   bundle tensor) and the 1-deep ring stops covering it: warps block at the per-unit
-      //   __pipeline_wait_prior and the MIO queue saturates (36% mio_throttle; see the plan doc).
-      //   Depth 2 wins despite dropping to 2 blocks/SM (~89 KB): b=1024 f32 no-write 153.5 →
-      //   132.3 µs (cps=16), → 122.8 with the cps=4 grid above; write 276 → 227.  Small batches
-      //   (grid capped at total_work → ~1 unit/CTA, ring never engages) may prefer 1 — override
-      //   via the env until the heuristic is batch-aware.
-      static int const main_stages = [] {
+      int const main_stages = [&] {
         char const* e = std::getenv("FLASHINFER_SSU_MAIN_PIPELINE_STAGES");
-        int const v = e ? std::atoi(e) : (sizeof(state_t) == 4 ? 2 : 1);
-        FLASHINFER_CHECK(v == 1 || v == 2,
+        int const v = e ? std::atoi(e) : 0;  // unset → regime default
+        FLASHINFER_CHECK(v == 0 || v == 1 || v == 2,
                          "FLASHINFER_SSU_MAIN_PIPELINE_STAGES must be 1 or 2, got ", v);
-        return v;
+        return v > 0 ? v : regime.stages;
       }();
 
       // INTERNAL PDL: the main ALWAYS co-launches with the precompute (attr hard-wired to 1,

@@ -83,7 +83,9 @@ MMA_FRAG_SIZE = 8
 def _two_kernel_scratch(batch, nheads, max_window, dtype, device):
     """Precompute scratch that routes checkpointing_ssu to the two-kernel split.
 
-    Shapes hold for NPREDICTED <= 16 (cumAdt_vec pads to the m16 MMA row count)."""
+    Shapes hold for NPREDICTED <= 16 (cumAdt_vec pads to the m16 MMA row count).
+    Forces algorithm="two-kernel": test batches sit below the wrapper's auto
+    threshold (batch*nheads >= sm_count) and would silently run the monolith."""
     k_old = ((max_window + 7) // 8) * 8
     return dict(
         cb_scaled=torch.empty(
@@ -93,6 +95,7 @@ def _two_kernel_scratch(batch, nheads, max_window, dtype, device):
         cb_old=torch.empty(
             batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
         ),
+        algorithm="two-kernel",
     )
 
 
@@ -588,6 +591,7 @@ def test_two_kernel_matches_monolithic(main_heads_per_cta):
             kw["cb_old"] = torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             )
+            kw["algorithm"] = "two-kernel"
         checkpointing_ssu(
             st,
             ox,
@@ -734,6 +738,7 @@ def test_two_kernel_d_split2():
             cb_old=torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             ),
+            algorithm="two-kernel",
         )
         return out, st, ox, ob, odt, oca
 
@@ -852,6 +857,7 @@ def test_two_kernel_pipeline_stages2(monkeypatch):
             cb_old=torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             ),
+            algorithm="two-kernel",
         )
         return out, st, ox, ob, odt, oca
 
@@ -953,6 +959,7 @@ def test_persistent_main_matches_monolithic(monkeypatch):
             kw["cb_old"] = torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             )
+            kw["algorithm"] = "two-kernel"
         checkpointing_ssu(
             st,
             ox,
@@ -1073,6 +1080,7 @@ def test_two_kernel_meta_ring_refill(monkeypatch):
             kw["cb_old"] = torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             )
+            kw["algorithm"] = "two-kernel"
         checkpointing_ssu(
             st,
             ox,
@@ -1197,6 +1205,7 @@ def _run_two_kernel_state_dtype_case(
             kw["cb_old"] = torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=act_dtype
             )
+            kw["algorithm"] = "two-kernel"
         checkpointing_ssu(
             st,
             ox,

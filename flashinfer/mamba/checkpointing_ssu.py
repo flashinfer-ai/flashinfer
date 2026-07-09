@@ -25,6 +25,11 @@ from ..utils import register_custom_op, register_fake_op
 
 
 @functools.cache
+def _sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+@functools.cache
 def _get_module(
     state_dtype: torch.dtype,
     input_dtype: torch.dtype,
@@ -253,6 +258,7 @@ def checkpointing_ssu(
     cb_old: Optional[torch.Tensor] = None,
     main_heads_per_cta: int = 0,
     precompute_heads_per_cta: int = 0,
+    algorithm: str = "auto",
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 
@@ -307,15 +313,23 @@ def checkpointing_ssu(
         Per-head DIM split factor.  This is only exposed for benchmarking.
         Do not use it cause it will make things slow.
     main_heads_per_cta : int
-        Two-kernel MAIN head-tiling: number of consecutive heads (within one group)
-        each main CTA processes in a loop, amortizing the per-group C / old_B loads and
-        cutting the main's CTA count (fewer waves).  Must divide nheads/ngroups; the
-        launcher snaps it to the HEADS_PER_GROUP>>k chain.  0 (default) = launcher
-        auto-heuristic (batch≥512 → 4, else 1).  Tuning knob — two-kernel path only.
+        Ignored.  The persistent grid-stride main subsumed MAIN head-tiling
+        (work-unit = one head, MHC=1); the launcher discards this value.  Kept
+        for call-site compatibility.
     precompute_heads_per_cta : int
         Two-kernel PRECOMPUTE head-tiling: heads per precompute CTA.  0 (default) uses the
         launcher's co-residency heuristic; >0 overrides it (must divide nheads/ngroups,
         snapped to the HEADS_PER_GROUP>>k chain).  Tuning knob — two-kernel path only.
+    algorithm : str
+        Kernel selection: ``"auto"`` (default), ``"monolith"``, or ``"two-kernel"``.
+        ``"auto"`` runs the two-kernel split iff the scratch trio is provided AND
+        ``batch * nheads >= sm_count``.  The crossover collapses in
+        ``batch * nheads`` across nheads (measured at TP 8/4/2) and state widths:
+        the monolith wins <= 128 work-units and the split wins from 256 on a
+        148-SM B200 (mixed-PNAT + conv1d/PDL bench; ties take the split).
+        ``"two-kernel"`` forces the split (scratch trio required); ``"monolith"``
+        forces the monolith (scratch ignored).  Benches/tests that must pin the
+        path should force it.
     enable_pdl : bool
         When True the kernel is launched with
         `cudaLaunchAttributeProgrammaticStreamSerialization`, enabling the
@@ -326,9 +340,10 @@ def checkpointing_ssu(
     cb_scaled : Optional[torch.Tensor]
         Pre-allocated fp32 scratch for the precomputed CB matrix, shape
         (batch, nheads, T_pad, window_pad).  Providing it (together with
-        ``cumAdt_vec``) selects the **two-kernel** (precompute + main) path;
-        leaving both ``None`` runs the monolithic kernel.  Caller-allocated so
-        the path is CUDA-graph-safe (no in-wrapper allocation, like ``out``).
+        ``cumAdt_vec`` / ``cb_old``) makes the **two-kernel** (precompute + main)
+        path available — ``algorithm`` decides whether it runs; leaving all three
+        ``None`` always runs the monolithic kernel.  Caller-allocated so the path
+        is CUDA-graph-safe (no in-wrapper allocation, like ``out``).
     cumAdt_vec : Optional[torch.Tensor]
         Pre-allocated fp32 scratch for the per-head raw cumAdt vector, shape
         (batch, nheads, T_pad); the main kernel exponentiates it on the fly to
@@ -428,16 +443,67 @@ def checkpointing_ssu(
         f"npredicted ({npredicted}) must be <= max_window ({max_window})"
     )
 
+    # ── Monolith vs two-kernel split (auto unless forced) ──
+    # The split is AVAILABLE iff the caller provides the scratch trio — graph-safe,
+    # the caller pre-allocates like `out` (no wrapper allocation).  All three or
+    # none: cb_scaled (C5) + cumAdt_vec (β) are produced on both paths; cb_old (C6)
+    # is consumed on the no-write path, which the wrapper can't predict per-slot.
+    # The launcher routes on params.cb_scaled != nullptr.
+    scratch_provided = cb_scaled is not None
+    if scratch_provided != (cumAdt_vec is not None) or scratch_provided != (
+        cb_old is not None
+    ):
+        raise ValueError(
+            "cb_scaled, cumAdt_vec, and cb_old must be provided together (they make "
+            f"the two-kernel path available); got cb_scaled set={cb_scaled is not None}, "
+            f"cumAdt_vec set={cumAdt_vec is not None}, cb_old set={cb_old is not None}"
+        )
+    batch = cu_seqlens.numel() - 1 if cu_seqlens is not None else x.size(0)
+    nheads = state.size(1)
+    assert algorithm in ("auto", "monolith", "two-kernel"), (
+        f"algorithm must be one of 'auto', 'monolith', 'two-kernel'; got {algorithm!r}"
+    )
+    if algorithm == "auto":
+        # Crossover collapses in batch*nheads across nheads∈{16,32,64} (TP 8/4/2)
+        # and state widths {2,4} B once the main runs its stg1/cps16 default:
+        # monolith wins ≤128 work-units, the split wins from 256 (mixed-PNAT bench
+        # with conv1d+PDL — the production shape; B200, 148 SMs; see
+        # .plans/ssu_persistent_main.md).  Threshold 1 unit/SM splits the gap;
+        # ties take the split.
+        two_kernel = scratch_provided and batch * nheads >= _sm_count(state.device)
+    else:
+        two_kernel = algorithm == "two-kernel"
+        if two_kernel and not scratch_provided:
+            raise ValueError(
+                "algorithm='two-kernel' requires the cb_scaled/cumAdt_vec/cb_old "
+                "scratch trio (got none) — allocate them or use 'auto'/'monolith'"
+            )
+    if not two_kernel:
+        cb_scaled = cumAdt_vec = cb_old = None
+
     # ── d_split selection (v12 §59) ──
-    # Auto-heuristic: pick the largest pow2 ∈ {1, 2} that keeps total CTA
-    # count <= SMs * occupancy_estimate.  occupancy_estimate=2 matches the
-    # PAD_TOKENS path's CTAs/SM (see v10.7).  d_split=4 is deferred to
-    # v12.x (needs warp-count restructure for output MMA).
+    # Auto-heuristic, measured on B200 (mixed-batch bench): d_split=2 pays
+    # only when BOTH hold —
+    #   (a) f32 state: the per-CTA state load (dim/d_split × dstate × 4 B) is
+    #       the small-batch latency pole; halving it cut mixed b1 13 %
+    #       (5.73 → 4.99 µs) and won through b64.  2-byte state is half as
+    #       long already — splitting only buys duplicated B/C/x traffic and
+    #       idle output-MMA warps (bf16 regressed at every batch size).
+    #   (b) the d_split=1 grid (batch × nheads CTAs) underfills the GPU.
+    #       Crossover measured between b64 (win) and b128 (loss) at
+    #       nheads=16 on 148 SMs → threshold 8 × SM count.
+    # d_split=4 is deferred to v12.x (needs warp-count restructure for
+    # output MMA).
     if d_split is None:
-        # Auto-heuristic still clamped to 1 — re-enable as a separate
-        # tuning change once the benchmarking is in place.  The override
-        # knob is open and exercised by the d_split=2 correctness tests.
         d_split = 1
+        if (
+            not two_kernel  # monolith only — 2k main measured worse at DS=2 (ncu v30)
+            and state.dtype == torch.float32
+            and dim % 2 == 0
+            and dim // 2 >= 32
+            and batch * nheads <= 8 * _sm_count(state.device)
+        ):
+            d_split = 2
     assert d_split in (1, 2), (
         f"d_split must be in {{1, 2}} for v12 (d_split=4 deferred), got {d_split}"
     )
@@ -456,7 +522,6 @@ def checkpointing_ssu(
     # exactly one specialization instead of seven — ~7x faster per JIT.
     # The kernel asserts `params.nheads / params.ngroups == HEADS_PER_GROUP`
     # before launch.
-    nheads = state.size(1)
     ngroups = B.size(-2)
     assert nheads % ngroups == 0, (
         f"nheads ({nheads}) must be divisible by ngroups ({ngroups})"
@@ -475,22 +540,6 @@ def checkpointing_ssu(
         if D is not None
         else (dt_bias.dtype if dt_bias is not None else dt.dtype)
     )
-
-    # ── Two-kernel split dispatch (presence of caller-provided scratch) ──
-    # The two-kernel (precompute + main) path runs iff the caller provides the
-    # scratch tensors cb_scaled / cumAdt_vec / cb_old — graph-safe, since the
-    # caller pre-allocates them like `out` (no wrapper allocation).  All three
-    # or none: cb_scaled (C5) + cumAdt_vec (β) are produced on both paths;
-    # cb_old (C6) is consumed on the no-write path, which the wrapper can't
-    # predict per-slot, so it must be present whenever the path is selected.
-    # The launcher routes on params.cb_scaled != nullptr.
-    two_kernel = cb_scaled is not None
-    if two_kernel != (cumAdt_vec is not None) or two_kernel != (cb_old is not None):
-        raise ValueError(
-            "cb_scaled, cumAdt_vec, and cb_old must be provided together (all select "
-            f"the two-kernel path); got cb_scaled set={cb_scaled is not None}, "
-            f"cumAdt_vec set={cumAdt_vec is not None}, cb_old set={cb_old is not None}"
-        )
 
     _checkpointing_ssu(
         state,

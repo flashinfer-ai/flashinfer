@@ -850,20 +850,26 @@ def _make_run_closure(
         _cb = inputs.cb_scaled if _two else None
         _ca = inputs.cumAdt_vec if _two else None
         _cbo = inputs.cb_old if _two else None
-        # MAIN head-tiling knob (two-kernel only): heads-per-CTA the main loops over.
-        # 0 = launcher heuristic (batch>=512 → 4, else 1); >0 overrides.
-        # Swept via env, mirroring the precompute's FLASHINFER_SSU_HEADS_PER_CTA.
+        # Pin the path: "auto" would route small batches to the monolith even
+        # with scratch present, silently merging the two rows.
+        _algo = "two-kernel" if _two else "monolith"
+        # MAIN head-tiling knob: ignored by the launcher (persistent main is MHC=1);
+        # kept only so old env-driven sweeps don't crash.
         _mhc = (
             int(os.environ.get("FLASHINFER_SSU_MAIN_HEADS_PER_CTA", "0")) if _two else 1
         )
         # PRECOMPUTE head-tiling knob (two-kernel only): 0 = launcher co-residency heuristic;
         # >0 overrides.  Driven via FLASHINFER_SSU_HEADS_PER_CTA, passed as the Python handle.
         _phc = int(os.environ.get("FLASHINFER_SSU_HEADS_PER_CTA", "0")) if _two else 0
-        # D-split knob (two-kernel only): splits each head's DIM across D_SPLIT CTAs.
-        # DS=1 default (D_PER_CTA=64): the operand-swap output tiles M=DIM across all NUM_WARPS warps;
+        # D-split knob: splits each head's DIM across D_SPLIT CTAs.
+        # DS=1 (D_PER_CTA=64): the operand-swap output tiles M=DIM across all NUM_WARPS warps;
         # DS=2 (D_PER_CTA=32) leaves half the warps idle in the output MMA → they stall at the shared
-        # __syncthreads (big barrier-stall regression, ncu v30).  DS was a pre-swap occupancy knob.
-        _ds = int(os.environ.get("FLASHINFER_SSU_D_SPLIT", "1")) if _two else 1
+        # __syncthreads (big barrier-stall regression at saturating batch, ncu v30).  At SMALL batch
+        # the monolith grid (d_split, batch, nheads) underfills the GPU (b1 = 16 CTAs on 148 SMs), so
+        # DS=2 trades idle-warp slack nobody else wants for 2× CTAs and half the per-CTA state load.
+        # Env unset → None → the wrapper's auto-heuristic decides (f32 small-batch monolith → 2).
+        _ds_env = os.environ.get("FLASHINFER_SSU_D_SPLIT")
+        _ds = int(_ds_env) if _ds_env is not None else None
         if with_conv1d:
 
             def _run():
@@ -899,6 +905,7 @@ def _make_run_closure(
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
                     cb_old=_cbo,
+                    algorithm=_algo,
                 )
         else:
 
@@ -934,6 +941,7 @@ def _make_run_closure(
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
                     cb_old=_cbo,
+                    algorithm=_algo,
                 )
 
         return _run

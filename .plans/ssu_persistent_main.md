@@ -81,6 +81,10 @@ uv run python benchmarks/collect_checkpointing_ssu_runs.py \
     --pnat 0,1,4,8,12,14 --npredicted 4,8 --max-window 16 --tag 25
 ```
 Re-plot from an existing CSV without re-running: `--plot-only <csv>`.
+These are UNIFORM-PNAT points — pre-07-09 f32 tags were collected under the
+then-default stg2/cps4 regime, so fresh large-batch f32 2k rows read ~8-28 µs
+higher under the current stg1/cps16 default (a default change, not a kernel
+regression; the envs pass through to the child bench as optional overrides).
 
 # Mixed benchmark
 ```bash
@@ -1039,6 +1043,12 @@ Remaining (optional, ~10 µs pool): hand-rolled wide-A LDS.64 addressing (kill
 cute's per-access swizzle recompute), cp.async.cg for the read-once state stream,
 state-width-aware `main_maxnreg`, TMA state loads.
 
+**(superseded 2026-07-09)** — the stg2/cps4 f32 default was fit to the UNIFORM
+kernel-only bench and LOSES the mixed+conv1d workload at every batch; the
+launcher's per-(state-width, work) regime table now defaults to stg1/cps16, and
+stg2/cps4 stays reachable through the optional envs for uniform-bench isolation.
+See "stg1/cps16 becomes the universal main default" below.
+
 ### Tried + REVERTED: write-first / interleaved slot visiting order (B200, 2026-07-06)
 
 Mixed-batch decomposition (b=1024, mtp=6, f32, write_frac=0.31, no conv1d): our
@@ -1138,6 +1148,66 @@ The matrix is data (regenerable by parsing cached URI names); missing rows
 build lazily as before; `FLASHINFER_TEST_WARM_JIT=0` disables.  Cold CI gets
 the same parallelism.
 
+### LANDED: auto mono/2k dispatch — crossover collapses in batch×nheads (B200, 2026-07-09)
+
+Generalizes the monolith-vs-2k choice over head count (TP).  Mixed bench
+(`bench_ssu_checkpoint_mixed.py`, conv1d+PDL, K=8) at nheads=16/32/64 with
+matched ngroups (TP=8/4/2, HPG=16 fixed): the 2k−mono delta is a function of
+**units = batch × nheads** alone — deltas at equal units match within noise
+across all three head counts AND both state widths (with the main on its
+stg1/cps16 default, next section):
+
+    f32:  units  512→ +2.7/+3.0/+2.5    1024→ −0.3/−0.3/−0.4    2048→ −3.8/−4.4/−3.6
+          4096→ −8.7/−8.0/−10.3    16384→ −47.4/−45.2/−47.1    (nh16/nh32/nh64)
+    bf16: 4096→ −6.8/−6.8/−6.7     16384→ −23.1/−23.8/−23.8
+
+Physics: the GPU-fill boundary.  Below ~1 unit/SM both kernels sit on the latency
+floor and the split's second dependent launch + precompute tail is pure added
+latency; above it the faster main wins and the precompute amortizes.  Measured
+flip: mono wins ≤128 units, split from 256, BOTH dtypes (bf16 256–512u
+−1.2..−2.4; f32-stg1 256u −0.6).  bf16 concedes +0.4..+1.2 µs at exactly ~1024u
+(PDL-overlap exhaustion — co-residency room runs out before big-batch efficiency
+kicks in; a cps=4 probe didn't move it) — accepted; ties and gray zones take the
+split (Igor's call).
+
+Wrapper (`checkpointing_ssu.py`): new `algorithm: str = "auto"`.
+"auto" — split iff scratch trio present AND `batch*nheads >= sm_count`;
+"two-kernel" forces the split (scratch required); "monolith" forces the
+monolith (scratch ignored).  Scratch presence = availability, not selection
+(graph-safe, caller allocates).  d_split auto now keys on the RESOLVED path
+(was: scratch presence), so small-batch f32 keeps ds2 when auto falls back to
+the monolith.  The bench's cuda-incr/-2k rows and every 2k test site pin the
+path (`algorithm="two-kernel"`/`"monolith"`) — auto would silently run the
+monolith at their batch sizes.
+
+No-PDL / no-conv1d declared OUT OF SCOPE (production always runs conv1d+PDL).
+For the record: without conv1d the mono wins to 2048u (bf16 +0.9) and the split
+takes over by 4096u (−4.3); f32-stg1 split already wins at 2048u (−3.2).
+Cross-GPU: the sm_count scaling is physics-plausible but B200-only (TODO below).
+
+### LANDED: stg1/cps16 becomes the universal main default (B200, 2026-07-09)
+
+Igor's sweep request — is there a stages 1↔2 crossover on the 2k below b=1024?
+**No.**  Mixed+conv1d, f32, nh16 — stg1/cps16 beats stg2/cps4 at EVERY batch:
+
+    b:      16     32     64    128    256    512   1024
+    stg2: 11.98  17.22  21.94  32.90  53.09  91.33  163.28
+    stg1: 11.66  14.05  21.07  30.24  46.46  84.88  154.93
+
+(b=8 is the one +0.4 exception — below the dispatch threshold, so moot.)
+bf16 stg2/cps4: within ±0.8 µs below 2048u, ~1 µs worse above — stg1 stays.
+
+Reconciliation with the 07-06 stg2 landing: that tuning was fit to the UNIFORM
+kernel-only bench, where few long-lived CTAs keep the deep ring warm (122.8 vs
+150.5 µs at b=1024 no-write).  A mixed batch makes the per-CTA write count
+binomial — the cps=4 grid waits on its unluckiest CTA (the ~9.5 µs straggler
+tail measured in the slot-order experiment) and can't co-reside with conv1d.
+The host can't detect PNAT mixture at launch → default to the production shape;
+`FLASHINFER_SSU_MAIN_PIPELINE_STAGES=2` + `FLASHINFER_SSU_MAIN_CTA_PER_SM=4`
+recovers the uniform-bench optimum for isolated-path experiments.  This also
+closes the 07-06 CAVEAT (batch-aware stages): with the split auto-gated at
+≥1 unit/SM and stg1 universal, the small-batch stages question is moot.
+
 ## TODO
 
 - [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs
@@ -1155,3 +1225,8 @@ the same parallelism.
   already in registers after OUT.2, `D·x[t,d] = D·x[d, j=t]` could be pulled from that
   fragment instead of a fresh smem read — eliminating the D·x smem load entirely. Register
   reindex needed; defer unless ncu flags it.
+
+- [ ] **B300 spot-check of the dispatch threshold.** The mono/2k crossover collapse in
+  `batch*nheads` is validated on B200 (148 SMs) only; the `>= 1 unit/SM` threshold assumes
+  it scales with SM count.  One mixed-bench run at b∈{4,8,16,32} nh16 on B300 confirms or
+  refutes.

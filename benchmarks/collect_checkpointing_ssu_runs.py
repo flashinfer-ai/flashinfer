@@ -12,6 +12,14 @@ Usage:
 
   # Plot only from existing CSV
   python benchmarks/collect_checkpointing_ssu_runs.py --plot-only benchmarks/img/foo.csv
+
+NOTE (2026-07-09): pre-07-09 f32 tags were collected under the launcher's
+then-default stg2/cps4 regime; the default is now stg1/cps16 (tuned on the
+production-shaped mixed-PNAT + conv1d workload), so fresh f32 large-batch 2k
+rows in this UNIFORM-PNAT sweep read ~8-28 µs higher than those tags.  That is
+the default change, not a kernel regression.  The FLASHINFER_SSU_MAIN_* envs
+(inherited by the child bench subprocess) remain available as optional
+overrides to pin any regime when isolating kernels.
 """
 
 import argparse
