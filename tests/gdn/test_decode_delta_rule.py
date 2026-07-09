@@ -2398,7 +2398,8 @@ def test_gdn_decode_bf16_state_wide_vec_mtp_kernel(
 # natural (pool, HV, V, K) bf16 layout with no prepack. This is the OUTPUT-ONLY
 # path: state is frozen (disable_state_update=True) and intermediate caching is
 # unsupported, so only cache_intermediate_states=False is exercised. The kernel
-# is Blackwell-only -> SM100 skip. Grid mirrors the PR's output-only test.
+# requires SM90+ (TMA + mbarrier; validated on H200 and B200). Grid mirrors
+# the PR's output-only test.
 
 try:
     from flashinfer.gdn_kernels.gdn_decode_bf16_wy_output_only import (
@@ -2433,8 +2434,8 @@ def test_gdn_decode_bf16_wy_output_only_mtp_kernel(
 ):
     if not GDN_DECODE_BF16_WY_OUTPUT_ONLY_AVAILABLE:
         pytest.skip("gdn_decode_bf16_wy_output_only kernel not available")
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("gdn_decode_bf16_wy_output_only requires SM100 (Blackwell)")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("gdn_decode_bf16_wy_output_only requires SM90 (Hopper) or later")
     # Swap the module-level kernel symbol that _test_gdn_decode_bf16_state_mtp_kernel
     # looks up at call time. monkeypatch auto-restores after the test. The v18
     # signature is call-compatible (output-only subset), so no partial is needed.

@@ -1896,7 +1896,8 @@ class GdnDecodeKernel:
 #   A_log [HV], a [B,T,HV], dt_bias [HV], q/k [B,T,H,K], v [B,T,HV,V], b [B,T,HV],
 #   initial_state_source [pool,HV,V,K] bf16, initial_state_indices [B] int32,
 #   scale, output [B,T,HV,V] -> returns output [B,T,HV,V] bf16.
-# Requires SM100 (Blackwell); K == V == 128.
+# Requires SM90+ (TMA + mbarrier; validated on H200/SM90 and B200/GB300 SM100);
+# K == V == 128.
 # ============================================================================
 
 _CACHE: dict = {}
