@@ -1254,11 +1254,26 @@ bos < 2^23 wrapper-asserted (total packed tokens).  Storage takes `bool VARLEN`
 b=1024 f32 +6.8 → **+1.6** (1.1%), bf16 +5.0 → **+1.6** (1.7%).  Dense
 post-vs-pre = noise at every batch (b=1024 f32 140.69 vs 140.67).  Igor's
 packed-vs-padded rule ("if perf drops, single-load padded ring"): perf didn't
-drop — packed stands.  Residual ~1.6 µs at saturation: fill_meta's own loads +
-unpack ALU + the PRECOMPUTE kernel's per-CTA cu[] reads (untouched — the next
-varlen lever if we care).  Coverage: 2k+varlen was previously UNTESTED
-anywhere; `test_checkpointing_ssu_varlen_mixed_*[two_kernel-*]` now runs the
-split against the padded monolith reference (93 passed / 4 quantized skips).
+drop — packed stands.  Coverage: 2k+varlen was previously UNTESTED anywhere;
+`test_checkpointing_ssu_varlen_mixed_*[two_kernel-*]` now runs the split
+against the padded monolith reference (93 passed / 4 quantized skips).
+
+ncu attribution of the residual (`ssu_varlen_residual_{dense,varlen}.ncu-rep`,
+f32 b=1024, steady pair): main 128.32 → 128.58 µs (+0.26, NOISE — the ring did
+its job; flat-cu re-encoding of the main has nothing left to recover);
+precompute 14.02 → 15.74 µs (+1.72 = the whole residual).  Stall MIX is
+unchanged (long_scoreboard 18.7 → 17.2%) — a uniform slowdown, i.e. intrinsic
+per-CTA varlen work (row masking, int64 outer addressing), not one hot fetch.
+
+**Tried + REJECTED: precompute cu-pair hoist above the pad branch (2026-07-09).**
+Premise: the pair, sitting behind `if (cache_slot == pad) return`, serializes a
+gmem round-trip into each CTA prologue.  Measured: dense bit-identical; varlen
+f32 b=1024 142.24 → 143.22 µs (gap +1.6 → +2.4) — WORSE; bf16 noise.  nvcc
+evidently already speculates the read-only __ldg pair above the branch; the
+reorder only perturbed scheduling.  Reverted byte-clean.  Lesson: check SASS
+before reordering loads the compiler may already hoist.  Remaining precompute
+varlen cost = intrinsic; next lever (only if ~1% matters) is restructuring its
+varlen row handling, guided by the captured full-set reports.
 
 ## TODO
 
