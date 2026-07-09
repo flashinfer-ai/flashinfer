@@ -1,7 +1,30 @@
 apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2
 click
+# cuda-python + nccl4py: runtime deps for the moe_ep EP transport backends
+# (default since the EP install became opt-out; CUDA-13 wheels only — see
+# build_backend.py). NCCL-EP is the released nccl4py wheel (`nccl.ep` API +
+# bundled libnccl_ep.so); no in-tree NCCL build.
+#
+# nvidia-nccl-cu13 is deliberately NOT a base dep: torch's cu13 wheels pin it
+# EXACTLY (e.g. ==2.29.7), so any floor here (>=2.30.7 for B200 EP) makes the
+# resolver evict torch — on aarch64 it backtracks all the way to the CPU-only
+# torch 2.10.0 wheel. torch supplies libnccl; the >=2.30.7 B200 floor is
+# enforced at runtime in flashinfer/moe_ep/_validators.py, and the build hook
+# installs the newer wheel --no-deps on source installs (build_backend.py).
+#
+# The same base-deps-must-not-force-a-CUDA-major rule applies to cuda-python:
+# a >=13.0 floor bulldozes CUDA-12 environments (pip reports e.g.
+# "nvshmem4py-cu12 requires cuda-python<=12.9" and then re-resolves torch to
+# the cu13 default build, whose cuda-toolkit[cudart] dep drops libcudart.so.13
+# next to the env's libcudart.so.12 — cudnn-frontend's cuda-pathfinder loader
+# then aborts with "Multiple libcudart libraries found"). With a >=12.0 floor
+# a cu12 env keeps cuda-python 12.x (moe_ep is CUDA-13-only and its runtime
+# validator raises a clear error there), while cu13 envs resolve 13.x and get
+# the full nccl.ep stack.
+cuda-python>=12.0
 cuda-tile>=1.4.0
 einops
+nccl4py>=0.3.1
 ninja
 numpy
 nvidia-cudnn-frontend>=1.13.0

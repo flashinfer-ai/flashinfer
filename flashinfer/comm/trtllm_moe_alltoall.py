@@ -14,7 +14,7 @@ import functools
 
 from ..api_logging import flashinfer_api
 
-from .mnnvl import MnnvlMemory, MnnvlConfig
+from .mnnvl import CommBackend, MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
 from ..utils import register_custom_op, device_support_pdl
@@ -125,7 +125,8 @@ def get_moe_alltoall_module():
         payload_in_workspace: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         output_scales: Optional[torch.Tensor] = None,
-        sf_layout: SfLayout = SfLayout.layout_linear,
+        output_scalar_scale: float = 1.0,
+        sf_layout: Optional[SfLayout] = None,
         use_low_precision: bool = False,
         enable_pdl: bool = True,
     ) -> torch.Tensor:
@@ -143,11 +144,16 @@ def get_moe_alltoall_module():
             top_k: Number of experts per token
             combine_payload_offset: Offset from dispatch
             payload_in_workspace: If True, payload is workspace-backed
-            output_dtype: Optional output data type
-                currently supports [torch.bfloat16, torch.float8_e4m3fn]
-            output_scales: Optional output scale tensor for quantized outputs
-                currently support ue8m0 (packed in torch.uint8) with vector size of 32
-            sf_layout: Output swizzle layout
+            output_dtype: Optional output data type. Supported types:
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.uint8 (packed fp4)
+            output_scales: Optional output scale tensor for quantized outputs. Support types:
+                torch.uint8 (packed ue8m0), vector size of 32
+                torch.float8_e4m3fn, vector size of 16
+            output_scalar_scale: Per-tensor global scale applied before FP4 block scaling
+                (NVFP4 SFScaleVal). Defaults to 1.0; ignored by MXFP8/MXFP4 paths.
+            sf_layout: Output swizzle layout. Defaults to linear.
             use_low_precision: If True, quantize payload to FP8 before combine
             enable_pdl: Whether to use programmatic dependent launch
         Returns:
@@ -166,7 +172,8 @@ def get_moe_alltoall_module():
             payload_in_workspace,
             output_dtype,
             output_scales,
-            sf_layout.value,
+            output_scalar_scale,
+            sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
             use_low_precision,
             enable_pdl,
         )
@@ -456,6 +463,7 @@ def moe_a2a_combine(
     payload_in_workspace: bool = False,
     output_dtype: Optional[torch.dtype] = None,
     output_scales: Optional[torch.Tensor] = None,
+    output_scalar_scale: float = 1.0,
     sf_layout: SfLayout = SfLayout.layout_linear,
     use_low_precision: bool = False,
     enable_pdl: Optional[bool] = None,
@@ -494,12 +502,17 @@ def moe_a2a_combine(
         ``True`` if ``payload`` is already a workspace-backed view (skips
         the staging copy).  Defaults to ``False``.
     output_dtype : Optional[torch.dtype]
-        Optional output data type; currently supports
-        ``torch.bfloat16`` and ``torch.float8_e4m3fn``.
+        Optional output data type.  Currently supports ``torch.bfloat16``,
+        ``torch.float8_e4m3fn``, and ``torch.uint8`` (packed fp4).
     output_scales : Optional[torch.Tensor]
-        Optional output scale tensor for quantized (MXFP8) outputs.
+        Optional output scale tensor for quantized outputs.  Currently
+        supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+    output_scalar_scale : float
+        Per-tensor global scale applied before FP4 block scaling
+        (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
+        paths.
     sf_layout : SfLayout
-        Output scale-factor swizzle layout.
+        Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
     use_low_precision : bool
         If ``True``, quantize the recv-buffer payload to FP8 (e4m3) before
         accumulating; the combine upcasts to a bf16 output.
@@ -527,6 +540,7 @@ def moe_a2a_combine(
         payload_in_workspace,
         output_dtype,
         output_scales,
+        output_scalar_scale,
         sf_layout,
         use_low_precision,
         enable_pdl,
@@ -870,8 +884,76 @@ class MoeAlltoAll:
         """
         return self._state.eplb_gathered_stats
 
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Unmap MNNVL handles for checkpointing; repeated calls are no-ops."""
+        record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
+        if not record.mapped:
+            return
+        if self._state.phase != "idle":
+            raise RuntimeError(
+                "Cannot unmap MNNVL handles during an active all-to-all phase"
+            )
+
+        # Every rank must stop using the workspace before releasing its backing.
+        torch.cuda.synchronize()
+        record.comm.barrier()
+        MnnvlMemory._unmap_and_release_handles(record)
+        record.mem_handles = [None] * record.comm_size
+        record.mapped = False
+        # Do not return until every rank has released its handles.
+        record.comm.barrier()
+
+    @flashinfer_api
+    def checkpoint_restore(
+        self,
+        comm_backend: CommBackend,
+    ) -> None:
+        """Remap MNNVL handles after restore; repeated calls are no-ops."""
+        record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
+        if record.mapped:
+            return
+
+        comm_size = comm_backend.Get_size()
+        comm_rank = comm_backend.Get_rank()
+        if comm_size != record.comm_size or comm_rank != record.comm_rank:
+            raise RuntimeError(
+                "Cannot remap MNNVL handles because the communicator does not "
+                "match the graph-visible allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{record.comm_rank}/{record.comm_size}"
+            )
+        # CUDA work must quiesce before the workspace is remapped.
+        torch.cuda.synchronize()
+        record.mem_handles = MnnvlMemory._create_and_map_handles(
+            comm_backend,
+            record.aligned_size,
+            record.start_address,
+            record.rank_stride,
+            record.address_offset,
+        )
+        record.comm = comm_backend
+        MnnvlMemory.comm = comm_backend
+        record.mapped = True
+        refreshed_metainfo = moe_a2a_initialize(
+            self.workspace,
+            self.ep_rank,
+            self.ep_size,
+            self.max_num_tokens,
+        )
+        if not torch.equal(refreshed_metainfo, self.metainfo):
+            raise RuntimeError(
+                "MoeAlltoAll metainfo changed during MNNVL handle remap; "
+                "existing CUDA graphs are not safe to replay"
+            )
+        torch.cuda.synchronize()
+        comm_backend.barrier()
+        self._state = _A2AState()
+
     def _reset_workspace(self):
         """Reset the workspace to free up its state. This is mainly used for testing. Use this with caution. This object is no longer usable after this."""
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         torch.cuda.synchronize()
         del self._WORKSPACE
         del self._WORKSPACE_CACHE[
@@ -926,6 +1008,8 @@ class MoeAlltoAll:
             Workspace-backed receive tensors, one per ``input_payloads``
             entry, each shaped ``[ep_size, runtime_max_tokens_per_rank, *]``.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "idle", "dispatch called twice without combine"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "runtime_max_tokens_per_rank exceeds max_num_tokens"
@@ -983,6 +1067,7 @@ class MoeAlltoAll:
         payload_in_workspace: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         output_scales: Optional[torch.Tensor] = None,
+        output_scalar_scale: float = 1.0,
         sf_layout: SfLayout = SfLayout.layout_linear,
         use_low_precision: bool = False,
     ) -> torch.Tensor:
@@ -1000,12 +1085,17 @@ class MoeAlltoAll:
             ``True`` if ``payload`` is already a workspace-backed view (skips
             the staging copy).  Defaults to ``False``.
         output_dtype : Optional[torch.dtype]
-            Optional output data type (``torch.bfloat16`` or
-            ``torch.float8_e4m3fn``).
+            Optional output data type.  Currently supports ``torch.bfloat16``,
+            ``torch.float8_e4m3fn``, and ``torch.uint8`` (packed fp4).
         output_scales : Optional[torch.Tensor]
-            Optional output scale tensor for quantized (MXFP8) outputs.
+            Optional output scale tensor for quantized outputs.  Currently
+            supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+        output_scalar_scale : float
+            Per-tensor global scale applied before FP4 block scaling
+            (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
+            paths.
         sf_layout : SfLayout
-            Output scale-factor swizzle layout.
+            Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
         use_low_precision : bool
             If ``True``, quantize the recv-buffer payload to FP8 (e4m3) before
             accumulating; the combine upcasts to a bf16 output.
@@ -1015,6 +1105,8 @@ class MoeAlltoAll:
         torch.Tensor
             ``[local_num_tokens, elements_per_token]`` combined tensor.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "dispatched", (
             "combine called before successful dispatch"
         )
@@ -1035,6 +1127,7 @@ class MoeAlltoAll:
             payload_in_workspace,
             output_dtype,
             output_scales,
+            output_scalar_scale,
             sf_layout,
             use_low_precision,
         )
@@ -1078,6 +1171,8 @@ class MoeAlltoAll:
         RuntimeError
             If called before a successful :meth:`dispatch`.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         if self._state.phase != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before successful dispatch"

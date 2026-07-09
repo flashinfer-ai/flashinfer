@@ -23,6 +23,11 @@ from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
 
+from .gemm_bf16_fp4 import (
+    mm_bf16_fp4 as mm_bf16_fp4,
+    prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
+)
+
 from .routergemm import (
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
@@ -62,11 +67,11 @@ try:
 except ImportError:
     pass
 
-# is_cuda_tile_available is always importable — cutile_common.py has no
-# cuda.tile imports by design, so this never fails even when cuda-tile is
-# absent.  Mirrors how is_cute_dsl_available is exported unconditionally
+# is_cuda_tile_available is always importable: flashinfer.cutile.cutile_common
+# has no cuda.tile imports by design, so this never fails even when cuda-tile is
+# absent. Mirrors how is_cute_dsl_available is exported unconditionally
 # from flashinfer.cute_dsl.
-from .kernels.cutile.cutile_common import (
+from ..cutile import (
     is_cuda_tile_available as is_cuda_tile_available,
 )
 
@@ -101,6 +106,8 @@ __all__ = (
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
         "fp8_blockscale_gemm_sm90",
+        "mm_bf16_fp4",
+        "prepare_bf16_fp4_weights",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",

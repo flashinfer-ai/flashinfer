@@ -2,22 +2,23 @@
 
 This package is a thin Python wrapper over two transport backends:
 
-- ``flashinfer.moe_ep.nccl_ep``  — primary backend, wraps NVIDIA's ``nccl_ep``
-  (built in-tree from ``3rdparty/nccl/contrib/nccl_ep``).
+- ``flashinfer.moe_ep.nccl_ep``  — primary backend, wraps NVIDIA's nccl4py
+  ``nccl.ep`` API (nccl-ep-v0.1.0; provided by the released ``nccl4py`` wheel,
+  a base dependency of flashinfer-python).
 - ``flashinfer.moe_ep.nixl_ep``  — alternate backend, wraps ai-dynamo's
   ``nixl_ep`` (built in-tree from ``3rdparty/nixl/examples/device/ep``).
 
-The shared libraries that back these wrappers (``libnccl_ep.so``,
-``nixl_ep_cpp*.so``, etc.) are produced by the FlashInfer build only when
-``BUILD_NVEP=1`` is set in the env at install time:
+NCCL-EP availability is the importability of ``nccl.ep`` (no in-tree
+``libnccl_ep.so`` as of v0.1.0); NIXL-EP ships a staged ``nixl_ep_cpp*.so``.
+Both are enabled by default: plain ``pip install .`` pulls the nccl4py wheel
+and builds NIXL-EP best-effort (skipped with a warning when its build deps —
+meson, UCX, nvcc, ... — are missing). Opt out with ``BUILD_NVEP=0`` (or the
+per-backend ``BUILD_NCCL_EP=0`` / ``BUILD_NIXL_EP=0``); force a hard error on
+missing NIXL-EP build deps with ``BUILD_NIXL_EP=1``.
 
-    BUILD_NVEP=1 pip install -e ".[nvep]"
-
-Without ``BUILD_NVEP=1`` the package imports succeed but calling
+Without a built backend the package imports succeed but calling
 :func:`create_fleet` raises :class:`MoEEpNotBuiltError` with rebuild
-instructions. This file lays down only the import-time probe and the
-``Fleet`` / ``Handle`` factory plumbing; the actual abstract classes and
-backend implementations land in Part B of the integration plan.
+instructions.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from pathlib import Path
 
 from .algo_knobs import (
     AlgoKnob,
+    FleetAlgoKnobAllocator,
     FleetAlgoKnobNumChannelsPerRank,
     FleetAlgoKnobNumQpsPerRank,
     FleetAlgoKnobQuantization,
@@ -44,6 +46,7 @@ from .config import (
     DispatchInputParams,
     DispatchOutput,
     EpAlgorithm,
+    EpLayout,
     FleetParams,
     HandleParams,
     QuantType,
@@ -68,7 +71,9 @@ __all__ = [
     "DispatchInputParams",
     "DispatchOutput",
     "EpAlgorithm",
+    "EpLayout",
     "Fleet",
+    "FleetAlgoKnobAllocator",
     "FleetAlgoKnobNumChannelsPerRank",
     "FleetAlgoKnobNumQpsPerRank",
     "FleetAlgoKnobQuantization",
@@ -98,10 +103,11 @@ __all__ = [
 
 _pkg_dir = Path(__file__).parent
 _REBUILD_HINT = (
-    "flashinfer.moe_ep is not built. Rebuild with:\n"
-    '    BUILD_NVEP=1 pip install -e ".[nvep]"\n'
-    "from the FlashInfer source tree. See "
-    "flashinfer/moe_ep/README.md for required system dependencies."
+    "flashinfer.moe_ep is not built. It builds by default; rebuild with:\n"
+    "    pip install -e .\n"
+    "from the FlashInfer source tree (use BUILD_NIXL_EP=1 to turn missing\n"
+    "build deps into hard errors instead of skip-with-warning). See the\n"
+    "moe_ep section of build_backend.py for required system dependencies."
 )
 
 
@@ -110,14 +116,18 @@ class MoEEpNotBuiltError(RuntimeError):
 
 
 def _probe_nccl_ep() -> bool:
-    """True if the NCCL-EP plugin .so was staged by the build.
+    """True if the NCCL-EP backend is available.
 
-    The base libnccl.so.2 is NOT staged into this package — it comes from the
-    pip-installed nvidia-nccl-cu13 wheel. The runtime loader in
-    flashinfer.moe_ep.nccl_ep loads it explicitly before opening libnccl_ep.so.
+    As of nccl-ep-v0.1.0 the backend is the nccl4py ``nccl.ep`` package (no
+    in-tree libnccl_ep.so).  Probe with ``find_spec`` so we don't import/execute
+    ``nccl.ep`` (and pull in its native lib) just to answer availability.
     """
-    libs = _pkg_dir / "nccl_ep" / "_libs"
-    return (libs / "libnccl_ep.so").exists()
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("nccl.ep") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
 
 
 def _probe_nixl_ep() -> bool:
@@ -169,9 +179,9 @@ def _require_built(backend: str) -> None:
 
 # Quiet diagnostic at import time when a build flag was set but the libs
 # are absent — most likely cause is a partial build (probe failure
-# swallowed in BUILD_NVEP=1 best-effort mode). Helpful for first-time
-# users. Covers all three opt-in flags: the legacy BUILD_NVEP alias plus
-# the per-backend BUILD_NCCL_EP / BUILD_NIXL_EP.
+# swallowed in the default best-effort mode). Helpful for first-time
+# users. Covers all three flags: the legacy BUILD_NVEP alias plus the
+# per-backend BUILD_NCCL_EP / BUILD_NIXL_EP.
 _set_build_flags = [
     name
     for name in ("BUILD_NVEP", "BUILD_NCCL_EP", "BUILD_NIXL_EP")
@@ -192,7 +202,7 @@ if _set_build_flags and not available_backends():
 
 # Trigger backend registration. Importing these modules populates
 # ``_BACKEND_REGISTRY`` via module-level assignments. Both imports are
-# pure-Python and don't touch libnccl_ep.so / nixl_ep_cpp.so — those
+# pure-Python and don't touch the nccl.ep native lib / nixl_ep_cpp.so — those
 # only load when a Fleet is actually instantiated. Must happen AFTER
 # MoEEpNotBuiltError / _require_built are defined above (the backend
 # modules `from .. import` them).

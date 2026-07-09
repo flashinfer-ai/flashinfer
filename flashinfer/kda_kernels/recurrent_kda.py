@@ -234,12 +234,19 @@ def load_qkvg_async(
     val_layout = cute.make_layout((copy_elems,))
     tiled_copy = cute.make_tiled_copy_tv(atom_async, thr_layout, val_layout)
 
-    # Gate the upper half of the block out of the issue. The split is
-    # warp-aligned at both D=128 (warps 0-1 issue, 2-3 idle) and D=64
-    # (warp 0 issues, 1 idle) -- no intra-warp divergence.
-    if tidx < N_ISSUE_THR:
-        vec_idx = tidx // N_THR_PER_VEC
-        local_tidx = tidx % N_THR_PER_VEC
+    # D=128 assigns one vector to each warp so all four warps contribute to
+    # the producer phase before the block-wide publication barrier. D=64 keeps
+    # the compact single-warp issue path.
+    should_issue = tidx < N_ISSUE_THR
+    vec_idx = tidx // N_THR_PER_VEC
+    local_tidx = tidx % N_THR_PER_VEC
+    if HEAD_DIM == 128:
+        lane_idx = tidx % 32
+        should_issue = lane_idx < N_THR_PER_VEC
+        vec_idx = tidx // 32
+        local_tidx = lane_idx
+
+    if should_issue:
         thr_copy = tiled_copy.get_slice(local_tidx)
 
         if vec_idx == 0:
@@ -1103,6 +1110,227 @@ def recurrent_kda_decode_kernel(
 
 
 # ==============================================================================
+# D128 T=4 CHUNK-MAJOR BASE KERNEL
+# ==============================================================================
+
+
+@cute.kernel
+def recurrent_kda_decode_chunk_major_kernel(
+    gQ: cute.Tensor,
+    gK: cute.Tensor,
+    gV: cute.Tensor,
+    gG: cute.Tensor,
+    gBeta: cute.Tensor,
+    gH: cute.Tensor,
+    gO: cute.Tensor,
+    gALog: cute.Tensor,
+    gDtBias: cute.Tensor,
+    gCuSeqlens: cute.Tensor,
+    gSsmStateIndices: cute.Tensor,
+    gNumAcceptedTokens: cute.Tensor,
+    scale: cutlass.Float32,
+    eps: cutlass.Float32,
+    lower_bound: cutlass.Float32,
+    HEAD_DIM: cutlass.Constexpr[int],
+    USE_QK_L2NORM: cutlass.Constexpr[int],
+    USE_GATE_IN_KERNEL: cutlass.Constexpr[int],
+    HAS_DT_BIAS: cutlass.Constexpr[int],
+    USE_LOWER_BOUND: cutlass.Constexpr[int],
+    USE_CU_SEQLENS: cutlass.Constexpr[int],
+    NUM_TOKENS: cutlass.Constexpr[int],
+):
+    """D128 T=4 base kernel with V-chunk-outer, token-inner traversal."""
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+
+    HV = cutlass.Int32(gV.shape[2])
+    H = cutlass.Int32(gQ.shape[2])
+    batch_idx = bidx // HV
+    value_head_idx = bidx % HV
+    query_head_idx = value_head_idx // (HV // H)
+
+    token_base_offset = cutlass.Int32(0)
+    seq_len = cutlass.Int32(1)
+    if USE_CU_SEQLENS == 1:
+        token_base_offset = gCuSeqlens[batch_idx].to(cutlass.Int32)
+        seq_len = gCuSeqlens[batch_idx + 1].to(cutlass.Int32) - token_base_offset
+
+    init_seq_idx = batch_idx
+    if USE_CU_SEQLENS == 1:
+        nat_raw = gNumAcceptedTokens[batch_idx].to(cutlass.Int32)
+        nat_offset = cutlass.Int32(0) if nat_raw <= 1 else (nat_raw - 1)
+        init_raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS + nat_offset].to(
+            cutlass.Int32
+        )
+        init_seq_idx = cutlass.Int32(0) if init_raw_slot < 0 else init_raw_slot
+
+    A_log_val = cutlass.Float32(0.0)
+    h_K_offset = cutlass.Int32(0)
+    if USE_GATE_IN_KERNEL == 1:
+        A_log_val = cute.exp(gALog[query_head_idx].to(cutlass.Float32), fastmath=True)
+        h_K_offset = query_head_idx * HEAD_DIM
+
+    smem = utils.SmemAllocator()
+    h_sh_a = smem.allocate_tensor(
+        cutlass.BFloat16,
+        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        byte_alignment=128,
+    )
+    h_sh_b = smem.allocate_tensor(
+        cutlass.BFloat16,
+        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        byte_alignment=128,
+    )
+    q_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
+    k_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
+    g_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
+    pred_sh = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32))
+    )
+    out_sh = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32))
+    )
+    v_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
+
+    warp_idx = tidx // 32
+    lane_idx = tidx % 32
+    k_base = warp_idx * 32
+    h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
+    seq_idx = batch_idx
+    is_active = seq_len > 0
+    token_offset = token_base_offset
+    beta = cutlass.Float32(0.0)
+    raw_slot = cutlass.Int32(0)
+    g_head = gG[(0, 0, value_head_idx, None)]
+    q_head = gQ[(0, 0, query_head_idx, None)]
+    k_head = gK[(0, 0, query_head_idx, None)]
+    v_head = gV[(0, 0, value_head_idx, None)]
+    o_head = gO[(0, 0, value_head_idx, None)]
+    h_out = gH[(batch_idx, value_head_idx, None, None)]
+    h_global_in = gH[(init_seq_idx, value_head_idx, None, None)]
+
+    for pair_idx in cutlass.range_constexpr(2):
+        v_offset_a = pair_idx * 64
+        v_offset_b = v_offset_a + 32
+        load_h_chunk_async(h_sh_a, h_global_in, tidx, v_offset_a, HEAD_DIM)
+        nvvm.cp_async_commit_group()
+        load_h_chunk_async(h_sh_b, h_global_in, tidx, v_offset_b, HEAD_DIM)
+        nvvm.cp_async_commit_group()
+
+        for token_t in cutlass.range(NUM_TOKENS):
+            if USE_CU_SEQLENS == 1:
+                raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS + token_t].to(
+                    cutlass.Int32
+                )
+                is_active = raw_slot >= 0
+                seq_idx = cutlass.Int32(0) if raw_slot < 0 else raw_slot
+            else:
+                seq_idx = batch_idx
+                is_active = seq_len > 0
+
+            token_offset = token_base_offset + token_t
+            if USE_CU_SEQLENS == 1:
+                g_head = gG[(0, token_offset, value_head_idx, None)]
+                beta = gBeta[(0, token_offset, value_head_idx)].to(cutlass.Float32)
+                q_head = gQ[(0, token_offset, query_head_idx, None)]
+                k_head = gK[(0, token_offset, query_head_idx, None)]
+                v_head = gV[(0, token_offset, value_head_idx, None)]
+                o_head = gO[(0, token_offset, value_head_idx, None)]
+            else:
+                g_head = gG[(batch_idx, 0, value_head_idx, None)]
+                beta = gBeta[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
+                q_head = gQ[(batch_idx, 0, query_head_idx, None)]
+                k_head = gK[(batch_idx, 0, query_head_idx, None)]
+                v_head = gV[(batch_idx, 0, value_head_idx, None)]
+                o_head = gO[(batch_idx, 0, value_head_idx, None)]
+            h_out = gH[(seq_idx, value_head_idx, None, None)]
+
+            if warp_idx == 0:
+                normalize_and_store_qk_to_smem(
+                    q_head,
+                    k_head,
+                    q_sh,
+                    k_sh,
+                    lane_idx,
+                    scale,
+                    eps,
+                    HEAD_DIM,
+                    USE_QK_L2NORM,
+                )
+            cute.arch.sync_threads()
+            v_sh[tidx] = v_head[tidx].to(cutlass.Float32)
+
+            if token_t == 0:
+                nvvm.cp_async_wait_group(1)
+                cute.arch.sync_threads()
+
+            compute_gate_to_smem(
+                g_sh,
+                g_head,
+                k_base,
+                lane_idx,
+                A_log_val,
+                gDtBias,
+                h_K_offset,
+                lower_bound,
+                USE_GATE_IN_KERNEL,
+                HAS_DT_BIAS,
+                USE_LOWER_BOUND,
+            )
+            cute.arch.sync_threads()
+
+            _process_v_chunk(
+                h_sh_a,
+                h_sh_a,
+                h_chunk,
+                lane_idx,
+                warp_idx,
+                k_base,
+                g_sh,
+                k_sh,
+                q_sh,
+                v_sh,
+                pred_sh,
+                out_sh,
+                v_offset_a,
+                o_head,
+                beta,
+                is_active,
+                HEAD_DIM,
+            )
+
+            if token_t == 0:
+                nvvm.cp_async_wait_group(0)
+            cute.arch.sync_threads()
+            if is_active:
+                store_h_smem_to_gmem(h_sh_a, h_out, tidx, v_offset_a, HEAD_DIM)
+
+            _process_v_chunk(
+                h_sh_b,
+                h_sh_b,
+                h_chunk,
+                lane_idx,
+                warp_idx,
+                k_base,
+                g_sh,
+                k_sh,
+                q_sh,
+                v_sh,
+                pred_sh,
+                out_sh,
+                v_offset_b,
+                o_head,
+                beta,
+                is_active,
+                HEAD_DIM,
+            )
+            cute.arch.sync_threads()
+            if is_active:
+                store_h_smem_to_gmem(h_sh_b, h_out, tidx, v_offset_b, HEAD_DIM)
+            cute.arch.sync_threads()
+
+
+# ==============================================================================
 # V-TILED KERNEL (experimental: one V-chunk per CTA)
 # ==============================================================================
 # Unlike `recurrent_kda_decode_kernel` which runs one CTA per (batch, head) and
@@ -1223,12 +1451,14 @@ def recurrent_kda_decode_vtile_kernel(
     # skipped by idle lanes).
     v_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM + 32)
 
-    # bf16 staging buffers for cp.async'd Q/K/V/G. 16-byte aligned so 64-bit
-    # cp.async destinations are 8B-aligned.
-    q_raw_sh = smem.allocate_tensor(cutlass.BFloat16, HEAD_DIM, byte_alignment=16)
-    k_raw_sh = smem.allocate_tensor(cutlass.BFloat16, HEAD_DIM, byte_alignment=16)
-    v_raw_sh = smem.allocate_tensor(cutlass.BFloat16, HEAD_DIM, byte_alignment=16)
-    g_raw_sh = smem.allocate_tensor(cutlass.BFloat16, HEAD_DIM, byte_alignment=16)
+    # T>1 ping-pongs raw inputs so token t+1 can be in flight while token t
+    # computes. T=1 has one bank and the constexpr shape adds no extra storage.
+    N_RAW_BANKS: cutlass.Constexpr[int] = 2 if NUM_TOKENS > 1 else 1
+    raw_layout = cute.make_layout((N_RAW_BANKS, HEAD_DIM), stride=(HEAD_DIM, 1))
+    q_raw_sh = smem.allocate_tensor(cutlass.BFloat16, raw_layout, byte_alignment=16)
+    k_raw_sh = smem.allocate_tensor(cutlass.BFloat16, raw_layout, byte_alignment=16)
+    v_raw_sh = smem.allocate_tensor(cutlass.BFloat16, raw_layout, byte_alignment=16)
+    g_raw_sh = smem.allocate_tensor(cutlass.BFloat16, raw_layout, byte_alignment=16)
 
     warp_idx = tidx // 32
     lane_idx = tidx % 32
@@ -1275,6 +1505,11 @@ def recurrent_kda_decode_vtile_kernel(
             is_active = seq_len > 0
 
         token_offset = token_base_offset + token_t
+        raw_bank = token_t % N_RAW_BANKS
+        q_raw = q_raw_sh[(raw_bank, None)]
+        k_raw = k_raw_sh[(raw_bank, None)]
+        v_raw = v_raw_sh[(raw_bank, None)]
+        g_raw = g_raw_sh[(raw_bank, None)]
 
         # ----------------------------------------------------------------
         # Batched async gmem->smem issue.
@@ -1291,38 +1526,54 @@ def recurrent_kda_decode_vtile_kernel(
                 HEAD_DIM,
                 V_TILE_ROWS,
             )
-        issue_qkvg_async_for_token(
-            q_raw_sh,
-            k_raw_sh,
-            v_raw_sh,
-            g_raw_sh,
-            gQ,
-            gK,
-            gV,
-            gG,
-            batch_idx,
-            token_offset,
-            query_head_idx,
-            value_head_idx,
-            tidx,
-            HEAD_DIM,
-            USE_CU_SEQLENS,
-        )
-        nvvm.cp_async_commit_group()
+            issue_qkvg_async_for_token(
+                q_raw,
+                k_raw,
+                v_raw,
+                g_raw,
+                gQ,
+                gK,
+                gV,
+                gG,
+                batch_idx,
+                token_offset,
+                query_head_idx,
+                value_head_idx,
+                tidx,
+                HEAD_DIM,
+                USE_CU_SEQLENS,
+            )
+            nvvm.cp_async_commit_group()
 
-        # Register-carry writeback for token>0 overlaps the cp.async issue
-        # above (targets h_sh; cp.async targets disjoint *_raw_sh buffers).
-        # Previous iter's token-boundary sync guarantees store_h_smem_to_gmem
-        # finished reading h_sh before we clobber it here. Guard so idle lanes
-        # at V_TILE_ROWS=16 don't write OOB into h_sh (sized (V_TILE_ROWS, K)).
-        if token_t > 0:
-            if lane_idx < V_TILE_ROWS:
-                write_h_chunk_to_smem(h_chunk, h_sh, lane_idx, k_base)
+        # For token>0, h_sh already contains the prior token's BF16 checkpoint
+        # written by _process_v_chunk. The cp.async destinations are disjoint.
 
-        # Drain all async loads + publish h_sh register-carry writeback in a
-        # single cross-thread sync.
+        # Drain all async loads and publish the staging buffers in one
+        # cross-thread sync.
         nvvm.cp_async_wait_group(0)
         cute.arch.sync_threads()
+
+        if token_t + 1 < NUM_TOKENS:
+            next_token_offset = token_base_offset + token_t + 1
+            next_raw_bank = (token_t + 1) % N_RAW_BANKS
+            issue_qkvg_async_for_token(
+                q_raw_sh[(next_raw_bank, None)],
+                k_raw_sh[(next_raw_bank, None)],
+                v_raw_sh[(next_raw_bank, None)],
+                g_raw_sh[(next_raw_bank, None)],
+                gQ,
+                gK,
+                gV,
+                gG,
+                batch_idx,
+                next_token_offset,
+                query_head_idx,
+                value_head_idx,
+                tidx,
+                HEAD_DIM,
+                USE_CU_SEQLENS,
+            )
+            nvvm.cp_async_commit_group()
 
         # ----------------------------------------------------------------
         # Consume bf16 staging buffers. Reads are cross-warp (e.g., warp 3
@@ -1333,8 +1584,8 @@ def recurrent_kda_decode_vtile_kernel(
         # negligible -- ~HEAD_DIM flops vs. state update's ~32*HEAD_DIM).
         if warp_idx == 0:
             normalize_and_store_qk_to_smem(
-                q_raw_sh,
-                k_raw_sh,
+                q_raw,
+                k_raw,
                 q_sh,
                 k_sh,
                 lane_idx,
@@ -1346,13 +1597,13 @@ def recurrent_kda_decode_vtile_kernel(
 
         # V: bf16 staging -> f32 working buffer. Same-thread read/write;
         # cross-warp visibility is resolved by the next sync_threads().
-        v_sh[tidx] = v_raw_sh[tidx].to(cutlass.Float32)
+        v_sh[tidx] = v_raw[tidx].to(cutlass.Float32)
 
         # Per-K gate: each warp reads its own g_raw_sh[k_base..k_base+31]
         # slice. Writes go to g_sh at disjoint per-warp offsets.
         compute_gate_to_smem(
             g_sh,
-            g_raw_sh,
+            g_raw,
             k_base,
             lane_idx,
             A_log_val,
@@ -1406,10 +1657,6 @@ def recurrent_kda_decode_vtile_kernel(
                 V_TILE_ROWS,
             )
 
-        # Token boundary barrier: ensure h_sh GMEM store completes before next
-        # iteration's register-carry write clobbers h_sh.
-        cute.arch.sync_threads()
-
 
 # ==============================================================================
 # LAUNCH WRAPPERS
@@ -1441,13 +1688,19 @@ def recurrent_kda_launch(
     USE_LOWER_BOUND: cutlass.Constexpr[int],
     USE_CU_SEQLENS: cutlass.Constexpr[int],
     NUM_TOKENS: cutlass.Constexpr[int],
+    USE_CHUNK_MAJOR: cutlass.Constexpr[int],
 ):
     batch_size = mQ.shape[0]
     if USE_CU_SEQLENS == 1:
         batch_size = mCuSeqlens.shape[0] - 1
     HV = mV.shape[2]
 
-    recurrent_kda_decode_kernel(
+    if cutlass.const_expr(USE_CHUNK_MAJOR == 1):
+        kernel = recurrent_kda_decode_chunk_major_kernel
+    else:
+        kernel = recurrent_kda_decode_kernel
+
+    kernel(
         mQ,
         mK,
         mV,
@@ -1627,6 +1880,7 @@ def _get_compiled_kernel(
     USE_LOWER_BOUND,
     USE_CU_SEQLENS,
     NUM_TOKENS=1,
+    USE_CHUNK_MAJOR=0,
 ):
     """Cache compiled kernel for given configuration."""
     B, H, HV, N = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
@@ -1694,6 +1948,7 @@ def _get_compiled_kernel(
         USE_LOWER_BOUND,
         USE_CU_SEQLENS,
         NUM_TOKENS,
+        USE_CHUNK_MAJOR,
         options="--enable-tvm-ffi --generate-line-info",
     )
 
@@ -2158,6 +2413,8 @@ def run_recurrent_kda(
     USE_CU = 1 if cu_seqlens_i32 is not None else 0
     if cu_seqlens is None:
         NUM_TOKENS = 1
+    grid_seqs = cu_seqlens_i32.shape[0] - 1 if cu_seqlens_i32 is not None else B
+    base_grid = grid_seqs * HV
     # Dispatch between the base and v-tiled kernels.
     #   - base:  grid = B*HV, one CTA per (batch, head), SMEM ping-pong over V chunks.
     #            Wins when the grid is large enough to saturate SMs (larger B).
@@ -2177,8 +2434,6 @@ def run_recurrent_kda(
     elif _vtile_env == "0":
         use_vtile = False
     else:
-        grid_seqs = cu_seqlens_i32.shape[0] - 1 if cu_seqlens_i32 is not None else B
-        base_grid = grid_seqs * HV
         use_vtile = base_grid < 4 * _get_num_sms(device)
 
     # V-row tile size inside vtile: 32 (standard) or 16 (finer-grained).
@@ -2217,8 +2472,16 @@ def run_recurrent_kda(
                 V_TILE_ROWS,
             )
     else:
+        use_chunk_major = K == 128 and NUM_TOKENS == 4 and base_grid >= 2048
         compiled = _get_compiled_kernel(
-            K, USE_QK_NORM, USE_GATE, HAS_BIAS, USE_LB, USE_CU, NUM_TOKENS
+            K,
+            USE_QK_NORM,
+            USE_GATE,
+            HAS_BIAS,
+            USE_LB,
+            USE_CU,
+            NUM_TOKENS,
+            int(use_chunk_major),
         )
 
     # Dummy tensors for unused optional args (TVM FFI requires all args present)

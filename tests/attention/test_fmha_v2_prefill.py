@@ -1003,8 +1003,6 @@ def test_trtllm_fmha_v2_prefill_skip_softmax(
     rtol: float,
     atol: float,
 ) -> None:
-    if dtype == torch.float8_e4m3fn:
-        pytest.skip("FP8 (e4m3) FMHA v2 kernels are known to hang on SM90")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,

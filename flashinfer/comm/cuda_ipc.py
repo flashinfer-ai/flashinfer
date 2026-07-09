@@ -191,7 +191,19 @@ class CudaRTLibrary:
         return devPtr
 
 
-cudart = CudaRTLibrary()
+class _LazyCudaRTLibrary:
+    _library: Optional[CudaRTLibrary] = None
+
+    def _get_library(self) -> CudaRTLibrary:
+        if self._library is None:
+            self._library = CudaRTLibrary()
+        return self._library
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._get_library(), name)
+
+
+cudart = _LazyCudaRTLibrary()
 
 
 def create_shared_buffer(

@@ -1448,8 +1448,15 @@ struct Kernel_traits : public Base {
   enum { VEC_COLS_PER_LDG = CTAS_PER_ROW * THREADS_PER_ROW };
   // The total number of vectorized loads/stores per hidden vector.
   enum { VEC_COLS = COLS / ELTS_PER_LDG };
-  // The number of loads per thread for the input.
-  enum { LDGS = VEC_COLS / VEC_COLS_PER_LDG };
+  // Allow VEC_COLS not divisible by VEC_COLS_PER_LDG by emitting one
+  // partial tail LDG (predicated per lane). When VEC_COLS is an exact
+  // multiple, HAS_TAIL_LDG is 0 and the predicate degenerates to a
+  // compile-time true, so the original codegen is preserved.
+  enum { LDGS_FULL = VEC_COLS / VEC_COLS_PER_LDG };
+  enum { TAIL_VEC_COLS = VEC_COLS - LDGS_FULL * VEC_COLS_PER_LDG };
+  enum { HAS_TAIL_LDG = (TAIL_VEC_COLS > 0) ? 1 : 0 };
+  // The number of loads per thread for the input (full + optional tail).
+  enum { LDGS = LDGS_FULL + HAS_TAIL_LDG };
 
   using Stats = Stats<compute_t, CTAS_PER_ROW, WARPS_M, WARPS_N, USE_CLUSTER, WHOLE_CTA>;
   enum { SMEM_BYTES_FWD = Stats::SMEM_BYTES };
