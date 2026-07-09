@@ -24,7 +24,7 @@ from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.attention import cute_dsl_batch_prefill_run_trace
 
 from ..config import AttentionConfig, AttentionFusion
-from ..fusion.mask import MaskType
+from ..fusion.mask import MaskSpec
 from ..fusion.variant import AttentionVariant, StandardAttention
 from ..prefill import BlackwellFusedMultiHeadAttentionForward
 
@@ -36,8 +36,7 @@ def _get_compiled_prefill_kernel(
     num_qo_heads,
     num_kv_heads,
     head_dim,
-    mask_type,
-    window_left,
+    mask_spec,
     is_persistent,
     variant,
     params_shape,
@@ -65,9 +64,8 @@ def _get_compiled_prefill_kernel(
         pv_acc_dtype=cutlass.Float32,
         mma_tiler=(128, 128, head_dim),
         is_persistent=is_persistent,
-        mask_type=mask_type,
+        mask_spec=mask_spec,
         num_repeat_kv_heads=h_r,
-        window_left=window_left,
     )
     _dtype_width_map = {
         cutlass.Float16: 16,
@@ -210,6 +208,7 @@ class BatchPrefillCuteDSLWrapper:
         q_data_type=torch.float16,
         kv_data_type=torch.float16,
         window_left: int = -1,
+        window_right: int = -1,
         variant: AttentionVariant | None = None,
     ) -> None:
         """Compile the FMHA prefill kernel for the given configuration.
@@ -237,7 +236,13 @@ class BatchPrefillCuteDSLWrapper:
         kv_data_type : torch.dtype
             Data type for keys/values.
         window_left : int
-            Sliding window size. -1 disables sliding window.
+            Max lookback distance: query ``q`` attends to keys
+            ``k >= q + (kv_len - qo_len) - window_left``. -1 = unbounded.
+            Composes with ``causal`` (causal sliding window attention).
+        window_right : int
+            Max lookahead distance for non-causal masks: query ``q`` attends
+            to keys ``k <= q + (kv_len - qo_len) + window_right``. -1 =
+            unbounded. Mutually exclusive with ``causal=True``.
         variant : Optional[AttentionVariant]
             Attention variant (ALiBi, RPE, Sigmoid, etc.). None uses standard softmax.
         """
@@ -303,15 +308,14 @@ class BatchPrefillCuteDSLWrapper:
 
         mma_tiler_n = 128
 
-        # Determine mask type
-        self._mask_type = MaskType.NO_MASK
-        if self._causal:
-            self._mask_type = MaskType.CAUSAL_MASK
-        elif window_left > 0:
-            self._mask_type = MaskType.SLIDING_WINDOW_MASK
-        else:
-            if torch.any(s_k % mma_tiler_n != 0).item():
-                self._mask_type = MaskType.RESIDUAL_MASK
+        # Mask band: causal and window bounds are independent, composable
+        # parameters (MaskSpec validates causal/window_right exclusivity).
+        self._mask_spec = MaskSpec(
+            causal=self._causal,
+            window_left=window_left,
+            window_right=window_right,
+            check_kv_bounds=bool(torch.any(s_k % mma_tiler_n != 0).item()),
+        )
 
         self._problem_size = (
             self._batch_size,
@@ -337,8 +341,7 @@ class BatchPrefillCuteDSLWrapper:
             num_qo_heads,
             num_kv_heads,
             self._head_dim,
-            self._mask_type,
-            window_left,
+            self._mask_spec,
             self._is_persistent,
             cache_variant,
             params_shape,

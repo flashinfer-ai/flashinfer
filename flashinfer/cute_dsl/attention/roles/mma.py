@@ -55,8 +55,7 @@ class MmaRole:
         has_logits_transform: bool = False,
     ):
         self.cta_tiler = config.cta_tiler
-        self.mask_type = config.mask_type
-        self.window_left = config.window_left
+        self.mask_spec = config.mask_spec
         self.tmem_alloc_cols = tmem_alloc_cols
         self.tmem_alloc_sync_bar_id = tmem_alloc_sync_bar_id
         self.threads_per_warp = threads_per_warp
@@ -294,8 +293,7 @@ class MmaRole:
 
                 seqlen_kv_loop_steps = (
                     get_trip_count(
-                        self.mask_type,
-                        self.window_left,
+                        self.mask_spec,
                         curr_block_coord,
                         self.cta_tiler,
                         seqlen_k,

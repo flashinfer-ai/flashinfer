@@ -5,7 +5,8 @@
 
 Covers: basic prefill (various q/kv/batch combos, GQA vs MHA, causal),
 variable-length sequences, output transform, logits transform (sigmoid),
-and attention sink.
+attention sink, and band masks (causal sliding window, symmetric window,
+left-bound-only window).
 
 Each unique (mask_type, fusion) combination triggers one JIT compilation
 (~30s). The test matrix is designed to reuse compiled kernels across
@@ -792,18 +793,23 @@ def test_attention_prefill_fp16(
 # ---------------------------------------------------------------------------
 
 
-def attention_sliding_window_ref(
+def attention_band_mask_ref(
     batch_size,
     q,
     k,
     v,
-    window_left,
     sm_scale,
+    causal,
+    window_left,
+    window_right,
 ):
-    """Reference for symmetric sliding window: |kv_idx - (q_idx + offset)| <= window_left.
+    """Band-mask reference. With offset = kv_len - qo_len (Q right-aligned
+    to KV), row q sees k in::
 
-    When qo_len != kv_len, Q positions are right-aligned to KV: q_idx maps
-    to kv position q_idx + (kv_len - qo_len).
+        max(0, q + offset - window_left) <= k <= q + offset            (causal)
+        max(0, q + offset - window_left) <= k <= q + offset + window_right
+
+    where a window value of -1 means unbounded on that side.
     """
     qo_len = q.shape[0] // batch_size
     kv_len = k.shape[0] // batch_size
@@ -829,7 +835,13 @@ def attention_sliding_window_ref(
     qk_offset = kv_len - qo_len
     q_idx = torch.arange(qo_len, device=q.device).unsqueeze(1)
     k_idx = torch.arange(kv_len, device=q.device).unsqueeze(0)
-    mask = torch.abs(k_idx - (q_idx + qk_offset)) <= window_left
+    mask = torch.ones(qo_len, kv_len, dtype=torch.bool, device=q.device)
+    if causal:
+        mask &= k_idx <= q_idx + qk_offset
+    elif window_right >= 0:
+        mask &= k_idx - (q_idx + qk_offset) <= window_right
+    if window_left >= 0:
+        mask &= (q_idx + qk_offset) - k_idx <= window_left
     logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
 
     p = torch.softmax(logits, dim=-1)
@@ -846,29 +858,7 @@ def attention_sliding_window_ref(
     return o_ref
 
 
-SLIDING_WINDOW_PARAMS = [
-    # (batch, qo_len, kv_len, window_left)
-    (1, 256, 256, 64),
-    (1, 256, 256, 128),
-    (9, 256, 256, 100),
-    (1, 512, 512, 200),
-    # qo_len != kv_len (Q right-aligned to KV, as in append/prefill-with-cache)
-    (1, 128, 256, 64),
-    (1, 128, 512, 100),
-    (1, 256, 512, 128),
-    (3, 128, 384, 80),
-]
-
-
-@pytest.mark.parametrize("batch_size,qo_len,kv_len,window_left", SLIDING_WINDOW_PARAMS)
-def test_attention_prefill_sliding_window(
-    batch_size,
-    qo_len,
-    kv_len,
-    window_left,
-):
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("SM100A is not supported on this device")
+def _run_band_mask_case(batch_size, qo_len, kv_len, causal, window_left, window_right):
     num_kv_heads = 8
 
     torch.manual_seed(42)
@@ -898,16 +888,116 @@ def test_attention_prefill_sliding_window(
         num_kv_heads,
         HEAD_DIM,
         head_dim_vo=HEAD_DIM,
-        causal=False,
+        causal=causal,
         sm_scale=SM_SCALE,
         q_data_type=DTYPE,
         kv_data_type=DTYPE,
         window_left=window_left,
+        window_right=window_right,
     )
     o = wrapper.run(q, k, v)
-    o_ref = attention_sliding_window_ref(batch_size, q, k, v, window_left, SM_SCALE)
+    o_ref = attention_band_mask_ref(
+        batch_size, q, k, v, SM_SCALE, causal, window_left, window_right
+    )
 
     torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
+SLIDING_WINDOW_PARAMS = [
+    # (batch, qo_len, kv_len, window_left)
+    (1, 256, 256, 64),
+    (1, 256, 256, 128),
+    (9, 256, 256, 100),
+    (1, 512, 512, 200),
+    # qo_len != kv_len (Q right-aligned to KV, as in append/prefill-with-cache)
+    (1, 128, 256, 64),
+    (1, 128, 512, 100),
+    (1, 256, 512, 128),
+    (3, 128, 384, 80),
+]
+
+# Causal sliding window (the serving configuration, e.g. Mistral/Gemma SWA).
+# Window values reuse the symmetric list's to share compiled kernels where
+# possible; includes a non-tile-aligned kv_len to exercise the seqlen_k tail
+# combined with the window left edge.
+CAUSAL_SLIDING_WINDOW_PARAMS = [
+    # (batch, qo_len, kv_len, window_left)
+    (1, 256, 256, 64),
+    (1, 512, 512, 128),
+    (9, 256, 256, 100),
+    (1, 128, 512, 100),  # qo_len != kv_len
+    (1, 256, 300, 64),  # kv_len not tile-aligned
+]
+
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len,window_left", SLIDING_WINDOW_PARAMS)
+def test_attention_prefill_sliding_window_symmetric(
+    batch_size,
+    qo_len,
+    kv_len,
+    window_left,
+):
+    """Non-causal symmetric window: k in [q+off-w, q+off+w]."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    _run_band_mask_case(
+        batch_size,
+        qo_len,
+        kv_len,
+        causal=False,
+        window_left=window_left,
+        window_right=window_left,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,window_left", CAUSAL_SLIDING_WINDOW_PARAMS
+)
+def test_attention_prefill_causal_sliding_window(
+    batch_size,
+    qo_len,
+    kv_len,
+    window_left,
+):
+    """Causal + window_left: k in [q+off-w, q+off] (regression: the window
+    used to be silently ignored when causal=True)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    _run_band_mask_case(
+        batch_size,
+        qo_len,
+        kv_len,
+        causal=True,
+        window_left=window_left,
+        window_right=-1,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,window_left",
+    [
+        (1, 256, 256, 64),
+        (1, 128, 512, 100),
+    ],
+)
+def test_attention_prefill_left_window_only(
+    batch_size,
+    qo_len,
+    kv_len,
+    window_left,
+):
+    """Non-causal left-bound-only window: k in [q+off-w, kv_len), matching
+    the FlashInfer window_left convention (variants.cuh)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    _run_band_mask_case(
+        batch_size,
+        qo_len,
+        kv_len,
+        causal=False,
+        window_left=window_left,
+        window_right=-1,
+    )
 
 
 # ---------------------------------------------------------------------------

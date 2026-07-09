@@ -20,7 +20,7 @@ from cutlass.cute.typing import Int32
 from cutlass.pipeline import PipelineProducer
 
 from ..config import AttentionConfig
-from ..fusion.mask import get_trip_count, get_kv_start_block_idx
+from ..fusion.mask import get_kv_block_range
 from ..scheduler.persistent import (
     FmhaStaticTileScheduler,
     FmhaStaticTileSchedulerParams,
@@ -38,8 +38,7 @@ class LoaderRole:
         self.cta_tiler = config.cta_tiler
         self.qk_mma_tiler = config.qk_mma_tiler
         self.pv_mma_tiler = config.pv_mma_tiler
-        self.mask_type = config.mask_type
-        self.window_left = config.window_left
+        self.mask_spec = config.mask_spec
 
     # =========================================================================
     #  Reusable primitives — for composing new kernel variants
@@ -266,14 +265,14 @@ class LoaderRole:
                     tma_bar_ptr=q0_handle_producer.barrier,
                 )
                 # K0
-                kv_coord = get_kv_start_block_idx(
-                    self.mask_type,
-                    self.window_left,
+                kv_block_start, kv_block_end = get_kv_block_range(
+                    self.mask_spec,
                     curr_block_coord,
                     self.cta_tiler,
                     seqlen_k,
                     seqlen_q,
                 )
+                kv_coord = kv_block_start
                 k_handle_producer = load_kv_producer.acquire_and_advance()
                 cute.copy(
                     tma_atom_k,
@@ -300,17 +299,7 @@ class LoaderRole:
                 )
                 kv_coord += 1
 
-                seqlen_kv_loop_steps = (
-                    get_trip_count(
-                        self.mask_type,
-                        self.window_left,
-                        curr_block_coord,
-                        self.cta_tiler,
-                        seqlen_k,
-                        seqlen_q,
-                    )
-                    - 1
-                )
+                seqlen_kv_loop_steps = kv_block_end - kv_block_start - 1
                 for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                     # Ki
                     k_handle_producer = load_kv_producer.acquire_and_advance()

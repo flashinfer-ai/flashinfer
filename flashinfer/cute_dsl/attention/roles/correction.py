@@ -53,8 +53,7 @@ class CorrectionRole:
         self.pv_mma_tiler = config.pv_mma_tiler
         self.pv_acc_dtype = config.pv_acc_dtype
         self.cta_tiler = config.cta_tiler
-        self.mask_type = config.mask_type
-        self.window_left = config.window_left
+        self.mask_spec = config.mask_spec
 
         # From TMEM layout
         self.tmem_vec0_offset = tmem.vec0_offset
@@ -360,8 +359,7 @@ class CorrectionRole:
                 vec1_handle = s1_corr_consumer.wait_and_advance()
                 seqlen_kv_loop_steps = (
                     get_trip_count(
-                        self.mask_type,
-                        self.window_left,
+                        self.mask_spec,
                         curr_block_coord,
                         self.cta_tiler,
                         seqlen_k,
