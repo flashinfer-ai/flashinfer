@@ -72,6 +72,8 @@ def run_sampling_test(args):
         return testTopKPageTableTransform(args)
     elif args.routine == "top_k_ragged_transform":
         return testTopKRaggedTransform(args)
+    elif args.routine == "top_k_decode":
+        return testTopKDecode(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -181,8 +183,8 @@ def parse_sampling_args(line, parser):
         required=False,
         nargs="+",
         default=["cuda"],
-        choices=["cuda"],
-        help="Kernel backends to test. Default: cuda",
+        choices=["cuda", "radix", "gvr"],
+        help="Kernel backends to test. Default: cuda. Use 'radix'/'gvr' for top_k_decode.",
     )
 
     args = parser.parse_args(line)
@@ -1895,6 +1897,129 @@ def testTopKPageTableTransform(args):
     return res
 
 
+def testTopKDecode(args):
+    """Test top_k_decode with two runners: 'radix' (masked fallback) and 'gvr' (Blackwell GVR LB).
+
+    Runners
+    -------
+    radix  — passes ``pre_idx=None``, forcing the masked-radix fallback on any GPU.
+    gvr    — passes a pre-computed ``pre_idx``, activating the GVR LB kernel on
+             Blackwell (sm_100+).  Filtered out on older hardware by
+             ``filter_backends_by_compute_capability``.
+
+    Reference check compares the *set* of selected indices against ``torch.topk`` applied
+    to logits masked to ``seq_lens``.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopKDecode")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(f"[INFO] To reproduce this test case, run: {args.repro_command}")
+
+    backends = args.backends[:]
+    # Default to both runners when caller passes legacy "cuda"
+    if backends == ["cuda"]:
+        backends = ["radix", "gvr"]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    top_k = args.top_k
+    is_cuda_graph_compatible = False  # GVR LB uses dynamic counters; not graph-safe
+    run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+    seq_lens = torch.full((batch_size,), vocab_size, dtype=torch.int32, device=device)
+
+    # pre_idx: argmax in col-0, sequential fill elsewhere (GVR convention)
+    argmax_idx = logits.argmax(dim=-1).int()
+    pre_idx = torch.zeros(batch_size, top_k, dtype=torch.int32, device=device)
+    pre_idx[:, 0] = argmax_idx
+    for j in range(1, top_k):
+        pre_idx[:, j] = j
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {logits.shape = }, {seq_lens.shape = }, {top_k = }")
+
+    def run_backend(backend, logits):
+        if backend == "radix":
+            return flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=None)
+        elif backend == "gvr":
+            return flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=pre_idx)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend, logits).detach()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, logits),
+        )
+
+    if run_refcheck and outputs:
+        col_idx = torch.arange(vocab_size, device=device).unsqueeze(0)
+        masked = logits.masked_fill(col_idx >= seq_lens.unsqueeze(1), float("-inf"))
+        ref_indices = torch.topk(masked.float(), k=top_k, dim=-1).indices.int()
+
+        for backend, out_indices in outputs.items():
+            mismatches = sum(
+                set(ref_indices[row].cpu().tolist()) != set(out_indices[row].cpu().tolist())
+                for row in range(batch_size)
+            )
+            pct = 100.0 * mismatches / batch_size
+            if mismatches > 0:
+                print(
+                    f"[REFCHECK] Backend {backend}: {mismatches}/{batch_size} rows "
+                    f"({pct:.1f}%) differ from torch.topk reference"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(f"[ERROR] Backend {backend} output mismatch")
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            problem_bytes = (
+                batch_size * vocab_size * input_dtype.itemsize  # logits read
+                + batch_size * top_k * 4                        # pre_idx read (int32)
+                + batch_size * top_k * 4                        # indices write (int32)
+            )
+            tb_per_sec = problem_bytes / (1e9 * median_time)
+
+            print_perf_metrics(backend, median_time, std_time, 0, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = 0
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["batch_size"] = batch_size
+                cur_res["vocab_size"] = vocab_size
+                cur_res["top_k"] = top_k
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
 def testTopKRaggedTransform(args):
     """
     Test top_k_ragged_transform API.
@@ -2035,6 +2160,129 @@ def testTopKRaggedTransform(args):
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["max_len"] = max_len
                 cur_res["num_rows"] = num_rows
+                cur_res["top_k"] = top_k
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopKDecode(args):
+    """Test top_k_decode with two runners: 'radix' (masked fallback) and 'gvr' (Blackwell GVR LB).
+
+    Runners
+    -------
+    radix  — passes ``pre_idx=None``, forcing the masked-radix fallback on any GPU.
+    gvr    — passes a pre-computed ``pre_idx``, activating the GVR LB kernel on
+             Blackwell (sm_100+).  Filtered out on older hardware by
+             ``filter_backends_by_compute_capability``.
+
+    Reference check compares the *set* of selected indices against ``torch.topk`` applied
+    to logits masked to ``seq_lens``.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopKDecode")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(f"[INFO] To reproduce this test case, run: {args.repro_command}")
+
+    backends = args.backends[:]
+    # Default to both runners when caller passes legacy "cuda"
+    if backends == ["cuda"]:
+        backends = ["radix", "gvr"]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    top_k = args.top_k
+    is_cuda_graph_compatible = False  # GVR LB uses dynamic counters; not graph-safe
+    run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+    seq_lens = torch.full((batch_size,), vocab_size, dtype=torch.int32, device=device)
+
+    # pre_idx: argmax in col-0, sequential fill elsewhere (GVR convention)
+    argmax_idx = logits.argmax(dim=-1).int()
+    pre_idx = torch.zeros(batch_size, top_k, dtype=torch.int32, device=device)
+    pre_idx[:, 0] = argmax_idx
+    for j in range(1, top_k):
+        pre_idx[:, j] = j
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {logits.shape = }, {seq_lens.shape = }, {top_k = }")
+
+    def run_backend(backend, logits):
+        if backend == "radix":
+            return flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=None)
+        elif backend == "gvr":
+            return flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=pre_idx)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend, logits).detach()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, logits),
+        )
+
+    if run_refcheck and outputs:
+        col_idx = torch.arange(vocab_size, device=device).unsqueeze(0)
+        masked = logits.masked_fill(col_idx >= seq_lens.unsqueeze(1), float("-inf"))
+        ref_indices = torch.topk(masked.float(), k=top_k, dim=-1).indices.int()
+
+        for backend, out_indices in outputs.items():
+            mismatches = sum(
+                set(ref_indices[row].cpu().tolist()) != set(out_indices[row].cpu().tolist())
+                for row in range(batch_size)
+            )
+            pct = 100.0 * mismatches / batch_size
+            if mismatches > 0:
+                print(
+                    f"[REFCHECK] Backend {backend}: {mismatches}/{batch_size} rows "
+                    f"({pct:.1f}%) differ from torch.topk reference"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(f"[ERROR] Backend {backend} output mismatch")
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            problem_bytes = (
+                batch_size * vocab_size * input_dtype.itemsize  # logits read
+                + batch_size * top_k * 4                        # pre_idx read (int32)
+                + batch_size * top_k * 4                        # indices write (int32)
+            )
+            tb_per_sec = problem_bytes / (1e9 * median_time)
+
+            print_perf_metrics(backend, median_time, std_time, 0, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = 0
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["batch_size"] = batch_size
+                cur_res["vocab_size"] = vocab_size
                 cur_res["top_k"] = top_k
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
