@@ -1,0 +1,80 @@
+name: PR Documentation Checks
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  documentation:
+    name: Public API and documentation
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check public API signature and export changes
+        id: public_api
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          if python scripts/check_pr_api_diff.py \
+              --base "$BASE_SHA" \
+              --head "$HEAD_SHA" \
+              --github-actions \
+              --strict \
+              --report-json reports/public-api.json | tee api-doc-check.txt; then
+            status=0
+          else
+            status=$?
+          fi
+          cat api-doc-check.txt >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Check all new static documentation drift
+        id: static_documentation
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          if python scripts/check_pr_document.py \
+              --base "$BASE_SHA" \
+              --head "$HEAD_SHA" \
+              --github-actions \
+              --strict \
+              --report-json reports/static-documentation.json | tee static-doc-check.txt; then
+            status=0
+          else
+            status=$?
+          fi
+          cat static-doc-check.txt >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Upload documentation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-documentation-report
+          path: reports/*.json
+          retention-days: 1
+
+      - name: Fail when a documentation check reports findings or crashes
+        if: always()
+        env:
+          PUBLIC_API_OUTCOME: ${{ steps.public_api.outcome }}
+          STATIC_DOCUMENTATION_OUTCOME: ${{ steps.static_documentation.outcome }}
+        run: |
+          if [[ "$PUBLIC_API_OUTCOME" != 'success' || "$STATIC_DOCUMENTATION_OUTCOME" != 'success' ]]; then
+            exit 1
+          fi
