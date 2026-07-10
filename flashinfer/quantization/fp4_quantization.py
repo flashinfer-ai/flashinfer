@@ -234,24 +234,19 @@ def get_fp4_quantization_module(backend: str = "100"):
         "90": gen_fp4_quantization_sm90_module,
     }
 
-    # On SM12x, prefer the arch-specific module (sm_120a / sm_121a), matching
-    # GEMM/MoE dispatch and what aot.py builds. Fall back to the sm_120f family
-    # variant only when it is the one prebuilt (release wheels build 12.0f only),
-    # so wheel users load it instead of JIT-compiling.
-    if backend in ("120", "121"):
-        from ..utils import version_at_least
-
-        if (
-            version_at_least(torch.version.cuda, "12.9")
-            and not backend_modules[backend]().is_aot
-            and gen_fp4_quantization_sm120f_module().is_aot
-        ):
-            backend = "120f"
-
     if backend not in backend_modules:
         raise ValueError(f"Invalid backend: {backend}")
 
-    module = backend_modules[backend]().build_and_load()
+    spec = backend_modules[backend]()
+    # SM12x uses the arch-specific module (sm_120a / sm_121a). When only the
+    # sm_120f family module is prebuilt (SM121 release wheels), load it
+    # instead of JIT-compiling.
+    if backend in ("120", "121") and not spec.is_aot:
+        family_spec = backend_modules["120f"]()
+        if family_spec.is_aot:
+            spec = family_spec
+
+    module = spec.build_and_load()
 
     @register_custom_op(
         "flashinfer::fp4_quantize_sm100",
