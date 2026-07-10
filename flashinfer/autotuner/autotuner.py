@@ -2081,7 +2081,14 @@ class AutoTuner:
         if not tuning_config.use_cold_l2_cache:
             return [inputs]
 
-        one_buffer_bytes = sum(input.numel() * input.element_size() for input in inputs)
+        # Inputs lists may carry non-tensor entries (dtypes, ints, bools) that
+        # runners consume as parameters; only tensors contribute to the L2
+        # footprint and only tensors are cloned per rotation copy.
+        one_buffer_bytes = sum(
+            t.numel() * t.element_size()
+            for t in inputs
+            if isinstance(t, torch.Tensor)
+        )
         if one_buffer_bytes <= 0:
             logger.debug(
                 "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
@@ -2093,7 +2100,9 @@ class AutoTuner:
 
         inputs_list = [inputs]
         for _ in range(num_buffers - 1):
-            inputs_list.append(list(t.clone() for t in inputs))
+            inputs_list.append(
+                [t.clone() if isinstance(t, torch.Tensor) else t for t in inputs]
+            )
 
         logger.debug(
             f"[Autotuner] use_cold_l2_cache={tuning_config.use_cold_l2_cache}, use {num_buffers} different tensors for profiling"
