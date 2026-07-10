@@ -19,7 +19,7 @@ OOB indexing, unchecked pointer/tensor math, integer overflow in offset/stride/s
 (int32 vs int64), unvalidated shapes/dtypes/device assumptions, under-allocated
 workspace/buffers on large problem sizes, missing synchronization.
 
-### Interface (API, internal OOB design)
+### Interface (API, internal OOP design)
 Interfaces get **replicated** — new code copies the shape of existing code, so review with
 "how will this be copied?" in mind. Check argument order, plan/run split, wrapper patterns,
 and especially **naming-convention adherence**. Framework separation: no Torch headers under
