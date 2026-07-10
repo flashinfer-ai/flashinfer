@@ -366,9 +366,13 @@ def _get_available_memory_gib() -> Optional[float]:
     except (OSError, ValueError, IndexError):
         pass
     try:
-        return (os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")) / (1024**3)
+        avphys_pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if avphys_pages > 0 and page_size > 0:
+            return (avphys_pages * page_size) / (1024**3)
     except (AttributeError, OSError, ValueError):
-        return None
+        pass
+    return None
 
 
 def _get_num_workers() -> Optional[int]:
