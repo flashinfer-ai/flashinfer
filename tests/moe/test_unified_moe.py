@@ -782,47 +782,6 @@ BF16_RTOL = 3e-2
 BF16_ATOL = 3e-2
 
 
-def _bf16_kernel_weight_views(w1: torch.Tensor, w2: torch.Tensor):
-    """BlockMajorK weight views for the trtllm bf16 routed runner (per-expert).
-
-    The authoritative recipe is ``BF16Moe.prepare_static_weights_for_kernel``
-    (tests/moe/trtllm_gen_fused_moe_utils.py) — the only bf16 prep validated
-    against independent dense math: gemm1 rows get the fused-gated-activation
-    reorder chained with the ``epilogue_tile_m=128`` shuffle (the w3_w1
-    permute), gemm2 gets the plain shuffle, then both convert to BlockMajorK
-    (``block_k=128`` on the uint8 view).  Pure layout transform: the dense
-    reference uses the unshuffled weights.  (Do NOT copy the moe_ep /
-    routed-parity recipe of shuffle(64) without the gated reorder — those
-    tests compare kernel-vs-same-kernel, so their layout was never validated
-    against dense math and disagrees with the kernel's gate/linear pairing.)
-    """
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        convert_to_block_layout,
-        get_w2_permute_indices_with_cache,
-    )
-
-    epilogue_tile_m = 128
-    block_k = 128
-    cache: dict = {}
-    w1_views, w2_views = [], []
-    for i in range(w1.shape[0]):
-        p1 = _maybe_get_cached_w3_w1_permute_indices(
-            cache, w1[i].view(torch.uint8), epilogue_tile_m
-        )
-        s1 = w1[i].view(torch.uint8)[p1.to(w1.device)].contiguous()
-        p2 = get_w2_permute_indices_with_cache(
-            cache, w2[i].view(torch.uint8), epilogue_tile_m
-        )
-        s2 = w2[i].view(torch.uint8)[p2.to(w2.device)].contiguous()
-        w1_views.append(convert_to_block_layout(s1, block_k))
-        w2_views.append(convert_to_block_layout(s2, block_k))
-    return (
-        torch.stack(w1_views).view(torch.bfloat16),
-        torch.stack(w2_views).view(torch.bfloat16),
-    )
-
-
 def _bf16_dense_reference(
     x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
 ):
@@ -917,14 +876,17 @@ def _make_bf16_packs_and_config(
         final_scales=final_scales,
     )
 
-    w1_view, w2_view = _bf16_kernel_weight_views(w1, w2)
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for(
         "trtllm_bf16_routed",
-        {
-            "gemm1_weights": w1_view,
-            "gemm2_weights": w2_view,
-        },
+        TrtllmBf16Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=local_num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        ),
     )
 
     config = MoEConfig(

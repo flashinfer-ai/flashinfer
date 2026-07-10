@@ -298,6 +298,34 @@ class TrtllmBf16Config:
     def supported(cls, arch: int) -> bool:
         return arch >= 100
 
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build the ``trtllm_bf16_routed`` weight view from canonical bf16 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("trtllm_bf16_routed", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_bf16_weights`.
+        """
+        from .prepare import prepare_trtllm_bf16_weights
+
+        return prepare_trtllm_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+            permute_cache=permute_cache,
+        )
+
     def __repr__(self) -> str:
         return "TrtllmBf16Config()"
 
