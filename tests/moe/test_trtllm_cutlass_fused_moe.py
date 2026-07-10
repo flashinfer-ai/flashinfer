@@ -272,7 +272,7 @@ def torch_moe_w4a8(
             scale1 = fc1_input_scale[expert_id]
 
         if fc1_pre_quant_scale is not None:
-            expert_inputs_scaled = expert_inputs * fc1_pre_quant_scale[expert_id]
+            expert_inputs_scaled = expert_inputs * fc1_pre_quant_scale
         else:
             expert_inputs_scaled = expert_inputs
         inp_q = (
@@ -292,7 +292,7 @@ def torch_moe_w4a8(
         if fc2_input_scale is not None:
             scale2 = fc2_input_scale[expert_id]
         if fc2_pre_quant_scale is not None:
-            inter_scaled = inter * fc2_pre_quant_scale[expert_id]
+            inter_scaled = inter * fc2_pre_quant_scale
         else:
             inter_scaled = inter
         inter_q = (
@@ -1916,12 +1916,12 @@ def test_moe_w4a8(
         torch.randn(e, n, k // group_size, dtype=dtype, device="cuda") * affine_coeff
     )
 
-    # per channel pre quant scales
-    w1_pre_quant_scale = torch.rand(e, k, dtype=dtype, device="cuda") * 0.1 + 0.95
-    w2_pre_quant_scale = torch.rand(e, n, dtype=dtype, device="cuda") * 0.1 + 0.95
-    w3_pre_quant_scale = torch.rand(e, k, dtype=dtype, device="cuda") * 0.1 + 0.95
+    # The current W4A8 contract shares prequant scales across experts.
+    w1_pre_quant_scale = torch.rand(k, dtype=dtype, device="cuda") * 0.1 + 0.95
+    w2_pre_quant_scale = torch.rand(n, dtype=dtype, device="cuda") * 0.1 + 0.95
+    w3_pre_quant_scale = torch.rand(k, dtype=dtype, device="cuda") * 0.1 + 0.95
 
-    input_scale = torch.rand(e, 1, dtype=torch.float32, device="cuda") * 0.2 + 0.1
+    input_scale = torch.rand(1, dtype=torch.float32, device="cuda") * 0.2 + 0.1
     weight_scale_2 = torch.ones(e, 1, dtype=torch.float32, device="cuda")
 
     fc1_weights = torch.cat([w3_weight, w1_weight], dim=1)
@@ -1942,7 +1942,7 @@ def test_moe_w4a8(
     w3_w1_pre_quant_max = torch.max(w1_pre_quant_scale, w3_pre_quant_scale)
     w3_w1_input_scale_max = input_scale.max()
     fc31_act_scale = (w3_w1_pre_quant_max / w3_w1_input_scale_max).to(dtype)
-    fc2_act_scale = (w2_pre_quant_scale / input_scale).to(dtype).unsqueeze(-1)
+    fc2_act_scale = (w2_pre_quant_scale / input_scale).to(dtype)
 
     fc31_alpha = (weight_scale_2.squeeze(-1) * w3_w1_input_scale_max).float()
     fc2_alpha = (weight_scale_2.squeeze(-1) * input_scale.squeeze(-1)).float()
@@ -2017,8 +2017,11 @@ def test_moe_w4a8(
     w31_weight_dequant = torch.stack(w31_weight_list, dim=0)  # [e, 2N, K]
     w2_weight_dequant = torch.stack(w2_weight_list, dim=0)  # [e, K, N]
 
-    fc1_input_scale_for_ref = torch.full_like(
-        input_scale.squeeze(-1), w3_w1_input_scale_max.item()
+    input_scale_for_ref = torch.full(
+        (num_experts,),
+        input_scale.item(),
+        dtype=input_scale.dtype,
+        device=input_scale.device,
     )
     ref_output = torch_moe_w4a8(
         num_experts,
@@ -2027,8 +2030,8 @@ def test_moe_w4a8(
         w2_weight_dequant,
         selected_experts,
         routing_weights,
-        fc1_input_scale=fc1_input_scale_for_ref,
-        fc2_input_scale=input_scale.squeeze(-1),
+        fc1_input_scale=input_scale_for_ref,
+        fc2_input_scale=input_scale_for_ref,
         fc1_pre_quant_scale=torch.max(w1_pre_quant_scale, w3_pre_quant_scale),
         fc2_pre_quant_scale=w2_pre_quant_scale,
         fc1_weight_scale_2=weight_scale_2.squeeze(-1),
@@ -3395,10 +3398,10 @@ def _run_w4a8_moe_hopper(
     w3_scale = (
         torch.randn(e, n, k // group_size, dtype=dtype, device=device) * affine_coeff
     )
-    w1_pre_quant_scale = torch.rand(e, k, dtype=dtype, device=device) * 0.1 + 0.95
-    w2_pre_quant_scale = torch.rand(e, n, dtype=dtype, device=device) * 0.1 + 0.95
-    w3_pre_quant_scale = torch.rand(e, k, dtype=dtype, device=device) * 0.1 + 0.95
-    input_scale = torch.rand(e, 1, dtype=torch.float32, device=device) * 0.2 + 0.1
+    w1_pre_quant_scale = torch.rand(k, dtype=dtype, device=device) * 0.1 + 0.95
+    w2_pre_quant_scale = torch.rand(n, dtype=dtype, device=device) * 0.1 + 0.95
+    w3_pre_quant_scale = torch.rand(k, dtype=dtype, device=device) * 0.1 + 0.95
+    input_scale = torch.rand(1, dtype=torch.float32, device=device) * 0.2 + 0.1
     weight_scale_2 = torch.ones(e, 1, dtype=torch.float32, device=device)
 
     fc1_weights = torch.cat([w3_weight, w1_weight], dim=1)
@@ -3423,7 +3426,7 @@ def _run_w4a8_moe_hopper(
     fc31_act_scale = (
         torch.max(w1_pre_quant_scale, w3_pre_quant_scale) / w3_w1_input_scale_max
     ).to(dtype)
-    fc2_act_scale = (w2_pre_quant_scale / input_scale).to(dtype).unsqueeze(-1)
+    fc2_act_scale = (w2_pre_quant_scale / input_scale).to(dtype)
     fc31_alpha = (weight_scale_2.squeeze(-1) * w3_w1_input_scale_max).float()
     fc2_alpha = (weight_scale_2.squeeze(-1) * input_scale.squeeze(-1)).float()
     zero_1 = torch.empty(0, dtype=dtype, device=device)
@@ -3471,9 +3474,11 @@ def _run_w4a8_moe_hopper(
         w31_list.append(torch.cat([w3_dq, w1_dq], dim=0))
         w2_list.append(w2_dq)
 
-    # Broadcast max over experts; see comment on fc31_act_scale above.
-    fc1_input_scale_for_ref = torch.full_like(
-        input_scale.squeeze(-1), w3_w1_input_scale_max.item()
+    input_scale_for_ref = torch.full(
+        (num_experts,),
+        input_scale.item(),
+        dtype=input_scale.dtype,
+        device=input_scale.device,
     )
     ref_output = torch_moe_w4a8(
         num_experts,
@@ -3482,8 +3487,8 @@ def _run_w4a8_moe_hopper(
         torch.stack(w2_list, dim=0),
         selected_experts,
         routing_weights,
-        fc1_input_scale=fc1_input_scale_for_ref,
-        fc2_input_scale=input_scale.squeeze(-1),
+        fc1_input_scale=input_scale_for_ref,
+        fc2_input_scale=input_scale_for_ref,
         fc1_pre_quant_scale=torch.max(w1_pre_quant_scale, w3_pre_quant_scale),
         fc2_pre_quant_scale=w2_pre_quant_scale,
         fc1_weight_scale_2=weight_scale_2.squeeze(-1),

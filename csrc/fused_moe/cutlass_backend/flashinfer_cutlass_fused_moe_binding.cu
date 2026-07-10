@@ -1442,6 +1442,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       auto const& fc2_weight_zeros = quant_scales.value()[5];
       auto const& fc1_alpha = quant_scales.value()[6];
       auto const& fc2_alpha = quant_scales.value()[7];
+      if (fc1_act_scales.numel() > 0) {
+        TVM_FFI_ICHECK_EQ(fc1_act_scales.numel(), hidden_size)
+            << "INT4xFP8 FC1 prequant scale must be shared across experts with shape [hidden_size]";
+      }
+      if (fc2_act_scales.numel() > 0) {
+        TVM_FFI_ICHECK_EQ(fc2_act_scales.numel(), inter_size)
+            << "INT4xFP8 FC2 prequant scale must be shared across experts with shape [inter_size]";
+      }
       int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size;
       return kernels::QuantParams::GroupWise(
           group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
