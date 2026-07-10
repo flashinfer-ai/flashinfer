@@ -3652,11 +3652,10 @@ def _resolve_tuning(
 
 def replay_selective_state_update(
     state: torch.Tensor,
-    old_x: torch.Tensor,
-    old_B: torch.Tensor,
-    old_dt: torch.Tensor,
-    old_dA_cumsum: torch.Tensor,
-    cache_buf_idx: torch.Tensor,
+    x_cache: torch.Tensor,
+    B_cache: torch.Tensor,
+    dt_cache: torch.Tensor,
+    ring_start: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -3766,20 +3765,27 @@ def replay_selective_state_update(
         main blocks until precompute completes before loading conv1d outputs
         (x, C) and precompute outputs (CB_scaled, decay_vec).
 
-    Uses double-buffered cache tensors. cache_buf_idx[slot] indicates which
-    buffer (0 or 1) to read from for replay. Checkpoint-write steps write the
-    new history to the inactive buffer; no-write steps append to the active
-    buffer. The caller must update cache_buf_idx and PNAT with the same
-    checkpoint predicate used by the kernel.
+    RING-BUFFER cache contract (ReplaySSM, 2026-07-10): single-buffered
+    head-major caches of physical length L = x_cache.shape[2]; the logical
+    replay window is ``max_window = L - T`` and the flush rule
+    ``pnat + 2T > L`` ⇔ ``pnat + T > max_window`` (identical write/no-write
+    decisions to the legacy double-buffer rule at L = W_legacy + T).  The
+    Triton kernels below keep the legacy dense contract: this wrapper GATHERS
+    the ring window [start, start+max_window) mod L into legacy-shaped
+    scratches (recomputing dA_cumsum from the dt ring — no decay is cached),
+    launches unchanged, then SCATTERS the appended rows back into the ring at
+    (start + pnat + i) mod L.  The host owns all bookkeeping: after a call the
+    caller advances ``prev_num_accepted_tokens`` by the accepted count and, on
+    a flush step, ``ring_start += pnat_replayed`` (mod L) with pnat reset to
+    the fresh token count.
 
     Arguments:
         state: (cache, nheads, dim, dstate) in-place.  After the call, contains
             the state after replaying prev_num_accepted_tokens old tokens.
-        old_x: (cache, 2, T, nheads, dim) bf16 — double-buffered old x cache.
-        old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered old B cache.
-        old_dt: (cache, 2, nheads, T) fp32 — double-buffered processed dt.
-        old_dA_cumsum: (cache, 2, nheads, T) fp32 — double-buffered cumulative A*dt.
-        cache_buf_idx: (cache,) int32 — which buffer to read (0 or 1).
+        x_cache: (cache, nheads, L, dim) activation dtype — ring of cached x.
+        B_cache: (cache, ngroups, L, dstate) activation dtype — ring of cached B.
+        dt_cache: (cache, nheads, L) fp32 — ring of cached processed dt.
+        ring_start: (cache,) int32 — ring head (oldest live token's row).
         prev_num_accepted_tokens: (cache,) int32.
         x: (batch, T, nheads, dim) new token inputs.
         dt: (batch, T, nheads, dim) with stride(-1)==0 (tie_hdim).
@@ -4114,12 +4120,17 @@ def replay_selective_state_update(
         )
         assert state_scales.device == state.device
 
-    # Cache window capacity comes from old_x.shape[2]; it may equal T or be
-    # larger when retaining replay history. Replay and rectangle window tile
-    # sizes are derived independently from MAX_REPLAY_BUFFER_LENGTH so
-    # max_window can exceed BLOCK_SIZE_T freely.
-    max_window = old_x.shape[2]
-    assert max_window >= T, f"T={T} exceeds cache max_window={max_window}"
+    # Ring capacity L comes from x_cache.shape[2]; the LOGICAL replay window
+    # max_window = L - T reserves one speculative window so a full accept can
+    # never overflow the ring (the ReplaySSM early-flush rule).  Replay and
+    # rectangle window tile sizes derive from MAX_REPLAY_BUFFER_LENGTH
+    # (= max_window) as before.
+    ring_len = x_cache.shape[2]
+    max_window = ring_len - T
+    assert max_window >= T, (
+        f"ring length {ring_len} must be >= 2*T (T={T}): logical window "
+        f"{max_window} cannot fit a full append"
+    )
 
     if is_varlen:
         # Packed (1, total_tokens, ...): validate trailing dims only; cu_seqlens
@@ -4145,14 +4156,61 @@ def replay_selective_state_update(
         assert A.shape == (nheads, dim, dstate)
         assert B.shape == (batch, T, ngroups, dstate)
         assert C.shape == B.shape
-    assert old_x.shape == (cache_size, 2, max_window, nheads, dim)
-    assert old_B.shape == (cache_size, 2, max_window, ngroups, dstate)
-    assert old_dt.shape == (cache_size, 2, nheads, max_window)
-    assert old_dA_cumsum.shape == (cache_size, 2, nheads, max_window)
-    assert cache_buf_idx.shape == (cache_size,)
-    assert cache_buf_idx.dtype == torch.int32, (
-        f"cache_buf_idx must be int32, got {cache_buf_idx.dtype}"
+    assert x_cache.shape == (cache_size, nheads, ring_len, dim), (
+        f"x_cache shape {tuple(x_cache.shape)} != {(cache_size, nheads, ring_len, dim)}"
     )
+    assert B_cache.shape == (cache_size, ngroups, ring_len, dstate), (
+        f"B_cache shape {tuple(B_cache.shape)} != "
+        f"{(cache_size, ngroups, ring_len, dstate)}"
+    )
+    assert dt_cache.shape == (cache_size, nheads, ring_len), (
+        f"dt_cache shape {tuple(dt_cache.shape)} != {(cache_size, nheads, ring_len)}"
+    )
+    assert dt_cache.dtype == torch.float32, (
+        f"dt_cache must be float32, got {dt_cache.dtype}"
+    )
+    assert ring_start.shape == (cache_size,)
+    assert ring_start.dtype == torch.int32, (
+        f"ring_start must be int32, got {ring_start.dtype}"
+    )
+
+    # ── Ring → legacy scratch (host gather; this IS the executable ring spec) ──
+    # Gather the logical window [start, start+max_window) mod L into buf 0 of
+    # legacy-shaped scratches (token-major), recompute dA_cumsum from the dt
+    # ring (the ring caches no decay), and hand the kernels cache_buf_idx = 0.
+    # The appended rows are scattered back into the ring after the launches.
+    device = x_cache.device  # the wrapper's own `device = x.device` comes later
+    win = torch.arange(max_window, device=device, dtype=torch.int64)
+    rows = (ring_start.to(torch.int64)[:, None] + win[None, :]) % ring_len
+    pnat_l = prev_num_accepted_tokens.to(torch.int64)
+    valid_win = win[None, :] < pnat_l[:, None]  # (cache, max_window)
+
+    def _gather_ring(cache_t):
+        # (cache, ch, L, inner) → token-major (cache, max_window, ch, inner)
+        ch, inner = cache_t.shape[1], cache_t.shape[3]
+        idx = rows[:, None, :, None].expand(cache_size, ch, max_window, inner)
+        return torch.gather(cache_t, 2, idx).permute(0, 2, 1, 3)
+
+    old_x = torch.zeros(
+        cache_size, 2, max_window, nheads, dim, device=device, dtype=x_cache.dtype
+    )
+    old_x[:, 0] = _gather_ring(x_cache)
+    old_B = torch.zeros(
+        cache_size, 2, max_window, ngroups, dstate, device=device, dtype=B_cache.dtype
+    )
+    old_B[:, 0] = _gather_ring(B_cache)
+    dt_win = torch.gather(
+        dt_cache, 2, rows[:, None, :].expand(cache_size, nheads, max_window)
+    )
+    dt_win = dt_win * valid_win[:, None, :]  # zero ring garbage before the cumsum
+    old_dt = torch.zeros(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_dt[:, 0] = dt_win
+    A_head = A[:, 0, 0].to(torch.float32)  # tie_hdim: one scalar per head
+    old_dA_cumsum = torch.zeros_like(old_dt)
+    old_dA_cumsum[:, 0] = A_head[None, :, None] * dt_win.cumsum(-1)
+    cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
     assert prev_num_accepted_tokens.shape == (cache_size,)
     assert prev_num_accepted_tokens.dtype == torch.int32, (
         f"prev_num_accepted_tokens must be int32, got {prev_num_accepted_tokens.dtype}"
@@ -4826,3 +4884,49 @@ def replay_selective_state_update(
                 f"mode={mode!r} is not supported.  Supported modes: "
                 f"'persistent_dynamic', 'persistent_main'."
             )
+
+    # ── Scatter the kernels' cache appends back into the ring ──
+    # Legacy contract inside the launches: no-write slots appended into buf 0
+    # rows [pnat, pnat+seq_len); write slots wrote buf 1 rows [0, seq_len).
+    # Ring placement is (start + pnat + i) mod L for BOTH — a flush only
+    # advances `ring_start` past the replayed prefix (the CALLER's job, after
+    # this returns).  Slots not addressed by this batch scatter nothing.
+    if is_varlen:
+        seq_lens_b = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
+    else:
+        seq_lens_b = torch.full((batch,), T, device=device, dtype=torch.int64)
+    if state_batch_indices is not None:
+        slot_of_b = state_batch_indices.view(-1)[:batch].to(torch.int64)
+    else:
+        slot_of_b = torch.arange(batch, device=device, dtype=torch.int64)
+    seq_len_slot = torch.zeros(cache_size, device=device, dtype=torch.int64)
+    seq_len_slot[slot_of_b] = seq_lens_b
+    tvec = torch.arange(T, device=device, dtype=torch.int64)
+    wrote = (pnat_l + seq_len_slot) > max_window  # matches the launch partition
+    src_row = torch.where(
+        wrote[:, None], tvec[None, :], pnat_l[:, None] + tvec[None, :]
+    )
+    dst = (
+        ring_start.to(torch.int64)[:, None] + pnat_l[:, None] + tvec[None, :]
+    ) % ring_len
+    live = tvec[None, :] < seq_len_slot[:, None]  # (cache, T)
+    ar_c = torch.arange(cache_size, device=device)
+    src_buf = wrote.to(torch.int64)
+    x_sel = old_x[ar_c, src_buf]  # (cache, max_window, nheads, dim)
+    B_sel = old_B[ar_c, src_buf]  # (cache, max_window, ngroups, dstate)
+    dt_sel = old_dt[ar_c, src_buf]  # (cache, nheads, max_window)
+
+    def _scatter_tok_major(cache_t, sel):
+        ch, inner = cache_t.shape[1], cache_t.shape[3]
+        g_idx = src_row[:, :, None, None].expand(cache_size, T, ch, inner)
+        src = torch.gather(sel, 1, g_idx).permute(0, 2, 1, 3)  # (cache, ch, T, inner)
+        d_idx = dst[:, None, :, None].expand(cache_size, ch, T, inner)
+        keep = torch.gather(cache_t, 2, d_idx)
+        cache_t.scatter_(2, d_idx, torch.where(live[:, None, :, None], src, keep))
+
+    _scatter_tok_major(x_cache, x_sel)
+    _scatter_tok_major(B_cache, B_sel)
+    dt_src = torch.gather(dt_sel, 2, src_row[:, None, :].expand(cache_size, nheads, T))
+    d_idx = dst[:, None, :].expand(cache_size, nheads, T)
+    keep = torch.gather(dt_cache, 2, d_idx)
+    dt_cache.scatter_(2, d_idx, torch.where(live[:, None, :], dt_src, keep))
