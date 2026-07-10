@@ -1156,3 +1156,94 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
         f"Python allocations grew by {allocated_bytes / 1024:.1f} KB "
         f"({allocated_bytes / N:.0f} B/call)."
     )
+
+
+def _build_moe_style_tuning_config(topk_ids_initializer):
+    """Build a config with tensor_initializers present, MoE-style.
+    Mimics ``_make_tuning_config`` in fused_moe/core.py.
+    """
+    from flashinfer.autotuner.initializers import autotuner_initializer_randn
+    from flashinfer.fused_moe.utils import (
+        get_hybrid_num_tokens_buckets,
+        make_hybrid_bucket_mapper,
+    )
+
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1),
+                dim_idx=(0, 0),
+                gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192, 1),
+                map_to_tuning_buckets=make_hybrid_bucket_mapper(8192),
+                tensor_initializers=[
+                    autotuner_initializer_randn,
+                    topk_ids_initializer,
+                ],
+            ),
+        ),
+    )
+
+
+def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
+    """Regression test: rebuilt MoE-style configs with tensor_initializers
+    must collapse to a single cache entry.
+    """
+    from flashinfer.fused_moe.core import _moe_topk_ids_init
+
+    # The factory must return the identical object for the same expert count.
+    assert _moe_topk_ids_init(128) is _moe_topk_ids_init(128)
+
+    AutoTuner._find_nearest_profile.cache_clear()
+    shapes = ((1024, 4096), (1024, 8))
+
+    AutoTuner._find_nearest_profile(
+        shapes, _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+    )
+    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+    N = 1_000
+    for _ in range(N):
+        config = _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+        AutoTuner._find_nearest_profile(shapes, config)
+
+    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    assert cache_growth == 0, (
+        f"Cache grew by {cache_growth} entries across {N} rebuilds of an "
+        "equivalent MoE-style config with a fixed shape."
+    )
+
+
+def test_find_nearest_profile_cache_grows_with_fresh_closure_initializer():
+    """Negative control: a fresh initializer closure per call leaks one
+    entry per call DESPITE equal hashes.
+    """
+    AutoTuner._find_nearest_profile.cache_clear()
+    shapes = ((1024, 4096), (1024, 8))
+
+    def make_fresh_closure():
+        def _init(s, dt, dev):
+            return None
+
+        return _init
+
+    ref_config = _build_moe_style_tuning_config(make_fresh_closure())
+    other_config = _build_moe_style_tuning_config(make_fresh_closure())
+    assert hash(ref_config) == hash(other_config), "hashes should match"
+    assert ref_config != other_config, "equality should fail on fresh closures"
+
+    AutoTuner._find_nearest_profile(shapes, ref_config)
+    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+    N = 1_000
+    for _ in range(N):
+        config = _build_moe_style_tuning_config(make_fresh_closure())
+        AutoTuner._find_nearest_profile(shapes, config)
+
+    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    assert cache_growth == N, (
+        f"Expected {N} new cache entries (one per fresh closure), got {cache_growth}."
+    )
