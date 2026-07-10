@@ -3766,10 +3766,10 @@ def replay_selective_state_update(
         (x, C) and precompute outputs (CB_scaled, decay_vec).
 
     RING-BUFFER cache contract (ReplaySSM, 2026-07-10): single-buffered
-    head-major caches of physical length L = x_cache.shape[2]; the logical
-    replay window is ``max_window = L - T`` and the flush rule
-    ``pnat + 2T > L`` ⇔ ``pnat + T > max_window`` (identical write/no-write
-    decisions to the legacy double-buffer rule at L = W_legacy + T).  The
+    head-major caches of physical length RING_BUFFER_LEN = x_cache.shape[2]; the logical
+    replay window is ``max_window = RING_BUFFER_LEN - T`` and the flush rule
+    ``pnat + 2T > RING_BUFFER_LEN`` ⇔ ``pnat + T > max_window`` (identical write/no-write
+    decisions to the legacy double-buffer rule at RING_BUFFER_LEN = W_legacy + T).  The
     Triton kernels below keep the legacy dense contract: this wrapper GATHERS
     the ring window [start, start+max_window) mod L into legacy-shaped
     scratches (recomputing dA_cumsum from the dt ring — no decay is cached),
@@ -3782,9 +3782,9 @@ def replay_selective_state_update(
     Arguments:
         state: (cache, nheads, dim, dstate) in-place.  After the call, contains
             the state after replaying prev_num_accepted_tokens old tokens.
-        x_cache: (cache, nheads, L, dim) activation dtype — ring of cached x.
-        B_cache: (cache, ngroups, L, dstate) activation dtype — ring of cached B.
-        dt_cache: (cache, nheads, L) fp32 — ring of cached processed dt.
+        x_cache: (cache, nheads, RING_BUFFER_LEN, dim) activation dtype — ring of cached x.
+        B_cache: (cache, ngroups, RING_BUFFER_LEN, dstate) activation dtype — ring of cached B.
+        dt_cache: (cache, nheads, RING_BUFFER_LEN) fp32 — ring of cached processed dt.
         ring_start: (cache,) int32 — ring head (oldest live token's row).
         prev_num_accepted_tokens: (cache,) int32.
         x: (batch, T, nheads, dim) new token inputs.
@@ -4120,15 +4120,15 @@ def replay_selective_state_update(
         )
         assert state_scales.device == state.device
 
-    # Ring capacity L comes from x_cache.shape[2]; the LOGICAL replay window
+    # Ring capacity RING_BUFFER_LEN comes from x_cache.shape[2]; the LOGICAL replay window
     # max_window = L - T reserves one speculative window so a full accept can
     # never overflow the ring (the ReplaySSM early-flush rule).  Replay and
     # rectangle window tile sizes derive from MAX_REPLAY_BUFFER_LENGTH
     # (= max_window) as before.
-    ring_len = x_cache.shape[2]
-    max_window = ring_len - T
+    ring_buffer_len = x_cache.shape[2]
+    max_window = ring_buffer_len - T
     assert max_window >= T, (
-        f"ring length {ring_len} must be >= 2*T (T={T}): logical window "
+        f"ring length {ring_buffer_len} must be >= 2*T (T={T}): logical window "
         f"{max_window} cannot fit a full append"
     )
 
@@ -4156,15 +4156,15 @@ def replay_selective_state_update(
         assert A.shape == (nheads, dim, dstate)
         assert B.shape == (batch, T, ngroups, dstate)
         assert C.shape == B.shape
-    assert x_cache.shape == (cache_size, nheads, ring_len, dim), (
-        f"x_cache shape {tuple(x_cache.shape)} != {(cache_size, nheads, ring_len, dim)}"
+    assert x_cache.shape == (cache_size, nheads, ring_buffer_len, dim), (
+        f"x_cache shape {tuple(x_cache.shape)} != {(cache_size, nheads, ring_buffer_len, dim)}"
     )
-    assert B_cache.shape == (cache_size, ngroups, ring_len, dstate), (
+    assert B_cache.shape == (cache_size, ngroups, ring_buffer_len, dstate), (
         f"B_cache shape {tuple(B_cache.shape)} != "
-        f"{(cache_size, ngroups, ring_len, dstate)}"
+        f"{(cache_size, ngroups, ring_buffer_len, dstate)}"
     )
-    assert dt_cache.shape == (cache_size, nheads, ring_len), (
-        f"dt_cache shape {tuple(dt_cache.shape)} != {(cache_size, nheads, ring_len)}"
+    assert dt_cache.shape == (cache_size, nheads, ring_buffer_len), (
+        f"dt_cache shape {tuple(dt_cache.shape)} != {(cache_size, nheads, ring_buffer_len)}"
     )
     assert dt_cache.dtype == torch.float32, (
         f"dt_cache must be float32, got {dt_cache.dtype}"
@@ -4181,7 +4181,7 @@ def replay_selective_state_update(
     # The appended rows are scattered back into the ring after the launches.
     device = x_cache.device  # the wrapper's own `device = x.device` comes later
     win = torch.arange(max_window, device=device, dtype=torch.int64)
-    rows = (ring_start.to(torch.int64)[:, None] + win[None, :]) % ring_len
+    rows = (ring_start.to(torch.int64)[:, None] + win[None, :]) % ring_buffer_len
     pnat_l = prev_num_accepted_tokens.to(torch.int64)
     valid_win = win[None, :] < pnat_l[:, None]  # (cache, max_window)
 
@@ -4908,7 +4908,7 @@ def replay_selective_state_update(
     )
     dst = (
         ring_start.to(torch.int64)[:, None] + pnat_l[:, None] + tvec[None, :]
-    ) % ring_len
+    ) % ring_buffer_len
     live = tvec[None, :] < seq_len_slot[:, None]  # (cache, T)
     ar_c = torch.arange(cache_size, device=device)
     src_buf = wrote.to(torch.int64)
