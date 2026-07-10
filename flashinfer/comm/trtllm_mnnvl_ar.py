@@ -273,7 +273,15 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
 
     @flashinfer_api
     def checkpoint_restore(self, comm_backend: CommBackend) -> None:
-        """Restore physical backing; repeated successful calls are no-ops."""
+        """Restore physical backing; repeated successful calls are no-ops.
+
+        Parameters
+        ----------
+        comm_backend : CommBackend
+            Communication backend used to recreate and exchange MNNVL memory
+            handles. It must have the same rank and world size as the original
+            allocation.
+        """
         memory = getattr(self.handle, "mcast_device_memory", None)
         if not isinstance(memory, SymmDeviceMemory):
             raise NotImplementedError(

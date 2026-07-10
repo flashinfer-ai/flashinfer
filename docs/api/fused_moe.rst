@@ -27,6 +27,7 @@ Utility Functions
     interleave_moe_weights_for_sm90_mixed_gemm
     interleave_moe_scales_for_sm90_mixed_gemm
     fused_topk_deepseek
+    hash_topk
 
 Multi-LoRA MoE (BGMV)
 ---------------------
