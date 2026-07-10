@@ -281,6 +281,153 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
     torch.testing.assert_close(o_decode_fp8, o_fp8, atol=1e-2, rtol=1e-2)
 
 
+# ---------------------------------------------------------------------------
+# CTA_TILE_Q selection for FP8-KV head_dim=512 (gh #3843)
+#
+# FP8 h512 ragged/single prefill run on the non-VO-split SharedStorage; only
+# the 2-Q x 2-KV-warp layout keeps its cross-warp merge buffer within the
+# 101376B per-block limit of SM120/121-class GPUs at CTA_TILE_Q=32 (the 1x4
+# layout needs 132176B and cannot launch there, and clamping to CTA_TILE_Q=16
+# doubles the KV traversal).
+# ---------------------------------------------------------------------------
+
+_PLAN_INFO_CTA_TILE_Q_IDX = 3  # PrefillPlanInfo::ToVector layout (scheduler.cuh)
+
+
+# 128: full Q tiles; 53: partial tail tile of 21 rows (the second Q-warp of
+# the 2x2 layout gets a partial slice -- the failure mode of the old generic
+# 2x2 layout removed in gh #523); 40: partial tail tile of 8 rows (the second
+# Q-warp gets no rows).
+@pytest.mark.parametrize("qo_len", [128, 53, 40])
+def test_ragged_fp8_h512_long_q_keeps_cta32(qo_len):
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(42)
+    batch_size = 2
+    kv_len = 128
+    num_qo_heads = num_kv_heads = 4
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    v = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    k_fp8 = k.to(torch.float8_e4m3fn)
+    v_fp8 = v.to(torch.float8_e4m3fn)
+    qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper_ref = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper_ref.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    o_ref = wrapper_ref.run(q, k_fp8.to(torch.float16), v_fp8.to(torch.float16))
+
+    wrapper_f8 = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper_f8.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+    )
+    # Long q must keep CTA_TILE_Q=32: 16 would double the KV traversal, and a
+    # regression to the 1x4 layout at 32 fails to launch on 99KB-smem GPUs
+    # ("Required shared memory (132176 bytes) exceeds ...").
+    assert wrapper_f8._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == 32
+    o_fp8 = wrapper_f8.run(q, k_fp8, v_fp8)
+    torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
+
+
+def test_paged_fp8_h512_long_q_keeps_cta32():
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(42)
+    batch_size = 2
+    qo_len = kv_len = 128
+    page_size = 16
+    num_qo_heads = num_kv_heads = 4
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_data_fp8 = (
+        torch.randn(
+            total_num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16
+        )
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
+    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    ).to(0)
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+    )
+    assert wrapper._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == 32
+    o = wrapper.run(q, kv_data_fp8)
+    assert torch.isfinite(o).all()
+
+
+def test_single_prefill_fp8_h512_long_q():
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(42)
+    qo_len = 100  # 3 full CTA_TILE_Q=32 tiles plus a 4-row partial tile
+    kv_len = 128
+    num_qo_heads = num_kv_heads = 4
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.float16).to(0)
+    k_fp8 = (
+        torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16)
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    v_fp8 = (
+        torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16)
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    o_ref = flashinfer.single_prefill_with_kv_cache(
+        q, k_fp8.to(torch.float16), v_fp8.to(torch.float16)
+    )
+    o_fp8 = flashinfer.single_prefill_with_kv_cache(q, k_fp8, v_fp8)
+    torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
+
+
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
         12, 7, 54, 1, 4, 4, 128, "NHD", torch.float8_e5m2

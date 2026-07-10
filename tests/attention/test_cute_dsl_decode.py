@@ -14,6 +14,7 @@ small so the full suite compiles a handful of kernels.
 """
 
 import math
+import warnings
 
 import pytest
 import torch
@@ -53,6 +54,7 @@ def _decode_reference_paged(
     kv_last_page_len: torch.Tensor,
     sm_scale: float,
     o_scale: float = 1.0,
+    sinks: torch.Tensor | None = None,
 ):
     """Single-token GQA decode reference using a paged KV cache (NHD layout)."""
     batch_size = kv_indptr.numel() - 1
@@ -86,7 +88,11 @@ def _decode_reference_paged(
         values = values.repeat_interleave(group, dim=1)
         # logits: [num_qo_heads, valid_len]
         logits = torch.einsum("hd,nhd->hn", q_f32[b], keys) * sm_scale
+        if sinks is not None:
+            logits = torch.cat([logits, sinks.float().unsqueeze(-1)], dim=-1)
         probs = torch.softmax(logits, dim=-1)
+        if sinks is not None:
+            probs = probs[:, :-1]
         out[b] = torch.einsum("hn,nhd->hd", probs, values)
     out *= o_scale
     return out.to(q.dtype)
@@ -121,6 +127,7 @@ def _decode_reference_contiguous(
     k: torch.Tensor,
     v: torch.Tensor,
     sm_scale: float,
+    sinks: torch.Tensor | None = None,
 ):
     """Ragged (contiguous KV) GQA decode reference; q has shape [b, 1, h_q, d]."""
     batch_size, q_len, num_qo_heads, head_dim = q.shape
@@ -131,7 +138,13 @@ def _decode_reference_contiguous(
     values = v.repeat_interleave(group, dim=2).float()
     q_f32 = q.float()
     logits = torch.einsum("bqhd,bnhd->bhqn", q_f32, keys) * sm_scale
+    if sinks is not None:
+        sink_logits = sinks.float().view(1, num_qo_heads, 1, 1)
+        sink_logits = sink_logits.expand(batch_size, -1, q_len, -1)
+        logits = torch.cat([logits, sink_logits], dim=-1)
     probs = torch.softmax(logits, dim=-1)
+    if sinks is not None:
+        probs = probs[:, :, :, :-1]
     out = torch.einsum("bhqn,bnhd->bqhd", probs, values)
     return out.to(q.dtype)
 
@@ -145,6 +158,378 @@ HEAD_DIM = 128
 NUM_QO_HEADS = 32
 NUM_KV_HEADS = 4
 DEVICE = torch.device("cuda")
+
+
+# ---------------------------------------------------------------------------
+# Deprecation shims
+# ---------------------------------------------------------------------------
+
+
+def _capture_decode_plan_impl(monkeypatch):
+    captured = {}
+
+    def fake_plan_impl(self, *args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper,
+        "_plan_impl",
+        fake_plan_impl,
+    )
+    return object.__new__(
+        flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper
+    ), captured
+
+
+def _capture_ragged_cute_plan_impl(monkeypatch):
+    captured = {}
+
+    def fake_plan_impl(self, *args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(BatchDecodeCuteDSLWrapper, "_plan_impl", fake_plan_impl)
+    return object.__new__(BatchDecodeCuteDSLWrapper), captured
+
+
+def _capture_ragged_cute_run_impl(monkeypatch):
+    captured = {}
+
+    def fake_run_impl(self, *args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return "ragged-run-result"
+
+    monkeypatch.setattr(BatchDecodeCuteDSLWrapper, "_run_impl", fake_run_impl)
+    return object.__new__(BatchDecodeCuteDSLWrapper), captured
+
+
+def _capture_paged_cute_plan_impl(monkeypatch):
+    captured = {}
+
+    def fake_plan_impl(self, *args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(BatchDecodePagedCuteDSLWrapper, "_plan_impl", fake_plan_impl)
+    return object.__new__(BatchDecodePagedCuteDSLWrapper), captured
+
+
+def _capture_paged_cute_run_impl(monkeypatch):
+    captured = {}
+
+    def fake_run_impl(self, *args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return "paged-run-result"
+
+    monkeypatch.setattr(BatchDecodePagedCuteDSLWrapper, "_run_impl", fake_run_impl)
+    return object.__new__(BatchDecodePagedCuteDSLWrapper), captured
+
+
+def test_batch_decode_plan_deprecated_positional_args_warn_and_bind(monkeypatch):
+    wrapper, captured = _capture_decode_plan_impl(monkeypatch)
+    legacy_tail = (
+        "ALIBI",
+        7,
+        2.0,
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.float16,
+        0.25,
+        2.0,
+        10000.0,
+        False,
+        "block_tables",
+        "seq_lens",
+        8,
+        True,
+        3,
+    )
+
+    with pytest.warns(DeprecationWarning, match="positionally"):
+        wrapper.plan("indptr", "indices", "last", 32, 4, 128, 16, *legacy_tail)
+
+    assert captured["args"] == ("indptr", "indices", "last", 32, 4, 128, 16)
+    assert captured["kwargs"]["pos_encoding_mode"] == "ALIBI"
+    assert captured["kwargs"]["window_left"] == 7
+    assert captured["kwargs"]["logits_soft_cap"] == 2.0
+    assert captured["kwargs"]["q_data_type"] is torch.float32
+    assert captured["kwargs"]["kv_data_type"] is torch.float16
+    assert captured["kwargs"]["o_data_type"] is torch.bfloat16
+    assert captured["kwargs"]["data_type"] is torch.float16
+    assert captured["kwargs"]["sm_scale"] == 0.25
+    assert captured["kwargs"]["rope_scale"] == 2.0
+    assert captured["kwargs"]["rope_theta"] == 10000.0
+    assert captured["kwargs"]["non_blocking"] is False
+    assert captured["kwargs"]["block_tables"] == "block_tables"
+    assert captured["kwargs"]["seq_lens"] == "seq_lens"
+    assert captured["kwargs"]["fixed_split_size"] == 8
+    assert captured["kwargs"]["disable_split_kv"] is True
+    assert captured["kwargs"]["q_len_per_req"] == 3
+
+
+def test_batch_decode_plan_window_right_is_keyword_only(monkeypatch):
+    wrapper, captured = _capture_decode_plan_impl(monkeypatch)
+
+    wrapper.plan("indptr", "indices", "last", 32, 4, 128, 16, window_right=4)
+    assert captured["kwargs"]["window_right"] == 4
+
+    with pytest.raises(TypeError, match="at most 16"):
+        wrapper.plan("indptr", "indices", "last", 32, 4, 128, 16, *(None,) * 17)
+
+
+def test_batch_decode_plan_duplicate_deprecated_positional_arg_rejected(monkeypatch):
+    wrapper, _ = _capture_decode_plan_impl(monkeypatch)
+
+    with pytest.raises(TypeError, match="multiple values.*pos_encoding_mode"):
+        wrapper.plan(
+            "indptr",
+            "indices",
+            "last",
+            32,
+            4,
+            128,
+            16,
+            "ALIBI",
+            pos_encoding_mode="NONE",
+        )
+
+
+def test_paged_cute_plan_deprecated_positional_args_warn_and_bind(monkeypatch):
+    wrapper, captured = _capture_paged_cute_plan_impl(monkeypatch)
+    legacy_tail = (
+        torch.float16,
+        torch.float16,
+        torch.float32,
+        0.125,
+        4,
+        "none",
+        2,
+        False,
+        2048,
+        False,
+        True,
+    )
+
+    with warnings.catch_warnings(record=True) as warning_records:
+        warnings.simplefilter("always", DeprecationWarning)
+        wrapper.plan("indptr", "indices", "seq_lens", 32, 4, 128, 16, *legacy_tail)
+    warning_messages = [str(record.message) for record in warning_records]
+    assert any("positionally" in message for message in warning_messages)
+    assert any("is_causal" in message for message in warning_messages)
+
+    assert captured["args"] == ("indptr", "indices", "seq_lens", 32, 4, 128, 16)
+    assert captured["kwargs"]["q_data_type"] is torch.float16
+    assert captured["kwargs"]["kv_data_type"] is torch.float16
+    assert captured["kwargs"]["o_data_type"] is torch.float32
+    assert captured["kwargs"]["sm_scale"] == 0.125
+    assert captured["kwargs"]["kv_splits"] == 4
+    assert captured["kwargs"]["reduction"] == "none"
+    assert captured["kwargs"]["q_len_per_req"] == 2
+    assert captured["kwargs"]["window_left"] is None
+    assert captured["kwargs"]["window_right"] is None
+    assert captured["kwargs"]["max_kv_len"] == 2048
+    assert captured["kwargs"]["non_blocking"] is False
+    assert captured["kwargs"]["precompile_skip_softmax_kernel"] is True
+    assert "is_causal" not in captured["kwargs"]
+
+
+def test_paged_cute_plan_is_causal_keyword_translation(monkeypatch):
+    wrapper, captured = _capture_paged_cute_plan_impl(monkeypatch)
+
+    with pytest.warns(DeprecationWarning, match="is_causal"):
+        wrapper.plan("indptr", "indices", "seq_lens", 32, 4, 128, 16, is_causal=True)
+    assert captured["kwargs"]["window_left"] is None
+    assert captured["kwargs"]["window_right"] == 0
+
+    with pytest.warns(DeprecationWarning, match="is_causal"):
+        wrapper.plan("indptr", "indices", "seq_lens", 32, 4, 128, 16, is_causal=False)
+    assert captured["kwargs"]["window_left"] is None
+    assert captured["kwargs"]["window_right"] is None
+
+
+def test_paged_cute_plan_is_causal_conflicts_with_window_args(monkeypatch):
+    wrapper, _ = _capture_paged_cute_plan_impl(monkeypatch)
+
+    with pytest.raises(TypeError, match="is_causal"):
+        wrapper.plan(
+            "indptr",
+            "indices",
+            "seq_lens",
+            32,
+            4,
+            128,
+            16,
+            is_causal=True,
+            window_left=1,
+        )
+
+
+def test_paged_cute_plan_window_right_is_keyword_only(monkeypatch):
+    wrapper, captured = _capture_paged_cute_plan_impl(monkeypatch)
+
+    wrapper.plan("indptr", "indices", "seq_lens", 32, 4, 128, 16, window_right=3)
+    assert captured["kwargs"]["window_right"] == 3
+
+    with pytest.raises(TypeError, match="at most 11"):
+        wrapper.plan("indptr", "indices", "seq_lens", 32, 4, 128, 16, *(None,) * 12)
+
+
+def test_paged_cute_plan_duplicate_deprecated_positional_arg_rejected(monkeypatch):
+    wrapper, _ = _capture_paged_cute_plan_impl(monkeypatch)
+
+    with pytest.raises(TypeError, match="multiple values.*q_data_type"):
+        wrapper.plan(
+            "indptr",
+            "indices",
+            "seq_lens",
+            32,
+            4,
+            128,
+            16,
+            torch.float16,
+            q_data_type=torch.bfloat16,
+        )
+
+
+def test_ragged_cute_plan_deprecated_positional_args_warn_and_bind(monkeypatch):
+    wrapper, captured = _capture_ragged_cute_plan_impl(monkeypatch)
+    legacy_tail = (
+        torch.float16,
+        torch.float16,
+        torch.float32,
+        0.125,
+        4,
+        "none",
+        2,
+        False,
+    )
+
+    with warnings.catch_warnings(record=True) as warning_records:
+        warnings.simplefilter("always", DeprecationWarning)
+        wrapper.plan(8, 2048, 32, 4, 128, *legacy_tail)
+    warning_messages = [str(record.message) for record in warning_records]
+    assert any("positionally" in message for message in warning_messages)
+    assert any("is_causal" in message for message in warning_messages)
+
+    assert captured["args"] == (8, 2048, 32, 4, 128)
+    assert captured["kwargs"]["q_data_type"] is torch.float16
+    assert captured["kwargs"]["kv_data_type"] is torch.float16
+    assert captured["kwargs"]["o_data_type"] is torch.float32
+    assert captured["kwargs"]["sm_scale"] == 0.125
+    assert captured["kwargs"]["kv_splits"] == 4
+    assert captured["kwargs"]["reduction"] == "none"
+    assert captured["kwargs"]["q_len_per_req"] == 2
+    assert captured["kwargs"]["window_left"] is None
+    assert captured["kwargs"]["window_right"] is None
+    assert "is_causal" not in captured["kwargs"]
+
+
+def test_ragged_cute_plan_deprecated_is_causal_keyword_translation(monkeypatch):
+    wrapper, captured = _capture_ragged_cute_plan_impl(monkeypatch)
+
+    with pytest.warns(DeprecationWarning, match="is_causal"):
+        wrapper.plan(8, 2048, 32, 4, 128, is_causal=True)
+    assert captured["kwargs"]["window_left"] is None
+    assert captured["kwargs"]["window_right"] == 0
+
+    with pytest.warns(DeprecationWarning, match="is_causal"):
+        wrapper.plan(8, 2048, 32, 4, 128, is_causal=False)
+    assert captured["kwargs"]["window_left"] is None
+    assert captured["kwargs"]["window_right"] is None
+
+
+def test_ragged_cute_plan_deprecated_is_causal_conflict_rejected(monkeypatch):
+    wrapper, _ = _capture_ragged_cute_plan_impl(monkeypatch)
+
+    with pytest.raises(TypeError, match="is_causal"):
+        wrapper.plan(8, 2048, 32, 4, 128, is_causal=True, window_right=0)
+
+
+def test_ragged_cute_plan_deprecation_window_right_is_keyword_only(monkeypatch):
+    wrapper, captured = _capture_ragged_cute_plan_impl(monkeypatch)
+
+    wrapper.plan(8, 2048, 32, 4, 128, window_right=3)
+    assert captured["kwargs"]["window_right"] == 3
+
+    with pytest.raises(TypeError, match="at most 8"):
+        wrapper.plan(8, 2048, 32, 4, 128, *(None,) * 9)
+
+
+def test_ragged_cute_run_deprecated_positional_args_warn_and_bind(monkeypatch):
+    wrapper, captured = _capture_ragged_cute_run_impl(monkeypatch)
+    legacy_tail = ("out", 0.5, 2.0, "lse", False)
+
+    with pytest.warns(DeprecationWarning, match="positionally"):
+        result = wrapper.run("q", "k", "v", *legacy_tail)
+
+    assert result == "ragged-run-result"
+    assert captured["args"] == ("q", "k", "v")
+    assert captured["kwargs"]["out"] == "out"
+    assert captured["kwargs"]["sm_scale"] == 0.5
+    assert captured["kwargs"]["o_scale"] == 2.0
+    assert captured["kwargs"]["lse"] == "lse"
+    assert captured["kwargs"]["enable_pdl"] is False
+
+
+def test_ragged_cute_run_deprecation_sinks_is_keyword_only(monkeypatch):
+    wrapper, captured = _capture_ragged_cute_run_impl(monkeypatch)
+
+    wrapper.run("q", "k", "v", sinks="sinks")
+    assert captured["kwargs"]["sinks"] == "sinks"
+
+    with pytest.raises(TypeError, match="at most 5"):
+        wrapper.run("q", "k", "v", *(None,) * 6)
+
+
+def test_ragged_cute_run_duplicate_deprecated_positional_arg_rejected(monkeypatch):
+    wrapper, _ = _capture_ragged_cute_run_impl(monkeypatch)
+
+    with pytest.raises(TypeError, match="multiple values.*out"):
+        wrapper.run("q", "k", "v", "positional-out", out="keyword-out")
+
+
+def test_paged_cute_run_deprecated_positional_args_warn_and_bind(monkeypatch):
+    wrapper, captured = _capture_paged_cute_run_impl(monkeypatch)
+    legacy_tail = ("out", 0.5, 2.0, 1e-6, "lse", False)
+
+    with pytest.warns(DeprecationWarning, match="positionally"):
+        result = wrapper.run("q", "k_cache", "v_cache", *legacy_tail)
+
+    assert result == "paged-run-result"
+    assert captured["args"] == ("q", "k_cache", "v_cache")
+    assert captured["kwargs"]["out"] == "out"
+    assert captured["kwargs"]["sm_scale"] == 0.5
+    assert captured["kwargs"]["o_scale"] == 2.0
+    assert captured["kwargs"]["skip_softmax_threshold_scale_factor"] == 1e-6
+    assert captured["kwargs"]["lse"] == "lse"
+    assert captured["kwargs"]["enable_pdl"] is False
+
+
+def test_paged_cute_run_deprecation_sinks_is_keyword_only(monkeypatch):
+    wrapper, captured = _capture_paged_cute_run_impl(monkeypatch)
+
+    wrapper.run("q", "k_cache", "v_cache", sinks="sinks")
+    assert captured["kwargs"]["sinks"] == "sinks"
+
+    with pytest.raises(TypeError, match="at most 6"):
+        wrapper.run("q", "k_cache", "v_cache", *(None,) * 7)
+
+
+def test_paged_cute_run_duplicate_deprecated_positional_arg_rejected(monkeypatch):
+    wrapper, _ = _capture_paged_cute_run_impl(monkeypatch)
+
+    with pytest.raises(TypeError, match="multiple values.*out"):
+        wrapper.run(
+            "q",
+            "k_cache",
+            "v_cache",
+            "positional-out",
+            out="keyword-out",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +570,35 @@ def test_cute_dsl_decode_ragged(batch_size, kv_len, dtype):
     ret = wrapper.run(q, k, v, out=out_buf)
     assert ret.data_ptr() == out_buf.data_ptr()
     torch.testing.assert_close(out_buf, ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_cute_dsl_decode_ragged_attention_sinks(dtype):
+    torch.manual_seed(0)
+    batch_size, kv_len = 4, 1024
+    q = torch.randn(batch_size, 1, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    k = torch.randn(
+        batch_size, kv_len, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    sinks = torch.randn(NUM_QO_HEADS, device=DEVICE, dtype=torch.float32)
+
+    wrapper = BatchDecodeCuteDSLWrapper(
+        torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+    )
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    wrapper.plan(
+        batch_size=batch_size,
+        max_kv_len=kv_len,
+        num_qo_heads=NUM_QO_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+    )
+    out = wrapper.run(q, k, v, sinks=sinks)
+    ref = _decode_reference_contiguous(q, k, v, sm_scale, sinks=sinks)
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +732,9 @@ def test_cute_dsl_decode_paged_non_causal(
         q_data_type=dtype,
         sm_scale=sm_scale,
         q_len_per_req=q_len_per_req,
-        is_causal=False,
+        # dense non-causal mask
+        window_left=None,
+        window_right=None,
     )
     out = wrapper.run(
         q.reshape(batch_size * q_len_per_req, NUM_QO_HEADS, HEAD_DIM), k_cache, v_cache
@@ -367,7 +783,9 @@ def test_cute_dsl_decode_paged_non_causal_split_boundary_tile():
         kv_splits=2,
         reduction="kernel",
         q_len_per_req=q_len_per_req,
-        is_causal=False,
+        # dense non-causal mask
+        window_left=None,
+        window_right=None,
         max_kv_len=max(seq_lens_host),
     )
     out = wrapper.run(
@@ -397,7 +815,7 @@ def test_batch_decode_wrapper_cute_dsl_backend(batch_size, kv_len, page_size, dt
     """Integration test via the standard BatchDecodeWithPagedKVCacheWrapper API."""
     torch.manual_seed(0)
     q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
-    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, _seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
 
@@ -443,6 +861,58 @@ def test_batch_decode_wrapper_cute_dsl_backend(batch_size, kv_len, page_size, dt
     out_buf = torch.zeros_like(out)
     cd_wrapper.run(q, kv, out=out_buf)
     torch.testing.assert_close(out_buf, ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_batch_decode_wrapper_cute_dsl_sliding_window(dtype):
+    """Public cute-dsl decode path should honor plan(window_left=...)."""
+    batch_size, page_size, kv_len = 4, 16, 256
+    window_left = 63
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    kv, kv_indptr, kv_indices, kv_last_page_len, _seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+
+    cd = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+        kv_layout="NHD",
+        backend="cute-dsl",
+    )
+    cd.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        NUM_QO_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        window_left=window_left,
+    )
+
+    ref_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+        kv_layout="NHD",
+        backend="fa2",
+    )
+    ref_wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        NUM_QO_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        window_left=window_left,
+    )
+
+    out = cd.run(q, kv)
+    ref = ref_wrapper.run(q, kv)
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
 
 
 @pytest.mark.parametrize("batch_size", [4])
@@ -504,6 +974,48 @@ def test_batch_decode_wrapper_cute_dsl_hnd(batch_size, kv_len, page_size, dtype)
     )
     ref = ref_wrapper.run(q, kv_nhd)
     torch.testing.assert_close(out_hnd, ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_batch_decode_wrapper_cute_dsl_attention_sinks(dtype):
+    """Public cute-dsl decode path should pass attention sinks to the paged kernel."""
+    batch_size, page_size, kv_len = 4, 16, 1024
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    kv, kv_indptr, kv_indices, kv_last_page_len, _seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    sinks = torch.randn(NUM_QO_HEADS, device=DEVICE, dtype=torch.float32)
+
+    workspace = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    cd = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="cute-dsl"
+    )
+    cd.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        NUM_QO_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    out = cd.run(q, kv, sinks=sinks)
+
+    k_cache, v_cache = kv.unbind(dim=1)
+    ref = _decode_reference_paged(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        1.0 / math.sqrt(HEAD_DIM),
+        sinks=sinks,
+    )
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
 
 
 @pytest.mark.parametrize("batch_size", [4])
@@ -819,19 +1331,6 @@ def test_batch_decode_wrapper_cute_dsl_rejects_unsupported(dtype):
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         workspace, kv_layout="NHD", backend="cute-dsl"
     )
-    with pytest.raises(NotImplementedError, match="sliding window"):
-        wrapper.plan(
-            kv_indptr,
-            kv_indices,
-            seq_lens,
-            NUM_QO_HEADS,
-            NUM_KV_HEADS,
-            HEAD_DIM,
-            page_size,
-            q_data_type=dtype,
-            kv_data_type=dtype,
-            window_left=64,
-        )
     with pytest.raises(NotImplementedError, match="logits_soft_cap"):
         wrapper.plan(
             kv_indptr,

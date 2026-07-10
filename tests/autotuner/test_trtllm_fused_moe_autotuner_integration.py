@@ -6,14 +6,20 @@ import torch
 
 from flashinfer import autotune, RoutingMethodType
 from flashinfer.autotuner import AutoTuner
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    get_compute_capability,
+    next_positive_power_of_2,
+    last_positive_power_of_2,
+)
 from flashinfer.fused_moe.utils import make_random_topk_ids
 from .utils import reset_autotuner
 
 TUNE_MAX = 8192
 
 
-def _prepare_bf16_moe_weights(num_experts, intermediate_size, hidden_size, device):
+def _prepare_bf16_moe_weights(
+    num_experts: int, intermediate_size: int, hidden_size: int, device: torch.device
+):
     """Prepare shuffled BF16 weights in BlockMajorK layout."""
     from flashinfer import shuffle_matrix_a
     from flashinfer.fused_moe import convert_to_block_layout
@@ -59,14 +65,14 @@ def _overwrite_cached_tactic_for_op(custom_op: str, new_tactic):
 
 def _tune_bf16_moe_once(
     *,
-    device,
+    device: torch.device,
     tune_num_tokens: int,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     intermediate_size: int,
-    gemm1_weights,
-    gemm2_weights,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
     tune_max: int,
 ):
     from flashinfer.fused_moe import trtllm_bf16_moe, WeightLayout
@@ -101,14 +107,14 @@ def _tune_bf16_moe_once(
 
 def _run_bf16_moe_infer(
     *,
-    device,
+    device: torch.device,
     infer_num_tokens: int,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     intermediate_size: int,
-    gemm1_weights,
-    gemm2_weights,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
     tune_max: int,
 ):
     from flashinfer.fused_moe import trtllm_bf16_moe, WeightLayout
@@ -146,7 +152,6 @@ def _compute_selected_tile_n_base_element(
     num_tokens: int, top_k: int, num_experts: int
 ) -> int:
     """Compute the base element used by computeSelectedTileN(num_tokens) to filter tile_N candidates."""
-    from flashinfer.fused_moe.utils import next_positive_power_of_2
 
     return min(next_positive_power_of_2(int(num_tokens * top_k / num_experts)), 256)
 
@@ -194,7 +199,6 @@ def test_bf16_moe_all_supported_tile_n_inference_succeed(
     """SM100 BF16 integration: Test that MoE works when given any supported tileN value,
     including values filtered out by computeSelectedTileN for the given inference num tokens.
     """
-    from flashinfer.fused_moe.utils import last_positive_power_of_2
 
     _require_sm100()
     torch.manual_seed(42)

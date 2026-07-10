@@ -63,6 +63,7 @@ from flashinfer.trace.templates.comm import allreduce_fusion_trace
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
+from .trtllm_ar import _initialize_allreduce_fusion_protocol
 from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
 from .trtllm_ar import trtllm_moe_allreduce_fusion
 from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
@@ -177,6 +178,59 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         except ValueError as e:
             logger.warning("Workspace is insufficient for problem size. %s", e)
             return False
+
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Detach physical backing; repeated successful calls are no-ops."""
+        if not self.mem_handles or not all(
+            isinstance(handle, SymmDeviceMemory) for handle in self.mem_handles
+        ):
+            raise NotImplementedError(
+                "Stable-VA checkpointing is unavailable for workspaces backed "
+                "by torch symmetric memory"
+            )
+
+        mapped = [handle.mapped for handle in self.mem_handles]
+        if not any(mapped):
+            return
+        if not all(mapped):
+            raise RuntimeError("TRT-LLM symmetric-memory handle state is inconsistent")
+
+        for handle in self.mem_handles:
+            handle._unmap_and_release_handles()
+        # Do not return until every rank has released all workspace handles.
+        self.mem_handles[0].comm_backend.barrier()
+
+    @flashinfer_api
+    def checkpoint_restore(self, comm_backend: CommBackend) -> None:
+        """Restore physical backing; repeated successful calls are no-ops."""
+        if not self.mem_handles or not all(
+            isinstance(handle, SymmDeviceMemory) for handle in self.mem_handles
+        ):
+            raise NotImplementedError(
+                "Stable-VA checkpointing is unavailable for workspaces backed "
+                "by torch symmetric memory"
+            )
+
+        mapped = [handle.mapped for handle in self.mem_handles]
+        if all(mapped):
+            return
+        if any(mapped):
+            raise RuntimeError("TRT-LLM symmetric-memory handle state is inconsistent")
+        for handle in self.mem_handles:
+            handle._create_and_map_handles(comm_backend)
+
+        _initialize_allreduce_fusion_protocol(
+            ipc_handles=self.ipc_handles,
+            tp_rank=self.rank,
+            flag_size=self.metadata["flag_size"],
+            lamport_buffer_size=self.metadata["lamport_buffer_size"],
+            lamport_comm_size=self.metadata["lamport_comm_size"],
+            use_fp32_lamport=self.metadata["use_fp32_lamport"],
+            control_flag_ptr=self.metadata["control_flag_ptr"],
+        )
+        torch.cuda.synchronize()
+        comm_backend.barrier()
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
@@ -676,6 +730,11 @@ def allreduce_fusion(
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
         # TensorRT-LLM backend implementation
+        if any(
+            isinstance(handle, SymmDeviceMemory) and not handle.mapped
+            for handle in workspace.mem_handles
+        ):
+            raise RuntimeError("TRT-LLM symmetric-memory handles are not attached")
 
         # ---- MOE Reduction pattern ----
         if pattern == AllReduceFusionPattern.kMoEReductionARResidualRMSNorm:
