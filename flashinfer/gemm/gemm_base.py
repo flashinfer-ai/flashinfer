@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 import functools
-from dataclasses import replace
 from enum import Enum
 from types import SimpleNamespace
 from typing import Callable, List, Literal, Optional, Tuple
@@ -5250,11 +5249,7 @@ def mm_mxfp8(
 
     tuner = AutoTuner.get()
 
-    tuning_config = (
-        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-        if backends == ["cute-dsl"]
-        else _MM_MXFP8_TUNING_CONFIG
-    )
+    tuning_config = _MM_MXFP8_TUNING_CONFIG
 
     inputs = [
         a,
@@ -6386,6 +6381,8 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
 
 
 _MM_MXFP8_TUNING_CONFIG = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -6414,11 +6411,6 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
     ),
 )
 
-_MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
-    _MM_MXFP8_TUNING_CONFIG,
-    use_cuda_graph=True,
-    use_cold_l2_cache=True,
-)
 
 
 @backend_requirement(
