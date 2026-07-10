@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 import functools
-from dataclasses import replace
 from enum import Enum
 from types import SimpleNamespace
 from typing import Callable, List, Literal, Optional, Tuple
@@ -50,7 +49,10 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from .kernels.utils import _select_sm100_mm_fp4_cute_dsl_tactic
+from .kernels.utils import (
+    _select_sm100_mm_fp4_cute_dsl_tactic,
+    _select_sm100_mm_mxfp8_cute_dsl_tactic,
+)
 from ..utils import (
     get_device_sm_count,
     get_native_fp4_dtype,
@@ -4831,23 +4833,19 @@ def _cute_dsl_gemm_mxfp8_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                if split_k_kernel_cls.supports_m(m) and out.is_contiguous():
-                    # Untuned low-M execution uses the corresponding base tactic.
-                    tactic = (
-                        split_k_kernel_cls.mma_tiler_mn_for_m(m),
-                        (1, 1),
-                        True,
-                        False,
-                        1,
-                    )
-                else:
-                    tactic = (
+                core_tactic = _select_sm100_mm_mxfp8_cute_dsl_tactic(
+                    m, n, real_k, get_device_sm_count(a.device)
+                )
+                if core_tactic[2] and not out.is_contiguous():
+                    # swap_ab stores C column-major by reinterpreting the
+                    # output buffer via as_strided, which needs a dense out.
+                    core_tactic = (
                         _SM100_DEFAULT_MMA_TILER_MN,
                         _SM100_DEFAULT_CLUSTER_SHAPE_MN,
                         False,
                         False,
-                        1,
                     )
+                tactic = core_tactic + (1,)
 
             (
                 mma_tiler_mn,
@@ -5251,11 +5249,7 @@ def mm_mxfp8(
 
     tuner = AutoTuner.get()
 
-    tuning_config = (
-        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-        if backends == ["cute-dsl"]
-        else _MM_MXFP8_TUNING_CONFIG
-    )
+    tuning_config = _MM_MXFP8_TUNING_CONFIG
 
     inputs = [
         a,
@@ -6387,6 +6381,8 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
 
 
 _MM_MXFP8_TUNING_CONFIG = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -6415,11 +6411,6 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
     ),
 )
 
-_MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
-    _MM_MXFP8_TUNING_CONFIG,
-    use_cuda_graph=True,
-    use_cold_l2_cache=True,
-)
 
 
 @backend_requirement(

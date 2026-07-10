@@ -30,9 +30,10 @@ _SM100_MMA_TILER_MN_CANDIDATES = [
     (256, 256),
 ]
 
-# Tactic cache: (n, real_k, sm_count) -> dict[m_bucket -> tactic_tuple]
+# Tactic caches: (n, real_k, sm_count) -> dict[m_bucket -> tactic_tuple]
 # Bounded by the number of unique (N, K) pairs in the model (typically < 50).
 _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
+_SM100_MM_MXFP8_TACTIC_CACHE: dict[tuple, dict] = {}
 
 # M bucket boundaries — powers of 2 for fast bucketing via
 # next_positive_power_of_2 (imported from flashinfer.fused_moe.utils).
@@ -64,6 +65,10 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
        Otherwise uses (1, 1).  tile_m=256 forces cluster_m=2 (HW constraint).
 
     4. **Prefetch**: Disabled.
+
+    Returns the core tactic (mma_tiler_mn, cluster_shape_mn, swap_ab,
+    use_prefetch) shared by the mm_fp4 and mm_mxfp8 cute-dsl runners; the
+    scoring depends only on problem geometry, not the operand dtype.
     """
     n_aligned = n % 8 == 0
 
@@ -132,8 +137,6 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
         (cga_m, cga_n),
         swap_ab,
         False,
-        "sm100",
-        None,
     )
 
 
@@ -159,8 +162,42 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
     if bucket_tactics is None:
         bucket_tactics = {}
         for rep_m in _M_BUCKETS:
-            bucket_tactics[rep_m] = _compute_tactic_for_m(rep_m, n, real_k, sm_count)
+            # mm_fp4 tactics carry two extra fields: kernel_type and
+            # use_tma_store.  Appended at cache-build time so the per-call
+            # lookup stays a plain dict access.
+            bucket_tactics[rep_m] = _compute_tactic_for_m(
+                rep_m, n, real_k, sm_count
+            ) + ("sm100", None)
         _SM100_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
+
+    bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
+    return bucket_tactics[bucket]
+
+
+def _select_sm100_mm_mxfp8_cute_dsl_tactic(m, n, real_k, sm_count):
+    """Select the best tactic for mm_mxfp8(backend='cute-dsl').
+
+    Mirrors _select_sm100_mm_fp4_cute_dsl_tactic (same geometry-based
+    scoring in _compute_tactic_for_m); only the tactic tuple format
+    differs — the mxfp8 runner appends its own split_k_slices field to
+    the core 4-tuple at the call site.
+
+    Args:
+        m: M dimension of the GEMM problem.
+        n: N dimension of the GEMM problem.
+        real_k: K dimension in elements (fp8 is unpacked, so a.shape[1]).
+        sm_count: Number of SMs on the target GPU.
+
+    Returns:
+        Tactic tuple: (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch)
+    """
+    cache_key = (n, real_k, sm_count)
+    bucket_tactics = _SM100_MM_MXFP8_TACTIC_CACHE.get(cache_key)
+    if bucket_tactics is None:
+        bucket_tactics = {}
+        for rep_m in _M_BUCKETS:
+            bucket_tactics[rep_m] = _compute_tactic_for_m(rep_m, n, real_k, sm_count)
+        _SM100_MM_MXFP8_TACTIC_CACHE[cache_key] = bucket_tactics
 
     bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
     return bucket_tactics[bucket]
