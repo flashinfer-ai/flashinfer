@@ -79,15 +79,19 @@ _DECODE_MAX_TOKENS = 64
 _DECODE_DSV4_DISPATCH = frozenset(
     {
         (8, 128),
+        (8, 256),
         (8, 512),
         (8, 1024),
         (16, 128),
+        (16, 256),
         (16, 512),
         (16, 1024),
         (32, 128),
+        (32, 256),
         (32, 512),
         (32, 1024),
         (64, 128),
+        (64, 256),
         (64, 512),
         (64, 1024),
         (128, 128),
@@ -376,6 +380,14 @@ def get_sparse_mla_sm120_module():
                 model_type=model_type,
             )
             return
+
+        if num_tokens <= _DECODE_MAX_TOKENS:
+            raise RuntimeError(
+                "Unsupported SM120 sparse-MLA decode shape: "
+                f"model_type={model_type}, num_tokens={num_tokens}, "
+                f"num_heads={num_heads}, topk={topk}, d_qk={d_qk}, "
+                f"page_block_size={kv_pbs}, extra_topk={extra_topk}"
+            )
 
         module.sparse_mla_sm120_paged_attention(
             q,

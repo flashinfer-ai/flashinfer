@@ -132,8 +132,8 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
 }
 
 // Public surface — explicit instantiation switch over the PR-body bench grid.
-// DSV4 only, page_block_size=64 only. NUM_HEADS ∈ {8, 16, 32, 64, 128},
-// TOPK ∈ {128, 512, 1024}.
+// TOPK=256 covers DeepSeek-V4 DSpark's 128-token context plus padded draft
+// block when vLLM builds the non-causal sparse-attention metadata.
 bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int page_block_size,
                                    int num_tokens, int num_splits, const bf16* Q,
                                    const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out,
@@ -154,15 +154,19 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
         stride_kv_block, stream);                                                           \
   }
   DSV4_DISPATCH(8, 128)
+  DSV4_DISPATCH(8, 256)
   DSV4_DISPATCH(8, 512)
   DSV4_DISPATCH(8, 1024)
   DSV4_DISPATCH(16, 128)
+  DSV4_DISPATCH(16, 256)
   DSV4_DISPATCH(16, 512)
   DSV4_DISPATCH(16, 1024)
   DSV4_DISPATCH(32, 128)
+  DSV4_DISPATCH(32, 256)
   DSV4_DISPATCH(32, 512)
   DSV4_DISPATCH(32, 1024)
   DSV4_DISPATCH(64, 128)
+  DSV4_DISPATCH(64, 256)
   DSV4_DISPATCH(64, 512)
   DSV4_DISPATCH(64, 1024)
   DSV4_DISPATCH(128, 128)
