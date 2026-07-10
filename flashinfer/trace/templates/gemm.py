@@ -1976,7 +1976,7 @@ mm_nvfp4_svdquant_trace = TraceTemplate(
     op_type="gemm_nvfp4_svdquant",
     description=(
         "SVDQuant fused NVFP4 GEMM (SM100): out = alpha * (a @ bᵀ) + d @ l1ᵀ. "
-        "The block-scaled NVFP4 residual GEMM fused with a rank-32 BF16 LoRA-up "
+        "The block-scaled NVFP4 residual GEMM fused with a rank-r BF16 LoRA-up "
         "correction in the same accumulator; 1/alpha is pre-folded into l1."
     ),
     axes={
@@ -1985,7 +1985,7 @@ mm_nvfp4_svdquant_trace = TraceTemplate(
         "K_packed": Const(description="K / 2 (two e2m1 values per byte)."),
         "SF_A": Const(description="128x4-swizzled activation scale buffer size."),
         "SF_B": Const(description="128x4-swizzled weight scale buffer size."),
-        "rank": Const(description="LoRA rank, fixed at 32 by the kernel."),
+        "rank": Const(description="LoRA rank, a positive multiple of 32."),
     },
     inputs={
         "a": Tensor(
@@ -2135,7 +2135,7 @@ svdquant_linear_trace = TraceTemplate(
     op_type="linear_nvfp4_svdquant",
     description=(
         "Full SVDQuant linear: y = (x * pre_quant_scale) @ (R + L1 @ L2)ᵀ where R is the "
-        "NVFP4-quantized residual weight — smooth-quantize, BF16 rank-32 down-projection, "
+        "NVFP4-quantized residual weight — smooth-quantize, BF16 rank-r down-projection, "
         "and the fused NVFP4 residual + LoRA-up GEMM."
     ),
     axes={
@@ -2144,7 +2144,7 @@ svdquant_linear_trace = TraceTemplate(
         "K": Const(),
         "K_packed": Const(description="K / 2 (two e2m1 values per byte)."),
         "SF_B": Const(description="128x4-swizzled weight scale buffer size."),
-        "rank": Const(description="LoRA rank, fixed at 32 by the kernel."),
+        "rank": Const(description="LoRA rank, a positive multiple of 32."),
     },
     inputs={
         "x": Tensor(["M", "K"], param="x", description="Input activation, bf16."),

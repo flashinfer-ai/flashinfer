@@ -114,14 +114,19 @@ struct CollectiveMmaLoRA<
   // SAME f32 TMEM accumulator after the NVFP4 K-loop. Build the bf16 TiledMMA via CUTLASS's
   // own SM100 helper (matches the residual cta_group; SS = both operands SMEM-sourced, as
   // the residual mainloop requires). The MMA tile is the full CTA-group tile, while the
-  // SMEM layouts below are explicitly reduced to each CTA's partition. ===
-  static constexpr int LoRaK = 32;  // Logical SVDQuant rank r=32 = 2 bf16 16-wide K-atoms.
+  // SMEM layouts below are explicitly reduced to each CTA's partition. The runtime rank
+  // (Arguments::lora_rank) is any positive multiple of LoRaK; ranks wider than one
+  // LoRaStorageK tile are consumed as extra post-K-loop chunks over the same stage
+  // buffers (see load()/mma()). ===
+  static constexpr int LoRaK = 32;  // Rank granularity: 32 columns = 2 bf16 16-wide K-atoms.
   using ResidualElementA = remove_cvref_t<decltype(get<0>(ElementPairA_{}))>;
   static_assert((cute::size<2>(TileShape{}) * cute::sizeof_bits_v<ResidualElementA>) %
                     cute::sizeof_bits_v<cutlass::bfloat16_t> ==
                 0);
   // Match one residual A/B stage exactly: FP4 K128 -> BF16 K32, FP4 K256 -> BF16 K64.
-  // The global D/L1 tensors remain logical K32; TMA zero-fills the upper half of a K64 box.
+  // The runtime rank is chunked into ceil(rank / LoRaStorageK) such tiles; TMA zero-fills
+  // the box columns beyond the global tensors' K extent (e.g. rank 32 in a K64 box, or the
+  // upper half of the second K64 chunk of a rank-96 tensor).
   static constexpr int LoRaStorageK = cute::size<2>(TileShape{}) *
                                       cute::sizeof_bits_v<ResidualElementA> /
                                       cute::sizeof_bits_v<cutlass::bfloat16_t>;
@@ -296,11 +301,11 @@ struct CollectiveMmaLoRA<
                         cute::sizeof_bits_v<cutlass::bfloat16_t> ==
                     cute::cosize(take<0, 3>(SmemLayoutB{})) * cute::sizeof_bits_v<ElementB>,
                 "Each CTA's LoRA L1 tile must exactly overlay one residual B stage");
-  using StrideD = cute::Stride<int64_t, cute::_1, int64_t>;   // D  [M, LoRaK, L] (K-contig)
-  using StrideL1 = cute::Stride<int64_t, cute::_1, int64_t>;  // L1 [N, LoRaK, L] (K-contig)
-  // CTA-group bytes for one stage -- the post-loop TMA loads one D/L1 tile per output tile.
-  // (Unused in the post-loop, which relies on D/L1 arriving the armed A/B byte budget, but
-  // kept correct in case of an expect_transaction path.)
+  using StrideD = cute::Stride<int64_t, cute::_1, int64_t>;   // D  [M, rank, L] (K-contig)
+  using StrideL1 = cute::Stride<int64_t, cute::_1, int64_t>;  // L1 [N, rank, L] (K-contig)
+  // CTA-group bytes for one stage -- the post-loop TMA loads one D/L1 chunk per producer
+  // step. (Unused in the post-loop, which relies on D/L1 arriving the armed A/B byte
+  // budget, but kept correct in case of an expect_transaction path.)
   static constexpr uint32_t LoRaTmaBytes =
       cutlass::bits_to_bytes(cute::size(AtomThrShapeMNK{}) *
                              cute::cosize(take<0, 3>(SmemLayoutD{})) *
@@ -509,11 +514,13 @@ struct CollectiveMmaLoRA<
     LayoutSFB layout_SFB{};
     RuntimeDataTypeA runtime_data_type_a{};
     RuntimeDataTypeB runtime_data_type_b{};
-    // LoRA-up: D [M, LoRaK] (1/alpha NOT here), L1 [N, LoRaK] (1/alpha folded in). bf16.
+    // LoRA-up: D [M, lora_rank] (1/alpha NOT here), L1 [N, lora_rank] (1/alpha folded
+    // in). bf16. lora_rank must be a positive multiple of LoRaK.
     cutlass::bfloat16_t const* ptr_D{nullptr};
     StrideD dD{};
     cutlass::bfloat16_t const* ptr_L1{nullptr};
     StrideL1 dL1{};
+    int lora_rank{LoRaK};
   };
 
   // Device side kernel params
@@ -580,6 +587,7 @@ struct CollectiveMmaLoRA<
     dim3 cluster_shape_fallback;
     RuntimeDataTypeA runtime_data_type_a;
     RuntimeDataTypeB runtime_data_type_b;
+    int lora_rank;
   };
 
   CUTLASS_DEVICE
@@ -590,7 +598,8 @@ struct CollectiveMmaLoRA<
         layout_SFA_(params.layout_SFA),
         layout_SFB_(params.layout_SFB),
         runtime_data_type_a_(params.runtime_data_type_a),
-        runtime_data_type_b_(params.runtime_data_type_b) {
+        runtime_data_type_b_(params.runtime_data_type_b),
+        lora_rank_(params.lora_rank) {
     if constexpr (IsDynamicCluster) {
       bool const is_fallback_cluster =
           (cute::size<0>(cluster_shape_) == params.cluster_shape_fallback.x &&
@@ -678,11 +687,12 @@ struct CollectiveMmaLoRA<
         GmemTiledCopySFB{}, tensor_sfb, SmemLayoutSFB{}(_, _, _, cute::Int<0>{}), TileShape_SF{},
         TiledMMA_SF{}, cluster_layout_sfb_vmnk_fallback);
 
-    // LoRA D/L1 TMA atoms (bf16; [M,LoRaK,L] / [N,LoRaK,L], K-contiguous).
+    // LoRA D/L1 TMA atoms (bf16; [M,rank,L] / [N,rank,L], K-contiguous). The descriptor
+    // carries the true runtime rank so partially out-of-bounds chunk boxes zero-fill.
     Tensor tensor_d =
-        make_tensor(args.ptr_D, make_layout(make_shape(M, cute::Int<LoRaK>{}, L), args.dD));
+        make_tensor(args.ptr_D, make_layout(make_shape(M, args.lora_rank, L), args.dD));
     Tensor tensor_l1 =
-        make_tensor(args.ptr_L1, make_layout(make_shape(N, cute::Int<LoRaK>{}, L), args.dL1));
+        make_tensor(args.ptr_L1, make_layout(make_shape(N, args.lora_rank, L), args.dL1));
     typename Params::TMA_D tma_load_d = make_tma_atom_A_sm100<cutlass::bfloat16_t>(
         GmemTiledCopyA{}, tensor_d, SmemLayoutD{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{},
         LoRaMma{}, cluster_layout_vmnk);
@@ -712,7 +722,8 @@ struct CollectiveMmaLoRA<
             args.layout_SFB,
             hw_info.cluster_shape_fallback,
             args.runtime_data_type_a,
-            args.runtime_data_type_b};
+            args.runtime_data_type_b,
+            args.lora_rank};
   }
 
   template <class ProblemShape>
@@ -750,6 +761,11 @@ struct CollectiveMmaLoRA<
     implementable = implementable && (layout_sfb_ref == take<0, 2>(args.layout_SFB));
     if (!implementable) {
       CUTLASS_TRACE_HOST("  CAN IMPLEMENT: layout_SFB mismatch, layout_SFB needs to be K-major\n");
+    }
+
+    if (args.lora_rank < LoRaK || args.lora_rank % LoRaK != 0) {
+      CUTLASS_TRACE_HOST("  CAN IMPLEMENT: lora_rank must be a positive multiple of 32\n");
+      implementable = false;
     }
 
     if (!implementable) {
@@ -936,9 +952,10 @@ struct CollectiveMmaLoRA<
     uint16_t mcast_mask_sfa = create_tma_multicast_mask<2>(cta_layout_vmnk, cta_coord_vmnk);
     uint16_t mcast_mask_sfb = create_tma_multicast_mask<1>(cta_layout_sfb_vmnk, cta_coord_sfb_vmnk);
 
-    // LoRA D[M,LoRaK]/L1[N,LoRaK]: partition like A/B (D along M, L1 along N), single k-tile.
-    Tensor mD_mkl = observed_tma_load_d_->get_tma_tensor(make_shape(M, cute::Int<LoRaK>{}, L));
-    Tensor mL1_nkl = observed_tma_load_l1_->get_tma_tensor(make_shape(N, cute::Int<LoRaK>{}, L));
+    // LoRA D[M,rank]/L1[N,rank]: partition like A/B (D along M, L1 along N); the k-tile
+    // mode holds the ceil(rank / LoRaStorageK) post-K-loop chunks.
+    Tensor mD_mkl = observed_tma_load_d_->get_tma_tensor(make_shape(M, lora_rank_, L));
+    Tensor mL1_nkl = observed_tma_load_l1_->get_tma_tensor(make_shape(N, lora_rank_, L));
     Tensor gD_mkl = local_tile(mD_mkl, LoRaMmaTileShape{}, make_coord(_, _, _), Step<_1, X, _1>{});
     Tensor gL1_nkl =
         local_tile(mL1_nkl, LoRaMmaTileShape{}, make_coord(_, _, _), Step<X, _1, _1>{});
@@ -1122,30 +1139,39 @@ struct CollectiveMmaLoRA<
       ++k_tile_iter;
     }
 
-    // === load D/L1 in ONE extra producer step AFTER the K-loop, INTO the
-    // freed residual stage buffers smem_A[ws]/smem_B[ws] (no dedicated sD/sL1, no carveout), ONLY
-    // in the mainloop call (lora_start_k != 0) so it lands at the END of the k-tile sequence (else
-    // the prologue's copy would inject mid-sequence -> consumer misreads it as a tile -> hang). The
-    // producer_acquire arms the barrier for the A+B+SF byte budget; D arrives EXACTLY the A-stage
-    // bytes (D-tile == A-stage) into smem_A[ws], L1 the B-stage bytes into smem_B[ws], and SFA/SFB
-    // are DUMMY-reloaded to arrive the SF bytes -> D+L1+SF == armed A+B+SF, so NO
-    // expect_transaction and NO A/B re-load needed. (D/L1 in pipeline-managed stage buffers also
-    // removes the earlier dedicated-single-buffer cross-tile clobber caveat.) ===
+    // === load D/L1 in ceil(rank / LoRaStorageK) extra producer steps AFTER the K-loop, INTO
+    // the freed residual stage buffers smem_A[ws]/smem_B[ws] (no dedicated sD/sL1, no carveout),
+    // ONLY in the mainloop call (lora_start_k != 0) so they land at the END of the k-tile sequence
+    // (else the prologue's copy would inject mid-sequence -> consumer misreads it as a tile ->
+    // hang). Each producer_acquire arms the barrier for the A+B+SF byte budget; a D chunk arrives
+    // EXACTLY the A-stage bytes (D-chunk box == A-stage) into smem_A[ws], an L1 chunk the B-stage
+    // bytes into smem_B[ws], and SFA/SFB are DUMMY-reloaded to arrive the SF bytes -> D+L1+SF ==
+    // armed A+B+SF, so NO expect_transaction and NO A/B re-load needed. The last chunk of a rank
+    // that does not fill its box is TMA zero-filled (the descriptor carries the true rank).
+    // (D/L1 in pipeline-managed stage buffers also removes the earlier dedicated-single-buffer
+    // cross-tile clobber caveat.) ===
     if (lora_start_k != 0) {
-      mainloop_pipeline.producer_acquire(mainloop_pipe_producer_state, barrier_token);
-      using BarrierTypePost = typename MainloopPipeline::ProducerBarrierType;
-      BarrierTypePost* tb = mainloop_pipeline.producer_get_barrier(mainloop_pipe_producer_state);
-      int ws = mainloop_pipe_producer_state.index();
-      ++mainloop_pipe_producer_state;
-      if (cute::elect_one_sync()) {
-        copy(observed_tma_load_sfa_->with(*tb, mcast_mask_sfa), tAgSFA(_, cute::_0{}),
-             tAsSFA(_, ws));  // dummy: arrive SFA bytes
-        copy(observed_tma_load_sfb_->with(*tb, mcast_mask_sfb), tBgSFB(_, cute::_0{}),
-             tBsSFB(_, ws));  // dummy: arrive SFB bytes
-        copy(observed_tma_load_d_->with(*tb, mcast_mask_d), tDgD(_, cute::_0{}),
-             tDsD(_, ws));  // D -> smem_A[ws] (== A-stage bytes)
-        copy(observed_tma_load_l1_->with(*tb, mcast_mask_l1), tL1gL1(_, cute::_0{}),
-             tL1sL1(_, ws));  // L1 -> smem_B[ws] (== B-stage bytes)
+      int const lora_k_tiles = cutlass::ceil_div(lora_rank_, LoRaStorageK);
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int lk = 0; lk < lora_k_tiles; ++lk) {
+        mainloop_pipeline.producer_acquire(mainloop_pipe_producer_state, barrier_token);
+        using BarrierTypePost = typename MainloopPipeline::ProducerBarrierType;
+        BarrierTypePost* tb = mainloop_pipeline.producer_get_barrier(mainloop_pipe_producer_state);
+        int ws = mainloop_pipe_producer_state.index();
+        ++mainloop_pipe_producer_state;
+        if (lk + 1 < lora_k_tiles) {
+          barrier_token = mainloop_pipeline.producer_try_acquire(mainloop_pipe_producer_state);
+        }
+        if (cute::elect_one_sync()) {
+          copy(observed_tma_load_sfa_->with(*tb, mcast_mask_sfa), tAgSFA(_, cute::_0{}),
+               tAsSFA(_, ws));  // dummy: arrive SFA bytes
+          copy(observed_tma_load_sfb_->with(*tb, mcast_mask_sfb), tBgSFB(_, cute::_0{}),
+               tBsSFB(_, ws));  // dummy: arrive SFB bytes
+          copy(observed_tma_load_d_->with(*tb, mcast_mask_d), tDgD(_, lk),
+               tDsD(_, ws));  // D chunk -> smem_A[ws] (== A-stage bytes)
+          copy(observed_tma_load_l1_->with(*tb, mcast_mask_l1), tL1gL1(_, lk),
+               tL1sL1(_, ws));  // L1 chunk -> smem_B[ws] (== B-stage bytes)
+        }
       }
     }
 
@@ -1213,21 +1239,27 @@ struct CollectiveMmaLoRA<
     //
     tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
 
-    // LoRA-up D@L1ᵀ applied in ONE post-K-loop consumer step (see load(): D/L1 are TMA'd into the
-    // residual stage buffers smem_A[ws]/smem_B[ws] in an extra producer step after the K-loop). The
-    // residual accumulator is still held (producer_acquire'd, not yet committed), and f32 acc adds
-    // are commutative, so adding D@L1ᵀ after the full residual == folding it in. accumulate_=One
-    // adds. rstage = the consumed pipeline stage holding THIS output tile's D/L1 (tCrD/tCrL1 are
-    // stage-moded since SmemLayoutD/L1 overlay the multi-stage smem_A/smem_B).
+    // LoRA-up D@L1ᵀ applied in ceil(rank / LoRaStorageK) post-K-loop consumer steps (see load():
+    // D/L1 chunks are TMA'd into the residual stage buffers smem_A[ws]/smem_B[ws] in matching
+    // extra producer steps after the K-loop). The residual accumulator is still held
+    // (producer_acquire'd, not yet committed), and f32 acc adds are commutative, so adding D@L1ᵀ
+    // after the full residual == folding it in. accumulate_=One adds. rstage = the consumed
+    // pipeline stage holding THIS chunk's D/L1 (tCrD/tCrL1 are stage-moded since SmemLayoutD/L1
+    // overlay the multi-stage smem_A/smem_B). k_blocks = the chunk's REAL rank columns / atom K:
+    // the tail of a partially out-of-bounds chunk is TMA zero-filled, but skipping its k-blocks
+    // keeps the rank-32 instruction stream identical to the original fixed-rank kernel.
     auto lora_mma = LoRaMma{};
     lora_mma.accumulate_ = UMMA::ScaleOut::One;
     static constexpr int LoRaAtomK = cute::size<2>(typename LoRaMma::AtomShape_MNK{});
     static_assert(LoRaK % LoRaAtomK == 0);
-    static constexpr int LoRaMmaKBlocks = LoRaK / LoRaAtomK;
-    auto apply_lora = [&](int rstage) {
+    static_assert(LoRaStorageK % LoRaAtomK == 0);
+    static constexpr int LoRaMmaKBlocksMax = LoRaStorageK / LoRaAtomK;
+    auto apply_lora = [&](int rstage, int k_blocks) {
       CUTLASS_PRAGMA_UNROLL
-      for (int kb = 0; kb < LoRaMmaKBlocks; ++kb) {
-        cute::gemm(lora_mma, tCrD(_, _, kb, rstage), tCrL1(_, _, kb, rstage), accumulators);
+      for (int kb = 0; kb < LoRaMmaKBlocksMax; ++kb) {
+        if (kb < k_blocks) {
+          cute::gemm(lora_mma, tCrD(_, _, kb, rstage), tCrL1(_, _, kb, rstage), accumulators);
+        }
       }
     };
 
@@ -1311,18 +1343,24 @@ struct CollectiveMmaLoRA<
       mainloop_pipeline.consumer_release(curr_mainloop_pipe_consumer_state);
     }
 
-    // === consume the SINGLE post-K-loop D/L1 producer step (load() emits it
-    // only in the mainloop call, gated by lora_start_k != 0, so exactly one occurs at the end of
-    // the k-tile sequence), then run the LoRA MMA reading D/L1 from the consumed stage buffer
-    // (read_stage = the smem_A[stage]/smem_B[stage] this step's D/L1 landed in) into the still-held
-    // residual accumulator. One consumer step balances the one producer step. ===
+    // === consume the post-K-loop D/L1 producer steps (load() emits them only in the mainloop
+    // call, gated by lora_start_k != 0, so they occur exactly once at the end of the k-tile
+    // sequence), running one LoRA MMA chunk per consumed stage buffer (read_stage = the
+    // smem_A[stage]/smem_B[stage] this chunk's D/L1 landed in) into the still-held residual
+    // accumulator. Consumer steps balance the producer steps one-for-one. ===
     {
-      auto lora_token = mainloop_pipeline.consumer_try_wait(mainloop_pipe_consumer_state);
-      mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state, lora_token);
-      int lora_read_stage = mainloop_pipe_consumer_state.index();
-      apply_lora(lora_read_stage);
-      mainloop_pipeline.consumer_release(mainloop_pipe_consumer_state);
-      ++mainloop_pipe_consumer_state;
+      int lora_cols_left = lora_rank_;
+      CUTLASS_PRAGMA_NO_UNROLL
+      while (lora_cols_left > 0) {
+        auto lora_token = mainloop_pipeline.consumer_try_wait(mainloop_pipe_consumer_state);
+        mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state, lora_token);
+        int lora_read_stage = mainloop_pipe_consumer_state.index();
+        int const chunk_cols = lora_cols_left < LoRaStorageK ? lora_cols_left : LoRaStorageK;
+        apply_lora(lora_read_stage, chunk_cols / LoRaAtomK);
+        mainloop_pipeline.consumer_release(mainloop_pipe_consumer_state);
+        ++mainloop_pipe_consumer_state;
+        lora_cols_left -= LoRaStorageK;
+      }
     }
 
     return mainloop_pipe_consumer_state;
@@ -1340,6 +1378,7 @@ struct CollectiveMmaLoRA<
   LayoutSFB layout_SFB_;
   RuntimeDataTypeA runtime_data_type_a_{};
   RuntimeDataTypeB runtime_data_type_b_{};
+  int lora_rank_ = LoRaK;
 
   ClusterShape cluster_shape_;
   uint32_t block_rank_in_cluster_;

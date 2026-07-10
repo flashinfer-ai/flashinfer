@@ -47,9 +47,10 @@ from ..utils import (
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
-# The fused kernel accumulates the rank-32 BF16 LoRA-up into the NVFP4 residual accumulator; the
-# rank is fixed by the collective (CollectiveMmaLoRA::LoRaK).
-SVDQUANT_LORA_RANK = 32
+# The fused kernel accumulates the rank-r BF16 LoRA-up into the NVFP4 residual accumulator.
+# The rank is inferred from the d/l1 shapes and must be a positive multiple of the collective's
+# rank granularity (CollectiveMmaLoRA::LoRaK); ranks 32-128 are validated.
+SVDQUANT_LORA_RANK_GRANULARITY = 32
 
 
 def _pad_up(x: int, y: int) -> int:
@@ -123,7 +124,7 @@ _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG = TuningConfig(
             lambda shapes: _swizzled_sf_size(shapes[0][0], shapes[0][1] * 2 // 16),
         ),
         ConstraintSpec(
-            5,  # d tensor index: [m, 32] LoRA-down output
+            5,  # d tensor index: [m, r] LoRA-down output (r kept from the real input)
             0,
             lambda shapes: shapes[0][0],
         ),
@@ -172,15 +173,20 @@ def _check_mm_nvfp4_svdquant_problem(
     k = k_packed * 2
     if n % 32 != 0 or k % 32 != 0:
         raise ValueError(f"n and k must be divisible by 32, got n={n}, k={k}")
-    if d.ndim != 2 or d.shape[0] != m or d.shape[1] != SVDQUANT_LORA_RANK:
+    if d.ndim != 2 or d.shape[0] != m:
         raise ValueError(
-            f"d must have shape [m, {SVDQUANT_LORA_RANK}] (rank-{SVDQUANT_LORA_RANK} "
-            f"LoRA-down output), got {tuple(d.shape)}"
+            f"d must have shape [m, r] (rank-r LoRA-down output), got {tuple(d.shape)}"
         )
-    if l1.ndim != 2 or l1.shape[0] != n or l1.shape[1] != SVDQUANT_LORA_RANK:
+    rank = d.shape[1]
+    if rank < SVDQUANT_LORA_RANK_GRANULARITY or rank % SVDQUANT_LORA_RANK_GRANULARITY:
         raise ValueError(
-            f"l1 must have shape [n, {SVDQUANT_LORA_RANK}] (rank-{SVDQUANT_LORA_RANK} "
-            f"LoRA-up weight pre-divided by alpha), got {tuple(l1.shape)}"
+            f"the LoRA rank (d.shape[1]) must be a positive multiple of "
+            f"{SVDQUANT_LORA_RANK_GRANULARITY}, got {rank}"
+        )
+    if l1.ndim != 2 or l1.shape[0] != n or l1.shape[1] != rank:
+        raise ValueError(
+            f"l1 must have shape [n, {rank}] (rank-{rank} LoRA-up weight pre-divided "
+            f"by alpha, same rank as d), got {tuple(l1.shape)}"
         )
     if d.dtype != torch.bfloat16 or l1.dtype != torch.bfloat16:
         raise ValueError("d and l1 must be bf16")
@@ -207,11 +213,13 @@ def mm_nvfp4_svdquant(
 ) -> torch.Tensor:
     r"""SVDQuant fused NVFP4 GEMM (SM100): ``out = alpha * (a @ bᵀ) + d @ l1ᵀ [+ bias]``.
 
-    The block-scaled NVFP4 residual GEMM is fused with the rank-32 BF16 LoRA-up correction
+    The block-scaled NVFP4 residual GEMM is fused with the rank-r BF16 LoRA-up correction
     ``d @ l1ᵀ``, computed by a second BF16 tcgen05 MMA into the same accumulator after the
-    NVFP4 K-loop, plus an optional fused per-column bias. ``1/alpha`` must be folded into
-    ``l1`` by the caller (``l1 = svdquant_lora_b / alpha``) so the epilogue
-    ``out = alpha * acc + bias`` yields the correction unscaled.
+    NVFP4 K-loop, plus an optional fused per-column bias. The LoRA rank ``r`` is inferred
+    from the ``d``/``l1`` shapes and must be a positive multiple of 32 (ranks 32-128 are
+    validated). ``1/alpha`` must be folded into ``l1`` by the caller
+    (``l1 = svdquant_lora_b / alpha``) so the epilogue ``out = alpha * acc + bias`` yields
+    the correction unscaled.
 
     Parameters
     ----------
@@ -230,10 +238,10 @@ def mm_nvfp4_svdquant(
     alpha: torch.Tensor
         Per-tensor residual dequantization scale, float32, device scalar (``numel >= 1``).
     d: torch.Tensor
-        LoRA-down output ``x_hat @ L2ᵀ``, shape ``(m, 32)`` bf16, contiguous and 16-byte
+        LoRA-down output ``x_hat @ L2ᵀ``, shape ``(m, r)`` bf16, contiguous and 16-byte
         aligned (TMA). Compute it as ``x @ (pre_quant_scale[:, None] * L2ᵀ)`` in bf16.
     l1: torch.Tensor
-        LoRA-up weight pre-divided by alpha, shape ``(n, 32)`` bf16.
+        LoRA-up weight pre-divided by alpha, shape ``(n, r)`` bf16 (same rank as ``d``).
     bias: Optional[torch.Tensor]
         Optional per-column bias, shape ``(n,)`` bf16, fused in the epilogue.
     out: Optional[torch.Tensor]
@@ -364,7 +372,8 @@ def svdquant_linear(
 
     The invariant per-layer transforms must be prepared offline by the caller:
     ``l2t_smoothed = (pre_quant_scale[:, None] * svdquant_lora_a.T).to(bf16)`` with shape
-    ``(k, 32)`` and ``l1_scaled = (svdquant_lora_b / alpha).to(bf16)`` with shape ``(n, 32)``.
+    ``(k, r)`` and ``l1_scaled = (svdquant_lora_b / alpha).to(bf16)`` with shape ``(n, r)``,
+    where the LoRA rank ``r`` is a positive multiple of 32.
 
     Parameters
     ----------
@@ -379,9 +388,9 @@ def svdquant_linear(
     pre_quant_scale: torch.Tensor
         Per-input-channel smoothing scale, shape ``(k,)`` bf16.
     l2t_smoothed: torch.Tensor
-        ``pre_quant_scale[:, None] * L2ᵀ``, shape ``(k, 32)`` bf16.
+        ``pre_quant_scale[:, None] * L2ᵀ``, shape ``(k, r)`` bf16.
     l1_scaled: torch.Tensor
-        ``L1 / alpha``, shape ``(n, 32)`` bf16.
+        ``L1 / alpha``, shape ``(n, r)`` bf16.
     global_scale: torch.Tensor
         Activation global scale, float32 device scalar.
     bias: Optional[torch.Tensor]

@@ -33,8 +33,9 @@ namespace gemm {
 //
 //   A   [m, k]  NVFP4 (e2m1), row-major          SFA/SFB  block scale factors (ue4m3, swizzled)
 //   B   [n, k]  NVFP4 (e2m1), column-major        alpha   per-tensor dequant scale (device f32[1])
-//   D   [m, r]  bf16, row-major (r = 32)          out     [m, n] bf16
+//   D   [m, r]  bf16, row-major                   out     [m, n] bf16
 //   L1  [n, r]  bf16, row-major (= svdquant_lora_b / alpha)
+// r is the SVDQuant LoRA rank: any positive multiple of 32 (ranks 32-128 are validated).
 enum class Nvfp4SvdquantGemmTactic : int {
   // Preserve the original tactic IDs used by existing sweeps.
   k1Sm128x256x128 = 0,
@@ -76,7 +77,7 @@ size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic = 0);
 
 void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const* sfa,
                              void const* sfb, float const* alpha, void const* D, void const* L1,
-                             void const* bias, int m, int n, int k, char* workspace,
+                             void const* bias, int m, int n, int k, int lora_rank, char* workspace,
                              size_t workspaceBytes, cudaStream_t stream, int tactic = 0,
                              bool enable_pdl = false);
 

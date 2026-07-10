@@ -236,8 +236,8 @@ size_t workspace_size_for_tactic(int m, int n, int k, RuntimeTactic const& tacti
 template <class Config>
 void run_tactic(void* out, void const* A, void const* B, void const* sfa, void const* sfb,
                 float const* alpha, void const* D, void const* L1, void const* bias, int m, int n,
-                int k, char* ws, size_t wsBytes, cudaStream_t stream, RuntimeTactic const& tactic,
-                bool enable_pdl) {
+                int k, int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
+                RuntimeTactic const& tactic, bool enable_pdl) {
   using Gemm = typename Config::Gemm;
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
   typename Gemm::Arguments args{};
@@ -252,12 +252,16 @@ void run_tactic(void* out, void const* A, void const* B, void const* sfa, void c
   args.mainloop.dB = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, 0);
   args.mainloop.layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(args.problem_shape);
   args.mainloop.layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(args.problem_shape);
-  // LoRA D[M,LoRaK] / L1[N,LoRaK] (bf16, row-major K-contiguous). 1/alpha is folded into L1.
-  constexpr int64_t LoRaK = 32;  // must match CollectiveMmaLoRA::LoRaK
+  // LoRA D[M,r] / L1[N,r] (bf16, row-major K-contiguous, r a positive multiple of 32).
+  // 1/alpha is folded into L1.
+  if (lora_rank < 32 || lora_rank % 32 != 0)
+    throw std::invalid_argument("nvfp4_svdquant_gemm: lora_rank must be a positive multiple of 32");
+  int64_t const r = lora_rank;
   args.mainloop.ptr_D = static_cast<cutlass::bfloat16_t const*>(D);
-  args.mainloop.dD = cute::make_stride(LoRaK, cute::_1{}, int64_t(m) * LoRaK);
+  args.mainloop.dD = cute::make_stride(r, cute::_1{}, int64_t(m) * r);
   args.mainloop.ptr_L1 = static_cast<cutlass::bfloat16_t const*>(L1);
-  args.mainloop.dL1 = cute::make_stride(LoRaK, cute::_1{}, int64_t(n) * LoRaK);
+  args.mainloop.dL1 = cute::make_stride(r, cute::_1{}, int64_t(n) * r);
+  args.mainloop.lora_rank = lora_rank;
 
   args.epilogue.ptr_C = nullptr;
   args.epilogue.ptr_D = static_cast<OutElementType*>(out);
@@ -293,22 +297,22 @@ void run_tactic(void* out, void const* A, void const* B, void const* sfa, void c
   if (st != cutlass::Status::kSuccess) throw std::runtime_error("nvfp4_svdquant_gemm: run failed");
 }
 
-#define INSTANTIATE_NVFP4_SVDQUANT_GEMM_TACTIC(Config)                                       \
-  template size_t workspace_size_for_tactic<Config>(int m, int n, int k,                     \
-                                                    RuntimeTactic const& tactic);            \
-  template void run_tactic<Config>(void* out, void const* A, void const* B, void const* sfa, \
-                                   void const* sfb, float const* alpha, void const* D,       \
-                                   void const* L1, void const* bias, int m, int n, int k,    \
-                                   char* ws, size_t wsBytes, cudaStream_t stream,            \
+#define INSTANTIATE_NVFP4_SVDQUANT_GEMM_TACTIC(Config)                                           \
+  template size_t workspace_size_for_tactic<Config>(int m, int n, int k,                         \
+                                                    RuntimeTactic const& tactic);                \
+  template void run_tactic<Config>(void* out, void const* A, void const* B, void const* sfa,     \
+                                   void const* sfb, float const* alpha, void const* D,           \
+                                   void const* L1, void const* bias, int m, int n, int k,        \
+                                   int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream, \
                                    RuntimeTactic const& tactic, bool enable_pdl);
 
-#define EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Config)                                               \
-  extern template size_t workspace_size_for_tactic<Config>(int m, int n, int k,                 \
-                                                           RuntimeTactic const& tactic);        \
-  extern template void run_tactic<Config>(                                                      \
-      void* out, void const* A, void const* B, void const* sfa, void const* sfb,                \
-      float const* alpha, void const* D, void const* L1, void const* bias, int m, int n, int k, \
-      char* ws, size_t wsBytes, cudaStream_t stream, RuntimeTactic const& tactic,               \
+#define EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Config)                                                \
+  extern template size_t workspace_size_for_tactic<Config>(int m, int n, int k,                  \
+                                                           RuntimeTactic const& tactic);         \
+  extern template void run_tactic<Config>(                                                       \
+      void* out, void const* A, void const* B, void const* sfa, void const* sfb,                 \
+      float const* alpha, void const* D, void const* L1, void const* bias, int m, int n, int k,  \
+      int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream, RuntimeTactic const& tactic, \
       bool enable_pdl);
 
 // The per-shape kernels are explicitly instantiated in Jinja-generated translation units (one per

@@ -16,8 +16,9 @@
  */
 // TVM-FFI binding for the SM100 SVDQuant fused NVFP4 GEMM:
 //   nvfp4_svdquant_gemm : out = alpha * (A @ Bᵀ) + (D @ L1ᵀ) [+ bias], the residual NVFP4 GEMM
-//                         fused with the rank-32 LoRA-up via a 2nd bf16 tcgen05 MMA in the same
+//                         fused with the rank-r LoRA-up via a 2nd bf16 tcgen05 MMA in the same
 //                         TMEM accumulator (custom CUTLASS SM100 block-scaled collective).
+//                         r is inferred from d/l1 and must be a positive multiple of 32.
 //   nvfp4_svdquant_gemm_tactic_num : number of kernel tactics for the autotuner.
 
 #include <cuda_fp16.h>
@@ -73,42 +74,42 @@ size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic) {
 // collective. 1/alpha folded into L1 so the epilogue yields alpha*residual + D@L1ᵀ + bias.
 void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const* sfa,
                              void const* sfb, float const* alpha, void const* D, void const* L1,
-                             void const* bias, int m, int n, int k, char* ws, size_t wsBytes,
-                             cudaStream_t stream, int tactic, bool enable_pdl) {
+                             void const* bias, int m, int n, int k, int lora_rank, char* ws,
+                             size_t wsBytes, cudaStream_t stream, int tactic, bool enable_pdl) {
   RuntimeTactic const runtime_tactic = resolve_tactic(tactic);
   switch (runtime_tactic.kernel_shape) {
     case KernelShape::k1Sm128x256x128:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic1Sm128x256x128Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic,
-          enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
+          runtime_tactic, enable_pdl);
     case KernelShape::k2Sm256x256x128:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic2Sm256x256x128Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic,
-          enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
+          runtime_tactic, enable_pdl);
     case KernelShape::k1Sm128x128x128:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic1Sm128x128x128Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic,
-          enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
+          runtime_tactic, enable_pdl);
     case KernelShape::k2Sm256x192x128:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic2Sm256x192x128Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic,
-          enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
+          runtime_tactic, enable_pdl);
     case KernelShape::k1Sm128x64x128:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic1Sm128x64x128Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic,
-          enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
+          runtime_tactic, enable_pdl);
     case KernelShape::k1Sm128x128x256:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic1Sm128x128x256Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic,
-          enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
+          runtime_tactic, enable_pdl);
     case KernelShape::k2Sm256x128x256:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic2Sm256x128x256Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic,
-          enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
+          runtime_tactic, enable_pdl);
     case KernelShape::k2Sm256x256x256:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic2Sm256x256x256Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic,
-          enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
+          runtime_tactic, enable_pdl);
   }
   throw std::invalid_argument("nvfp4_svdquant_gemm_run: invalid kernel shape");
 }
@@ -133,8 +134,9 @@ inline int64_t swizzled_sf_size(int64_t rows, int64_t sfCols) {
 
 // out = alpha * (A @ Bᵀ) + (D @ L1ᵀ) [+ bias]. a = quant(x_hat) [m, k/2] uint8, b [n, k/2] uint8
 // (packed e2m1), a_sf/b_sf swizzled UE4M3 block scales, alpha f32[1] (residual dequant scale).
-// D [m, 32] = x_hat @ L2ᵀ (bf16) and L1 [n, 32] = svdquant_lora_b / alpha (bf16; 1/alpha folded so
-// the epilogue out = alpha * acc yields the LoRA). out [m, n] bf16, allocated by the caller.
+// D [m, r] = x_hat @ L2ᵀ (bf16) and L1 [n, r] = svdquant_lora_b / alpha (bf16; 1/alpha folded so
+// the epilogue out = alpha * acc yields the LoRA); the LoRA rank r is inferred from d/l1 and must
+// be a positive multiple of 32. out [m, n] bf16, allocated by the caller.
 void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView b_sf,
                          TensorView alpha, TensorView d, TensorView l1,
                          Optional<TensorView> const& bias, TensorView out,
@@ -169,12 +171,15 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
       << "a_sf is smaller than the required swizzled scale layout";
   TVM_FFI_ICHECK_GE(b_sf.numel(), swizzled_sf_size(n, k / 16))
       << "b_sf is smaller than the required swizzled scale layout";
-  TVM_FFI_ICHECK(d.ndim() == 2 && d.size(0) == m && d.size(1) == 32)
-      << "d must have shape [m, 32] (rank-32 LoRA-down output)";
+  TVM_FFI_ICHECK(d.ndim() == 2 && d.size(0) == m)
+      << "d must have shape [m, r] (rank-r LoRA-down output)";
+  int64_t const loraRank = d.size(1);
+  TVM_FFI_ICHECK(loraRank >= 32 && loraRank % 32 == 0)
+      << "the LoRA rank (d/l1 inner dimension) must be a positive multiple of 32, got " << loraRank;
   TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(d.data_ptr()) % 16, 0)
       << "d must be 16-byte aligned for TMA";
-  TVM_FFI_ICHECK(l1.ndim() == 2 && l1.size(0) == n && l1.size(1) == 32)
-      << "l1 must have shape [n, 32] (rank-32 LoRA-up weight, pre-divided by alpha)";
+  TVM_FFI_ICHECK(l1.ndim() == 2 && l1.size(0) == n && l1.size(1) == loraRank)
+      << "l1 must have shape [n, r] with the same LoRA rank as d (pre-divided by alpha)";
   TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(l1.data_ptr()) % 16, 0)
       << "l1 must be 16-byte aligned for TMA";
   TVM_FFI_ICHECK(out.ndim() == 2 && out.size(0) == m && out.size(1) == n)
@@ -206,7 +211,7 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
     flashinfer::gemm::nvfp4_svdquant_gemm_run(
         out.data_ptr(), a.data_ptr(), b.data_ptr(), a_sf.data_ptr(), b_sf.data_ptr(),
         static_cast<float const*>(alpha.data_ptr()), d.data_ptr(), l1.data_ptr(), biasPtr,
-        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(loraRank),
         reinterpret_cast<char*>(workspace), requiredWorkspaceBytes, stream, tacticId, enable_pdl);
   };
 
