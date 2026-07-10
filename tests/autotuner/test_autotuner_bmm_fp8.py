@@ -6,13 +6,19 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import (
     _FP8_GEMM_SM100_TUNING_CONFIG,
     _cudnn_gemm_fp8_runner,
-    _is_cudnn_engine_knob_tactic,
     _get_cache_buf,
     get_gemm_module,
     DEFAULT_WORKSPACE_SIZE,
 )
 from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
+
+
+def _assert_engine_knob_tactic(tactic):
+    """cuDNN tactics are stable (engine_id, knob_items) descriptors, not plan indices."""
+    engine_id, knob_items = tactic
+    assert isinstance(engine_id, int)
+    assert all(len(item) == 2 for item in knob_items)
 
 
 @pytest.mark.parametrize(
@@ -121,8 +127,7 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
     assert is_cache_hit == expected_cache_hit
     if is_cache_hit:
         assert runner_id == 0
-        # cuDNN tactics are stable engine/knob descriptors, not plan indices.
-        assert _is_cudnn_engine_knob_tactic(tactic)
+        _assert_engine_knob_tactic(tactic)
         assert stored_profile is not None
 
 
@@ -199,7 +204,7 @@ def test_autotuner_gemm_cross_bucket_m(backend):
     )
     assert is_cache_hit
     if backend == "cudnn":
-        assert _is_cudnn_engine_knob_tactic(tactic)
+        _assert_engine_knob_tactic(tactic)
     else:
         assert tactic >= 0
     assert stored_profile is not None
