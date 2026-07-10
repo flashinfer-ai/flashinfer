@@ -71,5 +71,5 @@ kernel correctness.
 
 **Design principle → design doc as markdown → code owner / agent enforce.** When a change
 embodies a design decision for durable code, capture the principle as a markdown design doc
-(see `docs/design_docs/`) so reviewers — human or agent — can enforce against a written
+(see [design_docs/](design_docs/)) so reviewers — human or agent — can enforce against a written
 rationale instead of re-deriving it each PR.
