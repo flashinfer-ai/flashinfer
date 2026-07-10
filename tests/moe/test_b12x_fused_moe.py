@@ -1135,6 +1135,163 @@ class TestB12xFunctional:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    def test_input_global_scale_decouples_weight_alpha(self):
+        """input_global_scale lets w1_alpha carry an exact fp32 weight scale.
+
+        Encodes weights checkpoint-style (block scales hold W/scale_2, the
+        per-expert scale_2 ~ 2e-4 stays outside the e4m3 encoding, as nvfp4
+        checkpoints ship) and passes scale_2 as w1_alpha/w2_alpha with
+        input_global_scale=1.  Without the new argument a caller must bake
+        scale_2 into the e4m3 block scales (pushing them into the 3-bit
+        subnormal range) -- that path must be measurably worse against the
+        same reference.  The reference uses dequantized fp4 weights so the
+        shared weight-quantization error cancels and the comparison isolates
+        the baking error.  Also checks that omitting input_global_scale
+        reproduces the legacy dual-use bit-for-bit (modulo the bf16 atomic
+        scatter-combine noise).
+        """
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fp4_quantization import fp4_quantize
+        from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+        torch.manual_seed(7)
+        device = "cuda"
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 256, 2
+        sf_vec_size = 16
+
+        # Unit-scale input keeps the intermediate activations out of the
+        # subnormal scale-byte range, so this test isolates the weight-side
+        # block-scale precision and stays orthogonal to the activation-side
+        # subnormal decode behavior.
+        x_bf16 = torch.randn(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+        )
+        router = torch.randn(num_tokens, num_experts, device=device)
+        weights, ids = torch.topk(F.softmax(router, dim=1, dtype=torch.float), top_k)
+        weights = (weights / weights.sum(-1, keepdim=True)).float()
+        ids = ids.to(torch.int32)
+
+        w1_bf16 = (
+            torch.randn(
+                num_experts,
+                2 * intermediate_size,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            / 10
+        )
+        w2_bf16 = (
+            torch.randn(
+                num_experts,
+                hidden_size,
+                intermediate_size,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            / 10
+        )
+        amax = max(w1_bf16.abs().max().item(), w2_bf16.abs().max().item())
+        scale_2 = torch.full(
+            (num_experts,), amax / (448.0 * 6.0), device=device, dtype=torch.float32
+        )
+
+        def quant_ckpt_style(w, m, k):
+            # modelopt encoding: quantize with gs=1/scale_2 so payload x
+            # block_scale ~= W/scale_2; scale_2 is applied outside as alpha.
+            q, sf = fp4_quantize(
+                w.reshape(num_experts * m, k),
+                global_scale=(1.0 / scale_2[:1]),
+                sf_vec_size=sf_vec_size,
+                is_sf_swizzled_layout=True,
+            )
+            sf_mma = convert_sf_to_mma_layout(
+                sf, m=m, k=k, num_groups=num_experts, sf_vec_size=sf_vec_size
+            )
+            return q.reshape(num_experts, m, k // 2), sf_mma
+
+        w1_q, w1_sf = quant_ckpt_style(w1_bf16, 2 * intermediate_size, hidden_size)
+        w2_q, w2_sf = quant_ckpt_style(w2_bf16, hidden_size, intermediate_size)
+        ones = torch.ones(num_experts, device=device, dtype=torch.float32)
+        fc2_scale = torch.tensor([1.0], device=device, dtype=torch.float32)
+
+        def run(w1_sf_, w2_sf_, alpha, input_gs):
+            return b12x_fused_moe(
+                x=x_bf16,
+                w1_weight=w1_q,
+                w1_weight_sf=w1_sf_,
+                w1_alpha=alpha,
+                fc2_input_scale=fc2_scale,
+                input_global_scale=input_gs,
+                w2_weight=w2_q,
+                w2_weight_sf=w2_sf_,
+                w2_alpha=alpha,
+                token_selected_experts=ids,
+                token_final_scales=weights,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_experts,
+            ).float()
+
+        # Reference on dequantized fp4 weights (round-tripped with the same
+        # encoding), so both kernel paths share the weight-quant error and
+        # the exact-vs-baked comparison isolates the block-scale precision.
+        w1_deq = quant_dequant_fp4_reference(
+            w1_bf16.reshape(num_experts * 2 * intermediate_size, hidden_size),
+            (1.0 / scale_2[:1]),
+        ).reshape(num_experts, 2 * intermediate_size, hidden_size)
+        w2_deq = quant_dequant_fp4_reference(
+            w2_bf16.reshape(num_experts * hidden_size, intermediate_size),
+            (1.0 / scale_2[:1]),
+        ).reshape(num_experts, hidden_size, intermediate_size)
+
+        ref = compute_reference_moe_fp4(
+            hidden_states=x_bf16.float(),
+            gemm1_weights=w1_deq,
+            gemm2_weights=w2_deq,
+            token_selected_experts=ids,
+            token_final_scales=weights,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=fc2_scale,
+        )
+
+        # Decoupled path: exact fp32 scale_2 as alpha, unit input-quant scale.
+        out_exact = run(w1_sf, w2_sf, scale_2, ones)
+        passed, percent_within, atol = check_accuracy(out_exact, ref)
+        assert passed, (
+            f"decoupled path: only {percent_within * 100:.2f}% within "
+            f"tolerance (atol={atol:.4f})"
+        )
+
+        # Baked encoding (the workaround the new argument removes): scale_2
+        # multiplied into the e4m3 block scales, alpha = 1.
+        w1_sf_baked = (w1_sf.float() * scale_2[0]).to(torch.float8_e4m3fn)
+        w2_sf_baked = (w2_sf.float() * scale_2[0]).to(torch.float8_e4m3fn)
+        out_baked = run(w1_sf_baked, w2_sf_baked, ones, None)
+        relf_exact = ((out_exact - ref).norm() / ref.norm()).item()
+        relf_baked = ((out_baked - ref).norm() / ref.norm()).item()
+        assert relf_baked > 2.0 * relf_exact, (
+            f"baked block scales should be measurably worse: "
+            f"exact={relf_exact:.4f} baked={relf_baked:.4f}"
+        )
+
+        # Back-compat: omitting input_global_scale must reproduce the legacy
+        # dual-use within the bf16 atomic scatter-combine noise.
+        out_legacy = run(w1_sf, w2_sf, ones, None)
+        out_legacy2 = run(w1_sf, w2_sf, ones, None)
+        out_explicit = run(w1_sf, w2_sf, ones, ones)
+        noise = (out_legacy - out_legacy2).abs().max().item()
+        diff = (out_legacy - out_explicit).abs().max().item()
+        assert diff <= max(2.0 * noise, 1e-6), (
+            f"explicit input_global_scale=w1_alpha diverged from legacy "
+            f"dual-use: diff={diff:.3e} noise={noise:.3e}"
+        )
+
     @pytest.mark.parametrize(
         "activation", ["silu", "gelu_tanh", "swigluoai_uninterleave"]
     )

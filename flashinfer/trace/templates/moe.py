@@ -3139,6 +3139,16 @@ b12x_fused_moe_trace = TraceTemplate(
                 "activation_precision='bf16'."
             ),
         ),
+        "input_global_scale": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description=(
+                "Global scale for FC1 input quantization (scalar or "
+                "per-expert). Defaults to w1_alpha; ignored for "
+                "activation_precision='bf16'."
+            ),
+        ),
         "activation_precision": Scalar(
             "string",
             optional=True,
