@@ -1634,9 +1634,7 @@ class AutoTuner:
 
             return runners[runner_id], tactic
 
-    def _get_input_sizes(
-        self, inputs: list[torch.Tensor]
-    ) -> tuple[tuple[int, ...], ...]:
+    def _get_input_sizes(self, inputs: list[Any]) -> tuple[tuple[int, ...], ...]:
         """Return ``torch.Size`` for each input, using ``(0,)`` for non-Tensor values."""
         return tuple(
             tuple(tensor.size()) if isinstance(tensor, torch.Tensor) else (0,)
