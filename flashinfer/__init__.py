@@ -217,11 +217,7 @@ from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform
 from .topk import top_k_ragged_transform as top_k_ragged_transform
 from .topk import TopKTieBreak as TopKTieBreak
-from .topk_blackwell import can_use_gvr_topk as can_use_gvr_topk
-from .topk_blackwell import gvr_topk_decode as gvr_topk_decode
-from .topk_blackwell import gvr_topk_sort_prepare as gvr_topk_sort_prepare
-from .topk_blackwell import gvr_topk_lb_prepare as gvr_topk_lb_prepare
-from .topk_blackwell import gvr_topk_lb_decode as gvr_topk_lb_decode
+from .topk_blackwell import top_k_decode as top_k_decode
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,

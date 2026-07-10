@@ -13,7 +13,14 @@
 # limitations under the License.
 """GVR Top-K CuTe DSL kernels for Blackwell (sm_100+)."""
 
+from .config import GvrTopKConfig, GvrTopKLBConfig
 from .gvr_topk_decode import GvrTopKKernel
 from .gvr_topk_decode_lb import GvrTopKLBKernel, GvrTopKLBPrepareKernel
 
-__all__ = ["GvrTopKKernel", "GvrTopKLBKernel", "GvrTopKLBPrepareKernel"]
+__all__ = [
+    "GvrTopKConfig",
+    "GvrTopKLBConfig",
+    "GvrTopKKernel",
+    "GvrTopKLBKernel",
+    "GvrTopKLBPrepareKernel",
+]
