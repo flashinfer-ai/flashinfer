@@ -229,7 +229,9 @@ def validate_mega_arch() -> None:
         )
 
 
-def validate_fleet_weights(params: FleetParams, world_size: int) -> None:
+def validate_fleet_weights(
+    weights: MoEWeightPack, params: FleetParams, world_size: int
+) -> None:
     """Check canonical weight layout matches EP sizing for this rank."""
     if world_size <= 0:
         raise MoEEpConfigError(f"world_size must be positive, got {world_size}")
@@ -239,10 +241,10 @@ def validate_fleet_weights(params: FleetParams, world_size: int) -> None:
             f"world_size ({world_size})"
         )
     local = params.num_experts // world_size
-    pack = params.weights
+    pack = weights
     if not isinstance(pack, MoEWeightPack):
         raise MoEEpConfigError(
-            f"FleetParams.weights must be MoEWeightPack, got {type(pack).__name__}"
+            f"layer weights must be MoEWeightPack, got {type(pack).__name__}"
         )
     hidden = params.token_hidden_size
     for name in ("w13", "w2"):

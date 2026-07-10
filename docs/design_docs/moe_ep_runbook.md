@@ -212,7 +212,8 @@ up). If the kernel needs NVSHMEM, return it from `runtime_requirements()` (see
 from flashinfer.moe_ep import MoEEpLayer, MegaConfig, MyMegaMoeConfig
 
 layer = MoEEpLayer(
-    bootstrap=..., fleet_params=...,   # weights required on fleet_params
+    bootstrap=..., fleet_params=...,
+    weights=...,                       # canonical MoEWeightPack, required
     backend=MegaConfig(megakernel=MyMegaMoeConfig(intermediate_size=1024, top_k=4)),
 )
 out = layer.forward(tensors)

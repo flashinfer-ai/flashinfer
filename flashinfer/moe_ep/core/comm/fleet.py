@@ -56,10 +56,11 @@ def create_fleet(
     algo_knobs: Sequence["AlgoKnob"] = (),
     backend: str | object = "nccl_ep",
 ) -> Fleet:
-    """Instantiate the registered Fleet class for ``backend``."""
-    from ...core.validation.common import validate_fleet_weights
+    """Instantiate the registered Fleet class for ``backend``.
 
-    validate_fleet_weights(params, bootstrap.world_size)
+    Expert weights are not validated here — they are a layer concern
+    (validated in the MoEEpLayer ctor); the Fleet transport never reads them.
+    """
     name = getattr(backend, "backend_name", backend)
     if not isinstance(name, str):
         raise TypeError(

@@ -361,8 +361,8 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
                 num_experts=problem["num_experts"],
                 max_tokens_per_rank=problem["max_tokens"],
                 token_hidden_size=problem["hidden"],
-                weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
             ),
+            weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
             backend=MegaConfig(
                 megakernel=_megakernel_config(problem),
                 quantize_input=quantize_input,

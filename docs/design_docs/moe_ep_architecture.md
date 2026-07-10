@@ -10,7 +10,7 @@ Expert-Parallel MoE with two execution modes:
 | **Split** | dispatch → inner kernel → combine | Pluggable comm + compute; NCCL-EP / NIXL-EP transport |
 | **Mega** | fused comm + MoE kernel | Single symmetric-memory kernel; no separate Fleet/Handle |
 
-Entry point: `MoEEpLayer(bootstrap, fleet_params, fleet_knobs=(), backend=...)` → `MoEEpSplitLayer` or `MoEEpMegaLayer`.
+Entry point: `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backend=...)` → `MoEEpSplitLayer` or `MoEEpMegaLayer`.
 
 ## Layout
 
@@ -31,9 +31,9 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 | Type | Role |
 |------|------|
 | `BootstrapConfig` | `world_size`, `rank`, `stream`, `nccl_comm`, `tcp_store`, optional `process_group` (EP comm; defaults to WORLD), `auto_bootstrap=True` |
-| `FleetParams` | EP sizing + required `weights`; split transport fields (`algorithm`, `layout`, `dtype_bytes`) default and are ignored by mega |
+| `FleetParams` | EP sizing only (no weights); split transport fields (`algorithm`, `layout`, `dtype_bytes`) default and are ignored by mega |
 | `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales`, `fc1_alpha`, `fc2_alpha`, `fc1_norm_const`, `recv_count`, `num_tokens_per_expert` |
-| `MoEWeightPack` | Canonical `w13` / `w2` (+ optional `w13_scale` / `w2_scale`); `dummy_moe_weights()` for comm-only split |
+| `MoEWeightPack` | Canonical `w13` / `w2` (+ optional `w13_scale` / `w2_scale`); required `weights` arg at layer construction; `dummy_moe_weights()` for comm-only split |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |
 | `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
 
@@ -46,7 +46,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 
 Both bf16 and NVFP4 are supported in the compute path (`MoEConfig.quant.variant`); NVFP4 activations are quantized in the bridge (linear SF layout). Correctness is currently validated for bf16 only (see **Tests**).
 
-**Mega:** pass `MegaConfig(megakernel=...)`. Weights required on `fleet_params`. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
+**Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
 ## Architecture
 
@@ -133,7 +133,8 @@ from flashinfer.moe_ep import (
 layer = MoEEpLayer(
     bootstrap=BootstrapConfig(world_size=4, rank=rank),
     fleet_params=FleetParams(num_experts=32, max_tokens_per_rank=256,
-        token_hidden_size=2048, weights=MoEWeightPack(w13=..., w2=...)),
+        token_hidden_size=2048),
+    weights=MoEWeightPack(w13=..., w2=...),
     backend=SplitConfig(comm=NcclEpConfig(),
         kernel=FusedMoeKernelConfig(moe_config=moe_config)),
 )

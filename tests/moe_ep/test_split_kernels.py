@@ -37,7 +37,6 @@ class TestIdentitySplitKernel:
 
         from flashinfer.moe_ep import (
             FleetParams,
-            dummy_moe_weights,
             IdentityConfig,
             SplitKernelContext,
             run_split_kernel,
@@ -51,7 +50,6 @@ class TestIdentitySplitKernel:
                 num_experts=1,
                 max_tokens_per_rank=8,
                 token_hidden_size=128,
-                weights=dummy_moe_weights(num_local_experts=1, hidden=128),
             ),
         )
         out = run_split_kernel(IdentityConfig(), ctx)
@@ -74,7 +72,6 @@ class TestSplitKernelRegistry:
 
         from flashinfer.moe_ep import (
             FleetParams,
-            dummy_moe_weights,
             SplitKernelContext,
             run_split_kernel,
         )
@@ -89,7 +86,6 @@ class TestSplitKernelRegistry:
                 num_experts=2,
                 max_tokens_per_rank=2,
                 token_hidden_size=4,
-                weights=dummy_moe_weights(num_local_experts=2, hidden=4),
             ),
         )
         with pytest.raises(KeyError, match="unknown"):
@@ -173,8 +169,8 @@ def test_split_layer_identity_kernel_wires_dispatch_to_combine(capturing_stub_fl
             num_experts=2,
             max_tokens_per_rank=4,
             token_hidden_size=6,
-            weights=dummy_moe_weights(num_local_experts=2, hidden=6),
         ),
+        weights=dummy_moe_weights(num_local_experts=2, hidden=6),
         backend=SplitConfig(comm=NCCLEPConfig(), kernel=IdentityConfig()),
     )
     out = split(
@@ -284,10 +280,10 @@ def test_identity_split_kernel_multirank_roundtrip(comm_backend):
             token_hidden_size=hidden,
             dtype_bytes=2,
             algorithm=EpAlgorithm.LOW_LATENCY,
-            weights=dummy_moe_weights(
-                num_local_experts=num_experts // world_size,
-                hidden=hidden,
-            ),
+        ),
+        weights=dummy_moe_weights(
+            num_local_experts=num_experts // world_size,
+            hidden=hidden,
         ),
         backend=SplitConfig(comm=comm, kernel=IdentityConfig()),
     )

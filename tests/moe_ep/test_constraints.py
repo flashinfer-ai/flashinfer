@@ -28,31 +28,30 @@ def _split(
     world_size: int = 4,
     max_tokens_per_rank: int = 128,
     token_hidden_size: int = 4096,
-    num_local_experts: int | None = None,
 ) -> FleetParams:
-    local = num_local_experts if num_local_experts is not None else num_experts // world_size
     return FleetParams(
         num_experts=num_experts,
         max_tokens_per_rank=max_tokens_per_rank,
         token_hidden_size=token_hidden_size,
-        weights=dummy_moe_weights(num_local_experts=local, hidden=token_hidden_size),
     )
 
 
 def test_num_experts_must_be_divisible_by_world_size():
-    p = _split(num_experts=7, world_size=2, max_tokens_per_rank=64, num_local_experts=1)
+    p = _split(num_experts=7, world_size=2, max_tokens_per_rank=64)
+    pack = dummy_moe_weights(num_local_experts=1, hidden=p.token_hidden_size)
     with pytest.raises(MoEEpConfigError, match="num_experts"):
-        validate_fleet_weights(p, world_size=2)
+        validate_fleet_weights(pack, p, world_size=2)
     # nixl_ep also checks divisibility against topology capacity (defaults to world_size).
-    p2 = _split(num_experts=7, world_size=2, max_tokens_per_rank=64, num_local_experts=1)
+    p2 = _split(num_experts=7, world_size=2, max_tokens_per_rank=64)
     with pytest.raises(MoEEpConfigError, match="num_experts"):
         validate_fleet_params(p2, backend="nixl_ep", world_size=2)
 
 
 def test_fleet_weights_local_expert_count():
-    p = _split(num_experts=8, world_size=4, max_tokens_per_rank=64, num_local_experts=1)
+    p = _split(num_experts=8, world_size=4, max_tokens_per_rank=64)
+    pack = dummy_moe_weights(num_local_experts=1, hidden=p.token_hidden_size)
     with pytest.raises(MoEEpConfigError, match="num_experts // world_size"):
-        validate_fleet_weights(p, world_size=4)
+        validate_fleet_weights(pack, p, world_size=4)
 
 
 def test_nixl_ep_max_tokens_cap():
@@ -78,7 +77,7 @@ def test_nixl_ep_supported_hidden_sizes_pass():
 
 
 def test_mega_fleet_params_rejects_indivisible_experts():
-    p = _split(num_experts=7, world_size=2, max_tokens_per_rank=64, num_local_experts=1)
+    p = _split(num_experts=7, world_size=2, max_tokens_per_rank=64)
     with pytest.raises(MoEEpConfigError, match="num_experts"):
         validate_mega_fleet_params(
             p, world_size=2, intermediate_size=2048, top_k=4

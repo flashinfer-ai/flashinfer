@@ -176,8 +176,8 @@ def _run_one_layout(layout_str):
             dtype_bytes=2,
             algorithm=EpAlgorithm.LOW_LATENCY,
             layout=layout,
-            weights=canonical_weights,
         ),
+        weights=canonical_weights,
         backend=SplitConfig(
             comm=NcclEpConfig(),
             kernel=FusedMoeKernelConfig(moe_config=moe_config),

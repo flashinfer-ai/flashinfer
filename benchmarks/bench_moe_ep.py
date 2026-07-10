@@ -282,18 +282,10 @@ def main() -> int:
         layer_backend: SplitConfig | str = SplitConfig(
             comm=comm, kernel=IdentityConfig()
         )
-        fleet_params = FleetParams(
-            num_experts=args.num_experts,
-            max_tokens_per_rank=per_rank,
-            token_hidden_size=args.hidden,
-            dtype_bytes=2,
-            algorithm=ep_algorithm,
-            layout=ep_layout,
-            weights=dummy_moe_weights(
-                num_local_experts=local_num_experts,
-                hidden=args.hidden,
-                device=device,
-            ),
+        layer_weights = dummy_moe_weights(
+            num_local_experts=local_num_experts,
+            hidden=args.hidden,
+            device=device,
         )
     else:
         moe_config, canonical_weights = _build_compute(
@@ -307,17 +299,19 @@ def main() -> int:
             comm=comm,
             kernel=FusedMoeKernelConfig(moe_config=moe_config),
         )
-        fleet_params = FleetParams(
-            num_experts=args.num_experts,
-            max_tokens_per_rank=per_rank,
-            token_hidden_size=args.hidden,
-            dtype_bytes=2,
-            algorithm=ep_algorithm,
-            layout=ep_layout,
-            weights=canonical_weights,
-        )
+        layer_weights = canonical_weights
 
-    layer = MoEEpLayer(bootstrap, fleet_params, backend=layer_backend)
+    fleet_params = FleetParams(
+        num_experts=args.num_experts,
+        max_tokens_per_rank=per_rank,
+        token_hidden_size=args.hidden,
+        dtype_bytes=2,
+        algorithm=ep_algorithm,
+        layout=ep_layout,
+    )
+    layer = MoEEpLayer(
+        bootstrap, fleet_params, weights=layer_weights, backend=layer_backend
+    )
     t = MoEEpTensors(hidden_states=x, topk_ids=topk_ids, topk_weights=topk_weights)
 
     from statistics import median

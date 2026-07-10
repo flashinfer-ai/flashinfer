@@ -6,40 +6,55 @@ import pytest
 
 
 def _split_fleet_params():
-    from flashinfer.moe_ep import FleetParams, dummy_moe_weights
+    from flashinfer.moe_ep import FleetParams
 
     return FleetParams(
         num_experts=2,
         max_tokens_per_rank=4,
         token_hidden_size=8,
-        weights=dummy_moe_weights(num_local_experts=2, hidden=8),
     )
 
 
+def _split_weights():
+    from flashinfer.moe_ep import dummy_moe_weights
+
+    return dummy_moe_weights(num_local_experts=2, hidden=8)
+
+
 def _nvep_fleet_params():
-    from flashinfer.moe_ep import FleetParams, dummy_moe_weights
+    from flashinfer.moe_ep import FleetParams
 
     return FleetParams(
         num_experts=8,
         max_tokens_per_rank=128,
         token_hidden_size=4096,
-        weights=dummy_moe_weights(num_local_experts=8, hidden=4096),
     )
 
 
-def _mega_fleet_params():
-    import torch
+def _nvep_weights():
+    from flashinfer.moe_ep import dummy_moe_weights
 
-    from flashinfer.moe_ep import FleetParams, MoEWeightPack
+    return dummy_moe_weights(num_local_experts=8, hidden=4096)
+
+
+def _mega_fleet_params():
+    from flashinfer.moe_ep import FleetParams
 
     return FleetParams(
         num_experts=1,
         max_tokens_per_rank=64,
         token_hidden_size=128,
-        weights=MoEWeightPack(
-            w13=torch.zeros(1, 256, 128),
-            w2=torch.zeros(1, 128, 128),
-        ),
+    )
+
+
+def _mega_weights():
+    import torch
+
+    from flashinfer.moe_ep import MoEWeightPack
+
+    return MoEWeightPack(
+        w13=torch.zeros(1, 256, 128),
+        w2=torch.zeros(1, 128, 128),
     )
 
 
@@ -80,6 +95,7 @@ def test_factory_returns_split_for_string_backend():
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0),
         fleet_params=_split_fleet_params(),
+        weights=_split_weights(),
         backend="nccl_ep",
     )
     assert isinstance(layer, MoEEpSplitLayer)
@@ -91,6 +107,7 @@ def test_factory_returns_split_for_nvep_config():
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0, tcp_store=object()),
         fleet_params=_nvep_fleet_params(),
+        weights=_nvep_weights(),
         backend=NvepConfig(),
     )
     assert isinstance(layer, MoEEpSplitLayer)
@@ -105,6 +122,7 @@ def test_factory_returns_mega_for_mega_config(dist_not_initialized):
         layer = MoEEpLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
             fleet_params=_mega_fleet_params(),
+            weights=_mega_weights(),
             backend=_mega_config(),
         )
     assert isinstance(layer, MoEEpMegaLayer)
@@ -125,6 +143,7 @@ def test_factory_mega_ignores_fleet_knobs_warns(dist_not_initialized):
             layer = MoEEpLayer(
                 bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
                 fleet_params=_mega_fleet_params(),
+                weights=_mega_weights(),
                 fleet_knobs=[FleetAlgoKnobNumChannelsPerRank(n=4)],
                 backend=_mega_config(),
             )
@@ -147,6 +166,7 @@ def test_split_destroy_calls_fleet_destroy(stubbed_fleet_registry):
     split = MoEEpSplitLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0),
         fleet_params=_split_fleet_params(),
+        weights=_split_weights(),
         backend="nccl_ep",
     )
     t = MoEEpTensors(
@@ -178,6 +198,7 @@ def test_split_destroy_is_idempotent(stubbed_fleet_registry):
     split = MoEEpSplitLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0),
         fleet_params=_split_fleet_params(),
+        weights=_split_weights(),
         backend="nccl_ep",
     )
     t = MoEEpTensors(
@@ -207,6 +228,7 @@ def test_split_layer_init_rejects_process_group_without_dist():
                     auto_bootstrap=False,
                 ),
                 fleet_params=_split_fleet_params(),
+                weights=_split_weights(),
                 backend="nccl_ep",
             )
 
@@ -218,6 +240,7 @@ def test_factory_rejects_raw_mega_kernel_config():
         MoEEpLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0),
             fleet_params=_split_fleet_params(),
+            weights=_split_weights(),
             backend=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
         )
 
@@ -229,5 +252,6 @@ def test_factory_rejects_raw_split_kernel_config():
         MoEEpLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0),
             fleet_params=_split_fleet_params(),
+            weights=_split_weights(),
             backend=IdentityConfig(),
         )
