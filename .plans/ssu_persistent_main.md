@@ -1290,7 +1290,37 @@ before reordering loads the compiler may already hoist.  Remaining precompute
 varlen cost = intrinsic; next lever (only if ~1% matters) is restructuring its
 varlen row handling, guided by the captured full-set reports.
 
+### B300 pre-ring baselines — 2k lead grows; SR (philox) anomaly flagged (B300, 2026-07-10)
+
+Recorded ahead of the ring-buffer migration so post-ring parity has a same-GPU
+reference: `ssu_checkpoint_mixed_b300-preRing_*.csv` (bf16 / fp16-philox-5 /
+f32, b=1..1024, conv1d, K=8) + ncu `ssu_2k_v35_b300_b1024_bf16_8_pnat{4,12}{,_varlen}`.
+B300 = CC 10.3, **148 SMs — same count as B200**, so every SM-scaled heuristic
+(dispatch ≥1 u/SM, d_split ≤8·SM, hc·10, regime table) transfers at identical
+thresholds; this closes the B300 spot-check TODO.  b=1024 (µs):
+
+    kernel            bf16    f32   fp16-philox-5
+    cuda-incr        126.1  202.9   197.4
+    cuda-incr-2k     104.8  152.6   191.7
+    triton-replay-pm 118.3  168.3   159.4
+
+- **The 2k lead grows on B300** (bf16 −13.5 vs triton-pm, f32 −15.7): HBM3e
+  lifts the split more than the monolith; the mono/2k crossover moves DOWN
+  (bf16 2k wins from b=16; auto's 1 u/SM threshold still picks winners
+  everywhere except the known ±1 µs bf16 band at b=64/1024 units).
+- **SR anomaly (BACKBURNERED, per Igor)**: fp16-philox-5 at scale LOSES to
+  triton-pm by 32 µs — the philox premium over bf16 is +87 µs for our 2k
+  (104.8 → 191.7) vs +41 for triton-pm (118.3 → 159.4).  At small batch the
+  philox rows also start ~2× the bf16 rows (b=1: 10.6 vs 6.2).  Possibly an
+  SR-path error/regression rather than physics — needs a dedicated bench
+  (philox on/off × rounds × dtype, ncu on the writeback) AFTER the ring work.
+
 ## TODO
+
+- [ ] **SR (philox) perf anomaly on B300** — see the B300-baselines section:
+  our fp16-philox-5 pays +87 µs over bf16 at b=1024 where triton-pm pays +41,
+  flipping the lead.  Suspected error in the stochastic-rounding path; bench
+  philox on/off × rounds × dtype + ncu the state-writeback before optimizing.
 
 - [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs
   `state_batch_indices=None` (no pads), and no test injects `pad_slot_id`, so the
@@ -1308,7 +1338,6 @@ varlen row handling, guided by the captured full-set reports.
   fragment instead of a fresh smem read — eliminating the D·x smem load entirely. Register
   reindex needed; defer unless ncu flags it.
 
-- [ ] **B300 spot-check of the dispatch threshold.** The mono/2k crossover collapse in
-  `batch*nheads` is validated on B200 (148 SMs) only; the `>= 1 unit/SM` threshold assumes
-  it scales with SM count.  One mixed-bench run at b∈{4,8,16,32} nh16 on B300 confirms or
-  refutes.
+- [x] **B300 spot-check of the dispatch threshold.** Done 2026-07-10 (see the
+  B300-baselines section): B300 has the same 148 SMs, thresholds transfer
+  unchanged, crossover positions confirmed by the b300-preRing sweep.
