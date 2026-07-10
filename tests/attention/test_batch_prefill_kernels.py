@@ -1794,7 +1794,14 @@ def test_single_prefill_torch_compile_cuda_graph():
         torch.cuda.synchronize()
         print("PASS")
     """)
+    import gc
     import os
+
+    # The subprocess needs its own CUDA context and cudagraph pool, but the parent
+    # pytest process's caching allocator may still hold nearly all GPU memory from
+    # earlier tests, OOM-ing the child on 24GB CI GPUs. Release it first.
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # torch.compile's inductor calls getpass.getuser() for cache dir, which fails
     # in CI containers where the uid has no /etc/passwd entry. Setting USER avoids this.
