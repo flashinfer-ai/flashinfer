@@ -1665,10 +1665,10 @@ class TestCuteDslMoEWrapper:
             torch.cuda.synchronize()
             assert not torch.isnan(result).any()
             # Confirm profiling actually ran for this custom op. Cache keys
-            # are (custom_op, runner_class, hash(runner), profile, extras)
-            # tuples; see AutoTuner._get_cache_key in flashinfer/autotuner.py.
+            # are ProfilingCacheKey instances; see AutoTuner._get_cache_key
+            # in flashinfer/autotuner/autotuner.py.
             assert any(
-                isinstance(k, tuple) and k[:1] == ("CuteDslMoEWrapper::run::Swiglu",)
+                k.custom_op == "CuteDslMoEWrapper::run::Swiglu"
                 for k in autotuner.profiling_cache
             ), "autotune(True) did not populate a CuteDslMoEWrapper::run cache entry"
             return ref, finalized

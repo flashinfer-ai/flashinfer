@@ -86,6 +86,31 @@ from .utils import (
 )
 
 
+@functools.cache
+def _moe_topk_ids_init(num_experts: int):
+    """Return a packed-topk-ids initializer for a given expert count. Cached for
+    object identity preservation.
+    """
+
+    def _init(
+        shapes: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        expert_ids = make_random_topk_ids(
+            num_experts=num_experts,
+            num_tokens=math.prod(shapes[:-1]),
+            top_k=shapes[-1],
+            device=device,
+        ).view(shapes)
+        expert_weights = torch.ones(shapes, dtype=torch.bfloat16, device=device).view(
+            torch.int16
+        )
+        return (expert_ids << 16) | expert_weights
+
+    return _init
+
+
 # Routing input modes for FusedMoE launcher
 # Please keep this in sync with the counterpart defined in csrc/trtllm_fused_moe_kernel_launcher.cu
 class RoutingInputMode(IntEnum):
@@ -1250,22 +1275,6 @@ def get_trtllm_moe_sm100_module():
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
 
-            def _init_packed_topk_ids(
-                shapes: tuple[int, ...],
-                dtype: torch.dtype,
-                device: torch.device,
-            ) -> torch.Tensor:
-                expert_ids = make_random_topk_ids(
-                    num_experts=self.num_experts,
-                    num_tokens=math.prod(shapes[:-1]),
-                    top_k=shapes[-1],
-                    device=device,
-                ).view(shapes)
-                expert_weights = torch.ones(
-                    shapes, dtype=torch.bfloat16, device=device
-                ).view(torch.int16)
-                return (expert_ids << 16) | expert_weights
-
             spec = {
                 "output": autotuner_initializer_empty,
                 "hidden_states": autotuner_initializer_randn,
@@ -1273,7 +1282,7 @@ def get_trtllm_moe_sm100_module():
             if moe_inputs.routing_logits is not None:
                 spec["routing_logits"] = autotuner_initializer_rand
             if moe_inputs.topk_ids is not None:
-                spec["topk_ids"] = _init_packed_topk_ids
+                spec["topk_ids"] = _moe_topk_ids_init(self.num_experts)
             if moe_inputs.expert_weights is not None:
                 spec["expert_weights"] = autotuner_initializer_ones
             if moe_inputs.hidden_states_scale is not None:
