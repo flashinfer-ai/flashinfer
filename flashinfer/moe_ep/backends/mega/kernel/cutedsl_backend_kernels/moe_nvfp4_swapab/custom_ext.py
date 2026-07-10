@@ -272,7 +272,7 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
     physical tensor.
     """
 
-    WorkTileInfo = SwapABSwigluFp4Fc12WorkTileInfo
+    WorkTileInfo = SwapABSwigluFp4Fc12WorkTileInfo  # type: ignore[assignment]
 
     def __init__(
         self,
@@ -538,7 +538,7 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
 class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
     """Sched extension for the fused fc1+fc2 GLU MXFP8 kernel."""
 
-    WorkTileInfo = GluMxFp8WorkTileInfo
+    WorkTileInfo = GluMxFp8WorkTileInfo  # type: ignore[assignment]
 
     def __init__(
         self,

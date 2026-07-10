@@ -30,7 +30,7 @@
 
 from abc import ABC, abstractmethod
 from enum import IntEnum
-from typing import List, Optional, Tuple, Literal
+from typing import Any, List, Optional, Tuple, Literal
 
 import cutlass
 import cutlass.cute as cute
@@ -692,6 +692,21 @@ class MoESchedulerBase(ABC):
         _num_sched_stages: int      — number of pipeline stages
         _producer_state             — pipeline producer state (MLIR-serialized)
     """
+
+    # Annotations for the required members above (no runtime effect; the
+    # concrete __init__ / create() implementations assign them).
+    params: Any  # concrete schedulers use their own params subclass
+    offs: cute.Tensor
+    _ext: Any
+    cta_id_in_cluster: Any
+    current_expert_idx: Int32
+    expert_tile_start: Int32
+    expert_tile_end: Int32
+    current_work: Any
+    _pipeline: Any
+    _smem_buf_tensor: cute.Tensor
+    _num_sched_stages: int
+    _producer_state: Any
 
     # =========================================================================
     # Abstract interface
@@ -1562,6 +1577,8 @@ class MoEDynamicPersistentTileScheduler(MoESchedulerBase):
             # ... do work using work.token_offset, work.tokens_i, etc. ...
             work = consumer.consume_work()
     """
+
+    params: MoEDynamicSchedulerParams
 
     def __init__(
         self,

@@ -605,13 +605,13 @@ class SwapABSwigluFp4Epilogue:
         ):
             self.fc2_hidden_needs_predicate: bool = False
         else:
-            self.fc2_hidden_needs_predicate: bool = True
+            self.fc2_hidden_needs_predicate = True
 
         if static_expert_shape is not None:
             intermediate_downproj = static_expert_shape[1] // 2
             self.intermediate_downproj: Optional[int] = intermediate_downproj
         else:
-            self.intermediate_downproj: Optional[int] = None
+            self.intermediate_downproj = None
 
         self.subtile_cnt = self.cta_tile_n // self._EpilogueTokenTileSize
         self.overlapping_accum = allow_overlap_acc and (
@@ -918,7 +918,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_push("fc1_epi")
-        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile  # type: ignore[attr-defined]
 
         # Overlap path preloads two subtiles before releasing acc TMEM.
         unroll_tile_cnt = 2 if cutlass.const_expr(self.overlapping_accum) else 0
@@ -1600,7 +1600,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         work_tile_info: MoEWorkTileInfo,
     ) -> "Fc2OutputRouter":
         task_tile_data_row_start = (
-            work_tile_info.cumulative_data_physical_row
+            work_tile_info.cumulative_data_physical_row  # type: ignore[attr-defined]
             + work_tile_info.tile_n_idx * cutlass.Int32(self.cta_tile_n)
         )
         hidden_base_this_cta_tile = work_tile_info.tile_m_idx * cutlass.Int32(
@@ -1636,7 +1636,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             base_output=self.fc2_output,
             hidden_base_this_cta_tile=hidden_base_this_cta_tile,
             peer_rank_ptr_mapper=peer_rank_ptr_mapper,
-            valid_tokens_this_cta_tile=work_tile_info.valid_tokens_in_cta_tile,
+            valid_tokens_this_cta_tile=work_tile_info.valid_tokens_in_cta_tile,  # type: ignore[attr-defined]
             valid_hidden_this_cta_tile=valid_hidden_this_cta_tile,
             reduce_topk_in_kernel=self.reduce_topk_in_kernel,
             output_mapping=self.process_pipeline.store_out_mapping,
@@ -1658,7 +1658,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         else:
             alpha_val = None
         acc_ready = False
-        if not work_tile_info.peek_ready:
+        if not work_tile_info.peek_ready:  # type: ignore[attr-defined]
             acc_ready = True
             acc_pipeline.consumer_wait(acc_consumer_state)
         fc2_output_router = self._make_output_router(work_tile_info)
@@ -1670,7 +1670,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
 
         acc_pipeline.consumer_wait(acc_consumer_state, acc_ready)
         iket.range_push("fc2_epi")
-        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile  # type: ignore[attr-defined]
 
         # Overlap path preloads two subtiles before releasing acc TMEM.
         unroll_tile_cnt = (

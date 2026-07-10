@@ -240,14 +240,14 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             group_hint=group_hint,
             token_padding_block=token_padding_block,
             sf_padding_block=sf_padding_block,
-            load_balance_mode=load_balance_mode,
+            load_balance_mode=load_balance_mode,  # type: ignore[arg-type]
             static_expert_shape=static_expert_shape,
             force_static_sched=force_static_sched,
             clc_bundle_size=clc_bundle_size,
             num_sched_stages=num_sched_stages,
             acc_dtype=acc_dtype,
             sf_vec_size=sf_vec_size,
-            scenario=scenario,
+            scenario=scenario,  # type: ignore[arg-type]
             fc2_output_dtype=fc2_output_dtype,
             non_ubulk_fc2_store=non_ubulk_fc2_store,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,

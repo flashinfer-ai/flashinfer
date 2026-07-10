@@ -2057,7 +2057,7 @@ class SwapABSwigluFp4Epilogue:
         ):
             self._fc2_hidden_needs_predicate: bool = False
         else:
-            self._fc2_hidden_needs_predicate: bool = True
+            self._fc2_hidden_needs_predicate = True
 
         # K-padding gate for fc1 epi SF writes; see PostSwigluHalf.stg_sfc.
         # ``cga_cluster_tile_intermediate_downproj`` is the CGA-level
@@ -2077,7 +2077,7 @@ class SwapABSwigluFp4Epilogue:
                 )
             self._intermediate_downproj: Optional[int] = intermediate_downproj
         else:
-            self._intermediate_downproj: Optional[int] = None
+            self._intermediate_downproj = None
 
         self._epi_tile = (EpilogueTokenTile, Fc1EpilogueOutputTile)
         self._subtile_cnt = self._cta_tile_n // EpilogueTokenTile
@@ -2722,9 +2722,9 @@ class SwapABSwigluFp4Epilogue:
         if cutlass.const_expr(self._fc2_use_bulk):
             token_contract = BulkReturnTokenContract(self._cta_tile_n)
         elif cutlass.const_expr(self._reduce_topk_in_kernel):
-            token_contract = TransposeRedgReturnTokenContract(self._cta_tile_n)
+            token_contract = TransposeRedgReturnTokenContract(self._cta_tile_n)  # type: ignore[assignment]
         else:
-            token_contract = TransposeStgReturnTokenContract(self._cta_tile_n)
+            token_contract = TransposeStgReturnTokenContract(self._cta_tile_n)  # type: ignore[assignment]
 
         return_tile = Fc2ReturnTile(
             tensor=gmem_fc2_output,

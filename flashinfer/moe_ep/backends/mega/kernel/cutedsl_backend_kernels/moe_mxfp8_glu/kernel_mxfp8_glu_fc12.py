@@ -1322,7 +1322,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
             acc_full_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_acc_pipeline_stages * 2
             ]
-            sched_storage: SchedStorage
+            sched_storage: SchedStorage  # type: ignore[valid-type]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 

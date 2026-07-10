@@ -164,7 +164,7 @@ class GluMxfp8Epilogue:
         ):
             self._fc2_stg_needs_predicate: bool = False
         else:
-            self._fc2_stg_needs_predicate: bool = True
+            self._fc2_stg_needs_predicate = True
 
         # Non-swap-AB: TMA tile is (EpilogueTileN tokens, Fc1EpilogueOutputTileN intermediates)
         self._epi_tile = (EpilogueTileN, Fc1EpilogueOutputTileN)
@@ -359,7 +359,7 @@ class GluMxfp8Epilogue:
         tmem_gate_tensor: cute.Tensor,
         tmem_up_tensor: cute.Tensor,
         col_offset: int,
-    ) -> (cute.Tensor, cute.Tensor):
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
         """Move the tmem tensor to the correct position."""
         tmem_gate_ptr = tmem_gate_tensor.iterator + cute.assume(col_offset, divby=16)
         tmem_up_ptr = tmem_up_tensor.iterator + cute.assume(col_offset, divby=16)

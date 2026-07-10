@@ -155,7 +155,7 @@ declare -a TESTS=(
     "M21_mr_N64_1cta_balanced_topk3_sa    | multi  | --num_tokens_per_rank 288 --num_topk 3 --num_total_experts 48 --hidden 1408 --intermediate 2240 --enable_static_expert_shape --mma_tiler_mnk 128,64,256 --cluster_shape_mnk 1,1,1 --ref_compute_graph transformers --token_back_mode standalone_warps"
     "M22_mr_N64_T256_clm2_pl_topk4_redg_sa | multi  | --num_tokens_per_rank 480 --num_topk 4 --num_total_experts 96 --hidden 1472 --intermediate 2752 --enable_static_expert_shape --mma_tiler_mnk 256,64,256 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --route_distribution power_law --in_kernel_fc2_reduce --token_back_mode standalone_warps"
     "M23_mr_N64_T256_clm4_pl_atomic_topk7_ru | multi  | --num_tokens_per_rank 672 --num_topk 7 --num_total_experts 72 --hidden 1728 --intermediate 3520 --enable_static_expert_shape --mma_tiler_mnk 256,64,256 --cluster_shape_mnk 4,1,1 --use_2cta_instrs --route_distribution power_law --load_balance_mode atomic_counter --ref_compute_graph transformers --gate_up_clamp 6 --token_back_mode reuse_dispatch_warps"
-    
+
     # -- Token-back modes (standalone/reuse) + in_kernel_reduce + flag > 1.
     # M24 keeps the default atomic batch (1); M25-M27 exercise the
     # developer-only MEGA_TOKEN_BACK_ATOMIC_BATCH env at 2/3 (only meaningful

@@ -1319,7 +1319,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
         # SharedStorage.
         SchedCls = sched_params.get_scheduler_type()
-        SchedStorage = SchedCls.make_storage_struct(
+        SchedStorage = SchedCls.make_storage_struct(  # type: ignore[attr-defined]
             sched_params, ext, num_drain_warps=0
         )
 
@@ -1329,7 +1329,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             acc_full_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_acc_pipeline_stages * 2
             ]
-            sched_storage: SchedStorage
+            sched_storage: SchedStorage  # type: ignore[valid-type]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
@@ -1407,7 +1407,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 *self.epilogue_warp_id,
             )
         )
-        scheduler = SchedCls.create(
+        scheduler = SchedCls.create(  # type: ignore[attr-defined]
             sched_params,
             cute.arch.block_idx(),
             cute.arch.grid_dim(),

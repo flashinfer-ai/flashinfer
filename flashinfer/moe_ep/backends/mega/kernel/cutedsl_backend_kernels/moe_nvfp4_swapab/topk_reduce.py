@@ -1326,6 +1326,7 @@ def _validate_tensors(
                 f"{mxfp8_scale.device}."
             )
         scale_cols = (H + MXFP8_SCALE_BLOCK_SIZE - 1) // MXFP8_SCALE_BLOCK_SIZE
+        expected_scale_shape: tuple
         if mxfp8_scale.dim() == 2:
             expected_scale_shape = (T, scale_cols)
         elif mxfp8_scale.dim() == 3:

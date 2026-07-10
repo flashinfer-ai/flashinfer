@@ -400,7 +400,7 @@ class TokenCommProblemDesc:
 
     def __str__(self) -> str:
         dtype_name = lambda t: str(t).split(".")[-1]
-        route_str = self.route_distribution
+        route_str: str = self.route_distribution
         if self.route_distribution == "power_law":
             route_str = f"power_law(exponent={self.power_law_exponent:.3g})"
         clamp_str = "off" if self.gate_up_clamp is None else f"{self.gate_up_clamp:.4g}"
@@ -2302,12 +2302,12 @@ class MegaMoETester:
         """
         from moe_nvfp4_swapab.megamoe_kernel import _layout_regions
 
-        local_specs = self._kernel._local_region_specs
-        shared_specs = self._kernel._shared_region_specs
+        local_specs = self._kernel._local_region_specs  # type: ignore[attr-defined]
+        shared_specs = self._kernel._shared_region_specs  # type: ignore[attr-defined]
         local_offsets, _ = _layout_regions(local_specs)
         shared_offsets, _ = _layout_regions(shared_specs)
-        local_by_name = self._kernel._local_region_by_name
-        shared_by_name = self._kernel._shared_region_by_name
+        local_by_name = self._kernel._local_region_by_name  # type: ignore[attr-defined]
+        shared_by_name = self._kernel._shared_region_by_name  # type: ignore[attr-defined]
 
         def _region(ws, by_name, offsets, name, torch_dtype):
             spec = by_name[name]

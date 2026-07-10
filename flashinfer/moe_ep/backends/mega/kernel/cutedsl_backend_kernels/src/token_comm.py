@@ -533,7 +533,7 @@ class TokenInPullTokenBackPush:
         # same as the bf16 path (dropping q_scratch/sf_scratch keeps smem under
         # the ~228KB cap that the doubled chunk size would otherwise blow).
         @cute.struct
-        class TokenCommStorage:
+        class TokenCommStorage:  # type: ignore[no-redef]
             pull_mbar: cute.struct.MemRange[Int64, self.num_dispatch_warps]
             smem_expert_count: cute.struct.MemRange[Int32, num_total_experts]
             pull_buffer: cute.struct.Align[
