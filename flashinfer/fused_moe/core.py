@@ -86,7 +86,7 @@ from .utils import (
 )
 
 
-@functools.lru_cache(maxsize=32)
+@functools.cache
 def _moe_topk_ids_init(num_experts: int):
     """Return a packed-topk-ids initializer for a given expert count. Cached for
     object identity preservation.

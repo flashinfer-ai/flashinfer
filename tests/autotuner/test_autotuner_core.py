@@ -1215,6 +1215,71 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     )
 
 
+def test_make_tuning_config_reuses_topk_ids_initializer():
+    """_make_tuning_config must return configs whose topk_ids initializer is the
+    same object across calls for the same num_experts.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import flashinfer.fused_moe.core as core_mod
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+    from flashinfer.tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+
+    fn = core_mod.get_trtllm_moe_sm100_module
+    fn.cache_clear()
+    try:
+        mock_module = MagicMock()
+        mock_module.get_library_path.return_value = "/tmp/fake.so"
+        with (
+            patch.object(
+                core_mod,
+                "gen_trtllm_gen_fused_moe_sm100_module",
+                return_value=mock_module,
+            ),
+            patch.object(core_mod, "setup_cubin_loader"),
+        ):
+            MoERunner = core_mod.get_trtllm_moe_sm100_module().MoERunner
+
+        runner = MoERunner(
+            top_k=8,
+            num_local_experts=128,
+            dtype_act=DtypeTrtllmGen.Bfloat16,
+            dtype_weights=DtypeTrtllmGen.Bfloat16,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+            hidden_size=4096,
+            intermediate_size=14336,
+            num_experts=128,
+        )
+        moe_inputs = MoeRunnerInputs(
+            output=torch.empty((8, 4096)),
+            routing_logits=None,
+            topk_ids=torch.zeros((8, 8), dtype=torch.int32),
+            expert_weights=None,
+            hidden_states=torch.empty((8, 4096)),
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+        config_a = runner._make_tuning_config(moe_inputs)
+        config_b = runner._make_tuning_config(moe_inputs)
+
+        spec_a = config_a.dynamic_tensor_specs[0]
+        spec_b = config_b.dynamic_tensor_specs[0]
+        topk_idx = MoeRunnerInputs.idx("topk_ids")
+        init_a = spec_a.tensor_initializers[spec_a.input_idx.index(topk_idx)]
+        init_b = spec_b.tensor_initializers[spec_b.input_idx.index(topk_idx)]
+
+        assert init_a is init_b, (
+            "_make_tuning_config returned a different topk_ids initializer object "
+            "on each call. It must reuse _moe_topk_ids_init(num_experts) so that "
+            "rebuilt TuningConfigs collapse to the same _find_nearest_profile "
+            "lru_cache key — a per-call closure reintroduces the memory leak."
+        )
+    finally:
+        fn.cache_clear()
+
+
 def test_find_nearest_profile_cache_grows_with_fresh_closure_initializer():
     """Negative control: a fresh initializer closure per call leaks one
     entry per call DESPITE equal hashes.
