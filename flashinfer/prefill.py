@@ -34,7 +34,7 @@ from .trace.templates.gemm import (
     trtllm_ragged_attention_deepseek_trace,
 )
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
-from .fmha_v2 import FmhaV2PrefillBackend, get_trtllm_fmha_v2_module
+from .fmha_v2 import FmhaV2Layout, FmhaV2PrefillBackend, get_trtllm_fmha_v2_module
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
@@ -2514,6 +2514,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 page_size=page_size,
                 max_blocks_per_seq=max_num_blocks_per_seq,
                 batch_size=batch_size,
+                max_q_len=self._max_q_len,
+                max_kv_len=self._max_kv_len,
                 kv_layout=self._kv_layout,
                 q_data_type=q_data_type,
                 o_data_type=o_data_type,
@@ -2858,21 +2860,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # cum_seq_lens_*/scales/tile_id_counter were populated in plan() by the prep kernel.
             assert self._cached_module is not None, "trtllm-fmhav2 module is not loaded"
             assert self._fmhav2 is not None, "trtllm-fmhav2 backend is not planned"
-            self._fmhav2.run_paged(
+            self._fmhav2.run(
                 self._cached_module,
                 q,
                 k_cache,
                 v_cache,
-                out,
+                out=out,
                 workspace_buffer=self._float_workspace_buffer,
                 workspace_size=self._workspace_size,
-                block_tables=self._block_tables,
-                page_size=page_size,
-                kv_lens=self._kv_lens_buffer[: self._batch_size],
-                kv_layout=self._kv_layout,
-                max_q_len=self._max_q_len,
-                max_kv_len=self._max_kv_len,
-                batch_size=self._batch_size,
                 causal=self._causal,
                 window_left=window_left,
                 logits_soft_cap=self._logits_soft_cap,
@@ -3644,9 +3639,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
             if self._fmhav2 is None:
                 self._fmhav2 = FmhaV2PrefillBackend(self.device)
-            self._cached_module = self._fmhav2.plan_ragged(
+            self._cached_module = self._fmhav2.plan(
                 fmhav2_seq_lens_q,
                 fmhav2_seq_lens_kv,
+                layout=FmhaV2Layout.SEPARATE_Q_K_V,
                 batch_size=batch_size,
                 max_q_len=fmhav2_max_q_len,
                 max_kv_len=fmhav2_max_kv_len,
@@ -3974,12 +3970,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             # SEPARATE_Q_K_V FMHAv2 path. Prep ran in plan(); run is a single kernel launch.
             assert self._cached_module is not None, "trtllm-fmhav2 module is not loaded"
             assert self._fmhav2 is not None, "trtllm-fmhav2 backend is not planned"
-            self._fmhav2.run_ragged(
+            self._fmhav2.run(
                 self._cached_module,
                 q,
                 k,
                 v,
-                out,
+                out=out,
                 workspace_buffer=self._float_workspace_buffer,
                 causal=self._causal,
                 window_left=window_left,

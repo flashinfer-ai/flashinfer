@@ -20,9 +20,10 @@ limitations under the License.
 # The public kernel APIs (``trtllm_fmha_v2_prefill``,
 # ``fmha_v2_prefill_deepseek``) remain in ``flashinfer/prefill.py``.
 
+import enum
 import functools
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -64,6 +65,36 @@ def _fmhav2_dtype_code(dtype: torch.dtype) -> int:
     return code
 
 
+class FmhaV2Layout(str, enum.Enum):
+    """FMHAv2 attention input layouts (Attention_input_layout in fmha_v2_run.cu).
+
+    The layout is a codegen specialization — ``gen_fmha_v2_module`` compiles a
+    separate module per layout — so it must be chosen at plan() time; it cannot
+    be inferred from tensor shapes at run().
+    """
+
+    PAGED = "paged"  # q [T,H,D]; k/v paged pools + block_tables/page_size
+    SEPARATE_Q_K_V = "separate_q_k_v"  # q/k/v all [T,H,D]
+    PACKED_QKV = "packed_qkv"  # single qkv [T,3,H,D]
+    CONTIGUOUS_Q_KV = "contiguous_q_kv"  # q [T,H,D]; kv [T,2,H_kv,D]
+
+
+# Codegen module key (gen_fmha_v2_module input_layout) per non-paged layout;
+# PAGED resolves to Q_PAGED_KV_{NHD,HND} from the wrapper's kv_layout instead.
+_LAYOUT_MODULE_KEY = {
+    FmhaV2Layout.SEPARATE_Q_K_V: "SEPARATE_Q_K_V",
+    FmhaV2Layout.PACKED_QKV: "PACKED_QKV",
+    FmhaV2Layout.CONTIGUOUS_Q_KV: "CONTIGUOUS_Q_KV",
+}
+
+# input_layout_str accepted by fmha_v2_run.cu's string_to_input_layout().
+_LAYOUT_RUN_STR = {
+    FmhaV2Layout.SEPARATE_Q_K_V: "separate_q_k_v",
+    FmhaV2Layout.PACKED_QKV: "packed_qkv",
+    FmhaV2Layout.CONTIGUOUS_Q_KV: "contiguous_q_kv",
+}
+
+
 class FmhaV2PrefillBackend:
     """State and plan/run logic for one wrapper's trtllm-fmhav2 backend.
 
@@ -83,10 +114,13 @@ class FmhaV2PrefillBackend:
         self._has_alibi: bool = False
         self._bmm1_scale: float = 1.0
         self._bmm2_scale: float = 1.0
-        # Ragged-only state (the paged wrapper keeps the equivalents itself,
-        # shared with its other backends).
+        # Per-plan state consumed by run(); set by plan()/plan_paged().
+        self._layout: Optional[FmhaV2Layout] = None
+        self._run_layout_str: str = ""
         self._seq_lens_q: Optional[torch.Tensor] = None
-        self._seq_lens_kv: Optional[torch.Tensor] = None
+        self._kv_lens: Optional[torch.Tensor] = None
+        self._block_tables: Optional[torch.Tensor] = None
+        self._page_size: int = 0
         self._max_q_len: int = 0
         self._max_kv_len: int = 0
         self._batch_size: int = 0
@@ -195,6 +229,8 @@ class FmhaV2PrefillBackend:
         page_size: int,
         max_blocks_per_seq: int,
         batch_size: int,
+        max_q_len: int,
+        max_kv_len: int,
         kv_layout: str,
         q_data_type: torch.dtype,
         o_data_type: Optional[torch.dtype],
@@ -205,13 +241,14 @@ class FmhaV2PrefillBackend:
         bmm2_scale: Optional[float],
         head_dim_qk: int,
     ):
-        """Load the paged module and issue the fused prep launch; returns the module.
+        """Plan for :attr:`FmhaV2Layout.PAGED`; returns the loaded module.
 
-        The single prepare_paged launch derives q/kv lens from the indptrs (the
-        q lens feed the cum-scan in-register, no intermediate tensor), writes
-        kv_lens into ``kv_lens_out`` for run(), scatters the dense
-        ``block_tables_out``, zeroes the tile counter, and encodes the BMM
-        scales.
+        The paged layout has its own entry point because its prep genuinely
+        differs: the single prepare_paged launch derives q/kv lens from the
+        indptrs (the q lens feed the cum-scan in-register, no intermediate
+        tensor), writes kv_lens into ``kv_lens_out`` for run(), scatters the
+        dense ``block_tables_out``, zeroes the tile counter, and encodes the
+        BMM scales.
         """
         cc = self._check_gates(pos_encoding_mode, logits_soft_cap)
         if kv_layout not in ("NHD", "HND"):
@@ -222,6 +259,18 @@ class FmhaV2PrefillBackend:
             q_data_type,
             o_data_type if q_data_type == torch.float8_e4m3fn else None,
         )
+        self._layout = FmhaV2Layout.PAGED
+        self._run_layout_str = (
+            "q_paged_kv_hnd" if kv_layout == "HND" else "q_paged_kv_nhd"
+        )
+        self._seq_lens_q = None
+        self._kv_lens = kv_lens_out
+        self._block_tables = block_tables_out
+        self._page_size = page_size
+        self._max_q_len = max_q_len
+        self._max_kv_len = max_kv_len
+        self._batch_size = batch_size
+
         module.prepare_paged(
             qo_indptr,
             paged_kv_indptr,
@@ -245,11 +294,12 @@ class FmhaV2PrefillBackend:
         )
         return module
 
-    def plan_ragged(
+    def plan(
         self,
         seq_lens_q: torch.Tensor,
         seq_lens_kv: torch.Tensor,
         *,
+        layout: Union[FmhaV2Layout, str] = FmhaV2Layout.SEPARATE_Q_K_V,
         batch_size: int,
         max_q_len: int,
         max_kv_len: int,
@@ -262,17 +312,31 @@ class FmhaV2PrefillBackend:
         bmm2_scale: Optional[float],
         head_dim_qk: int,
     ):
-        """Load the SEPARATE_Q_K_V module and issue the fused prep launch; returns the module."""
+        """Plan for any non-paged layout; returns the loaded module.
+
+        SEPARATE_Q_K_V, PACKED_QKV and CONTIGUOUS_Q_KV share this path
+        entirely — their prep is the same cum-scan over caller-provided
+        seq lens; only how the caller derived those lens (and the tensor
+        forms later passed to run()) differ.
+        """
+        layout = FmhaV2Layout(layout)
+        if layout == FmhaV2Layout.PAGED:
+            raise ValueError("use plan_paged() for the paged layout")
         cc = self._check_gates(pos_encoding_mode, logits_soft_cap)
 
         module = get_trtllm_fmhav2_prefill_module(
-            "SEPARATE_Q_K_V",
+            _LAYOUT_MODULE_KEY[layout],
             q_data_type,
             o_data_type if q_data_type == torch.float8_e4m3fn else None,
         )
-        # Hold references so the tensors aren't freed before run() consumes them.
+        self._layout = layout
+        self._run_layout_str = _LAYOUT_RUN_STR[layout]
+        # Hold references so the tensors aren't freed before the async prep
+        # kernel (and run()) consume them.
         self._seq_lens_q = seq_lens_q
-        self._seq_lens_kv = seq_lens_kv
+        self._kv_lens = seq_lens_kv
+        self._block_tables = None
+        self._page_size = 0
         self._max_q_len = max_q_len
         self._max_kv_len = max_kv_len
         self._batch_size = batch_size
@@ -302,47 +366,69 @@ class FmhaV2PrefillBackend:
         assert self._tile_id_counter is not None, "plan() must run before run()"
         self._tile_id_counter.zero_()
 
-    def run_paged(
+    def run(
         self,
         module,
         q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        out: torch.Tensor,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
         *,
+        out: torch.Tensor,
         workspace_buffer: torch.Tensor,
-        workspace_size: int,
-        block_tables: torch.Tensor,
-        page_size: int,
-        kv_lens: torch.Tensor,
-        kv_layout: str,
-        max_q_len: int,
-        max_kv_len: int,
-        batch_size: int,
+        workspace_size: Optional[int] = None,
         causal: bool,
         window_left: Optional[int],
         logits_soft_cap: Optional[float],
         lse: Optional[torch.Tensor],
-        sinks: Optional[torch.Tensor],
+        sinks: Optional[torch.Tensor] = None,
     ) -> None:
-        """Single FMHAv2 kernel launch consuming the device-resident prep outputs."""
+        """Single FMHAv2 kernel launch; prep ran in plan()/plan_paged().
+
+        The FFI has three tensor slots whose meaning follows the planned
+        layout (fmha_v2_run.cu:381-410); unused slots expect dummy tensors,
+        not None, and are filled in here so callers pass only what their
+        layout actually has:
+
+        - PAGED:           q [T,H,D], k/v = paged K/V pools
+        - SEPARATE_Q_K_V:  q/k/v all [T,H,D]
+        - PACKED_QKV:      q = packed qkv [T,3,H,D] (k/v omitted)
+        - CONTIGUOUS_Q_KV: q [T,H,D], k = packed kv [T,2,H_kv,D] (v omitted)
+        """
+        assert self._layout is not None, "plan() must run before run()"
+        if self._layout == FmhaV2Layout.PACKED_QKV:
+            if q.dim() != 4 or q.shape[1] != 3:
+                raise ValueError(
+                    f"PACKED_QKV expects qkv of shape [total_tokens, 3, H, D]; got {tuple(q.shape)}"
+                )
+            k = v = q
+        elif self._layout == FmhaV2Layout.CONTIGUOUS_Q_KV:
+            if k is None or k.dim() != 4 or k.shape[1] != 2:
+                raise ValueError(
+                    "CONTIGUOUS_Q_KV expects kv of shape [total_tokens, 2, H_kv, D] in the k slot"
+                )
+            v = k
+        elif k is None or v is None:
+            raise ValueError(f"layout {self._layout.value} requires k and v tensors")
+        if workspace_size is None:
+            workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+
         self._zero_tile_counter()
         module.run(
             q,
-            k_cache,
-            v_cache,
+            k,
+            v,
             out,
             workspace_buffer,
             workspace_size,
-            block_tables,
-            page_size,
-            kv_lens,
+            self._block_tables,  # None for non-paged layouts
+            self._page_size,  # 0 for non-paged layouts
+            self._kv_lens,
             self._cum_seq_lens_q,
             self._cum_seq_lens_kv,
-            "q_paged_kv_hnd" if kv_layout == "HND" else "q_paged_kv_nhd",
-            max_q_len,
-            max_kv_len,
-            batch_size,
+            self._run_layout_str,
+            self._max_q_len,
+            self._max_kv_len,
+            self._batch_size,
             "causal" if causal else "padding",
             1.0,  # scale_softmax (encoded scales come from the prep kernel)
             self._bmm1_scale,
@@ -355,54 +441,6 @@ class FmhaV2PrefillBackend:
             lse,
             sinks,
             # Device-resident scratch from prep kernel; bypasses host set_alpha + memset.
-            self._scale_bmm1_d,
-            self._scale_bmm2_d,
-            self._tile_id_counter,
-        )
-
-    def run_ragged(
-        self,
-        module,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        out: torch.Tensor,
-        *,
-        workspace_buffer: torch.Tensor,
-        causal: bool,
-        window_left: Optional[int],
-        logits_soft_cap: Optional[float],
-        lse: Optional[torch.Tensor],
-    ) -> None:
-        """Single SEPARATE_Q_K_V FMHAv2 kernel launch; prep ran in plan()."""
-        self._zero_tile_counter()
-        module.run(
-            q,
-            k,
-            v,
-            out,
-            workspace_buffer,
-            workspace_buffer.numel() * workspace_buffer.element_size(),
-            None,  # block_tables (ragged has none)
-            0,  # page_size
-            self._seq_lens_kv,
-            self._cum_seq_lens_q,
-            self._cum_seq_lens_kv,
-            "separate_q_k_v",
-            self._max_q_len,
-            self._max_kv_len,
-            self._batch_size,
-            "causal" if causal else "padding",
-            1.0,  # scale_softmax
-            self._bmm1_scale,
-            self._bmm2_scale,
-            window_left if window_left is not None else -1,
-            0,  # chunked_attention_size
-            self._has_alibi,
-            float(logits_soft_cap or 0.0),
-            0.0,  # skip_softmax_threshold_scale_factor
-            lse,
-            None,  # sinks
             self._scale_bmm1_d,
             self._scale_bmm2_d,
             self._tile_id_counter,
