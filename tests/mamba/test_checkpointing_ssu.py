@@ -3,7 +3,7 @@
 
 """
 Tests for the CUDA checkpointing_ssu kernel.
-Validates against the Triton checkpointing_state_update reference.
+Validates against the Triton replay_selective_state_update reference.
 """
 
 import pytest
@@ -15,12 +15,11 @@ from einops import repeat
 from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
 from flashinfer.utils import is_cvt_rs_supported
 
-# Import Triton reference.  All tests drive the 5D persistent path via
-# `replay_selective_state_update`; the old 4D `checkpointing_state_update` is no
-# longer used here.
-from .triton_reference.checkpointing_state_update import (
-    _get_sm_version,
-    replay_selective_state_update,
+# Triton reference: the standalone TMA persistent kernel only (the old 4D
+# `checkpointing_state_update` and its merged non-TMA replay copy were removed
+# 2026-07-10 — the TMA impls carry all reference coverage, incl. varlen).
+from .triton_reference.replay_selective_state_update import (
+    get_sm_version as _get_sm_version,
 )
 
 # Faithful TMA-optimized standalone persistent kernel (the merged copy above
@@ -67,11 +66,10 @@ def _old_x_to_5d(old_x_4d, cache_buf_idx):
     return old_x_5d
 
 
-# Triton replay configs tested for non-varlen + varlen.  `non_tma` is the old
-# (merged, non-TMA) persistent kernel kept for cross-validation; `tma_pd`/`tma_pm`
-# are the faithful TMA standalone in its two modes.  When the old kernel is
-# removed, drop "non_tma" here (single point of change).
-_TRITON_IMPLS = ["non_tma", "tma_pd", "tma_pm"]
+# Triton replay configs tested for non-varlen + varlen: the faithful TMA
+# standalone in its two modes (the merged non-TMA copy was removed with the
+# old 4D kernel, 2026-07-10).
+_TRITON_IMPLS = ["tma_pd", "tma_pm"]
 
 # fragA-native cb_scaled layout for the two-kernel CUDA path (.plans/ssu_split.md):
 # per (batch, head), one PackedAligned<bf16> per lane = WARP_SIZE lanes ×
@@ -161,9 +159,8 @@ def _call_replay(
     max_seqlen=None,
 ):
     """Dispatch one replay call to a test config (see ``_TRITON_IMPLS``):
-      ``non_tma`` → merged ``replay_selective_state_update`` (non-TMA,
-        persistent_dynamic); ``tma_pd``/``tma_pm`` → the TMA standalone
-        ``replay_persistent`` in persistent_dynamic / persistent_main.
+      ``tma_pd``/``tma_pm`` → the TMA standalone ``replay_persistent`` in
+        persistent_dynamic / persistent_main.
 
     ``old_x`` is the 4-D single-buffer cache (converted to 5-D here).
     ``work_seq_len`` is the new-token count for the persistent_main work-item
@@ -188,41 +185,28 @@ def _call_replay(
     )
     if cu_seqlens is not None:
         common.update(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-    if impl == "non_tma":
-        replay_selective_state_update(
-            state,
-            old_x_5d,
-            old_B,
-            old_dt,
-            old_dA,
-            cache_buf_idx,
-            prev_tokens,
-            rectangle_for_nowrite=False,
-            **common,
-        )
-    else:
-        mode = "persistent_dynamic" if impl == "tma_pd" else "persistent_main"
-        n_writes, replay_work_items = _make_replay_work_items(
-            prev_tokens,
-            cache_buf_idx,
-            work_seq_len,
-            max_window,
-            batch,
-            state_batch_indices,
-        )
-        replay_persistent(
-            state,
-            old_x_5d,
-            old_B,
-            old_dt,
-            old_dA,
-            cache_buf_idx,
-            prev_tokens,
-            n_writes=n_writes,
-            replay_work_items=replay_work_items,
-            mode=mode,
-            **common,
-        )
+    mode = "persistent_dynamic" if impl == "tma_pd" else "persistent_main"
+    n_writes, replay_work_items = _make_replay_work_items(
+        prev_tokens,
+        cache_buf_idx,
+        work_seq_len,
+        max_window,
+        batch,
+        state_batch_indices,
+    )
+    replay_persistent(
+        state,
+        old_x_5d,
+        old_B,
+        old_dt,
+        old_dA,
+        cache_buf_idx,
+        prev_tokens,
+        n_writes=n_writes,
+        replay_work_items=replay_work_items,
+        mode=mode,
+        **common,
+    )
     # Return the (kernel-mutated) 5D old_x so cache-postcondition checks can
     # inspect it (the kernel wrote new tokens into the write buffer in place).
     return old_x_5d

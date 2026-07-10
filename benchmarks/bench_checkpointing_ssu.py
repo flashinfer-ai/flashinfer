@@ -63,10 +63,8 @@ from einops import repeat
 # Add tests/mamba to path for triton_reference imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests" / "mamba"))
 
-from triton_reference.checkpointing_state_update import checkpointing_state_update
 
 # triton-replay uses the faithful, TMA-optimized standalone reference (the
-# merged checkpointing_state_update copy dropped TMA + tuning during migration).
 from triton_reference.replay_selective_state_update import (
     REPLAY_WORK_CACHE_BUF_IDX,
     REPLAY_WORK_CACHE_SLOT,
@@ -126,7 +124,7 @@ STATE_DTYPE_MAP: dict[str, torch.dtype] = {
 }
 
 # Dtypes for which Philox stochastic rounding on gmem state writeback is
-# supported (cuda-incr and Triton incremental paths only).
+# supported (CUDA and Triton replay paths).
 _PHILOX_STATE_DTYPES = (torch.float16, torch.int8, torch.float8_e4m3fn)
 
 
@@ -196,11 +194,11 @@ def _build_tensors(
     Returns:
       state0                   : (batch, nheads, head_dim, d_state) – initial SSM state
       intermediate_update_inputs: (batch, mtp_len, nheads*head_dim + nheads + ngroups*d_state)
-                                   packed [old_x | old_dt_base | old_B] for incremental kernel
+                                   packed [old_x | old_dt_base | old_B] caches
       x, dt, B, C              : (batch, mtp_len, ...) – token inputs for both kernels
       A, dt_bias, D            : SSM parameters (float32, tie_hdim strides)
       prev_tokens              : (batch,)
-      out_incr                 : pre-allocated output for incremental kernel (batch, mtp_len, nheads, head_dim)
+      out_incr                 : pre-allocated output for the CUDA kernels (batch, mtp_len, nheads, head_dim)
       out_base                 : pre-allocated output for baseline kernel   (batch, mtp_len, nheads, head_dim)
       intermediate_states_buffer: for baseline kernel (batch, mtp_len, nheads, head_dim, d_state)
     """
@@ -246,7 +244,7 @@ def _build_tensors(
         )
         state_scale = None
 
-    # --- Cache tensors for incremental kernel ---
+    # --- Cache tensors ---
     # T-axis = max_window (cache capacity), independent of mtp_len (per-step
     # speculation depth).  must_checkpoint = (pnat + mtp_len > max_window),
     # so max_window > mtp_len leaves room for the no-checkpoint branch.
@@ -278,7 +276,7 @@ def _build_tensors(
         [old_x_flat, old_dt_base, old_B_flat], dim=-1
     ).contiguous()
 
-    # --- Token inputs (used by both incremental and baseline kernels) ---
+    # --- Token inputs ---
     x = torch.randn(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
     # TODO: For now, dt has to match D (fp32) for flashifner, so always do that
     dt_base = torch.randn(batch, mtp_len, nheads, device=device, dtype=torch.float32)
@@ -359,7 +357,6 @@ def _build_tensors(
 KernelName = Literal[
     "cuda-incr",  # cuda_checkpointing_ssu (monolithic)
     "cuda-incr-2k",  # cuda_checkpointing_ssu, two-kernel split (precompute + main)
-    "incremental",  # Triton checkpointing_state_update (old 4D path)
     "triton-replay",  # Triton replay_selective_state_update — persistent_dynamic
     "triton-replay-pm",  # Triton replay_selective_state_update — persistent_main
     "fi-dump",  # flashinfer_selective_state_update with dst_state_batch_indices
@@ -381,21 +378,6 @@ class TimingOptions:
     cupti: bool = False
     cuda_graph: bool = True
     l2_flush: bool = True
-
-
-@dataclass
-class TritonAutotune:
-    """Optional autotune overrides for the Triton incremental kernel.
-
-    ``None`` for any field means: let the kernel pick.  These are passed
-    straight through to ``checkpointing_state_update``.
-    """
-
-    block_size_m: int | None = None
-    num_warps: int | None = None
-    num_stages: int | None = None
-    precompute_num_warps: int | None = None
-    precompute_num_stages: int | None = None
 
 
 @dataclass
@@ -442,7 +424,7 @@ class KernelInputs:
     D: torch.Tensor
 
     # Per-slot accepted-tokens vector.  ``prev_tokens_i32`` feeds the
-    # cuda-incr / Triton incremental kernels.  Mutated by ``time_kernel`` to
+    # CUDA kernels.  Mutated by ``time_kernel`` to
     # the user-supplied vector before each timed batch.
     prev_tokens_i32: torch.Tensor
 
@@ -710,7 +692,6 @@ def time_kernel(
     tag: str = "",
     philox_rounds: int = 0,
     rand_seed: torch.Tensor | None = None,
-    autotune: TritonAutotune | None = None,
 ) -> tuple[float, float, float]:
     """Time one kernel invocation against a (batch,) prev_tokens vector.
 
@@ -724,8 +705,6 @@ def time_kernel(
     """
     if timing is None:
         timing = TimingOptions()
-    if autotune is None:
-        autotune = TritonAutotune()
 
     assert prev_tokens.device.type == "cuda", (
         f"prev_tokens must be on CUDA, got {prev_tokens.device}"
@@ -751,7 +730,6 @@ def time_kernel(
         inputs=inputs,
         philox_rounds=philox_rounds,
         rand_seed=rand_seed,
-        autotune=autotune,
     )
     return _time_kernel(timing, run_fn, inputs.reset, tag)
 
@@ -765,7 +743,6 @@ def time_kernel_with_conv1d(
     tag: str = "",
     philox_rounds: int = 0,
     rand_seed: torch.Tensor | None = None,
-    autotune: TritonAutotune | None = None,
     external_pdl: bool = True,
 ) -> tuple[float, float, float]:
     """Time conv1d + kernel combined, measuring total span.
@@ -781,8 +758,6 @@ def time_kernel_with_conv1d(
         )
     if timing is None:
         timing = TimingOptions()
-    if autotune is None:
-        autotune = TritonAutotune()
 
     assert inputs.xbc_input_work is not None, (
         "conv1d tensors not allocated in KernelInputs"
@@ -810,7 +785,6 @@ def time_kernel_with_conv1d(
         inputs=inputs,
         philox_rounds=philox_rounds,
         rand_seed=rand_seed,
-        autotune=autotune,
         with_conv1d=True,
         external_pdl=external_pdl,
     )
@@ -827,7 +801,6 @@ def _make_run_closure(
     inputs: KernelInputs,
     philox_rounds: int,
     rand_seed: torch.Tensor | None,
-    autotune: TritonAutotune,
     with_conv1d: bool = False,
     external_pdl: bool = True,
 ) -> Callable[[], None]:
@@ -1073,81 +1046,6 @@ def _make_run_closure(
                     state_scales=inputs.state_scale_work,
                     mode=replay_mode,
                 )
-
-        return _run
-
-    if kernel == "incremental":
-        # Triton's `write_checkpoint` is `tl.constexpr` — one kernel launch
-        # = one branch.  For a heterogeneous batch, production must launch
-        # both variants per step (one for no-write slots, one for write
-        # slots); the Triton kernels early-exit slots that don't match the
-        # launch's WRITE_CHECKPOINT, so each launch can run over the full
-        # batch without corrupting unrelated slots.  See the early-exit
-        # block in tests/mamba/triton_reference/checkpointing_state_update.py.
-        #
-        # Decision rule based on the user-supplied prev_tokens vector:
-        #   uniform-write    → 1 launch with write_checkpoint=True
-        #   uniform-nowrite  → 1 launch with write_checkpoint=False
-        #   heterogeneous    → 2 launches (False then True)
-        needs_write = (inputs.prev_tokens_i32 + mtp_len) > max_window
-        any_write = bool(needs_write.any().item())
-        all_write = bool(needs_write.all().item())
-        launches: list[bool]
-        if all_write:
-            launches = [True]
-        elif not any_write:
-            launches = [False]
-        else:
-            launches = [False, True]
-
-        def _one_launch(wc: bool, x_call, B_call, C_call, _launch_with_pdl=False):
-            checkpointing_state_update(
-                inputs.state_work,
-                inputs.old_x_work,
-                inputs.old_B_work,
-                inputs.old_dt_work,
-                inputs.old_cumAdt_work,
-                inputs.cache_buf_idx_work,
-                inputs.prev_tokens_i32,
-                x=x_call,
-                dt=inputs.dt,
-                A=inputs.A,
-                B=B_call,
-                C=C_call,
-                out=inputs.out_incr,
-                D=inputs.D,
-                dt_bias=inputs.dt_bias,
-                dt_softplus=True,
-                state_batch_indices=None,
-                # Internal precompute→main PDL is intrinsic to the split (the
-                # main's replay overlaps the precompute) — always on, never a
-                # user knob.  Only external (conv1d) PDL is exposed.
-                use_internal_pdl=True,
-                rand_seed=rand_seed,
-                philox_rounds=philox_rounds,
-                state_scales=inputs.state_scale_work,
-                write_checkpoint=wc,
-                launch_with_pdl=_launch_with_pdl,
-                _block_size_m=autotune.block_size_m,
-                _num_warps=autotune.num_warps,
-                _num_stages=autotune.num_stages,
-                _precompute_num_warps=autotune.precompute_num_warps,
-                _precompute_num_stages=autotune.precompute_num_stages,
-            )
-
-        if with_conv1d:
-
-            def _run(_launches=tuple(launches)):
-                x_conv, B_conv, C_conv = _conv1d_split()
-                for wc in _launches:
-                    _one_launch(
-                        wc, x_conv, B_conv, C_conv, _launch_with_pdl=external_pdl
-                    )
-        else:
-
-            def _run(_launches=tuple(launches)):
-                for wc in _launches:
-                    _one_launch(wc, inputs.x, inputs.B, inputs.C)
 
         return _run
 
@@ -1563,7 +1461,7 @@ def _time_kernel(args, run_fn, reset_fn, tag: str) -> tuple[float, float, float]
 
 
 # ---------------------------------------------------------------------------
-# Per-config benchmark (consolidated baseline + incremental)
+# Per-config benchmark
 # ---------------------------------------------------------------------------
 
 
@@ -1659,75 +1557,6 @@ def _bench_config(
             p95_us,
             p99_us,
         )
-
-    def _parse_sweep(val):
-        if val is None:
-            return [None]
-        return [int(x) for x in val.split(",")]
-
-    bsm_values = _parse_sweep(args.block_size_m)
-    nw_values = _parse_sweep(args.num_warps)
-    ns_values = _parse_sweep(args.num_stages)
-    pnw_values = _parse_sweep(args.precompute_num_warps)
-    pns_values = _parse_sweep(args.precompute_num_stages)
-
-    # --- Triton incremental kernel, one row per pnat × autotune-point ---
-    # (skipped under --varlen: the Triton reference takes no cu_seqlens)
-    for pnat in pnats if not args.varlen else []:
-        pt_uniform_i32.fill_(pnat)
-        tag = (
-            f"incr_b{batch}_mtp{mtp_len}_k{pnat}_s{state_dtype_name}_a{act_dtype_name}"
-        )
-        for bsm in bsm_values:
-            for nw in nw_values:
-                for ns in ns_values:
-                    for pnw in pnw_values:
-                        for pns in pns_values:
-                            autotune = TritonAutotune(
-                                block_size_m=bsm,
-                                num_warps=nw,
-                                num_stages=ns,
-                                precompute_num_warps=pnw,
-                                precompute_num_stages=pns,
-                            )
-                            parts = []
-                            if bsm is not None:
-                                parts.append(f"M={bsm}")
-                            if nw is not None:
-                                parts.append(f"W={nw}")
-                            if ns is not None:
-                                parts.append(f"S={ns}")
-                            if pnw is not None:
-                                parts.append(f"pW={pnw}")
-                            if pns is not None:
-                                parts.append(f"pS={pns}")
-                            sweep_suffix = (" " + ",".join(parts)) if parts else ""
-                            sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(
-                                ",", "_"
-                            )
-                            median_us, p95_us, p99_us = time_kernel(
-                                kernel="incremental",
-                                inputs=inputs,
-                                prev_tokens=pt_uniform_i32,
-                                timing=timing,
-                                tag=sweep_tag,
-                                philox_rounds=philox_rounds,
-                                rand_seed=rand_seed,
-                                autotune=autotune,
-                            )
-                            _print_row(
-                                show_kernel_col,
-                                "incremental",
-                                batch,
-                                mtp_len,
-                                pnat,
-                                state_dtype_name,
-                                act_dtype_name,
-                                median_us,
-                                p95_us,
-                                p99_us,
-                                sweep_suffix,
-                            )
 
     # --- CUDA checkpointing_ssu kernel ---
     if args.cuda_incr:
@@ -1903,7 +1732,7 @@ def _run_benchmark(args) -> None:
     max_window = args.max_window
     assert max_window >= max(mtp_lengths), (
         f"--max-window ({max_window}) must be >= max(mtp_lengths) "
-        f"({max(mtp_lengths)}); the incremental kernel requires npredicted <= max_window"
+        f"({max(mtp_lengths)}); the kernels require npredicted <= max_window"
     )
 
     state_specs = [parse_state_spec(s) for s in args.state_dtypes.split(",")]
@@ -2111,7 +1940,7 @@ def _parse_args() -> argparse.Namespace:
         nargs="?",
         const="triton",
         choices=[None, "triton", "flashinfer"],
-        help="Baseline to benchmark alongside the incremental kernel. "
+        help="Baseline to benchmark alongside the CUDA kernels. "
         "'triton': native Triton selective_state_update. "
         "'flashinfer': flashinfer selective_state_update (same signature). "
         "Pass --baseline alone for 'triton'. Default: no baseline.",
@@ -2122,36 +1951,6 @@ def _parse_args() -> argparse.Namespace:
         help="Path to save results (file or directory). "
         "If a directory, writes bench_checkpointing_ssu_[<SSU_TAG>_]b<batch>_<dtype>_mtp<mtp>_"
         "pf<fracs>_<timestamp>.txt inside it (SSU_TAG env optional).",
-    )
-    parser.add_argument(
-        "--block-size-m",
-        type=str,
-        default=None,
-        help="Override BLOCK_SIZE_M: single value or comma-separated sweep (e.g. '4,8,16,32').",
-    )
-    parser.add_argument(
-        "--num-warps",
-        type=str,
-        default=None,
-        help="Override num_warps: single value or comma-separated sweep (e.g. '1,2,4').",
-    )
-    parser.add_argument(
-        "--num-stages",
-        type=str,
-        default=None,
-        help="Override num_stages for the main kernel (comma-separated sweep).",
-    )
-    parser.add_argument(
-        "--precompute-num-warps",
-        type=str,
-        default=None,
-        help="Override num_warps for precompute kernel (comma-separated sweep).",
-    )
-    parser.add_argument(
-        "--precompute-num-stages",
-        type=str,
-        default=None,
-        help="Override num_stages for precompute kernel (comma-separated sweep).",
     )
     parser.add_argument(
         "--cuda-incr",

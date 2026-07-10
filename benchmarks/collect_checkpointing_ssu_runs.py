@@ -157,8 +157,8 @@ def read_csv(path: Path) -> list[dict]:
 def plot_results(rows: list[dict], png_path: Path) -> None:
     """Plot latency vs PNAT (previously accepted tokens), one line per (kernel, npredicted).
 
-    Kernel → color, npredicted (mtp) → linestyle/marker.  Only the CUDA kernels + the
-    Triton incremental reference are drawn; other impls in the CSV are skipped."""
+    Kernel → color, npredicted (mtp) → linestyle/marker.  Only the CUDA kernels
+    are drawn; other impls in the CSV are skipped."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -166,7 +166,6 @@ def plot_results(rows: list[dict], png_path: Path) -> None:
 
     # Kernel → (color, legend label).  Kernels not listed here are skipped.
     kernel_style = {
-        "incremental": ("#7f7f7f", "triton-incr"),
         "cuda-incr": ("#ff7f0e", "cuda-incr (mono)"),
         "cuda-incr-2k": ("#1f77b4", "cuda-incr-2k"),
     }
@@ -228,7 +227,7 @@ def plot_results(rows: list[dict], png_path: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Collect incremental SSU benchmarks and plot",
+        description="Collect checkpointing SSU benchmarks and plot",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

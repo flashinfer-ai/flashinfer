@@ -71,14 +71,13 @@ DEFAULT_SEED = 42
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
 DEFAULT_NUM_PNAT_SAMPLES = 8
-DEFAULT_KERNELS = "cuda-incr,cuda-incr-2k,incremental,triton-replay,triton-replay-pm"
+DEFAULT_KERNELS = "cuda-incr,cuda-incr-2k,triton-replay,triton-replay-pm"
 # Kernels that honor Philox stochastic rounding on the gmem state writeback
 # (the FlashInfer / baseline rows silently ignore rand_seed).  Includes the new
 # 5D persistent paths (triton-replay = persistent_dynamic, -pm = persistent_main).
 _PHILOX_KERNELS = (
     "cuda-incr",
     "cuda-incr-2k",
-    "incremental",
     "triton-replay",
     "triton-replay-pm",
 )
@@ -313,7 +312,7 @@ def run_in_process_bench(
     ``state_dtype_spec`` follows the bench_checkpointing_ssu convention:
     plain dtype name (e.g. ``"e4m3"``) for philox_rounds=0, or
     ``"<dtype>-philox-<N>"`` to enable Philox-<N> stochastic rounding on
-    gmem state writeback (the CUDA kernels + Triton incremental/replay;
+    gmem state writeback (the CUDA kernels + Triton replay;
     see _PHILOX_KERNELS).
 
     When *with_conv1d* is True, each kernel iteration prepends a
@@ -368,7 +367,7 @@ def run_in_process_bench(
         if ignoring:
             print(
                 f"WARN: philox_rounds={philox_rounds} only applies to "
-                f"cuda-incr / incremental; kernels {ignoring} run without it.",
+                f"the CUDA / Triton-replay kernels; kernels {ignoring} run without it.",
                 file=sys.stderr,
             )
 
@@ -426,7 +425,7 @@ def run_in_process_bench(
     for batch in batch_sizes:
         print(f"\n[batch={batch}] sampling K={K} PNAT vectors...")
         pnats_np = sample_steady_state_pnat(al, T, window, batch, K, seed=seed)
-        # Per-sample pre-built tensors (int32 for cuda-incr/incremental,
+        # Per-sample pre-built tensors (int32 for the CUDA kernels,
         # int64 for fi-replay).  Built on the host once and copied to the
         # inputs.prev_tokens_* tensors at time_kernel() time.
         pnats_i32 = [
@@ -610,7 +609,6 @@ def plot_results(rows: list[dict], png_path: Path) -> None:
 
     colors = {
         "cuda-incr": "#d62728",
-        "incremental": "#1f77b4",
         "fi-dump": "#2ca02c",
         "fi-replay": "#ff7f0e",
         "baseline-triton": "#9467bd",
@@ -706,8 +704,8 @@ def main() -> None:
         help=(
             "State dtype.  Plain name (e.g. 'e4m3', 'bf16') or "
             "'<dtype>-philox-<N>' (e.g. 'e4m3-philox-5') to enable Philox-<N> "
-            "stochastic rounding on gmem state writeback (cuda-incr / "
-            "incremental only).  Valid suffix dtypes: f16/fp16/int8/i8/fp8/e4m3."
+            "stochastic rounding on gmem state writeback.  "
+            "Valid suffix dtypes: f16/fp16/int8/i8/fp8/e4m3."
         ),
     )
     parser.add_argument(
@@ -715,7 +713,7 @@ def main() -> None:
         default=DEFAULT_KERNELS,
         help=(
             "Comma-separated kernel names from bench_checkpointing_ssu.KernelName: "
-            "cuda-incr, incremental, triton-replay, triton-replay-pm, fi-dump, "
+            "cuda-incr, cuda-incr-2k, triton-replay, triton-replay-pm, fi-dump, "
             "fi-replay, baseline-triton, baseline-flashinfer"
         ),
     )
