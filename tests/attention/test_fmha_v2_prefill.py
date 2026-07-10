@@ -7,7 +7,11 @@ import flashinfer
 
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
-from flashinfer.utils import is_sm12x_supported
+from flashinfer.utils import (
+    is_sm12x_supported,
+    is_sm90a_supported,
+    is_sm120a_supported,
+)
 
 _WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _workspace_buffer: Optional[torch.Tensor] = None
@@ -1308,16 +1312,15 @@ def test_trtllm_fmha_v2_prefill_chunked_attention(
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("batch_size", [1, 8])
-@pytest.mark.parametrize("max_seq_len", [256, 1024])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("page_size", [16, 64])
-@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("causal", [True, False])
-def test_batch_prefill_paged_trtllm_fmhav2_wrapper(
+def _skip_unless_trtllm_fmhav2_supported() -> None:
+    if not (
+        is_sm90a_supported(torch.device("cuda"))
+        or is_sm120a_supported(torch.device("cuda"))
+    ):
+        pytest.skip("trtllm-fmhav2 backend requires SM90 or SM120")
+
+
+def _make_trtllm_fmhav2_paged_case(
     batch_size: int,
     max_seq_len: int,
     num_qo_heads: int,
@@ -1327,23 +1330,19 @@ def test_batch_prefill_paged_trtllm_fmhav2_wrapper(
     kv_layout: str,
     dtype: torch.dtype,
     causal: bool,
-) -> None:
-    """End-to-end test for ``BatchPrefillWithPagedKVCacheWrapper(backend='trtllm-fmhav2')``.
+    seed: int,
+):
+    """Build paged-KV inputs for ``backend='trtllm-fmhav2'`` plus the reference output.
 
-    Drives the new ``prepare_paged`` + ``prepare`` device kernels through
-    ``wrapper.plan()`` (paged→dense block-table scatter, then cum-scan / tile
-    reset / scale encode) and the device-resident scale/tile-counter feed into
-    ``wrapper.run()``.
+    Returns ``(q, paged_kv_cache, plan_args, out_ref)`` where ``plan_args`` are
+    the positional arguments of ``BatchPrefillWithPagedKVCacheWrapper.plan()``
+    and ``out_ref`` is the fp32 ``attention_ref_torch`` output.
+
+    The KV pool is a single interleaved allocation ``[num_pages, 2, ...]``
+    (K at page*2, V at page*2+1) as the trtllm-fmhav2 kernel requires;
+    k_cache/v_cache are non-owning views so k_cache.data_ptr() == pool base.
     """
-    from flashinfer.utils import is_sm90a_supported
-
-    if not (
-        is_sm90a_supported(torch.device("cuda"))
-        or is_sm120a_supported(torch.device("cuda"))
-    ):
-        pytest.skip("trtllm-fmhav2 backend requires SM90 or SM120")
-
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     device = torch.device("cuda")
 
     # Per-sequence KV lengths; full prefill so q_len == kv_len.
@@ -1354,150 +1353,10 @@ def test_batch_prefill_paged_trtllm_fmhav2_wrapper(
         dtype=torch.int32,
         device=device,
     )
-    q_seq_lens = kv_seq_lens
 
     # FlashInfer paged indptr/indices (the prepare_paged kernel's natural inputs).
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    qo_indptr[1:] = torch.cumsum(q_seq_lens, dim=0)
-
-    num_pages_per_seq = (kv_seq_lens + page_size - 1) // page_size
-    paged_kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    paged_kv_indptr[1:] = torch.cumsum(num_pages_per_seq, dim=0)
-    total_pages = int(paged_kv_indptr[-1].item())
-    paged_kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)
-    paged_kv_last_page_len = ((kv_seq_lens - 1) % page_size) + 1
-
-    # Paged KV cache: create an interleaved pool [num_pages, 2, page_size, H, D] (NHD)
-    # or [num_pages, 2, H, page_size, D] (HND).  The trtllm-fmhav2 kernel requires K
-    # and V to be interleaved in a single contiguous pool (K at page*2, V at page*2+1).
-    # k_cache and v_cache are non-owning views into the pool so that
-    # k_cache.data_ptr() == kv_pool.data_ptr(), giving the kernel the correct base.
-    if kv_layout == "NHD":
-        kv_pool = torch.randn(
-            total_pages,
-            2,
-            page_size,
-            num_kv_heads,
-            head_dim,
-            dtype=dtype,
-            device=device,
-        )
-    else:  # HND
-        kv_pool = torch.randn(
-            total_pages,
-            2,
-            num_kv_heads,
-            page_size,
-            head_dim,
-            dtype=dtype,
-            device=device,
-        )
-    k_cache = kv_pool[:, 0]
-    v_cache = kv_pool[:, 1]
-    paged_kv_cache = (k_cache, v_cache)
-
-    total_q_tokens = int(qo_indptr[-1].item())
-    q = torch.randn(total_q_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
-
-    workspace = _get_workspace_buffer()
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace, kv_layout=kv_layout, backend="trtllm-fmhav2"
-    )
-    wrapper.plan(
-        qo_indptr,
-        paged_kv_indptr,
-        paged_kv_indices,
-        paged_kv_last_page_len,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        causal=causal,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-    )
-    out = wrapper.run(q, paged_kv_cache)
-
-    # Reference: attention_ref_torch expects a 5-D NHD paged cache and a
-    # dense block_tables layout. Build both host-side here (the kernel derived
-    # them on device inside plan()).
-    # k_cache/v_cache are non-contiguous views of kv_pool, so make them contiguous.
-    if kv_layout == "HND":
-        k_ref = kv_pool[:, 0].transpose(-3, -2).contiguous()
-        v_ref = kv_pool[:, 1].transpose(-3, -2).contiguous()
-    else:
-        k_ref = kv_pool[:, 0].contiguous()
-        v_ref = kv_pool[:, 1].contiguous()
-    paged_kv_cache_ref = torch.stack([k_ref, v_ref], dim=1)
-
-    max_blocks = int(num_pages_per_seq.max().item())
-    block_tables_ref = torch.zeros(
-        batch_size, max_blocks, dtype=torch.int32, device=device
-    )
-    indptr_cpu = paged_kv_indptr.cpu()
-    num_pages_cpu = num_pages_per_seq.cpu()
-    for i in range(batch_size):
-        n = int(num_pages_cpu[i].item())
-        s = int(indptr_cpu[i].item())
-        block_tables_ref[i, :n] = paged_kv_indices[s : s + n]
-
-    out_ref = attention_ref_torch(
-        (q, paged_kv_cache_ref),
-        seq_lens=kv_seq_lens,
-        cum_seq_lens_q=qo_indptr,
-        sm_scale=1.0 / math.sqrt(head_dim),
-        causal=causal,
-        block_tables=block_tables_ref,
-    )
-
-    rtol, atol = 1e-2, 1e-2
-    torch.testing.assert_close(out.float(), out_ref.float(), rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
-@pytest.mark.parametrize("causal", [True, False])
-def test_batch_prefill_paged_trtllm_fmhav2_plan_reuse(
-    kv_layout: str,
-    causal: bool,
-) -> None:
-    """plan() once, run() many times back-to-back.
-
-    On SM90 the warp-specialized kernel's tile scheduler consumes
-    ``tile_id_counter`` via atomicAdd (dma.h), leaving it at ``num_tiles``
-    after each launch. Since the wrapper skips the launcher-side memset
-    (``tile_id_counter_external_zeroed``), run() must re-zero the counter
-    itself or every run after the first reads a stale value and schedules
-    nothing. This test fails if that re-zero is ever dropped.
-    """
-    from flashinfer.utils import is_sm90a_supported
-
-    if not (
-        is_sm90a_supported(torch.device("cuda"))
-        or is_sm120a_supported(torch.device("cuda"))
-    ):
-        pytest.skip("trtllm-fmhav2 backend requires SM90 or SM120")
-
-    torch.manual_seed(7)
-    device = torch.device("cuda")
-    batch_size = 4
-    max_seq_len = 512
-    num_qo_heads = num_kv_heads = 4
-    head_dim = 128
-    page_size = 16
-    dtype = torch.float16
-    num_runs = 32
-
-    kv_seq_lens = torch.randint(
-        max_seq_len // 2,
-        max_seq_len + 1,
-        (batch_size,),
-        dtype=torch.int32,
-        device=device,
-    )
-    q_seq_lens = kv_seq_lens
-
-    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    qo_indptr[1:] = torch.cumsum(q_seq_lens, dim=0)
+    qo_indptr[1:] = torch.cumsum(kv_seq_lens, dim=0)
 
     num_pages_per_seq = (kv_seq_lens + page_size - 1) // page_size
     paged_kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
@@ -1531,24 +1390,8 @@ def test_batch_prefill_paged_trtllm_fmhav2_plan_reuse(
     total_q_tokens = int(qo_indptr[-1].item())
     q = torch.randn(total_q_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
 
-    workspace = _get_workspace_buffer()
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace, kv_layout=kv_layout, backend="trtllm-fmhav2"
-    )
-    wrapper.plan(
-        qo_indptr,
-        paged_kv_indptr,
-        paged_kv_indices,
-        paged_kv_last_page_len,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        causal=causal,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-    )
-
+    # Reference: attention_ref_torch expects a 5-D NHD paged cache and dense
+    # block_tables; build both host-side (plan() derives them on device).
     if kv_layout == "HND":
         k_ref = kv_pool[:, 0].transpose(-3, -2).contiguous()
         v_ref = kv_pool[:, 1].transpose(-3, -2).contiguous()
@@ -1577,14 +1420,112 @@ def test_batch_prefill_paged_trtllm_fmhav2_plan_reuse(
         block_tables=block_tables_ref,
     ).float()
 
-    rtol, atol = 1e-2, 1e-2
+    plan_args = (
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+    )
+    return q, paged_kv_cache, plan_args, out_ref
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("max_seq_len", [256, 1024])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("page_size", [16, 64])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [True, False])
+def test_batch_prefill_paged_trtllm_fmhav2_wrapper(
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    kv_layout: str,
+    dtype: torch.dtype,
+    causal: bool,
+) -> None:
+    """End-to-end test for ``BatchPrefillWithPagedKVCacheWrapper(backend='trtllm-fmhav2')``.
+
+    Drives the new ``prepare_paged`` + ``prepare`` device kernels through
+    ``wrapper.plan()`` (paged→dense block-table scatter, then cum-scan / tile
+    reset / scale encode) and the device-resident scale/tile-counter feed into
+    ``wrapper.run()``.
+    """
+    _skip_unless_trtllm_fmhav2_supported()
+
+    q, paged_kv_cache, plan_args, out_ref = _make_trtllm_fmhav2_paged_case(
+        batch_size,
+        max_seq_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        kv_layout,
+        dtype,
+        causal,
+        seed=42,
+    )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        _get_workspace_buffer(), kv_layout=kv_layout, backend="trtllm-fmhav2"
+    )
+    wrapper.plan(*plan_args, causal=causal, q_data_type=dtype, kv_data_type=dtype)
+    out = wrapper.run(q, paged_kv_cache)
+
+    torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("causal", [True, False])
+def test_batch_prefill_paged_trtllm_fmhav2_plan_reuse(
+    kv_layout: str,
+    causal: bool,
+) -> None:
+    """plan() once, run() many times back-to-back.
+
+    On SM90 the warp-specialized kernel's tile scheduler consumes
+    ``tile_id_counter`` via atomicAdd (dma.h), leaving it at ``num_tiles``
+    after each launch. Since the wrapper skips the launcher-side memset
+    (``tile_id_counter_external_zeroed``), run() must re-zero the counter
+    itself or every run after the first reads a stale value and schedules
+    nothing. This test fails if that re-zero is ever dropped.
+    """
+    _skip_unless_trtllm_fmhav2_supported()
+
+    dtype = torch.float16
+    num_runs = 32
+    q, paged_kv_cache, plan_args, out_ref = _make_trtllm_fmhav2_paged_case(
+        batch_size=4,
+        max_seq_len=512,
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=128,
+        page_size=16,
+        kv_layout=kv_layout,
+        dtype=dtype,
+        causal=causal,
+        seed=7,
+    )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        _get_workspace_buffer(), kv_layout=kv_layout, backend="trtllm-fmhav2"
+    )
+    wrapper.plan(*plan_args, causal=causal, q_data_type=dtype, kv_data_type=dtype)
+
     for run_idx in range(num_runs):
         out = wrapper.run(q, paged_kv_cache)
         torch.testing.assert_close(
             out.float(),
             out_ref,
-            rtol=rtol,
-            atol=atol,
+            rtol=1e-2,
+            atol=1e-2,
             msg=lambda m, i=run_idx: f"mismatch on run #{i} after single plan(): {m}",
         )
 

@@ -2084,47 +2084,22 @@ def gen_fmha_v2_module(
         compilation_context=current_compilation_context,
     )
 
-    # copy static fmha_v2_run.cu
-    static_run_path = csrc_dir / "fmha_v2_run.cu"
-    run_path = gen_directory / "fmha_v2_run.cu"
-    with open(static_run_path, "r") as f:
-        write_if_different(run_path, f.read())
-    source_paths.append(run_path)
-
-    # copy static fmha_v2_jit_binding.cu
-    static_binding_path = csrc_dir / "fmha_v2_jit_binding.cu"
-    binding_path = gen_directory / "fmha_v2_jit_binding.cu"
-    with open(static_binding_path, "r") as f:
-        write_if_different(binding_path, f.read())
-    source_paths.append(binding_path)
-
-    # copy static fmha_v2_prepare.cu + its binding so the loaded module exposes
-    # both prepare() (called once per plan) and run() (called once per run).
-    static_prepare_path = csrc_dir / "fmha_v2_prepare.cu"
-    prepare_path = gen_directory / "fmha_v2_prepare.cu"
-    with open(static_prepare_path, "r") as f:
-        write_if_different(prepare_path, f.read())
-    source_paths.append(prepare_path)
-
-    static_prepare_binding_path = csrc_dir / "fmha_v2_prepare_jit_binding.cu"
-    prepare_binding_path = gen_directory / "fmha_v2_prepare_jit_binding.cu"
-    with open(static_prepare_binding_path, "r") as f:
-        write_if_different(prepare_binding_path, f.read())
-    source_paths.append(prepare_binding_path)
-
-    # copy static fmha_v2_prepare_paged.cu + its binding so the loaded module exposes
-    # prepare_paged() for converting paged KV indptr/indices into dense block_tables on GPU.
-    static_prepare_paged_path = csrc_dir / "fmha_v2_prepare_paged.cu"
-    prepare_paged_path = gen_directory / "fmha_v2_prepare_paged.cu"
-    with open(static_prepare_paged_path, "r") as f:
-        write_if_different(prepare_paged_path, f.read())
-    source_paths.append(prepare_paged_path)
-
-    static_prepare_paged_binding_path = csrc_dir / "fmha_v2_prepare_paged_jit_binding.cu"
-    prepare_paged_binding_path = gen_directory / "fmha_v2_prepare_paged_jit_binding.cu"
-    with open(static_prepare_paged_binding_path, "r") as f:
-        write_if_different(prepare_paged_binding_path, f.read())
-    source_paths.append(prepare_paged_binding_path)
+    # Copy the static launcher/binding sources so one loaded module exposes
+    # run() (called once per run), prepare() (cum-scan + tile reset + scale
+    # encode, called once per plan), and prepare_paged() (paged KV
+    # indptr/indices → dense block_tables, on GPU).
+    for fname in [
+        "fmha_v2_run.cu",
+        "fmha_v2_jit_binding.cu",
+        "fmha_v2_prepare.cu",
+        "fmha_v2_prepare_jit_binding.cu",
+        "fmha_v2_prepare_paged.cu",
+        "fmha_v2_prepare_paged_jit_binding.cu",
+    ]:
+        dest_path = gen_directory / fname
+        with open(csrc_dir / fname, "r") as f:
+            write_if_different(dest_path, f.read())
+        source_paths.append(dest_path)
 
     # Setup compilation flags
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
