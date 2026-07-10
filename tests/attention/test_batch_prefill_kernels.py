@@ -1803,8 +1803,8 @@ def test_single_prefill_torch_compile_cuda_graph():
     env.setdefault("USER", "ci")
 
     # The parent pytest process has already run thousands of prefill cases in this
-	# file. Release its cached blocks before the subprocess initializes
-	# torch.compile/cudagraph state on memory-constrained A10G runners.
+    # file. Release its cached blocks before the subprocess initializes
+    # torch.compile/cudagraph state on memory-constrained A10G runners.
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
