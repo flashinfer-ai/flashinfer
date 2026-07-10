@@ -69,6 +69,7 @@ def b12x_fused_moe(
     w1_alpha: torch.Tensor,
     w2_alpha: torch.Tensor,
     fc2_input_scale: Optional[torch.Tensor] = None,
+    input_global_scale: Optional[torch.Tensor] = None,
     num_local_experts: Optional[int] = None,
     output: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -117,6 +118,13 @@ def b12x_fused_moe(
         Global scale for FC2 input quantization.  Required for
         ``quant_mode="nvfp4"``; accepted but ignored for
         ``quant_mode="w4a16"``.
+    input_global_scale : Optional[torch.Tensor]
+        Global scale for FC1 input quantization, scalar or
+        ``[num_experts]``.  Decouples the input-quant scale from
+        ``w1_alpha`` so ``w1_alpha`` can carry an exact fp32 weight scale
+        instead of baking it into the e4m3 block scales; folded into the
+        output multiplier internally.  Defaults to ``w1_alpha`` (legacy
+        dual-use).  Ignored for ``quant_mode="w4a16"``.
     num_local_experts : Optional[int]
         Local experts for expert parallelism.  Defaults to ``num_experts``.
     output : Optional[torch.Tensor]
@@ -205,6 +213,7 @@ def b12x_fused_moe(
         w1_weight_sf=w1_weight_sf,
         w1_alpha=w1_alpha,
         fc2_input_scale=fc2_input_scale,
+        input_global_scale=input_global_scale,
         w2_weight=w2_weight,
         w2_weight_sf=w2_weight_sf,
         w2_alpha=w2_alpha,
@@ -375,6 +384,8 @@ class B12xMoEWrapper:
         self._padded_weights: Any = None
         self._padded_weight_key: Optional[Tuple] = None
         self._moe_output: Optional[torch.Tensor] = None
+        self._folded_w1_alpha: Optional[torch.Tensor] = None
+        self._folded_w1_alpha_key: Optional[Tuple] = None
 
         if use_cuda_graph:
             self._allocate_buffers()
@@ -482,6 +493,7 @@ class B12xMoEWrapper:
         w1_alpha: torch.Tensor,
         w2_alpha: torch.Tensor,
         fc2_input_scale: Optional[torch.Tensor] = None,
+        input_global_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the b12x fused-MoE forward pass.
 
@@ -509,6 +521,10 @@ class B12xMoEWrapper:
         fc2_input_scale : Optional[torch.Tensor]
             Global scale for FC2 input quantization.  Required for
             ``quant_mode="nvfp4"``; accepted but ignored for ``"w4a16"``.
+        input_global_scale : Optional[torch.Tensor]
+            Global scale for FC1 input quantization, scalar or
+            ``[num_experts]``.  Defaults to ``w1_alpha``; see
+            :func:`b12x_fused_moe`.  Ignored for ``"w4a16"``.
 
         Returns
         -------
@@ -565,6 +581,17 @@ class B12xMoEWrapper:
                 workspace = self._dynamic_workspace
             else:
                 workspace = self._static_workspace
+
+        if self.quant_mode == "nvfp4" and input_global_scale is not None:
+            # Fold once and reuse; launch_sm120_moe skips its fold when
+            # weight views are given.
+            fold_key = (w1_alpha.data_ptr(), input_global_scale.data_ptr())
+            if self._folded_w1_alpha is None or self._folded_w1_alpha_key != fold_key:
+                self._folded_w1_alpha = (
+                    w1_alpha.to(torch.float32) * input_global_scale.to(torch.float32)
+                ).contiguous()
+                self._folded_w1_alpha_key = fold_key
+            w1_alpha = self._folded_w1_alpha
 
         if self.quant_mode == "nvfp4":
             # Cache weight views; invalidate if weight pointers change.
@@ -636,6 +663,7 @@ class B12xMoEWrapper:
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
             fc2_input_scale=fc2_input_scale,
+            input_global_scale=input_global_scale,
             w2_weight=w2_weight,
             w2_weight_sf=w2_weight_sf,
             w2_alpha=w2_alpha,

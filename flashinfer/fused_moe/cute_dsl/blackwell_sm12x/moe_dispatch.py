@@ -979,9 +979,13 @@ def _get_micro_kernel(
 # Launch
 # ---------------------------------------------------------------------------
 def _expand_to_experts(t: torch.Tensor, num_experts: int) -> torch.Tensor:
-    """Broadcast a scalar or [1] tensor to [num_experts]."""
+    """Broadcast a scalar or [1] tensor to [num_experts], always fp32.
+
+    Both branches must cast: the kernels are compiled against fp32 fake
+    tensors for every per-expert scale.
+    """
     if t.numel() == 1:
-        return t.expand(num_experts).contiguous()
+        return t.to(torch.float32).expand(num_experts).contiguous()
     return t.contiguous().to(torch.float32)
 
 
@@ -2536,6 +2540,7 @@ def launch_sm120_moe(
     w1_weight_sf: torch.Tensor,
     w1_alpha: torch.Tensor,
     fc2_input_scale: Optional[torch.Tensor] = None,
+    input_global_scale: Optional[torch.Tensor] = None,
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
     w2_alpha: torch.Tensor,
@@ -2557,6 +2562,10 @@ def launch_sm120_moe(
     _prepared_weights=None,
 ) -> torch.Tensor:
     """Unified SM120 MoE dispatch — selects static or dynamic by token count.
+
+    input_global_scale overrides w1_alpha as the FC1 input-quant scale and
+    is folded into the multiplier internally.  With _weight_views supplied,
+    w1_alpha must already contain the fold.
 
     Optional _workspace and _weight_views can be pre-allocated and reused
     across calls to avoid per-call allocation overhead (wrapper path).
@@ -2623,6 +2632,16 @@ def launch_sm120_moe(
     if fc2_input_scale is None:
         raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
     down_input_scale = fc2_input_scale
+    if input_global_scale is not None:
+        input_gs = input_global_scale
+        if _weight_views is None:
+            # Alpha must carry input_gs back or the output magnitude is wrong.
+            # The wrapper folds before building _weight_views; don't fold twice.
+            w1_alpha = (
+                w1_alpha.to(torch.float32) * input_global_scale.to(torch.float32)
+            ).contiguous()
+    else:
+        input_gs = w1_alpha
 
     weights = (
         _weight_views
@@ -2697,7 +2716,7 @@ def launch_sm120_moe(
             a=a,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            input_gs=w1_alpha,
+            input_gs=input_gs,
             down_input_scale=down_input_scale,
             scatter_output=scatter_output,
             num_experts=num_experts,
@@ -2720,7 +2739,7 @@ def launch_sm120_moe(
             a=a,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            input_gs=w1_alpha,
+            input_gs=input_gs,
             down_input_scale=down_input_scale,
             scatter_output=scatter_output,
             num_experts=num_experts,
