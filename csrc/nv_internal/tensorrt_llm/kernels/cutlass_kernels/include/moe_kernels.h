@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include <algorithm>
 #include <cstdint>
 
 #include "cutlass/gemm/gemm.h"
@@ -635,7 +636,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   }
 
   std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) override {
-    return moe_gemm_runner_.getConfigs(gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused());
+    return filterMxfp8Tactics(
+        moe_gemm_runner_.getConfigs(gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused()));
   }
 
   int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) override {
@@ -644,8 +646,25 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm, MoeGemmId gemm_id) {
     using RunnerType = decltype(moe_gemm_runner_);
-    return RunnerType::getConfigs(sm,
-                                  gemm_id == MoeGemmId::GEMM_2 && Self::mayHaveFinalizeFused(sm));
+    return filterMxfp8Tactics(
+        RunnerType::getConfigs(sm, gemm_id == MoeGemmId::GEMM_2 && Self::mayHaveFinalizeFused(sm)));
+  }
+
+  // MXFP8 shares the FP8 activation/weight types, so the underlying gemm
+  // runner also reports the non-TMA (SM80/SM89-style) fallback configs.
+  // Those paths cannot do FpX block scaling (they hard-assert
+  // !use_block_scaling), so they must never be offered as tactics for an
+  // MXFP8 runner instantiation.
+  static std::vector<cutlass_extensions::CutlassGemmConfig> filterMxfp8Tactics(
+      std::vector<cutlass_extensions::CutlassGemmConfig> configs) {
+    if constexpr (use_mxfp8) {
+      configs.erase(std::remove_if(configs.begin(), configs.end(),
+                                   [](cutlass_extensions::CutlassGemmConfig const& config) {
+                                     return !config.is_tma_warp_specialized;
+                                   }),
+                    configs.end());
+    }
+    return configs;
   }
 
   void runMoe(void const* input_activations, void const* input_sf, bool const swizzled_input_sf,
@@ -1011,7 +1030,8 @@ struct GemmProfilerBackend {
             int num_experts, int k, int64_t hidden_size, int64_t unpadded_hidden_size,
             int64_t inter_size, int64_t group_size, ActivationType activation_type, bool bias,
             bool use_lora, bool min_latency_mode, bool need_weights,
-            MOEParallelismConfig parallelism_config, bool const enable_alltoall) {
+            MOEParallelismConfig parallelism_config, bool const enable_alltoall,
+            bool use_mxfp8_act_scaling = false) {
     mInterface = &runner;
     mGemmToProfile = gemm_to_profile;
     mDType = dtype;
@@ -1040,6 +1060,14 @@ struct GemmProfilerBackend {
     } else if ((dtype == nvinfer1::DataType::kFP4 || dtype == nvinfer1::DataType::kINT64) &&
                (wtype == nvinfer1::DataType::kFP4 || wtype == nvinfer1::DataType::kINT64)) {
       mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+    } else if (use_mxfp8_act_scaling && dtype == nvinfer1::DataType::kFP8 &&
+               wtype == nvinfer1::DataType::kFP8) {
+      // MXFP8xMXFP8: same storage dtypes as plain FP8, so the data types
+      // alone cannot identify it. Without this the profiler prepares
+      // per-tensor FP8 quant params and a null activation-SF buffer, and the
+      // TMA warp-specialized MXFP8 kernels fault on the null SF descriptor
+      // during the tuning pass (issue #3558).
+      mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
     }
   }
 

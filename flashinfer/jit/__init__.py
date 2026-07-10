@@ -91,14 +91,20 @@ from .dsv3_optimizations import (
 )
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
+from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
 from .fp4_kv_dequantization import (
     gen_fp4_kv_dequantization_module as gen_fp4_kv_dequantization_module,
 )
 from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
 )
+from .nvfp4_attention_sm120 import (
+    gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
+)
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
+from .monomoe import gen_monomoe_module as gen_monomoe_module
+from .monomoe import load_monomoe_module as load_monomoe_module
 
 
 cuda_lib_path = os.environ.get(

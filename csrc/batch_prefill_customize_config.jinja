@@ -55,6 +55,12 @@ struct RaggedParams {
   uint32_t k_stride_h;
   uint32_t v_stride_n;
   uint32_t v_stride_h;
+  uint32_t k_sf_stride_page;
+  uint32_t k_sf_stride_n;
+  uint32_t k_sf_stride_h;
+  uint32_t v_sf_stride_page;
+  uint32_t v_sf_stride_n;
+  uint32_t v_sf_stride_h;
   int32_t window_left;
 
   IdType* request_indices;
@@ -95,6 +101,12 @@ struct PagedParams {
   uint32_t num_qo_heads;
   IdType q_stride_n;
   IdType q_stride_h;
+  uint32_t k_sf_stride_page;
+  uint32_t k_sf_stride_n;
+  uint32_t k_sf_stride_h;
+  uint32_t v_sf_stride_page;
+  uint32_t v_sf_stride_n;
+  uint32_t v_sf_stride_h;
   int32_t window_left;
 
   IdType* request_indices;

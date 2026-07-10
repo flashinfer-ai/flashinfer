@@ -40,6 +40,8 @@ from ..utils import (
     device_support_pdl,
     get_compute_capability,
     get_device_sm_count,
+    _get_trtllm_gen_multi_ctas_kv_counter_buffer,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
     is_sm12x_supported,
     log2e,
 )
@@ -624,9 +626,23 @@ def _check_trtllm_gen_mla_shape(
     page_table: torch.Tensor,
     page_size: int,
     uses_shared_paged_kv_idx: bool = True,
+    batch_size: Optional[int] = None,
+    max_q_len: Optional[int] = None,
 ) -> torch.Tensor:
-    if query.ndim != 4:
-        raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
+    is_flattened_query = False
+    if query.ndim == 4:
+        num_seqs, num_tokens, _, qk_head_dim = query.shape
+    elif query.ndim == 3:
+        is_flattened_query = True
+        if batch_size is None or max_q_len is None:
+            raise ValueError(
+                "batch_size and max_q_len are required when query.ndim == 3"
+            )
+        num_seqs = batch_size
+        num_tokens = max_q_len
+        _, _, qk_head_dim = query.shape
+    else:
+        raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
 
     # Support both 3D and 4D kv_cache for backward compatibility
     if kv_cache.ndim == 3:
@@ -648,7 +664,6 @@ def _check_trtllm_gen_mla_shape(
             f"Unsupported MLA dimensions, got kv_lora_rank={kv_lora_rank} and qk_rope_head_dim={qk_rope_head_dim}, supported dimensions are: {supported_mla_head_dimensions}"
         )
 
-    num_seqs, num_tokens, _, qk_head_dim = query.shape
     ckv_dim = kv_cache.shape[3]
     expected_qk_head_dim = kv_lora_rank + qk_rope_head_dim
     if qk_head_dim != expected_qk_head_dim or ckv_dim != expected_qk_head_dim:
@@ -658,9 +673,15 @@ def _check_trtllm_gen_mla_shape(
 
     if sparse_mla_top_k > 0:
         page_table_shape = page_table.shape
-        if page_table_shape != (num_seqs, num_tokens, sparse_mla_top_k):
+        expected_page_table_shape = (
+            (query.size(0), sparse_mla_top_k)
+            if is_flattened_query
+            else (num_seqs, num_tokens, sparse_mla_top_k)
+        )
+        if page_table_shape != expected_page_table_shape:
             raise ValueError(
-                f"Expected page_table.shape == (num_seqs, num_tokens, sparse_mla_top_k), got {page_table_shape}"
+                "Expected page_table.shape == "
+                f"{expected_page_table_shape}" + f", got {page_table_shape}"
             )
     else:
         _check_block_tables_shape(page_table, uses_shared_paged_kv_idx)
@@ -1170,7 +1191,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses packed
         uint8 head dim 584. Layout follows ``kv_layout``.
     workspace_buffer : torch.Tensor
-        Backend workspace buffer. Must be zero-initialized for first use.
+        TRTLLM-GEN workspace buffer. The multi-CTA KV counters are managed in a
+        separate internal buffer.
     sparse_indices : torch.Tensor
         TRTLLM-GEN combined sparse table, or the SM120 sparse SWA segment.
     compressed_kv_cache : Optional[torch.Tensor]
@@ -1315,12 +1337,18 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         )
 
     sm_count = get_device_sm_count(query.device)
+    # Fresh zero-initialized buffer; the kernel self-resets the counters at the
+    # end of the launch, so no explicit re-zeroing is required.
+    multi_ctas_kv_counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+        batch_size, query_flat.size(1), sm_count, query.device
+    )
     run_func(
         out,
         query_flat,
         primary_kv_cache,
         swa_kv_cache,
         workspace_buffer,
+        multi_ctas_kv_counter_buffer,
         sparse_indices,
         seq_lens.contiguous(),
         sparse_topk_lens,
@@ -1578,6 +1606,44 @@ class BatchMLAPagedAttentionWrapper:
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
         """
+        # Other 1-byte dtypes (uint8, fp4, e5m2) would JIT-map to non-FP8
+        # element types and silently take an unsupported code path inside
+        # the kernel, so allowlist exactly the dtypes the kernel can handle.
+        _SUPPORTED_MLA_KV_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        if kv_data_type not in _SUPPORTED_MLA_KV_DTYPES:
+            raise ValueError(
+                f"MLA kv_data_type {kv_data_type} is not supported. "
+                f"Supported dtypes: {list(_SUPPORTED_MLA_KV_DTYPES)}."
+            )
+        if kv_data_type == torch.float8_e4m3fn:
+            if self._backend != "fa3":
+                raise ValueError(
+                    "FP8 kv_data_type for MLA is only supported with the fa3 "
+                    f"backend on SM90, got backend={self._backend!r}."
+                )
+            # Backend selection is independent of the runtime device; FP8 MLA
+            # requires SM90 specifically.
+            major, minor = get_compute_capability(self.device)
+            if major != 9:
+                raise ValueError(
+                    "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
+                    f"got SM{major}{minor}."
+                )
+            # Removing this guard exposes vec_cast<half, fp8_e4m3>, which
+            # exists but is untested for MLA — silent wrong output.
+            if q_data_type != torch.bfloat16:
+                raise ValueError(
+                    "FP8 kv_data_type for MLA currently only supports "
+                    f"q_data_type=torch.bfloat16, got {q_data_type}."
+                )
+            # Also enforced by static_assert in mla_hopper.cuh.
+            if head_dim_ckv != 512 or head_dim_kpe != 64:
+                raise ValueError(
+                    "FP8 kv_data_type for MLA currently only supports "
+                    "head_dim_ckv=512 and head_dim_kpe=64 (DeepSeek MLA), got "
+                    f"head_dim_ckv={head_dim_ckv}, head_dim_kpe={head_dim_kpe}."
+                )
+
         self._cached_module = get_batch_mla_module(
             self._backend,
             q_data_type,
@@ -1605,6 +1671,11 @@ class BatchMLAPagedAttentionWrapper:
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
+        # Used by run() to reject dtype mismatches; the C++ launcher
+        # reinterprets storage by the JIT-template type chosen at plan(),
+        # so a mismatch produces silent wrong output.
+        self._q_data_type = q_data_type
+        self._kv_data_type = kv_data_type
         self._use_profiler = use_profiler
 
         self._plan_info = self._cached_module.plan(
@@ -1634,6 +1705,9 @@ class BatchMLAPagedAttentionWrapper:
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
+        *,
+        ckv_scale: Optional[float] = None,
+        kpe_scale: Optional[float] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1651,6 +1725,9 @@ class BatchMLAPagedAttentionWrapper:
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
+        *,
+        ckv_scale: Optional[float] = None,
+        kpe_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api(trace=mla_paged_decode_trace)
@@ -1668,6 +1745,9 @@ class BatchMLAPagedAttentionWrapper:
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
+        *,
+        ckv_scale: Optional[float] = None,
+        kpe_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -1706,6 +1786,16 @@ class BatchMLAPagedAttentionWrapper:
             FP8 output dequantization scale (``real = quantized * o_scale``).
             When provided, ``out`` must be an FP8 tensor. Only supported with
             the ``cutlass`` backend.
+        ckv_scale : Optional[float]
+            Per-tensor dequantization scale for the compressed-KV cache when
+            ``kv_data_type`` is FP8 (``real = quantized * ckv_scale``). Required
+            (together with ``kpe_scale``) for the FP8 KV cache path on the
+            ``fa3`` backend. Must be a finite positive value. Must not be
+            provided when ``kv_data_type`` is BF16/FP16.
+        kpe_scale : Optional[float]
+            Per-tensor dequantization scale for the rope-K cache when
+            ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Same
+            usage rules as ``ckv_scale``.
         """
         if self._backend == "cutlass":
             if return_lse:
@@ -1713,6 +1803,11 @@ class BatchMLAPagedAttentionWrapper:
             if profiler_buffer is not None:
                 raise ValueError(
                     "profiler_buffer does not support cutlass backend for now."
+                )
+            if ckv_scale is not None or kpe_scale is not None:
+                raise ValueError(
+                    "ckv_scale / kpe_scale are only supported with the fa3 backend "
+                    "and FP8 kv_data_type."
                 )
             self._cached_module = get_mla_module()
             output_scale = 1.0
@@ -1760,6 +1855,56 @@ class BatchMLAPagedAttentionWrapper:
             raise ValueError(
                 "o_scale is only supported with the cutlass backend for now."
             )
+
+        # The C++ launcher reinterprets tensor storage by the JIT-template
+        # type chosen at plan(); a dtype mismatch here silently produces
+        # wrong output.
+        if q_nope.dtype != self._q_data_type:
+            raise ValueError(
+                f"q_nope.dtype={q_nope.dtype} does not match the planned "
+                f"q_data_type={self._q_data_type}."
+            )
+        if q_pe.dtype != self._q_data_type:
+            raise ValueError(
+                f"q_pe.dtype={q_pe.dtype} does not match the planned "
+                f"q_data_type={self._q_data_type}."
+            )
+        if ckv_cache.dtype != self._kv_data_type:
+            raise ValueError(
+                f"ckv_cache.dtype={ckv_cache.dtype} does not match the planned "
+                f"kv_data_type={self._kv_data_type}."
+            )
+        if kpe_cache.dtype != self._kv_data_type:
+            raise ValueError(
+                f"kpe_cache.dtype={kpe_cache.dtype} does not match the planned "
+                f"kv_data_type={self._kv_data_type}."
+            )
+
+        # e4m3fn is the only FP8 dtype reachable here (plan() rejects others).
+        kv_is_fp8 = self._kv_data_type == torch.float8_e4m3fn
+        if kv_is_fp8:
+            if ckv_scale is None or kpe_scale is None:
+                raise ValueError(
+                    "ckv_scale and kpe_scale are required when kv_data_type is FP8."
+                )
+            ckv_scale_f = float(ckv_scale)
+            kpe_scale_f = float(kpe_scale)
+            if not math.isfinite(ckv_scale_f) or ckv_scale_f <= 0.0:
+                raise ValueError(
+                    f"ckv_scale must be a finite positive value, got {ckv_scale}"
+                )
+            if not math.isfinite(kpe_scale_f) or kpe_scale_f <= 0.0:
+                raise ValueError(
+                    f"kpe_scale must be a finite positive value, got {kpe_scale}"
+                )
+        else:
+            if ckv_scale is not None or kpe_scale is not None:
+                raise ValueError(
+                    "ckv_scale / kpe_scale are only valid when kv_data_type is FP8."
+                )
+            ckv_scale_f = 1.0
+            kpe_scale_f = 1.0
+
         if profiler_buffer is None:
             if self._use_profiler:
                 raise ValueError(
@@ -1802,6 +1947,8 @@ class BatchMLAPagedAttentionWrapper:
             page_size,
             sm_scale,
             return_lse_base_on_e,
+            ckv_scale_f,
+            kpe_scale_f,
             *profiler_args,
         )
 
@@ -1812,32 +1959,9 @@ class BatchMLAPagedAttentionWrapper:
 # Autotuning support for trtllm_batch_decode_with_kv_cache_mla
 # ---------------------------------------------------------------------------
 
-# Trtllm-gen kernel has a hardcoded max_batch_size = 8192 cap in
-# csrc/trtllm_fmha_kernel_launcher.cu:200 (the counter-region semaphore array
-# is sized for this max). Profiling beyond this would alias semaphores and
-# produce non-representative measurements.
+# Keep the trtllm-gen autotune sweep bounded; actual counter storage is sized
+# dynamically per profiled batch.
 _TRTLLM_GEN_MLA_MAX_BATCH = 8192
-
-# Size of the trtllm-gen workspace counter region (multi-block semaphores)
-# per csrc/trtllm_fmha_kernel_launcher.cu:200: max_batch_size * max_num_qo_heads
-# * sizeof(uint32_t) = 8192 * 256 * 4 = 8 MB. trtllm-gen places this counter
-# slab at the head of the workspace_buffer and self-resets it at the end of
-# every launch, so back-to-back trtllm-gen launches keep it valid without any
-# host-side zeroing.
-_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES = 8192 * 256 * 4
-
-
-def _cute_dsl_workspace_view(workspace_buffer: torch.Tensor) -> torch.Tensor:
-    """Sub-view of the shared workspace that skips trtllm-gen's counter region.
-
-    cute-dsl carves its scratch from offset 0 of whatever buffer it is given;
-    offsetting past the 8 MB counter region keeps it from writing into the
-    bytes trtllm-gen needs zero on entry. Costs 8 MB of usable workspace
-    (callers should size the buffer accordingly; the recommended 128 MB has
-    ample headroom).
-    """
-    workspace_i8 = workspace_buffer.reshape(-1).view(torch.int8)
-    return workspace_i8[_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES:]
 
 
 def _round_to_seq_len_bucket(x: int) -> int:
@@ -1910,14 +2034,8 @@ def _compute_mla_decode_buckets(
     if "cute-dsl" in runner_names:
         from ..cute_dsl.utils import get_num_sm
 
-        # cute-dsl gives up the counter region only when trtllm-gen shares the
-        # buffer, so its usable size excludes that reservation only then.
-        reserved = (
-            _TRTLLM_GEN_MLA_COUNTER_REGION_BYTES if "trtllm-gen" in runner_names else 0
-        )
         cute_dsl_cap = _cute_dsl_max_supported_batch(
-            workspace_bytes=workspace_buffer.numel() * workspace_buffer.element_size()
-            - reserved,
+            workspace_bytes=workspace_buffer.numel() * workspace_buffer.element_size(),
             q_len=q_len,
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
@@ -1944,6 +2062,7 @@ def _cute_dsl_incompatibility_reason(
     is_var_seq: bool,
     return_lse: bool,
     lse: Optional[torch.Tensor],
+    cute_dsl_impl: str = "auto",
 ) -> Optional[str]:
     """Return None if cute-dsl can handle this call, else a human-readable reason.
 
@@ -1994,7 +2113,17 @@ def _cute_dsl_incompatibility_reason(
 
     _, q_len, num_heads, _ = query.shape
     try:
-        from ..cute_dsl.attention.wrappers.batch_mla import _check_can_implement
+        from ..cute_dsl.attention.mla_dispatch import _resolve_impl
+
+        resolved_impl = _resolve_impl(requested=cute_dsl_impl, kwargs={"sinks": sinks})
+    except (ValueError, ImportError) as e:
+        return f"cute-dsl backend (MLA decode kernel): {e}"
+
+    try:
+        if resolved_impl == "monolithic":
+            from ..cute_dsl.attention.monolithic.mla_decode import _check_can_implement
+        else:
+            from ..cute_dsl.attention.wrappers.batch_mla import _check_can_implement
 
         _check_can_implement(
             torch_dtype=query.dtype,
@@ -2033,8 +2162,7 @@ def _build_mla_decode_tuning_config(
     page reads give correct timing measurements. ``seq_lens`` is filled
     homogeneously with ``min(max_seq_len, provisioned_max_seq_len)``.
     """
-    from ..autotuner import DynamicTensorSpec, TuningConfig
-    from ..fused_moe.utils import make_bucket_mapper
+    from ..autotuner import DynamicTensorSpec, TuningConfig, make_bucket_mapper
 
     # kv_cache may be 3D [num_pages, page_size, D] or 4D
     # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
@@ -2073,6 +2201,8 @@ def _build_mla_decode_tuning_config(
                 tensor_initializers=[None, init_block_tables, init_seq_lens, None],
             ),
         ),
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
     )
 
 
@@ -2132,6 +2262,11 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
         self.return_lse = return_lse
         self.lse = lse
+        # Allocated lazily on first forward() and reused (grown if a later call
+        # needs more). Held on the runner so its lifetime is tied to this
+        # instance rather than a leaking module-global cache. The kernel
+        # self-resets the counters after each launch, so no re-zeroing.
+        self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     def __hash__(self):
         # The default `TunableRunner.__hash__` walks `self.__dict__` and falls
@@ -2205,6 +2340,16 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
+        required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_qo_heads, self.sm_count
+        )
+        counter_buffer = self._multi_ctas_kv_counter_buffer
+        if counter_buffer is None or counter_buffer.numel() < required_counter_bytes:
+            counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+                batch_size, num_qo_heads, self.sm_count, query.device
+            )
+            self._multi_ctas_kv_counter_buffer = counter_buffer
+        multi_ctas_kv_counter_buffer = counter_buffer
         self._run(
             out,
             None,  # fp4 output (unsupported by wrapper)
@@ -2212,6 +2357,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             self.kv_cache,
             self.kv_cache,  # kv passed twice (K/V views over the same buffer)
             self.workspace_buffer,
+            multi_ctas_kv_counter_buffer,
             block_tables,
             seq_lens,
             max_q_len,
@@ -2271,20 +2417,12 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         return_lse: bool,
         sinks: Optional[torch.Tensor],
         cute_dsl_impl: str,
-        reserve_counter_region: bool = False,
     ):
         from ..cute_dsl.attention import cute_dsl_mla_decode
 
         self._run = cute_dsl_mla_decode
         self.kv_cache = kv_cache
-        # Only skip trtllm-gen's counter region when trtllm-gen shares this
-        # buffer (the "auto" path); a standalone cute-dsl runner owns the whole
-        # buffer and can use it from offset 0.
-        self.workspace_buffer = (
-            _cute_dsl_workspace_view(workspace_buffer)
-            if reserve_counter_region
-            else workspace_buffer
-        )
+        self.workspace_buffer = workspace_buffer
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -2413,6 +2551,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     return_lse: bool = False,
     cute_dsl_impl: str = "auto",
     kv_scale_format: str = "auto",
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
 
@@ -2448,6 +2588,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     block_tables : torch.Tensor
         Page table for dense MLA backends when ``sparse_mla_top_k == 0``. For
         SM100/SM103 TRTLLM-GEN sparse MLA it is the usual paged block table.
+        When ``cum_seq_lens_q`` is provided with sparse MLA, pass compact
+        sparse rows in flattened query-token order with shape
+        ``[total_q, sparse_mla_top_k]``.
         For SM120/SM121 sparse v32/GLM, it is the sparse index matrix and must
         have shape ``[batch_size, q_len_per_request, sparse_mla_top_k]`` with
         int32 physical token indices.
@@ -2463,7 +2606,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Enables sparse MLA when greater than zero. On SM100/SM103 this selects
         the TRTLLM-GEN sparse page-table path. On SM120/SM121 with
         ``backend="auto"`` or ``backend="sparse"``, this is the width of the
-        packed v32/GLM sparse index matrix.
+        packed v32/GLM sparse index matrix. The TRTLLM-GEN backend supports
+        dense query input or flattened query input plus ``cum_seq_lens_q``.
     out : Optional[torch.Tensor]
         Output tensor. If not provided, it is allocated internally.
     bmm1_scale : Union[float, torch.Tensor]
@@ -2524,8 +2668,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``.
     cute_dsl_impl : str = "auto"
-        Which cute-dsl implementation to use.  Honored only when
-        ``backend="cute-dsl"``; ignored for other backends.
+        Which cute-dsl implementation to use. Honored when
+        ``backend="cute-dsl"`` and when ``backend="auto"`` considers the
+        cute-dsl candidate; ignored for non-cute-dsl backends.
 
         * ``"auto"`` (default) — picks monolithic by default, automatically
           promoted to modular when the call uses a feature monolithic
@@ -2539,6 +2684,23 @@ def trtllm_batch_decode_with_kv_cache_mla(
         ``"auto"`` and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32 inline
         scales; ``"arbitrary_fp32"`` selects GLM-style arbitrary FP32 inline scales.
         Ignored by the ``trtllm-gen``, ``xqa``, and ``cute-dsl`` backends.
+    cum_seq_lens_q : Optional[torch.Tensor] = None
+        Cumulative query sequence lengths for variable-length query support,
+        shape ``[batch_size + 1]``, dtype ``torch.int32``. Must be a 1D tensor
+        with at least two entries. When ``max_q_len`` is not provided, this
+        function validates that it starts with 0, ends at ``query.size(0)``,
+        and is monotonically non-decreasing. Only supported by the
+        ``trtllm-gen`` backend. When provided, ``query`` must have shape
+        ``[total_q, num_heads, head_dim_qk]``.
+        For best performance, provide ``max_q_len`` together with
+        ``cum_seq_lens_q`` to avoid host-side metadata validation.
+    max_q_len : Optional[int] = None
+        Maximum query sequence length across all requests when using
+        ``cum_seq_lens_q``. Provide with ``cum_seq_lens_q`` to avoid
+        host-side metadata validation. Must be greater than or equal to the
+        maximum segment length represented by ``cum_seq_lens_q``. Over-estimation
+        is safe but may waste work; under-estimation is invalid and may produce
+        incorrect output.
 
     Note
     ----
@@ -2585,6 +2747,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     if isinstance(bmm2_scale, torch.Tensor):
         if bmm2_scale.dtype != torch.float32:
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
+    if max_q_len is not None and cum_seq_lens_q is None:
+        raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
 
     if backend == "auto":
         cc = get_compute_capability(query.device)
@@ -2598,6 +2762,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError("seq_lens is required for XQA MLA")
         if sparse_mla_top_k > 0:
             raise ValueError("XQA MLA does not support sparse_mla_top_k")
+        if cum_seq_lens_q is not None or max_q_len is not None:
+            raise ValueError("XQA MLA does not support cum_seq_lens_q / max_q_len")
         if not is_sm12x_supported(query.device):
             raise ValueError(
                 "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
@@ -2642,7 +2808,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
             sinks,
             enable_pdl,
         )
-
     if backend not in ("auto", "trtllm-gen", "cute-dsl", "sparse"):
         raise ValueError(f"Backend {backend} not supported")
 
@@ -2693,6 +2858,126 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
     if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
         raise ValueError("skip_softmax is not supported for sparse MLA")
+
+    has_var_q = cum_seq_lens_q is not None
+    if has_var_q:
+        if backend == "cute-dsl":
+            raise ValueError("cute-dsl MLA does not support cum_seq_lens_q")
+        if return_lse or lse is not None:
+            raise NotImplementedError(
+                "trtllm-gen MLA does not support return_lse/lse with cum_seq_lens_q"
+            )
+        if query.ndim != 3:
+            raise ValueError(
+                "query must have shape [total_q, num_heads, head_dim_qk] "
+                "when cum_seq_lens_q is provided"
+            )
+        check_shape_dtype_device(
+            cum_seq_lens_q,
+            None,
+            torch.int32,
+            query.device,
+            "cum_seq_lens_q",
+        )
+        if cum_seq_lens_q.ndim != 1:
+            raise ValueError(
+                f"Expected cum_seq_lens_q.ndim == 1, got {cum_seq_lens_q.ndim}"
+            )
+        if cum_seq_lens_q.size(0) < 2:
+            raise ValueError("cum_seq_lens_q must contain at least two entries")
+        batch_size = cum_seq_lens_q.size(0) - 1
+        if batch_size != seq_lens.size(0):
+            raise ValueError(
+                "Batch size mismatch: cum_seq_lens_q describes "
+                f"{batch_size} sequences, but seq_lens has {seq_lens.size(0)} entries"
+            )
+        if max_q_len is None:
+            cum_seq_lens_q_host = cum_seq_lens_q.cpu()
+            if cum_seq_lens_q_host[0].item() != 0:
+                raise ValueError("cum_seq_lens_q must start with 0")
+            if cum_seq_lens_q_host[-1].item() != query.size(0):
+                raise ValueError(
+                    "cum_seq_lens_q[-1] must match the flattened query length"
+                )
+            q_lens = cum_seq_lens_q_host[1:] - cum_seq_lens_q_host[:-1]
+            if torch.any(q_lens < 0).item():
+                raise ValueError("cum_seq_lens_q must be monotonically non-decreasing")
+            max_q_len = q_lens.max().item()
+            if max_q_len <= 0:
+                raise ValueError(
+                    "cum_seq_lens_q must describe at least one query token"
+                )
+        elif max_q_len <= 0:
+            raise ValueError("max_q_len must be greater than 0")
+        elif max_q_len > query.size(0):
+            raise ValueError("max_q_len cannot exceed the flattened query length")
+
+        kv_cache = _check_trtllm_gen_mla_shape(
+            query,
+            kv_cache,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            sparse_mla_top_k,
+            block_tables,
+            block_size,
+            uses_shared_paged_kv_idx,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+        )
+
+        expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
+        if out is None:
+            out = torch.empty(
+                expected_out_shape, dtype=torch.bfloat16, device=query.device
+            )
+        else:
+            check_shape_dtype_device(
+                out,
+                expected_out_shape,
+                torch.bfloat16,
+                query.device,
+                "out",
+            )
+
+        # Fresh zero-initialized counter buffer; the kernel self-resets the
+        # counters at the end of the launch, so no explicit re-zeroing.
+        multi_ctas_kv_counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+            batch_size, query.size(1), sm_count, query.device
+        )
+        get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
+            out,
+            None,  # fp4 output (unsupported by wrapper)
+            query,
+            kv_cache,
+            kv_cache,
+            workspace_buffer,
+            multi_ctas_kv_counter_buffer,
+            block_tables,
+            seq_lens,
+            max_q_len,
+            max_seq_len,
+            bmm1_scale,
+            bmm2_scale,
+            -1,  # o_sf_scale
+            -1,  # o_sf_vec_size
+            0,  # o_sf_start_index
+            batch_size,
+            -1,  # window_left
+            sparse_mla_top_k,
+            sm_count,
+            enable_pdl,
+            workspace_buffer.numel() * workspace_buffer.element_size(),
+            sinks,
+            cum_seq_lens_q,
+            None,  # key_block_scales
+            None,  # value_block_scales
+            skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
+            None,  # lse
+            0,  # lse_stride_tokens
+            0,  # lse_stride_heads
+        )
+        return out
 
     # Normalize kv_cache to 4D and validate MLA dimensions. Despite the name,
     # the shape/dim checks here apply to both backends.
@@ -2765,6 +3050,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         is_var_seq,
         return_lse,
         lse,
+        cute_dsl_impl,
     )
     if backend == "cute-dsl":
         if cute_dsl_reason is not None:
@@ -2836,9 +3122,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 return_lse=return_lse,
                 sinks=cute_dsl_sinks,
                 cute_dsl_impl=cute_dsl_impl,
-                # Reserve trtllm-gen's counter region only when it co-runs on
-                # the shared workspace (the "auto" path).
-                reserve_counter_region="trtllm-gen" in runner_names,
             )
         )
 
@@ -2907,7 +3190,7 @@ def xqa_batch_decode_with_kv_cache_mla(
         dimension is the concatenation ``[ckv_cache, kpe_cache]``.  Both shapes are
         accepted for backward compatibility.
     workspace_buffer : torch.Tensor
-        Pre-allocated workspace buffer.  Must be zero-initialized on first use.
+        Pre-allocated backend scratch workspace buffer.
     qk_nope_head_dim : int
         Non-RoPE head dimension.  Must be ``128``.  Will be removed in 1.0; pass
         ``kv_lora_rank`` instead going forward.
