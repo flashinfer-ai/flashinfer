@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import torch
 
@@ -634,7 +634,10 @@ def try_trtllm_capture_aware_da(
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
             dtype_act=dtype_act,
-            dtype_weights=DtypeTrtllmGen(da_context.dtype_weights),
+            dtype_weights=cast(
+                DtypeTrtllmGen,
+                DtypeTrtllmGen._value2member_map_[int(da_context.dtype_weights)],
+            ),
             quantization_type=Fp8QuantizationType(da_context.quantization_type),
             da_context=da_context,
         )
@@ -722,6 +725,14 @@ def try_trtllm_capture_aware_da(
         )
 
     populate_candidate_routing_metadata: Optional[Callable[[], None]] = None
+    # A post-deduplication singleton needs metadata for only its retained body.
+    # Passing one tile also selects the ordinary routingIndicesClusterKernel in
+    # the C++ population helper; multi-tile routing is reserved for SWITCH.
+    routing_population_tiles = (
+        (int(per_tile_tactics[0][0]),)
+        if len(per_tile_tactics) == 1
+        else tuple(int(tile) for tile in candidate_tile_sizes)
+    )
     if capture_resources is None:
         routing_plan = prepare_capture_routing(
             backend=backend,
@@ -751,7 +762,7 @@ def try_trtllm_capture_aware_da(
             int(tile): _bundle_routing_metadata(bundle.tensors, int(tile))
             for tile, bundle in capture_resources.routing_metadata_by_tile
         }
-        first_tile = int(candidate_tile_sizes[0])
+        first_tile = int(routing_population_tiles[0])
         first_bundle = prepared_by_tile[first_tile]
         ffi_moe_op = backend.ffi_moe_op
         use_packed_logits_multi_tile = (
@@ -796,10 +807,10 @@ def try_trtllm_capture_aware_da(
                     int(num_local_experts),
                     routed_scaling_factor,
                     int(routing_method_type),
-                    [int(tile) for tile in candidate_tile_sizes],
+                    list(routing_population_tiles),
                     [
                         tensor
-                        for tile in candidate_tile_sizes
+                        for tile in routing_population_tiles
                         for tensor in prepared_by_tile[int(tile)].tensors
                     ],
                     metadata_routing_input_mode,
@@ -807,7 +818,10 @@ def try_trtllm_capture_aware_da(
                     True,
                 )
 
-            if len(candidate_tile_sizes) > 1 and not config.select_from_routing_counts:
+            if (
+                len(routing_population_tiles) > 1
+                and not config.select_from_routing_counts
+            ):
                 populate_candidate_routing_metadata = (
                     _populate_packed_candidate_routing_metadata
                 )
@@ -835,7 +849,9 @@ def try_trtllm_capture_aware_da(
                 first_bundle.public_metadata(),
             )
             remaining_tiles = tuple(
-                int(tile) for tile in candidate_tile_sizes if int(tile) != first_tile
+                int(tile)
+                for tile in routing_population_tiles
+                if int(tile) != first_tile
             )
         else:
             remaining_tiles = tuple(int(tile) for tile in candidate_tile_sizes)
@@ -865,7 +881,10 @@ def try_trtllm_capture_aware_da(
                     False,
                 )
 
-            if len(candidate_tile_sizes) > 1 and not config.select_from_routing_counts:
+            if (
+                len(routing_population_tiles) > 1
+                and not config.select_from_routing_counts
+            ):
                 # Precomputed IDs/weights are already ready before the fork.
                 # Populate all candidate metadata on the routing branch while
                 # the selector reads the same immutable IDs on the outer branch.

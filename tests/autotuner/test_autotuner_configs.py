@@ -336,11 +336,13 @@ class TestSearchCacheFallbackChain:
         """clear_cache should reset in-memory cache and file configs."""
         runner = FakeRunnerA(value=1)
         _populate_cache(self.tuner, runner, "op1", ((1, 2),), tactic=5)
+        self.tuner.profiling_tactic_time_cache[("profile", 5)] = 1.0
         self.tuner._file_configs["some_key"] = ("FakeRunnerA", 3)
 
         self.tuner.clear_cache()
 
         assert len(self.tuner.profiling_cache) == 0
+        assert len(self.tuner.profiling_tactic_time_cache) == 0
         assert len(self.tuner._file_configs) == 0
 
 

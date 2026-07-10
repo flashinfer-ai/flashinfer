@@ -4,6 +4,21 @@ import pytest
 import torch
 
 from benchmarks import bench_trtllm_moe_da as benchmark
+from flashinfer.autotuner import ProfilingCacheKey
+
+
+def test_profile_count_accepts_typed_and_legacy_autotuner_cache_keys():
+    shapes = ((64, 7168), (128, 7168))
+    value_profile = (shapes, (32, 1))
+    typed_value = ProfilingCacheKey("op", "runner", 1, value_profile, ())
+    typed_static = ProfilingCacheKey("op", "runner", 1, shapes, ())
+    legacy_value = ("op", "runner", 1, value_profile)
+    legacy_static = ("op", "runner", 1, shapes)
+
+    assert benchmark._is_value_profile_cache_key(typed_value)
+    assert benchmark._is_value_profile_cache_key(legacy_value)
+    assert not benchmark._is_value_profile_cache_key(typed_static)
+    assert not benchmark._is_value_profile_cache_key(legacy_static)
 
 
 def test_benchmark_mode_table_and_all_selector_are_exact():
@@ -125,3 +140,68 @@ def test_routed_inputs_follow_each_public_api_contract_and_report_routed():
 
     assert benchmark._reported_internal_routing_mode("routed") == "routed"
     assert benchmark._reported_internal_routing_mode("logits") == "packed"
+
+
+def test_guarded_noda_requires_no_da_capture_dispatch():
+    """A rejected DA plan must execute without DA graph mutation."""
+    row = {
+        "execution_mode": "graph",
+        "da_policy": "noda_baseline_guard",
+        "noda_capture_dispatch_count": 0,
+        "da_capture_dispatch_count": 0,
+        "noda_finite": 1.0,
+        "da_finite": 1.0,
+        "noda_match_ratio": 1.0,
+        "da_match_ratio": 1.0,
+        "match_ratio_threshold": 1.0,
+    }
+    assert benchmark._row_status(row) == "PASS"
+    row["da_capture_dispatch_count"] = 1
+    assert benchmark._row_status(row) == "FAIL_NODA_USED_DA_CAPTURE"
+
+
+def test_guard_reporting_separates_candidate_and_final_plans():
+    """CSV fields retain the switch that a baseline guard collapsed."""
+    fields = benchmark._guard_row_fields(
+        {
+            "policy": "noda_baseline_guard",
+            "candidate_policy": "da_switch",
+            "candidate_tactics": [(32, 121), (8, 65)],
+            "final_policy": "noda_baseline_guard",
+            "final_tactics": [(32, 43)],
+            "baseline_tactic": (32, 43),
+            "singleton_tactic": (32, 43),
+            "singleton_source": "noda_baseline",
+            "control_overhead_source": "pre_recorded_calibration",
+            "overhead_ms": 0.012,
+            "admission_applied": True,
+            "limitation": None,
+        }
+    )
+
+    assert fields["da_policy"] == "noda_baseline_guard"
+    assert fields["da_candidate_policy"] == "da_switch"
+    assert fields["da_candidate_tactics"] == "[(32, 121), (8, 65)]"
+    assert fields["da_final_policy"] == "noda_baseline_guard"
+    assert fields["da_final_tactics"] == "[(32, 43)]"
+    assert fields["da_overhead_ms"] == pytest.approx(0.012)
+    assert fields["da_guard_admission_applied"] is True
+    assert fields["da_guard_limitation"] is None
+
+
+def test_noda_plan_requires_no_da_capture_dispatch():
+    """The noda label is reserved for execution without the DA mechanism."""
+    row = {
+        "execution_mode": "graph",
+        "da_policy": "noda",
+        "noda_capture_dispatch_count": 0,
+        "da_capture_dispatch_count": 0,
+        "noda_finite": 1.0,
+        "da_finite": 1.0,
+        "noda_match_ratio": 1.0,
+        "da_match_ratio": 1.0,
+        "match_ratio_threshold": 1.0,
+    }
+    assert benchmark._row_status(row) == "PASS"
+    row["da_capture_dispatch_count"] = 1
+    assert benchmark._row_status(row) == "FAIL_NODA_USED_DA_CAPTURE"

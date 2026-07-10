@@ -8,7 +8,8 @@ import torch
 from ...tllm_enums import DtypeTrtllmGen, Fp8QuantizationType, WeightLayout
 from .da_config import DAConfig
 
-
+# Increment when DAMoeContext fields or their cache-identity meaning changes;
+# incompatible in-memory keys and persisted profile metadata must not mix.
 CONTEXT_SCHEMA_VERSION = 1
 
 
@@ -161,6 +162,7 @@ CAPTURE_KEEPALIVE: Dict[DAMoeContext, Dict[int, torch.Tensor]] = {}
 STATIC_FALLBACK_TACTICS: Dict[
     Tuple[str, int, int, DAMoeContext], Optional[Tuple[Tuple[int, int], float]]
 ] = {}
+BASELINE_GUARD_DECISIONS: Dict[Tuple[int, DAMoeContext], Dict[str, Any]] = {}
 
 
 def retain_capture_tensor(context: DAMoeContext, tensor: torch.Tensor) -> None:

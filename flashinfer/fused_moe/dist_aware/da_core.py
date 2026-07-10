@@ -8,7 +8,13 @@ from typing import Any, Callable, Optional, Sequence
 
 import torch
 
-from ...autotuner import AutoTuner, DynamicValueSpec, OptimizationProfile, StaticDim
+from ...autotuner import (
+    AutoTuner,
+    Dim,
+    DynamicValueSpec,
+    OptimizationProfile,
+    StaticDim,
+)
 from ...tllm_enums import DtypeTrtllmGen
 from . import da_capture, da_profile, da_state
 from .da_config import DAConfig
@@ -107,7 +113,7 @@ def _bucketed_profile(
 ) -> OptimizationProfile:
     """Build the runner profile used to query a DA token bucket."""
 
-    shapes = [
+    shapes: list[list[Dim]] = [
         [StaticDim(int(dim)) for dim in tensor.shape]
         if isinstance(tensor, torch.Tensor)
         else [StaticDim(0)]
@@ -220,6 +226,9 @@ class DADistributionTensorGenerator:
     def __init__(self, execution: DAExecution, *, pack_topk_ids: bool) -> None:
         self.execution = execution
         self.pack_topk_ids = pack_topk_ids
+        self._assignment_cache: dict[
+            tuple[int, int, int, torch.device], torch.Tensor
+        ] = {}
 
     def __call__(
         self,
@@ -227,6 +236,7 @@ class DADistributionTensorGenerator:
         profiled_tensor: torch.Tensor,
         original_tensor: torch.Tensor,
         inputs: list[torch.Tensor],
+        sample_index: int = 0,
     ) -> torch.Tensor:
         del original_tensor, inputs
         call = self.execution.invocation
@@ -237,14 +247,22 @@ class DADistributionTensorGenerator:
             return profiled_tensor
         num_tokens = int(profiled_tensor.shape[0])
         device = profiled_tensor.device
-        assignments = generate_da_distribution_assignments(
-            dist,
-            torch.zeros(num_tokens, call.top_k, dtype=torch.int32, device=device),
-            call.num_local_experts,
-            call.num_experts,
-            call.top_k,
-            call.local_expert_offset,
-        )
+        # For example, the tile-32 and tile-128 profiles for 512-token
+        # `ddist:2` must receive the same sampled expert assignments. Generate
+        # the sample once through the ordinary RNG path, then reuse it for
+        # every tactic instead of replacing it with a fixed seed.
+        sample_key = (int(bucket_id), int(sample_index), num_tokens, device)
+        assignments = self._assignment_cache.get(sample_key)
+        if assignments is None:
+            assignments = generate_da_distribution_assignments(
+                dist,
+                torch.zeros(num_tokens, call.top_k, dtype=torch.int32, device=device),
+                call.num_local_experts,
+                call.num_experts,
+                call.top_k,
+                call.local_expert_offset,
+            )
+            self._assignment_cache[sample_key] = assignments
         if (
             profiled_tensor.shape[-1] == call.top_k
             and not profiled_tensor.is_floating_point()
@@ -413,6 +431,7 @@ def _profile_backend(execution: DAExecution) -> da_profile.DAProfileBackend:
         supported_tile_sizes=lambda bucket, **_kwargs: switch_tile_sizes(
             execution, bucket
         ),
+        capture_backend=execution.backend.capture_backend,
     )
 
 
@@ -452,13 +471,23 @@ def maybe_prepare_bundle(execution: DAExecution, tuner: Any) -> None:
             da_context=call.da_context,
             hidden_states=call.hidden_states,
             hidden_states_scale=call.hidden_states_scale,
+            routing_logits=call.routing_logits,
+            routing_bias=call.routing_bias,
             gemm1_weights=call.gemm1_weights,
             gemm1_weights_scale=call.gemm1_weights_scale,
+            gemm1_bias=call.gemm1_bias,
+            gemm1_alpha=call.gemm1_alpha,
+            gemm1_beta=call.gemm1_beta,
+            gemm1_clamp_limit=call.gemm1_clamp_limit,
             gemm2_weights=call.gemm2_weights,
             gemm2_weights_scale=call.gemm2_weights_scale,
+            gemm2_bias=call.gemm2_bias,
             output1_scale_scalar=call.output1_scale_scalar,
             output1_scale_gate_scalar=call.output1_scale_gate_scalar,
             output2_scale_scalar=call.output2_scale_scalar,
+            per_token_scale=(
+                call.tuning_inputs[7] if len(call.tuning_inputs) > 7 else None
+            ),
             num_experts=call.num_experts,
             top_k=call.top_k,
             n_group=call.n_group,
@@ -467,9 +496,13 @@ def maybe_prepare_bundle(execution: DAExecution, tuner: Any) -> None:
             local_expert_offset=call.local_expert_offset,
             num_local_experts=call.num_local_experts,
             routed_scaling_factor=call.routed_scaling_factor,
+            use_routing_scales_on_input=call.use_routing_scales_on_input,
             routing_method_type=call.routing_method_type,
             activation_type=call.activation_type,
             tune_max_num_tokens=call.tune_max_num_tokens,
+            enable_pdl=call.enable_pdl,
+            runner=call.runner,
+            runner_hash=hash(call.runner),
             config=execution.config,
         )
 
@@ -497,6 +530,18 @@ def try_capture_dispatch(
     """Delegate capture dispatch with the execution's immutable configuration."""
 
     call = execution.invocation
+    bucket = upload_bucket(call.num_tokens, call.tune_max_num_tokens)
+    decision = da_state.BASELINE_GUARD_DECISIONS.get(
+        da_state.cache_key(call.da_context, bucket), {}
+    )
+    final_policy = decision.get("final_policy", decision.get("policy"))
+    if final_policy == "noda_baseline_guard":
+        debug_log(
+            f"[DA capture-aware SKIP] bucket={bucket} baseline guard selected "
+            "the monolithic NoDA path",
+            execution.config,
+        )
+        return None
     capture_backend = replace(
         execution.backend.capture_backend(),
         supported_tile_sizes=lambda bucket, **_kwargs: switch_tile_sizes(

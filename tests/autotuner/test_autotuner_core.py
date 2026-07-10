@@ -468,6 +468,7 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert chosen_runner is runner
     assert tactic == 1
     assert len(tuner.profiling_cache) >= 1
+    assert sorted(tuner.profiling_tactic_time_cache.values()) == [1.0, 3.0, 5.0]
     assert tuner.stats.tuned_op_total_configs["dummy_tune"] >= 1
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
 
@@ -689,6 +690,80 @@ def test_empty_profile_dependent_value_spec_does_not_create_partial_key(monkeypa
         (8, (32, 0)),
         (8, (32, 1)),
     }
+
+
+def test_factorized_value_profile_retains_fixed_default_tactic_timing(monkeypatch):
+    """The default NoDA tactic is measured without changing DA composition."""
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    tuner = reset_autotuner()
+
+    class FactorizedRunner(DummyRunner):
+        def __init__(self):
+            super().__init__(valid_tactics=((32, 66), (32, 1), (32, 2), (32, 3)))
+
+        def get_tactic_groups(self, _inputs, profile):
+            if profile.value_buckets == (-1,):
+                return None
+            return [[(32, 1)], [(32, 2)]]
+
+        def compose_tactics(self, _group_winners, _inputs, _profile):
+            return (32, 3)
+
+    runner = FactorizedRunner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8,),
+                map_to_tuning_buckets=lambda _size: 8,
+                value_specs=(
+                    DynamicValueSpec(
+                        input_idx=0,
+                        gen_value_buckets=(32,),
+                        map_to_value_bucket=lambda _tensor: 32,
+                        tensor_value_generator=lambda bucket, profiled, original: (
+                            original
+                            if bucket == -1
+                            else torch.full_like(profiled, bucket)
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        default_value_buckets=(-1,),
+    )
+    inputs = [torch.zeros((8,), dtype=torch.float32)]
+
+    def fake_profile(_self, _runner, profile_inputs, tactic, _config, **_kwargs):
+        if float(profile_inputs[0][0]) == 0.0:
+            return 0.5 if tuple(tactic) == (32, 66) else 1.0
+        return {
+            (32, 1): 0.8,
+            (32, 2): 0.7,
+            (32, 3): 0.6,
+            (32, 66): 0.9,
+        }[tuple(tactic)]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        tuner.choose_one("factorized_default_timing", [runner], config, inputs)
+
+    generated_entries = [
+        (cache_key, tactic, time_ms)
+        for (cache_key, tactic), time_ms in tuner.profiling_tactic_time_cache.items()
+        if cache_key.nearest_profile[1] == (32,)
+    ]
+    assert any(
+        tactic == (32, 66) and time_ms == 0.9
+        for _, tactic, time_ms in generated_entries
+    ), generated_entries
+    generated_winner = next(
+        tactic
+        for cache_key, (_runner_id, tactic, _profile) in tuner.profiling_cache.items()
+        if len(cache_key.nearest_profile) == 2 and cache_key.nearest_profile[1] == (32,)
+    )
+    assert tuple(generated_winner) == (32, 3)
 
 
 class TileTacticDummyRunner(TunableRunner):

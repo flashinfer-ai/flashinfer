@@ -1509,9 +1509,15 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache: dict[
-            ProfilingCacheKey, tuple[int, int, OptimizationProfile]
+            ProfilingCacheKey, tuple[int, Any, OptimizationProfile]
         ] = {}
         self.profiling_time_cache: dict[ProfilingCacheKey, float] = {}
+        # Retain every measured tactic, not only the winner. Post-selection
+        # policies can compare fixed tactics on identical value profiles
+        # without launching a second profiling sweep.
+        self.profiling_tactic_time_cache: dict[
+            tuple[ProfilingCacheKey, Any], float
+        ] = {}
         self.last_selection: Optional[dict[str, Any]] = None
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
@@ -2202,6 +2208,57 @@ class AutoTuner:
                                         if candidate_key not in seen_tactics:
                                             seen_tactics.add(candidate_key)
                                             valid_tactics.append(candidate)
+                            runner_profile_cache_key = AutoTuner._get_cache_key(
+                                custom_op,
+                                r,
+                                p.get_opt_shapes(),
+                                tuning_config,
+                                r.get_cache_key_extras(tensors),
+                                value_buckets=p.value_buckets,
+                            )
+                            # The explicit default-profile winner is the fixed
+                            # NoDA fallback.  Factorized value profiles would
+                            # not necessarily measure that exact composed
+                            # tactic, so include it as a measurement-only
+                            # candidate for the matching tile.  It is not part
+                            # of either factorized group and therefore cannot
+                            # change their winners or the composed DA tactic.
+                            if (
+                                tactic_groups is not None
+                                and tuning_config.default_value_buckets is not None
+                                and p.value_buckets
+                                != tuning_config.default_value_buckets
+                                and p.value_buckets
+                            ):
+                                shape_cache_key = AutoTuner._get_cache_key(
+                                    custom_op,
+                                    r,
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    r.get_cache_key_extras(tensors),
+                                )
+                                default_entry = self.profiling_cache.get(
+                                    shape_cache_key
+                                )
+                                if default_entry is not None:
+                                    default_runner_id, default_tactic, _ = default_entry
+                                    try:
+                                        matches_profile_tile = int(
+                                            default_tactic[0]
+                                        ) == int(p.value_buckets[0])
+                                    except (IndexError, TypeError, ValueError):
+                                        matches_profile_tile = False
+                                    default_key = _tactic_key(default_tactic)
+                                    if (
+                                        default_runner_id == r_id
+                                        and matches_profile_tile
+                                        and default_key not in seen_tactics
+                                    ):
+                                        seen_tactics.add(default_key)
+                                        valid_tactics.append(default_tactic)
+                                        candidate_stages.setdefault(
+                                            default_key, []
+                                        ).append("default_profile_baseline")
                             valid_tactics = self._blocklist.filter(
                                 custom_op, r, valid_tactics
                             )
@@ -2374,6 +2431,17 @@ class AutoTuner:
                                             **(session_diagnostics or {}),
                                         }
                                     )
+                                tactic_time_key = (
+                                    runner_profile_cache_key,
+                                    _tactic_key(tac),
+                                )
+                                previous_time = self.profiling_tactic_time_cache.get(
+                                    tactic_time_key, float("inf")
+                                )
+                                if time_measured < previous_time:
+                                    self.profiling_tactic_time_cache[
+                                        tactic_time_key
+                                    ] = time_measured
                                 return time_measured
 
                             measured_tactics = {}
@@ -3251,6 +3319,7 @@ class AutoTuner:
         with self._lock:
             self.profiling_cache.clear()
             self.profiling_time_cache.clear()
+            self.profiling_tactic_time_cache.clear()
             self.last_selection = None
             self._profiling_records.clear()
             self._file_configs.clear()

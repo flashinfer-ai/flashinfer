@@ -4054,6 +4054,9 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
     all_tiles_power_of_two = all_tiles_power_of_two && computeRoutingLog2(tile_tokens_dims[i]) > 0;
   }
   bool const can_use_multi_cluster =
+      // A post-deduplication DA singleton has no metadata sharing to exploit;
+      // use the lower-overhead ordinary routingIndicesClusterKernel instead.
+      tile_tokens_dims.size() > 1 &&
       (input_mode == RoutingInputMode::UnpackedPrecomputed ||
        (allow_packed_multi_cluster && input_mode == RoutingInputMode::PackedPrecomputed)) &&
       num_tokens <= moe::dev::routing::routingDeepSeek::maxTokensMultiTileCluster(num_experts) &&

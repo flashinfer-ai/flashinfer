@@ -10,7 +10,7 @@ import torch
 
 from . import da_state
 from .da_config import DAConfig
-from .da_utils import generate_da_distribution_assignments, pack_expert_assignments
+from .da_utils import generate_da_distribution_assignments
 from ..utils import compute_local_expert_counts_from_plain_ids
 from ...autotuner import AutoTuner
 from ...tllm_enums import (
@@ -20,7 +20,8 @@ from ...tllm_enums import (
     WeightLayout,
 )
 
-
+# Keep this value in sync with da_heuristic::kMaxExemplars in
+# include/flashinfer/trtllm/fused_moe/da_heuristic_constants.cuh.
 MAX_EXEMPLARS = 8
 _bundle_has_tactics = False
 _bundle_loaded = False
@@ -33,6 +34,19 @@ def _dtype_from_context(value: int) -> DtypeTrtllmGen:
 
 def _resolve_config(config: Optional[DAConfig]) -> DAConfig:
     return DAConfig() if config is None else config
+
+
+def _profiling_cache_key_parts(cache_key: Any) -> tuple[str, str, int, Any]:
+    """Read both upstream typed cache keys and legacy tuple cache keys."""
+    if hasattr(cache_key, "custom_op"):
+        return (
+            cache_key.custom_op,
+            cache_key.runner_class_name,
+            cache_key.runner_hash,
+            cache_key.nearest_profile,
+        )
+    op_name, runner_name, runner_hash, profile_key, *_extras = cache_key
+    return op_name, runner_name, runner_hash, profile_key
 
 
 def active_auto_distributions(config: Optional[DAConfig] = None) -> tuple:
@@ -62,6 +76,7 @@ class DAProfileBackend:
 
     get_ffi_moe_op: Callable[[], Any]
     supported_tile_sizes: Callable[..., Sequence[int]]
+    capture_backend: Optional[Callable[[], Any]] = None
 
 
 def merge_same_tactic_exemplars(rows: list, best_idxs: list) -> tuple:
@@ -132,6 +147,260 @@ def deduplicate_body_tactics(tactics: list) -> tuple:
     return per_body, body_indices
 
 
+def baseline_guard_signature(config: DAConfig) -> Dict[str, Any]:
+    """Return the bundle identity for policy inputs that affect final plans."""
+    return {
+        "enabled": bool(config.baseline_guard),
+        "control_overhead_us": float(config.control_overhead_us),
+        "margin": float(config.baseline_guard_margin),
+    }
+
+
+def bundle_guard_signature_matches(meta: Dict[str, Any], config: DAConfig) -> bool:
+    """Return whether a persisted final plan used compatible guard inputs."""
+    return meta.get("baseline_guard_signature") == baseline_guard_signature(config)
+
+
+def unconstrained_candidate_plan(
+    switch_tiles: Sequence[int],
+    best_idxs: Sequence[int],
+    tile_to_tactic: Dict[int, Tuple[int, int]],
+) -> Tuple[str, List[Tuple[int, int]]]:
+    """Classify the fixed pre-guard assignments after tactic deduplication."""
+    assigned = [
+        tuple(int(v) for v in tile_to_tactic[int(switch_tiles[int(best_idx)])])
+        for best_idx in best_idxs
+    ]
+    tactics, _body_indices = deduplicate_body_tactics(assigned)
+    return ("da_singleton" if len(tactics) == 1 else "da_switch"), tactics
+
+
+@dataclass(frozen=True)
+class DABaselineGuardDecision:
+    """Publication policy chosen by the NoDA baseline guard."""
+
+    policy: str
+    baseline_tactic: Optional[Tuple[int, int]]
+    baseline_ms: Optional[float]
+    baseline_worst_ms: Optional[float]
+    overhead_ms: float
+    margin: float
+    dynamic_worst_ms: Optional[float]
+    singleton_tactic: Optional[Tuple[int, int]]
+    singleton_worst_ms: Optional[float]
+    singleton_source: Optional[str]
+    admission_applied: bool
+    limitation: Optional[str]
+
+    def asdict(self) -> Dict[str, Any]:
+        """Return a stable dictionary shape for diagnostics and benchmark CSVs."""
+
+        return {
+            "policy": self.policy,
+            "baseline_tactic": self.baseline_tactic,
+            "baseline_ms": self.baseline_ms,
+            "baseline_worst_ms": self.baseline_worst_ms,
+            "overhead_ms": self.overhead_ms,
+            "margin": self.margin,
+            "dynamic_worst_ms": self.dynamic_worst_ms,
+            "singleton_tactic": self.singleton_tactic,
+            "singleton_worst_ms": self.singleton_worst_ms,
+            "singleton_source": self.singleton_source,
+            "admission_applied": self.admission_applied,
+            "limitation": self.limitation,
+        }
+
+
+def choose_baseline_guard_policy(
+    *,
+    baseline: Optional[Tuple[Tuple[int, int], float]],
+    switch_tiles: Sequence[int],
+    best_idxs: Sequence[int],
+    per_distribution_latencies: Sequence[Dict[int, float]],
+    per_distribution_tactic_latencies: Optional[
+        Sequence[Dict[Tuple[int, int], float]]
+    ] = None,
+    tile_to_tactic: Dict[int, Tuple[int, int]],
+    config: DAConfig,
+) -> Tuple[str, Optional[Tuple[int, int]], DABaselineGuardDecision]:
+    """Choose a post-deduplication DA switch or singleton plan for one bucket.
+
+    Latencies are recorded ordinary-autotuner measurements in milliseconds.
+    Admission compares the fixed candidate and fixed NoDA tactic measured on
+    the same distribution samples. Switches must win every assignment after
+    control overhead. A natural singleton uses the robust worst-case score
+    across those samples, matching singleton selection rather than allowing
+    one noisy pairwise crossing to force a different execution topology.
+    """
+
+    overhead_ms = float(config.control_overhead_us) / 1000.0
+    margin = float(config.baseline_guard_margin)
+    candidate_tactics: list[Tuple[int, int]] = []
+    for best_idx in best_idxs:
+        try:
+            tile = int(switch_tiles[int(best_idx)])
+            raw_tactic = tile_to_tactic[tile]
+            candidate_tactics.append((int(raw_tactic[0]), int(raw_tactic[1])))
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+    unique_candidate_tactics = list(dict.fromkeys(candidate_tactics))
+    natural_singleton = len(unique_candidate_tactics) == 1
+    unguarded_policy = "da_singleton" if natural_singleton else "da_switch"
+
+    exact_latencies = per_distribution_tactic_latencies or ()
+    assigned: list[tuple[Tuple[int, int], float]] = []
+    for dist_idx, best_idx in enumerate(best_idxs):
+        if dist_idx >= len(exact_latencies):
+            continue
+        try:
+            tile = int(switch_tiles[int(best_idx)])
+            raw_tactic = tile_to_tactic[tile]
+            tactic = (int(raw_tactic[0]), int(raw_tactic[1]))
+            body_ms = float(exact_latencies[dist_idx][tactic])
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+        assigned.append((tactic, body_ms))
+
+    unique_assigned = list(dict.fromkeys(tactic for tactic, _ in assigned))
+    assignments_complete = (
+        len(candidate_tactics) == len(best_idxs)
+        and len(assigned) == len(best_idxs)
+        and len(per_distribution_latencies) == len(best_idxs)
+        and len(exact_latencies) == len(best_idxs)
+    )
+    natural_singleton_worst = (
+        max(body_ms for _tactic, body_ms in assigned)
+        if natural_singleton and assigned
+        else None
+    )
+
+    baseline_costs: list[float] = []
+    if baseline is not None:
+        baseline_tactic = (int(baseline[0][0]), int(baseline[0][1]))
+        for dist_idx in range(len(best_idxs)):
+            if dist_idx >= len(exact_latencies):
+                continue
+            try:
+                baseline_costs.append(float(exact_latencies[dist_idx][baseline_tactic]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    baseline_timings_complete = len(baseline_costs) == len(best_idxs)
+    baseline_worst_ms = max(baseline_costs) if baseline_costs else None
+
+    limitation = None
+    if config.baseline_guard:
+        if baseline is None:
+            limitation = "missing_noda_baseline"
+        elif not exact_latencies or not assignments_complete:
+            limitation = "missing_fixed_candidate_timing"
+        elif not baseline_timings_complete:
+            limitation = "missing_matched_noda_timing"
+
+    if not config.baseline_guard or limitation is not None:
+        natural_tactic = unique_candidate_tactics[0] if natural_singleton else None
+        return (
+            unguarded_policy,
+            None,
+            DABaselineGuardDecision(
+                policy=unguarded_policy,
+                baseline_tactic=None if baseline is None else baseline[0],
+                baseline_ms=None if baseline is None else float(baseline[1]),
+                baseline_worst_ms=baseline_worst_ms,
+                overhead_ms=overhead_ms,
+                margin=margin,
+                dynamic_worst_ms=None,
+                singleton_tactic=natural_tactic,
+                singleton_worst_ms=natural_singleton_worst,
+                singleton_source="profiled" if natural_tactic is not None else None,
+                admission_applied=False,
+                limitation=limitation,
+            ),
+        )
+
+    baseline_tactic, baseline_ms = baseline
+    baseline_ms = float(baseline_ms)
+
+    switch_costs = [body_ms + overhead_ms for _tactic, body_ms in assigned]
+    dynamic_worst = max(switch_costs) if switch_costs else None
+    if (
+        len(unique_assigned) > 1
+        and assignments_complete
+        and switch_costs
+        and all(
+            cost <= baseline_cost * max(0.0, 1.0 - margin)
+            for cost, baseline_cost in zip(switch_costs, baseline_costs, strict=True)
+        )
+    ):
+        return (
+            "da_switch",
+            None,
+            DABaselineGuardDecision(
+                policy="da_switch",
+                baseline_tactic=(int(baseline_tactic[0]), int(baseline_tactic[1])),
+                baseline_ms=baseline_ms,
+                baseline_worst_ms=baseline_worst_ms,
+                overhead_ms=overhead_ms,
+                margin=margin,
+                dynamic_worst_ms=dynamic_worst,
+                singleton_tactic=None,
+                singleton_worst_ms=None,
+                singleton_source=None,
+                admission_applied=True,
+                limitation=None,
+            ),
+        )
+
+    if (
+        natural_singleton
+        and assignments_complete
+        and natural_singleton_worst is not None
+        and baseline_worst_ms is not None
+        and natural_singleton_worst <= baseline_worst_ms * (1.0 + margin)
+    ):
+        natural_tactic = unique_assigned[0]
+        return (
+            "da_singleton",
+            None,
+            DABaselineGuardDecision(
+                policy="da_singleton",
+                baseline_tactic=(int(baseline_tactic[0]), int(baseline_tactic[1])),
+                baseline_ms=baseline_ms,
+                baseline_worst_ms=baseline_worst_ms,
+                overhead_ms=overhead_ms,
+                margin=margin,
+                dynamic_worst_ms=None,
+                singleton_tactic=natural_tactic,
+                singleton_worst_ms=float(natural_singleton_worst),
+                singleton_source="profiled",
+                admission_applied=True,
+                limitation=None,
+            ),
+        )
+
+    # Guard rejection is an execution-topology decision, not another DA body
+    # search. The measured baseline is the monolithic public-wrapper path, so
+    # running its tactic inside a DA metadata graph is not a valid fallback.
+    forced_baseline = (int(baseline_tactic[0]), int(baseline_tactic[1]))
+    return (
+        "noda_baseline_guard",
+        forced_baseline,
+        DABaselineGuardDecision(
+            policy="noda_baseline_guard",
+            baseline_tactic=forced_baseline,
+            baseline_ms=baseline_ms,
+            baseline_worst_ms=baseline_worst_ms,
+            overhead_ms=overhead_ms,
+            margin=margin,
+            dynamic_worst_ms=dynamic_worst,
+            singleton_tactic=forced_baseline,
+            singleton_worst_ms=baseline_worst_ms,
+            singleton_source="noda_baseline",
+            admission_applied=True,
+            limitation=None,
+        ),
+    )
+
+
 def load_knn_v2_bundle(
     bundle: dict,
     bundle_path: str,
@@ -181,6 +450,16 @@ def load_knn_v2_bundle(
             if verbose:
                 print("[DA k-NN v2] skip: profile_sample_count mismatch")
             return 0
+
+    expected_guard_signature = baseline_guard_signature(config)
+    if not bundle_guard_signature_matches(meta, config):
+        if verbose:
+            print(
+                "[DA k-NN v2] skip: baseline_guard_signature mismatch "
+                f"bundle={meta.get('baseline_guard_signature')!r} "
+                f"expected={expected_guard_signature!r}"
+            )
+        return 0
 
     num_local = int(meta.get("num_local", 256))
     top_k = int(meta.get("top_k", 8))
@@ -250,6 +529,7 @@ def load_knn_v2_bundle(
     import numpy as np
 
     exemplars_by_bucket = bundle.get("exemplars", {})
+    plans_by_bucket = bundle.get("plans", {}) or {}
     global _bundle_has_tactics
     tactic_table = bundle.get("tactic_table", {}) or {}
     if tactic_table:
@@ -263,6 +543,37 @@ def load_knn_v2_bundle(
         offsets = list(config.exemplar_offsets)
 
     uploaded = 0
+    for bucket_key, raw_plan in sorted(
+        plans_by_bucket.items(), key=lambda item: int(item[0])
+    ):
+        plan = dict(raw_plan)
+        policy = plan.get("final_policy", plan.get("policy"))
+        if policy != "noda_baseline_guard":
+            continue
+        try:
+            bucket = int(bucket_key)
+            baseline_tactic = tuple(int(v) for v in plan["baseline_tactic"])
+            if len(baseline_tactic) != 2:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            if verbose:
+                print(
+                    f"[DA k-NN v2] skip: invalid guarded NoDA plan "
+                    f"for bucket {bucket_key}",
+                    flush=True,
+                )
+            return 0
+        plan["policy"] = "noda_baseline_guard"
+        plan["final_policy"] = "noda_baseline_guard"
+        plan["final_tactics"] = [baseline_tactic]
+        for offset in sorted(set(offsets)):
+            offset_context = da_state.context_with_offset(da_context, int(offset))
+            offset_key = da_state.cache_key(offset_context, bucket)
+            da_state.BASELINE_GUARD_DECISIONS[offset_key] = dict(plan)
+            da_state.PER_TILE_TACTICS.pop(offset_key, None)
+            da_state.PER_BODY_TACTICS.pop(offset_key, None)
+        uploaded += 1
+
     for bucket_key, exemplars in sorted(exemplars_by_bucket.items()):
         if not exemplars:
             continue
@@ -280,6 +591,31 @@ def load_knn_v2_bundle(
             rows, tactics = merge_same_tactic_exemplars(rows, tactics)
         rows, tactics = limit_exemplars(rows, tactics)
         per_body, body_indices = deduplicate_body_tactics(tactics)
+        plan = dict(plans_by_bucket.get(str(bucket_key), {}))
+        if not plan:
+            plan = {
+                "policy": "da_singleton" if len(per_body) == 1 else "da_switch",
+                "candidate_policy": (
+                    "da_singleton" if len(per_body) == 1 else "da_switch"
+                ),
+                "candidate_tactics": list(per_body),
+                "final_policy": "da_singleton" if len(per_body) == 1 else "da_switch",
+                "final_tactics": list(per_body),
+                "singleton_tactic": per_body[0] if len(per_body) == 1 else None,
+                "singleton_source": "profiled" if len(per_body) == 1 else None,
+            }
+        if plan.get("final_policy", plan.get("policy")) == "noda_baseline_guard":
+            continue
+        if plan.get("policy") not in {
+            "da_switch",
+            "da_singleton",
+        }:
+            if verbose:
+                print(
+                    f"[DA k-NN v2] skip: invalid plan policy "
+                    f"{plan.get('policy')!r} for bucket {bucket_key}"
+                )
+            return 0
         flat = np.stack(rows).astype(np.float32).reshape(-1).copy()
         flat_tensor = torch.from_numpy(flat).to(
             device=torch.device(da_context.device_type, da_context.device_index)
@@ -307,6 +643,9 @@ def load_knn_v2_bundle(
                 per_tile_tactics=tile_map,
                 per_body_tactics=per_body,
             )
+            da_state.BASELINE_GUARD_DECISIONS[
+                da_state.cache_key(offset_context, int(bucket_key))
+            ] = dict(plan)
         uploaded += 1
     return uploaded
 
@@ -354,8 +693,6 @@ def maybe_load_existing_bundle(
 
         with open(path, "rb") as bundle_file:
             bundle = pickle.load(bundle_file)
-        if int(bundle.get("version", 1)) < 2:
-            raise ValueError("only DAKNNv2 bundles are supported")
         count = load_knn_v2_bundle(
             bundle,
             path,
@@ -425,8 +762,6 @@ def maybe_prepare_bundle(
 
             with open(path, "rb") as bundle_file:
                 bundle = pickle.load(bundle_file)
-            if int(bundle.get("version", 1)) < 2:
-                raise ValueError("only DAKNNv2 bundles are supported")
             count = load_knn_v2_bundle(
                 bundle,
                 path,
@@ -465,7 +800,9 @@ def cached_profile_tactics(
     latencies: Dict[Tuple[int, int], Dict[int, float]] = {}
     tuner = AutoTuner.get()
     for cache_key, (_runner_id, tactic, _profile) in tuner.profiling_cache.items():
-        op_name, runner_name, _runner_hash, profile_key, *_extras = cache_key
+        op_name, runner_name, _runner_hash, profile_key = _profiling_cache_key_parts(
+            cache_key
+        )
         if op_name != da_context.op_name or runner_name != "MoERunner":
             continue
         if not isinstance(profile_key, tuple) or len(profile_key) != 2:
@@ -486,6 +823,57 @@ def cached_profile_tactics(
         latency = float(tuner.profiling_time_cache.get(cache_key, float("inf")))
         if np.isfinite(latency):
             latencies.setdefault((bucket, distribution), {})[tile] = latency
+    return latencies
+
+
+def cached_profile_tactic_latencies(
+    da_context: da_state.DAMoeContext,
+    top_k: int,
+    *,
+    runner_hash: Optional[int] = None,
+    config: Optional[DAConfig] = None,
+) -> Dict[Tuple[int, int], Dict[Tuple[int, int], float]]:
+    """Return every finite fixed-tactic timing by bucket and distribution."""
+    import numpy as np
+
+    latencies: Dict[Tuple[int, int], Dict[Tuple[int, int], float]] = {}
+    tuner = AutoTuner.get()
+    for (
+        profile_cache_key,
+        raw_tactic,
+    ), latency in tuner.profiling_tactic_time_cache.items():
+        op_name, runner_name, cached_hash, profile_key = _profiling_cache_key_parts(
+            profile_cache_key
+        )
+        if op_name != da_context.op_name or runner_name != "MoERunner":
+            continue
+        if runner_hash is not None and int(cached_hash) != int(runner_hash):
+            continue
+        if not isinstance(profile_key, tuple) or len(profile_key) != 2:
+            continue
+        shapes, value_buckets = profile_key
+        if not value_buckets or len(value_buckets) < 2:
+            continue
+        try:
+            bucket = int(shapes[0][0])
+            if len(shapes) >= 3 and int(shapes[2][1]) != int(top_k):
+                continue
+            profile_tile = int(value_buckets[0])
+            distribution = int(value_buckets[1])
+            tactic = (int(raw_tactic[0]), int(raw_tactic[1]))
+        except (IndexError, TypeError, ValueError):
+            continue
+        if profile_tile != tactic[0]:
+            continue
+        if not 0 <= distribution < len(active_auto_distributions(config)):
+            continue
+        latency = float(latency)
+        if not np.isfinite(latency):
+            continue
+        per_distribution = latencies.setdefault((bucket, distribution), {})
+        previous = per_distribution.get(tactic)
+        if previous is None or latency < previous:
+            per_distribution[tactic] = latency
     return latencies
 
 
@@ -518,7 +906,9 @@ def populate_per_tile_tactics_from_autotune(
     per_bucket_tile_best: Dict[int, Dict[int, Tuple[int, float]]] = {}
     for cache_key, (_runner_id, tactic, _profile) in tuner.profiling_cache.items():
         stats["total"] += 1
-        op_name, runner_name, cached_hash, profile_key, *_extras = cache_key
+        op_name, runner_name, cached_hash, profile_key = _profiling_cache_key_parts(
+            cache_key
+        )
         if op_name != custom_op or runner_name != "MoERunner":
             stats["reject_op_or_runner"] += 1
             continue
@@ -532,10 +922,11 @@ def populate_per_tile_tactics_from_autotune(
         if not value_buckets:
             stats["reject_no_value_buckets"] += 1
             continue
+        tactic_value = cast(Any, tactic)
         try:
-            tile = int(tactic[0])
-            kernel_config = int(tactic[1])
-            if len(tactic) != 2:
+            tile = int(tactic_value[0])
+            kernel_config = int(tactic_value[1])
+            if len(tactic_value) != 2:
                 raise ValueError
         except (TypeError, IndexError, ValueError):
             stats["reject_tactic_shape"] += 1
@@ -594,46 +985,68 @@ def best_static_tactic_from_profiles(
     *,
     da_context: da_state.DAMoeContext,
 ) -> Optional[Tuple[Tuple[int, int], float]]:
-    """Return the fastest measured DA tactic for a shape bucket."""
+    """Return the fastest measured NoDA tactic for a shape bucket."""
     cache_key = (custom_op, int(runner_hash), int(num_tokens_bucket), da_context)
     if cache_key in da_state.STATIC_FALLBACK_TACTICS:
         return da_state.STATIC_FALLBACK_TACTICS[cache_key]
 
-    best: Optional[Tuple[Tuple[int, int], float]] = None
+    best_exact: Optional[Tuple[Tuple[int, int], float]] = None
+    best_compatible: Optional[Tuple[Tuple[int, int], float]] = None
     for profile_cache_key, (
         _runner_id,
         tactic,
         _profile,
     ) in tuner.profiling_cache.items():
-        (
-            op_name,
-            cached_runner_name,
-            cached_runner_hash,
-            profile_key,
-            *_extras,
-        ) = profile_cache_key
+        op_name, cached_runner_name, cached_runner_hash, profile_key = (
+            _profiling_cache_key_parts(profile_cache_key)
+        )
+        if op_name != custom_op or cached_runner_name != runner_name:
+            continue
+        if not isinstance(profile_key, tuple):
+            continue
+        # Shape-only cache keys store ``shapes`` directly. Value-aware keys
+        # wrap them as ``(shapes, value_buckets)``.
+        shapes: Any
+        value_buckets: Any
         if (
-            op_name != custom_op
-            or cached_runner_name != runner_name
-            or cached_runner_hash != runner_hash
+            len(profile_key) == 2
+            and isinstance(profile_key[0], tuple)
+            and profile_key[0]
+            and isinstance(profile_key[0][0], tuple)
         ):
-            continue
-        if not isinstance(profile_key, tuple) or len(profile_key) != 2:
-            continue
-        shapes, value_buckets = profile_key
-        if not value_buckets:
+            shapes, value_buckets = profile_key
+        else:
+            shapes, value_buckets = profile_key, ()
+        if value_buckets:
             continue
         try:
             if int(shapes[0][0]) != int(num_tokens_bucket):
                 continue
-            if len(tactic) != 2:
+            if int(shapes[0][1]) != int(da_context.hidden_size):
                 continue
-            candidate_tactic = (int(tactic[0]), int(tactic[1]))
+            if len(shapes) > 2 and len(shapes[2]) > 1:
+                if int(shapes[2][1]) != int(da_context.top_k):
+                    continue
+            tactic_value = cast(Any, tactic)
+            if len(tactic_value) != 2:
+                continue
+            candidate_tactic = (int(tactic_value[0]), int(tactic_value[1]))
         except (TypeError, IndexError, ValueError):
             continue
         time_ms = float(tuner.profiling_time_cache.get(profile_cache_key, float("inf")))
-        if best is None or time_ms < best[1]:
-            best = (candidate_tactic, time_ms)
+        if not np.isfinite(time_ms):
+            continue
+        candidate = (candidate_tactic, time_ms)
+        if cached_runner_hash == runner_hash:
+            if best_exact is None or time_ms < best_exact[1]:
+                best_exact = candidate
+        elif best_compatible is None or time_ms < best_compatible[1]:
+            # The NoDA and DA runners can differ only in DA policy fields and
+            # therefore hash differently. The shape/context checks above keep
+            # this fallback scoped to the same MoE problem.
+            best_compatible = candidate
+
+    best = best_exact or best_compatible
 
     da_state.STATIC_FALLBACK_TACTICS[cache_key] = best
     return best
@@ -820,13 +1233,21 @@ def auto_profile_knn_exemplars(
     da_context: da_state.DAMoeContext,
     hidden_states: torch.Tensor,
     hidden_states_scale: Optional[torch.Tensor],
+    routing_logits: Optional[torch.Tensor],
+    routing_bias: Optional[torch.Tensor],
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
+    gemm1_bias: Optional[torch.Tensor],
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
+    gemm2_bias: Optional[torch.Tensor],
     output1_scale_scalar: torch.Tensor,
     output1_scale_gate_scalar: torch.Tensor,
     output2_scale_scalar: torch.Tensor,
+    per_token_scale: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
     n_group: Optional[int],
@@ -835,9 +1256,13 @@ def auto_profile_knn_exemplars(
     local_expert_offset: int,
     num_local_experts: int,
     routed_scaling_factor: Optional[float],
+    use_routing_scales_on_input: bool,
     routing_method_type: int,
     activation_type: int,
     tune_max_num_tokens: int,
+    enable_pdl: bool,
+    runner: Any,
+    runner_hash: Optional[int] = None,
     config: Optional[DAConfig] = None,
 ) -> int:
     """Build kNN exemplars from DA autotune results.
@@ -880,6 +1305,7 @@ def auto_profile_knn_exemplars(
     iters = config.auto_iters
     n_uploaded = 0
     bundle_exemplars: Dict[str, List[Dict[str, Any]]] = {}
+    bundle_plans: Dict[str, Dict[str, Any]] = {}
 
     num_global = max(num_experts, num_local_experts)
     auto_offsets = sorted(set(range(0, num_global, max(1, num_local_experts))))
@@ -892,11 +1318,83 @@ def auto_profile_knn_exemplars(
         switch_tiles: List[int],
         rows: List[np.ndarray],
         best_idxs: List[int],
+        per_distribution_latencies: List[Dict[int, float]],
+        per_distribution_tactic_latencies: List[Dict[Tuple[int, int], float]],
     ) -> int:
         nonlocal n_uploaded
 
         if not rows:
             return 0
+        config_key = da_state.cache_key(da_context, int(bucket))
+        tile_map = buckets_with_tiles[int(bucket)]
+        candidate_policy, candidate_tactics = unconstrained_candidate_plan(
+            switch_tiles,
+            best_idxs,
+            tile_map,
+        )
+        static_baseline = (
+            None
+            if runner_hash is None
+            else best_static_tactic_from_profiles(
+                tuner,
+                da_context.op_name,
+                "MoERunner",
+                int(runner_hash),
+                int(bucket),
+                da_context=da_context,
+            )
+        )
+        policy, forced_singleton_tactic, decision = choose_baseline_guard_policy(
+            baseline=static_baseline,
+            switch_tiles=switch_tiles,
+            best_idxs=best_idxs,
+            per_distribution_latencies=per_distribution_latencies,
+            per_distribution_tactic_latencies=per_distribution_tactic_latencies,
+            tile_to_tactic=tile_map,
+            config=config,
+        )
+        decision_dict = decision.asdict()
+        decision_dict.update(
+            {
+                "candidate_policy": candidate_policy,
+                "candidate_tactics": list(candidate_tactics),
+                "final_policy": policy,
+                "control_overhead_source": "pre_recorded_calibration",
+                "baseline_guard_signature": baseline_guard_signature(config),
+            }
+        )
+
+        if policy == "noda_baseline_guard":
+            if forced_singleton_tactic is None:
+                raise RuntimeError("guarded NoDA policy requires a baseline tactic")
+            decision_dict["final_tactics"] = [
+                (
+                    int(forced_singleton_tactic[0]),
+                    int(forced_singleton_tactic[1]),
+                )
+            ]
+            bundle_plans[str(int(bucket))] = dict(decision_dict)
+            for off in auto_offsets:
+                offset_context = da_state.context_with_offset(da_context, int(off))
+                offset_key = da_state.cache_key(offset_context, int(bucket))
+                da_state.BASELINE_GUARD_DECISIONS[offset_key] = dict(decision_dict)
+                da_state.PER_TILE_TACTICS.pop(offset_key, None)
+                da_state.PER_BODY_TACTICS.pop(offset_key, None)
+            n_uploaded += 1
+            if _verbose:
+                print(
+                    f"[DA k-NN auto-profile] bucket={bucket} "
+                    f"policy={policy} tactic={forced_singleton_tactic} "
+                    "DA metadata upload skipped",
+                    flush=True,
+                )
+            return 1
+
+        if forced_singleton_tactic is not None:
+            raise RuntimeError(
+                f"DA policy {policy!r} unexpectedly forced tactic "
+                f"{forced_singleton_tactic!r}"
+            )
         if len(set(best_idxs)) == 1:
             rows = rows[:1]
             best_idxs = best_idxs[:1]
@@ -910,18 +1408,27 @@ def auto_profile_knn_exemplars(
                 f"from {original_count} to {len(rows)}",
                 flush=True,
             )
+        tile_shapes = [int(switch_tiles[bi]) for bi in best_idxs]
+        kernel_ids = [int(tile_map[int(tile_shape)][1]) for tile_shape in tile_shapes]
+
         flat = np.stack(rows).astype(np.float32).reshape(-1).copy()
         upload_device = torch.device(da_context.device_type, da_context.device_index)
         flat_t = torch.from_numpy(flat).contiguous().to(device=upload_device)
         n_ex = len(rows)
-        tile_shapes = [int(switch_tiles[bi]) for bi in best_idxs]
-        kernel_ids = [
-            int(buckets_with_tiles[int(bucket)][int(tile_shape)][1])
-            for tile_shape in tile_shapes
-        ]
         per_body, body_idxs = deduplicate_body_tactics(
             list(zip(tile_shapes, kernel_ids, strict=True))
         )
+        expected_policy = "da_singleton" if len(per_body) == 1 else "da_switch"
+        if policy != expected_policy:
+            raise RuntimeError(
+                f"DA plan classification {policy!r} disagrees with "
+                f"post-deduplication bodies {per_body!r}"
+            )
+        decision_dict["final_tactics"] = list(per_body)
+        da_state.BASELINE_GUARD_DECISIONS[config_key] = dict(decision_dict)
+        bundle_plans[str(int(bucket))] = dict(decision_dict)
+        published_tiles = sorted({int(tactic[0]) for tactic in per_body})
+        published_tile_map = {int(tactic[0]): tactic for tactic in per_body}
         bundle_exemplars[str(int(bucket))] = [
             {
                 "norm_vec": np.asarray(rows[i], dtype=np.float32),
@@ -932,6 +1439,9 @@ def auto_profile_knn_exemplars(
         ]
         for off in auto_offsets:
             offset_context = da_state.context_with_offset(da_context, int(off))
+            da_state.BASELINE_GUARD_DECISIONS[
+                da_state.cache_key(offset_context, int(bucket))
+            ] = dict(decision_dict)
             upload_and_publish_selector_tactics(
                 moe_op,
                 offset_context,
@@ -939,19 +1449,20 @@ def auto_profile_knn_exemplars(
                 body_idxs,
                 tile_shapes,
                 kernel_ids,
-                [int(t) for t in switch_tiles],
+                published_tiles,
                 int(num_local_experts),
                 int(off),
                 int(top_k),
                 int(bucket),
-                per_tile_tactics=None,
+                per_tile_tactics=published_tile_map,
                 per_body_tactics=per_body,
             )
         n_uploaded += 1
         if _verbose:
             print(
                 f"[DA k-NN auto-profile] bucket={bucket} "
-                f"tiles={switch_tiles} "
+                f"policy={policy} "
+                f"tiles={published_tiles} "
                 f"exemplars={len(rows)} "
                 f"best_idxs={best_idxs}",
                 flush=True,
@@ -961,8 +1472,12 @@ def auto_profile_knn_exemplars(
     cached_latencies: Dict[Tuple[int, int], Dict[int, float]] = {}
     tuner = AutoTuner.get()
     for cache_key, (_runner_id, tactic, _profile) in tuner.profiling_cache.items():
-        op_name, runner_name, _hash, profile_key, *_extras = cache_key
+        op_name, runner_name, cached_hash, profile_key = _profiling_cache_key_parts(
+            cache_key
+        )
         if op_name != da_context.op_name or runner_name != "MoERunner":
+            continue
+        if runner_hash is not None and int(cached_hash) != int(runner_hash):
             continue
         if not isinstance(profile_key, tuple) or len(profile_key) != 2:
             continue
@@ -990,6 +1505,16 @@ def auto_profile_knn_exemplars(
             continue
         cached_latencies.setdefault((bucket, dist_idx), {})[tile] = ms
 
+    cached_tactic_latencies = cached_profile_tactic_latencies(
+        da_context,
+        top_k,
+        runner_hash=runner_hash,
+        config=config,
+    )
+
+    # The ordinary autotuner cache is the only source of candidate assignments
+    # and body costs. Guard policy is evaluated after those assignments are
+    # fixed and never triggers a second profiling discipline.
     if cached_latencies:
         for bucket in sorted(buckets_with_tiles):
             switch_tiles = sorted(
@@ -1010,6 +1535,8 @@ def auto_profile_knn_exemplars(
 
             rows = []
             best_idxs = []
+            bucket_latencies = []
+            bucket_tactic_latencies = []
             for dist_idx, dist in enumerate(active_auto_distributions(config)):
                 tile_latencies = {
                     int(t): float(cached_latencies[(bucket, dist_idx)][int(t)])
@@ -1060,201 +1587,47 @@ def auto_profile_knn_exemplars(
                     sorted_desc = sorted_desc[:num_local_experts]
                 rows.append(sorted_desc)
                 best_idxs.append(best_idx)
-
-            _finish_bucket(bucket, switch_tiles, rows, best_idxs)
-
-    live_profile = config.live_profile
-    if live_profile and da_context.op_name != "flashinfer::trtllm_fp4_block_scale_moe":
-        if _verbose:
-            print(
-                "[DA k-NN auto-profile] live profiling is currently FP4-only; "
-                f"using cached DA profiles for {da_context.op_name}",
-                flush=True,
-            )
-        live_profile = False
-    if n_uploaded > 0:
-        live_profile = False
-    elif not live_profile:
-        if _verbose:
-            print(
-                "[DA k-NN auto-profile] no cached DA profiles available; "
-                "set FLASHINFER_DA_KNN_LIVE_PROFILE=1 to run live MoE profiling",
-                flush=True,
-            )
-
-    start_event = torch.cuda.Event(enable_timing=True) if live_profile else None
-    end_event = torch.cuda.Event(enable_timing=True) if live_profile else None
-
-    for bucket in sorted(buckets_with_tiles) if live_profile else ():
-        tile_map = buckets_with_tiles[bucket]
-        switch_tiles = sorted(
-            t
-            for t in backend.supported_tile_sizes(
-                bucket,
-                top_k=top_k,
-                num_local_experts=num_local_experts,
-                local_expert_offset=local_expert_offset,
-                dtype_act=dtype_act,
-                dtype_weights=_dtype_from_context(da_context.dtype_weights),
-                quantization_type=quant_type,
-                da_context=da_context,
-            )
-        )
-        if not switch_tiles:
-            continue
-
-        # Dummy hidden states (kernel latency depends on work
-        # distribution across experts, not hidden-state values).
-        dummy_hs = torch.randint(
-            0,
-            256,
-            (bucket, hidden_size // 2),
-            dtype=torch.uint8,
-            device=device,
-        )
-        dummy_hs_scale = (
-            torch.ones(
-                bucket, hidden_size // 16, dtype=torch.float8_e4m3fn, device=device
-            )
-            if hidden_states_scale is not None
-            else None
-        )
-        routing_bias_dummy = torch.zeros(
-            num_experts,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        output_buf = torch.empty(
-            bucket,
-            hidden_size,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        expert_weights_buf = torch.empty(
-            bucket,
-            top_k,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-
-        rows = []
-        best_idxs = []
-
-        for dist in active_auto_distributions(config):
-            # Generate expert assignments for this distribution.  The helper
-            # guarantees the local histogram sums to bucket * top_k.
-            ti = generate_da_distribution_assignments(
-                dist,
-                torch.zeros(bucket, top_k, dtype=torch.int32, device=device),
-                num_local_experts,
-                num_experts,
-                top_k,
-                local_expert_offset,
-            )
-
-            tv = torch.full(
-                (bucket, top_k),
-                1.0 / top_k,
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            packed = pack_expert_assignments(ti, tv, top_k=top_k)
-
-            counts = compute_local_expert_counts_from_plain_ids(
-                ti,
-                num_local_experts,
-                local_expert_offset,
-            ).astype(np.float64)
-
-            live_tile_latencies: Dict[int, float] = {}
-            for tile in switch_tiles:
-                tactic = [int(tile_map[tile][0]), int(tile_map[tile][1])]
-
-                def _run(
-                    _packed=packed,
-                    _tactic=tactic,
-                    _dummy_hs=dummy_hs,
-                    _dummy_hs_scale=dummy_hs_scale,
-                ):
-                    moe_op.trtllm_fp4_block_scale_moe(
-                        None,
-                        _packed,
-                        expert_weights_buf,
-                        routing_bias_dummy,
-                        _dummy_hs,
-                        _dummy_hs_scale,
-                        gemm1_weights,
-                        gemm1_weights_scale,
-                        None,
-                        None,
-                        None,
-                        None,
-                        gemm2_weights,
-                        gemm2_weights_scale,
-                        None,
-                        output1_scale_scalar,
-                        output1_scale_gate_scalar,
-                        output2_scale_scalar,
-                        num_experts,
-                        top_k,
-                        n_group if n_group is not None else 1,
-                        topk_group if topk_group is not None else 1,
-                        intermediate_size,
-                        local_expert_offset,
-                        num_local_experts,
-                        routed_scaling_factor if routed_scaling_factor else 1.0,
-                        routing_method_type,
-                        True,
-                        False,
-                        activation_type,
-                        output_buf,
-                        _tactic,
-                    )
-
-                for _ in range(warmup):
-                    _run()
-                torch.cuda.synchronize()
-
-                times = []
-                for _ in range(iters):
-                    start_event.record()
-                    _run()
-                    end_event.record()
-                    torch.cuda.synchronize()
-                    times.append(start_event.elapsed_time(end_event))
-                live_tile_latencies[tile] = float(np.median(times))
-
-            if not live_tile_latencies:
-                continue
-            min_lat = min(live_tile_latencies.values())
-            if tie_eps > 0.0 and min_lat > 0.0:
-                near_best = {
-                    t: l
-                    for t, l in live_tile_latencies.items()
-                    if (l - min_lat) / min_lat <= tie_eps
-                }
-            else:
-                near_best = live_tile_latencies
-            best_tile = max(near_best.keys())
-            best_idx = switch_tiles.index(int(best_tile))
-            sorted_desc = np.sort(counts)[::-1].astype(np.float32)
-            n = float(np.linalg.norm(sorted_desc))
-            if n < 1e-12:
-                continue
-            sorted_desc = sorted_desc / n
-            if sorted_desc.shape[0] < num_local_experts:
-                pad = np.zeros(
-                    num_local_experts - sorted_desc.shape[0],
-                    dtype=np.float32,
+                bucket_latencies.append(tile_latencies)
+                bucket_tactic_latencies.append(
+                    dict(cached_tactic_latencies.get((bucket, dist_idx), {}))
                 )
-                sorted_desc = np.concatenate([sorted_desc, pad])
-            elif sorted_desc.shape[0] > num_local_experts:
-                sorted_desc = sorted_desc[:num_local_experts]
-            rows.append(sorted_desc)
-            best_idxs.append(best_idx)
 
-        _finish_bucket(bucket, switch_tiles, rows, best_idxs)
+            _finish_bucket(
+                bucket,
+                switch_tiles,
+                rows,
+                best_idxs,
+                bucket_latencies,
+                bucket_tactic_latencies,
+            )
 
+    if not cached_latencies:
+        unavailable_decision = {
+            "policy": "noda",
+            "candidate_policy": "unavailable",
+            "candidate_tactics": [],
+            "final_policy": "noda",
+            "final_tactics": [],
+            "control_overhead_source": "pre_recorded_calibration",
+            "overhead_ms": float(config.control_overhead_us) / 1000.0,
+            "margin": float(config.baseline_guard_margin),
+            "admission_applied": False,
+            "limitation": "missing_fixed_candidate_timing",
+            "baseline_guard_signature": baseline_guard_signature(config),
+        }
+        for bucket in sorted(buckets_with_tiles):
+            bundle_plans[str(int(bucket))] = dict(unavailable_decision)
+            for offset in auto_offsets:
+                offset_context = da_state.context_with_offset(da_context, int(offset))
+                da_state.BASELINE_GUARD_DECISIONS[
+                    da_state.cache_key(offset_context, int(bucket))
+                ] = dict(unavailable_decision)
+        if _verbose:
+            print(
+                "[DA k-NN auto-profile] no recorded autotuner timing; "
+                "baseline guard admission unavailable, skipping",
+                flush=True,
+            )
     if _verbose:
         print(
             f"[DA k-NN auto-profile] done: {n_uploaded} buckets uploaded, "
@@ -1267,11 +1640,12 @@ def auto_profile_knn_exemplars(
         import pickle
 
         bundle = {
-            "version": 4,
             "tactic_table": {},
             "exemplars": bundle_exemplars,
+            "plans": bundle_plans,
             "meta": {
                 "schema_version": int(da_context.schema_version),
+                "baseline_guard_signature": baseline_guard_signature(config),
                 "device_type": da_context.device_type,
                 "device_index": int(da_context.device_index),
                 "ep": max(1, num_experts // max(1, num_local_experts)),
@@ -1321,13 +1695,21 @@ def register_auto_profile_callback(
     da_context: da_state.DAMoeContext,
     hidden_states,
     hidden_states_scale,
+    routing_logits,
+    routing_bias,
     gemm1_weights,
     gemm1_weights_scale,
+    gemm1_bias,
+    gemm1_alpha,
+    gemm1_beta,
+    gemm1_clamp_limit,
     gemm2_weights,
     gemm2_weights_scale,
+    gemm2_bias,
     output1_scale_scalar,
     output1_scale_gate_scalar,
     output2_scale_scalar,
+    per_token_scale,
     num_experts,
     top_k,
     n_group,
@@ -1336,9 +1718,13 @@ def register_auto_profile_callback(
     local_expert_offset,
     num_local_experts,
     routed_scaling_factor,
+    use_routing_scales_on_input,
     routing_method_type,
     activation_type,
     tune_max_num_tokens,
+    enable_pdl,
+    runner,
+    runner_hash: Optional[int] = None,
     config: Optional[DAConfig] = None,
 ):
     """Register a post-autotuning callback that runs kNN auto-profiling.
@@ -1359,13 +1745,21 @@ def register_auto_profile_callback(
                 da_context=da_context,
                 hidden_states=hidden_states,
                 hidden_states_scale=hidden_states_scale,
+                routing_logits=routing_logits,
+                routing_bias=routing_bias,
                 gemm1_weights=gemm1_weights,
                 gemm1_weights_scale=gemm1_weights_scale,
+                gemm1_bias=gemm1_bias,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_beta=gemm1_beta,
+                gemm1_clamp_limit=gemm1_clamp_limit,
                 gemm2_weights=gemm2_weights,
                 gemm2_weights_scale=gemm2_weights_scale,
+                gemm2_bias=gemm2_bias,
                 output1_scale_scalar=output1_scale_scalar,
                 output1_scale_gate_scalar=output1_scale_gate_scalar,
                 output2_scale_scalar=output2_scale_scalar,
+                per_token_scale=per_token_scale,
                 num_experts=num_experts,
                 top_k=top_k,
                 n_group=n_group,
@@ -1374,9 +1768,13 @@ def register_auto_profile_callback(
                 local_expert_offset=local_expert_offset,
                 num_local_experts=num_local_experts,
                 routed_scaling_factor=routed_scaling_factor,
+                use_routing_scales_on_input=use_routing_scales_on_input,
                 routing_method_type=routing_method_type,
                 activation_type=activation_type,
                 tune_max_num_tokens=tune_max_num_tokens,
+                enable_pdl=enable_pdl,
+                runner=runner,
+                runner_hash=runner_hash,
                 config=config,
             )
             label = (

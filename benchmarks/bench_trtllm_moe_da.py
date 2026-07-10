@@ -1027,8 +1027,6 @@ def _tune_result_from_loaded_bundle(
     da_context = _make_da_context(case, cfg, device)
     with open(bundle_path, "rb") as f:
         bundle = pickle.load(f)
-    if int(bundle.get("version", 1)) < 2:
-        raise ValueError(f"{bundle_path}: only DAKNNv2 bundles are supported")
 
     def valid_tile_sizes(bucket: int, **_kwargs) -> tuple[int, ...]:
         tactics = moe_core.get_trtllm_moe_sm100_module().ffi_moe_op.trtllm_get_valid_moe_configs(
@@ -1145,6 +1143,21 @@ def _prime_single_body_da_cache(
     return tactic
 
 
+def _is_value_profile_cache_key(cache_key: Any) -> bool:
+    """Return whether an autotuner cache key includes value-profile buckets."""
+    if hasattr(cache_key, "nearest_profile"):
+        profile_key = cache_key.nearest_profile
+    else:
+        profile_key = cache_key[3]
+    return bool(
+        isinstance(profile_key, tuple)
+        and len(profile_key) == 2
+        and isinstance(profile_key[0], tuple)
+        and profile_key[0]
+        and isinstance(profile_key[0][0], tuple)
+    )
+
+
 def _run_real_autotune(
     case: PrecisionCase,
     cfg: BenchConfig,
@@ -1157,6 +1170,7 @@ def _run_real_autotune(
     da_state.PER_TILE_TACTICS.clear()
     da_state.PER_BODY_TACTICS.clear()
     da_state.STATIC_FALLBACK_TACTICS.clear()
+    da_state.BASELINE_GUARD_DECISIONS.clear()
 
     tuning_input = _make_routing_input(
         routing_input_mode, case.name, "uniform", cfg, device
@@ -1196,10 +1210,13 @@ def _run_real_autotune(
         da_core.upload_bucket(cfg.num_tokens, cfg.tune_max_num_tokens),
     )
     tactics = da_state.PER_BODY_TACTICS.get(key)
-    if not tactics:
+    guard_decision = da_state.BASELINE_GUARD_DECISIONS.get(key, {})
+    final_policy = guard_decision.get("final_policy", guard_decision.get("policy"))
+    if not tactics and final_policy != "noda_baseline_guard":
         raise RuntimeError(f"DA autotune produced no runtime bodies for {key}")
     return {
-        "tactics": [(int(tile), int(config)) for tile, config in tactics],
+        "tactics": [(int(tile), int(config)) for tile, config in tactics or ()],
+        "guard_decision": guard_decision,
         "static_profiles": static_profiles,
         "total_profiles": len(tuner.profiling_cache),
         "static_tune_seconds": static_tune_seconds,
@@ -1220,9 +1237,85 @@ def _runtime_tactics(
         da_core.upload_bucket(cfg.num_tokens, cfg.tune_max_num_tokens),
     )
     tactics = da_state.PER_BODY_TACTICS.get(key)
+    decision = da_state.BASELINE_GUARD_DECISIONS.get(key, {})
+    final_policy = decision.get("final_policy", decision.get("policy"))
+    if not tactics and final_policy == "noda_baseline_guard":
+        return []
     if not tactics:
         raise RuntimeError(f"tuning result has no runtime bodies for {key}")
-    return [(int(tile), int(config)) for tile, config in tactics]
+    return [(int(tile), int(config)) for tile, config in tactics or ()]
+
+
+def _runtime_guard_decision(
+    case: PrecisionCase,
+    cfg: BenchConfig,
+    device: torch.device,
+) -> dict:
+    """Return the DA baseline-guard decision for one runtime token bucket."""
+
+    da_context = _make_da_context(case, cfg, device)
+    key = da_state.cache_key(
+        da_context,
+        da_core.upload_bucket(cfg.num_tokens, cfg.tune_max_num_tokens),
+    )
+    decision = dict(da_state.BASELINE_GUARD_DECISIONS.get(key, {}))
+    if decision:
+        return decision
+    tactics = da_state.PER_BODY_TACTICS.get(key, ())
+    if len(tactics) == 1:
+        return {
+            "policy": "da_singleton",
+            "candidate_policy": "da_singleton",
+            "candidate_tactics": [tuple(int(v) for v in tactics[0])],
+            "final_policy": "da_singleton",
+            "final_tactics": [tuple(int(v) for v in tactics[0])],
+            "singleton_tactic": tuple(int(v) for v in tactics[0]),
+            "singleton_source": "profiled",
+        }
+    if len(tactics) > 1:
+        normalized = [tuple(int(v) for v in tactic) for tactic in tactics]
+        return {
+            "policy": "da_switch",
+            "candidate_policy": "da_switch",
+            "candidate_tactics": normalized,
+            "final_policy": "da_switch",
+            "final_tactics": normalized,
+        }
+    return {
+        "policy": "noda",
+        "candidate_policy": "noda",
+        "candidate_tactics": [],
+        "final_policy": "noda",
+        "final_tactics": [],
+    }
+
+
+def _guard_row_fields(decision: dict) -> dict:
+    """Convert a guard decision into stable benchmark CSV columns."""
+
+    return {
+        "da_policy": decision.get("policy", "noda"),
+        "da_candidate_policy": decision.get(
+            "candidate_policy", decision.get("policy", "noda")
+        ),
+        "da_candidate_tactics": repr(decision.get("candidate_tactics", [])),
+        "da_final_policy": decision.get("final_policy", decision.get("policy", "noda")),
+        "da_final_tactics": repr(decision.get("final_tactics", [])),
+        "da_baseline_tactic": repr(decision.get("baseline_tactic")),
+        "da_baseline_ms": decision.get("baseline_ms"),
+        "da_baseline_worst_ms": decision.get("baseline_worst_ms"),
+        "da_overhead_ms": decision.get("overhead_ms"),
+        "da_control_overhead_source": decision.get(
+            "control_overhead_source", "unavailable"
+        ),
+        "da_guard_margin": decision.get("margin"),
+        "da_guard_admission_applied": decision.get("admission_applied"),
+        "da_guard_limitation": decision.get("limitation"),
+        "da_dynamic_worst_ms": decision.get("dynamic_worst_ms"),
+        "da_singleton_tactic": repr(decision.get("singleton_tactic")),
+        "da_singleton_worst_ms": decision.get("singleton_worst_ms"),
+        "da_singleton_source": decision.get("singleton_source"),
+    }
 
 
 def _last_runtime_tactic(custom_op: str) -> tuple[Any, str]:
@@ -1373,7 +1466,10 @@ def _resolve_local_num_experts(num_experts: int, local_num_experts: int | None) 
 def _row_status(row: dict) -> str:
     if row.get("noda_capture_dispatch_count", 0) != 0:
         return "FAIL_NODA_USED_DA"
-    if (
+    if row.get("da_policy") in {"noda", "noda_baseline_guard"}:
+        if row.get("da_capture_dispatch_count", 0) != 0:
+            return "FAIL_NODA_USED_DA_CAPTURE"
+    elif (
         row.get("execution_mode") == "graph"
         and row.get("da_capture_dispatch_count", 0) <= 0
     ):
@@ -1452,6 +1548,7 @@ def _run_precision_sweep(
 
         if args.build_only:
             tactics = _runtime_tactics(tuning_case, tuning_cfg, device)
+            guard_decision = _runtime_guard_decision(tuning_case, tuning_cfg, device)
             rows.append(
                 {
                     "precision": precision,
@@ -1465,6 +1562,7 @@ def _run_precision_sweep(
                     "static_tune_seconds": tune_result["static_tune_seconds"],
                     "da_tune_seconds": tune_result["da_tune_seconds"],
                     "tune_seconds": tune_result["tune_seconds"],
+                    **_guard_row_fields(guard_decision),
                 }
             )
             continue
@@ -1479,8 +1577,11 @@ def _run_precision_sweep(
                     precision, cfg, hidden, w1, w2, args.routing_input_mode
                 )
                 tactics = _runtime_tactics(case, cfg, device)
+                guard_decision = _runtime_guard_decision(case, cfg, device)
                 print(
-                    f"  [tokens={cfg.num_tokens}] [DA bodies] {tactics}",
+                    f"  [tokens={cfg.num_tokens}] "
+                    f"[DA policy] {guard_decision.get('policy', 'noda')} "
+                    f"[DA bodies] {tactics}",
                     flush=True,
                 )
             except Exception as exc:
@@ -1521,6 +1622,7 @@ def _run_precision_sweep(
                     "tune_seconds": tune_result["tune_seconds"],
                     "match_ratio_threshold": case.match_ratio,
                     "bundle_output": bundle_path,
+                    **_guard_row_fields(guard_decision),
                 }
                 try:
                     routing_input = _make_routing_input(

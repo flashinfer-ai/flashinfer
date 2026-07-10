@@ -80,6 +80,41 @@ DA_DISTRIBUTION_NAMES = ("uniform", "exp:2", "single")
 DA_ROUTING_METHODS = (RoutingMethodType.DeepSeekV3, RoutingMethodType.Renormalize)
 
 
+def test_da_distribution_samples_are_stable_across_tactic_profiles():
+    distribution = get_da_distribution_specs("ddist:2")[0]
+    invocation = SimpleNamespace(
+        top_k=8,
+        num_experts=128,
+        num_local_experts=128,
+        local_expert_offset=0,
+    )
+    execution = SimpleNamespace(
+        invocation=invocation,
+        config=da_profile.DAConfig(distributions=(distribution,)),
+    )
+    generator = da_core.DADistributionTensorGenerator(execution, pack_topk_ids=False)
+    profiled = torch.zeros(512, 8, dtype=torch.int32)
+
+    torch.manual_seed(9284)
+    expected = generate_da_distribution_assignments(
+        distribution,
+        profiled,
+        invocation.num_local_experts,
+        invocation.num_experts,
+        invocation.top_k,
+        invocation.local_expert_offset,
+    )
+    torch.manual_seed(9284)
+    first = generator(0, profiled, profiled, [], sample_index=3)
+    torch.rand(4096)
+    repeated = generator(0, profiled, profiled, [], sample_index=3)
+    next_sample = generator(0, profiled, profiled, [], sample_index=4)
+
+    assert torch.equal(first, expected)
+    assert torch.equal(first, repeated)
+    assert not torch.equal(first, next_sample)
+
+
 def test_da_single_graph_has_no_fp4_launcher_code():
     """The graph injector remains independent of precision-owned launchers."""
     source = inspect.getsource(da_single_graph).lower()
@@ -395,7 +430,6 @@ NON_FP4_DA_PRECISION_CONTRACTS = tuple(
 DA_RUNTIME_PLAN_POLICIES = {
     "da_switch",
     "da_singleton",
-    "da_singleton_baseline_guard",
 }
 
 
@@ -2173,6 +2207,9 @@ def test_nvfp4_unpacked_public_wrapper_metadata_replay_is_bit_exact():
 
 def _reset_tuner_and_da(monkeypatch: pytest.MonkeyPatch) -> AutoTuner:
     monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    # These tests exercise DA body publication and graph topology. Baseline
+    # guard rejection is covered separately by the monolithic-NoDA contracts.
+    monkeypatch.setenv("FLASHINFER_DA_BASELINE_GUARD", "0")
     monkeypatch.setenv("FLASHINFER_DA_KNN_TIE_EPS", "0.05")
     monkeypatch.setenv(
         "FLASHINFER_DA_DISTRIBUTIONS",
@@ -2323,21 +2360,85 @@ def test_da_baseline_guard_cost_model_keeps_switch_when_all_bodies_win():
     """A deduplicated multi-body plan stays a switch when every body wins."""
     config = da_profile.DAConfig(
         baseline_guard=True,
-        switch_overhead_us=100.0,
-        routing_overhead_us=0.0,
+        control_overhead_us=100.0,
         baseline_guard_margin=0.0,
     )
     policy, forced_singleton, decision = da_profile.choose_baseline_guard_policy(
-        baseline=((16, 1), 1.0),
+        baseline=((64, 9), 1.0),
         switch_tiles=[16, 32],
         best_idxs=[0, 1],
         per_distribution_latencies=[{16: 0.7, 32: 1.2}, {16: 1.1, 32: 0.8}],
+        per_distribution_tactic_latencies=[
+            {(16, 1): 0.7, (32, 2): 1.2, (64, 9): 1.0},
+            {(16, 1): 1.1, (32, 2): 0.8, (64, 9): 1.0},
+        ],
         tile_to_tactic={16: (16, 1), 32: (32, 2)},
         config=config,
     )
     assert policy == "da_switch"
     assert forced_singleton is None
     assert decision.dynamic_worst_ms == pytest.approx(0.9)
+
+
+def test_da_baseline_guard_uses_pre_recorded_control_overhead_once():
+    """The calibrated control-plane estimate is added once per assignment."""
+    policy, forced_singleton, decision = da_profile.choose_baseline_guard_policy(
+        baseline=((64, 9), 1.0),
+        switch_tiles=[16, 32],
+        best_idxs=[0, 1],
+        per_distribution_latencies=[{16: 0.8, 32: 1.2}, {16: 1.2, 32: 0.8}],
+        per_distribution_tactic_latencies=[
+            {(16, 1): 0.8, (32, 2): 1.2, (64, 9): 1.0},
+            {(16, 1): 1.2, (32, 2): 0.8, (64, 9): 1.0},
+        ],
+        tile_to_tactic={16: (16, 1), 32: (32, 2)},
+        config=da_profile.DAConfig(
+            baseline_guard=True,
+            control_overhead_us=10.0,
+        ),
+    )
+
+    assert policy == "da_switch"
+    assert forced_singleton is None
+    assert decision.overhead_ms == pytest.approx(0.01)
+    assert decision.dynamic_worst_ms == pytest.approx(0.81)
+
+
+def test_da_baseline_guard_default_control_overhead_is_twelve_us():
+    assert da_profile.DAConfig().control_overhead_us == pytest.approx(12.0)
+
+
+@pytest.mark.parametrize(
+    ("baseline", "latencies", "limitation"),
+    [
+        (None, [{16: 0.8}], "missing_noda_baseline"),
+        (((16, 1), 1.0), [], "missing_fixed_candidate_timing"),
+    ],
+)
+def test_da_baseline_guard_missing_timing_skips_admission(
+    baseline, latencies, limitation
+):
+    policy, forced_singleton, decision = da_profile.choose_baseline_guard_policy(
+        baseline=baseline,
+        switch_tiles=[16],
+        best_idxs=[0],
+        per_distribution_latencies=latencies,
+        per_distribution_tactic_latencies=([{(16, 1): 0.8}] if latencies else []),
+        tile_to_tactic={16: (16, 1)},
+        config=da_profile.DAConfig(baseline_guard=True),
+    )
+
+    assert policy == "da_singleton"
+    assert forced_singleton is None
+    assert not decision.admission_applied
+    assert decision.limitation == limitation
+
+
+def test_da_baseline_guard_source_has_no_cuda_graph_profiling():
+    source = inspect.getsource(da_profile.auto_profile_knn_exemplars)
+    assert "CUDAGraph" not in source
+    assert "graph.replay" not in source
+    assert "runtime_cuda_graph" not in source
 
 
 @pytest.mark.parametrize(
@@ -2364,17 +2465,22 @@ def test_guard_preserves_unconstrained_candidate_tactics_for_all_precisions(
         {8: 0.90, 16: 0.82, 32: 0.70},
         {8: 0.72, 16: 0.84, 32: 0.91},
     ]
+    tactic_latencies = [
+        {(8, 65): 0.90, (16, 90): 0.82, (32, 121): 0.70, (32, 43): 0.85},
+        {(8, 65): 0.72, (16, 90): 0.84, (32, 121): 0.91, (32, 43): 0.85},
+    ]
     candidate_policy, candidate_tactics = da_profile.unconstrained_candidate_plan(
         switch_tiles, best_idxs, tile_to_tactic
     )
     assert candidate_policy == "da_switch", precision
     assert candidate_tactics == [(32, 121), (8, 65)]
 
-    off_policy, off_singleton, _ = da_profile.choose_baseline_guard_policy(
+    off_policy, off_singleton, off_decision = da_profile.choose_baseline_guard_policy(
         baseline=((32, 43), 0.85),
         switch_tiles=switch_tiles,
         best_idxs=best_idxs,
         per_distribution_latencies=latencies,
+        per_distribution_tactic_latencies=tactic_latencies,
         tile_to_tactic=tile_to_tactic,
         config=da_profile.DAConfig(baseline_guard=False),
     )
@@ -2383,18 +2489,19 @@ def test_guard_preserves_unconstrained_candidate_tactics_for_all_precisions(
         switch_tiles=switch_tiles,
         best_idxs=best_idxs,
         per_distribution_latencies=latencies,
+        per_distribution_tactic_latencies=tactic_latencies,
         tile_to_tactic=tile_to_tactic,
         config=da_profile.DAConfig(
             baseline_guard=True,
-            switch_overhead_us=200.0,
-            routing_overhead_us=0.0,
+            control_overhead_us=200.0,
         ),
     )
 
     assert off_policy == "da_switch"
     assert off_singleton is None
-    assert on_policy == "da_singleton_baseline_guard"
-    assert on_singleton == (16, 90)
+    assert off_decision.limitation is None
+    assert on_policy == "noda_baseline_guard"
+    assert on_singleton == (32, 43)
     assert da_profile.unconstrained_candidate_plan(
         switch_tiles, best_idxs, tile_to_tactic
     ) == (candidate_policy, candidate_tactics)
@@ -2415,15 +2522,18 @@ def test_da_baseline_guard_classifies_natural_singleton_after_deduplication():
     """Repeated distribution assignments deduplicate to a natural singleton."""
     config = da_profile.DAConfig(
         baseline_guard=True,
-        switch_overhead_us=300.0,
-        routing_overhead_us=0.0,
+        control_overhead_us=300.0,
         baseline_guard_margin=0.0,
     )
     policy, forced_singleton, decision = da_profile.choose_baseline_guard_policy(
-        baseline=((16, 1), 1.0),
+        baseline=((64, 3), 1.0),
         switch_tiles=[16, 32],
         best_idxs=[0, 0],
         per_distribution_latencies=[{16: 0.8, 32: 1.2}, {16: 0.9, 32: 1.1}],
+        per_distribution_tactic_latencies=[
+            {(16, 1): 0.8, (32, 2): 1.2, (64, 3): 1.0},
+            {(16, 1): 0.9, (32, 2): 1.1, (64, 3): 1.0},
+        ],
         tile_to_tactic={16: (16, 1), 32: (32, 2)},
         config=config,
     )
@@ -2434,94 +2544,213 @@ def test_da_baseline_guard_classifies_natural_singleton_after_deduplication():
     assert decision.singleton_worst_ms == pytest.approx(0.9)
 
 
+def test_da_baseline_guard_matches_fixed_tactics_on_each_distribution():
+    """One noisy pairwise crossing cannot reject a better robust singleton."""
+    candidate = (128, 42)
+    baseline = (32, 13)
+    candidate_times = [6, 4, 5]
+    baseline_times = [5, 10, 9]
+    policy, forced_singleton, decision = da_profile.choose_baseline_guard_policy(
+        # This is the unrelated balanced default-profile time.  It remains a
+        # useful eager diagnostic but is not an admission threshold.
+        baseline=(baseline, 3),
+        switch_tiles=[32, 128],
+        best_idxs=[1] * len(candidate_times),
+        per_distribution_latencies=[
+            {32: baseline_ms, 128: candidate_ms}
+            for candidate_ms, baseline_ms in zip(
+                candidate_times, baseline_times, strict=True
+            )
+        ],
+        per_distribution_tactic_latencies=[
+            {baseline: baseline_ms, candidate: candidate_ms}
+            for candidate_ms, baseline_ms in zip(
+                candidate_times, baseline_times, strict=True
+            )
+        ],
+        tile_to_tactic={32: baseline, 128: candidate},
+        config=da_profile.DAConfig(baseline_guard=True),
+    )
+
+    assert policy == "da_singleton"
+    assert forced_singleton is None
+    assert decision.baseline_ms == pytest.approx(3)
+    assert decision.baseline_worst_ms == pytest.approx(max(baseline_times))
+    assert decision.singleton_tactic == candidate
+
+
 def test_da_baseline_guard_rejects_uncompetitive_natural_singleton():
-    """A natural singleton that loses to NoDA becomes a guarded singleton."""
+    """A natural singleton that loses to NoDA selects the monolithic fallback."""
     policy, forced_singleton, decision = da_profile.choose_baseline_guard_policy(
         baseline=((64, 3), 0.7),
         switch_tiles=[16, 32],
         best_idxs=[0, 0],
         per_distribution_latencies=[{16: 0.8, 32: 1.2}, {16: 0.9, 32: 1.1}],
+        per_distribution_tactic_latencies=[
+            {(16, 1): 0.8, (32, 2): 1.2, (64, 3): 0.7},
+            {(16, 1): 0.9, (32, 2): 1.1, (64, 3): 0.7},
+        ],
         tile_to_tactic={16: (16, 1), 32: (32, 2)},
         config=da_profile.DAConfig(
             baseline_guard=True,
-            switch_overhead_us=0.0,
-            routing_overhead_us=0.0,
+            control_overhead_us=0.0,
         ),
     )
 
-    assert policy == "da_singleton_baseline_guard"
+    assert policy == "noda_baseline_guard"
     assert forced_singleton == (64, 3)
     assert decision.singleton_source == "noda_baseline"
 
 
-def test_da_baseline_guard_cost_model_collapses_to_robust_singleton():
-    """The guard collapses to a robust singleton when dynamic overhead loses."""
+def test_da_baseline_guard_rejects_switch_to_monolithic_noda():
+    """A rejected switch selects NoDA rather than a metadata-replay singleton."""
     config = da_profile.DAConfig(
         baseline_guard=True,
-        switch_overhead_us=300.0,
-        routing_overhead_us=0.0,
-        baseline_guard_margin=0.0,
-    )
-    policy, forced_singleton, decision = da_profile.choose_baseline_guard_policy(
-        baseline=((16, 1), 1.0),
-        switch_tiles=[16, 32],
-        best_idxs=[0, 1],
-        per_distribution_latencies=[{16: 0.8, 32: 0.95}, {16: 0.9, 32: 0.7}],
-        tile_to_tactic={16: (16, 1), 32: (32, 2)},
-        config=config,
-    )
-    assert policy == "da_singleton_baseline_guard"
-    assert forced_singleton == (16, 1)
-    assert decision.singleton_tactic == (16, 1)
-    assert decision.singleton_source == "profiled"
-    assert decision.singleton_worst_ms == pytest.approx(0.9)
-    assert decision.dynamic_worst_ms == pytest.approx(1.1)
-
-
-def test_da_baseline_guard_uses_baseline_tactic_as_da_singleton():
-    """An uncompetitive profile publishes the NoDA tactic as a DA singleton."""
-    config = da_profile.DAConfig(
-        baseline_guard=True,
-        switch_overhead_us=300.0,
-        routing_overhead_us=0.0,
-        baseline_guard_margin=0.0,
-    )
-    policy, forced_singleton, decision = da_profile.choose_baseline_guard_policy(
-        baseline=((16, 1), 1.0),
-        switch_tiles=[16, 32],
-        best_idxs=[0, 1],
-        per_distribution_latencies=[{16: 1.1, 32: 1.4}, {16: 1.2, 32: 1.05}],
-        tile_to_tactic={16: (16, 1), 32: (32, 2)},
-        config=config,
-    )
-    assert policy == "da_singleton_baseline_guard"
-    assert forced_singleton == (16, 1)
-    assert decision.baseline_tactic == (16, 1)
-    assert decision.singleton_tactic == (16, 1)
-    assert decision.singleton_source == "noda_baseline"
-    assert decision.singleton_worst_ms == pytest.approx(1.0)
-
-
-def test_da_baseline_guard_singleton_score_uses_mean_as_tie_breaker():
-    """Equal worst-case singleton latency is broken by lower mean latency."""
-    config = da_profile.DAConfig(
-        baseline_guard=True,
-        switch_overhead_us=300.0,
-        routing_overhead_us=0.0,
+        control_overhead_us=300.0,
         baseline_guard_margin=0.0,
     )
     policy, forced_singleton, decision = da_profile.choose_baseline_guard_policy(
         baseline=((64, 3), 1.0),
         switch_tiles=[16, 32],
         best_idxs=[0, 1],
-        per_distribution_latencies=[{16: 0.9, 32: 0.6}, {16: 0.8, 32: 0.9}],
+        per_distribution_latencies=[{16: 0.8, 32: 0.95}, {16: 0.9, 32: 0.7}],
+        per_distribution_tactic_latencies=[
+            {(16, 1): 0.8, (32, 2): 0.95, (64, 3): 1.0},
+            {(16, 1): 0.9, (32, 2): 0.7, (64, 3): 1.0},
+        ],
         tile_to_tactic={16: (16, 1), 32: (32, 2)},
         config=config,
     )
-    assert policy == "da_singleton_baseline_guard"
-    assert forced_singleton == (32, 2)
-    assert decision.singleton_tactic == (32, 2)
-    assert decision.singleton_worst_ms == pytest.approx(0.9)
+    assert policy == "noda_baseline_guard"
+    assert forced_singleton == (64, 3)
+    assert decision.singleton_tactic == (64, 3)
+    assert decision.singleton_source == "noda_baseline"
+    assert decision.singleton_worst_ms == pytest.approx(1.0)
+    assert decision.dynamic_worst_ms == pytest.approx(1.1)
+
+
+def test_da_baseline_guard_reports_baseline_tactic_for_noda_fallback():
+    """An uncompetitive profile reports the monolithic NoDA tactic."""
+    config = da_profile.DAConfig(
+        baseline_guard=True,
+        control_overhead_us=300.0,
+        baseline_guard_margin=0.0,
+    )
+    policy, forced_singleton, decision = da_profile.choose_baseline_guard_policy(
+        baseline=((64, 3), 1.0),
+        switch_tiles=[16, 32],
+        best_idxs=[0, 1],
+        per_distribution_latencies=[{16: 1.1, 32: 1.4}, {16: 1.2, 32: 1.05}],
+        per_distribution_tactic_latencies=[
+            {(16, 1): 1.1, (32, 2): 1.4, (64, 3): 1.0},
+            {(16, 1): 1.2, (32, 2): 1.05, (64, 3): 1.0},
+        ],
+        tile_to_tactic={16: (16, 1), 32: (32, 2)},
+        config=config,
+    )
+    assert policy == "noda_baseline_guard"
+    assert forced_singleton == (64, 3)
+    assert decision.baseline_tactic == (64, 3)
+    assert decision.singleton_tactic == (64, 3)
+    assert decision.singleton_source == "noda_baseline"
+    assert decision.singleton_worst_ms == pytest.approx(1.0)
+
+
+def test_guarded_noda_skips_before_capture_backend_construction():
+    """A rejected plan must not reach any graph-mutating DA backend."""
+    context = _da_test_context(
+        "flashinfer::trtllm_fp4_block_scale_moe",
+        moe_core.DtypeTrtllmGen.E2m1,
+        moe_core.DtypeTrtllmGen.E2m1,
+    )
+    key = da_state.cache_key(context, 512)
+    da_state.BASELINE_GUARD_DECISIONS[key] = {
+        "policy": "noda_baseline_guard",
+        "final_policy": "noda_baseline_guard",
+        "baseline_tactic": (32, 86),
+    }
+    execution = SimpleNamespace(
+        invocation=SimpleNamespace(
+            da_context=context,
+            num_tokens=512,
+            tune_max_num_tokens=512,
+        ),
+        backend=SimpleNamespace(
+            capture_backend=lambda: pytest.fail(
+                "guarded NoDA constructed a graph-mutating capture backend"
+            )
+        ),
+        config=da_profile.DAConfig(),
+    )
+    try:
+        assert da_core.try_capture_dispatch(execution, lambda *_args: None) is None
+    finally:
+        da_state.BASELINE_GUARD_DECISIONS.pop(key, None)
+
+
+def test_guarded_noda_bundle_restores_policy_without_da_bodies():
+    """Bundle reuse preserves the monolithic fallback and eager tactic."""
+    config = da_profile.DAConfig(baseline_guard=True)
+    context = _da_test_context(
+        "flashinfer::trtllm_fp4_block_scale_moe",
+        moe_core.DtypeTrtllmGen.E2m1,
+        moe_core.DtypeTrtllmGen.E2m1,
+    )
+    key = da_state.cache_key(context, 512)
+    bundle = {
+        "meta": {
+            "schema_version": context.schema_version,
+            "device_type": context.device_type,
+            "device_index": context.device_index,
+            "profile_signature": list(config.profile_signature),
+            "baseline_guard_signature": da_profile.baseline_guard_signature(config),
+            "default_profile_contract": da_profile.DEFAULT_PROFILE_CONTRACT,
+            "num_local": context.num_local_experts,
+            "num_global_experts": context.num_experts,
+            "local_offset": context.local_expert_offset,
+            "top_k": context.top_k,
+        },
+        "plans": {
+            "512": {
+                "policy": "noda_baseline_guard",
+                "candidate_policy": "da_switch",
+                "candidate_tactics": [(32, 202), (128, 14)],
+                "final_policy": "noda_baseline_guard",
+                "baseline_tactic": (128, 14),
+            }
+        },
+        "exemplars": {},
+        "eager_tactics": {"512": {"tactic": (128, 14), "time_ms": 0.51}},
+    }
+    da_state.BASELINE_GUARD_DECISIONS.pop(key, None)
+    da_state.PER_TILE_TACTICS[key] = {32: (32, 202)}
+    da_state.PER_BODY_TACTICS[key] = [(32, 202)]
+    da_state.BUNDLE_EAGER_TACTICS.pop(key, None)
+    try:
+        uploaded = da_profile.load_knn_v2_bundle(
+            bundle,
+            "unused.pkl",
+            config=config,
+            backend=SimpleNamespace(
+                get_ffi_moe_op=lambda: pytest.fail(
+                    "guarded NoDA bundle uploaded selector metadata"
+                )
+            ),
+            da_context=context,
+        )
+        assert uploaded == 1
+        decision = da_state.BASELINE_GUARD_DECISIONS[key]
+        assert decision["candidate_tactics"] == [(32, 202), (128, 14)]
+        assert decision["final_policy"] == "noda_baseline_guard"
+        assert decision["final_tactics"] == [(128, 14)]
+        assert key not in da_state.PER_TILE_TACTICS
+        assert key not in da_state.PER_BODY_TACTICS
+        assert da_state.BUNDLE_EAGER_TACTICS[key] == ((128, 14), 0.51)
+    finally:
+        da_state.BASELINE_GUARD_DECISIONS.pop(key, None)
+        da_state.PER_TILE_TACTICS.pop(key, None)
+        da_state.PER_BODY_TACTICS.pop(key, None)
+        da_state.BUNDLE_EAGER_TACTICS.pop(key, None)
 
 
 @dataclass(frozen=True)

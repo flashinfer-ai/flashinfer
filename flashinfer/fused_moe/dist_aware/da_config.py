@@ -72,6 +72,19 @@ def _env_tie_epsilon() -> float:
     return epsilon
 
 
+def _env_nonnegative_float(env: str, default: float) -> float:
+    """Read a non-negative floating point environment variable."""
+
+    value = os.environ.get(env, str(default))
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ValueError(f"{env} must be non-negative, got {value!r}") from error
+    if parsed < 0:
+        raise ValueError(f"{env} must be non-negative, got {value!r}")
+    return parsed
+
+
 @dataclass(frozen=True)
 class DAConfig:
     """DA policy snapshot, with each omitted field read from its legacy envvar."""
@@ -114,10 +127,6 @@ class DAConfig:
     )
     # Optional local-expert offsets represented in bundle exemplars.
     exemplar_offsets: tuple[int, ...] = field(default_factory=_env_offsets)
-    # Enables direct live profiling when autotuner cache data is unavailable.
-    live_profile: bool = field(
-        default_factory=lambda: _env_bool("FLASHINFER_DA_KNN_LIVE_PROFILE", False)
-    )
     # Latency tolerance for treating candidate body tactics as tied.
     tie_epsilon: float = field(default_factory=_env_tie_epsilon)
     # Optional diagnostic cap on FP4 kNN tile sizes.
@@ -141,6 +150,24 @@ class DAConfig:
     # Enables CUDA-profiler instrumentation around the autotune phase.
     autotune_cuda_profiler: bool = field(
         default_factory=lambda: _env_bool("FLASHINFER_DA_AUTOTUNE_CUDA_PROFILER", False)
+    )
+    # Enables the NoDA baseline guard for DA selector publication.
+    baseline_guard: bool = field(
+        default_factory=lambda: _env_bool("FLASHINFER_DA_BASELINE_GUARD", True)
+    )
+    # Pre-recorded combined routing-metadata + selector + conditional SWITCH
+    # critical-path overhead in microseconds. Routing and selector overlap, so
+    # this calibrated value is added once rather than summing both branches.
+    control_overhead_us: float = field(
+        default_factory=lambda: _env_nonnegative_float(
+            "FLASHINFER_DA_CONTROL_OVERHEAD_US", 12.0
+        )
+    )
+    # Required dynamic-DA win margin and singleton no-worse tolerance.
+    baseline_guard_margin: float = field(
+        default_factory=lambda: _env_nonnegative_float(
+            "FLASHINFER_DA_BASELINE_GUARD_MARGIN", 0.0
+        )
     )
 
     @property

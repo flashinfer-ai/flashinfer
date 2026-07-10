@@ -23,6 +23,8 @@ namespace da_heuristic {
 constexpr int kMaxTiles = 8;
 
 // Maximum normalized routing-count exemplars stored for one selector state.
+// Keep in sync with MAX_EXEMPLARS in
+// flashinfer/fused_moe/dist_aware/da_profile.py.
 constexpr int kMaxExemplars = 8;
 // Largest local-expert count vector accepted by the k-NN selector.
 constexpr int kMaxKnnExperts = 512;
