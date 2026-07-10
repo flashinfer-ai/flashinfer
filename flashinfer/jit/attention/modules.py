@@ -2085,16 +2085,15 @@ def gen_fmha_v2_module(
     )
 
     # Copy the static launcher/binding sources so one loaded module exposes
-    # run() (called once per run), prepare() (cum-scan + tile reset + scale
-    # encode, called once per plan), and prepare_paged() (paged KV
-    # indptr/indices → dense block_tables, on GPU).
+    # run() (called once per run) plus prepare()/prepare_paged() — two
+    # instantiations of the same fused prep kernel (cum-scan + tile reset +
+    # scale encode; the paged variant also derives kv_lens/block_tables),
+    # called once per plan().
     for fname in [
         "fmha_v2_run.cu",
         "fmha_v2_jit_binding.cu",
         "fmha_v2_prepare.cu",
         "fmha_v2_prepare_jit_binding.cu",
-        "fmha_v2_prepare_paged.cu",
-        "fmha_v2_prepare_paged_jit_binding.cu",
     ]:
         dest_path = gen_directory / fname
         with open(csrc_dir / fname, "r") as f:

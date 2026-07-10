@@ -2484,8 +2484,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 "Q_PAGED_KV_HND" if self._kv_layout == "HND" else "Q_PAGED_KV_NHD"
             )
 
-            # Use prepare_paged to fill block_tables/kv_lens/seq_lens_q on device
-            # instead of the host-side for-loop.
+            # prepare_paged fills block_tables/kv_lens on device instead of the
+            # host-side for-loop, fused with the cum-scan/scale-encode prep.
             # Size block_tables off kv_lens_arr_host (already on CPU, same as the
             # trtllm-gen arm above) so plan() stays free of device round-trips;
             # ceil(kv_len / page_size) == pages per sequence since
@@ -2515,9 +2515,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 dtype=torch.int32,
                 device=self.device,
             )
-            fmhav2_seq_lens_q = torch.empty(
-                batch_size, dtype=torch.int32, device=self.device
-            )
 
             fmhav2_module = get_trtllm_fmhav2_prefill_module(
                 fmhav2_layout,
@@ -2526,35 +2523,32 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             self._cached_module = fmhav2_module
 
-            # Materialize kv_lens, seq_lens_q, block_tables on device.
-            # Write kv_lens directly into _kv_lens_buffer to avoid a redundant D2D copy.
+            # One fused prep launch: derives q/kv lens from the indptrs (the q
+            # lens feed the cum-scan in-register, no intermediate tensor),
+            # writes kv_lens straight into _kv_lens_buffer for run(), scatters
+            # the dense block_tables, zeroes the tile counter, and encodes the
+            # BMM scales.
             fmhav2_module.prepare_paged(
                 qo_indptr,
                 paged_kv_indptr,
                 paged_kv_last_page_len,
                 paged_kv_indices,
-                fmhav2_seq_lens_q,
                 self._kv_lens_buffer[:batch_size],
                 self._block_tables,
                 page_size,
-                batch_size,
                 max_num_blocks_per_seq,
-            )
-
-            _fmhav2_plan_prepare(
-                self,
-                fmhav2_module,
-                fmhav2_seq_lens_q,
-                self._kv_lens_buffer[:batch_size],
-                batch_size,
-                cc[0],
-                pos_encoding_mode,
-                logits_soft_cap,
-                sm_scale,
-                bmm1_scale,
-                bmm2_scale,
-                head_dim_qk,
-                q_data_type,
+                *_fmhav2_prep_args(
+                    self,
+                    batch_size,
+                    cc[0],
+                    pos_encoding_mode,
+                    logits_soft_cap,
+                    sm_scale,
+                    bmm1_scale,
+                    bmm2_scale,
+                    head_dim_qk,
+                    q_data_type,
+                ),
             )
 
         if self._cached_module is not None and self._backend not in (
@@ -3711,20 +3705,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._fmhav2_seq_lens_kv = fmhav2_seq_lens_kv
             self._fmhav2_batch_size = batch_size
 
-            _fmhav2_plan_prepare(
-                self,
-                fmhav2_module,
+            fmhav2_module.prepare(
                 fmhav2_seq_lens_q,
                 fmhav2_seq_lens_kv,
-                batch_size,
-                cc[0],
-                pos_encoding_mode,
-                logits_soft_cap,
-                sm_scale,
-                bmm1_scale,
-                bmm2_scale,
-                head_dim_qk,
-                q_data_type,
+                *_fmhav2_prep_args(
+                    self,
+                    batch_size,
+                    cc[0],
+                    pos_encoding_mode,
+                    logits_soft_cap,
+                    sm_scale,
+                    bmm1_scale,
+                    bmm2_scale,
+                    head_dim_qk,
+                    q_data_type,
+                ),
             )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -5194,11 +5189,8 @@ def _fmhav2_plan_gates(
     return cc
 
 
-def _fmhav2_plan_prepare(
+def _fmhav2_prep_args(
     wrapper,
-    module,
-    seq_lens_q: torch.Tensor,
-    seq_lens_kv: torch.Tensor,
     batch_size: int,
     cc_major: int,
     pos_encoding_mode: str,
@@ -5208,13 +5200,15 @@ def _fmhav2_plan_prepare(
     bmm2_scale: Optional[float],
     head_dim_qk: int,
     q_data_type: torch.dtype,
-) -> None:
+) -> tuple:
     """Shared tail of both trtllm-fmhav2 plan() arms.
 
     (Re)allocates the wrapper's prep-kernel device buffers, resolves and
-    encodes the BMM scales, and launches the fused prepare() kernel
-    (cum-seq-lens scan + tile-counter reset + scale encode). Stores the
-    resolved scales and ALIBI flag on the wrapper for run().
+    encodes the BMM scales, and stores the resolved scales and ALIBI flag on
+    the wrapper for run(). Returns the trailing arguments common to the
+    module's ``prepare()`` (ragged) and ``prepare_paged()`` (paged) entry
+    points — both instantiations of the same fused prep kernel — so each
+    plan() arm issues exactly one kernel launch.
     """
     device = wrapper.device
     if (
@@ -5261,10 +5255,7 @@ def _fmhav2_plan_prepare(
     else:
         scale_bmm2_dtype_code = _fmhav2_dtype_code(torch.float32)
 
-    # Scan into cum_seq_lens + encode scales
-    module.prepare(
-        seq_lens_q,
-        seq_lens_kv,
+    return (
         batch_size,
         scale_bmm1_dtype_code,
         scale_bmm2_dtype_code,

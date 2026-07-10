@@ -1455,9 +1455,9 @@ def test_batch_prefill_paged_trtllm_fmhav2_wrapper(
 ) -> None:
     """End-to-end test for ``BatchPrefillWithPagedKVCacheWrapper(backend='trtllm-fmhav2')``.
 
-    Drives the new ``prepare_paged`` + ``prepare`` device kernels through
-    ``wrapper.plan()`` (paged→dense block-table scatter, then cum-scan / tile
-    reset / scale encode) and the device-resident scale/tile-counter feed into
+    Drives the fused ``prepare_paged`` device kernel through ``wrapper.plan()``
+    (paged→dense block-table scatter + cum-scan / tile reset / scale encode in
+    one launch) and the device-resident scale/tile-counter feed into
     ``wrapper.run()``.
     """
     _skip_unless_trtllm_fmhav2_supported()
