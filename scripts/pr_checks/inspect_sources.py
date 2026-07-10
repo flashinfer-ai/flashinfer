@@ -93,10 +93,9 @@ def module_name(py_file: Path, pkg_root: Path) -> str:
 # as intentionally deprecated, alongside the AST-level ``@deprecated`` check.
 _DEPRECATED_DOCSTRING_RE = re.compile(
     r"(?:"
-    r"\.\.\s+deprecated::"  # Sphinx directive
-    r"|Deprecated\s*:\s*$"  # Google-style "Deprecated:"
-    r"|Deprecated\s*\n\s*[-=]{3,}"  # NumPy-style "Deprecated\n----"
-    r"|Deprecated\b"  # leading-line "Deprecated pointer-based ..."
+    r"^\s*\.\.\s+deprecated::"  # Sphinx directive at line start
+    r"|^\s*Deprecated\s*:"  # Google-style "Deprecated:" section
+    r"|^\s*Deprecated\s*\n\s*[-=]{3,}"  # NumPy-style "Deprecated\n----"
     r")",
     re.MULTILINE,
 )
@@ -107,9 +106,9 @@ def is_function_deprecated(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
 
     Matches either an ``@deprecated(...)``-flavoured decorator (suffix match,
     so ``typing.deprecated`` / ``warnings.deprecated`` / project-local
-    ``deprecated`` helpers all count) or a docstring that opens with a
-    Sphinx ``.. deprecated::`` directive, a Google ``Deprecated:`` section,
-    or a NumPy ``Deprecated\\n----`` block.
+    ``deprecated`` helpers all count) or a docstring that contains a
+    line-anchored Sphinx ``.. deprecated::`` directive, a Google
+    ``Deprecated:`` section, or a NumPy ``Deprecated\\n----`` block.
 
     Used by the API↔.rst checker to exempt deprecated-but-still-documented
     helpers from the STALE bucket: the .rst entry is a deliberate
@@ -120,7 +119,7 @@ def is_function_deprecated(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
         if name == "deprecated" or name.endswith(".deprecated"):
             return True
     doc = ast.get_docstring(fn)
-    if doc and _DEPRECATED_DOCSTRING_RE.match(doc.lstrip()):
+    if doc and _DEPRECATED_DOCSTRING_RE.search(doc):
         return True
     return False
 

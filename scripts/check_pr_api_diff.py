@@ -33,7 +33,9 @@ class ApiFunction:
 
 
 def git(*args: str) -> str:
-    return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL)
+    return subprocess.check_output(
+        ["git", *args], text=True, errors="replace", stderr=subprocess.DEVNULL
+    )
 
 
 def git_file(rev: str, path: str) -> str | None:
