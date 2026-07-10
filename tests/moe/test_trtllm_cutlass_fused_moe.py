@@ -2017,6 +2017,9 @@ def test_moe_w4a8(
     w31_weight_dequant = torch.stack(w31_weight_list, dim=0)  # [e, 2N, K]
     w2_weight_dequant = torch.stack(w2_weight_list, dim=0)  # [e, K, N]
 
+    fc1_input_scale_for_ref = torch.full_like(
+        input_scale.squeeze(-1), w3_w1_input_scale_max.item()
+    )
     ref_output = torch_moe_w4a8(
         num_experts,
         x,
@@ -2024,7 +2027,7 @@ def test_moe_w4a8(
         w2_weight_dequant,
         selected_experts,
         routing_weights,
-        fc1_input_scale=input_scale.squeeze(-1),
+        fc1_input_scale=fc1_input_scale_for_ref,
         fc2_input_scale=input_scale.squeeze(-1),
         fc1_pre_quant_scale=torch.max(w1_pre_quant_scale, w3_pre_quant_scale),
         fc2_pre_quant_scale=w2_pre_quant_scale,

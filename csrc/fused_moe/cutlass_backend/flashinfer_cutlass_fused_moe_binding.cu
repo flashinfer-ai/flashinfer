@@ -1540,6 +1540,10 @@ void interleave_moe_weights_for_sm90_mixed_gemm(TensorView weight, TensorView we
   int64_t const num_experts = weight.size(0);
   int64_t const n = weight.size(1);
   int64_t const k = weight.size(2) * 2;
+  TVM_FFI_ICHECK_EQ(n % 16, 0)
+      << "weight n dimension must be divisible by 16 for SM90 mixed-gemm interleave";
+  TVM_FFI_ICHECK_EQ(k % 64, 0)
+      << "logical K dimension must be divisible by 64 for SM90 mixed-gemm interleave";
   int64_t const per_expert_bytes = n * (k / 2);
 
   auto stream = get_stream(weight.device());
