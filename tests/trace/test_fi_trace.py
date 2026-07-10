@@ -18,7 +18,9 @@ limitations under the License.
 
 import json
 from contextlib import suppress
+from pathlib import Path
 
+import pytest
 import torch
 
 from flashinfer.fi_trace import fi_trace
@@ -285,6 +287,135 @@ def test_mm_bf16_fi_trace():
     assert defn["inputs"]["A"]["shape"] == ["M", "K"]
     assert defn["inputs"]["B"]["shape"] == ["K", "N"]
     assert defn["outputs"]["C"]["shape"] == ["M", "N"]
+
+
+# ---------------------------------------------------------------------------
+# quantization
+# ---------------------------------------------------------------------------
+
+
+def test_nvfp4_kv_dequantize_paged_fi_trace():
+    import flashinfer
+
+    batch_size = 2
+    max_seq_len = 7
+    num_pages = 8
+    page_size = 4
+    num_heads = 2
+    k_head_dim = 64
+    v_head_dim = 128
+
+    for kv_layout in ("NHD", "HND"):
+        if kv_layout == "NHD":
+            k_cache_shape = (num_pages, page_size, num_heads, k_head_dim // 2)
+            v_cache_shape = (num_pages, page_size, num_heads, v_head_dim // 2)
+            k_scale_shape = (num_pages, page_size, num_heads, k_head_dim // 16)
+            v_scale_shape = (num_pages, page_size, num_heads, v_head_dim // 16)
+            expected_cache_shape = [
+                "num_pages",
+                "page_size",
+                "num_heads",
+                "k_packed_dim",
+            ]
+            expected_name = "nvfp4_kv_dequantize_paged"
+            expected_init_name = "_nvfp4_kv_dequantize_paged_nhd_init"
+        else:
+            k_cache_shape = (num_pages, num_heads, page_size, k_head_dim // 2)
+            v_cache_shape = (num_pages, num_heads, page_size, v_head_dim // 2)
+            k_scale_shape = (num_pages, num_heads, page_size, k_head_dim // 16)
+            v_scale_shape = (num_pages, num_heads, page_size, v_head_dim // 16)
+            expected_cache_shape = [
+                "num_pages",
+                "num_heads",
+                "page_size",
+                "k_packed_dim",
+            ]
+            expected_name = "nvfp4_kv_dequantize_paged_hnd"
+            expected_init_name = "_nvfp4_kv_dequantize_paged_hnd_init"
+
+        k_cache = torch.empty(k_cache_shape, dtype=torch.uint8)
+        v_cache = torch.empty(v_cache_shape, dtype=torch.uint8)
+        k_scales = torch.empty(k_scale_shape, dtype=torch.uint8).view(
+            torch.float8_e4m3fn
+        )
+        v_scales = torch.empty(v_scale_shape, dtype=torch.uint8).view(
+            torch.float8_e4m3fn
+        )
+        block_tables = torch.zeros(batch_size, 2, dtype=torch.int32)
+        seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32)
+        k_scale = torch.ones(1, dtype=torch.float32)
+        v_scale = torch.ones(1, dtype=torch.float32)
+        output_k = torch.empty(
+            batch_size, max_seq_len, num_heads, k_head_dim, dtype=torch.bfloat16
+        )
+        output_v = torch.empty(
+            batch_size, max_seq_len, num_heads, v_head_dim, dtype=torch.bfloat16
+        )
+
+        defn = flashinfer.nvfp4_kv_dequantize_paged.fi_trace(
+            paged_kv_cache=(k_cache, v_cache),
+            kv_cache_sf=(k_scales, v_scales),
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            output_k=output_k,
+            output_v=output_v,
+            kv_layout=kv_layout,
+        )
+        _check_defn(defn, "dequantize_fp4", "nvfp4_kv_dequantize_paged")
+        assert defn["name"].startswith(expected_name)
+        axes = defn["axes"]
+        assert axes["num_heads"]["value"] == num_heads
+        assert axes["k_head_dim"]["value"] == k_head_dim
+        assert axes["v_head_dim"]["value"] == v_head_dim
+        assert axes["page_size"]["value"] == page_size
+        assert axes["batch_size"]["type"] == "var"
+
+        assert defn["inputs"]["paged_k_cache"]["shape"] == expected_cache_shape
+        assert defn["outputs"]["output_k"]["dtype"] == "bfloat16"
+        assert "block_table_stride * page_size >= max_seq_len" in defn["constraints"]
+        assert "init" in defn
+
+        init_namespace = {}
+        exec(defn["init"], init_namespace)
+        dumped_init = init_namespace[expected_init_name]
+        dumped_init_inputs = dumped_init(
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            num_heads=num_heads,
+            k_head_dim=k_head_dim,
+            v_head_dim=v_head_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            device="cpu",
+        )
+        dumped_init_k_cache, dumped_init_v_cache = dumped_init_inputs["paged_kv_cache"]
+        dumped_init_k_scales, dumped_init_v_scales = dumped_init_inputs["kv_cache_sf"]
+        assert dumped_init_inputs["kv_layout"] == kv_layout
+        assert dumped_init_k_cache.shape == k_cache_shape
+        assert dumped_init_v_cache.shape == v_cache_shape
+        assert dumped_init_k_scales.shape == k_scale_shape
+        assert dumped_init_v_scales.shape == v_scale_shape
+
+        init_inputs = flashinfer.nvfp4_kv_dequantize_paged.fi_init(
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            num_heads=num_heads,
+            k_head_dim=k_head_dim,
+            v_head_dim=v_head_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            kv_layout=kv_layout,
+            device="cpu",
+        )
+        init_k_cache, init_v_cache = init_inputs["paged_kv_cache"]
+        init_k_scales, init_v_scales = init_inputs["kv_cache_sf"]
+        assert init_inputs["kv_layout"] == kv_layout
+        assert init_k_cache.shape == k_cache_shape
+        assert init_v_cache.shape == v_cache_shape
+        assert init_k_scales.shape == k_scale_shape
+        assert init_v_scales.shape == v_scale_shape
 
 
 # ---------------------------------------------------------------------------
@@ -779,3 +910,30 @@ def test_fi_trace_filename_matches_definition_name(tmp_path):
     expected_file = tmp_path / f"{expected_name}.json"
     assert expected_file.exists()
     assert json.loads(expected_file.read_text())["name"] == expected_name
+
+
+def test_nvfp4_append_trace_json_init_is_self_contained():
+    trace_dir = Path(__file__).parent / "fi_trace_out"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cases = [
+        (
+            "nvfp4_quantize_append_paged_kv_cache_kv2_d64_pd32_sd4_ps4.json",
+            "_nvfp4_quantize_append_paged_kv_cache_init",
+        ),
+        (
+            "nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kv2_d64_pd32_sd4_ps4.json",
+            "_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init",
+        ),
+    ]
+    for filename, init_name in cases:
+        source = json.loads((trace_dir / filename).read_text())["init"]
+        namespace = {}
+        exec(source, namespace)
+        assert init_name in namespace
+        try:
+            result = namespace[init_name](nnz_kv=1, device=device)
+        except (RuntimeError, NotImplementedError, ValueError, ImportError) as exc:
+            if device == "cpu":
+                pytest.skip(f"{filename} init unsupported on CPU: {exc}")
+            raise
+        assert isinstance(result, dict)

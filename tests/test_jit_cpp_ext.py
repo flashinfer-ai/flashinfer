@@ -1,6 +1,18 @@
 import subprocess
+from types import SimpleNamespace
 
+import pytest
+import torch
+
+import flashinfer
 from flashinfer.jit import core, cpp_ext
+from flashinfer.jit.attention import modules as attention_modules
+from flashinfer.utils import (
+    PosEncodingMode,
+    determine_attention_backend,
+    is_fa3_prefill_head_dim_supported,
+)
+from tests.test_helpers import jit_utils
 
 
 def test_nvcc_parallelism_flags_use_flashinfer_nvcc_threads(monkeypatch):
@@ -136,3 +148,141 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
     spec.build(verbose=False, need_lock=False)
 
     assert writes == [True]
+
+
+def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(
+        attention_modules.current_compilation_context, "TARGET_CUDA_ARCHS", {(8, 6)}
+    )
+    monkeypatch.setattr(
+        attention_modules.jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path / "gen"
+    )
+
+    spec = attention_modules.gen_customize_batch_prefill_module(
+        "fa2",
+        "test_batch_prefill_nvfp4_large_head",
+        torch.float16,
+        torch.uint8,
+        torch.float16,
+        torch.int32,
+        512,
+        512,
+        [],
+        [],
+        ["sm_scale"],
+        ["double"],
+        "DefaultAttention<false, false, false, false>",
+        "#include <flashinfer/attention/variants.cuh>",
+    )
+
+    assert any("sm_86" in flag for flag in spec.extra_cuda_cflags)
+    with pytest.raises(RuntimeError, match="No supported CUDA architectures"):
+        attention_modules._fa2_head_dim_nvcc_flags(512, 512, torch.uint8)
+
+
+@pytest.mark.parametrize(
+    ("head_dim_qk", "head_dim_vo", "supported"),
+    [
+        (64, 64, True),
+        (128, 128, True),
+        (256, 256, True),
+        (192, 128, True),
+        (512, 512, False),
+        (256, 128, False),
+        (128, 192, False),
+    ],
+)
+def test_fa3_prefill_head_dim_supported(head_dim_qk, head_dim_vo, supported):
+    assert is_fa3_prefill_head_dim_supported(head_dim_qk, head_dim_vo) is supported
+
+
+@pytest.mark.parametrize(
+    ("head_dim_qk", "head_dim_vo", "expected_backend"),
+    [
+        (256, 256, "fa3"),
+        (192, 128, "fa3"),
+        (512, 512, "fa2"),
+    ],
+)
+def test_determine_attention_backend_respects_fa3_prefill_head_dim(
+    monkeypatch, head_dim_qk, head_dim_vo, expected_backend
+):
+    monkeypatch.setattr(flashinfer.utils, "is_sm90a_supported", lambda device: True)
+
+    backend = determine_attention_backend(
+        torch.device("cuda"),
+        PosEncodingMode.NONE.value,
+        use_fp16_qk_reductions=False,
+        use_custom_mask=False,
+        dtype_q=torch.float16,
+        dtype_kv=torch.float16,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+    )
+
+    assert backend == expected_backend
+
+
+def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
+    calls = []
+
+    def fake_single_prefill_module(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim_qk,
+        head_dim_vo,
+        *_args,
+    ):
+        calls.append(("single", backend, head_dim_qk, head_dim_vo))
+        return SimpleNamespace(name=f"{backend}_single_{head_dim_qk}_{head_dim_vo}")
+
+    def fake_batch_prefill_module(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        *_args,
+    ):
+        calls.append(("batch", backend, head_dim_qk, head_dim_vo))
+        return SimpleNamespace(name=f"{backend}_batch_{head_dim_qk}_{head_dim_vo}")
+
+    monkeypatch.setattr(jit_utils, "is_sm90a_supported", lambda device: True)
+    monkeypatch.setattr(
+        flashinfer.prefill, "gen_single_prefill_module", fake_single_prefill_module
+    )
+    monkeypatch.setattr(
+        flashinfer.prefill, "gen_batch_prefill_module", fake_batch_prefill_module
+    )
+    monkeypatch.setattr(
+        flashinfer.quantization,
+        "gen_quantization_module",
+        lambda: SimpleNamespace(name="quantization"),
+    )
+    monkeypatch.setattr(
+        flashinfer.page,
+        "gen_page_module",
+        lambda: SimpleNamespace(name="page"),
+    )
+
+    jit_utils.gen_prefill_attention_modules(
+        q_dtypes=[torch.float16],
+        kv_dtypes=[torch.float16],
+        head_dims=[512],
+        pos_encoding_modes=[PosEncodingMode.NONE.value],
+        use_sliding_window_options=[False],
+        use_logits_soft_cap_options=[False],
+        use_fp16_qk_reduction_options=[False],
+    )
+
+    assert ("single", "fa3", 512, 512) not in calls
+    assert ("batch", "fa3", 512, 512) not in calls
+    assert ("single", "fa2", 512, 512) in calls
+    assert ("batch", "fa2", 512, 512) in calls

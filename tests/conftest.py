@@ -156,11 +156,20 @@ def pytest_configure(config):
         for fn in TORCH_COMPILE_FNS:
             _monkeypatch_add_torch_compile(fn)
     # moe_ep markers (Part B of the EP API design integration).
-    config.addinivalue_line("markers", "nvep: requires BUILD_NVEP=1 install")
+    config.addinivalue_line(
+        "markers", "nvep: requires a moe_ep-enabled install (default)"
+    )
     config.addinivalue_line("markers", "gpu_2: requires >=2 GPUs")
     config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")
     config.addinivalue_line("markers", "arch_blackwell: requires sm_100 or sm_103")
+    config.addinivalue_line(
+        "markers",
+        "long_running: front-load this test file at the start of the parallel CI queue",
+    )
+    config.addinivalue_line(
+        "markers", "solo: run this whole test file alone (memory-heavy)"
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -184,7 +193,8 @@ def pytest_collection_modifyitems(config, items):
         if "nvep" in item.keywords and not nvep_built:
             item.add_marker(
                 pytest.mark.skip(
-                    reason="needs BUILD_NCCL_EP=1 / BUILD_NIXL_EP=1 install"
+                    reason="no moe_ep backend built (EP builds by default; "
+                    "check install log for skipped-backend warnings)"
                 )
             )
         for mk, req in (("gpu_2", 2), ("gpu_4", 4), ("gpu_8", 8)):

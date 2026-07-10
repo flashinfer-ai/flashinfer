@@ -17,7 +17,8 @@ compilation via :func:`functools.cache` keyed on the static configuration.
 """
 
 import functools
-from typing import Literal, Optional, Tuple, cast
+import warnings
+from typing import Any, Literal, Optional, Tuple, cast
 
 import torch
 
@@ -28,6 +29,7 @@ from cutlass.cute.typing import Float32, Int32
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.cute_dsl.utils import get_num_sm
 
+from ..fusion.mask import AttentionMask, DenseMask, CausalMask, SlidingWindowMask
 from ..gqa_decode import GroupedQueryAttentionDecode
 from ..gqa_decode_paged import GroupedQueryAttentionDecodePaged
 
@@ -43,6 +45,133 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e5m2: cutlass.Float8E5M2,
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
 }
+
+_RAGGED_DECODE_PLAN_LEGACY_POS_ARGS = (
+    "q_data_type",
+    "kv_data_type",
+    "o_data_type",
+    "sm_scale",
+    "kv_splits",
+    "reduction",
+    "q_len_per_req",
+    "is_causal",
+)
+
+_RAGGED_DECODE_RUN_LEGACY_POS_ARGS = (
+    "out",
+    "sm_scale",
+    "o_scale",
+    "lse",
+    "enable_pdl",
+)
+
+_PAGED_DECODE_PLAN_LEGACY_POS_ARGS = (
+    "q_data_type",
+    "kv_data_type",
+    "o_data_type",
+    "sm_scale",
+    "kv_splits",
+    "reduction",
+    "q_len_per_req",
+    "is_causal",
+    "max_kv_len",
+    "non_blocking",
+    "precompile_skip_softmax_kernel",
+)
+
+_PAGED_DECODE_RUN_LEGACY_POS_ARGS = (
+    "out",
+    "sm_scale",
+    "o_scale",
+    "skip_softmax_threshold_scale_factor",
+    "lse",
+    "enable_pdl",
+)
+
+
+def _merge_deprecated_kwargs(
+    api_name: str,
+    method_name: str,
+    deprecated_positional_args: Tuple[Any, ...],
+    legacy_positional_names: Tuple[str, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    if len(deprecated_positional_args) > len(legacy_positional_names):
+        raise TypeError(
+            f"{api_name}.{method_name}() accepts at most "
+            f"{len(legacy_positional_names)} deprecated optional positional "
+            "arguments after the required arguments; got "
+            f"{len(deprecated_positional_args)}"
+        )
+
+    merged_kwargs = dict(kwargs)
+    for name, value in zip(
+        legacy_positional_names, deprecated_positional_args, strict=False
+    ):
+        if name in merged_kwargs:
+            raise TypeError(
+                f"{api_name}.{method_name}() got multiple values for argument {name!r}"
+            )
+        merged_kwargs[name] = value
+    return merged_kwargs
+
+
+def _merge_deprecated_plan_kwargs(
+    api_name: str,
+    deprecated_positional_args: Tuple[Any, ...],
+    legacy_positional_names: Tuple[str, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    return _merge_deprecated_kwargs(
+        api_name,
+        "plan",
+        deprecated_positional_args,
+        legacy_positional_names,
+        kwargs,
+    )
+
+
+def _merge_deprecated_run_kwargs(
+    api_name: str,
+    deprecated_positional_args: Tuple[Any, ...],
+    legacy_positional_names: Tuple[str, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    return _merge_deprecated_kwargs(
+        api_name,
+        "run",
+        deprecated_positional_args,
+        legacy_positional_names,
+        kwargs,
+    )
+
+
+def _warn_deprecated_positional_args(api_name: str, method_name: str) -> None:
+    warnings.warn(
+        f"Passing optional arguments to {api_name}.{method_name}() positionally is "
+        "deprecated; pass them as keyword arguments instead. Scheduled for "
+        "removal in a future release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+def _warn_deprecated_plan_positional_args(api_name: str) -> None:
+    _warn_deprecated_positional_args(api_name, "plan")
+
+
+def _warn_deprecated_run_positional_args(api_name: str) -> None:
+    _warn_deprecated_positional_args(api_name, "run")
+
+
+def _warn_deprecated_is_causal(api_name: str) -> None:
+    warnings.warn(
+        f"Passing `is_causal` to {api_name}.plan() is deprecated; use "
+        "`window_left` and `window_right` instead. Scheduled for removal in "
+        "a future release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
 
 
 def _torch_to_cutlass(dtype: torch.dtype) -> "cutlass.dtype":
@@ -126,6 +255,21 @@ def _resolve_reduction(reduction: str, kv_splits: int, o_dtype: "cutlass.dtype")
     return "kernel"
 
 
+def _get_mask_config(
+    window_left: Optional[int],
+    window_right: Optional[int],
+) -> AttentionMask:
+    if window_left is None and window_right is None:
+        return DenseMask()
+    elif window_left is None and window_right == 0:
+        return CausalMask()
+    else:
+        # Runtime sliding window for int types
+        window_left_ = Int32(window_left) if window_left is not None else None
+        window_right_ = Int32(window_right) if window_right is not None else None
+        return SlidingWindowMask(window_left_, window_right_)
+
+
 def _slice_workspace(
     workspace: torch.Tensor,
     kv_splits: int,
@@ -187,8 +331,10 @@ def _get_compiled_decode_kernel(
     head_dim: int,
     prediction: int,
     reduction: str,
-    tma_mask: bool,
+    window_left: Optional[int],
+    window_right: Optional[int],
     use_lse: bool,
+    use_sink: bool,
 ):
     """Compile and cache the ragged (contiguous-KV) GQA decode kernel."""
     grouped_head_tile, prediction_tile = _pick_tile_shape(
@@ -206,8 +352,8 @@ def _get_compiled_decode_kernel(
         prediction_tile=prediction_tile,
         sequence_tile=sequence_tile,
         reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
-        tma_mask=tma_mask,
     )
+    mask_config = _get_mask_config(window_left, window_right)
     has_workspace = reduction == "kernel"
     acc_dtype = cutlass.Float32
 
@@ -285,6 +431,12 @@ def _get_compiled_decode_kernel(
             assumed_align=16,
         )
 
+    sink_fake = None
+    if use_sink:
+        sink_fake = cute.runtime.make_fake_compact_tensor(
+            acc_dtype, (num_qo_heads,), assumed_align=16
+        )
+
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     return cute.compile(
@@ -299,6 +451,8 @@ def _get_compiled_decode_kernel(
         o_partial_fake,
         l_partial_fake,
         m_partial_fake,
+        sink_fake,
+        mask_config,
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
         stream_fake,
@@ -317,9 +471,11 @@ def _get_compiled_paged_decode_kernel(
     head_dim: int,
     prediction: int,
     reduction: str,
-    tma_mask: bool,
+    window_left: Optional[int],
+    window_right: Optional[int],
     use_threshold: bool,
     use_lse: bool,
+    use_sink: bool,
 ):
     """Compile and cache the paged GQA decode kernel."""
     grouped_head_tile, prediction_tile = _pick_tile_shape(
@@ -350,8 +506,8 @@ def _get_compiled_paged_decode_kernel(
         sequence_tile=sequence_tile,
         reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
         softmax_warpgroups=softmax_warpgroups,
-        tma_mask=tma_mask,
     )
+    mask_config = _get_mask_config(window_left, window_right)
     has_workspace = reduction == "kernel"
     acc_dtype = cutlass.Float32
 
@@ -443,6 +599,12 @@ def _get_compiled_paged_decode_kernel(
             assumed_align=16,
         )
 
+    sink_fake = None
+    if use_sink:
+        sink_fake = cute.runtime.make_fake_compact_tensor(
+            acc_dtype, (num_qo_heads,), assumed_align=16
+        )
+
     threshold_p_fake = Float32(0.0) if use_threshold else None
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -461,6 +623,8 @@ def _get_compiled_paged_decode_kernel(
         o_partial_fake,
         l_partial_fake,
         m_partial_fake,
+        sink_fake,
+        mask_config,
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
         threshold_p_fake,
@@ -520,14 +684,8 @@ class BatchDecodeCuteDSLWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
-        q_data_type: torch.dtype = torch.bfloat16,
-        kv_data_type: Optional[torch.dtype] = None,
-        o_data_type: Optional[torch.dtype] = None,
-        sm_scale: Optional[float] = None,
-        kv_splits: Optional[int] = None,
-        reduction: str = "auto",
-        q_len_per_req: int = 1,
-        is_causal: bool = True,
+        *deprecated_positional_args: Any,
+        **kwargs: Any,
     ) -> None:
         """Compile the ragged-KV decode kernel for the planned configuration.
 
@@ -554,16 +712,90 @@ class BatchDecodeCuteDSLWrapper:
             ``"none"`` skips flash-decoding entirely (no reduction kernel,
             no cluster atomics) and requires ``kv_splits == 1``. Atomic
             reduction is faster than kernel reduction but requires kv_splits
-            ∈ {1, 2, 4, 8, 16} and an output dtype in {float32, float16,
+            in {1, 2, 4, 8, 16} and an output dtype in {float32, float16,
             bfloat16}. ``"auto"`` picks ``"none"`` when kv_splits == 1,
             ``"atomic"`` for compatible dtypes and small kv_splits, else
             ``"kernel"``.
         q_len_per_req : int
             Predicted tokens per request (1 for plain decode, >1 for
             speculative decode).
-        is_causal : bool
-            Causal masking for speculative decode.
+        window_left : int
+            Sliding-window left bound. ``None`` disables left bound.
+        window_right : int
+            Sliding-window right bound. ``None`` disables right bound.
+
+        Note
+        ----
+        Optional arguments after ``head_dim`` are accepted positionally for
+        backward compatibility, but that calling convention is deprecated and
+        scheduled for removal in a future release. Pass them by keyword instead.
+        ``window_left`` and ``window_right`` are keyword-only. The legacy
+        ``is_causal`` argument is deprecated; use ``window_left`` and
+        ``window_right`` instead.
         """
+        if not deprecated_positional_args and "is_causal" not in kwargs:
+            return self._plan_impl(
+                batch_size,
+                max_kv_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                **kwargs,
+            )
+
+        plan_kwargs = _merge_deprecated_plan_kwargs(
+            "BatchDecodeCuteDSLWrapper",
+            deprecated_positional_args,
+            _RAGGED_DECODE_PLAN_LEGACY_POS_ARGS,
+            kwargs,
+        )
+        is_causal_was_provided = "is_causal" in plan_kwargs
+        if is_causal_was_provided:
+            window_args = sorted(
+                {"window_left", "window_right"}.intersection(plan_kwargs)
+            )
+            if window_args:
+                raise TypeError(
+                    "BatchDecodeCuteDSLWrapper.plan() got deprecated `is_causal` "
+                    "together with explicit window arguments "
+                    f"{window_args!r}; use `window_left` and `window_right` only"
+                )
+            is_causal = plan_kwargs.pop("is_causal")
+            plan_kwargs["window_left"] = None
+            plan_kwargs["window_right"] = 0 if is_causal else None
+
+        if deprecated_positional_args:
+            _warn_deprecated_plan_positional_args("BatchDecodeCuteDSLWrapper")
+        if is_causal_was_provided:
+            _warn_deprecated_is_causal("BatchDecodeCuteDSLWrapper")
+
+        return self._plan_impl(
+            batch_size,
+            max_kv_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            **plan_kwargs,
+        )
+
+    def _plan_impl(
+        self,
+        batch_size: int,
+        max_kv_len: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        *,
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: Optional[torch.dtype] = None,
+        o_data_type: Optional[torch.dtype] = None,
+        sm_scale: Optional[float] = None,
+        kv_splits: Optional[int] = None,
+        reduction: str = "auto",
+        q_len_per_req: int = 1,
+        window_left: Optional[int] = None,
+        window_right: Optional[int] = 0,
+    ) -> None:
         if kv_data_type is not None and kv_data_type != q_data_type:
             raise NotImplementedError(
                 "cute-dsl decode requires kv_data_type == q_data_type"
@@ -625,7 +857,7 @@ class BatchDecodeCuteDSLWrapper:
         # write to o_bshd directly (atomic via atomic_add, none via direct
         # store).
         self._has_workspace = reduction == "kernel"
-        self._tma_mask = not is_causal
+        self._mask_config = _get_mask_config(window_left, window_right)
         if sm_scale is None:
             sm_scale = head_dim**-0.5
         self._sm_scale = sm_scale
@@ -645,8 +877,8 @@ class BatchDecodeCuteDSLWrapper:
             self._l_partial = l_partial
             self._m_partial = m_partial
 
-        # Always compile the no-LSE variant at plan() time; the LSE variant
-        # is lazily fetched at run() time when needed (compile cache hit).
+        # Always compile the no-LSE/no-sink variant at plan() time; optional
+        # feature variants are lazily fetched at run() time when needed.
         self._compile_args = (
             in_dtype,
             out_dtype,
@@ -655,10 +887,11 @@ class BatchDecodeCuteDSLWrapper:
             head_dim,
             q_len_per_req,
             reduction,
-            self._tma_mask,
+            window_left,
+            window_right,
         )
         self._compiled_fmha_std = _get_compiled_decode_kernel(
-            *self._compile_args, False
+            *self._compile_args, False, False
         )
         self._planned = True
 
@@ -668,11 +901,8 @@ class BatchDecodeCuteDSLWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        sm_scale: Optional[float] = None,
-        o_scale: Optional[float] = None,
-        lse: Optional[torch.Tensor] = None,
-        enable_pdl: bool = True,
+        *deprecated_positional_args: Any,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Run ragged-KV GQA decode.
 
@@ -695,6 +925,11 @@ class BatchDecodeCuteDSLWrapper:
             Output scale applied to the final O before it is written. The
             cute-dsl kernel folds this in for free in the reduction
             epilogue (no separate post-kernel multiply). Defaults to 1.0.
+        sinks : Optional[torch.Tensor]
+            Contiguous float32 per-head attention sink logits on the query
+            device, shape ``(num_qo_heads,)``. When provided, the sink logit
+            is included in the softmax denominator and receives no output
+            value contribution.
         lse : Optional[torch.Tensor]
             Pre-allocated float32 buffer of shape
             ``(batch_size, q_len_per_req, num_qo_heads)`` to receive the
@@ -707,7 +942,39 @@ class BatchDecodeCuteDSLWrapper:
             Default ``True``. Set to ``False`` to disable PDL when the
             target device does not support it. See
             https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+
+        Note
+        ----
+        Optional arguments after ``v`` are accepted positionally for backward
+        compatibility, but that calling convention is deprecated and scheduled
+        for removal in a future release. Pass them by keyword instead.
+        ``sinks`` is keyword-only.
         """
+        if not deprecated_positional_args:
+            return self._run_impl(q, k, v, **kwargs)
+
+        run_kwargs = _merge_deprecated_run_kwargs(
+            "BatchDecodeCuteDSLWrapper",
+            deprecated_positional_args,
+            _RAGGED_DECODE_RUN_LEGACY_POS_ARGS,
+            kwargs,
+        )
+        _warn_deprecated_run_positional_args("BatchDecodeCuteDSLWrapper")
+        return self._run_impl(q, k, v, **run_kwargs)
+
+    def _run_impl(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        sm_scale: Optional[float] = None,
+        o_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+        enable_pdl: bool = True,
+    ) -> torch.Tensor:
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
         if (
@@ -776,6 +1043,7 @@ class BatchDecodeCuteDSLWrapper:
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
         use_lse = lse is not None
+        use_sink = sinks is not None
         if use_lse:
             if lse.dtype != torch.float32:
                 raise ValueError(
@@ -787,11 +1055,28 @@ class BatchDecodeCuteDSLWrapper:
                     f"lse shape {tuple(lse.shape)} must equal {expected_lse_shape}"
                 )
 
-        fmha = (
-            self._compiled_fmha_std
-            if not use_lse
-            else _get_compiled_decode_kernel(*self._compile_args, True)
-        )
+        if use_sink:
+            if sinks.ndim != 1 or sinks.shape[0] != self._num_qo_heads:
+                raise ValueError(
+                    f"sinks tensor must have shape (num_qo_heads,) = "
+                    f"({self._num_qo_heads},), got shape {tuple(sinks.shape)}"
+                )
+            if sinks.dtype != torch.float32:
+                raise ValueError(f"sinks must be float32, got {sinks.dtype}")
+            if sinks.device != device:
+                raise ValueError(
+                    f"sinks must be on device {device}, got {sinks.device}"
+                )
+            if not sinks.is_contiguous():
+                raise ValueError(
+                    f"sinks tensor must be contiguous, got strides {sinks.stride()} "
+                    f"for shape {sinks.shape}"
+                )
+
+        if use_lse or use_sink:
+            fmha = _get_compiled_decode_kernel(*self._compile_args, use_lse, use_sink)
+        else:
+            fmha = self._compiled_fmha_std
 
         scale_o = 1.0 if o_scale is None else o_scale
         # Stream is bound from the TVM-FFI env stream at runtime
@@ -807,6 +1092,8 @@ class BatchDecodeCuteDSLWrapper:
             o_partial,
             l_partial,
             m_partial,
+            sinks,
+            self._mask_config,
             Float32(scale_s),
             Float32(scale_o),
             enable_pdl,
@@ -861,17 +1148,8 @@ class BatchDecodePagedCuteDSLWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
-        q_data_type: torch.dtype = torch.bfloat16,
-        kv_data_type: Optional[torch.dtype] = None,
-        o_data_type: Optional[torch.dtype] = None,
-        sm_scale: Optional[float] = None,
-        kv_splits: Optional[int] = None,
-        reduction: str = "auto",
-        q_len_per_req: int = 1,
-        is_causal: bool = True,
-        max_kv_len: Optional[int] = None,
-        non_blocking: bool = True,
-        precompile_skip_softmax_kernel: bool = False,
+        *deprecated_positional_args: Any,
+        **kwargs: Any,
     ) -> None:
         """Plan paged GQA decode for the given problem.
 
@@ -903,18 +1181,102 @@ class BatchDecodePagedCuteDSLWrapper:
             for compatible dtypes, else kernel).
         q_len_per_req : int
             Predicted tokens per request (1 for plain decode).
-        is_causal : bool
-            Causal masking for speculative decode.
+        window_left : int
+            Sliding-window left bound. ``None`` disables left bound.
+        window_right : int
+            Sliding-window right bound. ``None`` disables the right bound.
+            Defaults to ``0``.
         max_kv_len : Optional[int]
             Maximum KV sequence length across the batch.  Used to auto-tune
-            ``kv_splits``; pass it explicitly to avoid a GPU→CPU sync.
+            ``kv_splits``; pass it explicitly to avoid a GPU->CPU sync.
         non_blocking : bool
             Async device copies for the plan-time integer buffers.
         precompile_skip_softmax_kernel : bool
             If True, also compile the BLASST skip-softmax variant of the
             kernel at plan() time, so the first :meth:`run` call that
             passes ``skip_softmax_threshold_scale_factor`` is fast.
+
+        Note
+        ----
+        Optional arguments after ``page_size`` are accepted positionally for
+        backward compatibility, but that calling convention is deprecated and
+        scheduled for removal in a future release. Pass them by keyword instead.
+        ``window_left`` and ``window_right`` are keyword-only. The legacy
+        ``is_causal`` argument is deprecated; use ``window_left`` and
+        ``window_right`` instead.
         """
+        if not deprecated_positional_args and "is_causal" not in kwargs:
+            return self._plan_impl(
+                indptr,
+                indices,
+                seq_lens,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                **kwargs,
+            )
+
+        plan_kwargs = _merge_deprecated_plan_kwargs(
+            "BatchDecodePagedCuteDSLWrapper",
+            deprecated_positional_args,
+            _PAGED_DECODE_PLAN_LEGACY_POS_ARGS,
+            kwargs,
+        )
+        is_causal_was_provided = "is_causal" in plan_kwargs
+        if is_causal_was_provided:
+            window_args = sorted(
+                {"window_left", "window_right"}.intersection(plan_kwargs)
+            )
+            if window_args:
+                raise TypeError(
+                    "BatchDecodePagedCuteDSLWrapper.plan() got deprecated "
+                    "`is_causal` together with explicit window arguments "
+                    f"{window_args!r}; use `window_left` and `window_right` only"
+                )
+            is_causal = plan_kwargs.pop("is_causal")
+            plan_kwargs["window_left"] = None
+            plan_kwargs["window_right"] = 0 if is_causal else None
+
+        if deprecated_positional_args:
+            _warn_deprecated_plan_positional_args("BatchDecodePagedCuteDSLWrapper")
+        if is_causal_was_provided:
+            _warn_deprecated_is_causal("BatchDecodePagedCuteDSLWrapper")
+
+        return self._plan_impl(
+            indptr,
+            indices,
+            seq_lens,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            **plan_kwargs,
+        )
+
+    def _plan_impl(
+        self,
+        indptr: torch.Tensor,
+        indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        *,
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: Optional[torch.dtype] = None,
+        o_data_type: Optional[torch.dtype] = None,
+        sm_scale: Optional[float] = None,
+        kv_splits: Optional[int] = None,
+        reduction: str = "auto",
+        q_len_per_req: int = 1,
+        window_left: Optional[int] = None,
+        window_right: Optional[int] = 0,
+        max_kv_len: Optional[int] = None,
+        non_blocking: bool = True,
+        precompile_skip_softmax_kernel: bool = False,
+    ) -> None:
         if page_size not in (8, 16, 32, 64):
             raise ValueError(
                 f"cute-dsl paged decode supports page_size ∈ {{8,16,32,64}}, got {page_size}"
@@ -1003,7 +1365,7 @@ class BatchDecodePagedCuteDSLWrapper:
         # Only kernel-reduction uses workspace tensors; atomic and none
         # write to o_bshd directly.
         self._has_workspace = reduction == "kernel"
-        self._tma_mask = not is_causal
+        self._mask_config = _get_mask_config(window_left, window_right)
         if sm_scale is None:
             sm_scale = head_dim**-0.5
         self._sm_scale = sm_scale
@@ -1039,17 +1401,18 @@ class BatchDecodePagedCuteDSLWrapper:
             head_dim,
             q_len_per_req,
             reduction,
-            self._tma_mask,
+            window_left,
+            window_right,
         )
         # Standard (no-BLASST, no-LSE) variant — always compiled at plan().
         # BLASST and LSE variants compile lazily on first use via the cache.
         self._compiled_fmha_std = _get_compiled_paged_decode_kernel(
-            *self._compile_args, False, False
+            *self._compile_args, False, False, False
         )
         if precompile_skip_softmax_kernel:
             # Warm the cache so the BLASST variant is ready for the first
             # run() that uses skip_softmax_threshold.
-            _get_compiled_paged_decode_kernel(*self._compile_args, True, False)
+            _get_compiled_paged_decode_kernel(*self._compile_args, True, False, False)
         self._planned = True
 
     @flashinfer_api
@@ -1058,12 +1421,8 @@ class BatchDecodePagedCuteDSLWrapper:
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        sm_scale: Optional[float] = None,
-        o_scale: Optional[float] = None,
-        skip_softmax_threshold_scale_factor: Optional[float] = None,
-        lse: Optional[torch.Tensor] = None,
-        enable_pdl: bool = True,
+        *deprecated_positional_args: Any,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Run paged GQA decode.
 
@@ -1089,6 +1448,11 @@ class BatchDecodePagedCuteDSLWrapper:
             Output scale applied to the final O before it is written. The
             cute-dsl kernel folds this in for free in the reduction
             epilogue (no separate post-kernel multiply). Defaults to 1.0.
+        sinks : Optional[torch.Tensor]
+            Contiguous float32 per-head attention sink logits on the query
+            device, shape ``(num_qo_heads,)``. When provided, the sink logit
+            is included in the softmax denominator and receives no output
+            value contribution.
         skip_softmax_threshold_scale_factor : Optional[float]
             BLASST skip-softmax scale factor. The kernel divides this by
             each batch's KV seqlen to obtain the per-request effective
@@ -1109,7 +1473,40 @@ class BatchDecodePagedCuteDSLWrapper:
             Default ``True``. Set to ``False`` to disable PDL when the
             target device does not support it. See
             https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+
+        Note
+        ----
+        Optional arguments after ``v_cache`` are accepted positionally for
+        backward compatibility, but that calling convention is deprecated and
+        scheduled for removal in a future release. Pass them by keyword instead.
+        ``sinks`` is keyword-only.
         """
+        if not deprecated_positional_args:
+            return self._run_impl(q, k_cache, v_cache, **kwargs)
+
+        run_kwargs = _merge_deprecated_run_kwargs(
+            "BatchDecodePagedCuteDSLWrapper",
+            deprecated_positional_args,
+            _PAGED_DECODE_RUN_LEGACY_POS_ARGS,
+            kwargs,
+        )
+        _warn_deprecated_run_positional_args("BatchDecodePagedCuteDSLWrapper")
+        return self._run_impl(q, k_cache, v_cache, **run_kwargs)
+
+    def _run_impl(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        sm_scale: Optional[float] = None,
+        o_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        lse: Optional[torch.Tensor] = None,
+        enable_pdl: bool = True,
+    ) -> torch.Tensor:
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
         if q.dtype != self._q_data_type:
@@ -1221,6 +1618,7 @@ class BatchDecodePagedCuteDSLWrapper:
         scale_s = self._sm_scale if sm_scale is None else sm_scale
         use_threshold = skip_softmax_threshold_scale_factor is not None
         use_lse = lse is not None
+        use_sink = sinks is not None
         if use_threshold:
             if not skip_softmax_threshold_scale_factor > 0:
                 raise ValueError(
@@ -1252,11 +1650,30 @@ class BatchDecodePagedCuteDSLWrapper:
         else:
             l_view = None
 
-        # Pick the variant matching this (use_threshold, use_lse) — std is
-        # always already compiled; the other three are lazy.
-        if use_threshold or use_lse:
+        if use_sink:
+            if sinks.ndim != 1 or sinks.shape[0] != self._num_qo_heads:
+                raise ValueError(
+                    f"sinks tensor must have shape (num_qo_heads,) = "
+                    f"({self._num_qo_heads},), got shape {tuple(sinks.shape)}"
+                )
+            if sinks.dtype != torch.float32:
+                raise ValueError(f"sinks must be float32, got {sinks.dtype}")
+            if sinks.device != device:
+                raise ValueError(
+                    f"sinks must be on device {device}, got {sinks.device}"
+                )
+            if not sinks.is_contiguous():
+                raise ValueError(
+                    f"sinks tensor must be contiguous, got strides {sinks.stride()} "
+                    f"for shape {sinks.shape}"
+                )
+
+        # Pick the variant matching this optional-feature set. The standard
+        # no-threshold/no-LSE/no-sink path is always already compiled; the
+        # other combinations are lazy.
+        if use_threshold or use_lse or use_sink:
             fmha = _get_compiled_paged_decode_kernel(
-                *self._compile_args, use_threshold, use_lse
+                *self._compile_args, use_threshold, use_lse, use_sink
             )
         else:
             fmha = self._compiled_fmha_std
@@ -1278,6 +1695,8 @@ class BatchDecodePagedCuteDSLWrapper:
             o_partial,
             l_partial,
             m_partial,
+            sinks,
+            self._mask_config,
             Float32(scale_s),
             Float32(o_scale_val),
             threshold_arg,
