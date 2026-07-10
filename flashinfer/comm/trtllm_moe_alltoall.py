@@ -841,7 +841,15 @@ class MoeAlltoAll:
         self,
         comm_backend: CommBackend,
     ) -> None:
-        """Remap MNNVL handles after restore; repeated calls are no-ops."""
+        """Remap MNNVL handles after restore; repeated calls are no-ops.
+
+        Parameters
+        ----------
+        comm_backend : CommBackend
+            Communication backend used to recreate and exchange MNNVL memory
+            handles. It must have the same rank and world size as the original
+            allocation.
+        """
         record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
         if record.mapped:
             return
