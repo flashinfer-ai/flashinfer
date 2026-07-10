@@ -1304,6 +1304,8 @@ class TestCuteDslFusedMoeFunctional:
             hidden_states=tensors["x_bf16"].float().cuda(),
             gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
             gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            gemm1_alpha=tensors["w1_alpha"],
+            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -1456,6 +1458,8 @@ class TestCuteDslMoEWrapper:
             hidden_states=tensors["x_bf16"].float().cuda(),
             gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
             gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            gemm1_alpha=tensors["w1_alpha"],
+            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -1806,11 +1810,9 @@ class TestCuteDslMoEWrapper:
                 result = run_wrapper(moe, tensors)
             torch.cuda.synchronize()
             assert not torch.isnan(result).any()
-            # Confirm profiling actually ran for this custom op. Cache keys
-            # are (custom_op, runner_class, hash(runner), profile, extras)
-            # tuples; see AutoTuner._get_cache_key in flashinfer/autotuner.py.
+            # Confirm profiling actually ran for this custom op.
             assert any(
-                isinstance(k, tuple) and k[:1] == ("CuteDslMoEWrapper::run::Swiglu",)
+                k.custom_op == "CuteDslMoEWrapper::run::Swiglu"
                 for k in autotuner.profiling_cache
             ), "autotune(True) did not populate a CuteDslMoEWrapper::run cache entry"
             return ref, finalized
