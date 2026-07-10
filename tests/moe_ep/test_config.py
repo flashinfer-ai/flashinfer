@@ -29,12 +29,29 @@ def _weights():
 
 
 class TestFleetParams:
-    def test_requires_weights(self) -> None:
+    def test_rejects_weights_kwarg(self) -> None:
+        # Weights moved to the layer constructor; FleetParams no longer
+        # accepts them.
         with pytest.raises(TypeError):
             FleetParams(
                 num_experts=8,
                 max_tokens_per_rank=128,
                 token_hidden_size=4096,
+                weights=_weights(),
+            )
+
+    def test_layer_requires_weights(self) -> None:
+        from flashinfer.moe_ep import MoEEpLayer
+
+        with pytest.raises(TypeError):
+            MoEEpLayer(
+                bootstrap=BootstrapConfig(world_size=1, rank=0),
+                fleet_params=FleetParams(
+                    num_experts=8,
+                    max_tokens_per_rank=128,
+                    token_hidden_size=4096,
+                ),
+                backend="nccl_ep",
             )
 
     def test_happy_path(self) -> None:
@@ -42,10 +59,8 @@ class TestFleetParams:
             num_experts=8,
             max_tokens_per_rank=128,
             token_hidden_size=4096,
-            weights=_weights(),
         )
         assert p.num_experts == 8
-        assert p.weights is not None
         assert p.algorithm is EpAlgorithm.LOW_LATENCY
 
     def test_rejects_rank_major_under_ht(self) -> None:
@@ -54,7 +69,6 @@ class TestFleetParams:
                 num_experts=8,
                 max_tokens_per_rank=128,
                 token_hidden_size=4096,
-                weights=_weights(),
                 algorithm=EpAlgorithm.HIGH_THROUGHPUT,
                 layout=EpLayout.RANK_MAJOR,
             )
@@ -74,7 +88,6 @@ class TestFleetParams:
             num_experts=8,
             max_tokens_per_rank=128,
             token_hidden_size=4096,
-            weights=_weights(),
         )
         kwargs[field] = value
         with pytest.raises(ValueError, match=field):
@@ -85,7 +98,6 @@ class TestFleetParams:
             num_experts=8,
             max_tokens_per_rank=128,
             token_hidden_size=4096,
-            weights=_weights(),
         )
         p2 = replace(p1, num_experts=16)
         assert p1.num_experts == 8 and p2.num_experts == 16

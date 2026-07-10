@@ -175,8 +175,8 @@ def _run_ht(per_rank):
             token_hidden_size=HIDDEN,
             dtype_bytes=2,
             algorithm=EpAlgorithm.HIGH_THROUGHPUT,
-            weights=canonical_weights,
         ),
+        weights=canonical_weights,
         backend=SplitConfig(
             comm=NcclEpConfig(),
             kernel=FusedMoeKernelConfig(moe_config=moe_config),

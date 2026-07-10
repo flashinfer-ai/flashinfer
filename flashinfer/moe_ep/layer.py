@@ -11,6 +11,7 @@ from .core.kernel.registry import is_mega_kernel_config, is_split_kernel_config
 from .modes.config import MegaConfig, SplitConfig
 from .modes.mega_layer import MoEEpMegaLayer
 from .modes.split_layer import MoEEpSplitLayer
+from .weights import MoEWeightPack
 
 __all__ = ["MoEEpLayer", "MoEEpMegaLayer", "MoEEpSplitLayer"]
 
@@ -18,6 +19,7 @@ __all__ = ["MoEEpLayer", "MoEEpMegaLayer", "MoEEpSplitLayer"]
 def MoEEpLayer(
     bootstrap: BootstrapConfig,
     fleet_params: FleetParams,
+    weights: MoEWeightPack,
     fleet_knobs: Sequence[AlgoKnob] = (),
     backend: Union[str, SplitConfig, MegaConfig, object] = "nccl_ep",
 ) -> Union[MoEEpSplitLayer, MoEEpMegaLayer]:
@@ -25,6 +27,10 @@ def MoEEpLayer(
 
     - ``SplitConfig`` or a comm string/config → :class:`MoEEpSplitLayer`
     - ``MegaConfig`` → :class:`MoEEpMegaLayer`
+
+    ``weights`` is the canonical :class:`~flashinfer.moe_ep.weights.MoEWeightPack`
+    holding this rank's expert weights; it is validated and (depending on the
+    kernel) preprocessed at construction.
     """
     if isinstance(backend, MegaConfig):
         if fleet_knobs:
@@ -34,7 +40,7 @@ def MoEEpLayer(
                 UserWarning,
                 stacklevel=2,
             )
-        return MoEEpMegaLayer(bootstrap, fleet_params, backend)
+        return MoEEpMegaLayer(bootstrap, fleet_params, weights, backend)
 
     if is_mega_kernel_config(backend):
         raise TypeError(
@@ -48,4 +54,6 @@ def MoEEpLayer(
             f"got raw {type(backend).__name__} as backend=."
         )
 
-    return MoEEpSplitLayer(bootstrap, fleet_params, fleet_knobs, backend=backend)
+    return MoEEpSplitLayer(
+        bootstrap, fleet_params, weights, fleet_knobs, backend=backend
+    )

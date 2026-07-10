@@ -42,6 +42,7 @@ from ..core.validation.common import (
     validate_fleet_weights,
     validate_split_forward_inputs,
 )
+from ..weights import MoEWeightPack
 from .config import SplitConfig
 from ..backends.split.kernel.identity.config import IdentityConfig
 
@@ -56,12 +57,14 @@ class MoEEpSplitLayer(nn.Module):
         self,
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
+        weights: MoEWeightPack,
         fleet_knobs: Sequence[AlgoKnob] = (),
         backend: Union[str, SplitConfig, object] = "nccl_ep",
     ) -> None:
         super().__init__()
         self._bootstrap = bootstrap
         self._fleet_params = fleet_params
+        self._weights = weights
         self._fleet_knobs = list(fleet_knobs)
         if isinstance(backend, SplitConfig):
             self._comm_backend = backend.comm
@@ -85,7 +88,7 @@ class MoEEpSplitLayer(nn.Module):
         self._kernel.validate_init(bootstrap, fleet_params)
 
         if type(self._kernel).requires_weights():
-            self._kernel.preprocess_weights(fleet_params.weights, fleet_params)
+            self._kernel.preprocess_weights(self._weights, fleet_params)
 
         self._fleet: Fleet | None = None
 
@@ -108,7 +111,9 @@ class MoEEpSplitLayer(nn.Module):
     def _validate_at_init(self) -> None:
         backend_name = self._comm_backend_name()
         validate_bootstrap_world_size(self._bootstrap)
-        validate_fleet_weights(self._fleet_params, self._bootstrap.world_size)
+        validate_fleet_weights(
+            self._weights, self._fleet_params, self._bootstrap.world_size
+        )
         if backend_name == "nixl_ep" and self._bootstrap.tcp_store is None:
             raise MoEEpConfigError(
                 "nixl_ep requires BootstrapConfig.tcp_store; construct a "

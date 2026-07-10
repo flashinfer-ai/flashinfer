@@ -17,7 +17,6 @@ import pytest
 
 
 def _make_fleet(fake_nccl_ep, *, algorithm=None, world=4, max_tokens=128, hidden=64):
-    from flashinfer.moe_ep import dummy_moe_weights
     from flashinfer.moe_ep.config import BootstrapConfig, EpAlgorithm, FleetParams
     from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
 
@@ -25,7 +24,6 @@ def _make_fleet(fake_nccl_ep, *, algorithm=None, world=4, max_tokens=128, hidden
         num_experts=2 * world,
         max_tokens_per_rank=max_tokens,
         token_hidden_size=hidden,
-        weights=dummy_moe_weights(num_local_experts=2, hidden=hidden),
         dtype_bytes=2,
         algorithm=algorithm if algorithm is not None else EpAlgorithm.LOW_LATENCY,
     )

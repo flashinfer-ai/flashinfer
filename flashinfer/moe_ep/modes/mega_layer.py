@@ -35,6 +35,7 @@ class MoEEpMegaLayer(nn.Module):
         self,
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
+        weights: MoEWeightPack,
         backend: MegaConfig,
     ) -> None:
         super().__init__()
@@ -58,9 +59,9 @@ class MoEEpMegaLayer(nn.Module):
         self._kernel.validate_init(bootstrap, fleet_params)
 
         if backend.transformed_weights is None:
-            validate_fleet_weights(fleet_params, bootstrap.world_size)
+            validate_fleet_weights(weights, fleet_params, bootstrap.world_size)
 
-        self._weights: MoEWeightPack = fleet_params.weights
+        self._weights: MoEWeightPack = weights
         self._transformed: Optional[Any] = None
         self._workspace: Any = None
 

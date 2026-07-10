@@ -1,7 +1,7 @@
 """Canonical MoE weight container for all moe_ep paths.
 
-Users supply a single :class:`MoEWeightPack` via
-:attr:`~flashinfer.moe_ep.config.FleetParams.weights`.
+Users supply a single :class:`MoEWeightPack` as the ``weights`` argument at
+layer construction (:func:`~flashinfer.moe_ep.layer.MoEEpLayer`).
 Split and mega kernel plugins materialize backend-specific layouts in
 :meth:`~flashinfer.moe_ep.core.kernel.base.SplitKernelBackend.preprocess_weights`
 or the mega equivalent — callers never touch per-backend native views directly.

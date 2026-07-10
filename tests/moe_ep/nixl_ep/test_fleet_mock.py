@@ -143,7 +143,6 @@ def test_fleet_init_calls_update_memory_and_connect(patched_loader, fake_buffer_
     _skip_unless_ep_capable()
 
     from flashinfer.moe_ep import (
-        dummy_moe_weights,
         BootstrapConfig,
         EpAlgorithm,
         FleetParams,
@@ -156,7 +155,6 @@ def test_fleet_init_calls_update_memory_and_connect(patched_loader, fake_buffer_
         num_experts=8,
         max_tokens_per_rank=128,
         token_hidden_size=4096,
-        weights=dummy_moe_weights(num_local_experts=2, hidden=4096),
         dtype_bytes=2,
         algorithm=EpAlgorithm.LOW_LATENCY,
     )
@@ -186,7 +184,6 @@ def test_handle_combine_requires_topk_weights(patched_loader, fake_buffer_cls):
     _skip_unless_ep_capable()
 
     from flashinfer.moe_ep import (
-        dummy_moe_weights,
         BootstrapConfig,
         CombineInputParams,
         DispatchInputParams,
@@ -201,7 +198,6 @@ def test_handle_combine_requires_topk_weights(patched_loader, fake_buffer_cls):
         num_experts=8,
         max_tokens_per_rank=64,
         token_hidden_size=4096,
-        weights=dummy_moe_weights(num_local_experts=2, hidden=4096),
         algorithm=EpAlgorithm.LOW_LATENCY,
     )
     fleet = create_fleet(bootstrap, params, [], backend="nixl_ep")
@@ -222,7 +218,6 @@ def test_update_topology_diffs_ranks(patched_loader, fake_buffer_cls):
     _skip_unless_ep_capable()
 
     from flashinfer.moe_ep import (
-        dummy_moe_weights,
         BootstrapConfig,
         FleetParams,
         create_fleet,
@@ -233,7 +228,6 @@ def test_update_topology_diffs_ranks(patched_loader, fake_buffer_cls):
         num_experts=8,
         max_tokens_per_rank=64,
         token_hidden_size=4096,
-        weights=dummy_moe_weights(num_local_experts=2, hidden=4096),
     )
     fleet = create_fleet(bootstrap, params, [], backend="nixl_ep")
 

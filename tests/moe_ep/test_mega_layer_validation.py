@@ -52,10 +52,10 @@ def _mega_layer(
                 num_experts=1,
                 max_tokens_per_rank=64,
                 token_hidden_size=128,
-                weights=MoEWeightPack(
-                    w13=torch.zeros(1, 256, 128),
-                    w2=torch.zeros(1, 128, 128),
-                ),
+            ),
+            weights=MoEWeightPack(
+                w13=torch.zeros(1, 256, 128),
+                w2=torch.zeros(1, 128, 128),
             ),
             backend=MegaConfig(
                 megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
@@ -77,14 +77,27 @@ def _fake_symm_buffer(*, max_tokens: int = 64, hidden: int = 128, top_k: int = 2
     )
 
 
-def test_mega_fleet_params_requires_weights():
-    from flashinfer.moe_ep import FleetParams
+def test_mega_layer_requires_weights():
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        DeepGemmMegaMoeConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+    )
 
     with pytest.raises(TypeError):
-        FleetParams(
-            num_experts=8,
-            max_tokens_per_rank=64,
-            token_hidden_size=128,
+        MoEEpMegaLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=8,
+                max_tokens_per_rank=64,
+                token_hidden_size=128,
+            ),
+            backend=MegaConfig(
+                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                transformed_weights=_fake_deep_gemm_transformed(),
+            ),
         )
 
 
@@ -303,10 +316,10 @@ def test_mega_layer_init_rejects_bad_fleet_weights(dist_not_initialized):
                     num_experts=8,
                     max_tokens_per_rank=64,
                     token_hidden_size=128,
-                    weights=MoEWeightPack(
-                        w13=torch.zeros(4, 256, 128),
-                        w2=torch.zeros(4, 128, 128),
-                    ),
+                ),
+                weights=MoEWeightPack(
+                    w13=torch.zeros(4, 256, 128),
+                    w2=torch.zeros(4, 128, 128),
                 ),
                 backend=MegaConfig(
                     megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
@@ -336,10 +349,10 @@ def test_mega_layer_init_skips_fleet_weights_when_transformed_supplied(
                 num_experts=8,
                 max_tokens_per_rank=64,
                 token_hidden_size=128,
-                weights=MoEWeightPack(
-                    w13=torch.zeros(4, 256, 128),
-                    w2=torch.zeros(4, 128, 128),
-                ),
+            ),
+            weights=MoEWeightPack(
+                w13=torch.zeros(4, 256, 128),
+                w2=torch.zeros(4, 128, 128),
             ),
             backend=MegaConfig(
                 megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),

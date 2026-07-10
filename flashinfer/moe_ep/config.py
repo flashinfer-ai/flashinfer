@@ -1,7 +1,7 @@
 """Config dataclasses + I/O envelopes for moe_ep.
 
 Frozen dataclasses for `BootstrapConfig` (the inputs each backend needs at
-construction), `FleetParams` (EP sizing + weights; split transport fields
+construction), `FleetParams` (EP sizing; split transport fields
 have defaults mega ignores), `HandleParams`
 (per-iteration topk_ids), and the four envelope types
 :class:`DispatchInputParams` / :class:`DispatchOutput` /
@@ -22,8 +22,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 if TYPE_CHECKING:
     import torch
     import torch.distributed
-
-    from .weights import MoEWeightPack
 
 
 class EpAlgorithm(enum.Enum):
@@ -111,7 +109,11 @@ class BootstrapConfig:
 
 @dataclass(frozen=True)
 class FleetParams:
-    """EP sizing, canonical weights, and split-path transport defaults.
+    """EP sizing and split-path transport defaults.
+
+    Canonical expert weights are NOT carried here; pass the
+    :class:`~flashinfer.moe_ep.weights.MoEWeightPack` as the ``weights``
+    argument at layer construction (:func:`~flashinfer.moe_ep.layer.MoEEpLayer`).
 
     ``num_channels``, ``num_qp_per_rank``, ``rdma_buffer_size`` are exposed as
     :mod:`flashinfer.moe_ep.algo_knobs` Fleet-level knobs rather than top-level
@@ -122,7 +124,6 @@ class FleetParams:
     num_experts: int
     max_tokens_per_rank: int
     token_hidden_size: int
-    weights: "MoEWeightPack"
     dtype_bytes: int = 2  # bf16 default; FP8 path overrides
     algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
     layout: EpLayout = EpLayout.EXPERT_MAJOR

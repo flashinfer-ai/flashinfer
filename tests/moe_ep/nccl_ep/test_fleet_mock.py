@@ -14,14 +14,12 @@ import pytest
 
 
 def _fleet_params(**overrides):
-    from flashinfer.moe_ep import dummy_moe_weights
     from flashinfer.moe_ep.config import FleetParams
 
     kwargs = dict(
         num_experts=8,
         max_tokens_per_rank=128,
         token_hidden_size=7168,
-        weights=dummy_moe_weights(num_local_experts=2, hidden=7168),
         dtype_bytes=2,
     )
     kwargs.update(overrides)

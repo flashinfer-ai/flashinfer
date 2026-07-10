@@ -273,8 +273,8 @@ def _run_mega_layer(rank, world_size):
             num_experts=problem["num_experts"],
             max_tokens_per_rank=problem["max_tokens"],
             token_hidden_size=problem["hidden"],
-            weights=weights,
         ),
+        weights=weights,
         backend=MegaConfig(
             megakernel=DeepGemmMegaMoeConfig(
                 intermediate_size=problem["intermediate"],
