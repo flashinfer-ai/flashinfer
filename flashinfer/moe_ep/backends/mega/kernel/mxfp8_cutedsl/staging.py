@@ -60,9 +60,7 @@ def stage_mega_moe_inputs(
 
     x_fp8[:num_tokens].view(torch.uint8).copy_(q.view(torch.uint8))
     x_sf[:num_tokens].zero_()
-    x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(
-        sf.view(torch.uint8)
-    )
+    x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
     topk_idx_out[:num_tokens].copy_(topk_ids)
     topk_weights_out[:num_tokens].copy_(topk_weights)
 

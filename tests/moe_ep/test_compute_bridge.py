@@ -112,7 +112,9 @@ def test_rank_major_masks_out_of_range_local_expert_ids():
     m = world * per_rank
     et = _dispatch_tensor(world, per_rank, hidden, "cuda")
 
-    recv_idx = torch.full((m, top_k), num_local_experts, dtype=torch.int64, device="cuda")
+    recv_idx = torch.full(
+        (m, top_k), num_local_experts, dtype=torch.int64, device="cuda"
+    )
     recv_w = torch.ones(m, top_k, device="cuda")
 
     pack = build_activation_pack_rank_major(

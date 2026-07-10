@@ -35,6 +35,7 @@ _Mxfp8ScaleDtype: torch.dtype = torch.float8_e8m0fnu
 # kind_* helpers
 # ---------------------------------------------------------------------------
 
+
 def kind_data_dtype(kind: str) -> torch.dtype:
     if kind == "nvfp4":
         return _Nvfp4DataDtype
@@ -57,6 +58,7 @@ def kind_sf_vec_size(kind: str) -> int:
 # Mxfp8 quantize function. May move function to mxfp8 folder later
 # ---------------------------------------------------------------------------
 
+
 def mxfp8_quantize_per_block_32(
     c_fp32: torch.Tensor,
     data_dtype: torch.dtype,
@@ -68,7 +70,9 @@ def mxfp8_quantize_per_block_32(
             f"Trailing dim ({N}) must be a multiple of sf_vec_size ({Mxfp8BlockSize})."
         )
     n_blocks = N // Mxfp8BlockSize
-    data_max_rcp_limit = Fp8E4M3RcpLimit if data_dtype == torch.float8_e4m3fn else Fp8E5M2RcpLimit
+    data_max_rcp_limit = (
+        Fp8E4M3RcpLimit if data_dtype == torch.float8_e4m3fn else Fp8E5M2RcpLimit
+    )
     blocked = c_fp32.view(M, n_blocks, Mxfp8BlockSize)
     absmax = blocked.abs().amax(dim=-1)
     safe_absmax = torch.clamp(absmax, min=1e-30)
@@ -87,6 +91,7 @@ def mxfp8_quantize_per_block_32(
 # referench check helper
 # ---------------------------------------------------------------------------
 
+
 def compare_and_report_mismatches(
     gpu_tensor,
     ref_tensor,
@@ -97,6 +102,7 @@ def compare_and_report_mismatches(
     print_first_8=False,
 ):
     import torch as _torch  # host-only helper, keep out of module-level imports
+
     """
     Compare two tensors and report the first N mismatched elements.
 

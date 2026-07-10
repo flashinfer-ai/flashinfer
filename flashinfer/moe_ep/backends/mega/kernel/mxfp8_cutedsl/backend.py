@@ -96,7 +96,9 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ..cutedsl_backend_kernels.frontend import get_symm_buffer_for_mxfp8_mega_moe
+        from ..cutedsl_backend_kernels.frontend import (
+            get_symm_buffer_for_mxfp8_mega_moe,
+        )
 
         k = self._kernel_config
         fp = fleet_params

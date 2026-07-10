@@ -10,6 +10,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
@@ -41,8 +42,8 @@ from moe_nvfp4_swapab.moe_utils import spin_wait
 # Sm100SwigluMxfp8Fc12Kernel
 # =============================================================================
 
-class Sm100SwigluMxfp8Fc12Kernel:
 
+class Sm100SwigluMxfp8Fc12Kernel:
     # SMEM budget for all "non-problem-tensor" buffers (mbarriers, sched
     # work-tile buffer, TMEM allocator state).  Reserved at host side in
     # ``_compute_stages``.  Bump if ``SharedStorage`` over-allocates SMEM.
@@ -51,7 +52,10 @@ class Sm100SwigluMxfp8Fc12Kernel:
     # Supported (ab_dtype, sf_vec_size) pairings.
     # MXFP8 → Float8E4M3FN / Float8E5M2 + sf_vec_size=32  (FP8-E8M0 scales, MmaMXF8Op)
     VALID_AB_DTYPE_SF_SIZE: dict = {
-        32: (cutlass.Float8E4M3FN, cutlass.Float8E5M2,),
+        32: (
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E5M2,
+        ),
     }
 
     # Interleave granularity for gate and up in SwiGLU / GeGlu
@@ -100,13 +104,10 @@ class Sm100SwigluMxfp8Fc12Kernel:
                 raise ValueError(
                     f"ab_dtype={ab_dtype.__name__} is not valid for "
                     f"sf_vec_size={sf_vec_size}. "
-                    f"Expected one of: {[t.__name__ for t in valid_ab_tuple]}."
+                    f"Expected one of: {[t.__name__ for t in valid_ab]}."
                 )
         else:
-            raise NotImplementedError(
-                f"sf_vec_size must be {Mxfp8BlockSize} (MXFP8)"
-            )
-
+            raise NotImplementedError(f"sf_vec_size must be {Mxfp8BlockSize} (MXFP8)")
 
         if scenario != "2Dx3D":
             raise NotImplementedError(
@@ -134,9 +135,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self.token_back_by_dispatch = token_back_by_dispatch
         self.epi_flag_batch = epi_flag_batch
-        self.gate_up_clamp = (
-            abs(gate_up_clamp) if gate_up_clamp is not None else None
-        )
+        self.gate_up_clamp = abs(gate_up_clamp) if gate_up_clamp is not None else None
 
         self.acc_dtype = acc_dtype
         self.mma_tiler_mnk = mma_tiler_mnk
@@ -218,9 +217,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
         cm, cn = self.cluster_shape_mn
 
         if m not in SupportedMmaTileM:
-            raise ValueError(
-                f"mma_tiler M ({m}) must be one of {SupportedMmaTileM}"
-            )
+            raise ValueError(f"mma_tiler M ({m}) must be one of {SupportedMmaTileM}")
 
         per_cta_m = m // (2 if self.use_2cta_instrs else 1)
         if per_cta_m != 128:
@@ -282,10 +279,14 @@ class Sm100SwigluMxfp8Fc12Kernel:
             self.sf_vec_size,
         )
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            *common, self.cta_group, self.mma_inst_shape_mn,
+            *common,
+            self.cta_group,
+            self.mma_inst_shape_mn,
         )
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            *common, tcgen05.CtaGroup.ONE, self.mma_inst_shape_mn_sfb,
+            *common,
+            tcgen05.CtaGroup.ONE,
+            self.mma_inst_shape_mn_sfb,
         )
         return tiled_mma, tiled_mma_sfb
 
@@ -448,7 +449,9 @@ class Sm100SwigluMxfp8Fc12Kernel:
 
         # TMA load bytes per stage (A + B + SFA + SFB).
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
-        self.atom_thr_size = atom_thr_size  # store as Python int for use in @cute.kernel
+        self.atom_thr_size = (
+            atom_thr_size  # store as Python int for use in @cute.kernel
+        )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         sfa_smem_layout = cute.slice_(
@@ -489,21 +492,32 @@ class Sm100SwigluMxfp8Fc12Kernel:
         occupancy: int,
         num_sched_stages: int,
     ) -> Tuple[int, int, int]:
-        """Compute stage counts for ACC, AB+SF, and scheduler.
-        """
+        """Compute stage counts for ACC, AB+SF, and scheduler."""
         num_acc_stage = 2
 
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
-            tiled_mma, mma_tiler_mnk, a_dtype, 1,
+            tiled_mma,
+            mma_tiler_mnk,
+            a_dtype,
+            1,
         )
         b_smem_layout_staged_one = sm100_utils.make_smem_layout_b(
-            tiled_mma, mma_tiler_mnk, b_dtype, 1,
+            tiled_mma,
+            mma_tiler_mnk,
+            b_dtype,
+            1,
         )
         sfa_smem_layout_staged_one = blockscaled_utils.make_smem_layout_sfa(
-            tiled_mma, mma_tiler_mnk, sf_vec_size, 1,
+            tiled_mma,
+            mma_tiler_mnk,
+            sf_vec_size,
+            1,
         )
         sfb_smem_layout_staged_one = blockscaled_utils.make_smem_layout_sfb(
-            tiled_mma, mma_tiler_mnk, sf_vec_size, 1,
+            tiled_mma,
+            mma_tiler_mnk,
+            sf_vec_size,
+            1,
         )
 
         ab_bytes_per_stage = (
@@ -513,9 +527,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
             + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
         )
 
-        fixed_overhead = (
-            self._smem_misc_budget_bytes() + c_bytes_total
-        )
+        fixed_overhead = self._smem_misc_budget_bytes() + c_bytes_total
 
         num_ab_stage = (
             smem_capacity // occupancy - fixed_overhead
@@ -548,16 +560,13 @@ class Sm100SwigluMxfp8Fc12Kernel:
 
         # fc1_output_sf sf_vec_size matches the kernel's sf_vec_size.
         fc1_out_sf_vec_size = self.sf_vec_size
-        sf_block_cols = (
-            (intermediate_downproj // fc1_out_sf_vec_size) + 3
-        ) // 4 * 4
+        sf_block_cols = ((intermediate_downproj // fc1_out_sf_vec_size) + 3) // 4 * 4
         fc1_output_sf_bytes = sf_total_rows_upper * sf_block_cols
 
         # fc1_done_counter: one Int32 per global token block, plus expert slack.
         counter_slots_upper = (
-            (data_total_rows + mma_tiler_n - 1) // mma_tiler_n
-            + experts
-        )
+            data_total_rows + mma_tiler_n - 1
+        ) // mma_tiler_n + experts
         fc1_done_counter_bytes = counter_slots_upper * 4
 
         # load_balance_counter: Int32 scalar.
@@ -642,20 +651,34 @@ class Sm100SwigluMxfp8Fc12Kernel:
         pass
 
     @cute.jit
-    def token_comm_hook_fc1_tma_b_predispatch_spin(self, token_comm_args, work_tile_info):
+    def token_comm_hook_fc1_tma_b_predispatch_spin(
+        self, token_comm_args, work_tile_info
+    ):
         """TMA warp: spin until dispatch-pulled tokens are resident.  No-op base."""
         pass
 
     @cute.jit
     def token_comm_hook_dispatch_warp_body(
-        self, token_comm_args, token_comm_storage, *, warp_idx, lane_idx, tidx,
+        self,
+        token_comm_args,
+        token_comm_storage,
+        *,
+        warp_idx,
+        lane_idx,
+        tidx,
     ):
         """Body for dispatch warps 8-11 (MegaMoE-only).  No-op base."""
         pass
 
     @cute.jit
     def token_comm_hook_token_back_warp_body(
-        self, token_comm_args, token_comm_storage, *, warp_idx, lane_idx, tidx,
+        self,
+        token_comm_args,
+        token_comm_storage,
+        *,
+        warp_idx,
+        lane_idx,
+        tidx,
     ):
         """Body for standalone token-back warps 12-15 (MegaMoE-only).  No-op base."""
         pass
@@ -669,19 +692,19 @@ class Sm100SwigluMxfp8Fc12Kernel:
     def __call__(
         self,
         # ── fc1 (Linear1) problem tensors ────────────────────────────────
-        activation: cute.Tensor,           # (token_sum_padded, hidden)
-        fc1_weight: cute.Tensor,           # (experts, hidden, intermediate_gateup)
-        activation_sf: cute.Tensor,         # (token_sum_padded_sf, hidden / sf_vec_size)
-        fc1_weight_sf: cute.Tensor,         # (experts, intermediate_gateup_padded * hidden / sf_vec_size)
+        activation: cute.Tensor,  # (token_sum_padded, hidden)
+        fc1_weight: cute.Tensor,  # (experts, hidden, intermediate_gateup)
+        activation_sf: cute.Tensor,  # (token_sum_padded_sf, hidden / sf_vec_size)
+        fc1_weight_sf: cute.Tensor,  # (experts, intermediate_gateup_padded * hidden / sf_vec_size)
         # ── fc1 workspace consumed as fc2 GEMM-B ─────────────────────────
-        fc1_output: cute.Tensor,         # (token_sum_padded, intermediate_downproj)
-        fc1_output_sf: cute.Tensor,      # (token_sum_padded_sf, intermediate_downproj / sf_vec_size)
+        fc1_output: cute.Tensor,  # (token_sum_padded, intermediate_downproj)
+        fc1_output_sf: cute.Tensor,  # (token_sum_padded_sf, intermediate_downproj / sf_vec_size)
         # ── fc2 (Linear2) problem tensors ────────────────────────────────
-        fc2_weight: cute.Tensor,          # (experts, intermediate_downproj, hidden)
-        fc2_weight_sf: cute.Tensor,        # (experts, hidden_padded * intermediate_downproj / sf_vec_size)
-        fc2_output: cute.Tensor,         # (token_sum_padded, hidden) BFloat16, hidden stride-1
+        fc2_weight: cute.Tensor,  # (experts, intermediate_downproj, hidden)
+        fc2_weight_sf: cute.Tensor,  # (experts, hidden_padded * intermediate_downproj / sf_vec_size)
+        fc2_output: cute.Tensor,  # (token_sum_padded, hidden) BFloat16, hidden stride-1
         # ── topk weights (Path A) ────────────────────────────────────────
-        topk_scores: cute.Tensor,     # (token_sum_padded,) Float32
+        topk_scores: cute.Tensor,  # (token_sum_padded,) Float32
         # ── Cross-phase workspace ────────────────────────────────────────
         fc1_done_counter: cute.Tensor,  # (max_token_block_per_rank,) Int32
         # ── Sched / runtime ──────────────────────────────────────────────
@@ -787,7 +810,11 @@ class Sm100SwigluMxfp8Fc12Kernel:
             fc1_weight.iterator,
             cute.make_layout(
                 (intermediate_gateup, hidden_b, experts),
-                stride=(fc1_weight.stride[2], fc1_weight.stride[1], fc1_weight.stride[0]),
+                stride=(
+                    fc1_weight.stride[2],
+                    fc1_weight.stride[1],
+                    fc1_weight.stride[0],
+                ),
             ),
         )
 
@@ -835,7 +862,11 @@ class Sm100SwigluMxfp8Fc12Kernel:
             fc2_weight.iterator,
             cute.make_layout(
                 (hidden_b2, intermediate_downproj_b2, experts2),
-                stride=(fc2_weight.stride[2], fc2_weight.stride[1], fc2_weight.stride[0]),
+                stride=(
+                    fc2_weight.stride[2],
+                    fc2_weight.stride[1],
+                    fc2_weight.stride[0],
+                ),
             ),
         )
 
@@ -915,8 +946,12 @@ class Sm100SwigluMxfp8Fc12Kernel:
         self.b_dtype: Type[cutlass.Numeric] = fc1_weight_gemm.element_type
         self.fc1_output_dtype: Type[cutlass.Numeric] = fc1_output_gemm.element_type
         self.sf_dtype: Type[cutlass.Numeric] = activation_sf_gemm.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(activation_gemm).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(fc1_weight_gemm).mma_major_mode()
+        self.a_major_mode = utils.LayoutEnum.from_tensor(
+            activation_gemm
+        ).mma_major_mode()
+        self.b_major_mode = utils.LayoutEnum.from_tensor(
+            fc1_weight_gemm
+        ).mma_major_mode()
         self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
 
         self._setup_attributes()
@@ -929,13 +964,15 @@ class Sm100SwigluMxfp8Fc12Kernel:
             self.cluster_shape_mn, tiled_mma.thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        tma_atom_fc1_activation, tma_tensor_fc1_activation = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op,
-            activation_gemm,
-            a_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
+        tma_atom_fc1_activation, tma_tensor_fc1_activation = (
+            cute.nvgpu.make_tiled_tma_atom_A(
+                a_op,
+                activation_gemm,
+                a_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+            )
         )
 
         # TMA load B1 (= fc1 weights, non-swap-AB: B=weights)
@@ -959,14 +996,16 @@ class Sm100SwigluMxfp8Fc12Kernel:
         sfa_smem_layout = cute.slice_(
             self.sfa_smem_layout_staged, (None, None, None, 0)
         )
-        tma_atom_fc1_activation_sf, tma_tensor_fc1_activation_sf = cute.nvgpu.make_tiled_tma_atom_A(
-            sfa_op,
-            activation_sf_gemm,
-            sfa_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Uint64,
+        tma_atom_fc1_activation_sf, tma_tensor_fc1_activation_sf = (
+            cute.nvgpu.make_tiled_tma_atom_A(
+                sfa_op,
+                activation_sf_gemm,
+                sfa_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=cutlass.Uint64,
+            )
         )
 
         # TMA load SFB1 (= fc1_weight_sf, non-swap-AB: SFB=weight SFs, B-side)
@@ -976,14 +1015,16 @@ class Sm100SwigluMxfp8Fc12Kernel:
         sfb_smem_layout = cute.slice_(
             self.sfb_smem_layout_staged, (None, None, None, 0)
         )
-        tma_atom_fc1_weight_sf, tma_tensor_fc1_weight_sf = cute.nvgpu.make_tiled_tma_atom_B(
-            sfb_op,
-            fc1_weight_sf_gemm,
-            sfb_smem_layout,
-            self.mma_tiler_sfb,
-            tiled_mma_sfb,
-            self.cluster_layout_sfb_vmnk.shape,
-            internal_type=cutlass.Uint64,
+        tma_atom_fc1_weight_sf, tma_tensor_fc1_weight_sf = (
+            cute.nvgpu.make_tiled_tma_atom_B(
+                sfb_op,
+                fc1_weight_sf_gemm,
+                sfb_smem_layout,
+                self.mma_tiler_sfb,
+                tiled_mma_sfb,
+                self.cluster_layout_sfb_vmnk.shape,
+                internal_type=cutlass.Uint64,
+            )
         )
 
         # TMA store for fc1 MXFP8 output.
@@ -1022,15 +1063,13 @@ class Sm100SwigluMxfp8Fc12Kernel:
                 self.cluster_layout_vmnk.shape,
             )
         )
-        tma_atom_fc2_weight, tma_tensor_fc2_weight = (
-            cute.nvgpu.make_tiled_tma_atom_B(
-                b_op,
-                fc2_weight_gemm,
-                b_smem_layout,
-                self.mma_tiler,
-                tiled_mma,
-                self.cluster_layout_vmnk.shape,
-            )
+        tma_atom_fc2_weight, tma_tensor_fc2_weight = cute.nvgpu.make_tiled_tma_atom_B(
+            b_op,
+            fc2_weight_gemm,
+            b_smem_layout,
+            self.mma_tiler,
+            tiled_mma,
+            self.cluster_layout_vmnk.shape,
         )
         tma_atom_fc2_activation_sf, tma_tensor_fc2_activation_sf = (
             cute.nvgpu.make_tiled_tma_atom_A(
@@ -1171,7 +1210,6 @@ class Sm100SwigluMxfp8Fc12Kernel:
             min_blocks_per_mp=self.occupancy,
         )
 
-
     @cute.kernel
     def kernel(
         self,
@@ -1246,8 +1284,10 @@ class Sm100SwigluMxfp8Fc12Kernel:
         # Each N-tile is processed by atom_thr_size CTAs (both CTA0 and CTA1 increment
         # the counter), so the threshold must account for both CTAs' contributions.
         ext_fc2_spin_threshold = (
-            fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[1] - 1
-        ) // self.cta_tile_shape_mnk[1] * self.epilogue._atom_thr_size
+            (fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[1] - 1)
+            // self.cta_tile_shape_mnk[1]
+            * self.epilogue._atom_thr_size
+        )
 
         ext = GluMxFp8Fc12SchedExtension(
             sf_vec_size=self.sf_vec_size,
@@ -1306,9 +1346,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
 
         # ── Pipelines: two TMA producer warps share the AB pipeline. ──
 
-        ab_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 2
-        )
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 2)
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_tma_producer
@@ -1377,9 +1415,8 @@ class Sm100SwigluMxfp8Fc12Kernel:
         # per-expert sizes from ``expert_recv_count_sum`` -- those are not
         # valid until the dispatch barrier completes, so we defer init to the
         # sched warp (after ``token_comm_hook_sched_warp_pre_init_wait``).
-        early_internal_init = (
-            (self.load_balance_mode == "atomic_counter")
-            or (not self.enable_token_comm)
+        early_internal_init = (self.load_balance_mode == "atomic_counter") or (
+            not self.enable_token_comm
         )
 
         if cutlass.const_expr(early_internal_init):
@@ -1420,9 +1457,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
         # ``overlapping_accum`` the two acc buffers share TMEM with SF
         # columns; we shrink the stage stride so the second buffer
         # starts at ``(256 - num_sf_tmem_cols)`` cols instead of 256.
-        acc_fake = tiled_mma.make_fragment_C(
-            cute.append(acc_shape, self.num_acc_stage)
-        )
+        acc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
         if cutlass.const_expr(self.overlapping_accum):
             acc_fake = cute.make_tensor(
                 acc_fake.iterator,
@@ -1486,7 +1521,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
 
         # ── TMA-A warp (warp 5) ─────────────────────────────────────────────
         if warp_idx == self.tma_a_warp_id:
-            _iket_active = (tidx == cutlass.Int32(160))
+            _iket_active = tidx == cutlass.Int32(160)
             a_full_mcast_mask = None
             sfa_full_mcast_mask = None
             if cutlass.const_expr(self.is_a_mcast or use_2cta_instrs):
@@ -1518,8 +1553,8 @@ class Sm100SwigluMxfp8Fc12Kernel:
             work_tile_info = sched_consumer.consume_work()
 
             while work_tile_info.is_valid_tile:
-                is_phase_linear1 = (
-                    work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
+                is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
+                    BlockPhase.Linear1
                 )
                 if is_phase_linear1:
                     # ── fc1 phase A-side (non-swap-AB: A=activations, per-CTA partitioned) ──
@@ -1532,15 +1567,20 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     # task tile's token activations into the L1 token buffer.
                     # No-op on the lean path (activations resident at launch).
                     self.token_comm_hook_fc1_tma_b_predispatch_spin(
-                        token_comm_args, work_tile_info,
+                        token_comm_args,
+                        work_tile_info,
                     )
 
                     k_tile_cnt = k_tile_cnt_fc1
                     real_a, desc_ptr_a = ext.get_gmem_tensor(
-                        "fc1_activation", tma_tensor_fc1_activation_1, work_tile_info,
+                        "fc1_activation",
+                        tma_tensor_fc1_activation_1,
+                        work_tile_info,
                     )
                     real_sfa, desc_ptr_sfa = ext.get_gmem_tensor(
-                        "fc1_activation_sf", tma_tensor_fc1_activation_1_sf, work_tile_info,
+                        "fc1_activation_sf",
+                        tma_tensor_fc1_activation_1_sf,
+                        work_tile_info,
                     )
 
                     gA_mkl = cute.local_tile(
@@ -1583,9 +1623,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     peek_ab_empty_status = ab_producer.try_acquire()
 
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        handle = ab_producer.acquire_and_advance(
-                            peek_ab_empty_status
-                        )
+                        handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
                             peek_ab_empty_status = ab_producer.try_acquire()
@@ -1614,7 +1652,8 @@ class Sm100SwigluMxfp8Fc12Kernel:
                         iket.range_push("tma_token_fc2")
                     counter_slot = (
                         work_tile_info.cumulative_token_block_count
-                        + work_tile_info.tile_m_idx // cutlass.Int32(self.epilogue._atom_thr_size)
+                        + work_tile_info.tile_m_idx
+                        // cutlass.Int32(self.epilogue._atom_thr_size)
                     )
                     counter_ptr = fc1_done_counter.iterator + counter_slot
                     # Always spin (no peek shortcut) to guarantee counter=4 in this warp,
@@ -1629,16 +1668,17 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     )
                     if _iket_active:
                         iket.range_pop()
-                    cute.arch.load(counter_ptr, counter_ptr.dtype, sem="acquire", scope="gpu")
+                    cute.arch.load(
+                        counter_ptr, counter_ptr.dtype, sem="acquire", scope="gpu"
+                    )
                     cute.arch.fence_proxy("async")
                     cute.arch.fence_proxy("async.global")
 
                     # DEBUG: print counter slot/value after spin exits for first hidden N-tile only.
                     # Using tidx == tma_a_warp_id*32 since tidx==0 never fires in warp 5.
-                    if (
-                        tidx == cutlass.Int32(32 * self.tma_a_warp_id)
-                        and work_tile_info.tile_n_idx == cutlass.Int32(0)
-                    ):
+                    if tidx == cutlass.Int32(
+                        32 * self.tma_a_warp_id
+                    ) and work_tile_info.tile_n_idx == cutlass.Int32(0):
                         counter_val_post = cute.arch.load(
                             counter_ptr, counter_ptr.dtype, cop="cg"
                         )
@@ -1655,7 +1695,9 @@ class Sm100SwigluMxfp8Fc12Kernel:
                             fc1_output_gemm.iterator.toint() + fc1_byte_offset,
                             cute.AddressSpace.gmem,
                         )
-                        fc1_first_i32 = cute.arch.load(fc1_probe_ptr, cutlass.Int32, cop="cg")
+                        fc1_first_i32 = cute.arch.load(
+                            fc1_probe_ptr, cutlass.Int32, cop="cg"
+                        )
                         # cute.printf(
                         #     "[fc2_spin_exit] slot=%d counter=%d thresh=%d "
                         #     "tile_m=%d cumul=%d fc1_first_i32=0x%08x",
@@ -1669,10 +1711,14 @@ class Sm100SwigluMxfp8Fc12Kernel:
 
                     k_tile_cnt = k_tile_cnt_fc2
                     real_a, desc_ptr_a = ext.get_gmem_tensor(
-                        "fc2_activation", tma_tensor_fc2_activation, work_tile_info,
+                        "fc2_activation",
+                        tma_tensor_fc2_activation,
+                        work_tile_info,
                     )
                     real_sfa, desc_ptr_sfa = ext.get_gmem_tensor(
-                        "fc2_activation_sf", tma_tensor_fc2_activation_sf, work_tile_info,
+                        "fc2_activation_sf",
+                        tma_tensor_fc2_activation_sf,
+                        work_tile_info,
                     )
 
                     gA_mkl = cute.local_tile(
@@ -1718,9 +1764,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     peek_ab_empty_status = ab_producer.try_acquire()
 
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        handle = ab_producer.acquire_and_advance(
-                            peek_ab_empty_status
-                        )
+                        handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
                             peek_ab_empty_status = ab_producer.try_acquire()
@@ -1749,7 +1793,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
 
         # ── TMA-B warp (warp 6) ─────────────────────────────────────────────
         if warp_idx == self.tma_b_warp_id:
-            _iket_active = (tidx == cutlass.Int32(192))
+            _iket_active = tidx == cutlass.Int32(192)
             b_full_mcast_mask = None
             sfb_full_mcast_mask = None
             if cutlass.const_expr(self.is_b_mcast or use_2cta_instrs):
@@ -1786,8 +1830,8 @@ class Sm100SwigluMxfp8Fc12Kernel:
             work_tile_info = sched_consumer.consume_work()
 
             while work_tile_info.is_valid_tile:
-                is_phase_linear1 = (
-                    work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
+                is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
+                    BlockPhase.Linear1
                 )
 
                 if is_phase_linear1:
@@ -1801,10 +1845,14 @@ class Sm100SwigluMxfp8Fc12Kernel:
 
                     k_tile_cnt = k_tile_cnt_fc1
                     real_b, desc_ptr_b = ext.get_gmem_tensor(
-                        "fc1_weight", tma_tensor_weight, work_tile_info,
+                        "fc1_weight",
+                        tma_tensor_weight,
+                        work_tile_info,
                     )
                     real_sfb, desc_ptr_sfb = ext.get_gmem_tensor(
-                        "fc1_weight_sf", tma_tensor_fc1_weight_sf, work_tile_info,
+                        "fc1_weight_sf",
+                        tma_tensor_fc1_weight_sf,
+                        work_tile_info,
                     )
 
                     # N-K tiling for N-side weight (N=intermediate, K=hidden).
@@ -1847,9 +1895,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     peek_ab_empty_status = ab_producer.try_acquire()
 
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        handle = ab_producer.acquire_and_advance(
-                            peek_ab_empty_status
-                        )
+                        handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
                             peek_ab_empty_status = ab_producer.try_acquire()
@@ -1876,10 +1922,14 @@ class Sm100SwigluMxfp8Fc12Kernel:
                         iket.range_push("tma_weight_fc2")
                     k_tile_cnt = k_tile_cnt_fc2
                     real_b, desc_ptr_b = ext.get_gmem_tensor(
-                        "fc2_weight", tma_tensor_fc2_weight, work_tile_info,
+                        "fc2_weight",
+                        tma_tensor_fc2_weight,
+                        work_tile_info,
                     )
                     real_sfb, desc_ptr_sfb = ext.get_gmem_tensor(
-                        "fc2_weight_sf", tma_tensor_fc2_weight_sf, work_tile_info,
+                        "fc2_weight_sf",
+                        tma_tensor_fc2_weight_sf,
+                        work_tile_info,
                     )
 
                     gB_nkl = cute.local_tile(
@@ -1922,9 +1972,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     peek_ab_empty_status = ab_producer.try_acquire()
 
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        handle = ab_producer.acquire_and_advance(
-                            peek_ab_empty_status
-                        )
+                        handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
                             peek_ab_empty_status = ab_producer.try_acquire()
@@ -1956,7 +2004,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
         #
         # Both phases share tiled_mma and TMEM; only K-tile count differs.
         if warp_idx == self.mma_warp_id:
-            _iket_active = (tidx == cutlass.Int32(128))
+            _iket_active = tidx == cutlass.Int32(128)
 
             tCrA = tiled_mma.make_fragment_A(sA)
             tCrB = tiled_mma.make_fragment_B(sB)
@@ -2012,8 +2060,8 @@ class Sm100SwigluMxfp8Fc12Kernel:
             work_tile_info = sched_consumer.consume_work()
 
             while work_tile_info.is_valid_tile:
-                is_phase_linear1 = (
-                    work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
+                is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
+                    BlockPhase.Linear1
                 )
                 # Prebind k_tile_cnt due to DSL AST.
                 k_tile_cnt = cutlass.Int32(0)
@@ -2108,13 +2156,13 @@ class Sm100SwigluMxfp8Fc12Kernel:
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             acc_tensor = cute.make_tensor(acc_tmem_ptr, acc_fake.layout)
 
-            #acc_tensor = cute.make_tensor(
+            # acc_tensor = cute.make_tensor(
             #    acc_tmem_ptr,
             #    cute.make_layout(
             #        (((128, self.cta_tile_shape_mnk[1]), 1),),
             #        stride=(((1 << 16, 1), 0),),
             #    ),
-            #)
+            # )
 
             # Build common kwargs shared by both epilogue flavours.
             _run_kwargs = dict(
@@ -2194,4 +2242,3 @@ class Sm100SwigluMxfp8Fc12Kernel:
                 lane_idx=lane_idx,
                 tidx=tidx,
             )
-

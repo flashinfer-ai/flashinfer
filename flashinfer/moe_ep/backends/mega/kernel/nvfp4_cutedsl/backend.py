@@ -165,7 +165,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 t.scales[:num_tokens, :hidden_sf_cols]
             )
             if t.scales.shape[1] >= hidden_sf_cols_padded:
-                workspace.x_sf[:num_tokens, hidden_sf_cols:hidden_sf_cols_padded].zero_()
+                workspace.x_sf[
+                    :num_tokens, hidden_sf_cols:hidden_sf_cols_padded
+                ].zero_()
             workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
             workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
             capacity = workspace.x.shape[0]

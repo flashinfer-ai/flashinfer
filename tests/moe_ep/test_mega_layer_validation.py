@@ -429,9 +429,7 @@ def test_deep_gemm_stage_inputs_copy_path_stages_prequantized():
     )
     backend.stage_inputs(t, workspace, quantize_input=False)
 
-    assert torch.equal(
-        workspace.x[:num_tokens], hidden_fp8.to(torch.float32)
-    )
+    assert torch.equal(workspace.x[:num_tokens], hidden_fp8.to(torch.float32))
     assert torch.equal(workspace.x_sf[:num_tokens], scales)
     assert torch.equal(workspace.topk_idx[:num_tokens], topk_ids)
     assert torch.equal(workspace.topk_weights[:num_tokens], topk_weights)

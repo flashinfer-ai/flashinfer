@@ -69,7 +69,9 @@ def _make_inputs(
 def _make_epilogue_params(rank: int, num_local_experts: int):
     import torch
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import make_dummy_epilogue_params
+    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+        make_dummy_epilogue_params,
+    )
 
     g = torch.Generator(device="cuda").manual_seed(19 + rank)
     return make_dummy_epilogue_params(num_local_experts, generator=g)
@@ -205,7 +207,10 @@ def _reference_nvfp4_mega_moe_staged(problem: dict, *, destroy_buffer: bool = Tr
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import get_symm_buffer_for_mega_moe, nvfp4_mega_moe
+    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+        get_symm_buffer_for_mega_moe,
+        nvfp4_mega_moe,
+    )
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
         stage_mega_moe_inputs,
@@ -248,9 +253,7 @@ def _reference_nvfp4_mega_moe_staged(problem: dict, *, destroy_buffer: bool = Tr
         gate_up_clamp=problem["gate_up_clamp"],
     )
 
-    y = torch.empty(
-        num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-    )
+    y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
     nvfp4_mega_moe(
         y,
         transformed_l1,
@@ -273,7 +276,10 @@ def _reference_nvfp4_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import get_symm_buffer_for_mega_moe, nvfp4_mega_moe
+    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+        get_symm_buffer_for_mega_moe,
+        nvfp4_mega_moe,
+    )
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
         preprocess_mega_weights,
@@ -308,9 +314,7 @@ def _reference_nvfp4_mega_moe_prestaged(
         gate_up_clamp=problem["gate_up_clamp"],
     )
 
-    y = torch.empty(
-        num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-    )
+    y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
     nvfp4_mega_moe(
         y,
         transformed_l1,
@@ -382,7 +386,9 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import get_symm_buffer_for_mega_moe
+            from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+                get_symm_buffer_for_mega_moe,
+            )
 
             staging_buffer = get_symm_buffer_for_mega_moe(
                 problem["num_experts"],
@@ -495,9 +501,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
-    print(
-        f"rank {rank}: nvfp4_cutedsl mega layer (prestaged inputs) matches reference"
-    )
+    print(f"rank {rank}: nvfp4_cutedsl mega layer (prestaged inputs) matches reference")
 
 
 @pytest.mark.arch_blackwell

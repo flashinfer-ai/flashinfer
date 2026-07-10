@@ -141,8 +141,7 @@ def preprocess_mega_weights(
                 weights.w2
             ):
                 raise ValueError(
-                    "packed NVFP4 weights must be torch.uint8 or "
-                    "torch.float4_e2m1fn_x2"
+                    "packed NVFP4 weights must be torch.uint8 or torch.float4_e2m1fn_x2"
                 )
         elif (
             weights.w13.shape != logical_w13_shape
@@ -174,9 +173,7 @@ def preprocess_mega_weights(
                 f"w2_scale must have shape {expected_w2_scale_shape}, "
                 f"got {tuple(weights.w2_scale.shape)}"
             )
-        w13 = _interleave_gate_up_16(
-            weights.w13, intermediate_size=intermediate_size
-        )
+        w13 = _interleave_gate_up_16(weights.w13, intermediate_size=intermediate_size)
         w13_scale = _interleave_gate_up_16(
             weights.w13_scale, intermediate_size=intermediate_size
         )
@@ -202,12 +199,9 @@ def preprocess_mega_weights(
             )
         if weights.w2.shape != logical_w2_shape:
             raise ValueError(
-                f"w2 must have shape {logical_w2_shape}, "
-                f"got {tuple(weights.w2.shape)}"
+                f"w2 must have shape {logical_w2_shape}, got {tuple(weights.w2.shape)}"
             )
-        w13 = _interleave_gate_up_16(
-            weights.w13, intermediate_size=intermediate_size
-        )
+        w13 = _interleave_gate_up_16(weights.w13, intermediate_size=intermediate_size)
         for expert in range(num_experts):
             fc1_q, fc1_sf = _quantize_expert_weights(
                 w13[expert],

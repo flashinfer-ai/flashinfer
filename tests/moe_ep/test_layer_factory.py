@@ -102,7 +102,12 @@ def test_factory_returns_split_for_string_backend():
 
 
 def test_factory_returns_split_for_nvep_config():
-    from flashinfer.moe_ep import BootstrapConfig, MoEEpLayer, MoEEpSplitLayer, NvepConfig
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        MoEEpLayer,
+        MoEEpSplitLayer,
+        NvepConfig,
+    )
 
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0, tcp_store=object()),

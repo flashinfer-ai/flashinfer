@@ -42,15 +42,15 @@ from common.host_utils import mxfp8_quantize_per_block_32
 
 def compute_megamoe_reference_mxfp8(
     # MXFP8 tensors carry LOGICAL shape (fp8 = 1 byte/element, no packing).
-    input_activation: torch.Tensor,        # (num_ranks, num_tokens_per_rank, hidden) fp8
-    input_activation_sf: torch.Tensor,     # (num_ranks, num_tokens_per_rank, hidden//32) E8M0
-    input_topk_idx: torch.Tensor,          # (num_ranks, num_tokens_per_rank, num_topk) int64
-    input_topk_weights: torch.Tensor,      # (num_ranks, num_tokens_per_rank, num_topk) fp32
-    fc1_weight: torch.Tensor,              # (num_ranks, num_experts_per_rank, hidden, intermediate) fp8, hidden stride-1
-    fc1_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, intermediate, hidden//32) E8M0
-    fc2_weight: torch.Tensor,              # (num_ranks, num_experts_per_rank, intermediate//2, hidden) fp8, inter//2 stride-1
-    fc2_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//32) E8M0
-    ab_dtype: torch.dtype,                 # torch.float8_e4m3fn or torch.float8_e5m2
+    input_activation: torch.Tensor,  # (num_ranks, num_tokens_per_rank, hidden) fp8
+    input_activation_sf: torch.Tensor,  # (num_ranks, num_tokens_per_rank, hidden//32) E8M0
+    input_topk_idx: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) int64
+    input_topk_weights: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) fp32
+    fc1_weight: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, intermediate) fp8, hidden stride-1
+    fc1_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate, hidden//32) E8M0
+    fc2_weight: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate//2, hidden) fp8, inter//2 stride-1
+    fc2_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//32) E8M0
+    ab_dtype: torch.dtype,  # torch.float8_e4m3fn or torch.float8_e5m2
     norm_const: float = 1.0,
     ref_compute_graph: Literal["transformers", "deepgemm"] = "deepgemm",
     fc2_output_dtype: torch.dtype = torch.bfloat16,
@@ -136,8 +136,8 @@ def compute_megamoe_reference_mxfp8(
             Mxfp8BlockSize,
             global_scale=None,
         )
-        fc1_weight_fp32 = fc1_weight_t_fp32.transpose(0, 1)         # (hidden, intermediate)
-        fc1_output_fp32 = gathered_act @ fc1_weight_fp32           # (R, intermediate)
+        fc1_weight_fp32 = fc1_weight_t_fp32.transpose(0, 1)  # (hidden, intermediate)
+        fc1_output_fp32 = gathered_act @ fc1_weight_fp32  # (R, intermediate)
 
         # SwiGLU fold: gate/up interleaved at Mxfp8BlockSize (=32) granularity,
         # matching the kernel's PostSwigluHalf interleave for MXFP8.
@@ -152,7 +152,7 @@ def compute_megamoe_reference_mxfp8(
             _up = _up.clamp(min=-limit, max=limit)
         swiglu_output = _swiglu_pair_hw_match_cuda(_gate, _up).reshape(
             _M, _N // 2
-        )                                                          # (R, intermediate//2)
+        )  # (R, intermediate//2)
 
         # fc1-out MXFP8 round-trip (the only step that introduces kernel-vs-ref
         # disagreement above fp32 accumulation noise).
@@ -167,8 +167,8 @@ def compute_megamoe_reference_mxfp8(
             Mxfp8BlockSize,
             global_scale=None,
         )
-        fc2_weight_fp32 = fc2_weight_t_fp32.transpose(0, 1)        # (intermediate//2, hidden)
-        fc2_output_fp32 = fc1_dequant @ fc2_weight_fp32            # (R, hidden)
+        fc2_weight_fp32 = fc2_weight_t_fp32.transpose(0, 1)  # (intermediate//2, hidden)
+        fc2_output_fp32 = fc1_dequant @ fc2_weight_fp32  # (R, hidden)
 
         combine_ref[source_ranks, source_tokens, source_topk_slots, :] = (
             fc2_output_fp32.to(fc2_output_dtype)

@@ -43,10 +43,10 @@ try:
 except ImportError:  # older wheels: value is fixed by the GEP encoding ABI
     MLIR_DYNAMIC_INDEX = -(2**31)
 
-_BYVAL_RANK_LIMIT = 16             # struct<(array<16 x i64>)> == exactly 128B
+_BYVAL_RANK_LIMIT = 16  # struct<(array<16 x i64>)> == exactly 128B
 
 
-#TODO: Fix this when compiler fixed. This is a shit WAR due to the cuda-to-llvm bug, it just treats any kernel arg to tma_desc as long as it's marked `grid_constant + byval`
+# TODO: Fix this when compiler fixed. This is a shit WAR due to the cuda-to-llvm bug, it just treats any kernel arg to tma_desc as long as it's marked `grid_constant + byval`
 def _byval_struct_ty() -> Any:
     """128B byval pointee shared by alloca / GEP / the ``llvm.byval`` attr."""
     return ir.Type.parse(f"!llvm.struct<(array<{_BYVAL_RANK_LIMIT} x i64>)>")
@@ -77,10 +77,14 @@ class SymBufferDeviceBase:
 
     def __extract_mlir_attributes__(self) -> list:
         if self.num_max_ranks <= _BYVAL_RANK_LIMIT:
-            return [ir.DictAttr.get({
-                "cute_nvgpu.grid_constant": ir.UnitAttr.get(),
-                "llvm.byval": ir.TypeAttr.get(_byval_struct_ty()),
-            })]
+            return [
+                ir.DictAttr.get(
+                    {
+                        "cute_nvgpu.grid_constant": ir.UnitAttr.get(),
+                        "llvm.byval": ir.TypeAttr.get(_byval_struct_ty()),
+                    }
+                )
+            ]
         return [ir.DictAttr.get({})]
 
     @cute.jit
@@ -148,8 +152,7 @@ class SymBufferHost:
         num_max_ranks = self.num_max_ranks
         if len(offsets) != num_max_ranks:
             raise ValueError(
-                f"len(offsets)={len(offsets)} must equal "
-                f"num_max_ranks={num_max_ranks}."
+                f"len(offsets)={len(offsets)} must equal num_max_ranks={num_max_ranks}."
             )
 
         if num_max_ranks <= _BYVAL_RANK_LIMIT:
@@ -158,16 +161,28 @@ class SymBufferHost:
             i64_ty = ir.Type.parse("i64")
             one = arith.constant(
                 value=ir.IntegerAttr.get(i64_ty, 1),
-                result=i64_ty, loc=loc, ip=ip,
+                result=i64_ty,
+                loc=loc,
+                ip=ip,
             )
             buf = llvm.alloca(
-                res=ptr_ty, elem_type=st_ty, array_size=one,
-                alignment=64, loc=loc, ip=ip,
+                res=ptr_ty,
+                elem_type=st_ty,
+                array_size=one,
+                alignment=64,
+                loc=loc,
+                ip=ip,
             )
             for i, off in enumerate(offsets):
                 slot = llvm.getelementptr(
-                    ptr_ty, buf, [], [i], i64_ty,
-                    no_wrap_flags="None", loc=loc, ip=ip,
+                    ptr_ty,
+                    buf,
+                    [],
+                    [i],
+                    i64_ty,
+                    no_wrap_flags="None",
+                    loc=loc,
+                    ip=ip,
                 )
                 llvm.store(self._as_int64(off).ir_value(), slot, loc=loc, ip=ip)
             return SymBufferDeviceBase(val=buf, num_max_ranks=num_max_ranks)
@@ -178,10 +193,16 @@ class SymBufferHost:
         for i, off in enumerate(offsets):
             idx = arith.constant(
                 value=ir.IntegerAttr.get(i32_ty, i),
-                result=i32_ty, loc=loc, ip=ip,
+                result=i32_ty,
+                loc=loc,
+                ip=ip,
             )
             vec = llvm.insertelement(
-                vec, self._as_int64(off).ir_value(), idx, loc=loc, ip=ip,
+                vec,
+                self._as_int64(off).ir_value(),
+                idx,
+                loc=loc,
+                ip=ip,
             )
         return SymBufferDeviceBase(val=vec, num_max_ranks=num_max_ranks)
 
@@ -231,17 +252,17 @@ class _SymBufferHostAdapter:
         idx = 0
 
         base_n = len(get_mlir_types(self._fields[0]))
-        base_addr = new_from_mlir_values(self._fields[0], values[idx:idx + base_n])
+        base_addr = new_from_mlir_values(self._fields[0], values[idx : idx + base_n])
         idx += base_n
 
         offsets = []
         for field in self._fields[1:-1]:
             n = len(get_mlir_types(field))
-            offsets.append(new_from_mlir_values(field, values[idx:idx + n]))
+            offsets.append(new_from_mlir_values(field, values[idx : idx + n]))
             idx += n
 
         rank_n = len(get_mlir_types(self._fields[-1]))
-        rank_idx = new_from_mlir_values(self._fields[-1], values[idx:idx + rank_n])
+        rank_idx = new_from_mlir_values(self._fields[-1], values[idx : idx + rank_n])
         idx += rank_n
         if idx != len(values):
             raise ValueError(

@@ -79,7 +79,10 @@ class TestMaterializeFusedMoeWeights:
             torch.bfloat16
         )
         cfg = _bf16_moe_config(
-            num_experts=4, local_num_experts=local_n, offset=0, intermediate=intermediate
+            num_experts=4,
+            local_num_experts=local_n,
+            offset=0,
+            intermediate=intermediate,
         )
         canonical = MoEWeightPack(w13=w13, w2=w2)
 
@@ -108,7 +111,10 @@ class TestMaterializeFusedMoeWeights:
             torch.bfloat16
         )
         cfg = _bf16_moe_config(
-            num_experts=4, local_num_experts=local_n, offset=0, intermediate=intermediate
+            num_experts=4,
+            local_num_experts=local_n,
+            offset=0,
+            intermediate=intermediate,
         )
         pack = materialize_fused_moe_weights(MoEWeightPack(w13=w13, w2=w2), cfg)
         view = pack.get_view("trtllm_bf16_routed")
@@ -122,7 +128,10 @@ class TestMaterializeFusedMoeWeights:
     def test_nvfp4_trtllm_matches_manual_prepare(self):
         import torch
 
-        from flashinfer.fused_moe.api import MoEWeightPack as FusedMoEWeightPack, TrtllmFp4Config
+        from flashinfer.fused_moe.api import (
+            MoEWeightPack as FusedMoEWeightPack,
+            TrtllmFp4Config,
+        )
         from flashinfer.moe_ep import MoEWeightPack
         from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
             materialize_fused_moe_weights,
@@ -141,7 +150,10 @@ class TestMaterializeFusedMoeWeights:
             * 0.1
         )
         cfg = _nvfp4_moe_config(
-            num_experts=4, local_num_experts=local_n, offset=0, intermediate=intermediate
+            num_experts=4,
+            local_num_experts=local_n,
+            offset=0,
+            intermediate=intermediate,
         )
 
         got = materialize_fused_moe_weights(MoEWeightPack(w13=w13, w2=w2), cfg)

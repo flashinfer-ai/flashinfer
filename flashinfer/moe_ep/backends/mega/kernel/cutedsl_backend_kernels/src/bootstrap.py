@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 
 import nvshmem.core
+
 try:
     # cuda-core < 1.0 (APIs were still under the experimental namespace).
     from cuda.core.experimental import Device
@@ -63,6 +64,7 @@ class _Region:
     before placement. Default 16B matches the TMA descriptor minimum;
     large FP8 token rows use 128B for ``cp.async.bulk`` efficiency.
     """
+
     name: str
     dtype: torch.dtype
     shape: Tuple[int, ...]
@@ -77,6 +79,7 @@ class _Shapes:
     ``get_num_padded_sf_pool_tokens``. Stored on ``Workspace`` so callers
     don't recompute when ``num_tokens_per_rank`` is overridden per-launch.
     """
+
     num_tokens_per_rank: int
     num_max_pool_tokens: int
     num_max_pool_blocks: int
@@ -139,29 +142,31 @@ def _build_spec(
 
     return (
         # Input region (per-rank source side).
-        _Region("input_token_buffer",         torch.uint8,   (T, H_BYTES),                    align=128),
-        _Region("input_sf_buffer",            torch.int32,   (T, SFU),                        align=16),
-        _Region("input_topk_idx_buffer",      torch.int64,   (T, K),                          align=16),
-        _Region("input_topk_weights_buffer",  torch.float32, (T, K),                          align=16),
+        _Region("input_token_buffer", torch.uint8, (T, H_BYTES), align=128),
+        _Region("input_sf_buffer", torch.int32, (T, SFU), align=16),
+        _Region("input_topk_idx_buffer", torch.int64, (T, K), align=16),
+        _Region("input_topk_weights_buffer", torch.float32, (T, K), align=16),
         # Counters (atomicAdd targets).
-        _Region("expert_send_count",          torch.int64,   (E_total,),                      align=16),
-        _Region("expert_recv_count",          torch.int64,   (R, E_local),                    align=16),
-        _Region("expert_recv_count_sum",      torch.int64,   (E_local,),                      align=16),
+        _Region("expert_send_count", torch.int64, (E_total,), align=16),
+        _Region("expert_recv_count", torch.int64, (R, E_local), align=16),
+        _Region("expert_recv_count_sum", torch.int64, (E_local,), align=16),
         # Routing workspace.
-        _Region("src_token_topk_idx",         torch.int32,   (E_local, R, MAX_SLOT),          align=16),
-        _Region("token_src_metadata",         torch.uint8,   (P_TOK, TOKEN_METADATA_BYTES),   align=16),
+        _Region("src_token_topk_idx", torch.int32, (E_local, R, MAX_SLOT), align=16),
+        _Region(
+            "token_src_metadata", torch.uint8, (P_TOK, TOKEN_METADATA_BYTES), align=16
+        ),
         # L1 receive-side pool.  Note: ``l1_arrival_count`` is sized at
         # ``cluster_tile_m`` granularity (num_max_task_tiles), not at
         # ``block_m`` granularity -- see fc12_integrate_comm.md §4 C3.
-        _Region("l1_arrival_count",           torch.int32,   (P_TT,),                         align=16),
-        _Region("l1_token_buffer",            torch.uint8,   (P_TOK, H_BYTES),                align=128),
-        _Region("l1_sf_buffer",               torch.int32,   (SFU, P_SF),                     align=16),
-        _Region("l1_topk_weights_buffer",     torch.float32, (P_TOK,),                        align=16),
+        _Region("l1_arrival_count", torch.int32, (P_TT,), align=16),
+        _Region("l1_token_buffer", torch.uint8, (P_TOK, H_BYTES), align=128),
+        _Region("l1_sf_buffer", torch.int32, (SFU, P_SF), align=16),
+        _Region("l1_topk_weights_buffer", torch.float32, (P_TOK,), align=16),
         # Cross-rank barrier signal (slot 0 = pre-pull, slot 1 = kernel-tail).
-        _Region("nvlink_barrier_signal",      torch.int32,   (R, 2),                          align=16),
+        _Region("nvlink_barrier_signal", torch.int32, (R, 2), align=16),
         # Local-only counter for software_grid_sync (carried in symmetric heap
         # so layout is uniform; intra-rank, no peer reads).
-        _Region("grid_sync_counter",          torch.int32,   (2,),                            align=16),
+        _Region("grid_sync_counter", torch.int32, (2,), align=16),
     )
 
 
@@ -201,6 +206,7 @@ class Workspace:
     the same delta works for every sub-region (mega_moe ``SymBuffer.map``
     semantics, ``sym_buffer.cuh:34-37``).
     """
+
     # Input region.
     input_token_buffer: torch.Tensor
     input_sf_buffer: torch.Tensor
@@ -227,7 +233,7 @@ class Workspace:
     # byval ABI). ``peer_offsets_list[r] = peer_r_base - local_base`` in
     # bytes; ``peer_offsets_list[local_rank] == 0``.
     symmetric_base: int
-    peer_offsets_list: tuple   # tuple[int, ...] length = world_size
+    peer_offsets_list: tuple  # tuple[int, ...] length = world_size
     local_rank: int
     # Derived pool shapes (so callers don't recompute when num_tokens_per_rank
     # is overridden per-launch).
@@ -332,8 +338,7 @@ def alloc_workspace(
         for r in range(world_size)
     )
     assert peer_offsets_list[rank] == 0, (
-        f"peer_offsets_list[rank={rank}] expected 0, got "
-        f"{peer_offsets_list[rank]}"
+        f"peer_offsets_list[rank={rank}] expected 0, got {peer_offsets_list[rank]}"
     )
 
     return Workspace(
@@ -466,5 +471,3 @@ def finalize_dist_and_nvshmem(workspace: Workspace | None = None) -> None:
             dist.destroy_process_group()
     except Exception:  # noqa: BLE001
         pass
-
-

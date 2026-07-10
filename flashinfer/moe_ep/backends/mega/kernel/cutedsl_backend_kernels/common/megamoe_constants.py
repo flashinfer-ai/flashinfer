@@ -14,11 +14,11 @@ TmaLeadingDimByteAlign = 16
 
 Nvfp4E2M1Max = 6.0
 Fp8E4M3FNMax = 448.0
-Fp8E5M2Max   = 57344.0
+Fp8E5M2Max = 57344.0
 
 Nvfp4E2M1RcpLimit = 1.0 / Nvfp4E2M1Max
-Fp8E4M3RcpLimit   = 1.0 / Fp8E4M3FNMax
-Fp8E5M2RcpLimit   = 1.0 / Fp8E5M2Max
+Fp8E4M3RcpLimit = 1.0 / Fp8E4M3FNMax
+Fp8E5M2RcpLimit = 1.0 / Fp8E5M2Max
 
 SupportedMmaTileM = (128, 256)
 SupportedMmaTileN = (64, 128, 256)

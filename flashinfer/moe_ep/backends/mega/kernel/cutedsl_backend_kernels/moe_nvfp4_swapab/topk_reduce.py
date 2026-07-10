@@ -75,24 +75,66 @@ assert NVFP4_HIDDEN_PER_THREAD % NVFP4_GLOBAL_SCALE_BLOCK_SIZE == 0, (
 
 _Fp4DecodeTable: torch.Tensor = torch.tensor(
     [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
     ],
     dtype=torch.float32,
 )
 
 _Fp4ValuesEvenFirst: torch.Tensor = torch.tensor(
     [
-        0.0, 1.0, 2.0, 4.0, -0.0, -1.0, -2.0, -4.0,
-        0.5, 1.5, 3.0, 6.0, -0.5, -1.5, -3.0, -6.0,
+        0.0,
+        1.0,
+        2.0,
+        4.0,
+        -0.0,
+        -1.0,
+        -2.0,
+        -4.0,
+        0.5,
+        1.5,
+        3.0,
+        6.0,
+        -0.5,
+        -1.5,
+        -3.0,
+        -6.0,
     ],
     dtype=torch.float32,
 )
 
 _ReorderToNibble: torch.Tensor = torch.tensor(
     [
-        0x0, 0x2, 0x4, 0x6, 0x8, 0xA, 0xC, 0xE,
-        0x1, 0x3, 0x5, 0x7, 0x9, 0xB, 0xD, 0xF,
+        0x0,
+        0x2,
+        0x4,
+        0x6,
+        0x8,
+        0xA,
+        0xC,
+        0xE,
+        0x1,
+        0x3,
+        0x5,
+        0x7,
+        0x9,
+        0xB,
+        0xD,
+        0xF,
     ],
     dtype=torch.uint8,
 )
@@ -175,22 +217,46 @@ def _pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
     """Round FP32 to FP4 E2M1 and pack pairs along the last dimension."""
     if fp32.dim() == 0 or fp32.shape[-1] % 2 != 0:
         raise ValueError(
-            f"FP4 packing requires an even non-empty last dim, got "
-            f"{tuple(fp32.shape)}."
+            f"FP4 packing requires an even non-empty last dim, got {tuple(fp32.shape)}."
         )
     device = fp32.device
     boundaries = torch.tensor(
         [
-            -5.0, -3.5, -2.5, -1.75, -1.25, -0.75, -0.25,
-            0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0,
+            -5.0,
+            -3.5,
+            -2.5,
+            -1.75,
+            -1.25,
+            -0.75,
+            -0.25,
+            0.25,
+            0.75,
+            1.25,
+            1.75,
+            2.5,
+            3.5,
+            5.0,
         ],
         device=device,
         dtype=fp32.dtype,
     )
     bucket_to_nibble = torch.tensor(
         [
-            0xF, 0xE, 0xD, 0xC, 0xB, 0xA, 0x9, 0x0,
-            0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7,
+            0xF,
+            0xE,
+            0xD,
+            0xC,
+            0xB,
+            0xA,
+            0x9,
+            0x0,
+            0x1,
+            0x2,
+            0x3,
+            0x4,
+            0x5,
+            0x6,
+            0x7,
         ],
         device=device,
         dtype=torch.uint8,
@@ -210,8 +276,7 @@ def unpack_fp4_to_f32(packed: torch.Tensor) -> torch.Tensor:
         raw = packed.view(torch.uint8)
     else:
         raise TypeError(
-            "packed must be torch.uint8 or torch.float4_e2m1fn_x2, got "
-            f"{packed.dtype}."
+            f"packed must be torch.uint8 or torch.float4_e2m1fn_x2, got {packed.dtype}."
         )
     lo = (raw & 0x0F).to(torch.int64)
     hi = (raw >> 4).to(torch.int64)
@@ -590,15 +655,15 @@ def faithful_mxfp8_reference_sum(
               acc = round32(contrib * score + acc)          (fma_packed)
     """
     block = MXFP8_SCALE_BLOCK_SIZE
-    val = _f32_in_f64(q)                                # (T, K, H)
-    scale = _f32_in_f64(scale)                          # (T, H/block) or (T, K, H/block)
+    val = _f32_in_f64(q)  # (T, K, H)
+    scale = _f32_in_f64(scale)  # (T, H/block) or (T, K, H/block)
     if scale.dim() == 2:
-        scale = scale[:, None, :]                       # share a rank-2 scale across K
+        scale = scale[:, None, :]  # share a rank-2 scale across K
     # Per-block scale -> per-element.  repeat_interleave + truncate tolerates a
     # partial trailing block (H not a multiple of `block`); a rank-2 scale then
     # broadcasts over K in the multiply below.
     exp_scale = scale.repeat_interleave(block, dim=-1)[..., : q.shape[-1]]
-    prod = val * exp_scale                              # val * scale, unrounded
+    prod = val * exp_scale  # val * scale, unrounded
     # no-score fuses val*scale+acc; score pre-rounds the product (mul_packed) first.
     summand = _f32_in_f64(prod) if topk_score is not None else prod
     return _ordered_fma_reduce(summand, topk_score)
@@ -624,14 +689,16 @@ def faithful_nvfp4_pack6_reference_sum(
     """
     val = _f32_in_f64(unpack_fp4_to_f32(q))
     T, K, H = val.shape
-    n_tiles = H // NVFP4_GLOBAL_SCALE_BLOCK_SIZE                       # per-32 tiles g
-    sub = NVFP4_GLOBAL_SCALE_BLOCK_SIZE // NVFP4_SFC_SCALE_BLOCK_SIZE  # 16-blocks per tile
-    per_sub = NVFP4_SFC_SCALE_BLOCK_SIZE                              # elems per 16-block
+    n_tiles = H // NVFP4_GLOBAL_SCALE_BLOCK_SIZE  # per-32 tiles g
+    sub = (
+        NVFP4_GLOBAL_SCALE_BLOCK_SIZE // NVFP4_SFC_SCALE_BLOCK_SIZE
+    )  # 16-blocks per tile
+    per_sub = NVFP4_SFC_SCALE_BLOCK_SIZE  # elems per 16-block
     val = val.reshape(T, K, n_tiles, sub, per_sub)
     sfc = _f32_in_f64(sfc_view).reshape(T, K, n_tiles, sub, 1)
     glob = _f32_in_f64(global_view[..., 0]).reshape(T, K, n_tiles, 1, 1)
-    contrib = _f32_in_f64(val * sfc)                    # mul_packed(fp4 * sfc)
-    prod = (contrib * glob).reshape(T, K, H)            # contrib * global, unrounded
+    contrib = _f32_in_f64(val * sfc)  # mul_packed(fp4 * sfc)
+    prod = (contrib * glob).reshape(T, K, H)  # contrib * global, unrounded
     # no-score fuses contrib*global+acc; score pre-rounds contrib*global first.
     summand = _f32_in_f64(prod) if topk_score is not None else prod
     return _ordered_fma_reduce(summand, topk_score)
@@ -960,9 +1027,7 @@ def topk_reduce_kernel(
                 # PACK6 4D (T,K,N,2) scales; sub = (h//16) % 2 selects the e4m3 byte
                 # within tile g (= global_col); the fp32 word is at [.,.,g,0].
                 sfc_sub = sfc_col - global_col * Int32(2)
-                sfc = Float32(
-                    nvfp4_sfc_scale[token_idx, Int32(k), global_col, sfc_sub]
-                )
+                sfc = Float32(nvfp4_sfc_scale[token_idx, Int32(k), global_col, sfc_sub])
                 global_sf = Float32(
                     nvfp4_global_scale[token_idx, Int32(k), global_col, Int32(0)]
                 )
@@ -1104,9 +1169,7 @@ def topk_reduce_nvfp4_vec_kernel(
                 # g sit at [.,.,g,0]/[.,.,g,1] (bytes 8g+4 / 8g+5).  Here g == global_col
                 # and sfc_block_i in {0,1} is the sub-block.
                 sfc = Float32(
-                    nvfp4_sfc_scale[
-                        token_idx, Int32(k), global_col, Int32(sfc_block_i)
-                    ]
+                    nvfp4_sfc_scale[token_idx, Int32(k), global_col, Int32(sfc_block_i)]
                 )
                 sfc_pair = (sfc, sfc)
                 for byte_offset in cutlass.range_constexpr(
@@ -1175,6 +1238,7 @@ def topk_reduce_nvfp4_vec_kernel(
                 for i in cutlass.range_constexpr(0, NVFP4_SFC_SCALE_BLOCK_SIZE, 1):
                     out_tile[i] = acc[i]
 
+
 def _validate_tensors(
     combine_output: torch.Tensor,
     reduced_output: torch.Tensor,
@@ -1190,8 +1254,7 @@ def _validate_tensors(
         )
     if reduced_output.dim() != 2:
         raise ValueError(
-            f"reduced_output must have shape (T, H), got "
-            f"{tuple(reduced_output.shape)}."
+            f"reduced_output must have shape (T, H), got {tuple(reduced_output.shape)}."
         )
     if reduced_output.dtype not in (torch.float32, torch.bfloat16):
         raise TypeError(
@@ -1226,8 +1289,7 @@ def _validate_tensors(
     H = int(H_storage) * 2 if nvfp4_mode else int(H_storage)
     if reduced_output.shape != (T, H):
         raise ValueError(
-            f"reduced_output shape must be {(T, H)}, got "
-            f"{tuple(reduced_output.shape)}."
+            f"reduced_output shape must be {(T, H)}, got {tuple(reduced_output.shape)}."
         )
 
     mxfp8_scale_rank = 0
@@ -1238,9 +1300,7 @@ def _validate_tensors(
                 f"or NVFP4 scales are provided, got {combine_output.dtype}."
             )
     elif mxfp8_scale is not None:
-        if not hasattr(torch, "float8_e4m3fn") or not hasattr(
-            torch, "float8_e8m0fnu"
-        ):
+        if not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"):
             raise TypeError(
                 "MXFP8 mode requires torch float8_e4m3fn and float8_e8m0fnu."
             )
@@ -1251,8 +1311,7 @@ def _validate_tensors(
             )
         if mxfp8_scale.dtype != torch.float8_e8m0fnu:
             raise TypeError(
-                f"mxfp8_scale must be torch.float8_e8m0fnu, got "
-                f"{mxfp8_scale.dtype}."
+                f"mxfp8_scale must be torch.float8_e8m0fnu, got {mxfp8_scale.dtype}."
             )
         if reduced_output.dtype != torch.bfloat16:
             raise TypeError(
@@ -1345,8 +1404,7 @@ def _validate_tensors(
     if topk_score is not None:
         if topk_score.dim() != 2:
             raise ValueError(
-                f"topk_score must have shape (T, K), got "
-                f"{tuple(topk_score.shape)}."
+                f"topk_score must have shape (T, K), got {tuple(topk_score.shape)}."
             )
         if topk_score.dtype != torch.float32:
             raise TypeError(
@@ -1361,8 +1419,7 @@ def _validate_tensors(
             )
         if topk_score.shape != (T, K):
             raise ValueError(
-                f"topk_score shape must be {(T, K)}, got "
-                f"{tuple(topk_score.shape)}."
+                f"topk_score shape must be {(T, K)}, got {tuple(topk_score.shape)}."
             )
     return int(T), int(K), int(H), int(mxfp8_scale_rank)
 
@@ -1423,9 +1480,7 @@ def compile_topk_reduce(
         _to_cute_tensor(nvfp4_sfc_scale) if nvfp4_sfc_scale is not None else None
     )
     nvfp4_global_scale_cute = (
-        _to_cute_tensor(nvfp4_global_scale)
-        if nvfp4_global_scale is not None
-        else None
+        _to_cute_tensor(nvfp4_global_scale) if nvfp4_global_scale is not None else None
     )
     nvfp4_mode = nvfp4_sfc_scale is not None
     # PACK6 delivers the SF plane as 4D (T,K,N,2) interleaved views (global[..,g,0]
@@ -1599,6 +1654,7 @@ def launch_compiled_topk_reduce(
     return_elapsed_ms: bool = False,
 ) -> Optional[float]:
     """Launch a topk reduce plan returned by :func:`compile_topk_reduce`."""
+
     def _launch() -> None:
         compiled(
             combine_cute,
@@ -1834,8 +1890,12 @@ def benchmark_topk_reduce_vs_torch_sum(
         if timed_baseline:
             if topk_score is None:
                 return combine_output_ref.to(torch.float32).sum(dim=1).to(output_dtype)
-            return weighted_reference_sum(combine_output_ref, topk_score).to(output_dtype)
-        return faithful_bf16_reference_sum(combine_output_ref, topk_score).to(output_dtype)
+            return weighted_reference_sum(combine_output_ref, topk_score).to(
+                output_dtype
+            )
+        return faithful_bf16_reference_sum(combine_output_ref, topk_score).to(
+            output_dtype
+        )
 
     expected_result = reference_result(timed_baseline=False)
     # Strict 1e-5 for FP32 and BF16 output alike.  The accuracy reference above is

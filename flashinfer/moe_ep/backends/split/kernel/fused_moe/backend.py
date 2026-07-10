@@ -104,7 +104,5 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 is_nvfp4=is_nvfp4,
             )
 
-        out_2d = self._ensure_compute(fleet_params)(
-            act_pack, self._transformed_weights
-        )
+        out_2d = self._ensure_compute(fleet_params)(act_pack, self._transformed_weights)
         return reshape_for_combine(out_2d, dim0, dim1)

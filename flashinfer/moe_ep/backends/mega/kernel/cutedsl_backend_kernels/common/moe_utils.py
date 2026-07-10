@@ -65,7 +65,7 @@ def swiglu_act(
         t_swiglu_log2e = cute.arch.mul_packed_f32x2(
             (t_gate[i], t_gate[i + 1]),
             (-Log2E, -Log2E),
-            rnd='rn',
+            rnd="rn",
             ftz=False,
         )
         (
@@ -86,7 +86,7 @@ def swiglu_act(
         ) = cute.arch.mul_packed_f32x2(
             (t_swiglu[i], t_swiglu[i + 1]),
             (t_gate[i + 0], t_gate[i + 1]),
-            rnd='rn',
+            rnd="rn",
             ftz=False,
         )
         (
@@ -95,7 +95,7 @@ def swiglu_act(
         ) = cute.arch.mul_packed_f32x2(
             (t_swiglu[i], t_swiglu[i + 1]),
             (t_up[i], t_up[i + 1]),
-            rnd='rn',
+            rnd="rn",
             ftz=False,
         )
         (
@@ -104,7 +104,7 @@ def swiglu_act(
         ) = cute.arch.mul_packed_f32x2(
             (t_swiglu[i], t_swiglu[i + 1]),
             (prob, prob),
-            rnd='rn',
+            rnd="rn",
             ftz=False,
         )
 
@@ -204,7 +204,6 @@ def cvt_f32_to_f8_to_f32(fp32x1, fp8_type, loc=None, ip=None):
     return dst_f32
 
 
-
 @cute.jit
 def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, loc=None, ip=None):
     fp32x4 = fp32x4.load()
@@ -296,8 +295,12 @@ def cvt_f32x8_to_f4x8_pack_i32(fp32x8, loc=None, ip=None):
 
 @cute.jit
 def quant_sfd_row(
-    src, dst, norm_const,
-    sf_vec_size, sf_dtype, d_dtype,
+    src,
+    dst,
+    norm_const,
+    sf_vec_size,
+    sf_dtype,
+    d_dtype,
 ) -> None:
     rcp_limit = Fp8E4M3RcpLimit if d_dtype == cutlass.Float8E4M3FN else Fp8E5M2RcpLimit
     acc_frg = src.load()
@@ -305,14 +308,18 @@ def quant_sfd_row(
     abs_acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
     avg_fp32 = (
         abs_acc_frg.reduce(cute.ReductionOp.MAX, Float32(0.0), 0)
-        * rcp_limit * norm_const
+        * rcp_limit
+        * norm_const
     )
     qpvscale_up = cvt_f32_to_f8_to_f32(avg_fp32, sf_dtype)
     acc_scale = norm_const * cute.arch.rcp_approx(qpvscale_up)
     acc_scale = fmin(acc_scale, Fp32Max, nan=True)
     for ei in cutlass.range_constexpr(0, sf_vec_size, 2):
         src[ei], src[ei + 1] = cute.arch.mul_packed_f32x2(
-            (src[ei], src[ei + 1]), (acc_scale, acc_scale), rnd="rn", ftz=False,
+            (src[ei], src[ei + 1]),
+            (acc_scale, acc_scale),
+            rnd="rn",
+            ftz=False,
         )
     dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
     for ei in cutlass.range_constexpr(0, sf_vec_size, 4):

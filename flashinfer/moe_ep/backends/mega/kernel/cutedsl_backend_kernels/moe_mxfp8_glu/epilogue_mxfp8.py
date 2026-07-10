@@ -11,6 +11,7 @@ import dataclasses
 
 import cutlass
 import cutlass.cute as cute
+
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
@@ -127,7 +128,8 @@ class Fc2OutputDest:
         src_topk = md.src_topk
         local_row = cute.slice_(self.tensor, (src_token, src_topk, None))
         peer_iter = self.peer_rank_ptr_mapper.ptr_map_to_rank(
-            local_row.iterator, src_rank,
+            local_row.iterator,
+            src_rank,
         )
         return cute.make_tensor(peer_iter, local_row.layout)
 
@@ -136,8 +138,8 @@ class Fc2OutputDest:
 # GluMxfp8Epilogue
 # =============================================================================
 
-class GluMxfp8Epilogue:
 
+class GluMxfp8Epilogue:
     _SubtileBarIdBase = 4
 
     def __init__(
@@ -202,7 +204,7 @@ class GluMxfp8Epilogue:
         self._num_sfb_tmem_cols = (
             self._cta_tile_n_sfb * k // sf_vec_size * 4 // 4 // 128
         )
-        self._num_sf_tmem_cols = 32 # self._num_sfa_tmem_cols + self._num_sfb_tmem_cols
+        self._num_sf_tmem_cols = 32  # self._num_sfa_tmem_cols + self._num_sfb_tmem_cols
 
         self._num_accumulator_tmem_cols = self._cta_tile_n * self._num_acc_stage - (
             self._num_sf_tmem_cols if self._overlapping_accum else 0
@@ -221,9 +223,7 @@ class GluMxfp8Epilogue:
             self._epi_fc1_batch = max(1, epi_flag_batch)
             self._epi_fc2_batch = max(1, epi_flag_batch)
 
-        self.glu_clamp = (
-            cutlass.Float32(glu_clamp) if glu_clamp is not None else None
-        )
+        self.glu_clamp = cutlass.Float32(glu_clamp) if glu_clamp is not None else None
 
     # -- Codegen-time queries  --
 
@@ -319,9 +319,7 @@ class GluMxfp8Epilogue:
         )
 
         leader_warp = store_idx
-        tile_has_valid = (
-            store_idx * cutlass.Int32(EpilogueTileN) < valid_tokens
-        )
+        tile_has_valid = store_idx * cutlass.Int32(EpilogueTileN) < valid_tokens
 
         bar_id = store_idx + cutlass.Int32(GluMxfp8Epilogue._SubtileBarIdBase)
         bar = pipeline.NamedBarrier(
@@ -372,7 +370,7 @@ class GluMxfp8Epilogue:
             cute.make_tensor(
                 subtile_up_ptr,
                 _TmemTranspose16x32Core._tmem_layout(32, EpilogueTileN),
-            )
+            ),
         )
 
     def _subtile_forward_tmem_tensor(
@@ -392,7 +390,7 @@ class GluMxfp8Epilogue:
             cute.make_tensor(
                 tmem_up_ptr,
                 _TmemTranspose16x32Core._tmem_layout(32, EpilogueTileN),
-            )
+            ),
         )
 
     # -- fc1 subtile: SM100 path --
@@ -416,9 +414,15 @@ class GluMxfp8Epilogue:
         norm_const,
     ) -> None:
         """MXFP8 fc1 task-tile: TmemTranspose16x32 TMEM loading + cross-warp E8M0 exchange."""
-        real_fc1_output, _    = sched_ext.get_gmem_tensor("d",    gmem_fc1_output,    work_tile_info)
-        real_fc1_output_sf, _ = sched_ext.get_gmem_tensor("sfd",  gmem_fc1_output_sf, work_tile_info)
-        real_topk_scores, _   = sched_ext.get_gmem_tensor("topk", gmem_topk_scores,   work_tile_info)
+        real_fc1_output, _ = sched_ext.get_gmem_tensor(
+            "d", gmem_fc1_output, work_tile_info
+        )
+        real_fc1_output_sf, _ = sched_ext.get_gmem_tensor(
+            "sfd", gmem_fc1_output_sf, work_tile_info
+        )
+        real_topk_scores, _ = sched_ext.get_gmem_tensor(
+            "topk", gmem_topk_scores, work_tile_info
+        )
 
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_push("mxfp8_fc1_epi_tile")
@@ -432,9 +436,11 @@ class GluMxfp8Epilogue:
                 cutlass.Int32(acc_consumer_state.index) * self._cta_tile_n
             )
 
-        subtile_cnt  = self._subtile_cnt
+        subtile_cnt = self._subtile_cnt
         tmem_gate, tmem_up = self._subtile_local_tmem_tensor_pair(
-            tmem_acc_tensor, subtile_cnt - 1 if is_odd_turn else 0, warp_idx,
+            tmem_acc_tensor,
+            subtile_cnt - 1 if is_odd_turn else 0,
+            warp_idx,
         )
         tmem_forward_cols = Fc1GateUpInterleave * 2
         if cutlass.const_expr(self._overlapping_accum):
@@ -456,7 +462,7 @@ class GluMxfp8Epilogue:
             if cutlass.const_expr(self._overlapping_accum):
                 subtile_idx = cutlass.Int32(i)
                 if is_odd_turn:
-                    subtile_idx = cutlass.Int32(subtile_cnt - 1 - i)              
+                    subtile_idx = cutlass.Int32(subtile_cnt - 1 - i)
             else:
                 subtile_idx = cutlass.Int32(i)
 
@@ -481,7 +487,9 @@ class GluMxfp8Epilogue:
                 acc_consumer_state=acc_consumer_state,
             )
 
-            tmem_gate, tmem_up = self._subtile_forward_tmem_tensor(tmem_gate, tmem_up, tmem_forward_cols)
+            tmem_gate, tmem_up = self._subtile_forward_tmem_tensor(
+                tmem_gate, tmem_up, tmem_forward_cols
+            )
 
         self._stg_sf_fc1(rmem_sf, real_fc1_output_sf, work_tile_info, tidx)
 
@@ -489,8 +497,8 @@ class GluMxfp8Epilogue:
             self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, True)
 
         # ── TMA store: 4 stores (one per warp group) after all subtiles ──
-        base_token_tile = (
-            work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m // EpilogueTileN)
+        base_token_tile = work_tile_info.tile_m_idx * cutlass.Int32(
+            self._cta_tile_m // EpilogueTileN
         )
         for idx in cutlass.range_constexpr(EpiWarpCount):
             g_fc1_output_warp_view = cute.local_tile(
@@ -499,8 +507,11 @@ class GluMxfp8Epilogue:
                 (base_token_tile + idx, work_tile_info.tile_n_idx, 0),
             )
             GluMxfp8Epilogue.tma_store_fc1_output(
-                warp_idx, smem_fc1_output_buffer, idx,
-                tma_atom_fc1_output, g_fc1_output_warp_view,
+                warp_idx,
+                smem_fc1_output_buffer,
+                idx,
+                tma_atom_fc1_output,
+                g_fc1_output_warp_view,
                 work_tile_info.valid_tokens_in_cta_tile,
             )
 
@@ -536,12 +547,15 @@ class GluMxfp8Epilogue:
         r_up = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
 
         atom_t2r = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), self.acc_dtype,
+            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32),
+            self.acc_dtype,
         )
         cute.copy(atom_t2r, tmem_gate_tensor, r_gate)
         cute.copy(atom_t2r, tmem_up_tensor, r_up)
 
-        self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, acc_is_release)
+        self._acc_pipeline_consumer_release(
+            acc_pipeline, acc_consumer_state, acc_is_release
+        )
 
         if cutlass.const_expr(self.glu_clamp is not None):
             for i in cutlass.range_constexpr(cute.size(r_up)):
@@ -553,7 +567,14 @@ class GluMxfp8Epilogue:
         swiglu_act(swiglu, r_up, r_gate, Float32(1.0))
 
         c = cute.make_rmem_tensor(r_layout.shape, self.fc1_output_dtype)
-        qpvscale = quant_sfd_row(swiglu, c, norm_const, self._sf_vec_size, self.sf_dtype, self.fc1_output_dtype)
+        qpvscale = quant_sfd_row(
+            swiglu,
+            c,
+            norm_const,
+            self._sf_vec_size,
+            self.sf_dtype,
+            self.fc1_output_dtype,
+        )
         if subtile_idx == 0:
             rmem_sf[0] = qpvscale
         elif subtile_idx == 1:
@@ -643,13 +664,13 @@ class GluMxfp8Epilogue:
         hidden_group = (
             work_tile_info.tile_n_idx * cutlass.Int32(fc2_subtile_cnt) + subtile_idx
         )
-        hidden_col_start = (
-            work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
-            + subtile_idx * cutlass.Int32(EpilogueTileN)
-        )
+        hidden_col_start = work_tile_info.tile_n_idx * cutlass.Int32(
+            self._cta_tile_n
+        ) + subtile_idx * cutlass.Int32(EpilogueTileN)
         r_acc_layout = cute.make_layout((((EpilogueTileN,), 1),), stride=(((1,), 0),))
         atom_t2r = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), self.acc_dtype,
+            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32),
+            self.acc_dtype,
         )
         r_acc = cute.make_rmem_tensor(r_acc_layout.shape, self.acc_dtype)
         cute.copy(atom_t2r, tmem_subtile_tensor, r_acc)
@@ -660,7 +681,9 @@ class GluMxfp8Epilogue:
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
         if token_row_in_cta < valid_tokens and hidden_col_start < valid_hidden:
             stg_atom = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=256,
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.BFloat16,
+                num_bits_per_copy=256,
             )
             for stg_half in cutlass.range_constexpr(EpilogueTileN // 16):
                 reg_view = cute.make_tensor(
@@ -676,7 +699,8 @@ class GluMxfp8Epilogue:
                     # fc2_output_workspace pool instead (falls through to the else
                     # branch); the dispatch warp handles the NVLink pushback.
                     metadata_u32 = cute.recast_tensor(
-                        token_comm_args.token_src_metadata, cutlass.Uint32,
+                        token_comm_args.token_src_metadata,
+                        cutlass.Uint32,
                     )
                     fc2_output_dest = Fc2OutputDest(
                         tensor=token_comm_args.combine_output,
@@ -697,7 +721,8 @@ class GluMxfp8Epilogue:
                         assumed_align=32,
                     )
                     cute.copy(
-                        stg_atom, reg_view,
+                        stg_atom,
+                        reg_view,
                         cute.make_tensor(dest_ptr, cute.make_layout(16)),
                     )
                 else:
@@ -708,7 +733,9 @@ class GluMxfp8Epilogue:
                     )
                     g_fc2_slice = cute.slice_(g_fc2_output_tile, (None, None, 0))
                     g_thread_row = cute.local_tile(
-                        g_fc2_slice, (1, 16), (token_row_in_cta, stg_half),
+                        g_fc2_slice,
+                        (1, 16),
+                        (token_row_in_cta, stg_half),
                     )
                     g_flat = cute.coalesce(g_thread_row)
                     aligned_iter = cute.make_ptr(
@@ -717,10 +744,13 @@ class GluMxfp8Epilogue:
                         cute.AddressSpace.gmem,
                         assumed_align=32,
                     )
-                    cute.copy(stg_atom, reg_view, cute.make_tensor(aligned_iter, g_flat.layout))
+                    cute.copy(
+                        stg_atom,
+                        reg_view,
+                        cute.make_tensor(aligned_iter, g_flat.layout),
+                    )
 
         iket.range_pop()
-
 
     @cute.jit
     def _run_fc2_task_tile(
@@ -746,7 +776,9 @@ class GluMxfp8Epilogue:
           - TMEM tensor advances by +/- EpilogueTileN each iteration
         """
         real_fc2_output, _ = sched_ext.get_gmem_tensor(
-            "d", gmem_fc2_output, work_tile_info,
+            "d",
+            gmem_fc2_output,
+            work_tile_info,
         )
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_push("mxfp8_fc2_epi_tile")
@@ -771,7 +803,9 @@ class GluMxfp8Epilogue:
         # Start subtile mirrors fc1: last for odd turn, first for even.
         start_subtile = fc2_subtile_cnt - 1 if is_odd_turn else 0
         tmem_t = self._subtile_fc2_tmem_tensor(
-            tmem_acc_tensor, cutlass.Int32(start_subtile), warp_idx,
+            tmem_acc_tensor,
+            cutlass.Int32(start_subtile),
+            warp_idx,
         )
 
         # Step direction mirrors fc1 gate/up: +EpilogueTileN (even) or -EpilogueTileN (odd).
@@ -800,7 +834,9 @@ class GluMxfp8Epilogue:
             )
 
             if cutlass.const_expr(self._overlapping_accum):
-                self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, i == 0)
+                self._acc_pipeline_consumer_release(
+                    acc_pipeline, acc_consumer_state, i == 0
+                )
 
             tmem_t = self._advance_fc2_tmem_tensor(tmem_t, tmem_forward_cols)
 
@@ -809,7 +845,6 @@ class GluMxfp8Epilogue:
             self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, True)
 
         iket.range_pop()
-
 
     @cute.jit
     def _stg_sf_fc1(
@@ -832,22 +867,22 @@ class GluMxfp8Epilogue:
         """
         bx, _, _ = cute.arch.block_idx()
         sf_idx = work_tile_info.tile_n_idx
-        token_idx = (
-            work_tile_info.tile_m_idx * self._cta_tile_m
-            + tidx
-        )
+        token_idx = work_tile_info.tile_m_idx * self._cta_tile_m + tidx
         if tidx < work_tile_info.valid_tokens_in_cta_tile:
             sf_base = cute.local_tile(
                 real_fc1_output_sf,
                 (1, 1, 1),
-                (token_idx, sf_idx * cutlass.Int32(Fc1EpilogueOutputTileN), cutlass.Int32(0)),
+                (
+                    token_idx,
+                    sf_idx * cutlass.Int32(Fc1EpilogueOutputTileN),
+                    cutlass.Int32(0),
+                ),
             )
             gmem_sf_f8 = cute.make_tensor(sf_base.iterator, cute.make_layout(4))
             sf_layout = cute.make_layout(4)
             r_sf_f8 = cute.make_rmem_tensor(sf_layout.shape, self.sf_dtype)
             r_sf_f8.store(rmem_sf_f32.load().to(self.sf_dtype))
             cute.autovec_copy(r_sf_f8, gmem_sf_f8)
-
 
     @cute.jit
     def run(
@@ -988,4 +1023,3 @@ class GluMxfp8Epilogue:
                 )
 
         flag_tracker.fire()
-

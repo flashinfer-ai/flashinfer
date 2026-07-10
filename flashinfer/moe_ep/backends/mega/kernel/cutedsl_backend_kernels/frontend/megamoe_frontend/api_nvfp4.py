@@ -111,7 +111,9 @@ class MegaMoENvfp4Config:
                 f"(got hidden={self.hidden}, intermediate={self.intermediate})."
             )
         if self.token_back_mode not in (
-            "epi_warps", "standalone_warps", "reuse_dispatch_warps"
+            "epi_warps",
+            "standalone_warps",
+            "reuse_dispatch_warps",
         ):
             raise ValueError(
                 f"token_back_mode must be 'epi_warps', 'standalone_warps', "
@@ -409,11 +411,14 @@ class MegaMoENvfp4Frontend:
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
-            (local_ws_bytes,), dtype=torch.uint8, device="cuda",
+            (local_ws_bytes,),
+            dtype=torch.uint8,
+            device="cuda",
         )
         shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
         symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace, c.world_size,
+            shared_workspace,
+            c.world_size,
         )
 
         mega = _CompiledMega(
@@ -521,7 +526,8 @@ class MegaMoENvfp4Frontend:
 
     @staticmethod
     def _resolve_num_tokens(
-        inputs: MegaMoENvfp4Inputs, num_tokens: Optional[int],
+        inputs: MegaMoENvfp4Inputs,
+        num_tokens: Optional[int],
     ) -> int:
         buf_tokens = inputs.activation.shape[0]
         if num_tokens is None:
@@ -543,10 +549,7 @@ class MegaMoENvfp4Frontend:
             return None
         self._validate_inputs(inputs, num_tokens=resolved)
         buf_tokens = inputs.activation.shape[0]
-        if (
-            not self.config.fc2_reduces_topk
-            and resolved < buf_tokens
-        ):
+        if not self.config.fc2_reduces_topk and resolved < buf_tokens:
             raise ValueError(
                 "Partial num_tokens is not supported when in_kernel_fc2_reduce=False "
                 f"(top-k reduce compiles for the full buffer of {buf_tokens} tokens). "
@@ -557,7 +560,9 @@ class MegaMoENvfp4Frontend:
         return self._slice_inputs(inputs, resolved)
 
     @staticmethod
-    def _slice_inputs(inputs: MegaMoENvfp4Inputs, num_tokens: int) -> MegaMoENvfp4Inputs:
+    def _slice_inputs(
+        inputs: MegaMoENvfp4Inputs, num_tokens: int
+    ) -> MegaMoENvfp4Inputs:
         tok = slice(None, num_tokens)
 
         def _slice_optional(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -584,7 +589,10 @@ class MegaMoENvfp4Frontend:
         )
 
     def _validate_inputs(
-        self, inputs: MegaMoENvfp4Inputs, *, num_tokens: int,
+        self,
+        inputs: MegaMoENvfp4Inputs,
+        *,
+        num_tokens: int,
     ) -> None:
         from common.megamoe_constants import Nvfp4BlockSize
         from moe_nvfp4_swapab.runner_common import _DataDtype, _ScaleDtype
@@ -658,9 +666,7 @@ class MegaMoENvfp4Frontend:
                 f"got {tuple(inputs.topk_idx.shape)}."
             )
         if inputs.topk_idx.dtype != torch.int64:
-            raise ValueError(
-                f"topk_idx must be int64, got {inputs.topk_idx.dtype}."
-            )
+            raise ValueError(f"topk_idx must be int64, got {inputs.topk_idx.dtype}.")
         if inputs.topk_weights.shape != (buf_tokens, c.num_topk):
             raise ValueError(
                 f"topk_weights must have shape ({buf_tokens}, {c.num_topk}), "
@@ -706,8 +712,18 @@ class MegaMoENvfp4Frontend:
             )
 
         weight_checks = (
-            ("fc1_weight", inputs.fc1_weight, (e, c.hidden // 2, c.intermediate), _DataDtype),
-            ("fc2_weight", inputs.fc2_weight, (e, intermediate_down // 2, c.hidden), _DataDtype),
+            (
+                "fc1_weight",
+                inputs.fc1_weight,
+                (e, c.hidden // 2, c.intermediate),
+                _DataDtype,
+            ),
+            (
+                "fc2_weight",
+                inputs.fc2_weight,
+                (e, intermediate_down // 2, c.hidden),
+                _DataDtype,
+            ),
         )
         for name, tensor, shape, dtype in weight_checks:
             _require_cuda(name, tensor)
@@ -716,11 +732,12 @@ class MegaMoENvfp4Frontend:
                     f"{name} must have shape {shape}, got {tuple(tensor.shape)}."
                 )
             if tensor.dtype != dtype:
-                raise ValueError(
-                    f"{name} must have dtype {dtype}, got {tensor.dtype}."
-                )
+                raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}.")
 
-        for name, tensor in (("fc1_weight_sf", inputs.fc1_weight_sf), ("fc2_weight_sf", inputs.fc2_weight_sf)):
+        for name, tensor in (
+            ("fc1_weight_sf", inputs.fc1_weight_sf),
+            ("fc2_weight_sf", inputs.fc2_weight_sf),
+        ):
             _require_cuda(name, tensor)
             if tensor.ndim != 2 or tensor.shape[0] != e or tensor.shape[1] <= 0:
                 raise ValueError(
@@ -740,9 +757,7 @@ class MegaMoENvfp4Frontend:
                     f"got {tuple(tensor.shape)}."
                 )
             if tensor.dtype != torch.float32:
-                raise ValueError(
-                    f"{name} must be float32, got {tensor.dtype}."
-                )
+                raise ValueError(f"{name} must be float32, got {tensor.dtype}.")
 
         if inputs.topk_score_for_reduce is not None:
             expected = (buf_tokens, c.num_topk)
@@ -772,9 +787,7 @@ class MegaMoENvfp4Frontend:
                     f"({buf_tokens}), got {inputs.combine_output_q.shape[0]}."
                 )
             if c.combine_dtype == "nvfp4" and inputs.combine_global_q is None:
-                raise ValueError(
-                    "combine_dtype='nvfp4' requires combine_global_q."
-                )
+                raise ValueError("combine_dtype='nvfp4' requires combine_global_q.")
             if inputs.combine_global_q is not None:
                 _require_cuda("combine_global_q", inputs.combine_global_q)
                 if inputs.combine_global_q.shape[0] != buf_tokens:
@@ -784,8 +797,11 @@ class MegaMoENvfp4Frontend:
                     )
 
     @staticmethod
-    def _to_cute(tensor: torch.Tensor, assumed_align: int = 16, *, static_layout: bool = False):
+    def _to_cute(
+        tensor: torch.Tensor, assumed_align: int = 16, *, static_layout: bool = False
+    ):
         import cutlass.torch as cutlass_torch
+
         cute_tensor = cutlass_torch.from_dlpack(tensor, assumed_align=assumed_align)
         if static_layout:
             return cute_tensor
@@ -793,7 +809,9 @@ class MegaMoENvfp4Frontend:
         return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
     def _build_mega_runtime_kwargs(
-        self, inputs: MegaMoENvfp4Inputs, mega: _CompiledMega,
+        self,
+        inputs: MegaMoENvfp4Inputs,
+        mega: _CompiledMega,
     ) -> dict:
         import cuda.bindings.driver as cuda
         from src.sym_buffer import SymBufferHost
@@ -811,7 +829,9 @@ class MegaMoENvfp4Frontend:
                     f"combine_dtype={c.combine_dtype!r} requires combine_output_q "
                     "and combine_sf_q."
                 )
-            combine_output_q_cute = self._to_cute(inputs.combine_output_q.view(torch.uint8))
+            combine_output_q_cute = self._to_cute(
+                inputs.combine_output_q.view(torch.uint8)
+            )
             combine_sf_q_cute = self._to_cute(inputs.combine_sf_q.view(torch.uint8))
             if c.combine_dtype == "nvfp4":
                 if inputs.combine_global_q is None:
@@ -849,7 +869,8 @@ class MegaMoENvfp4Frontend:
             combine_sf_q=combine_sf_q_cute,
             combine_global_q=combine_global_q_cute,
             local_workspace=self._to_cute(
-                mega.local_workspace, static_layout=True,
+                mega.local_workspace,
+                static_layout=True,
             ),
             shared_workspace=self._to_cute(mega.shared_workspace),
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
@@ -859,6 +880,7 @@ class MegaMoENvfp4Frontend:
     @staticmethod
     def _build_topk_runtime_kwargs(topk: _CompiledTopk) -> dict:
         import cuda.bindings.driver as cuda
+
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         return dict(
             combine_cute=topk.combine_cute,

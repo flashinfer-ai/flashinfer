@@ -193,9 +193,7 @@ def _reference_mxfp8_mega_moe_staged(problem: dict, *, destroy_buffer: bool = Tr
         gate_up_clamp=problem["gate_up_clamp"],
     )
 
-    y = torch.empty(
-        num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-    )
+    y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
     mxfp8_mega_moe(
         y,
         transformed_l1,
@@ -255,9 +253,7 @@ def _reference_mxfp8_mega_moe_prestaged(
         gate_up_clamp=problem["gate_up_clamp"],
     )
 
-    y = torch.empty(
-        num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-    )
+    y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
     mxfp8_mega_moe(
         y,
         transformed_l1,
@@ -420,9 +416,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
-    print(
-        f"rank {rank}: mxfp8_cutedsl mega layer (prestaged inputs) matches reference"
-    )
+    print(f"rank {rank}: mxfp8_cutedsl mega layer (prestaged inputs) matches reference")
 
 
 @pytest.mark.arch_blackwell

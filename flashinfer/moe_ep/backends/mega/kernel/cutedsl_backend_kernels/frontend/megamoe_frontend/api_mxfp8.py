@@ -311,11 +311,14 @@ class MegaMoEMxfp8Frontend:
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
-            (local_ws_bytes,), dtype=torch.uint8, device="cuda",
+            (local_ws_bytes,),
+            dtype=torch.uint8,
+            device="cuda",
         )
         shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
         symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace, c.world_size,
+            shared_workspace,
+            c.world_size,
         )
 
         mega = _CompiledMega(
@@ -346,7 +349,8 @@ class MegaMoEMxfp8Frontend:
 
     @staticmethod
     def _resolve_num_tokens(
-        inputs: MegaMoEMxfp8Inputs, num_tokens: Optional[int],
+        inputs: MegaMoEMxfp8Inputs,
+        num_tokens: Optional[int],
     ) -> int:
         buf_tokens = inputs.activation.shape[0]
         if num_tokens is None:
@@ -380,7 +384,8 @@ class MegaMoEMxfp8Frontend:
 
     @staticmethod
     def _slice_inputs(
-        inputs: MegaMoEMxfp8Inputs, num_tokens: int,
+        inputs: MegaMoEMxfp8Inputs,
+        num_tokens: int,
     ) -> MegaMoEMxfp8Inputs:
         tok = slice(None, num_tokens)
         return MegaMoEMxfp8Inputs(
@@ -396,7 +401,10 @@ class MegaMoEMxfp8Frontend:
         )
 
     def _validate_inputs(
-        self, inputs: MegaMoEMxfp8Inputs, *, num_tokens: int,
+        self,
+        inputs: MegaMoEMxfp8Inputs,
+        *,
+        num_tokens: int,
     ) -> None:
         from common.megamoe_constants import Mxfp8BlockSize
         from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype
@@ -468,9 +476,7 @@ class MegaMoEMxfp8Frontend:
                 f"got {tuple(inputs.topk_idx.shape)}."
             )
         if inputs.topk_idx.dtype != torch.int64:
-            raise ValueError(
-                f"topk_idx must be int64, got {inputs.topk_idx.dtype}."
-            )
+            raise ValueError(f"topk_idx must be int64, got {inputs.topk_idx.dtype}.")
         if inputs.topk_weights.shape != (buf_tokens, c.num_topk):
             raise ValueError(
                 f"topk_weights must have shape ({buf_tokens}, {c.num_topk}), "
@@ -526,7 +532,10 @@ class MegaMoEMxfp8Frontend:
 
     @staticmethod
     def _to_cute(
-        tensor: torch.Tensor, assumed_align: int = 16, *, static_layout: bool = False,
+        tensor: torch.Tensor,
+        assumed_align: int = 16,
+        *,
+        static_layout: bool = False,
     ):
         import cutlass.torch as cutlass_torch
 
@@ -537,7 +546,9 @@ class MegaMoEMxfp8Frontend:
         return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
     def _build_mega_runtime_kwargs(
-        self, inputs: MegaMoEMxfp8Inputs, mega: _CompiledMega,
+        self,
+        inputs: MegaMoEMxfp8Inputs,
+        mega: _CompiledMega,
     ) -> dict:
         import cuda.bindings.driver as cuda
         from src.sym_buffer import SymBufferHost
@@ -568,7 +579,8 @@ class MegaMoEMxfp8Frontend:
             fc2_weight_sf=self._to_cute(inputs.fc2_weight_sf),
             combine_output=self._to_cute(inputs.combine_output),
             local_workspace=self._to_cute(
-                mega.local_workspace, static_layout=True,
+                mega.local_workspace,
+                static_layout=True,
             ),
             shared_workspace=self._to_cute(mega.shared_workspace),
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,

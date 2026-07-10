@@ -12,9 +12,7 @@ import pytest
 # under ``tests/moe_ep/{nccl,nixl}_ep/``.
 _MOE_EP_TEST_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path[:] = [
-    p
-    for p in sys.path
-    if os.path.abspath(p or os.getcwd()) != _MOE_EP_TEST_ROOT
+    p for p in sys.path if os.path.abspath(p or os.getcwd()) != _MOE_EP_TEST_ROOT
 ]
 
 

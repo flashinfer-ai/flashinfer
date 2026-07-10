@@ -126,9 +126,7 @@ def _make_moe_weight_pack(
         w13_q, w13_sf = per_token_cast_to_fp4(
             w13_bf16[expert], use_ue8m0=True, gran_k=32
         )
-        w2_q, w2_sf = per_token_cast_to_fp4(
-            w2_bf16[expert], use_ue8m0=True, gran_k=32
-        )
+        w2_q, w2_sf = per_token_cast_to_fp4(w2_bf16[expert], use_ue8m0=True, gran_k=32)
         w13[expert].copy_(w13_q)
         w2[expert].copy_(w2_q)
         w13_sf_fp32[expert].copy_(w13_sf)
@@ -223,9 +221,7 @@ def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
         hidden_size=problem["hidden"],
     )
 
-    y = torch.empty(
-        num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-    )
+    y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
     kernel = DeepGemmMegaKernelBackend(
         DeepGemmMegaMoeConfig(
             intermediate_size=problem["intermediate"],

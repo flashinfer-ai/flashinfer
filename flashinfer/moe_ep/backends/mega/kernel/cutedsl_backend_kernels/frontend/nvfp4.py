@@ -61,7 +61,9 @@ def _resolve_per_expert_epilogue(
 ) -> torch.Tensor:
     """Build a per-local-expert fp32 CUDA vector (default 1.0)."""
     out = torch.ones(
-        (num_experts_per_rank,), dtype=torch.float32, device="cuda",
+        (num_experts_per_rank,),
+        dtype=torch.float32,
+        device="cuda",
     )
     if value is None:
         return out
@@ -82,7 +84,8 @@ def _resolve_per_expert_epilogue(
 
 
 def _sym_zeros_byte_view(
-    logical_shape: Tuple[int, ...], target_dtype: torch.dtype,
+    logical_shape: Tuple[int, ...],
+    target_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """NVFP4 / fp8 symmetric heap via uint8 reinterpret (matches mega_runner).
 
@@ -238,7 +241,8 @@ def get_symm_buffer_for_mega_moe(
     x, x_root = _sym_zeros_byte_view((num_max_tokens, hidden), _DataDtype)
     sym_roots.append(x_root)
     x_sf, x_sf_root = _sym_zeros_byte_view(
-        (num_max_tokens, hidden_sf_cols_padded), _ScaleDtype,
+        (num_max_tokens, hidden_sf_cols_padded),
+        _ScaleDtype,
     )
     sym_roots.append(x_sf_root)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
@@ -246,20 +250,29 @@ def get_symm_buffer_for_mega_moe(
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     sym_roots.append(topk_weights)
     combine_output = sym_zeros(
-        (num_max_tokens, num_topk, hidden), torch.bfloat16,
+        (num_max_tokens, num_topk, hidden),
+        torch.bfloat16,
     )
     sym_roots.append(combine_output)
     combine_reduced_output = torch.empty(
-        (num_max_tokens, hidden), dtype=torch.bfloat16, device="cuda",
+        (num_max_tokens, hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     fc1_alpha = _resolve_per_expert_epilogue(
-        "fc1_alpha", fc1_alpha, num_experts_per_rank,
+        "fc1_alpha",
+        fc1_alpha,
+        num_experts_per_rank,
     )
     fc2_alpha = _resolve_per_expert_epilogue(
-        "fc2_alpha", fc2_alpha, num_experts_per_rank,
+        "fc2_alpha",
+        fc2_alpha,
+        num_experts_per_rank,
     )
     fc1_norm_const = _resolve_per_expert_epilogue(
-        "fc1_norm_const", fc1_norm_const, num_experts_per_rank,
+        "fc1_norm_const",
+        fc1_norm_const,
+        num_experts_per_rank,
     )
 
     return MegaMoESymmBuffer(
@@ -378,9 +391,13 @@ def nvfp4_mega_moe(
                 reduced = active_form_a_fp32.sum(dim=1).to(y.dtype)
             else:
                 reduced = (
-                    active_form_a_fp32
-                    * symm_buffer.topk_weights[:n, :, None].to(torch.float32)
-                ).sum(dim=1).to(y.dtype)
+                    (
+                        active_form_a_fp32
+                        * symm_buffer.topk_weights[:n, :, None].to(torch.float32)
+                    )
+                    .sum(dim=1)
+                    .to(y.dtype)
+                )
             y.copy_(reduced)
 
 
@@ -392,19 +409,31 @@ def make_dummy_epilogue_params(
     """Random per-local-expert epilogue scalars (matches ``mega_runner``)."""
     fc1_alpha = (
         torch.randint(
-            1, 5, (num_local_experts,), generator=generator, device="cuda",
+            1,
+            5,
+            (num_local_experts,),
+            generator=generator,
+            device="cuda",
         ).to(torch.float32)
         * 0.5
     )
     fc2_alpha = (
         torch.randint(
-            1, 5, (num_local_experts,), generator=generator, device="cuda",
+            1,
+            5,
+            (num_local_experts,),
+            generator=generator,
+            device="cuda",
         ).to(torch.float32)
         * 0.5
     )
     fc1_norm_const = (
         torch.randint(
-            2, 5, (num_local_experts,), generator=generator, device="cuda",
+            2,
+            5,
+            (num_local_experts,),
+            generator=generator,
+            device="cuda",
         ).to(torch.float32)
         * 0.5
     )
@@ -448,9 +477,8 @@ def _create_dummy_weights(
         to_blocked(fc1_weight_sf_plain[e]) for e in range(num_local_experts)
     ]
     fc1_flat_sf_size = fc1_sf_swizzled[0].numel()
-    fc1_weight_sf = (
-        _stack_byte_reinterpretable_tensors(fc1_sf_swizzled, dim=0)
-        .view(num_local_experts, fc1_flat_sf_size)
+    fc1_weight_sf = _stack_byte_reinterpretable_tensors(fc1_sf_swizzled, dim=0).view(
+        num_local_experts, fc1_flat_sf_size
     )
 
     fc2_weight = make_nvfp4_tensor_from_torch_rng(
@@ -470,9 +498,8 @@ def _create_dummy_weights(
         to_blocked(fc2_weight_sf_plain[e]) for e in range(num_local_experts)
     ]
     fc2_flat_sf_size = fc2_sf_swizzled[0].numel()
-    fc2_weight_sf = (
-        _stack_byte_reinterpretable_tensors(fc2_sf_swizzled, dim=0)
-        .view(num_local_experts, fc2_flat_sf_size)
+    fc2_weight_sf = _stack_byte_reinterpretable_tensors(fc2_sf_swizzled, dim=0).view(
+        num_local_experts, fc2_flat_sf_size
     )
 
     return (fc1_weight, fc1_weight_sf), (fc2_weight, fc2_weight_sf)
@@ -522,7 +549,8 @@ def create_dummy_inputs(
     gen.manual_seed(seed + rank)
     if fc1_alpha is None and fc2_alpha is None and fc1_norm_const is None:
         fc1_alpha, fc2_alpha, fc1_norm_const = make_dummy_epilogue_params(
-            num_local_experts, generator=gen,
+            num_local_experts,
+            generator=gen,
         )
 
     symm_buffer = get_symm_buffer_for_mega_moe(
@@ -540,7 +568,10 @@ def create_dummy_inputs(
     )
 
     transformed_l1, transformed_l2 = _create_dummy_weights(
-        num_local_experts, hidden, intermediate, gen,
+        num_local_experts,
+        hidden,
+        intermediate,
+        gen,
     )
 
     from moe_nvfp4_swapab.runner_common import (
@@ -549,17 +580,31 @@ def create_dummy_inputs(
     )
 
     activation = make_nvfp4_tensor_from_torch_rng(
-        gen, (num_tokens, hidden), packed_dim=-1, perf_run=True,
+        gen,
+        (num_tokens, hidden),
+        packed_dim=-1,
+        perf_run=True,
     )
     activation_sf = make_raw_scale_tensor_from_torch_rng(
-        gen, num_tokens, hidden, blocksize=Nvfp4BlockSize, strict=True,
+        gen,
+        num_tokens,
+        hidden,
+        blocksize=Nvfp4BlockSize,
+        strict=True,
     ).reshape(num_tokens, ceil_div(hidden, Nvfp4BlockSize))
 
     scores = torch.randn(
-        num_tokens, num_total_experts, device="cuda", dtype=torch.float32,
+        num_tokens,
+        num_total_experts,
+        device="cuda",
+        dtype=torch.float32,
     )
     topk_weights, topk_idx = torch.topk(
-        scores, num_topk, dim=-1, largest=True, sorted=False,
+        scores,
+        num_topk,
+        dim=-1,
+        largest=True,
+        sorted=False,
     )
 
     symm_buffer.x[:num_tokens].copy_(activation)
@@ -598,7 +643,8 @@ def _main() -> None:
         epilogue_gen = torch.Generator(device="cuda")
         epilogue_gen.manual_seed(0 + rank)
         fc1_alpha, fc2_alpha, fc1_norm_const = make_dummy_epilogue_params(
-            num_local_experts, generator=epilogue_gen,
+            num_local_experts,
+            generator=epilogue_gen,
         )
 
         y, transformed_l1, transformed_l2, symm_buffer = create_dummy_inputs(
@@ -638,4 +684,5 @@ def _main() -> None:
         no_dist = bool(int(os.environ.get("MEGA_NO_DIST", "0")))
         if not no_dist and dist.is_initialized():
             from src.bootstrap import finalize_dist_and_nvshmem
+
             finalize_dist_and_nvshmem()

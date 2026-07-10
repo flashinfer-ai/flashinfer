@@ -17,7 +17,11 @@ from .....core.validation.common import (
 from .....weights import MoEWeightPack
 from .config import DeepGemmMegaMoeConfig
 from .staging import stage_mega_moe_inputs
-from .weights import TransformedMegaWeights, preprocess_mega_weights, validate_transformed_mega_weights
+from .weights import (
+    TransformedMegaWeights,
+    preprocess_mega_weights,
+    validate_transformed_mega_weights,
+)
 
 if TYPE_CHECKING:
     from .....tensors import MoEEpTensors

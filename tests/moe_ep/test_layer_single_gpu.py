@@ -136,11 +136,12 @@ def test_split_layer_accepts_fused_moe_kernel_with_weights(stubbed_fleet_registr
         SplitConfig,
     )
 
-    with mock.patch(
-        "flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"
-    ), mock.patch(
-        "flashinfer.moe_ep.backends.split.kernel.fused_moe.backend.materialize_fused_moe_weights",
-        return_value=object(),
+    with (
+        mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"),
+        mock.patch(
+            "flashinfer.moe_ep.backends.split.kernel.fused_moe.backend.materialize_fused_moe_weights",
+            return_value=object(),
+        ),
     ):
         split = MoEEpSplitLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0),
@@ -270,9 +271,7 @@ def test_split_layer_nixl_rejects_missing_tcp_store_at_init(dist_not_initialized
 
     with pytest.raises(MoEEpConfigError, match="tcp_store"):
         MoEEpSplitLayer(
-            bootstrap=BootstrapConfig(
-                world_size=2, rank=0, auto_bootstrap=False
-            ),
+            bootstrap=BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False),
             fleet_params=FleetParams(
                 num_experts=8,
                 max_tokens_per_rank=128,

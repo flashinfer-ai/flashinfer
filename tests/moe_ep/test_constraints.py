@@ -79,22 +79,16 @@ def test_nixl_ep_supported_hidden_sizes_pass():
 def test_mega_fleet_params_rejects_indivisible_experts():
     p = _split(num_experts=7, world_size=2, max_tokens_per_rank=64)
     with pytest.raises(MoEEpConfigError, match="num_experts"):
-        validate_mega_fleet_params(
-            p, world_size=2, intermediate_size=2048, top_k=4
-        )
+        validate_mega_fleet_params(p, world_size=2, intermediate_size=2048, top_k=4)
 
 
 def test_mega_fleet_params_requires_128_aligned_sizes():
     p = _split(max_tokens_per_rank=64, token_hidden_size=1000)
     with pytest.raises(MoEEpConfigError, match="token_hidden_size"):
-        validate_mega_fleet_params(
-            p, world_size=4, intermediate_size=2048, top_k=4
-        )
+        validate_mega_fleet_params(p, world_size=4, intermediate_size=2048, top_k=4)
     p2 = _split(max_tokens_per_rank=64)
     with pytest.raises(MoEEpConfigError, match="intermediate_size"):
-        validate_mega_fleet_params(
-            p2, world_size=4, intermediate_size=1000, top_k=4
-        )
+        validate_mega_fleet_params(p2, world_size=4, intermediate_size=1000, top_k=4)
 
 
 def test_mega_fleet_params_happy_path():

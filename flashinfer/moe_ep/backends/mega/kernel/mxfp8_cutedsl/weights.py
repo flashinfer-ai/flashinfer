@@ -47,9 +47,11 @@ def _fc1_weight_from_w13(
         raise ValueError(
             f"expected w13 with {2 * i} rows (gate||up), got shape {tuple(w13.shape)}"
         )
-    return _interleave_gate_up_32(
-        w13, intermediate_size=2 * i
-    ).transpose(1, 2).contiguous()
+    return (
+        _interleave_gate_up_32(w13, intermediate_size=2 * i)
+        .transpose(1, 2)
+        .contiguous()
+    )
 
 
 def _interleave_gate_up_32(
@@ -86,9 +88,11 @@ def _interleave_gate_up_32(
 def _fc1_kernel_weight_from_canonical_mxfp8(
     w13: "torch.Tensor", *, intermediate_size: int
 ) -> "torch.Tensor":
-    return _interleave_gate_up_32(
-        w13, intermediate_size=2 * intermediate_size
-    ).transpose(1, 2).contiguous()
+    return (
+        _interleave_gate_up_32(w13, intermediate_size=2 * intermediate_size)
+        .transpose(1, 2)
+        .contiguous()
+    )
 
 
 def _quantize_mxfp8_weight_k_major(
@@ -210,9 +214,7 @@ def preprocess_mega_weights(
                 weights.w13, intermediate_size=intermediate_size
             )
             fc2_weight = weights.w2.transpose(1, 2).contiguous()
-            w13_scale = _interleave_gate_up_32(
-                w13_scale_in, intermediate_size=fc1_out
-            )
+            w13_scale = _interleave_gate_up_32(w13_scale_in, intermediate_size=fc1_out)
         else:
             raise ValueError(
                 "pre-quantized MXFP8 weights must be in kernel layout "
@@ -234,8 +236,7 @@ def preprocess_mega_weights(
             )
         if weights.w2.shape != logical_w2_shape:
             raise ValueError(
-                f"w2 must have shape {logical_w2_shape}, "
-                f"got {tuple(weights.w2.shape)}"
+                f"w2 must have shape {logical_w2_shape}, got {tuple(weights.w2.shape)}"
             )
 
         fc1_fp32 = _fc1_weight_from_w13(

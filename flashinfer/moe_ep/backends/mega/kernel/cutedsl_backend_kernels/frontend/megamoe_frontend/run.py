@@ -49,7 +49,10 @@ from moe_nvfp4_swapab.mega_runner import (
 
 
 def _config_from_args(
-    args: argparse.Namespace, *, rank: int, world_size: int,
+    args: argparse.Namespace,
+    *,
+    rank: int,
+    world_size: int,
 ) -> MegaMoENvfp4Config:
     def _parse_tuple(s: str) -> tuple[int, ...]:
         return tuple(int(x) for x in s.split(","))
@@ -151,6 +154,7 @@ def _finalize(runner: MegaMoENvfp4Frontend | None, tester) -> None:
     if not no_dist and torch.distributed.is_initialized():
         torch.distributed.barrier()
         from src.bootstrap import finalize_dist_and_nvshmem
+
         finalize_dist_and_nvshmem()
 
 

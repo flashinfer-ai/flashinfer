@@ -75,9 +75,7 @@ class MegaKernelBackend(ABC):
     @abstractmethod
     def kernel_name(cls) -> str: ...
 
-    def runtime_requirements(
-        self, bootstrap: "BootstrapConfig"
-    ) -> frozenset[str]:
+    def runtime_requirements(self, bootstrap: "BootstrapConfig") -> frozenset[str]:
         """Process resources this mega kernel needs (``torch_dist``, ``nvshmem``, …)."""
         from ...core.runtime import TORCH_DIST
 
@@ -94,7 +92,10 @@ class MegaKernelBackend(ABC):
     def _try_resolve_ep_comm_group(self, bootstrap: "BootstrapConfig") -> None:
         import torch.distributed as dist
 
-        from ...core.bootstrap_utils import bootstrap_comm_group, bootstrap_ep_rank_world
+        from ...core.bootstrap_utils import (
+            bootstrap_comm_group,
+            bootstrap_ep_rank_world,
+        )
 
         if bootstrap.process_group is not None or dist.is_initialized():
             self._ep_comm_group = bootstrap_comm_group(bootstrap)

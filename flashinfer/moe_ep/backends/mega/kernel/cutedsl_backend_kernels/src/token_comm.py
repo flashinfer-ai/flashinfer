@@ -169,6 +169,7 @@ _CONST_FIELDS = (
     "sm_count",
 )
 
+
 class TokenCommArgs:
     """MegaMoE token communication argument bundle."""
 
@@ -274,9 +275,7 @@ class TokenCommArgs:
             attrs.extend(extract_mlir_attributes(attr))
         return attrs
 
-    def __new_from_mlir_values__(
-        self, values: List[ir.Value]
-    ) -> "TokenCommArgs":
+    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "TokenCommArgs":
         idx = 0
         rebuilt: Dict[str, Any] = {}
         for name in _MLIR_VALUE_FIELDS:
@@ -294,6 +293,7 @@ class TokenCommArgs:
         const_kwargs = {name: getattr(self, name) for name in _CONST_FIELDS}
         return TokenCommArgs(**rebuilt, **const_kwargs)
 
+
 class TokenInPullTokenBackPush:
     """Current implementation: token-in pull, token-back push."""
 
@@ -309,7 +309,6 @@ class TokenInPullTokenBackPush:
     token_back_atomic_batch: int = int(
         os.environ.get("MEGA_TOKEN_BACK_ATOMIC_BATCH", "1")
     )
-
 
     def __init__(
         self,
@@ -375,8 +374,12 @@ class TokenInPullTokenBackPush:
         # Standalone token-back: a dedicated warpgroup (size == dispatch group)
         # right after the dispatch warps, active only when token-back is enabled.
         # It joins the dispatch->sched handshake and the kernel-tail rendezvous.
-        self.token_back_standalone = (fc2_output_dtype is not None) and token_back_standalone
-        self.num_token_back_warps = self.num_dispatch_warps if self.token_back_standalone else 0
+        self.token_back_standalone = (
+            fc2_output_dtype is not None
+        ) and token_back_standalone
+        self.num_token_back_warps = (
+            self.num_dispatch_warps if self.token_back_standalone else 0
+        )
         self.num_token_back_threads = self.num_token_back_warps * self.warp_threads
         self.token_back_warp_start = dispatch_warp_start + self.num_dispatch_warps
         # Standalone token-back per-warp pull buffer; token is moved in
@@ -468,7 +471,7 @@ class TokenInPullTokenBackPush:
                 self.combine_global_token_bytes = 0
             else:  # nvfp4
                 self.combine_q_token_bytes = hidden // 2
-                self.combine_sf_token_bytes = hidden // 16        # per-16 e4m3 sfc
+                self.combine_sf_token_bytes = hidden // 16  # per-16 e4m3 sfc
                 # PACK6 combined SF plane: 8 B per 32-elem tile, INTERLEAVED
                 # [ global fp32 (4B) | sfc0 (1B) | sfc1 (1B) | pad (2B) ], N=hidden//
                 # quant_block tiles.  The per-16 sfc is packed in here too, so the
@@ -507,15 +510,22 @@ class TokenInPullTokenBackPush:
         num_total_experts = self.num_total_experts
 
         if self.token_back_standalone:
+
             @cute.struct
             class TokenCommStorage:
                 pull_mbar: cute.struct.MemRange[Int64, self.num_dispatch_warps]
-                smem_expert_count: cute.struct.MemRange[
-                    Int32, num_total_experts
+                smem_expert_count: cute.struct.MemRange[Int32, num_total_experts]
+                pull_buffer: cute.struct.Align[
+                    cute.struct.MemRange[Uint8, self.num_dispatch_warps * hidden_bytes],
+                    16,
                 ]
-                pull_buffer: cute.struct.Align[cute.struct.MemRange[Uint8, self.num_dispatch_warps * hidden_bytes], 16]
                 tb_pull_mbar: cute.struct.MemRange[Int64, self.num_token_back_warps]
-                tb_pull_buffer: cute.struct.Align[cute.struct.MemRange[Uint8, self.num_token_back_warps * self.tb_chunk_bytes], 16]
+                tb_pull_buffer: cute.struct.Align[
+                    cute.struct.MemRange[
+                        Uint8, self.num_token_back_warps * self.tb_chunk_bytes
+                    ],
+                    16,
+                ]
 
             return TokenCommStorage
 
@@ -527,10 +537,10 @@ class TokenInPullTokenBackPush:
         @cute.struct
         class TokenCommStorage:
             pull_mbar: cute.struct.MemRange[Int64, self.num_dispatch_warps]
-            smem_expert_count: cute.struct.MemRange[
-                Int32, num_total_experts
+            smem_expert_count: cute.struct.MemRange[Int32, num_total_experts]
+            pull_buffer: cute.struct.Align[
+                cute.struct.MemRange[Uint8, self.num_dispatch_warps * hidden_bytes], 16
             ]
-            pull_buffer: cute.struct.Align[cute.struct.MemRange[Uint8, self.num_dispatch_warps * hidden_bytes], 16]
 
         return TokenCommStorage
 
@@ -548,7 +558,9 @@ class TokenInPullTokenBackPush:
     @cute.jit
     def fc1_tma_b_predispatch_spin(self, token_comm_args, work_tile_info):
         if cutlass.const_expr(self.is_swap_ab):
-            counter_slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+            counter_slot = (
+                work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+            )
             peek_threshold = work_tile_info.valid_tokens_in_cta_tile
         else:
             counter_slot = (
@@ -595,9 +607,13 @@ class TokenInPullTokenBackPush:
 
         tokens_per_warp: cutlass.Constexpr[int] = 32 // self.num_topk
         active_lanes: cutlass.Constexpr[int] = tokens_per_warp * self.num_topk
-        num_dispatch_warps_per_grid: cutlass.Constexpr[int] = num_sms * self.num_dispatch_warps
+        num_dispatch_warps_per_grid: cutlass.Constexpr[int] = (
+            num_sms * self.num_dispatch_warps
+        )
 
-        base_token_for_warp = (sm_idx * self.num_dispatch_warps + warp_idx) * tokens_per_warp
+        base_token_for_warp = (
+            sm_idx * self.num_dispatch_warps + warp_idx
+        ) * tokens_per_warp
         grid_token_stride = num_dispatch_warps_per_grid * tokens_per_warp
 
         t = base_token_for_warp
@@ -623,13 +639,17 @@ class TokenInPullTokenBackPush:
         )
 
         for offset in cutlass.range_constexpr(
-            0, self.num_total_experts, self.experts_per_dispatch_pass,
+            0,
+            self.num_total_experts,
+            self.experts_per_dispatch_pass,
         ):
             expert_id = Int32(offset + warp_idx * self.warp_threads + lane_idx)
             if expert_id < Int32(self.num_total_experts):
                 slot_ptr = smem_count_ptr + expert_id
                 local_count = (slot_ptr).load()
-                delta = (Int64(1) << Int64(32)) | (Int64(local_count) & Int64(0xFFFFFFFF))
+                delta = (Int64(1) << Int64(32)) | (
+                    Int64(local_count) & Int64(0xFFFFFFFF)
+                )
                 old_packed = cute.arch.atomic_add(
                     expert_send_count.iterator + expert_id,
                     delta,
@@ -668,7 +688,8 @@ class TokenInPullTokenBackPush:
                     ) * Int32(4)
                     peer_addr = peer_rank_ptr_mapper.map(
                         src_token_topk_idx.iterator.toint(),
-                        dst_rank, Int64(elem_off),
+                        dst_rank,
+                        Int64(elem_off),
                     )
                     stg_b32_raw(peer_addr, token_topk_word)
             cute.arch.sync_warp()
@@ -693,12 +714,19 @@ class TokenInPullTokenBackPush:
         # software_grid_sync expects a dispatch-group-relative thread id.
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
 
-        software_grid_sync(grid_sync_counter, sm_idx, num_sms, tid_in_group,
-                           num_threads=self.num_dispatch_threads)
+        software_grid_sync(
+            grid_sync_counter,
+            sm_idx,
+            num_sms,
+            tid_in_group,
+            num_threads=self.num_dispatch_threads,
+        )
 
         if sm_idx == 0:
             for offset in cutlass.range_constexpr(
-                0, self.num_total_experts, self.experts_per_dispatch_pass,
+                0,
+                self.num_total_experts,
+                self.experts_per_dispatch_pass,
             ):
                 expert_id = Int32(offset + warp_idx * self.warp_threads + lane_idx)
                 if expert_id < Int32(self.num_total_experts):
@@ -713,15 +741,19 @@ class TokenInPullTokenBackPush:
                     token_count_u32 = Int32(status_u64 & Int64(0xFFFFFFFF))
                     erc_local_base = expert_recv_count.iterator.toint()
                     erc_elem_off = (
-                        Int32(self.local_rank) * Int32(self.num_experts_per_rank) + dst_local_expert
+                        Int32(self.local_rank) * Int32(self.num_experts_per_rank)
+                        + dst_local_expert
                     ) * Int32(8)
                     erc_peer_addr = peer_rank_ptr_mapper.map(
-                        erc_local_base, dst_rank, Int64(erc_elem_off),
+                        erc_local_base,
+                        dst_rank,
+                        Int64(erc_elem_off),
                     )
                     stg_b64_raw(erc_peer_addr, Int64(token_count_u32))
                     ercs_local_base = expert_recv_count_sum.iterator.toint()
                     ercs_peer_addr = peer_rank_ptr_mapper.map(
-                        ercs_local_base, dst_rank,
+                        ercs_local_base,
+                        dst_rank,
                         Int64(dst_local_expert * Int32(8)),
                     )
                     red_add_relaxed_sys_u64_raw(ercs_peer_addr, status_u64)
@@ -744,6 +776,7 @@ class TokenInPullTokenBackPush:
             prologue_grid_sync=False,
             epilogue_grid_sync=True,
         )
+
     @cute.jit
     def dispatch_pull(
         self,
@@ -772,7 +805,6 @@ class TokenInPullTokenBackPush:
         if lane_idx == Int32(0):
             cute.arch.mbarrier_init(pull_mbar_ptr + warp_idx, 1)
         cute.arch.sync_warp()
-
 
         phase_bit = Int32(0)
 
@@ -818,9 +850,7 @@ class TokenInPullTokenBackPush:
         token_idx = sm_idx * Int32(self.num_dispatch_warps) + warp_idx
 
         _iket_pull_emit = (
-            (sm_idx == Int32(0))
-            and (warp_idx == Int32(0))
-            and (lane_idx == Int32(0))
+            (sm_idx == Int32(0)) and (warp_idx == Int32(0)) and (lane_idx == Int32(0))
         )
 
         while current_expert_idx < Int32(self.num_experts_per_rank):
@@ -834,16 +864,12 @@ class TokenInPullTokenBackPush:
                 prev_block_count = (
                     prev_valid_count + Int32(self.token_padding_block) - Int32(1)
                 ) // Int32(self.token_padding_block)
-                expert_pool_block_offset = (
-                    expert_pool_block_offset + prev_block_count
-                )
+                expert_pool_block_offset = expert_pool_block_offset + prev_block_count
                 # Mirror cumul for the release-counter granularity (self.cluster_tile_tokens).
                 prev_task_tile_count = (
                     prev_valid_count + Int32(self.cluster_tile_tokens) - Int32(1)
                 ) // Int32(self.cluster_tile_tokens)
-                expert_task_tile_offset = (
-                    expert_task_tile_offset + prev_task_tile_count
-                )
+                expert_task_tile_offset = expert_task_tile_offset + prev_task_tile_count
                 # Mirror cumul for the SF axis granularity (self.sf_padding_block).
                 prev_sf_block_count = (
                     prev_valid_count + Int32(self.sf_padding_block) - Int32(1)
@@ -855,10 +881,11 @@ class TokenInPullTokenBackPush:
                 if current_expert_idx < Int32(self.num_experts_per_rank):
                     expert_start_idx = expert_end_idx
                     valid_value = Int32(0)
-                    for i in cutlass.range_constexpr(
-                        0, NUM_EXPERTS_PER_LANE, 1
-                    ):
-                        if current_expert_idx == Int32(i * self.warp_threads) + lane_idx:
+                    for i in cutlass.range_constexpr(0, NUM_EXPERTS_PER_LANE, 1):
+                        if (
+                            current_expert_idx
+                            == Int32(i * self.warp_threads) + lane_idx
+                        ):
                             valid_value = stored_num_tokens_per_expert[i]
                     total_for_expert = cute.arch.shuffle_sync(
                         valid_value, current_expert_idx % Int32(self.warp_threads)
@@ -891,9 +918,7 @@ class TokenInPullTokenBackPush:
                         v_for_min = Int32(0x7FFFFFFF)
                         if active:
                             v_for_min = remaining_lane
-                        length = Int32(
-                            cute.arch.warp_redux_sync(v_for_min, "min")
-                        )
+                        length = Int32(cute.arch.warp_redux_sync(v_for_min, "min"))
 
                         if num_active_ranks > Int32(0):
                             num_round_tokens = length * num_active_ranks
@@ -1001,7 +1026,7 @@ class TokenInPullTokenBackPush:
 
                 if _iket_pull_emit:
                     _iket.range_pop()  # Pull.SF_LDG_STG  (= LD phase)
-                    _iket.range_push("Pull.Weight_LDG")   # (= ST phase)
+                    _iket.range_push("Pull.Weight_LDG")  # (= ST phase)
 
                 for i in cutlass.range_constexpr(0, sf_passes, 1):
                     j = Int32(i * self.warp_threads) + lane_idx
@@ -1073,7 +1098,9 @@ class TokenInPullTokenBackPush:
 
                 task_tile_addr = (fc1_ready_counter.iterator + task_tile_idx).toint()
                 flag_tracker = flag_tracker.accumulate(
-                    Int32(0), self._flag_batch, task_tile_addr,
+                    Int32(0),
+                    self._flag_batch,
+                    task_tile_addr,
                 )
                 cute.arch.sync_warp()
 
@@ -1142,9 +1169,7 @@ class TokenInPullTokenBackPush:
         """
         nblk: cutlass.Constexpr = self.combine_sf_chunk_blocks
         blk: cutlass.Constexpr = self.quant_block
-        nrounds: cutlass.Constexpr = (
-            nblk + self.warp_threads - 1
-        ) // self.warp_threads
+        nrounds: cutlass.Constexpr = (nblk + self.warp_threads - 1) // self.warp_threads
 
         s_bf16 = cute.make_tensor(
             cute.recast_ptr(smem_bf16_ptr, dtype=cutlass.BFloat16),
@@ -1166,7 +1191,8 @@ class TokenInPullTokenBackPush:
                 elem_off = blk_idx * Int32(blk)
                 r_src = cute.make_rmem_tensor(blk, Float32)
                 s_blk = cute.make_tensor(
-                    s_bf16.iterator + elem_off, cute.make_layout(blk),
+                    s_bf16.iterator + elem_off,
+                    cute.make_layout(blk),
                 )
                 r_src.store(s_blk.load().to(Float32))
                 e8m0_byte = Int32(127)
@@ -1183,7 +1209,8 @@ class TokenInPullTokenBackPush:
                     abs_frg = type(acc)(abs_ir, acc.shape, acc.dtype)
                     absmax = abs_frg.reduce(cute.ReductionOp.MAX, Float32(0.0), 0)
                     scale_f32 = cute.arch.fmax(
-                        absmax * Float32(1.0 / 448.0), Float32(2.0 ** -30),
+                        absmax * Float32(1.0 / 448.0),
+                        Float32(2.0**-30),
                     )
                     # Round scale UP to a power of two; derive the e8m0 byte and
                     # the exact reciprocal by f32 exponent bit-manip (cute's e8m0
@@ -1272,9 +1299,7 @@ class TokenInPullTokenBackPush:
         num_experts_per_lane: cutlass.Constexpr[int] = (
             self.num_experts_per_rank + 31
         ) // 32
-        num_global_warps: cutlass.Constexpr[int] = (
-            num_sms * self.num_dispatch_warps
-        )
+        num_global_warps: cutlass.Constexpr[int] = num_sms * self.num_dispatch_warps
         schedule_mode = self.token_back_schedule_mode
         atomic_batch = self.token_back_atomic_batch
 
@@ -1283,8 +1308,13 @@ class TokenInPullTokenBackPush:
         # atomicAdd(atomic_batch) when exhausted so fast warps keep stealing
         # work.  cuTeDSL forbids closures over enclosing locals -> pass all in.
         def update_token_idx(
-            token_idx, batch_remaining, lane_idx, schedule_counter,
-            schedule_mode, atomic_batch, num_global_warps,
+            token_idx,
+            batch_remaining,
+            lane_idx,
+            schedule_counter,
+            schedule_mode,
+            atomic_batch,
+            num_global_warps,
         ):
             if cutlass.const_expr(schedule_mode == "atomic_counter"):
                 batch_remaining = batch_remaining - Int32(1)
@@ -1292,8 +1322,10 @@ class TokenInPullTokenBackPush:
                     base = Int32(0)
                     if lane_idx == Int32(0):
                         base = cute.arch.atomic_add(
-                            schedule_counter, Int32(atomic_batch),
-                            sem="relaxed", scope="gpu",
+                            schedule_counter,
+                            Int32(atomic_batch),
+                            sem="relaxed",
+                            scope="gpu",
                         )
                     token_idx = cute.arch.shuffle_sync(base, Int32(0))
                     batch_remaining = Int32(atomic_batch)
@@ -1309,9 +1341,13 @@ class TokenInPullTokenBackPush:
             token_idx = Int32(0)
             batch_remaining = Int32(1)
             token_idx, batch_remaining = update_token_idx(
-                token_idx, batch_remaining, lane_idx,
+                token_idx,
+                batch_remaining,
+                lane_idx,
                 token_back_schedule_counter,
-                schedule_mode, atomic_batch, num_global_warps,
+                schedule_mode,
+                atomic_batch,
+                num_global_warps,
             )
         else:
             token_idx = sm_idx * Int32(self.num_dispatch_warps) + warp_idx
@@ -1332,20 +1368,17 @@ class TokenInPullTokenBackPush:
                 prev_block_count = (
                     prev_valid_count + Int32(self.token_padding_block) - Int32(1)
                 ) // Int32(self.token_padding_block)
-                expert_pool_block_offset = (
-                    expert_pool_block_offset + prev_block_count
-                )
+                expert_pool_block_offset = expert_pool_block_offset + prev_block_count
 
                 current_expert_idx = current_expert_idx + Int32(1)
                 if current_expert_idx < Int32(self.num_experts_per_rank):
                     expert_start_idx = expert_end_idx
                     valid_value = Int32(0)
-                    for i in cutlass.range_constexpr(
-                        0, num_experts_per_lane, 1
-                    ):
-                        if current_expert_idx == Int32(
-                            i * self.warp_threads
-                        ) + lane_idx:
+                    for i in cutlass.range_constexpr(0, num_experts_per_lane, 1):
+                        if (
+                            current_expert_idx
+                            == Int32(i * self.warp_threads) + lane_idx
+                        ):
                             valid_value = stored_num_tokens_per_expert[i]
                     total_for_expert = cute.arch.shuffle_sync(
                         valid_value,
@@ -1354,9 +1387,7 @@ class TokenInPullTokenBackPush:
                     expert_end_idx = expert_end_idx + total_for_expert
 
                     cluster_tile_cnt = (
-                        total_for_expert
-                        + Int32(self.cluster_tile_tokens)
-                        - Int32(1)
+                        total_for_expert + Int32(self.cluster_tile_tokens) - Int32(1)
                     ) // Int32(self.cluster_tile_tokens)
                     # Stash the threshold; the wait is deferred to the expert we
                     # actually land on, so stepped-over experts are never waited.
@@ -1391,10 +1422,9 @@ class TokenInPullTokenBackPush:
                 src_topk = md.src_topk
                 is_remote_token_back = src_rank != Int32(self.local_rank)
 
-                local_token_addr = (
-                    fc2_output_workspace.iterator.toint()
-                    + Int64(pool_token_idx) * Int64(fc2_token_bytes)
-                )
+                local_token_addr = fc2_output_workspace.iterator.toint() + Int64(
+                    pool_token_idx
+                ) * Int64(fc2_token_bytes)
                 smem_ptr_warp = pull_buffer_ptr + warp_idx * Int32(chunk_bytes)
                 mbar_ptr_warp = pull_mbar_ptr + warp_idx
 
@@ -1407,22 +1437,23 @@ class TokenInPullTokenBackPush:
                     # All copies are TMA load(async)->store(async): the bf16 branch
                     # proves no generic->async fence is needed.
                     peer_q_ptr = peer_rank_ptr_mapper.ptr_map_to_rank(
-                        combine_output_q.iterator, src_rank,
+                        combine_output_q.iterator,
+                        src_rank,
                     )
                     peer_sf_ptr = peer_rank_ptr_mapper.ptr_map_to_rank(
-                        combine_sf_q.iterator, src_rank,
+                        combine_sf_q.iterator,
+                        src_rank,
                     )
                     cell_idx = Int64(src_token * Int32(self.num_topk) + src_topk)
-                    peer_token_ptr_q = (
-                        peer_q_ptr + cell_idx * Int64(self.combine_q_token_bytes)
+                    peer_token_ptr_q = peer_q_ptr + cell_idx * Int64(
+                        self.combine_q_token_bytes
                     )
-                    peer_token_ptr_sf = (
-                        peer_sf_ptr + cell_idx * Int64(self.combine_sf_token_bytes)
+                    peer_token_ptr_sf = peer_sf_ptr + cell_idx * Int64(
+                        self.combine_sf_token_bytes
                     )
-                    local_sf_addr = (
-                        fc2_output_sf_workspace.iterator.toint()
-                        + Int64(pool_token_idx) * Int64(self.combine_sf_token_bytes)
-                    )
+                    local_sf_addr = fc2_output_sf_workspace.iterator.toint() + Int64(
+                        pool_token_idx
+                    ) * Int64(self.combine_sf_token_bytes)
 
                     if _iket_emit:
                         _iket.range_push("token_back_q")
@@ -1438,7 +1469,8 @@ class TokenInPullTokenBackPush:
                                 Int32(chunk_bytes),
                             )
                             cute.arch.mbarrier_arrive_and_expect_tx(
-                                mbar_ptr_warp, Int32(chunk_bytes),
+                                mbar_ptr_warp,
+                                Int32(chunk_bytes),
                             )
                             cute.arch.mbarrier_wait(mbar_ptr_warp, phase_bit)
                             if cutlass.const_expr(not _MEGA_NO_COMBINE_STORE):
@@ -1468,7 +1500,8 @@ class TokenInPullTokenBackPush:
                                 Int32(self.combine_sf_token_bytes),
                             )
                             cute.arch.mbarrier_arrive_and_expect_tx(
-                                mbar_ptr_warp, Int32(self.combine_sf_token_bytes),
+                                mbar_ptr_warp,
+                                Int32(self.combine_sf_token_bytes),
                             )
                             cute.arch.mbarrier_wait(mbar_ptr_warp, phase_bit)
                             tma_store_1d(
@@ -1486,11 +1519,11 @@ class TokenInPullTokenBackPush:
                     if cutlass.const_expr(self.combine_has_global):
                         if cutlass.const_expr(not _MEGA_NO_COMBINE_STORE):
                             peer_global_ptr = peer_rank_ptr_mapper.ptr_map_to_rank(
-                                combine_global_q.iterator, src_rank,
+                                combine_global_q.iterator,
+                                src_rank,
                             )
-                            peer_token_ptr_global = (
-                                peer_global_ptr
-                                + cell_idx * Int64(self.combine_global_token_bytes)
+                            peer_token_ptr_global = peer_global_ptr + cell_idx * Int64(
+                                self.combine_global_token_bytes
                             )
                             local_global_addr = (
                                 fc2_output_global_workspace.iterator.toint()
@@ -1522,15 +1555,15 @@ class TokenInPullTokenBackPush:
                         _iket.range_pop()
                 else:
                     peer_combine_ptr = peer_rank_ptr_mapper.ptr_map_to_rank(
-                        combine_output.iterator, src_rank,
+                        combine_output.iterator,
+                        src_rank,
                     )
                     if cutlass.const_expr(self.token_back_reduce_topk):
                         peer_token_offset = Int64(src_token) * Int64(fc2_token_bytes)
                     else:
-                        peer_token_offset = (
-                            Int64(src_token * Int32(self.num_topk) + src_topk)
-                            * Int64(fc2_token_bytes)
-                        )
+                        peer_token_offset = Int64(
+                            src_token * Int32(self.num_topk) + src_topk
+                        ) * Int64(fc2_token_bytes)
                     peer_token_ptr = peer_combine_ptr + peer_token_offset
 
                     if _iket_emit:
@@ -1555,7 +1588,8 @@ class TokenInPullTokenBackPush:
                                 this_bytes,
                             )
                             cute.arch.mbarrier_arrive_and_expect_tx(
-                                mbar_ptr_warp, this_bytes,
+                                mbar_ptr_warp,
+                                this_bytes,
                             )
                             cute.arch.mbarrier_wait(mbar_ptr_warp, phase_bit)
                             if cutlass.const_expr(not _MEGA_NO_COMBINE_STORE):
@@ -1579,16 +1613,23 @@ class TokenInPullTokenBackPush:
                         if cutlass.const_expr(not _MEGA_NO_COMBINE_STORE):
                             if is_remote_token_back and remain_experts > Int32(4):
                                 avg_token_back_window = self._adaptive_pace(
-                                    avg_token_back_window, current_window, lo=1000, hi=5000,
+                                    avg_token_back_window,
+                                    current_window,
+                                    lo=1000,
+                                    hi=5000,
                                 )
 
                     if _iket_emit:
                         _iket.range_pop()
 
                 token_idx, batch_remaining = update_token_idx(
-                    token_idx, batch_remaining, lane_idx,
+                    token_idx,
+                    batch_remaining,
+                    lane_idx,
                     token_back_schedule_counter,
-                    schedule_mode, atomic_batch, num_global_warps,
+                    schedule_mode,
+                    atomic_batch,
+                    num_global_warps,
                 )
         # if lane_idx == 0:
         #     cute.printf("<{}>", avg_token_back_window)
@@ -1616,8 +1657,13 @@ class TokenInPullTokenBackPush:
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
 
         if prologue_grid_sync:
-            software_grid_sync(grid_sync_counter, sm_idx, num_sms, tid_in_group,
-                               num_threads=self.num_dispatch_threads)
+            software_grid_sync(
+                grid_sync_counter,
+                sm_idx,
+                num_sms,
+                tid_in_group,
+                num_threads=self.num_dispatch_threads,
+            )
 
         if sm_idx == 0:
             if warp_idx == 0:
@@ -1635,7 +1681,8 @@ class TokenInPullTokenBackPush:
                 nbs_local_base = nvlink_barrier_signal.iterator.toint()
                 if lane_idx < Int32(self.world_size):
                     lane_peer_addr = peer_rank_ptr_mapper.map(
-                        nbs_local_base, lane_idx,
+                        nbs_local_base,
+                        lane_idx,
                         Int64(signal_phase * Int32(4)),
                     )
                     red_add_release_sys_s32_raw(lane_peer_addr, signal_delta)
@@ -1651,15 +1698,30 @@ class TokenInPullTokenBackPush:
                         )
                     local_signal_ptr = nvlink_barrier_signal.iterator + signal_phase
                     if cutlass.const_expr(nvlink_barrier_counter is None):
-                        while cute.arch.load(local_signal_ptr, Int32, sem="acquire", scope="sys") < target:
+                        while (
+                            cute.arch.load(
+                                local_signal_ptr, Int32, sem="acquire", scope="sys"
+                            )
+                            < target
+                        ):
                             pass
                     else:
-                        while cute.arch.load(local_signal_ptr, Int32, sem="acquire", scope="sys") != target:
+                        while (
+                            cute.arch.load(
+                                local_signal_ptr, Int32, sem="acquire", scope="sys"
+                            )
+                            != target
+                        ):
                             pass
 
         if epilogue_grid_sync:
-            software_grid_sync(grid_sync_counter, sm_idx, num_sms, tid_in_group,
-                               num_threads=self.num_dispatch_threads)
+            software_grid_sync(
+                grid_sync_counter,
+                sm_idx,
+                num_sms,
+                tid_in_group,
+                num_threads=self.num_dispatch_threads,
+            )
 
     @cute.jit
     def dispatch_warp_body(
@@ -1675,8 +1737,7 @@ class TokenInPullTokenBackPush:
         cta_linear_id = (
             Int32(bidx)
             + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
-            + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
-            * Int32(bidz)
+            + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0]) * Int32(bidz)
         )
         local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
 
@@ -1748,7 +1809,9 @@ class TokenInPullTokenBackPush:
         if iket_active:
             _iket.range_pop()
 
-        if cutlass.const_expr(self.enable_token_back and not self.token_back_standalone):
+        if cutlass.const_expr(
+            self.enable_token_back and not self.token_back_standalone
+        ):
             if iket_active:
                 _iket.range_push("Token_Back_By_Push")
 
@@ -1759,7 +1822,9 @@ class TokenInPullTokenBackPush:
                 combine_output_q = token_comm_args.combine_output_q
                 combine_sf_q = token_comm_args.combine_sf_q
                 combine_global_q = token_comm_args.combine_global_q
-                fc2_output_global_workspace = token_comm_args.fc2_output_global_workspace
+                fc2_output_global_workspace = (
+                    token_comm_args.fc2_output_global_workspace
+                )
             else:
                 q_scratch_ptr = None
                 sf_scratch_ptr = None
@@ -1810,8 +1875,7 @@ class TokenInPullTokenBackPush:
         cta_linear_id = (
             Int32(bidx)
             + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
-            + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
-            * Int32(bidz)
+            + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0]) * Int32(bidz)
         )
         local_warp_idx = Int32(warp_idx) - Int32(self.token_back_warp_start)
         if cutlass.const_expr(self.combine_is_quantized):
@@ -1886,15 +1950,11 @@ class TokenInPullTokenBackPush:
         lane_idx,
     ):
         thread_linear = (
-            (cta_linear_id * Int32(self.num_dispatch_warps) + local_warp_idx)
-            * Int32(self.warp_threads)
-            + lane_idx
-        )
+            cta_linear_id * Int32(self.num_dispatch_warps) + local_warp_idx
+        ) * Int32(self.warp_threads) + lane_idx
         stride = Int32(token_comm_args.sm_count * self.num_dispatch_threads)
 
-        recv_total: cutlass.Constexpr[int] = (
-            self.world_size * self.num_experts_per_rank
-        )
+        recv_total: cutlass.Constexpr[int] = self.world_size * self.num_experts_per_rank
         i = thread_linear
         while i < Int32(recv_total):
             rank_idx = i // Int32(self.num_experts_per_rank)

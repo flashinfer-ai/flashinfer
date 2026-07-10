@@ -45,7 +45,8 @@ Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
 
 
 def _sym_zeros_byte_view_1b(
-    logical_shape: Tuple[int, ...], target_dtype: torch.dtype,
+    logical_shape: Tuple[int, ...],
+    target_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """fp8 / E8M0 symmetric heap via uint8 reinterpret (matches mega_runner).
 
@@ -178,7 +179,8 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     x, x_root = _sym_zeros_byte_view_1b((num_max_tokens, hidden), data_dtype)
     sym_roots.append(x_root)
     x_sf, x_sf_root = _sym_zeros_byte_view_1b(
-        (num_max_tokens, hidden_sf_cols_padded), Mxfp8ScaleDtype,
+        (num_max_tokens, hidden_sf_cols_padded),
+        Mxfp8ScaleDtype,
     )
     sym_roots.append(x_sf_root)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
@@ -187,7 +189,8 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     sym_roots.append(topk_weights)
     combine_k = 1 if in_kernel_fc2_reduce else num_topk
     combine_output = sym_zeros(
-        (num_max_tokens, combine_k, hidden), torch.bfloat16,
+        (num_max_tokens, combine_k, hidden),
+        torch.bfloat16,
     )
     sym_roots.append(combine_output)
 
@@ -293,9 +296,13 @@ def mxfp8_mega_moe(
         )
         if out is not None:
             reduced = (
-                out[:n].to(torch.float32)
-                * symm_buffer.topk_weights[:n, :, None].to(torch.float32)
-            ).sum(dim=1).to(y.dtype)
+                (
+                    out[:n].to(torch.float32)
+                    * symm_buffer.topk_weights[:n, :, None].to(torch.float32)
+                )
+                .sum(dim=1)
+                .to(y.dtype)
+            )
             y.copy_(reduced)
 
 
@@ -337,9 +344,8 @@ def _create_dummy_weights(
         to_blocked(fc1_weight_sf_plain[e]) for e in range(num_local_experts)
     ]
     fc1_flat_sf_size = fc1_sf_swizzled[0].numel()
-    fc1_weight_sf = (
-        _stack_byte_reinterpretable_tensors(fc1_sf_swizzled, dim=0)
-        .view(num_local_experts, fc1_flat_sf_size)
+    fc1_weight_sf = _stack_byte_reinterpretable_tensors(fc1_sf_swizzled, dim=0).view(
+        num_local_experts, fc1_flat_sf_size
     )
 
     fc2_weight = _make_fp8_tensor(
@@ -358,9 +364,8 @@ def _create_dummy_weights(
         to_blocked(fc2_weight_sf_plain[e]) for e in range(num_local_experts)
     ]
     fc2_flat_sf_size = fc2_sf_swizzled[0].numel()
-    fc2_weight_sf = (
-        _stack_byte_reinterpretable_tensors(fc2_sf_swizzled, dim=0)
-        .view(num_local_experts, fc2_flat_sf_size)
+    fc2_weight_sf = _stack_byte_reinterpretable_tensors(fc2_sf_swizzled, dim=0).view(
+        num_local_experts, fc2_flat_sf_size
     )
 
     return (fc1_weight, fc1_weight_sf), (fc2_weight, fc2_weight_sf)
@@ -414,24 +419,41 @@ def create_dummy_inputs(
     )
 
     transformed_l1, transformed_l2 = _create_dummy_weights(
-        num_local_experts, hidden, intermediate, gen, kind=kind,
+        num_local_experts,
+        hidden,
+        intermediate,
+        gen,
+        kind=kind,
     )
 
     from moe_mxfp8_glu.mega_runner import _make_e8m0_scale_tensor, _make_fp8_tensor
 
     data_dtype = symm_buffer._frontend.config.torch_ab_dtype
     activation = _make_fp8_tensor(
-        gen, (num_tokens, hidden), data_dtype, perf_run=True,
+        gen,
+        (num_tokens, hidden),
+        data_dtype,
+        perf_run=True,
     )
     activation_sf = _make_e8m0_scale_tensor(
-        gen, num_tokens, hidden, blocksize=Mxfp8BlockSize,
+        gen,
+        num_tokens,
+        hidden,
+        blocksize=Mxfp8BlockSize,
     ).reshape(num_tokens, ceil_div(hidden, Mxfp8BlockSize))
 
     scores = torch.randn(
-        num_tokens, num_total_experts, device="cuda", dtype=torch.float32,
+        num_tokens,
+        num_total_experts,
+        device="cuda",
+        dtype=torch.float32,
     )
     topk_weights, topk_idx = torch.topk(
-        scores, num_topk, dim=-1, largest=True, sorted=False,
+        scores,
+        num_topk,
+        dim=-1,
+        largest=True,
+        sorted=False,
     )
 
     symm_buffer.x[:num_tokens].view(torch.uint8).copy_(
@@ -504,6 +526,7 @@ def _main() -> None:
         no_dist = bool(int(os.environ.get("MEGA_NO_DIST", "0")))
         if not no_dist and dist.is_initialized():
             from src.bootstrap import finalize_dist_and_nvshmem
+
             finalize_dist_and_nvshmem()
 
 

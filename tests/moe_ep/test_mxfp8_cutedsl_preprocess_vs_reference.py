@@ -105,9 +105,7 @@ def _plain_mxfp8_from_bf16(problem: dict):
     pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     num_experts = pack.w13.shape[0]
 
-    fc1_fp32 = _fc1_weight_from_w13(
-        pack.w13, intermediate_size=intermediate_size
-    )
+    fc1_fp32 = _fc1_weight_from_w13(pack.w13, intermediate_size=intermediate_size)
     fc1_weights = []
     fc1_plain_sf = []
     fc2_weights = []
@@ -249,9 +247,9 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
 
     block = Mxfp8BlockSize
     expected_gate0 = w13[:, :block, :].transpose(1, 2).contiguous()
-    expected_up0 = w13[:, intermediate : intermediate + block, :].transpose(
-        1, 2
-    ).contiguous()
+    expected_up0 = (
+        w13[:, intermediate : intermediate + block, :].transpose(1, 2).contiguous()
+    )
     torch.testing.assert_close(
         fc1_weight[:, :, :block].view(torch.uint8),
         expected_gate0.view(torch.uint8),
@@ -309,9 +307,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference():
         gate_up_clamp=problem["gate_up_clamp"],
     )
 
-    fc1_kernel, fc1_plain_sf, fc2_kernel, fc2_plain_sf = _plain_mxfp8_from_bf16(
-        problem
-    )
+    fc1_kernel, fc1_plain_sf, fc2_kernel, fc2_plain_sf = _plain_mxfp8_from_bf16(problem)
     _pre_fc1, _pre_fc2 = transformed_l1[0], transformed_l2[0]
     torch.testing.assert_close(
         _pre_fc1.view(torch.uint8), fc1_kernel.view(torch.uint8), atol=0, rtol=0
@@ -361,9 +357,13 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference():
             gate_up_clamp=problem["gate_up_clamp"],
         )
         y_ref = (
-            combine_ref[0].to(torch.float32)
-            * topk_weights[:, :, None].to(torch.float32)
-        ).sum(dim=1).to(torch.bfloat16)
+            (
+                combine_ref[0].to(torch.float32)
+                * topk_weights[:, :, None].to(torch.float32)
+            )
+            .sum(dim=1)
+            .to(torch.bfloat16)
+        )
 
         y_kernel = torch.empty(
             num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"

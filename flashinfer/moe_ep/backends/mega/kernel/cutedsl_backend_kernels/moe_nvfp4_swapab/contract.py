@@ -22,8 +22,7 @@ class ContractMismatchError(ContractError):
 class MappingSpec(Protocol):
     """Protocol for objects that can produce a canonical mapping table."""
 
-    def normalize(self, *, domain: "Space", codomain: "Space") -> tuple[int, ...]:
-        ...
+    def normalize(self, *, domain: "Space", codomain: "Space") -> tuple[int, ...]: ...
 
 
 def _as_tuple(value: Iterable[object], *, name: str) -> tuple[object, ...]:
@@ -194,7 +193,9 @@ class FunctionMapping:
 
     @staticmethod
     def _function_name(function: Callable[..., object]) -> str:
-        return getattr(function, "__qualname__", getattr(function, "__name__", repr(function)))
+        return getattr(
+            function, "__qualname__", getattr(function, "__name__", repr(function))
+        )
 
     @classmethod
     def _validate_signature(
@@ -418,10 +419,7 @@ def eval_function_mapping(contract: Contract, **domain_coord):
                 "FunctionMapping result rank does not match codomain rank: "
                 f"{len(result)} vs {contract.codomain.rank}"
             )
-        return {
-            name: result[i]
-            for i, name in enumerate(contract.codomain.names)
-        }
+        return {name: result[i] for i, name in enumerate(contract.codomain.names)}
     if contract.codomain.rank == 1:
         return {contract.codomain.names[0]: result}
     raise TypeError(

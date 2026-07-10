@@ -29,6 +29,7 @@ def bootstrap_dist():
         return 0, 0, 1, dev
 
     from src.bootstrap import init_dist_and_nvshmem
+
     return init_dist_and_nvshmem()
 
 
@@ -37,6 +38,7 @@ def sym_zeros(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     if _NO_DIST:
         return torch.zeros(shape, dtype=dtype, device="cuda")
     import nvshmem.core
+
     tensor = nvshmem.core.tensor(shape, dtype=dtype)
     tensor.zero_()
     return tensor
@@ -47,6 +49,7 @@ def free_sym_tensor(tensor: Optional[torch.Tensor]) -> None:
     if tensor is None or _NO_DIST:
         return
     import nvshmem.core
+
     try:
         nvshmem.core.free_tensor(tensor)
     except (RuntimeError, ValueError, TypeError) as exc:
@@ -57,12 +60,14 @@ def free_sym_tensor(tensor: Optional[torch.Tensor]) -> None:
 
 
 def _compute_peer_offsets(
-    sym_tensor: torch.Tensor, world_size: int,
+    sym_tensor: torch.Tensor,
+    world_size: int,
 ) -> Tuple[int, Tuple[int, ...]]:
     if _NO_DIST:
         local_base = int(sym_tensor.data_ptr())
         return local_base, tuple(0 for _ in range(world_size))
     import nvshmem.core
+
     local_base = int(sym_tensor.data_ptr())
     peer_offsets_list = tuple(
         int(nvshmem.core.get_peer_tensor(sym_tensor, peer).data_ptr()) - local_base

@@ -43,7 +43,9 @@ def tma_load_1d(dst_smem, src_gmem, mbar_smem, num_bytes, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def tma_load_1d_raw(dst_smem, src_gmem_addr: Int64, mbar_smem, num_bytes, *, loc=None, ip=None):
+def tma_load_1d_raw(
+    dst_smem, src_gmem_addr: Int64, mbar_smem, num_bytes, *, loc=None, ip=None
+):
     """Variant of ``tma_load_1d`` that takes a raw int64 GMEM byte address.
 
     Used for cross-rank TMA load via ``peer_rank_ptr_mapper.map`` style: source
@@ -364,7 +366,9 @@ def red_add_release_gpu_s32(
 
 
 @dsl_user_op
-def red_async_add_release_sys_u32_raw(addr: Int64, val: Int32, *, loc=None, ip=None) -> None:
+def red_async_add_release_sys_u32_raw(
+    addr: Int64, val: Int32, *, loc=None, ip=None
+) -> None:
     """``red.async.release.sys.global.add.u32`` via raw int64 byte address.
 
     sm_90+ async reduction — fire-and-forget; the issuing SM does NOT
@@ -401,6 +405,7 @@ def read_clock64(*, loc=None, ip=None) -> Int64:
         )
     )
 
+
 @dsl_user_op
 def _fence_rel_sys(
     *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
@@ -411,6 +416,7 @@ def _fence_rel_sys(
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-membar>`__.
     """
     llvm.fence(llvm.AtomicOrdering.release, loc=loc, ip=ip)
+
 
 @dsl_user_op
 def _fence_rel_gpu(

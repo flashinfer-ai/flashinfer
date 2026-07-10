@@ -4,7 +4,6 @@
 Host driver for the MegaMoE MXFP8 GLU fused fc1+fc2 kernel.
 """
 
-
 import argparse
 import os
 import sys
@@ -119,9 +118,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
         data_dtype = kind_data_dtype(problem.kind)
 
         # -- activation: (data_total_rows, hidden) fp8, hidden stride-1 --
-        self.activation = self._create_fp8_tensor(
-            (data_total_rows, hidden), data_dtype
-        )
+        self.activation = self._create_fp8_tensor((data_total_rows, hidden), data_dtype)
 
         # -- fc1_weight: (experts, intermediate, hidden) -> permute ->
         #    (experts, hidden, intermediate), hidden stride-1 --
@@ -140,7 +137,9 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
         valid_tokens = self.valid_tokens_per_expert
         data_offsets = self.data_physical_offsets
         self.topk_scores = torch.zeros(
-            (data_total_rows,), dtype=torch.float32, device="cuda",
+            (data_total_rows,),
+            dtype=torch.float32,
+            device="cuda",
         )
         for e in range(self.problem.experts):
             v_e = valid_tokens[e]
@@ -158,7 +157,8 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
         fc2_output_bytes = torch.full(
             (data_total_rows, hidden * problem.fc2_output_dtype.itemsize),
             0xFF,
-            dtype=torch.uint8, device="cuda",
+            dtype=torch.uint8,
+            device="cuda",
         )
         self.fc2_output = fc2_output_bytes.view(problem.fc2_output_dtype).reshape(
             data_total_rows, hidden
@@ -242,7 +242,9 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
                 kfp32.cpu(),
                 ref_fp32.cpu(),
                 name=f"fc1_expert{e}",
-                atol=5e-2, rtol=5e-2, max_mismatches=5,
+                atol=5e-2,
+                rtol=5e-2,
+                max_mismatches=5,
             )
         print("=" * 60)
 
@@ -263,17 +265,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     # -- MXFP8-only Problem --
     parser.add_argument(
-        "--kind", type=str, default="mxfp8_e4m3",
+        "--kind",
+        type=str,
+        default="mxfp8_e4m3",
         choices=["mxfp8_e4m3", "mxfp8_e5m2"],
         help="MXFP8 element format: mxfp8_e4m3 (default) or mxfp8_e5m2.",
     )
     parser.add_argument(
-        "--flag_batch", type=int, default=1,
+        "--flag_batch",
+        type=int,
+        default=1,
         help="dispatch_pull release-flag batch size; 1 == per-token "
         "baseline, larger amortizes the device fence over more tokens.",
     )
     parser.add_argument(
-        "--gate_up_clamp", type=float, default=None,
+        "--gate_up_clamp",
+        type=float,
+        default=None,
         help="DeepSeek-V4 swiglu_limit: clamp gate/up pre-activations before SiLU.",
     )
 
