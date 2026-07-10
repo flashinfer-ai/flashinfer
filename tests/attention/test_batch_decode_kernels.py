@@ -1026,9 +1026,7 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
     dtype = torch.bfloat16
     num_qo_heads = num_kv_heads * gqa_group_size
     capture_kv_lens = [129] * batch_size
-    # kv_len >= q_len_per_req is a plan-time contract (the verified tokens
-    # are already appended to the KV cache); kv_len == q_len_per_req is the
-    # tightest legal case — row 0 attends to exactly one position.
+    # tightest legal kv under the plan contract kv_len >= q_len_per_req
     replay_kv_lens_sets = [
         [[33, 17, 65, 129][i % 4] for i in range(batch_size)],
         [[q_len_per_req, 128, 64, 100][i % 4] for i in range(batch_size)],
@@ -1209,8 +1207,6 @@ def test_tensor_core_decode_rejects_mismatched_q_len():
             q_len_per_req=2,
         )
 
-    # kv_len < q_len_per_req would give the earlier rows of a request an
-    # empty causal KV range (undefined); the plan must reject it loudly.
     short_kv_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         ws, "NHD", use_tensor_cores=True
     )
