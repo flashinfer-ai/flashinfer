@@ -17,40 +17,21 @@ try:
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.typing import AddressSpace
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import arith as _arith
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import dsl_user_op, Int32 as _epi_Int32, Int64
+from cutlass.cutlass_dsl import Int64
 
 from src.flag_batch import GpuReleaseFlagBatchTracker
 from src.token_comm import TokenSrcMetadata
 
-from moe_nvfp4_swapab.contract import (
-    Contract,
-    FunctionMapping,
-    Space,
-    TensorWithContract,
-    assert_contract_equivalent,
-)
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
-from common.megamoe_constants import Nvfp4BlockSize
 
 from common.moe_utils import fmin, fmax, swiglu_act, quant_sfd_row
 from cutlass.cute.typing import Float32
 from moe_nvfp4_swapab.epilogue import (
     _TmemTranspose16x32Core,
-    _red_add_release_gpu_s32,
-    SwapABSwigluFp4Epilogue,
-    EpilogueTokenTile,
-    Fc2AccLoadAndPack,
-    TmemTranspose16x32Packed,
-    Fc2UnpackPermuteStg,
-    Region,
 )
 
 Fc1GateUpInterleave = 32

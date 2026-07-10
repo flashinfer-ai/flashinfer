@@ -2539,8 +2539,8 @@ class MegaMoETester:
                 print(f"  first 16 extras (src_rank, src_token, src_topk): {sample}")
         else:
             print(
-                f"---- expected-vs-actual reverse check skipped "
-                f"(fc1_output peek unavailable) ----"
+                "---- expected-vs-actual reverse check skipped "
+                "(fc1_output peek unavailable) ----"
             )
 
         # ---- 3. fc1_output non-zero row mask (per pool_slot) + hash.
@@ -2838,7 +2838,7 @@ class MegaMoETester:
                 f"top {n_worst_cells_per_token} hidden cells; K already "
                 "reduced on device) ----"
             )
-            for t, ds in zip(bad_tokens, bad_diff_sums):
+            for t, ds in zip(bad_tokens, bad_diff_sums, strict=False):
                 token_diff = unreduced_diff[t]  # (H,)
                 n_cells = min(n_worst_cells_per_token, token_diff.numel())
                 top_cells = torch.topk(token_diff, k=n_cells)
@@ -2860,7 +2860,7 @@ class MegaMoETester:
                 f"{n_worst_tokens} by sum over (topk, hidden); per token: "
                 f"top {n_worst_cells_per_token} (topk, hidden) cells) ----"
             )
-            for t, ds in zip(bad_tokens, bad_diff_sums):
+            for t, ds in zip(bad_tokens, bad_diff_sums, strict=False):
                 token_diff = unreduced_diff[t]  # (K, H)
                 flat = token_diff.flatten()
                 n_cells = min(n_worst_cells_per_token, flat.numel())

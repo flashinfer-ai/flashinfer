@@ -36,11 +36,10 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.arch import nvvm_wrappers
-from cutlass.cutlass_dsl import dsl_user_op, Boolean, Int32, Float32, T
+from cutlass.cutlass_dsl import dsl_user_op, Boolean, Int32, T
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import cute as _cute_ir
-from cutlass._mlir.dialects import vector, arith
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 from dataclasses import dataclass
 

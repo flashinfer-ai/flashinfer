@@ -60,7 +60,6 @@ from moe_nvfp4_swapab.mega_runner import (
     _generate_topk_weights,
     _print_remote_rank_comm_matrices,
     _sym_zeros,
-    _compute_peer_offsets,
     _parse_tuple,
     _parse_output_dtype,
     _NO_DIST,
@@ -497,7 +496,6 @@ class MegaMoEMxfp8Tester(MegaMoETester):
             )
 
         import cuda.bindings.driver as cuda
-        import cutlass
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
         import cutlass.utils as utils

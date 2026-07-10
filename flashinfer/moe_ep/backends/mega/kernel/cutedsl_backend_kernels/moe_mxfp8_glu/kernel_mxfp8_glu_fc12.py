@@ -22,7 +22,6 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
-from moe_nvfp4_swapab.epilogue import SwapABSwigluFp4Epilogue, _TmemTranspose16x32Core
 from moe_mxfp8_glu.epilogue_mxfp8 import GluMxfp8Epilogue
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     BlockPhase,
@@ -31,7 +30,6 @@ from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
 from moe_nvfp4_swapab.custom_ext import GluMxFp8Fc12SchedExtension
 from common.megamoe_constants import (
     Mxfp8BlockSize,
-    Nvfp4BlockSize,
     SupportedMmaTileM,
     SupportedMmaTileN,
 )

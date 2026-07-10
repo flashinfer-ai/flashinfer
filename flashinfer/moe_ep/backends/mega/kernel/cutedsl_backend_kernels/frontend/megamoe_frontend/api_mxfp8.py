@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 

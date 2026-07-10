@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-import torch
 
 from flashinfer.moe_ep import (
     BootstrapConfig,
@@ -17,7 +16,6 @@ from flashinfer.moe_ep import (
     FleetParams,
     HandleAlgoKnobSplitOperation,
     HandleAlgoKnobUserStream,
-    MoEWeightPack,
     QuantType,
     dummy_moe_weights,
 )

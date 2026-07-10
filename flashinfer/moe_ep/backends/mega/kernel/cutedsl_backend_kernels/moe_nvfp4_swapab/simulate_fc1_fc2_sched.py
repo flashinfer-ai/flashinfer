@@ -5,7 +5,6 @@
 
 import sys
 from enum import IntEnum
-from math import ceil
 from typing import IO, Iterator, List, Optional, Tuple
 
 
@@ -30,7 +29,7 @@ class FusedFc12Simulator:
     ):
         if any(off < 0 for off in offsets):
             raise ValueError("offsets entries must be non-negative")
-        if any(b < a for a, b in zip(offsets, offsets[1:])):
+        if any(b < a for a, b in zip(offsets, offsets[1:], strict=False)):
             raise ValueError("offsets must be non-decreasing (it's a cumsum)")
         if cta_tile_token <= 0 or num_fc1_n_blocks <= 0 or num_fc2_n_blocks <= 0:
             raise ValueError("tile / block counts must be positive")

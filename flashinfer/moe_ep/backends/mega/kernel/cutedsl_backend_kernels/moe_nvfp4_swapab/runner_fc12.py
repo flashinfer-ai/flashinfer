@@ -5,10 +5,8 @@
 import argparse
 import os
 import sys
-from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import numpy as np
 import torch
 
 # Ensure absolute package imports work when this file is run as a script.

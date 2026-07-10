@@ -8,7 +8,7 @@ store components.
 """
 
 import dataclasses
-from typing import Any, List, Literal, Optional, Tuple, Type, Union
+from typing import Any, Optional, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute

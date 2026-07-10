@@ -2,21 +2,12 @@
 # SPDX-License-Identifier: BSD-3-Clause OR Apache-2.0
 """Host utility helpers shared across NVFP4 and MXFP8 runners."""
 
-import argparse
-import os
-import sys
-from typing import List, Optional, Tuple
+from typing import Tuple
 import torch
 
 from common.megamoe_constants import (
-    Fp8E5M2Max,
-    Fp8E4M3FNMax,
-    Nvfp4E2M1Max,
     Nvfp4BlockSize,
     Mxfp8BlockSize,
-    SfPaddingBlock,
-    TmaLeadingDimByteAlign,
-    Nvfp4E2M1RcpLimit,
     Fp8E4M3RcpLimit,
     Fp8E5M2RcpLimit,
 )
@@ -137,7 +128,7 @@ def compare_and_report_mismatches(
             f"{'Index':<6} {'Coordinate':<30} {'GPU Data':<20} {'CPU Data':<20} {'Abs Error':<20}"
         )
         print("-" * 100)
-        print(f"\n")
+        print("\n")
 
         flat_gpu = gpu_data.flatten()
         flat_ref = ref_data.flatten()

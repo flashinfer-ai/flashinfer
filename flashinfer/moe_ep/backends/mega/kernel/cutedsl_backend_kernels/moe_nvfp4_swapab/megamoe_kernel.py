@@ -38,7 +38,6 @@ multiple of ``token_padding_block``.
 # quoted explicitly.
 
 import dataclasses
-import os
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import cutlass

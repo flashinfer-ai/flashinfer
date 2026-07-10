@@ -12,7 +12,7 @@ the per-token metadata is fetched.
 """
 
 import dataclasses
-from typing import Any, Callable, List, Literal, Optional, Tuple, Type, Union
+from typing import Callable, List, Optional, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute
