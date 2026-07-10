@@ -614,13 +614,11 @@ def msa_proxy_score_fp4(
     Numerics equal a torch dequant of the same packed inputs (not the bf16
     reference, which differs by fp4 rounding). The two global scales are folded
     into the logits as ``q_global_scale * k_global_scale`` before the block-max.
-    Single-token decode uses a dim-parallel scalar schedule that streams packed
-    K straight to registers and decodes with cvt instructions. Short multi-token
-    decode uses a head-fused packed schedule on the fp4 tensor cores
-    (``MmaMXF4NVF4Op``) that scores all ``group_size`` heads of a kv_head from
-    one shared index-K read. Longer q uses the general tensor-core schedule.
-    Both flat and paged K are supported; see the dispatch below for the exact
-    regime bounds.
+    Short q (decode, including multi-token verify) uses a head-fused packed
+    schedule on the fp4 tensor cores (``MmaMXF4NVF4Op``) that scores all
+    ``group_size`` heads of a kv_head from one shared index-K read; longer q
+    uses the general tensor-core schedule. Both flat and paged K are supported;
+    see the dispatch below for the exact regime bounds.
 
     Parameters
     ----------
