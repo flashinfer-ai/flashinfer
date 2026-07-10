@@ -289,11 +289,9 @@ def interleave_moe_scales_for_sm90_mixed_gemm(
             f"scales must be 3D (num_experts, rows, K/group_size); got {tuple(scales.shape)}"
         )
 
+    if group_size <= 0 or 128 % group_size != 0:
+        raise ValueError(f"group_size={group_size} must be positive and divide 128")
     scale_groups_per_k128 = 128 // group_size
-    if scale_groups_per_k128 < 1 or 128 % group_size != 0:
-        raise ValueError(
-            f"group_size={group_size} must divide 128 (scale groups per K128 block)"
-        )
     element_bits = scales.element_size() * 8
     physical_cols = 128 // element_bits
     if physical_cols < 1 or 128 % element_bits != 0:

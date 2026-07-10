@@ -226,15 +226,13 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     }
 
     if (isWFP4A16Quant()) {
+      TVM_FFI_ICHECK_EQ(mActivationDtype, dl_bfloat16)
+          << "SM90 MXFP4 W4A16 supports BF16 activations only; FP16 is incompatible with the "
+             "interleaved weight layout.";
       mInnerDimMultiplier = 2;
-      if (mActivationDtype == dl_float16) {
-        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, kernels::Fp4Type>>();
-      }
 #ifdef ENABLE_BF16
-      else if (mActivationDtype == dl_bfloat16) {
-        mKernelRunner =
-            std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, kernels::Fp4Type>>();
-      }
+      mKernelRunner =
+          std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, kernels::Fp4Type>>();
 #endif
     }
 
