@@ -1143,20 +1143,8 @@ class MoEScaledGroupedGemmTensormapConstructor(OnlineTensormapDescCreator):
         """
         c1 = cutlass.Int32(1)
 
-        a_chunks_to_move = (
-            padded_offset
-            // self.sf_vec_size
-            * cute.size(self.sfa_tensor, mode=[0])
-            // 128
-        )
         a_elems_to_move = (
             cute.size(self.sfa_tensor, mode=[0]) * padded_offset // self.sf_vec_size
-        )
-        b_chunks_to_move = (
-            padded_offset
-            // self.sf_vec_size
-            * cute.size(self.sfb_tensor, mode=[0])
-            // 128
         )
         b_elems_to_move = (
             cute.size(self.sfb_tensor, mode=[0]) * padded_offset // self.sf_vec_size

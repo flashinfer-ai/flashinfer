@@ -27,6 +27,7 @@ Launcher::
 import argparse
 import gc
 import os
+import contextlib
 import sys
 from typing import List, Optional, Tuple
 
@@ -801,10 +802,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 tester.shared_workspace,
             ):
                 if sym_tensor is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         nvshmem.core.free_tensor(sym_tensor)
-                    except Exception:  # noqa: BLE001
-                        pass
             tester.my_activation = None
             tester.my_activation_sf = None
             tester.my_topk_idx = None

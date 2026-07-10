@@ -409,11 +409,11 @@ class GluMxfp8Epilogue:
         iket.range_push("mxfp8_fc1_epi_tile")
 
         if cutlass.const_expr(self._overlapping_accum):
-            acc_stage_col_offset = cutlass.Int32(acc_consumer_state.phase) * (
+            _acc_stage_col_offset = cutlass.Int32(acc_consumer_state.phase) * (
                 256 - self._num_sf_tmem_cols
             )
         else:
-            acc_stage_col_offset = (
+            _acc_stage_col_offset = (
                 cutlass.Int32(acc_consumer_state.index) * self._cta_tile_n
             )
 
@@ -437,7 +437,6 @@ class GluMxfp8Epilogue:
             self.fc1_output_dtype,
             num_bits_per_copy=128,
         )
-        tRS_sC = None
 
         for i in cutlass.range(0, subtile_cnt, 1, unroll=1):
             if cutlass.const_expr(self._overlapping_accum):
@@ -751,7 +750,7 @@ class GluMxfp8Epilogue:
         """fc2 (Linear2) task-tile body following fc1 pattern exactly.
 
         Key alignment with fc1:
-          - acc_stage_col_offset = 0 for overlapping_accum (single physical stage)
+          - _acc_stage_col_offset = 0 for overlapping_accum (single physical stage)
           - is_odd_turn determines start subtile (7 odd, 0 even) and direction
           - consumer_release after first subtile (i==0) when overlapping_accum
           - TMEM tensor advances by +/- EpilogueTileN each iteration
@@ -771,11 +770,11 @@ class GluMxfp8Epilogue:
         # reads the wrong stage for phase=1 clusters.
         # For non-overlapping: stage index selects the physical region.
         if cutlass.const_expr(self._overlapping_accum):
-            acc_stage_col_offset = cutlass.Int32(acc_consumer_state.phase) * (
+            _acc_stage_col_offset = cutlass.Int32(acc_consumer_state.phase) * (
                 256 - self._num_sf_tmem_cols
             )
         else:
-            acc_stage_col_offset = (
+            _acc_stage_col_offset = (
                 cutlass.Int32(acc_consumer_state.index) * self._cta_tile_n
             )
 

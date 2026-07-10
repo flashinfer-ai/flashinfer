@@ -27,7 +27,7 @@ class Handle(ABC):
     def complete(self) -> None:
         """Wait on a staged operation. No-op when ``kSplitOperation`` was unset."""
 
-    def destroy(self) -> None:
+    def destroy(self) -> None:  # noqa: B027 - intentional no-op default
         """Release per-iteration native resources. Idempotent."""
 
     def dispatch_send_only(self, params: "DispatchInputParams") -> "DispatchOutput":

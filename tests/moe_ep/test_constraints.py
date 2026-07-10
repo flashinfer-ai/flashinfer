@@ -101,21 +101,21 @@ def test_bootstrap_world_size_must_match_dist_when_initialized():
 
     bootstrap = BootstrapConfig(world_size=4, rank=0)
     mock_pg = mock.MagicMock()
-    with mock.patch("torch.distributed.is_initialized", return_value=True):
-        with mock.patch(
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch(
             "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_comm_group",
             return_value=mock_pg,
-        ):
-            with mock.patch("torch.distributed.get_world_size", return_value=8):
-                with mock.patch("torch.distributed.get_rank", return_value=0):
-                    with mock.patch(
-                        "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_ep_rank_world",
-                        return_value=(0, 8),
-                    ):
-                        with pytest.raises(
-                            MoEEpConfigError, match="BootstrapConfig.world_size"
-                        ):
-                            validate_bootstrap_world_size(bootstrap)
+        ),
+        mock.patch("torch.distributed.get_world_size", return_value=8),
+        mock.patch("torch.distributed.get_rank", return_value=0),
+        mock.patch(
+            "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_ep_rank_world",
+            return_value=(0, 8),
+        ),
+        pytest.raises(MoEEpConfigError, match="BootstrapConfig.world_size"),
+    ):
+        validate_bootstrap_world_size(bootstrap)
 
 
 def test_bootstrap_world_size_skipped_when_dist_not_initialized():
@@ -131,9 +131,11 @@ def test_bootstrap_process_group_requires_dist_at_init():
 
     pg = mock.MagicMock()
     bootstrap = BootstrapConfig(world_size=4, rank=0, process_group=pg)
-    with mock.patch("torch.distributed.is_initialized", return_value=False):
-        with pytest.raises(MoEEpConfigError, match="process_group is set"):
-            validate_bootstrap_process_group_ready(bootstrap)
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=False),
+        pytest.raises(MoEEpConfigError, match="process_group is set"),
+    ):
+        validate_bootstrap_process_group_ready(bootstrap)
 
 
 def test_ensure_bootstrap_dist_validated_deferred_world_size_check():
@@ -144,21 +146,21 @@ def test_ensure_bootstrap_dist_validated_deferred_world_size_check():
         ensure_bootstrap_dist_validated(bootstrap)
 
     mock_pg = mock.MagicMock()
-    with mock.patch("torch.distributed.is_initialized", return_value=True):
-        with mock.patch(
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch(
             "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_comm_group",
             return_value=mock_pg,
-        ):
-            with mock.patch("torch.distributed.get_world_size", return_value=8):
-                with mock.patch("torch.distributed.get_rank", return_value=0):
-                    with mock.patch(
-                        "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_ep_rank_world",
-                        return_value=(0, 8),
-                    ):
-                        with pytest.raises(
-                            MoEEpConfigError, match="BootstrapConfig.world_size"
-                        ):
-                            ensure_bootstrap_dist_validated(bootstrap)
+        ),
+        mock.patch("torch.distributed.get_world_size", return_value=8),
+        mock.patch("torch.distributed.get_rank", return_value=0),
+        mock.patch(
+            "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_ep_rank_world",
+            return_value=(0, 8),
+        ),
+        pytest.raises(MoEEpConfigError, match="BootstrapConfig.world_size"),
+    ):
+        ensure_bootstrap_dist_validated(bootstrap)
 
 
 def test_split_forward_inputs_rejects_token_overflow():

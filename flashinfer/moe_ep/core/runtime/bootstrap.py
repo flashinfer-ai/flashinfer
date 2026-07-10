@@ -40,7 +40,6 @@ def _mega_no_dist() -> bool:
 
 def _nvshmem_initialized() -> bool:
     try:
-        import nvshmem.core
         from nvshmem.core.memory import InternalInitStatus, _is_initialized
 
         return _is_initialized["status"] == InternalInitStatus.INITIALIZED

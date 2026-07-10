@@ -143,15 +143,17 @@ def test_factory_mega_ignores_fleet_knobs_warns(dist_not_initialized):
         MoEEpMegaLayer,
     )
 
-    with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
-        with pytest.warns(UserWarning, match="fleet_knobs are ignored"):
-            layer = MoEEpLayer(
-                bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
-                fleet_params=_mega_fleet_params(),
-                weights=_mega_weights(),
-                fleet_knobs=[FleetAlgoKnobNumChannelsPerRank(n=4)],
-                backend=_mega_config(),
-            )
+    with (
+        mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"),
+        pytest.warns(UserWarning, match="fleet_knobs are ignored"),
+    ):
+        layer = MoEEpLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=_mega_fleet_params(),
+            weights=_mega_weights(),
+            fleet_knobs=[FleetAlgoKnobNumChannelsPerRank(n=4)],
+            backend=_mega_config(),
+        )
     assert isinstance(layer, MoEEpMegaLayer)
 
 
@@ -223,19 +225,21 @@ def test_split_layer_init_rejects_process_group_without_dist():
     from flashinfer.moe_ep import BootstrapConfig, MoEEpConfigError, MoEEpSplitLayer
 
     pg = mock.MagicMock()
-    with mock.patch("torch.distributed.is_initialized", return_value=False):
-        with pytest.raises(MoEEpConfigError, match="process_group is set"):
-            MoEEpSplitLayer(
-                bootstrap=BootstrapConfig(
-                    world_size=1,
-                    rank=0,
-                    process_group=pg,
-                    auto_bootstrap=False,
-                ),
-                fleet_params=_split_fleet_params(),
-                weights=_split_weights(),
-                backend="nccl_ep",
-            )
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=False),
+        pytest.raises(MoEEpConfigError, match="process_group is set"),
+    ):
+        MoEEpSplitLayer(
+            bootstrap=BootstrapConfig(
+                world_size=1,
+                rank=0,
+                process_group=pg,
+                auto_bootstrap=False,
+            ),
+            fleet_params=_split_fleet_params(),
+            weights=_split_weights(),
+            backend="nccl_ep",
+        )
 
 
 def test_factory_rejects_raw_mega_kernel_config():

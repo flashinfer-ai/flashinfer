@@ -1763,14 +1763,8 @@ class MegaMoETester:
                 raise RuntimeError(
                     "form A CuTeDSL reduce requires combine_reduced_output allocation."
                 )
-            combine_reduced_output_cute = _to_cute(self.combine_reduced_output)
             topk_reduce_score = (
                 self.my_topk_weights
-                if self.misc.ref_compute_graph == "transformers"
-                else None
-            )
-            topk_reduce_score_cute = (
-                topk_weights_cute
                 if self.misc.ref_compute_graph == "transformers"
                 else None
             )
@@ -2403,9 +2397,8 @@ class MegaMoETester:
             coll_counts = counts[coll_mask]
             # Rank collision triples by replication count (worst first).
             sort_idx = torch.argsort(coll_counts, descending=True)
-            shown = 0
             shown_limit = 8
-            for i in sort_idx.tolist():
+            for shown, i in enumerate(sort_idx.tolist(), start=1):
                 k = int(coll_keys[i].item())
                 c = int(coll_counts[i].item())
                 src_rank = (k >> 48) & 0xFFFF
@@ -2422,7 +2415,6 @@ class MegaMoETester:
                     f"src_topk={src_topk}) x {c}{tag}"
                 )
                 print(f"    first {len(slot_sample)} slot ids: {slot_sample}")
-                shown += 1
                 if shown >= shown_limit:
                     remaining = n_collisions - shown
                     if remaining > 0:

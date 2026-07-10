@@ -354,7 +354,9 @@ class Contract:
             mismatch_idx = next(
                 (
                     idx
-                    for idx, (lhs, rhs) in enumerate(zip(self.table, other.table, strict=False))
+                    for idx, (lhs, rhs) in enumerate(
+                        zip(self.table, other.table, strict=False)
+                    )
                     if lhs != rhs
                 ),
                 None,

@@ -539,7 +539,6 @@ class Sm100SwigluMxfp8Fc12Kernel:
     ) -> int:
         """Compute opaque workspace size for one fused fc1+fc2 launch."""
         sf_padding_block = self.sf_padding_block
-        sf_vec_size = self.sf_vec_size
 
         mma_tiler_n = self.mma_tiler_mnk[1]
 
@@ -1273,10 +1272,6 @@ class Sm100SwigluMxfp8Fc12Kernel:
         loop (acc consumer state, subtile dispatch, TMA commit/drain, and
         the piggyback ``red.release.gpu.add.s32`` to ``fc1_done_counter``).
         """
-        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, None, 0))
-        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, None, 0))
-        sfa_smem_layout = cute.slice_(sfa_smem_layout_staged, (None, None, None, 0))
-        sfb_smem_layout = cute.slice_(sfb_smem_layout_staged, (None, None, None, 0))
 
         # fc2 waits for all fc1 intermediate N-tiles in the same token block.
         # Each N-tile is processed by atom_thr_size CTAs (both CTA0 and CTA1 increment
@@ -1620,7 +1615,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
@@ -1677,7 +1672,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     if tidx == cutlass.Int32(
                         32 * self.tma_a_warp_id
                     ) and work_tile_info.tile_n_idx == cutlass.Int32(0):
-                        counter_val_post = cute.arch.load(
+                        _counter_val_post = cute.arch.load(
                             counter_ptr, counter_ptr.dtype, cop="cg"
                         )
                         # Also load first Int32 from fc1_output for this tile to
@@ -1693,7 +1688,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                             fc1_output_gemm.iterator.toint() + fc1_byte_offset,
                             cute.AddressSpace.gmem,
                         )
-                        fc1_first_i32 = cute.arch.load(
+                        _fc1_first_i32 = cute.arch.load(
                             fc1_probe_ptr, cutlass.Int32, cop="cg"
                         )
                         # cute.printf(
@@ -1761,7 +1756,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
@@ -1892,7 +1887,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
@@ -1969,7 +1964,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:

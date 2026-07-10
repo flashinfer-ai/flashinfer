@@ -38,7 +38,6 @@ def stage_mega_moe_inputs(
         return
     if hidden % 128 != 0:
         raise ValueError("hidden_size must be a multiple of 128.")
-    top_k = topk_ids.shape[1]
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 

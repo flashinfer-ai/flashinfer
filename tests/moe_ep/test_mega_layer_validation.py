@@ -129,9 +129,11 @@ def test_mega_layer_forward_accepts_partial_batch():
         topk_ids=torch.zeros(16, 2, dtype=torch.int64),
         topk_weights=torch.zeros(16, 2),
     )
-    with mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states):
-        with mock.patch.object(layer._kernel, "stage_inputs"):
-            out = layer.forward(t)
+    with (
+        mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states),
+        mock.patch.object(layer._kernel, "stage_inputs"),
+    ):
+        out = layer.forward(t)
     assert out.shape == (16, 128)
 
 
@@ -206,30 +208,32 @@ def test_mega_layer_prepare_workspace_requires_dist(mock_dist_init):
     import sys
 
     layer = _mega_layer()
-    with mock.patch.dict(sys.modules, {"deep_gemm": mock.MagicMock()}):
-        with pytest.raises(RuntimeError, match="torch.distributed"):
-            layer._ensure_workspace()
+    with (
+        mock.patch.dict(sys.modules, {"deep_gemm": mock.MagicMock()}),
+        pytest.raises(RuntimeError, match="torch.distributed"),
+    ):
+        layer._ensure_workspace()
 
 
 def test_mega_layer_init_rejects_bootstrap_world_size_mismatch():
     from flashinfer.moe_ep import MoEEpConfigError
 
     mock_pg = mock.MagicMock()
-    with mock.patch("torch.distributed.is_initialized", return_value=True):
-        with mock.patch(
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch(
             "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_comm_group",
             return_value=mock_pg,
-        ):
-            with mock.patch("torch.distributed.get_world_size", return_value=8):
-                with mock.patch("torch.distributed.get_rank", return_value=0):
-                    with mock.patch(
-                        "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_ep_rank_world",
-                        return_value=(0, 8),
-                    ):
-                        with pytest.raises(
-                            MoEEpConfigError, match="BootstrapConfig.world_size"
-                        ):
-                            _mega_layer()
+        ),
+        mock.patch("torch.distributed.get_world_size", return_value=8),
+        mock.patch("torch.distributed.get_rank", return_value=0),
+        mock.patch(
+            "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_ep_rank_world",
+            return_value=(0, 8),
+        ),
+        pytest.raises(MoEEpConfigError, match="BootstrapConfig.world_size"),
+    ):
+        _mega_layer()
 
 
 def test_mega_layer_forward_passes_quantize_input_to_kernel():
@@ -245,11 +249,13 @@ def test_mega_layer_forward_passes_quantize_input_to_kernel():
         topk_ids=torch.zeros(8, 2, dtype=torch.int64),
         topk_weights=torch.zeros(8, 2),
     )
-    with mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states):
-        with mock.patch.object(layer._kernel, "stage_inputs") as stage_mock:
-            layer.forward(t)
-            stage_mock.assert_called_once()
-            assert stage_mock.call_args.kwargs["quantize_input"] is True
+    with (
+        mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states),
+        mock.patch.object(layer._kernel, "stage_inputs") as stage_mock,
+    ):
+        layer.forward(t)
+        stage_mock.assert_called_once()
+        assert stage_mock.call_args.kwargs["quantize_input"] is True
 
 
 def test_mega_layer_forward_skips_quantize_when_config_disabled():
@@ -269,11 +275,13 @@ def test_mega_layer_forward_skips_quantize_when_config_disabled():
         topk_weights=torch.zeros(8, 2),
         scales=torch.zeros(8, 4),
     )
-    with mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states):
-        with mock.patch.object(layer._kernel, "stage_inputs") as stage_mock:
-            layer.forward(t)
-            stage_mock.assert_called_once()
-            assert stage_mock.call_args.kwargs["quantize_input"] is False
+    with (
+        mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states),
+        mock.patch.object(layer._kernel, "stage_inputs") as stage_mock,
+    ):
+        layer.forward(t)
+        stage_mock.assert_called_once()
+        assert stage_mock.call_args.kwargs["quantize_input"] is False
 
 
 def test_mega_layer_forward_rejects_non_bf16_with_quantize_input():
@@ -308,24 +316,26 @@ def test_mega_layer_init_rejects_bad_fleet_weights(dist_not_initialized):
         MoEWeightPack,
     )
 
-    with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
-        with pytest.raises(MoEEpConfigError, match="num_experts // world_size"):
-            MoEEpMegaLayer(
-                bootstrap=BootstrapConfig(world_size=4, rank=0, auto_bootstrap=False),
-                fleet_params=FleetParams(
-                    num_experts=8,
-                    max_tokens_per_rank=64,
-                    token_hidden_size=128,
-                ),
-                weights=MoEWeightPack(
-                    w13=torch.zeros(4, 256, 128),
-                    w2=torch.zeros(4, 128, 128),
-                ),
-                backend=MegaConfig(
-                    megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
-                    preprocess_weights=True,
-                ),
-            )
+    with (
+        mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"),
+        pytest.raises(MoEEpConfigError, match="num_experts // world_size"),
+    ):
+        MoEEpMegaLayer(
+            bootstrap=BootstrapConfig(world_size=4, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=8,
+                max_tokens_per_rank=64,
+                token_hidden_size=128,
+            ),
+            weights=MoEWeightPack(
+                w13=torch.zeros(4, 256, 128),
+                w2=torch.zeros(4, 128, 128),
+            ),
+            backend=MegaConfig(
+                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                preprocess_weights=True,
+            ),
+        )
 
 
 def test_mega_layer_init_skips_fleet_weights_when_transformed_supplied(
@@ -377,21 +387,21 @@ def test_mega_layer_forward_deferred_bootstrap_validation():
         topk_weights=torch.zeros(4, 2),
     )
     mock_pg = mock.MagicMock()
-    with mock.patch("torch.distributed.is_initialized", return_value=True):
-        with mock.patch(
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch(
             "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_comm_group",
             return_value=mock_pg,
-        ):
-            with mock.patch("torch.distributed.get_world_size", return_value=8):
-                with mock.patch("torch.distributed.get_rank", return_value=0):
-                    with mock.patch(
-                        "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_ep_rank_world",
-                        return_value=(0, 8),
-                    ):
-                        with pytest.raises(
-                            MoEEpConfigError, match="BootstrapConfig.world_size"
-                        ):
-                            layer.forward(t)
+        ),
+        mock.patch("torch.distributed.get_world_size", return_value=8),
+        mock.patch("torch.distributed.get_rank", return_value=0),
+        mock.patch(
+            "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_ep_rank_world",
+            return_value=(0, 8),
+        ),
+        pytest.raises(MoEEpConfigError, match="BootstrapConfig.world_size"),
+    ):
+        layer.forward(t)
 
 
 def test_deep_gemm_stage_inputs_copy_path_stages_prequantized():

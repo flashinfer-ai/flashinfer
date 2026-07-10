@@ -1315,7 +1315,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 # Tma load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
@@ -1658,7 +1658,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Get accumulator stage index
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
-                    reverse_subtile = True if acc_stage_index == 0 else False
+                    reverse_subtile = bool(acc_stage_index == 0)
                 else:
                     acc_stage_index = acc_consumer_state.index
 

@@ -100,7 +100,6 @@ def _plain_mxfp8_from_bf16(problem: dict):
     )
 
     intermediate_size = problem["intermediate"]
-    hidden_size = problem["hidden"]
     kind = problem["kind"]
     pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     num_experts = pack.w13.shape[0]

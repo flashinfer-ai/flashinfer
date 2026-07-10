@@ -1371,7 +1371,6 @@ def _validate_tensors(
                 f"nvfp4_global_scale must be on {combine_output.device}, got "
                 f"{nvfp4_global_scale.device}."
             )
-        sfc_cols = (H + NVFP4_SFC_SCALE_BLOCK_SIZE - 1) // NVFP4_SFC_SCALE_BLOCK_SIZE
         global_cols = (
             H + NVFP4_GLOBAL_SCALE_BLOCK_SIZE - 1
         ) // NVFP4_GLOBAL_SCALE_BLOCK_SIZE

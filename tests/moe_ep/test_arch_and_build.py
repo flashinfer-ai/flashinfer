@@ -24,9 +24,9 @@ def test_validate_arch_rejects_pre_hopper(backend: str):
         mock.patch("torch.cuda.is_available", return_value=True),
         mock.patch("torch.cuda.current_device", return_value=0),
         mock.patch("torch.cuda.get_device_capability", return_value=(8, 6)),
+        pytest.raises(MoEEpArchError, match="sm_90"),
     ):
-        with pytest.raises(MoEEpArchError, match="sm_90"):
-            validate_arch_for_backend(backend)
+        validate_arch_for_backend(backend)
 
 
 @pytest.mark.parametrize("backend", ["nccl_ep", "nixl_ep"])
@@ -49,9 +49,9 @@ def test_validate_mega_arch_rejects_pre_blackwell():
         mock.patch("torch.cuda.is_available", return_value=True),
         mock.patch("torch.cuda.current_device", return_value=0),
         mock.patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        pytest.raises(MoEEpArchError, match="sm_100"),
     ):
-        with pytest.raises(MoEEpArchError, match="sm_100"):
-            validate_mega_arch()
+        validate_mega_arch()
 
 
 def test_validate_mega_arch_accepts_blackwell():
@@ -79,9 +79,11 @@ def test_require_built_raises_when_libs_missing(backend: str):
     from flashinfer.moe_ep import MoEEpNotBuiltError
 
     probe_name = "_probe_nccl_ep" if backend == "nccl_ep" else "_probe_nixl_ep"
-    with mock.patch.object(moe_ep, probe_name, return_value=False):
-        with pytest.raises(MoEEpNotBuiltError, match=backend):
-            moe_ep._require_built(backend)
+    with (
+        mock.patch.object(moe_ep, probe_name, return_value=False),
+        pytest.raises(MoEEpNotBuiltError, match=backend),
+    ):
+        moe_ep._require_built(backend)
 
 
 def test_available_backends_reflects_probes():

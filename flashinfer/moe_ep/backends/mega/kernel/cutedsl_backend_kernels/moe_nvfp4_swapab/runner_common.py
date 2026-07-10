@@ -43,8 +43,6 @@ def round_up(a: int, b: int) -> int:
     return ceil_div(a, b) * b
 
 
-
-
 def kind_data_max(kind: str) -> float:
     if kind == "nvfp4":
         return Nvfp4E2M1Max

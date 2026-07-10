@@ -40,7 +40,7 @@ class SplitKernelBackend(ABC):
     def requires_weights(cls) -> bool:
         return True
 
-    def validate_init(
+    def validate_init(  # noqa: B027 - intentional no-op default
         self,
         bootstrap: "BootstrapConfig",
         fleet_params: "FleetParams",
@@ -134,7 +134,7 @@ class MegaKernelBackend(ABC):
             )
         return self._ep_world_size
 
-    def validate_init(
+    def validate_init(  # noqa: B027 - intentional no-op default
         self,
         bootstrap: "BootstrapConfig",
         fleet_params: "FleetParams",
@@ -162,7 +162,7 @@ class MegaKernelBackend(ABC):
     def _allocate_workspace(self, fleet_params: "FleetParams") -> Any:
         """Backend-specific symmetric-memory / workspace allocation."""
 
-    def validate_forward(
+    def validate_forward(  # noqa: B027 - intentional no-op default
         self,
         t: "MoEEpTensors",
         fleet_params: "FleetParams",
@@ -171,7 +171,7 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Optional per-iteration validation before staging/compute."""
 
-    def validate_transformed_weights(
+    def validate_transformed_weights(  # noqa: B027 - intentional no-op default
         self,
         transformed_weights: Any,
         bootstrap: "BootstrapConfig",
@@ -179,7 +179,7 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Optional init-time validation for user-supplied kernel-ready weights."""
 
-    def stage_inputs(
+    def stage_inputs(  # noqa: B027 - intentional no-op default
         self,
         t: "MoEEpTensors",
         workspace: Any,
@@ -197,5 +197,5 @@ class MegaKernelBackend(ABC):
         output: "torch.Tensor",
     ) -> "torch.Tensor": ...
 
-    def destroy(self, workspace: Any) -> None:
+    def destroy(self, workspace: Any) -> None:  # noqa: B027 - intentional no-op default
         """Release durable workspace resources."""

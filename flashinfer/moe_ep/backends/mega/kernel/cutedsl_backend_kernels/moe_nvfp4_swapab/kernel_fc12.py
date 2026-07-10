@@ -783,7 +783,6 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
         # ── GEMM-domain fake-MNKL transform (swap-AB) for fc1 phase ──
         c1 = cutlass.Int32(1)
-        c0 = cutlass.Int32(0)
 
         # A_gemm (fc1 weights): (experts, hidden, intermediate_gateup)
         # -> (M=intermediate_gateup, K=hidden, L=experts).
@@ -1280,10 +1279,6 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         loop (acc consumer state, subtile dispatch, TMA commit/drain, and
         the piggyback ``red.release.gpu.add.s32`` to ``fc1_done_counter``).
         """
-        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, None, 0))
-        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, None, 0))
-        sfa_smem_layout = cute.slice_(sfa_smem_layout_staged, (None, None, None, 0))
-        sfb_smem_layout = cute.slice_(sfb_smem_layout_staged, (None, None, None, 0))
 
         # fc2 waits for all fc1 intermediate CTAs in the same token block.
         ext_fc2_spin_threshold = (
@@ -1626,7 +1621,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
@@ -1701,7 +1696,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
@@ -1857,7 +1852,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
@@ -1984,7 +1979,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
