@@ -524,6 +524,26 @@ MXFP4_SF_LAYOUTS = [
 ]
 
 
+@pytest.mark.parametrize("sf_layout", MXFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_mxfp4_quantize_layout(sf_layout: SfLayout, device: str) -> None:
+    """Test MXFP4 quantize/dequantize with the requested scale layout."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("MXFP4 requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.manual_seed(42)
+    x = torch.randn((128, 128), dtype=torch.bfloat16, device=device)
+    quantized, scales = mxfp4_quantize(x, sfLayout=sf_layout)
+    dequantized = mxfp4_dequantize(quantized, scales, sfLayout=sf_layout)
+    torch.testing.assert_close(
+        dequantized,
+        x.cpu().float(),
+        rtol=0.3,
+        atol=0.5,
+    )
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", MXFP4_SHAPES)
 @pytest.mark.parametrize("sf_layout", MXFP4_SF_LAYOUTS)
@@ -537,8 +557,7 @@ def test_mxfp4_quantize_layout_backend_parity(
 ) -> None:
     """Test that CUDA and CuTe-DSL backends agree across MXFP4 SF layouts.
 
-    Uses the low-level fp4_quantize API to exercise the sf_layout knob, since
-    the high-level mxfp4_quantize() hardcodes 128x4 on both backends.
+    Uses the low-level fp4_quantize API to verify underlying backend agreement.
     """
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
