@@ -2181,14 +2181,19 @@ class AutoTuner:
 
     def _prepare_input_tensors_with_batches(
         self,
-        inputs: list[torch.Tensor],
+        inputs: list[Any],
         tuning_config: TuningConfig,
-    ) -> list[list[torch.Tensor]]:
+    ) -> list[list[Any]]:
         """Create multiple input copies to flush the L2 cache between profiling iterations."""
         if not tuning_config.use_cold_l2_cache:
             return [inputs]
 
-        one_buffer_bytes = sum(input.numel() * input.element_size() for input in inputs)
+        one_buffer_bytes = sum(
+            input.numel() * input.element_size()
+            if isinstance(input, torch.Tensor)
+            else 0
+            for input in inputs
+        )
         if one_buffer_bytes <= 0:
             logger.debug(
                 "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
@@ -2200,7 +2205,9 @@ class AutoTuner:
 
         inputs_list = [inputs]
         for _ in range(num_buffers - 1):
-            inputs_list.append(list(t.clone() for t in inputs))
+            inputs_list.append(
+                [t.clone() if isinstance(t, torch.Tensor) else t for t in inputs]
+            )
 
         logger.debug(
             f"[Autotuner] use_cold_l2_cache={tuning_config.use_cold_l2_cache}, use {num_buffers} different tensors for profiling"
