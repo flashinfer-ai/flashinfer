@@ -347,7 +347,7 @@ void {{ launcher_name }}(
         if (launch_params.attention_mask_type == Attention_mask_type::CAUSAL) {
             // 2 * {{ bytes_per_elt }} stands for kv cache and {{ bytes_per_elt }} bytes per element.
             size_t size_in_bytes = params.b * params.h * params.s * params.d * 2 * {{ bytes_per_elt }};
-            params.use_balanced_scheduling = (size_in_bytes <= launch_params.device_l2_cache_size);
+            params.use_balanced_scheduling = {{ "true" if fp8_kernel else "(size_in_bytes <= launch_params.device_l2_cache_size)" }};
         }
 
         block_size.x = 1;

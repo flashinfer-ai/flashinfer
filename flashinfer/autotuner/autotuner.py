@@ -17,6 +17,7 @@ from typing import (
     Any,
     Callable,
     Iterable,
+    Optional,
     Sequence,
     TypeAlias,
 )
@@ -831,6 +832,48 @@ def is_in_profile_measurement() -> bool:
     return getattr(_profile_measurement_thread_local, "active", False)
 
 
+_tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
+
+
+def set_autotune_process_group(
+    group: Optional["torch.distributed.ProcessGroup"],
+) -> None:
+    """All-reduce (mean) per-tactic profile timings across ``group`` so every
+    rank's ``argmin`` picks the same tactic.
+
+    Without it, GPU timing noise makes ranks diverge on tactic choice, which
+    deadlocks NCCL symmetric-memory allocation (``NCCL_WIN_COLL_SYMMETRIC``).
+    Prefer a CPU (``gloo``) subgroup; a NCCL group also works. ``None``
+    disables (default); not thread-safe.
+
+    Caller contract: every rank must enter ``_profile_single_kernel`` the same
+    number of times in the same order, or the reduction itself deadlocks. Across
+    ranks that requires identical: ``get_valid_tactics`` and shape buckets;
+    ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
+    reduces); and ``profiling_cache`` / loaded ``autotune(cache=...)`` at entry
+    (a cache hit skips that profile's reduce) -- so set the group from the first
+    ``choose_one`` with identical (ideally empty) starting caches. Residual: a
+    per-rank OOM *outside* ``_profile_single_kernel`` (input synthesis /
+    ``do_preparation``) can still early-return and desync.
+
+    Example::
+
+        set_autotune_process_group(cpu_group)  # gloo subgroup
+        try:
+            with autotune(True):
+                model(inputs)
+        finally:
+            set_autotune_process_group(None)
+    """
+    global _tune_process_group
+    _tune_process_group = group
+
+
+def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
+    """Return the process group previously passed to ``set_autotune_process_group``."""
+    return _tune_process_group
+
+
 @dataclass(frozen=True)
 class ProfilingCacheKey:
     """Immutable key identifying a profiled (op, runner, shape) combination.
@@ -1472,7 +1515,24 @@ class AutoTuner:
                                         r, tensors, tac, tuning_config, **kwargs
                                     )
                                 except torch.cuda.OutOfMemoryError:
-                                    raise
+                                    # Distributed autotuning: the per-tactic
+                                    # all-reduce must run the same number of
+                                    # times on every rank. Bubbling OOM up to
+                                    # choose_one's outer handler early-returns
+                                    # runners[0], -1 on this rank while peers
+                                    # keep profiling -- the next tactic's
+                                    # all_reduce then deadlocks. When a tune
+                                    # group is set, treat OOM like any other
+                                    # failed tactic (free memory, disqualify
+                                    # with inf, keep looping in lockstep) so
+                                    # cardinality is preserved. Without a group
+                                    # the original early-return path is kept.
+                                    if _tune_process_group is None:
+                                        raise
+                                    with contextlib.suppress(Exception):
+                                        torch.cuda.empty_cache()
+                                    skipped_count += 1
+                                    time_measured = float("inf")
                                 except Exception as e:
                                     skipped_count += 1
                                     shapes = self._get_input_sizes(tensors)
@@ -1664,12 +1724,59 @@ class AutoTuner:
 
                 return start.elapsed_time(end) / repeat
 
-        with _profile_measurement_scope():
-            # warm up, no timing
-            for _ in range(self.warmup):
-                runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
+        # Run the timing under ``_profile_measurement_scope`` (so runners
+        # can consult ``is_in_profile_measurement()``), then — if a
+        # cross-rank group is set — all-reduce the measured time so every
+        # rank's argmin picks the same tactic. Local GPU timing noise
+        # otherwise causes per-rank tactic divergence that can deadlock
+        # collective allocation paths (e.g. NCCL_WIN_COLL_SYMMETRIC). See
+        # ``set_autotune_process_group``.
+        #
+        # Collective cardinality invariant: every rank MUST reach the
+        # all-reduce below exactly once per ``_profile_single_kernel``
+        # call. If one rank raises inside the measurement window and exits
+        # without reducing while peers are still waiting, the next
+        # tactic's reduce deadlocks. We therefore catch failures here,
+        # mark this rank's ``avg_time`` as ``inf`` (so the tactic is
+        # disqualified everywhere after the SUM), run the reduce
+        # unconditionally, and then re-raise so the outer error-handling
+        # path in ``choose_one`` still runs (logging, stats, OOM
+        # fallback).
+        profile_exc: Optional[BaseException] = None
+        try:
+            with _profile_measurement_scope():
+                # warm up, no timing
+                for _ in range(self.warmup):
+                    runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-            avg_time = pure_profile(stream, self.repeat)
+                avg_time = pure_profile(stream, self.repeat)
+        except BaseException as e:  # noqa: BLE001
+            # Catch everything (incl. KeyboardInterrupt / SystemExit): this
+            # rank must still reach the all-reduce below or peers already
+            # waiting on it deadlock. The original error is re-raised after.
+            avg_time = float("inf")
+            profile_exc = e
+
+        try:
+            if _tune_process_group is not None:
+                import torch.distributed as dist
+
+                # NCCL requires a CUDA tensor; a gloo (CPU) subgroup — the
+                # recommended choice — uses a CPU tensor.
+                backend = str(dist.get_backend(_tune_process_group)).lower()
+                device = "cuda" if backend == "nccl" else "cpu"
+                time_tensor = torch.tensor(
+                    [avg_time], dtype=torch.float64, device=device
+                )
+                dist.all_reduce(
+                    time_tensor, op=dist.ReduceOp.SUM, group=_tune_process_group
+                )
+                avg_time = time_tensor.item() / dist.get_world_size(_tune_process_group)
+        finally:
+            # Re-raise even if the collective itself failed, so the original
+            # profiling error is never masked by a secondary reduce error.
+            if profile_exc is not None:
+                raise profile_exc
 
         shapes = self._get_input_sizes(inputs)
         logger.debug(

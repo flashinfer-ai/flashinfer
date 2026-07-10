@@ -226,6 +226,45 @@ def get_moe_alltoall_module():
         )
 
     @register_custom_op(
+        "flashinfer::moe_a2a_combine_into",
+        mutates_args=("workspace", "output"),
+    )
+    def moe_a2a_combine_into(
+        payload: torch.Tensor,
+        local_num_tokens: int,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        combine_payload_offset: int,
+        payload_in_workspace: bool,
+        output_dtype: Optional[torch.dtype],
+        output_scales: Optional[torch.Tensor],
+        output_scalar_scale: float,
+        sf_layout: Optional[SfLayout],
+        output: torch.Tensor,
+    ) -> None:
+        module.moe_a2a_combine_into(
+            payload,
+            local_num_tokens,
+            workspace,
+            metainfo,
+            runtime_max_tokens_per_rank,
+            ep_rank,
+            ep_size,
+            top_k,
+            combine_payload_offset,
+            payload_in_workspace,
+            output_dtype,
+            output_scales,
+            output_scalar_scale,
+            sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
+            output,
+        )
+
+    @register_custom_op(
         "flashinfer::moe_a2a_sanitize_expert_ids",
         mutates_args=("expert_ids",),
     )
@@ -284,6 +323,7 @@ def get_moe_alltoall_module():
         moe_a2a_initialize=moe_a2a_initialize,
         moe_a2a_dispatch=moe_a2a_dispatch,
         moe_a2a_combine=moe_a2a_combine,
+        moe_a2a_combine_into=moe_a2a_combine_into,
         moe_a2a_sanitize_expert_ids=moe_a2a_sanitize_expert_ids,
         moe_a2a_get_metainfo_index_pairs=moe_a2a_get_metainfo_index_pairs,
         moe_a2a_get_aux_data_size=moe_a2a_get_aux_data_size,
@@ -523,6 +563,7 @@ def moe_a2a_combine(
     use_low_precision: bool = False,
     enable_pdl: Optional[bool] = None,
     active_rank_mask: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Combine per-expert outputs back to the originating ranks.
 
@@ -579,6 +620,10 @@ def moe_a2a_combine(
         Optional CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]`` (see
         :func:`moe_a2a_active_rank_mask`).  Should match the mask passed to the
         corresponding :func:`moe_a2a_dispatch` call (or be omitted from both).
+    output : Optional[torch.Tensor]
+        Caller-provided contiguous output tensor. Its shape and dtype must
+        match the requested combine output, and it must be on the same device
+        as ``payload``.
 
     Returns
     -------
@@ -587,7 +632,16 @@ def moe_a2a_combine(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(payload.device)
-    return get_moe_alltoall_module().moe_a2a_combine(
+    if output is not None:
+        if not output.is_cuda:
+            raise ValueError(
+                f"output must be a CUDA tensor, got device={output.device}"
+            )
+        if not output.is_contiguous():
+            raise ValueError(f"output must be contiguous, got stride={output.stride()}")
+
+    module = get_moe_alltoall_module()
+    args = (
         payload,
         local_num_tokens,
         workspace,
@@ -606,6 +660,10 @@ def moe_a2a_combine(
         enable_pdl,
         active_rank_mask,
     )
+    if output is None:
+        return module.moe_a2a_combine(*args)
+    module.moe_a2a_combine_into(*args, output)
+    return output
 
 
 @flashinfer_api
@@ -1139,6 +1197,7 @@ class MoeAlltoAll:
         sf_layout: SfLayout = SfLayout.layout_linear,
         use_low_precision: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the MoE all-to-all combine phase.
 
@@ -1171,6 +1230,10 @@ class MoeAlltoAll:
         active_rank_mask : torch.Tensor, optional
             CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]``. Should match the
             mask passed to the preceding :meth:`dispatch` call (or be omitted from both).
+        output : Optional[torch.Tensor]
+            Caller-provided contiguous output tensor. Its shape and dtype must
+            match the requested combine output, and it must be on the same
+            device as ``payload``.
 
         Returns
         -------
@@ -1203,6 +1266,7 @@ class MoeAlltoAll:
             sf_layout,
             use_low_precision,
             active_rank_mask=active_rank_mask,
+            output=output,
         )
 
         # Reset state for next round
