@@ -103,7 +103,7 @@ You can follow the steps below to install FlashInfer from source code:
        python -m build --no-isolation --wheel
        python -m pip install dist/*.whl
 
-   Build ``flashinfer-jit-cache`` (customize ``FLASHINFER_CUDA_ARCH_LIST`` for your target GPUs):
+   Build ``flashinfer-jit-cache`` (customize ``FLASHINFER_CUDA_ARCH_LIST`` for your target GPUs; the full list below needs CUDA 13.0, trim it for older toolkits):
 
    .. code-block:: bash
 
