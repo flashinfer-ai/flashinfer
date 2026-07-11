@@ -644,6 +644,7 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
         paged: bool = False,
         qhead_per_kv: int = _QHEAD_PER_KV,
         pack_q_len: int = _PACK_Q_LEN,
+        qoff_default: bool = False,
     ):
         super().__init__(head_dim=head_dim, is_causal=is_causal, paged=paged)
         if qhead_per_kv * pack_q_len != self._M:
@@ -655,6 +656,10 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
         # gather/epilogue, so each factorization compiles to its own kernel.
         self._QHEAD_PER_KV = qhead_per_kv
         self._PACK_Q_LEN = pack_q_len
+        # Right-aligned decode (q_offset=None): the causal offset is
+        # seqlen_k - seqlen_q, computed in-kernel so the wrapper does not
+        # launch tensor-arithmetic kernels to build an offset tensor.
+        self._qoff_default = qoff_default
 
     @cute.jit
     def __call__(
@@ -911,13 +916,15 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
                 thr_vmnk = tiled_mma.thr_layout_vmnk.get_flat_coord(tidx)
                 nwarp = thr_vmnk[2]
                 self.cta_sync_barrier.arrive_and_wait()
+                if cutlass.const_expr(self._qoff_default):
+                    q_off = seqlen_k - seqlen_q
+                else:
+                    q_off = mQOffset[batch_idx]
                 for r in cutlass.range_constexpr(n_rows):
                     row = tScS_mn[r, 0][0]
                     token = row % self._PACK_Q_LEN
                     if cutlass.const_expr(self._is_causal):
-                        col_limit = cutlass.min(
-                            token + mQOffset[batch_idx] + 1, seqlen_k
-                        )
+                        col_limit = cutlass.min(token + q_off + 1, seqlen_k)
                     else:
                         col_limit = seqlen_k
                     for c in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):
