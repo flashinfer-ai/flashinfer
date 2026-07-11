@@ -207,7 +207,7 @@ class BatchPrefillCuteDSLWrapper:
         head_dim_qk,
         head_dim_vo=None,
         causal=True,
-        sm_scale=1.0,
+        sm_scale=None,
         q_data_type=torch.float16,
         kv_data_type=torch.float16,
         window_left: int = -1,
@@ -232,8 +232,9 @@ class BatchPrefillCuteDSLWrapper:
             Head dimension for values and output. Must equal head_dim_qk if set.
         causal : bool
             Whether to apply causal masking.
-        sm_scale : float
-            Softmax scale factor (typically 1/sqrt(head_dim)).
+        sm_scale : Optional[float]
+            Softmax scale factor.  Defaults to ``1/sqrt(head_dim_qk)``
+            when None (matching the top-level flashinfer wrappers).
         q_data_type : torch.dtype
             Data type for queries (float16, bfloat16, or float8_e4m3fn).
         kv_data_type : torch.dtype
@@ -263,6 +264,8 @@ class BatchPrefillCuteDSLWrapper:
             "head_dim_vo must be None or equal to head_dim_qk"
         )
         self._causal = causal
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(head_dim_qk)
         self._sm_scale = sm_scale
         self._device = qo_indptr.device
         if variant is None:
