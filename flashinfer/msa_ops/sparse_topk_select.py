@@ -231,13 +231,11 @@ def msa_topk_select(
     from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
 
     # Dispatch on the runtime valid-page count: the kernels only ever touch
-    # blocks below num_valid_pages, regardless of the allocated score
-    # dimension. The chunked path covers grids that underfill the GPU, where
-    # the single-CTA kernels serialize each row's scan, and it also reads the
-    # scores once where the radix kernel makes a pass per stage; prefill-sized
-    # grids fill the GPU on their own and keep the single-kernel paths. All
-    # quantities are shape- or capture-constant, so the choice is CUDA-graph
-    # safe.
+    # blocks below num_valid_pages. The chunked path serves grids too small to
+    # fill the GPU, and still wins at full ones by reading the scores once
+    # where the radix kernel makes a pass per stage; prefill-sized grids keep
+    # the single-kernel paths. Everything here is shape-constant, so the
+    # choice is CUDA-graph safe.
     small = int(num_valid_pages) <= _MAX_BLOCKS
     n_mid = int(num_valid_pages) - force_begin_blocks - force_end_blocks
     chunked = (
