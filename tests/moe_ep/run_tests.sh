@@ -186,12 +186,14 @@ run_all() {
   print_summary
 }
 
+# Single-target runs must still propagate failure (print_summary returns
+# non-zero if any section failed) so CI callers see a real exit code.
 case "${1:-all}" in
-  unit) run_section "unit + mock (no multirank)" run_unit ;;
-  multirank) run_section "split-path multirank (NCCL-EP)" run_multirank ;;
-  split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16 ;;
-  mega) run_section "mega multirank (Blackwell)" run_mega ;;
-  smoke) run_section "smoke scripts" run_smoke ;;
+  unit) run_section "unit + mock (no multirank)" run_unit; print_summary ;;
+  multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
+  split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16; print_summary ;;
+  mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
+  smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   all) run_all ;;
   *)
     echo "Usage: $0 [unit|multirank|split_path_correctness_bf16|mega|smoke|all]" >&2
