@@ -121,11 +121,15 @@ def _preprocess_qkv(
         qm = q.mean(dim=-2, keepdim=True)
         q = (q - qm).contiguous()
 
-    qk_correction = torch.matmul(qm, k.transpose(-2, -1)).to(torch.float32)
-    if per_block_mean:
-        qk_correction = qk_correction.repeat_interleave(_TOKEN_BLOCK_SIZE, dim=2)
-    else:
-        qk_correction = qk_correction.expand(-1, -1, _TOKEN_BLOCK_SIZE, -1)
+    # Compact layout: one correction row per 128-token Q block ([B, H,
+    # seq_len / 128, seq_len]), or a single row when per_block_mean=False.
+    # The kernel's TMA descriptor addresses the tensor this way and
+    # broadcasts each row across the 128 rows of the Q tile in smem.
+    # Multiply in fp32: a float16 matmul output would overflow at 65504
+    # even though the accumulation itself runs in fp32.
+    qk_correction = torch.matmul(
+        qm.to(torch.float32), k.transpose(-2, -1).to(torch.float32)
+    )
     qk_correction = qk_correction.contiguous()
     return q.contiguous(), k.contiguous(), v.contiguous(), qk_correction
 
@@ -164,7 +168,9 @@ def nvfp4_attention_sm120_quantize_qkv(
     -------
     Tuple[torch.Tensor, ...]
         ``q_fp4``, ``k_fp4``, transposed ``v_fp4_t``, scale tensors
-        ``q_scale``, ``k_scale``, ``v_scale_t``, and the expanded FP32 QK correction.
+        ``q_scale``, ``k_scale``, ``v_scale_t``, and the compact FP32 QK
+        correction with shape ``[batch, num_heads, seq_len / 128, seq_len]``
+        (``[batch, num_heads, 1, seq_len]`` when ``per_block_mean=False``).
     """
     q_proc, k_proc, v_proc, qk_correction = _preprocess_qkv(q, k, v, per_block_mean)
     batch, num_heads, seq_len, head_dim = q_proc.shape
@@ -286,11 +292,11 @@ def _check_inputs(
         raise ValueError(
             "qk_correction must have shape [batch, num_heads, seq_len_s, seq_len]"
         )
-    expected_delta_groups = seq_len if per_block_mean else _TOKEN_BLOCK_SIZE
+    expected_delta_groups = seq_len // _TOKEN_BLOCK_SIZE if per_block_mean else 1
     if qk_correction.shape[2] != expected_delta_groups:
         raise ValueError(
-            f"qk_correction seq_len_s dimension must be {expected_delta_groups}, "
-            f"got {qk_correction.shape[2]}"
+            f"qk_correction must have one row per 128-token block "
+            f"({expected_delta_groups}), got {qk_correction.shape[2]}"
         )
     if qk_correction.shape[-1] != seq_len:
         raise ValueError(
@@ -332,7 +338,9 @@ def nvfp4_attention_sm120_fwd(
     q_scale, k_scale, v_scale_t : torch.Tensor
         Per-vector FP8 scale factors for Q/K/V.
     qk_correction : torch.Tensor
-        FP32 correction term returned by ``nvfp4_attention_sm120_quantize_qkv``.
+        Compact FP32 correction term returned by
+        :func:`nvfp4_attention_sm120_quantize_qkv`, one row per 128-token
+        Q block.
     sm_scale : Optional[float], optional
         Scale applied to QK scores before softmax. Defaults to
         ``1 / sqrt(head_dim)`` when omitted.
