@@ -33,7 +33,14 @@ def test_batch_prefill_nvfp4_swa_paged_params_declares_sf_strides(
     )
 
     generated = (tmp_path / "generated" / uri / "batch_prefill_config.inc").read_text()
-    assert "constexpr bool REQUIRE_FP4_KV_CACHE = true;" in generated
+    # The FP4 KV gate is emitted as compile-time checks: an #error if the
+    # FP4 enable flag is missing plus a static_assert pinning DTypeKV to the
+    # packed FP4 container type.
+    assert (
+        "#error \"NVFP4 KV paged prefill compiled without FLASHINFER_ENABLE_FP4_E2M1\""
+        in generated
+    )
+    assert "static_assert(std::is_same_v<DTypeKV, __nv_fp4x2_e2m1>," in generated
     assert "constexpr auto USE_SLIDING_WINDOW = true;" in generated
     for field in (
         "maybe_k_cache_sf",
