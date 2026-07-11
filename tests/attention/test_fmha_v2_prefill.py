@@ -5,6 +5,7 @@ from typing import Optional, Tuple, Union
 
 import flashinfer
 
+from flashinfer.fmha_v2 import FmhaV2BatchPrefillWithPagedKVCacheWrapper
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
 from flashinfer.utils import (
@@ -1335,7 +1336,7 @@ def _make_trtllm_fmhav2_paged_case(
     """Build paged-KV inputs for ``backend='trtllm-fmhav2'`` plus the reference output.
 
     Returns ``(q, paged_kv_cache, plan_args, out_ref)`` where ``plan_args`` are
-    the positional arguments of ``BatchPrefillWithPagedKVCacheWrapper.plan()``
+    the positional arguments of ``FmhaV2BatchPrefillWithPagedKVCacheWrapper.plan()``
     and ``out_ref`` is the fp32 ``attention_ref_torch`` output.
 
     The KV pool is a single interleaved allocation ``[num_pages, 2, ...]``
@@ -1453,7 +1454,7 @@ def test_batch_prefill_paged_trtllm_fmhav2_wrapper(
     dtype: torch.dtype,
     causal: bool,
 ) -> None:
-    """End-to-end test for ``BatchPrefillWithPagedKVCacheWrapper(backend='trtllm-fmhav2')``.
+    """End-to-end test for ``FmhaV2BatchPrefillWithPagedKVCacheWrapper``.
 
     Drives the fused ``prepare_paged`` device kernel through ``wrapper.plan()``
     (paged→dense block-table scatter + cum-scan / tile reset / scale encode in
@@ -1474,8 +1475,8 @@ def test_batch_prefill_paged_trtllm_fmhav2_wrapper(
         causal,
         seed=42,
     )
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        _get_workspace_buffer(), kv_layout=kv_layout, backend="trtllm-fmhav2"
+    wrapper = FmhaV2BatchPrefillWithPagedKVCacheWrapper(
+        _get_workspace_buffer(), kv_layout=kv_layout
     )
     wrapper.plan(*plan_args, causal=causal, q_data_type=dtype, kv_data_type=dtype)
     out = wrapper.run(q, paged_kv_cache)
@@ -1514,8 +1515,8 @@ def test_batch_prefill_paged_trtllm_fmhav2_plan_reuse(
         causal=causal,
         seed=7,
     )
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        _get_workspace_buffer(), kv_layout=kv_layout, backend="trtllm-fmhav2"
+    wrapper = FmhaV2BatchPrefillWithPagedKVCacheWrapper(
+        _get_workspace_buffer(), kv_layout=kv_layout
     )
     wrapper.plan(*plan_args, causal=causal, q_data_type=dtype, kv_data_type=dtype)
 
