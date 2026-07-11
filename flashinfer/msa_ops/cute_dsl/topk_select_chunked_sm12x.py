@@ -23,6 +23,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
+from .topk_select_radix_sm12x import _radix_key
+
 # Per-chunk SMEM staging cap (same as the count-rank kernel's score cap).
 _MAX_CHUNK_BLOCKS = 128
 # The merge stages _MAX_CHUNKS * topk candidate slots in SMEM.
@@ -35,6 +37,9 @@ _MIN_CHUNKS = 2
 # Dispatch floor: under this many middle blocks the second launch never pays
 # for itself.
 _MIN_BLOCKS = 32
+# Dispatch row cap: covers saturated decode batches while bounding the
+# per-call candidate scratch (rows * _MAX_CHUNKS * topk * 8 bytes).
+_MAX_CHUNKED_ROWS = 2048
 _NTHREADS_PARTIAL = 128
 _NTHREADS_MERGE = 256
 _SENTINEL = 0x7FFFFFFF  # INT32_MAX: empty slots sort to the tail, unlike -1
@@ -87,14 +92,6 @@ class TopKSelectChunkedSm12x:
             use_pdl=True,
         )
 
-    @cute.jit
-    def _radix_key(self, bits):
-        """Order-preserving transform: ascending key == descending float score."""
-        key = (~bits) & cutlass.Uint32(0x7FFFFFFF)
-        if (bits & cutlass.Uint32(0x80000000)) != cutlass.Uint32(0):
-            key = bits
-        return key
-
     @cute.kernel
     def kernel_partial(
         self,
@@ -144,7 +141,7 @@ class TopKSelectChunkedSm12x:
         while l < n_pad:
             k = cutlass.Uint32(_SENTINEL_KEY)
             if l < n_local:
-                k = self._radix_key(mBits[h, c_lo + l, q])
+                k = _radix_key(mBits[h, c_lo + l, q])
             score[l] = k
             l += _NTHREADS_PARTIAL
         cute.arch.barrier()
