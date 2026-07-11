@@ -477,10 +477,10 @@ def msa_proxy_score(
         q = q.to(torch.bfloat16)
         q_fp8 = False
 
-    # Right-aligned decode on the stream and key-major paths computes the
-    # causal limit in-kernel, so no offset tensor (and its build kernels,
-    # which dominate at batch 1) is needed.
-    if (use_stream or use_keymajor) and qoff_default:
+    # Right-aligned decode on the stream and packed paths computes the causal
+    # limit in-kernel, so no offset tensor (and its build kernels, which
+    # dominate at batch 1) is needed.
+    if (use_stream or use_packed) and qoff_default:
         qoff_dev = _proxy_dummies(dev.index)[1]
     else:
         qoff_dev = _q_offset_tensor(
@@ -501,7 +501,7 @@ def msa_proxy_score(
         use_keymajor,
         group_size,
         pack_q_len,
-        qoff_default if (use_stream or use_keymajor) else None,
+        qoff_default if (use_stream or use_packed) else None,
     )
     # The packed fp8 schedules take e4m3 operands as 16-bit torch views (half
     # the last dim): the kernel moves raw bytes and upconverts in registers,
@@ -571,6 +571,7 @@ def msa_proxy_score(
                 kv_fp8=kv_fp8,
                 qhead_per_kv=group_size,
                 pack_q_len=pack_q_len,
+                qoff_default=qoff_default,
             )
         else:
             kernel_obj = MsaProxyScoreSm12x(
@@ -817,9 +818,6 @@ def msa_proxy_score_fp4(
         batch_size = k_len_or_cu.numel() - 1
 
     cu_q_dev = cu_seqlens_q.to(dev)
-    qoff_dev = _q_offset_tensor(
-        q_offset, cu_q_dev, k_len_or_cu, dev, k_is_lengths=paged
-    )
     max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
         cu_seqlens_q, k_len_or_cu, max_seqlen_q, max_k_tiles, output, k_is_lengths=paged
     )
@@ -847,13 +845,30 @@ def msa_proxy_score_fp4(
     )
     pack_q_len = _PACK_ROWS // group_size if use_packed else 0
 
+    # Right-aligned decode on the packed path computes the causal limit
+    # in-kernel, so no offset tensor (and its build kernels) is needed.
+    qoff_default = q_offset is None
+    if use_packed and qoff_default:
+        qoff_dev = _proxy_dummies(dev.index)[1]
+    else:
+        qoff_dev = _q_offset_tensor(
+            q_offset, cu_q_dev, k_len_or_cu, dev, k_is_lengths=paged
+        )
+
     # Base grid CTAs (feeds split-K) and cache key, as in msa_proxy_score.
     if use_packed:
         base_ctas = batch_size * num_kv_heads
     else:
         base_ctas = ((max_seqlen_q + 127) // 128) * batch_size * num_qo_heads
 
-    key = ("proxy_fp4", causal, paged, use_packed, pack_q_len)
+    key = (
+        "proxy_fp4",
+        causal,
+        paged,
+        use_packed,
+        pack_q_len,
+        qoff_default if use_packed else None,
+    )
     compiled = _compile_cache.get(key)
     if compiled is None:
         u8 = _cutlass_dtype(torch.uint8)
@@ -888,6 +903,7 @@ def msa_proxy_score_fp4(
                 paged=paged,
                 qhead_per_kv=group_size,
                 pack_q_len=pack_q_len,
+                qoff_default=qoff_default,
             )
         else:
             kernel_obj = MsaProxyScoreFp4MmaSm12x(
