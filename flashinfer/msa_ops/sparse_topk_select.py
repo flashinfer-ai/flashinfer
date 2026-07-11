@@ -133,11 +133,9 @@ def msa_topk_select(
 
     Notes
     -----
-    Several kernels implement this selection, chosen by problem size. They
-    return identical indices unless two blocks have nearly identical scores
-    competing for the last slots; either block may then be selected, so exact
-    output indices are only reproducible for a fixed problem size and library
-    version. The selected score values match in every case.
+    When near-tied scores compete for the last slots, either block may be
+    selected; exact indices may vary across problem sizes and releases, but
+    the selected score values always match.
     """
     if not is_sm12x_supported(max_score.device):
         raise RuntimeError(
