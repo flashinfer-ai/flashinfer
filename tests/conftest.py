@@ -205,7 +205,9 @@ def pytest_collection_modifyitems(config, items):
                 # tests/moe_ep/run_tests.sh); under plain pytest auto-discovery
                 # (e.g. CI unit-test sweeps) they would hang on dist init.
                 item.add_marker(
-                    pytest.mark.skip(reason="requires torchrun launch (WORLD_SIZE unset)")
+                    pytest.mark.skip(
+                        reason="requires torchrun launch (WORLD_SIZE unset)"
+                    )
                 )
         if "arch_blackwell" in item.keywords and cc < (10, 0):
             item.add_marker(pytest.mark.skip(reason="needs sm_100+"))
