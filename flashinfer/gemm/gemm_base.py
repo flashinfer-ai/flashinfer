@@ -49,7 +49,10 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from .kernels.utils import _select_sm100_mm_fp4_cute_dsl_tactic
+from .kernels.utils import (
+    _score_sm100_mm_fp4_tactic,
+    _select_sm100_mm_fp4_cute_dsl_tactic,
+)
 from ..utils import (
     get_device_sm_count,
     get_native_fp4_dtype,
@@ -4512,6 +4515,9 @@ _SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
 _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
+# Max tactics the autotuner profiles per shape for mm_fp4(backend='cute-dsl')
+_MM_FP4_CUTE_DSL_MAX_TUNING_TACTICS = 16
+
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
     tile_m, tile_n = tile_mn
@@ -5825,7 +5831,15 @@ def _cute_dsl_gemm_fp4_runner(
                                     )
                                 )
 
-            return valid_tactics
+            # Rank tactics and autotune top-N instead of the entire O(100) congfigs
+            sm_count = get_device_sm_count(a.device)
+            valid_tactics.sort(
+                key=lambda t: _score_sm100_mm_fp4_tactic(
+                    m, n, real_k, sm_count, t[0], t[1], t[2]
+                ),
+                reverse=True,
+            )
+            return valid_tactics[:_MM_FP4_CUTE_DSL_MAX_TUNING_TACTICS]
 
         def forward(
             self,

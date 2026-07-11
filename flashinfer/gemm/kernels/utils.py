@@ -74,41 +74,12 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
     prob_m = n if swap_ab else rep_m
     prob_n = rep_m if swap_ab else n
 
-    # Small-K penalty factor (loop-invariant).
-    if real_k <= 1024:
-        large_tile_penalty = 0.50
-    elif real_k <= 2048:
-        large_tile_penalty = 0.80
-    else:
-        large_tile_penalty = 1.0
-
-    # Score all 8 tile candidates.
-    max_tile_area = 256 * 256
-    best_tile_m = 128
-    best_tile_n = 128
-    best_score = -1.0
-
-    for tile_m, tile_n in _SM100_MMA_TILER_MN_CANDIDATES:
-        if tile_n < 64 and prob_n > tile_n:
-            continue
-        n_tiles = (prob_n + tile_n - 1) // tile_n
-        n_eff = prob_n / (n_tiles * tile_n)
-        tile_area_factor = ((tile_m * tile_n) / max_tile_area) ** 0.5
-        tile_bal = min(tile_m, tile_n) / max(tile_m, tile_n)
-        tile_tp = tile_area_factor * (tile_bal**0.25)
-        ns = n_eff * tile_tp
-
-        if tile_m * tile_n > 128 * 128:
-            ns *= large_tile_penalty
-
-        m_tiles = (prob_m + tile_m - 1) // tile_m
-        total_ctas = m_tiles * n_tiles
-        num_waves = (total_ctas + sm_count - 1) // sm_count
-        score = prob_m * total_ctas * ns / (tile_m * num_waves * sm_count)
-        if score > best_score:
-            best_score = score
-            best_tile_m = tile_m
-            best_tile_n = tile_n
+    best_tile_m, best_tile_n = max(
+        _SM100_MMA_TILER_MN_CANDIDATES,
+        key=lambda tile: _score_sm100_mm_fp4_tactic(
+            rep_m, n, real_k, sm_count, tile, (1, 1), swap_ab
+        ),
+    )
 
     # Cluster: N-only for small prob_m, else (1,1).
     tiles_on_n = (prob_n + best_tile_n - 1) // best_tile_n
@@ -135,6 +106,58 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
         "sm100",
         None,
     )
+
+
+def _score_sm100_mm_fp4_tactic(
+    m, n, real_k, sm_count, mma_tiler_mn, cluster_shape_mn, swap_ab
+):
+    """Score a full mm_fp4 cute-dsl tactic for autotune ranking (higher = better).
+
+    Extends the tile score described in _compute_tactic_for_m (step 2) to
+    full (tile, cluster, swap_ab) tactics: the CTA grid is padded to the
+    cluster shape (partially-filled clusters waste SMs), and instead of
+    excluding candidates, large penalties demote tiles the heuristic would
+    skip and swap_ab values that disagree with its swap rule -- the tile
+    score is not calibrated to compare swap variants (at large m it
+    inflates swap_ab=True, which measures 15-100% slower on B200).
+    """
+    tile_m, tile_n = mma_tiler_mn
+    cga_m, cga_n = cluster_shape_mn
+    prob_m = n if swap_ab else m
+    prob_n = m if swap_ab else n
+
+    if real_k <= 1024:
+        large_tile_penalty = 0.50
+    elif real_k <= 2048:
+        large_tile_penalty = 0.80
+    else:
+        large_tile_penalty = 1.0
+
+    n_tiles = (prob_n + tile_n - 1) // tile_n
+    n_eff = prob_n / (n_tiles * tile_n)
+    tile_area_factor = ((tile_m * tile_n) / (256 * 256)) ** 0.5
+    tile_bal = min(tile_m, tile_n) / max(tile_m, tile_n)
+    ns = n_eff * tile_area_factor * (tile_bal**0.25)
+    if tile_m * tile_n > 128 * 128:
+        ns *= large_tile_penalty
+
+    m_tiles = (prob_m + tile_m - 1) // tile_m
+    total_ctas = m_tiles * n_tiles
+    # Pad the grid to the cluster shape: partially-filled clusters still
+    # occupy whole clusters' worth of SMs.
+    padded_ctas = ((m_tiles + cga_m - 1) // cga_m * cga_m) * (
+        (n_tiles + cga_n - 1) // cga_n * cga_n
+    )
+    num_waves = (padded_ctas + sm_count - 1) // sm_count
+    score = prob_m * total_ctas * ns / (tile_m * num_waves * sm_count)
+
+    if tile_n < 64 and prob_n > tile_n:
+        score *= 1e-6
+
+    rule_swap = (n % 8 == 0) and (1 <= m <= 32) and n > m
+    if swap_ab != rule_swap:
+        score *= 1e-3
+    return score
 
 
 def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
