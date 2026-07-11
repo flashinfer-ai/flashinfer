@@ -89,6 +89,7 @@ from .jit.fused_moe import (
 from .jit.bgmv_moe import gen_bgmv_moe_module
 from .jit.monomoe import gen_monomoe_module
 from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
+from .jit.gdn_fused_decode import gen_gdn_fused_decode_module
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
@@ -607,6 +608,12 @@ def gen_all_modules(
             gen_flash_kda_packed_t1_module(variant, "sm100f")
             for variant in FLASH_KDA_PACKED_T1_VARIANTS
         )
+
+    # Experimental fused GDN decode step (linear attention, not MoE): one
+    # SM120 module gated on the architecture alone, like the flash-KDA decode
+    # modules above.
+    if has_sm120:
+        jit_specs.append(gen_gdn_fused_decode_module())
 
     if add_act:
         for act_name in act_func_def_str:

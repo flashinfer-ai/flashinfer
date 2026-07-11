@@ -756,3 +756,320 @@ gdn_mtp_trace = TraceTemplate(
     reference=_gdn_mtp_reference,
     init=_gdn_mtp_init,
 )
+
+# ── GDN fused decode step ─────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _gdn_fused_decode_reference(
+    hidden_states,
+    w_ba,
+    mixed_qkv,
+    conv_weight,
+    conv_bias,
+    conv_state,
+    A_log,
+    dt_bias,
+    scale,
+    ssm_state,
+    state_indices,
+    use_qk_l2norm=True,
+    out=None,
+):
+    """Reference for the fused GDN decode step (one token, paged pools).
+
+    The whole serving chain in one op, in the order the kernels fuse it:
+
+    1. ``ba = hidden_states @ w_ba`` in fp32, **rounded through bf16** — the
+       reference materializes ``ba`` as a bf16 tensor, so a kernel that keeps
+       fp32 here is more precise than the operation it implements;
+    2. depthwise causal conv1d update (width 4, silu) over ``mixed_qkv``, with
+       the paged bf16 conv-state rows at ``state_indices`` shifting left and
+       appending the raw input;
+    3. q/k/v head split of the activated conv output;
+    4. gated delta-rule update with qk-L2-norm on the paged fp32 state pool.
+
+    ``softplus`` is the threshold form on purpose: ``log(1 + exp(x))``
+    overflows to ``+inf`` above ~88.7 in fp32 and silently collapses the decay
+    gate to zero.
+
+    Both pools are updated **in place** and returned alongside the output.
+    """
+    B = hidden_states.shape[0]
+    hv = A_log.shape[0]
+    qkv_dim = mixed_qkv.shape[1]
+    d = ssm_state.shape[-1]
+    h_q = (qkv_dim - hv * d) // (2 * d)
+    if scale is None or scale == 0.0:
+        scale = 1.0 / math.sqrt(d)
+    idx = state_indices.to(torch.long)
+
+    ba = (hidden_states.float() @ w_ba.float()).to(torch.bfloat16)
+    b_gate = ba[:, :hv]
+    a_gate = ba[:, hv:]
+
+    st = conv_state.index_select(0, idx)
+    x_t = mixed_qkv.to(conv_state.dtype)
+    window = torch.cat([st, x_t.unsqueeze(-1)], dim=-1)
+    y = (window.float() * conv_weight.float().unsqueeze(0)).sum(dim=-1)
+    y = y + conv_bias.float()
+    y = y * torch.sigmoid(y)
+    conv_out = y.to(torch.bfloat16)
+    conv_state.index_copy_(0, idx, window[..., 1:])
+
+    q = conv_out[:, : h_q * d].view(B, h_q, d).float()
+    k = conv_out[:, h_q * d : 2 * h_q * d].view(B, h_q, d).float()
+    v = conv_out[:, 2 * h_q * d :].view(B, hv, d).float()
+
+    if use_qk_l2norm:
+        q = q * torch.rsqrt(q.pow(2).sum(dim=-1, keepdim=True) + 1e-6)
+        k = k * torch.rsqrt(k.pow(2).sum(dim=-1, keepdim=True) + 1e-6)
+    group = hv // h_q
+    q = q.repeat_interleave(group, dim=1)
+    k = k.repeat_interleave(group, dim=1)
+
+    g = torch.exp(
+        -torch.exp(A_log.float()) * F.softplus(a_gate.float() + dt_bias.float())
+    )
+    beta = torch.sigmoid(b_gate.float())
+
+    state = ssm_state[idx]
+    state = state * g[:, :, None, None]
+    old_v = torch.einsum("bhk,bhvk->bhv", k, state)
+    delta = beta[:, :, None] * (v - old_v)
+    state = state + delta[..., None] * k[:, :, None, :]
+    attn_out = scale * torch.einsum("bhk,bhvk->bhv", q, state)
+
+    ssm_state[idx] = state
+    result = attn_out.unsqueeze(1).to(torch.bfloat16)
+    if out is not None:
+        out.copy_(result)
+        result = out
+    return result, conv_state, ssm_state
+
+
+def _gdn_fused_decode_init(
+    *,
+    batch_size: int,
+    num_pages: int = 8,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gdn_fused_decode_step``.
+
+    The layer geometry is baked in rather than exposed as kwargs: it is the
+    registry's dispatch surface (Qwen3.5-27B, ``hidden=5120``,
+    ``qkv_dim=10240``, 16 qk heads / 48 v heads, ``d=128``), and the fused op
+    only accelerates geometries a registry row lists — a scaled-down variant
+    would trace an op that never dispatches.
+
+    Distributions follow ``tests/gdn/test_fused_decode.py::_make_inputs``:
+    small-scale ``randn`` activations and weights (the b/a GEMV sums over
+    5120 terms), a negative ``A_log`` so the decay gate stays in range, and
+    distinct pool slots walked downwards from ``num_pages - 1``.
+    """
+    torch.manual_seed(seed)
+    hidden_size = 5120
+    n_ba = 96
+    qkv_dim = 10240
+    num_v_heads = 48
+    head_dim = 128
+    conv_width = 4
+    conv_state_len = conv_width - 1
+    if num_pages < batch_size:
+        raise ValueError("num_pages must be at least batch_size")
+
+    hidden_states = (
+        torch.randn(batch_size, hidden_size, dtype=torch.float32, device=device) * 0.05
+    ).to(torch.bfloat16)
+    w_ba = (
+        torch.randn(hidden_size, n_ba, dtype=torch.float32, device=device) * 0.05
+    ).to(torch.bfloat16)
+    mixed_qkv = (
+        torch.randn(batch_size, qkv_dim, dtype=torch.float32, device=device) * 0.5
+    ).to(torch.bfloat16)
+    conv_weight = (
+        torch.randn(qkv_dim, conv_width, dtype=torch.float32, device=device) * 0.5
+    ).to(torch.bfloat16)
+    conv_bias = (torch.randn(qkv_dim, dtype=torch.float32, device=device) * 0.1).to(
+        torch.bfloat16
+    )
+    # The vLLM pool is physically (conv_state_len, qkv_dim) per page; the op
+    # consumes its transposed [P, qkv_dim, conv_state_len] view ("SD").
+    conv_state = (
+        (
+            torch.randn(
+                num_pages, conv_state_len, qkv_dim, dtype=torch.float32, device=device
+            )
+            * 0.5
+        )
+        .to(torch.bfloat16)
+        .transpose(-1, -2)
+    )
+    A_log = -torch.rand(num_v_heads, dtype=torch.float32, device=device) * 2.0 - 1.0
+    dt_bias = (torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1).to(
+        torch.bfloat16
+    )
+    ssm_state = (
+        torch.randn(
+            num_pages,
+            num_v_heads,
+            head_dim,
+            head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.1
+    )
+    state_indices = torch.arange(
+        num_pages - 1, num_pages - 1 - batch_size, -1, dtype=torch.int32, device=device
+    )
+    out = torch.empty(
+        batch_size, 1, num_v_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    return {
+        "hidden_states": hidden_states,
+        "w_ba": w_ba,
+        "mixed_qkv": mixed_qkv,
+        "conv_weight": conv_weight,
+        "conv_bias": conv_bias,
+        "conv_state": conv_state,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "scale": head_dim**-0.5,
+        "ssm_state": ssm_state,
+        "state_indices": state_indices,
+        "use_qk_l2norm": True,
+        "out": out,
+    }
+
+
+gdn_fused_decode_trace = TraceTemplate(
+    op_type="gdn",
+    name_prefix="gdn_fused_decode",
+    description=(
+        "Fused single-token GDN decode step over paged conv/ssm state pools. "
+        "Folds the per-layer serving chain -- the b/a projection GEMV, the "
+        "depthwise causal conv1d state update, the q/k/v head split and the "
+        "gated delta-rule decode with qk-L2-norm -- into one op. Both pools "
+        "are updated in place. The input contract is one architecture's layer "
+        "geometry rather than a reusable tensor primitive, so the const axes "
+        "below are the dispatch surface, not tuning knobs."
+    ),
+    axes={
+        "batch_size": Var(
+            description="Number of sequences decoded in this step (one token each)."
+        ),
+        "num_pages": Var(
+            description="Slots in the paged conv/ssm state pools; state_indices selects one per sequence."
+        ),
+        "seq_len": Const(
+            description="Tokens per sequence (always 1 for single-token decode).",
+            abbrev="",
+            value=1,
+        ),
+        "hidden_size": Const(description="Layer input width.", abbrev="h"),
+        "n_ba": Const(
+            description="Fused b/a projection width (2 * num_v_heads).", abbrev=""
+        ),
+        "qkv_dim": Const(
+            description="Fused q/k/v channel count, (2 * num_qk_heads + num_v_heads) * head_dim.",
+            abbrev="",
+        ),
+        "num_v_heads": Const(
+            description="Number of value heads (GVA: more value heads than query heads).",
+            abbrev="v",
+        ),
+        "head_dim": Const(
+            description="Dimension of each head (K in query/key space, V in value space).",
+            abbrev="d",
+        ),
+        "conv_width": Const(description="Causal conv1d kernel width.", abbrev=""),
+        "conv_state_len": Const(
+            description="Raw inputs kept per channel in the conv pool, conv_width - 1.",
+            abbrev="",
+        ),
+    },
+    inputs={
+        "hidden_states": Tensor(
+            ["batch_size", "hidden_size"],
+            description="Layer input for the decoded token of each sequence.",
+        ),
+        "w_ba": Tensor(
+            ["hidden_size", "n_ba"],
+            description="Fused b/a projection weight; columns [:num_v_heads] feed the beta gate, [num_v_heads:] the decay gate.",
+        ),
+        "mixed_qkv": Tensor(
+            ["batch_size", "qkv_dim"],
+            description="Raw (pre-conv) fused q/k/v channels. Rows may be strided (a view into a wider fused projection).",
+        ),
+        "conv_weight": Tensor(
+            ["qkv_dim", "conv_width"], description="Depthwise causal conv1d weight."
+        ),
+        "conv_bias": Tensor(["qkv_dim"], description="Depthwise conv1d bias."),
+        "conv_state": Tensor(
+            ["num_pages", "qkv_dim", "conv_state_len"],
+            description="Paged conv-state pool as its logical [P, qkv_dim, conv_state_len] view; updated in place.",
+        ),
+        "A_log": Tensor(
+            ["num_v_heads"],
+            description="Log decay parameter. g = exp(-exp(A_log) * softplus(a + dt_bias)).",
+        ),
+        "dt_bias": Tensor(
+            ["num_v_heads"], description="Decay bias, added to 'a' before softplus."
+        ),
+        "scale": Scalar(
+            "float32",
+            optional=True,
+            description="Query scale. Default is 1/sqrt(head_dim).",
+        ),
+        "ssm_state": Tensor(
+            ["num_pages", "num_v_heads", "head_dim", "head_dim"],
+            description="Paged recurrent-state pool in V-major [P, HV, V, K] layout; updated in place.",
+        ),
+        "state_indices": Tensor(
+            ["batch_size"], description="Pool slot index of each sequence."
+        ),
+        "use_qk_l2norm": Scalar(
+            "int32",
+            optional=True,
+            description="Apply L2 normalization to q and k. Default true.",
+        ),
+        "out": Tensor(
+            ["batch_size", "seq_len", "num_v_heads", "head_dim"],
+            dtype="bfloat16",
+            optional=True,
+            description="Pre-allocated attention output, written in place when provided.",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "seq_len", "num_v_heads", "head_dim"],
+            dtype="bfloat16",
+            param="out",
+            description="Attention output for the decoded token.",
+        ),
+        "conv_state_out": Tensor(
+            ["num_pages", "qkv_dim", "conv_state_len"],
+            dtype="bfloat16",
+            param="conv_state",
+            description="The conv-state pool, mutated in place and returned.",
+        ),
+        "ssm_state_out": Tensor(
+            ["num_pages", "num_v_heads", "head_dim", "head_dim"],
+            dtype="float32",
+            param="ssm_state",
+            description="The recurrent-state pool, mutated in place and returned.",
+        ),
+    },
+    constraints=[
+        "num_pages >= batch_size",
+        "n_ba == 2 * num_v_heads",
+        "conv_state_len == conv_width - 1",
+        "qkv_dim > num_v_heads * head_dim",
+        "(qkv_dim - num_v_heads * head_dim) % (2 * head_dim) == 0",
+    ],
+    tags=["stage:decode", "status:verified"],
+    reference=_gdn_fused_decode_reference,
+    init=_gdn_fused_decode_init,
+)
