@@ -1315,6 +1315,41 @@ thresholds; this closes the B300 spot-check TODO.  b=1024 (µs):
   SR-path error/regression rather than physics — needs a dedicated bench
   (philox on/off × rounds × dtype, ncu on the writeback) AFTER the ring work.
 
+## Ring migration stage 5 — parity vs b300-preRing (B300, 2026-07-10)
+
+Mixed sweeps (bf16 / fp16-philox-5 / f32, b=1..1024, conv1d, K=8), tag
+`b300-ring` vs `b300-preRing`; ncu `--set full` at b1024 bf16 pnat 4/12
+(`ssu_2k_ring_b300_*` vs `ssu_2k_v35_b300_*`).
+
+- **Monolith (cuda-incr): parity.** ±1.5% at every (dtype, batch) point.
+  The ring gathers + shfl-scan decay recompute are free there — the scan
+  hides under the state cp.async, and at ring_start=0 the second gather
+  segment is predicated off.
+- **2k (cuda-incr-2k): +6–16%**, worst mid-batch bf16/f32 and fp16 b1024.
+  ncu attribution:
+  - precompute pnat4 **+26.5%** (13.98→17.70 µs): barrier stalls 28%→43%,
+    smem stores 86K→307K.  The dt→cumAdt recompute is a ONE-THREAD-per-head
+    serial loop behind a __syncthreads — it serializes the whole CTA.
+  - main pnat4 (nowrite) **+22.9%** (59.97→73.73 µs): smem store wavefronts
+    43K→613K (14×), barrier +39%, DRAM byte-flat, long_scoreboard DOWN —
+    pipeline overlap broken, not bandwidth.  The β-tail recompute does a
+    full 16-lane inclusive scan + 32-float smem round-trip where the
+    pre-ring code cp.async'd ONE float.
+  - main pnat12 (write) +6.2% — matmul-dominated, recompute mostly hidden.
+- Fix plan (pending go-ahead):
+  1. precompute: warp-parallel shfl_up scan per head (like the monolith's)
+     instead of the serial loop; fold into the existing coeff load phase so
+     no extra barrier.
+  2. main: the main only needs the TOTAL decay (β) — replace scan+STS with
+     a register-only warp REDUCTION per consumer warp (dt row ≤16 f32 = one
+     64B sector, L1-broadcast across warps; 4 shfls; zero smem, zero
+     barriers).
+- Triton reference rows (triton-replay/-pm) are now adapter-dominated in
+  the bench (~123 µs floor at b1: the wrapper's host-side ring
+  gather/scatter runs inside the timed span).  Kernel-perf tracking should
+  use the CUDA rows; the Triton rows are correctness references only
+  unless/until the six kernels get native ring addressing.
+
 ## TODO
 
 - [ ] **SR (philox) perf anomaly on B300** — see the B300-baselines section:
