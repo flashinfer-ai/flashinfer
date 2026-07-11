@@ -17,21 +17,40 @@ try:
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.typing import AddressSpace  # noqa: F401
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 
-from cutlass.cutlass_dsl import Int64
+from cutlass._mlir import ir  # noqa: F401
+from cutlass._mlir.dialects import arith as _arith  # noqa: F401
+from cutlass._mlir.dialects import llvm  # noqa: F401
+from cutlass.cutlass_dsl import dsl_user_op, Int32 as _epi_Int32, Int64  # noqa: F401
 
 from src.flag_batch import GpuReleaseFlagBatchTracker
 from src.token_comm import TokenSrcMetadata
 
+from moe_nvfp4_swapab.contract import (
+    Contract,  # noqa: F401
+    FunctionMapping,  # noqa: F401
+    Space,  # noqa: F401
+    TensorWithContract,  # noqa: F401
+    assert_contract_equivalent,  # noqa: F401
+)
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
+from common.megamoe_constants import Nvfp4BlockSize  # noqa: F401
 
 from common.moe_utils import fmin, fmax, swiglu_act, quant_sfd_row
 from cutlass.cute.typing import Float32
 from moe_nvfp4_swapab.epilogue import (
     _TmemTranspose16x32Core,
+    _red_add_release_gpu_s32,  # noqa: F401
+    SwapABSwigluFp4Epilogue,  # noqa: F401
+    EpilogueTokenTile,  # noqa: F401
+    Fc2AccLoadAndPack,  # noqa: F401
+    TmemTranspose16x32Packed,  # noqa: F401
+    Fc2UnpackPermuteStg,  # noqa: F401
+    Region,  # noqa: F401
 )
 
 Fc1GateUpInterleave = 32
@@ -164,7 +183,7 @@ class GluMxfp8Epilogue:
         ):
             self._fc2_stg_needs_predicate: bool = False
         else:
-            self._fc2_stg_needs_predicate = True
+            self._fc2_stg_needs_predicate: bool = True  # type: ignore[no-redef]
 
         # Non-swap-AB: TMA tile is (EpilogueTileN tokens, Fc1EpilogueOutputTileN intermediates)
         self._epi_tile = (EpilogueTileN, Fc1EpilogueOutputTileN)
@@ -409,11 +428,11 @@ class GluMxfp8Epilogue:
         iket.range_push("mxfp8_fc1_epi_tile")
 
         if cutlass.const_expr(self._overlapping_accum):
-            _acc_stage_col_offset = cutlass.Int32(acc_consumer_state.phase) * (
+            acc_stage_col_offset = cutlass.Int32(acc_consumer_state.phase) * (
                 256 - self._num_sf_tmem_cols
             )
         else:
-            _acc_stage_col_offset = (
+            acc_stage_col_offset = (  # noqa: F841
                 cutlass.Int32(acc_consumer_state.index) * self._cta_tile_n
             )
 
@@ -437,6 +456,7 @@ class GluMxfp8Epilogue:
             self.fc1_output_dtype,
             num_bits_per_copy=128,
         )
+        tRS_sC = None  # noqa: F841
 
         for i in cutlass.range(0, subtile_cnt, 1, unroll=1):
             if cutlass.const_expr(self._overlapping_accum):
@@ -750,7 +770,7 @@ class GluMxfp8Epilogue:
         """fc2 (Linear2) task-tile body following fc1 pattern exactly.
 
         Key alignment with fc1:
-          - _acc_stage_col_offset = 0 for overlapping_accum (single physical stage)
+          - acc_stage_col_offset = 0 for overlapping_accum (single physical stage)
           - is_odd_turn determines start subtile (7 odd, 0 even) and direction
           - consumer_release after first subtile (i==0) when overlapping_accum
           - TMEM tensor advances by +/- EpilogueTileN each iteration
@@ -770,11 +790,11 @@ class GluMxfp8Epilogue:
         # reads the wrong stage for phase=1 clusters.
         # For non-overlapping: stage index selects the physical region.
         if cutlass.const_expr(self._overlapping_accum):
-            _acc_stage_col_offset = cutlass.Int32(acc_consumer_state.phase) * (
+            acc_stage_col_offset = cutlass.Int32(acc_consumer_state.phase) * (
                 256 - self._num_sf_tmem_cols
             )
         else:
-            _acc_stage_col_offset = (
+            acc_stage_col_offset = (  # noqa: F841
                 cutlass.Int32(acc_consumer_state.index) * self._cta_tile_n
             )
 

@@ -43,9 +43,15 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int64
+from cutlass.cutlass_dsl import Int64, Int32  # noqa: F401
+
+try:
+    from cutlass.cute import iket  # type: ignore
+except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
+    from src.iket_compat import iket  # noqa: F401
 
 from moe_mxfp8_glu.kernel_mxfp8_glu_fc12 import Sm100SwigluMxfp8Fc12Kernel
+from moe_nvfp4_swapab.moe_utils import spin_wait  # noqa: F401
 from src.token_comm import (
     TokenCommArgs as ExtractedTokenCommArgs,
     TokenInPullTokenBackPush,
@@ -322,6 +328,7 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         pool_sf_capacity = (
             pool_token_capacity // token_padding_block
         ) * sf_padding_block
+        cluster_m = self.cluster_shape_mn[0]  # noqa: F841
         pool_task_tile_capacity = (
             pool_token_capacity + cluster_tile_tokens - 1
         ) // cluster_tile_tokens + num_experts_per_rank

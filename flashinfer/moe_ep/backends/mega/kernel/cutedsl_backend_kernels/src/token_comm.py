@@ -37,17 +37,19 @@ from .ptx_helpers import (
     read_clock64,
     red_add_relaxed_sys_u64_raw,
     red_add_release_sys_s32_raw,
+    red_add_release_sys_u64_raw,  # noqa: F401
     stg_b8_raw,
     stg_b32_raw,
     stg_b64_raw,
     tma_load_1d_raw,
     tma_store_1d,
+    _fence_rel_sys,  # noqa: F401
 )
 from .flag_batch import GpuReleaseFlagBatchTracker
 from .sf_swizzle import sf_atom_int32_offset
 from cutlass._mlir import ir
 from moe_nvfp4_swapab.moe_utils import _nanosleep, spin_wait
-from common.moe_utils import cvt_f32x4_to_f8x4_pack_i32
+from common.moe_utils import quant_sfd_row, cvt_f32x4_to_f8x4_pack_i32  # noqa: F401
 from cutlass._mlir.dialects import math as _cute_math
 
 

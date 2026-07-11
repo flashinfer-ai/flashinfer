@@ -28,15 +28,22 @@
 
 """Shared MoE scheduler utilities and online TMA descriptor helpers."""
 
-from typing import Union
+from abc import ABC, abstractmethod  # noqa: F401
+from typing import Any, Callable, Literal, Optional, Tuple, Type, Union  # noqa: F401
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import Float32, T
+from cutlass.cute.typing import AddressSpace, Numeric, Pointer  # noqa: F401
+from cutlass.cute.nvgpu import cpasync  # noqa: F401
+from cutlass.cute.arch import nvvm_wrappers  # noqa: F401
+from cutlass.cutlass_dsl import dsl_user_op, Boolean, Int32, Float32, T  # noqa: F401
 from cutlass._mlir import ir
 from common.megamoe_constants import Log2E, Fp32Max, Fp8E4M3RcpLimit, Fp8E5M2RcpLimit
 from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import cute as _cute_ir  # noqa: F401
 from cutlass._mlir.dialects import vector, arith
+from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir  # noqa: F401
+from dataclasses import dataclass  # noqa: F401
 
 
 # -----------------------------------------------------------------
@@ -111,15 +118,15 @@ def fmin(
     ip=None,
 ) -> Float32:
     if nan:
-        ptx_instr = "min.NaN.f32 $0, $1, $2;"
+        ptx_instr = f"min.NaN.f32 $0, $1, $2;"  # noqa: F541
     else:
-        ptx_instr = "min.f32 $0, $1, $2;"
+        ptx_instr = f"min.f32 $0, $1, $2;"  # noqa: F541
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
             f"{ptx_instr}",
-            "=f,f,f",
+            f"=f,f,f",  # noqa: F541
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -136,15 +143,15 @@ def fmax(
     ip=None,
 ) -> Float32:
     if nan:
-        ptx_instr = "max.NaN.f32 $0, $1, $2;"
+        ptx_instr = f"max.NaN.f32 $0, $1, $2;"  # noqa: F541
     else:
-        ptx_instr = "max.f32 $0, $1, $2;"
+        ptx_instr = f"max.f32 $0, $1, $2;"  # noqa: F541
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
             f"{ptx_instr}",
-            "=f,f,f",
+            f"=f,f,f",  # noqa: F541
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

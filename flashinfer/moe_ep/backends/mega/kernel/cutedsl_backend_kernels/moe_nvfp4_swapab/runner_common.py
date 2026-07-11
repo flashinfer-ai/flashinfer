@@ -14,9 +14,12 @@ from common.megamoe_constants import (
     Fp8E4M3FNMax,
     Nvfp4E2M1Max,
     Nvfp4BlockSize,
+    Mxfp8BlockSize,  # noqa: F401
     SfPaddingBlock,
     TmaLeadingDimByteAlign,
     Nvfp4E2M1RcpLimit,
+    Fp8E4M3RcpLimit,  # noqa: F401
+    Fp8E5M2RcpLimit,  # noqa: F401
 )
 
 ### TO BE REMOVED
@@ -41,6 +44,9 @@ def ceil_div(a: int, b: int) -> int:
 
 def round_up(a: int, b: int) -> int:
     return ceil_div(a, b) * b
+
+
+from common.host_utils import kind_data_dtype, kind_scale_dtype, kind_sf_vec_size  # noqa: F401
 
 
 def kind_data_max(kind: str) -> float:

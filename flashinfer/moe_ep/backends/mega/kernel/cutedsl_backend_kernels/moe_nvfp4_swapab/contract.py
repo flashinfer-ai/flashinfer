@@ -81,7 +81,7 @@ class Space:
 
         linear = 0
         stride = 1
-        for axis, (idx, size) in enumerate(zip(coord_tuple, self.sizes, strict=False)):
+        for axis, (idx, size) in enumerate(zip(coord_tuple, self.sizes)):  # noqa: B905
             if not isinstance(idx, int):
                 raise ContractError(
                     f"Coordinate {self.names[axis]!r} must be int, got {type(idx)!r}"
@@ -288,7 +288,7 @@ class FunctionMapping:
 
         table: list[int] = []
         for domain_coord in domain.coordinates():
-            binding = dict(zip(domain.names, domain_coord, strict=False))
+            binding = dict(zip(domain.names, domain_coord))  # noqa: B905
             result = self.function(**binding)
             codomain_coord = self._result_to_codomain_coord(
                 result,
@@ -354,9 +354,7 @@ class Contract:
             mismatch_idx = next(
                 (
                     idx
-                    for idx, (lhs, rhs) in enumerate(
-                        zip(self.table, other.table, strict=False)
-                    )
+                    for idx, (lhs, rhs) in enumerate(zip(self.table, other.table))  # noqa: B905
                     if lhs != rhs
                 ),
                 None,

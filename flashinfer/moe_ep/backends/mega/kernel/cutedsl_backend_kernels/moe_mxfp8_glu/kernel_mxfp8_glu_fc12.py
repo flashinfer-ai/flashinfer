@@ -22,6 +22,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
+from moe_nvfp4_swapab.epilogue import SwapABSwigluFp4Epilogue, _TmemTranspose16x32Core  # noqa: F401
 from moe_mxfp8_glu.epilogue_mxfp8 import GluMxfp8Epilogue
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     BlockPhase,
@@ -30,6 +31,7 @@ from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
 from moe_nvfp4_swapab.custom_ext import GluMxFp8Fc12SchedExtension
 from common.megamoe_constants import (
     Mxfp8BlockSize,
+    Nvfp4BlockSize,  # noqa: F401
     SupportedMmaTileM,
     SupportedMmaTileN,
 )
@@ -102,7 +104,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                 raise ValueError(
                     f"ab_dtype={ab_dtype.__name__} is not valid for "
                     f"sf_vec_size={sf_vec_size}. "
-                    f"Expected one of: {[t.__name__ for t in valid_ab]}."
+                    f"Expected one of: {[t.__name__ for t in valid_ab_tuple]}."  # type: ignore[name-defined]  # noqa: F821 - upstream kernel-team code; valid_ab_tuple undefined, should likely be valid_ab
                 )
         else:
             raise NotImplementedError(f"sf_vec_size must be {Mxfp8BlockSize} (MXFP8)")
@@ -539,6 +541,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
     ) -> int:
         """Compute opaque workspace size for one fused fc1+fc2 launch."""
         sf_padding_block = self.sf_padding_block
+        sf_vec_size = self.sf_vec_size  # noqa: F841
 
         mma_tiler_n = self.mma_tiler_mnk[1]
 
@@ -1272,6 +1275,10 @@ class Sm100SwigluMxfp8Fc12Kernel:
         loop (acc consumer state, subtile dispatch, TMA commit/drain, and
         the piggyback ``red.release.gpu.add.s32`` to ``fc1_done_counter``).
         """
+        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, None, 0))  # noqa: F841
+        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, None, 0))  # noqa: F841
+        sfa_smem_layout = cute.slice_(sfa_smem_layout_staged, (None, None, None, 0))  # noqa: F841
+        sfb_smem_layout = cute.slice_(sfb_smem_layout_staged, (None, None, None, 0))  # noqa: F841
 
         # fc2 waits for all fc1 intermediate N-tiles in the same token block.
         # Each N-tile is processed by atom_thr_size CTAs (both CTA0 and CTA1 increment
@@ -1615,7 +1622,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
@@ -1672,7 +1679,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     if tidx == cutlass.Int32(
                         32 * self.tma_a_warp_id
                     ) and work_tile_info.tile_n_idx == cutlass.Int32(0):
-                        _counter_val_post = cute.arch.load(
+                        counter_val_post = cute.arch.load(  # noqa: F841
                             counter_ptr, counter_ptr.dtype, cop="cg"
                         )
                         # Also load first Int32 from fc1_output for this tile to
@@ -1688,7 +1695,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                             fc1_output_gemm.iterator.toint() + fc1_byte_offset,
                             cute.AddressSpace.gmem,
                         )
-                        _fc1_first_i32 = cute.arch.load(
+                        fc1_first_i32 = cute.arch.load(  # noqa: F841
                             fc1_probe_ptr, cutlass.Int32, cop="cg"
                         )
                         # cute.printf(
@@ -1756,7 +1763,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
@@ -1887,7 +1894,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
@@ -1964,7 +1971,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
-                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
                         handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:

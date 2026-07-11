@@ -5,8 +5,10 @@
 import argparse
 import os
 import sys
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field  # noqa: F401
+from typing import List, Literal, Optional, Tuple  # noqa: F401
 
+import numpy as np  # noqa: F401
 import torch
 
 # Ensure absolute package imports work when this file is run as a script.

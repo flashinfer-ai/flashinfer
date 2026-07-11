@@ -27,7 +27,6 @@ Launcher::
 import argparse
 import gc
 import os
-import contextlib
 import sys
 from typing import List, Optional, Tuple
 
@@ -61,6 +60,7 @@ from moe_nvfp4_swapab.mega_runner import (
     _generate_topk_weights,
     _print_remote_rank_comm_matrices,
     _sym_zeros,
+    _compute_peer_offsets,  # noqa: F401
     _parse_tuple,
     _parse_output_dtype,
     _NO_DIST,
@@ -497,6 +497,7 @@ class MegaMoEMxfp8Tester(MegaMoETester):
             )
 
         import cuda.bindings.driver as cuda
+        import cutlass  # noqa: F401
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
         import cutlass.utils as utils
@@ -802,8 +803,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 tester.shared_workspace,
             ):
                 if sym_tensor is not None:
-                    with contextlib.suppress(Exception):
+                    try:  # noqa: SIM105
                         nvshmem.core.free_tensor(sym_tensor)
+                    except Exception:  # noqa: BLE001
+                        pass
             tester.my_activation = None
             tester.my_activation_sf = None
             tester.my_topk_idx = None

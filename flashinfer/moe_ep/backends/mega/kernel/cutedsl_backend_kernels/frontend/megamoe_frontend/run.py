@@ -54,13 +54,8 @@ def _config_from_args(
     rank: int,
     world_size: int,
 ) -> MegaMoENvfp4Config:
-    def _parse_tuple3(s: str) -> tuple[int, int, int]:
-        a, b, c = (int(x) for x in s.split(","))
-        return (a, b, c)
-
-    def _parse_tuple2(s: str) -> tuple[int, int]:
-        a, b = (int(x) for x in s.split(","))
-        return (a, b)
+    def _parse_tuple(s: str) -> tuple[int, ...]:
+        return tuple(int(x) for x in s.split(","))
 
     return MegaMoENvfp4Config(
         rank=rank,
@@ -70,8 +65,8 @@ def _config_from_args(
         num_total_experts=args.num_total_experts,
         hidden=args.hidden,
         intermediate=args.intermediate,
-        mma_tiler_mnk=_parse_tuple3(args.mma_tiler_mnk),
-        cluster_shape_mnk=_parse_tuple3(args.cluster_shape_mnk),
+        mma_tiler_mnk=_parse_tuple(args.mma_tiler_mnk),  # type: ignore[arg-type]
+        cluster_shape_mnk=_parse_tuple(args.cluster_shape_mnk),  # type: ignore[arg-type]
         use_2cta_instrs=args.use_2cta_instrs,
         load_balance_mode=args.load_balance_mode,
         group_hint=args.group_hint,
@@ -79,7 +74,7 @@ def _config_from_args(
         clc_bundle_size=args.clc_bundle_size,
         num_sched_stages=args.num_sched_stages,
         flag_batch=args.flag_batch,
-        epi_flag_batch=_parse_tuple2(args.epi_flag_batch),
+        epi_flag_batch=_parse_tuple(args.epi_flag_batch),  # type: ignore[arg-type]
         non_ubulk_fc2_store=not args.use_bulk_fc2_store,
         in_kernel_fc2_reduce=args.in_kernel_fc2_reduce,
         token_back_mode=args.token_back_mode,

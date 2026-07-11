@@ -1326,11 +1326,10 @@ def _validate_tensors(
                 f"{mxfp8_scale.device}."
             )
         scale_cols = (H + MXFP8_SCALE_BLOCK_SIZE - 1) // MXFP8_SCALE_BLOCK_SIZE
-        expected_scale_shape: tuple
         if mxfp8_scale.dim() == 2:
             expected_scale_shape = (T, scale_cols)
         elif mxfp8_scale.dim() == 3:
-            expected_scale_shape = (T, K, scale_cols)
+            expected_scale_shape = (T, K, scale_cols)  # type: ignore[assignment]
         else:
             raise ValueError(
                 "mxfp8_scale must have shape (T, ceil_div(H, 32)) or "
@@ -1372,6 +1371,7 @@ def _validate_tensors(
                 f"nvfp4_global_scale must be on {combine_output.device}, got "
                 f"{nvfp4_global_scale.device}."
             )
+        sfc_cols = (H + NVFP4_SFC_SCALE_BLOCK_SIZE - 1) // NVFP4_SFC_SCALE_BLOCK_SIZE  # noqa: F841
         global_cols = (
             H + NVFP4_GLOBAL_SCALE_BLOCK_SIZE - 1
         ) // NVFP4_GLOBAL_SCALE_BLOCK_SIZE

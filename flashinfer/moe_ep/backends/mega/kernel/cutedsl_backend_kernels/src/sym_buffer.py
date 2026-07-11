@@ -92,7 +92,7 @@ class SymBufferDeviceBase:
         self,
         local_ptr: Int64,
         dst_rank_idx: Int32,
-        byte_off: Int64 = Int64(0),  # noqa: B008 - CuTe DSL default
+        byte_off: Int64 = Int64(0),  # noqa: B008
     ) -> Int64:
         if cutlass.const_expr(self.num_max_ranks <= _BYVAL_RANK_LIMIT):
             # Opaque ptr -> the offsets array sits at byte 0 of the byval struct,

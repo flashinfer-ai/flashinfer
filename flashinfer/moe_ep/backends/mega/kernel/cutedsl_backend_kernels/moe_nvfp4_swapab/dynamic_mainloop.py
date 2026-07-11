@@ -6,6 +6,7 @@
 
 from typing import Optional
 
+import cutlass  # noqa: F401
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import dsl_user_op, Int32, Boolean
 from cutlass._mlir import ir

@@ -30,7 +30,7 @@
 
 from abc import ABC, abstractmethod
 from enum import IntEnum
-from typing import Any, List, Optional, Tuple, Literal
+from typing import List, Optional, Tuple, Literal
 
 import cutlass
 import cutlass.cute as cute
@@ -693,21 +693,6 @@ class MoESchedulerBase(ABC):
         _producer_state             — pipeline producer state (MLIR-serialized)
     """
 
-    # Annotations for the required members above (no runtime effect; the
-    # concrete __init__ / create() implementations assign them).
-    params: Any  # concrete schedulers use their own params subclass
-    offs: cute.Tensor
-    _ext: Any
-    cta_id_in_cluster: Any
-    current_expert_idx: Int32
-    expert_tile_start: Int32
-    expert_tile_end: Int32
-    current_work: Any
-    _pipeline: Any
-    _smem_buf_tensor: cute.Tensor
-    _num_sched_stages: int
-    _producer_state: Any
-
     # =========================================================================
     # Abstract interface
     # =========================================================================
@@ -730,9 +715,9 @@ class MoESchedulerBase(ABC):
         ip: Optional[ir.InsertionPoint] = None,
     ) -> None:
         """Write current_work to SMEM and advance the producer pipeline."""
-        self.current_work.write_to_smem(
-            self._smem_buf_tensor,
-            (self._pipeline, self._producer_state),
+        self.current_work.write_to_smem(  # type: ignore[attr-defined]
+            self._smem_buf_tensor,  # type: ignore[attr-defined]
+            (self._pipeline, self._producer_state),  # type: ignore[attr-defined]
             loc=loc,
             ip=ip,
         )
@@ -746,15 +731,15 @@ class MoESchedulerBase(ABC):
         ip: Optional[ir.InsertionPoint] = None,
     ) -> None:
         """Ensure all published stages are fully consumed, then release resources."""
-        self._pipeline.producer_tail(self._producer_state)
+        self._pipeline.producer_tail(self._producer_state)  # type: ignore[attr-defined]
 
     def make_consumer(self) -> "MoESchedConsumer":
         """Create a consumer handle for non-scheduler warps."""
         return MoESchedConsumer(
-            self._pipeline,
-            self._smem_buf_tensor,
-            self._num_sched_stages,
-            work_tile_cls=self._ext.WorkTileInfo,
+            self._pipeline,  # type: ignore[attr-defined]
+            self._smem_buf_tensor,  # type: ignore[attr-defined]
+            self._num_sched_stages,  # type: ignore[attr-defined]
+            work_tile_cls=self._ext.WorkTileInfo,  # type: ignore[attr-defined]
         )
 
     # =========================================================================
@@ -763,42 +748,42 @@ class MoESchedulerBase(ABC):
 
     @property
     def scenario(self) -> Literal["2Dx3D", "2Dx2D"]:
-        return self.params.scenario
+        return self.params.scenario  # type: ignore[attr-defined]
 
     @property
     def expert_cnt(self) -> Int32:
-        return self.params.expert_cnt
+        return self.params.expert_cnt  # type: ignore[attr-defined]
 
     @property
     def intermediate(self) -> Int32:
-        return self.params.intermediate
+        return self.params.intermediate  # type: ignore[attr-defined]
 
     @property
     def hidden(self) -> Int32:
-        return self.params.hidden
+        return self.params.hidden  # type: ignore[attr-defined]
 
     @property
     def cta_tile_shape_mnk(self) -> Tuple[int, int, int]:
-        return self.params.cta_tile_shape_mnk
+        return self.params.cta_tile_shape_mnk  # type: ignore[attr-defined]
 
     @property
     def cluster_shape_mn(self) -> Tuple[int, int]:
         """Cluster shape used to size cta_id_in_cluster."""
-        return self.params.cluster_shape_mn
+        return self.params.cluster_shape_mn  # type: ignore[attr-defined]
 
     @property
     def cluster_tile_m(self) -> int:
         """Tile-partitioning granularity along M."""
-        return self.params.cluster_tile_m
+        return self.params.cluster_tile_m  # type: ignore[attr-defined]
 
     @property
     def cluster_tile_n(self) -> int:
         """Tile-partitioning granularity along N."""
-        return self.params.cluster_tile_n
+        return self.params.cluster_tile_n  # type: ignore[attr-defined]
 
     @property
     def cta_tile_k(self) -> int:
-        return self.params.cta_tile_k
+        return self.params.cta_tile_k  # type: ignore[attr-defined]
 
     # =========================================================================
     # Shared tile iteration helpers
@@ -823,7 +808,7 @@ class MoESchedulerBase(ABC):
         """
         self._advance_expert_to_contain(cluster_linear_idx, loc=loc, ip=ip)
 
-        is_valid = self.current_expert_idx < self.expert_cnt
+        is_valid = self.current_expert_idx < self.expert_cnt  # type: ignore[has-type]
 
         work_tile_info = MoEWorkTileInfo(
             expert_idx=Int32(WorkTileState.DONE),
@@ -833,22 +818,27 @@ class MoESchedulerBase(ABC):
         )
 
         if is_valid:
-            local_idx = cluster_linear_idx - self.expert_tile_start
+            local_idx = cluster_linear_idx - self.expert_tile_start  # type: ignore[has-type]
             cluster_tile_m_idx, cluster_tile_n_idx = self._decompose_local_idx(
-                local_idx, self.current_expert_idx, loc=loc, ip=ip
+                local_idx,
+                self.current_expert_idx,  # type: ignore[has-type]
+                loc=loc,
+                ip=ip,  # type: ignore[has-type]
             )
 
             cta_tile_m_idx = (
                 cluster_tile_m_idx * self.cluster_shape_mn[0]
-                + self.cta_id_in_cluster[0]  # type: ignore[index]
+                + self.cta_id_in_cluster[0]  # type: ignore[attr-defined,index]
             )
             cta_tile_n_idx = (
                 cluster_tile_n_idx * self.cluster_shape_mn[1]
-                + self.cta_id_in_cluster[1]  # type: ignore[index]
+                + self.cta_id_in_cluster[1]  # type: ignore[attr-defined,index]
             )
 
             k_tile_cnt = self._compute_k_tile_cnt(
-                self.current_expert_idx, loc=loc, ip=ip
+                self.current_expert_idx,  # type: ignore[has-type]
+                loc=loc,
+                ip=ip,  # type: ignore[has-type]
             )
 
             # Swap-AB: re-express the tile indices in GEMM-domain (M, N) on
@@ -857,11 +847,11 @@ class MoESchedulerBase(ABC):
             # (M = grouped axis, N = full axis); when is_swap_ab is True the
             # GEMM-domain mapping is flipped.  Codegen-time const_expr makes
             # this a zero-cost branch.
-            if const_expr(self.params.is_swap_ab):
+            if const_expr(self.params.is_swap_ab):  # type: ignore[attr-defined]
                 cta_tile_m_idx, cta_tile_n_idx = cta_tile_n_idx, cta_tile_m_idx
 
             work_tile_info = MoEWorkTileInfo(
-                expert_idx=self.current_expert_idx,
+                expert_idx=self.current_expert_idx,  # type: ignore[has-type]
                 tile_m_idx=cta_tile_m_idx,
                 tile_n_idx=cta_tile_n_idx,
                 k_tile_cnt=k_tile_cnt,
@@ -883,7 +873,7 @@ class MoESchedulerBase(ABC):
 
         Fast path: If already in correct expert, no work needed.
         """
-        if self.expert_tile_end == Int32(0):
+        if self.expert_tile_end == Int32(0):  # type: ignore[has-type]
             tiles_for_expert_0 = self._compute_tiles_for_expert(
                 Int32(0), loc=loc, ip=ip
             )
@@ -891,9 +881,9 @@ class MoESchedulerBase(ABC):
 
         while (
             cluster_linear_idx >= self.expert_tile_end
-            and self.current_expert_idx < self.expert_cnt
+            and self.current_expert_idx < self.expert_cnt  # type: ignore[has-type]
         ):
-            self.current_expert_idx = self.current_expert_idx + 1
+            self.current_expert_idx = self.current_expert_idx + 1  # type: ignore[has-type]
             self.expert_tile_start = self.expert_tile_end
 
             if self.current_expert_idx < self.expert_cnt:
@@ -926,9 +916,9 @@ class MoESchedulerBase(ABC):
             ) // self.cluster_tile_n
             return cluster_tile_m_cnt * cluster_tile_n_cnt
         else:  # 2Dx3D
-            tokens_i = self.offs[expert_idx]
+            tokens_i = self.offs[expert_idx]  # type: ignore[attr-defined]
             if expert_idx > 0:
-                tokens_i = tokens_i - self.offs[expert_idx - 1]  # type: ignore[operator]
+                tokens_i = tokens_i - self.offs[expert_idx - 1]  # type: ignore[attr-defined,operator]
             cluster_tile_m_cnt = (
                 tokens_i + self.cluster_tile_m - 1  # type: ignore[operator]
             ) // self.cluster_tile_m
@@ -989,9 +979,9 @@ class MoESchedulerBase(ABC):
                 self.intermediate + self.cluster_tile_n - 1
             ) // self.cluster_tile_n
         else:  # 2Dx3D
-            tokens_i = self.offs[expert_idx]
+            tokens_i = self.offs[expert_idx]  # type: ignore[attr-defined]
             if expert_idx > 0:
-                tokens_i = tokens_i - self.offs[expert_idx - 1]  # type: ignore[operator]
+                tokens_i = tokens_i - self.offs[expert_idx - 1]  # type: ignore[attr-defined,operator]
             cluster_tile_m_cnt = (
                 tokens_i + self.cluster_tile_m - 1  # type: ignore[operator]
             ) // self.cluster_tile_m
@@ -1018,9 +1008,9 @@ class MoESchedulerBase(ABC):
         if const_expr(self.scenario == "2Dx3D"):
             return (self.hidden + self.cta_tile_k - 1) // self.cta_tile_k
         else:  # 2Dx2D
-            tokens_i = self.offs[expert_idx]
+            tokens_i = self.offs[expert_idx]  # type: ignore[attr-defined]
             if expert_idx > cutlass.Int32(0):
-                tokens_i = tokens_i - self.offs[expert_idx - 1]  # type: ignore[operator]
+                tokens_i = tokens_i - self.offs[expert_idx - 1]  # type: ignore[attr-defined,operator]
             return (tokens_i + self.cta_tile_k - 1) // self.cta_tile_k  # type: ignore[return-value, operator]
 
 
@@ -1577,8 +1567,6 @@ class MoEDynamicPersistentTileScheduler(MoESchedulerBase):
             # ... do work using work.token_offset, work.tokens_i, etc. ...
             work = consumer.consume_work()
     """
-
-    params: MoEDynamicSchedulerParams
 
     def __init__(
         self,

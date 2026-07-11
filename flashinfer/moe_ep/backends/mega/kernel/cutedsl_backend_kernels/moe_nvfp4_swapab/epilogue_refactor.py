@@ -12,7 +12,7 @@ the per-token metadata is fetched.
 """
 
 import dataclasses
-from typing import Callable, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, List, Literal, Optional, Tuple, Type, Union  # noqa: F401
 
 import cutlass
 import cutlass.cute as cute
@@ -605,13 +605,13 @@ class SwapABSwigluFp4Epilogue:
         ):
             self.fc2_hidden_needs_predicate: bool = False
         else:
-            self.fc2_hidden_needs_predicate = True
+            self.fc2_hidden_needs_predicate: bool = True  # type: ignore[no-redef]
 
         if static_expert_shape is not None:
             intermediate_downproj = static_expert_shape[1] // 2
             self.intermediate_downproj: Optional[int] = intermediate_downproj
         else:
-            self.intermediate_downproj = None
+            self.intermediate_downproj: Optional[int] = None  # type: ignore[no-redef]
 
         self.subtile_cnt = self.cta_tile_n // self._EpilogueTokenTileSize
         self.overlapping_accum = allow_overlap_acc and (

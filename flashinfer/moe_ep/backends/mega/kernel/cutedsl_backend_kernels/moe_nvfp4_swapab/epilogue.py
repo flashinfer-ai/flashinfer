@@ -8,7 +8,7 @@ store components.
 """
 
 import dataclasses
-from typing import Any, Optional, Tuple, Type, Union
+from typing import Any, List, Literal, Optional, Tuple, Type, Union  # noqa: F401
 
 import cutlass
 import cutlass.cute as cute
@@ -2057,7 +2057,7 @@ class SwapABSwigluFp4Epilogue:
         ):
             self._fc2_hidden_needs_predicate: bool = False
         else:
-            self._fc2_hidden_needs_predicate = True
+            self._fc2_hidden_needs_predicate: bool = True  # type: ignore[no-redef]
 
         # K-padding gate for fc1 epi SF writes; see PostSwigluHalf.stg_sfc.
         # ``cga_cluster_tile_intermediate_downproj`` is the CGA-level
@@ -2077,7 +2077,7 @@ class SwapABSwigluFp4Epilogue:
                 )
             self._intermediate_downproj: Optional[int] = intermediate_downproj
         else:
-            self._intermediate_downproj = None
+            self._intermediate_downproj: Optional[int] = None  # type: ignore[no-redef]
 
         self._epi_tile = (EpilogueTokenTile, Fc1EpilogueOutputTile)
         self._subtile_cnt = self._cta_tile_n // EpilogueTokenTile

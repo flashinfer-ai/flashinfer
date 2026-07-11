@@ -36,6 +36,7 @@ from typing import List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
+import cutlass  # noqa: F401
 from cutlass.utils import HardwareInfo
 
 from moe_nvfp4_swapab.epilogue import (

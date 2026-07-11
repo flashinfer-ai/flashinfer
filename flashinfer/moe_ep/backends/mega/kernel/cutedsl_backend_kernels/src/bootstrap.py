@@ -15,7 +15,6 @@ host-side payload used to build a ``SymBufferHost`` runtime argument.
 
 from __future__ import annotations
 
-import contextlib
 import math
 import os
 from dataclasses import dataclass
@@ -257,10 +256,12 @@ class Workspace:
         # NVSHMEM tracks the allocation by `data_ptr()` of the root byte
         # buffer. Drop our reference first so torch's caching allocator
         # doesn't hold a phantom view while we call free_tensor.
-        # Best-effort: if NVSHMEM has already torn down (e.g. the
-        # process is exiting mid-fault), don't shadow the real error.
-        with contextlib.suppress(Exception):
+        try:  # noqa: SIM105
             nvshmem.core.free_tensor(self._byte_buf)
+        except Exception:  # noqa: BLE001
+            # Best-effort: if NVSHMEM has already torn down (e.g. the
+            # process is exiting mid-fault), don't shadow the real error.
+            pass
 
 
 def alloc_workspace(
@@ -461,8 +462,10 @@ def finalize_dist_and_nvshmem(workspace: Workspace | None = None) -> None:
     """
     if workspace is not None:
         workspace.release()
-    with contextlib.suppress(Exception):
+    try:  # noqa: SIM105
         nvshmem.core.finalize()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         if dist.is_initialized():
             dist.destroy_process_group()

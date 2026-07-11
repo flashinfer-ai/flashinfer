@@ -400,9 +400,9 @@ class TokenCommProblemDesc:
 
     def __str__(self) -> str:
         dtype_name = lambda t: str(t).split(".")[-1]
-        route_str: str = self.route_distribution
+        route_str = self.route_distribution
         if self.route_distribution == "power_law":
-            route_str = f"power_law(exponent={self.power_law_exponent:.3g})"
+            route_str = f"power_law(exponent={self.power_law_exponent:.3g})"  # type: ignore[assignment]
         clamp_str = "off" if self.gate_up_clamp is None else f"{self.gate_up_clamp:.4g}"
         return (
             f"TokenCommProblemDesc: world={self.world_size} "
@@ -1763,8 +1763,14 @@ class MegaMoETester:
                 raise RuntimeError(
                     "form A CuTeDSL reduce requires combine_reduced_output allocation."
                 )
+            combine_reduced_output_cute = _to_cute(self.combine_reduced_output)  # noqa: F841
             topk_reduce_score = (
                 self.my_topk_weights
+                if self.misc.ref_compute_graph == "transformers"
+                else None
+            )
+            topk_reduce_score_cute = (  # noqa: F841
+                topk_weights_cute
                 if self.misc.ref_compute_graph == "transformers"
                 else None
             )
@@ -2397,8 +2403,9 @@ class MegaMoETester:
             coll_counts = counts[coll_mask]
             # Rank collision triples by replication count (worst first).
             sort_idx = torch.argsort(coll_counts, descending=True)
+            shown = 0
             shown_limit = 8
-            for shown, i in enumerate(sort_idx.tolist(), start=1):
+            for i in sort_idx.tolist():
                 k = int(coll_keys[i].item())
                 c = int(coll_counts[i].item())
                 src_rank = (k >> 48) & 0xFFFF
@@ -2415,6 +2422,7 @@ class MegaMoETester:
                     f"src_topk={src_topk}) x {c}{tag}"
                 )
                 print(f"    first {len(slot_sample)} slot ids: {slot_sample}")
+                shown += 1  # noqa: SIM113
                 if shown >= shown_limit:
                     remaining = n_collisions - shown
                     if remaining > 0:
@@ -2531,8 +2539,8 @@ class MegaMoETester:
                 print(f"  first 16 extras (src_rank, src_token, src_topk): {sample}")
         else:
             print(
-                "---- expected-vs-actual reverse check skipped "
-                "(fc1_output peek unavailable) ----"
+                f"---- expected-vs-actual reverse check skipped "  # noqa: F541
+                f"(fc1_output peek unavailable) ----"  # noqa: F541
             )
 
         # ---- 3. fc1_output non-zero row mask (per pool_slot) + hash.
@@ -2830,7 +2838,7 @@ class MegaMoETester:
                 f"top {n_worst_cells_per_token} hidden cells; K already "
                 "reduced on device) ----"
             )
-            for t, ds in zip(bad_tokens, bad_diff_sums, strict=False):
+            for t, ds in zip(bad_tokens, bad_diff_sums):  # noqa: B905
                 token_diff = unreduced_diff[t]  # (H,)
                 n_cells = min(n_worst_cells_per_token, token_diff.numel())
                 top_cells = torch.topk(token_diff, k=n_cells)
@@ -2852,7 +2860,7 @@ class MegaMoETester:
                 f"{n_worst_tokens} by sum over (topk, hidden); per token: "
                 f"top {n_worst_cells_per_token} (topk, hidden) cells) ----"
             )
-            for t, ds in zip(bad_tokens, bad_diff_sums, strict=False):
+            for t, ds in zip(bad_tokens, bad_diff_sums):  # noqa: B905
                 token_diff = unreduced_diff[t]  # (K, H)
                 flat = token_diff.flatten()
                 n_cells = min(n_worst_cells_per_token, flat.numel())

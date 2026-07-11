@@ -453,6 +453,7 @@ class MegaMoENvfp4Frontend:
                 "combine_reduced_output is required when in_kernel_fc2_reduce=False."
             )
 
+        has_topk_score = inputs.topk_score_for_reduce is not None  # noqa: F841
         has_combine_sf_q = inputs.combine_sf_q is not None
         has_combine_global_q = inputs.combine_global_q is not None
         if c.combine_dtype == "mxfp8":
