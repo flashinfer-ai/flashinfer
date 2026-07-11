@@ -143,7 +143,9 @@ class SoftmaxRole:
         kv_head_idx = qo_head_idx // self.num_repeat_kv_heads
         kv_tile_idx = cS[0][1] // self.qk_mma_tiler[1]
 
-        seqlen_q, seqlen_k, scale_softmax_log2 = value_args
+        seqlen_q, seqlen_k, scale_softmax_log2, window_left, window_right = (
+            value_args
+        )
         (
             mma_si_consumer,
             si_corr_producer,
@@ -163,6 +165,7 @@ class SoftmaxRole:
             tTMEM_LOADtS,
             tTMEM_STORE_VECtS,
             tTMEM_STOREtS_x4,
+            tTMEM_LOADcS_static,
         ) = tensor_args
 
         if cutlass.const_expr(self.has_statistics_update):
@@ -199,6 +202,9 @@ class SoftmaxRole:
                 tTMEM_LOADcS,
                 seqlen_k,
                 seqlen_k - seqlen_q,
+                tTMEM_LOADcS_static,
+                window_left,
+                window_right,
             )
 
         frg_cnt = 4
@@ -230,6 +236,9 @@ class SoftmaxRole:
                     tTMEM_LOADcS,
                     seqlen_k,
                     seqlen_k - seqlen_q,
+                    tTMEM_LOADcS_static,
+                    window_left,
+                    window_right,
                 )
 
         if cutlass.const_expr(not self.has_logits_transform):
@@ -367,6 +376,7 @@ class SoftmaxRole:
     def dead_step(
         self,
         stage: int,
+        store_zero_p: bool,
         cS: cute.Tensor,
         row_max: Float32,
         row_sum: Float32,
@@ -384,6 +394,12 @@ class SoftmaxRole:
         max, so the correction rescale factor is exactly 1), honor the
         s0/s1 sequence tokens, and store a zero P so the still-running PV
         gemm accumulates nothing.  row_max/row_sum pass through unchanged.
+
+        ``store_zero_p`` (compile-time): dead-prefix blocks (stage 1's first
+        trip) keep the zero-P store because their PV gemm is the
+        ACCUMULATE=False overwrite that initializes O1; dead-suffix blocks
+        (stage 0's last trip) pass False — the MMA skips their PV gemm
+        entirely (see MmaRole.run), so nothing reads that P tile.
 
         Standard path only (callers gate on not has_logits_transform and
         not has_statistics_update).  Kept as a separate function so the
@@ -440,17 +456,21 @@ class SoftmaxRole:
             sequence_consumer_handle = s0_s1_sequence_consumer.wait_and_advance()
 
         # P = 0 so the PV gemm adds nothing (zero f32 backing = packed
-        # bf16/fp16 zeros).
-        tTMEM_STORErS_x4 = cute.make_rmem_tensor(tTMEM_STOREcS.shape, self.qk_acc_dtype)
-        for idx in range(cute.size(tTMEM_STORErS_x4)):
-            tTMEM_STORErS_x4[idx] = 0.0
+        # bf16/fp16 zeros).  Skipped when the MMA skips the PV gemm.
+        if cutlass.const_expr(store_zero_p):
+            tTMEM_STORErS_x4 = cute.make_rmem_tensor(
+                tTMEM_STOREcS.shape, self.qk_acc_dtype
+            )
+            for idx in range(cute.size(tTMEM_STORErS_x4)):
+                tTMEM_STORErS_x4[idx] = 0.0
 
         if cutlass.const_expr(stage == 0):
             sequence_producer_handle.commit()
         else:
             sequence_consumer_handle.release()
-        cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
-        cute.arch.fence_view_async_tmem_store()
+        if cutlass.const_expr(store_zero_p):
+            cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
+            cute.arch.fence_view_async_tmem_store()
         si_handle.release()
 
         vec_i_handle = si_corr_producer.acquire_and_advance()
@@ -555,6 +575,8 @@ class SoftmaxRole:
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
         scale_output: Float32,
+        window_left: Int32,
+        window_right: Int32,
         qk_thr_mma: cute.ThrMma,
         pv_thr_mma: cute.ThrMma | None,
         tStS: cute.Tensor,
@@ -616,6 +638,9 @@ class SoftmaxRole:
         )
         thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
         tTMEM_LOADtS = thr_tmem_load.partition_S(tStSi)
+        # Unshifted identity partition: per-element coordinates with no
+        # dynamic domain offset; apply_mask requires it (see fusion/mask.py).
+        tTMEM_LOADcS_static = thr_tmem_load.partition_D(tScS)
         tmem_store_vec_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(2)),
             self.qk_acc_dtype,
@@ -661,7 +686,13 @@ class SoftmaxRole:
                     seqlen_k_ = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 row_max = -Float32.inf
                 row_sum = 0.0
-                value_args = (seqlen_q_, seqlen_k_, scale_softmax_log2)
+                value_args = (
+                    seqlen_q_,
+                    seqlen_k_,
+                    scale_softmax_log2,
+                    window_left,
+                    window_right,
+                )
                 atom_args = (
                     qk_thr_mma,
                     tiled_tmem_load,
@@ -675,6 +706,7 @@ class SoftmaxRole:
                     tTMEM_LOADtS,
                     tTMEM_STORE_VECtS,
                     tTMEM_STOREtS_x4,
+                    tTMEM_LOADcS_static,
                 )
 
                 (
@@ -688,6 +720,8 @@ class SoftmaxRole:
                     self.cta_tiler,
                     seqlen_k_,
                     seqlen_q_,
+                    window_left,
+                    window_right,
                 )
                 kv_start_offset = kv_start_block * self.qk_mma_tiler[1]
                 # Dead-step split: the trip range above is the union over
@@ -711,6 +745,8 @@ class SoftmaxRole:
                         (self.qk_mma_tiler[0], self.cta_tiler[1]),
                         seqlen_k_,
                         seqlen_q_,
+                        window_left,
+                        window_right,
                     )
                     kv_end_block = (
                         kv_start_block + masked_left + unmask_count + masked_right
@@ -748,6 +784,7 @@ class SoftmaxRole:
                             s0_s1_sequence_producer,
                         ) = self.dead_step(
                             stage,
+                            True,  # store_zero_p: prefix PV1 is the O1 init
                             cS_iter,
                             row_max,
                             row_sum,
@@ -898,6 +935,7 @@ class SoftmaxRole:
                             s0_s1_sequence_producer,
                         ) = self.dead_step(
                             stage,
+                            False,  # store_zero_p: MMA skips the suffix PV0
                             cS_iter,
                             row_max,
                             row_sum,

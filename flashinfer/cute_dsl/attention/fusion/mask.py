@@ -36,41 +36,38 @@ from cutlass.cute.typing import Int32, Float32, Optional
 
 @dataclass(frozen=True)
 class MaskSpec:
-    """Compile-time description of the attention mask band.
+    """Compile-time description of WHICH band bounds exist.
+
+    Only bound *presence* is compile-time (it drives dead-code
+    elimination: a no-window kernel contains no window instructions).
+    The bound *values* (``window_left``/``window_right``) are runtime
+    kernel arguments, so one compiled kernel serves every window size.
+    Causal masking is a right bound with a runtime value of 0, not a
+    separate spec kind.  The ``k < seqlen_k`` tail bound is always on:
+    the trip-segment math yields zero masked blocks at runtime when
+    every ``seqlen_k`` is tile-aligned, so alignment does not change
+    which kernel is compiled (and cannot trigger recompiles).
 
     Attributes:
-        causal: right bound follows the diagonal (``k <= q + offset``).
-        window_left: max lookback distance; ``-1`` = unbounded.
-        window_right: max lookahead distance for non-causal masks;
-            ``-1`` = unbounded.  Mutually exclusive with ``causal``.
-        check_kv_bounds: some ``seqlen_k`` is not a multiple of the KV tile,
-            so the trailing partial tile needs ``k < seqlen_k`` masking even
-            when no other bound is active.
+        has_window_left: a max-lookback bound exists.
+        has_window_right: a max-lookahead bound exists (0 = causal).
     """
 
-    causal: bool = False
-    window_left: int = -1
-    window_right: int = -1
-    check_kv_bounds: bool = False
-
-    def __post_init__(self):
-        if self.causal and self.window_right >= 0:
-            raise ValueError(
-                "window_right is mutually exclusive with causal "
-                "(causal already bounds lookahead at 0)"
-            )
+    has_window_left: bool = False
+    has_window_right: bool = False
 
     @property
     def has_left_bound(self) -> bool:
-        return self.window_left >= 0
+        return self.has_window_left
 
     @property
     def has_right_bound(self) -> bool:
-        return self.causal or self.window_right >= 0
+        return self.has_window_right
 
     @property
     def needs_masking(self) -> bool:
-        return self.has_left_bound or self.has_right_bound or self.check_kv_bounds
+        # The seqlen_k tail bound is unconditional; see class docstring.
+        return True
 
 
 @cute.jit
@@ -80,6 +77,8 @@ def get_kv_block_range(
     tile_shape: cute.Shape,
     seqlen_k: Int32,
     seqlen_q: Int32,
+    window_left: Int32,
+    window_right: Int32,
 ) -> tuple[Int32, Int32]:
     """[start, end) KV block range visited for this Q tile (union over rows).
 
@@ -88,16 +87,14 @@ def get_kv_block_range(
     """
     qk_offset = seqlen_k - seqlen_q
     start_block = 0
-    if cutlass.const_expr(spec.window_left >= 0):
+    if cutlass.const_expr(spec.has_window_left):
         first_q = blk_coord[0] * tile_shape[0] + qk_offset
-        min_kv = cutlass.max(0, first_q - spec.window_left)
+        min_kv = cutlass.max(0, first_q - window_left)
         start_block = min_kv // tile_shape[1]
     last_q = (blk_coord[0] + 1) * tile_shape[0] - 1 + qk_offset
     end_elem = seqlen_k
-    if cutlass.const_expr(spec.causal):
-        end_elem = cutlass.min(seqlen_k, last_q + 1)
-    elif cutlass.const_expr(spec.window_right >= 0):
-        end_elem = cutlass.min(seqlen_k, last_q + spec.window_right + 1)
+    if cutlass.const_expr(spec.has_window_right):
+        end_elem = cutlass.min(seqlen_k, last_q + window_right + 1)
     end_block = cute.ceil_div(end_elem, tile_shape[1])
     return start_block, end_block
 
@@ -109,10 +106,12 @@ def get_trip_count(
     tile_shape: cute.Shape,
     seqlen_k: Int32,
     seqlen_q: Int32,
+    window_left: Int32,
+    window_right: Int32,
 ) -> Int32:
     """Number of KV tile blocks to process for this Q tile."""
     start_block, end_block = get_kv_block_range(
-        spec, blk_coord, tile_shape, seqlen_k, seqlen_q
+        spec, blk_coord, tile_shape, seqlen_k, seqlen_q, window_left, window_right
     )
     return end_block - start_block
 
@@ -124,6 +123,8 @@ def get_trip_segments(
     tile_shape: cute.Shape,
     seqlen_k: Int32,
     seqlen_q: Int32,
+    window_left: Int32,
+    window_right: Int32,
 ) -> tuple[Int32, Int32, Int32, Int32]:
     """KV trip structure: (start_block, masked_left, unmasked, masked_right).
 
@@ -134,7 +135,7 @@ def get_trip_segments(
     seqlen_k tail) need apply_mask.
     """
     start_block, end_block = get_kv_block_range(
-        spec, blk_coord, tile_shape, seqlen_k, seqlen_q
+        spec, blk_coord, tile_shape, seqlen_k, seqlen_q, window_left, window_right
     )
     if cutlass.const_expr(not spec.needs_masking):
         return start_block, 0, end_block - start_block, 0
@@ -145,13 +146,11 @@ def get_trip_segments(
         # Intersection over all rows of the tile: blocks fully inside
         # [lo_max, hi_min) are visible to every row.
         lo_max = 0
-        if cutlass.const_expr(spec.window_left >= 0):
-            lo_max = cutlass.max(0, last_q - spec.window_left)
+        if cutlass.const_expr(spec.has_window_left):
+            lo_max = cutlass.max(0, last_q - window_left)
         hi_min = seqlen_k
-        if cutlass.const_expr(spec.causal):
-            hi_min = cutlass.min(seqlen_k, first_q + 1)
-        elif cutlass.const_expr(spec.window_right >= 0):
-            hi_min = cutlass.min(seqlen_k, first_q + spec.window_right + 1)
+        if cutlass.const_expr(spec.has_window_right):
+            hi_min = cutlass.min(seqlen_k, first_q + window_right + 1)
         unmasked_start = cute.ceil_div(lo_max, tile_shape[1])
         unmasked_end = hi_min // tile_shape[1]
         unmasked_start = cutlass.min(
@@ -173,61 +172,70 @@ def apply_mask(
     index_qk: cute.Tensor,
     seqlen_k: Int32,
     causal_offset: Int32,
+    index_qk_static: cute.Tensor,
+    window_left: Int32,
+    window_right: Int32,
 ) -> None:
-    """Apply the band mask to scores.  ``pos = (q, k)`` are logical coords.
+    """Set out-of-band scores to -inf.
 
-    For specs with a left bound (sliding windows — the regime where every
-    visited block is a boundary block), the row's visible band ``[lo, hi)``
-    is hoisted out of the element loop: a thread's accumulator fragment
-    covers exactly one Q row under the tcgen05 TMEM-load partitioning (the
-    softmax's scalar row_max reduction relies on the same fact), so only
-    the K coordinate needs comparing per element.  ``hi`` folds the
-    ``seqlen_k`` tail bound.  Measured: masked-block cost drops ~2x and the
-    sliding-window kernel gains ~25% end-to-end.
+    The row's visible band ``[lo, hi)`` (see module docstring) is hoisted
+    out of the element loop, so each element only compares its K
+    coordinate against row-invariant bounds.  ``index_qk`` is the
+    identity partition of the score tile carrying global ``(q, k)``
+    coordinates; ``index_qk_static`` is the same partition of the
+    unshifted identity tensor, so its coordinates are trace-time
+    constants.
 
-    The no-left-bound specs (plain causal, right-window, residual) keep the
-    per-element two-coordinate predicate.  Do NOT rewrite them as a compare
-    against a hoisted scalar bound: when the DSL can fold the mask predicate
-    into a single element-index-vs-invariant-threshold compare (``k >= hi``
-    directly, or ``hi <= k or k >= seqlen_k`` after or-folding), MLIR lowers
-    each element's conditional -inf write as a select over the ENTIRE packed
-    f32x2 accumulator chunk instead of a per-element select (observed: 16
-    selp.b64 per element, 8320 vs 512 kernel-wide), which ptxas cannot
-    allocate — ~1850 local-memory spills and a kernel-wide ~2.5x slowdown,
-    unmasked steps included.  The two-sided band compare above is immune
-    because opposite-direction compares don't fold to one threshold
-    (1024 selp.b64, no spills).  Seen with cutlass-dsl 4.x / CUDA 13.5.
+    Layout assumptions:
+    - One Q row per thread fragment, so the band bounds are uniform
+      across a thread's elements (the softmax's scalar row_max reduction
+      relies on the same fact).
+    - ``index_qk[i] == index_qk_static[i] + domain_offset`` for all i,
+      so the tile's dynamic base folds into the hoisted bounds.
+    Fragment layouts that break these (e.g. head-packed decode rows, or
+    a gathered/sparse KV axis) cannot use this function as-is; they need
+    per-element two-coordinate predicates instead of hoisted bounds.
+
+    Codegen rules — both are required to avoid register spills:
+    - Masked writes use ``cutlass.select_``, never a traced ``if``.
+      Register data is immutable SSA values in the IR, so a traced
+      conditional element write is recorded as an ``scf.if`` that
+      yields the whole fragment, and the backend does not reliably
+      reduce that to a single-element select.  ``cutlass.select_``
+      emits one scalar ``arith.select`` per element and is safe for
+      any predicate shape.
+    - Per-element K reads come from ``index_qk_static``: its
+      coordinates are compile-time constants that lower to immediate
+      operands, whereas reading the shifted partition materializes
+      each global coordinate through per-element address arithmetic
+      that inflates register pressure.
     """
     if cutlass.const_expr(spec.needs_masking):
-        if cutlass.const_expr(spec.window_left >= 0):
-            row_q = index_qk[0][0] + causal_offset
-            lo = row_q - spec.window_left
-            hi = seqlen_k
-            if cutlass.const_expr(spec.causal):
-                hi = cutlass.min(row_q + 1, seqlen_k)
-            elif cutlass.const_expr(spec.window_right >= 0):
-                hi = cutlass.min(row_q + spec.window_right + 1, seqlen_k)
+        base_k = index_qk[0][1] - index_qk_static[0][1]
+        row_q = index_qk[0][0] + causal_offset
+        hi = seqlen_k
+        if cutlass.const_expr(spec.has_window_right):
+            hi = cutlass.min(row_q + window_right + 1, seqlen_k)
+        hi_rel = hi - base_k
+        if cutlass.const_expr(spec.has_window_left):
+            lo_rel = row_q - window_left - base_k
             for i in range(cute.size(acc_qk)):
-                k = index_qk[i][1]
-                if k < lo or k >= hi:
-                    acc_qk[i] = -Float32.inf
-        elif cutlass.const_expr(spec.causal):
-            for i in range(cute.size(acc_qk)):
-                pos = index_qk[i]
-                if pos[0] + causal_offset < pos[1] or pos[1] >= seqlen_k:
-                    acc_qk[i] = -Float32.inf
-        elif cutlass.const_expr(spec.window_right >= 0):
-            for i in range(cute.size(acc_qk)):
-                pos = index_qk[i]
-                if (
-                    pos[1] - pos[0] - causal_offset > spec.window_right
-                    or pos[1] >= seqlen_k
-                ):
-                    acc_qk[i] = -Float32.inf
+                k = index_qk_static[i][1]
+                acc_qk[i] = cutlass.select_(
+                    (k < lo_rel) | (k >= hi_rel),
+                    -Float32.inf,
+                    acc_qk[i],
+                )
         else:
+            # Right-bound-only specs (causal, right window, seqlen_k
+            # tail): single-direction compare — safe here because
+            # select_ has no scf.if region for MLIR to fold.
             for i in range(cute.size(acc_qk)):
-                if index_qk[i][1] >= seqlen_k:
-                    acc_qk[i] = -Float32.inf
+                acc_qk[i] = cutlass.select_(
+                    index_qk_static[i][1] >= hi_rel,
+                    -Float32.inf,
+                    acc_qk[i],
+                )
 
 
 # JIT-extendable masking configurations

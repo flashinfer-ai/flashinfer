@@ -84,6 +84,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         s_k_all: Int32,
         scale_softmax_log2: Float32,
         scale_output: Float32,
+        window_left: Int32,
+        window_right: Int32,
         params_in: cute.Tensor | None,
         stream,
     ):
@@ -98,6 +100,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param cum_seqlen_k: Cumulative KV sequence lengths, or None
         :param scale_softmax_log2: ``log2(e) * sm_scale``
         :param scale_output: Output scaling factor
+        :param window_left: runtime lookback bound (read only when the
+            compile-time ``MaskSpec.has_window_left`` is set)
+        :param window_right: runtime lookahead bound (read only when the
+            compile-time ``MaskSpec.has_window_right`` is set)
         :param params_in: Variant runtime data tensor, or None
         :param stream: CUDA stream
         """
@@ -265,6 +271,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             cum_seqlen_k,
             scale_softmax_log2,
             scale_output,
+            window_left,
+            window_right,
             params,
             lp.q_smem_layout_staged,
             lp.k_smem_layout_staged,
@@ -371,6 +379,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
         scale_output: Float32,
+        window_left: Int32,
+        window_right: Int32,
         params: cute.Tensor | None,
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
@@ -491,6 +501,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 sV,
                 cum_seqlen_q,
                 cum_seqlen_k,
+                window_left,
+                window_right,
                 load_q_producer,
                 load_kv_producer,
                 tile_sched_params,
@@ -516,6 +528,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 mK_kdl.shape[0],
                 cum_seqlen_q,
                 cum_seqlen_k,
+                window_left,
+                window_right,
                 load_q_consumer,
                 load_kv_consumer,
                 mma_s0_producer,
@@ -557,6 +571,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cum_seqlen_k=cum_seqlen_k,
                 scale_softmax_log2=scale_softmax_log2,
                 scale_output=scale_output,
+                window_left=window_left,
+                window_right=window_right,
                 qk_thr_mma=qk_thr_mma,
                 pv_thr_mma=pv_thr_mma,
                 tStS=tStS,
@@ -591,6 +607,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cum_seqlen_k=cum_seqlen_k,
                 scale_softmax_log2=scale_softmax_log2,
                 scale_output=scale_output,
+                window_left=window_left,
+                window_right=window_right,
                 qk_thr_mma=qk_thr_mma,
                 pv_thr_mma=pv_thr_mma,
                 tStS=tStS,
@@ -629,6 +647,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                     cum_seqlen_k,
                     scale_softmax_log2,
                     scale_output,
+                    window_left,
+                    window_right,
                     s0_corr_consumer,
                     s1_corr_consumer,
                     mma_corr_consumer,

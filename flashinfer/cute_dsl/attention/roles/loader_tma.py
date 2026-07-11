@@ -156,6 +156,8 @@ class LoaderRole:
         sV: cute.Tensor,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
+        window_left: Int32,
+        window_right: Int32,
         load_q_producer: PipelineProducer,
         load_kv_producer: PipelineProducer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
@@ -271,6 +273,8 @@ class LoaderRole:
                     self.cta_tiler,
                     seqlen_k,
                     seqlen_q,
+                    window_left,
+                    window_right,
                 )
                 kv_coord = kv_block_start
                 k_handle_producer = load_kv_producer.acquire_and_advance()

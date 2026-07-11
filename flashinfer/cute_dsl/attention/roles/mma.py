@@ -220,6 +220,8 @@ class MmaRole:
         seqlen_k_global: Int32,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
+        window_left: Int32,
+        window_right: Int32,
         load_q_consumer: PipelineConsumer,
         load_kv_consumer: PipelineConsumer,
         mma_s0_producer: PipelineProducer,
@@ -270,10 +272,14 @@ class MmaRole:
                 # gemms for KV blocks outside a stage's band are skipped —
                 # the softmax dead_step never reads that S tile, and
                 # committing a handle without a gemm is the same pattern as
-                # the tile-end commits below.  PV gemms are NOT skipped:
-                # PV1's ACCUMULATE overwrite->accumulate transition happens
-                # at the first trip, exactly where stage 1's dead block
-                # sits, and the softmax dead_step stores a zero P for them.
+                # the tile-end commits below.  PV asymmetry: PV0 for stage
+                # 0's dead trip (always the union's LAST trip) is skipped
+                # together with its zero-P store in dead_step — its
+                # ACCUMULATE bit is True mid-stream, so skipping leaves O0
+                # untouched.  PV1 for stage 1's dead trip (always the
+                # union's FIRST trip) is KEPT: it is the ACCUMULATE=False
+                # overwrite that initializes O1, so dead_step stores a zero
+                # P for it.
                 kv_start_block = 0
                 stage0_lo = 0
                 stage0_hi = 0
@@ -290,6 +296,8 @@ class MmaRole:
                         self.cta_tiler,
                         seqlen_k,
                         seqlen_q_,
+                        window_left,
+                        window_right,
                     )
                     stage0_lo, stage0_hi = get_kv_block_range(
                         self.mask_spec,
@@ -301,6 +309,8 @@ class MmaRole:
                         stage_tiler,
                         seqlen_k,
                         seqlen_q_,
+                        window_left,
+                        window_right,
                     )
                     stage1_lo, stage1_hi = get_kv_block_range(
                         self.mask_spec,
@@ -312,6 +322,8 @@ class MmaRole:
                         stage_tiler,
                         seqlen_k,
                         seqlen_q_,
+                        window_left,
+                        window_right,
                     )
                     qk1_live_prologue = not (
                         kv_start_block < stage1_lo or kv_start_block >= stage1_hi
@@ -354,6 +366,8 @@ class MmaRole:
                         self.cta_tiler,
                         seqlen_k,
                         seqlen_q_,
+                        window_left,
+                        window_right,
                     )
                     - 1
                 )
@@ -401,13 +415,16 @@ class MmaRole:
                     s1_handle_producer.commit()
                     k_handle_consumer.release()
 
-                    # GEMM_PV0i
+                    # GEMM_PV0i — consumes P0 of trip _i+1, the same trip
+                    # qk0_live gates, so a dead trip skips both its QK and
+                    # its PV (ACCUMULATE is True mid-stream; O0 unchanged).
                     v_handle_consumer = load_kv_consumer.wait_and_advance()
                     tOrVi = tOrV[None, None, None, v_handle_consumer.index]
                     if cutlass.const_expr(not self.has_logits_transform):
                         o0_handle_producer = mma_corr_producer.acquire_and_advance()
                     s0_handle_producer = mma_s0_producer.acquire_and_advance()
-                    self.gemm_pv(tOtO0, tOrP0, tOrVi, True)
+                    if qk0_live:
+                        self.gemm_pv(tOtO0, tOrP0, tOrVi, True)
                     if cutlass.const_expr(not self.has_logits_transform):
                         o0_handle_producer.commit()
 

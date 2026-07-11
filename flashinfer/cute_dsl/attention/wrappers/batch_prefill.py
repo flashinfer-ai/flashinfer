@@ -12,6 +12,7 @@ and reused across batches of any size.
 
 import functools
 import math
+import os
 from typing import Optional
 
 import torch
@@ -141,6 +142,8 @@ def _get_compiled_prefill_kernel(
         1,
         0.0,
         1.0,
+        0,
+        0,
         params_fake,
         stream_fake,
         options="--enable-tvm-ffi --opt-level 2",
@@ -262,8 +265,6 @@ class BatchPrefillCuteDSLWrapper:
         self._causal = causal
         self._sm_scale = sm_scale
         self._device = qo_indptr.device
-        self._is_persistent = True
-
         if variant is None:
             variant = StandardAttention()
         self._variant = variant
@@ -306,16 +307,25 @@ class BatchPrefillCuteDSLWrapper:
                 )
             self._params_torch = ep
 
-        mma_tiler_n = 128
-
         # Mask band: causal and window bounds are independent, composable
-        # parameters (MaskSpec validates causal/window_right exclusivity).
+        # parameters.
+        if self._causal and window_right >= 0:
+            raise ValueError(
+                "window_right is mutually exclusive with causal "
+                "(causal already bounds lookahead at 0)"
+            )
+        # Causal is a right bound with runtime value 0; window VALUES are
+        # runtime kernel arguments (only their presence is compiled in),
+        # so one cached kernel serves every window size and the causal /
+        # right-window cases share a kernel.
         self._mask_spec = MaskSpec(
-            causal=self._causal,
-            window_left=window_left,
-            window_right=window_right,
-            check_kv_bounds=bool(torch.any(s_k % mma_tiler_n != 0).item()),
+            has_window_left=window_left >= 0,
+            has_window_right=self._causal or window_right >= 0,
         )
+        self._window_left = max(window_left, 0)
+        self._window_right = 0 if self._causal else max(window_right, 0)
+
+        self._is_persistent = True
 
         self._problem_size = (
             self._batch_size,
@@ -449,6 +459,8 @@ class BatchPrefillCuteDSLWrapper:
             self._s_k_all,
             self._scale_softmax_log2,
             self._scale_output,
+            self._window_left,
+            self._window_right,
             self._params_torch if self._has_params else None,
         )
 
