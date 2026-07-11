@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+from collections import defaultdict
 from enum import Enum
 from types import SimpleNamespace
 from typing import List, Literal, Optional, Tuple
@@ -50,6 +51,7 @@ from ..fused_moe.utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from .kernels.utils import (
+    _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
     _score_sm100_mm_fp4_tactic,
     _select_sm100_mm_fp4_cute_dsl_tactic,
 )
@@ -4500,23 +4502,11 @@ _SM100_MMA_TILER_MN_CANDIDATES = [
     (256, 256),
 ]
 
-_SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
-    (1, 1),
-    (1, 2),
-    (1, 4),
-    (2, 1),
-    (2, 2),
-    (2, 4),
-    (4, 1),
-    (4, 2),
-    (4, 4),
-]
-
 _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
-# Max tactics the autotuner profiles per shape for mm_fp4(backend='cute-dsl')
-_MM_FP4_CUTE_DSL_MAX_TUNING_TACTICS = 16
+# Max distinct configs the autotuner profiles mm_fp4(backend='cute-dsl')
+_MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS = 32
 
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
@@ -5831,15 +5821,29 @@ def _cute_dsl_gemm_fp4_runner(
                                     )
                                 )
 
-            # Rank tactics and autotune top-N instead of the entire O(100) congfigs
+            # Rank configs and autotune the top-N instead of the entire O(100).
+            # Current heuristic cannot predict use_prefetch, so autotuner profiles both.
             sm_count = get_device_sm_count(a.device)
-            valid_tactics.sort(
-                key=lambda t: _score_sm100_mm_fp4_tactic(
-                    m, n, real_k, sm_count, t[0], t[1], t[2]
+            config_tactics: dict = defaultdict(list)
+            for t in valid_tactics:
+                # group by everything except use_prefetch (t[3])
+                tile, cluster, swap_ab, _, kernel_type, tma_store = t
+                config_key = (tile, cluster, swap_ab, kernel_type, tma_store)
+                config_tactics[config_key].append(t)
+            ranked_configs = sorted(
+                config_tactics.values(),
+                key=lambda ts: _score_sm100_mm_fp4_tactic(
+                    m, n, real_k, sm_count, ts[0][0], ts[0][1], ts[0][2]
                 ),
                 reverse=True,
             )
-            return valid_tactics[:_MM_FP4_CUTE_DSL_MAX_TUNING_TACTICS]
+            return [
+                t
+                for ts in ranked_configs[
+                    : _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS // 2
+                ]  # // 2 for prefetch and non-prefetch
+                for t in ts
+            ]
 
         def forward(
             self,

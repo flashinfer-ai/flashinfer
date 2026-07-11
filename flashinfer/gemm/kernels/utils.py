@@ -39,124 +39,114 @@ _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 _M_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 
+_SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
+    (1, 1),
+    (1, 2),
+    (1, 4),
+    (2, 1),
+    (2, 2),
+    (2, 4),
+    (4, 1),
+    (4, 2),
+    (4, 4),
+]
+
+
 def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
     """Compute the best tactic for a specific (M, N, K) on a GPU with sm_count SMs.
 
-    Selects swap_ab, tile shape, and cluster shape sequentially:
-
-    1. **swap_ab**: Swap A and B operands when M is small (1-32) and N is
-       8-aligned, putting the larger N dimension on the M-axis to increase
-       the number of CTAs.
-
-    2. **Tile shape**: Scores all 8 candidates from _SM100_MMA_TILER_MN_CANDIDATES.
-       The score balances three factors:
-         - Tile quantization: M and N padding waste from rounding up to tile
-           boundaries. Smaller tiles waste less for small dimensions.
-         - Wave quantization: How well total CTAs fill the available SMs.
-           Ideal when total_ctas is a multiple of sm_count.
-         - Tile throughput: Larger, balanced tiles have higher per-CTA
-           throughput. Penalized for small K (<=2048) where the K-pipeline
-           can't hide launch latency of large tiles.
-       The combined score is: m_eff * wave_eff * n_eff * tile_throughput.
-
-    3. **Cluster shape**: For narrow GEMMs (prob_m fits in one tile row),
-       clusters in the N dimension (up to 4) for scale-factor multicast.
-       Otherwise uses (1, 1).  tile_m=256 forces cluster_m=2 (HW constraint).
-
-    4. **Prefetch**: Disabled.
+    Argmax of _score_sm100_mm_fp4_tactic over (tile, cluster, swap_ab), with
+    prefetch disabled.  Measured against the previous rule-based selection on
+    B200 over the 217 unique shapes of the mm_fp4 tuning + holdout testlists:
+    geomean -2.6%, wins up to 2x.
     """
     n_aligned = n % 8 == 0
-
-    swap_ab = False
-    if n_aligned and 1 <= rep_m <= 32 and n > rep_m:
-        swap_ab = True
-
-    prob_m = n if swap_ab else rep_m
-    prob_n = rep_m if swap_ab else n
-
-    best_tile_m, best_tile_n = max(
-        _SM100_MMA_TILER_MN_CANDIDATES,
-        key=lambda tile: _score_sm100_mm_fp4_tactic(
-            rep_m, n, real_k, sm_count, tile, (1, 1), swap_ab
-        ),
-    )
-
-    # Cluster: N-only for small prob_m, else (1,1).
-    tiles_on_n = (prob_n + best_tile_n - 1) // best_tile_n
-    if prob_m <= best_tile_m:
-        if tiles_on_n % 4 == 0 or tiles_on_n > 10:
-            cga_n = 4
-        elif tiles_on_n % 2 == 0:
-            cga_n = 2
-        else:
-            cga_n = 1
-        cga_m = 1
-    else:
-        cga_m = 1
-        cga_n = 1
-
-    if best_tile_m == 256 and cga_m < 2:
-        cga_m = 2
-
-    return (
-        (best_tile_m, best_tile_n),
-        (cga_m, cga_n),
-        swap_ab,
-        False,
-        "sm100",
-        None,
-    )
+    best_tactic = None
+    best_score = -1.0
+    for tile in _SM100_MMA_TILER_MN_CANDIDATES:
+        for cluster in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+            if tile[0] == 256 and cluster[0] < 2:
+                continue  # 2-CTA MMA (tile_m == 256) requires cluster_m >= 2
+            # swap_ab is only valid for 8-aligned n
+            for swap_ab in (False,) if not n_aligned else (False, True):
+                score = _score_sm100_mm_fp4_tactic(
+                    rep_m, n, real_k, sm_count, tile, cluster, swap_ab
+                )
+                if score > best_score:
+                    best_score = score
+                    best_tactic = (tile, cluster, swap_ab, False, "sm100", None)
+    return best_tactic
 
 
 def _score_sm100_mm_fp4_tactic(
     m, n, real_k, sm_count, mma_tiler_mn, cluster_shape_mn, swap_ab
 ):
-    """Score a full mm_fp4 cute-dsl tactic for autotune ranking (higher = better).
+    """Score a mm_fp4 cute-dsl tactic (higher = better), modeling execution
+    time as num_waves x per-CTA-tile time.
 
-    Extends the tile score described in _compute_tactic_for_m (step 2) to
-    full (tile, cluster, swap_ab) tactics: the CTA grid is padded to the
-    cluster shape (partially-filled clusters waste SMs), and instead of
-    excluding candidates, large penalties demote tiles the heuristic would
-    skip and swap_ab values that disagree with its swap rule -- the tile
-    score is not calibrated to compare swap variants (at large m it
-    inflates swap_ab=True, which measures 15-100% slower on B200).
+    Ranks autotune candidates and drives _compute_tactic_for_m's no-autotune
+    argmax.  Validated against exhaustive per-tactic measurements on B200
+    over 16 (m, n, k) shapes: the top-16 configs by this score contain a
+    tactic within 0.1% of the exhaustive optimum on every shape.
     """
     tile_m, tile_n = mma_tiler_mn
     cga_m, cga_n = cluster_shape_mn
     prob_m = n if swap_ab else m
     prob_n = m if swap_ab else n
 
-    if real_k <= 1024:
-        large_tile_penalty = 0.50
-    elif real_k <= 2048:
-        large_tile_penalty = 0.80
-    else:
-        large_tile_penalty = 1.0
-
-    n_tiles = (prob_n + tile_n - 1) // tile_n
-    n_eff = prob_n / (n_tiles * tile_n)
-    tile_area_factor = ((tile_m * tile_n) / (256 * 256)) ** 0.5
-    tile_bal = min(tile_m, tile_n) / max(tile_m, tile_n)
-    ns = n_eff * tile_area_factor * (tile_bal**0.25)
-    if tile_m * tile_n > 128 * 128:
-        ns *= large_tile_penalty
-
+    # Tile-quantization efficiency: padding waste from rounding the problem
+    # up to tile boundaries.
     m_tiles = (prob_m + tile_m - 1) // tile_m
-    total_ctas = m_tiles * n_tiles
-    # Pad the grid to the cluster shape: partially-filled clusters still
-    # occupy whole clusters' worth of SMs.
-    padded_ctas = ((m_tiles + cga_m - 1) // cga_m * cga_m) * (
+    n_tiles = (prob_n + tile_n - 1) // tile_n
+    m_eff = prob_m / (m_tiles * tile_m)
+    n_eff = prob_n / (n_tiles * tile_n)
+
+    # tile_m == 256 runs as 2-CTA cooperative MMA (the reason it requires
+    # cluster_m >= 2), so each output tile occupies two SMs.
+    cta_group = 2 if tile_m == 256 else 1
+    ctas_m = m_tiles * cta_group
+    # Wave count over the real CTA grid, padded to the cluster shape:
+    # partially-filled clusters still occupy whole clusters' worth of SMs.
+    padded_ctas = ((ctas_m + cga_m - 1) // cga_m * cga_m) * (
         (n_tiles + cga_n - 1) // cga_n * cga_n
     )
     num_waves = (padded_ctas + sm_count - 1) // sm_count
-    score = prob_m * total_ctas * ns / (tile_m * num_waves * sm_count)
 
+    # Per-CTA tile is (128, tile_n) regardless of tile_m; its throughput
+    # scales ~sqrt(tile_n).  Wide tiles are penalized at small K where the
+    # K-pipeline cannot hide their latency.
+    throughput = (tile_n / 256) ** 0.5
+    if tile_n > 128:
+        if real_k <= 1024:
+            throughput *= 0.50
+        elif real_k <= 2048:
+            throughput *= 0.80
+
+    score = m_eff * n_eff * throughput / (num_waves * tile_n)
+
+    # Tie-breakers keep the ranking strict where the wave model is degenerate
+    # (equal waves and quantization).  Exact values sit on a wide flat
+    # optimum of the validation sweep.
+    if cta_group == 2:
+        # 2-CTA MMA: higher per-SM throughput at equal per-CTA tile
+        score *= 1.05
+    if prob_m > tile_m:
+        # cluster multicast hurts when the m-grid is thicker than one tile
+        # (measured up to 1.8x slower); cga values 1/2/4 -> exponent 0/1/2
+        score *= 0.95 ** (0, 1, 2)[cga_n.bit_length() - 1]
+        score *= 0.99 ** (0, 1, 2)[cga_m.bit_length() - 1]
+
+    # Demote (rather than exclude) narrow tiles that cannot cover prob_n,
+    # keeping the ranking total over all valid tactics.
     if tile_n < 64 and prob_n > tile_n:
         score *= 1e-6
 
+    # The swap comparison is only roughly calibrated, but large-m swap
+    # winners can beat their twin by 12-16%: penalize deviations from the
+    # swap rule mildly, so both swap variants stay in the profiled top-N.
     rule_swap = (n % 8 == 0) and (1 <= m <= 32) and n > m
     if swap_ab != rule_swap:
-        score *= 1e-3
+        score *= 0.95
     return score
 
 
