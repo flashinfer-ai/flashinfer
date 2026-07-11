@@ -325,7 +325,22 @@ class BatchPrefillCuteDSLWrapper:
         self._window_left = max(window_left, 0)
         self._window_right = 0 if self._causal else max(window_right, 0)
 
-        self._is_persistent = True
+        # Scheduling: the persistent kernel assigns work items to SMs
+        # statically at launch; the non-persistent kernel launches one CTA
+        # per item and lets the hardware dispatch dynamically.  Banded
+        # masks (causal / windows) run faster non-persistent: their items
+        # are short or heterogeneous, and the static assignment's
+        # imbalance costs more than the per-CTA prologue it saves.
+        # Unmasked items are uniform, so the static schedule is free and
+        # the amortized prologue wins.
+        # FLASHINFER_CUTE_PREFILL_PERSISTENT=0/1 overrides.
+        _persistent_env = os.environ.get("FLASHINFER_CUTE_PREFILL_PERSISTENT")
+        if _persistent_env is not None:
+            self._is_persistent = _persistent_env == "1"
+        else:
+            self._is_persistent = not (
+                self._mask_spec.has_left_bound or self._mask_spec.has_right_bound
+            )
 
         self._problem_size = (
             self._batch_size,
