@@ -1460,7 +1460,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf[: len(indices)].copy_(
                 indices, non_blocking=(indices.device == self.device) and non_blocking
             )
-            if self.use_tensor_cores and q_len_per_req > 1:
+            if q_len_per_req > 1 and self._backend in ("auto", "fa2"):
+                # "auto" is unresolved here; its fa3 resolution is rejected
+                # later in plan()
                 self._qo_indptr_buf.copy_(qo_indptr_host, non_blocking=non_blocking)
         else:
             self._paged_kv_indptr_buf = indptr.to(
