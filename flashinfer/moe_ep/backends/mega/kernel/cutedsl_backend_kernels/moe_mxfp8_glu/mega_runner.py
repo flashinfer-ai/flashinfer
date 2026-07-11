@@ -794,25 +794,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             import nvshmem.core
 
-            for sym_tensor in (
-                tester.my_activation,
-                tester.my_activation_sf,
-                tester.my_topk_idx,
-                tester.my_topk_weights,
-                tester.combine_output,
-                tester.shared_workspace,
+            # getattr: if generate_inputs failed partway, some of these
+            # attributes were never set; a bare access would raise
+            # AttributeError and mask the original exception.
+            for name in (
+                "my_activation",
+                "my_activation_sf",
+                "my_topk_idx",
+                "my_topk_weights",
+                "combine_output",
+                "shared_workspace",
             ):
+                sym_tensor = getattr(tester, name, None)
                 if sym_tensor is not None:
                     try:  # noqa: SIM105
                         nvshmem.core.free_tensor(sym_tensor)
                     except Exception:  # noqa: BLE001
                         pass
-            tester.my_activation = None
-            tester.my_activation_sf = None
-            tester.my_topk_idx = None
-            tester.my_topk_weights = None
-            tester.combine_output = None
-            tester.shared_workspace = None
+                setattr(tester, name, None)
         except ImportError:
             pass
 
