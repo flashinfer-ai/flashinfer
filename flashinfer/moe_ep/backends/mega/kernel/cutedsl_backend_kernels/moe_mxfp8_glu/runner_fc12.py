@@ -155,7 +155,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
         problem = self.problem
         hidden = problem.hidden
         fc2_output_bytes = torch.full(
-            (data_total_rows, hidden * problem.fc2_output_dtype.itemsize),
+            (data_total_rows, hidden * torch.tensor([], dtype=problem.fc2_output_dtype).element_size()),
             0xFF,
             dtype=torch.uint8,
             device="cuda",
