@@ -194,7 +194,7 @@ def _build_tensors(
     Returns:
       state0                   : (batch, nheads, head_dim, d_state) – initial SSM state
       intermediate_update_inputs: (batch, mtp_len, nheads*head_dim + nheads + ngroups*d_state)
-                                   packed [old_x | old_dt_base | old_B] caches
+                                   packed [x | dt_base | B] baseline caches
       x, dt, B, C              : (batch, mtp_len, ...) – token inputs for both kernels
       A, dt_bias, D            : SSM parameters (float32, tie_hdim strides)
       prev_tokens              : (batch,)
@@ -244,34 +244,31 @@ def _build_tensors(
         )
         state_scale = None
 
-    # --- Cache tensors ---
-    # T-axis = max_window (cache capacity), independent of mtp_len (per-step
-    # speculation depth).  must_checkpoint = (pnat + mtp_len > max_window),
-    # so max_window > mtp_len leaves room for the no-checkpoint branch.
-    # old_x: single-buffered (cache, max_window, nheads, dim)
-    old_x = torch.randn(
-        batch, max_window, nheads, head_dim, device=device, dtype=act_dtype
+    # --- Ring caches (ReplaySSM contract) ---
+    # RING_BUFFER_LEN = max_window + mtp_len rows, head-major.  The write
+    # decision is per slot: (pnat + mtp_len > max_window).  ring_start = 0
+    # keeps the gathers single-segment — the closest apples-to-apples layout
+    # vs the pre-ring double-buffer baselines (wrap cost measured separately).
+    ring_len = max_window + mtp_len
+    x_cache = torch.randn(
+        batch, nheads, ring_len, head_dim, device=device, dtype=act_dtype
     )
-    # old_B: double-buffered (cache, 2, max_window, ngroups, dstate)
-    old_B = torch.randn(
-        batch, 2, max_window, ngroups, d_state, device=device, dtype=act_dtype
+    B_cache = torch.randn(
+        batch, ngroups, ring_len, d_state, device=device, dtype=act_dtype
     )
-    # old_dt: double-buffered (cache, 2, nheads, max_window) fp32
-    old_dt = torch.randn(
-        batch, 2, nheads, max_window, device=device, dtype=torch.float32
+    dt_cache = torch.randn(
+        batch, nheads, ring_len, device=device, dtype=torch.float32
+    ).abs()
+    ring_start = torch.zeros(batch, device=device, dtype=torch.int32)
+    # Legacy packed tensor (kept for baseline kernel only) — mtp_len rows of
+    # fresh data in the baseline's token-major shape.
+    old_x_flat = torch.randn(
+        batch, mtp_len, nheads * head_dim, device=device, dtype=act_dtype
     )
-    # old_cumAdt: double-buffered (cache, 2, nheads, max_window) fp32
-    old_cumAdt = torch.randn(
-        batch, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    # cache_buf_idx: which buffer to read (0 or 1)
-    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
-    # Legacy packed tensor (kept for baseline kernel only) — uses mtp_len slice
-    # of the larger cache so the baseline shape (which is mtp_len-bound) stays
-    # unchanged.
-    old_x_flat = old_x[:, :mtp_len].reshape(batch, mtp_len, nheads * head_dim)
     old_dt_base = torch.randn(batch, mtp_len, nheads, device=device, dtype=act_dtype)
-    old_B_flat = old_B[:, 0, :mtp_len].reshape(batch, mtp_len, ngroups * d_state)
+    old_B_flat = torch.randn(
+        batch, mtp_len, ngroups * d_state, device=device, dtype=act_dtype
+    )
     intermediate_update_inputs = torch.cat(
         [old_x_flat, old_dt_base, old_B_flat], dim=-1
     ).contiguous()
@@ -322,11 +319,10 @@ def _build_tensors(
         state0,
         state_scale,
         intermediate_update_inputs,
-        old_x,
-        old_B,
-        old_dt,
-        old_cumAdt,
-        cache_buf_idx,
+        x_cache,
+        B_cache,
+        dt_cache,
+        ring_start,
         x,
         dt,
         B,
@@ -393,26 +389,19 @@ class KernelInputs:
     state0: torch.Tensor
     state_scale0: torch.Tensor | None
     intermediate_update_inputs: torch.Tensor
-    old_x0: torch.Tensor
-    # 5-D double-buffered old_x for the triton-replay (persistent) path, built
-    # from the 4-D old_x0 (active buffer = cache_buf_idx[slot]).  CUDA / old
-    # Triton use the 4-D old_x0; only triton-replay reads the 5-D copy.
-    old_x0_5d: torch.Tensor
-    old_B0: torch.Tensor
-    old_dt0: torch.Tensor
-    old_cumAdt0: torch.Tensor
-    cache_buf_idx0: torch.Tensor
+    x_cache0: torch.Tensor
+    B_cache0: torch.Tensor
+    dt_cache0: torch.Tensor
+    # Host-owned ring starts — read-only for every kernel, so no work copy.
+    ring_start: torch.Tensor
 
     # Working copies (mutated by kernels)
     state_work: torch.Tensor
     state_scale_work: torch.Tensor | None
     interm_work: torch.Tensor
-    old_x_work: torch.Tensor
-    old_x_work_5d: torch.Tensor
-    old_B_work: torch.Tensor
-    old_dt_work: torch.Tensor
-    old_cumAdt_work: torch.Tensor
-    cache_buf_idx_work: torch.Tensor
+    x_cache_work: torch.Tensor
+    B_cache_work: torch.Tensor
+    dt_cache_work: torch.Tensor
 
     # Read-only inputs
     x: torch.Tensor
@@ -470,12 +459,9 @@ class KernelInputs:
         if self.state_scale_work is not None:
             self.state_scale_work.copy_(self.state_scale0)
         self.interm_work.copy_(self.intermediate_update_inputs)
-        self.old_x_work.copy_(self.old_x0)
-        self.old_x_work_5d.copy_(self.old_x0_5d)
-        self.old_B_work.copy_(self.old_B0)
-        self.old_dt_work.copy_(self.old_dt0)
-        self.old_cumAdt_work.copy_(self.old_cumAdt0)
-        self.cache_buf_idx_work.copy_(self.cache_buf_idx0)
+        self.x_cache_work.copy_(self.x_cache0)
+        self.B_cache_work.copy_(self.B_cache0)
+        self.dt_cache_work.copy_(self.dt_cache0)
 
     def reset_with_conv1d(self) -> None:
         """Realistic reset for conv1d + SSU combined timing.
@@ -490,12 +476,9 @@ class KernelInputs:
         if self.state_scale_work is not None:
             self.state_scale_work.copy_(self.state_scale0)
         self.interm_work.copy_(self.intermediate_update_inputs)
-        self.old_x_work.copy_(self.old_x0)
-        self.old_x_work_5d.copy_(self.old_x0_5d)
-        self.old_B_work.copy_(self.old_B0)
-        self.old_dt_work.copy_(self.old_dt0)
-        self.old_cumAdt_work.copy_(self.old_cumAdt0)
-        self.cache_buf_idx_work.copy_(self.cache_buf_idx0)
+        self.x_cache_work.copy_(self.x_cache0)
+        self.B_cache_work.copy_(self.B_cache0)
+        self.dt_cache_work.copy_(self.dt_cache0)
         self.conv_state_work.copy_(self.conv_state0)
         # 2. L2 flush
         if _l2_flush is not None:
@@ -504,18 +487,7 @@ class KernelInputs:
         self.xbc_input_work.copy_(self.xbc_input0)
 
 
-def _old_x_to_5d(old_x_4d: torch.Tensor, cache_buf_idx: torch.Tensor) -> torch.Tensor:
-    """Build the 5-D double-buffered ``old_x`` the persistent (triton-replay)
-    path expects from the 4-D single-buffer ``old_x``; active buffer =
-    ``cache_buf_idx[slot]`` (the inactive buffer is left zero)."""
-    cache_size, window, nheads, dim = old_x_4d.shape
-    old_x_5d = old_x_4d.new_zeros(cache_size, 2, window, nheads, dim)
-    rows = torch.arange(cache_size, device=old_x_4d.device)
-    old_x_5d[rows, cache_buf_idx.long()] = old_x_4d
-    return old_x_5d
-
-
-def _make_replay_work_items(prev_tokens, cache_buf_idx, mtp_len, max_window, batch):
+def _make_replay_work_items(prev_tokens, mtp_len, max_window, batch):
     """Build (n_writes, replay_work_items) for the standalone persistent kernel,
     write-first sorted — matches mamba2_metadata._prepare_replay_work_items.
 
@@ -526,7 +498,6 @@ def _make_replay_work_items(prev_tokens, cache_buf_idx, mtp_len, max_window, bat
     device = prev_tokens.device
     pos = torch.arange(batch, device=device, dtype=torch.int32)
     pnat = prev_tokens[:batch].to(torch.int32)
-    active_buf = cache_buf_idx[:batch].to(torch.int32)
     write_mask = (pnat + mtp_len) > max_window
     n_writes = write_mask.sum().to(torch.int32).reshape(1)
     order = torch.argsort((~write_mask).to(torch.int32), stable=True).to(torch.long)
@@ -534,7 +505,7 @@ def _make_replay_work_items(prev_tokens, cache_buf_idx, mtp_len, max_window, bat
     work[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = pos[order]
     work[:, REPLAY_WORK_CACHE_SLOT] = pos[order]
     work[:, REPLAY_WORK_PNAT] = pnat[order]
-    work[:, REPLAY_WORK_CACHE_BUF_IDX] = active_buf[order]
+    work[:, REPLAY_WORK_CACHE_BUF_IDX] = 0
     return n_writes, work.contiguous()
 
 
@@ -562,11 +533,10 @@ def build_kernel_inputs(
         state0,
         state_scale0,
         intermediate_update_inputs,
-        old_x0,
-        old_B0,
-        old_dt0,
-        old_cumAdt0,
-        cache_buf_idx0,
+        x_cache0,
+        B_cache0,
+        dt_cache0,
+        ring_start,
         x,
         dt,
         B,
@@ -593,7 +563,6 @@ def build_kernel_inputs(
         d_state,
         ngroups,
     )
-    old_x0_5d = _old_x_to_5d(old_x0, cache_buf_idx0)
     d_inner = nheads * head_dim
     _conv_dim = d_inner + 2 * ngroups * d_state
 
@@ -638,21 +607,16 @@ def build_kernel_inputs(
         state0=state0,
         state_scale0=state_scale0,
         intermediate_update_inputs=intermediate_update_inputs,
-        old_x0=old_x0,
-        old_x0_5d=old_x0_5d,
-        old_B0=old_B0,
-        old_dt0=old_dt0,
-        old_cumAdt0=old_cumAdt0,
-        cache_buf_idx0=cache_buf_idx0,
+        x_cache0=x_cache0,
+        B_cache0=B_cache0,
+        dt_cache0=dt_cache0,
+        ring_start=ring_start,
         state_work=state0.clone(),
         state_scale_work=state_scale0.clone() if state_scale0 is not None else None,
         interm_work=intermediate_update_inputs.clone(),
-        old_x_work=old_x0.clone(),
-        old_x_work_5d=old_x0_5d.clone(),
-        old_B_work=old_B0.clone(),
-        old_dt_work=old_dt0.clone(),
-        old_cumAdt_work=old_cumAdt0.clone(),
-        cache_buf_idx_work=cache_buf_idx0.clone(),
+        x_cache_work=x_cache0.clone(),
+        B_cache_work=B_cache0.clone(),
+        dt_cache_work=dt_cache0.clone(),
         x=x,
         dt=dt,
         B=B,
@@ -892,11 +856,10 @@ def _make_run_closure(
                 x_conv, B_conv, C_conv = _conv1d_split()
                 cuda_checkpointing_ssu(
                     inputs.state_work,
-                    inputs.old_x_work,
-                    inputs.old_B_work,
-                    inputs.old_dt_work,
-                    inputs.old_cumAdt_work,
-                    inputs.cache_buf_idx_work,
+                    inputs.x_cache_work,
+                    inputs.B_cache_work,
+                    inputs.dt_cache_work,
+                    inputs.ring_start,
                     inputs.prev_tokens_i32,
                     x=x_conv,
                     dt=inputs.dt,
@@ -930,11 +893,10 @@ def _make_run_closure(
             def _run():
                 cuda_checkpointing_ssu(
                     inputs.state_work,
-                    inputs.old_x_work,
-                    inputs.old_B_work,
-                    inputs.old_dt_work,
-                    inputs.old_cumAdt_work,
-                    inputs.cache_buf_idx_work,
+                    inputs.x_cache_work,
+                    inputs.B_cache_work,
+                    inputs.dt_cache_work,
+                    inputs.ring_start,
                     inputs.prev_tokens_i32,
                     x=inputs.x,
                     dt=inputs.dt,
@@ -982,7 +944,6 @@ def _make_run_closure(
         )
         n_writes, replay_work_items = _make_replay_work_items(
             inputs.prev_tokens_i32,
-            inputs.cache_buf_idx_work,
             mtp_len,
             max_window,
             inputs.batch,
@@ -994,11 +955,10 @@ def _make_run_closure(
                 x_conv, B_conv, C_conv = _conv1d_split()
                 replay_selective_state_update(
                     inputs.state_work,
-                    inputs.old_x_work_5d,
-                    inputs.old_B_work,
-                    inputs.old_dt_work,
-                    inputs.old_cumAdt_work,
-                    inputs.cache_buf_idx_work,
+                    inputs.x_cache_work,
+                    inputs.B_cache_work,
+                    inputs.dt_cache_work,
+                    inputs.ring_start,
                     inputs.prev_tokens_i32,
                     x=x_conv,
                     dt=inputs.dt,
@@ -1023,11 +983,10 @@ def _make_run_closure(
             def _run():
                 replay_selective_state_update(
                     inputs.state_work,
-                    inputs.old_x_work_5d,
-                    inputs.old_B_work,
-                    inputs.old_dt_work,
-                    inputs.old_cumAdt_work,
-                    inputs.cache_buf_idx_work,
+                    inputs.x_cache_work,
+                    inputs.B_cache_work,
+                    inputs.dt_cache_work,
+                    inputs.ring_start,
                     inputs.prev_tokens_i32,
                     x=inputs.x,
                     dt=inputs.dt,
@@ -1863,7 +1822,7 @@ def _parse_args() -> argparse.Namespace:
         "--max-window",
         type=int,
         default=16,
-        help="Cache capacity (T-axis size for old_x/old_B/old_dt/old_cumAdt). "
+        help="Logical replay window MAX_WINDOW (ring rows = max_window + mtp_len). "
         "The CUDA kernel triggers must_checkpoint when pnat + mtp_len > max_window; "
         "Triton receives a matching write_checkpoint flag for apples-to-apples timing. "
         "Must be >= max(mtp_lengths).",
