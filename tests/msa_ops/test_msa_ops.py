@@ -883,10 +883,12 @@ def test_sparse_decode_nvfp4_scale_size_guard():
 # ---------------------------------------------------------------------------
 
 
-# nvp = P - 56 lands each P on a different kernel: P=88 count-rank (<= 32
-# middle blocks), P=256 chunked, P=2560 radix (past the chunked coverage).
-@pytest.mark.parametrize("P", [88, 256, 2560])
-def test_msa_topk_select_forced_and_clamped(P):
+# nvp = P - 56 lands each case on a different kernel: P=88 count-rank with a
+# tiny middle region, P=128 count-rank with a multi-pass scan (the S=1200 grid
+# is past the chunked row cap), P=256 chunked, P=2560 radix (past the chunked
+# block coverage).
+@pytest.mark.parametrize("P,S", [(88, 64), (128, 1200), (256, 64), (2560, 64)])
+def test_msa_topk_select_forced_and_clamped(P, S):
     """Forced begin/end blocks are always selected within the topk budget;
     num_valid_pages clamps the candidate range."""
     _skip_if_unsupported()
@@ -894,7 +896,7 @@ def test_msa_topk_select_forced_and_clamped(P):
 
     torch.manual_seed(120)
     dev = "cuda"
-    H, S = 2, 64
+    H = 2
     topk, nvp, fb, fe = 16, P - 56, 3, 2
     max_score = torch.randn(H, P, S, dtype=torch.float32, device=dev)
     max_score[:, nvp:, :] = float("-inf")
@@ -911,8 +913,9 @@ def test_msa_topk_select_forced_and_clamped(P):
     )
     torch.cuda.synchronize()
     forced = set(range(fb)) | set(range(nvp - fe, nvp))
+    q_step = max(1, S // 64)  # sample rows when S is large
     for h in range(H):
-        for qi in range(S):
+        for qi in range(0, S, q_step):
             row = out[qi, h]
             valid = row[row >= 0]
             assert valid.numel() == topk
