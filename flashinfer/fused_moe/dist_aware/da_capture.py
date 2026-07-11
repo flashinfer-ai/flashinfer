@@ -122,6 +122,10 @@ def prepare_capture_resources(
     with torch.cuda.device(
         torch.device(da_context.device_type, da_context.device_index)
     ):
+        device = torch.device(da_context.device_type, da_context.device_index)
+        side_stream, routing_stream, pool_handle = da_single_graph.capture_primitives(
+            device
+        )
         resources = DACaptureResources(
             da_context=da_context,
             num_tokens=int(num_tokens),
@@ -136,9 +140,9 @@ def prepare_capture_resources(
             per_body_tactics=tuple(
                 (int(tactic[0]), int(tactic[1])) for tactic in per_body_tactics
             ),
-            side_stream=torch.cuda.Stream(),
-            routing_stream=torch.cuda.Stream(),
-            pool_handle=torch.cuda.graph_pool_handle(),
+            side_stream=side_stream,
+            routing_stream=routing_stream,
+            pool_handle=pool_handle,
         )
     store_capture_resources(resources)
     da_state.retain_capture_tensor(da_context, resources.topk_ids)
@@ -1113,6 +1117,8 @@ def try_trtllm_capture_aware_da(
         side_stream=capture_resources.side_stream,
         routing_stream=capture_resources.routing_stream,
         pool_handle=capture_resources.pool_handle,
+        side_stream_supplied=False,
+        routing_stream_supplied=False,
     ) as ctx:
         if populate_candidate_routing_metadata is not None:
             with ctx.routing_branch():

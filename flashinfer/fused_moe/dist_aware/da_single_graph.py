@@ -30,6 +30,83 @@ _DA_INLINE_SIDE_STREAMS: Dict[int, "torch.cuda.Stream"] = {}
 _DA_INLINE_ROUTING_STREAMS: Dict[int, "torch.cuda.Stream"] = {}
 
 
+def _validated_capture_streams(
+    *,
+    device: torch.device,
+    outer_stream: torch.cuda.Stream,
+    side_stream: torch.cuda.Stream,
+    routing_stream: torch.cuda.Stream,
+    side_stream_supplied: bool = False,
+    routing_stream_supplied: bool = False,
+) -> Tuple[torch.cuda.Stream, torch.cuda.Stream]:
+    """Validate the three capture streams, repairing only internal streams."""
+    max_reacquire_attempts = 10
+    outer = int(outer_stream.cuda_stream)
+    for attempt in range(max_reacquire_attempts + 1):
+        side_handle = int(side_stream.cuda_stream)
+        routing_handle = int(routing_stream.cuda_stream)
+        if len({outer, side_handle, routing_handle}) == 3:
+            device_idx = int(device.index or 0)
+            if not side_stream_supplied:
+                _DA_INLINE_SIDE_STREAMS[device_idx] = side_stream
+            if not routing_stream_supplied:
+                _DA_INLINE_ROUTING_STREAMS[device_idx] = routing_stream
+            return side_stream, routing_stream
+        diagnostics = (
+            f"outer={outer}, side={side_handle}, routing={routing_handle}, "
+            f"reacquire_attempts={attempt}"
+        )
+        if side_stream_supplied and side_handle == outer:
+            raise RuntimeError(
+                "framework-supplied DA side_stream aliases the outer capture "
+                f"stream; {diagnostics}"
+            )
+        if routing_stream_supplied and routing_handle == outer:
+            raise RuntimeError(
+                "framework-supplied DA routing_stream aliases the outer capture "
+                f"stream; {diagnostics}"
+            )
+        if side_stream_supplied and routing_stream_supplied:
+            raise RuntimeError(
+                "framework-supplied DA auxiliary streams alias each other; "
+                + diagnostics
+            )
+        if attempt == max_reacquire_attempts:
+            raise RuntimeError(
+                "unable to acquire three distinct DA capture streams; " + diagnostics
+            )
+
+        # Preserve supplied handles. If one supplied auxiliary aliases an
+        # internal one, repair the internal counterpart.
+        if side_handle == outer or (
+            side_handle == routing_handle and routing_stream_supplied
+        ):
+            side_stream = torch.cuda.Stream(device=device)
+        elif routing_handle == outer or side_handle == routing_handle:
+            routing_stream = torch.cuda.Stream(device=device)
+    raise AssertionError("unreachable stream-reacquisition state")
+
+
+def capture_primitives(
+    device: torch.device,
+) -> Tuple[torch.cuda.Stream, torch.cuda.Stream, Any]:
+    """Return stable per-device auxiliary streams and a graph memory pool."""
+    device_idx = int(device.index or 0)
+    side_stream = _DA_INLINE_SIDE_STREAMS.get(device_idx)
+    if side_stream is None:
+        side_stream = torch.cuda.Stream(device=device)
+        _DA_INLINE_SIDE_STREAMS[device_idx] = side_stream
+    routing_stream = _DA_INLINE_ROUTING_STREAMS.get(device_idx)
+    if routing_stream is None:
+        routing_stream = torch.cuda.Stream(device=device)
+        _DA_INLINE_ROUTING_STREAMS[device_idx] = routing_stream
+    pool_handle = _DA_INLINE_POOL_HANDLES.get(device_idx)
+    if pool_handle is None:
+        pool_handle = torch.cuda.graph_pool_handle()
+        _DA_INLINE_POOL_HANDLES[device_idx] = pool_handle
+    return side_stream, routing_stream, pool_handle
+
+
 class DAInlineGraphInjector:
     """Inject a DA decision + SWITCH + per-tile MoE bodies into a torch
     stream-capture region that is already in progress.
@@ -81,8 +158,14 @@ class DAInlineGraphInjector:
         side_stream: Optional[torch.cuda.Stream] = None,
         routing_stream: Optional[torch.cuda.Stream] = None,
         pool_handle: Optional[Any] = None,
+        side_stream_supplied: Optional[bool] = None,
+        routing_stream_supplied: Optional[bool] = None,
     ):
         """Context manager that sets up the inline switch and tears it down."""
+        if side_stream_supplied is None:
+            side_stream_supplied = side_stream is not None
+        if routing_stream_supplied is None:
+            routing_stream_supplied = routing_stream is not None
         if not topk_ids.is_cuda:
             raise ValueError("topk_ids must be a CUDA tensor")
         if topk_ids.dtype != torch.int32:
@@ -127,6 +210,16 @@ class DAInlineGraphInjector:
                 cached_pool = torch.cuda.graph_pool_handle()
                 _DA_INLINE_POOL_HANDLES[device_idx] = cached_pool
             pool_handle = cached_pool
+
+        if torch.cuda.is_current_stream_capturing():
+            side_stream, routing_stream = _validated_capture_streams(
+                device=topk_ids.device,
+                outer_stream=torch.cuda.current_stream(topk_ids.device),
+                side_stream=side_stream,
+                routing_stream=routing_stream,
+                side_stream_supplied=side_stream_supplied,
+                routing_stream_supplied=routing_stream_supplied,
+            )
 
         if expert_counts is None:
             ctx_id = int(
