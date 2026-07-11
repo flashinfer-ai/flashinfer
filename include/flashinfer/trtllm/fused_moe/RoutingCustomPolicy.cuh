@@ -923,6 +923,22 @@ inline bool queryPolicySupportsBlockPerToken(Data const& data) {
   return supports;
 }
 
+// Whether the active (pre, post) policy has a compiled tier covering the runtime
+// (numExperts, topK) under the standard PolicyTraits dispatch — i.e. the tier list
+// LAUNCH_ROUTING_CUSTOM uses (block / dyn-block kernels and the cluster fallback).
+// Mirrors the dispatch predicate exactly (same policy resolution, same tier list,
+// same runtime comparison), so it reports precisely whether that launch would find
+// a tier. Lets host-side launchers surface an uncovered config as a loud error
+// instead of silently skipping the launch and leaving routing outputs uninitialized.
+inline bool queryPolicyHasCompiledTier(Data const& data) {
+  bool covered = false;
+  dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* /*policyName*/) {
+    using Pairs_ = typename PolicyTraits<decltype(preProc_), decltype(postProc_)>::Pairs;
+    covered = dispatchTierPairs(static_cast<Pairs_*>(nullptr), data, [](auto, auto) {});
+  });
+  return covered;
+}
+
 // Top-level dispatch: maps runtime preprocess/postprocess enums to compile-time policy types,
 // then delegates to the policy tier list using the supplied launch config.
 #define LAUNCH_ROUTING_CUSTOM_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads,       \

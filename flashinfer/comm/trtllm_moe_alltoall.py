@@ -158,6 +158,45 @@ def get_moe_alltoall_module():
         )
 
     @register_custom_op(
+        "flashinfer::moe_a2a_combine_into",
+        mutates_args=("workspace", "output"),
+    )
+    def moe_a2a_combine_into(
+        payload: torch.Tensor,
+        local_num_tokens: int,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        combine_payload_offset: int,
+        payload_in_workspace: bool,
+        output_dtype: Optional[torch.dtype],
+        output_scales: Optional[torch.Tensor],
+        output_scalar_scale: float,
+        sf_layout: Optional[SfLayout],
+        output: torch.Tensor,
+    ) -> None:
+        module.moe_a2a_combine_into(
+            payload,
+            local_num_tokens,
+            workspace,
+            metainfo,
+            runtime_max_tokens_per_rank,
+            ep_rank,
+            ep_size,
+            top_k,
+            combine_payload_offset,
+            payload_in_workspace,
+            output_dtype,
+            output_scales,
+            output_scalar_scale,
+            sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
+            output,
+        )
+
+    @register_custom_op(
         "flashinfer::moe_a2a_sanitize_expert_ids",
         mutates_args=("expert_ids",),
     )
@@ -210,6 +249,7 @@ def get_moe_alltoall_module():
         moe_a2a_initialize=moe_a2a_initialize,
         moe_a2a_dispatch=moe_a2a_dispatch,
         moe_a2a_combine=moe_a2a_combine,
+        moe_a2a_combine_into=moe_a2a_combine_into,
         moe_a2a_sanitize_expert_ids=moe_a2a_sanitize_expert_ids,
         moe_a2a_get_metainfo_index_pairs=moe_a2a_get_metainfo_index_pairs,
         moe_a2a_get_aux_data_size=moe_a2a_get_aux_data_size,
@@ -400,6 +440,7 @@ def moe_a2a_combine(
     output_scales: Optional[torch.Tensor] = None,
     output_scalar_scale: float = 1.0,
     sf_layout: SfLayout = SfLayout.layout_linear,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Combine per-expert outputs back to the originating ranks.
 
@@ -446,13 +487,26 @@ def moe_a2a_combine(
         paths.
     sf_layout : SfLayout
         Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
+    output : Optional[torch.Tensor]
+        Caller-provided contiguous output tensor. Its shape and dtype must
+        match the requested combine output, and it must be on the same device
+        as ``payload``.
 
     Returns
     -------
     torch.Tensor
         ``[local_num_tokens, *]`` tensor with the combined outputs.
     """
-    return get_moe_alltoall_module().moe_a2a_combine(
+    if output is not None:
+        if not output.is_cuda:
+            raise ValueError(
+                f"output must be a CUDA tensor, got device={output.device}"
+            )
+        if not output.is_contiguous():
+            raise ValueError(f"output must be contiguous, got stride={output.stride()}")
+
+    module = get_moe_alltoall_module()
+    args = (
         payload,
         local_num_tokens,
         workspace,
@@ -468,6 +522,10 @@ def moe_a2a_combine(
         output_scalar_scale,
         sf_layout,
     )
+    if output is None:
+        return module.moe_a2a_combine(*args)
+    module.moe_a2a_combine_into(*args, output)
+    return output
 
 
 @flashinfer_api
@@ -924,6 +982,7 @@ class MoeAlltoAll:
         output_scales: Optional[torch.Tensor] = None,
         output_scalar_scale: float = 1.0,
         sf_layout: SfLayout = SfLayout.layout_linear,
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the MoE all-to-all combine phase.
 
@@ -950,6 +1009,10 @@ class MoeAlltoAll:
             paths.
         sf_layout : SfLayout
             Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
+        output : Optional[torch.Tensor]
+            Caller-provided contiguous output tensor. Its shape and dtype must
+            match the requested combine output, and it must be on the same
+            device as ``payload``.
 
         Returns
         -------
@@ -980,6 +1043,7 @@ class MoeAlltoAll:
             output_scales,
             output_scalar_scale,
             sf_layout,
+            output,
         )
 
         # Reset state for next round

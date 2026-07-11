@@ -37,6 +37,7 @@ from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
+    bgmv_moe_gemm1_lora_delta,
     convert_to_block_layout,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
@@ -3292,10 +3293,16 @@ def run_moe_test(
     norm_topk_prob=True,
     check_reference=True,
     check_intermediate_output=False,
+    gemm1_lora_args=None,
     verify_unfinalized_weight_dtype=False,
 ):
-    """Common test logic for all routing methods."""
-    if gemm1_lora_delta is not None:
+    """Common test logic for all routing methods.
+
+    ``gemm1_lora_args``: optional dict of LoRA inputs (``w_ptr_a``, ``lora_stride_a``,
+    ``w_ptr_b``, ``lora_stride_b``, ``lora_ids``, ``rank``, optional ``scale``) used to
+    build the real FC1 delta internally against the generated hidden states/routing.
+    """
+    if gemm1_lora_delta is not None or gemm1_lora_args is not None:
         check_intermediate_output = True
 
     skip_checks(
@@ -3428,6 +3435,22 @@ def run_moe_test(
     else:
         raise NotImplementedError(
             f"Routing method {routing_method_type} not implemented"
+        )
+
+    # Build the real FC1 LoRA delta from the generated hidden states + routing.
+    if gemm1_lora_delta is None and gemm1_lora_args is not None:
+        gemm1_lora_delta = bgmv_moe_gemm1_lora_delta(
+            hidden_states,
+            gemm1_lora_args["w_ptr_a"],
+            gemm1_lora_args["lora_stride_a"],
+            gemm1_lora_args["w_ptr_b"],
+            gemm1_lora_args["lora_stride_b"],
+            permute_info["topKIndices"].to(torch.int64),
+            gemm1_lora_args["lora_ids"],
+            gemm1_lora_args["rank"],
+            intermediate_size,
+            scale=gemm1_lora_args.get("scale", 1.0),
+            out_dtype=torch.bfloat16,
         )
 
     # 1. Quantize weights offline
