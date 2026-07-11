@@ -29,11 +29,10 @@ void checkpointing_ssu(
     TensorView C,  // same as B
     TensorView output,  // same layout as x
     // Cache tensors
-    TensorView old_x,              // (cache, T, nheads, dim)
-    TensorView old_B,              // (cache, 2, T, ngroups, dstate)
-    TensorView old_dt,             // (cache, 2, nheads, T) f32
-    TensorView old_cumAdt,         // (cache, 2, nheads, T) f32
-    TensorView cache_buf_idx,      // (cache,) int32
+    TensorView x_cache,            // (cache, nheads, RING_BUFFER_LEN, dim)
+    TensorView B_cache,            // (cache, ngroups, RING_BUFFER_LEN, dstate)
+    TensorView dt_cache,           // (cache, nheads, RING_BUFFER_LEN) f32
+    TensorView ring_start,         // (cache,) int32
     TensorView prev_num_accepted,  // (cache,) int32
     // Optional tensors
     Optional<TensorView> D,        // (nheads, dim)

@@ -71,10 +71,9 @@ def _get_module(
     mutates_args=(
         "state",
         "out",
-        "old_x",
-        "old_B",
-        "old_dt",
-        "old_cumAdt",
+        "x_cache",
+        "B_cache",
+        "dt_cache",
         "state_scale",
         # Two-kernel scratch — the precompute writes them.
         "cb_scaled",
@@ -90,11 +89,10 @@ def _checkpointing_ssu(
     B: torch.Tensor,
     C: torch.Tensor,
     out: torch.Tensor,
-    old_x: torch.Tensor,
-    old_B: torch.Tensor,
-    old_dt: torch.Tensor,
-    old_cumAdt: torch.Tensor,
-    cache_buf_idx: torch.Tensor,
+    x_cache: torch.Tensor,
+    B_cache: torch.Tensor,
+    dt_cache: torch.Tensor,
+    ring_start: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
     D: Optional[torch.Tensor],
     z: Optional[torch.Tensor],
@@ -152,11 +150,10 @@ def _checkpointing_ssu(
         B,
         C,
         out,
-        old_x,
-        old_B,
-        old_dt,
-        old_cumAdt,
-        cache_buf_idx,
+        x_cache,
+        B_cache,
+        dt_cache,
+        ring_start,
         prev_num_accepted_tokens,
         D,
         z,
@@ -185,11 +182,10 @@ def _checkpointing_ssu_fake(
     B: torch.Tensor,
     C: torch.Tensor,
     out: torch.Tensor,
-    old_x: torch.Tensor,
-    old_B: torch.Tensor,
-    old_dt: torch.Tensor,
-    old_cumAdt: torch.Tensor,
-    cache_buf_idx: torch.Tensor,
+    x_cache: torch.Tensor,
+    B_cache: torch.Tensor,
+    dt_cache: torch.Tensor,
+    ring_start: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
     D: Optional[torch.Tensor],
     z: Optional[torch.Tensor],
@@ -228,11 +224,10 @@ def _checkpointing_ssu_fake(
 @flashinfer_api
 def checkpointing_ssu(
     state: torch.Tensor,
-    old_x: torch.Tensor,
-    old_B: torch.Tensor,
-    old_dt: torch.Tensor,
-    old_cumAdt: torch.Tensor,
-    cache_buf_idx: torch.Tensor,
+    x_cache: torch.Tensor,
+    B_cache: torch.Tensor,
+    dt_cache: torch.Tensor,
+    ring_start: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -266,16 +261,19 @@ def checkpointing_ssu(
     ----------
     state : torch.Tensor
         SSM state, shape (state_cache_size, nheads, dim, dstate). Updated in-place.
-    old_x : torch.Tensor
-        Cached x from previous step, shape (state_cache_size, T, nheads, dim). Single-buffered.
-    old_B : torch.Tensor
-        Cached B, shape (state_cache_size, 2, T, ngroups, dstate). Double-buffered.
-    old_dt : torch.Tensor
-        Cached processed dt, shape (state_cache_size, 2, nheads, T). Double-buffered, f32.
-    old_cumAdt : torch.Tensor
-        Cached cumulative A*dt, shape (state_cache_size, 2, nheads, T). Double-buffered, f32.
-    cache_buf_idx : torch.Tensor
-        Which buffer to read (0 or 1), shape (state_cache_size,), int32.
+    x_cache : torch.Tensor
+        Ring of cached x, shape (state_cache_size, nheads, RING_BUFFER_LEN, dim).
+        RING_BUFFER_LEN is implicit (= size(2)); the LOGICAL replay window is
+        max_window = RING_BUFFER_LEN - T (flush rule pnat + 2T > RING_BUFFER_LEN).
+    B_cache : torch.Tensor
+        Ring of cached B, shape (state_cache_size, ngroups, RING_BUFFER_LEN, dstate).
+    dt_cache : torch.Tensor
+        Ring of cached processed dt, shape (state_cache_size, nheads,
+        RING_BUFFER_LEN), f32.  Replay decays are recomputed from it (no
+        cumAdt is cached — prefix sums are not ring-shift-invariant).
+    ring_start : torch.Tensor
+        Ring head per slot (oldest live row), shape (state_cache_size,), int32.
+        The HOST owns bookkeeping: advance by the replayed count on flush.
     prev_num_accepted_tokens : torch.Tensor
         Number of old tokens to replay, shape (state_cache_size,), int32.
     x : torch.Tensor
@@ -413,13 +411,12 @@ def checkpointing_ssu(
     # Extract JIT specialization keys
     dim = state.size(2)
     dstate = state.size(3)
-    max_window = old_x.size(1)
     # Varlen: inputs are packed (1, total_tokens, ...) — `x.size(1)` is no
     # longer a JIT key (it varies per call).  The caller must promise an
     # upper bound on every cu_seqlens[i+1] - cu_seqlens[i] via `max_seqlen`,
-    # which becomes the JIT-stamped NPREDICTED.  Default (when omitted) is
-    # max_window — wider smem than strictly needed when actual seq_lens are
-    # small, but always safe.
+    # which becomes the JIT-stamped NPREDICTED.  REQUIRED under the ring
+    # contract: RING_BUFFER_LEN = max_window + NPREDICTED, so without an
+    # explicit T the split of the ring row count is underdetermined.
     if cu_seqlens is not None:
         assert x.dim() == 4 and x.size(0) == 1, (
             f"varlen mode: x must be (1, total_tokens, nheads, dim), got shape {tuple(x.shape)}"
@@ -436,13 +433,19 @@ def checkpointing_ssu(
             f"varlen total_tokens={x.size(1)} exceeds the packed meta_cu bos "
             f"capacity (must be < {1 << 23})"
         )
-        npredicted = max_seqlen if max_seqlen is not None else max_window
+        assert max_seqlen is not None, (
+            "varlen mode requires max_seqlen under the ring contract "
+            "(RING_BUFFER_LEN = max_window + max_seqlen is otherwise ambiguous)"
+        )
+        npredicted = max_seqlen
     else:
         assert max_seqlen is None, (
             "max_seqlen is only valid with cu_seqlens (varlen mode); for "
             "non-varlen the JIT key is taken from x.size(1)"
         )
         npredicted = x.size(1)
+    # LOGICAL replay window from the implicit ring length (ReplaySSM contract).
+    max_window = x_cache.size(2) - npredicted
     assert max_window <= 16, (
         f"checkpointing_ssu supports at most 16 cache tokens (max_window), got {max_window}"
     )
@@ -556,11 +559,10 @@ def checkpointing_ssu(
         B,
         C,
         out,
-        old_x,
-        old_B,
-        old_dt,
-        old_cumAdt,
-        cache_buf_idx,
+        x_cache,
+        B_cache,
+        dt_cache,
+        ring_start,
         prev_num_accepted_tokens,
         D,
         z,

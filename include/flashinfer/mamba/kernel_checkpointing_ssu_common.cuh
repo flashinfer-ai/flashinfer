@@ -326,11 +326,17 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
 // the predicate from `< NPREDICTED` to `< seq_len`.  When the caller omits it,
 // the default is the constexpr `VALID_ROWS` so non-varlen call sites fold to
 // the same SASS as before.
-template <typename SmemShape, int VALID_ROWS, typename input_t>
+// `ZFILL` selects the cp.async variant: true (default) writes ZEROS wherever
+// the predicate is false (rows ≥ valid, padded cols) — the legacy contract;
+// false SKIPS false-predicate elements entirely (plain cp.async), which the
+// ring gather's second segment needs so it can't clobber the first segment's
+// rows.  `first_valid_row` tightens the predicate from below (default 0).
+template <typename SmemShape, int VALID_ROWS, bool ZFILL = true, typename input_t>
 __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
                                                 input_t const* __restrict__ gmem_src,
                                                 int gmem_row_stride, int lane,
-                                                int valid_rows_rt = VALID_ROWS) {
+                                                int valid_rows_rt = VALID_ROWS,
+                                                int first_valid_row = 0) {
   using namespace cute;
   constexpr int ROWS_PAD = size<0>(SmemShape{});
   constexpr int VALID_COLS = size<1>(SmemShape{});
@@ -358,7 +364,9 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   using ThrLayout = Layout<Shape<_4, _8>, Stride<_8, _1>>;
   static_assert(size<1>(ThrLayout{}) * VAL_COLS_PER_THREAD == SmemSwizzle<input_t>::ATOM_COLS,
                 "wide thread layout must cover one full swizzle atom width per row");
-  auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::AtomZFill, input_t>{}, ThrLayout{},
+  using CopyAtomT =
+      std::conditional_t<ZFILL, typename Copy_prop::AtomZFill, typename Copy_prop::Atom>;
+  auto g2s = make_tiled_copy(Copy_Atom<CopyAtomT, input_t>{}, ThrLayout{},
                              Layout<Shape<_1, Int<VAL_COLS_PER_THREAD>>>{});
   auto thr = g2s.get_slice(lane);
 
@@ -367,9 +375,57 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   auto pred = make_tensor<bool>(shape(thr_id));
   CUTE_UNROLL
   for (int i = 0; i < size(pred); ++i) {
-    pred(i) = (get<0>(thr_id(i)) < valid_rows_rt) && (get<1>(thr_id(i)) < VALID_COLS);
+    pred(i) = (get<0>(thr_id(i)) >= first_valid_row) && (get<0>(thr_id(i)) < valid_rows_rt) &&
+              (get<1>(thr_id(i)) < VALID_COLS);
   }
   copy_if(g2s, pred, thr.partition_S(g_full), thr.partition_D(s_full));
+}
+
+// Ring gather: smem rows j ∈ [0, count_rt) come from gmem ring row
+// (start + j) mod ring_len (row stride `gmem_row_stride`); rows
+// [count_rt, ROWS_PAD) end up zero (the MMA K-pad contract).  Three ops with
+// DISJOINT smem write sets — cp.async ops from one thread to the same smem
+// address within a commit group have no defined order, so no set may overlap:
+//   1. plain (non-ZFILL) copy of rows [0, n1), n1 = min(count, ring_len−start),
+//      from base + start·stride;                       false predicate ⇒ skip
+//   2. plain copy of the wrapped rows [n1, count_rt) from base − n1·stride
+//      (row r reads base + (r−n1)·stride = ring row r−n1);
+//   3. tail zeros [count_rt, ROWS_PAD) via direct smem stores (synchronous,
+//      ≤ 16 short rows; ZFILL can't express "zero ONLY the tail").
+// Predicated-off rows of op 2 compute (never dereference) sub-base addresses —
+// same class as the legacy helper's OOB rows beyond the cache.
+template <typename SmemShape, int COUNT, typename input_t>
+__device__ __forceinline__ void load_ring_tile_async(input_t* __restrict__ smem_dst,
+                                                     input_t const* __restrict__ gmem_base,
+                                                     int gmem_row_stride, int lane, int ring_start,
+                                                     int ring_len, int count_rt = COUNT) {
+  int const n1 = ring_len - ring_start >= count_rt ? count_rt : ring_len - ring_start;
+  load_tile_async<SmemShape, COUNT, /*ZFILL=*/false>(
+      smem_dst, gmem_base + (int64_t)ring_start * gmem_row_stride, gmem_row_stride, lane, n1);
+  if (n1 < count_rt) {
+    load_tile_async<SmemShape, COUNT, /*ZFILL=*/false>(
+        smem_dst, gmem_base - (int64_t)n1 * gmem_row_stride, gmem_row_stride, lane, count_rt, n1);
+  }
+  // Tail zeros (rows [count_rt, ROWS_PAD)): direct smem stores through the
+  // swizzled layout — synchronous, disjoint from the cp.async rows above.
+  {
+    using namespace cute;
+    constexpr int ROWS_PAD = size<0>(SmemShape{});
+    constexpr int VALID_COLS = size<1>(SmemShape{});
+    constexpr int SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(VALID_COLS);
+    // count_rt may be negative (callers pass prev_k-8 style residues) — clamp
+    // so the zero loop never indexes below row 0.
+    int const zero_from = count_rt < 0 ? 0 : count_rt;
+    if (zero_from < ROWS_PAD) {
+      auto s_full = make_tensor(make_smem_ptr(smem_dst),
+                                make_swizzled_layout_rc<input_t, ROWS_PAD, SMEM_COLS>());
+      for (int r = zero_from; r < ROWS_PAD; ++r) {
+        for (int c = lane; c < SMEM_COLS; c += warpSize) {
+          s_full(r, c) = input_t(0);
+        }
+      }
+    }
+  }
 }
 
 // State load — D_SPLIT-conditional dispatch:
@@ -489,23 +545,34 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
 // untouched).  Shared by the monolithic load_pre/post halves (count =
 // MAX_WINDOW, single per-CTA smem.old_dt/old_cumAdt) and the two-kernel
 // precompute (count = prev_k, per-warp slice &smem.old_dt[warp][0]).
+// Ring dt load + decay recompute.  The ring caches only dt: cumAdt (prefix
+// sums) is not ring-shift-invariant — a flush would invalidate every cached
+// entry — so it is recomputed here as A · inclusive_scan(dt) over the window
+// (≤ 16 lanes, 4 shfl steps).  All `count` lanes must participate in the scan
+// even when their dt is a masked zero, so the shuffles stay convergent.
 __device__ __forceinline__ void load_old_dt_cumAdt(CheckpointingSsuParams const& params, int lane,
-                                                   int64_t cache_slot, int buf_read, int head,
-                                                   int count, float* __restrict__ dt_dst,
+                                                   int64_t cache_slot, int ring_start, int head,
+                                                   int count, float A_val,
+                                                   float* __restrict__ dt_dst,
                                                    float* __restrict__ ca_dst) {
+  auto const* __restrict__ dt_cache_ptr = reinterpret_cast<float const*>(params.dt_cache);
+  // head·head_stride is an index into a contiguous inner dim → 32-bit;
+  // slot-distance stride (*_stride_seq) stays 64-bit.
+  int64_t const dt_base =
+      cache_slot * params.dt_cache_stride_seq + (int64_t)(head * (int)params.dt_cache_stride_head);
+  int ring_row = ring_start + lane;
+  if (ring_row >= params.ring_buffer_len) ring_row -= params.ring_buffer_len;
+  float dt_v = (lane < count) ? dt_cache_ptr[dt_base + ring_row] : 0.f;
+  // Inclusive scan over the first 16 lanes (count ≤ MAX_WINDOW ≤ 16).
+  float scan = dt_v;
+#pragma unroll
+  for (int off = 1; off < 16; off <<= 1) {
+    float const up = __shfl_up_sync(0xffffffffu, scan, off);
+    if ((lane & 15) >= off) scan += up;
+  }
   if (lane < count) {
-    auto const* __restrict__ old_dt_ptr = reinterpret_cast<float const*>(params.old_dt);
-    auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
-    // head·head_stride is an index into a contiguous inner dim → 32-bit; buffer/slot-distance
-    // strides (*_stride_seq, *_stride_dbuf) stay 64-bit (can exceed 2^31 in production).
-    int64_t const dt_base = cache_slot * params.old_dt_stride_seq +
-                            (int64_t)buf_read * params.old_dt_stride_dbuf +
-                            (int64_t)(head * (int)params.old_dt_stride_head);
-    int64_t const ca_base = cache_slot * params.old_cumAdt_stride_seq +
-                            (int64_t)buf_read * params.old_cumAdt_stride_dbuf +
-                            (int64_t)(head * (int)params.old_cumAdt_stride_head);
-    dt_dst[lane] = old_dt_ptr[dt_base + lane];
-    ca_dst[lane] = old_cumAdt_ptr[ca_base + lane];
+    dt_dst[lane] = dt_v;
+    ca_dst[lane] = A_val * scan;
   }
 }
 
@@ -550,7 +617,7 @@ template <typename input_t, typename dt_t, typename state_t, int NPREDICTED, int
           int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_pre_pdl_wait_data(
     SmemT& smem, CheckpointingSsuParams const& params, int lane, int warp, int d_tile, int head,
-    int group_idx, int64_t cache_slot, int buf_read, float A_val, float dt_bias_val,
+    int group_idx, int64_t cache_slot, int ring_start, float A_val, float dt_bias_val,
     int64_t dt_seq_base, int64_t z_seq_base, int seq_len) {
   constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
@@ -559,13 +626,14 @@ __device__ __forceinline__ void load_pre_pdl_wait_data(
   int const d_tile_off = d_tile * D_PER_CTA;
 
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
-  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
-  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
+  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.x_cache);
+  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.B_cache);
   auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
 
-  int64_t const ox_base = cache_slot * params.old_x_stride_seq + head * DIM + d_tile_off;
-  int64_t const oB_base = cache_slot * params.old_B_stride_seq +
-                          buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
+  int64_t const ox_base = cache_slot * params.x_cache_stride_seq +
+                          (int64_t)head * params.x_cache_stride_head + d_tile_off;
+  int64_t const oB_base =
+      cache_slot * params.B_cache_stride_seq + (int64_t)group_idx * params.B_cache_stride_group;
 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
@@ -599,13 +667,15 @@ __device__ __forceinline__ void load_pre_pdl_wait_data(
   // ── old_B: redundant on all 4 warps (each warp's replay consumes full
   // DSTATE).  Identical payloads to same smem dest — final bytes
   // deterministic.  VALID_ROWS = MAX_WINDOW (cache rows). ──
-  load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base, params.old_B_stride_token,
-                                         lane);
+  load_ring_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base,
+                                              (int)params.B_cache_stride_pos, lane, ring_start,
+                                              params.ring_buffer_len);
 
   // ── old_x: redundant on all 4 warps (small, simpler than partitioning).
   // VALID_ROWS = MAX_WINDOW (cache rows). ──
-  load_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base, params.old_x_stride_token,
-                                       lane);
+  load_ring_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base,
+                                            (int)params.x_cache_stride_pos, lane, ring_start,
+                                            params.ring_buffer_len);
 
   // ── z: W3 only (Phase-2 read, final __syncthreads makes it visible).
   // Sourced from in_proj — not from conv1d — so safe to issue pre-wait. ──
@@ -630,7 +700,7 @@ __device__ __forceinline__ void load_pre_pdl_wait_data(
   // dt_proc: load up to NPREDICTED lanes (new-token scalars from in_proj).
   // Synchronous LDG + plain smem stores — no cp.async.  Writes from 4
   // warps to the same slots are idempotent (same payloads). ──
-  load_old_dt_cumAdt(params, lane, cache_slot, buf_read, head, MAX_WINDOW, smem.old_dt,
+  load_old_dt_cumAdt(params, lane, cache_slot, ring_start, head, MAX_WINDOW, A_val, smem.old_dt,
                      smem.old_cumAdt);
   // dt → softplus → smem.dt_proc.  Under varlen the active lane range is
   // `[0, seq_len)`; lanes `[seq_len, NPREDICTED)` are left uninitialized —
@@ -738,7 +808,7 @@ template <typename input_t, typename dt_t, typename state_t, int NPREDICTED, int
           int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams const& params,
                                           int lane, int warp, int d_tile, int head, int group_idx,
-                                          int64_t cache_slot, int buf_read, float A_val,
+                                          int64_t cache_slot, int ring_start, float A_val,
                                           float dt_bias_val, int64_t outer, int seq_len) {
   constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
@@ -750,16 +820,17 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
   auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
-  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
-  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
+  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.x_cache);
+  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.B_cache);
   auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
 
   int64_t const B_base = outer * params.B_stride_seq + (int64_t)group_idx * DSTATE;
   int64_t const C_base = outer * params.C_stride_seq + (int64_t)group_idx * DSTATE;
   int64_t const x_base = outer * params.x_stride_seq + head * DIM + d_tile_off;
-  int64_t const ox_base = cache_slot * params.old_x_stride_seq + head * DIM + d_tile_off;
-  int64_t const oB_base = cache_slot * params.old_B_stride_seq +
-                          buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
+  int64_t const ox_base = cache_slot * params.x_cache_stride_seq +
+                          (int64_t)head * params.x_cache_stride_head + d_tile_off;
+  int64_t const oB_base =
+      cache_slot * params.B_cache_stride_seq + (int64_t)group_idx * params.B_cache_stride_group;
 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int NPREDICTED_PAD_MMA_N = SmemT::NPREDICTED_PAD_MMA_N;
@@ -791,10 +862,12 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   }
   load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane, seq_len);
 
-  load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base, params.old_B_stride_token,
-                                         lane);
-  load_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base, params.old_x_stride_token,
-                                       lane);
+  load_ring_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base,
+                                              (int)params.B_cache_stride_pos, lane, ring_start,
+                                              params.ring_buffer_len);
+  load_ring_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base,
+                                            (int)params.x_cache_stride_pos, lane, ring_start,
+                                            params.ring_buffer_len);
 
   if (warp == 2) {
     load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_token, lane,
@@ -807,7 +880,7 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   }
 
   // ── Scalar loads (overlap with cp.async) + cumAdt cumsum ──
-  load_old_dt_cumAdt(params, lane, cache_slot, buf_read, head, MAX_WINDOW, smem.old_dt,
+  load_old_dt_cumAdt(params, lane, cache_slot, ring_start, head, MAX_WINDOW, A_val, smem.old_dt,
                      smem.old_cumAdt);
   int64_t const dt_seq_base_local = outer * params.dt_stride_seq + head;
   if (lane < seq_len) {
@@ -1831,17 +1904,21 @@ __device__ __forceinline__ void store_state(SmemT& smem, CheckpointingSsuParams 
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, typename SmemT>
 __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams const& params,
                                             int warp, int lane, int d_tile, int head,
-                                            int64_t cache_slot, int write_offset, int seq_len,
-                                            int tile_buf = 0) {
+                                            int64_t cache_slot, int ring_start, int write_offset,
+                                            int seq_len, int tile_buf = 0) {
   using namespace cute;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   int const flat_tid = warp * warpSize + lane;
 
-  auto* __restrict__ old_x_w = reinterpret_cast<input_t*>(params.old_x);
-  // gmem dest = head's full slot + d_tile's D-slice offset, shifted by
-  // `write_offset` along the T-axis (must_checkpoint ? 0 : prev_k).
-  int64_t const ox_w_base = cache_slot * params.old_x_stride_seq +
-                            (int64_t)write_offset * params.old_x_stride_token + head * DIM +
+  auto* __restrict__ old_x_w = reinterpret_cast<input_t*>(params.x_cache);
+  // gmem dest = ring rows (ring_start + write_offset + i) % RING_BUFFER_LEN;
+  // write_offset is the LOGICAL append offset (= prev_k on both branches —
+  // a flush only advances ring_start, host-side, after the call).
+  int r0 = ring_start + write_offset;
+  if (r0 >= params.ring_buffer_len) r0 -= params.ring_buffer_len;
+  int const n1 = params.ring_buffer_len - r0 >= seq_len ? seq_len : params.ring_buffer_len - r0;
+  int64_t const ox_w_base = cache_slot * params.x_cache_stride_seq +
+                            (int64_t)head * params.x_cache_stride_head +
                             (int64_t)d_tile * D_PER_CTA;
 
   // Smem and gmem are both viewed at the full atom-padded width D_SMEM_COLS.
@@ -1857,9 +1934,6 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
   auto layout_x_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
   auto const* x_base = smem.x + tile_buf * NPREDICTED_PAD_MMA_M * D_SMEM_COLS;
   Tensor sX = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(x_base)), layout_x_swz);
-  Tensor gX = make_tensor(make_gmem_ptr(old_x_w + ox_w_base),
-                          make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}),
-                                      make_stride(params.old_x_stride_token, Int<1>{})));
 
   // Wide layout (16×8 threads): uses all 128 threads for maximum STG.128 bandwidth.
   // UniversalCopy<uint128_t> has no .with(bool) → copy_if falls back to software predication
@@ -1871,20 +1945,31 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{}, ThrLayoutX{},
                              Layout<Shape<_1, _8>>{});
   auto thr_s2g = s2g.get_slice(flat_tid);
-
   auto tSsX = thr_s2g.partition_S(sX);
-  auto tSgX = thr_s2g.partition_D(gX);
-
-  // Per-(row, col) predicate: skip rows ≥ NPREDICTED (m-padding) and cols ≥
-  // D_PER_CTA (atom-padding past the d_tile's data).
   auto cX = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}));
   auto tScX = thr_s2g.partition_D(cX);
-  auto pred = make_tensor<bool>(shape(tScX));
+
+  // Two disjoint-row segments cover the ring wrap: smem rows [0, n1) land at
+  // ring rows r0+…, rows [n1, seq_len) at ring rows 0+… (base − n1·stride).
+  int const seg_lo[2] = {0, n1};
+  int const seg_hi[2] = {n1, seq_len};
+  int64_t const seg_base[2] = {(int64_t)r0, -(int64_t)n1};
   CUTE_UNROLL
-  for (int i = 0; i < size(pred); ++i) {
-    pred(i) = (get<0>(tScX(i)) < seq_len) && (get<1>(tScX(i)) < D_PER_CTA);
+  for (int sg = 0; sg < 2; ++sg) {
+    if (seg_lo[sg] >= seg_hi[sg]) continue;
+    Tensor gX =
+        make_tensor(make_gmem_ptr(old_x_w + ox_w_base + seg_base[sg] * params.x_cache_stride_pos),
+                    make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}),
+                                make_stride(params.x_cache_stride_pos, Int<1>{})));
+    auto tSgX = thr_s2g.partition_D(gX);
+    auto pred = make_tensor<bool>(shape(tScX));
+    CUTE_UNROLL
+    for (int i = 0; i < size(pred); ++i) {
+      pred(i) = (get<0>(tScX(i)) >= seg_lo[sg]) && (get<0>(tScX(i)) < seg_hi[sg]) &&
+                (get<1>(tScX(i)) < D_PER_CTA);
+    }
+    copy_if(s2g, pred, tSsX, tSgX);
   }
-  copy_if(s2g, pred, tSsX, tSgX);
 }
 
 // store_old_B runs on W0, W1 only (64 threads).  Caller must gate
@@ -1893,7 +1978,7 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
 // overlap (writeback fires before CB+replay consume smem.B).
 //
 // Source: smem.B with NPREDICTED_PAD_MMA_N rows.
-// Destination: gmem old_B[buf_write][write_offset:write_offset+NPREDICTED, :].
+// Destination: B_cache ring rows (ring_start + write_offset + i) % RING_BUFFER_LEN.
 // The `write_offset` argument shifts the gmem T-axis base — it's added to the
 // base pointer below; the per-element predicate masks rows ≥ NPREDICTED.
 //
@@ -1906,7 +1991,7 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
 template <typename input_t, int NPREDICTED, int DSTATE, int HEADS_PER_GROUP, typename SmemT>
 __device__ __forceinline__ void store_old_B(SmemT& smem, CheckpointingSsuParams const& params,
                                             int warp, int lane, int head, int group_idx,
-                                            int64_t cache_slot, int buf_write, int write_offset,
+                                            int64_t cache_slot, int ring_start, int write_offset,
                                             int seq_len) {
   using namespace cute;
   if (head % HEADS_PER_GROUP != 0) return;
@@ -1914,45 +1999,45 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, CheckpointingSsuParams 
   // Called only from warps 0, 1 — flat_tid ∈ [0, 64).
   int const flat_tid = warp * warpSize + lane;
 
-  auto* __restrict__ old_B_w = reinterpret_cast<input_t*>(params.old_B);
-  int64_t const oB_base = cache_slot * params.old_B_stride_seq +
-                          buf_write * params.old_B_stride_dbuf +
-                          (int64_t)write_offset * params.old_B_stride_token + group_idx * DSTATE;
+  auto* __restrict__ old_B_w = reinterpret_cast<input_t*>(params.B_cache);
+  int r0 = ring_start + write_offset;
+  if (r0 >= params.ring_buffer_len) r0 -= params.ring_buffer_len;
+  int const n1 = params.ring_buffer_len - r0 >= seq_len ? seq_len : params.ring_buffer_len - r0;
+  int64_t const oB_base =
+      cache_slot * params.B_cache_stride_seq + (int64_t)group_idx * params.B_cache_stride_group;
 
   auto layout_B_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_N, DSTATE>();
   Tensor sB = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.B)), layout_B_swz);
-  Tensor gB = make_tensor(make_gmem_ptr(old_B_w + oB_base),
-                          make_layout(make_shape(Int<NPREDICTED_PAD_MMA_N>{}, Int<DSTATE>{}),
-                                      make_stride(params.old_B_stride_token, Int<1>{})));
 
   // 64 threads, (8, 8) × (1, 8) = atom-aligned per-tile (8, 64).
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{},
                              Layout<Shape<_8, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
   auto thr_s2g = s2g.get_slice(flat_tid);
   auto tSsB = thr_s2g.partition_S(sB);
-  auto tSgB = thr_s2g.partition_D(gB);
-
-  // Fast path: no smem-side row padding AND no varlen-side truncation.
-  // The runtime `seq_len == NPREDICTED` is a constexpr-foldable compare in
-  // the non-varlen path (kernel prologue assigns `seq_len = NPREDICTED`),
-  // so it eliminates at -O3.  In varlen with `seq_len == NPREDICTED` it's
-  // a runtime check that picks the cheaper unpredicated STG.
-  if constexpr (NPREDICTED == NPREDICTED_PAD_MMA_N) {
-    if (seq_len == NPREDICTED) {
-      copy(s2g, tSsB, tSgB);
-      return;
-    }
-  }
-  // Predicated: either smem rows > NPREDICTED (m-padding) OR varlen with
-  // seq_len < NPREDICTED.  Mask each iter against `seq_len`.
   auto cB = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_N>{}, Int<DSTATE>{}));
   auto tScB = thr_s2g.partition_D(cB);
-  auto pred = make_tensor<bool>(shape(tScB));
+
+  // Two disjoint-row segments cover the ring wrap (see store_old_x).  The
+  // pre-ring seq_len == NPREDICTED unpredicated fast path is subsumed: the
+  // no-wrap case is a single predicated pass with rows [0, seq_len).
+  int const seg_lo[2] = {0, n1};
+  int const seg_hi[2] = {n1, seq_len};
+  int64_t const seg_base[2] = {(int64_t)r0, -(int64_t)n1};
   CUTE_UNROLL
-  for (int i = 0; i < size(pred); ++i) {
-    pred(i) = get<0>(tScB(i)) < seq_len;
+  for (int sg = 0; sg < 2; ++sg) {
+    if (seg_lo[sg] >= seg_hi[sg]) continue;
+    Tensor gB =
+        make_tensor(make_gmem_ptr(old_B_w + oB_base + seg_base[sg] * params.B_cache_stride_pos),
+                    make_layout(make_shape(Int<NPREDICTED_PAD_MMA_N>{}, Int<DSTATE>{}),
+                                make_stride(params.B_cache_stride_pos, Int<1>{})));
+    auto tSgB = thr_s2g.partition_D(gB);
+    auto pred = make_tensor<bool>(shape(tScB));
+    CUTE_UNROLL
+    for (int i = 0; i < size(pred); ++i) {
+      pred(i) = (get<0>(tScB(i)) >= seg_lo[sg]) && (get<0>(tScB(i)) < seg_hi[sg]);
+    }
+    copy_if(s2g, pred, tSsB, tSgB);
   }
-  copy_if(s2g, pred, tSsB, tSgB);
 }
 
 }  // namespace flashinfer::mamba::checkpointing

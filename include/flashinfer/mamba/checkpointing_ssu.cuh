@@ -50,16 +50,23 @@ struct CheckpointingSsuParams {
   void* __restrict__ dt_bias{nullptr};  // (nheads, dim) tie_hdim, optional
   void* __restrict__ output{nullptr};   // (batch, NPREDICTED, nheads, dim)
 
-  // ── Cache tensors for incremental replay ──
-  void* __restrict__ old_x{nullptr};  // (state_cache_size, MAX_WINDOW, nheads, dim) single-buffered
-  void* __restrict__ old_B{
-      nullptr};  // (state_cache_size, 2, MAX_WINDOW, ngroups, dstate) double-buffered
-  void* __restrict__ old_dt{
-      nullptr};  // (state_cache_size, 2, nheads, MAX_WINDOW) double-buffered, f32
-  void* __restrict__ old_cumAdt{
-      nullptr};  // (state_cache_size, 2, nheads, MAX_WINDOW) double-buffered, f32
-  void* __restrict__ cache_buf_idx{nullptr};      // (state_cache_size,) int32
+  // ── Ring-buffer cache tensors (ReplaySSM contract, 2026-07-10) ──
+  // Single-buffered, head-major.  The physical ring length RING_BUFFER_LEN is
+  // RUNTIME-implicit (`ring_buffer_len` below = the tensors' row count, never
+  // a JIT key); the LOGICAL replay window is the compile-time MAX_WINDOW =
+  // RING_BUFFER_LEN - NPREDICTED (flush rule pnat + 2T > RING_BUFFER_LEN ⇔
+  // pnat + T > MAX_WINDOW).  ring_start[slot] is the oldest live row; live
+  // rows are (ring_start + j) % RING_BUFFER_LEN for j in [0, pnat); appends
+  // land at (ring_start + pnat + i) % RING_BUFFER_LEN.  The HOST owns all
+  // bookkeeping (start advance on flush, pnat update) — kernels only read
+  // ring_start/pnat and append.  No decay is cached: replay decays are
+  // recomputed from dt_cache.
+  void* __restrict__ x_cache{nullptr};     // (state_cache_size, nheads, RING_BUFFER_LEN, dim)
+  void* __restrict__ B_cache{nullptr};     // (state_cache_size, ngroups, RING_BUFFER_LEN, dstate)
+  void* __restrict__ dt_cache{nullptr};    // (state_cache_size, nheads, RING_BUFFER_LEN) f32
+  void* __restrict__ ring_start{nullptr};  // (state_cache_size,) int32
   void* __restrict__ prev_num_accepted{nullptr};  // (state_cache_size,) int32
+  int32_t ring_buffer_len{};                      // = MAX_WINDOW + NPREDICTED (host-asserted)
 
   // ── Index tensors ──
   void* __restrict__ state_batch_indices{nullptr};  // (batch,) optional
@@ -118,24 +125,20 @@ struct CheckpointingSsuParams {
   int64_t z_stride_seq{};
   int64_t z_stride_token{};
 
-  // old_x: (state_cache_size, MAX_WINDOW, nheads, dim) — single-buffered
-  int64_t old_x_stride_seq{};
-  int64_t old_x_stride_token{};
+  // x_cache: (state_cache_size, nheads, RING_BUFFER_LEN, dim) — row (dim) contiguous,
+  // one head's RING_BUFFER_LEN rows contiguous
+  int64_t x_cache_stride_seq{};
+  int64_t x_cache_stride_head{};
+  int64_t x_cache_stride_pos{};
 
-  // old_B: (state_cache_size, 2, MAX_WINDOW, ngroups, dstate) — double-buffered
-  int64_t old_B_stride_seq{};
-  int64_t old_B_stride_dbuf{};
-  int64_t old_B_stride_token{};
+  // B_cache: (state_cache_size, ngroups, RING_BUFFER_LEN, dstate)
+  int64_t B_cache_stride_seq{};
+  int64_t B_cache_stride_group{};
+  int64_t B_cache_stride_pos{};
 
-  // old_dt: (state_cache_size, 2, nheads, MAX_WINDOW) — double-buffered, MAX_WINDOW contiguous
-  int64_t old_dt_stride_seq{};
-  int64_t old_dt_stride_dbuf{};
-  int64_t old_dt_stride_head{};
-
-  // old_cumAdt: (state_cache_size, 2, nheads, MAX_WINDOW) — double-buffered, MAX_WINDOW contiguous
-  int64_t old_cumAdt_stride_seq{};
-  int64_t old_cumAdt_stride_dbuf{};
-  int64_t old_cumAdt_stride_head{};
+  // dt_cache: (state_cache_size, nheads, RING_BUFFER_LEN) — pos contiguous
+  int64_t dt_cache_stride_seq{};
+  int64_t dt_cache_stride_head{};
 
   // state_scale: (state_cache_size, nheads, dim)
   int64_t state_scale_stride_seq{};

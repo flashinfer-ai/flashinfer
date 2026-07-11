@@ -78,8 +78,8 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
   FLASHINFER_CHECK_ALIGNMENT(params.C, 16);
   FLASHINFER_CHECK_ALIGNMENT(params.x, 16);
   FLASHINFER_CHECK_ALIGNMENT(params.state, 16);
-  FLASHINFER_CHECK_ALIGNMENT(params.old_x, 16);
-  FLASHINFER_CHECK_ALIGNMENT(params.old_B, 16);
+  FLASHINFER_CHECK_ALIGNMENT(params.x_cache, 16);
+  FLASHINFER_CHECK_ALIGNMENT(params.B_cache, 16);
   FLASHINFER_CHECK_ALIGNMENT(params.output, 16);
   if (params.z != nullptr) {
     FLASHINFER_CHECK_ALIGNMENT(params.z, 16);

@@ -118,10 +118,11 @@ struct CheckpointingSsuMainStorage {
   static constexpr int META_RING = 32;
   static_assert((META_RING & (META_RING - 1)) == 0, "META_RING must be a power of two");
   int32_t meta_pnat[META_RING];
-  int32_t meta_buf_read[META_RING];
+  int32_t meta_ring_start[META_RING];
   float meta_D[META_RING];
+  float meta_A[META_RING];  // per-head A scalar — the dt->cumAdt ring scan needs it at prefetch
   int32_t meta_cache_slot[META_RING];
-  // Varlen row geometry, batched into the ring like pnat/buf_read so is_valid / mc_of /
+  // Varlen row geometry, batched into the ring like pnat/ring_start so is_valid / mc_of /
   // derive_head never touch cu_seqlens per unit (up to ~12 __ldg/unit across their re-derivation
   // sites — measured +5-7% at b=1024 before this).  bos and seq_len are PACKED into one int32
   // ((bos << SEQLEN_BITS) | seq_len): one STS/LDS on the meta path instead of two, half the
@@ -158,23 +159,22 @@ template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, in
           int D_PER_CTA, int DSTATE, int NUM_WARPS, bool IS_FIRST, typename SmemT>
 __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams const& params,
                                           int lane, int warp, int d_tile, int head, int group_idx,
-                                          int64_t cache_slot, int buf_read, int64_t outer,
-                                          int seq_len, bool must_checkpoint, int prev_k,
-                                          int tile_buf) {
+                                          int64_t cache_slot, int ring_start, float A_val,
+                                          int64_t outer, int seq_len, bool must_checkpoint,
+                                          int prev_k, int tile_buf) {
   using namespace cute;
   int const d_tile_off = d_tile * D_PER_CTA;
 
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
-  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
-  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
+  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.x_cache);
+  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.B_cache);
 
-  // Indices into contiguous inner dims (head·DIM, group·DSTATE) are ≪ 2^31 → fold in 32-bit and
-  // cast ONCE onto the int64 base (native IMAD, not a 64-bit chain).  Buffer/slot-distance strides
-  // (*_stride_seq, *_stride_dbuf) stay 64-bit — they can exceed 2^31 in production layouts.
-  int64_t const ox_base = cache_slot * params.old_x_stride_seq + (int64_t)(head * DIM + d_tile_off);
-  int64_t const oB_base = cache_slot * params.old_B_stride_seq +
-                          (int64_t)buf_read * params.old_B_stride_dbuf +
-                          (int64_t)(group_idx * DSTATE);
+  // Slot-distance strides (*_stride_seq) stay 64-bit — they can exceed 2^31
+  // in production layouts; head/group strides are per-slot-internal.
+  int64_t const ox_base = cache_slot * params.x_cache_stride_seq +
+                          (int64_t)head * params.x_cache_stride_head + d_tile_off;
+  int64_t const oB_base =
+      cache_slot * params.B_cache_stride_seq + (int64_t)group_idx * params.B_cache_stride_group;
 
   constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
   using ZShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<D_PER_CTA>>;
@@ -198,33 +198,35 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
   // rows 8-15 of the full layout exactly.  W1's half ZFILLs when prev_k≤8 (cheap), and at
   // max_window=8 (no upper half) W1 is idle — accepted, not generalized per combination.
   using OxHalfShape = cute::Shape<cute::Int<8>, cute::Int<D_PER_CTA>>;
+  int const rs8 = ring_start + 8 >= params.ring_buffer_len ? ring_start + 8 - params.ring_buffer_len
+                                                           : ring_start + 8;
   if (warp == 0)
-    load_tile_async<OxHalfShape, /*VALID_ROWS=*/8>(old_x_slot, old_x_ptr + ox_base,
-                                                   params.old_x_stride_token, lane,
-                                                   /*valid_rows_rt=*/prev_k);
+    load_ring_tile_async<OxHalfShape, /*COUNT=*/8>(old_x_slot, old_x_ptr + ox_base,
+                                                   (int)params.x_cache_stride_pos, lane, ring_start,
+                                                   params.ring_buffer_len,
+                                                   /*count_rt=*/prev_k < 8 ? prev_k : 8);
   if constexpr (MAX_WINDOW_PAD_MMA_K > 8)
     if (warp == 1)
-      load_tile_async<OxHalfShape, /*VALID_ROWS=*/8>(
-          old_x_slot + 8 * SmemT::D_SMEM_COLS, old_x_ptr + ox_base + 8 * params.old_x_stride_token,
-          params.old_x_stride_token, lane, /*valid_rows_rt=*/prev_k - 8);
+      load_ring_tile_async<OxHalfShape, /*COUNT=*/8>(
+          old_x_slot + 8 * SmemT::D_SMEM_COLS, old_x_ptr + ox_base, (int)params.x_cache_stride_pos,
+          lane, rs8, params.ring_buffer_len,
+          /*count_rt=*/prev_k - 8);
   if (must_checkpoint) {
     if constexpr (IS_FIRST)
       if (warp == 1)
-        load_tile_async<OldBShape, MAX_WINDOW>(old_B_slot, old_B_ptr + oB_base,
-                                               params.old_B_stride_token, lane);
+        load_ring_tile_async<OldBShape, MAX_WINDOW>(old_B_slot, old_B_ptr + oB_base,
+                                                    (int)params.B_cache_stride_pos, lane,
+                                                    ring_start, params.ring_buffer_len);
     if (warp == 2)
-      load_old_dt_cumAdt(params, lane, cache_slot, buf_read, head, MAX_WINDOW, old_dt_slot,
+      load_old_dt_cumAdt(params, lane, cache_slot, ring_start, head, MAX_WINDOW, A_val, old_dt_slot,
                          old_cumAdt_slot);
-  } else if (prev_k > 0 && warp == 0 && lane == 0) {
-    auto const* __restrict__ oca_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
-    int64_t const ca_base = cache_slot * params.old_cumAdt_stride_seq +
-                            (int64_t)buf_read * params.old_cumAdt_stride_dbuf +
-                            (int64_t)(head * (int)params.old_cumAdt_stride_head);
-    // β tail (one float).  cp.async, NOT a synchronous LDG→STS: this is the only blocking load left
-    // in the prefetch path, and as a single-lane sync load it made W0 the laggard at the publish
-    // barrier.  As cp.async it's non-blocking (W0 issues + continues) and drains with the bundle.
-    __pipeline_memcpy_async(&old_cumAdt_slot[prev_k - 1], &oca_ptr[ca_base + prev_k - 1],
-                            sizeof(float));
+  } else if (prev_k > 0 && warp == 0) {
+    // β tail: exp(cumAdt[prev_k-1]).  The ring caches no decay, so the tail is
+    // recomputed from the dt ring by the same warp-wide scan the write path
+    // uses (≤16 parallel LDGs + 4 shfls — replaces the old one-float cp.async;
+    // the scan also fills old_dt/old_cumAdt, harmless extra smem writes).
+    load_old_dt_cumAdt(params, lane, cache_slot, ring_start, head, MAX_WINDOW, A_val, old_dt_slot,
+                       old_cumAdt_slot);
   }
   if (warp == 3 && z_ptr) {
     int64_t const z_base = outer * params.z_stride_seq + (int64_t)(head * DIM + d_tile_off);
@@ -357,9 +359,10 @@ template <typename input_t, typename weight_t, typename state_t, int NPREDICTED,
           bool MUST_CHECKPOINT, typename SmemT>
 __device__ __forceinline__ void output_head(SmemT& smem, CheckpointingSsuParams const& params,
                                             int lane, int warp, int d_tile, int head, int seq,
-                                            int64_t cache_slot, int prev_k, int64_t outer,
-                                            int seq_len, int64_t out_seq_base, int write_offset,
-                                            int64_t rand_seed, int tile_buf, float D_val) {
+                                            int64_t cache_slot, int ring_start, int prev_k,
+                                            int64_t outer, int seq_len, int64_t out_seq_base,
+                                            int write_offset, int64_t rand_seed, int tile_buf,
+                                            float D_val) {
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int CB_NEW_REGS = NPREDICTED_PAD_MMA_M / 2;
   constexpr int CB_OLD_REGS = SmemT::MAX_WINDOW_PAD_MMA_K / 2;
@@ -384,7 +387,8 @@ __device__ __forceinline__ void output_head(SmemT& smem, CheckpointingSsuParams 
   // store_old_x: 128-thread cooperative copy (16×8 layout), only first 4 warps participate.
   if (warp < 4)
     store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
-                                                     cache_slot, write_offset, seq_len, tile_buf);
+                                                     cache_slot, ring_start, write_offset, seq_len,
+                                                     tile_buf);
 }
 
 // add_init_out_ring (OPERAND SWAP): OUT.1 = state @ Cᵀ → frag_y[d, t] = Σ_n state[d,n]·C[t,n].
@@ -440,9 +444,9 @@ template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, in
           typename FragCBNew, typename FragCBOld, typename SmemT>
 __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuParams const& params,
                                                int lane, int warp, int d_tile, int head,
-                                               int64_t cache_slot, int prev_k, int64_t out_seq_base,
-                                               int write_offset, int seq_len, float D_val,
-                                               float beta_extra, int tile_buf,
+                                               int64_t cache_slot, int ring_start, int prev_k,
+                                               int64_t out_seq_base, int write_offset, int seq_len,
+                                               float D_val, float beta_extra, int tile_buf,
                                                FragCBNew const& frag_CB_new,
                                                FragCBOld const& frag_CB_old) {
   using namespace cute;
@@ -621,7 +625,8 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
   // store_old_x: 128-thread cooperative copy (16×8 layout), only first 4 warps participate.
   if (warp < 4)
     store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
-                                                     cache_slot, write_offset, seq_len, tile_buf);
+                                                     cache_slot, ring_start, write_offset, seq_len,
+                                                     tile_buf);
 }
 
 // replay_state_mma_ring: main-local copy of ssu.cuh's replay_state_mma, but with old_B ALSO
@@ -868,11 +873,12 @@ __device__ __forceinline__ void replay_state_mma_ring(SmemT& smem,
 struct HeadMetaSSU {
   int tile{-1};
   int pnat{0};             // prev_num_accepted[cache_slot], batched at fill_meta
-  int buf_read{0};         // cache_buf_idx[cache_slot], batched at fill_meta
+  int ring_start{0};       // ring_start[cache_slot], batched at fill_meta
   int32_t cache_slot{-1};  // -1 = pad / past-the-end (fill_meta canonicalizes pad_slot_id).
                            // int32 like the ring slot: no widening SHF on the LDS critical path;
                            // consumers promote inside their int64 address math (native IMAD.WIDE).
   float D_val{0.f};        // params.D[head] skip coeff
+  float A_val{0.f};        // params.A[head] scalar (tie_hdim) — decay recompute
   int32_t seq_len{0};      // varlen only: cu[seq+1]-cu[seq], batched at fill_meta.  Dense never
                            // reads/writes these two — SROA drops the dead registers.
   int32_t bos{0};          // varlen only: cu[seq] (packed token offset)
@@ -880,12 +886,12 @@ struct HeadMetaSSU {
 
 // Working scalars derived from a meta-ring entry (derive_head output).
 struct HeadCoords {
-  int d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len;
+  int d_tile, seq, first_head, group_idx, ring_start, prev_k, seq_len;
   int64_t outer;
 };
 
 // derive_head: expand the ring entry into the working scalars.  Pure ALU for BOTH layouts — the
-// tile unflatten is constexpr divides and pnat / buf_read (varlen: + seq_len / bos) were batched
+// tile unflatten is constexpr divides and pnat / ring_start (varlen: + seq_len / bos) were batched
 // into the ring at fill_meta — so re-deriving at a use site costs no memory traffic.
 template <int NHEADS, int HEADS_PER_GROUP, int D_SPLIT, int NPREDICTED, bool VARLEN>
 __device__ __forceinline__ HeadCoords derive_head(CheckpointingSsuParams const& /*params*/,
@@ -895,7 +901,7 @@ __device__ __forceinline__ HeadCoords derive_head(CheckpointingSsuParams const& 
   coords.d_tile = (meta.tile / NHEADS) % D_SPLIT;          // compile-time D_SPLIT divisor
   coords.seq = (meta.tile / NHEADS) / D_SPLIT;             // batch is the range, never a divisor
   coords.group_idx = coords.first_head / HEADS_PER_GROUP;  // compile-time HPG divisor
-  coords.buf_read = meta.buf_read;
+  coords.ring_start = meta.ring_start;
   coords.prev_k = meta.pnat;
   if constexpr (VARLEN) {
     coords.seq_len = meta.seq_len;
@@ -918,8 +924,8 @@ __device__ __forceinline__ void prefetch_async_pre_gdc(SmemT& smem,
       smem, params, lane, warp, coords.d_tile, coords.first_head, meta.cache_slot, slot);
   load_head<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
             /*IS_FIRST=*/true>(smem, params, lane, warp, coords.d_tile, coords.first_head,
-                               coords.group_idx, meta.cache_slot, coords.buf_read, coords.outer,
-                               coords.seq_len, must_checkpoint, coords.prev_k, slot);
+                               coords.group_idx, meta.cache_slot, coords.ring_start, meta.A_val,
+                               coords.outer, coords.seq_len, must_checkpoint, coords.prev_k, slot);
 }
 
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, typename SmemT>
@@ -1056,11 +1062,13 @@ __device__ __forceinline__ void compute_output_and_store(SmemT& smem,
         frag_CB_old[on](r) = raw.val[on * CB_OLD_REGS_PER + r];
   }
   int64_t const out_seq_base = outer * params.out_stride_seq;
-  int const write_offset = MUST_CHECKPOINT ? 0 : prev_k;
+  // Ring: appends land at (ring_start + prev_k + i) % RING_BUFFER_LEN on both
+  // branches; the flush advances ring_start host-side after the step.
+  int const write_offset = prev_k;
   output_head_2k<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS,
                  NUM_WARPS, MUST_CHECKPOINT>(
-      smem, params, lane, warp, d_tile, first_head, meta.cache_slot, prev_k, out_seq_base,
-      write_offset, seq_len, D_val, beta_extra, slot, frag_CB_new, frag_CB_old);
+      smem, params, lane, warp, d_tile, first_head, meta.cache_slot, meta.ring_start, prev_k,
+      out_seq_base, write_offset, seq_len, D_val, beta_extra, slot, frag_CB_new, frag_CB_old);
 }
 
 // process_head: PURE CONSUMER of a prefetched ring slot — replay (write path) then output.  The
@@ -1150,13 +1158,14 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
   auto const* __restrict__ cu = reinterpret_cast<int32_t const*>(params.cu_seqlens);
   auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
-  auto const* __restrict__ cbi = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
+  auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
+  auto const* __restrict__ rsp = reinterpret_cast<int32_t const*>(params.ring_start);
 
   // ── META PIPELINE: gmem →(32-wide, once per window)→ SMEM RING →(1 LDS/unit, STAGES early)→
   // REGISTER QUEUE ──
   // Level 1 — smem ring (slot = unit % META_RING): fill_meta(base) resolves units
   // [base, base+META_RING) warp-wide — lane l owns unit base+l — so the sbi[seq] →
-  // {prev_num_accepted, cache_buf_idx} dependent chase (+ D[head]) runs 32-wide ONCE per window
+  // {prev_num_accepted, ring_start} dependent chase (+ D/A[head]) runs 32-wide ONCE per window
   // instead of per unit (was the top-2 long_scoreboard sites).  ALL warps fill redundantly with
   // identical values: each warp writes the full window and reads only its own smem writes, so
   // __syncwarp() is the only fence needed (no block barrier).  Refill every META_RING−STAGES
@@ -1181,18 +1190,19 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
     int const work_unit = blockIdx.x + unit * stride;
     int const ring_slot = unit & (META_RING - 1);
     int32_t cache_slot = -1;  // canonical pad / past-the-end sentinel
-    int pnat = 0, buf_read = 0;
+    int pnat = 0, ring_start = 0;
     int32_t seq_len = 0, bos = 0;
-    float D_val = 0.f;
+    float D_val = 0.f, A_val = 0.f;
     if (work_unit < total_work) {
       int const seq = (work_unit / NHEADS) / D_SPLIT;  // compile-time NHEADS, D_SPLIT divisors
       int64_t const raw_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
       if (raw_slot != params.pad_slot_id) {
         cache_slot = static_cast<int32_t>(raw_slot);  // cache slots ≪ 2^31
         pnat = prev_ptr[raw_slot];
-        buf_read = __ldg(cbi + raw_slot);
+        ring_start = __ldg(rsp + raw_slot);
       }
       D_val = D_ptr ? toFloat(D_ptr[work_unit % NHEADS]) : 0.f;
+      A_val = toFloat(A_ptr[work_unit % NHEADS]);
       if constexpr (VARLEN) {
         bos = __ldg(&cu[seq]);
         seq_len = __ldg(&cu[seq + 1]) - bos;
@@ -1200,8 +1210,9 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
     }
     smem.meta_cache_slot[ring_slot] = cache_slot;
     smem.meta_pnat[ring_slot] = pnat;
-    smem.meta_buf_read[ring_slot] = buf_read;
+    smem.meta_ring_start[ring_slot] = ring_start;
     smem.meta_D[ring_slot] = D_val;
+    smem.meta_A[ring_slot] = A_val;
     if constexpr (VARLEN) {
       smem.meta_cu[ring_slot] = (bos << SmemT::SEQLEN_BITS) | seq_len;
     }
@@ -1213,8 +1224,9 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
     meta.tile = blockIdx.x + unit * stride;
     meta.cache_slot = smem.meta_cache_slot[ring_slot];
     meta.pnat = smem.meta_pnat[ring_slot];
-    meta.buf_read = smem.meta_buf_read[ring_slot];
+    meta.ring_start = smem.meta_ring_start[ring_slot];
     meta.D_val = smem.meta_D[ring_slot];
+    meta.A_val = smem.meta_A[ring_slot];
     if constexpr (VARLEN) {
       int32_t const packed = smem.meta_cu[ring_slot];  // one LDS for both fields
       meta.seq_len = packed & ((1 << SmemT::SEQLEN_BITS) - 1);

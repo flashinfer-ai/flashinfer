@@ -1329,9 +1329,9 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
   if (cache_slot == params.pad_slot_id) return;
 
-  // ── Double-buffer index ──
-  auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
-  int const buf_read = __ldg(&buf_idx_ptr[cache_slot]);
+  // ── Ring head (oldest live cache row) ──
+  auto const* __restrict__ ring_start_ptr = reinterpret_cast<int32_t const*>(params.ring_start);
+  int const ring_start = __ldg(&ring_start_ptr[cache_slot]);
 
   // ── prev_num_accepted_tokens ──
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
@@ -1373,16 +1373,16 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   int64_t const z_seq_base = outer * params.z_stride_seq;
   int64_t const out_seq_base = outer * params.out_stride_seq;
 
-  // ── Per-CTA implicit checkpoint criterion ──
-  // When the new tokens would overflow the cache buffer, we must checkpoint:
-  // replay [0, prev_k) into state, write state to HBM, write the new tokens
-  // to the **staging** buffer (1 - buf_read) at offset 0.  Otherwise, we
-  // append the new tokens to the **active** buffer (buf_read) at offset
-  // prev_k and skip the state HBM write entirely.  Cache writes always
-  // happen — only their target buffer + offset depends on must_checkpoint.
+  // ── Per-CTA implicit checkpoint criterion (ring semantics) ──
+  // When the new tokens would overflow the logical window we must checkpoint:
+  // replay [0, prev_k) into state and write state to HBM.  Cache appends are
+  // IDENTICAL on both branches — new tokens land at ring rows
+  // (ring_start + prev_k + i) % RING_BUFFER_LEN; a flush only advances
+  // ring_start past the replayed prefix (HOST-side, after this call), which
+  // is what empties the window.  MAX_WINDOW = RING_BUFFER_LEN - NPREDICTED
+  // guarantees the append region never overlaps the replay-read region.
   bool const must_checkpoint = (prev_k + seq_len > MAX_WINDOW);
-  int const buf_write = must_checkpoint ? (1 - buf_read) : buf_read;
-  int const write_offset = must_checkpoint ? 0 : prev_k;
+  int const write_offset = prev_k;
 
   // ── Load A (scalar, tie_hdim), dt_bias, and D (hoisted to hide gmem latency) ──
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
@@ -1417,15 +1417,15 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   if constexpr (ENABLE_PDL) {
     load_pre_pdl_wait_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                            NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
-                                      buf_read, A_val, dt_bias_val, dt_seq_base, z_seq_base,
+                                      ring_start, A_val, dt_bias_val, dt_seq_base, z_seq_base,
                                       seq_len);
     cudaGridDependencySynchronize();
     load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
         smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
   } else {
     load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-        smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read, A_val, dt_bias_val,
-        outer, seq_len);
+        smem, params, lane, warp, d_tile, head, group_idx, cache_slot, ring_start, A_val,
+        dt_bias_val, outer, seq_len);
   }
 
   // old_B writeback hoisted ahead of Phase 1.  Source (smem.B) is consumed
@@ -1437,7 +1437,7 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   // d_tile == 0 writes; other d_tiles would emit identical payloads.
   if (d_tile == 0 && warp < 2) {
     store_old_B<input_t, NPREDICTED, DSTATE, HEADS_PER_GROUP>(
-        smem, params, warp, lane, head, group_idx, cache_slot, buf_write, write_offset, seq_len);
+        smem, params, warp, lane, head, group_idx, cache_slot, ring_start, write_offset, seq_len);
   }
 
   // CB precompute (4-warp split): warps 0,1 compute CB_scaled (new tokens);
@@ -1496,31 +1496,20 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   // (old_B hoisted to pre-Phase-1; state hoisted into compute_and_store_output.)
 
   // Cache writes — old_x uses all warps (vectorized), dt/cumAdt one warp each.
-  // Each writes the new NPREDICTED tokens at gmem offset `write_offset` into
-  // buffer `buf_write` (computed above from must_checkpoint).
+  // Each writes the new NPREDICTED tokens at ring rows
+  // (ring_start + write_offset + i) % RING_BUFFER_LEN.
   store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
-                                                   cache_slot, write_offset, seq_len);
-  // dt_proc / cumAdt are D-independent — only d_tile == 0 writes.
+                                                   cache_slot, ring_start, write_offset, seq_len);
+  // dt_proc is D-independent — only d_tile == 0 writes.  cumAdt is NOT
+  // cached (recomputed from dt_cache at load — prefix sums are not
+  // ring-shift-invariant).
   if (d_tile == 0 && warp == 0 && lane < seq_len) {
-    auto* __restrict__ old_dt_w = reinterpret_cast<float*>(params.old_dt);
-    int64_t const dt_w_base = cache_slot * params.old_dt_stride_seq +
-                              buf_write * params.old_dt_stride_dbuf +
-                              head * params.old_dt_stride_head;
-    old_dt_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
-  }
-  if (d_tile == 0 && warp == 1 && lane < seq_len) {
-    auto* __restrict__ old_cumAdt_w = reinterpret_cast<float*>(params.old_cumAdt);
-    int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_seq +
-                              buf_write * params.old_cumAdt_stride_dbuf +
-                              head * params.old_cumAdt_stride_head;
-    // On no-write steps with prev_k > 0, offset the stored cumsum by the
-    // previous tail value so the buffer holds a monotonically increasing
-    // cumsum across consecutive no-write steps.  This is required for correct
-    // replay: total_old_cumAdt = old_cumAdt[prev_k-1] must reflect the total
-    // accumulated decay of all prev_k buffered tokens, not just the last step.
-    float const cumAdt_prefix =
-        (!must_checkpoint && prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
-    old_cumAdt_w[ca_w_base + write_offset + lane] = smem.cumAdt[lane] + cumAdt_prefix;
+    auto* __restrict__ dt_cache_w = reinterpret_cast<float*>(params.dt_cache);
+    int64_t const dt_w_base =
+        cache_slot * params.dt_cache_stride_seq + head * params.dt_cache_stride_head;
+    int dst = ring_start + write_offset + lane;
+    if (dst >= params.ring_buffer_len) dst -= params.ring_buffer_len;
+    dt_cache_w[dt_w_base + dst] = smem.dt_proc[lane];
   }
 }
 

@@ -4910,6 +4910,10 @@ def replay_selective_state_update(
         ring_start.to(torch.int64)[:, None] + pnat_l[:, None] + tvec[None, :]
     ) % ring_buffer_len
     live = tvec[None, :] < seq_len_slot[:, None]  # (cache, T)
+    # Dead lanes (slots not in this batch, or varlen pad rows) can carry
+    # src_row = pnat + t >= max_window — torch.gather traps on the index even
+    # though torch.where discards the value below.  Zero them.
+    src_row = torch.where(live, src_row, torch.zeros_like(src_row))
     ar_c = torch.arange(cache_size, device=device)
     src_buf = wrote.to(torch.int64)
     x_sel = old_x[ar_c, src_buf]  # (cache, max_window, nheads, dim)

@@ -154,14 +154,15 @@ __device__ __forceinline__ void load_B(SmemT& smem, CheckpointingSsuParams const
 // (state_cache_size, 2, MAX_WINDOW, ngroups, dstate).
 template <typename input_t, int MAX_WINDOW, int DSTATE, typename SmemT>
 __device__ __forceinline__ void load_old_B(SmemT& smem, CheckpointingSsuParams const& params,
-                                           int lane, int64_t cache_slot, int buf_read,
+                                           int lane, int64_t cache_slot, int ring_start,
                                            int group_idx, int prev_k) {
-  auto const* __restrict__ oldB_ptr = reinterpret_cast<input_t const*>(params.old_B);
-  int64_t const base = cache_slot * params.old_B_stride_seq +
-                       (int64_t)buf_read * params.old_B_stride_dbuf + (int64_t)group_idx * DSTATE;
+  auto const* __restrict__ oldB_ptr = reinterpret_cast<input_t const*>(params.B_cache);
+  int64_t const base =
+      cache_slot * params.B_cache_stride_seq + (int64_t)group_idx * params.B_cache_stride_group;
   using OldBShape = cute::Shape<cute::Int<SmemT::MAX_WINDOW_PAD_MMA_K>, cute::Int<DSTATE>>;
-  load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, oldB_ptr + base, params.old_B_stride_token,
-                                         lane, prev_k);
+  load_ring_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, oldB_ptr + base,
+                                              (int)params.B_cache_stride_pos, lane, ring_start,
+                                              params.ring_buffer_len, prev_k);
   __pipeline_commit();  // NOT drained here — see load_C/load_B; caller drains once before the MMA.
 }
 
@@ -176,8 +177,9 @@ template <typename dt_t, typename weight_t, typename matrixA_t, int NPREDICTED, 
 __device__ __forceinline__ void load_phase1_coeffs(SmemT& smem,
                                                    CheckpointingSsuParams const& params, int warp,
                                                    int lane, int first_head, int seq_len,
-                                                   int64_t outer, int64_t cache_slot, int buf_read,
-                                                   bool must_checkpoint, int prev_k) {
+                                                   int64_t outer, int64_t cache_slot,
+                                                   int ring_start, bool must_checkpoint,
+                                                   int prev_k) {
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
   auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
   int const flat_tid = warp * warpSize + lane;
@@ -202,31 +204,37 @@ __device__ __forceinline__ void load_phase1_coeffs(SmemT& smem,
     smem.A[flat_tid] = toFloat(A_ptr[first_head + flat_tid]);
     smem.dt_bias[flat_tid] = dt_bias_ptr ? toFloat(dt_bias_ptr[first_head + flat_tid]) : 0.f;
   }
-  // NO-WRITE only: old_dt / old_cumAdt[head, t] (f32 cache) — tokens contiguous (stride 1),
-  // heads strided (stride_head).  idx → (h, t) with t = idx % MAX_WINDOW so consecutive
-  // threads hit consecutive tokens → coalesced read.  Masked to the valid window
-  // (t < prev_k); the rest is zeroed so the C7 tail read (old_cumAdt[prev_k-1]) and the
-  // scale_store mask stay well-defined.
+  // NO-WRITE only: old dt from the RING (t < prev_k, ring row (start+t) % L;
+  // the rest zeroed) — then recompute old_cumAdt = A · inclusive_scan(old_dt)
+  // per head (prefix sums are not ring-shift-invariant, so no decay is
+  // cached).  One thread per head runs the ≤ MAX_WINDOW serial scan after a
+  // __syncthreads publishes the dt rows; smem.A is written above by the same
+  // barrier's producers.
   if (!must_checkpoint) {
-    auto const* __restrict__ odt_ptr = reinterpret_cast<float const*>(params.old_dt);
-    auto const* __restrict__ oca_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
-    int64_t const odt_base =
-        cache_slot * params.old_dt_stride_seq + (int64_t)buf_read * params.old_dt_stride_dbuf;
-    int64_t const oca_base = cache_slot * params.old_cumAdt_stride_seq +
-                             (int64_t)buf_read * params.old_cumAdt_stride_dbuf;
+    auto const* __restrict__ dtc_ptr = reinterpret_cast<float const*>(params.dt_cache);
+    int64_t const dtc_base = cache_slot * params.dt_cache_stride_seq;
     constexpr int OLD_N = HEADS_PER_CTA * MAX_WINDOW;
 #pragma unroll
     for (int idx = flat_tid; idx < OLD_N; idx += CTA_THREADS) {
       int const h = idx / MAX_WINDOW;
       int const t = idx % MAX_WINDOW;
-      float dv = 0.f, cv = 0.f;
+      float dv = 0.f;
       if (t < prev_k) {
         int64_t const hh = (int64_t)(first_head + h);
-        dv = odt_ptr[odt_base + hh * params.old_dt_stride_head + t];
-        cv = oca_ptr[oca_base + hh * params.old_cumAdt_stride_head + t];
+        int rr = ring_start + t;
+        if (rr >= params.ring_buffer_len) rr -= params.ring_buffer_len;
+        dv = dtc_ptr[dtc_base + hh * params.dt_cache_stride_head + rr];
       }
       smem.old_dt[h][t] = dv;
-      smem.old_cumAdt[h][t] = cv;
+    }
+    __syncthreads();
+    if (flat_tid < HEADS_PER_CTA) {
+      float const a = smem.A[flat_tid];
+      float acc = 0.f;
+      for (int t = 0; t < MAX_WINDOW; ++t) {
+        acc += smem.old_dt[flat_tid][t];
+        smem.old_cumAdt[flat_tid][t] = (t < prev_k) ? a * acc : 0.f;
+      }
     }
   }
 }
@@ -523,12 +531,12 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
 
   // prev_k is on the critical path — must_checkpoint (and load_old_B's row extent) consume it
   // first, and there's no executed work before that consume to hide the load.  Issue it FIRST,
-  // via __ldg (read-only path), so its latency overlaps the buf_read load instead of fully
+  // via __ldg (read-only path), so its latency overlaps the ring_start load instead of fully
   // stalling must_checkpoint on a cold dependent global load.
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
   int const prev_k = __ldg(&prev_ptr[cache_slot]);
-  auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
-  int const buf_read = __ldg(&buf_idx_ptr[cache_slot]);
+  auto const* __restrict__ ring_start_ptr = reinterpret_cast<int32_t const*>(params.ring_start);
+  int const ring_start = __ldg(&ring_start_ptr[cache_slot]);
 
   int seq_len;
   int64_t outer;
@@ -544,11 +552,12 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
     outer = (int64_t)seq;
   }
   bool const must_checkpoint = (prev_k + seq_len > MAX_WINDOW);
-  int const buf_write = must_checkpoint ? (1 - buf_read) : buf_read;
-  int const write_offset = must_checkpoint ? 0 : prev_k;
+  // Ring: appends land at (ring_start + prev_k + i) % RING_BUFFER_LEN on BOTH
+  // branches; a flush only advances ring_start (host-side, after the call).
+  int const write_offset = prev_k;
 
   if (!must_checkpoint && warp >= 2 && warp < 4) {
-    load_old_B<input_t, MAX_WINDOW, DSTATE>(smem, params, lane, cache_slot, buf_read, group_idx,
+    load_old_B<input_t, MAX_WINDOW, DSTATE>(smem, params, lane, cache_slot, ring_start, group_idx,
                                             prev_k);
   }
 
@@ -557,8 +566,8 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // the wait, so its LDGs fill the conv1d wait window.  No-op without programmatic conv1d.
   if constexpr (ENABLE_PDL) {
     load_phase1_coeffs<dt_t, weight_t, matrixA_t, NPREDICTED, MAX_WINDOW, HEADS_PER_CTA, NUM_WARPS>(
-        smem, params, warp, lane, first_head, seq_len, outer, cache_slot, buf_read, must_checkpoint,
-        prev_k);
+        smem, params, warp, lane, first_head, seq_len, outer, cache_slot, ring_start,
+        must_checkpoint, prev_k);
     cudaGridDependencySynchronize();
   }
 
@@ -577,8 +586,8 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // overlap the B/C + old_B cp.async issued above instead of exposing its LDG latency.
   if constexpr (!ENABLE_PDL) {
     load_phase1_coeffs<dt_t, weight_t, matrixA_t, NPREDICTED, MAX_WINDOW, HEADS_PER_CTA, NUM_WARPS>(
-        smem, params, warp, lane, first_head, seq_len, outer, cache_slot, buf_read, must_checkpoint,
-        prev_k);
+        smem, params, warp, lane, first_head, seq_len, outer, cache_slot, ring_start,
+        must_checkpoint, prev_k);
   }
 
   // ── Drain ALL cp.async ONCE (C/B from load_C/load_B + old_B from load_old_B) BEFORE
@@ -595,7 +604,7 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // store_old_B self-gates on head % HEADS_PER_GROUP — first_head qualifies. ──
   if (warp < 2) {
     store_old_B<input_t, NPREDICTED, DSTATE, HEADS_PER_GROUP>(smem, params, warp, lane, first_head,
-                                                              group_idx, cache_slot, buf_write,
+                                                              group_idx, cache_slot, ring_start,
                                                               write_offset, seq_len);
   }
 
@@ -681,8 +690,7 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // Store pass: each warp stores its contiguous heads (h_base..h_base+NUM_ITER-1).
   // No __syncthreads needed: each warp reads only its own smem writes from the loop above.
   // Lane i covers element [i/NPREDICTED, i%NPREDICTED] within this warp's head block.
-  auto* __restrict__ old_dt_w = reinterpret_cast<float*>(params.old_dt);
-  auto* __restrict__ old_ca_w = reinterpret_cast<float*>(params.old_cumAdt);
+  auto* __restrict__ dt_cache_w = reinterpret_cast<float*>(params.dt_cache);
   constexpr int STORE_ELEMS = NUM_ITER * NPREDICTED;
 #pragma unroll
   for (int i = lane; i < STORE_ELEMS; i += warpSize) {
@@ -694,15 +702,11 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
 
     cumAdt_gmem[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + t] =
         smem.cumAdt[h][t];
-    int64_t const dt_w_base = cache_slot * params.old_dt_stride_seq +
-                              (int64_t)buf_write * params.old_dt_stride_dbuf +
-                              (int64_t)head * params.old_dt_stride_head;
-    int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_seq +
-                              (int64_t)buf_write * params.old_cumAdt_stride_dbuf +
-                              (int64_t)head * params.old_cumAdt_stride_head;
-    float const prefix = (!must_checkpoint && prev_k > 0) ? smem.old_cumAdt[h][prev_k - 1] : 0.f;
-    old_dt_w[dt_w_base + write_offset + t] = smem.dt[h][t];
-    old_ca_w[ca_w_base + write_offset + t] = smem.cumAdt[h][t] + prefix;
+    int64_t const dt_w_base =
+        cache_slot * params.dt_cache_stride_seq + (int64_t)head * params.dt_cache_stride_head;
+    int dst = ring_start + write_offset + t;
+    if (dst >= params.ring_buffer_len) dst -= params.ring_buffer_len;
+    dt_cache_w[dt_w_base + dst] = smem.dt[h][t];
   }
 }
 
