@@ -30,9 +30,9 @@ _MAX_CHUNK_BLOCKS = 128
 # Merge capacity is _MAX_CHUNKS * topk candidate slots; together with the chunk
 # cap this bounds the middle region the chunked path can cover.
 _MAX_CHUNKS = 16
-# Target blocks per chunk. Small enough to spread one row's scan across many
-# CTAs, large enough that the merge's candidate count (topk per chunk) stays
-# low — measured crossover: halving the chunk count beats halving the scan.
+# Target blocks per chunk: small enough to spread one row's scan across many
+# CTAs, large enough to keep the merge's candidate count (topk per chunk) low.
+# The crossover was measured empirically.
 _CHUNK_BLOCKS = 64
 # Below two chunks the split is pure overhead over the single-CTA count-rank.
 _MIN_CHUNKS = 2
@@ -160,11 +160,11 @@ class TopKSelectChunkedSm12x:
 
         # rank = count of strictly-better blocks within the chunk (lower key =
         # higher score, ties broken toward the lower index). Every block in the
-        # global top-target ranks < target inside its own chunk too, so the
+        # global top-target ranks below target inside its own chunk too, so the
         # per-chunk survivors are a superset of the final selection. Ranks are
-        # distinct, so a survivor's rank IS its candidate slot — no atomics.
-        # The scan is 4-way unrolled: the serial chain of dependent SMEM loads
-        # is what a near-empty grid can't hide, so shortening it is the win.
+        # distinct, so a survivor's rank is its candidate slot — no atomics.
+        # The scan is 4-way unrolled because at these grid sizes there are too
+        # few warps to hide the serial chain of dependent SMEM loads.
         l = cutlass.Int32(tid)
         while l < n_local:
             kb = score[l]
@@ -255,11 +255,10 @@ class TopKSelectChunkedSm12x:
         cute.arch.barrier()
 
         # Global rank over the union of chunk survivors, by the same (key,
-        # block index) order the chunks used; empty slots never rank or count
-        # (their key/tie-break can never win, so no guard is needed on them).
-        # Distinct ranks double as emit slots; the scan is 4-way unrolled
-        # (n_cand is a multiple of topk) to shorten the serial SMEM chain a
-        # near-empty grid can't hide.
+        # block index) order the chunks used — rank-as-slot emit and unrolled
+        # scan as in the partial kernel (n_cand is a multiple of the unroll
+        # width). Empty slots need no guard as rankers: their sentinel key and
+        # index can never beat a real candidate.
         i = cutlass.Int32(tid)
         while i < n_cand:
             ib = idx[i]
