@@ -283,13 +283,12 @@ def msa_topk_select(
         _MIN_CHUNKS,
     )
 
-    # The chunked path covers grids that underfill the GPU, where the
-    # single-CTA kernels serialize each row's scan, and it also reads the
-    # scores once where the radix kernel makes a pass per stage; prefill-sized
-    # grids fill the GPU on their own and keep the single-kernel paths.
+    # The chunked path serves grids too small to fill the GPU, and still wins
+    # at full ones by reading the scores once where the radix kernel makes a
+    # pass per stage; prefill-sized grids keep the single-kernel paths.
     # Per-token extents stay on the single-kernel paths: the chunk geometry is
-    # host-derived from the scalar count. All quantities are shape- or
-    # capture-constant, so the choice is CUDA-graph safe.
+    # host-derived from the scalar count. Everything here is shape-constant,
+    # so the choice is CUDA-graph safe.
     if not per_token_nvp:
         n_mid = nvp_scalar - force_begin_blocks - force_end_blocks
         chunked = (

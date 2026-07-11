@@ -13,46 +13,40 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Chunked count-rank MSA top-K KV-block selection for SM120/SM121: candidate
-blocks are split into chunks ranked by independent CTAs, and a second kernel
-merges the per-chunk survivors. Recovers parallelism when the (query, head)
-grid alone leaves the GPU idle — the single-CTA-per-row kernels serialize the
-whole candidate scan on a handful of SMs there.
+Chunked count-rank MSA top-K KV-block selection for SM120/SM121: independent
+CTAs rank chunks of candidate blocks, then a second kernel merges the
+survivors. Exists for grids too small to fill the GPU, where the
+single-CTA-per-row kernels serialize each row's whole scan.
 """
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
-# Per-chunk staging cap: matches the count-rank kernel's SMEM score cap, so a
-# chunk is never bigger than what the single-kernel path already handles well.
+# Per-chunk SMEM staging cap (same as the count-rank kernel's score cap).
 _MAX_CHUNK_BLOCKS = 128
-# Merge capacity is _MAX_CHUNKS * topk candidate slots; together with the chunk
-# cap this bounds the middle region the chunked path can cover.
+# The merge stages _MAX_CHUNKS * topk candidate slots in SMEM.
 _MAX_CHUNKS = 16
-# Target blocks per chunk: small enough to spread one row's scan across many
-# CTAs, large enough to keep the merge's candidate count (topk per chunk) low.
-# The crossover was measured empirically.
+# Target blocks per chunk: balances CTA parallelism against the merge's
+# candidate count. The crossover was measured empirically.
 _CHUNK_BLOCKS = 64
 # Below two chunks the split is pure overhead over the single-CTA count-rank.
 _MIN_CHUNKS = 2
-# Dispatch floor: under this many middle blocks the single-CTA count-rank's
-# scan is short enough that the second launch never pays for itself.
+# Dispatch floor: under this many middle blocks the second launch never pays
+# for itself.
 _MIN_BLOCKS = 32
 _NTHREADS_PARTIAL = 128
 _NTHREADS_MERGE = 256
 _SENTINEL = 0x7FFFFFFF  # INT32_MAX: empty slots sort to the tail, unlike -1
-# Empty candidate slots also carry the worst possible key; detection uses the
-# index (a real NaN score can legitimately produce key 0xFFFFFFFF).
+# Empty-slot key. Detection must use the index: a NaN score can legitimately
+# produce this key.
 _SENTINEL_KEY = 0xFFFFFFFF
 
 
 class TopKSelectChunkedSm12x:
     """Two-phase (per-chunk rank + merge) top-K selection for small grids.
-
-    Ranks by the same (radix bit-key, block index) total order as the
-    single-kernel count-rank path, so the two produce identical selections.
-    """
+    Uses the count-rank kernel's (bit-key, block index) order, so the two
+    produce identical selections."""
 
     def __init__(self, topk: int):
         if topk != 16:
@@ -127,28 +121,25 @@ class TopKSelectChunkedSm12x:
         n_forced = force_begin + force_end
         target = cutlass.Int32(self._topk) - n_forced
 
-        # This chunk's slice of the middle region (tail chunk may be short or,
-        # past the end, empty; the sentinel fill below still runs for those).
+        # Tail chunks may be short or empty; their sentinel fill still runs.
         c_lo = force_begin + c * chunk_len
         c_hi = c_lo + chunk_len
         if c_hi > mid_hi:
             c_hi = mid_hi
         n_local = c_hi - c_lo
-        # Padding the staged keys to the unroll width keeps the rank loop
-        # branch-free; padded entries sit at local indices >= any real block,
-        # so neither the key compare nor the lower-index tie-break counts them.
+        # Pad to the unroll width; padded keys sit at indices above every real
+        # block, so neither the compare nor the tie-break can count them.
         n_pad = (n_local + 3) & ~cutlass.Int32(3)
         cand_base = c * cutlass.Int32(self._topk)
 
-        # Sentinel-fill this chunk's candidate slots; survivors overwrite after
-        # the barrier below, so unfilled slots read as empty in the merge.
+        # Sentinel-fill the candidate slots; survivors overwrite them after
+        # the barrier below.
         if tid < self._topk:
             mKey[q, h, cand_base + tid] = cutlass.Uint32(_SENTINEL_KEY)
             mIdx[q, h, cand_base + tid] = cutlass.Int32(_SENTINEL)
 
-        # Stage the chunk's radix keys in SMEM: the rank loop rereads each one
-        # n_local times, and the bit key preserves the exact radix-kernel order,
-        # with deterministic NaN placement.
+        # The bit keys preserve the radix-kernel order, with deterministic NaN
+        # placement.
         l = cutlass.Int32(tid)
         while l < n_pad:
             k = cutlass.Uint32(_SENTINEL_KEY)
@@ -158,13 +149,11 @@ class TopKSelectChunkedSm12x:
             l += _NTHREADS_PARTIAL
         cute.arch.barrier()
 
-        # rank = count of strictly-better blocks within the chunk (lower key =
-        # higher score, ties broken toward the lower index). Every block in the
-        # global top-target ranks below target inside its own chunk too, so the
-        # per-chunk survivors are a superset of the final selection. Ranks are
-        # distinct, so a survivor's rank is its candidate slot — no atomics.
-        # The scan is 4-way unrolled because at these grid sizes there are too
-        # few warps to hide the serial chain of dependent SMEM loads.
+        # A block in the global top-target also ranks below target within its
+        # chunk, so the per-chunk survivors are a superset of the final
+        # selection. Ranks are distinct, so a survivor's rank is its slot (no
+        # atomics). The 4-way unroll shortens the dependent-SMEM-load chain,
+        # which these small grids have too few warps to hide.
         l = cutlass.Int32(tid)
         while l < n_local:
             kb = score[l]
@@ -254,11 +243,10 @@ class TopKSelectChunkedSm12x:
             i += _NTHREADS_MERGE
         cute.arch.barrier()
 
-        # Global rank over the union of chunk survivors, by the same (key,
-        # block index) order the chunks used — rank-as-slot emit and unrolled
-        # scan as in the partial kernel (n_cand is a multiple of the unroll
-        # width). Empty slots need no guard as rankers: their sentinel key and
-        # index can never beat a real candidate.
+        # Rank-as-slot emit and unrolled scan as in the partial kernel, over
+        # the union of survivors (n_cand is a multiple of the unroll width).
+        # Empty slots need no ranker guard: a sentinel key and index can never
+        # beat a real candidate.
         i = cutlass.Int32(tid)
         while i < n_cand:
             ib = idx[i]
