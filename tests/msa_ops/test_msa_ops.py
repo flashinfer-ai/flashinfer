@@ -883,8 +883,9 @@ def test_sparse_decode_nvfp4_scale_size_guard():
 # ---------------------------------------------------------------------------
 
 
-# P=128 exercises the count-rank kernel, P=256 the radix kernel (crossover at 128).
-@pytest.mark.parametrize("P", [128, 256])
+# nvp = P - 56 lands each P on a different kernel: P=88 count-rank (<= 32
+# middle blocks), P=256 chunked, P=2560 radix (past the chunked coverage).
+@pytest.mark.parametrize("P", [88, 256, 2560])
 def test_msa_topk_select_forced_and_clamped(P):
     """Forced begin/end blocks are always selected within the topk budget;
     num_valid_pages clamps the candidate range."""
@@ -1634,10 +1635,13 @@ def test_fp8_q_decode():
 
 
 def test_msa_topk_select_countrank_matches_radix_on_nan():
-    """Both kernels must produce the same, deterministic selection even when the
-    proxy emits NaN scores (count-rank ranks on the radix bit-key)."""
+    """All three kernels must produce the same, deterministic selection even
+    when the proxy emits NaN scores (all rank on the radix bit-key)."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops.sparse_topk_select import _get_compiled_topk
+    from flashinfer.msa_ops.sparse_topk_select import (
+        _get_compiled_topk,
+        _get_compiled_topk_chunked,
+    )
 
     dev = "cuda"
     H, P, S, topk = 2, 100, 64, 16
@@ -1652,3 +1656,16 @@ def test_msa_topk_select_countrank_matches_radix_on_nan():
         outs.append(out.cpu())
     assert torch.equal(outs[0], outs[2]), "count-rank nondeterministic on NaN"
     assert torch.equal(outs[0], outs[1]), "count-rank != radix on NaN scores"
+
+    num_chunks = 2
+    chunk_len = (P + num_chunks - 1) // num_chunks
+    cand_key = torch.empty(S, H, num_chunks * topk, dtype=torch.int32, device=dev)
+    cand_idx = torch.empty_like(cand_key)
+    for _ in range(2):
+        out = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
+        _get_compiled_topk_chunked(topk)(
+            score, cand_key, cand_idx, out, P, 0, 0, num_chunks, chunk_len, S, H
+        )
+        outs.append(out.cpu())
+    assert torch.equal(outs[3], outs[4]), "chunked nondeterministic on NaN"
+    assert torch.equal(outs[0], outs[3]), "chunked != count-rank on NaN scores"

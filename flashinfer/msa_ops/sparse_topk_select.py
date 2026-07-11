@@ -24,6 +24,10 @@ from ..utils import is_sm12x_supported
 
 _topk_compile_cache: dict = {}
 
+# Row cap for the chunked kernel: covers saturated decode batches while keeping
+# the per-call candidate scratch bounded (rows * _MAX_CHUNKS * topk * 8 bytes).
+_MAX_CHUNKED_ROWS = 2048
+
 
 def _get_compiled_topk(topk: int, small: bool):
     """``small`` picks the O(N^2) count-rank kernel, else the radix kernel; the
@@ -62,6 +66,50 @@ def _get_compiled_topk(topk: int, small: bool):
         cutlass.Int32(1),  # num_valid_pages
         cutlass.Int32(0),  # force_begin
         cutlass.Int32(0),  # force_end
+        cutlass.Int32(1),  # total_qo_len
+        cutlass.Int32(1),  # num_qo_heads
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    _topk_compile_cache[key] = compiled
+    return compiled
+
+
+def _get_compiled_topk_chunked(topk: int):
+    """Two-kernel (per-chunk rank + merge) variant; selections match the
+    count-rank kernel exactly (same bit-key and tie order)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    key = (topk, "chunked")
+    compiled = _topk_compile_cache.get(key)
+    if compiled is not None:
+        return compiled
+
+    from .cute_dsl.topk_select_chunked_sm12x import TopKSelectChunkedSm12x
+
+    kernel_obj = TopKSelectChunkedSm12x(topk=topk)
+
+    def fk(dtype, ndim, align):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            tuple(cute.sym_int() for _ in range(ndim)),
+            stride_order=tuple(reversed(range(ndim))),
+            assumed_align=align,
+        )
+
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = cute.compile(
+        kernel_obj,
+        fk(cutlass.Float32, 3, 4),  # max_score (H, P, S)
+        fk(cutlass.Int32, 3, 4),  # candidate keys (S, H, C*topk)
+        fk(cutlass.Int32, 3, 4),  # candidate block indices (S, H, C*topk)
+        fk(cutlass.Int32, 3, 4),  # out (S, H, topk)
+        cutlass.Int32(1),  # num_valid_pages
+        cutlass.Int32(0),  # force_begin
+        cutlass.Int32(0),  # force_end
+        cutlass.Int32(1),  # num_chunks
+        cutlass.Int32(1),  # chunk_len
         cutlass.Int32(1),  # total_qo_len
         cutlass.Int32(1),  # num_qo_heads
         stream_fake,
@@ -173,12 +221,54 @@ def msa_topk_select(
         if output.dtype != torch.int32:
             raise ValueError(f"output must be int32, got {output.dtype}")
 
+    from .cute_dsl.topk_select_chunked_sm12x import (
+        _CHUNK_BLOCKS,
+        _MAX_CHUNK_BLOCKS,
+        _MAX_CHUNKS,
+        _MIN_BLOCKS,
+        _MIN_CHUNKS,
+    )
     from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
 
-    # Dispatch on the runtime valid-page count: the count-rank kernel only ever
-    # touches blocks below num_valid_pages, regardless of the allocated score
-    # dimension.
+    # Dispatch on the runtime valid-page count: the kernels only ever touch
+    # blocks below num_valid_pages, regardless of the allocated score
+    # dimension. The chunked variant splits each row's candidate scan across
+    # CTAs and merges the survivors: decode-sized (query, head) grids stop
+    # serializing on a few SMs, and the scores are read once instead of the
+    # radix kernel's pass-per-stage. The row cap keeps its candidate scratch
+    # small and leaves prefill-sized grids — which fill the GPU on their own —
+    # to the single-kernel paths. All quantities are shape- or capture-
+    # constant, so the choice is CUDA-graph safe.
     small = int(num_valid_pages) <= _MAX_BLOCKS
+    n_mid = int(num_valid_pages) - force_begin_blocks - force_end_blocks
+    chunked = (
+        total_qo_len * num_qo_heads <= _MAX_CHUNKED_ROWS
+        and _MIN_BLOCKS < n_mid <= _MAX_CHUNKS * _MAX_CHUNK_BLOCKS
+    )
+    if chunked:
+        num_chunks = max(_MIN_CHUNKS, min(_MAX_CHUNKS, -(-n_mid // _CHUNK_BLOCKS)))
+        chunk_len = -(-n_mid // num_chunks)
+        cand_key = torch.empty(
+            (total_qo_len, num_qo_heads, num_chunks * topk),
+            dtype=torch.int32,
+            device=max_score.device,
+        )
+        cand_idx = torch.empty_like(cand_key)
+        _get_compiled_topk_chunked(topk)(
+            max_score,
+            cand_key,
+            cand_idx,
+            output,
+            int(num_valid_pages),
+            int(force_begin_blocks),
+            int(force_end_blocks),
+            num_chunks,
+            chunk_len,
+            int(total_qo_len),
+            int(num_qo_heads),
+        )
+        return output
+
     _get_compiled_topk(topk, small)(
         max_score,
         output,
