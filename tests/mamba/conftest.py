@@ -2,11 +2,20 @@
 
 Each test lazily JIT-compiles its module URI (~2 min, mostly ONE cicc at a
 time), so after any kernel-header edit a full run spends 30-40 min in
-SEQUENTIAL rebuilds.  This fixture batch-builds the suite's whole URI matrix
-through a single ninja graph (`build_jit_specs` aggregates per-module
-build.ninja files via subninja), so every TU of every module compiles in
-parallel — on a 28-core box the same rebuild takes a few minutes, and cold CI
-gets the same win.
+SEQUENTIAL rebuilds.  This fixture prebuilds the suite's whole URI matrix in
+parallel — on a 28-core box the rebuild takes ~10 min, and cold CI gets the
+same win.
+
+Each spec is built via its own ``JitSpec.build()`` (ninja rooted at the URI
+dir) — the SAME invocation ``build_and_load()`` uses at import time — NOT via
+``build_jit_specs``'s single batch graph.  The batch grapher keeps a separate
+ninja db at the JIT root; two dbs over the same outputs invalidate each other
+("stored deps info out of date"), so batch-prebuilt modules were fully
+recompiled AGAIN at load time, once per test, every session.  With per-spec
+builds there is one authoritative db per URI and the load-time ninja is a
+~100ms no-op.  Parallelism comes from a pool of ninjas (each URI is only ~3
+TUs, so a pool of ~nproc/3 keeps ~nproc nvcc's in flight, matching what the
+batch graph achieved).
 
 The matrix below is DATA, regenerable from a warm cache:
     ls $FLASHINFER_JIT_DIR | grep checkpointing_ssu_ | <parse the URI fields>
@@ -16,37 +25,60 @@ ninja edge.  Disable with FLASHINFER_TEST_WARM_JIT=0.
 
 import contextlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 # (state, dt, weight, npredicted, max_window, hpg, ng, state_scale, philox, pdl);
 # input=bf16, matrixA=f32, stateIndex=i32, dim=64, dstate=128 throughout.
 _WARM_MATRIX = [
-    ("bf16", "bf16", "bf16", 10, 16, 16, 1, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 10, 16, 16, 1, "-", 0, 1),
-    ("bf16", "bf16", "bf16", 16, 16, 16, 1, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 16, 16, 8, 2, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 4, 16, 16, 1, "-", 0, 0),
     ("bf16", "bf16", "bf16", 4, 8, 16, 1, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 6, 16, 16, 1, "-", 0, 0),
+    ("bf16", "bf16", "bf16", 4, 16, 16, 1, "-", 0, 0),
     ("bf16", "bf16", "bf16", 6, 6, 16, 1, "-", 0, 0),
     ("bf16", "bf16", "bf16", 6, 6, 16, 1, "-", 0, 1),
     ("bf16", "bf16", "bf16", 6, 8, 16, 1, "-", 0, 0),
     ("bf16", "bf16", "bf16", 6, 8, 16, 1, "-", 0, 1),
+    ("bf16", "bf16", "bf16", 6, 16, 16, 1, "-", 0, 0),
     ("bf16", "bf16", "bf16", 8, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 10, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 12, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 14, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 16, 16, 16, 1, "-", 0, 0),
+    ("bf16", "bf16", "bf16", 10, 16, 16, 1, "-", 0, 0),
+    ("bf16", "bf16", "bf16", 10, 16, 16, 1, "-", 0, 1),
+    ("bf16", "bf16", "bf16", 16, 16, 8, 2, "-", 0, 0),
+    ("bf16", "bf16", "bf16", 16, 16, 16, 1, "-", 0, 0),
+    ("bf16", "f32", "bf16", 6, 16, 16, 1, "-", 0, 0),
     ("bf16", "f32", "f32", 4, 16, 16, 1, "-", 0, 0),
     ("bf16", "f32", "f32", 6, 16, 16, 1, "-", 0, 0),
     ("bf16", "f32", "f32", 6, 16, 16, 1, "-", 0, 1),
     ("bf16", "f32", "f32", 8, 16, 16, 1, "-", 0, 0),
-    ("e4m3", "bf16", "bf16", 16, 16, 16, 1, "f32", 0, 0),
+    ("bf16", "f32", "f32", 10, 16, 16, 1, "-", 0, 0),
+    ("bf16", "f32", "f32", 12, 16, 16, 1, "-", 0, 0),
+    ("bf16", "f32", "f32", 14, 16, 16, 1, "-", 0, 0),
+    ("bf16", "f32", "f32", 16, 16, 16, 1, "-", 0, 0),
     ("e4m3", "bf16", "bf16", 4, 16, 16, 1, "f32", 0, 0),
+    ("e4m3", "bf16", "bf16", 6, 6, 16, 1, "f32", 0, 0),
     ("e4m3", "bf16", "bf16", 6, 6, 16, 1, "f32", 5, 0),
     ("e4m3", "bf16", "bf16", 6, 6, 16, 1, "f32", 5, 1),
+    ("e4m3", "bf16", "bf16", 6, 6, 16, 1, "f32", 10, 0),
+    ("e4m3", "bf16", "bf16", 6, 6, 16, 2, "f32", 0, 0),
+    ("e4m3", "bf16", "bf16", 6, 6, 16, 2, "f32", 10, 0),
     ("e4m3", "bf16", "bf16", 8, 16, 16, 1, "f32", 0, 0),
+    ("e4m3", "bf16", "bf16", 8, 16, 64, 1, "f32", 0, 0),
+    ("e4m3", "bf16", "bf16", 16, 16, 16, 1, "f32", 0, 0),
+    ("e4m3", "bf16", "bf16", 16, 16, 16, 1, "f32", 10, 0),
+    ("e4m3", "bf16", "bf16", 16, 16, 16, 2, "f32", 0, 0),
+    ("e4m3", "bf16", "bf16", 16, 16, 16, 2, "f32", 10, 0),
+    ("f16", "bf16", "bf16", 3, 16, 16, 1, "-", 0, 0),
+    ("f16", "bf16", "bf16", 4, 8, 16, 1, "-", 0, 0),
+    ("f16", "bf16", "bf16", 4, 8, 16, 1, "-", 10, 0),
+    ("f16", "bf16", "bf16", 4, 8, 16, 2, "-", 10, 0),
+    ("f16", "bf16", "bf16", 4, 16, 16, 1, "-", 0, 0),
+    ("f16", "bf16", "bf16", 6, 6, 16, 1, "-", 0, 0),
+    ("f16", "bf16", "bf16", 6, 6, 16, 1, "-", 10, 0),
+    ("f16", "bf16", "bf16", 6, 6, 16, 2, "-", 0, 0),
+    ("f16", "bf16", "bf16", 6, 6, 16, 2, "-", 10, 0),
+    ("f16", "bf16", "bf16", 6, 16, 16, 1, "-", 0, 0),
+    ("f16", "bf16", "bf16", 6, 16, 16, 1, "-", 5, 0),
+    ("f16", "bf16", "bf16", 8, 16, 16, 1, "-", 0, 0),
+    ("f16", "bf16", "bf16", 8, 16, 64, 1, "-", 0, 0),
     ("f16", "bf16", "bf16", 10, 16, 16, 1, "-", 0, 0),
     ("f16", "bf16", "bf16", 10, 16, 16, 1, "-", 10, 0),
     ("f16", "bf16", "bf16", 10, 16, 16, 2, "-", 0, 0),
@@ -57,35 +89,32 @@ _WARM_MATRIX = [
     ("f16", "bf16", "bf16", 16, 16, 16, 1, "-", 10, 0),
     ("f16", "bf16", "bf16", 16, 16, 16, 2, "-", 0, 0),
     ("f16", "bf16", "bf16", 16, 16, 16, 2, "-", 10, 0),
-    ("f16", "bf16", "bf16", 4, 16, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 4, 8, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 4, 8, 16, 1, "-", 10, 0),
-    ("f16", "bf16", "bf16", 4, 8, 16, 2, "-", 10, 0),
-    ("f16", "bf16", "bf16", 6, 16, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 6, 16, 16, 1, "-", 5, 0),
-    ("f16", "bf16", "bf16", 6, 6, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 6, 6, 16, 1, "-", 10, 0),
-    ("f16", "bf16", "bf16", 6, 6, 16, 2, "-", 0, 0),
-    ("f16", "bf16", "bf16", 6, 6, 16, 2, "-", 10, 0),
-    ("f16", "bf16", "bf16", 8, 16, 16, 1, "-", 0, 0),
     ("f16", "f16", "f16", 6, 16, 16, 1, "-", 0, 0),
     ("f16", "f32", "f32", 6, 16, 16, 1, "-", 0, 1),
     ("f16", "f32", "f32", 6, 16, 16, 1, "-", 5, 1),
+    ("f32", "bf16", "bf16", 4, 8, 16, 1, "-", 0, 0),
+    ("f32", "bf16", "bf16", 4, 16, 16, 1, "-", 0, 0),
+    ("f32", "bf16", "bf16", 6, 6, 16, 1, "-", 0, 0),
+    ("f32", "bf16", "bf16", 6, 16, 16, 1, "-", 0, 0),
+    ("f32", "bf16", "bf16", 8, 16, 16, 1, "-", 0, 0),
     ("f32", "bf16", "bf16", 10, 16, 16, 1, "-", 0, 0),
     ("f32", "bf16", "bf16", 16, 16, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 4, 16, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 4, 8, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 6, 16, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 6, 6, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 8, 16, 16, 1, "-", 0, 0),
-    ("f32", "f32", "f32", 10, 16, 16, 1, "-", 0, 0),
     ("f32", "f32", "f32", 6, 16, 16, 1, "-", 0, 0),
     ("f32", "f32", "f32", 6, 16, 16, 1, "-", 0, 1),
     ("f32", "f32", "f32", 8, 16, 16, 1, "-", 0, 0),
-    ("i8", "bf16", "bf16", 16, 16, 16, 1, "f32", 0, 0),
+    ("f32", "f32", "f32", 10, 16, 16, 1, "-", 0, 0),
+    ("i8", "bf16", "bf16", 1, 1, 16, 1, "f32", 0, 0),
+    ("i8", "bf16", "bf16", 1, 1, 16, 1, "f32", 5, 0),
     ("i8", "bf16", "bf16", 4, 16, 16, 1, "f32", 0, 0),
     ("i8", "bf16", "bf16", 6, 6, 16, 1, "f32", 0, 0),
+    ("i8", "bf16", "bf16", 6, 6, 16, 1, "f32", 10, 0),
+    ("i8", "bf16", "bf16", 6, 6, 16, 2, "f32", 0, 0),
+    ("i8", "bf16", "bf16", 6, 6, 16, 2, "f32", 10, 0),
     ("i8", "bf16", "bf16", 8, 16, 16, 1, "f32", 0, 0),
+    ("i8", "bf16", "bf16", 16, 16, 16, 1, "f32", 0, 0),
+    ("i8", "bf16", "bf16", 16, 16, 16, 1, "f32", 10, 0),
+    ("i8", "bf16", "bf16", 16, 16, 16, 2, "f32", 0, 0),
+    ("i8", "bf16", "bf16", 16, 16, 16, 2, "f32", 10, 0),
 ]
 
 
@@ -96,7 +125,6 @@ def warm_checkpointing_jit():
         return
     import torch
 
-    from flashinfer.jit.core import build_jit_specs
     from flashinfer.jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
 
     dt = {
@@ -129,8 +157,19 @@ def warm_checkpointing_jit():
                     enable_pdl=bool(pdl),
                 )
             )
-    try:
-        build_jit_specs(specs, verbose=False)
-    except Exception as exc:  # non-fatal: the lazy JIT path still works
-        print(f"[warm-jit] batch prebuild skipped: {exc}")
+
+    def _build(spec):
+        if spec.is_aot:
+            return None
+        try:
+            spec.build(verbose=False)
+        except Exception as exc:  # non-fatal: the lazy JIT path still works
+            return f"{spec.name}: {exc}"
+        return None
+
+    workers = max(2, (os.cpu_count() or 8) // 3)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for err in pool.map(_build, specs):
+            if err is not None:
+                print(f"[warm-jit] prebuild failed (will retry lazily): {err}")
     yield
