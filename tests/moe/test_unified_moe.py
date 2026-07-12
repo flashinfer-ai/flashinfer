@@ -1215,6 +1215,10 @@ class TestTrtllmRoutedPackingContract:
             + local_expert_offset
         )
         final_scales = torch.rand(num_tokens, top_k, device=device)
+        # One negative weight: its bf16 sign bit makes the int16->int32 widen
+        # sign-extend, so a dropped `& 0xFFFF` mask corrupts the id field and
+        # fails the assertions below (all-positive scales mask that regression).
+        final_scales[0, 0] = -final_scales[0, 0]
         hidden_q, hidden_scale = spec.make_hidden(num_tokens, hidden_size, device)
         act_pack = MoEActivationPack(
             hidden_states_q=hidden_q,
