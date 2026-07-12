@@ -150,7 +150,7 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
   if (num_splits <= 0) return false;
 #define DSV4_DISPATCH_MT(MT_, H, K)                                                         \
   if (mt == (MT_) && num_heads == (H) && topk == (K)) {                                     \
-    return launch_decode_dsv4_impl<(MT_), (H), (K), 64>(                                    \
+    return launch_decode_dsv4_impl<MT_, H, K, 64>(                                          \
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,    \
         extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra,            \
         stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale, \

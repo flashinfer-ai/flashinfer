@@ -38,7 +38,7 @@ __device__ __forceinline__ uint8_t e2m1_nibble_to_fp8_io(uint8_t nib) {
   const uint8_t sign = static_cast<uint8_t>((nib & 0x8) << 4);
   const uint8_t code = static_cast<uint8_t>(nib & 0x7);
   const uint8_t mag =
-      (code == 0) ? 0x00 : (code == 1) ? 0x30 : static_cast<uint8_t>(0x38 + (code - 2) * 4);
+      (code == 0) ? 0x00 : (code == 1) ? 0x30 : static_cast<uint8_t>(0x30 + code * 4);
   return static_cast<uint8_t>(sign | mag);
 }
 
