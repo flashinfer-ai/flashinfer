@@ -20,6 +20,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Any, Callable
 
 import torch
@@ -68,6 +69,7 @@ from flashinfer.fused_moe.dist_aware.da_utils import (
     get_da_distribution_specs,
 )
 from flashinfer.tllm_enums import DtypeTrtllmGen
+from flashinfer.testing.utils import bench_gpu_time
 
 
 FLOAT8_E4M3_MAX = 448.0
@@ -1353,19 +1355,21 @@ def _capture_and_time(call: Callable[[], torch.Tensor], warmup: int, iters: int)
     torch.cuda.synchronize()
     stats = moe_core.get_da_fast_path_stats()
 
-    for _ in range(warmup):
-        graph.replay()
-    torch.cuda.synchronize()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        graph.replay()
-    end.record()
-    end.synchronize()
-    latency_ms = start.elapsed_time(end) / max(iters, 1)
-    torch.cuda.synchronize()
+    # `graph.replay` already launches the captured inference graph. Asking the
+    # timing helper to use another CUDA graph would attempt an invalid nested
+    # capture; use its event backend while retaining cold-L2 flushing.
+    latency_ms = float(
+        median(
+            bench_gpu_time(
+                graph.replay,
+                dry_run_iters=warmup,
+                repeat_iters=max(iters, 1),
+                enable_cupti=False,
+                use_cuda_graph=False,
+                cold_l2_cache=True,
+            )
+        )
+    )
     return out.detach().clone(), latency_ms, int(stats["capture_dispatch_count"])
 
 
@@ -1379,14 +1383,18 @@ def _eager_and_time(call: Callable[[], torch.Tensor], warmup: int, iters: int):
     torch.cuda.synchronize()
     stats = moe_core.get_da_fast_path_stats()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        _ = call()
-    end.record()
-    end.synchronize()
-    latency_ms = start.elapsed_time(end) / max(iters, 1)
+    latency_ms = float(
+        median(
+            bench_gpu_time(
+                call,
+                dry_run_iters=warmup,
+                repeat_iters=max(iters, 1),
+                enable_cupti=False,
+                use_cuda_graph=False,
+                cold_l2_cache=True,
+            )
+        )
+    )
     return out.detach().clone(), latency_ms, int(stats["capture_dispatch_count"])
 
 
