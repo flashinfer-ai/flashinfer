@@ -16,8 +16,6 @@ Run on one Blackwell GPU from the FlashInfer repo root (no torchrun required)::
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 pytest.importorskip("flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels")
@@ -270,7 +268,7 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
 
 
 @pytest.mark.arch_blackwell
-def test_mxfp8_preprocess_and_kernel_match_mega_reference():
+def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
     """Single-rank kernel output matches ``compute_megamoe_reference_mxfp8``."""
     _require_cuda()
 
@@ -289,7 +287,9 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference():
     )
     from moe_mxfp8_glu.mega_reference_mxfp8 import compute_megamoe_reference_mxfp8
 
-    os.environ["MEGA_NO_DIST"] = "1"
+    # monkeypatch (not os.environ): restored after the test, so it cannot
+    # silently downgrade later nvshmem-path tests in the same process.
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
     problem = _single_rank_problem()
     rank = 0
     world_size = 1

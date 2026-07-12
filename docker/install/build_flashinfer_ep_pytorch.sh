@@ -11,8 +11,14 @@
 # Env:
 #   FI_SRC        FlashInfer checkout (default /host/flashinfer)
 #   CUDA_MAJOR    CUDA major for the cuXX wheel suffix (default: auto from torch.version.cuda)
-#   NCCL_VERSION  nvidia-nccl-<cuXX> pin (default 2.30.7)
+#   FI_NCCL_VERSION  nvidia-nccl-<cuXX> pin (default 2.30.7). FI_-prefixed
+#                 because NVIDIA base images export NCCL_VERSION as the Debian
+#                 package version (e.g. 2.28.3-1), which is not a valid pip pin.
 #   NCCL4PY_SPEC  nccl4py pin (default nccl4py[<cuXX>]==0.3.1)
+#   FI_EP_PREWARM 1 runs the ~25-min trtllm fused-MoE JIT prewarm (default 0).
+#                 Set to 1 when baking container-save images for torchrun jobs
+#                 (lazy JIT under torchrun outlives the NCCL watchdog); PR CI
+#                 doesn't exercise the prewarmed modules.
 set -euo pipefail
 
 # Derive the CUDA major (cu12 / cu13 / ...) from the base image's torch so the
@@ -23,7 +29,7 @@ CUDA_MAJOR="${CUDA_MAJOR:-$(python -c 'import torch; v = torch.version.cuda or "
 CU="cu${CUDA_MAJOR}"
 
 FI_SRC="${FI_SRC:-/host/flashinfer}"
-NCCL_VERSION="${NCCL_VERSION:-2.30.7}"
+NCCL_VERSION="${FI_NCCL_VERSION:-2.30.7}"
 NCCL4PY_SPEC="${NCCL4PY_SPEC:-nccl4py[${CU}]==0.3.1}"
 CUDA_CORE_VERSION="${CUDA_CORE_VERSION:-1.0.1}"
 CUDA_BINDINGS_VERSION="${CUDA_BINDINGS_VERSION:-13.2.0}"
@@ -73,9 +79,25 @@ echo "== build & install FlashInfer (NCCL-EP + Mega path) =="
 # (_ensure_nccl_floor, nvidia-nccl-cu13>=2.30.7) isn't blocked by the base
 # image's constraint file — a no-op here since 2.30.7 is already pinned above.
 cd "${FI_SRC}"
+# --no-build-isolation makes pyproject's [build-system] requires OUR job:
+# setuptools>=77 (PEP 639 SPDX `license = "Apache-2.0"`), packaging>=24, and
+# apache-tvm-ffi. The flashinfer-ci conda py312 image ships an older
+# setuptools that fails metadata generation on the SPDX license string
+# without this upgrade.
+PIP_CONSTRAINT="" pip install --no-cache-dir -U \
+    "setuptools>=77" "packaging>=24" \
+    "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2"
 PIP_CONSTRAINT="" BUILD_NIXL_EP=0 \
     pip install --no-cache-dir --no-build-isolation -e .
 
+# The full-dep editable install above lets pip's resolver downgrade
+# nvidia-nccl-<cuXX> to torch's exact pin (2.28.9 on the 26.05 image), undoing
+# the 2.30.7 pin from the top of this script — and _ensure_nccl_floor runs at
+# build time, before that final resolution. Re-assert the pin last.
+PIP_CONSTRAINT="" pip install --no-cache-dir --no-deps \
+    "nvidia-nccl-${CU}==${NCCL_VERSION}"
+
+if [ "${FI_EP_PREWARM:-0}" = "1" ]; then
 echo "== pre-warm FlashInfer JIT cache (trtllm fused-MoE reference kernels) =="
 # First-use JIT of fused_moe_trtllm_sm100 costs ~25 min of nvcc. Compiled
 # lazily under torchrun, that outlives torch's 10-min NCCL watchdog and
@@ -92,10 +114,16 @@ for gen in (gen_trtllm_gen_fused_moe_sm100_module, gen_fp4_quantization_sm100_mo
     spec.build_and_load()
     print(f"[prewarm] {spec.name} OK", flush=True)
 PYEOF
+else
+    echo "== FI_EP_PREWARM=0: skipping JIT prewarm =="
+fi
 
 echo "== smoke probe =="
 python -c "\
 from flashinfer.moe_ep import available_backends; \
 b = available_backends(); print('moe_ep backends:', b); \
-assert 'nccl_ep' in b, 'nccl_ep backend missing'"
+assert 'nccl_ep' in b, 'nccl_ep backend missing'; \
+from importlib.metadata import version; \
+nccl = version('nvidia-nccl-${CU}'); print('nvidia-nccl-${CU}:', nccl); \
+assert nccl == '${NCCL_VERSION}', f'NCCL pin lost: {nccl} != ${NCCL_VERSION}'"
 echo "BUILD OK"

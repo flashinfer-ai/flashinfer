@@ -637,7 +637,10 @@ def _generate_topk_weights(
 # compute-sanitizer).  Single-rank only; sym tensors degrade to plain
 # CUDA ``torch.zeros`` and the SymBuffer offsets list is hard-coded to
 # ``(0,) * world_size``.
-_NO_DIST: bool = bool(int(os.environ.get("MEGA_NO_DIST", "0")))
+def _no_dist() -> bool:
+    # Read at call time, not import time: callers (e.g. single-rank pytest
+    # tests) set MEGA_NO_DIST=1 after this module is already imported.
+    return bool(int(os.environ.get("MEGA_NO_DIST", "0")))
 
 
 # Tile-wise low-precision combine: one shared scale per this many contiguous
@@ -661,8 +664,13 @@ def _sym_zeros(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     Caller is responsible for freeing via ``nvshmem.core.free_tensor``
     before ``nvshmem.core.finalize()``.
     """
-    if _NO_DIST:
-        return torch.zeros(shape, dtype=dtype, device="cuda")
+    if _no_dist():
+        tensor = torch.zeros(shape, dtype=dtype, device="cuda")
+        # Tag so teardown can free by allocation kind, not by whatever
+        # MEGA_NO_DIST happens to be at free time (the env can be flipped
+        # between alloc and free, e.g. by pytest monkeypatch teardown).
+        tensor._mega_plain_alloc = True
+        return tensor
     import nvshmem.core
 
     tensor = nvshmem.core.tensor(shape, dtype=dtype)
@@ -732,7 +740,7 @@ def _compute_peer_offsets(
     byval ``SymBuffer`` removes that indirection entirely (one LDC
     against the param bank, zero GMEM).
     """
-    if _NO_DIST:
+    if _no_dist():
         local_base = int(sym_tensor.data_ptr())
         return local_base, tuple(0 for _ in range(world_size))
     import nvshmem.core
@@ -1519,7 +1527,7 @@ class MegaMoETester:
                 return
             torch.cuda.synchronize()
             torch.distributed.barrier()
-            if not _NO_DIST:
+            if not _no_dist():
                 import nvshmem.core
 
                 nvshmem.core.barrier_all(torch.cuda.current_stream())
@@ -1869,7 +1877,7 @@ class MegaMoETester:
         #       the symmetric-memory teardown and is the leading suspect
         #       behind multi-rank ``nsys`` runs hanging post-capture.
         #
-        # ``_NO_DIST=1`` / uninitialised ``torch.distributed`` paths skip
+        # ``MEGA_NO_DIST=1`` / uninitialised ``torch.distributed`` paths skip
         # both barriers silently so single-rank smoke runs and the
         # ``MEGA_NO_DIST=1`` debugger path are unaffected.
         #
@@ -3134,7 +3142,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
 
-    if _NO_DIST:
+    # Snapshot once so init and teardown take matching paths even if the
+    # env var is mutated mid-run.
+    no_dist = _no_dist()
+    if no_dist:
         # MEGA_NO_DIST=1: bypass torch.distributed + NVSHMEM init so the
         # script can be launched as plain ``python mega_runner.py`` under
         # compute-sanitizer / debugger.  Single-rank only.
@@ -3157,7 +3168,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if rank == 0:
             print(f"[mega_runner] kernel launch skipped: {exc}")
 
-    if not _NO_DIST:
+    if not no_dist:
         # nvshmem_free/finalize are collective barriers; an unsynchronized or
         # GC-driven teardown deadlocks once per-rank free order diverges.  So
         # just barrier-align, then os._exit and let the driver reclaim the heap

@@ -10,7 +10,11 @@ from typing import Any, Optional, Tuple
 
 import torch
 
-_NO_DIST: bool = bool(int(os.environ.get("MEGA_NO_DIST", "0")))
+
+def _no_dist() -> bool:
+    # Read at call time, not import time: callers (e.g. single-rank pytest
+    # tests) set MEGA_NO_DIST=1 after this module is already imported.
+    return bool(int(os.environ.get("MEGA_NO_DIST", "0")))
 
 
 def bootstrap_dist():
@@ -18,7 +22,7 @@ def bootstrap_dist():
 
     Returns ``(local_rank, rank, world_size, cuda.core.Device)``.
     """
-    if _NO_DIST:
+    if _no_dist():
         torch.cuda.set_device(0)
         try:
             from cuda.core.experimental import Device
@@ -35,8 +39,13 @@ def bootstrap_dist():
 
 def sym_zeros(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     """Zero-initialised symmetric-heap tensor (plain CUDA when ``MEGA_NO_DIST=1``)."""
-    if _NO_DIST:
-        return torch.zeros(shape, dtype=dtype, device="cuda")
+    if _no_dist():
+        tensor = torch.zeros(shape, dtype=dtype, device="cuda")
+        # Tag so free_sym_tensor frees by allocation kind, not by whatever
+        # MEGA_NO_DIST happens to be at free time (the env can be flipped
+        # back between alloc and free, e.g. by pytest monkeypatch teardown).
+        tensor._mega_plain_alloc = True
+        return tensor
     import nvshmem.core
 
     tensor = nvshmem.core.tensor(shape, dtype=dtype)
@@ -46,7 +55,7 @@ def sym_zeros(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
 
 def free_sym_tensor(tensor: Optional[torch.Tensor]) -> None:
     """Release an NVSHMEM symmetric tensor; no-op under ``MEGA_NO_DIST=1``."""
-    if tensor is None or _NO_DIST:
+    if tensor is None or getattr(tensor, "_mega_plain_alloc", False) or _no_dist():
         return
     import nvshmem.core
 
@@ -63,7 +72,7 @@ def _compute_peer_offsets(
     sym_tensor: torch.Tensor,
     world_size: int,
 ) -> Tuple[int, Tuple[int, ...]]:
-    if _NO_DIST:
+    if _no_dist():
         local_base = int(sym_tensor.data_ptr())
         return local_base, tuple(0 for _ in range(world_size))
     import nvshmem.core

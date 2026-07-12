@@ -63,7 +63,7 @@ from moe_nvfp4_swapab.mega_runner import (
     _compute_peer_offsets,  # noqa: F401
     _parse_tuple,
     _parse_output_dtype,
-    _NO_DIST,
+    _no_dist,
 )
 from moe_mxfp8_glu.mega_reference_mxfp8 import compute_megamoe_reference_mxfp8
 
@@ -723,7 +723,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
 
-    if _NO_DIST:
+    # Snapshot once so init and teardown take matching paths even if the
+    # env var is mutated mid-run.
+    no_dist = _no_dist()
+    if no_dist:
         torch.cuda.set_device(0)
         rank = 0
         world_size = 1
@@ -786,7 +789,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if rank == 0:
             print(f"[mega_runner_mxfp8] kernel launch skipped: {exc}")
 
-    if not _NO_DIST:
+    if not no_dist:
         tester._compiled_kernel = None
         tester._kernel = None
         gc.collect()
@@ -806,7 +809,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "shared_workspace",
             ):
                 sym_tensor = getattr(tester, name, None)
-                if sym_tensor is not None:
+                if sym_tensor is not None and not getattr(
+                    sym_tensor, "_mega_plain_alloc", False
+                ):
                     try:  # noqa: SIM105
                         nvshmem.core.free_tensor(sym_tensor)
                     except Exception:  # noqa: BLE001
