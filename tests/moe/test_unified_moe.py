@@ -1334,3 +1334,78 @@ class TestTrtllmEPOffset:
             f"offset={local_expert_offset}: EP-shard output diverges from the "
             f"offset-0 baseline ({pct * 100:.2f}% within tolerance, atol={atol:.4f})"
         )
+
+
+# ---------------------------------------------------------------------------
+# 4. FromLogits packing contract (gh #3595)
+# ---------------------------------------------------------------------------
+
+
+@sm100_required
+class TestTrtllmFromLogitsPackingContract:
+    """FromLogits buffer allocation must follow the kernel's output contract.
+
+    The fp4 routing kernel writes bf16 expert weights regardless of the logits
+    dtype; allocating ``expert_weights`` with ``routing_logits.dtype`` (fp32
+    DeepSeekV3 logits) mislabels the kernel-filled buffer, so an unfinalized
+    read interprets bf16 bits as fp32 garbage (gh #3595 — same bug previously
+    fixed in the canonical ``trtllm_fp4_block_scale_moe`` wrapper).  Packing
+    inspection only; no kernel launch.
+    """
+
+    @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+    def test_expert_weights_buffer_is_bf16(self, logits_dtype):
+        from flashinfer.fused_moe.core import MoeRunnerInputs, RoutingInputMode
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_experts, top_k, num_tokens, hidden_size = 128, 4, 16, 256
+
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            experts=ExpertConfig(intermediate_size=512),
+        )
+        runner = TrtllmFp4RoutedRunner(config, device=device)
+
+        routing_logits = torch.randn(
+            num_tokens, num_experts, dtype=logits_dtype, device=device
+        )
+        act_pack = MoEActivationPack(
+            hidden_states_q=torch.zeros(
+                num_tokens, hidden_size // 2, dtype=torch.uint8, device=device
+            ),
+            hidden_states_scale=torch.zeros(
+                num_tokens, hidden_size // 16, dtype=torch.uint8, device=device
+            ).view(torch.float8_e4m3fn),
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=routing_logits,
+        )
+        weight_pack = MoEWeightPack()
+        weight_pack.prepare_for(
+            "trtllm_fp4_routed",
+            {
+                "gemm1_weights": torch.empty(0, device=device),
+                "gemm1_weights_scale": torch.empty(0, device=device),
+                "gemm1_alpha": torch.empty(0, device=device),
+                "gemm2_weights": torch.empty(0, device=device),
+                "gemm2_weights_scale": torch.empty(0, device=device),
+            },
+        )
+
+        moe_inputs = MoeRunnerInputs.from_list(
+            runner.pack_inputs(act_pack, weight_pack)
+        )
+
+        # Kernel-filled OUTPUT buffers: bf16 weights (gh #3595), int32 ids.
+        assert moe_inputs.expert_weights.dtype == torch.bfloat16, (
+            f"logits_dtype={logits_dtype}: expert_weights buffer is "
+            f"{moe_inputs.expert_weights.dtype}, but the fp4 routing kernel "
+            f"writes bf16 — an unfinalized read would mislabel the data"
+        )
+        assert moe_inputs.expert_weights.shape == (num_tokens, top_k)
+        assert moe_inputs.topk_ids.dtype == torch.int32
+        # Logits thread through unchanged; mode reaches the kernel kwargs.
+        assert moe_inputs.routing_logits is routing_logits
+        assert (
+            runner._static_kwargs["routing_input_mode"] == RoutingInputMode.FromLogits
+        )

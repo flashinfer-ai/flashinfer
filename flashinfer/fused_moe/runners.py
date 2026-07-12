@@ -325,8 +325,13 @@ class TrtllmFp4RoutedRunner(TunableRunner):
             topk_ids = act.hidden_states_q.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.int32
             )
-            # routing_logits.new_empty inherits its device + dtype (core.py:2253).
-            expert_weights = routing_logits.new_empty((num_tokens, routing.top_k))
+            # MUST be bf16 regardless of logits dtype: the fp4 routing kernel
+            # writes bf16 expert weights, so inheriting fp32 from the logits
+            # mislabels the returned buffer (gh #3595 — the canonical wrapper
+            # in core.py hardcodes bf16 for the same reason).
+            expert_weights = routing_logits.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
             # Pre-routed: pack the host selection into (GLOBAL expert_id << 16) | bf16(weight).
             # The kernel expects GLOBAL ids and filters/maps them via the separately
