@@ -273,7 +273,8 @@ void SparseMlaSm120PagedAttention(
   TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "
                      << "model="
                      << (mt == ModelType::DSV3_2 ? "DSV3_2"
-                                                 : (mt == ModelType::GLM_NSA ? "GLM_NSA" : "DSV4"))
+                         : mt == ModelType::GLM_NSA ? "GLM_NSA"
+                         : mt == ModelType::DSV4_NVFP4 ? "DSV4_NVFP4" : "DSV4")
                      << " num_heads=" << num_heads << " topk=" << topk
                      << " page_block_size=" << page_block_size << " topk_extra=" << extra_topk
                      << " extra_page_block_size=" << extra_page_block_size;

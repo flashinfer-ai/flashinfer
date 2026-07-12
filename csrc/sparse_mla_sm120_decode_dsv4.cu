@@ -132,8 +132,8 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
 }
 
 // Public surface — explicit instantiation switch over the PR-body bench grid.
-// DSV4 only, page_block_size=64 only. NUM_HEADS ∈ {8, 16, 32, 64, 128},
-// TOPK ∈ {128, 512, 1024}.
+// DSV4 and DSV4_NVFP4, page_block_size=64 only. NUM_HEADS ∈ {8, 16, 32, 64, 128},
+// TOPK ∈ {128, 256, 512, 1024}.
 bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int page_block_size,
                                    int num_tokens, int num_splits, const bf16* Q,
                                    const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out,
@@ -148,7 +148,7 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
   if (num_splits <= 0) return false;
 #define DSV4_DISPATCH_MT(MT_, H, K)                                                         \
   if (mt == (MT_) && num_heads == (H) && topk == (K)) {                                     \
-    return launch_decode_dsv4_impl<(MT_), (H), (K), 64>(                                    \
+    return launch_decode_dsv4_impl<MT_, H, K, 64>(                                          \
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,    \
         extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra,            \
         stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale, \
