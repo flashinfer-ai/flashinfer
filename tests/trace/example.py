@@ -34,6 +34,7 @@ gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
 layernorm_h768.json
+magi_ffa_flex_h2_kv2_d128.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
@@ -71,9 +72,11 @@ Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
 FP4 MoE files are only generated on Blackwell (SM100+) GPUs with fp4_quantize available.
 GDN prefill files require SM90+ (Hopper) GPU.
+magi_ffa_flex is only generated when the optional MagiAttention dependency is installed.
 """
 
 import contextlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -1349,3 +1352,27 @@ with contextlib.suppress(Exception):
         page_size=_rqfap_PS,
         kv_layout="NHD",
     )
+
+# ── MagiAttention Flex Flash Attention (optional dependency) ─────────────────
+# magi_ffa_flex_h2_kv2_d128.json is only generated when MagiAttention is
+# installed (it is NOT a FlashInfer dependency); skipped otherwise.
+if importlib.util.find_spec("magi_attention") is not None:
+    from flashinfer.magi_ffa import flex_flash_attn
+
+    _ffa_seq, _ffa_h, _ffa_d = 64, 2, 128
+    _ffa_q = torch.randn(_ffa_seq, _ffa_h, _ffa_d, dtype=torch.bfloat16, device=device)
+    _ffa_k = torch.randn(_ffa_seq, _ffa_h, _ffa_d, dtype=torch.bfloat16, device=device)
+    _ffa_v = torch.randn(_ffa_seq, _ffa_h, _ffa_d, dtype=torch.bfloat16, device=device)
+    _ffa_q_ranges = torch.tensor([[0, _ffa_seq]], dtype=torch.int32, device=device)
+    _ffa_k_ranges = torch.tensor([[0, _ffa_seq]], dtype=torch.int32, device=device)
+    _ffa_type_map = torch.tensor([1], dtype=torch.int32, device=device)
+    flex_flash_attn(
+        _ffa_q,
+        _ffa_k,
+        _ffa_v,
+        q_ranges=_ffa_q_ranges,
+        k_ranges=_ffa_k_ranges,
+        attn_type_map=_ffa_type_map,
+    )
+else:
+    print("magi_attention not installed; skipping magi_ffa_flex trace example")

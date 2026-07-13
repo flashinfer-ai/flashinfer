@@ -15,13 +15,41 @@ limitations under the License.
 """
 
 import functools
+from importlib.metadata import PackageNotFoundError, version
 from typing import Optional, Tuple, Union
 
 import torch
 
 from flashinfer.api_logging import flashinfer_api
+from flashinfer.trace.templates.attention import magi_ffa_flex_trace
 
 _SUPPORTED_LAYOUTS = ("NHD", "HND")
+
+# FlashInfer's own floor for nvidia-cutlass-dsl (see requirements.txt).
+# MagiAttention's installer is known to downgrade this package (e.g. to
+# 4.3.5), which breaks `import flashinfer` (cute.nvgpu.OperandMajorMode
+# needs >=4.5.0). Documented, validated override: magi_attention==1.1.0.post10
+# with nvidia-cutlass-dsl>=4.5.0 reinstalled AFTER MagiAttention.
+_MIN_CUTLASS_DSL_VERSION = (4, 5, 0)
+
+
+def _check_cutlass_dsl_not_downgraded() -> None:
+    try:
+        installed = version("nvidia-cutlass-dsl")
+    except PackageNotFoundError:
+        return  # flashinfer's own cute-dsl paths surface this when needed
+    installed_tuple = tuple(
+        int(part) for part in installed.split(".")[:3] if part.isdigit()
+    )
+    if installed_tuple < _MIN_CUTLASS_DSL_VERSION:
+        minimum = ".".join(str(v) for v in _MIN_CUTLASS_DSL_VERSION)
+        raise RuntimeError(
+            f"nvidia-cutlass-dsl=={installed} is below FlashInfer's requirement "
+            f">={minimum}; it was likely downgraded by the MagiAttention install. "
+            f'Restore it with: pip install "nvidia-cutlass-dsl>={minimum}" '
+            "(run AFTER installing MagiAttention). Validated combination: "
+            f"magi_attention==1.1.0.post10 + nvidia-cutlass-dsl>={minimum}."
+        )
 
 
 @functools.cache
@@ -39,8 +67,11 @@ def _load_flex_flash_attn_func():
             "MagiAttention is required to use flashinfer.magi_ffa.flex_flash_attn. "
             "It is an optional dependency (SandAI MagiAttention, Apache-2.0) and is "
             "not installed automatically; install it in the active Python environment "
-            "before calling flex_flash_attn()."
+            "before calling flex_flash_attn(). Note: MagiAttention's install may "
+            "downgrade nvidia-cutlass-dsl; afterwards run pip install "
+            '"nvidia-cutlass-dsl>=4.5.0" to keep flashinfer importable.'
         ) from exc
+    _check_cutlass_dsl_not_downgraded()
     return flex_flash_attn_func
 
 
@@ -68,19 +99,13 @@ def _check_attn_type_map(
         raise ValueError("attn_type_map must have the same length as q_ranges")
 
 
-def _to_token_major(t: torch.Tensor) -> torch.Tensor:
-    # HND (num_heads, num_tokens, head_dim) -> NHD (num_tokens, num_heads, head_dim),
-    # the token-major layout MagiAttention FFA expects.
+def _swap_token_head_dims(t: torch.Tensor) -> torch.Tensor:
+    # HND <-> NHD: swaps the leading (num_heads, num_tokens) dims in either
+    # direction. Works for the 3D q/k/v/out tensors and the 2D lse.
     return t.transpose(0, 1).contiguous()
 
 
-def _from_token_major(t: torch.Tensor) -> torch.Tensor:
-    # NHD (num_tokens, ...) -> HND (.., num_tokens, ..). Works for both the 3D output
-    # (num_tokens, num_heads, head_dim) and the 2D lse (num_tokens, num_heads).
-    return t.transpose(0, 1).contiguous()
-
-
-@flashinfer_api
+@flashinfer_api(trace=magi_ffa_flex_trace)
 def flex_flash_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -168,7 +193,7 @@ def flex_flash_attn(
     func = _load_flex_flash_attn_func()
 
     if tensor_layout == "HND":
-        q, k, v = _to_token_major(q), _to_token_major(k), _to_token_major(v)
+        q, k, v = (_swap_token_head_dims(t) for t in (q, k, v))
 
     out, meta = func(
         q=q,
@@ -181,7 +206,7 @@ def flex_flash_attn(
     )
 
     if tensor_layout == "HND":
-        out = _from_token_major(out)
+        out = _swap_token_head_dims(out)
 
     if not return_lse:
         return out
@@ -190,7 +215,7 @@ def flex_flash_attn(
     if lse is None:
         raise RuntimeError("MagiAttention did not return lse metadata")
     if tensor_layout == "HND":
-        lse = _from_token_major(lse)
+        lse = _swap_token_head_dims(lse)
     return out, lse
 
 

@@ -3722,3 +3722,71 @@ cute_dsl_batch_prefill_run_trace = TraceTemplate(
     tags=["status:verified", "stage:prefill", "backend:cute-dsl"],
     reference=_cute_dsl_batch_prefill_run_reference,
 )
+
+
+# ── MagiAttention Flex Flash Attention (optional dependency) ─────────────────
+# No reference= is provided on purpose: the per-range mask semantics
+# (causal / inverse-causal / bidirectional-causal alignment) are owned by
+# MagiAttention, and the adapter's real-path tests in tests/ffa compare
+# directly against MagiAttention's native flex_flash_attn_func instead.
+
+magi_ffa_flex_trace = TraceTemplate(
+    op_type="magi_ffa_flex",
+    name_prefix="magi_ffa_flex",
+    description=(
+        "Single-GPU Flex Flash Attention via MagiAttention (optional, "
+        "separately-installed dependency). Ragged, range-based mask model: "
+        "q_ranges/k_ranges are (num_ranges, 2) int32 [start, end) pairs and "
+        "attn_type_map selects the per-range mask type (0=full, 1=causal, "
+        "2=inverse-causal, 3=bidirectional-causal)."
+    ),
+    axes={
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "num_tokens_q": Var(description="Total query tokens (ragged, token-major)."),
+        "num_tokens_kv": Var(description="Total key/value tokens (ragged)."),
+        "num_ranges": Var(description="Number of (q_range, k_range) mask entries."),
+        "range_pair": Const(
+            abbrev="", description="Always 2: [start, end) bounds of a range."
+        ),
+    },
+    inputs={
+        "q": Tensor(["num_tokens_q", "num_qo_heads", "head_dim"]),
+        "k": Tensor(["num_tokens_kv", "num_kv_heads", "head_dim"]),
+        "v": Tensor(["num_tokens_kv", "num_kv_heads", "head_dim"]),
+        "q_ranges": Tensor(
+            ["num_ranges", "range_pair"],
+            description="int32 [start, end) query ranges of the attention mask.",
+        ),
+        "k_ranges": Tensor(
+            ["num_ranges", "range_pair"],
+            description="int32 [start, end) key ranges of the attention mask.",
+        ),
+        "attn_type_map": Tensor(
+            ["num_ranges"],
+            optional=True,
+            description=(
+                "int32 per-range mask type (0=full, 1=causal, 2=inverse-causal, "
+                "3=bidirectional-causal). None means full attention."
+            ),
+        ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["num_tokens_q", "num_qo_heads", "head_dim"],
+            dtype_from="q",
+            description="Attention output in the requested tensor_layout.",
+        ),
+        "lse": Tensor(
+            ["num_tokens_q", "num_qo_heads"],
+            optional=True,
+            dtype="float32",
+            description="Log-sum-exp of attention logits (natural log).",
+        ),
+    },
+    tags=["status:experimental", "stage:prefill", "backend:magi-attention"],
+)
