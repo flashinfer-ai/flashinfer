@@ -70,6 +70,7 @@ from .jit.fused_moe import (
     gen_trtllm_gen_fused_moe_sm100_module,
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
+from .jit.monomoe import gen_monomoe_module
 from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
@@ -109,6 +110,7 @@ from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
+from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
@@ -527,12 +529,17 @@ def gen_all_modules(
         jit_specs.append(gen_gemm_module())
         # Multi-LoRA MoE BGMV kernel
         jit_specs.append(gen_bgmv_moe_module())
+        # DSv4 hash-based MoE routing (SM-portable)
+        jit_specs.append(gen_hash_topk_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
+            # MonoMoe kernel: single-kernel block-FP8 top-K MoE,
+            # Hopper (SM90a) only — uses wgmma.mma_async + TMA.
+            jit_specs.append(gen_monomoe_module())
         if has_sm100:
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())

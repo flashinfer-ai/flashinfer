@@ -939,7 +939,7 @@ class TestAutotunerBucketConfig:
         TRT-LLM's ``last_positive_power_of_2(x)`` behavior. Locks in
         the fi/trt-llm parity that IS achievable in this regime.
         """
-        from flashinfer.fused_moe.utils import last_positive_power_of_2
+        from flashinfer.utils import last_positive_power_of_2
 
         result = bucket_spec.map_to_tuning_buckets(x)
         assert result == x == last_positive_power_of_2(x), (
@@ -994,7 +994,7 @@ class TestAutotunerBucketConfig:
         least the same coarse-grained coverage as TRT-LLM at every
         power-of-2 boundary up to the input dim.
         """
-        from flashinfer.fused_moe.utils import last_positive_power_of_2
+        from flashinfer.utils import last_positive_power_of_2
 
         fi_buckets = set(bucket_spec.gen_tuning_buckets(max_n))
         # Mirror TRT-LLM's get_last_power_of_2_num_tokens_buckets:

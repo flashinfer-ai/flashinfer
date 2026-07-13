@@ -137,7 +137,8 @@ class TrtllmFp4RoutedRunner(TunableRunner):
     ``core.MoERunner.forward``.
 
     Routing is pre-computed (``RoutingInputMode.PackedPrecomputed``): the packed
-    int32 top-k ids carry ``((expert_id - local_offset) << 16) | bf16(weight)``.
+    int32 top-k ids carry ``(global_expert_id << 16) | bf16(weight)``; the
+    kernel maps global ids onto the local shard via ``local_expert_offset``.
     The inner ``MoERunner`` needs the hidden size for its tactic keys and tuning
     buckets, so it is built lazily on the first ``pack_inputs`` call.
     """
@@ -236,10 +237,11 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar.
 
         The local-shard offset comes from ``ExpertConfig.local_expert_offset``
-        on the config this runner was built with.  For expert-parallel
-        pre-routed inputs the kernel indexes local experts as
-        ``[0, local_num_experts)``, so global expert ids are shifted down by the
-        local offset before packing.
+        on the config this runner was built with.  ``selected_experts`` carries
+        GLOBAL expert ids and is packed as-is; the kernel performs the
+        global→local mapping itself by subtracting ``local_expert_offset``
+        (passed via the static kwargs) and dropping ids outside
+        ``[offset, offset + local_num_experts)``.
         """
         from .core import MoeRunnerInputs, RoutingInputMode
 

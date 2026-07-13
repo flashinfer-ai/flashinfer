@@ -23,6 +23,29 @@ if [ -z "${MAX_JOBS:-}" ]; then
 fi
 export MAX_JOBS
 
+# Pin the preinstalled CUDA torch for every job-time pip install. Twice now a
+# runtime dep's transitive constraint has made pip re-resolve torch and evict
+# the CUDA build (the nvidia-nccl-cu13 floor, then nvshmem4py-cu12's
+# cuda-python<=12.9 pin downgrading cuda-bindings on cu13 images) — on aarch64
+# pip backtracks to the CPU-only PyPI wheel and tests fail later with "Torch
+# not compiled with CUDA enabled". A constraints file makes any resolution that
+# would replace torch fail loudly at install time instead. The +cuXXX local
+# tag is stripped: PEP 440 lets the installed 2.X.Y+cuNNN satisfy ==2.X.Y, but
+# PEP-517 build envs (flashinfer-jit-cache's build-system.requires includes
+# torch) inherit PIP_CONSTRAINT and must be able to resolve the pin from PyPI,
+# where local-version wheels don't exist.
+if [ -z "${PIP_CONSTRAINT:-}" ]; then
+    _torch_pin=$(python -c "import torch; print('torch=='+torch.__version__.split('+')[0])" 2>/dev/null || true)
+    if [ -n "${_torch_pin}" ]; then
+        _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
+        echo "${_torch_pin}" > "${_constraint_file}"
+        export PIP_CONSTRAINT="${_constraint_file}"
+        echo "Pinning for all pip installs in this job: ${_torch_pin}"
+        unset _constraint_file
+    fi
+    unset _torch_pin
+fi
+
 # CUDA_VISIBLE_DEVICES: Not set by default - let detect_gpus() auto-detect via nvidia-smi
 : "${SAMPLE_RATE:=5}"  # Run every Nth test in sanity mode (5 = ~20% coverage)
 : "${PARALLEL_TESTS:=false}"  # Disable parallel test execution by default

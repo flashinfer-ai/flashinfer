@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -178,6 +180,154 @@ def test_nvfp4_attention_sm120_accuracy(
         cos_threshold,
         mean_abs_err_threshold,
     )
+
+
+@pytest.mark.parametrize("per_block_mean", [True, False])
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_structured_q_correction(per_block_mean):
+    """Q with real block structure makes qk_correction large; a misaddressed
+    correction tensor collapses accuracy (regression test for the expanded
+    [B, H, S, S] correction layout the kernel never addressed)."""
+    _require_sm120()
+
+    torch.manual_seed(42)
+    batch, num_heads, seq_len, head_dim = 2, 4, 1024, 128
+    q = torch.randn(
+        (batch, num_heads, seq_len, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    if per_block_mean:
+        # distinct mean per 128-token block, batch, and head
+        bias = torch.randn(
+            (batch, num_heads, seq_len // 128, 1, head_dim),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        q = (q.view(batch, num_heads, seq_len // 128, 128, head_dim) + bias).view(
+            batch, num_heads, seq_len, head_dim
+        )
+    else:
+        # distinct mean per batch and head, constant across the sequence,
+        # so the full-sequence Q centering removes it exactly
+        bias = torch.randn(
+            (batch, num_heads, 1, head_dim), device="cuda", dtype=torch.bfloat16
+        )
+        q = q + bias
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    q_fp4, k_fp4, v_fp4_t, q_scale, k_scale, v_scale_t, qk_correction = (
+        flashinfer.nvfp4_attention_sm120_quantize_qkv(
+            q, k, v, per_block_mean=per_block_mean
+        )
+    )
+    expected_rows = seq_len // 128 if per_block_mean else 1
+    assert qk_correction.shape == (batch, num_heads, expected_rows, seq_len)
+
+    out, _ = flashinfer.nvfp4_attention_sm120_fwd(
+        q_fp4,
+        k_fp4,
+        v_fp4_t,
+        q_scale,
+        k_scale,
+        v_scale_t,
+        qk_correction,
+        sm_scale=head_dim**-0.5,
+        causal=False,
+        per_block_mean=per_block_mean,
+    )
+    torch.cuda.synchronize()
+
+    # smoothing + correction reproduce plain attention exactly, so the exact
+    # output is the reference; the remaining gap is FP4 quantization error
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q.float(), k.float(), v.float(), scale=head_dim**-0.5
+    )
+    cos_sim = F.cosine_similarity(out.float().reshape(1, -1), ref.reshape(1, -1)).item()
+    assert cos_sim >= 0.95
+
+
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_output_magnitude():
+    """With uniform scores and V = ones the exact output is 1.0 everywhere;
+    a mis-reduced row_sum shows up as a uniform scale error that cosine
+    thresholds cannot see (regression test for the halved output)."""
+    _require_sm120()
+
+    batch, num_heads, seq_len, head_dim = 1, 2, 512, 128
+    q = torch.zeros(
+        (batch, num_heads, seq_len, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.zeros_like(q)
+    v = torch.ones_like(q)
+
+    quantized = flashinfer.nvfp4_attention_sm120_quantize_qkv(q, k, v)
+    out, lse = flashinfer.nvfp4_attention_sm120_fwd(
+        *quantized, sm_scale=head_dim**-0.5, causal=False
+    )
+    torch.cuda.synchronize()
+
+    # the only remaining error is V quantization (~3%)
+    assert (out.float() - 1.0).abs().max().item() <= 0.05
+    # uniform scores: lse is exactly ln(seq_len)
+    assert (lse.float() - math.log(seq_len)).abs().max().item() <= 0.02
+
+
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_rejects_expanded_correction():
+    """The old expanded [B, H, S, S] correction layout (which the kernel never
+    addressed correctly) must be rejected by the shape validation."""
+    _require_sm120()
+
+    torch.manual_seed(42)
+    batch, num_heads, seq_len, head_dim = 1, 2, 256, 128
+    q = torch.randn(
+        (batch, num_heads, seq_len, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    quantized = list(flashinfer.nvfp4_attention_sm120_quantize_qkv(q, k, v))
+    quantized[6] = quantized[6].repeat_interleave(128, dim=2).contiguous()
+
+    with pytest.raises(ValueError, match="qk_correction"):
+        flashinfer.nvfp4_attention_sm120_fwd(
+            *quantized, sm_scale=head_dim**-0.5, causal=False
+        )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_lse(causal):
+    """lse must be the log-sum-exp of the scaled scores the kernel attends
+    over (K is mean-centered by quantize_qkv, which shifts each row's lse)."""
+    _require_sm120()
+
+    torch.manual_seed(42)
+    batch, num_heads, seq_len, head_dim = 2, 4, 1024, 128
+    q = torch.randn(
+        (batch, num_heads, seq_len, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    quantized = flashinfer.nvfp4_attention_sm120_quantize_qkv(q, k, v)
+    _, lse = flashinfer.nvfp4_attention_sm120_fwd(
+        *quantized, sm_scale=head_dim**-0.5, causal=causal
+    )
+    torch.cuda.synchronize()
+
+    k_centered = k.float() - k.float().mean(dim=-2, keepdim=True)
+    scores = torch.matmul(q.float(), k_centered.transpose(-2, -1)) * head_dim**-0.5
+    if causal:
+        mask = torch.triu(
+            torch.ones(seq_len, seq_len, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        scores.masked_fill_(mask, float("-inf"))
+    lse_ref = torch.logsumexp(scores, dim=-1)
+
+    diff = (lse.float() - lse_ref).abs()
+    assert diff.mean().item() <= 0.05
+    assert diff.max().item() <= 0.5
 
 
 @torch.inference_mode()

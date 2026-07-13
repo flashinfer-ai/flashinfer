@@ -789,6 +789,7 @@ class BlockSparseAttentionWrapper:
                 args.append(-1)  # fixed_split_size
                 args.append(False)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
+                args.append(0)  # uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -1425,6 +1426,7 @@ class VariableBlockSparseAttentionWrapper:
             args.append(-1)  # fixed_split_size
             args.append(False)  # disable_split_kv
             args.append(0)  # num_colocated_ctas
+            args.append(0)  # uniform_q_len
         self._plan_info = self._cached_module.plan(
             *args,
         )

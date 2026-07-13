@@ -64,11 +64,13 @@ from .utils import (
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
+    _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
     get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
     is_float8,
     is_sm100a_supported,
     is_sm110a_supported,
@@ -244,10 +246,32 @@ def get_trtllm_gen_prefill_module():
         uses_shared_paged_kv_idx: bool = True,
         is_causal: bool = True,
         lse: Optional[torch.Tensor] = None,
+        multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
             out = torch.empty_like(query)
+        required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, query.size(1), sm_count
+        )
+        if multi_ctas_kv_counter_buffer is None:
+            multi_ctas_kv_counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+                batch_size, query.size(1), sm_count, query.device
+            )
+        elif multi_ctas_kv_counter_buffer.device != query.device:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer must be on the same device as query"
+            )
+        else:
+            counter_buffer_bytes = (
+                multi_ctas_kv_counter_buffer.numel()
+                * multi_ctas_kv_counter_buffer.element_size()
+            )
+            if counter_buffer_bytes < required_counter_bytes:
+                raise ValueError(
+                    "multi_ctas_kv_counter_buffer is too small: got "
+                    f"{counter_buffer_bytes} bytes, need {required_counter_bytes} bytes"
+                )
         if isinstance(bmm1_scale, torch.Tensor):
             assert bmm1_scale.dtype == torch.float32
             bmm1_scale = bmm1_scale * log2e
@@ -269,6 +293,7 @@ def get_trtllm_gen_prefill_module():
             k_cache,
             v_cache,
             workspace_buffer,
+            multi_ctas_kv_counter_buffer,
             block_tables,
             seq_lens,
             max_q_len,
@@ -626,6 +651,7 @@ def get_batch_prefill_module(backend, *args):
         mutates_args=(
             "float_workspace_buffer",
             "int_workspace_buffer",
+            "multi_ctas_kv_counter_buffer",
             "paged_k_cache",
             "paged_v_cache",
             "o",
@@ -679,6 +705,7 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert num_qo_heads is not None
@@ -691,6 +718,7 @@ def get_batch_prefill_module(backend, *args):
             assert cum_seq_lens_q is not None
             assert cum_seq_lens_kv is not None
             assert enable_pdl is not None
+            assert multi_ctas_kv_counter_buffer is not None
             assert workspace_size > 0, "workspace_size must be greater than 0"
             o = paged_run_func(
                 q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
@@ -717,6 +745,7 @@ def get_batch_prefill_module(backend, *args):
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
                 is_causal=mask_mode != MaskMode.NON_CAUSAL.value,
                 lse=maybe_lse,
+                multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -858,6 +887,7 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -1688,6 +1718,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             * self._float_workspace_buffer.element_size()
         )
         self.device = float_workspace_buffer.device
+        self._trtllm_gen_multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
         self._kv_lens_buffer = torch.empty(
             (32768,), dtype=torch.int32, device=self.device
@@ -1824,6 +1855,91 @@ class BatchPrefillWithPagedKVCacheWrapper:
         as the device/stream selector for the underlying module query.  This
         method does not allocate buffers and does not mutate cached plan state.
 
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+        paged_kv_indptr : torch.Tensor
+            The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
+        paged_kv_indices : torch.Tensor
+            The page indices of the paged kv-cache, shape: ``[paged_kv_indptr[-1]]``.
+        paged_kv_last_page_len : torch.Tensor
+            The number of entries in the last page of each request in the paged
+            kv-cache, shape: ``[batch_size]``.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim_qk : int
+            The dimension of the query/key heads.
+        page_size : int
+            The size of each page in the paged kv-cache.
+        head_dim_vo : Optional[int]
+            The dimension of the value/output heads. If not provided, defaults to
+            ``head_dim_qk``.
+        custom_mask : Optional[torch.Tensor]
+            The flattened boolean mask tensor; when provided the packed mask is
+            generated internally. See :meth:`plan` for the full description.
+        packed_custom_mask : Optional[torch.Tensor]
+            The 1D packed uint8 mask tensor. If provided, ``custom_mask`` is ignored.
+        causal : bool
+            Whether to apply a causal mask. Defaults to ``False``.
+        pos_encoding_mode : str
+            The position encoding applied inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+            Defaults to ``NONE``.
+        use_fp16_qk_reduction : bool
+            Whether to use fp16 for qk reduction. Defaults to ``False``.
+        sm_scale : Optional[float]
+            Softmax scale. If ``None``, defaults to ``1.0 / sqrt(head_dim_qk)``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.),
+            if not provided, will be set to ``0``.
+        rope_scale : Optional[float]
+            Scale factor applied during RoPE interpolation. Defaults to ``1.0`` when ``None``.
+        rope_theta : Optional[float]
+            Base value for the RoPE frequencies. Defaults to ``1e4`` when ``None``.
+        q_data_type : Union[str, torch.dtype]
+            The data type of the query tensor. Defaults to ``torch.float16``.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If ``None``, will be set to ``q_data_type``.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If ``None``, will be set to ``q_data_type``.
+        prefix_len_ptr : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the prefix length of each prompt,
+            shape: ``[batch_size]``.
+        token_pos_in_items_ptr : Optional[torch.Tensor]
+            A uint16 1D tensor indicating the token position of each item within its item.
+        token_pos_in_items_len : int
+            Zero-padding length for ``token_pos_in_items_ptr``. Defaults to ``0``.
+        max_item_len_ptr : Optional[torch.Tensor]
+            A uint16 vector containing the max token length of all items for each prompt.
+        seq_lens : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt,
+            shape: ``[batch_size]``.
+        seq_lens_q : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the q sequence length of each prompt,
+            shape: ``[batch_size]``.
+        block_tables : Optional[torch.Tensor]
+            A uint32 2D tensor indicating the block table of each prompt,
+            shape: ``[batch_size, max_num_blocks_per_seq]``.
+        max_token_per_sequence : Optional[int]
+            Required for cuDNN backend. The scalar max token length of each sequence.
+        max_sequence_kv : Optional[int]
+            Maximum number of KV tokens per sequence for cuDNN backend.
+        fixed_split_size : Optional[int]
+            The fixed split size for split-kv prefill, in pages.
+        disable_split_kv : bool
+            Whether to disable the split-kv. Defaults to ``False``.
+
+        Returns
+        -------
+        Tuple[int, int]
+            ``(float_workspace_size, int_workspace_size)`` in bytes.
+
         Example
         -------
         >>> float_bytes, int_bytes = wrapper.workspace_size(...)
@@ -1957,6 +2073,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             args.append(fixed_split_size)
             args.append(disable_split_kv)
             args.append(0)  # num_colocated_ctas
+            args.append(0)  # uniform_q_len
         float_workspace_size, int_workspace_size = module.workspace_size(*args)
         return int(float_workspace_size), int(int_workspace_size)
 
@@ -2304,6 +2421,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
+            # Allocated once per plan and reused across run() launches; the
+            # trtllm-gen kernel self-resets the counters after each launch.
+            self._trtllm_gen_multi_ctas_kv_counter_buffer = (
+                _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+                    batch_size,
+                    num_qo_heads,
+                    get_device_sm_count(self.device),
+                    self.device,
+                )
+            )
             if logits_soft_cap != 0.0:
                 raise ValueError(
                     "logits_soft_cap must be 0.0 for trtllm-gen paged KV cache"
@@ -2358,6 +2485,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
+                args.append(0)  # uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -2764,8 +2892,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     value_block_scales,
                     skip_softmax_threshold_scale_factor,
                     True,  # uses_shared_paged_kv_idx
+                    self._trtllm_gen_multi_ctas_kv_counter_buffer,
                 ]
 
+            if self._backend == "trtllm-gen":
+                assert self._trtllm_gen_multi_ctas_kv_counter_buffer is not None
             assert self._cached_module is not None, "cached module is not initialized"
             self._cached_module.paged_run(*run_args)
 
@@ -3450,6 +3581,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
+                args.append(0)  # uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -4329,6 +4461,7 @@ def trtllm_batch_context_with_kv_cache(
     causal: bool = True,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -4348,8 +4481,8 @@ def trtllm_batch_context_with_kv_cache(
 
         - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint
         - The head and batch/page dims can have arbitrary strides.
-    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
-        workspace
+    workspace_buffer : torch.Tensor
+        Workspace used for trtllm-gen softmax stats/scratch.
     block_tables : torch.Tensor
         Page table of kv cache.
         When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
@@ -4442,6 +4575,12 @@ def trtllm_batch_context_with_kv_cache(
         True and this is None, a buffer will be allocated.
     return_lse : bool = False
         Whether to return Log-Sum-Exp values. When True, returns ``(out, lse)``.
+    multi_ctas_kv_counter_buffer : Optional[torch.Tensor] = None
+        Optional separate trtllm-gen multi-CTA KV counter buffer. If not provided,
+        FlashInfer creates a fresh zeroed internal buffer. When provided, it must be
+        zero-initialized at allocation (e.g. via ``torch.zeros``); the kernel
+        self-resets the counters after each launch, so it does not need to be
+        re-zeroed between calls.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -4581,6 +4720,27 @@ def trtllm_batch_context_with_kv_cache(
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
 
     num_qo_heads = query.size(1)
+    required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    if multi_ctas_kv_counter_buffer is None:
+        multi_ctas_kv_counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+            batch_size, num_qo_heads, sm_count, query.device
+        )
+    elif multi_ctas_kv_counter_buffer.device != query.device:
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer must be on the same device as query"
+        )
+    else:
+        counter_buffer_bytes = (
+            multi_ctas_kv_counter_buffer.numel()
+            * multi_ctas_kv_counter_buffer.element_size()
+        )
+        if counter_buffer_bytes < required_counter_bytes:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is too small: got "
+                f"{counter_buffer_bytes} bytes, need {required_counter_bytes} bytes"
+            )
     lse_shape = (query.size(0), num_qo_heads)
     if lse is not None:
         check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
@@ -4601,6 +4761,7 @@ def trtllm_batch_context_with_kv_cache(
         k_cache,
         v_cache,
         workspace_buffer,
+        multi_ctas_kv_counter_buffer,
         block_tables,
         seq_lens,
         max_q_len,
@@ -4785,7 +4946,7 @@ def trtllm_fmha_v2_prefill(
           ``[num_tokens, num_heads, head_dim]`` and K, V have shape
           ``[num_tokens, num_kv_heads, head_dim]``.
     workspace_buffer
-        The workspace buffer. Must be initialized to 0 for its first use.
+        The workspace buffer used for trtllm-gen softmax stats/scratch.
     seq_lens
         The KV sequence length of each request, shape: ``[batch_size]``.
     max_q_len
@@ -4969,7 +5130,6 @@ def trtllm_fmha_v2_prefill(
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
     if is_e4m3:
-        logging.warning("The FP8 (e4m3) kernels are currently known to hang on SM90.")
         if is_sm12x_supported(query.device):
             raise ValueError(
                 "FP8 (e4m3) is not yet supported for FMHAv2 on SM120 (Blackwell). "

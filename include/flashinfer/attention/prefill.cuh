@@ -2396,10 +2396,13 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO);
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
-    // hd512 uses the 2-Q x 2-KV-warp layout at CTA_TILE_Q=32. FP4 large-head
-    // single-prefill additionally uses VO-split output so it avoids the
-    // cta_sync_o_smem traffic that exceeds SM86 shared memory.
-    constexpr bool kLargeHeadWarpSplit = ((sizeof(DTypeKV) == 2) || is_fp4_type_v<DTypeKV>) &&
+    // hd512 uses the 2-Q x 2-KV-warp layout at CTA_TILE_Q=32. FP8 must take it
+    // too: it stays on the split-D merge path whose cta_sync_o_smem buffer
+    // (NUM_WARPS_KV x CTA_TILE_Q x 256 floats) only fits ~99KB-per-block parts
+    // (SM120/121) with NUM_WARPS_KV=2. FP4 large-head single-prefill
+    // additionally uses VO-split output so it avoids that cta_sync_o_smem
+    // traffic entirely.
+    constexpr bool kLargeHeadWarpSplit = ((sizeof(DTypeKV) <= 2) || is_fp4_type_v<DTypeKV>) &&
                                          (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
     constexpr uint32_t NUM_WARPS_Q = kLargeHeadWarpSplit ? 2 : get_num_warps_q(CTA_TILE_Q);
     constexpr uint32_t NUM_WARPS_KV = kLargeHeadWarpSplit ? 2 : get_num_warps_kv(CTA_TILE_Q);
@@ -3213,56 +3216,98 @@ __device__ __forceinline__ void vosplit_compute_pv(
       a_frag[mma_q][2] = *(uint32_t*)&p_smem[r0 * CTA_TILE_KV + c0 + 8];
       a_frag[mma_q][3] = *(uint32_t*)&p_smem[(r0 + 8) * CTA_TILE_KV + c0 + 8];
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
+    constexpr bool USE_SM8X_VEC_V_SCALE = true;
+#else
+    constexpr bool USE_SM8X_VEC_V_SCALE = false;
+#endif
+    // SM120 measurements show this path can regress there; keep it to the SM8x path where
+    // scalar V-scale loads were measured as the bottleneck.
+    constexpr bool USE_VEC_V_SCALE =
+        USE_SM8X_VEC_V_SCALE && IS_FP4 && NUM_MMA_D_VO_PER_WARP % 4 == 0;
+    constexpr uint32_t LOCAL_D_GROUP = USE_VEC_V_SCALE ? 4 : 1;
+    // Call sites pass warp_vo_base as a multiple of NUM_MMA_D_VO_PER_WARP,
+    // so the vectorized V-scale path is 4-byte aligned whenever it is enabled.
 #pragma unroll
-    for (uint32_t local_d = 0; local_d < NUM_MMA_D_VO_PER_WARP; ++local_d) {
-      const uint32_t global_d = warp_vo_base + local_d;
-      uint32_t b_frag[4];
-      if constexpr (sizeof(DTypeKV) == 1) {
-        // In-loop one-byte V dequant (no staging). FP8 and NVFP4 both share a
-        // 2-b128-column region for a pair of VO MMA tiles (global_d, global_d^1),
-        // read via the left/right ldmatrix halves; mirrors compute_sfm_v's V path.
-        uint32_t b_frag_quant[2];
-        const uint32_t voff = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
-            mma_kv * 16 + lane_idx % 16, lane_idx / 16 + 2 * (global_d / 2));
-        if (global_d % 2 == 0) {
-          v_smem.ldmatrix_m8n8x4_trans_left_half(voff, b_frag_quant);
-        } else {
-          v_smem.ldmatrix_m8n8x4_trans_right_half(voff, b_frag_quant);
-        }
-        if constexpr (IS_FP4) {
-          b_frag_quant[0] = frag_layout_swizzle_16b_to_4b_trans(b_frag_quant[0]);
-          b_frag_quant[1] = frag_layout_swizzle_16b_to_4b_trans(b_frag_quant[1]);
-        } else {
-          b_frag_quant[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_quant[0]);
-          b_frag_quant[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_quant[1]);
-        }
-        vec_cast<DTypeQ, DTypeKV>::template cast<8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_quant);
-        swap(b_frag[1], b_frag[2]);
-        if constexpr (IS_FP4) {
-          using packed2 = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, __nv_bfloat162>;
-          constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;
-          const uint32_t sf_base = (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + global_d;
-          __nv_fp8_e4m3 sf0_fp8, sf1_fp8, sf2_fp8, sf3_fp8;
-          sf0_fp8.__x = smem_storage->v_sf_smem[sf_base];
-          sf1_fp8.__x = smem_storage->v_sf_smem[sf_base + SF_COLS_V];
-          sf2_fp8.__x = smem_storage->v_sf_smem[sf_base + 8 * SF_COLS_V];
-          sf3_fp8.__x = smem_storage->v_sf_smem[sf_base + 9 * SF_COLS_V];
-          packed2 scale_lo{static_cast<DTypeQ>(sf0_fp8), static_cast<DTypeQ>(sf1_fp8)};
-          packed2 scale_hi{static_cast<DTypeQ>(sf2_fp8), static_cast<DTypeQ>(sf3_fp8)};
-          *(packed2*)&b_frag[0] = __hmul2(*(packed2*)&b_frag[0], scale_lo);
-          *(packed2*)&b_frag[1] = __hmul2(*(packed2*)&b_frag[1], scale_hi);
-          *(packed2*)&b_frag[2] = __hmul2(*(packed2*)&b_frag[2], scale_lo);
-          *(packed2*)&b_frag[3] = __hmul2(*(packed2*)&b_frag[3], scale_hi);
-        }
-      } else {
-        const uint32_t voff = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
-            mma_kv * 16 + lane_idx % 16, global_d * VO_COLS_PER_TILE + lane_idx / 16);
-        v_smem.ldmatrix_m8n8x4_trans(voff, b_frag);
+    for (uint32_t local_d_base = 0; local_d_base < NUM_MMA_D_VO_PER_WARP;
+         local_d_base += LOCAL_D_GROUP) {
+      [[maybe_unused]] uint32_t sf_row0 = 0, sf_row1 = 0, sf_row2 = 0, sf_row3 = 0;
+      if constexpr (USE_VEC_V_SCALE) {
+        constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;
+        const uint32_t sf_base =
+            (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + warp_vo_base + local_d_base;
+        sf_row0 = *(uint32_t*)&smem_storage->v_sf_smem[sf_base];
+        sf_row1 = *(uint32_t*)&smem_storage->v_sf_smem[sf_base + SF_COLS_V];
+        sf_row2 = *(uint32_t*)&smem_storage->v_sf_smem[sf_base + 8 * SF_COLS_V];
+        sf_row3 = *(uint32_t*)&smem_storage->v_sf_smem[sf_base + 9 * SF_COLS_V];
       }
 #pragma unroll
-      for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-        mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ>(o_frag[mma_q][local_d], a_frag[mma_q],
-                                                          b_frag);
+      for (uint32_t local_d_offset = 0; local_d_offset < LOCAL_D_GROUP; ++local_d_offset) {
+        const uint32_t local_d = local_d_base + local_d_offset;
+        const uint32_t global_d = warp_vo_base + local_d;
+        uint32_t b_frag[4];
+        if constexpr (sizeof(DTypeKV) == 1) {
+          // In-loop one-byte V dequant (no staging). FP8 and NVFP4 both share a
+          // 2-b128-column region for a pair of VO MMA tiles (global_d, global_d^1),
+          // read via the left/right ldmatrix halves; mirrors compute_sfm_v's V path.
+          uint32_t b_frag_quant[2];
+          const uint32_t voff = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
+              mma_kv * 16 + lane_idx % 16, lane_idx / 16 + 2 * (global_d / 2));
+          if (global_d % 2 == 0) {
+            v_smem.ldmatrix_m8n8x4_trans_left_half(voff, b_frag_quant);
+          } else {
+            v_smem.ldmatrix_m8n8x4_trans_right_half(voff, b_frag_quant);
+          }
+          if constexpr (IS_FP4) {
+            b_frag_quant[0] = frag_layout_swizzle_16b_to_4b_trans(b_frag_quant[0]);
+            b_frag_quant[1] = frag_layout_swizzle_16b_to_4b_trans(b_frag_quant[1]);
+          } else {
+            b_frag_quant[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_quant[0]);
+            b_frag_quant[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_quant[1]);
+          }
+          vec_cast<DTypeQ, DTypeKV>::template cast<8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_quant);
+          swap(b_frag[1], b_frag[2]);
+          if constexpr (IS_FP4) {
+            using packed2 = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, __nv_bfloat162>;
+            if constexpr (USE_VEC_V_SCALE) {
+              const uint32_t sf_shift = local_d_offset * 8;
+              uint32_t sf_pack =
+                  ((sf_row0 >> sf_shift) & 0xffU) | (((sf_row1 >> sf_shift) & 0xffU) << 8) |
+                  (((sf_row2 >> sf_shift) & 0xffU) << 16) | (((sf_row3 >> sf_shift) & 0xffU) << 24);
+              uint2 scale_pair;
+              fast_dequant_f8f16x4<__nv_fp8_e4m3, DTypeQ>(&sf_pack, &scale_pair);
+              packed2 scale_lo = *(packed2*)&scale_pair.x;
+              packed2 scale_hi = *(packed2*)&scale_pair.y;
+              *(packed2*)&b_frag[0] = __hmul2(*(packed2*)&b_frag[0], scale_lo);
+              *(packed2*)&b_frag[1] = __hmul2(*(packed2*)&b_frag[1], scale_hi);
+              *(packed2*)&b_frag[2] = __hmul2(*(packed2*)&b_frag[2], scale_lo);
+              *(packed2*)&b_frag[3] = __hmul2(*(packed2*)&b_frag[3], scale_hi);
+            } else {
+              constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;
+              const uint32_t sf_base = (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + global_d;
+              __nv_fp8_e4m3 sf0_fp8, sf1_fp8, sf2_fp8, sf3_fp8;
+              sf0_fp8.__x = smem_storage->v_sf_smem[sf_base];
+              sf1_fp8.__x = smem_storage->v_sf_smem[sf_base + SF_COLS_V];
+              sf2_fp8.__x = smem_storage->v_sf_smem[sf_base + 8 * SF_COLS_V];
+              sf3_fp8.__x = smem_storage->v_sf_smem[sf_base + 9 * SF_COLS_V];
+              packed2 scale_lo{static_cast<DTypeQ>(sf0_fp8), static_cast<DTypeQ>(sf1_fp8)};
+              packed2 scale_hi{static_cast<DTypeQ>(sf2_fp8), static_cast<DTypeQ>(sf3_fp8)};
+              *(packed2*)&b_frag[0] = __hmul2(*(packed2*)&b_frag[0], scale_lo);
+              *(packed2*)&b_frag[1] = __hmul2(*(packed2*)&b_frag[1], scale_hi);
+              *(packed2*)&b_frag[2] = __hmul2(*(packed2*)&b_frag[2], scale_lo);
+              *(packed2*)&b_frag[3] = __hmul2(*(packed2*)&b_frag[3], scale_hi);
+            }
+          }
+        } else {
+          const uint32_t voff = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
+              mma_kv * 16 + lane_idx % 16, global_d * VO_COLS_PER_TILE + lane_idx / 16);
+          v_smem.ldmatrix_m8n8x4_trans(voff, b_frag);
+        }
+#pragma unroll
+        for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+          mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ>(o_frag[mma_q][local_d], a_frag[mma_q],
+                                                            b_frag);
+        }
       }
     }
   }
@@ -3939,13 +3984,16 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
   // Large-head CTA_TILE_Q=32 uses a 2-Q x 2-KV-warp layout to keep the per-warp
-  // output fragment bounded. The 16-bit and NVFP4 softmax paths also use the
-  // VO-split P/V helpers below; FP8 keeps the existing split-D merge path.
-  constexpr bool kBf16VOSplit = ((sizeof(DTypeKV) == 2) || is_fp4_type_v<DTypeKV>) &&
-                                (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
-  constexpr uint32_t NUM_MMA_Q = kBf16VOSplit ? 1 : get_num_mma_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_Q = kBf16VOSplit ? 2 : get_num_warps_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_KV = kBf16VOSplit ? 2 : get_num_warps_kv(CTA_TILE_Q);
+  // output fragment bounded. FP8 must take it too: it stays on the split-D
+  // merge path whose cta_sync_o_smem buffer (NUM_WARPS_KV x CTA_TILE_Q x 256
+  // floats) only fits ~99KB-per-block parts (SM120/121) with NUM_WARPS_KV=2.
+  // The 16-bit and NVFP4 softmax paths additionally use the VO-split P/V
+  // helpers below, which avoid that buffer entirely.
+  constexpr bool kLargeHeadWarpSplit = ((sizeof(DTypeKV) <= 2) || is_fp4_type_v<DTypeKV>) &&
+                                       (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
+  constexpr uint32_t NUM_MMA_Q = kLargeHeadWarpSplit ? 1 : get_num_mma_q(CTA_TILE_Q);
+  constexpr uint32_t NUM_WARPS_Q = kLargeHeadWarpSplit ? 2 : get_num_warps_q(CTA_TILE_Q);
+  constexpr uint32_t NUM_WARPS_KV = kLargeHeadWarpSplit ? 2 : get_num_warps_kv(CTA_TILE_Q);
 
   if (padded_batch_size == 0) {
     // No request, skip

@@ -1646,6 +1646,21 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head():
     )
 
 
+def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head_bf16():
+    skip_if_head_dim_unsupported(512)
+    test_batch_prefill_with_paged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=128,
+        qo_len=64,
+        page_size=16,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.bfloat16,
+    )
+
+
 def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head():
     skip_if_head_dim_unsupported(512)
     test_batch_prefill_with_paged_kv_cache_nvfp4(
@@ -1658,6 +1673,22 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head():
         head_dim=512,
         causal=False,
         q_dtype=torch.float16,
+        pos_encoding_mode="ROPE_LLAMA",
+    )
+
+
+def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head_bf16():
+    skip_if_head_dim_unsupported(512)
+    test_batch_prefill_with_paged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=128,
+        qo_len=64,
+        page_size=16,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.bfloat16,
         pos_encoding_mode="ROPE_LLAMA",
     )
 
@@ -1763,12 +1794,21 @@ def test_single_prefill_torch_compile_cuda_graph():
         torch.cuda.synchronize()
         print("PASS")
     """)
+    import gc
     import os
 
     # torch.compile's inductor calls getpass.getuser() for cache dir, which fails
     # in CI containers where the uid has no /etc/passwd entry. Setting USER avoids this.
     env = os.environ.copy()
     env.setdefault("USER", "ci")
+
+    # The parent pytest process has already run thousands of prefill cases in this
+    # file. Release its cached blocks before the subprocess initializes
+    # torch.compile/cudagraph state on memory-constrained A10G runners.
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+
     result = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True,

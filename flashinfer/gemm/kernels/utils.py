@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from ...fused_moe.utils import next_positive_power_of_2
+from flashinfer.utils import next_positive_power_of_2
 
 _SM100_MMA_TILER_MN_CANDIDATES = [
     (128, 8),
