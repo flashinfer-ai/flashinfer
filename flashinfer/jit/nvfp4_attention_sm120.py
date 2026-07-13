@@ -18,7 +18,8 @@ import functools
 from pathlib import Path
 
 from . import env as jit_env
-from .core import JitSpec, current_compilation_context, gen_jit_spec
+from .core import JitSpec, current_compilation_context, gen_jit_spec, sm120a_nvcc_flags
+from .cpp_ext import is_cuda_version_at_least
 
 
 _NVFP4_ATTENTION_SM120_MODULE_NAME = "nvfp4_attention_sm120"
@@ -89,9 +90,13 @@ def gen_nvfp4_attention_sm120_module() -> JitSpec:
     ]
     include_paths: list[str | Path] = []
     include_paths.extend(_nvfp4_attention_sm120_include_paths())
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[12]
-    )
+    # CUDA < 12.9 can't target the 12.0f/12.1a split and SM121 needs >= 12.9 so fall back to sm_120a.
+    if is_cuda_version_at_least("12.9"):
+        nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[12]
+        )
+    else:
+        nvcc_flags = sm120a_nvcc_flags
     return gen_jit_spec(
         _NVFP4_ATTENTION_SM120_MODULE_NAME,
         source_paths,
