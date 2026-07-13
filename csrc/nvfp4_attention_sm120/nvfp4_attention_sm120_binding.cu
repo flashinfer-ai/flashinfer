@@ -265,9 +265,12 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   TVM_FFI_ICHECK_EQ(v_scale_t.size(2), head_dim);
   TVM_FFI_ICHECK_EQ(v_scale_t.size(3), seq_len / 16);
 
+  // Compact correction: one row per 128-token Q block. The kernel's TMA
+  // layout addresses the tensor this way and broadcasts each row across
+  // the rows of the corresponding Q tile.
   TVM_FFI_ICHECK_EQ(qk_correction.size(0), batch);
   TVM_FFI_ICHECK_EQ(qk_correction.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(qk_correction.size(2), per_block_mean ? seq_len : 128);
+  TVM_FFI_ICHECK_EQ(qk_correction.size(2), per_block_mean ? seq_len / 128 : 1);
   TVM_FFI_ICHECK_EQ(qk_correction.size(3), seq_len);
 
   TVM_FFI_ICHECK_EQ(out.size(0), batch);
