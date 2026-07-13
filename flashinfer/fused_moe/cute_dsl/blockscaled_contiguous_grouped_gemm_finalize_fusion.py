@@ -390,6 +390,20 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     seq_len = token_final_scales.shape[0]
     topk = token_final_scales.shape[1]
 
+    use_a_per_token_scale = a_per_token_scale is not None
+    if use_a_per_token_scale:
+        if a_per_token_scale.device.type != "cuda":
+            raise ValueError("a_per_token_scale must be on CUDA device")
+        if a_per_token_scale.dtype != torch.float32:
+            raise ValueError("a_per_token_scale must have dtype torch.float32")
+        if not a_per_token_scale.is_contiguous():
+            raise ValueError("a_per_token_scale must be contiguous")
+        if a_per_token_scale.shape != (permuted_m,):
+            raise ValueError(
+                f"a_per_token_scale must have shape ({permuted_m},), "
+                f"got {tuple(a_per_token_scale.shape)}"
+            )
+
     # Check compute capability
     major, minor = get_compute_capability(a.device)
     if major != 10:
@@ -495,19 +509,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
-    use_a_per_token_scale = a_per_token_scale is not None
     if use_a_per_token_scale:
-        assert a_per_token_scale.device.type == "cuda", (
-            "a_per_token_scale must be on CUDA device"
-        )
-        assert a_per_token_scale.dtype == torch.float32, (
-            "a_per_token_scale must have dtype torch.float32"
-        )
-        assert a_per_token_scale.is_contiguous(), "a_per_token_scale must be contiguous"
-        assert a_per_token_scale.numel() >= permuted_m, (
-            f"a_per_token_scale must have at least {permuted_m} elements, "
-            f"got {a_per_token_scale.numel()}"
-        )
         a_per_token_scale_ptr = make_ptr(
             cutlass.Float32,
             a_per_token_scale.data_ptr(),

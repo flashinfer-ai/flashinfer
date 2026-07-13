@@ -455,6 +455,113 @@ def check_accuracy(
 
 
 # =============================================================================
+# Test Class: GEMM input validation
+# =============================================================================
+
+
+@cute_dsl_available
+@sm100_required
+class TestKernelInputValidation:
+    @staticmethod
+    def _gather_kwargs():
+        device = "cuda"
+        return {
+            "a": torch.empty((4, 64), dtype=torch.uint8, device=device),
+            "b": torch.empty((2, 256, 64), dtype=torch.uint8, device=device),
+            "a_scale": torch.empty(1, dtype=torch.uint8, device=device),
+            "b_scale": torch.empty(1, dtype=torch.uint8, device=device),
+            "alpha": torch.empty(2, dtype=torch.float32, device=device),
+            "tile_idx_to_expert_idx": torch.empty(1, dtype=torch.int32, device=device),
+            "tile_idx_to_mn_limit": torch.empty(1, dtype=torch.int32, device=device),
+            "token_id_mapping": torch.empty(4, dtype=torch.int32, device=device),
+            "num_non_exiting_tiles": torch.empty(1, dtype=torch.int32, device=device),
+        }
+
+    @staticmethod
+    def _finalize_kwargs():
+        device = "cuda"
+        return {
+            "a": torch.empty((4, 64), dtype=torch.uint8, device=device),
+            "b": torch.empty((2, 128, 64), dtype=torch.uint8, device=device),
+            "a_scale": torch.empty(1, dtype=torch.uint8, device=device),
+            "b_scale": torch.empty(1, dtype=torch.uint8, device=device),
+            "alpha": torch.empty(2, dtype=torch.float32, device=device),
+            "tile_idx_to_expert_idx": torch.empty(1, dtype=torch.int32, device=device),
+            "num_non_exiting_tiles": torch.empty(1, dtype=torch.int32, device=device),
+            "tile_idx_to_mn_limit": torch.empty(1, dtype=torch.int32, device=device),
+            "permuted_idx_to_expanded_idx": torch.empty(
+                4, dtype=torch.int32, device=device
+            ),
+            "token_final_scales": torch.empty(
+                (2, 2), dtype=torch.float32, device=device
+            ),
+        }
+
+    @pytest.mark.parametrize("stage", ["gather", "finalize"])
+    @pytest.mark.parametrize(
+        ("invalid_kind", "match"),
+        [
+            ("device", "CUDA device"),
+            ("dtype", "dtype torch.float32"),
+            ("contiguous", "contiguous"),
+            ("length", "must have shape"),
+            ("rank", "must have shape"),
+        ],
+    )
+    def test_rejects_invalid_per_token_scale(self, stage, invalid_kind, match):
+        if stage == "gather":
+            from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+                blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4,
+            )
+
+            op = blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4
+            kwargs = self._gather_kwargs()
+        else:
+            from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+                blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4,
+            )
+
+            op = blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4
+            kwargs = self._finalize_kwargs()
+
+        expected_rows = kwargs["a"].shape[0]
+        if invalid_kind == "device":
+            per_token_scale = torch.ones(expected_rows, dtype=torch.float32)
+        elif invalid_kind == "dtype":
+            per_token_scale = torch.ones(
+                expected_rows, dtype=torch.float16, device="cuda"
+            )
+        elif invalid_kind == "contiguous":
+            per_token_scale = torch.ones(
+                expected_rows * 2, dtype=torch.float32, device="cuda"
+            )[::2]
+        elif invalid_kind == "length":
+            per_token_scale = torch.ones(
+                expected_rows + 1, dtype=torch.float32, device="cuda"
+            )
+        else:
+            per_token_scale = torch.ones(
+                (2, expected_rows // 2), dtype=torch.float32, device="cuda"
+            )
+
+        with pytest.raises(ValueError, match=match):
+            op(**kwargs, a_per_token_scale=per_token_scale)
+
+    @pytest.mark.parametrize("scale_name", ["out_scale", "global_scale"])
+    def test_rejects_output_scales_for_non_fp4_output(self, scale_name):
+        from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+            blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4,
+        )
+
+        kwargs = self._gather_kwargs()
+        kwargs[scale_name] = torch.ones(1, dtype=torch.float32, device="cuda")
+        with pytest.raises(ValueError, match="only supported"):
+            blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+                **kwargs, c_dtype="bfloat16"
+            )
+
+
+# =============================================================================
 # Test Class: Tactic-enumeration structural invariants (no GPU required)
 # =============================================================================
 

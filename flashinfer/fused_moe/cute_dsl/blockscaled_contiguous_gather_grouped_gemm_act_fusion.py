@@ -300,8 +300,9 @@ def _get_compiled_gather_kernel(
         # Order must match wrapper signature:
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
-        #  num_non_exiting_tiles_ptr, global_sf_ptr, orig_m, m, n, k, l,
-        #  tile_size, scaling_vector_size, max_active_clusters, stream)
+        #  num_non_exiting_tiles_ptr, global_sf_ptr, a_per_token_scale_ptr,
+        #  orig_m, m, n, k, l, tile_size, scaling_vector_size,
+        #  max_active_clusters, stream)
         compiled_gemm = cute.compile(
             gemm.wrapper,
             a_ptr,
@@ -479,8 +480,33 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     intermediate_size = n // (2 if gated else 1)
     permuted_m = token_id_mapping.shape[0]
 
+    use_a_per_token_scale = a_per_token_scale is not None
+    if use_a_per_token_scale:
+        if a_per_token_scale.device.type != "cuda":
+            raise ValueError("a_per_token_scale must be on CUDA device")
+        if a_per_token_scale.dtype != torch.float32:
+            raise ValueError("a_per_token_scale must have dtype torch.float32")
+        if not a_per_token_scale.is_contiguous():
+            raise ValueError("a_per_token_scale must be contiguous")
+        if a_per_token_scale.shape != (seq_len,):
+            raise ValueError(
+                f"a_per_token_scale must have shape ({seq_len},), "
+                f"got {tuple(a_per_token_scale.shape)}"
+            )
+
     if n % 128 != 0:
         raise ValueError(f"GEMM1 output dim n={n} must be a multiple of 128.")
+
+    # Check if we're doing FP4 quantization
+    generate_sfc = c_dtype == "float4_e2m1fn"
+    if generate_sfc:
+        if global_scale is None:
+            raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
+    elif out_scale is not None or global_scale is not None:
+        raise ValueError(
+            "out_scale and global_scale are only supported when "
+            "c_dtype is 'float4_e2m1fn'"
+        )
 
     # Check compute capability
     major, minor = get_compute_capability(a.device)
@@ -514,17 +540,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             f"Unsupported configuration: ab_dtype={ab_dtype}, sf_dtype={sf_dtype}, "
             f"sf_vec_size={sf_vec_size}, c_dtype={c_dtype}, mma_tiler_mn={mma_tiler_mn}, "
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
-        )
-
-    # Check if we're doing FP4 quantization
-    generate_sfc = c_dtype == "float4_e2m1fn"
-    if generate_sfc:
-        if global_scale is None:
-            raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
-    elif out_scale is not None or global_scale is not None:
-        raise ValueError(
-            "out_scale and global_scale are only supported when "
-            "c_dtype is 'float4_e2m1fn'"
         )
 
     # Create output tensor if not provided
@@ -598,19 +613,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         norm_const_ptr = None
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
-    use_a_per_token_scale = a_per_token_scale is not None
     if use_a_per_token_scale:
-        assert a_per_token_scale.device.type == "cuda", (
-            "a_per_token_scale must be on CUDA device"
-        )
-        assert a_per_token_scale.dtype == torch.float32, (
-            "a_per_token_scale must have dtype torch.float32"
-        )
-        assert a_per_token_scale.is_contiguous(), "a_per_token_scale must be contiguous"
-        assert a_per_token_scale.numel() >= seq_len, (
-            f"a_per_token_scale must have at least {seq_len} elements, "
-            f"got {a_per_token_scale.numel()}"
-        )
         a_per_token_scale_ptr = make_ptr(
             cutlass.Float32,
             a_per_token_scale.data_ptr(),
@@ -684,7 +687,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     # Order must match wrapper signature:
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
-    #  orig_m, m, n, k, l, stream)
+    #  a_per_token_scale_ptr, orig_m, m, n, k, l, stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
