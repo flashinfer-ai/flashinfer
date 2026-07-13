@@ -30,6 +30,11 @@ ConstInt = ct.Constant[int]
 ConstBool = ct.Constant[bool]
 ConstFloat = ct.Constant[float]
 
+# Max pages one BLOCK_N may span. _load_page_prefill unrolls a per-page TMA load
+# for NUM_PAGES in {1,2,4,8}; capping BLOCK_N // page_size at 8 keeps configs
+# inside that range and bounds the unrolled-kernel compile time.
+_MAX_LOAD_PAGES = 8
+
 
 def _get_prefill_autotune_configs(page_size=None):
     configs = [
@@ -52,17 +57,20 @@ def _get_prefill_autotune_configs(page_size=None):
         )
 
     for cfg in configs:
-        # Keep BLOCK_N <= page_size (NUM_PAGES == 1). The 2/4/8-page unrolled loader
-        # exists but is UNSAFE for block-sparse: the off-band loop applies no boundary
-        # mask, so a BLOCK_N spanning k>1 pages requires seq_len_kv % BLOCK_N == 0. A
-        # row's selected-block count is generally not a multiple of k, so the tail
-        # iteration reads past the row's page list into the next row's KV (gather
-        # returns page 0, not zeros) and folds it, unmasked, into the softmax.
-        # Verified on B300 (sm103): enabling BLOCK_N=4*C picked NUM_PAGES=4 and gave
-        # 94% element mismatch. Re-enabling needs a boundary mask in the off-band
-        # tail, not just this filter relaxation.
-        if page_size is not None and cfg.BLOCK_N > page_size:
-            continue
+        if page_size is not None:
+            # Allow BLOCK_N to span multiple pages (BLOCK_N > page_size) as long as
+            # it is a whole number of pages, so the unrolled 2/4/8-page loader is
+            # actually reachable -- a real throughput win for block-sparse where
+            # page_size == C is small (e.g. 16). This is only correct because the
+            # kernel now boundary-masks the off-band (and on-band) tail; without
+            # that, a BLOCK_N spanning k>1 pages folds out-of-range KV into the
+            # softmax (verified: 94% mismatch). LOAD_BLOCK_N = min(BLOCK_N,
+            # page_size), so NUM_PAGES = BLOCK_N // page_size here; cap it at
+            # _MAX_LOAD_PAGES to stay within the loader's {1,2,4,8} range.
+            if cfg.BLOCK_N > page_size and cfg.BLOCK_N % page_size != 0:
+                continue
+            if cfg.BLOCK_N // page_size > _MAX_LOAD_PAGES:
+                continue
         yield cfg
 
 
@@ -464,6 +472,16 @@ def _prefill_attention_paged_body(
             )
             qk = ct.mma(q_pe, ct.transpose(k_pe), acc=qk)
 
+        # Boundary mask: drop KV positions at/after off_band_hi. Required once a
+        # config lets BLOCK_N span multiple pages (BLOCK_N > page_size): off_band_hi
+        # is then no longer a multiple of BLOCK_N, so the final iteration would
+        # otherwise fold out-of-range KV (next block-row / padding-page 0, which is
+        # real data, not zeros) into the softmax. No-op when off_band_hi is a
+        # multiple of BLOCK_N (the single-page case), so single-page results are bit-identical.
+        offs_n = curr_n + offs_n_base
+        boundary_mask = ct.reshape((offs_n < off_band_hi), (1, BLOCK_N))
+        qk = ct.where(boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32))
+
         # Online softmax with flush_to_zero for IR parity with Triton
         qk_max = ct.max(qk, axis=1, keepdims=False)
         m_ij = ct.maximum(m_i, (qk_max * qk_scale))
@@ -530,6 +548,13 @@ def _prefill_attention_paged_body(
             offs_n = curr_n + offs_n_base
             causal_mask = ct.reshape(offs_m, (BLOCK_M, 1)) >= ct.reshape(offs_n, (1, BLOCK_N))
             qk = ct.where(causal_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32))
+
+            # Boundary mask: when seq_len_kv < start_m + BLOCK_M, on_band_hi is
+            # clamped to seq_len_kv and the causal mask alone (offs_m >= offs_n)
+            # does not exclude past-seq_len_kv positions that a multi-page BLOCK_N
+            # can pull in. No-op when seq_len_kv is a multiple of BLOCK_N.
+            boundary_mask = ct.reshape((offs_n < seq_len_kv), (1, BLOCK_N))
+            qk = ct.where(boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32))
 
             qk_max = ct.max(qk, axis=1, keepdims=False)
             m_ij = ct.maximum(m_i, (qk_max * qk_scale))
