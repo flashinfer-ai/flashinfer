@@ -7,7 +7,7 @@ is an optional dependency that FlashInfer does not install.
 
 Running the real path locally (Hopper / Blackwell / Ampere GPU):
 
-    pip install magi_attention
+    pip install magi_attention==1.1.0.post10  # version the adapter was validated with
     # MagiAttention's install can downgrade nvidia-cutlass-dsl below FlashInfer's
     # requirement (>=4.5.0) and break `import flashinfer`; restore it afterwards:
     pip install "nvidia-cutlass-dsl>=4.5.0"
