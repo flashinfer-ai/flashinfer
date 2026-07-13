@@ -1,0 +1,296 @@
+schema_version = 2
+
+[upstream]
+repository = "https://gitlab-master.nvidia.com/dlarch-fastkernels/dynamic-kernel-generator.git"
+prepared_commit = "0ff8b75e136311d28b0a75510b2262b078065266"
+decode_tree = "73951d2529d298771e03a9a512594315c3d7ecae"
+source_directory = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode"
+copy_date = "2026-07-03"
+
+[approval]
+status = "approved"
+scope = "MLA decode vendoring and FlashInfer integration requested by the project owner on 2026-07-03"
+license = "LicenseRef-NvidiaProprietary"
+header_treatment = "Preserve SPDX copyright/license and proprietary notice; remove non-license nv-internal-release template markers"
+change_control = "Preserve kernel features and policy; integration deltas are limited to the allowlist below."
+
+[toolchain]
+target_arch = "sm_100a"
+cuda_version = "13.4"
+cutlass_version = "0.3.0"
+compiler_api_revision = "cutlass-dsl-dkg-ts-v1"
+
+[local]
+package = "flashinfer.attention.prims_ts.kernels.mla_decode"
+integration_status = "first public MLA decode correctness checkpoint: upstream 1CTA and 2CTA policy families are vendored behind the FlashInfer-owned plan/run wrapper"
+production_file_count = 29
+authored_glue_file_count = 4
+hash_status = "final"
+snapshot_sha256 = "04b09beb6a31207a9ef0007223ba00eb27c39e11324f10f0ca91b3d8791c0753"
+source_revision = "73951d2529d298771e03a9a512594315c3d7ecae+fi.04b09beb6a31207a"
+
+[scan]
+roots = [
+  "flashinfer/attention/prims_ts/kernels/mla_decode",
+]
+authored_files = [
+  "flashinfer/attention/prims_ts/kernels/mla_decode/__init__.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/__init__.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/__init__.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/__init__.py",
+]
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/constants.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/constants.py"
+sha256 = "05c9184ae6f02ac9caca7a049d88856882a4fe281b60db7a172164e5dff37578"
+local_sha256 = "0c8b4abde263e65a2270ab0c5da55bef816b2cb8a6b7ca67273a14c9f315b1ee"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/layout.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/layout.py"
+sha256 = "a2e875620a80a312e2353f24bf2b4ec997c2904adab6a8e498e428bd57876c30"
+local_sha256 = "3cfeb09c87de0d60b8b4a819d5e1f248da933bd65975d218b387c2c5d4431217"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/mask.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/mask.py"
+sha256 = "55cfb73d7ffe9f161fd862945b324ba1b87da55601f2be21b84e70ac84d7413b"
+local_sha256 = "3ae087c13b9a34dc29726369a52e42a9374e56b9ef872fcd3b14f15882fc4648"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/math.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/math.py"
+sha256 = "f395a5d2560e10e7416b47c4b2227a06f6e1112ad8ca2312c02580e0aef294aa"
+local_sha256 = "02520fb06916db4a1d0e164151d1fede341816aee2574141061169bb7651d874"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/ops.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/ops.py"
+sha256 = "74fc871b1240eb42765486be24268446131a90bb083e8fa9b0fe49a539dd9c9b"
+local_sha256 = "b0a68914e2d8ab417a320d1cb7b10a9fe6388c00eb5f99ebcda849b799c917c3"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/query.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/query.py"
+sha256 = "2253832b75b7109c9e22ea4b2eba0d266b87ca960e8ede19f5ca085b4c770b7a"
+local_sha256 = "73e17917451f54590c90e1dec958bc4566a2daf716f028d3960159a397ffc30d"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/schedule.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/schedule.py"
+sha256 = "61c44f0d55a180f281f69fe39223a764eeed007e8321cdf65c0eedfda576580a"
+local_sha256 = "9091a3e0be55806f5429cc88105d692b09522c7da8a076fc9917a429becaf216"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/stage.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/stage.py"
+sha256 = "f4fe62c0c874b5ed6cbf6103df87a215098e6bfe04a0b3a3b72461bc675afc2c"
+local_sha256 = "7aa2465c56563965959b42d92ff24a212748056baf23702bb87ebfb1b632a545"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/tile.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/tile.py"
+sha256 = "90977b8873674429bc18af5b9674da828e1dd8976adab3d98d6a95e8149ab88e"
+local_sha256 = "65901440af7c47e2fb41c0956b6a2c3eb0385bbfa93f40a85ad6f7064b81bfbe"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/tile_scheduler.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/tile_scheduler.py"
+sha256 = "0eb1af17d80ddda3e8499591e5941115d849b55d8440b909daeb83066c26ec76"
+local_sha256 = "e37e8648f79870e87e3807ec2b8cb41c7f39ddba2f6dfa0afb6a1a84012ee1b3"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/kernel_policy.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/kernel_policy.py"
+sha256 = "a5d86fb2acb2d44f5be11671ba73c90840eea9a3a1efa39f0349e26594e5d61f"
+local_sha256 = "7f2bb2af1fd16314510cd6815e21b5f4adbb0021a29eccbb40effc4ffaf741ee"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_2cta/config.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/config.py"
+sha256 = "6709f641d7c0432680a4e64eb95494d7897b9342b36b8782c46b5eeec34d20bb"
+local_sha256 = "a177deffe9605735bce7a417ce2774de37c8512005a687fa13341b7c4c884253"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_2cta/kernel.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/kernel.py"
+sha256 = "811c463a3be60aaf5f48cd92c055b469404fa308272d051b3f2b2ec89251c140"
+local_sha256 = "391e9e78e3026b74d2a286af546b2d53825b309c448335d6800c69d7920980af"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_2cta/reduction.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/reduction.py"
+sha256 = "0f84fd256f58694cedd63937679b2518d80ed3dc354e999a991a80ada32e31fd"
+local_sha256 = "1a1e9cc6e6fb377f6028736a13a794f06c3fd3021cd55b3e323349a980e6f17e"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_2cta/resources.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/resources.py"
+sha256 = "d3599e3000149cf854f0ad463b6eec05e30fe935a92c6edf031e8f2ef82c4b08"
+local_sha256 = "892a23dcc20a109162705734d384de89c2e28735d92cca9fbcd8417fa2864a6d"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_2cta/tasks.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/tasks.py"
+sha256 = "c9e9fc10629ed9539b143cad0144ac1ce0b24c44489e98ab7c35ad600503f146"
+local_sha256 = "05a73515766062a7ef1560048af5a10151cdb88e580998ed0c41eeb95916f54e"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/config.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/config.py"
+sha256 = "c849fd40b25b3c82d171fd2180e883c0676b9645892390a68b46ef852b6a9554"
+local_sha256 = "8f852a479eab40e8bbf7389c8ce5fa998decb5d5996ecf4c9170c1d80df885d6"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/kernel.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py"
+sha256 = "9f173742ee5214b88bf3f387053acbbdbe7a5ebb6c4a826661aa4dc7dda975e8"
+local_sha256 = "76a0d33c4b41ad46877a35b6c736fca0220c3e385ff24fe54a093fb7856447c0"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/reduction.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/reduction.py"
+sha256 = "bb3261ef8172fd7f838a6dcb3e0b55ff3b93fb1c7afe4ac3697fcf784478969c"
+local_sha256 = "c2a051601219ab24bc2b95aff48df87034f28c49a2fbd46bad3feb6c734cd913"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/resources/__init__.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/__init__.py"
+sha256 = "73eba16c6f2e9f439421783a799393b3b416628293632268af728c3999ac8041"
+local_sha256 = "bb56397b5fda7fb19adfb9bff1dd7e4a2e0df12c624ca8bc827f749d84d44337"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/resources/common.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/common.py"
+sha256 = "69b590d4c521ea6af2e51eb904022cf5a47411f871c74394122c0954e0b996eb"
+local_sha256 = "1cbaa9fc153f326358ee2343d26f24bde4fbe001fd3cc6d7fac0056bd5874f20"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/resources/smem_p.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/smem_p.py"
+sha256 = "f33aa56743f0fb7d87210d0650987be38084058ec6dd11d4c85192eb80d599a4"
+local_sha256 = "0d0a7c78af6a4ba894ee49a6eb427ab955a110026a15e3630bd2d98e055610b1"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/resources/smem_resources.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/smem_resources.py"
+sha256 = "bbd0dfbdca77843e3fe3be89e623db2621aba6691b132c67463036ee5d10d2da"
+local_sha256 = "1ca59c010cf74cefbf04bd842809272701adec00e9c3fd51e6d5212d2afd748c"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/resources/tmem_corr.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_corr.py"
+sha256 = "4649dd62e2786febb45335af63168bd762894538a65440b4c338291e080583c9"
+local_sha256 = "d99629b7f331bff068a79d2a147cea18099a1c5b86e96b59a5c0db6d02d7c888"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/resources/tmem_o.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_o.py"
+sha256 = "5d07852767ca6eeee02cb95c8e4f84a1a15e2c11f7e0abe668569cc1d9019d3b"
+local_sha256 = "1f8256eb6549524383f6d567ae8e1a6613f82c47905e9cc9fe4e8adca19ed589"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/resources/tmem_p.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_p.py"
+sha256 = "16cb76c11565bd3dd9972cb21b1f3ee3d59bb4f8b7cb6b769b5cb48d14c8b7a3"
+local_sha256 = "5b4b7e7a8265cb2634e8a0197113cf81ac92dad43b26c46f81c10e350b28f7d5"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/resources/tmem_s.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_s.py"
+sha256 = "b13a6c90560c79874c96f3bb79db771eb5919af3cae578f1f0efe4297acdb6d1"
+local_sha256 = "2e94a528a33c1218ebabb334f5535a60703810a39bafc7258dc71689cf9c4b5f"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/resources/tmem_softmax_stats.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_softmax_stats.py"
+sha256 = "122c80778d8910787107506e398310d87c30711d438f58945159205ef7fba0b0"
+local_sha256 = "0c7d9da98d85d8fb5a8ba3cc7d294917da9a4d9656e5ae3bc21cb8317bc85462"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/throughput_latency_1cta/tasks.py"
+local = "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/tasks.py"
+sha256 = "6e42738b6bf1dde8d062f5a4432bc6da4f3a914ae416f714350cd21598e40b52"
+local_sha256 = "b666e6e0bd95ba6ba271736eda0b58fa144a079f4c04e73d68d7cfc68c9c14ab"
+
+[[omitted]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/mla_decode_run.py"
+reason = "Replaced by the FlashInfer-owned plan/run integration and local debugging surface; kernel policy remains vendored."
+
+[[omitted]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/README.md"
+reason = "Upstream example CLI documentation is replaced by FlashInfer integration and provenance documentation."
+
+[[omitted]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/mla/decode/helpers/internal_knobs.py"
+reason = "Private compiler/scheduler pragma helpers are intentionally excluded from the public-release source; their call sites are removed without replacing kernel features or policy."
+
+[[deltas]]
+id = "mla-release-marker-sanitation"
+status = "All 29 production files retain their license headers and omit only non-license internal-release template markers."
+files = [
+  "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/*.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/kernel_policy.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/*.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/*.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/*.py",
+]
+ledger = "REMOVED_INTERNALS.md"
+
+[[deltas]]
+id = "mla-public-api-migration-helper-relocation"
+status = "Legacy ctm operations use public cutlass/cutlass.experimental APIs, and examples.common tensor-map imports use the shared FlashInfer-owned tensor_map helper. Integer-address vector pointers use cutlass.inttoptr; TMEM pointers use prims.make_tmem_ptr."
+files = [
+  "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/ops.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/kernel.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/resources.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/smem_resources.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_corr.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_o.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_s.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_softmax_stats.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "mla-fp8-probability-scale-unification"
+status = "FlashInfer preserves the TRTLLM-gen/DKG 448-scaled E4M3 probability convention for 1CTA and applies the same P448 scale and LSE reciprocal to 2CTA; public scales, ABI, launch policy, and reduction policy are unchanged."
+files = [
+  "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/ops.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/resources.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_corr.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "mla-valid-lse-row-publication"
+status = "1CTA LSE and O publication reject padded correction rows before direct, GMEM-partial, or CGA stores, preventing tile-Q8 multi-head races without changing launch policy."
+files = [
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_corr.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "mla-bf16-2cta-gap-closure"
+status = "BF16 2CTA uses BF16 row-packed split partials, an eight-row PDL reducer, a greater-than-one-wave CTA0-only CLC scheduler with query-major rastering, and omits only the redundant post-tcgen05.alloc cluster barrier; FP8, one-wave, explicit-policy, paged-cache, LSE, and pre-allocation synchronization capabilities remain."
+files = [
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/config.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/kernel.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/reduction.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/resources.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/tasks.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "mla-remove-private-compiler-scheduler-directives"
+status = "Private FenceCode, WarpOpexPrev, ColdBlock, and SchedResBusyXU64 directives and imports are removed; no public knob or replacement pragma is introduced."
+files = [
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/smem_p.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_corr.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_p.py",
+  "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_s.py",
+]
+ledger = "REMOVED_INTERNALS.md"

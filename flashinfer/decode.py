@@ -87,6 +87,30 @@ from .utils import (
 )
 
 
+_PRIMS_TS_LAZY_EXPORTS = frozenset(
+    {
+        "get_prims_ts_batch_decode_workspace_size",
+        "prims_ts_batch_decode_with_kv_cache",
+    }
+)
+
+
+def __getattr__(name: str):
+    """Resolve PrimTS decode APIs without loading their runtime at import."""
+
+    if name in _PRIMS_TS_LAZY_EXPORTS:
+        from .attention.prims_ts import decode as prims_ts_decode
+
+        value = getattr(prims_ts_decode, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+
+
 @functools.cache
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)

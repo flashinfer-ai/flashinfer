@@ -1,0 +1,391 @@
+schema_version = 2
+
+[upstream]
+repository = "https://gitlab-master.nvidia.com/dlarch-fastkernels/dynamic-kernel-generator.git"
+base_commit = "8122f5f0244b96a3f34acfc3f8366150977fe4f9"
+prepared_commit = "0ff8b75e136311d28b0a75510b2262b078065266"
+decode_tree = "feac3e5c53abffeed22980fa3c9ad9935deafbce"
+source_directory = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode"
+copy_date = "2026-07-01"
+recovery_date = "2026-07-02"
+merge_requests = [24070, 24113]
+applied_commits = [
+  "638fed448c27ef1461a0cab264b7e0856eed8dcb",
+  "54715e448cdbd65240974b139f717ccb1e82aeb1",
+  "160e3f2c26ee92a38f7f0a9e06416d439317557d",
+  "d6deea7768c0f0714f28a40eda00a4013262878e",
+  "0ff8b75e136311d28b0a75510b2262b078065266",
+]
+
+[approval]
+status = "approved"
+scope = "Vendoring and preparation for public release"
+reference = "Integration-plan review, user decision 4: approve entirely (2026-07-01)"
+license = "LicenseRef-NvidiaProprietary"
+header_treatment = "Preserve SPDX copyright/license and proprietary notice; remove non-license nv-internal-release template markers"
+change_control = "Narrow initial tests do not authorize source feature removal or heuristic changes; obtain project-owner approval before either."
+heuristic_approval = "Project owner approved replacing the shape whitelist with general automatic CGA eligibility on 2026-07-02 and approved changing the heuristic: starting at the ordinary auto split, select the largest legal split whose complete cluster grid fits one wave; preserve positive explicit fanout and explicit launch modes; no public tuning knob is introduced."
+reducer_slice_approval = "Project owner approved matching TRTLLM-gen's minimum inline-reducer unit on 2026-07-02: 128 correction threads x 16 bytes per thread for both in-kernel GMEM and CGA ownership; no public tuning knob is introduced."
+runtime_seqlen_approval = "Project owner directed fixing the dynamic/runtime sequence-length regression on 2026-07-02 while retaining one general runtime callable; the implementation caches task-invariant sequence/CSR/raw-tile geometry and streamlines the runtime-paged non-split tail load, with no planner specialization, heuristic change, or tuning knob."
+grouped_keeps_approval = "Project owner directed enabling grouped tokens/heads for every public ratio-32 TileQ64/128 Keeps-MMA-AB cost-model profile on 2026-07-07; the change widens the existing paged FP8 capability family without changing launch heuristics or kernel algorithms."
+grouped_keeps_mask_approval = "Project owner approved optimizing grouped Keeps masking on 2026-07-07: qualified fixed-Q1 profiles may rely on existing guarded publication instead of masking independent inactive score rows on every KV tile; retain structurally distinct schedules when silicon regresses; no launch heuristic or tuning knob is introduced."
+grouped_keeps_q4_approval = "Project owner directed a B300 comparison between equal full Q tiles on 2026-07-07: ungrouped Hq=TileQ/SQ1 versus grouped Hq=TileQ/4/SQ4; the capability delta admits only exact fixed full-tile SQ4 geometry and changes no heuristic or public knob."
+grouped_q_mma_selection_approval = "Project owner explicitly directed on 2026-07-07 that the seqlen-Q>1 heuristic consider KeepsMmaAb for TileQ above 32, validate legal combinations for accuracy and performance, and modify the heuristic to support them. The retained implementation generalizes fixed complete grouped-Q tiles, uses a direct physical-wave service rule, preserves explicit MMA/launch/fanout requests, and exposes no public knob."
+grouped_q_joint_launch_approval = "Project owner explicitly approved on 2026-07-07 that automatic grouped-Q selection always consider splitting KV when launch capacity is idle and directed reusing TRTLLM-gen FmhaAutoTuner.cpp empirical factors where useful. The retained TS policy jointly ranks every production-valid full-Q-tile direct and useful one-wave/first-crossing split recipe with the da589566 empirical mainloop/reduction proxy, keeps TS profile and measured TileQ restrictions, preserves explicit fields, and exposes no public knob."
+
+[toolchain]
+target_arch = "sm_100a"
+validated_target_arches = ["sm_100a", "sm_103a"]
+cuda_version = "13.4"
+cutlass_version = "0.3.0"
+compiler_api_revision = "cutlass-dsl-dkg-ts-v1"
+
+[local]
+package = "flashinfer.attention.prims_ts.kernels"
+restoration_status = "implemented: full upstream feature graph is restored with additive native-CSR, public-scale, producer-only CGA split-CTA without a redundant tail rendezvous, 2-KiB reducer-slice, adaptive CGA owner waiting, converged predicated FP8 paged TMA issue, one-wave auto-CGA, runtime-paged domain-cache, native split page-window lifetime, Swaps H256 shared-KV-ring, FP8-to-FP8 D256 output overlays, paged FP8 grouped-Keeps cost profiles, fixed-Q1 grouped-Keeps output-guard masking, general fixed-full-tile grouped-Keeps capability, and empirical joint Swaps/Keeps TileQ/split launch selection, plus the FlashInfer-owned standalone plan/run runtime and one-shot wrapper"
+profile_revision = "upstream-policy-restored-plan-run-v13-grouped-q-joint-launch-selection"
+target_kernel_abi_revision = "attention-ts-decode-native-csr-v2-token-major-o"
+packaged_kernel_abi = "additive native FlashInfer CSR page mapping with plan-derived canonical seq_lens; fixed multi-Q input/output are token-major [B,SQ,Hq,D], packed variable-Q input/output remain [sumQ,Hq,D]; native KV uses shared K/V page IDs, runtime physical capacity, and independent signed-64 K/V outer page strides; legacy paging is preserved"
+native_csr_implemented = true
+public_scale_integration = "implemented: effective bmm1_scale uses the existing score-scale path; bmm2_scale is applied exactly once by every final-output route while split partial O remains unscaled"
+runtime_validation = "plan/run validated with all compiler/runtime components resolved from the feature2 DKG build: restored upstream policy coverage; 26/26 focused DKG automatic-CGA policy tests; complete public decode 57/57; public FP8 D256 native page-window coverage for page sizes 16/32/64/128, ragged runtime lengths, and exact B4 lower-split graph replay (6/6); final all-runtime-span eligibility gate 1/1; all 52 formerly slower public cold-L2 one-call graph rows passed correctness with zero rows above 5% and a +3.6797% worst residual; the final public cross-feature gate passed 14/14; CPU release/benchmark hygiene passed 15/15; and exact mirrored-DKG B128 persistent plus B1 CGA split16 standalone references and filtered synccheck passed with zero sanitizer errors. Earlier native/legacy, reducer, runtime-length, standalone DKG, and D256 evidence remains recorded in the ledgers."
+grouped_keeps_validation = "78/78 public ratio-32 TileQ64/128 cost candidates resolved through the production factory; 6/6 path-complete public plan/run pytest cases passed eager reuse and CUDA-graph replay; final mask-optimization timing passed 63/63 pre/post-graph correctness blocks and 6/6 non-aligned tails; strict single-tile D256 P448 checks passed both TileQ64 legacy-mask and TileQ128 guarded-output schedules; heterogeneous-batch guarded direct and ragged split exception cases passed; a ratio-5 grouped FP16 launch exercised the CuTe fast-divmod fallback; the general fixed-full-tile factory matrix covers SQ4/SQ8 and direct/inline/standalone modes; 235 timed B300 candidate pairs plus 6 SQ8/SQ16 geometry pairs passed P448 or IEEE-FP32 correctness. The joint selector adds a complete 20-cell FP8 B/ratio/K CPU policy matrix, explicit-control regressions, a 110/110 complete FMHA decode suite, and six B200 matched-input cases whose 26 recipes passed eager plus poisoned-graph P448/FP32 checks with all 42 recorded GMEM counter checks zero."
+grouped_keeps_performance = "the original partial fixed-Q1 ratio-32 comparison remains cost-model training evidence; the later equal-full-tile direct candidate matrix uses paired cold-L2 one-call CUDA graphs on B300 and matched 60/60 FP8 best candidates plus 19/20 FP16 best candidates with 2.865% maximum regret. The approved joint selector reuses TRTLLM-gen da589566 empirical TileQ mainloop/reduction factors while enumerating TS-legal fanouts. Six representative B200 K8/D128 cold-L2 graph cases selected within 0.1% of the measured best in five 100-sample rows; the one bimodal duplicate-config row was confirmed with 1,000 samples at 0.713% regret. Explicit profiles remain pinned and no shape whitelist or public knob is introduced."
+known_correctness_limitation = "the inherited split-head-dimension paged+window schedule used by the remaining Keeps/instruction-local path can stage a 32-ID window from K0/V0 while K1/V1 straddles into the next window; the qualified Swaps D256 and current no-window validation are unaffected"
+known_performance_limitation = "the retained native split fast path holds one 32-ID page window only when every possible runtime split-local span fits and aligns within that window; other native and all generic DKG paged profiles retain the original per-load handoff. The joint grouped-Q proxy currently reuses FP8-derived TRTLLM-gen factors for every dtype, does not model the second standalone-reducer kernel or persistent scheduling, and has only a six-shape B200 post-change timing sample; the prior broad B300 direct/split matrices remain historical evidence rather than a post-change full sweep. In the earlier rerun of all 52 formerly slower public decode rows, none was above 5%."
+hash_status = "final"
+snapshot_sha256 = "b9bb3afff30b39aabe710b1ac183ac6bbe81ec5986a5462849d360593add774e"
+source_revision = "feac3e5c53abffeed22980fa3c9ad9935deafbce+fi.b9bb3afff30b39aa"
+
+[scan]
+roots = [
+  "flashinfer/attention/prims_ts/kernels/__init__.py",
+  "flashinfer/attention/prims_ts/kernels/placeholder_helpers.py",
+  "flashinfer/attention/prims_ts/kernels/stage.py",
+  "flashinfer/attention/prims_ts/kernels/tensor_map.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode",
+]
+authored_files = [
+  "flashinfer/attention/prims_ts/kernels/__init__.py",
+]
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/placeholder_helpers.py"
+local = "flashinfer/attention/prims_ts/kernels/placeholder_helpers.py"
+sha256 = "3a15a06d93dafae619a95e4c67b0b05e65eec069499578dc2e2c0f375034ba7b"
+local_sha256 = "023adef36d39bf4381ca79794a604c6c40f5f8626c6a4b4ad05e3371fa0b5eff"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/stage.py"
+local = "flashinfer/attention/prims_ts/kernels/stage.py"
+sha256 = "7d6acc07c7beb06cf431c1c517cd96c4316dfeacef24a602d784edc835a6409f"
+local_sha256 = "838bdd79b141d369020fcb6c1b6c65507c1c5e17861c729145d2d2d1fbe31d5d"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/__init__.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/__init__.py"
+sha256 = "25302f8a62de5bc3ecc2bf336ab3f2afb90d2258de98ab4d1ddc21e21a8809d5"
+local_sha256 = "6f8c7359f325f95e23ea6de69a8a63d16ce22356ce41527cd52ea06ea05c8b14"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_config.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py"
+sha256 = "d4121ff00f6747a12adca9c5692c3d559b7e992b7da1d952e1f9ff4f2ed3c89d"
+local_sha256 = "c6688114ae7c46e57805af408c2649aa46af375611b811f3476fa1edd7db01db"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_constants.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_constants.py"
+sha256 = "0170c2eaaa1ab957f838ca4873ac9acdfe70cd939f770643440c9b6e73f926e9"
+local_sha256 = "0c299589405445330a390dd55177986127204e9fe981fbf3ee842c12e23b6631"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_kernel.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_kernel.py"
+sha256 = "6358b00d540339447ab3cf51ff4578a37e0d86ecdb0698cf0a1728f4cf30aa5a"
+local_sha256 = "d9ff9819abcc201235cb92b6a37d2590dc33f6fa281de9d402ef6c3ac1f55f2c"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_tasks.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_tasks.py"
+sha256 = "6266673ad55cf07bc80e3af1571fb234992bc565d3cdb1d89125bfb374f11892"
+local_sha256 = "6d8a79a7ab01a22ceeb2b2b59811f5f8ff12a455f4687b4e0209aa5e41ded804"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/reduction.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/reduction.py"
+sha256 = "c5e4825fae8d2b067549a9213e710015f1e0a3e6baf96c4a0dd59305d699b161"
+local_sha256 = "d3ca2eb0918b8b7317fc46716cf38aa6694b58723879297f278a70b61b475d10"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/__init__.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/__init__.py"
+sha256 = "9933c6e57681463a00175bef3fc6cc4b733d6a9fc2d643b19e224f08dfa94352"
+local_sha256 = "56b794281c509b2534921a3f8e01b747c78bb28159a7aada5ec30083c8fe8dab"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/helpers_common.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py"
+sha256 = "369eff53e85008c2eb8215d9ea9f6bbd33d33a0193794cb29f4043f375382652"
+local_sha256 = "525741e5416ae8375be631796c6aed7c1a7fd8a089a7c062f1de4f89a8dc25f8"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/helpers_kv_tile_idx.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_kv_tile_idx.py"
+sha256 = "06f7f751c100948cd224842638efcd0dd16cbf9acc9c38432fe64a5836015b9d"
+local_sha256 = "c5f3a95b494f5f2b4ad21213d3b49868c87544af8d6fa6fb181a8992eb3ed74e"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/helpers_output.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_output.py"
+sha256 = "6080b2d85b073663fcd334494333d43448b8d038a9af77163c43e28ca4557434"
+local_sha256 = "dfd8c98c09d7a96b6d80d7c417b72f6429d8be1f7bb6435144d3f58d277ac32f"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/helpers_softmax.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_softmax.py"
+sha256 = "55c5c4e1e696b63b6eacab57606f343da8eb8549b2c8c07b2e9f2d1961b78d08"
+local_sha256 = "ae01a835266c8f5f6fe68892cc5e1b7631e1c98a5e475fa98de8b956ecc39d39"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/smem_p.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_p.py"
+sha256 = "dd5dd97626d43e87dc91ce5cb9d9f941e010dd2c2a3f0a1393909298ea5a6e32"
+local_sha256 = "19a17e3ef3d6e061bc4ac4625e6050315a6a1da56d3ecc01b9fe8664247c02b5"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/smem_resources.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_resources.py"
+sha256 = "76b5a25c21b8f4b9261522b1067ed6f21a0f6e18e35377e1acc91e806746c062"
+local_sha256 = "5ff98964cfe60aa8ee28011b0405bd5d0e72c85d6f381a8d29e618435d4d8430"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/tmem_corr.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_corr.py"
+sha256 = "49516c37efad4faea5e754c3dcb038176307cb0bb81e63de23243c9f55151968"
+local_sha256 = "4cf52d0b4208f9fb90496d448f7e55b01bd5db9844a25a167e028333354fa6c9"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/tmem_o.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_o.py"
+sha256 = "502f89901b4e8a4051c3e620c7f426fb4a4d588c8b72802528da3bd528e76529"
+local_sha256 = "07bdcd97c15d1ca856800babb98e2efc234f4c435fccea38c697ec8d2e74e182"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/tmem_s.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_s.py"
+sha256 = "def31cd6b465ee265b020d7dd3b373b76c51f272dcd0b61c313316609b94fc6b"
+local_sha256 = "7a30c5385bb13ec558770f1de0f10a70f53c2ff86492cb6d2c426f59247d58b6"
+
+[[files]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_resources/tmem_softmax_stats.py"
+local = "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_softmax_stats.py"
+sha256 = "5432396b6e53fdab5ffb864da5cb497f516c1b70ebaf48a3b0e130fe310102dd"
+local_sha256 = "1a09abbfdc91ba988911e19694c867cb7353243b1ba2540a28a001b7b4eaf71d"
+
+[[files]]
+upstream = "DkgDSL/examples/common.py"
+local = "flashinfer/attention/prims_ts/kernels/tensor_map.py"
+sha256 = "f53c5e5f42875a6ec8245046fa5f8f97120377f347baec2115faaeaba260b024"
+local_sha256 = "f7ea6aef8323e4cfbd14d950f399a690ae387c433ef75005597fa90808a47564"
+
+[[omitted]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/fmha_decode_run.py"
+reason = "Replaced by the FlashInfer-owned local debug runner; kernel policy remains in the restored config and graph."
+
+[[omitted]]
+upstream = "cutlass_ir/compiler/python/examples/CuTeDSL/experimental/blackwell/kernel/attention_ts/fmha/decode/README.md"
+reason = "Upstream example CLI documentation is replaced by FlashInfer integration documentation."
+
+[[deltas]]
+id = "release-marker-sanitation"
+files = [
+  "flashinfer/attention/prims_ts/kernels/placeholder_helpers.py",
+  "flashinfer/attention/prims_ts/kernels/stage.py",
+  "flashinfer/attention/prims_ts/kernels/**/*.py",
+]
+ledger = "REMOVED_INTERNALS.md"
+
+[[deltas]]
+id = "flashinfer-owned-helper-relocation"
+status = "implemented: kernel and SMEM resource imports use the FlashInfer-owned tensor-map helper; helper algorithms remain upstream-equivalent"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_kernel.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_resources.py",
+  "flashinfer/attention/prims_ts/kernels/tensor_map.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "remove-internal-compiler-scheduler-knobs"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_p.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_softmax_stats.py",
+]
+ledger = "REMOVED_INTERNALS.md"
+
+[[deltas]]
+id = "public-barrier-api"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "native-csr-page-abi"
+status = "implemented: additive planning derives canonical seq_lens from native CSR metadata; kernel page mapping consumes indptr plus shared K/V indices; physical page capacity and independent K/V outer strides stay runtime values; native-disabled codegen retains upstream behavior"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_kernel.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_resources.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "native-split-page-window-lifetime"
+status = "implemented as a FlashInfer native-CSR overlay: when every possible runtime split-local span for a non-windowed profile fits and evenly partitions one aligned 32-ID cache window, PageOffsetsTask publishes that window once and LoadTask holds its consumer stage across every K/V and head-dimension load; all other profiles retain the original staged cadence"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_tasks.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "public-bmm-scale-integration"
+status = "implemented: public bmm1_scale maps to the existing BMM1 score coefficient; bmm2_scale is applied exactly once on direct Swaps, direct Keeps, in-kernel GMEM/CGA reduction, and standalone-reducer final output; intermediate split partials are unscaled"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_corr.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/reduction.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "cga-producer-only-split-ctas"
+status = "implemented: CGA split fanout may exceed TileSizeQ; all split CTAs publish partials, only CTAs with an assigned reducer slice wait/reduce, and producer-only ranks retire after async store issue because they are never distributed-SMEM targets; owner transaction completion guards incoming partial lifetime without a redundant tail cluster rendezvous"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_kernel.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_corr.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "fp8-paged-converged-tma-issue"
+status = "implemented without an ABI, policy, or feature change: FP8 paged K/V producer lanes compute uniform coordinates and each 4-D TMA instruction is predicated by elect.sync, eliminating elected-thread control-flow regions while preserving one elected issue per load warp"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_resources.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "adaptive-cga-owner-wait"
+status = "implemented without a public knob or shape list: all 128 correction lanes make one nonblocking acquire probe; when pending, only lane 0 continues timed transaction-mbarrier polling and the existing 128-thread barrier publishes readiness before distributed-SMEM loads"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_corr.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "auto-cga-one-wave-policy"
+status = "implemented with explicit project-owner approval: automatic CGA promotion has no shape whitelist. The legacy auto-launch path may search its ordinary split downward for the largest structurally legal complete-grid one-wave CGA; a jointly scored grouped-Q recipe instead pins its exact fanout and retains GMEM if that exact CGA is not one-wave. Positive explicit fanout and explicit launch modes are preserved; no internal knob is public"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "warpgroup-reducer-slices"
+status = "implemented with explicit project-owner approval: in-kernel GMEM and CGA reduction use a minimum owner unit of 128 correction threads x 16 bytes (2 KiB); slice ownership uses active splits while max splits sizes scratch, and no internal knob is public"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_corr.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "runtime-seqlen-task-cache"
+status = "implemented at project-owner direction: the general runtime-length kernel caches seq_len_kv, native CSR bounds, raw tile base, valid tile end, and window start per task; native-paged producers clamp only derived page indices, and non-split Q1 Swaps loads S before masking a rounded empty tail; uniform/ragged compile identity, launch heuristics, and public API are unchanged"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_kernel.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_tasks.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_kv_tile_idx.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_resources.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_s.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "swaps-h256-shared-kv-ring"
+status = "implemented without a policy or ABI change: Swaps H256 reuses the existing configured multi-stage shared K/V ring across its two 128-wide MMA stages; Keeps retains instruction-local split-head resources"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_kernel.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "fp8-d256-output-layout"
+status = "implemented for qualified Swaps TileQ 8/16/32 profiles: D256 FP8 output is staged as two consecutive 128-column bands and direct output pairs are folded and packed immediately to stay within the correction-task register budget"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_output.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_corr.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "fmha-grouped-keeps-paged-fp8"
+status = "implemented with explicit project-owner approval: public ratio-32 cost-model candidates use grouped TileQ64/128 Keeps-MMA-AB for paged causal page-32 FP8 QKV; FP8 output is enabled for headDim 64/128 and FP16 output for staged headDim 256 across direct and pre-existing legal GMEM split modes; kernel algorithms and launch heuristics are unchanged"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "fmha-fixed-q1-grouped-keeps-output-guard"
+status = "implemented with explicit project-owner approval: qualified fixed-Q1 paged FP8 grouped Keeps profiles use one uniform valid-row causal bound and existing guarded direct/split/reducer publication instead of per-KV inactive-score-row masking; TileQ64 one-instruction TMEM-P retains legacy masking after measured regression; ratio-32 row mapping is shift/mask with a CuTe fast-divmod fallback; no launch heuristic or tuning knob is added"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py",
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_s.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "fmha-full-tile-q4-grouped-keeps"
+status = "implemented at project-owner direction for B300 validation: paged causal page-32 FP8 grouped Keeps additionally admits fixed SQ4 only when four complete head groups exactly fill TileQ; fixed-Q1 ratio-32 support, kernel algorithms, launch heuristics, and public APIs are unchanged"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "fmha-full-tile-grouped-q-mma-selection"
+status = "implemented with explicit project-owner approval: supersedes the SQ4-only capability with any fixed complete grouped-Q tiles and exposes production-valid Swaps TileQ8/16/32 and Keeps TileQ64/128 candidates to automatic selection. Its original direct-only wave-times-row policy is preserved as historical B300 evidence and has been superseded for underfilled grids by fmha-joint-grouped-q-launch-selection; K128 remains automatic over an available K64 only for staged D256"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[deltas]]
+id = "fmha-joint-grouped-q-launch-selection"
+status = "implemented with explicit project-owner approval: every production-valid full-Q-tile candidate whose base grid leaves cluster-size-one capacity idle is evaluated as direct plus useful split fanouts through the first capacity crossing. Recipes use TRTLLM-gen da589566 empirical TileQ mainloop/reduction factors with actual Q-tile CTA waves; TS retains its profile validator, D64/D128 K128 suppression, exact-fanout CGA promotion, and explicit-control bypass. Unsupported automatic split/persistent modes fall back to direct; no shape whitelist or public knob is added"
+files = [
+  "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py",
+]
+ledger = "KERNEL_CHANGES.md"
+
+[[recovered]]
+id = "fixed-m1-config-pruning"
+status = "fully reverted; full upstream config and launch heuristics restored before the separately approved general one-wave auto-CGA delta"
+
+[[recovered]]
+id = "fixed-m1-task-resource-pruning"
+status = "fully reverted; full upstream task/resource graph restored"
+
+[[recovered]]
+id = "remove-packed-ragged-tensor-map"
+status = "fully reverted; packed/ragged Q helpers and call sites restored"
+
+[[recovered]]
+id = "omit-standalone-reducer"
+status = "fully reverted; reduction.py and reducer integration restored"
