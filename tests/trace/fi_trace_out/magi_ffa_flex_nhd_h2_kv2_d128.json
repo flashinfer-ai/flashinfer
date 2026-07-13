@@ -1,12 +1,13 @@
 {
-  "name": "magi_ffa_flex_h2_kv2_d128",
-  "description": "Single-GPU Flex Flash Attention via MagiAttention (optional, separately-installed dependency). Ragged, range-based mask model: q_ranges/k_ranges are (num_ranges, 2) int32 [start, end) pairs and attn_type_map selects the per-range mask type (0=full, 1=causal, 2=inverse-causal, 3=bidirectional-causal).",
+  "name": "magi_ffa_flex_nhd_h2_kv2_d128",
+  "description": "Single-GPU Flex Flash Attention via MagiAttention (optional, separately-installed dependency), using NHD layout. Ragged, range-based mask model: q_ranges/k_ranges are (num_ranges, 2) int32 [start, end) pairs and attn_type_map selects the per-range mask type (0=full, 1=causal, 2=inverse-causal, 3=bidirectional-causal).",
   "op_type": "magi_ffa_flex",
   "tags": [
     "fi_api:flashinfer.magi_ffa._flex_flash_attn.flex_flash_attn",
     "status:experimental",
     "stage:prefill",
-    "backend:magi-attention"
+    "backend:magi-attention",
+    "layout:nhd"
   ],
   "axes": {
     "num_qo_heads": {
@@ -23,7 +24,7 @@
     },
     "num_tokens_q": {
       "type": "var",
-      "description": "Total query tokens (ragged, token-major)."
+      "description": "Total query tokens (ragged)."
     },
     "num_tokens_kv": {
       "type": "var",
@@ -103,7 +104,7 @@
         "head_dim"
       ],
       "dtype": "bfloat16",
-      "description": "Attention output in the requested tensor_layout."
+      "description": "Attention output in NHD layout."
     },
     "lse": {
       "shape": [

@@ -15,41 +15,14 @@ limitations under the License.
 """
 
 import functools
-from importlib.metadata import PackageNotFoundError, version
 from typing import Optional, Tuple, Union
 
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-from flashinfer.trace.templates.attention import magi_ffa_flex_trace
+from flashinfer.trace.templates.attention import magi_ffa_flex_trace_dispatch
 
 _SUPPORTED_LAYOUTS = ("NHD", "HND")
-
-# FlashInfer's own floor for nvidia-cutlass-dsl (see requirements.txt).
-# MagiAttention's installer is known to downgrade this package (e.g. to
-# 4.3.5), which breaks `import flashinfer` (cute.nvgpu.OperandMajorMode
-# needs >=4.5.0). Documented, validated override: magi_attention==1.1.0.post10
-# with nvidia-cutlass-dsl>=4.5.0 reinstalled AFTER MagiAttention.
-_MIN_CUTLASS_DSL_VERSION = (4, 5, 0)
-
-
-def _check_cutlass_dsl_not_downgraded() -> None:
-    try:
-        installed = version("nvidia-cutlass-dsl")
-    except PackageNotFoundError:
-        return  # flashinfer's own cute-dsl paths surface this when needed
-    installed_tuple = tuple(
-        int(part) for part in installed.split(".")[:3] if part.isdigit()
-    )
-    if installed_tuple < _MIN_CUTLASS_DSL_VERSION:
-        minimum = ".".join(str(v) for v in _MIN_CUTLASS_DSL_VERSION)
-        raise RuntimeError(
-            f"nvidia-cutlass-dsl=={installed} is below FlashInfer's requirement "
-            f">={minimum}; it was likely downgraded by the MagiAttention install. "
-            f'Restore it with: pip install "nvidia-cutlass-dsl>={minimum}" '
-            "(run AFTER installing MagiAttention). Validated combination: "
-            f"magi_attention==1.1.0.post10 + nvidia-cutlass-dsl>={minimum}."
-        )
 
 
 @functools.cache
@@ -66,12 +39,11 @@ def _load_flex_flash_attn_func():
         raise ImportError(
             "MagiAttention is required to use flashinfer.magi_ffa.flex_flash_attn. "
             "It is an optional dependency (SandAI MagiAttention, Apache-2.0) and is "
-            "not installed automatically; install it in the active Python environment "
-            "before calling flex_flash_attn(). Note: MagiAttention's install may "
-            "downgrade nvidia-cutlass-dsl; afterwards run pip install "
-            '"nvidia-cutlass-dsl>=4.5.0" to keep flashinfer importable.'
+            "not installed automatically. The validated environment uses "
+            "magi_attention==1.1.0.post10, followed by "
+            'pip install "nvidia-cutlass-dsl>=4.5.0" because MagiAttention may '
+            "downgrade FlashInfer's Cutlass DSL dependency."
         ) from exc
-    _check_cutlass_dsl_not_downgraded()
     return flex_flash_attn_func
 
 
@@ -105,7 +77,7 @@ def _swap_token_head_dims(t: torch.Tensor) -> torch.Tensor:
     return t.transpose(0, 1).contiguous()
 
 
-@flashinfer_api(trace=magi_ffa_flex_trace)
+@flashinfer_api(trace=magi_ffa_flex_trace_dispatch)
 def flex_flash_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -132,11 +104,24 @@ def flex_flash_attn(
         installed (e.g. locally or in an opt-in CI job); FlashInfer's default CI
         runs only the dependency-free unit tests.
 
+        FlashInfer has validated ``magi_attention==1.1.0.post10`` on Hopper/H20
+        with ``nvidia-cutlass-dsl>=4.5.0`` restored after installing
+        MagiAttention. Blackwell and Ampere through FFA_FA4 are supported upstream
+        by MagiAttention but are not validated by FlashInfer under this dependency
+        override.
+
+        Install the validated combination in this order:
+
+        .. code-block:: bash
+
+            python -m pip install magi_attention==1.1.0.post10
+            python -m pip install "nvidia-cutlass-dsl>=4.5.0"
+
     FFA uses a ragged, range-based mask model that does not map onto FlashInfer's
     paged / ``indptr`` abstractions, so it is exposed as a dedicated entry point
-    rather than a ``backend=`` of the paged wrappers. Arch support (Hopper FFA,
-    Blackwell/Ampere via FFA_FA4) is owned by MagiAttention; this adapter adds no
-    architecture gate.
+    rather than a ``backend=`` of the paged wrappers. Runtime architecture support
+    is owned by MagiAttention, so this adapter deliberately adds no architecture
+    gate.
 
     Parameters
     ----------

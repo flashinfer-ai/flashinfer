@@ -5,16 +5,20 @@ The dependency-free unit tests (MagiAttention monkeypatched) run anywhere. The
 skipped unless MagiAttention is installed and CUDA is available, since MagiAttention
 is an optional dependency that FlashInfer does not install.
 
-Running the real path locally (Hopper / Blackwell / Ampere GPU):
+Running the FlashInfer-validated real path locally (Hopper/H20):
 
-    pip install magi_attention==1.1.0.post10  # version the adapter was validated with
+    python -m pip install magi_attention==1.1.0.post10
     # MagiAttention's install can downgrade nvidia-cutlass-dsl below FlashInfer's
     # requirement (>=4.5.0) and break `import flashinfer`; restore it afterwards:
-    pip install "nvidia-cutlass-dsl>=4.5.0"
-    FLASHINFER_TEST_MAGI_FFA_EXTENDED=1 pytest tests/ffa -v
+    python -m pip install "nvidia-cutlass-dsl>=4.5.0"
+    FLASHINFER_TEST_MAGI_FFA_EXTENDED=1 python -m pytest tests/ffa -v
+
+MagiAttention upstream also supports Blackwell/Ampere through FFA_FA4, but those
+configurations have not been validated by FlashInfer under the dependency override
+above.
 
 In CI, the real path is covered by the opt-in workflow
-``.github/workflows/magi-ffa-optin-test.yml`` (manual / scheduled, non-blocking).
+``.github/workflows/magi-ffa-optin-test.yml`` (manual, non-blocking).
 """
 
 import math
@@ -48,8 +52,8 @@ def _full_attention_reference(q, k, v):
 
 def _skip_without_magi_attention_cuda():
     # Gate only on the optional dependency + CUDA — NOT on a specific arch.
-    # MagiAttention FFA is multi-arch (Hopper native, Blackwell/Ampere via FFA_FA4);
-    # let MagiAttention own architecture support.
+    # FlashInfer validates Hopper/H20, while MagiAttention owns runtime architecture
+    # support (including its upstream FFA_FA4 paths).
     pytest.importorskip("magi_attention")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for MagiAttention FFA")
@@ -109,7 +113,7 @@ def test_return_lse(monkeypatch):
 
     monkeypatch.setattr(ffa, "_load_flex_flash_attn_func", lambda: fake_ffa)
 
-    q_ranges, k_ranges, attn_type_map = _ranges()
+    q_ranges, k_ranges, _ = _ranges()
     q = torch.zeros((4, 2, 8), dtype=torch.float16)
     k = torch.zeros((4, 1, 8), dtype=torch.float16)
     v = torch.zeros((4, 1, 8), dtype=torch.float16)
@@ -160,6 +164,44 @@ def test_hnd_layout_is_normalized_in_and_out(monkeypatch):
     # output normalized back to HND
     assert out.shape == (2, 4, 8)
     assert lse.shape == (2, 4)
+
+
+def test_trace_dispatches_by_tensor_layout():
+    q_ranges, k_ranges, attn_type_map = _ranges()
+    q = torch.zeros((7, 4, 8), dtype=torch.bfloat16)
+    k = torch.zeros((9, 2, 8), dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+
+    nhd = flex_flash_attn.fi_trace(
+        q=q,
+        k=k,
+        v=v,
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        attn_type_map=attn_type_map,
+    )
+    hnd = flex_flash_attn.fi_trace(
+        q=q.transpose(0, 1).contiguous(),
+        k=k.transpose(0, 1).contiguous(),
+        v=v.transpose(0, 1).contiguous(),
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        attn_type_map=attn_type_map,
+        tensor_layout="HND",
+    )
+
+    assert nhd["name"] == "magi_ffa_flex_nhd_h4_kv2_d8"
+    assert hnd["name"] == "magi_ffa_flex_hnd_h4_kv2_d8"
+    assert nhd["inputs"]["q"]["shape"] == [
+        "num_tokens_q",
+        "num_qo_heads",
+        "head_dim",
+    ]
+    assert hnd["inputs"]["q"]["shape"] == [
+        "num_qo_heads",
+        "num_tokens_q",
+        "head_dim",
+    ]
 
 
 def test_rejects_invalid_tensor_layout():
@@ -311,22 +353,15 @@ def test_matches_direct_magi_attention_deterministic_bitwise():
     """
     _skip_without_magi_attention_cuda()
     torch.manual_seed(52)
-    try:
-        _assert_matches_direct_magi_attention(
-            seq_len=64,
-            num_qo_heads=2,
-            num_kv_heads=2,
-            q_ranges_list=[[0, 64]],
-            k_ranges_list=[[0, 64]],
-            attn_type_map_list=[1],
-            deterministic=True,
-        )
-    except TypeError as exc:
-        if "deterministic" in str(exc):
-            pytest.skip(
-                "installed MagiAttention does not support the deterministic= kwarg"
-            )
-        raise
+    _assert_matches_direct_magi_attention(
+        seq_len=64,
+        num_qo_heads=2,
+        num_kv_heads=2,
+        q_ranges_list=[[0, 64]],
+        k_ranges_list=[[0, 64]],
+        attn_type_map_list=[1],
+        deterministic=True,
+    )
 
 
 @pytest.mark.parametrize(

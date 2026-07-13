@@ -34,7 +34,8 @@ gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
 layernorm_h768.json
-magi_ffa_flex_h2_kv2_d128.json
+magi_ffa_flex_hnd_h2_kv2_d128.json
+magi_ffa_flex_nhd_h2_kv2_d128.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
@@ -1354,8 +1355,8 @@ with contextlib.suppress(Exception):
     )
 
 # ── MagiAttention Flex Flash Attention (optional dependency) ─────────────────
-# magi_ffa_flex_h2_kv2_d128.json is only generated when MagiAttention is
-# installed (it is NOT a FlashInfer dependency); skipped otherwise.
+# The NHD/HND magi_ffa_flex trace examples are generated only when MagiAttention
+# is installed (it is NOT a FlashInfer dependency); skipped otherwise.
 if importlib.util.find_spec("magi_attention") is not None:
     from flashinfer.magi_ffa import flex_flash_attn
 
@@ -1373,6 +1374,15 @@ if importlib.util.find_spec("magi_attention") is not None:
         q_ranges=_ffa_q_ranges,
         k_ranges=_ffa_k_ranges,
         attn_type_map=_ffa_type_map,
+    )
+    flex_flash_attn(
+        _ffa_q.transpose(0, 1).contiguous(),
+        _ffa_k.transpose(0, 1).contiguous(),
+        _ffa_v.transpose(0, 1).contiguous(),
+        q_ranges=_ffa_q_ranges,
+        k_ranges=_ffa_k_ranges,
+        attn_type_map=_ffa_type_map,
+        tensor_layout="HND",
     )
 else:
     print("magi_attention not installed; skipping magi_ffa_flex trace example")

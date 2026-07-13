@@ -3730,63 +3730,105 @@ cute_dsl_batch_prefill_run_trace = TraceTemplate(
 # MagiAttention, and the adapter's real-path tests in tests/ffa compare
 # directly against MagiAttention's native flex_flash_attn_func instead.
 
-magi_ffa_flex_trace = TraceTemplate(
-    op_type="magi_ffa_flex",
-    name_prefix="magi_ffa_flex",
-    description=(
-        "Single-GPU Flex Flash Attention via MagiAttention (optional, "
-        "separately-installed dependency). Ragged, range-based mask model: "
-        "q_ranges/k_ranges are (num_ranges, 2) int32 [start, end) pairs and "
-        "attn_type_map selects the per-range mask type (0=full, 1=causal, "
-        "2=inverse-causal, 3=bidirectional-causal)."
-    ),
-    axes={
-        "num_qo_heads": Const(abbrev="h"),
-        "num_kv_heads": Const(abbrev="kv"),
-        "head_dim": Const(abbrev="d"),
-        "num_tokens_q": Var(description="Total query tokens (ragged, token-major)."),
-        "num_tokens_kv": Var(description="Total key/value tokens (ragged)."),
-        "num_ranges": Var(description="Number of (q_range, k_range) mask entries."),
-        "range_pair": Const(
-            abbrev="", description="Always 2: [start, end) bounds of a range."
+
+def _make_magi_ffa_flex_trace(tensor_layout: str) -> TraceTemplate:
+    if tensor_layout == "NHD":
+        q_shape = ["num_tokens_q", "num_qo_heads", "head_dim"]
+        kv_shape = ["num_tokens_kv", "num_kv_heads", "head_dim"]
+        lse_shape = ["num_tokens_q", "num_qo_heads"]
+    else:
+        q_shape = ["num_qo_heads", "num_tokens_q", "head_dim"]
+        kv_shape = ["num_kv_heads", "num_tokens_kv", "head_dim"]
+        lse_shape = ["num_qo_heads", "num_tokens_q"]
+
+    layout = tensor_layout.lower()
+    return TraceTemplate(
+        op_type="magi_ffa_flex",
+        name_prefix=f"magi_ffa_flex_{layout}",
+        description=(
+            "Single-GPU Flex Flash Attention via MagiAttention (optional, "
+            f"separately-installed dependency), using {tensor_layout} layout. "
+            "Ragged, range-based mask model: q_ranges/k_ranges are "
+            "(num_ranges, 2) int32 [start, end) pairs and attn_type_map selects "
+            "the per-range mask type (0=full, 1=causal, 2=inverse-causal, "
+            "3=bidirectional-causal)."
         ),
-    },
-    inputs={
-        "q": Tensor(["num_tokens_q", "num_qo_heads", "head_dim"]),
-        "k": Tensor(["num_tokens_kv", "num_kv_heads", "head_dim"]),
-        "v": Tensor(["num_tokens_kv", "num_kv_heads", "head_dim"]),
-        "q_ranges": Tensor(
-            ["num_ranges", "range_pair"],
-            description="int32 [start, end) query ranges of the attention mask.",
-        ),
-        "k_ranges": Tensor(
-            ["num_ranges", "range_pair"],
-            description="int32 [start, end) key ranges of the attention mask.",
-        ),
-        "attn_type_map": Tensor(
-            ["num_ranges"],
-            optional=True,
-            description=(
-                "int32 per-range mask type (0=full, 1=causal, 2=inverse-causal, "
-                "3=bidirectional-causal). None means full attention."
+        axes={
+            "num_qo_heads": Const(abbrev="h"),
+            "num_kv_heads": Const(abbrev="kv"),
+            "head_dim": Const(abbrev="d"),
+            "num_tokens_q": Var(description="Total query tokens (ragged)."),
+            "num_tokens_kv": Var(description="Total key/value tokens (ragged)."),
+            "num_ranges": Var(description="Number of (q_range, k_range) mask entries."),
+            "range_pair": Const(
+                abbrev="", description="Always 2: [start, end) bounds of a range."
             ),
-        ),
-        "return_lse": Scalar(
-            "int32", optional=True, description="Bool: also return LSE."
-        ),
-    },
-    outputs={
-        "out": Tensor(
-            ["num_tokens_q", "num_qo_heads", "head_dim"],
-            dtype_from="q",
-            description="Attention output in the requested tensor_layout.",
-        ),
-        "lse": Tensor(
-            ["num_tokens_q", "num_qo_heads"],
-            optional=True,
-            dtype="float32",
-            description="Log-sum-exp of attention logits (natural log).",
-        ),
-    },
-    tags=["status:experimental", "stage:prefill", "backend:magi-attention"],
-)
+        },
+        inputs={
+            "q": Tensor(q_shape),
+            "k": Tensor(kv_shape),
+            "v": Tensor(kv_shape),
+            "q_ranges": Tensor(
+                ["num_ranges", "range_pair"],
+                dtype="int32",
+                description="int32 [start, end) query ranges of the attention mask.",
+            ),
+            "k_ranges": Tensor(
+                ["num_ranges", "range_pair"],
+                dtype="int32",
+                description="int32 [start, end) key ranges of the attention mask.",
+            ),
+            "attn_type_map": Tensor(
+                ["num_ranges"],
+                dtype="int32",
+                optional=True,
+                description=(
+                    "int32 per-range mask type (0=full, 1=causal, "
+                    "2=inverse-causal, 3=bidirectional-causal). None means "
+                    "full attention."
+                ),
+            ),
+            "return_lse": Scalar(
+                "int32", optional=True, description="Bool: also return LSE."
+            ),
+        },
+        outputs={
+            "out": Tensor(
+                q_shape,
+                dtype_from="q",
+                description=f"Attention output in {tensor_layout} layout.",
+            ),
+            "lse": Tensor(
+                lse_shape,
+                optional=True,
+                dtype="float32",
+                description="Log-sum-exp of attention logits (natural log).",
+            ),
+        },
+        tags=[
+            "status:experimental",
+            "stage:prefill",
+            "backend:magi-attention",
+            f"layout:{layout}",
+        ],
+    )
+
+
+magi_ffa_flex_nhd_trace = _make_magi_ffa_flex_trace("NHD")
+magi_ffa_flex_hnd_trace = _make_magi_ffa_flex_trace("HND")
+
+
+def magi_ffa_flex_trace_dispatch(**kwargs):
+    """Select the FFA trace schema matching the public tensor layout."""
+    tensor_layout = kwargs.get("tensor_layout", "NHD")
+    if tensor_layout == "NHD":
+        return magi_ffa_flex_nhd_trace
+    if tensor_layout == "HND":
+        return magi_ffa_flex_hnd_trace
+    raise ValueError("tensor_layout must be one of ('NHD', 'HND')")
+
+
+magi_ffa_flex_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    magi_ffa_flex_nhd_trace,
+    magi_ffa_flex_hnd_trace,
+]

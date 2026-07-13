@@ -7,7 +7,7 @@
 #   dependency-free unit tests in tests/ffa (the real kernel path is skipped via
 #   pytest.importorskip). This workflow exercises the REAL path by installing
 #   MagiAttention on a Hopper GPU runner. It is intentionally:
-#     - manual / scheduled only (workflow_dispatch + nightly schedule),
+#     - manual only (workflow_dispatch),
 #     - NON-BLOCKING for PRs (it is its own workflow; it does not gate pr-test.yml).
 #
 # Runs inside the repo's CI image (flashinfer-ci-cu129, same as pr-test.yml) via
@@ -15,18 +15,16 @@
 # (MagiAttention pin + nvidia-cutlass-dsl restore) lives in
 # scripts/task_test_magi_ffa.sh.
 #
-# MAINTAINER TODO (could not be validated by the author's environment):
-#   - Confirm the GPU runner label below (FFA's native kernel targets Hopper;
-#     FFA_FA4 also covers Blackwell/Ampere — adjust if you want broader coverage).
-#     The author verified the tests locally with magi_attention 1.1.0.post10 on H20.
+# FlashInfer-validated configuration: magi_attention==1.1.0.post10 on Hopper/H20,
+# with nvidia-cutlass-dsl>=4.5.0 restored after the MagiAttention install.
+# MagiAttention upstream also supports Blackwell/Ampere through FFA_FA4, but those
+# configurations are not validated here under this dependency override. Runtime
+# architecture support remains owned by MagiAttention; there is no SM90-only gate.
 
 name: MagiAttention FFA (opt-in real-path tests)
 
 on:
   workflow_dispatch: {}
-  # Uncomment to also run nightly once maintainers confirm runner availability:
-  # schedule:
-  #   - cron: "0 7 * * *"  # 07:00 UTC daily
 
 concurrency:
   group: magi-ffa-optin-${{ github.ref }}
@@ -58,7 +56,7 @@ jobs:
   magi-ffa-real-path:
     name: MagiAttention FFA real-path tests (Hopper)
     needs: setup
-    # TODO(maintainer): confirm this self-hosted GPU runner label (Hopper).
+    # Same Hopper runner label used by pr-test.yml.
     runs-on: [self-hosted, linux, x64, gpu, h100]
     timeout-minutes: 60
     env:
@@ -66,16 +64,21 @@ jobs:
     steps:
       - name: Cleanup
         run: |
-          # Stop all Docker containers to free memory
-          docker stop $(docker ps -q) 2>/dev/null || true
-          docker rm $(docker ps -aq) 2>/dev/null || true
-          # Clean workspace and caches
+          # Shared multi-runner node: only stop containers mounted from this
+          # runner's workspace. Do not disrupt jobs owned by sibling runners.
+          for cid in $(docker ps -q); do
+            if docker inspect "$cid" --format '{{json .Mounts}}' 2>/dev/null | grep -qF "${{ github.workspace }}/"; then
+              docker stop "$cid" 2>/dev/null || true
+            fi
+          done
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
+          docker container prune -f 2>/dev/null || true
           docker image prune -f || true
           docker builder prune -f --filter "until=24h" || true
-          nvidia-smi || true
+          echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+          nvidia-smi -i "$CUDA_VISIBLE_DEVICES" || true
 
       - uses: actions/checkout@v4
         with:
@@ -83,4 +86,4 @@ jobs:
           persist-credentials: false
 
       - name: Run MagiAttention FFA tests (real path)
-        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_test_magi_ffa.sh
+        run: bash ci/bash.sh "${DOCKER_IMAGE}" ./scripts/task_test_magi_ffa.sh
