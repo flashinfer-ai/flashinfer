@@ -5,6 +5,13 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
+
+DEFAULT_PROFILE_VALUE_BUCKET = -1
+DEFAULT_PROFILE_VALUE_BUCKETS = (
+    DEFAULT_PROFILE_VALUE_BUCKET,
+    DEFAULT_PROFILE_VALUE_BUCKET,
+)
+
 from ...tllm_enums import DtypeTrtllmGen, Fp8QuantizationType, WeightLayout
 from .da_config import DAConfig
 
@@ -162,6 +169,7 @@ CAPTURE_KEEPALIVE: Dict[DAMoeContext, Dict[int, torch.Tensor]] = {}
 STATIC_FALLBACK_TACTICS: Dict[
     Tuple[str, int, int, DAMoeContext], Optional[Tuple[Tuple[int, int], float]]
 ] = {}
+BUNDLE_EAGER_TACTICS: Dict[Tuple[int, DAMoeContext], Tuple[Tuple[int, int], float]] = {}
 BASELINE_GUARD_DECISIONS: Dict[Tuple[int, DAMoeContext], Dict[str, Any]] = {}
 
 

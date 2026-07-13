@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional, Sequence
@@ -14,19 +15,50 @@ from ...autotuner import (
     DynamicValueSpec,
     OptimizationProfile,
     StaticDim,
+    TuningConfig,
 )
 from ...tllm_enums import DtypeTrtllmGen
+from ..utils import make_random_topk_ids
 from . import da_capture, da_profile, da_state
 from .da_config import DAConfig
 from .da_utils import generate_da_distribution_assignments, pack_expert_assignments
 
 
+# Explicit provenance marker for the value sample produced by the unmodified
+# MoE tuning config.  DA-generated tile/distribution buckets are non-negative.
+DEFAULT_PROFILE_VALUE_BUCKET = da_state.DEFAULT_PROFILE_VALUE_BUCKET
+DEFAULT_PROFILE_VALUE_BUCKETS = da_state.DEFAULT_PROFILE_VALUE_BUCKETS
+
+
 @dataclass(frozen=True)
 class DABackend:
-    """Core-owned operations consumed by DA orchestration."""
+    """Fused-MoE module operations consumed by DA orchestration."""
 
     get_moe_op: Callable[[], Any]
     capture_backend: Callable[[], da_capture.DACaptureBackend]
+
+
+@functools.cache
+def create_backend(module_getter: Callable[[], Any]) -> DABackend:
+    """Adapt the fused-MoE module to DA's typed orchestration boundary."""
+
+    def capture_backend() -> da_capture.DACaptureBackend:
+        module = module_getter()
+        return da_capture.DACaptureBackend(
+            ffi_moe_op=module.ffi_moe_op,
+            prepare_routing_metadata=(
+                module.trtllm_moe_allocate_routing_metadata_from_logits
+            ),
+            prepare_routing_metadata_multi_tile=(
+                module.prepare_routing_metadata_multi_tile
+            ),
+            supported_tile_sizes=lambda *_args, **_kwargs: (),
+        )
+
+    return DABackend(
+        get_moe_op=lambda: module_getter().ffi_moe_op,
+        capture_backend=capture_backend,
+    )
 
 
 @dataclass(frozen=True)
@@ -206,6 +238,14 @@ def switch_tile_sizes(
 def _subset_value_tensor_generator(
     bucket_id: int, profiled_tensor: torch.Tensor, original_tensor: torch.Tensor
 ) -> torch.Tensor:
+    """Resize caller routing values along the token axis for a tuning profile.
+
+    Smaller profiles use a prefix. Larger profiles and incompatible non-token
+    dimensions retain the autotuner's initialized tensor so the routing-aware
+    generator can supply a valid representative default profile.
+    """
+
+    # The bucket marks profile provenance; it must not replace caller routing values.
     del bucket_id
     if not isinstance(original_tensor, torch.Tensor):
         return profiled_tensor
@@ -214,9 +254,12 @@ def _subset_value_tensor_generator(
     if (
         profiled_tensor.dim() == original_tensor.dim()
         and profiled_tensor.shape[1:] == original_tensor.shape[1:]
-        and profiled_tensor.shape[0] <= original_tensor.shape[0]
+        and original_tensor.shape[0] > 0
     ):
-        return original_tensor[: profiled_tensor.shape[0]].contiguous()
+        target_rows = int(profiled_tensor.shape[0])
+        source_rows = int(original_tensor.shape[0])
+        if target_rows <= source_rows:
+            return original_tensor[:target_rows].contiguous()
     return profiled_tensor
 
 
@@ -238,6 +281,37 @@ class DADistributionTensorGenerator:
         inputs: list[torch.Tensor],
         sample_index: int = 0,
     ) -> torch.Tensor:
+        if int(bucket_id) == DEFAULT_PROFILE_VALUE_BUCKET:
+            caller_values = _subset_value_tensor_generator(
+                bucket_id,
+                profiled_tensor,
+                original_tensor,
+            )
+            if caller_values is not profiled_tensor:
+                return caller_values
+            call = self.execution.invocation
+            if (
+                isinstance(profiled_tensor, torch.Tensor)
+                and isinstance(original_tensor, torch.Tensor)
+                and profiled_tensor.dim() == original_tensor.dim()
+                and profiled_tensor.shape[1:] == original_tensor.shape[1:]
+                and profiled_tensor.shape[0] > original_tensor.shape[0]
+                and profiled_tensor.dim() >= 2
+                and profiled_tensor.shape[-1] == call.top_k
+                and not profiled_tensor.is_floating_point()
+            ):
+                assignments = make_random_topk_ids(
+                    call.num_experts,
+                    int(profiled_tensor.shape[0]),
+                    call.top_k,
+                    profiled_tensor.device,
+                )
+                if not self.pack_topk_ids:
+                    return assignments.to(dtype=profiled_tensor.dtype)
+                return pack_expert_assignments(assignments, top_k=call.top_k).to(
+                    dtype=profiled_tensor.dtype
+                )
+            return profiled_tensor
         del original_tensor, inputs
         call = self.execution.invocation
         dist = da_profile.active_auto_distributions(self.execution.config)[
@@ -296,6 +370,13 @@ class DADistributionTensorGenerator:
 
 
 def should_attach_value_specs(execution: DAExecution, tuner: AutoTuner) -> bool:
+    """Return whether this call must add DA value profiles to one tuning sweep.
+
+    Value profiles are attached only during explicit autotuning, never while a
+    CUDA graph is being captured. A compatible bundle with published tactics
+    already supplies the value-aware plan and therefore suppresses profiling.
+    """
+
     if not execution.config.enabled or torch.cuda.is_current_stream_capturing():
         return False
     if not tuner.is_tuning_mode:
@@ -369,6 +450,8 @@ def tuning_config_kwargs(
     def value_sample_count(value_buckets, default_sample_count):
         if len(value_buckets) <= distribution_bucket_index:
             return default_sample_count
+        if tuple(value_buckets) == DEFAULT_PROFILE_VALUE_BUCKETS:
+            return 1
         try:
             distribution = da_profile.active_auto_distributions(execution.config)[
                 int(value_buckets[distribution_bucket_index])
@@ -383,18 +466,71 @@ def tuning_config_kwargs(
 
     kwargs["value_specs"] = value_specs
     kwargs["value_sample_count"] = value_sample_count
+    kwargs["default_value_buckets"] = DEFAULT_PROFILE_VALUE_BUCKETS
     return kwargs, True
+
+
+def choose_one(
+    execution: DAExecution,
+    tuner: AutoTuner,
+    *,
+    custom_op: str,
+    runner: Any,
+    tuning_config: TuningConfig,
+    inputs: list[torch.Tensor],
+    da_value_specs_active: bool,
+    **kwargs: Any,
+) -> tuple[Any, Any]:
+    """Choose the eager NoDA tactic and publish DA tuning results."""
+
+    # One DA sweep publishes both the value-aware graph plan and the marked
+    # shape-only NoDA tactic, so eager never selects a value-aware plan or
+    # implicitly captures/replays CUDA graphs.
+    if execution.config.enabled and da_value_specs_active and not tuner.is_tuning_mode:
+        static_specs = tuple(
+            replace(spec, value_specs=()) for spec in tuning_config.dynamic_tensor_specs
+        )
+        static_config = replace(
+            tuning_config,
+            dynamic_tensor_specs=static_specs,
+            value_sample_count=None,
+            default_value_buckets=None,
+        )
+        tuning_config = static_config
+
+    return tuner.choose_one(
+        custom_op,
+        [runner],
+        tuning_config,
+        inputs,
+        **kwargs,
+    )
 
 
 def resolve_static_fallback(
     execution: DAExecution,
-    tuner: Any,
+    tuner: AutoTuner,
     *,
     custom_op: str,
     runner: Any,
     tactic: Any,
 ) -> Any:
     """Use the normal static profile only when DA tuning has no winner."""
+
+    if (
+        execution.config.enabled
+        and execution.config.verbose
+        and not tuner.is_tuning_mode
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # TODO: Design an explicit eager piecewise-graph API if this becomes a
+        # product requirement. Never capture or replay CUDA graphs implicitly
+        # from an ordinary eager public-wrapper invocation.
+        print(
+            "[DA eager fallback WARNING] DA MoE is running eagerly outside "
+            "autotune; executing the ordinary NoDA shape-only tactic",
+            flush=True,
+        )
 
     if tactic != -1 or not execution.config.enabled or tuner.is_tuning_mode:
         return tactic

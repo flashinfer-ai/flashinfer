@@ -560,6 +560,11 @@ class TuningConfig:
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = False
     value_sample_count: Optional[Callable[[Tuple[Any, ...], int], int]] = None
+    # Optional explicit value-bucket tuple representing the unmodified/default
+    # input profile.  Its winner is also published under the ordinary
+    # shape-only cache key, allowing one value-aware sweep to serve eager and
+    # value-aware execution without conflating the two cache contracts.
+    default_value_buckets: Optional[Tuple[Any, ...]] = None
     # Optional callback invoked once per profile bucket, after dynamic
     # tensors are synthesized but before the per-tactic profile loop.
     # Receives the full list of tensors and returns a (possibly modified)
@@ -1855,6 +1860,7 @@ class AutoTuner:
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
             value_sample_count=tuning_config.value_sample_count,
+            default_value_buckets=tuning_config.default_value_buckets,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
@@ -2546,6 +2552,26 @@ class AutoTuner:
                             # inspect call stack
                             self.profiling_cache[cache_key] = (runner_id, tactic, p)
                             self.profiling_time_cache[cache_key] = min_time
+                            if (
+                                tuning_config.default_value_buckets is not None
+                                and p.value_buckets
+                                == tuning_config.default_value_buckets
+                            ):
+                                default_profile = copy.deepcopy(p)
+                                default_profile.value_buckets = ()
+                                shape_cache_key = AutoTuner._get_cache_key(
+                                    custom_op,
+                                    runners[runner_id],
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    runners[runner_id].get_cache_key_extras(tensors),
+                                )
+                                self.profiling_cache[shape_cache_key] = (
+                                    runner_id,
+                                    tactic,
+                                    default_profile,
+                                )
+                                self.profiling_time_cache[shape_cache_key] = min_time
                             self._dirty = True
                             self._dirty_seq += 1
                             self.stats.tuned_op_successful_configs[custom_op] = (
@@ -2890,6 +2916,17 @@ class AutoTuner:
         if _is_value_aware_autotune() and value_specs:
             expanded_profiles = []
             for profile in generated_profiles:
+                if tuning_config.default_value_buckets is not None:
+                    if len(tuning_config.default_value_buckets) != len(value_specs):
+                        raise ValueError(
+                            "default_value_buckets must provide one marker for "
+                            "each DynamicValueSpec"
+                        )
+                    default_profile = copy.deepcopy(profile)
+                    default_profile.value_buckets = tuple(
+                        tuning_config.default_value_buckets
+                    )
+                    expanded_profiles.append(default_profile)
                 value_bucket_lists = []
                 has_empty_value_spec = False
                 for value_spec in value_specs:

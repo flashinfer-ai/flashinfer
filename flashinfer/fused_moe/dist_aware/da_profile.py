@@ -23,6 +23,7 @@ from ...tllm_enums import (
 # Keep this value in sync with da_heuristic::kMaxExemplars in
 # include/flashinfer/trtllm/fused_moe/da_heuristic_constants.cuh.
 MAX_EXEMPLARS = 8
+DEFAULT_PROFILE_CONTRACT = "moe_runner_original_profile_v1"
 _bundle_has_tactics = False
 _bundle_loaded = False
 
@@ -159,6 +160,12 @@ def baseline_guard_signature(config: DAConfig) -> Dict[str, Any]:
 def bundle_guard_signature_matches(meta: Dict[str, Any], config: DAConfig) -> bool:
     """Return whether a persisted final plan used compatible guard inputs."""
     return meta.get("baseline_guard_signature") == baseline_guard_signature(config)
+
+
+def bundle_default_profile_contract_matches(meta: Dict[str, Any]) -> bool:
+    """Whether persisted eager tactics came from the marked default profile."""
+
+    return meta.get("default_profile_contract") == DEFAULT_PROFILE_CONTRACT
 
 
 def unconstrained_candidate_plan(
@@ -542,6 +549,30 @@ def load_knn_v2_bundle(
     if config.exemplar_offsets:
         offsets = list(config.exemplar_offsets)
 
+    offset_contexts = {
+        da_state.context_with_offset(da_context, int(offset))
+        for offset in sorted(set(offsets))
+    }
+    for eager_key in tuple(da_state.BUNDLE_EAGER_TACTICS):
+        if eager_key[1] in offset_contexts:
+            da_state.BUNDLE_EAGER_TACTICS.pop(eager_key, None)
+
+    eager_tactics = bundle.get("eager_tactics", {}) or {}
+    if eager_tactics and bundle_default_profile_contract_matches(meta):
+        for bucket_key, record in eager_tactics.items():
+            try:
+                tactic = tuple(int(value) for value in record["tactic"])
+                if len(tactic) != 2:
+                    raise ValueError
+                time_ms = float(record["time_ms"])
+                bucket = int(bucket_key)
+            except (KeyError, TypeError, ValueError):
+                continue
+            for offset_context in offset_contexts:
+                da_state.BUNDLE_EAGER_TACTICS[
+                    da_state.cache_key(offset_context, bucket)
+                ] = (tactic, time_ms)
+
     uploaded = 0
     for bucket_key, raw_plan in sorted(
         plans_by_bucket.items(), key=lambda item: int(item[0])
@@ -922,6 +953,8 @@ def populate_per_tile_tactics_from_autotune(
         if not value_buckets:
             stats["reject_no_value_buckets"] += 1
             continue
+        if tuple(value_buckets) == da_state.DEFAULT_PROFILE_VALUE_BUCKETS:
+            continue
         tactic_value = cast(Any, tactic)
         try:
             tile = int(tactic_value[0])
@@ -989,6 +1022,12 @@ def best_static_tactic_from_profiles(
     cache_key = (custom_op, int(runner_hash), int(num_tokens_bucket), da_context)
     if cache_key in da_state.STATIC_FALLBACK_TACTICS:
         return da_state.STATIC_FALLBACK_TACTICS[cache_key]
+    bundle_fallback = da_state.BUNDLE_EAGER_TACTICS.get(
+        da_state.cache_key(da_context, int(num_tokens_bucket))
+    )
+    if bundle_fallback is not None:
+        da_state.STATIC_FALLBACK_TACTICS[cache_key] = bundle_fallback
+        return bundle_fallback
 
     best_exact: Optional[Tuple[Tuple[int, int], float]] = None
     best_compatible: Optional[Tuple[Tuple[int, int], float]] = None
@@ -1628,6 +1667,39 @@ def auto_profile_knn_exemplars(
                 "baseline guard admission unavailable, skipping",
                 flush=True,
             )
+    eager_tactics: Dict[str, Dict[str, Any]] = {}
+    effective_runner_hash = hash(runner) if runner_hash is None else runner_hash
+    for bucket in sorted(buckets_with_tiles):
+        eager = best_static_tactic_from_profiles(
+            AutoTuner.get(),
+            da_context.op_name,
+            runner.__class__.__name__,
+            int(effective_runner_hash),
+            int(bucket),
+            da_context=da_context,
+        )
+        if eager is None:
+            continue
+        eager_fields = {
+            "eager_tactic": tuple(int(value) for value in eager[0]),
+            "eager_time_ms": float(eager[1]),
+            "eager_profile_contract": DEFAULT_PROFILE_CONTRACT,
+        }
+        eager_tactics[str(int(bucket))] = {
+            "tactic": [int(eager[0][0]), int(eager[0][1])],
+            "time_ms": float(eager[1]),
+        }
+        if str(int(bucket)) in bundle_plans:
+            bundle_plans[str(int(bucket))].update(eager_fields)
+        for offset in auto_offsets:
+            decision = da_state.BASELINE_GUARD_DECISIONS.get(
+                da_state.cache_key(
+                    da_state.context_with_offset(da_context, int(offset)), int(bucket)
+                )
+            )
+            if decision is not None:
+                decision.update(eager_fields)
+
     if _verbose:
         print(
             f"[DA k-NN auto-profile] done: {n_uploaded} buckets uploaded, "
@@ -1641,11 +1713,13 @@ def auto_profile_knn_exemplars(
 
         bundle = {
             "tactic_table": {},
+            "eager_tactics": eager_tactics,
             "exemplars": bundle_exemplars,
             "plans": bundle_plans,
             "meta": {
                 "schema_version": int(da_context.schema_version),
                 "baseline_guard_signature": baseline_guard_signature(config),
+                "default_profile_contract": DEFAULT_PROFILE_CONTRACT,
                 "device_type": da_context.device_type,
                 "device_index": int(da_context.device_index),
                 "ep": max(1, num_experts // max(1, num_local_experts)),

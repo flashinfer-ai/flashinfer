@@ -1201,3 +1201,14 @@ def reset_fast_path_stats() -> None:
 
 def capture_dispatch_count() -> int:
     return int(globals().get("_TRTLLM_DA_CAPTURE_DISPATCH_COUNT", 0))
+
+
+def fast_path_stats() -> Dict[str, Any]:
+    """Return the stable DA capture observability surface."""
+
+    return {
+        "fire_multi": 0,
+        "fire_single": 0,
+        "skip": {},
+        "capture_dispatch_count": capture_dispatch_count(),
+    }

@@ -21,6 +21,7 @@ import inspect
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -38,6 +39,7 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe import core as moe_core
 from flashinfer.fused_moe.dist_aware import (
     da_capture,
+    da_core,
     da_profile,
     da_single_graph,
     da_state,
@@ -78,6 +80,30 @@ TUNE_MAX_NUM_TOKENS = NUM_TOKENS
 DA_DISTRIBUTIONS = get_da_distribution_specs("uniform,exp:2,single")
 DA_DISTRIBUTION_NAMES = ("uniform", "exp:2", "single")
 DA_ROUTING_METHODS = (RoutingMethodType.DeepSeekV3, RoutingMethodType.Renormalize)
+
+
+@pytest.mark.parametrize("pack_topk_ids", [False, True])
+def test_future_default_profile_uses_valid_representative_routing(pack_topk_ids):
+    invocation = SimpleNamespace(top_k=8, num_experts=128)
+    execution = SimpleNamespace(invocation=invocation)
+    generator = da_core.DADistributionTensorGenerator(
+        execution, pack_topk_ids=pack_topk_ids
+    )
+    original = torch.zeros(64, 8, dtype=torch.int32)
+    profiled = torch.zeros(512, 8, dtype=torch.int32)
+
+    generated = generator(
+        da_core.DEFAULT_PROFILE_VALUE_BUCKET,
+        profiled,
+        original,
+        [],
+    )
+    expert_ids = generated >> 16 if pack_topk_ids else generated
+
+    assert generated.shape == profiled.shape
+    assert int(expert_ids.min()) >= 0
+    assert int(expert_ids.max()) < invocation.num_experts
+    assert torch.all(expert_ids.sort(dim=1).values.diff(dim=1) != 0)
 
 
 def test_da_distribution_samples_are_stable_across_tactic_profiles():
@@ -2227,6 +2253,7 @@ def _reset_tuner_and_da(monkeypatch: pytest.MonkeyPatch) -> AutoTuner:
     da_single_graph._DA_INLINE_SIDE_STREAMS.clear()
     da_single_graph._DA_INLINE_ROUTING_STREAMS.clear()
     da_state.STATIC_FALLBACK_TACTICS.clear()
+    da_state.BUNDLE_EAGER_TACTICS.clear()
     da_state.BASELINE_GUARD_DECISIONS.clear()
     fused_moe_api.reset_da_fast_path_stats()
 
@@ -2255,6 +2282,7 @@ def _clear_da_test_state(tuner: AutoTuner) -> None:
     da_single_graph._DA_INLINE_SIDE_STREAMS.clear()
     da_single_graph._DA_INLINE_ROUTING_STREAMS.clear()
     da_state.STATIC_FALLBACK_TACTICS.clear()
+    da_state.BUNDLE_EAGER_TACTICS.clear()
     da_state.BASELINE_GUARD_DECISIONS.clear()
     fused_moe_api.reset_da_fast_path_stats()
     tuner.clear_cache()
@@ -2516,6 +2544,10 @@ def test_bundle_guard_signature_rejects_incompatible_final_policy():
     assert da_profile.bundle_guard_signature_matches(meta, guard_off)
     assert not da_profile.bundle_guard_signature_matches(meta, guard_on)
     assert not da_profile.bundle_guard_signature_matches({}, guard_on)
+    assert da_profile.bundle_default_profile_contract_matches(
+        {"default_profile_contract": da_profile.DEFAULT_PROFILE_CONTRACT}
+    )
+    assert not da_profile.bundle_default_profile_contract_matches({})
 
 
 def test_da_baseline_guard_classifies_natural_singleton_after_deduplication():
@@ -2809,6 +2841,26 @@ def test_da_baseline_lookup_uses_only_shape_compatible_hash_fallback():
         64,
         da_context=_BaselineLookupContext(),
     ) == ((32, 2), 0.8)
+
+
+def test_da_baseline_lookup_restores_bundle_default_profile_tactic():
+    context = _BaselineLookupContext()
+    da_state.STATIC_FALLBACK_TACTICS.clear()
+    da_state.BUNDLE_EAGER_TACTICS.clear()
+    da_state.BUNDLE_EAGER_TACTICS[da_state.cache_key(context, 64)] = (
+        (32, 9),
+        0.75,
+    )
+
+    assert da_profile.best_static_tactic_from_profiles(
+        _baseline_lookup_tuner([]),
+        "flashinfer::trtllm_fp4_block_scale_moe",
+        "MoERunner",
+        7,
+        64,
+        da_context=context,
+    ) == ((32, 9), 0.75)
+    da_state.BUNDLE_EAGER_TACTICS.clear()
 
 
 def _capture_and_replay_da_graph(
@@ -3288,6 +3340,30 @@ def test_factorized_da_public_wrapper_graph_matches_independent_reference(
     monkeypatch, tmp_path, precision
 ):
     """The real public CUDA graph must dispatch DA and match the dequant reference."""
+    child_precision = os.getenv("_FLASHINFER_DA_FACTOR_GRAPH_CHILD")
+    if child_precision != precision.name:
+        # Earlier conditional-graph tests can leave CUDA state that is only
+        # reported by a later allocation.  Keep every precision contract real,
+        # but give it an independent CUDA context so failures are attributable
+        # to that public-wrapper capture rather than inherited graph lifetime.
+        env = os.environ.copy()
+        env["_FLASHINFER_DA_FACTOR_GRAPH_CHILD"] = precision.name
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                f"{__file__}::{test_factorized_da_public_wrapper_graph_matches_independent_reference.__name__}[{precision.name}]",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return
+
     tuner = _reset_tuner_and_da(monkeypatch)
     graph = None
     try:

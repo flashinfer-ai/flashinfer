@@ -108,48 +108,9 @@ class RoutingInputMode(IntEnum):
     UnpackedPrecomputed = 2
 
 
-# DA-MoE: retain the legacy observability surface after removing capture counters.
-def get_da_fast_path_stats() -> Dict[str, Any]:
-    """Stub retained for external tools. The in-capture counters have
-    been removed because they interacted poorly with graph capture
-    (triggered async CUDA IMAs on some workloads). The existing
-    ``_TRTLLM_DA_CAPTURE_DISPATCH_COUNT`` global is a coarse fire-rate
-    counter if needed.
-    """
-    return {
-        "fire_multi": 0,
-        "fire_single": 0,
-        "skip": {},
-        "capture_dispatch_count": da_capture.capture_dispatch_count(),
-    }
-
-
-# DA-MoE: reset the capture-aware selector state exposed to diagnostic callers.
-def reset_da_fast_path_stats() -> None:
-    da_capture.reset_fast_path_stats()
-
-
-# DA-MoE: adapt the fused-MoE FFI module to the capture orchestration interface.
-def _capture_backend() -> da_capture.DACaptureBackend:
-    module = get_trtllm_moe_sm100_module()
-    return da_capture.DACaptureBackend(
-        ffi_moe_op=module.ffi_moe_op,
-        prepare_routing_metadata=lambda *args, **kwargs: (
-            get_trtllm_moe_sm100_module().trtllm_moe_allocate_routing_metadata_from_logits(
-                *args, **kwargs
-            )
-        ),
-        prepare_routing_metadata_multi_tile=module.prepare_routing_metadata_multi_tile,
-        supported_tile_sizes=lambda *_args, **_kwargs: (),
-    )
-
-
-# DA-MoE: provide invocation-independent FFI and capture dependencies to da_core.
-def _da_backend() -> da_core.DABackend:
-    return da_core.DABackend(
-        get_moe_op=lambda: get_trtllm_moe_sm100_module().ffi_moe_op,
-        capture_backend=_capture_backend,
-    )
+# Backward-compatible core aliases; implementation and state live in DA modules.
+get_da_fast_path_stats = da_capture.fast_path_stats
+reset_da_fast_path_stats = da_capture.reset_fast_path_stats
 
 
 @functools.cache
@@ -1424,7 +1385,11 @@ def get_trtllm_moe_sm100_module():
                     )
                     return []
                 MoERunner.valid_tactics_dict[instance_key] = valid_tactics
-            if profile.value_buckets:
+            if (
+                profile.value_buckets
+                and int(profile.value_buckets[0])
+                != da_core.DEFAULT_PROFILE_VALUE_BUCKET
+            ):
                 target_tile = int(profile.value_buckets[0])
                 return [
                     tactic
@@ -1438,7 +1403,11 @@ def get_trtllm_moe_sm100_module():
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> Optional[List[List[Any]]]:
-            if not self.factorized_da_enabled or not profile.value_buckets:
+            if (
+                not self.factorized_da_enabled
+                or not profile.value_buckets
+                or int(profile.value_buckets[0]) == da_core.DEFAULT_PROFILE_VALUE_BUCKET
+            ):
                 return None
 
             moe_inputs = MoEInputs.from_list(inputs)
@@ -1909,7 +1878,7 @@ def get_trtllm_moe_sm100_module():
             da_expert_weights: Optional[torch.Tensor],
         ) -> da_core.DAExecution:
             return da_core.create_execution(
-                _da_backend(),
+                da_core.create_backend(get_trtllm_moe_sm100_module),
                 da_core.DAInvocation(
                     da_context=da_context,
                     runner=moe_runner,
@@ -1980,11 +1949,14 @@ def get_trtllm_moe_sm100_module():
             **_da_tuning_config_kwargs,
         )
 
-        _, tactic = tuner.choose_one(
-            custom_op,
-            [moe_runner],
-            tuning_config,
-            moe_inputs.to_list(),
+        _, tactic = da_core.choose_one(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tuning_config=tuning_config,
+            inputs=moe_inputs.to_list(),
+            da_value_specs_active=_da_value_specs_active,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm2_weights=gemm2_weights,
@@ -2322,7 +2294,7 @@ def get_trtllm_moe_sm100_module():
         # DA-MoE: build call-specific state for profiling and metadata replay.
         def _make_fp8_per_tensor_da_execution() -> da_core.DAExecution:
             return da_core.create_execution(
-                _da_backend(),
+                da_core.create_backend(get_trtllm_moe_sm100_module),
                 da_core.DAInvocation(
                     da_context=da_context,
                     runner=moe_runner,
@@ -2389,11 +2361,14 @@ def get_trtllm_moe_sm100_module():
             **_da_tuning_config_kwargs,
         )
 
-        _, tactic = tuner.choose_one(
-            custom_op,
-            [moe_runner],
-            tuning_config,
-            moe_inputs.to_list(),
+        _, tactic = da_core.choose_one(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tuning_config=tuning_config,
+            inputs=moe_inputs.to_list(),
+            da_value_specs_active=_da_value_specs_active,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             output1_scales_scalar=output1_scales_scalar,
@@ -2780,7 +2755,7 @@ def get_trtllm_moe_sm100_module():
             da_expert_weights: Optional[torch.Tensor],
         ) -> da_core.DAExecution:
             return da_core.create_execution(
-                _da_backend(),
+                da_core.create_backend(get_trtllm_moe_sm100_module),
                 da_core.DAInvocation(
                     da_context=da_context,
                     runner=moe_runner,
@@ -2851,11 +2826,14 @@ def get_trtllm_moe_sm100_module():
             **_da_tuning_config_kwargs,
         )
 
-        _, tactic = tuner.choose_one(
-            custom_op,
-            [moe_runner],
-            tuning_config,
-            moe_inputs.to_list(),
+        _, tactic = da_core.choose_one(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tuning_config=tuning_config,
+            inputs=moe_inputs.to_list(),
+            da_value_specs_active=_da_value_specs_active,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_weights_scale=gemm1_weights_scale,
@@ -3283,7 +3261,7 @@ def get_trtllm_moe_sm100_module():
         # DA-MoE: build call-specific state for profiling and metadata replay.
         def _make_fp4_da_execution() -> da_core.DAExecution:
             return da_core.create_execution(
-                _da_backend(),
+                da_core.create_backend(get_trtllm_moe_sm100_module),
                 da_core.DAInvocation(
                     da_context=da_context,
                     runner=moe_runner,
@@ -3446,11 +3424,14 @@ def get_trtllm_moe_sm100_module():
                 flush=True,
             )
 
-        _, tactic = tuner.choose_one(
-            custom_op,
-            [moe_runner],
-            tuning_config,
-            moe_inputs.to_list(),
+        _, tactic = da_core.choose_one(
+            da_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tuning_config=tuning_config,
+            inputs=moe_inputs.to_list(),
+            da_value_specs_active=_da_value_specs_active,
             routing_input_mode=routing_input_mode,
             num_experts=num_experts,
             routing_bias=routing_bias,
@@ -4080,7 +4061,7 @@ def get_trtllm_moe_sm100_module():
             da_expert_weights: Optional[torch.Tensor],
         ) -> da_core.DAExecution:
             return da_core.create_execution(
-                _da_backend(),
+                da_core.create_backend(get_trtllm_moe_sm100_module),
                 da_core.DAInvocation(
                     da_context=da_context,
                     runner=moe_runner,
@@ -4151,11 +4132,14 @@ def get_trtllm_moe_sm100_module():
             **_da_tuning_config_kwargs,
         )
 
-        _, tactic = tuner.choose_one(
-            custom_op,
-            [moe_runner],
-            tuning_config,
-            moe_inputs.to_list(),
+        _, tactic = da_core.choose_one(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tuning_config=tuning_config,
+            inputs=moe_inputs.to_list(),
+            da_value_specs_active=_da_value_specs_active,
             num_experts=num_experts,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,

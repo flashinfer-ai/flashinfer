@@ -1172,6 +1172,7 @@ def _run_real_autotune(
     da_state.PER_TILE_TACTICS.clear()
     da_state.PER_BODY_TACTICS.clear()
     da_state.STATIC_FALLBACK_TACTICS.clear()
+    da_state.BUNDLE_EAGER_TACTICS.clear()
     da_state.BASELINE_GUARD_DECISIONS.clear()
 
     tuning_input = _make_routing_input(
@@ -1181,20 +1182,7 @@ def _run_real_autotune(
     # shape that happened to trigger this benchmark invocation.
     tuning_buckets = get_hybrid_num_tokens_buckets(cfg.tune_max_num_tokens, 1)
 
-    # Establish the normal shape-only autotuned baseline first.
     tune_start = time.perf_counter()
-    os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "0"
-    with (
-        nvtx_range(f"phase=static-autotune, precision={case.name}"),
-        autotune(True, tuning_buckets=tuning_buckets, round_up=True),
-    ):
-        case.call(tuning_input)
-    torch.cuda.synchronize()
-    static_tune_seconds = time.perf_counter() - tune_start
-    static_profiles = len(tuner.profiling_cache)
-
-    # Then populate per-distribution profiles, body tactics, and kNN exemplars.
-    da_tune_start = time.perf_counter()
     os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "1"
     with (
         cuda_profiler_da_phase(),
@@ -1203,8 +1191,14 @@ def _run_real_autotune(
     ):
         case.call(tuning_input)
     torch.cuda.synchronize()
-    da_tune_seconds = time.perf_counter() - da_tune_start
     tune_seconds = time.perf_counter() - tune_start
+    da_tune_seconds = tune_seconds
+    static_tune_seconds = 0.0
+    static_profiles = sum(
+        1
+        for cache_key in tuner.profiling_cache
+        if not _is_value_profile_cache_key(cache_key)
+    )
 
     da_context = _make_da_context(case, cfg, device)
     key = da_state.cache_key(
@@ -1301,6 +1295,11 @@ def _guard_row_fields(decision: dict) -> dict:
             "candidate_policy", decision.get("policy", "noda")
         ),
         "da_candidate_tactics": repr(decision.get("candidate_tactics", [])),
+        "da_eager_tactic": repr(decision.get("eager_tactic")),
+        "da_eager_time_ms": decision.get("eager_time_ms"),
+        "da_eager_profile_contract": decision.get(
+            "eager_profile_contract", "unavailable"
+        ),
         "da_final_policy": decision.get("final_policy", decision.get("policy", "noda")),
         "da_final_tactics": repr(decision.get("final_tactics", [])),
         "da_baseline_tactic": repr(decision.get("baseline_tactic")),

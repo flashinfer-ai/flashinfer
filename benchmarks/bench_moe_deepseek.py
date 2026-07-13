@@ -21,8 +21,8 @@ Usage:
     # Custom token counts
     python bench_moe_deepseek.py --num-tokens 64,128,256
 
-    # Disable CUDA graph (useful for debugging or profiling)
-    python bench_moe_deepseek.py --no-cuda-graph
+    # Eager execution (CUDA graph is the default)
+    python bench_moe_deepseek.py --execution-mode eager
 
     # Disable CUPTI (use CUDA events for timing instead)
     python bench_moe_deepseek.py --no-cupti
@@ -63,11 +63,26 @@ GEN_PHASE_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]
 # EP=8: 32 experts per GPU (256/8)
 # EP=16: 16 experts per GPU (256/16)
 EP_CONFIGS = {
-    1: {"num_local_experts": 256, "local_expert_offset": 0},
-    2: {"num_local_experts": 128, "local_expert_offset": 0},
-    4: {"num_local_experts": 64, "local_expert_offset": 0},
-    8: {"num_local_experts": 32, "local_expert_offset": 0},
-    16: {"num_local_experts": 16, "local_expert_offset": 0},
+    1: {
+        "num_local_experts": DeepSeekConfig().num_experts // 1,
+        "local_expert_offset": 0,
+    },
+    2: {
+        "num_local_experts": DeepSeekConfig().num_experts // 2,
+        "local_expert_offset": 0,
+    },
+    4: {
+        "num_local_experts": DeepSeekConfig().num_experts // 4,
+        "local_expert_offset": 0,
+    },
+    8: {
+        "num_local_experts": DeepSeekConfig().num_experts // 8,
+        "local_expert_offset": 0,
+    },
+    16: {
+        "num_local_experts": DeepSeekConfig().num_experts // 16,
+        "local_expert_offset": 0,
+    },
 }
 
 
@@ -624,7 +639,6 @@ def bench_trtllm(
         "hidden_states_scale": hsc,
     }
 
-    # Pre-warm under autotune; measurement runs outside (see bench_cute_dsl).
     with autotune(True) if do_autotune else contextlib.nullcontext():
         run(**input_kwargs)
         torch.cuda.synchronize()
@@ -970,9 +984,10 @@ def main():
         help="Expert Parallelism: 1 (256 local), 8 (32 local), 16 (16 local)",
     )
     parser.add_argument(
-        "--no-cuda-graph",
-        action="store_true",
-        help="Disable CUDA graph for benchmarking (enabled by default)",
+        "--execution-mode",
+        choices=("graph", "eager"),
+        default="graph",
+        help="Execution mode for benchmarking (default: graph)",
     )
     parser.add_argument(
         "--no-cupti",
@@ -1015,7 +1030,7 @@ def main():
         ep_config=args.ep,
         do_autotune=not args.no_autotune,
         verbose=not args.quiet,
-        use_cuda_graph=not args.no_cuda_graph,
+        use_cuda_graph=args.execution_mode == "graph",
         use_cupti=not args.no_cupti,
         use_wrapper=not args.functional_api,
         routing_bias_scale=args.routing_bias_scale,

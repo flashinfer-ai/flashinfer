@@ -692,6 +692,86 @@ def test_empty_profile_dependent_value_spec_does_not_create_partial_key(monkeypa
     }
 
 
+def test_default_value_profile_uses_original_values_and_publishes_shape_cache(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    marker = (-1,)
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8,),
+                map_to_tuning_buckets=lambda _size: 8,
+                tensor_initializers=[
+                    lambda shape, dtype, device: torch.zeros(
+                        shape, dtype=dtype, device=device
+                    )
+                ],
+                value_specs=(
+                    DynamicValueSpec(
+                        input_idx=0,
+                        gen_value_buckets=(0, 1),
+                        map_to_value_bucket=lambda _tensor: 0,
+                        tensor_value_generator=lambda bucket,
+                        profiled,
+                        original,
+                        _inputs: (
+                            original
+                            if bucket == -1
+                            else torch.full_like(profiled, bucket)
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        default_value_buckets=marker,
+    )
+    inputs = [torch.arange(1, 9, dtype=torch.float32)]
+    profiles = tuner._generate_optimization_profiles(config, inputs)
+    assert [profile.value_buckets for profile in profiles] == [marker, (0,), (1,)]
+
+    def fake_profile(_self, _runner, profile_inputs, tactic, _config, **_kwargs):
+        is_default = bool(torch.equal(profile_inputs[0], inputs[0]))
+        return 1.0 if tactic == (1 if is_default else 0) else 2.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        tuner.choose_one("default_value_profile", [runner], config, inputs)
+
+    shape_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8,),
+                map_to_tuning_buckets=lambda _size: 8,
+                tensor_initializers=config.dynamic_tensor_specs[0].tensor_initializers,
+            ),
+        )
+    )
+    _, tactic = tuner.choose_one(
+        "default_value_profile", [runner], shape_config, inputs
+    )
+    assert tactic == 1
+
+    cache_path = tmp_path / "default-profile-cache.json"
+    tuner.save_configs(str(cache_path))
+    tuner.clear_cache()
+    assert tuner.load_configs(str(cache_path))
+    assert (
+        tuner.choose_one("default_value_profile", [runner], shape_config, inputs)[1]
+        == 1
+    )
+    assert tuner.choose_one("default_value_profile", [runner], config, inputs)[1] == 0
+    tuner.clear_cache()
+    tuner._override_config_cache.clear()
+    AutoTuner._find_nearest_profile.cache_clear()
+
+
 def test_factorized_value_profile_retains_fixed_default_tactic_timing(monkeypatch):
     """The default NoDA tactic is measured without changing DA composition."""
     monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
