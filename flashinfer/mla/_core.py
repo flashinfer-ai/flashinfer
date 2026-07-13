@@ -1364,6 +1364,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         "hca_swa_block_tables": hca_swa_block_tables,
         "hca_compressed_block_tables": hca_compressed_block_tables,
         "hca_seq_lens": hca_seq_lens,
+        "hca_is_causal": hca_is_causal if not hca_is_causal else None,
         "hca_use_persistent": hca_use_persistent if hca_use_persistent else None,
     }
     unexpected_hca_inputs = [

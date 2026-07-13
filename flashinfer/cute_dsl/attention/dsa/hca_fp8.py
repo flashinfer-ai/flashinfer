@@ -1612,11 +1612,12 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             for i in cutlass.range_constexpr(lse_per_thread):
                 sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
             sum_lse = cute.arch.warp_reduction_sum(sum_lse)
+            has_reduction_mass = sum_lse != self.lse_dtype(0.0) or sum_lse != sum_lse
             # calculate the global_lse
             global_lse = (
                 lse_max + cute.math.log2(sum_lse, fastmath=True)
-                if not sum_lse == self.lse_dtype(0.0) or sum_lse != sum_lse  # noqa: SIM201
-                else self.lse_dtype.inf
+                if has_reduction_mass
+                else -self.lse_dtype.inf
             )
             if tidx == 0:
                 mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
@@ -1624,8 +1625,10 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             for i in cutlass.range_constexpr(lse_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
                 if cute.elem_less(split_kv_idx, local_split_kv):
-                    smem_lse_scale[split_kv_idx] = cute.math.exp2(
-                        local_lse[i] - global_lse, fastmath=True
+                    smem_lse_scale[split_kv_idx] = (
+                        cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
+                        if has_reduction_mass
+                        else self.acc_dtype(0.0)
                     )
 
         pipeline.sync(barrier_id=4)
@@ -2013,26 +2016,26 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         is_win_for_idx = k_index == 0
         if is_win_for_idx:
             if cutlass.const_expr(self.mma_qk_tiler[1] // self.page_size_win == 1):
-                for i in cutlass.range_constexpr(page_per_tile_max):
+                for i in cutlass.range_constexpr(page_per_tile_win):
                     k_idx[i] = common_params.mPT_win[0]
             else:
-                for i in cutlass.range_constexpr(page_per_tile_max):
+                for i in cutlass.range_constexpr(page_per_tile_win):
                     k_idx[i] = common_params.mPT_win[
-                        common_params.blk_coord[0] * page_per_tile_max + i
+                        common_params.blk_coord[0] * page_per_tile_win + i
                     ]
         else:
             cmp_offset = k_index - 1
             if cutlass.const_expr(self.mma_qk_tiler[1] // self.page_size_cmp == 1):
-                for i in cutlass.range_constexpr(page_per_tile_max):
+                for i in cutlass.range_constexpr(page_per_tile_cmp):
                     k_idx[i] = common_params.mPT_cmp[cmp_offset]
             else:
-                for i in cutlass.range_constexpr(page_per_tile_max):
+                for i in cutlass.range_constexpr(page_per_tile_cmp):
                     k_idx[i] = common_params.mPT_cmp[
                         (
                             cmp_offset * qk_params.tiled_mma_qk.thr_id.shape
                             + common_params.blk_coord[0]
                         )
-                        * page_per_tile_max
+                        * page_per_tile_cmp
                         + i
                     ]
         # load q once at first iteration (single Q stream)
@@ -2117,19 +2120,19 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         is_win_for_idx = k_index == 0
         if is_win_for_idx:
             if cutlass.const_expr(page_per_tile_win == 1):
-                for i in cutlass.range_constexpr(page_per_tile_max):
+                for i in cutlass.range_constexpr(page_per_tile_win):
                     k_idx[i] = common_params.mPT_win[0]
             else:
-                for i in cutlass.range_constexpr(page_per_tile_max):
+                for i in cutlass.range_constexpr(page_per_tile_win):
                     k_idx[i] = common_params.mPT_win[i]
         else:
             cmp_offset = k_index - 1
             if cutlass.const_expr(page_per_tile_cmp == 1):
-                for i in cutlass.range_constexpr(page_per_tile_max):
+                for i in cutlass.range_constexpr(page_per_tile_cmp):
                     k_idx[i] = common_params.mPT_cmp[cmp_offset]
             else:
-                for i in cutlass.range_constexpr(page_per_tile_max):
-                    k_idx[i] = common_params.mPT_cmp[cmp_offset * page_per_tile_max + i]
+                for i in cutlass.range_constexpr(page_per_tile_cmp):
+                    k_idx[i] = common_params.mPT_cmp[cmp_offset * page_per_tile_cmp + i]
 
         # get the mbar ptr from pipeline.
         tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
@@ -3856,11 +3859,15 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             return False
         if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
             return False
+        if split_kv < 1 or split_kv > MAX_SPLITS:
+            return False
+        if page_size_cmp <= 1 or page_size_win <= 1:
+            return False
         # Both page sizes must divide mma_qk_tiler[1]; neither may equal 1
         # (TMA 128B alignment requirement).
-        if mma_qk_tiler_mn[1] % page_size_cmp != 0 or page_size_cmp == 1:
+        if mma_qk_tiler_mn[1] % page_size_cmp != 0:
             return False
-        if mma_qk_tiler_mn[1] % page_size_win != 0 or page_size_win == 1:
+        if mma_qk_tiler_mn[1] % page_size_win != 0:
             return False
         big, small = (
             max(page_size_win, page_size_cmp),
@@ -3878,6 +3885,8 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         if H > 128 or (H < 128 and split_kv != 1):
             return False
         if S <= 0:
+            return False
+        if not is_persistent and B * S > 65535:
             return False
         if K <= 0:
             return False

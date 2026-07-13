@@ -597,6 +597,12 @@ def main() -> None:
     parser.add_argument("--output-csv", type=Path)
     args = parser.parse_args()
 
+    batch_sizes = parse_int_list(args.batch_sizes)
+    raw_seq_lens = parse_int_list(args.raw_seq_lens)
+    if not batch_sizes or not raw_seq_lens:
+        parser.error("--batch-sizes and --raw-seq-lens must not be empty")
+    if any(value <= 0 for value in (*batch_sizes, *raw_seq_lens)):
+        parser.error("batch sizes and raw sequence lengths must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
@@ -629,10 +635,8 @@ def main() -> None:
         f"flashinfer={flashinfer_path}"
     )
     case_index = 0
-    for raw_seq_len in parse_int_list(args.raw_seq_lens):
-        for batch_size in parse_int_list(args.batch_sizes):
-            if raw_seq_len <= 0 or batch_size <= 0:
-                parser.error("batch sizes and raw sequence lengths must be positive")
+    for raw_seq_len in raw_seq_lens:
+        for batch_size in batch_sizes:
             case = HcaCase(
                 batch_size=batch_size,
                 raw_seq_len=raw_seq_len,

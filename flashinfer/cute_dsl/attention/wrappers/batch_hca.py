@@ -356,19 +356,58 @@ def _validate_hca_values(
     if invalid_window_lens.any().item():
         raise ValueError("window_valid_lens values must be between 0 and 128")
 
-    for tables, cache, name in (
-        (window_block_tables, window_kv_cache, "window_block_tables"),
-        (
-            compressed_block_tables,
-            compressed_kv_cache,
-            "compressed_block_tables",
+    # The kernel always loads the fixed 128-slot window tile, even when some
+    # slots are masked by window_valid_lens. Extra table columns are padding.
+    window_page_count = (
+        _HCA_WINDOW_CAPACITY + window_kv_cache.shape[1] - 1
+    ) // window_kv_cache.shape[1]
+    active_window_tables = window_block_tables[:, :window_page_count]
+    invalid_window_pages = torch.logical_or(
+        active_window_tables < 0,
+        active_window_tables >= window_kv_cache.shape[0],
+    )
+    if invalid_window_pages.any().item():
+        raise ValueError(
+            "window_block_tables active values must be physical page IDs in "
+            f"[0, {window_kv_cache.shape[0]})"
+        )
+
+    # TMA loads are scheduled from hca_seq_lens in 128-slot tiles, before
+    # sparse_topk_lens masks a query row. Validate every compressed page that
+    # those tile-rounded loads can touch; only later table columns are padding.
+    compressed_pages_per_tile = (
+        _HCA_WINDOW_CAPACITY + compressed_kv_cache.shape[1] - 1
+    ) // compressed_kv_cache.shape[1]
+    compressed_tiles_per_row = torch.div(
+        seq_lens_per_row - _HCA_WINDOW_CAPACITY + _HCA_WINDOW_CAPACITY - 1,
+        _HCA_WINDOW_CAPACITY,
+        rounding_mode="floor",
+    )
+    compressed_active_pages = compressed_tiles_per_row * compressed_pages_per_tile
+    if (compressed_active_pages > compressed_block_tables.shape[1]).any().item():
+        raise ValueError(
+            "compressed_block_tables must cover the 128-slot tile-rounded "
+            "hca_seq_lens footprint"
+        )
+    compressed_page_indices = torch.arange(
+        compressed_block_tables.shape[1],
+        device=compressed_block_tables.device,
+    ).unsqueeze(0)
+    compressed_page_mask = compressed_page_indices < compressed_active_pages.unsqueeze(
+        1
+    )
+    invalid_compressed_pages = torch.logical_and(
+        compressed_page_mask,
+        torch.logical_or(
+            compressed_block_tables < 0,
+            compressed_block_tables >= compressed_kv_cache.shape[0],
         ),
-    ):
-        invalid_pages = torch.logical_or(tables < 0, tables >= cache.shape[0])
-        if invalid_pages.any().item():
-            raise ValueError(
-                f"{name} values must be physical page IDs in [0, {cache.shape[0]})"
-            )
+    )
+    if invalid_compressed_pages.any().item():
+        raise ValueError(
+            "compressed_block_tables active values must be physical page IDs in "
+            f"[0, {compressed_kv_cache.shape[0]})"
+        )
 
 
 def cute_dsl_hca_decode(

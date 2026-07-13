@@ -10,6 +10,7 @@ import torch
 
 import flashinfer.mla._core as mla_core
 from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+from flashinfer.utils import get_compute_capability
 
 
 def _cpu_hca_inputs():
@@ -130,6 +131,16 @@ def test_dsv4_hca_rejects_backend_specific_metadata(monkeypatch):
     with pytest.raises(ValueError, match="does not accept hca_swa_block_tables"):
         trtllm_batch_decode_sparse_mla_dsv4(**args)
 
+    args = _cpu_hca_inputs()
+    args["backend"] = "trtllm-gen"
+    args["sparse_indices"] = torch.zeros((4, 256), dtype=torch.int32)
+    args["hca_swa_block_tables"] = None
+    args["hca_compressed_block_tables"] = None
+    args["hca_seq_lens"] = None
+    args["hca_is_causal"] = False
+    with pytest.raises(ValueError, match="does not accept hca_is_causal"):
+        trtllm_batch_decode_sparse_mla_dsv4(**args)
+
 
 def test_hca_rejects_nonpersistent_grid_overflow():
     pytest.importorskip("cutlass")
@@ -161,10 +172,35 @@ def test_hca_opt_in_metadata_value_validation(monkeypatch):
         "is_causal": True,
     }
     monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+
+    # Only the fixed 128-slot window footprint and the hca_seq_lens-driven,
+    # tile-rounded compressed footprint are loaded. Later columns may use
+    # conventional -1 padding.
+    validation_args["window_block_tables"] = torch.cat(
+        (
+            args["hca_swa_block_tables"],
+            torch.full((4, 2), -1, dtype=torch.int32),
+        ),
+        dim=1,
+    )
+    validation_args["compressed_block_tables"] = torch.tensor(
+        [[0, -1], [0, -1], [0, 1], [0, 1]], dtype=torch.int32
+    )
     _validate_hca_values(**validation_args)
 
     validation_args["hca_seq_lens"] = torch.tensor([129, 385], dtype=torch.int32)
     with pytest.raises(ValueError, match="block-table capacity 384"):
+        _validate_hca_values(**validation_args)
+
+    validation_args["hca_seq_lens"] = args["hca_seq_lens"]
+    validation_args["compressed_block_tables"][2, 1] = -1
+    with pytest.raises(ValueError, match="compressed_block_tables active values"):
+        _validate_hca_values(**validation_args)
+
+    validation_args["compressed_block_tables"][2, 1] = 1
+    validation_args["window_valid_lens"][0] = 0
+    validation_args["window_block_tables"][0, 3] = -1
+    with pytest.raises(ValueError, match="window_block_tables active values"):
         _validate_hca_values(**validation_args)
 
 
@@ -173,30 +209,42 @@ def test_hca_static_contract_accepts_fp8_to_bf16():
     import cutlass
 
     from flashinfer.cute_dsl.attention.dsa.hca_fp8 import (
+        MAX_SPLITS,
         BlackwellHeavilyCompressedAttentionForwardFP8,
     )
 
     can_implement = BlackwellHeavilyCompressedAttentionForwardFP8.can_implement
-    common = (
-        2,
-        2,
-        384,
-        128,
-        512,
-        cutlass.Float8E4M3FN,
-        cutlass.BFloat16,
-        cutlass.Float32,
-        cutlass.Float32,
-        (128, 128),
-        (128, 256),
-        1,
-        False,
-        True,
-        False,
-    )
-    assert can_implement(*common, 128, 32)
-    assert not can_implement(*common, 128, 1)
-    assert not can_implement(*common, 48, 32)
+    config = {
+        "B": 2,
+        "S": 2,
+        "K": 384,
+        "H": 128,
+        "L": 512,
+        "in_dtype": cutlass.Float8E4M3FN,
+        "out_dtype": cutlass.BFloat16,
+        "acc_dtype": cutlass.Float32,
+        "lse_dtype": cutlass.Float32,
+        "mma_qk_tiler_mn": (128, 128),
+        "mma_pv_tiler_mn": (128, 256),
+        "split_kv": 1,
+        "is_persistent": False,
+        "is_var_seq": True,
+        "is_var_split_kv": False,
+        "page_size_cmp": 128,
+        "page_size_win": 32,
+    }
+
+    def supports(**overrides):
+        return can_implement(**{**config, **overrides})
+
+    assert supports()
+    assert not supports(page_size_win=1)
+    assert not supports(page_size_cmp=0)
+    assert not supports(page_size_cmp=48)
+    assert not supports(split_kv=0)
+    assert not supports(split_kv=MAX_SPLITS + 1)
+    assert not supports(B=8, S=8192)
+    assert supports(B=8, S=8192, is_persistent=True)
 
 
 def _reference_hca(
@@ -237,10 +285,10 @@ def _reference_hca(
 
 
 @pytest.mark.arch_blackwell
-def test_cute_dsl_hca_fp8_to_bf16_correctness():
+def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
         pytest.skip("CuTe DSL HCA requires SM100/SM103")
     pytest.importorskip("cutlass")
 
@@ -320,33 +368,91 @@ def test_cute_dsl_hca_fp8_to_bf16_correctness():
         assert torch.isfinite(output).all()
         torch.testing.assert_close(output.float(), reference, atol=0.13, rtol=1e-5)
 
+    # Capture the private LSE scratch/result to verify the all-empty split-K
+    # reduction. The public DSV4 API intentionally returns output only.
+    from flashinfer.cute_dsl.attention.wrappers import batch_hca
+
+    real_compile_hca_kernel = batch_hca._compile_hca_kernel
+    captured = {}
+
+    def compile_and_capture_lse(*args, **kwargs):
+        compiled_kernel = real_compile_hca_kernel(*args, **kwargs)
+
+        def run_and_capture_lse(*kernel_args, **kernel_kwargs):
+            captured["lse"] = kernel_args[6]
+            return compiled_kernel(*kernel_args, **kernel_kwargs)
+
+        return run_and_capture_lse
+
+    monkeypatch.setattr(batch_hca, "_compile_hca_kernel", compile_and_capture_lse)
+    sparse_topk_lens.fill_(128)
+    window_valid_lens.zero_()
+    output = trtllm_batch_decode_sparse_mla_dsv4(
+        query=query,
+        swa_kv_cache=window_cache,
+        workspace_buffer=workspace,
+        sparse_indices=None,
+        compressed_kv_cache=compressed_cache,
+        sparse_topk_lens=sparse_topk_lens,
+        bmm1_scale=softmax_scale,
+        bmm2_scale=output_scale,
+        sinks=None,
+        swa_topk_lens=window_valid_lens,
+        backend="cute-dsl",
+        hca_swa_block_tables=window_tables,
+        hca_compressed_block_tables=compressed_tables,
+        hca_seq_lens=hca_seq_lens,
+        hca_is_causal=True,
+        hca_use_persistent=True,
+    )
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+    assert torch.isneginf(captured["lse"]).all()
+
 
 @pytest.mark.arch_blackwell
-def test_cute_dsl_hca_partial_head_tile_and_empty_attention():
+@pytest.mark.parametrize(
+    ("num_heads", "window_page_size", "compressed_page_size"),
+    ((64, 32, 128), (128, 32, 16), (128, 16, 32)),
+)
+def test_cute_dsl_hca_partial_head_tile_and_empty_attention(
+    num_heads, window_page_size, compressed_page_size
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
         pytest.skip("CuTe DSL HCA requires SM100/SM103")
     pytest.importorskip("cutlass")
 
     torch.manual_seed(23)
     device = torch.device("cuda")
-    batch_size, q_len, num_heads, head_dim = 1, 1, 64, 512
+    batch_size, q_len, head_dim = 1, 1, 512
     query = torch.randn((batch_size, q_len, num_heads, head_dim), device=device).clamp_(
         -2, 2
     )
     query = query.to(torch.float8_e4m3fn)
-    window_cache = torch.randn((4, 32, head_dim), device=device).clamp_(-2, 2)
+    active_window_pages = 128 // window_page_size
+    active_compressed_pages = 256 // compressed_page_size
+    window_table_pages = 2 * active_window_pages
+    compressed_table_pages = 2 * active_compressed_pages
+    window_cache = torch.randn(
+        (window_table_pages, window_page_size, head_dim), device=device
+    ).clamp_(-2, 2)
     window_cache = window_cache.to(torch.float8_e4m3fn)
-    compressed_cache = torch.randn((1, 128, head_dim), device=device).clamp_(-2, 2)
+    compressed_cache = torch.randn(
+        (compressed_table_pages, compressed_page_size, head_dim), device=device
+    ).clamp_(-2, 2)
     compressed_cache = compressed_cache.to(torch.float8_e4m3fn)
-    window_tables = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device=device)
-    compressed_tables = torch.tensor([[0]], dtype=torch.int32, device=device)
-    hca_seq_lens = torch.tensor([129], dtype=torch.int32, device=device)
-    workspace = torch.empty(1 << 20, dtype=torch.uint8, device=device)
+    window_tables = torch.arange(
+        window_table_pages, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+    compressed_tables = torch.arange(
+        compressed_table_pages, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+    hca_seq_lens = torch.tensor([384], dtype=torch.int32, device=device)
+    workspace = torch.empty(4 << 20, dtype=torch.uint8, device=device)
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    sparse_topk_lens = torch.tensor([129], dtype=torch.int32, device=device)
+    sparse_topk_lens = torch.tensor([384], dtype=torch.int32, device=device)
     window_valid_lens = torch.tensor([128], dtype=torch.int32, device=device)
     sinks = torch.linspace(2.0, 3.0, num_heads, dtype=torch.float32, device=device)
     output = trtllm_batch_decode_sparse_mla_dsv4(
