@@ -33,14 +33,14 @@ from .quantize import _fp4_quantize_reference
 # SM90 mixed-input weight preparation
 # ---------------------------------------------------------------------------
 
-_SM90_MIXED_WEIGHT_PREP_AXES = {
+_SM90_MIXED_WEIGHT_PREP_AXES: dict[str, Var | Const] = {
     "num_experts": Var(description="Number of local experts."),
     "rows": Var(description="Logical weight rows per expert."),
     "packed_k": Var(description="Packed 4-bit K bytes per row."),
     "scale_groups": Var(description="Weight-scale groups per row."),
 }
 
-_SM90_MIXED_WEIGHT_PREP_INPUTS = {
+_SM90_MIXED_WEIGHT_PREP_INPUTS: dict[str, Tensor | Scalar] = {
     "weight": Tensor(
         ["num_experts", "rows", "packed_k"],
         description="Packed 4-bit expert weights.",
