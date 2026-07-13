@@ -33,6 +33,82 @@ from ..autotuner import TunableRunner
 from .api import MoEActivationPack, MoEConfig, MoEWeightPack, RoutingInputMode
 
 
+def _validate_prerouted_inputs(
+    act: MoEActivationPack, num_tokens: int, top_k: int, runner: str
+) -> None:
+    """Runner-boundary validation for pre-routed packs.
+
+    Raises (never asserts — these must survive ``python -O``): a shape or
+    presence mismatch here silently mis-packs against the kernel's
+    ``top_k``-sized buffers or reads out of bounds in C++.  Duplicates the
+    construction-time ``MoEActivationPack.__post_init__`` checks on purpose —
+    the pack is mutable, so the launch boundary is the airtight layer.
+    """
+    if act.topk_ids is None or act.topk_weights is None:
+        raise ValueError(
+            f"{runner}: routing_input_mode=PackedPrecomputed requires "
+            "topk_ids + topk_weights."
+        )
+    if act.routing_logits is not None or act.routing_bias is not None:
+        raise ValueError(
+            f"{runner}: routing_logits/routing_bias are only consumed by "
+            "in-kernel (FromLogits) routing."
+        )
+    expected = (num_tokens, top_k)
+    for name in ("topk_ids", "topk_weights"):
+        shape = tuple(getattr(act, name).shape)
+        if shape != expected:
+            raise ValueError(
+                f"{runner}: {name} shape {shape} != {expected} "
+                "(num_tokens, RoutingConfig.top_k) — a column mismatch "
+                "mis-packs against the kernel's top_k-sized buffers."
+            )
+
+
+def _validate_logits_inputs(
+    act: MoEActivationPack, num_tokens: int, num_experts: int, runner: str
+) -> None:
+    """Runner-boundary validation for FromLogits packs (raises, see above).
+
+    The dtype checks guard against SILENT corruption: the launcher maps
+    bf16 -> Bfloat16 and anything else -> Fp32 with no dtype ICHECK, so an
+    fp16 bias/logits tensor would be reinterpreted as fp32 bits.  Bias dtype
+    is independent of logits dtype (mixed fp32 logits + bf16 bias is the
+    standard DeepSeek-V3 shape — see test_routing_dtype_flexibility).
+    """
+    if act.routing_logits is None:
+        raise ValueError(
+            f"{runner}: routing_input_mode=FromLogits requires routing_logits."
+        )
+    if act.topk_ids is not None or act.topk_weights is not None:
+        raise ValueError(
+            f"{runner}: FromLogits computes topk_ids/topk_weights in-kernel; "
+            "leave them None."
+        )
+    logits = act.routing_logits
+    if logits.dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError(
+            f"{runner}: routing_logits must be float32 or bfloat16, got {logits.dtype}."
+        )
+    if tuple(logits.shape) != (num_tokens, num_experts):
+        raise ValueError(
+            f"{runner}: routing_logits shape {tuple(logits.shape)} != "
+            f"({num_tokens}, {num_experts}) (num_tokens, num_experts) — "
+            "routing scores are over the GLOBAL expert set."
+        )
+    if act.routing_bias is not None:
+        if act.routing_bias.dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError(
+                f"{runner}: routing_bias must be bfloat16 or float32, "
+                f"got {act.routing_bias.dtype}."
+            )
+        if tuple(act.routing_bias.shape) != (num_experts,):
+            raise ValueError(
+                f"{runner}: routing_bias shape {tuple(act.routing_bias.shape)} "
+                f"!= ({num_experts},) (num_experts,)."
+            )
+
+
 # ---------------------------------------------------------------------------
 # CuteDSL NVFP4 runner — delegates to the existing CuteDslFusedMoENvfp4Runner
 # ---------------------------------------------------------------------------
@@ -106,11 +182,11 @@ class CuteDslNvfp4Runner(TunableRunner):
                 f"routing_input_mode={act.routing_input_mode!r} "
                 "(only PackedPrecomputed is wired; CuteDSL has no in-kernel router)."
             )
-        assert act.topk_ids is not None and act.topk_weights is not None, (
-            "routing_input_mode=PackedPrecomputed requires topk_ids + topk_weights."
-        )
         v = weights.get_view(self.backend_key)
         num_tokens = act.hidden_states_q.shape[0]
+        _validate_prerouted_inputs(
+            act, num_tokens, self._inner.top_k, "CuteDslNvfp4Runner"
+        )
         hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
         moe_output = act.hidden_states_q.new_empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16
@@ -297,29 +373,9 @@ class TrtllmFp4RoutedRunner(TunableRunner):
             # We allocate them here (mirroring trtllm_fp4_block_scale_moe_op, core.py ~2268)
             # because MoERunner.forward calls the raw op directly, bypassing the buffer-allocating
             # wrapper. Weight dtype mirrors logits dtype (core.py:2253).
-            assert act.routing_logits is not None, (
-                "routing_input_mode=FromLogits requires routing_logits."
+            _validate_logits_inputs(
+                act, num_tokens, routing.num_experts, "TrtllmFp4RoutedRunner"
             )
-            assert act.topk_ids is None and act.topk_weights is None, (
-                "FromLogits computes topk_ids/topk_weights in-kernel; leave them None."
-            )
-            # Validate here: the launcher enforces this with a C++ ICHECK whose
-            # failure message doesn't name the offending Python-side input.
-            assert act.routing_logits.dtype in (torch.float32, torch.bfloat16), (
-                f"routing_logits must be float32 or bfloat16, "
-                f"got {act.routing_logits.dtype}."
-            )
-            # Bias dtype is independent of logits dtype (the launcher derives
-            # mRoutingBiasDtype and mRoutingLogitsDtype separately; mixed
-            # combinations are supported — see test_routing_dtype_flexibility).
-            # But the launcher maps bf16 -> Bfloat16 and ANYTHING ELSE -> Fp32
-            # with no dtype ICHECK, so e.g. an fp16 bias would be silently
-            # reinterpreted as fp32 bits. Reject non-{bf16, fp32} here.
-            if act.routing_bias is not None:
-                assert act.routing_bias.dtype in (torch.bfloat16, torch.float32), (
-                    f"routing_bias must be bfloat16 or float32, "
-                    f"got {act.routing_bias.dtype}."
-                )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
             topk_ids = act.hidden_states_q.new_empty(
@@ -339,11 +395,8 @@ class TrtllmFp4RoutedRunner(TunableRunner):
             # tests/moe/test_trtllm_gen_routed_fused_moe.py). Do NOT pre-subtract the
             # offset: on ranks with local_expert_offset>0 that yields a local id below
             # the offset, which the kernel treats as non-local and skips → zero output.
-            assert act.topk_ids is not None and act.topk_weights is not None, (
-                "routing_input_mode=PackedPrecomputed requires topk_ids + topk_weights."
-            )
-            assert act.routing_bias is None, (
-                "routing_bias is only consumed by in-kernel (FromLogits) routing."
+            _validate_prerouted_inputs(
+                act, num_tokens, routing.top_k, "TrtllmFp4RoutedRunner"
             )
             routing_logits = None
             routing_bias = None
@@ -548,8 +601,8 @@ class TrtllmBf16RoutedRunner(TunableRunner):
         # tests/moe/test_trtllm_gen_routed_fused_moe.py). Do NOT pre-subtract the
         # offset: on ranks with local_expert_offset>0 that yields a local id below
         # the offset, which the kernel treats as non-local and skips → zero output.
-        assert act.topk_ids is not None and act.topk_weights is not None, (
-            "routing_input_mode=PackedPrecomputed requires topk_ids + topk_weights."
+        _validate_prerouted_inputs(
+            act, num_tokens, routing.top_k, "TrtllmBf16RoutedRunner"
         )
         ids = act.topk_ids
         weight_bf16_bits = (

@@ -579,7 +579,13 @@ class MoEActivationPack:
         # All routing tensors must live with the activations; a stray CPU
         # tensor otherwise surfaces as a cryptic launch/ICHECK failure.
         dev = self.hidden_states_q.device
-        for name in ("topk_ids", "topk_weights", "routing_logits", "routing_bias"):
+        for name in (
+            "hidden_states_scale",
+            "topk_ids",
+            "topk_weights",
+            "routing_logits",
+            "routing_bias",
+        ):
             t = getattr(self, name)
             if t is not None and t.device != dev:
                 raise ValueError(
