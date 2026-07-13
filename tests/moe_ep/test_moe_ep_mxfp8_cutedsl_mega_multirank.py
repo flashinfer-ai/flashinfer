@@ -98,11 +98,9 @@ def _make_bf16_weights(
     return w13, w2
 
 
-def _mega_problem(rank: int, world_size: int):
+def _mega_problem(rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64):
     hidden = 2048
     intermediate = 1024
-    num_tokens = 64
-    max_tokens = 64
     num_experts = 8
     topk = 4
     gate_up_clamp = 10.0
@@ -284,7 +282,9 @@ def _megakernel_config(problem: dict):
     )
 
 
-def _run_mega_layer(rank, world_size, *, quantize_input: bool):
+def _run_mega_layer(
+    rank, world_size, *, quantize_input: bool, num_tokens: int = 64, max_tokens: int = 64
+):
     import torch
     import torch.distributed as dist
 
@@ -308,7 +308,9 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
 
-    problem = _mega_problem(rank, world_size)
+    problem = _mega_problem(
+        rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
+    )
     kernel = create_mega_kernel(_megakernel_config(problem))
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
@@ -420,6 +422,28 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
     print(f"rank {rank}: mxfp8_cutedsl mega layer (prestaged inputs) matches reference")
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_mxfp8_cutedsl_mega_layer_large_tokens_matches_reference():
+    """Large-token (>=2048) path: exercises the tuner's LARGE profile for MXFP8.
+
+    With num_max_tokens >= 2048 the heuristic selects flag_batch=8 and
+    token_back reuse_dispatch_warps (-> token_back_by_dispatch=True); MXFP8's
+    mma_tiler stays kernel-fixed at (256,256). This is the regression guard for
+    whether MXFP8 large-token dispatch-warp token-back compiles + runs (it has
+    no non_ubulk_fc2_store knob); if the kernel rejects the combo we pin MXFP8
+    to epi_warps in the large profile.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank, world_size, quantize_input=True, num_tokens=2048, max_tokens=2048
+    )
+    print(f"rank {rank}: mxfp8_cutedsl mega layer (large tokens) matches reference")
 
 
 @pytest.mark.arch_blackwell

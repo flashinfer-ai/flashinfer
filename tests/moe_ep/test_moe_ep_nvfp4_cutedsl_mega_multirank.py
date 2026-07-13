@@ -154,11 +154,9 @@ def _make_packed_weights(
     return w13, w2, w13_scale, w2_scale
 
 
-def _mega_problem(rank: int, world_size: int):
+def _mega_problem(rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64):
     hidden = 2048
     intermediate = 1024
-    num_tokens = 64
-    max_tokens = 64
     num_experts = 8
     topk = 4
     gate_up_clamp = 10.0
@@ -351,7 +349,9 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool):
     return Nvfp4CutedslMegaMoeConfig(**kwargs)
 
 
-def _run_mega_layer(rank, world_size, *, quantize_input: bool):
+def _run_mega_layer(
+    rank, world_size, *, quantize_input: bool, num_tokens: int = 64, max_tokens: int = 64
+):
     import torch
     import torch.distributed as dist
 
@@ -375,7 +375,9 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
 
-    problem = _mega_problem(rank, world_size)
+    problem = _mega_problem(
+        rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
+    )
     kernel = create_mega_kernel(
         _megakernel_config(problem, epilogue_via_config=quantize_input)
     )
@@ -505,6 +507,26 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
     print(f"rank {rank}: nvfp4_cutedsl mega layer (prestaged inputs) matches reference")
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_nvfp4_cutedsl_mega_layer_large_tokens_matches_reference():
+    """Large-token (>=2048) path: exercises the tuner's LARGE profile.
+
+    With num_max_tokens >= 2048 the token-count heuristic selects the
+    throughput tile (mma_tiler (256,256,256), token_back reuse_dispatch_warps).
+    This confirms that profile compiles + runs and that the layer path stays
+    bit-exact with the direct-kernel reference (both use the same profile).
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank, world_size, quantize_input=True, num_tokens=2048, max_tokens=2048
+    )
+    print(f"rank {rank}: nvfp4_cutedsl mega layer (large tokens) matches reference")
 
 
 @pytest.mark.arch_blackwell
