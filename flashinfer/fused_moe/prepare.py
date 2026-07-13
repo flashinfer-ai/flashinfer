@@ -223,14 +223,25 @@ def prepare_trtllm_bf16_weights(
 
     if device is None:
         device = w1_bf16.device
-    # Honor the documented device target (no-op if already resident).
-    w1_bf16 = w1_bf16.to(device)
-    w2_bf16 = w2_bf16.to(device)
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise ValueError(
+            f"prepare_trtllm_bf16_weights expects bf16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype} (the uint8 byte-view below "
+            f"would silently reinterpret other dtypes)"
+        )
+    expect_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expect_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expect_w1 or tuple(w2_bf16.shape) != expect_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expect_w1}/{expect_w2}"
+        )
+    # Honor the documented device target (no-op if already resident); contiguity
+    # is required for the uint8 view below.
+    w1_bf16 = w1_bf16.to(device).contiguous()
+    w2_bf16 = w2_bf16.to(device).contiguous()
     if permute_cache is None:
         permute_cache = _TRTLLM_PERMUTE_CACHE
-
-    assert w1_bf16.shape == (num_local_experts, 2 * intermediate_size, hidden_size)
-    assert w2_bf16.shape == (num_local_experts, hidden_size, intermediate_size)
 
     epilogue_tile_m = 128  # TRTLLM kernel-internal constant
     block_k = 128

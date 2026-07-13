@@ -190,9 +190,9 @@ BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
 #   [bf16_imbalanced_e160_k6_t129_h1536_i256_s0]      (NUM_TESTS=12)
 # in ONE process hits `CUDA error: an illegal memory access` inside the
 # graph-captured trtllm_bf16_routed autotune-profiling replay of s0; each test
-# passes in isolation, so the OOB access is allocator-layout-dependent (a latent
-# kernel/launcher bug, not a harness artifact). CUDA_LAUNCH_BLOCKING cannot
-# localize it (graph replays ignore it).
+# passes in isolation, so the failure is order/state-dependent (allocator layout,
+# global autotuner cache, or CUDA process state -- root cause UNRESOLVED).
+# CUDA_LAUNCH_BLOCKING cannot localize it (graph replays ignore it).
 pytestmark = pytest.mark.skipif(
     not os.environ.get("FLASHINFER_UMOE_FUZZ"),
     reason="opt-in fuzzer (set FLASHINFER_UMOE_FUZZ=1); waived in CI pending "
@@ -338,7 +338,10 @@ def _bf16_reference(
 ):
     """Dense bf16 MoE authority: same SwiGLU convention as ``_nvfp4_reference``
     but no fp4 requant -- the only intermediate quantization is the bf16 rounding
-    of the gemm1 output, mirrored below."""
+    of the gemm1 output, mirrored below.  Routing weights are cast through bf16
+    to match the packed-id truncation in pack_inputs, so the tolerance measures
+    kernel error, not oracle mismatch."""
+    final_scales = final_scales.to(torch.bfloat16).float()
     x32, half = x.float(), intermediate_size
     out = torch.zeros_like(x32)
     for local_e in range(w1.shape[0]):
