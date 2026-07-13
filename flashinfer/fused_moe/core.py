@@ -35,12 +35,19 @@ from ..trace.templates.moe import (
     trtllm_fp8_per_tensor_scale_moe_trace,
     trtllm_mxint4_block_scale_moe_trace,
 )
-from ..autotuner import (
+from flashinfer.autotuner import (
     AutoTuner,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+)
+from flashinfer.autotuner.initializers import (
+    autotuner_initializer_empty,
+    autotuner_initializer_ones,
+    autotuner_initializer_rand,
+    autotuner_initializer_randn,
+    autotuner_initializer_zeros,
 )
 from ..jit import (
     setup_cubin_loader,
@@ -74,7 +81,7 @@ from ..utils import (
 )
 from .utils import (
     get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket,
+    make_hybrid_bucket_mapper,
     make_random_topk_ids,
 )
 
@@ -308,7 +315,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                     (0,),
                     (0,),
                     get_hybrid_num_tokens_buckets(8192),
-                    lambda x: map_to_hybrid_bucket(x, 8192),
+                    make_hybrid_bucket_mapper(8192),
                 ),
             )
         )
@@ -480,7 +487,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                         (0,),
                         (0,),
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens),
-                        lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
+                        make_hybrid_bucket_mapper(tune_max_num_tokens),
                     ),
                 )
             )
@@ -1242,11 +1249,14 @@ def get_trtllm_moe_sm100_module():
                 tune_max_num_tokens: Upper bound for the num_tokens tuning buckets.
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
-            num_experts = self.num_experts
 
-            def _init_packed_topk_ids(shapes, dtype, device):
+            def _init_packed_topk_ids(
+                shapes: tuple[int, ...],
+                dtype: torch.dtype,
+                device: torch.device,
+            ) -> torch.Tensor:
                 expert_ids = make_random_topk_ids(
-                    num_experts=num_experts,
+                    num_experts=self.num_experts,
                     num_tokens=math.prod(shapes[:-1]),
                     top_k=shapes[-1],
                     device=device,
@@ -1257,35 +1267,21 @@ def get_trtllm_moe_sm100_module():
                 return (expert_ids << 16) | expert_weights
 
             spec = {
-                "output": lambda shapes, dtype, device: torch.empty(
-                    shapes, dtype=dtype, device=device
-                ),
-                "hidden_states": lambda shapes, dtype, device: torch.randn(
-                    shapes, device=device
-                ).to(dtype),
+                "output": autotuner_initializer_empty,
+                "hidden_states": autotuner_initializer_randn,
             }
             if moe_inputs.routing_logits is not None:
-                spec["routing_logits"] = lambda shapes, dtype, device: torch.rand(
-                    shapes, dtype=dtype, device=device
-                )
+                spec["routing_logits"] = autotuner_initializer_rand
             if moe_inputs.topk_ids is not None:
                 spec["topk_ids"] = _init_packed_topk_ids
             if moe_inputs.expert_weights is not None:
-                spec["expert_weights"] = lambda shapes, dtype, device: torch.ones(
-                    shapes, dtype=dtype, device=device
-                )
+                spec["expert_weights"] = autotuner_initializer_ones
             if moe_inputs.hidden_states_scale is not None:
-                spec["hidden_states_scale"] = lambda shapes, dtype, device: torch.ones(
-                    shapes, device=device
-                ).to(dtype)
+                spec["hidden_states_scale"] = autotuner_initializer_ones
             if moe_inputs.gemm1_lora_delta is not None:
-                spec["gemm1_lora_delta"] = lambda shapes, dtype, device: torch.zeros(
-                    shapes, dtype=dtype, device=device
-                )
+                spec["gemm1_lora_delta"] = autotuner_initializer_zeros
             if moe_inputs.per_token_scale is not None:
-                spec["per_token_scale"] = lambda shapes, dtype, device: torch.ones(
-                    shapes, device=device
-                ).to(dtype)
+                spec["per_token_scale"] = autotuner_initializer_ones
 
             sorted_inputs = sorted(
                 (MoeRunnerInputs.idx(name), name, init) for name, init in spec.items()
@@ -1322,7 +1318,7 @@ def get_trtllm_moe_sm100_module():
                         input_idx,
                         dim_idx,
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
-                        lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
+                        make_hybrid_bucket_mapper(tune_max_num_tokens),
                         initializers,
                     ),
                 ),
@@ -1336,6 +1332,10 @@ def get_trtllm_moe_sm100_module():
         ) -> List[int]:
             moe_inputs = MoeRunnerInputs.from_list(inputs)
             num_tokens = moe_inputs.hidden_states.shape[0]
+
+            major, _ = get_compute_capability(moe_inputs.hidden_states.device)
+            if major == 10 and num_tokens * self.top_k < 2 * self.num_local_experts:
+                return []
 
             has_gemm1_lora_delta = moe_inputs.gemm1_lora_delta is not None
 
@@ -2333,9 +2333,14 @@ def get_trtllm_moe_sm100_module():
                 "either topk_ids or routing_logits must be provided."
             )
             assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
-            routing_dtype = torch.bfloat16
-        else:
-            routing_dtype = routing_logits.dtype
+        # The trtllm-gen routing kernel always emits expert weights as bfloat16
+        # (routingData.mDtypeOutput is hard-set to Bfloat16 for every routing
+        # method in csrc/trtllm_fused_moe_runner.cu), independent of the
+        # routing_logits dtype. This buffer is returned verbatim to the caller
+        # when do_finalize=False, so it must be bfloat16 regardless of
+        # routing_logits.dtype (e.g. fp32 DeepSeekV3 logits); otherwise the
+        # returned expert_weights mislabels bf16 data as fp32. See #3595.
+        routing_dtype = torch.bfloat16
         hidden_size = hidden_states.shape[-1]
         if hidden_states.dtype == torch.uint8:
             hidden_size = hidden_size * 2
@@ -2349,6 +2354,14 @@ def get_trtllm_moe_sm100_module():
             )
             assert topk_weights is not None, (
                 "topk_weights must be provided for UnpackedPrecomputed mode"
+            )
+            # The finalize kernel reads the expert weights as args.mDtypeExpW,
+            # which is bfloat16 for this op (see runner.h: expert_weights is
+            # "[num_tokens, top_k] in bfloat16 = mDtypeExpW"). A user-provided
+            # fp32 buffer would be reinterpreted as bf16, so reject it up front.
+            assert topk_weights.dtype == torch.bfloat16, (
+                "topk_weights must be bfloat16 for UnpackedPrecomputed mode, got "
+                f"{topk_weights.dtype}"
             )
         else:
             # For Mode 1 (FromLogits) and Mode 2 (PackedPrecomputed), allocate OUTPUT buffers
@@ -3964,6 +3977,10 @@ def trtllm_fp4_block_scale_moe(
     List[torch.Tensor]
         ``[output]`` when ``do_finalize`` is ``True``, otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
+        The ``expert_weights`` tensor is always ``bfloat16`` (the routing
+        kernel emits bf16 weights for every routing method), regardless of
+        the ``routing_logits`` dtype — including the ``do_finalize=False``
+        path and fp32 ``DeepSeekV3`` logits.
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(

@@ -9,8 +9,8 @@ same shape as the input. With identity inner compute on softmax-normalized
 topk_weights, the output approximates the input within bf16 tolerance.
 
 Designed for the Phase 4 on-cluster validation step. On the dev box this
-also exits 0 with ``--nproc_per_node=1`` provided the EP backends were
-built (``BUILD_NCCL_EP=1``).
+also exits 0 with ``--nproc_per_node=1`` provided the EP backends are
+available (they are by default: nccl4py is a base dependency).
 """
 
 from __future__ import annotations

@@ -3,16 +3,18 @@
 This package is a thin Python wrapper over two transport backends:
 
 - ``flashinfer.moe_ep.nccl_ep``  — primary backend, wraps NVIDIA's nccl4py
-  ``nccl.ep`` API (nccl-ep-v0.1.0; built from ``3rdparty/nccl/bindings/nccl4py``).
+  ``nccl.ep`` API (nccl-ep-v0.1.0; provided by the released ``nccl4py`` wheel,
+  a base dependency of flashinfer-python).
 - ``flashinfer.moe_ep.nixl_ep``  — alternate backend, wraps ai-dynamo's
   ``nixl_ep`` (built in-tree from ``3rdparty/nixl/examples/device/ep``).
 
 NCCL-EP availability is the importability of ``nccl.ep`` (no in-tree
-``libnccl_ep.so`` as of v0.1.0); NIXL-EP still ships a staged ``nixl_ep_cpp*.so``.
-Both are produced by the FlashInfer build only when ``BUILD_NVEP=1`` (or the
-per-backend ``BUILD_NCCL_EP`` / ``BUILD_NIXL_EP``) is set at install time:
-
-    BUILD_NVEP=1 pip install -e ".[nvep]"
+``libnccl_ep.so`` as of v0.1.0); NIXL-EP ships a staged ``nixl_ep_cpp*.so``.
+Both are enabled by default: plain ``pip install .`` pulls the nccl4py wheel
+and builds NIXL-EP best-effort (skipped with a warning when its build deps —
+meson, UCX, nvcc, ... — are missing). Opt out with ``BUILD_NVEP=0`` (or the
+per-backend ``BUILD_NCCL_EP=0`` / ``BUILD_NIXL_EP=0``); force a hard error on
+missing NIXL-EP build deps with ``BUILD_NIXL_EP=1``.
 
 Without a built backend the package imports succeed but calling
 :func:`create_fleet` raises :class:`MoEEpNotBuiltError` with rebuild
@@ -101,10 +103,11 @@ __all__ = [
 
 _pkg_dir = Path(__file__).parent
 _REBUILD_HINT = (
-    "flashinfer.moe_ep is not built. Rebuild with:\n"
-    '    BUILD_NVEP=1 pip install -e ".[nvep]"\n'
-    "from the FlashInfer source tree. See "
-    "flashinfer/moe_ep/README.md for required system dependencies."
+    "flashinfer.moe_ep is not built. It builds by default; rebuild with:\n"
+    "    pip install -e .\n"
+    "from the FlashInfer source tree (use BUILD_NIXL_EP=1 to turn missing\n"
+    "build deps into hard errors instead of skip-with-warning). See the\n"
+    "moe_ep section of build_backend.py for required system dependencies."
 )
 
 
@@ -176,9 +179,9 @@ def _require_built(backend: str) -> None:
 
 # Quiet diagnostic at import time when a build flag was set but the libs
 # are absent — most likely cause is a partial build (probe failure
-# swallowed in BUILD_NVEP=1 best-effort mode). Helpful for first-time
-# users. Covers all three opt-in flags: the legacy BUILD_NVEP alias plus
-# the per-backend BUILD_NCCL_EP / BUILD_NIXL_EP.
+# swallowed in the default best-effort mode). Helpful for first-time
+# users. Covers all three flags: the legacy BUILD_NVEP alias plus the
+# per-backend BUILD_NCCL_EP / BUILD_NIXL_EP.
 _set_build_flags = [
     name
     for name in ("BUILD_NVEP", "BUILD_NCCL_EP", "BUILD_NIXL_EP")

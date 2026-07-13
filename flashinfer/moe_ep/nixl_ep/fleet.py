@@ -43,7 +43,8 @@ def _load_nixl_ep():
         from . import _load_nixl_ep_cpp  # noqa: F401
     except ImportError as e:
         raise MoEEpNotBuiltError(
-            "nixl_ep loaders not staged; rebuild with BUILD_NIXL_EP=1"
+            "nixl_ep loaders not staged; rebuild with `pip install -e .` "
+            "(BUILD_NIXL_EP=1 makes missing build deps a hard error)"
         ) from e
     _load_nixl_ep_cpp()
     try:
@@ -59,7 +60,8 @@ def _load_nixl_ep():
         import nixl_ep  # type: ignore[import-not-found]
     except ImportError as e:
         raise MoEEpNotBuiltError(
-            "nixl_ep python module not importable; rebuild with BUILD_NIXL_EP=1"
+            "nixl_ep python module not importable; rebuild with `pip install -e .` "
+            "(BUILD_NIXL_EP=1 makes missing build deps a hard error)"
         ) from e
     return nixl_ep
 

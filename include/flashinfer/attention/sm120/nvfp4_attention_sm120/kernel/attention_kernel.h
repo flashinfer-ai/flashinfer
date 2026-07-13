@@ -246,6 +246,11 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp,
 
       collective_epilogue.mma_store(shared_storage, tiled_mma_pv, tOrO, mma_thread_idx, wg_id);
 
+      LSEWriter<Ktraits>::write_lse(
+          epilogue_params.ptr_LSE, select<0, 2, 3>(epilogue_params.shape_O),
+          epilogue_params.stride_LSE, softmax_fused, mainloop_params.softmax_scale_log2,
+          tiled_mma_pv, mma_thread_idx, m_block * kBlockM + wg_id * kBlockMPerWG, bidh, bidb);
+
       barrier_o.arrive();
 
       ++work_idx;

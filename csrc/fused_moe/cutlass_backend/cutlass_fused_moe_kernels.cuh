@@ -4450,6 +4450,26 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
                                        : 0;
   size_t quant_6_size = is_fp4_w_quant ? num_experts_per_node * sizeof(float) : 0;
 
+  // MXFP8xMXFP8 sizes: the FP8 branch above only reserves per-tensor float
+  // scalars, but block-scaled MXFP8 needs per-expert weight block SFs and
+  // global scales (issue #3558). Layout mirrors QuantParams::MXFP8MXFP8:
+  // quant_2/quant_5 = fc1/fc2 weight block SFs, quant_3/quant_6 = fc1/fc2
+  // per-expert global scales. fc1 N uses fc1_out_size (doubled when gated).
+  bool is_mxfp8_quant =
+      is_fp8_act_quant && is_fp8_w_quant &&
+      mScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+  if (is_mxfp8_quant) {
+    quant_1_size = 0;
+    quant_2_size =
+        getOffsetWeightSF(num_experts_per_node, fc1_out_size, hidden_size, mScalingType) *
+        sizeof(TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF);
+    quant_3_size = num_experts_per_node * sizeof(float);
+    quant_4_size = 0;
+    quant_5_size = getOffsetWeightSF(num_experts_per_node, hidden_size, inter_size, mScalingType) *
+                   sizeof(TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF);
+    quant_6_size = num_experts_per_node * sizeof(float);
+  }
+
   size_t tma_ws_input_workspace_size = 0;
   if (is_tma_ws_input) {
     tma_ws_input_workspace_size =
@@ -4622,7 +4642,7 @@ void GemmProfilerBackend::prepareRouting(int num_tokens, char* workspace_ptr_cha
 }
 
 void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr_char,
-                                             cudaStream_t) {
+                                             cudaStream_t stream) {
   auto workspaces = getProfilerWorkspaces(num_tokens, mSM >= 90);
 #define GET_WS_PTR(type, name)                                                                 \
   auto* name = (workspaces.at(#name).first                                                     \
@@ -4654,6 +4674,34 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
       mQuantParams =
           QuantParams::GroupWise(mGroupSize, quant_1, quant_2, nullptr, nullptr, quant_3, quant_4);
     }
+  } else if (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kFP8 &&
+             mScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX) {
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+    // MXFP8xMXFP8 must be matched before the generic FP8 branch below: the
+    // storage dtypes are identical and only mScalingType distinguishes them
+    // (issue #3558).
+    TLLM_CHECK(quant_2 && quant_3 && quant_5 && quant_6);
+    // Initialize the weight block-SF buffers to E8M0 1.0 (biased exponent
+    // 0x7F): the profiler never fills them with real data, and uninitialized
+    // exponents make the timed kernels read nondeterministic scale patterns,
+    // which can skew tactic rankings vs real traffic.
+    TLLM_CUDA_CHECK(
+        cudaMemsetAsync(const_cast<void*>(quant_2), 0x7F, workspaces.at("quant_2").first, stream));
+    TLLM_CUDA_CHECK(
+        cudaMemsetAsync(const_cast<void*>(quant_5), 0x7F, workspaces.at("quant_5").first, stream));
+    mQuantParams = QuantParams::MXFP8MXFP8(
+        static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_2),
+        static_cast<float const*>(quant_3),
+        static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_5),
+        static_cast<float const*>(quant_6));
+    // Backfill the shared FP8 dequant aliases: prepareTmaWsInputs() and the
+    // common GEMM/TMA setup read mQuantParams.fp8.dequant_fc1/fc2 directly,
+    // mirroring the WMXFP8AMXFP8 remap that runMoe() performs.
+    mQuantParams.fp8.dequant_fc1 = static_cast<float const*>(quant_3);
+    mQuantParams.fp8.dequant_fc2 = static_cast<float const*>(quant_6);
+#else
+    TLLM_CHECK_WITH_INFO(false, "MXFP8 x MXFP8 profiling requires OSS Cutlass MoE GEMM");
+#endif
   } else if (mWType == nvinfer1::DataType::kFP8) {
     TLLM_CHECK(quant_1 && quant_2 && quant_3);
     mQuantParams =
@@ -4734,6 +4782,16 @@ void GemmProfilerBackend::prepareTmaWsInputs(
   GET_WS_PTR(int*, active_expert_global_ids);
 
 #undef GET_WS_PTR
+
+  // For MXFP8, fill the activation block-SF buffer with E8M0 1.0 (biased
+  // exponent 0x7F). The profiler never quantizes real activations into it,
+  // and uninitialized exponents give the timed kernels a nondeterministic
+  // scale pattern, skewing tactic rankings relative to real traffic.
+  if (fp4_act_scale_flat != nullptr &&
+      mScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX) {
+    TLLM_CUDA_CHECK(cudaMemsetAsync(fp4_act_scale_flat, 0x7F,
+                                    workspaces.at("fp4_act_scale_flat").first, stream));
+  }
 
   size_t tma_ws_size =
       TmaWarpSpecializedGroupedGemmInput::workspaceSize(mNumExpertsPerNode, mScalingType);
