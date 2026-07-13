@@ -338,7 +338,7 @@ def _bf16_reference(
 ):
     """Dense bf16 MoE authority: same SwiGLU convention as ``_nvfp4_reference``
     but no fp4 requant -- the only intermediate quantization is the bf16 rounding
-    of the gemm1 output, mirrored below.  Routing weights are cast through bf16
+    of the gemm1 and gemm2 outputs, mirrored below.  Routing weights are cast through bf16
     to match the packed-id truncation in pack_inputs, so the tolerance measures
     kernel error, not oracle mismatch."""
     final_scales = final_scales.to(torch.bfloat16).float()
@@ -352,7 +352,8 @@ def _bf16_reference(
         gate, up = w1[local_e][half:, :].float(), w1[local_e][:half, :].float()
         inter = F.silu(x32[tok] @ gate.t()) * (x32[tok] @ up.t())
         inter = inter.to(torch.bfloat16).float()  # gemm1 output is stored bf16
-        out[tok] += final_scales[tok, nth, None] * (inter @ w2[local_e].float().t())
+        expert_out = (inter @ w2[local_e].float().t()).to(torch.bfloat16).float()
+        out[tok] += final_scales[tok, nth, None] * expert_out
     return out
 
 
