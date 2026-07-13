@@ -1377,6 +1377,7 @@ def rope_quantize_fp8(
     q_nope_out: Optional[torch.Tensor] = None,
     k_nope_out: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
+    backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Apply RoPE (Rotary Positional Embeddings) and quantize to FP8 format.
 
@@ -1423,12 +1424,37 @@ def rope_quantize_fp8(
         Pre-allocated output tensor for quantized key (non-rotary). If ``None``, allocated automatically.
     enable_pdl : bool
         Whether to enable PDL (Programmatic Dependent Launch). Default: ``False``.
+    backend : str
+        Implementation backend. ``"cuda"`` (default) uses the fused CUDA kernel;
+        ``"cutile"`` uses the cuda.tile Python kernel.
 
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         Quantized tensors: (q_rope_out, k_rope_out, q_nope_out, k_nope_out).
     """
+    if backend == "cutile":
+        from .quantization.kernels.cutile.rope_quantize_fp8_cutile import (
+            rope_quantize_fp8_cutile,
+        )
+
+        return rope_quantize_fp8_cutile(
+            q_rope,
+            k_rope,
+            q_nope,
+            k_nope,
+            cos_sin_cache,
+            pos_ids,
+            is_neox=is_neox,
+            quantize_dtype=quantize_dtype,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            q_nope_out=q_nope_out,
+            k_nope_out=k_nope_out,
+        )
+
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 

@@ -2,37 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for masked_bmm_cutile kernel (masked batched matrix multiply)."""
 
-import importlib.util
-import pathlib
 import random
-import sys
 
 import pytest
 import torch
 
-_REPO = pathlib.Path(__file__).resolve().parent.parent.parent
-
-
-def _load_module(name, rel_path):
-    path = _REPO / rel_path
-    spec = importlib.util.spec_from_file_location(name, path)
-    m = importlib.util.module_from_spec(spec)
-    sys.modules[name] = m
-    spec.loader.exec_module(m)
-    return m
-
-
-_common = _load_module("cutile_common", "flashinfer/gemm/kernels/cutile/cutile_common.py")
-is_cuda_tile_available = _common.is_cuda_tile_available
-
-if not is_cuda_tile_available():
-    pytest.skip("cuda.tile not available", allow_module_level=True)
-
-_mod = _load_module(
-    "masked_bmm_cutile",
-    "flashinfer/gemm/kernels/cutile/masked_bmm_cutile.py",
-)
-masked_bmm = _mod.masked_bmm
+from flashinfer.cutile.cutile_common import is_cuda_tile_available
+from flashinfer.gemm import masked_bmm
+from flashinfer.utils import get_compute_capability
 
 
 def enumerate_m_grouped_masked():
@@ -138,6 +115,7 @@ class Test_FlashInfer_MaskedBMM:
     @pytest.mark.parametrize("dtype", [torch.float16])
     @pytest.mark.parametrize("trans_a", [False, True])
     @pytest.mark.parametrize("trans_b", [False, True])
+    @pytest.mark.parametrize("backend", ["cutile"])
     def test_op(
         self,
         num_groups,
@@ -148,7 +126,16 @@ class Test_FlashInfer_MaskedBMM:
         dtype,
         trans_a,
         trans_b,
+        backend,
     ):
+        if backend == "cutile" and not is_cuda_tile_available():
+            pytest.skip("cuda.tile not available")
+        cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
+        if not masked_bmm.is_backend_supported(backend, cc_num):
+            pytest.skip(
+                f"masked_bmm {backend} backend not supported on compute capability {cc_num}."
+            )
+
         torch.manual_seed(0)
         random.seed(0)
         a_ref, b_ref, a_impl, b_impl, m_mask = self.prepare_data(
@@ -156,7 +143,7 @@ class Test_FlashInfer_MaskedBMM:
         )
 
         ref_c = self.reference(a_ref, b_ref, m_mask, trans_a, trans_b)
-        c = masked_bmm(a_impl, b_impl, m_mask, trans_a, trans_b)
+        c = masked_bmm(a_impl, b_impl, m_mask, trans_a, trans_b, backend=backend)
 
         for i in range(num_groups):
             c[i, m_mask[i]:, :] = 0

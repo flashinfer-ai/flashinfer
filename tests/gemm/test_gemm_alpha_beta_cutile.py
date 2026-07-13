@@ -2,37 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for gemm_alpha_beta_cutile kernel (GEMM with alpha/beta scaling)."""
 
-import importlib.util
-import pathlib
 import random
-import sys
 
 import pytest
 import torch
 
-_REPO = pathlib.Path(__file__).resolve().parent.parent.parent
-
-
-def _load_module(name, rel_path):
-    path = _REPO / rel_path
-    spec = importlib.util.spec_from_file_location(name, path)
-    m = importlib.util.module_from_spec(spec)
-    sys.modules[name] = m
-    spec.loader.exec_module(m)
-    return m
-
-
-_common = _load_module("cutile_common", "flashinfer/gemm/kernels/cutile/cutile_common.py")
-is_cuda_tile_available = _common.is_cuda_tile_available
-
-if not is_cuda_tile_available():
-    pytest.skip("cuda.tile not available", allow_module_level=True)
-
-_mod = _load_module(
-    "gemm_alpha_beta_cutile",
-    "flashinfer/gemm/kernels/cutile/gemm_alpha_beta_cutile.py",
-)
-gemm_alpha_beta = _mod.gemm_alpha_beta
+from flashinfer.cutile.cutile_common import is_cuda_tile_available
+from flashinfer.gemm import gemm_alpha_beta
+from flashinfer.utils import get_compute_capability
 
 
 class Test_FlashInfer_Matmul_Alpha_Beta:
@@ -71,13 +48,22 @@ class Test_FlashInfer_Matmul_Alpha_Beta:
     )
     @pytest.mark.parametrize("trans_a, trans_b", [(False, True)])
     @pytest.mark.parametrize("alpha, beta", [(1.0, 0.0), (1.5, 2.0)])
-    def test_op(self, m, n, k, dtype, out_dtype, trans_a, trans_b, alpha, beta):
+    @pytest.mark.parametrize("backend", ["cutile"])
+    def test_op(self, m, n, k, dtype, out_dtype, trans_a, trans_b, alpha, beta, backend):
+        if backend == "cutile" and not is_cuda_tile_available():
+            pytest.skip("cuda.tile not available")
+        cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
+        if not gemm_alpha_beta.is_backend_supported(backend, cc_num):
+            pytest.skip(
+                f"gemm_alpha_beta {backend} backend not supported on compute capability {cc_num}."
+            )
+
         torch.manual_seed(0)
         random.seed(0)
         a, b = self.prepare_data(m, n, k, trans_a, trans_b, dtype)
         c = torch.rand((m, n), device=a.device, dtype=out_dtype)
         ref_c = c.clone()
 
-        result = gemm_alpha_beta(a, b, c, trans_a, trans_b, alpha, beta)
+        result = gemm_alpha_beta(a, b, c, trans_a, trans_b, alpha, beta, backend=backend)
         ref = self.reference(a, b, ref_c, trans_a, trans_b, alpha, beta, out_dtype)
         torch.testing.assert_close(result, ref, atol=1e-2, rtol=1e-2)

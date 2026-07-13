@@ -2,37 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for ragged_block_scaled_bmm_cutile kernel (ragged FP8 block-scaled batched matrix multiply)."""
 
-import importlib.util
-import pathlib
 import random
-import sys
 
 import pytest
 import torch
 
-_REPO = pathlib.Path(__file__).resolve().parent.parent.parent
-
-
-def _load_module(name, rel_path):
-    path = _REPO / rel_path
-    spec = importlib.util.spec_from_file_location(name, path)
-    m = importlib.util.module_from_spec(spec)
-    sys.modules[name] = m
-    spec.loader.exec_module(m)
-    return m
-
-
-_common = _load_module("cutile_common", "flashinfer/gemm/kernels/cutile/cutile_common.py")
-is_cuda_tile_available = _common.is_cuda_tile_available
-
-if not is_cuda_tile_available():
-    pytest.skip("cuda.tile not available", allow_module_level=True)
-
-_mod = _load_module(
-    "ragged_block_scaled_bmm_cutile",
-    "flashinfer/gemm/kernels/cutile/ragged_block_scaled_bmm_cutile.py",
-)
-ragged_block_scaled_bmm = _mod.ragged_block_scaled_bmm
+from flashinfer.cutile.cutile_common import is_cuda_tile_available
+from flashinfer.gemm import ragged_block_scaled_bmm
+from flashinfer.utils import get_compute_capability
 
 
 class Test_FlashInfer_RaggedBlockScaledBMM:
@@ -235,12 +212,21 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
     @pytest.mark.parametrize("n, k", [(2048, 2048)])
     @pytest.mark.parametrize("dtype, out_dtype", [(torch.float8_e4m3fn, torch.bfloat16)])
     @pytest.mark.parametrize("trans_a, trans_b", [(False, True)])
-    def test_op(self, num_groups, m, n, k, dtype, out_dtype, trans_a, trans_b):
+    @pytest.mark.parametrize("backend", ["cutile"])
+    def test_op(self, num_groups, m, n, k, dtype, out_dtype, trans_a, trans_b, backend):
         if torch.cuda.get_device_capability(0) == (10, 3):
             pytest.xfail("Skip on sm103: due to CUDA error: unspecified launch failure")
 
         if torch.cuda.get_device_capability()[0] == 8 and "float8" in dtype.__repr__():
             pytest.skip("FP8 is not supported on sm80 (Ampere).")
+
+        if backend == "cutile" and not is_cuda_tile_available():
+            pytest.skip("cuda.tile not available")
+        cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
+        if not ragged_block_scaled_bmm.is_backend_supported(backend, cc_num):
+            pytest.skip(
+                f"ragged_block_scaled_bmm {backend} backend not supported on compute capability {cc_num}."
+            )
 
         torch.manual_seed(0)
         random.seed(0)
@@ -275,6 +261,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
             transpose_a=trans_a,
             transpose_b=trans_b,
             out_dtype=out_dtype,
+            backend=backend,
         )
 
         torch.testing.assert_close(ref_c, c, atol=1.0, rtol=1.0)

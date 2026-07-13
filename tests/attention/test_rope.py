@@ -385,6 +385,7 @@ def test_rope_cos_sin_cache(
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cutile"])
 def test_generalized_rope_quantize(
     attention_type,
     num_qo_heads,
@@ -395,8 +396,20 @@ def test_generalized_rope_quantize(
     input_dtype,
     quant_dtype,
     enable_pdl,
+    backend,
 ):
     """Test generalized rope + quantization for MLA, GQA, and MHA architectures."""
+    if backend == "cutile":
+        from flashinfer.cutile.cutile_common import is_cuda_tile_available
+
+        if not is_cuda_tile_available():
+            pytest.skip("cuda.tile not available")
+        # cuTile backend currently validates only e4m3fn output and ignores PDL;
+        # gate to its supported subset to avoid redundant / unsupported cases.
+        if quant_dtype != torch.float8_e4m3fn:
+            pytest.skip("cuTile rope_quantize backend supports float8_e4m3fn only.")
+        if enable_pdl:
+            pytest.skip("cuTile rope_quantize backend ignores PDL; covered with enable_pdl=False.")
     device = "cuda:0"
     # Fixed seed for reproducibility across tests
     torch.manual_seed(0)
@@ -470,6 +483,7 @@ def test_generalized_rope_quantize(
         quant_scale_q=1.0,
         quant_scale_kv=1.0,
         enable_pdl=enable_pdl,
+        backend=backend,
     )
 
     # Verify results

@@ -2,34 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for per_token_group_quant_8bit_cutile kernel."""
 
-import importlib.util
-import pathlib
-import sys
-
 import pytest
 import torch
 
-_REPO = pathlib.Path(__file__).resolve().parent.parent.parent
-
-def _load_module(name, rel_path):
-    path = _REPO / rel_path
-    spec = importlib.util.spec_from_file_location(name, path)
-    m = importlib.util.module_from_spec(spec)
-    sys.modules[name] = m
-    spec.loader.exec_module(m)
-    return m
-
-_common = _load_module("cutile_common", "flashinfer/gemm/kernels/cutile/cutile_common.py")
-is_cuda_tile_available = _common.is_cuda_tile_available
+from flashinfer.cutile.cutile_common import is_cuda_tile_available
+from flashinfer.quantization import per_token_group_quant_8bit
 
 if not is_cuda_tile_available():
     pytest.skip("cuda.tile not available", allow_module_level=True)
-
-_mod = _load_module(
-    "per_token_group_quant_8bit_cutile",
-    "flashinfer/quantization/kernels/cutile/per_token_group_quant_8bit_cutile.py",
-)
-per_token_group_quant_8bit_cutile = _mod.per_token_group_quant_8bit_cutile
 
 
 @pytest.fixture(autouse=True)
@@ -57,13 +37,15 @@ def _ref_quant(x, group_size, dst_dtype):
 @pytest.mark.parametrize("num_tokens,hidden_dim", [(128, 2048), (256, 4096)])
 @pytest.mark.parametrize("group_size", [64, 128])
 @pytest.mark.parametrize("dst_dtype", [torch.int8, torch.float8_e4m3fn])
-def test_basic(num_tokens, hidden_dim, group_size, dst_dtype):
+@pytest.mark.parametrize("backend", ["cutile"])
+def test_basic(num_tokens, hidden_dim, group_size, dst_dtype, backend):
     """Basic correctness: scale accuracy + dequant match."""
     torch.manual_seed(42)
     x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
 
-    x_q, x_s = per_token_group_quant_8bit_cutile(
-        x, group_size=group_size, dst_dtype=dst_dtype, column_major_scales=False
+    x_q, x_s = per_token_group_quant_8bit(
+        x, group_size=group_size, dst_dtype=dst_dtype, column_major_scales=False,
+        backend=backend,
     )
     ref_q, ref_s = _ref_quant(x, group_size, dst_dtype)
 
@@ -85,13 +67,15 @@ def test_basic(num_tokens, hidden_dim, group_size, dst_dtype):
 @pytest.mark.parametrize("num_tokens,hidden_dim", [(128, 2048), (512, 4096)])
 @pytest.mark.parametrize("group_size", [64, 128])
 @pytest.mark.parametrize("dst_dtype", [torch.int8, torch.float8_e4m3fn])
-def test_column_major_scales(num_tokens, hidden_dim, group_size, dst_dtype):
+@pytest.mark.parametrize("backend", ["cutile"])
+def test_column_major_scales(num_tokens, hidden_dim, group_size, dst_dtype, backend):
     """Column-major scale layout."""
     torch.manual_seed(7)
     x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
 
-    x_q, x_s = per_token_group_quant_8bit_cutile(
-        x, group_size=group_size, dst_dtype=dst_dtype, column_major_scales=True
+    x_q, x_s = per_token_group_quant_8bit(
+        x, group_size=group_size, dst_dtype=dst_dtype, column_major_scales=True,
+        backend=backend,
     )
 
     n_groups = hidden_dim // group_size
@@ -102,16 +86,18 @@ def test_column_major_scales(num_tokens, hidden_dim, group_size, dst_dtype):
 
 
 @pytest.mark.parametrize("num_tokens,hidden_dim,group_size", [(128, 2048, 64), (256, 4096, 128)])
-def test_scale_ue8m0(num_tokens, hidden_dim, group_size):
+@pytest.mark.parametrize("backend", ["cutile"])
+def test_scale_ue8m0(num_tokens, hidden_dim, group_size, backend):
     """UE8M0 scale format (Blackwell only)."""
     cc = torch.cuda.get_device_capability()
     if cc[0] < 10:
         pytest.skip("scale_ue8m0 requires sm100+ (Blackwell)")
     torch.manual_seed(99)
     x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
-    x_q, x_s = per_token_group_quant_8bit_cutile(
+    x_q, x_s = per_token_group_quant_8bit(
         x, group_size=group_size, dst_dtype=torch.float8_e4m3fn,
-        column_major_scales=True, scale_ue8m0=True
+        column_major_scales=True, scale_ue8m0=True,
+        backend=backend,
     )
     assert x_q.shape == x.shape
     assert not x_s.isnan().any()
