@@ -480,6 +480,12 @@ def test_deep_gemm_validate_transformed_weights_accepts_preprocess_output():
     pytest.importorskip("deep_gemm")
     import torch
 
+    cap = torch.cuda.get_device_capability()
+    if cap[0] != 10:
+        pytest.skip(
+            f"deep_gemm transform requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
+        )
+
     from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.weights import (
         preprocess_mega_weights,
         validate_transformed_mega_weights,

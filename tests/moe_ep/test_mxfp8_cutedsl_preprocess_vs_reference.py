@@ -274,6 +274,12 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
 
     import torch
 
+    cap = torch.cuda.get_device_capability()
+    if cap[0] != 10:
+        pytest.skip(
+            f"mxfp8_mega_moe requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
+        )
+
     from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,

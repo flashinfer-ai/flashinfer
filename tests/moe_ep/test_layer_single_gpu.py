@@ -24,7 +24,7 @@ def test_forward_call_order(stubbed_fleet_registry):
 
     log = stubbed_fleet_registry
     split = MoEEpSplitLayer(
-        bootstrap=BootstrapConfig(world_size=1, rank=0),
+        bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
         fleet_params=FleetParams(
             num_experts=2,
             max_tokens_per_rank=4,
@@ -61,7 +61,7 @@ def test_factory_routes_split_backend(stubbed_fleet_registry):
 
     log = stubbed_fleet_registry
     layer = MoEEpLayer(
-        bootstrap=BootstrapConfig(world_size=1, rank=0),
+        bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
         fleet_params=FleetParams(
             num_experts=2,
             max_tokens_per_rank=4,
@@ -144,7 +144,7 @@ def test_split_layer_accepts_fused_moe_kernel_with_weights(stubbed_fleet_registr
         ),
     ):
         split = MoEEpSplitLayer(
-            bootstrap=BootstrapConfig(world_size=1, rank=0),
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
             fleet_params=FleetParams(
                 num_experts=2,
                 max_tokens_per_rank=4,
@@ -247,7 +247,7 @@ def test_split_layer_forward_rejects_token_overflow(stubbed_fleet_registry):
     )
 
     split = MoEEpSplitLayer(
-        bootstrap=BootstrapConfig(world_size=1, rank=0),
+        bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
         fleet_params=FleetParams(
             num_experts=2,
             max_tokens_per_rank=4,
@@ -311,7 +311,7 @@ def test_split_layer_forward_accepts_partial_batch(stubbed_fleet_registry):
     )
 
     split = MoEEpSplitLayer(
-        bootstrap=BootstrapConfig(world_size=1, rank=0),
+        bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
         fleet_params=FleetParams(
             num_experts=2,
             max_tokens_per_rank=8,
