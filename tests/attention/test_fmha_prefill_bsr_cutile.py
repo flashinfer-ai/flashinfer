@@ -29,7 +29,7 @@ def _load_module(name, rel_path):
 
 _common = _load_module(
     "cutile_common",
-    "flashinfer/gemm/kernels/cutile/cutile_common.py",
+    "flashinfer/cutile/cutile_common.py",
 )
 is_cuda_tile_available = _common.is_cuda_tile_available
 

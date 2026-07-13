@@ -87,11 +87,32 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         trans_b=True,
         out_dtype=torch.bfloat16,
     ):
+        """Reference for ragged block-scaled (FP8) BMM.
+
+        For the NT layout the kernel supports, the reference is flashinfer's own
+        native grouped FP8 block-scaled GEMM (``group_gemm_fp8_nt_groupwise``,
+        trtllm backend) with K-major scales — the same grouped FP8 block-scaled
+        math — so the cuTile kernel is validated against a production flashinfer
+        kernel rather than a fresh torch impl. Falls back to the torch dequant
+        loop if the native op is unavailable on this device.
         """
-        PyTorch reference for ragged BMM with non-even M segments.
-        Matrix a is flattened with segment_offsets defining the boundaries.
-        a_scale and b_scale are block-level scales that need to be expanded.
-        """
+        if (not trans_a) and trans_b:
+            try:
+                from flashinfer.gemm import group_gemm_fp8_nt_groupwise
+
+                return group_gemm_fp8_nt_groupwise(
+                    a_fp8,
+                    b_fp8,
+                    a_scale,
+                    b_scale,
+                    segment_offsets.to(torch.int32),
+                    scale_granularity_mnk=(1, block_n, block_k),
+                    scale_major_mode="K",
+                    out_dtype=out_dtype,
+                    backend="trtllm",
+                )
+            except Exception:
+                pass  # fall through to torch reference below
 
         a = a_fp8.float()
         b = b_fp8.float()

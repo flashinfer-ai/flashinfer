@@ -66,10 +66,32 @@ def create_ragged_m_segments(num_groups, m, dtype, align_to=None):
 class Test_FlashInfer_RaggedBMM:
     @staticmethod
     def reference(a, b, segment_offsets, trans_a=False, trans_b=True, out_dtype=None):
+        """Reference for ragged BMM with non-even M segments.
+
+        For fp16/bf16 inputs (the ``trans_a=False, trans_b=True`` case the kernel
+        supports), the reference is flashinfer's own native grouped GEMM
+        (``SegmentGEMMWrapper``, sm80/sm90 CUTLASS): ``ragged_bmm`` here computes
+        ``y[i] = a[i] @ b[q].T`` with ``b = [Q, N, K]``, which is exactly
+        SegmentGEMM with ``weight_column_major=True``. This validates the cuTile
+        kernel against a production flashinfer kernel rather than a fresh torch impl.
+        Falls back to the torch loop for fp8 inputs (no native fp8 grouped GEMM).
         """
-        PyTorch reference for ragged BMM with non-even M segments.
-        Matrix a is flattened with segment_offsets defining the boundaries.
-        """
+        if out_dtype is None:
+            out_dtype = a.dtype
+        if (not trans_a) and trans_b and a.dtype in (torch.float16, torch.bfloat16):
+            from flashinfer.gemm import SegmentGEMMWrapper
+
+            num_groups = b.shape[0]
+            ws = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=a.device)
+            seg = SegmentGEMMWrapper(ws)
+            return seg.run(
+                a,
+                b,
+                batch_size=num_groups,
+                weight_column_major=True,
+                seg_indptr=segment_offsets.to(torch.int64),
+            ).to(out_dtype)
+        # Torch fallback: fp8 inputs, or non-standard transpose.
         if trans_a:
             a = torch.transpose(a, 0, 1)
         if trans_b:
