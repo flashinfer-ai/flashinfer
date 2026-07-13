@@ -3394,20 +3394,18 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             # load o
             cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
 
-            # Apply output scale and normalize by row_sum.  An empty causal
-            # split has row_sum == 0 and contributes a zero vector with -inf
-            # LSE to the split-K reduction.
-            if row_sum == self.acc_dtype(0.0):
-                tTR_rAcc.fill(0.0)
-            else:
-                for i in cutlass.range(
-                    cute.size(tTR_rAcc), vectorize=True, unroll_full=True
-                ):
-                    tTR_rAcc[i] = (
-                        tTR_rAcc[i]
-                        * epilogue_params.output_scale
-                        * cute.arch.rcp_approx(row_sum)
-                    )
+            # Keep the vectorized epilogue branch-free. An empty causal split
+            # has a zero accumulator and selects a zero reciprocal, while its
+            # row_sum remains zero so the LSE contribution stays -inf.
+            inv_row_sum = cutlass.select_(
+                row_sum == self.acc_dtype(0.0),
+                self.acc_dtype(0.0),
+                cute.arch.rcp_approx(row_sum),
+            )
+            for i in cutlass.range(
+                cute.size(tTR_rAcc), vectorize=True, unroll_full=True
+            ):
+                tTR_rAcc[i] = tTR_rAcc[i] * epilogue_params.output_scale * inv_row_sum
 
             # store o to global memory
             tR2G_rO_src = None
