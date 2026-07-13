@@ -276,9 +276,24 @@ def _moe_core_impl(
         moe_output.record_stream(aux_stream)
 
     # Step 2: GEMM1 + activation
+    output_kwargs: Dict[str, Any] = (
+        {
+            "out_scale": None,
+            "global_scale": None,
+            "a_per_token_scale": per_token_scale,
+            "c_dtype": _intermediate_c_dtype(output_dtype),
+        }
+        if use_per_token_activation
+        else {
+            "out_scale": gemm1_out_scale,
+            "global_scale": fc2_input_scale,
+            "a_per_token_scale": None,
+            "c_dtype": "float4_e2m1fn",
+        }
+    )
     intermediate_per_token_scale = None
-    if use_per_token_activation:
-        intermediate, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+    intermediate, intermediate_sf = (
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             a=x,
             b=w1_weight,
             a_scale=x_sf,
@@ -289,11 +304,8 @@ def _moe_core_impl(
             token_id_mapping=permuted_idx_to_expanded_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
             out=gemm1_out,
-            out_scale=None,
-            global_scale=None,
-            a_per_token_scale=per_token_scale,
+            **output_kwargs,
             topk=top_k,
-            c_dtype=_intermediate_c_dtype(output_dtype),
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
             enable_pdl=enable_pdl,
@@ -303,6 +315,8 @@ def _moe_core_impl(
             swiglu_limit=swiglu_limit,
             gated=gated,
         )
+    )
+    if use_per_token_activation:
         intermediate, intermediate_sf, intermediate_per_token_scale = (
             nvfp4_quantize_per_token_cute_dsl(
                 intermediate,
@@ -317,33 +331,6 @@ def _moe_core_impl(
             k=intermediate.shape[1] * 2,
             num_groups=1,
             sf_vec_size=16,
-        )
-    else:
-        intermediate, intermediate_sf = (
-            blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
-                a=x,
-                b=w1_weight,
-                a_scale=x_sf,
-                b_scale=w1_weight_sf,
-                alpha=w1_alpha,
-                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                token_id_mapping=permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                out=gemm1_out,
-                out_scale=gemm1_out_scale,
-                global_scale=fc2_input_scale,
-                topk=top_k,
-                c_dtype="float4_e2m1fn",
-                mma_tiler_mn=gemm1_mma_tiler_mn,
-                cluster_shape_mn=gemm1_cluster_shape_mn,
-                enable_pdl=enable_pdl,
-                activation_type=activation_type.value,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
-                swiglu_limit=swiglu_limit,
-                gated=gated,
-            )
         )
 
     # Step 3: Zero the active output slice before GEMM2 finalize.
