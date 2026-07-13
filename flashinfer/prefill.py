@@ -2073,6 +2073,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             args.append(fixed_split_size)
             args.append(disable_split_kv)
             args.append(0)  # num_colocated_ctas
+            args.append(0)  # uniform_q_len
         float_workspace_size, int_workspace_size = module.workspace_size(*args)
         return int(float_workspace_size), int(int_workspace_size)
 
@@ -2484,6 +2485,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
+                args.append(0)  # uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -3579,6 +3581,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
+                args.append(0)  # uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )

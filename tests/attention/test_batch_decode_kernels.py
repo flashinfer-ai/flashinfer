@@ -1005,3 +1005,275 @@ def test_single_decode_torch_compile_cuda_graph():
     assert result.returncode == 0 and "PASS" in result.stdout, (
         f"Test failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}"
     )
+
+
+@pytest.mark.parametrize("batch_size", [4, 8])
+@pytest.mark.parametrize("q_len_per_req", [2, 3])
+@pytest.mark.parametrize("num_kv_heads", [2, 8])
+@pytest.mark.parametrize("gqa_group_size", [4, 8])
+def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
+    batch_size,
+    q_len_per_req,
+    num_kv_heads,
+    gqa_group_size,
+):
+    # Spec-decode verify shape: every request carries q_len_per_req tokens.
+    # The tensor-core decode path must produce prefill-wrapper-identical
+    # results eagerly, and stay correct when the plan is refreshed with
+    # different kv lengths between CUDA graph replays.
+    page_size = 16
+    head_dim = 128
+    dtype = torch.bfloat16
+    num_qo_heads = num_kv_heads * gqa_group_size
+    capture_kv_lens = [129] * batch_size
+    # tightest legal kv under the plan contract kv_len >= q_len_per_req
+    replay_kv_lens_sets = [
+        [[33, 17, 65, 129][i % 4] for i in range(batch_size)],
+        [[q_len_per_req, 128, 64, 100][i % 4] for i in range(batch_size)],
+    ]
+
+    def build_kv_layout(kv_lens):
+        pages_per = [(length + page_size - 1) // page_size for length in kv_lens]
+        indptr = torch.tensor(
+            [0] + list(torch.cumsum(torch.tensor(pages_per), 0)),
+            dtype=torch.int32,
+            device="cuda:0",
+        )
+        indices = torch.arange(int(indptr[-1]), dtype=torch.int32, device="cuda:0")
+        last_len = torch.tensor(
+            [(length - 1) % page_size + 1 for length in kv_lens],
+            dtype=torch.int32,
+            device="cuda:0",
+        )
+        return indptr, indices, last_len
+
+    indptr, indices, last_len = build_kv_layout(capture_kv_lens)
+    total_pages = int(indptr[-1])
+    kv_data = torch.randn(
+        total_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device="cuda:0"
+    )
+    q = torch.randn(
+        batch_size * q_len_per_req, num_qo_heads, head_dim, dtype=dtype, device="cuda:0"
+    )
+
+    def reference(ref_indptr, ref_indices, ref_last_len):
+        ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+        prefill = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD")
+        qo_indptr = (
+            torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda:0")
+            * q_len_per_req
+        )
+        prefill.plan(
+            qo_indptr,
+            ref_indptr,
+            ref_indices,
+            ref_last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=True,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+        )
+        return prefill.run(q, kv_data)
+
+    workspace_buffer = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"
+    )
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer,
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=torch.empty(
+            batch_size + 1, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_indices_buffer=torch.empty(
+            total_pages, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_last_page_len_buffer=torch.empty(
+            batch_size, dtype=torch.int32, device="cuda:0"
+        ),
+    )
+
+    def plan(plan_indptr, plan_indices, plan_last_len):
+        wrapper.plan(
+            plan_indptr,
+            plan_indices,
+            plan_last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=q_len_per_req,
+        )
+
+    plan(indptr, indices, last_len)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            o = wrapper.run(q, kv_data)
+    torch.cuda.current_stream().wait_stream(s)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        o = wrapper.run(q, kv_data, out=o)
+
+    g.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        o, reference(indptr, indices, last_len), rtol=1e-2, atol=1e-2
+    )
+
+    for kv_lens in replay_kv_lens_sets:
+        new_indptr, new_indices, new_last_len = build_kv_layout(kv_lens)
+        plan(new_indptr, new_indices, new_last_len)
+        torch.cuda.synchronize()
+        g.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            o, reference(new_indptr, new_indices, new_last_len), rtol=1e-2, atol=1e-2
+        )
+
+
+def test_tensor_core_decode_rejects_mismatched_q_len():
+    batch_size = 4
+    page_size = 16
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    dtype = torch.bfloat16
+    indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda:0")
+    indices = torch.arange(batch_size, dtype=torch.int32, device="cuda:0")
+    last_len = torch.full((batch_size,), page_size, dtype=torch.int32, device="cuda:0")
+    kv_data = torch.randn(
+        batch_size, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device="cuda:0"
+    )
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=True
+    )
+    wrapper.plan(
+        indptr,
+        indices,
+        last_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        q_len_per_req=2,
+    )
+    q = torch.randn(
+        batch_size * 3, num_qo_heads, head_dim, dtype=dtype, device="cuda:0"
+    )
+    with pytest.raises(ValueError, match="q_len_per_req"):
+        wrapper.run(q, kv_data)
+
+    cuda_core_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=False
+    )
+    with pytest.raises(ValueError, match="use_tensor_cores"):
+        cuda_core_wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )
+
+    fa3_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=True, backend="fa3"
+    )
+    with pytest.raises(NotImplementedError, match="fa2"):
+        fa3_wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )
+
+    short_kv_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=True
+    )
+    short_last_len = torch.ones(batch_size, dtype=torch.int32, device="cuda:0")
+    with pytest.raises(ValueError, match="empty KV range"):
+        short_kv_wrapper.plan(
+            indptr,
+            indices,
+            short_last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )
+
+    graph_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws,
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=torch.empty(
+            batch_size + 1, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_indices_buffer=torch.empty(
+            batch_size, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_last_page_len_buffer=torch.empty(
+            batch_size, dtype=torch.int32, device="cuda:0"
+        ),
+    )
+
+    def plan_graph(q_len):
+        graph_wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=q_len,
+        )
+
+    plan_graph(2)
+    plan_graph(2)  # same value re-plans fine
+    with pytest.raises(ValueError, match="frozen"):
+        plan_graph(3)
+
+    unplanned = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=True
+    )
+    with pytest.raises(ValueError, match="prior plan"):
+        flashinfer.decode.fast_decode_plan(
+            unplanned,
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )
