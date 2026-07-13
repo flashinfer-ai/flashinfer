@@ -504,27 +504,29 @@ class Cfg:
 
 def _gen(seed):
     rng = random.Random(seed)
-    # Resample shape until the LOCAL-shard weights fit the budget (modest per-test GPU footprint).
-    for _ in range(64):
-        ne, h, i = rng.choice(_EXPERTS), rng.choice(_HIDDEN), rng.choice(_INTERMED)
-        # ~30%: expert-parallel shard -- split the global experts and pick a shard (offset>0). This
-        # is how large MoE actually runs (no rank holds all experts) and exercises the offset path.
-        local, offset = ne, 0
-        shards = rng.choice([2, 4])
-        if rng.random() < 0.3 and ne >= 16 and ne % shards == 0:
-            local = ne // shards
-            offset = local * rng.randrange(shards)
-        if _weight_elems(local, h, i) <= _WEIGHT_ELEM_BUDGET:
-            break
-
     method = rng.choice(_ROUTING_METHODS)
     # In-kernel routing ~half the time. FromLogits is single-shard only here: EP + in-kernel
     # routing semantics (does the kernel route over global logits then filter to local?) are a
     # separate validation, and EP collectives are out of scope for this single-GPU harness.
     # DeepSeekV3 group routing scores over the full expert set, so keep it non-EP too.
     fromlogits = rng.random() < 0.5
-    if fromlogits or method == RoutingMethodType.DeepSeekV3:
+    force_non_ep = fromlogits or method == RoutingMethodType.DeepSeekV3
+    # Resample shape until the weights of the FINAL config fit the budget (modest per-test
+    # GPU footprint). Routing mode is chosen BEFORE this loop on purpose: non-EP-forced
+    # configs (FromLogits / DeepSeekV3) hold the FULL expert set, so budgeting a sharded
+    # `local` and flipping to non-EP afterwards would admit up to shards x the budget.
+    for _ in range(64):
+        ne, h, i = rng.choice(_EXPERTS), rng.choice(_HIDDEN), rng.choice(_INTERMED)
+        # ~30%: expert-parallel shard -- split the global experts and pick a shard (offset>0). This
+        # is how large MoE actually runs (no rank holds all experts) and exercises the offset path.
         local, offset = ne, 0
+        if not force_non_ep:
+            shards = rng.choice([2, 4])
+            if rng.random() < 0.3 and ne >= 16 and ne % shards == 0:
+                local = ne // shards
+                offset = local * rng.randrange(shards)
+        if _weight_elems(local, h, i) <= _WEIGHT_ELEM_BUDGET:
+            break
 
     # Method-specific top_k + group params.
     n_group = topk_group = 0
@@ -808,11 +810,23 @@ def _describe(cfg: Cfg) -> str:
     )
 
 
+def _env_prefix() -> str:
+    """Shell-safe env prefix for repro commands: include only variables that are
+    actually set (an unset variable is not needed to reproduce), quoting values so
+    the printed command is directly executable."""
+    import shlex
+
+    parts = [
+        f"{var}={shlex.quote(os.environ[var])}"
+        for var in ("CUDA_HOME", "CUDA_VISIBLE_DEVICES")
+        if var in os.environ
+    ]
+    return " ".join(parts) + " " if parts else ""
+
+
 def _repro(cfg: Cfg) -> str:
-    cuda = os.environ.get("CUDA_HOME", "<cuda>")
-    dev = os.environ.get("CUDA_VISIBLE_DEVICES", "<sm100-idx>")
     return (
-        f"REPRO: CUDA_HOME={cuda} CUDA_VISIBLE_DEVICES={dev} FLASHINFER_UMOE_FUZZ=1 "
+        f"REPRO: {_env_prefix()}FLASHINFER_UMOE_FUZZ=1 "
         f"FLASHINFER_UMOE_FUZZ_ONLY_SEED={cfg.seed} "
         f"pytest -s tests/moe/test_unified_moe_fuzz.py::test_unified_moe_fuzz"
     )
@@ -1126,10 +1140,8 @@ def test_autotune_cache_coherence(base):
 
     E, H, I = base
     top_k = 4
-    _cuda = os.environ.get("CUDA_HOME", "<cuda>")
-    _dev = os.environ.get("CUDA_VISIBLE_DEVICES", "<sm100-idx>")
     _repro_cmd = (
-        f"REPRO: CUDA_HOME={_cuda} CUDA_VISIBLE_DEVICES={_dev} FLASHINFER_UMOE_FUZZ=1 "
+        f"REPRO: {_env_prefix()}FLASHINFER_UMOE_FUZZ=1 "
         f"pytest -s tests/moe/test_unified_moe_fuzz.py::test_autotune_cache_coherence -k e{E}h{H}i{I}"
     )
     print(

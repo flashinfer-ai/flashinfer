@@ -71,6 +71,13 @@ _RUNNER_QUANTS: Dict[type, Tuple[QuantVariant, ...]] = {
 class MoELayer:
     """Stateful MoE layer with cross-backend autotune.
 
+    Not thread-safe: the layer and its runners follow the autotuner's
+    sequential ``pack_inputs -> forward`` contract and stash per-call launch
+    state on the runner (``_static_kwargs``) between the two steps, so
+    concurrent calls on one instance can interleave that state. Use one
+    ``MoELayer`` per thread/stream; a stateless calling convention is a
+    tracked follow-up.
+
     Example
     -------
     >>> layer = MoELayer(config)
