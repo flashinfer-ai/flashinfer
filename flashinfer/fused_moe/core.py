@@ -306,7 +306,17 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
         runner_dict: Dict[
-            Tuple[torch.dtype, torch.dtype, torch.dtype, bool, bool, bool, bool, bool],
+            Tuple[
+                torch.dtype,
+                torch.dtype,
+                torch.dtype,
+                bool,
+                bool,
+                bool,
+                bool,
+                bool,
+                bool,
+            ],
             Any,
         ] = dict()
         tuning_config = TuningConfig(

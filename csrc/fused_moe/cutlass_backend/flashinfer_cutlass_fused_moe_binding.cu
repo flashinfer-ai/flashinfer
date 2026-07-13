@@ -730,12 +730,13 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       activation_dtype = isNvfp4Quant() ? dl_int64 : activation_dtype;
       int64_t const unpadded_hidden_size_profiler = hidden_size;  // HACK no padding by default
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-      mProfiler->init(
-          *mKernelRunner.get(), mProfiler->mGemmToProfile, DtypeUtils::dataType(activation_dtype),
-          DtypeUtils::dataType(mWeightDtype), DtypeUtils::dataType(mOutputDtype), num_experts,
-          static_cast<int>(top_k), hidden_size, unpadded_hidden_size_profiler, inter_size,
-          group_size, activation_type, USE_BIAS, USE_LORA, min_latency_mode,
-          /*need_weights*/ false, parallelism_config, enable_alltoall, mSm90Wfp4Afp8Mode);
+      mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
+                      DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
+                      DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
+                      hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
+                      activation_type, USE_BIAS, USE_LORA, min_latency_mode,
+                      /*need_weights*/ false, parallelism_config, enable_alltoall,
+                      mUseMxfp8ActScaling, mSm90Wfp4Afp8Mode);
 #else
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                       DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
@@ -743,7 +744,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                       hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
                       activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                       /*need_weights*/ false, parallelism_config,
-                      /*enable_alltoall*/ false, mSm90Wfp4Afp8Mode);
+                      /*enable_alltoall*/ false,
+                      /*use_mxfp8_act_scaling*/ false, mSm90Wfp4Afp8Mode);
 #endif
 
       size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
@@ -1514,12 +1516,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
 tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
                       bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling,
-                      bool use_mxfp8_act_scaling, bool use_packed_weights,
-                      bool use_fused_finalize,
+                      bool use_mxfp8_act_scaling, bool use_packed_weights, bool use_fused_finalize,
                       bool use_wfp4afp8_humming) {
   auto ptr = tvm::ffi::make_object<FusedMoeRunner>(
       activation_dtype, weight_dtype, output_dtype, use_deepseek_fp8_block_scale,
-      use_w4_group_scaling, use_mxfp8_act_scaling, use_packed_weights, use_fused_finalize, use_wfp4afp8_humming);
+      use_w4_group_scaling, use_mxfp8_act_scaling, use_packed_weights, use_fused_finalize,
+      use_wfp4afp8_humming);
   return tvm::ffi::Module(ptr);
 }
 

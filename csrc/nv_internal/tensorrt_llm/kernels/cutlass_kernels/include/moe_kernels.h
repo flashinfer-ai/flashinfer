@@ -1057,6 +1057,7 @@ struct GemmProfilerBackend {
             int64_t inter_size, int64_t group_size, ActivationType activation_type, bool bias,
             bool use_lora, bool min_latency_mode, bool need_weights,
             MOEParallelismConfig parallelism_config, bool const enable_alltoall = false,
+            bool use_mxfp8_act_scaling = false,
             Sm90Wfp4Afp8ScaleMode sm90_wfp4afp8_mode = Sm90Wfp4Afp8ScaleMode::kDisabled) {
     mInterface = &runner;
     mGemmToProfile = gemm_to_profile;
