@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import warnings
 from typing import Optional, Tuple, Union
 
 import torch
@@ -24,6 +25,11 @@ from flashinfer.trace.templates.attention import magi_ffa_flex_trace_dispatch
 
 _SUPPORTED_LAYOUTS = ("NHD", "HND")
 
+# MagiAttention versions FlashInfer has validated this adapter against
+# (Hopper/H20). Keep in sync with scripts/task_test_magi_ffa.sh and
+# docs/api/magi_ffa.rst.
+_VALIDATED_MAGI_ATTENTION_VERSIONS = ("1.1.0.post10",)
+
 
 @functools.cache
 def _load_flex_flash_attn_func():
@@ -31,19 +37,33 @@ def _load_flex_flash_attn_func():
 
     MagiAttention (SandAI, Apache-2.0) is an optional, separately-installed
     dependency. The import is deferred so that importing FlashInfer never
-    requires MagiAttention to be present.
+    requires MagiAttention to be present. A non-validated installed version
+    is allowed but warns once (the adapter is experimental and MagiAttention's
+    surface may drift).
     """
     try:
+        import magi_attention
         from magi_attention.api import flex_flash_attn_func
     except ImportError as exc:
         raise ImportError(
             "MagiAttention is required to use flashinfer.magi_ffa.flex_flash_attn. "
             "It is an optional dependency (SandAI MagiAttention, Apache-2.0) and is "
             "not installed automatically. The validated environment uses "
-            "magi_attention==1.1.0.post10, followed by "
+            f"magi_attention=={_VALIDATED_MAGI_ATTENTION_VERSIONS[-1]}, followed by "
             'pip install "nvidia-cutlass-dsl>=4.5.0" because MagiAttention may '
             "downgrade FlashInfer's Cutlass DSL dependency."
         ) from exc
+    version = getattr(magi_attention, "__version__", "unknown")
+    # Drop any local-version suffix (e.g. "1.1.0.post10+g36edcce").
+    if version.split("+")[0] not in _VALIDATED_MAGI_ATTENTION_VERSIONS:
+        warnings.warn(
+            f"flashinfer.magi_ffa is validated against MagiAttention "
+            f"{_VALIDATED_MAGI_ATTENTION_VERSIONS} (Hopper/H20), but {version} is "
+            f"installed; the adapter may not match its API or behavior. Install "
+            f"magi_attention=={_VALIDATED_MAGI_ATTENTION_VERSIONS[-1]} and then "
+            f'restore nvidia-cutlass-dsl with pip install "nvidia-cutlass-dsl>=4.5.0".',
+            stacklevel=3,
+        )
     return flex_flash_attn_func
 
 
