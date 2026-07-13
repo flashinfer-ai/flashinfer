@@ -30,7 +30,7 @@ _SM100_MMA_TILER_MN_CANDIDATES = [
     (256, 256),
 ]
 
-# Tactic cache: (n, real_k, sm_count) -> dict[m_bucket -> tactic_tuple]
+# Tactic cache: (n, real_k, sm_count, sf_vec_size) -> dict[m_bucket -> tactic_tuple]
 # Bounded by the number of unique (N, K) pairs in the model (typically < 50).
 _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
@@ -52,13 +52,37 @@ _SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
 ]
 
 
-def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
+def _compute_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
     """Compute the best tactic for a specific (M, N, K) on a GPU with sm_count SMs.
 
     Used for mm_fp4(backend='cute-dsl') without autotune by taking the
-    argmax of _score_sm100_mm_fp4_tactic over (tile, cluster, swap_ab), with
-    prefetch disabled.
+    argmax of _score_sm100_mm_fp4_tactic over kernel-feasible
+    (tile, cluster, swap_ab), with prefetch disabled.
     """
+    import cutlass
+
+    from .dense_blockscaled_gemm_sm100 import Sm100BlockScaledPersistentDenseGemmKernel
+
+    sf_dtype = cutlass.Float8E4M3FN if sf_vec_size == 16 else cutlass.Float8E8M0FNU
+
+    def is_feasible(tile, cluster, swap_ab):
+        kernel_m, kernel_n = (n, rep_m) if swap_ab else (rep_m, n)
+        return Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+            cutlass.Float4E2M1FN,
+            sf_dtype,
+            sf_vec_size,
+            cutlass.BFloat16,  # Note: BF16 or FP16 does not impact can_implement outcome
+            tile,
+            cluster,
+            kernel_m,
+            kernel_n,
+            real_k,
+            1,
+            "k",
+            "k",
+            "m" if swap_ab else "n",
+        )
+
     n_aligned = n % 8 == 0
     best_tactic = None
     best_score = -1.0
@@ -71,7 +95,7 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
                 score = _score_sm100_mm_fp4_tactic(
                     rep_m, n, real_k, sm_count, tile, cluster, swap_ab
                 )
-                if score > best_score:
+                if score > best_score and is_feasible(tile, cluster, swap_ab):
                     best_score = score
                     best_tactic = (tile, cluster, swap_ab, False, "sm100", None)
     return best_tactic
@@ -83,6 +107,8 @@ def _score_sm100_mm_fp4_tactic(
     """Score a mm_fp4 cute-dsl tactic (higher means better).
     Used for ranking candidates for both top-1 and autotune scenarios.
     """
+    if m == 0 or n == 0:
+        return 0.0
     tile_m, tile_n = mma_tiler_mn
     cga_m, cga_n = cluster_shape_mn
     prob_m = n if swap_ab else m
@@ -122,8 +148,8 @@ def _score_sm100_mm_fp4_tactic(
     if prob_m > tile_m:
         # Cluster multicast hurts when the m-grid is thicker than one tile
         # cga_x.bit_length() for cga_x = 1/2/4 -> exponent 0/1/2
-        score *= 0.95 ** (0, 1, 2)[cga_n.bit_length() - 1]
-        score *= 0.99 ** (0, 1, 2)[cga_m.bit_length() - 1]
+        score *= 0.95 ** (cga_n.bit_length() - 1)
+        score *= 0.99 ** (cga_m.bit_length() - 1)
 
     # 5. Demote narrow tiles that cannot cover prob_n,
     # keeping the ranking total over all valid tactics.
@@ -137,29 +163,32 @@ def _score_sm100_mm_fp4_tactic(
     return score
 
 
-def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
+def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
     """Select the best tactic for mm_fp4(backend='cute-dsl').
 
     On the first call for a given (N, K), precomputes the optimal tactic
-    for each M bucket (~13 buckets, ~55-86 usec).  Subsequent calls with
-    any M just look up the bucket — runs in ~0.2 usec.
+    for each M bucket. Subsequent calls with any M just look up the bucket
+    — runs in ~0.2 usec.
 
     Args:
         m: M dimension of the GEMM problem.
         n: N dimension of the GEMM problem.
         real_k: K dimension (unpacked, i.e. 2x the packed FP4 dimension).
         sm_count: Number of SMs on the target GPU.
+        sf_vec_size: Scale-factor vector size (16 for nvfp4, 32 for mxfp4).
 
     Returns:
         Tactic tuple: (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
                         kernel_type, use_tma_store)
     """
-    cache_key = (n, real_k, sm_count)
+    cache_key = (n, real_k, sm_count, sf_vec_size)
     bucket_tactics = _SM100_MM_FP4_TACTIC_CACHE.get(cache_key)
     if bucket_tactics is None:
         bucket_tactics = {}
         for rep_m in _M_BUCKETS:
-            bucket_tactics[rep_m] = _compute_tactic_for_m(rep_m, n, real_k, sm_count)
+            bucket_tactics[rep_m] = _compute_tactic_for_m(
+                rep_m, n, real_k, sm_count, sf_vec_size
+            )
         _SM100_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
 
     bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
