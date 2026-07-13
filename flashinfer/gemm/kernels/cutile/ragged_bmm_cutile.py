@@ -8,6 +8,8 @@ import cuda.tile as ct
 import torch
 from cuda.tile.tune import exhaustive_search
 
+from ....cutile.cutile_common import cached_replace_hints
+
 import os
 
 _AUTOTUNE_DISABLED = os.getenv('FLASHINFER_CUTILE_AUTOTUNE_DISABLED', '0') == '1'
@@ -734,7 +736,9 @@ def ragged_bmm(
             hints["num_ctas"] = num_ctas
         if occupancy is not None:
             hints["occupancy"] = occupancy
-        kernel = kernel_fn.replace_hints(**hints) if hints else kernel_fn
+        kernel = (
+            cached_replace_hints(kernel_fn, **hints) if hints else kernel_fn
+        )
 
         ct.launch(
             torch.cuda.current_stream(),

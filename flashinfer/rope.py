@@ -1434,6 +1434,25 @@ def rope_quantize_fp8(
         Quantized tensors: (q_rope_out, k_rope_out, q_nope_out, k_nope_out).
     """
     if backend == "cutile":
+        if is_neox:
+            # The cuTile kernel implements only the interleaved (GPT-J) rotary
+            # layout. is_neox defaults to True, so surface a clear error instead
+            # of the kernel's bare AssertionError (which -O would also strip).
+            raise NotImplementedError(
+                "backend='cutile' supports is_neox=False (interleaved/GPT-J "
+                "rotary) only; got is_neox=True."
+            )
+        if k_rope.ndim != 2:
+            # The kernel addresses the key as 2D [tokens, rope_dim] (single
+            # shared latent K head, the MLA use case). A 3D GQA/MHA key would
+            # fail deep in autotune with an opaque TileTypeError.
+            raise NotImplementedError(
+                "backend='cutile' rope_quantize_fp8 supports MLA-style 2D key "
+                f"tensors (single shared K head) only; got {k_rope.ndim}D key "
+                "(GQA/MHA multi-head K is not supported)."
+            )
+        if cos_sin_cache.dtype != torch.float32:
+            raise ValueError("cos_sin_cache should be float32")
         from .quantization.kernels.cutile.rope_quantize_fp8_cutile import (
             rope_quantize_fp8_cutile,
         )

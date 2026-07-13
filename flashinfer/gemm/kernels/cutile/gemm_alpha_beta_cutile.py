@@ -8,6 +8,8 @@ import cuda.tile as ct
 import torch
 from cuda.tile.tune import exhaustive_search
 
+from ....cutile.cutile_common import cached_replace_hints
+
 # Module-level tune cache: (M, N, K, transpose_a_int, transpose_b_int, dtype, num_sms, device) -> (best_cfg, tuned_kernel)
 _gemm_alpha_beta_tune_cache: dict = {}
 
@@ -459,7 +461,11 @@ def gemm_alpha_beta(
             hints["num_ctas"] = num_ctas
         if occupancy is not None:
             hints["occupancy"] = occupancy
-        kernel = _gemm_alpha_beta_kernel.replace_hints(**hints) if hints else _gemm_alpha_beta_kernel
+        kernel = (
+            cached_replace_hints(_gemm_alpha_beta_kernel, **hints)
+            if hints
+            else _gemm_alpha_beta_kernel
+        )
 
         ct.launch(
             torch.cuda.current_stream(),

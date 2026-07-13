@@ -22,6 +22,8 @@ import cuda.tile as ct
 import torch
 from cuda.tile.tune import exhaustive_search
 
+from ....cutile.cutile_common import cached_replace_hints
+
 ConstInt = ct.Constant[int]
 PAD_ZERO = ct.PaddingMode.ZERO
 
@@ -354,15 +356,21 @@ def rope_quantize_fp8_cutile(
     no_rope_chunks = (no_rope_dim + rope_dim - 1) // rope_dim
     total_blocks_y = num_qo_heads + num_kv_heads + num_kv_heads * no_rope_chunks + num_qo_heads * no_rope_chunks
 
-    assert not is_neox, "is_neox should be False for rope_quantize_fp8"
+    if is_neox:
+        raise ValueError(
+            "rope_quantize_fp8_cutile supports is_neox=False (interleaved) only."
+        )
 
     stream = torch.cuda.current_stream()
     configs = _rope_quantize_fp8_cutile_configs(num_tokens)
     if len(configs) == 1:
         cfg = configs[0]
         grid = (math.ceil(num_tokens / cfg.TOKENS_PER_BLOCK), total_blocks_y, 1)
-        # Replace cached_replace_hints with direct replace_hints call
-        kernel = _rope_quantize_fp8_kernel.replace_hints(occupancy=cfg.occupancy)
+        # Memoize the hinted kernel so cuTile's per-shape JIT compile cache
+        # survives across launches on this single-config (non-autotune) path.
+        kernel = cached_replace_hints(
+            _rope_quantize_fp8_kernel, occupancy=cfg.occupancy
+        )
         args = (
             q_rope,
             k_rope,

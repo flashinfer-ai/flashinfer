@@ -461,6 +461,29 @@ class BlockSparseAttentionWrapper:
                     "cuTile block-sparse backend does not apply position encoding "
                     "(pos_encoding_mode must be 'NONE')."
                 )
+            if M % R != 0:
+                # run() forces each block-row batch to exactly R query rows; a
+                # non-multiple M would slice past the query buffer -> OOB.
+                raise ValueError(
+                    f"cuTile block-sparse backend requires M % R == 0 (M={M}, R={R})."
+                )
+            if C < 16:
+                # Prefill autotune's minimum BLOCK_N is 16 (32 on SM90); a smaller
+                # C yields an empty search space -> opaque exhaustive_search error.
+                raise ValueError(
+                    "cuTile block-sparse backend requires C >= 16 (the minimum "
+                    f"prefill BLOCK_N); got C={C}."
+                )
+            if causal:
+                # The BSR->paged mapping gathers arbitrary column-blocks, so the
+                # kernel's packed (gathered-block) position mask does NOT equal
+                # global row/column causality. (The standalone prefill kernel
+                # supports causal for contiguous paged/ragged inputs; only this
+                # block-sparse mapping cannot express it correctly.)
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not support causal masking "
+                    "under the block-sparse (gathered-block) mapping."
+                )
             self._R = R
             self._C = C
             self._M = M
@@ -979,7 +1002,12 @@ class BlockSparseAttentionWrapper:
                 k_scale=sm_scale,
                 v_scale=1.0,
                 num_batch=num_block_rows,
-                max_seq_len=self._M,
+                # Each block-row is one variable-length batch of exactly R query
+                # rows, so the per-batch max query length is R (not the global M).
+                # Passing R sizes the grid / LPT tile count to exactly ceil(R/
+                # BLOCK_M) tiles instead of ceil(M/BLOCK_M), avoiding the ~M/R x
+                # over-launch of CTAs that would otherwise early-return.
+                max_seq_len=R,
                 is_causal=self._causal,
                 outputs=out,
             )

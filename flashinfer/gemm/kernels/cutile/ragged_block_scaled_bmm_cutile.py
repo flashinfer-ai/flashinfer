@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import cuda.tile as ct
 import torch
 
+from ....cutile.cutile_common import cached_replace_hints
+
 
 def _is_large_m(total_m, Q):
     """Determine if average M is large enough for non-swapped configs."""
@@ -518,7 +520,7 @@ def ragged_block_scaled_bmm(
         hints["num_ctas"] = num_ctas
     if occupancy is not None:
         hints["occupancy"] = occupancy
-    kernel = kernel_fn.replace_hints(**hints) if hints else kernel_fn
+    kernel = cached_replace_hints(kernel_fn, **hints) if hints else kernel_fn
 
     ct.launch(
         torch.cuda.current_stream(),

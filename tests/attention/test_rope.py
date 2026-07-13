@@ -404,6 +404,15 @@ def test_generalized_rope_quantize(
 
         if not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
+        # The cuTile fused rope+quant kernel is MLA-scoped: it addresses the key
+        # tensor as 2D [tokens, rope_dim] (single shared latent K head), matching
+        # the DeepSeek/MLA use case it was migrated for. GQA/MHA pass a 3D
+        # [tokens, kv_heads, rope_dim] key, which the kernel cannot index.
+        if attention_type != "mla":
+            pytest.skip(
+                "cuTile rope_quantize supports MLA-style 2D key tensors only "
+                "(single shared K head); GQA/MHA multi-head K is not supported."
+            )
         # cuTile backend currently validates only e4m3fn output and ignores PDL;
         # gate to its supported subset to avoid redundant / unsupported cases.
         if quant_dtype != torch.float8_e4m3fn:

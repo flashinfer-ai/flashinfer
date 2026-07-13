@@ -8,6 +8,8 @@ import cuda.tile as ct
 import torch
 from cuda.tile.tune import exhaustive_search
 
+from ....cutile.cutile_common import cached_replace_hints
+
 import os
 
 _AUTOTUNE_DISABLED = os.getenv('FLASHINFER_CUTILE_AUTOTUNE_DISABLED', '0') == '1'
@@ -408,7 +410,11 @@ def masked_bmm(
             hints["num_ctas"] = num_ctas
         if occupancy is not None:
             hints["occupancy"] = occupancy
-        kernel = _masked_bmm_kernel.replace_hints(**hints) if hints else _masked_bmm_kernel
+        kernel = (
+            cached_replace_hints(_masked_bmm_kernel, **hints)
+            if hints
+            else _masked_bmm_kernel
+        )
 
         ct.launch(
             torch.cuda.current_stream(),
