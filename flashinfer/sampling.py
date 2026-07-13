@@ -1378,14 +1378,11 @@ def _top_k_first_fast_path(
     to the masked full-vocab path (validated TV ~0.01) but far cheaper at small batch.
     """
     # Local import avoids a module-level cycle between sampling and topk.
-    # Import the module (not ``top_k as _radix_top_k``) so doc-checkers that
-    # walk nested ImportFrom aliases do not treat ``_radix_top_k`` as a public
-    # ``@flashinfer_api`` re-export of this module.
-    from . import topk as _topk_mod
+    from .topk import top_k as _radix_top_k
 
     # deterministic=True makes top-k reproducible (its radix deterministic-collect path is
     # stable even at ties). We do not enforce a tie break that requires 128KB smem/block.
-    values, gathered_indices = _topk_mod.top_k(
+    values, gathered_indices = _radix_top_k(
         x, top_k, sorted=True, deterministic=deterministic
     )
     values = values.float()
