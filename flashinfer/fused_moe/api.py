@@ -527,10 +527,12 @@ class MoEConfig:
 
 @dataclass
 class MoEActivationPack:
-    """Per-call transient data — pre-quantized NVFP4 activations + pre-routed indices."""
+    """Per-call transient data — activations (backend-native encoding) + pre-routed indices."""
 
-    hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4)
-    hidden_states_scale: Tensor  # [M, H//16] float8_e4m3fn
+    hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4) or [M, H] bf16 (BF16 path)
+    hidden_states_scale: Optional[
+        Tensor
+    ]  # [M, H//16] float8_e4m3fn block scales; None for BF16
     selected_experts: Tensor  # [M, top_k] int32
     final_scales: Tensor  # [M, top_k] float32
 
