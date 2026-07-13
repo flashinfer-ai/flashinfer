@@ -37,7 +37,7 @@ Kernel-client contract assumed below (lives in ``megamoe_kernel.py``)::
             topk_idx, topk_weights,
             fc1_weight, fc1_weight_sf,
             fc2_weight, fc2_weight_sf,
-            combine_output,                      # sym heap
+            output_activation,                   # (T, hidden) final output
             local_workspace, shared_workspace,   # opaque uint8
             # ``peer_rank_ptr_mapper_host`` carries runtime peer offsets;
             # kernel.__call__ packs it into SymBuffer{world_size}.
@@ -59,13 +59,13 @@ import triton
 import triton.language as tl
 
 
-_FORM_B_PERM_K_LIMIT = 4  # K! perms: K<=4 -> <=24, manageable
+_FORM_B_PERM_K_LIMIT = 4   # K! perms: K<=4 -> <=24, manageable
 
 
 @triton.jit
 def _form_b_all_perms_kernel(
-    src_ptr,  # (T, K, H) bf16, contiguous
-    dst_ptr,  # (T, H, n_perms) bf16, contiguous
+    src_ptr,    # (T, K, H) bf16, contiguous
+    dst_ptr,    # (T, H, n_perms) bf16, contiguous
     perms_ptr,  # (n_perms, K) int32
     T,
     K,
@@ -92,14 +92,12 @@ def _form_b_all_perms_kernel(
             k = tl.load(perms_ptr + p * K_const + k_pos)
             v = tl.load(
                 src_ptr + t * K * H + k * H + h_off,
-                mask=mask,
-                other=0,
+                mask=mask, other=0,
             ).to(tl.bfloat16)
             acc = acc + v
         tl.store(
             dst_ptr + t * H * n_perms_const + h_off * n_perms_const + p,
-            acc,
-            mask=mask,
+            acc, mask=mask,
         )
 
 
@@ -121,22 +119,13 @@ def _form_b_enumerate_perms(ref_K_terms: torch.Tensor) -> torch.Tensor:
     perms_t = torch.tensor(perms, dtype=torch.int32, device=ref_K_terms.device)
     src = ref_K_terms.contiguous()
     dst = torch.empty(
-        (T, H, n_perms),
-        dtype=torch.bfloat16,
-        device=ref_K_terms.device,
+        (T, H, n_perms), dtype=torch.bfloat16, device=ref_K_terms.device,
     )
     BLOCK_H = 256
     grid = (T, triton.cdiv(H, BLOCK_H))
     _form_b_all_perms_kernel[grid](
-        src,
-        dst,
-        perms_t,
-        T,
-        K,
-        H,
-        BLOCK_H=BLOCK_H,
-        K_const=K,
-        n_perms_const=n_perms,
+        src, dst, perms_t, T, K, H,
+        BLOCK_H=BLOCK_H, K_const=K, n_perms_const=n_perms,
     )
     return dst
 
@@ -149,20 +138,15 @@ def _quantile_compat(x: torch.Tensor, qs: List[float]) -> List[float]:
     and has no such cap.  Both paths return the same fp64 quantiles.
     """
     if x.numel() <= 16_777_216:
-        return (
-            torch.quantile(
-                x,
-                torch.tensor(qs, dtype=x.dtype, device=x.device),
-            )
-            .cpu()
-            .tolist()
-        )
+        return torch.quantile(
+            x, torch.tensor(qs, dtype=x.dtype, device=x.device),
+        ).cpu().tolist()
     return np.quantile(x.cpu().numpy(), np.asarray(qs)).tolist()
 
 
 def _form_b_bitwise_match(
     actual_reduced: torch.Tensor,  # (T, H) bf16 or fp32 (bit cast via .to(bf16))
-    ref_K_terms: torch.Tensor,  # (T, K, H) bf16
+    ref_K_terms: torch.Tensor,     # (T, K, H) bf16
 ) -> Tuple[torch.Tensor, int]:
     """For each (t, h) cell, return True iff ``actual_reduced[t, h]`` is
     bit-exactly equal to SOME of the K! bf16-sequential-add permutations
@@ -190,8 +174,8 @@ def _form_b_bitwise_match(
 
 @triton.jit
 def _bf16_seq_sum_k_kernel(
-    src_ptr,  # (T, K, H) bf16 contiguous
-    dst_ptr,  # (T, H)    bf16 contiguous
+    src_ptr,    # (T, K, H) bf16 contiguous
+    dst_ptr,    # (T, H)    bf16 contiguous
     T: tl.constexpr,
     K: tl.constexpr,
     H: tl.constexpr,
@@ -209,9 +193,9 @@ def _bf16_seq_sum_k_kernel(
     mask = h_off < H
     acc = tl.zeros((BLOCK_H,), dtype=tl.bfloat16)
     for k in tl.static_range(K):
-        v = tl.load(src_ptr + t * K * H + k * H + h_off, mask=mask, other=0).to(
-            tl.bfloat16
-        )
+        v = tl.load(
+            src_ptr + t * K * H + k * H + h_off, mask=mask, other=0
+        ).to(tl.bfloat16)
         acc = acc + v
     tl.store(dst_ptr + t * H + h_off, acc, mask=mask)
 
@@ -229,7 +213,6 @@ def _bf16_seq_sum_k(src: torch.Tensor) -> torch.Tensor:
     _bf16_seq_sum_k_kernel[grid](src, dst, T, K, H, BLOCK_H=BLOCK_H)
     return dst
 
-
 # Ensure absolute package imports work when run as a script.
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_PKG_DIR)
@@ -242,6 +225,7 @@ from moe_nvfp4_swapab.epilogue_refactor import (
     SwapABSwigluFp4Epilogue as _SwapABEpilogue,
 )
 from moe_nvfp4_swapab.mega_reference import compute_megamoe_reference
+from src.token_comm import CombineFormat
 from common.megamoe_constants import Nvfp4BlockSize
 from moe_nvfp4_swapab.runner_common import (
     _DataDtype,
@@ -260,7 +244,9 @@ from moe_nvfp4_swapab.runner_fc12 import (
 )
 
 _SwapABEpilogueTokenTile = _SwapABEpilogue._EpilogueTokenTileSize
-_SwapABEpilogueIntermediateAlignment = 2 * _SwapABEpilogue._EpilogueFc1GateUpInterleave
+_SwapABEpilogueIntermediateAlignment = (
+    2 * _SwapABEpilogue._EpilogueFc1GateUpInterleave
+)
 
 
 # =============================================================================
@@ -311,6 +297,9 @@ class TokenCommProblemDesc:
     hidden: int = 0
     intermediate: int = 0
     fc2_output_dtype: torch.dtype = torch.bfloat16
+    # Cross-rank combine wire format (drives the host ref's quant round-trip and,
+    # once wired, the kernel's fc2 encoder). Default is the bf16 no-quant baseline.
+    combine_format: CombineFormat = CombineFormat.parse("bf16")
     # ``balanced``: locally uniform random block assignment, with exact
     # per-expert balance on each full E-token block and randomized tails.
     # ``power_law``: Zipf-rank-frequency, matches the empirical
@@ -395,15 +384,19 @@ class TokenCommProblemDesc:
             )
         if self.gate_up_clamp is not None and self.gate_up_clamp < 0.0:
             raise ValueError(
-                f"gate_up_clamp must be None or non-negative, got {self.gate_up_clamp}."
+                f"gate_up_clamp must be None or non-negative, got "
+                f"{self.gate_up_clamp}."
             )
 
     def __str__(self) -> str:
         dtype_name = lambda t: str(t).split(".")[-1]
         route_str = self.route_distribution
         if self.route_distribution == "power_law":
-            route_str = f"power_law(exponent={self.power_law_exponent:.3g})"  # type: ignore[assignment]
-        clamp_str = "off" if self.gate_up_clamp is None else f"{self.gate_up_clamp:.4g}"
+            route_str = f"power_law(exponent={self.power_law_exponent:.3g})"
+        clamp_str = (
+            "off" if self.gate_up_clamp is None
+            else f"{self.gate_up_clamp:.4g}"
+        )
         return (
             f"TokenCommProblemDesc: world={self.world_size} "
             f"tokens_per_rank={self.num_tokens_per_rank} topk={self.num_topk} "
@@ -411,6 +404,7 @@ class TokenCommProblemDesc:
             f"per_rank={self.num_experts_per_rank}) | "
             f"hidden={self.hidden} intermediate={self.intermediate} | "
             f"fc2_output_dtype={dtype_name(self.fc2_output_dtype)} | "
+            f"combine={self.combine_format} | "
             f"route={route_str} | swiglu_clamp={clamp_str}"
         )
 
@@ -456,21 +450,19 @@ def _generate_topk_idx_balanced(
     expert_permutations = rng.random(
         (num_ranks, num_blocks, num_total_experts)
     ).argsort(axis=-1)
-    topk_offsets = rng.random((num_ranks, num_blocks, num_total_experts)).argsort(
-        axis=-1
-    )[..., :num_topk]
+    topk_offsets = rng.random(
+        (num_ranks, num_blocks, num_total_experts)
+    ).argsort(axis=-1)[..., :num_topk]
 
     token_offsets = np.arange(num_total_experts)[None, None, :, None]
-    expert_indices = (token_offsets + topk_offsets[:, :, None, :]) % num_total_experts
+    expert_indices = (
+        token_offsets + topk_offsets[:, :, None, :]
+    ) % num_total_experts
     topk_blocks = np.take_along_axis(
-        expert_permutations[..., None],
-        expert_indices,
-        axis=2,
+        expert_permutations[..., None], expert_indices, axis=2,
     )
     return topk_blocks.reshape(
-        num_ranks,
-        num_padded_tokens_per_rank,
-        num_topk,
+        num_ranks, num_padded_tokens_per_rank, num_topk,
     )[:, :num_tokens_per_rank, :].astype(np.int64)
 
 
@@ -565,9 +557,7 @@ def _print_remote_rank_comm_matrices(
 ) -> None:
     """Print remote rank-to-rank routed-token counts for route inspection."""
     dispatch, fc2_return = _get_remote_rank_comm_matrices(
-        topk_idx,
-        world_size,
-        num_total_experts,
+        topk_idx, world_size, num_total_experts,
     )
 
     def _print_matrix(title: str, matrix: np.ndarray) -> None:
@@ -611,15 +601,10 @@ def _generate_topk_weights(
     see the same tensor so the absolute scale doesn't affect correctness,
     only the local numerical regime.
     """
-    return (
-        torch.rand(
-            (num_ranks, num_tokens_per_rank, num_topk),
-            dtype=torch.float32,
-            device="cuda",
-            generator=rng,
-        )
-        + 0.5
-    )
+    return torch.rand(
+        (num_ranks, num_tokens_per_rank, num_topk),
+        dtype=torch.float32, device="cuda", generator=rng,
+    ) + 0.5
 
 
 # =============================================================================
@@ -637,21 +622,7 @@ def _generate_topk_weights(
 # compute-sanitizer).  Single-rank only; sym tensors degrade to plain
 # CUDA ``torch.zeros`` and the SymBuffer offsets list is hard-coded to
 # ``(0,) * world_size``.
-def _no_dist() -> bool:
-    # Read at call time, not import time: callers (e.g. single-rank pytest
-    # tests) set MEGA_NO_DIST=1 after this module is already imported.
-    return bool(int(os.environ.get("MEGA_NO_DIST", "0")))
-
-
-# Tile-wise low-precision combine: one shared scale per this many contiguous
-# hidden elements (block=32 -> 7168/32 = 224 scale entries per token-cell).
-_COMBINE_SF_BLOCK = 32
-# Tile-wise NVFP4 combine uses TWO scale planes per 32-element tile (mirroring
-# topk_reduce.NVFP4_SFC_SCALE_BLOCK_SIZE / NVFP4_GLOBAL_SCALE_BLOCK_SIZE): a per-16
-# e4m3 "sfc" sub-block scale and a per-32 fp32 "global" scale.  These literals must
-# match the topk_reduce constants (the end-to-end lossy check catches any drift).
-_NVFP4_SFC_BLOCK = 16
-_NVFP4_GLOBAL_BLOCK = _COMBINE_SF_BLOCK  # 32 (one global per 32-elem tile)
+_NO_DIST: bool = bool(int(os.environ.get("MEGA_NO_DIST", "0")))
 
 
 def _sym_zeros(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
@@ -664,23 +635,16 @@ def _sym_zeros(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     Caller is responsible for freeing via ``nvshmem.core.free_tensor``
     before ``nvshmem.core.finalize()``.
     """
-    if _no_dist():
-        tensor = torch.zeros(shape, dtype=dtype, device="cuda")
-        # Tag so teardown can free by allocation kind, not by whatever
-        # MEGA_NO_DIST happens to be at free time (the env can be flipped
-        # between alloc and free, e.g. by pytest monkeypatch teardown).
-        tensor._mega_plain_alloc = True
-        return tensor
+    if _NO_DIST:
+        return torch.zeros(shape, dtype=dtype, device="cuda")
     import nvshmem.core
-
     tensor = nvshmem.core.tensor(shape, dtype=dtype)
     tensor.zero_()
     return tensor
 
 
 def _sym_zeros_byte_view(
-    logical_shape: Tuple[int, ...],
-    target_dtype: torch.dtype,
+    logical_shape: Tuple[int, ...], target_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Sym-heap allocation for dtypes nvshmem4py doesn't natively support
     (NVFP4 / fp8): allocate uint8 byte buffer, ``.view(target_dtype)``.
@@ -707,11 +671,7 @@ def _sym_zeros_byte_view(
     total_bytes = 1
     for dim_size in storage_shape:
         total_bytes *= dim_size
-    return (
-        _sym_zeros((total_bytes,), torch.uint8)
-        .view(target_dtype)
-        .reshape(storage_shape)
-    )
+    return _sym_zeros((total_bytes,), torch.uint8).view(target_dtype).reshape(storage_shape)
 
 
 def _compute_peer_offsets(
@@ -740,14 +700,14 @@ def _compute_peer_offsets(
     byval ``SymBuffer`` removes that indirection entirely (one LDC
     against the param bank, zero GMEM).
     """
-    if _no_dist():
+    if _NO_DIST:
         local_base = int(sym_tensor.data_ptr())
         return local_base, tuple(0 for _ in range(world_size))
     import nvshmem.core
-
     local_base = int(sym_tensor.data_ptr())
     peer_offsets_list = tuple(
-        int(nvshmem.core.get_peer_tensor(sym_tensor, peer).data_ptr()) - local_base
+        int(nvshmem.core.get_peer_tensor(sym_tensor, peer).data_ptr())
+        - local_base
         for peer in range(world_size)
     )
     return local_base, peer_offsets_list
@@ -836,13 +796,8 @@ class MegaMoETester:
         self._global_fc2_alpha: Optional[torch.Tensor] = None
         self._global_fc1_norm_const: Optional[torch.Tensor] = None
 
-        self.combine_output: Optional[torch.Tensor] = None
-        self.combine_reduced_output: Optional[torch.Tensor] = None
-        # Tile-wise low-precision combine staging (combine_dtype != "bf16");
-        # allocated in generate_inputs -> _allocate_combine_quantized.
-        self.combine_output_q: Optional[torch.Tensor] = None
-        self.combine_sf_q: Optional[torch.Tensor] = None
-        self.combine_global_q: Optional[torch.Tensor] = None  # nvfp4 per-32 fp32 global
+        # Public 2D (T, hidden) combined output the kernel produces.  
+        self.output_activation: Optional[torch.Tensor] = None
         self.combine_output_ref: Optional[torch.Tensor] = None
         self.combine_reduced_output_ref: Optional[torch.Tensor] = None
 
@@ -856,7 +811,6 @@ class MegaMoETester:
 
         self._kernel = None
         self._compiled_kernel = None
-        self._compiled_topk_reduce = None
         self._use_torch_profiler = False
         self._perf_warmup = 1
         self._perf_iters = 1
@@ -879,17 +833,14 @@ class MegaMoETester:
     def _check_cuda_rng_consistency(self) -> None:
         """Weakly verify CUDA RNG streams stayed aligned across ranks."""
         if not (
-            torch.distributed.is_available() and torch.distributed.is_initialized()
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
         ):
             return
 
         random_parts = torch.randint(
-            0,
-            1 << 31,
-            (2, 16),
-            dtype=torch.int64,
-            device="cuda",
-            generator=self._torch_cuda_rng,
+            0, 1 << 31, (2, 16),
+            dtype=torch.int64, device="cuda", generator=self._torch_cuda_rng,
         )
         sentinel = (random_parts[0] << 31) ^ random_parts[1]
         gathered = [torch.empty_like(sentinel) for _ in range(self.world_size)]
@@ -897,8 +848,7 @@ class MegaMoETester:
 
         reference = gathered[0]
         mismatched_ranks = [
-            rank
-            for rank, value in enumerate(gathered)
+            rank for rank, value in enumerate(gathered)
             if not torch.equal(value, reference)
         ]
         if mismatched_ranks:
@@ -931,48 +881,32 @@ class MegaMoETester:
         # before fc1 reads it; the boundary stays plain so the host
         # reference can dequant directly.
         self._global_activation = _make_nvfp4_tensor_from_torch_rng(
-            self._torch_cuda_rng,
-            (num_ranks, num_tokens_per_rank, hidden),
-            packed_dim=-1,
-            perf_run=self.misc.perf_run,
+            self._torch_cuda_rng, (num_ranks, num_tokens_per_rank, hidden),
+            packed_dim=-1, perf_run=self.misc.perf_run,
         )
         self._global_activation_sf = _make_raw_scale_tensor_from_torch_rng(
             self._torch_cuda_rng,
-            num_ranks * num_tokens_per_rank,
-            hidden,
-            blocksize=scale_blocksize,
-            strict=True,
+            num_ranks * num_tokens_per_rank, hidden, blocksize=scale_blocksize,
+            strict=True
         ).reshape(num_ranks, num_tokens_per_rank, hidden_sf_cols)
 
         # ---- Routing table.
         if problem.route_distribution == "balanced":
             topk_idx_np = _generate_topk_idx_balanced(
-                num_ranks,
-                num_tokens_per_rank,
-                num_topk,
-                problem.num_total_experts,
-                rng,
+                num_ranks, num_tokens_per_rank, num_topk,
+                problem.num_total_experts, rng,
             )
         else:
             topk_idx_np = _generate_topk_idx_power_law(
-                num_ranks,
-                num_tokens_per_rank,
-                num_topk,
-                problem.num_total_experts,
-                problem.power_law_exponent,
-                rng,
+                num_ranks, num_tokens_per_rank, num_topk,
+                problem.num_total_experts, problem.power_law_exponent, rng,
             )
         topk_weights = _generate_topk_weights(
-            num_ranks,
-            num_tokens_per_rank,
-            num_topk,
-            self._torch_cuda_rng,
+            num_ranks, num_tokens_per_rank, num_topk, self._torch_cuda_rng,
         )
         if self.rank == 0:
             _print_remote_rank_comm_matrices(
-                topk_idx_np,
-                num_ranks,
-                problem.num_total_experts,
+                topk_idx_np, num_ranks, problem.num_total_experts,
             )
         self._global_topk_idx = torch.from_numpy(topk_idx_np).cuda()
         self._global_topk_weights = topk_weights
@@ -982,66 +916,37 @@ class MegaMoETester:
         self._global_fc1_weight = _make_nvfp4_tensor_from_torch_rng(
             self._torch_cuda_rng,
             (num_ranks, num_experts_per_rank, hidden, intermediate),
-            packed_dim=2,
-            perf_run=self.misc.perf_run,
+            packed_dim=2, perf_run=self.misc.perf_run,
         )
         self._global_fc1_weight_sf = _make_raw_scale_tensor_from_torch_rng(
             self._torch_cuda_rng,
             num_ranks * num_experts_per_rank * intermediate,
-            hidden,
-            blocksize=scale_blocksize,
-            strict=True,
+            hidden, blocksize=scale_blocksize, strict=True
         ).reshape(num_ranks, num_experts_per_rank, intermediate, hidden_sf_cols)
 
         self._global_fc2_weight = _make_nvfp4_tensor_from_torch_rng(
             self._torch_cuda_rng,
             (num_ranks, num_experts_per_rank, intermediate_downproj, hidden),
-            packed_dim=2,
-            perf_run=self.misc.perf_run,
+            packed_dim=2, perf_run=self.misc.perf_run,
         )
         self._global_fc2_weight_sf = _make_raw_scale_tensor_from_torch_rng(
             self._torch_cuda_rng,
             num_ranks * num_experts_per_rank * hidden,
-            intermediate_downproj,
-            blocksize=scale_blocksize,
-            strict=True,
+            intermediate_downproj, blocksize=scale_blocksize,
+            strict=True
         ).reshape(
-            num_ranks,
-            num_experts_per_rank,
-            hidden,
-            intermediate_downproj_sf_cols,
+            num_ranks, num_experts_per_rank, hidden, intermediate_downproj_sf_cols,
         )
         epi_arg_shape = (num_ranks, num_experts_per_rank)
-        self._global_fc1_alpha = (
-            torch.randint(
-                1,
-                5,
-                epi_arg_shape,
-                generator=self._torch_cuda_rng,
-                device="cuda",
-            ).to(torch.float32)
-            * 0.5
-        )
-        self._global_fc2_alpha = (
-            torch.randint(
-                1,
-                5,
-                epi_arg_shape,
-                generator=self._torch_cuda_rng,
-                device="cuda",
-            ).to(torch.float32)
-            * 0.5
-        )
-        self._global_fc1_norm_const = (
-            torch.randint(
-                2,
-                5,
-                epi_arg_shape,
-                generator=self._torch_cuda_rng,
-                device="cuda",
-            ).to(torch.float32)
-            * 0.5
-        )
+        self._global_fc1_alpha = torch.randint(
+            1, 5, epi_arg_shape, generator=self._torch_cuda_rng, device="cuda",
+        ).to(torch.float32) * 0.5
+        self._global_fc2_alpha = torch.randint(
+            1, 5, epi_arg_shape, generator=self._torch_cuda_rng, device="cuda",
+        ).to(torch.float32) * 0.5
+        self._global_fc1_norm_const = torch.randint(
+            2, 5, epi_arg_shape, generator=self._torch_cuda_rng, device="cuda",
+        ).to(torch.float32) * 0.5
 
         # ---- Atom-swizzle the weight SFs.  fc1_weight / fc2_weight are
         # consumed by the base kernel directly (NOT routed through dispatch
@@ -1058,9 +963,10 @@ class MegaMoETester:
             for e in range(num_experts_per_rank)
         ]
         fc1_flat_sf_size = fc1_sf_swizzled[0].numel()
-        self._global_fc1_weight_sf_swizzled = _stack_byte_reinterpretable_tensors(
-            fc1_sf_swizzled, dim=0
-        ).view(num_ranks, num_experts_per_rank, fc1_flat_sf_size)
+        self._global_fc1_weight_sf_swizzled = (
+            _stack_byte_reinterpretable_tensors(fc1_sf_swizzled, dim=0)
+            .view(num_ranks, num_experts_per_rank, fc1_flat_sf_size)
+        )
 
         fc2_sf_swizzled = [
             to_blocked(self._global_fc2_weight_sf[r, e])
@@ -1068,9 +974,10 @@ class MegaMoETester:
             for e in range(num_experts_per_rank)
         ]
         fc2_flat_sf_size = fc2_sf_swizzled[0].numel()
-        self._global_fc2_weight_sf_swizzled = _stack_byte_reinterpretable_tensors(
-            fc2_sf_swizzled, dim=0
-        ).view(num_ranks, num_experts_per_rank, fc2_flat_sf_size)
+        self._global_fc2_weight_sf_swizzled = (
+            _stack_byte_reinterpretable_tensors(fc2_sf_swizzled, dim=0)
+            .view(num_ranks, num_experts_per_rank, fc2_flat_sf_size)
+        )
 
         # ---- Stage own-rank inputs into the symmetric heap.
         own_activation = self._global_activation[self.rank]
@@ -1082,8 +989,7 @@ class MegaMoETester:
         # natively support these dtypes); copy via uint8 to dodge any
         # NVFP4-to-NVFP4 assignment quirks between allocators.
         self.my_activation = _sym_zeros_byte_view(
-            (num_tokens_per_rank, hidden),
-            _DataDtype,
+            (num_tokens_per_rank, hidden), _DataDtype,
         )
         self.my_activation.view(torch.uint8).copy_(own_activation.view(torch.uint8))
 
@@ -1102,8 +1008,7 @@ class MegaMoETester:
         # tensor-indexing assignment across torch versions.
         hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
         self.my_activation_sf = _sym_zeros_byte_view(
-            (num_tokens_per_rank, hidden_sf_cols_padded),
-            _ScaleDtype,
+            (num_tokens_per_rank, hidden_sf_cols_padded), _ScaleDtype,
         )
         self.my_activation_sf.view(torch.uint8)[:, :hidden_sf_cols].copy_(
             own_activation_sf.view(torch.uint8)
@@ -1132,134 +1037,35 @@ class MegaMoETester:
         self.my_fc2_alpha = self._global_fc2_alpha[self.rank]
         self.my_fc1_norm_const = self._global_fc1_norm_const[self.rank]
 
-        # ---- Combine output on sym heap (peer-STG / peer-REDG target).
-        # Shape depends on which fc2-output flavour the impl asks for:
-        #   * STG.256 mode (default): (T, K, H) -- one BF16 cell per
-        #     (src_token, src_topk).  A standalone CuTeDSL kernel reduces
-        #     the K axis into a BF16 (T, H) tensor after the main kernel.
-        #   * REDG mode (form B): (T, 1, H) -- the device-side
-        #     ``red.global.add.v2.bf16x2`` collapses the K axis on the GPU
-        #     by atomic-adding every (src_token, *) cell onto a single
-        #     accumulator row.  ``_sym_zeros`` already zero-inits, which
-        #     is the form-B caller-contract requirement (atomic add
-        #     accumulates on top of existing cells).
-        combine_k = 1 if self.impl.fc2_reduces_topk else num_topk
-        self.combine_output = _sym_zeros(
-            (num_tokens_per_rank, combine_k, hidden),
-            problem.fc2_output_dtype,
-        )
-        # P0 scaffolding: tile-wise low-precision combine staging buffers.
-        # The bf16 ``combine_output`` above is left byte-identical; the
-        # quantized path additionally allocates separate packed-data + scale
-        # symmetric buffers that the fc2 epilogue (P1/P2) writes and the
-        # token-back warps push.  ``run_kernel`` gates the non-bf16 kernel
-        # path until that wiring lands.
-        self.combine_output_q = None
-        self.combine_sf_q = None
-        self.combine_global_q = None  # nvfp4 only: per-32 fp32 global plane
-        if self.impl.combine_is_quantized:
-            self._allocate_combine_quantized(
-                num_tokens_per_rank,
-                combine_k,
-                hidden,
+        # ---- Public 2D (T, hidden) combined output.  The kernel owns the
+        # per-topk (T, K, H) combine staging internally; the caller only
+        # provides/consumes the final reduced result.  Placement depends on the
+        # reduce mode:
+        #   * in_kernel_reduce: this IS the cross-rank ``red.global.add.v2.bf16x2``
+        #     target, so it MUST live on the sym heap; ``_sym_zeros`` also gives
+        #     the atomic-add-accumulate caller contract (start from zero).
+        #   * separate_kernel_reduce: peers write the internal staging instead;
+        #     this only receives the local tail reduce, so allocate it locally
+        #     (avoids any symmetric-heap caching ambiguity, matches deployment).
+        if self.impl.fc2_reduces_topk:
+            self.output_activation = _sym_zeros(
+                (num_tokens_per_rank, hidden),
+                problem.fc2_output_dtype,
             )
-        if not self.impl.fc2_reduces_topk:
+        else:
             if problem.fc2_output_dtype != torch.bfloat16:
                 raise ValueError(
-                    "form A CuTeDSL reduce currently expects "
-                    f"BF16 combine_output, got {problem.fc2_output_dtype}."
+                    "separate_kernel_reduce currently expects BF16 output, "
+                    f"got {problem.fc2_output_dtype}."
                 )
-            self.combine_reduced_output = torch.empty(
+            self.output_activation = torch.empty(
                 (num_tokens_per_rank, hidden),
                 dtype=problem.fc2_output_dtype,
                 device="cuda",
             )
-        else:
-            self.combine_reduced_output = None
 
         torch.cuda.synchronize()
         self._check_cuda_rng_consistency()
-
-    def _allocate_combine_quantized(
-        self,
-        num_tokens_per_rank: int,
-        combine_k: int,
-        hidden: int,
-    ) -> None:
-        """P0 scaffolding for tile-wise low-precision combine (block=32).
-
-        Allocates the per-``(token, topk)`` symmetric staging buffers the
-        token-back push will write when ``combine_dtype`` is ``mxfp8`` /
-        ``nvfp4`` (form A: one cell per ``(src_token, src_topk)``):
-
-          * ``combine_output_q`` -- packed low-precision data
-              - mxfp8: ``(T, K, hidden)`` fp8_e4m3 (1 byte/elem)
-              - nvfp4: ``(T, K, hidden)`` fp4_e2m1 packed 2/byte
-                       (storage last dim ``hidden // 2``)
-          * ``combine_sf_q``     -- per-32-elem-block scale, LINEAR row-major
-                                    (``hidden // 32`` entries; NOT swizzled)
-              - mxfp8: e8m0 (1 byte)
-              - nvfp4: e4m3 (1 byte)
-
-        Both are zero-initialised; form A writes each cell once so there is
-        no accumulation contract.  Nothing consumes these yet -- the fc2
-        epilogue quantization and the token-back scale push land in P1/P2.
-        """
-        block = _COMBINE_SF_BLOCK
-        if hidden % block != 0:
-            raise ValueError(
-                f"combine_dtype={self.impl.combine_dtype!r} tile-wise "
-                f"quantization needs hidden ({hidden}) divisible by "
-                f"block={block}."
-            )
-        num_sf_blocks = hidden // block
-        data_logical = (num_tokens_per_rank, combine_k, hidden)
-        sf_logical = (num_tokens_per_rank, combine_k, num_sf_blocks)
-        if self.impl.combine_dtype == "mxfp8":
-            # fp8_e4m3 data == nvshmem-native byte-view ScaleDtype (1 byte,
-            # shape kept); e8m0 scale is not a byte-view dtype, so allocate
-            # raw uint8 bytes and reinterpret.
-            self.combine_output_q = _sym_zeros_byte_view(
-                data_logical,
-                torch.float8_e4m3fn,
-            )
-            self.combine_sf_q = _sym_zeros(
-                sf_logical,
-                torch.uint8,
-            ).view(torch.float8_e8m0fnu)
-        elif self.impl.combine_dtype == "nvfp4":
-            # Tile-wise two-level: each 32-elem tile is a self-contained NVFP4
-            # quantum -> fp4 data + per-16 e4m3 sfc (hidden//16) + per-32 fp32
-            # global (hidden//32).  combine_sf_q carries the per-16 sfc;
-            # combine_global_q carries the per-32 fp32 global.
-            if hidden % _NVFP4_SFC_BLOCK != 0:
-                raise ValueError(
-                    f"combine_dtype='nvfp4' needs hidden ({hidden}) divisible "
-                    f"by the per-16 sfc block ({_NVFP4_SFC_BLOCK})."
-                )
-            sfc_logical = (
-                num_tokens_per_rank,
-                combine_k,
-                hidden // _NVFP4_SFC_BLOCK,
-            )
-            self.combine_output_q = _sym_zeros_byte_view(
-                data_logical,
-                torch.float4_e2m1fn_x2,
-            )
-            self.combine_sf_q = _sym_zeros_byte_view(
-                sfc_logical,
-                torch.float8_e4m3fn,
-            )
-            # PACK6 combined two-level SF plane: u8, 8 B per 32-elem tile, INTERLEAVED
-            # [ global fp32 (4B) | sfc0 (1B) | sfc1 (1B) | pad (2B) ], N=hidden//32.
-            # Token-back push dest; the receiver reads the 4D (T,K,N,2) views below.
-            # Must match the global_ws 8N region + token_comm combine_global_token_bytes.
-            self.combine_global_q = _sym_zeros(
-                (num_tokens_per_rank, combine_k, (hidden // _NVFP4_GLOBAL_BLOCK) * 8),
-                torch.uint8,
-            )
-        else:  # pragma: no cover - guarded by ImplDesc validation
-            raise AssertionError(self.impl.combine_dtype)
 
     # ------------------------------------------------------------------
     # Step 2: reference
@@ -1284,14 +1090,13 @@ class MegaMoETester:
             fc2_alpha=self._global_fc2_alpha,
             fc1_norm_const=self._global_fc1_norm_const,
             ref_compute_graph=self.misc.ref_compute_graph,
-            fc2_output_dtype=self.problem.fc2_output_dtype,
+            combine_format=self.problem.combine_format,
             gate_up_clamp=self.problem.gate_up_clamp,
-            combine_dtype=self.impl.combine_dtype,
         )
         self.combine_output_ref = reference.combine_output[self.rank].contiguous()
-        self.combine_reduced_output_ref = reference.combine_reduced_output[
-            self.rank
-        ].contiguous()
+        self.combine_reduced_output_ref = (
+            reference.combine_reduced_output[self.rank].contiguous()
+        )
 
     # ------------------------------------------------------------------
     # Step 3: workspace allocation
@@ -1324,14 +1129,11 @@ class MegaMoETester:
         local_ws_bytes, shared_ws_bytes = self._kernel.get_workspace_sizes()
 
         self.local_workspace = torch.zeros(
-            (local_ws_bytes,),
-            dtype=torch.uint8,
-            device="cuda",
+            (local_ws_bytes,), dtype=torch.uint8, device="cuda",
         )
         self.shared_workspace = _sym_zeros((shared_ws_bytes,), torch.uint8)
         self.symmetric_base, self.peer_offsets_list = _compute_peer_offsets(
-            self.shared_workspace,
-            self.world_size,
+            self.shared_workspace, self.world_size,
         )
 
     # ------------------------------------------------------------------
@@ -1364,7 +1166,7 @@ class MegaMoETester:
                 continue
             event_time_us = self._profiler_event_cuda_time_us(event)
             matched_event_names.append(event_name)
-            if event_name.startswith("kernel_cutlass_topk_reduce_"):
+            if event_name.startswith("kernel_cutlass__reduce_"):
                 topk_time_us += event_time_us
             else:
                 mega_time_us += event_time_us
@@ -1382,12 +1184,15 @@ class MegaMoETester:
             if topk_time_us == 0.0:
                 topk_time_us = float("nan")
         finite_parts = [
-            time_us for time_us in (mega_time_us, topk_time_us) if np.isfinite(time_us)
+            time_us
+            for time_us in (mega_time_us, topk_time_us)
+            if np.isfinite(time_us)
         ]
         total_time_us = sum(finite_parts) if finite_parts else float("nan")
 
         dist_active = (
-            torch.distributed.is_available() and torch.distributed.is_initialized()
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
         )
         if dist_active:
             local_times = torch.tensor(
@@ -1444,109 +1249,33 @@ class MegaMoETester:
             if not matched_event_names:
                 print("  warning: no kernel_cutlass* events matched")
 
-    def _reset_local_counters(self) -> None:
-        """Zero only the local flag/counter regions between back-to-back
-        launches.  The kernel does not reset its accumulating local counters
-        (``fc1_done_counter`` / ``fc2_done_counter`` spin thresholds,
-        ``load_balance_counter`` work-stealing cursor, ``expert_send_count`` /
-        ``l1_arrival_count`` / ``atomic_counter`` dispatch write-cursors, plus
-        the phase-flip ``grid_sync_counter`` / ``nvlink_barrier_counter``), so a
-        re-launch with stale values deadlocks or writes out of bounds.  Data
-        buffers (token / act / sf / fc1_output / fc2_output_workspace / topk
-        weights) are fully overwritten each launch and are deliberately NOT
-        zeroed -- a large memset between launches desyncs the ranks and pollutes
-        the steady-state entry-barrier timing.  Each region is rank-local, so
-        the async zero races nothing, and a memset is not a ``kernel_cutlass*``
-        event so it stays out of the measured time."""
-        kernel = self._kernel
-        if kernel is None or self.local_workspace is None:
-            return
-        for name in (
-            "l1_arrival_count",
-            "expert_send_count",
-            "grid_sync_counter",
-            "nvlink_barrier_counter",
-            "fc1_done_counter",
-            "fc2_done_counter",
-            "atomic_counter",
-            "load_balance_counter",
-        ):
-            if name in kernel._local_offsets:
-                off = kernel._local_offsets[name]
-                nbytes = kernel._local_region_by_name[name].nbytes
-                self.local_workspace[off : off + nbytes].zero_()
-
     def _launch_target_kernels_with_optional_torch_profiler(
         self,
         runtime_kwargs,
-        topk_reduce_runtime_kwargs,
     ) -> None:
-        """Launch the target kernel pipeline, optionally under torch profiler."""
+        """Launch the target kernel pipeline, optionally under torch profiler.
+
+        The compiled kernel now owns the separate-kernel-reduce tail internally
+        (launched on the same stream inside ``__call__``), so this is a single
+        compiled-kernel call; the reduce still shows up as its own
+        ``kernel_cutlass_topk_reduce_*`` device event in the profiler.
+        """
         if self._compiled_kernel is None:
             raise RuntimeError("compiled kernel is not available")
-        if (
-            topk_reduce_runtime_kwargs is not None
-            and self._compiled_topk_reduce is None
-        ):
-            raise RuntimeError("compiled topk reduce kernel is not available")
 
         def _launch() -> None:
             self._compiled_kernel(**runtime_kwargs)
-            if topk_reduce_runtime_kwargs is not None:
-                self._compiled_topk_reduce(**topk_reduce_runtime_kwargs)
 
         if not self._use_torch_profiler:
             _launch()
             torch.cuda.synchronize()
             return
 
-        # Per-iter cross-rank alignment + inter-launch spacing (requested):
-        #   * ``_align()``: drain this rank, CPU ``dist.barrier()``, then a
-        #     GPU-stream ``nvshmem.barrier_all`` left STREAM-ADJACENT to the
-        #     launch (deliberately NO trailing cuda.sync) so every rank's
-        #     kernel dequeues at ~the same wall-clock.  This stops the kernel's
-        #     in-kernel NVLink entry barrier from absorbing host launch skew as
-        #     inflated ``kernel_cutlass*`` device time (the prior no-barrier
-        #     path showed a 5.06 -> 8.01 ms per-rank spread from exactly this).
-        #   * ``loop_sleep_s``: idle gap AFTER each launch fully completes.  A
-        #     host sleep is not a ``kernel_cutlass*`` event, so it never enters
-        #     the measured time; it only spaces launches.  NB: a >0 gap lets
-        #     GB200 SM clocks ramp down, so the next launch may start clock-
-        #     limited -- expect a slightly higher / noisier number than the
-        #     back-to-back regime.  Override via ``MEGA_LOOP_SLEEP_MS`` (10).
-        import time
-
-        loop_sleep_s = (
-            max(0.0, float(os.environ.get("MEGA_LOOP_SLEEP_MS", "10"))) / 1000.0
-        )
-
-        def _align() -> None:
-            if not (
-                torch.distributed.is_available() and torch.distributed.is_initialized()
-            ):
-                return
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-            if not _no_dist():
-                import nvshmem.core
-
-                nvshmem.core.barrier_all(torch.cuda.current_stream())
-
-        # Warm up (untimed): same barrier + sleep regime as the timed loop so
-        # the steady state we measure matches the warmed-up state.
         for _ in range(self._perf_warmup):
-            self._reset_local_counters()
-            _align()
             self._compiled_kernel(**runtime_kwargs)
-            torch.cuda.synchronize()
-            if loop_sleep_s > 0:
-                time.sleep(loop_sleep_s)
         torch.cuda.synchronize()
 
-        # Timed: per-iter barrier-aligned launches, each fully drained then a
-        # ``loop_sleep_s`` idle gap.  The profiler still sums ``kernel_cutlass*``
-        # device time over the n_iters launches; barrier/sleep are filtered out
-        # by event name / are host-side, so the per-launch number stays clean.
+        # Timed: `_perf_iters` back-to-back launches, no host sync between them.
         n_iters = max(1, self._perf_iters)
         with torch.profiler.profile(
             activities=[
@@ -1555,12 +1284,8 @@ class MegaMoETester:
             ],
         ) as prof:
             for _ in range(n_iters):
-                self._reset_local_counters()
-                _align()
                 _launch()
-                torch.cuda.synchronize()
-                if loop_sleep_s > 0:
-                    time.sleep(loop_sleep_s)
+            torch.cuda.synchronize()
         self._report_torch_profiler_kernel_time(prof, num_iters=n_iters)
 
     def run_kernel(self) -> None:
@@ -1579,9 +1304,6 @@ class MegaMoETester:
           4. ``cute.compile`` once.
           5. Launch on the current cuda stream.
         """
-        # nvfp4 (tile-wise two-level): the fc2 epilogue quantizes to fp4 + per-16
-        # e4m3 sfc + per-32 fp32 global; token-back byte-copies all three
-        # planes; topk_reduce dequant-reduces to bf16.  Fully wired below.
         if (
             self.my_activation is None
             or self.my_activation_sf is None
@@ -1594,7 +1316,7 @@ class MegaMoETester:
             or self.my_fc1_alpha is None
             or self.my_fc2_alpha is None
             or self.my_fc1_norm_const is None
-            or self.combine_output is None
+            or self.output_activation is None
         ):
             raise RuntimeError("run_kernel requires generate_inputs first.")
 
@@ -1622,12 +1344,6 @@ class MegaMoETester:
         from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel
         from src.sym_buffer import SymBufferHost
 
-        if not self.impl.fc2_reduces_topk:
-            from moe_nvfp4_swapab.topk_reduce import (
-                compile_topk_reduce,
-                nvfp4_pack6_views,
-            )
-
         # -- 1. Kernel instance --
         # MegaMoE currently requires ``static_expert_shape != None`` (see
         # the subclass docstring): the dispatch SMEM sizing + the pool
@@ -1639,8 +1355,12 @@ class MegaMoETester:
             self.problem.hidden,
         )
 
-        cluster_size = self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
-        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
+        cluster_size = (
+            self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
+        )
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
+        )
         group_hint = self.impl.group_hint
         if group_hint is None:
             group_hint = max_active_clusters
@@ -1658,11 +1378,11 @@ class MegaMoETester:
             clc_bundle_size=self.impl.clc_bundle_size,
             num_sched_stages=self.impl.num_sched_stages,
             world_size=self.world_size,
-            local_rank=self.rank,
             num_topk=self.problem.num_topk,
             max_tokens_per_rank=self.problem.num_tokens_per_rank,
             hidden=self.problem.hidden,
             fc2_output_dtype=cutlass.BFloat16,
+            combine_format=self.problem.combine_format,
             non_ubulk_fc2_store=self.impl.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=self.impl.in_kernel_fc2_reduce,
             token_back_mode=self.impl.token_back_mode,
@@ -1670,7 +1390,6 @@ class MegaMoETester:
             gate_up_clamp=self.problem.gate_up_clamp,
             flag_batch=self.impl.flag_batch,
             epi_flag_batch=self.impl.epi_flag_batch,
-            combine_dtype=self.impl.combine_dtype,
         )
 
         # -- 2. Workspaces (local cuda + sym-heap) --
@@ -1679,12 +1398,9 @@ class MegaMoETester:
         # -- 3. Torch -> cute --
         # Same align defaults as runner_fc12: 16 B for general tensors,
         # 4 B for the i32 / fp32 counter / sized buffers.
-        def _to_cute(
-            tensor: torch.Tensor, assumed_align: int = 16, force_static_layout=False
-        ):
+        def _to_cute(tensor: torch.Tensor, assumed_align: int = 16, force_static_layout = False):
             cute_tensor = cutlass_torch.from_dlpack(
-                tensor,
-                assumed_align=assumed_align,
+                tensor, assumed_align=assumed_align,
             )
             if force_static_layout:
                 return cute_tensor
@@ -1702,26 +1418,22 @@ class MegaMoETester:
         fc1_alpha_cute = _to_cute(self.my_fc1_alpha, assumed_align=4)
         fc2_alpha_cute = _to_cute(self.my_fc2_alpha, assumed_align=4)
         fc1_norm_const_cute = _to_cute(self.my_fc1_norm_const, assumed_align=4)
-        combine_output_cute = _to_cute(self.combine_output)
-        local_workspace_cute = _to_cute(self.local_workspace, force_static_layout=True)
-        shared_workspace_cute = _to_cute(self.shared_workspace)
+        output_activation_cute = _to_cute(self.output_activation)
 
-        # Quantized combine staging (architecture B).  The kernel only reads
-        # these when combine_dtype != "bf16"; otherwise they are dead args, so
-        # the bf16 path passes the combine_output tensor as an unused placeholder
-        # (avoids None tensor args through cute.compile).
-        if self.impl.combine_is_quantized:
-            combine_output_q_cute = _to_cute(self.combine_output_q.view(torch.uint8))
-            combine_sf_q_cute = _to_cute(self.combine_sf_q.view(torch.uint8))
-            if self.impl.combine_dtype == "nvfp4":
-                # per-32 fp32 global plane (symmetric; token-back byte-copies it).
-                combine_global_q_cute = _to_cute(self.combine_global_q)
-            else:
-                combine_global_q_cute = combine_output_cute  # unused (mxfp8)
-        else:
-            combine_output_q_cute = combine_output_cute
-            combine_sf_q_cute = combine_output_cute
-            combine_global_q_cute = combine_output_cute
+        # Opaque byte workspaces -> raw uint8 gmem base pointers (no tensor). The
+        # kernel addresses them by base + Int64 byte offset; a tensor's shape would
+        # be ignored AND overflow cute's 32-bit memref shape field once the
+        # internalized combine staging pushes shared_workspace past 2 GiB.
+        from cutlass.cute.typing import AddressSpace as _AddressSpace
+
+        def _to_cute_ptr(tensor: torch.Tensor, assumed_align: int = 16):
+            return cute.runtime.make_ptr(
+                cutlass.Uint8, tensor.data_ptr(), _AddressSpace.gmem,
+                assumed_align=assumed_align,
+            )
+
+        local_workspace_cute = _to_cute_ptr(self.local_workspace)
+        shared_workspace_cute = _to_cute_ptr(self.shared_workspace)
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1748,10 +1460,7 @@ class MegaMoETester:
             fc1_alpha=fc1_alpha_cute,
             fc2_alpha=fc2_alpha_cute,
             fc1_norm_const=fc1_norm_const_cute,
-            combine_output=combine_output_cute,
-            combine_output_q=combine_output_q_cute,
-            combine_sf_q=combine_sf_q_cute,
-            combine_global_q=combine_global_q_cute,
+            output_activation=output_activation_cute,
             local_workspace=local_workspace_cute,
             shared_workspace=shared_workspace_cute,
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
@@ -1764,83 +1473,9 @@ class MegaMoETester:
 
         self._compiled_kernel = cute.compile(self._kernel, **compile_kwargs)
 
-        self._compiled_topk_reduce = None
-        topk_reduce_runtime_kwargs = None
-        if not self.impl.fc2_reduces_topk:
-            if self.combine_reduced_output is None:
-                raise RuntimeError(
-                    "form A CuTeDSL reduce requires combine_reduced_output allocation."
-                )
-            combine_reduced_output_cute = _to_cute(self.combine_reduced_output)  # noqa: F841
-            topk_reduce_score = (
-                self.my_topk_weights
-                if self.misc.ref_compute_graph == "transformers"
-                else None
-            )
-            topk_reduce_score_cute = (  # noqa: F841
-                topk_weights_cute
-                if self.misc.ref_compute_graph == "transformers"
-                else None
-            )
-            # Architecture B: under mxfp8 the kernel pushed fp8 data +
-            # e8m0 scales into combine_output_q / combine_sf_q; the receiver
-            # reduce dequantizes those (block=32, native in topk_reduce) into
-            # bf16.  bf16 reduces the plain combine_output as before.
-            topk_nvfp4_sfc = None
-            topk_nvfp4_global = None
-            if self.impl.combine_dtype == "mxfp8":
-                topk_combine_input = self.combine_output_q
-                topk_mxfp8_scale = self.combine_sf_q
-            elif self.impl.combine_dtype == "nvfp4":
-                # The kernel/token-back deliver the two-level scales consolidated into
-                # ONE PACK6 combined plane (combine_global_q, u8, 8 B/tile INTERLEAVED
-                # [ global fp32 (4B) | sfc0 (1B) | sfc1 (1B) | pad (2B) ] at byte 8g,
-                # g = hidden//32 tile).  Unpack it back into the (per-32 fp32 global,
-                # per-16 e4m3 sfc) tensors the receiver expects.
-                topk_combine_input = self.combine_output_q.view(torch.uint8)
-                topk_mxfp8_scale = None
-                # The two sfc bytes (8g+4, 8g+5) have a NON-UNIFORM stride across tile
-                # boundaries, so a flat (T,K,2N) sfc view is impossible.  Unpack BOTH
-                # scales as 4D (T,K,N,2), N=hidden//32, each with a stride-1 innermost
-                # dim (from_dlpack/get_leading_dim need it):
-                #   global[..,g,0] = fp32 word (byte 8g); [..,g,1] is sfc|pad (unused)
-                #   sfc[..,g,0] = byte 8g+4 (sfc0); sfc[..,g,1] = byte 8g+5 (sfc1)
-                # The receiver indexes [token,k,g,sub].
-                # LIVE strided views into combine_global_q (the buffer token-back fills
-                # every iteration).  Do NOT .contiguous() -- that snapshots the buffer's
-                # contents now (compile/setup time, before token-back runs) and the
-                # receiver would dequantize stale zeros.
-                # Single source of the PACK6 unpack contract (shared with the
-                # topk_reduce tests via nvfp4_pack6_views).  Returns LIVE strided
-                # views; combine_global_q must stay alive (it is the member tensor
-                # token-back fills every iteration) and must NOT be .contiguous()'d.
-                topk_nvfp4_global, topk_nvfp4_sfc = nvfp4_pack6_views(
-                    self.combine_global_q
-                )
-            else:
-                topk_combine_input = self.combine_output
-                topk_mxfp8_scale = None
-            topk_reduce_plan = compile_topk_reduce(
-                topk_combine_input,
-                self.combine_reduced_output,
-                topk_reduce_score,
-                mxfp8_scale=topk_mxfp8_scale,
-                nvfp4_sfc_scale=topk_nvfp4_sfc,
-                nvfp4_global_scale=topk_nvfp4_global,
-                stream=stream,
-            )
-            self._compiled_topk_reduce = topk_reduce_plan[0]
-            # Use the plan's own cute tensors (built against the exact dtypes /
-            # layouts it specialized for) for the launch.
-            topk_reduce_runtime_kwargs = dict(
-                combine_cute=topk_reduce_plan[1],
-                reduced_cute=topk_reduce_plan[2],
-                topk_score_cute=topk_reduce_plan[3],
-                mxfp8_scale_cute=topk_reduce_plan[4],
-                nvfp4_sfc_scale_cute=topk_reduce_plan[5],
-                nvfp4_global_scale_cute=topk_reduce_plan[6],
-                stream=stream,
-            )
+        # The separate-kernel-reduce tail is now launched inside the kernel's
+        # ``__call__`` (same stream, right after the mega kernel), so the runner
+        # no longer compiles or chains a standalone reduce.
 
         # -- 5. Launch --
         #
@@ -1877,7 +1512,7 @@ class MegaMoETester:
         #       the symmetric-memory teardown and is the leading suspect
         #       behind multi-rank ``nsys`` runs hanging post-capture.
         #
-        # ``MEGA_NO_DIST=1`` / uninitialised ``torch.distributed`` paths skip
+        # ``_NO_DIST=1`` / uninitialised ``torch.distributed`` paths skip
         # both barriers silently so single-rank smoke runs and the
         # ``MEGA_NO_DIST=1`` debugger path are unaffected.
         #
@@ -1887,7 +1522,8 @@ class MegaMoETester:
 
             torch.cuda.synchronize()
             _dist_active = (
-                torch.distributed.is_available() and torch.distributed.is_initialized()
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
             )
             if _dist_active:
                 torch.distributed.barrier()
@@ -1895,7 +1531,6 @@ class MegaMoETester:
             with nvtx.annotate("cute_dsl_prof"):
                 self._launch_target_kernels_with_optional_torch_profiler(
                     runtime_kwargs,
-                    topk_reduce_runtime_kwargs,
                 )
             if _dist_active:
                 torch.distributed.barrier()
@@ -1903,7 +1538,6 @@ class MegaMoETester:
         else:
             self._launch_target_kernels_with_optional_torch_profiler(
                 runtime_kwargs,
-                topk_reduce_runtime_kwargs,
             )
 
     # ------------------------------------------------------------------
@@ -1943,72 +1577,7 @@ class MegaMoETester:
         """
         if self.misc.skip_ref_check:
             return
-        if self.impl.combine_is_quantized:
-            # Lossy acceptance: the cross-rank push quantized fc2 to mxfp8/nvfp4
-            # tile-wise, so the exact bf16 bitwise gate cannot apply.  Compare
-            # the final reduced (T, H) bf16 against the bf16 golden via SNR
-            # (scale-free, no tensor-size limit) plus rel-error stats.
-            if self.combine_reduced_output is None:
-                raise RuntimeError(
-                    "quantized combine validate requires combine_reduced_output."
-                )
-            if self.combine_reduced_output_ref is None:
-                raise RuntimeError("validate requires reduced reference output.")
-            actual = self.combine_reduced_output.to(torch.float32)
-            ref = self.combine_reduced_output_ref.to(torch.float32)
-            err = actual - ref
-            sig_pow = (ref * ref).sum()
-            err_pow = (err * err).sum()
-            snr_db = float(
-                (10.0 * torch.log10(sig_pow / err_pow.clamp(min=1e-30))).item()
-            )
-            rel = err.abs() / ref.abs().clamp(min=1.0)
-            mean_rel = float(rel.mean().item())
-            max_rel = float(rel.max().item())
-            max_abs = float(err.abs().max().item())
-            # mxfp8 (32xfp8 + e8m0/block) gives ~1-3% per-element rel error; the
-            # K-axis fp32 reduce averages it down, so SNR ~31.5 dB measured -> a
-            # 28 dB gate (measured - ~3.5 dB margin).  nvfp4 tile-wise (fp4 + per-16
-            # e4m3 sfc + per-32 fp32 global) is inherently coarser: fp4 e2m1 has a
-            # ~10 dB per-element grid ceiling, clawed back to ~20.5 dB measured
-            # post-reduce (single-rank h7168/topk6/gh512 = 20.49 dB, matching the
-            # make_nvfp4_input reference prior to the decimal).  Gate at 17 dB =
-            # measured - ~3.5 dB, mirroring the mxfp8 margin -- NOT a hand-wave.
-            snr_thresh = 28.0 if self.impl.combine_dtype == "mxfp8" else 17.0
-            local_pass = snr_db >= snr_thresh
-            if self.rank == 0:
-                print(
-                    f"---- combine_dtype={self.impl.combine_dtype} lossy check: "
-                    f"SNR={snr_db:.2f}dB (>= {snr_thresh}) "
-                    f"mean_rel={mean_rel:.4f} max_rel={max_rel:.4f} "
-                    f"max_abs={max_abs:.4f} ----"
-                )
-                sys.stdout.flush()
-            # Cross-rank lockstep: all ranks must branch identically or a
-            # passing rank returning early desyncs NCCL against a failing one.
-            rank_passes = [local_pass]
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                pt = torch.tensor(
-                    [int(local_pass)],
-                    device=actual.device,
-                    dtype=torch.int32,
-                )
-                gathered = [torch.empty_like(pt) for _ in range(self.world_size)]
-                torch.distributed.all_gather(gathered, pt)
-                rank_passes = [bool(t.item()) for t in gathered]
-            if all(rank_passes):
-                if self.rank == 0:
-                    print(
-                        f"Validation PASSED on all ranks "
-                        f"(lossy {self.impl.combine_dtype}: SNR within band)"
-                    )
-                return
-            raise AssertionError(
-                f"[rank {self.rank}] quantized combine validation FAILED: "
-                f"SNR={snr_db:.2f}dB < {snr_thresh} "
-                f"(mean_rel={mean_rel:.4f} max_rel={max_rel:.4f})"
-            )
-        if self.combine_output is None:
+        if self.output_activation is None:
             raise RuntimeError("validate requires run_kernel first.")
         if self.combine_output_ref is None:
             raise RuntimeError("validate requires compute_reference first.")
@@ -2025,22 +1594,15 @@ class MegaMoETester:
                 "collapsed the topk axis."
             )
 
+        # Both modes now expose the same 2D (T, hidden) ``output_activation``.
+        actual_reduced = self.output_activation.to(torch.float32)
         if self.impl.fc2_reduces_topk:
-            if self.combine_output.shape[1] != 1:
-                raise AssertionError(
-                    f"[rank {self.rank}] fc2 reduce mode expects "
-                    f"combine_output.shape[1] == 1 (device-side topk "
-                    f"reduce collapses K), got "
-                    f"{tuple(self.combine_output.shape)}."
-                )
-            actual_reduced = self.combine_output.squeeze(1).to(torch.float32)
-            ref_reduced = _bf16_seq_sum_k(self.combine_output_ref).to(torch.float32)
+            # in_kernel_reduce: K already collapsed on device; the reference is
+            # the host bf16 sequential K-sum of the per-topk reference cells.
+            ref_reduced = _bf16_seq_sum_k(
+                self.combine_output_ref
+            ).to(torch.float32)
         else:
-            if self.combine_reduced_output is None:
-                raise RuntimeError(
-                    "validate requires combine_reduced_output for form A."
-                )
-            actual_reduced = self.combine_reduced_output.to(torch.float32)
             ref_reduced = self.combine_reduced_output_ref.to(torch.float32)
 
         diff = (actual_reduced - ref_reduced).abs()
@@ -2061,8 +1623,7 @@ class MegaMoETester:
             K = self.combine_output_ref.shape[1]
             if K <= _FORM_B_PERM_K_LIMIT:
                 match_mask, n_perms = _form_b_bitwise_match(
-                    actual_reduced,
-                    self.combine_output_ref,
+                    actual_reduced, self.combine_output_ref,
                 )
                 n_matched = int(match_mask.sum().item())
                 n_total = match_mask.numel()
@@ -2091,10 +1652,13 @@ class MegaMoETester:
                         dtype=torch.int32,
                     )
                     gathered_passes = [
-                        torch.empty_like(pass_tensor) for _ in range(self.world_size)
+                        torch.empty_like(pass_tensor)
+                        for _ in range(self.world_size)
                     ]
                     torch.distributed.all_gather(gathered_passes, pass_tensor)
-                    rank_bitwise_passes = [bool(t.item()) for t in gathered_passes]
+                    rank_bitwise_passes = [
+                        bool(t.item()) for t in gathered_passes
+                    ]
                 if all(rank_bitwise_passes):
                     if self.rank == 0:
                         print(
@@ -2106,14 +1670,16 @@ class MegaMoETester:
                 if not local_bitwise_pass:
                     bad = (~match_mask).nonzero(as_tuple=False)
                     n_local_bad = int(bad.shape[0])
-                    sample = bad[: min(8, n_local_bad)].cpu().tolist()
+                    sample = bad[:min(8, n_local_bad)].cpu().tolist()
                     print(
                         f"[rank {self.rank}] form-B bitwise miss: "
                         f"{n_local_bad} cell(s); sample "
                         f"(token, hidden)={sample}"
                     )
                     sys.stdout.flush()
-                failed_ranks = [r for r, ok in enumerate(rank_bitwise_passes) if not ok]
+                failed_ranks = [
+                    r for r, ok in enumerate(rank_bitwise_passes) if not ok
+                ]
                 n_bad = int((diff > atol).sum().item())
                 raise AssertionError(
                     f"[rank {self.rank}] form-B bitwise check failed on ranks "
@@ -2192,9 +1758,9 @@ class MegaMoETester:
                 # Gather per-cell K terms (n_verify, K) then sum of |x|.
                 # combine_output_ref is (T, K, H) bf16; advanced index
                 # combines suspect_t and suspect_h elementwise.
-                cells_ref_K = self.combine_output_ref[suspect_t, :, suspect_h].to(
-                    torch.float32
-                )
+                cells_ref_K = self.combine_output_ref[
+                    suspect_t, :, suspect_h
+                ].to(torch.float32)
                 cells_abs_sum = cells_ref_K.abs().sum(dim=1)
                 bound = SAFETY * K * cells_abs_sum / 256.0
                 suspect_abs_diff = abs_diff.flatten()[top_indices].cpu()
@@ -2234,10 +1800,7 @@ class MegaMoETester:
         bitwise_mismatch_count = None
         if self.impl.fc2_reduces_topk:
             local_pass = torch.allclose(
-                actual_reduced,
-                ref_reduced,
-                atol=atol,
-                rtol=rtol,
+                actual_reduced, ref_reduced, atol=atol, rtol=rtol,
             )
         else:
             bitwise_mismatch_count = int((diff != 0).sum().item())
@@ -2246,7 +1809,8 @@ class MegaMoETester:
         rank_max_diffs = [float(local_max_diff.item())]
         rank_passes = [local_pass]
         _dist_active = (
-            torch.distributed.is_available() and torch.distributed.is_initialized()
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
         )
         if _dist_active:
             gathered_diffs = [
@@ -2264,7 +1828,7 @@ class MegaMoETester:
             rank_passes = [bool(rank_pass.item()) for rank_pass in gathered_passes]
 
         if not local_pass:
-            print(self.combine_output)
+            print(self.output_activation)
             print(self.combine_output_ref)
             num_bad = (
                 bitwise_mismatch_count
@@ -2290,7 +1854,10 @@ class MegaMoETester:
                 f"rank {rank}: max_diff={max_diff:.4g}"
                 for rank, max_diff in enumerate(rank_max_diffs)
             )
-            print(f"Validation PASSED on all ranks ({diff_summary})")
+            print(
+                f"Validation PASSED on all ranks "
+                f"({diff_summary})"
+            )
 
     # ------------------------------------------------------------------
     # Workspace peek (MEGA_PEEK_WORKSPACE=1)
@@ -2316,25 +1883,22 @@ class MegaMoETester:
         """
         from moe_nvfp4_swapab.megamoe_kernel import _layout_regions
 
-        local_specs = self._kernel._local_region_specs  # type: ignore[attr-defined]
-        shared_specs = self._kernel._shared_region_specs  # type: ignore[attr-defined]
+        local_specs = self._kernel._local_region_specs
+        shared_specs = self._kernel._shared_region_specs
         local_offsets, _ = _layout_regions(local_specs)
         shared_offsets, _ = _layout_regions(shared_specs)
-        local_by_name = self._kernel._local_region_by_name  # type: ignore[attr-defined]
-        shared_by_name = self._kernel._shared_region_by_name  # type: ignore[attr-defined]
+        local_by_name = self._kernel._local_region_by_name
+        shared_by_name = self._kernel._shared_region_by_name
 
         def _region(ws, by_name, offsets, name, torch_dtype):
             spec = by_name[name]
             off = offsets[name]
-            return ws[off : off + spec.nbytes].view(torch_dtype)
+            return ws[off:off + spec.nbytes].view(torch_dtype)
 
         # ---- 1. expert routing counters (low32=tokens, high32=publishers*ranks).
         ercs = _region(
-            self.shared_workspace,
-            shared_by_name,
-            shared_offsets,
-            "expert_recv_count_sum",
-            torch.int64,
+            self.shared_workspace, shared_by_name, shared_offsets,
+            "expert_recv_count_sum", torch.int64,
         )
         print("---- expert_recv_count_sum ----")
         for i in range(ercs.shape[0]):
@@ -2346,28 +1910,25 @@ class MegaMoETester:
 
         # ---- 2. token_src_metadata: (pool_slot) -> (src_rank, src_token, src_topk).
         mbuf = _region(
-            self.local_workspace,
-            local_by_name,
-            local_offsets,
-            "token_src_metadata",
-            torch.int32,
+            self.local_workspace, local_by_name, local_offsets,
+            "token_src_metadata", torch.int32,
         )
         md_u32 = mbuf.reshape(-1, 3)
         n_slots = md_u32.shape[0]
-        sample_rows = sorted(
-            set(
-                list(range(min(8, n_slots)))
-                + [n_slots // 2 - 1, n_slots // 2, n_slots // 2 + 1]
-                + list(range(max(0, n_slots - 4), n_slots))
-            )
-        )
+        sample_rows = sorted(set(
+            list(range(min(8, n_slots)))
+            + [n_slots // 2 - 1, n_slots // 2, n_slots // 2 + 1]
+            + list(range(max(0, n_slots - 4), n_slots))
+        ))
         print(
             f"---- token_src_metadata (pool_slot -> (src_rank, src_token, src_topk)) "
             f"n_slots={n_slots} ----"
         )
         for s in sample_rows:
             r = md_u32[s].cpu().tolist()
-            print(f"  slot[{s}]: src_rank={r[0]} src_token={r[1]} src_topk={r[2]}")
+            print(
+                f"  slot[{s}]: src_rank={r[0]} src_token={r[1]} src_topk={r[2]}"
+            )
 
         # ---- 2a. duplicate (src_rank, src_token, src_topk) detection.
         #
@@ -2402,7 +1963,8 @@ class MegaMoETester:
         coll_mask = counts > 1
         n_collisions = int(coll_mask.sum().item())
         print(
-            f"---- duplicate metadata triples (n_collision_triples={n_collisions}) ----"
+            f"---- duplicate metadata triples (n_collision_triples="
+            f"{n_collisions}) ----"
         )
         if n_collisions == 0:
             print("  (no duplicates -- metadata is 1:1 with combine_output cells)")
@@ -2421,7 +1983,7 @@ class MegaMoETester:
                 src_topk = k & 0xFFFF
                 # Find which pool_slots map here.
                 slot_ids = (key == k).nonzero(as_tuple=False).squeeze(-1)
-                slot_sample = slot_ids[: min(8, slot_ids.numel())].tolist()
+                slot_sample = slot_ids[:min(8, slot_ids.numel())].tolist()
                 tag = ""
                 if src_rank == 0 and src_token == 0 and src_topk == 0:
                     tag = "  [LIKELY PADDING / UNWRITTEN]"
@@ -2429,12 +1991,16 @@ class MegaMoETester:
                     f"  (src_rank={src_rank}, src_token={src_token}, "
                     f"src_topk={src_topk}) x {c}{tag}"
                 )
-                print(f"    first {len(slot_sample)} slot ids: {slot_sample}")
-                shown += 1  # noqa: SIM113
+                print(
+                    f"    first {len(slot_sample)} slot ids: {slot_sample}"
+                )
+                shown += 1
                 if shown >= shown_limit:
                     remaining = n_collisions - shown
                     if remaining > 0:
-                        print(f"  ... ({remaining} more collision triples elided)")
+                        print(
+                            f"  ... ({remaining} more collision triples elided)"
+                        )
                     break
 
         # ---- 2b. expected-vs-actual (src_token, src_topk) reverse check.
@@ -2466,10 +2032,15 @@ class MegaMoETester:
         fc1_spec_rc = local_by_name["fc1_output"]
         fc1_off_rc = local_offsets["fc1_output"]
         fc1_raw_rc = self.local_workspace[
-            fc1_off_rc : fc1_off_rc + fc1_spec_rc.nbytes
+            fc1_off_rc:fc1_off_rc + fc1_spec_rc.nbytes
         ].view(torch.uint8)
-        row_bytes_rc = fc1_spec_rc.shape[1] // 2 if len(fc1_spec_rc.shape) >= 2 else 0
-        rc_ready = row_bytes_rc > 0 and fc1_raw_rc.numel() % row_bytes_rc == 0
+        row_bytes_rc = (
+            fc1_spec_rc.shape[1] // 2 if len(fc1_spec_rc.shape) >= 2 else 0
+        )
+        rc_ready = (
+            row_bytes_rc > 0
+            and fc1_raw_rc.numel() % row_bytes_rc == 0
+        )
         if rc_ready:
             fc1_2d_rc = fc1_raw_rc.view(-1, row_bytes_rc).cpu()
             valid_slot_mask = (fc1_2d_rc != 0).any(dim=1)
@@ -2479,7 +2050,9 @@ class MegaMoETester:
             # (t, k) on different source ranks lives in different
             # pool slots on the receiver).  Single-rank degenerates to
             # the previous behaviour (src_rank == 0 everywhere).
-            seen_triples = set(map(tuple, md_cpu[valid_slot_mask, :].tolist()))
+            seen_triples = set(
+                map(tuple, md_cpu[valid_slot_mask, :].tolist())
+            )
             # Expected universe: every (src_rank, src_token, src_topk)
             # whose routed expert lands on THIS rank.  Per-rank
             # routing is built by replaying ``_generate_topk_idx_*``;
@@ -2487,9 +2060,14 @@ class MegaMoETester:
             # tensor in ``self._global_topk_idx`` (shape
             # ``(num_ranks, T, K)``).  Filter by
             # ``expert // num_experts_per_rank == self.rank``.
-            num_experts_per_rank = self.problem.num_total_experts // self.world_size
+            num_experts_per_rank = (
+                self.problem.num_total_experts // self.world_size
+            )
             expected_triples = set()
-            if hasattr(self, "_global_topk_idx") and self._global_topk_idx is not None:
+            if (
+                hasattr(self, "_global_topk_idx")
+                and self._global_topk_idx is not None
+            ):
                 gti = self._global_topk_idx.cpu()  # (R, T, K)
                 for sr in range(self.world_size):
                     for t in range(T):
@@ -2547,8 +2125,8 @@ class MegaMoETester:
                 print(f"  first 16 extras (src_rank, src_token, src_topk): {sample}")
         else:
             print(
-                f"---- expected-vs-actual reverse check skipped "  # noqa: F541
-                f"(fc1_output peek unavailable) ----"  # noqa: F541
+                f"---- expected-vs-actual reverse check skipped "
+                f"(fc1_output peek unavailable) ----"
             )
 
         # ---- 3. fc1_output non-zero row mask (per pool_slot) + hash.
@@ -2561,9 +2139,9 @@ class MegaMoETester:
         # differs the race is on the read / fc2 phase side.
         fc1_spec = local_by_name["fc1_output"]
         fc1_off = local_offsets["fc1_output"]
-        fc1_raw = self.local_workspace[fc1_off : fc1_off + fc1_spec.nbytes].view(
-            torch.uint8
-        )
+        fc1_raw = self.local_workspace[
+            fc1_off:fc1_off + fc1_spec.nbytes
+        ].view(torch.uint8)
         row_bytes = fc1_spec.shape[1] // 2 if len(fc1_spec.shape) >= 2 else 0
         if row_bytes > 0 and fc1_raw.numel() % row_bytes == 0:
             fc1_2d = fc1_raw.view(-1, row_bytes).cpu()
@@ -2581,8 +2159,12 @@ class MegaMoETester:
                 f"hash=0x{fc1_hash:08x} ----"
             )
             if zero_rows:
-                print(f"  first 16 zero rows: {zero_rows[:16]}")
-                print(f"  last 16 zero rows : {zero_rows[-16:]}")
+                print(
+                    f"  first 16 zero rows: {zero_rows[:16]}"
+                )
+                print(
+                    f"  last 16 zero rows : {zero_rows[-16:]}"
+                )
 
             # ---- 3b. fc1_output * SF dequant sample (head/tail rows).
             #
@@ -2598,11 +2180,9 @@ class MegaMoETester:
             K_atoms = (K_sf_blocks_total + 3) // 4
             sf_spec = local_by_name["fc1_output_sf"]
             sf_off = local_offsets["fc1_output_sf"]
-            sf_raw = (
-                self.local_workspace[sf_off : sf_off + sf_spec.nbytes]
-                .view(torch.uint8)
-                .cpu()
-            )
+            sf_raw = self.local_workspace[
+                sf_off:sf_off + sf_spec.nbytes
+            ].view(torch.uint8).cpu()
 
             def _sf_byte_offset(m: int, sf_block: int) -> int:
                 return (
@@ -2617,10 +2197,8 @@ class MegaMoETester:
             n_show_cells = 16
             n_rows_total = fc1_2d.shape[0]
             sample_row_ids = list(range(min(n_show_rows, n_rows_total))) + [
-                r
-                for r in range(
-                    max(0, n_rows_total - n_show_rows),
-                    n_rows_total,
+                r for r in range(
+                    max(0, n_rows_total - n_show_rows), n_rows_total,
                 )
                 if r >= n_show_rows  # avoid duplicates when rows < 2*n_show
             ]
@@ -2637,7 +2215,10 @@ class MegaMoETester:
                 fp4_vals = _Fp4DecodeTable[fp4_idx]
                 # SF bytes for this row (one byte per sf_block).
                 sf_byte_idxs = torch.tensor(
-                    [_sf_byte_offset(r, sb) for sb in range(K_sf_blocks_total)],
+                    [
+                        _sf_byte_offset(r, sb)
+                        for sb in range(K_sf_blocks_total)
+                    ],
                     dtype=torch.int64,
                 )
                 sf_bytes = sf_raw[sf_byte_idxs]
@@ -2649,7 +2230,9 @@ class MegaMoETester:
                 ).reshape(-1)
 
                 n_cells_actual = min(n_show_cells, dequant.numel())
-                head_cells = [f"{v:+.2f}" for v in dequant[:n_cells_actual].tolist()]
+                head_cells = [
+                    f"{v:+.2f}" for v in dequant[:n_cells_actual].tolist()
+                ]
                 sf_show = [f"{s:+.3f}" for s in sf_fp32.tolist()]
                 print(
                     f"  row[{r}]: dequant min={dequant.min().item():+.3f} "
@@ -2674,8 +2257,7 @@ class MegaMoETester:
                 full_lo = (fc1_2d & 0x0F).to(torch.int64)
                 full_hi = ((fc1_2d >> 4) & 0x0F).to(torch.int64)
                 full_fp4_idx = torch.stack(
-                    [full_lo, full_hi],
-                    dim=-1,
+                    [full_lo, full_hi], dim=-1,
                 ).reshape(fc1_2d.shape[0], -1)
                 full_fp4_vals = _Fp4DecodeTable[full_fp4_idx]
                 # Per-(valid_row, sf_block) SF byte offsets, gathered
@@ -2689,16 +2271,15 @@ class MegaMoETester:
                     dtype=torch.int64,
                 )
                 sf_bytes_all = sf_raw[sf_offsets_all].view(
-                    n_valid,
-                    K_sf_blocks_total,
+                    n_valid, K_sf_blocks_total,
                 )
-                sf_fp32_all = sf_bytes_all.view(torch.float8_e4m3fn).to(torch.float32)
+                sf_fp32_all = (
+                    sf_bytes_all.view(torch.float8_e4m3fn).to(torch.float32)
+                )
                 valid_fp4 = full_fp4_vals[valid_row_ids]
                 dequant_all = (
                     valid_fp4.reshape(
-                        n_valid,
-                        K_sf_blocks_total,
-                        sf_vec_size,
+                        n_valid, K_sf_blocks_total, sf_vec_size,
                     )
                     * sf_fp32_all.unsqueeze(-1)
                 ).reshape(n_valid, -1)
@@ -2745,7 +2326,7 @@ class MegaMoETester:
         for buf_name in ("fc1_output_sf", "l1_sf_buffer"):
             spec = local_by_name[buf_name]
             off = local_offsets[buf_name]
-            raw = self.local_workspace[off : off + spec.nbytes].view(torch.uint8)
+            raw = self.local_workspace[off:off + spec.nbytes].view(torch.uint8)
             u32 = raw.view(torch.int32).cpu().to(torch.int64)
             buf_hash = int((u32 & 0xFFFFFFFF).sum().item()) % 0x7FFFFFFF
             print(
@@ -2764,7 +2345,8 @@ class MegaMoETester:
         if hasattr(self, "_global_topk_idx") and self._global_topk_idx is not None:
             host_diff_per_token = diff.sum(dim=-1).cpu()  # (T,)
             bad_token_ids = (
-                (host_diff_per_token > 0).nonzero(as_tuple=False).squeeze(-1).tolist()
+                (host_diff_per_token > 0).nonzero(as_tuple=False)
+                .squeeze(-1).tolist()
             )
             n_bad_tokens = len(bad_token_ids)
             topk_idx_cpu = self._global_topk_idx[self.rank].cpu()
@@ -2778,9 +2360,12 @@ class MegaMoETester:
             # rank's ``num_experts_per_rank`` experts; global expert
             # ids that route to OTHER ranks have no entry here).
             n_local_e = ercs.shape[0]
-            num_experts_per_rank = self.problem.num_total_experts // self.world_size
+            num_experts_per_rank = (
+                self.problem.num_total_experts // self.world_size
+            )
             expert_recv_local = [
-                int(ercs[i].item()) & 0xFFFFFFFF for i in range(n_local_e)
+                int(ercs[i].item()) & 0xFFFFFFFF
+                for i in range(n_local_e)
             ]
 
             def _recv_for(e_global):
@@ -2807,8 +2392,12 @@ class MegaMoETester:
                         if topk_w_cpu is not None
                         else ""
                     )
-                    pieces.append(f"k{k_idx}=e{e_int}(recv={_recv_for(e_int)},{wt})")
-                print(f"  token[{t}] diff_sum={ds:.4g}  " + " ".join(pieces))
+                    pieces.append(
+                        f"k{k_idx}=e{e_int}(recv={_recv_for(e_int)},{wt})"
+                    )
+                print(
+                    f"  token[{t}] diff_sum={ds:.4g}  " + " ".join(pieces)
+                )
 
         # ---- 4. worst-diff tokens (on UNREDUCED (T, K, H) abs diff).
         #
@@ -2818,17 +2407,26 @@ class MegaMoETester:
         # The peek instead works on the raw ``|actual - ref|`` cell
         # tensor of shape ``(T, K, H)`` so every cell-level error is
         # visible.
-        # form A: actual & ref both (T, K, H), do raw per-cell diff.
-        # form B: actual is (T, 1, H) (K already reduced on device); the
-        # per-(K, H) cell diff is no longer meaningful, so reduce ref's
-        # K axis on host and do the diff in (T, H).
+        # separate_kernel_reduce: the per-topk (T, K, H) staging is internal to
+        #   the kernel, so read it back from the shared-workspace
+        #   ``combine_quant`` region for a raw per-cell diff (bf16 combine only).
+        # in_kernel_reduce: device output is already (T, H) (K reduced on
+        #   device); the per-(K, H) cell diff is meaningless, so reduce ref's K
+        #   axis on host and diff in (T, H).
         if self.impl.fc2_reduces_topk:
-            actual_full = self.combine_output.to(torch.float32).squeeze(1)
+            actual_full = self.output_activation.to(torch.float32)
             ref_full = self.combine_output_ref.to(torch.float32).sum(dim=1)
             unreduced_diff = (actual_full - ref_full).abs()  # (T, H)
             per_token_diff_sum = unreduced_diff.sum(dim=-1)  # (T,)
         else:
-            actual_full = self.combine_output.to(torch.float32)
+            combine_quant_raw = _region(
+                self.shared_workspace, shared_by_name, shared_offsets,
+                "combine_quant", self.problem.fc2_output_dtype,
+            )
+            actual_full = (
+                combine_quant_raw.reshape(self.combine_output_ref.shape)
+                .to(torch.float32)
+            )
             ref_full = self.combine_output_ref.to(torch.float32)
             unreduced_diff = (actual_full - ref_full).abs()  # (T, K, H)
             per_token_diff_sum = unreduced_diff.sum(dim=(1, 2))  # (T,)
@@ -2846,7 +2444,7 @@ class MegaMoETester:
                 f"top {n_worst_cells_per_token} hidden cells; K already "
                 "reduced on device) ----"
             )
-            for t, ds in zip(bad_tokens, bad_diff_sums):  # noqa: B905
+            for t, ds in zip(bad_tokens, bad_diff_sums):
                 token_diff = unreduced_diff[t]  # (H,)
                 n_cells = min(n_worst_cells_per_token, token_diff.numel())
                 top_cells = torch.topk(token_diff, k=n_cells)
@@ -2860,7 +2458,8 @@ class MegaMoETester:
                     r = float(ref_full[t, h].item())
                     d = float(token_diff[h].item())
                     print(
-                        f"    (hidden={h}): actual={a:.4g}  ref={r:.4g}  diff={d:.4g}"
+                        f"    (hidden={h}): "
+                        f"actual={a:.4g}  ref={r:.4g}  diff={d:.4g}"
                     )
         else:
             print(
@@ -2868,7 +2467,7 @@ class MegaMoETester:
                 f"{n_worst_tokens} by sum over (topk, hidden); per token: "
                 f"top {n_worst_cells_per_token} (topk, hidden) cells) ----"
             )
-            for t, ds in zip(bad_tokens, bad_diff_sums):  # noqa: B905
+            for t, ds in zip(bad_tokens, bad_diff_sums):
                 token_diff = unreduced_diff[t]  # (K, H)
                 flat = token_diff.flatten()
                 n_cells = min(n_worst_cells_per_token, flat.numel())
@@ -2911,8 +2510,11 @@ class MegaMoETester:
                 ("my_activation_sf", self.my_activation_sf),
                 ("my_topk_idx", self.my_topk_idx),
                 ("my_fc1_weight", self.my_fc1_weight),
-                ("combine_output", self.combine_output),
+                ("output_activation", self.output_activation),
             ):
+                if tensor is None:
+                    print(f"[rank {self.rank}] {name:18s} not allocated")
+                    continue
                 print(
                     f"[rank {self.rank}] {name:18s} "
                     f"shape={tuple(tensor.shape)} dtype={tensor.dtype}"
@@ -2944,17 +2546,21 @@ def _parse_tuple(argument: str) -> Tuple[int, ...]:
 
 def _parse_output_dtype(argument: str) -> torch.dtype:
     mapping = {
-        "bf16": torch.bfloat16,
-        "bfloat16": torch.bfloat16,
-        "fp16": torch.float16,
-        "float16": torch.float16,
-        "half": torch.float16,
+        "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+        "fp16": torch.float16, "float16": torch.float16, "half": torch.float16,
     }
     if argument not in mapping:
         raise argparse.ArgumentTypeError(
             f"fc2_output_dtype must be one of {sorted(mapping.keys())}, got {argument!r}"
         )
     return mapping[argument]
+
+
+def _parse_combine_format(argument: str) -> CombineFormat:
+    try:
+        return CombineFormat.parse(argument)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -2968,53 +2574,45 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--intermediate", type=int, default=1024)
     parser.add_argument(
-        "--fc2_output_dtype",
-        type=_parse_output_dtype,
-        default=torch.bfloat16,
+        "--fc2_output_dtype", type=_parse_output_dtype, default=torch.bfloat16,
     )
     parser.add_argument(
-        "--route_distribution",
-        type=str,
-        default="balanced",
+        "--combine_format", type=_parse_combine_format,
+        default=CombineFormat.parse("bf16"),
+        help="Cross-rank combine wire format: 'bf16' (no-quant baseline), "
+             "'16e2m1xbf16' (fp4 + per-16 bf16 amax), or '32e4m3xe8m0' (MXFP8).",
+    )
+    parser.add_argument(
+        "--route_distribution", type=str, default="balanced",
         choices=["balanced", "power_law"],
     )
     parser.add_argument(
-        "--power_law_exponent",
-        type=float,
-        default=1.0,
+        "--power_law_exponent", type=float, default=1.0,
         help="Zipf exponent for --route_distribution power_law; 1.0 = classic "
-        "Zipf, larger = more skewed, 0 = uniform.",
+             "Zipf, larger = more skewed, 0 = uniform.",
     )
     parser.add_argument(
-        "--gate_up_clamp",
-        type=float,
-        default=None,
+        "--gate_up_clamp", type=float, default=None,
         help="DeepSeek-V4 swiglu_limit: asymmetric clamp on the real gate/up "
-        "pre-activations (gate<=limit, |up|<=limit) before SiLU. "
-        "Omitted/None disables the clamp; must be non-negative.",
+             "pre-activations (gate<=limit, |up|<=limit) before SiLU. "
+             "Omitted/None disables the clamp; must be non-negative.",
     )
 
     parser.add_argument("--mma_tiler_mnk", type=str, default="128,128,256")
     parser.add_argument("--cluster_shape_mnk", type=str, default="1,1,1")
     parser.add_argument("--use_2cta_instrs", action="store_true", default=False)
-    parser.add_argument(
-        "--enable_static_expert_shape", action="store_true", default=False
-    )
+    parser.add_argument("--enable_static_expert_shape", action="store_true", default=False)
     parser.add_argument("--dynamic_sched", action="store_true", default=False)
     parser.add_argument("--clc_bundle_size", type=int, default=None)
     parser.add_argument("--num_sched_stages", type=int, default=None)
     parser.add_argument(
-        "--load_balance_mode",
-        type=str,
-        default="static",
+        "--load_balance_mode", type=str, default="static",
         choices=["static", "atomic_counter"],
     )
     parser.add_argument("--group_hint", type=int, default=None)
     parser.add_argument("--flag_batch", type=int, default=4)
     parser.add_argument(
-        "--epi_flag_batch",
-        type=str,
-        default="1,1",
+        "--epi_flag_batch", type=str, default="1,1",
         help="(fc1,fc2) done-counter publish batch in comma form",
     )
     parser.add_argument(
@@ -3033,19 +2631,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="epi_warps",
         choices=["epi_warps", "standalone_warps", "reuse_dispatch_warps"],
         help="Where the cross-rank fc2 push-back runs: epi_warps (epilogue "
-        "STG redirect, default), standalone_warps (dedicated warps "
-        "12-15), or reuse_dispatch_warps (dispatch warps 8-11).",
-    )
-    parser.add_argument(
-        "--combine_dtype",
-        type=str,
-        default=os.environ.get("MEGA_COMBINE_DTYPE", "bf16"),
-        choices=["bf16", "mxfp8", "nvfp4"],
-        help="Cross-rank combine transfer format for the reuse_dispatch_warps "
-        "token-back: bf16 (default, unchanged), mxfp8 (32-elem block + "
-        "E8M0 scale) or nvfp4 (tile-wise, 32-elem block + E4M3 scale).  "
-        "Low-precision modes cut combine NVLink volume; the receiver "
-        "dequant+reduces via topk_reduce.  Env alias: MEGA_COMBINE_DTYPE.",
+             "STG redirect, default), standalone_warps (dedicated warps "
+             "12-15), or reuse_dispatch_warps (dispatch warps 8-11).",
     )
     parser.add_argument("--perf_run", action="store_true", default=False)
     parser.add_argument("--skip_ref_check", action="store_true", default=False)
@@ -3056,9 +2643,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--perf_iters", type=int, default=1)
     parser.add_argument("--enable_debug_checks", action="store_true", default=False)
     parser.add_argument(
-        "--ref_compute_graph",
-        type=str,
-        default="deepgemm",
+        "--ref_compute_graph", type=str, default="deepgemm",
         choices=["transformers", "deepgemm"],
     )
     parser.add_argument("--enable_iket", action="store_true", default=False)
@@ -3066,20 +2651,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_tester_from_args(
-    args: argparse.Namespace,
-    *,
-    rank: int,
-    world_size: int,
-) -> "MegaMoETester":
-    """Build a configured ``MegaMoETester`` from parsed CLI ``args``.
+def main(argv: Optional[List[str]] = None) -> int:
+    """Bootstrap NCCL + NVSHMEM, build the tester, run one pass.
 
-    Extracted verbatim from ``main`` so out-of-process callers (notably the
-    CI accuracy pytest in ``tests/test_megamoe_pipeline_accuracy.py``) can
-    construct the *exact* same tester the CLI builds -- same desc fields, no
-    drift -- without going through the ``torchrun`` / NVSHMEM bootstrap.
-    ``main`` delegates here, so its behaviour is unchanged.
+    Launcher::
+
+        torchrun --nproc_per_node=4 -m moe_nvfp4_swapab.mega_runner \\
+            --num_total_experts 32 --route_distribution balanced
     """
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if _NO_DIST:
+        # MEGA_NO_DIST=1: bypass torch.distributed + NVSHMEM init so the
+        # script can be launched as plain ``python mega_runner.py`` under
+        # compute-sanitizer / debugger.  Single-rank only.
+        torch.cuda.set_device(0)
+        rank = 0
+        world_size = 1
+    else:
+        from src.bootstrap import init_dist_and_nvshmem
+        _local_rank, rank, world_size, _ = init_dist_and_nvshmem()
+
     problem = TokenCommProblemDesc(
         world_size=world_size,
         num_tokens_per_rank=args.num_tokens_per_rank,
@@ -3088,10 +2681,16 @@ def build_tester_from_args(
         hidden=args.hidden,
         intermediate=args.intermediate,
         fc2_output_dtype=args.fc2_output_dtype,
+        combine_format=args.combine_format,
         route_distribution=args.route_distribution,
         power_law_exponent=args.power_law_exponent,
         gate_up_clamp=args.gate_up_clamp,
     )
+
+    if problem.num_topk > 32:
+        raise ValueError(
+            f"num_topk ({problem.num_topk}) > 32 is unsupported by the current. Shit inherited from DeepGEMM."
+        )
 
     impl = ImplDesc(
         mma_tiler_mnk=_parse_tuple(args.mma_tiler_mnk),
@@ -3108,7 +2707,6 @@ def build_tester_from_args(
         token_back_mode=args.token_back_mode,
         flag_batch=args.flag_batch,
         epi_flag_batch=_parse_tuple(args.epi_flag_batch),
-        combine_dtype=args.combine_dtype,
     )
 
     misc = MiscDesc(
@@ -3128,36 +2726,6 @@ def build_tester_from_args(
     tester = MegaMoETester(problem, impl, misc, rank=rank)
     tester.set_torch_profiler_enabled(args.use_torch_profiler)
     tester.set_perf_iters(args.perf_warmup, args.perf_iters)
-    return tester
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    """Bootstrap NCCL + NVSHMEM, build the tester, run one pass.
-
-    Launcher::
-
-        torchrun --nproc_per_node=4 -m moe_nvfp4_swapab.mega_runner \\
-            --num_total_experts 32 --route_distribution balanced
-    """
-    parser = _build_arg_parser()
-    args = parser.parse_args(argv)
-
-    # Snapshot once so init and teardown take matching paths even if the
-    # env var is mutated mid-run.
-    no_dist = _no_dist()
-    if no_dist:
-        # MEGA_NO_DIST=1: bypass torch.distributed + NVSHMEM init so the
-        # script can be launched as plain ``python mega_runner.py`` under
-        # compute-sanitizer / debugger.  Single-rank only.
-        torch.cuda.set_device(0)
-        rank = 0
-        world_size = 1
-    else:
-        from src.bootstrap import init_dist_and_nvshmem
-
-        _local_rank, rank, world_size, _ = init_dist_and_nvshmem()
-
-    tester = build_tester_from_args(args, rank=rank, world_size=world_size)
 
     return_code = 0
     try:
@@ -3168,7 +2736,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if rank == 0:
             print(f"[mega_runner] kernel launch skipped: {exc}")
 
-    if not no_dist:
+    if not _NO_DIST:
         # nvshmem_free/finalize are collective barriers; an unsynchronized or
         # GC-driven teardown deadlocks once per-rank free order diverges.  So
         # just barrier-align, then os._exit and let the driver reclaim the heap

@@ -17,13 +17,20 @@ from dataclasses import dataclass
 from typing import Literal, Optional, Tuple, Type, Union, Any
 
 import torch
+import cutlass
 
-from common.megamoe_constants import Nvfp4BlockSize
+from common.megamoe_constants import Nvfp4BlockSize, Nvfp4E2M1RcpLimit
+from common.host_utils import mxfp8_quantize_per_block_32
 from moe_nvfp4_swapab.runner_common import (
     nvfp4_quantize_per_block_16,
     swiglu_fold_interleave,
     to_blocked,
+    unpack_fp4_to_f32,
+    dequant_block_scale_to_fp32,
+    _pack_f32_to_fp4,
+    _rcp_approx_ftz_f32_cuda,
 )
+from src.token_comm import CombineFormat
 
 
 @dataclass(frozen=True)
@@ -100,21 +107,15 @@ def reference_expert_fc12(
     fc1-phase ablation.
     """
     intermediate_downproj = intermediate // 2
-
     fc1_fp32 = ref_scaled_mm(
-        a=act_packed,
-        sfa=act_sf,
-        b=fc1_weight_packed,
-        sfb=fc1_weight_sf,
-        n=intermediate,
-        k=hidden,
+        a=act_packed, sfa=act_sf,
+        b=fc1_weight_packed, sfb=fc1_weight_sf,
+        n=intermediate, k=hidden,
     )
     fc1_fp32 = fc1_fp32 * fc1_alpha
 
     swiglu = swiglu_fold_interleave(
-        fc1_fp32,
-        gate_up_interleave,
-        gate_up_clamp=gate_up_clamp,
+        fc1_fp32, gate_up_interleave, gate_up_clamp=gate_up_clamp,
     )
     if ref_compute_graph == "deepgemm":
         swiglu = swiglu * topk_weights.unsqueeze(-1)
@@ -122,99 +123,96 @@ def reference_expert_fc12(
     fc1_q, fc1_sf_out = quantize_fn(swiglu, fc1_norm_const)
 
     fc2_fp32 = ref_scaled_mm(
-        a=fc1_q,
-        sfa=fc1_sf_out,
-        b=fc2_weight_packed,
-        sfb=fc2_weight_sf,
-        n=hidden,
-        k=intermediate_downproj,
+        a=fc1_q, sfa=fc1_sf_out,
+        b=fc2_weight_packed, sfb=fc2_weight_sf,
+        n=hidden, k=intermediate_downproj,
     )
     fc2_fp32 = fc2_fp32 * fc2_alpha
-    return fc2_fp32, fc1_q, fc1_sf_out
+    return fc2_fp32, fc1_q, fc1_sf_out, fc1_fp32
 
 
-def _lowprec_combine_reduce(
-    combine_ref: torch.Tensor,  # (num_ranks, num_tokens, num_topk, hidden) in out_dtype
-    topk_weights: torch.Tensor,  # (num_ranks, num_tokens, num_topk) fp32
-    *,
-    combine_dtype: str,
-    ref_compute_graph: str,
-    num_ranks: int,
-    num_tokens_per_rank: int,
-    num_topk: int,
-    hidden: int,
-    out_dtype: torch.dtype,
+# Per-term quantization SNR floor (dB) for each quantized combine format. The
+# theoretical block-scaled-float round-trip SNR is ~14.5 + 6*mantissa_bits:
+# e2m1 (m=1) -> ~20.5, e5m2 (m=2) -> ~26.5, e4m3 (m=3) -> ~32.5 (e8m0's
+# power-of-2 scale loses ~1 dB -> ~31.5 / ~25.5 respectively). These are
+# nearly distribution-independent (within ~0.5 dB), so the floors sit ~1.5 dB
+# below target -- tight enough to catch a degraded quantizer, loose enough
+# for bf16-amax scale rounding and real-data drift.
+_combine_snr_floor_db = {
+    "16e2m1xbf16": 19.0,
+    "32e4m3xe8m0": 30.0,
+    "32e5m2xe8m0": 24.0,
+}
+
+
+def combine_roundtrip_to_fp32(
+    terms_fp32: torch.Tensor,           # (..., hidden) fp32 per-(token, topk) fc2 terms
+    combine_format: CombineFormat,
 ) -> torch.Tensor:
-    """Device-consistent low-precision combine reduce, bit-exact to the kernel.
+    """Round-trip the fc2 terms through the combine wire format.
 
-    Quantizes the byte-exact per-topk fc2 terms to the kernel's mxfp8 / nvfp4-PACK6
-    combine wire via :mod:`combine_quant_ref` (validated byte-identical to the
-    kernel's combine_output_q / combine_sf_q / combine_global_q planes), then
-    reduces with the faithful single-rounding-FMA reference.  The kernel quantizes
-    from the bf16 reorder regs, so ``combine_ref`` (bf16) widened to fp32 is the
-    exact quantization input.  Result is per-ULP identical to the kernel's
-    ``combine_reduced_output``.
+    Quantize then dequantize each block exactly as the device combine encoder +
+    topk_reduce do, returning the fp32 values topk_reduce reduces over. The bf16
+    baseline is identity (terms are already bf16). The fp4 path stores a per-16
+    bf16 amax (decode scale = amax / 6) and packs e2m1 with the shared
+    nearest-fp4 LUT; the mxfp8 path reuses the standard per-32 e8m0 quantizer.
+    Decode mirrors topk_reduce: plain ``unpack * stored_scale``.
     """
-    from .combine_quant_ref import (
-        mxfp8_quantize_combine,
-        nvfp4_pack6_quantize_combine,
-    )
-    from .topk_reduce import (
-        faithful_mxfp8_reference_sum,
-        faithful_nvfp4_pack6_reference_sum,
-        nvfp4_pack6_views,
-    )
+    if not combine_format.is_quantized:
+        return terms_fp32
 
-    rt = num_ranks * num_tokens_per_rank
-    src = combine_ref.to(torch.float32).reshape(rt, num_topk, hidden)
-    score = (
-        topk_weights.reshape(rt, num_topk)
-        if ref_compute_graph == "transformers"
-        else None
-    )
-    if combine_dtype == "mxfp8":
-        q_codes, e8m0 = mxfp8_quantize_combine(src)
-        reduced = faithful_mxfp8_reference_sum(
-            q_codes.view(torch.float8_e4m3fn),
-            e8m0.view(torch.float8_e8m0fnu),
-            score,
-        )
-    elif combine_dtype == "nvfp4":
-        q_fp4, plane = nvfp4_pack6_quantize_combine(src)
-        global_view, sfc_view = nvfp4_pack6_views(plane)
-        reduced = faithful_nvfp4_pack6_reference_sum(
-            q_fp4,
-            sfc_view,
-            global_view,
-            score,
-        )
-    else:
+    block = combine_format.scale_block
+    *lead, hidden = terms_fp32.shape
+    if hidden % block != 0:
         raise ValueError(
-            f"_lowprec_combine_reduce: combine_dtype must be 'mxfp8' or 'nvfp4', "
-            f"got {combine_dtype!r}."
+            f"hidden ({hidden}) must be a multiple of scale_block ({block})."
         )
-    return reduced.reshape(num_ranks, num_tokens_per_rank, hidden).to(out_dtype)
+
+    if combine_format.act_dtype is cutlass.Float4E2M1FN:
+        blocked = terms_fp32.reshape(*lead, hidden // block, block)
+        amax = blocked.abs().amax(dim=-1)
+        # amax of a bf16 set is itself a bf16 value, so storing it as bf16 is
+        # lossless; decode scale = amax / 6 (matches topk_reduce's * RcpLimit).
+        decode_scale = amax.to(torch.bfloat16).float() * Nvfp4E2M1RcpLimit
+        # Encode with the reciprocal of the *stored* scale (round-trip idiom);
+        # rcp.approx.ftz matches the device encoder. amax==0 -> 0 (codes stay 0).
+        enc_scale = _rcp_approx_ftz_f32_cuda(decode_scale.contiguous())
+        enc_scale = torch.where(
+            decode_scale > 0, enc_scale, torch.zeros_like(enc_scale)
+        )
+        codes = _pack_f32_to_fp4(blocked * enc_scale.unsqueeze(-1))
+        deq = unpack_fp4_to_f32(codes) * decode_scale.unsqueeze(-1)
+        return deq.reshape(*lead, hidden)
+
+    # mxfp8-family combine (e4m3 or e5m2): standard per-32 e8m0 round-trip.
+    torch_act_dtype = {
+        cutlass.Float8E4M3FN: torch.float8_e4m3fn,
+        cutlass.Float8E5M2: torch.float8_e5m2,
+    }[combine_format.act_dtype]
+    flat = terms_fp32.reshape(-1, hidden)
+    codes, scale_e8m0 = mxfp8_quantize_per_block_32(flat, torch_act_dtype)
+    deq = dequant_block_scale_to_fp32(codes, scale_e8m0, block)
+    return deq.reshape(*lead, hidden)
 
 
 def compute_megamoe_reference(
     # NVFP4 tensors below carry STORAGE shape: a logical dim of size N is
     # stored as a packed dim of size N // 2 (one byte holds two fp4 values).
     # ``unpack_fp4_to_f32`` reverses the packing by doubling the packed dim.
-    input_activation: torch.Tensor,  # storage (num_ranks, num_tokens_per_rank, hidden//2)
-    input_activation_sf: torch.Tensor,  # (num_ranks, num_tokens_per_rank, hidden//Nvfp4BlockSize) fp8 plain K-major
-    input_topk_idx: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) int64
-    input_topk_weights: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) fp32
-    fc1_weight: torch.Tensor,  # storage (num_ranks, num_experts_per_rank, hidden//2, intermediate); hidden is the packed dim
-    fc1_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate, hidden//Nvfp4BlockSize) fp8 plain
-    fc2_weight: torch.Tensor,  # storage (num_ranks, num_experts_per_rank, intermediate//4, hidden); intermediate//2 is the packed dim
-    fc2_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//Nvfp4BlockSize) fp8 plain
-    fc1_alpha: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
-    fc2_alpha: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
-    fc1_norm_const: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
+    input_activation: torch.Tensor,        # storage (num_ranks, num_tokens_per_rank, hidden//2)
+    input_activation_sf: torch.Tensor,     # (num_ranks, num_tokens_per_rank, hidden//Nvfp4BlockSize) fp8 plain K-major
+    input_topk_idx: torch.Tensor,          # (num_ranks, num_tokens_per_rank, num_topk) int64
+    input_topk_weights: torch.Tensor,      # (num_ranks, num_tokens_per_rank, num_topk) fp32
+    fc1_weight: torch.Tensor,              # storage (num_ranks, num_experts_per_rank, hidden//2, intermediate); hidden is the packed dim
+    fc1_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, intermediate, hidden//Nvfp4BlockSize) fp8 plain
+    fc2_weight: torch.Tensor,              # storage (num_ranks, num_experts_per_rank, intermediate//4, hidden); intermediate//2 is the packed dim
+    fc2_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//Nvfp4BlockSize) fp8 plain
+    fc1_alpha: torch.Tensor,                # (num_ranks, num_experts_per_rank) fp32
+    fc2_alpha: torch.Tensor,                # (num_ranks, num_experts_per_rank) fp32
+    fc1_norm_const: torch.Tensor,           # (num_ranks, num_experts_per_rank) fp32
     ref_compute_graph: Literal["transformers", "deepgemm"],
-    fc2_output_dtype: torch.dtype,
+    combine_format: CombineFormat,
     gate_up_clamp: Optional[float] = None,
-    combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
 ) -> MegaMoEReference:
     """Return per-topk combine terms plus optional reduced reference.
 
@@ -235,11 +233,6 @@ def compute_megamoe_reference(
         raise ValueError(
             f"ref_compute_graph must be 'transformers' or 'deepgemm', "
             f"got {ref_compute_graph!r}."
-        )
-    if fc2_output_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(
-            f"fc2_output_dtype must be torch.bfloat16 or torch.float16, "
-            f"got {fc2_output_dtype}."
         )
     _check_cuda_inputs(
         (
@@ -297,7 +290,7 @@ def compute_megamoe_reference(
 
     combine_ref = torch.zeros(
         (num_ranks, num_tokens_per_rank, num_topk, hidden),
-        dtype=fc2_output_dtype,
+        dtype=torch.bfloat16,
         device=input_activation.device,
     )
 
@@ -332,18 +325,14 @@ def compute_megamoe_reference(
         # flip when a value sits within ~half an fp4 step of a bin boundary).
         # ``transformers`` keeps the per-topk fc2 term unweighted so the
         # standalone topk_reduce kernel can match the device graph.
-        fc2_output_fp32, _fc1_q, _fc1_sf = reference_expert_fc12(
+        fc2_output_fp32, _fc1_q, _fc1_sf, _fc1_gateup = reference_expert_fc12(
             ref_scaled_mm=ref_scaled_mm,
             quantize_fn=nvfp4_quantize_per_block_16,
             act_packed=gathered_act,
             act_sf=gathered_act_sf,
-            fc1_weight_packed=_byte_select_expert(
-                fc1_weight, target_rank, local_expert
-            ),
+            fc1_weight_packed=_byte_select_expert(fc1_weight, target_rank, local_expert),
             fc1_weight_sf=_byte_select_expert(fc1_weight_sf, target_rank, local_expert),
-            fc2_weight_packed=_byte_select_expert(
-                fc2_weight, target_rank, local_expert
-            ),
+            fc2_weight_packed=_byte_select_expert(fc2_weight, target_rank, local_expert),
             fc2_weight_sf=_byte_select_expert(fc2_weight_sf, target_rank, local_expert),
             intermediate=intermediate,
             hidden=hidden,
@@ -357,30 +346,7 @@ def compute_megamoe_reference(
         )
 
         combine_ref[source_ranks, source_tokens, source_topk_slots, :] = (
-            fc2_output_fp32.to(fc2_output_dtype)
-        )
-
-    if combine_dtype != "bf16":
-        # Low-precision combine: the kernel quantizes each per-topk fc2 term (bf16
-        # reorder regs) to the mxfp8 / nvfp4-PACK6 wire then topk-reduces with a
-        # single-rounding FMA.  Mirror that EXACTLY on the host -- device-consistent
-        # quantize (combine_quant_ref, byte-identical to the kernel planes) + the
-        # faithful single-rounding-FMA reduce -- so combine_reduced_output is
-        # element-wise bit-identical to the kernel's.  bf16 path below is unchanged.
-        reduced_ref = _lowprec_combine_reduce(
-            combine_ref,
-            input_topk_weights,
-            combine_dtype=combine_dtype,
-            ref_compute_graph=ref_compute_graph,
-            num_ranks=num_ranks,
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_topk=num_topk,
-            hidden=hidden,
-            out_dtype=fc2_output_dtype,
-        )
-        return MegaMoEReference(
-            combine_output=combine_ref,
-            combine_reduced_output=reduced_ref,
+            fc2_output_fp32.to(torch.bfloat16)
         )
 
     reduced_fp32 = torch.zeros(
@@ -389,6 +355,25 @@ def compute_megamoe_reference(
         device=input_activation.device,
     )
     terms_fp32 = combine_ref.to(torch.float32)
+    ideal_terms = terms_fp32
+    terms_fp32 = combine_roundtrip_to_fp32(terms_fp32, combine_format)
+    if combine_format.is_quantized:
+        # Self-guard: per-term quantization SNR must clear the format floor.
+        # A correct round-trip sits well above it; a broken quantizer craters.
+        signal = ideal_terms.pow(2).mean()
+        noise = (terms_fp32 - ideal_terms).pow(2).mean()
+        snr_db = (
+            float("inf") if noise.item() == 0
+            else 10.0 * torch.log10(signal / noise).item()
+        )
+        floor_db = _combine_snr_floor_db.get(combine_format.name)
+        if floor_db is None:
+            raise KeyError(f"no combine SNR floor configured for {combine_format}.")
+        if snr_db < floor_db:
+            raise AssertionError(
+                f"combine {combine_format} round-trip SNR {snr_db:.1f} dB < "
+                f"floor {floor_db:.1f} dB; the host quantizer is likely broken."
+            )
     if ref_compute_graph == "transformers":
         for k in range(num_topk):
             reduced_fp32 = torch.addcmul(
@@ -396,16 +381,17 @@ def compute_megamoe_reference(
                 terms_fp32[:, :, k, :],
                 input_topk_weights[:, :, k].unsqueeze(-1),
             )
-        reduced_ref = reduced_fp32.to(fc2_output_dtype)
+        reduced_ref = reduced_fp32.to(torch.bfloat16)
     else:
         for k in range(num_topk):
             reduced_fp32 = reduced_fp32 + terms_fp32[:, :, k, :]
-        reduced_ref = reduced_fp32.to(fc2_output_dtype)
+        reduced_ref = reduced_fp32.to(torch.bfloat16)
 
     return MegaMoEReference(
         combine_output=combine_ref,
         combine_reduced_output=reduced_ref,
     )
+
 
 
 import cuda.bindings.driver as cuda
@@ -1315,7 +1301,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 # Tma load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
+                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
@@ -1658,7 +1644,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Get accumulator stage index
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
-                    reverse_subtile = True if acc_stage_index == 0 else False  # noqa: SIM210
+                    reverse_subtile = True if acc_stage_index == 0 else False
                 else:
                     acc_stage_index = acc_consumer_state.index
 
@@ -2596,7 +2582,7 @@ class _BlockScaledGemmReferenceLauncher:
                 stream,
             )
             self._compiled[key] = compiled
-
+        
         compiled(
             a_cute,
             b_cute,
@@ -2608,6 +2594,7 @@ class _BlockScaledGemmReferenceLauncher:
         )
         torch.cuda.current_stream().synchronize()
         return c_3d.squeeze(-1)
+
 
 
 __all__ = ["MegaMoEReference", "compute_megamoe_reference", "Nvfp4BlockSize"]

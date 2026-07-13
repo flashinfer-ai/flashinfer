@@ -19,7 +19,7 @@ freeing those slots lets all 16 byval lanes hold offsets (EP16, not EP14).
 """
 
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -43,10 +43,10 @@ try:
 except ImportError:  # older wheels: value is fixed by the GEP encoding ABI
     MLIR_DYNAMIC_INDEX = -(2**31)
 
-_BYVAL_RANK_LIMIT = 16  # struct<(array<16 x i64>)> == exactly 128B
+_BYVAL_RANK_LIMIT = 16             # struct<(array<16 x i64>)> == exactly 128B
 
 
-# TODO: Fix this when compiler fixed. This is a shit WAR due to the cuda-to-llvm bug, it just treats any kernel arg to tma_desc as long as it's marked `grid_constant + byval`
+#TODO: Fix this when compiler fixed. This is a shit WAR due to the cuda-to-llvm bug, it just treats any kernel arg to tma_desc as long as it's marked `grid_constant + byval`
 def _byval_struct_ty() -> Any:
     """128B byval pointee shared by alloca / GEP / the ``llvm.byval`` attr."""
     return ir.Type.parse(f"!llvm.struct<(array<{_BYVAL_RANK_LIMIT} x i64>)>")
@@ -77,14 +77,10 @@ class SymBufferDeviceBase:
 
     def __extract_mlir_attributes__(self) -> list:
         if self.num_max_ranks <= _BYVAL_RANK_LIMIT:
-            return [
-                ir.DictAttr.get(
-                    {
-                        "cute_nvgpu.grid_constant": ir.UnitAttr.get(),
-                        "llvm.byval": ir.TypeAttr.get(_byval_struct_ty()),
-                    }
-                )
-            ]
+            return [ir.DictAttr.get({
+                "cute_nvgpu.grid_constant": ir.UnitAttr.get(),
+                "llvm.byval": ir.TypeAttr.get(_byval_struct_ty()),
+            })]
         return [ir.DictAttr.get({})]
 
     @cute.jit
@@ -92,7 +88,7 @@ class SymBufferDeviceBase:
         self,
         local_ptr: Int64,
         dst_rank_idx: Int32,
-        byte_off: Int64 = Int64(0),  # noqa: B008
+        byte_off: Int64 = Int64(0),
     ) -> Int64:
         if cutlass.const_expr(self.num_max_ranks <= _BYVAL_RANK_LIMIT):
             # Opaque ptr -> the offsets array sits at byte 0 of the byval struct,
@@ -113,28 +109,42 @@ class SymBufferDeviceBase:
         return local_ptr + off + byte_off
 
     @cute.jit
-    def ptr_map_to_rank(self, ptr, dst_rank_idx: Int32):
+    def ptr_map_to_rank(self, ptr, dst_rank_idx: Int32, byte_align: Optional[int] = None):
         if cutlass.const_expr(ptr.memspace != AddressSpace.gmem):
             raise ValueError(
                 f"ptr_map_to_rank: source pointer must live in GMEM "
                 f"(NVSHMEM symmetric heap), got memspace={ptr.memspace}."
             )
+        if cutlass.const_expr(byte_align is None):
+            byte_align = ptr.max_alignment
         peer_addr = self.map(ptr.toint(), dst_rank_idx, Int64(0))
         return cute.make_ptr(
             ptr.dtype,
             peer_addr,
             ptr.memspace,
-            assumed_align=ptr.max_alignment,
+            assumed_align=byte_align,
         )
 
 
 @dataclass(frozen=True)
 class SymBufferHost:
-    """Runtime launch payload for a device-side ``SymBuffer{N}``."""
+    """Runtime launch payload for a device-side ``SymBuffer{N}``.
 
-    base_addr: int
-    offsets: Tuple[int, ...]
-    rank_idx: int
+    Field annotations are tvm-ffi-aware (the args-spec converter dispatches the
+    dataclass field-by-field): ``Int64`` / ``Int32`` make the scalar fields land on
+    the converter's typed-scalar branch (``arg_type in AcceptableNumericTypesForScalar``,
+    i64/i32) even when the held value is a plain Python ``int`` -- the AOT-compile
+    spec is what fixes the width, runtime values just marshal into it. ``offsets`` is
+    a bare ``tuple`` (not ``Tuple[int, ...]``): the converter's variadic-``Tuple``
+    handling assumes a fixed arity (``get_args`` -> ``(elem, Ellipsis)``) and would
+    raise a length mismatch for ``world != 1``; a bare ``tuple`` takes the generic
+    element-by-element path whose per-element width is driven by the value type
+    (so the fake's offset values are built as ``Int64`` -> i64). The non-tvm
+    ``_SymBufferHostAdapter`` is unaffected (it re-wraps with ``Int64(...)``)."""
+
+    base_addr: Int64
+    offsets: tuple
+    rank_idx: Int32
     num_max_ranks: cutlass.Constexpr[int]
 
     @staticmethod
@@ -152,7 +162,8 @@ class SymBufferHost:
         num_max_ranks = self.num_max_ranks
         if len(offsets) != num_max_ranks:
             raise ValueError(
-                f"len(offsets)={len(offsets)} must equal num_max_ranks={num_max_ranks}."
+                f"len(offsets)={len(offsets)} must equal "
+                f"num_max_ranks={num_max_ranks}."
             )
 
         if num_max_ranks <= _BYVAL_RANK_LIMIT:
@@ -161,28 +172,16 @@ class SymBufferHost:
             i64_ty = ir.Type.parse("i64")
             one = arith.constant(
                 value=ir.IntegerAttr.get(i64_ty, 1),
-                result=i64_ty,
-                loc=loc,
-                ip=ip,
+                result=i64_ty, loc=loc, ip=ip,
             )
             buf = llvm.alloca(
-                res=ptr_ty,
-                elem_type=st_ty,
-                array_size=one,
-                alignment=64,
-                loc=loc,
-                ip=ip,
+                res=ptr_ty, elem_type=st_ty, array_size=one,
+                alignment=64, loc=loc, ip=ip,
             )
             for i, off in enumerate(offsets):
                 slot = llvm.getelementptr(
-                    ptr_ty,
-                    buf,
-                    [],
-                    [i],
-                    i64_ty,
-                    no_wrap_flags="None",
-                    loc=loc,
-                    ip=ip,
+                    ptr_ty, buf, [], [i], i64_ty,
+                    no_wrap_flags="None", loc=loc, ip=ip,
                 )
                 llvm.store(self._as_int64(off).ir_value(), slot, loc=loc, ip=ip)
             return SymBufferDeviceBase(val=buf, num_max_ranks=num_max_ranks)
@@ -193,16 +192,10 @@ class SymBufferHost:
         for i, off in enumerate(offsets):
             idx = arith.constant(
                 value=ir.IntegerAttr.get(i32_ty, i),
-                result=i32_ty,
-                loc=loc,
-                ip=ip,
+                result=i32_ty, loc=loc, ip=ip,
             )
             vec = llvm.insertelement(
-                vec,
-                self._as_int64(off).ir_value(),
-                idx,
-                loc=loc,
-                ip=ip,
+                vec, self._as_int64(off).ir_value(), idx, loc=loc, ip=ip,
             )
         return SymBufferDeviceBase(val=vec, num_max_ranks=num_max_ranks)
 
@@ -252,17 +245,17 @@ class _SymBufferHostAdapter:
         idx = 0
 
         base_n = len(get_mlir_types(self._fields[0]))
-        base_addr = new_from_mlir_values(self._fields[0], values[idx : idx + base_n])
+        base_addr = new_from_mlir_values(self._fields[0], values[idx:idx + base_n])
         idx += base_n
 
         offsets = []
         for field in self._fields[1:-1]:
             n = len(get_mlir_types(field))
-            offsets.append(new_from_mlir_values(field, values[idx : idx + n]))
+            offsets.append(new_from_mlir_values(field, values[idx:idx + n]))
             idx += n
 
         rank_n = len(get_mlir_types(self._fields[-1]))
-        rank_idx = new_from_mlir_values(self._fields[-1], values[idx : idx + rank_n])
+        rank_idx = new_from_mlir_values(self._fields[-1], values[idx:idx + rank_n])
         idx += rank_n
         if idx != len(values):
             raise ValueError(

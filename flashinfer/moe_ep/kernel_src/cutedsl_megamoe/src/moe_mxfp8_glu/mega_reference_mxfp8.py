@@ -8,13 +8,15 @@ scales, ``sf_vec_size = 32``) plus a routing table ``topk_idx`` and computes
 ``combine_output[r, t, k] = fc12(input[r, t], expert[topk_idx[r, t, k]])`` for
 every ``(rank, token, topk_slot)``.
 
-Topk weighting: the MXFP8 fused fc1+fc2 epilogue applies **no** topk weighting
-(``swiglu_act`` uses a 1.0 scale and the per-token score is not multiplied into
-the swiglu output -- mirroring the MXFP8 fc12 standalone tester, which inherits
-the no-op pre/post topk hooks).  ``norm_const`` is hard-coded to 1.0 in the
-kernel epilogue.  This reference therefore produces *unweighted* per-(token,
-topk) fc12 outputs; callers must multiply by topk weights when reducing form-A
-outputs to final per-token outputs.
+Topk weighting: controlled by ``apply_topk_in_fc1`` (default False).
+
+* ``apply_topk_in_fc1=False``: the reference produces *unweighted*
+  per-(token, topk) fc12 outputs; the caller compares them per-(token,
+  topk) cell or sums without weighting.
+* ``apply_topk_in_fc1=True``: each token's SwiGLU output is multiplied by
+  its per-(rank, token, topk_slot) routing weight *before* the MXFP8
+  round-trip, matching the kernel epilogue exactly.  fc2 therefore sees the
+  already-weighted intermediate and the reference output encodes the weight.
 
 The per-expert chain (dequant input -> gather -> fc1 -> swiglu fold + fc1-out
 MXFP8 round-trip -> fc2 -> scatter back) mirrors the MXFP8 fc12 reference in
@@ -37,32 +39,54 @@ from moe_nvfp4_swapab.runner_common import (
     transpose_rhs_for_block_dequant,
     _swiglu_pair_hw_match_cuda,
 )
+from moe_nvfp4_swapab.mega_reference import combine_roundtrip_to_fp32
 from common.host_utils import mxfp8_quantize_per_block_32
+from src.token_comm import CombineFormat
 
 
 def compute_megamoe_reference_mxfp8(
     # MXFP8 tensors carry LOGICAL shape (fp8 = 1 byte/element, no packing).
-    input_activation: torch.Tensor,  # (num_ranks, num_tokens_per_rank, hidden) fp8
-    input_activation_sf: torch.Tensor,  # (num_ranks, num_tokens_per_rank, hidden//32) E8M0
-    input_topk_idx: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) int64
-    input_topk_weights: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) fp32
-    fc1_weight: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, intermediate) fp8, hidden stride-1
-    fc1_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate, hidden//32) E8M0
-    fc2_weight: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate//2, hidden) fp8, inter//2 stride-1
-    fc2_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//32) E8M0
-    ab_dtype: torch.dtype,  # torch.float8_e4m3fn or torch.float8_e5m2
+    input_activation: torch.Tensor,        # (num_ranks, num_tokens_per_rank, hidden) fp8
+    input_activation_sf: torch.Tensor,     # (num_ranks, num_tokens_per_rank, hidden//32) E8M0
+    input_topk_idx: torch.Tensor,          # (num_ranks, num_tokens_per_rank, num_topk) int64
+    input_topk_weights: torch.Tensor,      # (num_ranks, num_tokens_per_rank, num_topk) fp32
+    fc1_weight: torch.Tensor,              # (num_ranks, num_experts_per_rank, hidden, intermediate) fp8, hidden stride-1
+    fc1_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, intermediate, hidden//32) E8M0
+    fc2_weight: torch.Tensor,              # (num_ranks, num_experts_per_rank, intermediate//2, hidden) fp8, inter//2 stride-1
+    fc2_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//32) E8M0
+    ab_dtype: torch.dtype,                 # torch.float8_e4m3fn or torch.float8_e5m2
     norm_const: float = 1.0,
     ref_compute_graph: Literal["transformers", "deepgemm"] = "deepgemm",
     fc2_output_dtype: torch.dtype = torch.bfloat16,
+    combine_format: Optional[CombineFormat] = None,
     gate_up_clamp: Optional[float] = None,
-) -> torch.Tensor:
+    apply_topk_in_fc1: bool = False,
+    return_fc1_gateup: bool = False,
+):
     """Return ``(num_ranks, num_tokens_per_rank, num_topk, hidden)`` combine reference.
 
     ``norm_const`` / ``ref_compute_graph`` are accepted for API parity with the
-    NVFP4 reference. Top-k weighting is intentionally left to callers reducing
-    the returned form-A tensor; ``norm_const`` is not applied to the fc1-out
-    quant because the MXFP8 kernel hard-codes a 1.0 norm const and
-    ``mxfp8_quantize_per_block_32`` takes no norm-const argument.
+    NVFP4 reference but carry no topk weighting on the MXFP8 path (see module
+    docstring); ``norm_const`` is not applied to the fc1-out quant because the
+    MXFP8 kernel hard-codes a 1.0 norm const and ``mxfp8_quantize_per_block_32``
+    takes no norm-const argument.
+
+    When ``apply_topk_in_fc1=True`` the per-token topk weight is multiplied into
+    the SwiGLU output *before* the MXFP8 round-trip, mirroring what the kernel
+    epilogue does.  This is NOT mathematically equivalent to post-weighting
+    because the quantisation step changes the effective magnitude.
+
+    When ``combine_format`` is quantized (e.g. ``32e4m3xe8m0`` / ``32e5m2xe8m0``),
+    each expert's ``fc2_output_fp32`` is additionally round-tripped through the
+    combine wire format (quantize then dequantize, matching the device combine
+    encoder + ``TopkReduce``) via ``combine_roundtrip_to_fp32``
+
+    When ``return_fc1_gateup=True``, returns a tuple
+    ``(combine_ref, fc1_gateup_per_expert)`` where ``fc1_gateup_per_expert`` is a
+    dict ``{global_expert_id: Tensor(v_e, 2*intermediate, dtype=bfloat16)}``
+    holding the raw pre-SwiGLU fc1 accumulator (the quantity stored by the kernel
+    when ``generate_c=True``).  Only experts that received at least one token have
+    an entry.  When False, returns ``combine_ref`` only (original behaviour).
     """
     if fc2_output_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
@@ -112,6 +136,7 @@ def compute_megamoe_reference_mxfp8(
         dtype=fc2_output_dtype,
         device=input_activation.device,
     )
+    fc1_gateup_per_expert = {} if return_fc1_gateup else None
 
     # 2. Per-expert GEMM chain over routed tokens.
     for global_expert in range(num_total_experts):
@@ -136,8 +161,11 @@ def compute_megamoe_reference_mxfp8(
             Mxfp8BlockSize,
             global_scale=None,
         )
-        fc1_weight_fp32 = fc1_weight_t_fp32.transpose(0, 1)  # (hidden, intermediate)
-        fc1_output_fp32 = gathered_act @ fc1_weight_fp32  # (R, intermediate)
+        fc1_weight_fp32 = fc1_weight_t_fp32.transpose(0, 1)         # (hidden, intermediate)
+        fc1_output_fp32 = gathered_act @ fc1_weight_fp32           # (R, intermediate)
+
+        if return_fc1_gateup:
+            fc1_gateup_per_expert[global_expert] = fc1_output_fp32.to(torch.bfloat16)
 
         # SwiGLU fold: gate/up interleaved at Mxfp8BlockSize (=32) granularity,
         # matching the kernel's PostSwigluHalf interleave for MXFP8.
@@ -152,7 +180,14 @@ def compute_megamoe_reference_mxfp8(
             _up = _up.clamp(min=-limit, max=limit)
         swiglu_output = _swiglu_pair_hw_match_cuda(_gate, _up).reshape(
             _M, _N // 2
-        )  # (R, intermediate//2)
+        )                                                          # (R, intermediate//2)
+
+        if apply_topk_in_fc1:
+            # Mirror the kernel: weight applied before fp8 quantisation.
+            topk_w = input_topk_weights[
+                source_ranks, source_tokens, source_topk_slots
+            ].float().unsqueeze(-1)                                # (R, 1)
+            swiglu_output = swiglu_output * topk_w
 
         # fc1-out MXFP8 round-trip (the only step that introduces kernel-vs-ref
         # disagreement above fp32 accumulation noise).
@@ -167,13 +202,23 @@ def compute_megamoe_reference_mxfp8(
             Mxfp8BlockSize,
             global_scale=None,
         )
-        fc2_weight_fp32 = fc2_weight_t_fp32.transpose(0, 1)  # (intermediate//2, hidden)
-        fc2_output_fp32 = fc1_dequant @ fc2_weight_fp32  # (R, hidden)
+        fc2_weight_fp32 = fc2_weight_t_fp32.transpose(0, 1)        # (intermediate//2, hidden)
+        fc2_output_fp32 = fc1_dequant @ fc2_weight_fp32            # (R, hidden)
+
+        # Quantized combine: the device epilogue quantizes the raw fp32
+        # accumulator directly (quant_sfd_row's r_acc is acc_dtype=Float32,
+        # never bf16-rounded first) -- round-trip fc2_output_fp32 here, BEFORE
+        # any bf16 cast, so the reference quantizes the same full-precision
+        # value the kernel does.
+        if combine_format is not None and combine_format.is_quantized:
+            fc2_output_fp32 = combine_roundtrip_to_fp32(fc2_output_fp32, combine_format)
 
         combine_ref[source_ranks, source_tokens, source_topk_slots, :] = (
             fc2_output_fp32.to(fc2_output_dtype)
         )
 
+    if return_fc1_gateup:
+        return combine_ref, fc1_gateup_per_expert
     return combine_ref
 
 

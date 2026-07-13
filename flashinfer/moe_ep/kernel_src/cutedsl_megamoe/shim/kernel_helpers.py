@@ -28,6 +28,7 @@ from common.host_utils import kind_data_dtype, mxfp8_quantize_per_block_32
 from common.megamoe_constants import Mxfp8BlockSize, Nvfp4BlockSize
 from moe_nvfp4_swapab.runner_common import (
     Mxfp8ScaleDtype,
+    _stack_byte_reinterpretable_tensors,
     ceil_div,
     nvfp4_quantize_per_block_16,
     round_up,
@@ -37,10 +38,6 @@ from moe_nvfp4_swapab.runner_common import (
 # --- lazy: pull cutlass transitively; imported only on first attribute access
 #     (which happens inside the backend/test call sites, never at package load).
 _LAZY = {
-    "_stack_byte_reinterpretable_tensors": (
-        "moe_nvfp4_swapab.mega_runner",
-        "_stack_byte_reinterpretable_tensors",
-    ),
     "_make_fp8_tensor": ("moe_mxfp8_glu.mega_runner", "_make_fp8_tensor"),
     "_make_e8m0_scale_tensor": ("moe_mxfp8_glu.mega_runner", "_make_e8m0_scale_tensor"),
     "compute_megamoe_reference_mxfp8": (
@@ -69,9 +66,9 @@ __all__ = [
     "nvfp4_quantize_per_block_16",
     "round_up",
     "to_blocked",
+    "_stack_byte_reinterpretable_tensors",
     # lazy
     "_make_e8m0_scale_tensor",
     "_make_fp8_tensor",
-    "_stack_byte_reinterpretable_tensors",
     "compute_megamoe_reference_mxfp8",
 ]

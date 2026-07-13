@@ -59,6 +59,7 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
 
     @property
     def phase(self) -> Int32:
+
         """Decode the BlockPhase from slot 7's low 16 bits."""
         return self.phase_and_peek & Int32(PhaseMask)
 
@@ -112,7 +113,7 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
         rmem[0] = self.expert_idx
         rmem[1] = self.tile_m_idx
         rmem[2] = self.tile_n_idx
-        rmem[3] = self.k_tile_cnt  # = cumulative_data_physical_row
+        rmem[3] = self.k_tile_cnt              # = cumulative_data_physical_row
         rmem[4] = self.cumulative_sf_physical_row
         rmem[5] = self.cumulative_token_block_count
         rmem[6] = self.valid_tokens_in_cta_tile
@@ -169,9 +170,7 @@ class GluMxFp8WorkTileInfo(MoEWorkTileInfo):
         # fc1_counter_index: cluster_token_block_idx (intra-expert cluster token-block index).
         fc1_counter_index: Int32,
     ):
-        super().__init__(
-            expert_idx, tile_m_idx, tile_n_idx, cumulative_data_physical_row
-        )
+        super().__init__(expert_idx, tile_m_idx, tile_n_idx, cumulative_data_physical_row)
         self.cumulative_data_physical_row = self.k_tile_cnt
         self.cumulative_sf_physical_row = cumulative_sf_physical_row
         self.cumulative_token_block_count = cumulative_token_block_count
@@ -196,12 +195,12 @@ class GluMxFp8WorkTileInfo(MoEWorkTileInfo):
         return self.valid_tokens_in_cta_cluster_tile & Int32(0xFFFF)
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
-        values = super().__extract_mlir_values__()  # [0..3]
-        values.extend(extract_mlir_values(self.cumulative_sf_physical_row))  # [4]
-        values.extend(extract_mlir_values(self.cumulative_token_block_count))  # [5]
-        values.extend(extract_mlir_values(self.valid_tokens_in_cta_cluster_tile))  # [6]
-        values.extend(extract_mlir_values(self.phase_and_peek))  # [7]
-        values.extend(extract_mlir_values(self.fc1_counter_index))  # [8]
+        values = super().__extract_mlir_values__()                                   # [0..3]
+        values.extend(extract_mlir_values(self.cumulative_sf_physical_row))          # [4]
+        values.extend(extract_mlir_values(self.cumulative_token_block_count))        # [5]
+        values.extend(extract_mlir_values(self.valid_tokens_in_cta_cluster_tile))    # [6]
+        values.extend(extract_mlir_values(self.phase_and_peek))                      # [7]
+        values.extend(extract_mlir_values(self.fc1_counter_index))                   # [8]
         return values
 
     def __new_from_mlir_values__(
@@ -233,7 +232,7 @@ class GluMxFp8WorkTileInfo(MoEWorkTileInfo):
         rmem[0] = self.expert_idx
         rmem[1] = self.tile_m_idx
         rmem[2] = self.tile_n_idx
-        rmem[3] = self.k_tile_cnt  # = cumulative_data_physical_row
+        rmem[3] = self.k_tile_cnt          # = cumulative_data_physical_row
         rmem[4] = self.cumulative_sf_physical_row
         rmem[5] = self.cumulative_token_block_count
         rmem[6] = self.valid_tokens_in_cta_cluster_tile
@@ -272,7 +271,7 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
     physical tensor.
     """
 
-    WorkTileInfo = SwapABSwigluFp4Fc12WorkTileInfo  # type: ignore[assignment]
+    WorkTileInfo = SwapABSwigluFp4Fc12WorkTileInfo
 
     def __init__(
         self,
@@ -377,7 +376,9 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
             # Same slot index for both phases -- fc1 release-add (dispatch
             # pull) and fc2 release-add (fc1 epi) target the per-task-tile
             # counter slot indexed by ``cumulative_token_block_count + tile_n_idx``.
-            counter_slot = base_work.cumulative_token_block_count + base_work.tile_n_idx
+            counter_slot = (
+                base_work.cumulative_token_block_count + base_work.tile_n_idx
+            )
             is_fc1 = base_work.phase == Int32(int(BlockPhase.Linear1))
             is_fc2 = base_work.phase == Int32(int(BlockPhase.Linear2))
 
@@ -478,7 +479,9 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
             return (real, None)
 
         elif cutlass.const_expr(tensor_name == "sfb"):
-            real = cute.domain_offset((sf_token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = cute.domain_offset(
+                (sf_token_offset, 0, 0), gmem_tensor_in_moe_view
+            )
             per_expert_shape = (shape[0], shape[1], c1)  # type: ignore[index]
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
             real = cute.make_tensor(
@@ -496,7 +499,9 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
         elif cutlass.const_expr(tensor_name == "sfc"):
             # Linear1 phase only — fc2 has no output SF.  Caller must not
             # invoke this branch with ``work_tile_info.phase == Linear2``.
-            real = cute.domain_offset((sf_token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = cute.domain_offset(
+                (sf_token_offset, 0, 0), gmem_tensor_in_moe_view
+            )
             per_expert_shape = (shape[0], shape[1], c1)  # type: ignore[index]
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
             real = cute.make_tensor(
@@ -520,7 +525,9 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
             # length as the input but offset to the right slice).  The
             # epilogue then indexes it with the **expert-local** token
             # coord — symmetric with the SFC write pattern.
-            real = cute.domain_offset((data_token_offset,), gmem_tensor_in_moe_view)
+            real = cute.domain_offset(
+                (data_token_offset,), gmem_tensor_in_moe_view
+            )
             return (real, None)
 
         raise ValueError(f"Unknown tensor_name: {tensor_name!r}.")
@@ -536,9 +543,10 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
 
 
 class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
-    """Sched extension for the fused fc1+fc2 GLU MXFP8 kernel."""
+    """Sched extension for the fused fc1+fc2 GLU MXFP8 kernel.
+    """
 
-    WorkTileInfo = GluMxFp8WorkTileInfo  # type: ignore[assignment]
+    WorkTileInfo = GluMxFp8WorkTileInfo
 
     def __init__(
         self,
@@ -677,7 +685,9 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
             return (real, None)
 
         elif cutlass.const_expr(tensor_name == "fc1_activation_sf"):
-            real = cute.domain_offset((sf_token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = cute.domain_offset(
+                (sf_token_offset, 0, 0), gmem_tensor_in_moe_view
+            )
             per_expert_shape = (shape[0], shape[1], c1)  # type: ignore[index]
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
             real = cute.make_tensor(
@@ -694,6 +704,15 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
             )
             return (real, None)
 
+        elif cutlass.const_expr(tensor_name == "c"):
+            # Raw fc1 accumulator output (gate+up FP32, pre-SwiGLU).
+            # Token-indexed like "d" but distinct tensor with intermediate_gateup columns.
+            real = cute.domain_offset(
+                (data_token_offset, 0, 0), gmem_tensor_in_moe_view
+            )
+            real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))  # type: ignore[index]
+            return (real, None)
+
         elif cutlass.const_expr(tensor_name == "d"):
             real = cute.domain_offset(
                 (data_token_offset, 0, 0), gmem_tensor_in_moe_view
@@ -702,7 +721,9 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
             return (real, None)
 
         elif cutlass.const_expr(tensor_name == "sfd"):
-            real = cute.domain_offset((sf_token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = cute.domain_offset(
+                (sf_token_offset, 0, 0), gmem_tensor_in_moe_view
+            )
             per_expert_shape = (shape[0], shape[1], c1)  # type: ignore[index]
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
             real = cute.make_tensor(
@@ -711,7 +732,9 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
             return (real, None)
 
         elif cutlass.const_expr(tensor_name == "topk"):
-            real = cute.domain_offset((data_token_offset,), gmem_tensor_in_moe_view)
+            real = cute.domain_offset(
+                (data_token_offset,), gmem_tensor_in_moe_view
+            )
             return (real, None)
 
         elif cutlass.const_expr(tensor_name == "fc2_activation"):
@@ -724,7 +747,9 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
 
         elif cutlass.const_expr(tensor_name == "fc2_activation_sf"):
             # fc2 SFA = fc1_output_sf (token-indexed sf)
-            real = cute.domain_offset((sf_token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = cute.domain_offset(
+                (sf_token_offset, 0, 0), gmem_tensor_in_moe_view
+            )
             per_expert_shape = (shape[0], shape[1], c1)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
             real = cute.make_tensor(

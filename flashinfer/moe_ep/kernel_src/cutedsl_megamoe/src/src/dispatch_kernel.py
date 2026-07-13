@@ -34,6 +34,7 @@ def dispatch_kernel(
     l1_sf_buffer: cute.Tensor,
     l1_topk_weights_buffer: cute.Tensor,
     nvlink_barrier_signal: cute.Tensor,
+    nvlink_barrier_counter: cute.Tensor,
     grid_sync_counter: cute.Tensor,
     peer_rank_ptr_mapper,
     local_rank: cutlass.Constexpr[int],
@@ -61,7 +62,6 @@ def dispatch_kernel(
     """
     token_comm = TokenInPullTokenBackPush(
         world_size=world_size,
-        local_rank=local_rank,
         num_topk=num_topk,
         num_experts_per_rank=num_experts_per_rank,
         num_total_experts=num_total_experts,
@@ -98,6 +98,7 @@ def dispatch_kernel(
         sm_idx,
         warp_idx,
         lane_idx,
+        local_rank=local_rank,
         num_tokens=num_tokens,
         num_sms=num_sms,
     )
@@ -116,7 +117,9 @@ def dispatch_kernel(
         sm_idx,
         warp_idx,
         lane_idx,
+        local_rank=local_rank,
         num_sms=num_sms,
+        nvlink_barrier_counter=nvlink_barrier_counter,
     )
 
     if _iket_active:
@@ -149,13 +152,12 @@ def dispatch_kernel(
 
     token_comm.nvlink_barrier(
         nvlink_barrier_signal,
-        None,
+        nvlink_barrier_counter,
         grid_sync_counter,
         peer_rank_ptr_mapper,
         sm_idx,
         warp_idx,
         lane_idx,
-        slot=1,
         num_sms=num_sms,
         prologue_grid_sync=True,
         epilogue_grid_sync=True,

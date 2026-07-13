@@ -35,10 +35,7 @@ from .nvfp4 import (
     MegaMoENvfp4Inputs,
 )
 from .comm import bootstrap_dist, free_sym_tensor
-from moe_nvfp4_swapab.mega_runner import (
-    _build_arg_parser,
-    build_tester_from_args,
-)
+from moe_nvfp4_swapab.mega_runner import _build_arg_parser
 
 
 def _config_from_args(
@@ -169,7 +166,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _, rank, world_size, _ = bootstrap_dist()
-    tester = build_tester_from_args(args, rank=rank, world_size=world_size)
+    # The new kernel drop removed build_tester_from_args(); the tester is now
+    # constructed as MegaMoETester(problem, impl, misc, rank=rank) from
+    # moe_nvfp4_swapab.mega_runner. This standalone smoke runner (not used by
+    # moe_ep) has not been ported to build those problem/impl/misc objects.
+    raise NotImplementedError(
+        "correctness.py is not ported to the new kernel drop's MegaMoETester API "
+        "(moe_nvfp4_swapab.mega_runner.MegaMoETester). Build problem/impl/misc and "
+        "construct MegaMoETester(problem, impl, misc, rank=rank) to restore it."
+    )
     cfg = _config_from_args(args, rank=rank, world_size=world_size)
     runner = MegaMoENvfp4Frontend(cfg)
     rc = 1

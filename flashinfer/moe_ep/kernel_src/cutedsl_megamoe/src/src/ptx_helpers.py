@@ -43,9 +43,7 @@ def tma_load_1d(dst_smem, src_gmem, mbar_smem, num_bytes, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def tma_load_1d_raw(
-    dst_smem, src_gmem_addr: Int64, mbar_smem, num_bytes, *, loc=None, ip=None
-):
+def tma_load_1d_raw(dst_smem, src_gmem_addr: Int64, mbar_smem, num_bytes, *, loc=None, ip=None):
     """Variant of ``tma_load_1d`` that takes a raw int64 GMEM byte address.
 
     Used for cross-rank TMA load via ``peer_rank_ptr_mapper.map`` style: source
@@ -144,6 +142,29 @@ def cp_reduce_async_bulk_add_noftz_bf16_s2g(
 
 
 @dsl_user_op
+def max_abs_bf16x2(lhs: Int32, rhs: Int32, *, loc=None, ip=None) -> Int32:
+    """Per-lane abs-max of two packed bf16x2 words (``max.xorsign.abs.bf16x2``).
+
+    Returns ``max(|lhs|, |rhs|)`` for each of the two bf16 lanes. The result's
+    sign per lane is the xor of the input signs (junk), so callers mask 0x7FFF
+    before reading a lane back. Stays in bf16 -- no fp32 convert needed to find
+    an amax.
+    """
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [lhs.ir_value(), rhs.ir_value()],
+            "max.xorsign.abs.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def fns_b32(mask: Int32, base: Int32, n: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(
         llvm.inline_asm(
@@ -219,18 +240,13 @@ def stg_b32_raw(addr: Int64, val: Int32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def stg_b8_raw(addr: Int64, val: Int32, *, loc=None, ip=None) -> None:
-    """``st.global.u8`` via raw int64 byte address (low 8 bits of ``val``).
-
-    A genuine single-byte store: distinct addresses never clobber, unlike a
-    1-element ``autovec_copy`` which widens to a ~32-bit store and races
-    neighboring bytes when 32 lanes each write one byte.
-    """
+def stg_b64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -> None:
+    """``st.global.u64`` via raw int64 byte address."""
     llvm.inline_asm(
         None,
         [addr.ir_value(), val.ir_value()],
-        "st.global.u8 [$0], $1;",
-        "l,r",
+        "st.global.u64 [$0], $1;",
+        "l,l",
         has_side_effects=True,
         asm_dialect=0,
         loc=loc,
@@ -239,13 +255,66 @@ def stg_b8_raw(addr: Int64, val: Int32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def stg_b64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -> None:
-    """``st.global.u64`` via raw int64 byte address."""
+def stg_e8m0_from_f32(addr: Int64, fp32_val: Float32, *, loc=None, ip=None) -> None:
+    """Convert ``fp32_val`` to E8M0 via PTX and store the 1-byte result to global memory.
+
+    Uses ``cvt.rp.satfinite.ue8m0x2.f32`` which is the correct PTX path for
+    fp32 → E8M0.  Avoids CuTe DSL's generic ``.to(Float8E8M0FNU)`` which does
+    not lower correctly for the non-IEEE-754 E8M0 type.
+    """
     llvm.inline_asm(
         None,
-        [addr.ir_value(), val.ir_value()],
-        "st.global.u64 [$0], $1;",
-        "l,l",
+        [addr.ir_value(), fp32_val.ir_value()],
+        "{\n"
+        "  .reg .b16 bf_lo;\n"
+        "  .reg .u32 tmp;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 bf_lo, 0f00000000, $1;\n"
+        "  cvt.u32.u16 tmp, bf_lo;\n"
+        "  st.global.b8 [$0], tmp;\n"
+        "}",
+        "l,f",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def stg_e8m0x8_from_f32(
+    addr: Int64,
+    v0: Float32, v1: Float32, v2: Float32, v3: Float32,
+    v4: Float32, v5: Float32, v6: Float32, v7: Float32,
+    *, loc=None, ip=None,
+) -> None:
+    """Convert 8 fp32 values to E8M0 and store them as 8 contiguous bytes in one shot.
+
+    Batched form of ``stg_e8m0_from_f32``: four ``cvt.rp.satfinite.ue8m0x2.f32``
+    each pack two E8M0 bytes (``d.lo = cvt(b)``, ``d.hi = cvt(a)``), the four
+    ``.b16`` results are assembled into two ``.b32`` words, and a single
+    ``st.global.v2.u32`` writes all 8 bytes.  Halves the cvt count and turns 8
+    one-byte stores into one 64-bit store.  ``addr`` must be 8-byte aligned;
+    output byte ``k`` holds E8M0(``v{k}``).
+    """
+    llvm.inline_asm(
+        None,
+        [
+            addr.ir_value(),
+            v0.ir_value(), v1.ir_value(), v2.ir_value(), v3.ir_value(),
+            v4.ir_value(), v5.ir_value(), v6.ir_value(), v7.ir_value(),
+        ],
+        "{\n"
+        "  .reg .b16 p0, p1, p2, p3;\n"
+        "  .reg .b32 w0, w1;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 p0, $2, $1;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 p1, $4, $3;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 p2, $6, $5;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 p3, $8, $7;\n"
+        "  mov.b32 w0, {p0, p1};\n"
+        "  mov.b32 w1, {p2, p3};\n"
+        "  st.global.v2.u32 [$0], {w0, w1};\n"
+        "}",
+        "l,f,f,f,f,f,f,f,f",
         has_side_effects=True,
         asm_dialect=0,
         loc=loc,
@@ -366,9 +435,31 @@ def red_add_release_gpu_s32(
 
 
 @dsl_user_op
-def red_async_add_release_sys_u32_raw(
-    addr: Int64, val: Int32, *, loc=None, ip=None
+def red_min_relaxed_gpu_u32_from_f32_raw(
+    addr: Int64, value: Float32, *, loc=None, ip=None
 ) -> None:
+    """``red.relaxed.gpu.global.min.u32`` on the bit pattern of a non-negative f32.
+
+    PTX has no float min-reduce; for non-negative floats the u32 bit order
+    matches the float order, so a u32 min on the reinterpreted bits realises a
+    float min. The target slot must be seeded with a large positive sentinel
+    (e.g. ``Fp32Max``) and only fed non-negative candidates. Relaxed/GPU scope
+    suffices: a kernel boundary separates the reduction from its reader.
+    """
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(), value.ir_value()],
+        "{ .reg .b32 t; mov.b32 t, $1; red.relaxed.gpu.global.min.u32 [$0], t; }",
+        "l,f",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_async_add_release_sys_u32_raw(addr: Int64, val: Int32, *, loc=None, ip=None) -> None:
     """``red.async.release.sys.global.add.u32`` via raw int64 byte address.
 
     sm_90+ async reduction — fire-and-forget; the issuing SM does NOT
@@ -405,7 +496,6 @@ def read_clock64(*, loc=None, ip=None) -> Int64:
         )
     )
 
-
 @dsl_user_op
 def _fence_rel_sys(
     *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
@@ -416,7 +506,6 @@ def _fence_rel_sys(
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-membar>`__.
     """
     llvm.fence(llvm.AtomicOrdering.release, loc=loc, ip=ip)
-
 
 @dsl_user_op
 def _fence_rel_gpu(

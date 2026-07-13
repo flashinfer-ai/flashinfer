@@ -14,12 +14,12 @@ from common.megamoe_constants import (
     Fp8E4M3FNMax,
     Nvfp4E2M1Max,
     Nvfp4BlockSize,
-    Mxfp8BlockSize,  # noqa: F401
+    Mxfp8BlockSize,
     SfPaddingBlock,
     TmaLeadingDimByteAlign,
     Nvfp4E2M1RcpLimit,
-    Fp8E4M3RcpLimit,  # noqa: F401
-    Fp8E5M2RcpLimit,  # noqa: F401
+    Fp8E4M3RcpLimit,
+    Fp8E5M2RcpLimit,
 )
 
 ### TO BE REMOVED
@@ -46,7 +46,7 @@ def round_up(a: int, b: int) -> int:
     return ceil_div(a, b) * b
 
 
-from common.host_utils import kind_data_dtype, kind_scale_dtype, kind_sf_vec_size  # noqa: F401
+from common.host_utils import kind_data_dtype, kind_scale_dtype, kind_sf_vec_size
 
 
 def kind_data_max(kind: str) -> float:
@@ -72,12 +72,10 @@ def leading_dim_bytes(leading_elems: int, dtype: torch.dtype) -> int:
         return leading_elems * 2
     if dtype == torch.float32:
         return leading_elems * 4
-    if dtype in (
-        Nvfp4ScaleDtype,
-        Mxfp8DataDtype_e4m3,
-        Mxfp8DataDtype_e5m2,
-        Mxfp8ScaleDtype,
-    ):
+    if dtype in (Nvfp4ScaleDtype,
+                 Mxfp8DataDtype_e4m3,
+                 Mxfp8DataDtype_e5m2,
+                 Mxfp8ScaleDtype):
         return leading_elems
     raise ValueError(f"leading_dim_bytes: unsupported dtype {dtype!r}.")
 
@@ -109,22 +107,8 @@ def offs_to_group_sizes(offs: torch.Tensor) -> List[int]:
 
 _Fp4DecodeTable: torch.Tensor = torch.tensor(
     [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        -0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
     ],
     dtype=torch.float32,
 )
@@ -188,11 +172,7 @@ def dequant_block_scale_to_fp32(
     global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dequantize one 2D NVFP4 tensor using raw block scales."""
-    data_fp32 = (
-        unpack_fp4_to_f32(data)
-        if data.dtype == Nvfp4DataDtype
-        else data.to(torch.float32)
-    )
+    data_fp32 = unpack_fp4_to_f32(data) if data.dtype == Nvfp4DataDtype else data.to(torch.float32)
     if data_fp32.dim() != 2 or raw_scale.dim() != 2:
         raise ValueError(
             f"Expected 2D tensors, got data={data_fp32.dim()}D raw_scale={raw_scale.dim()}D."
@@ -348,7 +328,6 @@ def _create_raw_scale_tensor(
     scales = scale_values[indices]
     return scales.to(scale_dtype).reshape(non_k_size, scale_cols)
 
-
 def make_nvfp4_tensor_from_torch_rng(
     rng: torch.Generator,
     logical_shape: Tuple[int, ...],
@@ -371,21 +350,13 @@ def make_nvfp4_tensor_from_torch_rng(
         for dim_size in logical_shape:
             total_elements *= dim_size
         flat_bytes = torch.randint(
-            0,
-            256,
-            (total_elements // 2,),
-            dtype=torch.uint8,
-            device=device,
-            generator=rng,
+            0, 256, (total_elements // 2,),
+            dtype=torch.uint8, device=device, generator=rng,
         )
     else:
         random_u8 = torch.randint(
-            0,
-            100,
-            logical_shape,
-            dtype=torch.uint8,
-            device=device,
-            generator=rng,
+            0, 100, logical_shape,
+            dtype=torch.uint8, device=device, generator=rng,
         )
         nibbles = torch.zeros_like(random_u8)
         nibbles[(random_u8 >= 80) & (random_u8 < 90)] = 0x2
@@ -395,8 +366,7 @@ def make_nvfp4_tensor_from_torch_rng(
         if need_perm:
             perm_to_last = list(range(ndim))
             perm_to_last[packed_dim], perm_to_last[-1] = (
-                perm_to_last[-1],
-                perm_to_last[packed_dim],
+                perm_to_last[-1], perm_to_last[packed_dim],
             )
             nibbles = nibbles.permute(perm_to_last).contiguous()
         even, odd = nibbles[..., 0::2], nibbles[..., 1::2]
@@ -406,16 +376,14 @@ def make_nvfp4_tensor_from_torch_rng(
     need_perm = packed_dim != ndim - 1
     if need_perm:
         storage_shape[packed_dim], storage_shape[-1] = (
-            storage_shape[-1],
-            storage_shape[packed_dim],
+            storage_shape[-1], storage_shape[packed_dim],
         )
     storage_shape[-1] //= 2
     tensor = flat_bytes.view(Nvfp4DataDtype).reshape(storage_shape)
     if need_perm:
         permute_back = list(range(ndim))
         permute_back[packed_dim], permute_back[-1] = (
-            permute_back[-1],
-            permute_back[packed_dim],
+            permute_back[-1], permute_back[packed_dim],
         )
         tensor = tensor.permute(permute_back)
     return tensor
@@ -501,47 +469,68 @@ def swiglu_fold_interleave_16(
     return swiglu_fold_interleave(c_fp32, 16, gate_up_clamp=gate_up_clamp)
 
 
-_Fp4ValuesEvenFirst: torch.Tensor = torch.tensor(
-    [
-        0.0,
-        1.0,
-        2.0,
-        4.0,
-        -0.0,
-        -1.0,
-        -2.0,
-        -4.0,
-        0.5,
-        1.5,
-        3.0,
-        6.0,
-        -0.5,
-        -1.5,
-        -3.0,
-        -6.0,
-    ],
-    dtype=torch.float32,
-)
+@functools.lru_cache(None)
+def _get_pack_fp4_triton_kernel():
+    import triton
+    import triton.language as tl
 
-_ReorderToNibble: torch.Tensor = torch.tensor(
-    [0x0, 0x2, 0x4, 0x6, 0x8, 0xA, 0xC, 0xE, 0x1, 0x3, 0x5, 0x7, 0x9, 0xB, 0xD, 0xF],
-    dtype=torch.uint8,
-)
+    @triton.jit
+    def _pack_fp4_kernel(x_ptr, out_ptr, n_pairs, BLOCK: tl.constexpr):
+        # int64 offsets: the combine round-trip packs the whole (world*tok, topk,
+        # hidden) terms (billions of elements at ep4 / 32768), so ``2 * offsets``
+        # overflows int32 and wraps to a negative address (illegal access).
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < n_pairs
+        # Even element -> low nibble, odd -> high (matches unpack_fp4_to_f32).
+        # cvt.rn.satfinite.e2m1x2.f32 stores src $1 in the HIGH nibble and $2 in
+        # the LOW nibble, so pass (odd, even).
+        even = tl.load(x_ptr + 2 * offsets, mask=mask, other=0.0)
+        odd = tl.load(x_ptr + 2 * offsets + 1, mask=mask, other=0.0)
+        packed = tl.inline_asm_elementwise(
+            """
+            {
+                .reg .b8 r;
+                cvt.rn.satfinite.e2m1x2.f32 r, $1, $2;
+                mov.b32 $0, {r, r, r, r};
+            }
+            """,
+            constraints="=r,f,f",
+            args=[odd, even],
+            dtype=tl.uint8,
+            is_pure=True,
+            pack=1,
+        )
+        tl.store(out_ptr + offsets, packed, mask=mask)
+
+    return triton, _pack_fp4_kernel
 
 
 def _pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
-    """Round fp32 to FP4 E2M1 and nibble-pack into ``float4_e2m1fn_x2``."""
-    device = fp32.device
-    lut = _Fp4ValuesEvenFirst.to(device)
-    nibble_map = _ReorderToNibble.to(device)
-    flat = fp32.reshape(-1)
-    diffs = (flat.unsqueeze(-1) - lut.unsqueeze(0)).abs()
-    reordered_idx = diffs.argmin(dim=-1)
-    indices = nibble_map[reordered_idx].view(fp32.shape)
-    lo = indices[..., 0::2]
-    hi = indices[..., 1::2]
-    packed = (hi << 4) | lo
-    return packed.view(Nvfp4DataDtype)
+    """Round fp32 to FP4 E2M1 (HW ``cvt.rn.satfinite.e2m1x2.f32``, RTNE, bit-exact
+    with the device encoder) and nibble-pack into ``float4_e2m1fn_x2``.
+
+    O(N): replaces the per-element 16-way LUT argmin, whose ``(N, 16)`` distance
+    broadcast allocated ``N * 16`` fp32 (hundreds of GB at large token counts,
+    e.g. ep4 / 32768).  Even element -> low nibble, odd -> high (matches
+    ``unpack_fp4_to_f32``; the decode table is standard E2M1).
+    """
+    if not fp32.is_cuda or fp32.dtype != torch.float32:
+        raise ValueError(
+            f"_pack_f32_to_fp4 expects a CUDA float32 tensor; got "
+            f"device={fp32.device}, dtype={fp32.dtype}."
+        )
+    *lead, last = fp32.shape
+    if last % 2 != 0:
+        raise ValueError(f"FP4 pack needs an even trailing dim, got {last}.")
+    flat = fp32.reshape(-1).contiguous()
+    n_pairs = flat.numel() // 2
+    out = torch.empty(n_pairs, dtype=torch.uint8, device=fp32.device)
+    if n_pairs > 0:
+        triton, kernel = _get_pack_fp4_triton_kernel()
+        block = 1024
+        grid = (triton.cdiv(n_pairs, block),)
+        kernel[grid](flat, out, n_pairs, BLOCK=block)
+    return out.view(*lead, last // 2).view(Nvfp4DataDtype)
 
 
 @functools.lru_cache(None)
@@ -672,11 +661,11 @@ def nvfp4_quantize_per_block_16(
 
     fp32_max = torch.finfo(torch.float32).max
     acc_scale = float(norm_const) * _rcp_approx_ftz_f32_cuda(sfc_fp32_rt)
-    acc_scale = torch.nan_to_num(
-        acc_scale, nan=fp32_max, posinf=fp32_max, neginf=fp32_max
-    )
+    acc_scale = torch.nan_to_num(acc_scale, nan=fp32_max, posinf=fp32_max, neginf=fp32_max)
     acc_scale = torch.clamp(acc_scale, max=fp32_max)
-    acc_scale = torch.where(sfc_fp32_rt > 0, acc_scale, torch.zeros_like(acc_scale))
+    acc_scale = torch.where(
+        sfc_fp32_rt > 0, acc_scale, torch.zeros_like(acc_scale)
+    )
 
     scaled = c_swiglu * acc_scale.unsqueeze(-1).expand_as(blocked).reshape(M, N)
     c_fp4 = _pack_f32_to_fp4(scaled)

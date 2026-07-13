@@ -32,6 +32,7 @@ from .kernel_helpers import (
     Mxfp8BlockSize,
     Mxfp8ScaleDtype,
     Nvfp4BlockSize,
+    _stack_byte_reinterpretable_tensors,
     ceil_div,
     kind_data_dtype,
     mxfp8_quantize_per_block_32,
@@ -61,6 +62,15 @@ from .mxfp8 import (
     mxfp8_mega_moe,
 )
 
+# Kernel tuning knobs (tactic enumeration + config application).
+from . import tuner
+from .tuner import (
+    CORRECTNESS_KNOBS,
+    PERF_KNOBS,
+    iter_candidates,
+    with_knobs,
+)
+
 __all__ = [
     # paths
     "bootstrap_paths",
@@ -74,6 +84,7 @@ __all__ = [
     "Mxfp8BlockSize",
     "Mxfp8ScaleDtype",
     "Nvfp4BlockSize",
+    "_stack_byte_reinterpretable_tensors",
     "ceil_div",
     "kind_data_dtype",
     "mxfp8_quantize_per_block_32",
@@ -99,4 +110,10 @@ __all__ = [
     "create_dummy_mxfp8_inputs",
     "get_symm_buffer_for_mxfp8_mega_moe",
     "mxfp8_mega_moe",
+    # tuner
+    "tuner",
+    "CORRECTNESS_KNOBS",
+    "PERF_KNOBS",
+    "iter_candidates",
+    "with_knobs",
 ]

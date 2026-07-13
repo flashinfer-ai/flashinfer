@@ -102,15 +102,15 @@ test_matches_selectors() {
 declare -a TESTS=(
     # ── Group M: cluster_m=2, e4m3 ──
     "M1_e4m3_static_dynShape_c2     | --kind mxfp8_e4m3 --tokens_after_topk 2400 --experts 8  --hidden 1792 --intermediate 1536 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --balance_route --load_balance_mode static"
-    "M2_e4m3_static_statShape_c2    | --kind mxfp8_e4m3 --tokens_after_topk 2400 --experts 12 --hidden 1792 --intermediate 1536 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --balance_route --load_balance_mode static --enable_static_expert_shape"
+    "M2_e4m3_static_statShape_c2    | --kind mxfp8_e4m3 --tokens_after_topk 2400 --experts 12 --hidden 1792 --intermediate 1536 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --balance_route --load_balance_mode static --enable_static_expert_shape --generate_c"
     "M3_e4m3_atomic_dynShape_c2     | --kind mxfp8_e4m3 --tokens_after_topk 2400 --experts 16 --hidden 1792 --intermediate 1536 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --balance_route --load_balance_mode atomic_counter"
 
     # ── Group M: atomic + static expert shape, e4m3 ──
-    "M4_e4m3_atomic_statShape_c2    | --kind mxfp8_e4m3 --tokens_after_topk 4500 --experts 19 --hidden 2304 --intermediate 2560 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --balance_route --load_balance_mode atomic_counter --enable_static_expert_shape"
+    "M4_e4m3_atomic_statShape_c2    | --kind mxfp8_e4m3 --tokens_after_topk 4500 --experts 19 --hidden 2304 --intermediate 2560 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --balance_route --load_balance_mode atomic_counter --enable_static_expert_shape --generate_c"
 
     # ── Group M: dirichlet routing, e4m3 ──
     "M5_e4m3_dirichlet_static_c2    | --kind mxfp8_e4m3 --tokens_after_topk 3000 --experts 23 --hidden 2304 --intermediate 2560 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --load_balance_mode static"
-    "M6_e4m3_dirichlet_atomic_c2    | --kind mxfp8_e4m3 --tokens_after_topk 9000 --experts 31 --hidden 2304 --intermediate 2560 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --load_balance_mode atomic_counter --enable_static_expert_shape"
+    "M6_e4m3_dirichlet_atomic_c2    | --kind mxfp8_e4m3 --tokens_after_topk 9000 --experts 31 --hidden 2304 --intermediate 2560 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --load_balance_mode atomic_counter --enable_static_expert_shape --generate_c"
 
     # ── Group M: large shape (DeepSeek-ish) ──
     "M7_e4m3_large_atomic_balanced  | --kind mxfp8_e4m3 --tokens_after_topk 17000 --experts 8 --hidden 7168 --intermediate 4096 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --balance_route --load_balance_mode atomic_counter"

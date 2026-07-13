@@ -29,12 +29,15 @@ from __future__ import annotations
 # packages (moe_nvfp4_swapab, common, ...).  ``bootstrap_paths`` is re-exported
 # here so callers (e.g. core runtime) reach it through this public boundary.
 from .shim import (
+    CORRECTNESS_KNOBS,
     MegaMoEMxfp8SymmBuffer,
     MegaMoESymmBuffer,
     Mxfp8BlockSize,
     Mxfp8ScaleDtype,
     Nvfp4BlockSize,
+    PERF_KNOBS,
     TransformedWeights,
+    _stack_byte_reinterpretable_tensors,
     bootstrap_paths,
     ceil_div,
     create_dummy_mxfp8_inputs,
@@ -42,6 +45,7 @@ from .shim import (
     get_symm_buffer_for_mega_moe,
     get_symm_buffer_for_mxfp8_mega_moe,
     init_dist,
+    iter_candidates,
     kind_data_dtype,
     make_dummy_epilogue_params,
     mxfp8_mega_moe,
@@ -50,6 +54,8 @@ from .shim import (
     nvfp4_quantize_per_block_16,
     round_up,
     to_blocked,
+    tuner,
+    with_knobs,
 )
 
 # Heavy kernel helpers (``mega_runner`` byte-stacking, ``mega_runner`` fp8/E8M0
@@ -60,7 +66,6 @@ from .shim import (
 _LAZY_HELPERS = (
     "_make_e8m0_scale_tensor",
     "_make_fp8_tensor",
-    "_stack_byte_reinterpretable_tensors",
     "compute_megamoe_reference_mxfp8",
 )
 
@@ -100,6 +105,11 @@ __all__ = [
     "nvfp4_quantize_per_block_16",
     "round_up",
     "to_blocked",
+    "tuner",
+    "with_knobs",
+    "iter_candidates",
+    "CORRECTNESS_KNOBS",
+    "PERF_KNOBS",
     "_make_e8m0_scale_tensor",
     "_make_fp8_tensor",
     "_stack_byte_reinterpretable_tensors",

@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Host driver for the MegaMoE NVFP4 swap-AB fused fc1+fc2 kernel."""
 
+
 import argparse
 import os
 import sys
-from dataclasses import dataclass, field  # noqa: F401
-from typing import List, Literal, Optional, Tuple  # noqa: F401
+from dataclasses import dataclass, field
+from typing import List, Literal, Optional, Tuple
 
-import numpy as np  # noqa: F401
+import numpy as np
 import torch
 
 # Ensure absolute package imports work when this file is run as a script.
@@ -103,9 +104,9 @@ class SwapABSwigluFp4Fc12Tester(Fc12TesterBase):
 
         # -- Correctness mode --
         rand_u8 = torch.randint(0, 100, logical_shape, dtype=torch.uint8, device="cuda")
-        nibbles = torch.zeros_like(rand_u8)  # default 0 (nibble 0x0)
-        nibbles.masked_fill_((rand_u8 >= 80) & (rand_u8 < 90), 0x2)  # 10 %: +1
-        nibbles.masked_fill_(rand_u8 >= 90, 0xA)  # 10 %: -1
+        nibbles = torch.zeros_like(rand_u8)         # default 0 (nibble 0x0)
+        nibbles.masked_fill_((rand_u8 >= 80) & (rand_u8 < 90), 0x2)   # 10 %: +1
+        nibbles.masked_fill_(rand_u8 >= 90, 0xA)                      # 10 %: -1
 
         need_perm = packed_dim != ndim - 1
         if need_perm:
@@ -155,9 +156,7 @@ class SwapABSwigluFp4Fc12Tester(Fc12TesterBase):
             )
         else:
             self.activation = torch.empty(
-                (0, hidden // 2),
-                dtype=torch.uint8,
-                device="cuda",
+                (0, hidden // 2), dtype=torch.uint8, device="cuda",
             ).view(data_dtype)
 
         # -- fc1_weight --
@@ -191,8 +190,7 @@ class SwapABSwigluFp4Fc12Tester(Fc12TesterBase):
         fc2_output_bytes = torch.full(
             (data_total_rows, hidden * problem.fc2_output_dtype.itemsize),
             0xFF,
-            dtype=torch.uint8,
-            device="cuda",
+            dtype=torch.uint8, device="cuda",
         )
         self.fc2_output = fc2_output_bytes.view(problem.fc2_output_dtype).reshape(
             data_total_rows, 1, hidden
@@ -286,14 +284,16 @@ class SwapABSwigluFp4Fc12Tester(Fc12TesterBase):
 
             kernel_q = self._ws_fc1_output_torch[d_start : d_start + v_e]
             kernel_sf_raw = from_blocked(
-                self._ws_fc1_output_sf_torch[sf_start:sf_end].contiguous().view(-1),
-                v_e,
-                K_sf,
+                self._ws_fc1_output_sf_torch[sf_start:sf_end]
+                .contiguous().view(-1),
+                v_e, K_sf,
             )
             kernel_fp32 = dequant_block_scale_to_fp32(
                 kernel_q, kernel_sf_raw, sf_vec_size, None
             )
-            ref_fp32 = dequant_block_scale_to_fp32(ref_q, ref_sf, sf_vec_size, None)
+            ref_fp32 = dequant_block_scale_to_fp32(
+                ref_q, ref_sf, sf_vec_size, None
+            )
 
             diff = (kernel_fp32 - ref_fp32).abs()
             max_d = diff.max().item()
@@ -330,26 +330,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     add_common_fc12_arguments(parser)
 
     parser.add_argument(
-        "--flag_batch",
-        type=int,
-        default=1,
+        "--flag_batch", type=int, default=1,
         help="dispatch_pull release-flag batch size; 1 == per-token "
         "baseline, larger amortizes the device fence over more tokens.",
     )
     parser.add_argument(
-        "--epi_flag_batch",
-        type=str,
-        default="1,1",
+        "--epi_flag_batch", type=str, default="1,1",
         help="(fc1,fc2) done-counter publish batch in comma form like "
-        "--mma_tiler_mnk (warp-cooperative, each in 1..32). E.g. 1,4.",
+             "--mma_tiler_mnk (warp-cooperative, each in 1..32). E.g. 1,4.",
     )
     parser.add_argument(
-        "--gate_up_clamp",
-        type=float,
-        default=None,
+        "--gate_up_clamp", type=float, default=None,
         help="DeepSeek-V4 swiglu_limit: asymmetric clamp on the real gate/up "
-        "pre-activations (gate<=limit, |up|<=limit) before SiLU. "
-        "Omitted/None disables it; must be non-negative.",
+             "pre-activations (gate<=limit, |up|<=limit) before SiLU. "
+             "Omitted/None disables it; must be non-negative.",
     )
     parser.add_argument(
         "--use_bulk_fc2_store",
@@ -361,7 +355,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--in_kernel_fc2_reduce",
         action="store_true",
         default=False,
-        help="Reduce topk in-kernel via fc2 atomic add (lean runner forbids this).",
+        help="Reduce topk in-kernel via fc2 atomic add "
+             "(lean runner forbids this).",
     )
 
     return parser

@@ -17,6 +17,8 @@ kernel_src/cutedsl_megamoe/
 │   ├── mxfp8.py            ← MXFP8 frontend + symm-buffer/launch wrappers (self-contained)
 │   ├── kernel_helpers.py   ← SINGLE re-export point for raw-kernel helpers/constants/
 │   │                          reference the FI backend + tests need (drop-audit point)
+│   ├── tuner.py            ← kernel tuning knobs (tactic enumeration + config apply);
+│   │                          mirrors tester/solvers/inference_solver knob taxonomy
 │   └── correctness.py      ← standalone NVFP4 smoke runner (not used by moe_ep)
 └── SKILL.md                ← this file
 ```
@@ -63,7 +65,19 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    the sibling `src/` dir, so a verbatim drop just works. (Ignore any bootstrap
    the drop ships inside its packages.)
 
-3. **Audit shim compatibility** — `shim/nvfp4.py` and `shim/mxfp8.py` call into `common`,
+3. **Audit the kernel construct + launch signatures FIRST** — the highest-churn
+   surface, and one a symbol-existence grep will NOT catch (the args change, not
+   the names). `shim/{nvfp4,mxfp8}.py` `_ensure_mega_compiled` (constructor) and
+   `_build_mega_runtime_kwargs` (the `cute.compile` / launch kwargs) must match
+   `Sm100MegaMoE{,Mxfp8}Kernel.__init__` and `.__call__`. The authoritative
+   templates to mirror are the training integration's drivers:
+   `moe_ep_training/megamoe/forward_nvfp4.py` and `forward.py` (kernel construct,
+   `output_activation`, workspace pointer vs cute-tensor handling, `combine_format`).
+   Also re-check `tuner.py`'s knob value-sets against
+   `tester/solvers/inference_solver.py` (`_correctness_knobs` / `_perf_knobs` /
+   `filter_invalid`).
+
+4. **Audit shim compatibility** — `shim/nvfp4.py` and `shim/mxfp8.py` call into `common`,
    `moe_nvfp4_swapab`, `moe_mxfp8_glu`, and `src` via sys.path imports. Check these
    entrypoints after updating src/:
 
@@ -89,7 +103,7 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    | `from moe_mxfp8_glu.mega_runner import _make_fp8_tensor, _make_e8m0_scale_tensor` (lazy) | `src/moe_mxfp8_glu/mega_runner.py` |
    | `from moe_mxfp8_glu.mega_reference_mxfp8 import compute_megamoe_reference_mxfp8` (lazy) | `src/moe_mxfp8_glu/mega_reference_mxfp8.py` |
 
-4. **Run the cutedsl tests** to confirm everything still works:
+5. **Run the cutedsl tests** to confirm everything still works:
    ```bash
    # Blackwell-only; requires torchrun + 4+ GPUs
    torchrun --standalone --nproc_per_node=4 -m pytest \

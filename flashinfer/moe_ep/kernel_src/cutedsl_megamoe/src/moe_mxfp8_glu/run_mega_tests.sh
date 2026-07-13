@@ -157,6 +157,30 @@ declare -a TESTS=(
     "M17_mr_dynshape_balanced_topk4  | multi  | --kind mxfp8_e4m3 --num_tokens_per_rank 384  --num_topk 4  --num_total_experts 32  --hidden 2048 --intermediate 2048 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs"
     "M18_mr_dynshape_pl_topk7        | multi  | --kind mxfp8_e4m3 --num_tokens_per_rank 576  --num_topk 7  --num_total_experts 64  --hidden 1536 --intermediate 2688 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --route_distribution power_law --load_balance_mode atomic_counter"
 
+    # ── GC01..GC03: generate_c — raw pre-SwiGLU fc1 accumulator output ──
+    # Token padding is bumped to 128 (cta_tile_m) for TMA alignment; these
+    # cases verify that physical row offsets are 128-aligned on every rank and
+    # that the stored gate+up values match the reference fc1 accumulator.
+    "GC01_single_generate_c          | single | --kind mxfp8_e4m3 --num_tokens_per_rank 192  --num_topk 2  --num_total_experts 8   --hidden 1024 --intermediate 2048 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --enable_static_expert_shape --generate_c"
+    "GC02_mr_balanced_generate_c     | multi  | --kind mxfp8_e4m3 --num_tokens_per_rank 256  --num_topk 3  --num_total_experts 24  --hidden 1536 --intermediate 2048 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --enable_static_expert_shape --load_balance_mode atomic_counter --generate_c"
+    "GC03_mr_power_law_generate_c    | multi  | --kind mxfp8_e4m3 --num_tokens_per_rank 320  --num_topk 3  --num_total_experts 24  --hidden 1536 --intermediate 1792 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --enable_static_expert_shape --route_distribution power_law --generate_c"
+
+    # ── CM01..CM05: combine_format 32e4m3xe8m0 — fp8 e4m3+E8M0 quantized NVLink combine ──
+    # fc2 output is quantized to fp8 (e4m3) + per-32 E8M0 block scale before the
+    # NVLink combine; TopkReduce dequantizes and reduces to BF16 after the kernel.
+    # quantized combine_format is incompatible with --in_kernel_fc2_reduce (Form B).
+    "CM01_single_combine_mxfp8          | single | --kind mxfp8_e4m3 --num_tokens_per_rank 192  --num_topk 2  --num_total_experts 8   --hidden 1024 --intermediate 2048 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --enable_static_expert_shape --combine_format 32e4m3xe8m0"
+    "CM02_mr_balanced_topk2             | multi  | --kind mxfp8_e4m3 --num_tokens_per_rank 256  --num_topk 2  --num_total_experts 16  --hidden 1024 --intermediate 1024 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --enable_static_expert_shape --combine_format 32e4m3xe8m0"
+    "CM03_mr_balanced_topk8             | multi  | --kind mxfp8_e4m3 --num_tokens_per_rank 512  --num_topk 8  --num_total_experts 64  --hidden 2048 --intermediate 2048 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --enable_static_expert_shape --combine_format 32e4m3xe8m0"
+    "CM04_mr_power_law_topk5            | multi  | --kind mxfp8_e4m3 --num_tokens_per_rank 320  --num_topk 5  --num_total_experts 40  --hidden 1280 --intermediate 1920 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --enable_static_expert_shape --combine_format 32e4m3xe8m0 --route_distribution power_law"
+    "CM05_mr_atomic_topk6               | multi  | --kind mxfp8_e4m3 --num_tokens_per_rank 384  --num_topk 6  --num_total_experts 48  --hidden 1792 --intermediate 2304 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --enable_static_expert_shape --combine_format 32e4m3xe8m0 --load_balance_mode atomic_counter"
+
+    # ── CM06..CM07: combine_format 32e5m2xe8m0 — fp8 e5m2+E8M0 quantized NVLink combine ──
+    # Same bandwidth saving as e4m3 but using the e5m2 element format (wider dynamic
+    # range, lower precision).  Uses --kind mxfp8_e5m2 so fc1/fc2 weights and
+    # activations are also e5m2; the combine wire format matches the compute dtype.
+    "CM06_single_combine_e5m2           | single | --kind mxfp8_e5m2 --num_tokens_per_rank 192  --num_topk 2  --num_total_experts 8   --hidden 1024 --intermediate 2048 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --enable_static_expert_shape --combine_format 32e5m2xe8m0"
+    "CM07_mr_balanced_combine_e5m2      | multi  | --kind mxfp8_e5m2 --num_tokens_per_rank 256  --num_topk 4  --num_total_experts 32  --hidden 1024 --intermediate 1024 --mma_tiler_mnk 256,256,128 --cluster_shape_mnk 2,1,1 --use_2cta_instrs --enable_static_expert_shape --combine_format 32e5m2xe8m0"
 )
 
 PASS_COUNT=0

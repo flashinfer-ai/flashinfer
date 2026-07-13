@@ -159,7 +159,9 @@ class MegaMoEMxfp8Inputs:
     fc1_weight_sf: torch.Tensor
     fc2_weight: torch.Tensor
     fc2_weight_sf: torch.Tensor
-    combine_output: torch.Tensor
+    # Single 2D (T, hidden) bf16 output; the kernel reduces top-k internally
+    # (the drop replaced the old form-A ``combine_output`` with this).
+    output_activation: torch.Tensor
 
 
 class MegaMoEMxfp8Frontend:
@@ -208,23 +210,15 @@ class MegaMoEMxfp8Frontend:
         reset_counters: bool = True,
         reduce_topk: bool = True,
     ) -> Optional[torch.Tensor]:
-        """Launch MXFP8 MegaMoE.
+        """Launch MXFP8 MegaMoE and return the 2D ``(T, hidden)`` bf16 output.
 
-        Returns ``combine_output.squeeze(1)`` when ``in_kernel_fc2_reduce=True``;
-        otherwise form-A ``combine_output`` with shape ``(T, top_k, hidden)``.
-        If ``reduce_topk=True`` with ``in_kernel_fc2_reduce=False``, raises:
-        MXFP8 has no separate frontend top-k reduce kernel, so non-in-kernel
-        reduction remains the caller's responsibility.
+        The kernel drop reduces the top-k combine internally, so the result is
+        always the reduced ``output_activation`` (the old form-A path is gone).
+        ``reduce_topk`` is accepted for backward API compatibility and ignored.
         """
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return None
-        if reduce_topk and not self.config.in_kernel_fc2_reduce:
-            raise ValueError(
-                "MXFP8 MegaMoE has no separate top-k reduce kernel; call "
-                "run(..., reduce_topk=False) and reduce form-A output externally, "
-                "or enable in_kernel_fc2_reduce."
-            )
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         if reset_counters:
@@ -232,9 +226,7 @@ class MegaMoEMxfp8Frontend:
         mega.compiled(**runtime_kwargs)
         if sync:
             torch.cuda.synchronize()
-        if self.config.in_kernel_fc2_reduce:
-            return launch_inputs.combine_output.squeeze(1)
-        return launch_inputs.combine_output
+        return launch_inputs.output_activation
 
     def _mega_compile_key(self) -> tuple:
         c = self.config
@@ -310,7 +302,11 @@ class MegaMoEMxfp8Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
-            token_back_by_dispatch=c.token_back_by_dispatch,
+            # kernel renamed the bool token_back_by_dispatch -> token_back_mode enum:
+            # dispatch-reuse maps to "reuse_dispatch_warps", default to "epi_warps".
+            token_back_mode=(
+                "reuse_dispatch_warps" if c.token_back_by_dispatch else "epi_warps"
+            ),
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
             gate_up_clamp=self._gate_up_clamp,
@@ -404,7 +400,7 @@ class MegaMoEMxfp8Frontend:
             fc1_weight_sf=inputs.fc1_weight_sf,
             fc2_weight=inputs.fc2_weight,
             fc2_weight_sf=inputs.fc2_weight_sf,
-            combine_output=inputs.combine_output[tok],
+            output_activation=inputs.output_activation[tok],
         )
 
     def _validate_inputs(
@@ -456,7 +452,7 @@ class MegaMoEMxfp8Frontend:
             ("activation_sf", inputs.activation_sf),
             ("topk_idx", inputs.topk_idx),
             ("topk_weights", inputs.topk_weights),
-            ("combine_output", inputs.combine_output),
+            ("output_activation", inputs.output_activation),
         )
         for name, tensor in token_tensors:
             _require_cuda(name, tensor)
@@ -466,16 +462,16 @@ class MegaMoEMxfp8Frontend:
                     f"activation.shape[0] ({buf_tokens})."
                 )
 
-        combine_k = 1 if c.in_kernel_fc2_reduce else c.num_topk
-        if inputs.combine_output.shape != (buf_tokens, combine_k, c.hidden):
+        if inputs.output_activation.shape != (buf_tokens, c.hidden):
             raise ValueError(
-                "combine_output must have shape "
-                f"({buf_tokens}, {combine_k}, {c.hidden}), "
-                f"got {tuple(inputs.combine_output.shape)}."
+                "output_activation must have shape "
+                f"({buf_tokens}, {c.hidden}), "
+                f"got {tuple(inputs.output_activation.shape)}."
             )
-        if inputs.combine_output.dtype != torch.bfloat16:
+        if inputs.output_activation.dtype != torch.bfloat16:
             raise ValueError(
-                f"combine_output must be bfloat16, got {inputs.combine_output.dtype}."
+                "output_activation must be bfloat16, got "
+                f"{inputs.output_activation.dtype}."
             )
         if inputs.topk_idx.shape != (buf_tokens, c.num_topk):
             raise ValueError(
@@ -584,13 +580,16 @@ class MegaMoEMxfp8Frontend:
             fc1_weight_sf=self._to_cute(inputs.fc1_weight_sf),
             fc2_weight=self._to_cute(inputs.fc2_weight),
             fc2_weight_sf=self._to_cute(inputs.fc2_weight_sf),
-            combine_output=self._to_cute(inputs.combine_output),
+            output_activation=self._to_cute(inputs.output_activation),
             local_workspace=self._to_cute(
                 mega.local_workspace,
                 static_layout=True,
             ),
             shared_workspace=self._to_cute(mega.shared_workspace),
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
+            # fc1_c is the optional in-kernel fc1-out C buffer (generate_c path);
+            # None uses the kernel's internal staging (matches the drop default).
+            fc1_c=None,
             stream=stream,
         )
 
@@ -653,7 +652,7 @@ class MegaMoEMxfp8SymmBuffer:
     x_sf: torch.Tensor
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
-    combine_output: torch.Tensor
+    output_activation: torch.Tensor
 
     _frontend: MegaMoEMxfp8Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
@@ -688,6 +687,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     activation_clamp: Optional[float] = None,
     in_kernel_fc2_reduce: bool = False,
     token_back_by_dispatch: bool = False,
+    knobs: Optional[dict] = None,
 ) -> MegaMoEMxfp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
 
@@ -747,12 +747,13 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     sym_roots.append(topk_idx)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     sym_roots.append(topk_weights)
-    combine_k = 1 if in_kernel_fc2_reduce else num_topk
-    combine_output = sym_zeros(
-        (num_max_tokens, combine_k, hidden),
-        torch.bfloat16,
+    # Single 2D (T, hidden) bf16 output; the kernel reduces top-k internally.
+    # in_kernel_fc2_reduce=False (default) -> rank-local buffer (not sym heap).
+    output_activation = torch.zeros(
+        (num_max_tokens, hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
     )
-    sym_roots.append(combine_output)
 
     return MegaMoEMxfp8SymmBuffer(
         num_total_experts=num_total_experts,
@@ -767,7 +768,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         x_sf=x_sf,
         topk_idx=topk_idx,
         topk_weights=topk_weights,
-        combine_output=combine_output,
+        output_activation=output_activation,
         _frontend=frontend,
         _sym_roots=sym_roots,
     )
@@ -841,29 +842,16 @@ def mxfp8_mega_moe(
         fc1_weight_sf=fc1_weight_sf,
         fc2_weight=fc2_weight,
         fc2_weight_sf=fc2_weight_sf,
-        combine_output=symm_buffer.combine_output,
+        output_activation=symm_buffer.output_activation,
     )
 
-    if symm_buffer._frontend.config.in_kernel_fc2_reduce:
-        out = symm_buffer._frontend.run(inputs, num_tokens=n)
-        if out is not None:
-            y.copy_(out[:n])
-    else:
-        out = symm_buffer._frontend.run(
-            inputs,
-            num_tokens=None,
-            reduce_topk=False,
-        )
-        if out is not None:
-            reduced = (
-                (
-                    out[:n].to(torch.float32)
-                    * symm_buffer.topk_weights[:n, :, None].to(torch.float32)
-                )
-                .sum(dim=1)
-                .to(y.dtype)
-            )
-            y.copy_(reduced)
+    # The kernel reduces the top-k combine internally and writes the final 2D
+    # (T, hidden) output; no host-side form-A reduction is needed.  Launch the
+    # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
+    # live [:n] rows out -- matches the reference driver, which does not slice.
+    out = symm_buffer._frontend.run(inputs, num_tokens=None)
+    if out is not None:
+        y.copy_(out[:n])
 
 
 def _create_dummy_weights(

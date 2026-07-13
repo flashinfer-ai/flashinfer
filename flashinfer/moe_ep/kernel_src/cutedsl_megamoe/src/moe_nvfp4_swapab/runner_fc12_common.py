@@ -30,13 +30,14 @@ and MXFP8 (``moe_mxfp8_glu/runner_fc12.py``) fused-fc12 runners have in common:
     :func:`parse_tuple`, :func:`parse_output_dtype`).
 """
 
+
 import argparse
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
-import cutlass  # noqa: F401
+import cutlass
 from cutlass.utils import HardwareInfo
 
 from moe_nvfp4_swapab.epilogue import (
@@ -113,11 +114,7 @@ class ProblemDesc:
             raise ValueError(
                 f"hidden ({self.hidden}) must be a positive multiple of {Nvfp4BlockSize}."
             )
-        _interleave = (
-            Nvfp4Fc1GateUpInterleave
-            if self.kind == "nvfp4"
-            else Mxfp8Fc1GateUpInterleave
-        )
+        _interleave = Nvfp4Fc1GateUpInterleave if self.kind == "nvfp4" else Mxfp8Fc1GateUpInterleave
         if self.intermediate <= 0 or self.intermediate % (2 * _interleave) != 0:
             raise ValueError(
                 f"intermediate ({self.intermediate}) must be a positive multiple of "
@@ -133,7 +130,8 @@ class ProblemDesc:
             raise ValueError(f"simulate_ep must be positive, got {self.simulate_ep}.")
         if self.gate_up_clamp is not None and self.gate_up_clamp < 0.0:
             raise ValueError(
-                f"gate_up_clamp must be None or non-negative, got {self.gate_up_clamp}."
+                f"gate_up_clamp must be None or non-negative, got "
+                f"{self.gate_up_clamp}."
             )
 
         # -- Locked-domain fields --
@@ -200,7 +198,6 @@ class ProblemDesc:
         from moe_nvfp4_swapab.runner_common import (
             check_tma_leading_dim_align as _check_tma_leading_dim_align,
         )
-
         _check_tma_leading_dim_align(
             "activation",
             {"k_major": self.hidden}[self.fc1_activation_layout],
@@ -289,30 +286,21 @@ class ImplDesc:
     ] = "epi_warps"
     flag_batch: int = 4
     epi_flag_batch: Optional[Tuple[int, int]] = (1, 1)
-    # Cross-rank combine transfer format for the reuse_dispatch_warps
-    # token-back push.  "bf16" is the unchanged default; "mxfp8" / "nvfp4"
-    # quantize each 32-element block (tile-wise) on the wire to cut combine
-    # NVLink volume, with the receiver dequantizing + topk-reducing via the
-    # standalone topk_reduce kernel.  Low-precision modes are a form-A-only
-    # path (no fp8/fp4 cp.reduce).
-    combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16"
 
     def __post_init__(self) -> None:
         m, n, _k = self.mma_tiler_mnk
         cm, cn, cl = self.cluster_shape_mnk
 
         if m not in SupportedMmaTileM:
-            raise ValueError(
-                f"mma_tiler_m must be one of {SupportedMmaTileM}, got {m}."
-            )
+            raise ValueError(f"mma_tiler_m must be one of {SupportedMmaTileM}, got {m}.")
         if n not in SupportedMmaTileN:
-            raise ValueError(
-                f"mma_tiler_n must be one of {SupportedMmaTileN}, got {n}."
-            )
+            raise ValueError(f"mma_tiler_n must be one of {SupportedMmaTileN}, got {n}.")
         if cl != 1:
             raise ValueError(f"cluster_l must be 1, got {cl}.")
         if cn != 1:
-            raise ValueError(f"cluster_n must be 1 in v1, got {cn}.")
+            raise ValueError(
+                f"cluster_n must be 1 in v1, got {cn}."
+            )
         if cm < 1 or cm > 16 or cm * cn > 16:
             raise ValueError(
                 f"cluster_m must be in [1, 16] and cluster_m*cluster_n <=16, "
@@ -331,40 +319,14 @@ class ImplDesc:
                 f"got {self.load_balance_mode!r}."
             )
         if self.token_back_mode not in (
-            "epi_warps",
-            "standalone_warps",
-            "reuse_dispatch_warps",
+            "epi_warps", "standalone_warps", "reuse_dispatch_warps"
         ):
             raise ValueError(
                 f"token_back_mode must be 'epi_warps', 'standalone_warps', "
                 f"or 'reuse_dispatch_warps'; got {self.token_back_mode!r}."
             )
-        if self.combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
-            raise ValueError(
-                f"combine_dtype must be 'bf16', 'mxfp8', or 'nvfp4'; "
-                f"got {self.combine_dtype!r}."
-            )
-        if self.combine_dtype != "bf16":
-            # Tile-wise low-precision combine has no fp8/fp4 cp.reduce, so the
-            # topk reduction must run host-side (form A: one staged cell per
-            # (src_token, src_topk)).  In-kernel fc2 reduce (form B) and the
-            # epi_warps STG-redirect are therefore incompatible, and only the
-            # reuse_dispatch_warps push is wired for the quantized path.
-            if self.in_kernel_fc2_reduce:
-                raise ValueError(
-                    "combine_dtype != 'bf16' requires in_kernel_fc2_reduce="
-                    "False (low-precision combine is a form-A path)."
-                )
-            if self.token_back_mode != "reuse_dispatch_warps":
-                raise ValueError(
-                    "combine_dtype != 'bf16' is currently only wired for "
-                    "token_back_mode='reuse_dispatch_warps'; got "
-                    f"{self.token_back_mode!r}."
-                )
         if self.group_hint is not None and self.group_hint <= 0:
-            raise ValueError(
-                f"group_hint must be positive when set, got {self.group_hint}."
-            )
+            raise ValueError(f"group_hint must be positive when set, got {self.group_hint}.")
         if self.flag_batch < 1:
             raise ValueError(f"flag_batch must be >= 1, got {self.flag_batch}.")
         # epi done-counter batch is a ``(fc1, fc2)`` pair, published
@@ -373,7 +335,8 @@ class ImplDesc:
         eb = self.epi_flag_batch if self.epi_flag_batch is not None else (1, 1)
         if len(eb) != 2:
             raise ValueError(
-                f"epi_flag_batch must be a (fc1, fc2) pair, got {self.epi_flag_batch}."
+                f"epi_flag_batch must be a (fc1, fc2) pair, got "
+                f"{self.epi_flag_batch}."
             )
         for _leg, _val in (("fc1", eb[0]), ("fc2", eb[1])):
             if _val < 1 or _val > 32:
@@ -386,12 +349,6 @@ class ImplDesc:
         return self.in_kernel_fc2_reduce
 
     @property
-    def combine_is_quantized(self) -> bool:
-        """True when the cross-rank combine push uses a tile-wise
-        low-precision wire format (mxfp8 / nvfp4) instead of bf16."""
-        return self.combine_dtype != "bf16"
-
-    @property
     def token_back_by_dispatch(self) -> bool:
         """True when fc2 is staged to a local workspace and pushed back by
         dispatch-area warps (standalone or reused), i.e. any non-epi mode."""
@@ -400,16 +357,16 @@ class ImplDesc:
     def __str__(self) -> str:
         tile = ",".join(map(str, self.mma_tiler_mnk))
         cluster = ",".join(map(str, self.cluster_shape_mnk))
-        static_shape = "static" if self.enable_static_expert_shape else "dynamic"
+        static_shape = (
+            "static" if self.enable_static_expert_shape else "dynamic"
+        )
         sched = "static" if self.force_static_sched else "dynamic_clc"
         bundle = self.clc_bundle_size if self.clc_bundle_size is not None else "default"
         stages = (
             self.num_sched_stages if self.num_sched_stages is not None else "default"
         )
         group_hint_str = (
-            str(self.group_hint)
-            if self.group_hint is not None
-            else "max_active_clusters"
+            str(self.group_hint) if self.group_hint is not None else "max_active_clusters"
         )
         return (
             f"ImplDesc: tile={tile} cluster={cluster} 2cta={self.use_2cta_instrs} | "
@@ -417,8 +374,7 @@ class ImplDesc:
             f"load_balance={self.load_balance_mode} group_hint={group_hint_str} | "
             f"non_ubulk_fc2_store={self.non_ubulk_fc2_store} "
             f"in_kernel_fc2_reduce={self.in_kernel_fc2_reduce} "
-            f"token_back_mode={self.token_back_mode} "
-            f"combine_dtype={self.combine_dtype}"
+            f"token_back_mode={self.token_back_mode}"
         )
 
 
@@ -561,6 +517,7 @@ class Fc12TesterBase:
         # diff arithmetic stays GPU-side.
         self._ref_fc1_q_per_expert: List[Optional[torch.Tensor]] = []
         self._ref_fc1_raw_sf_per_expert: List[Optional[torch.Tensor]] = []
+        self._ref_fc1_gateup_per_expert: List[Optional[torch.Tensor]] = []
 
         # Workspace + launch handles re-used by the kernel-determinism
         # re-launch (``_check_kernel_determinism``) and by the per-expert
@@ -595,9 +552,7 @@ class Fc12TesterBase:
 
         experts = self.problem.experts
         if total < 0:
-            raise ValueError(
-                f"Effective valid token total ({total}) must be non-negative."
-            )
+            raise ValueError(f"Effective valid token total ({total}) must be non-negative.")
 
         if total == 0:
             return torch.zeros((experts,), dtype=torch.int32, device="cuda")
@@ -713,9 +668,7 @@ class Fc12TesterBase:
         data_offsets: List[int] = [0]
         sf_offsets: List[int] = [0]
         for v in valid_tokens_per_expert:
-            data_offsets.append(
-                data_offsets[-1] + round_up(v, self._epilogue_token_tile)
-            )
+            data_offsets.append(data_offsets[-1] + round_up(v, self._epilogue_token_tile))
             sf_offsets.append(sf_offsets[-1] + round_up(v, SfPaddingBlock))
         return data_offsets, sf_offsets
 
@@ -737,90 +690,58 @@ class Fc12TesterBase:
         experts = problem.experts
 
         # -- activation: (data_total_rows, hidden) fp4, hidden stride-1 --
-        data_dtype = kind_data_dtype(problem.kind)
-        scale_dtype = kind_scale_dtype(problem.kind)
-        sf_vec_size = kind_sf_vec_size(problem.kind)
+        data_dtype   = kind_data_dtype(problem.kind)
+        scale_dtype  = kind_scale_dtype(problem.kind)
+        sf_vec_size  = kind_sf_vec_size(problem.kind)
 
         if problem.kind == "nvfp4":
             self.activation = torch.empty(
-                (data_total_rows, hidden // 2),
-                dtype=torch.uint8,
-                device="cuda",
+                (data_total_rows, hidden // 2), dtype=torch.uint8, device="cuda",
             ).view(data_dtype)
             self.fc1_weight = (
-                torch.empty(
-                    (experts, intermediate, hidden // 2),
-                    dtype=torch.uint8,
-                    device="cuda",
-                )
-                .view(data_dtype)
-                .permute(0, 2, 1)
+                torch.empty((experts, intermediate, hidden // 2), dtype=torch.uint8, device="cuda")
+                .view(data_dtype).permute(0, 2, 1)
             )
             self.fc2_weight = (
-                torch.empty(
-                    (experts, hidden, (intermediate // 2) // 2),
-                    dtype=torch.uint8,
-                    device="cuda",
-                )
-                .view(data_dtype)
-                .permute(0, 2, 1)
+                torch.empty((experts, hidden, (intermediate // 2) // 2), dtype=torch.uint8, device="cuda")
+                .view(data_dtype).permute(0, 2, 1)
             )
         else:
-            self.activation = torch.empty(
-                (data_total_rows, hidden), dtype=data_dtype, device="cuda"
-            )
+            self.activation = torch.empty((data_total_rows, hidden), dtype=data_dtype, device="cuda")
             # fc1_weight: (experts, intermediate, hidden) → permute → (experts, hidden, intermediate), hidden stride-1
-            self.fc1_weight = torch.empty(
-                (experts, intermediate, hidden), dtype=data_dtype, device="cuda"
-            ).permute(0, 2, 1)
+            self.fc1_weight = torch.empty((experts, intermediate, hidden), dtype=data_dtype, device="cuda").permute(0, 2, 1)
             # fc2_weight: (experts, hidden, inter//2) → permute → (experts, inter//2, hidden), inter//2 stride-1
-            self.fc2_weight = torch.empty(
-                (experts, hidden, intermediate // 2), dtype=data_dtype, device="cuda"
-            ).permute(0, 2, 1)
+            self.fc2_weight = torch.empty((experts, hidden, intermediate // 2), dtype=data_dtype, device="cuda").permute(0, 2, 1)
 
         # -- SFs (atom-layout 2D buffers, byte-allocated) --
         sfa_cols = round_up(ceil_div(hidden, sf_vec_size), 4)
         self.activation_sf = torch.empty(
-            (sf_total_rows, sfa_cols),
-            dtype=torch.uint8,
-            device="cuda",
+            (sf_total_rows, sfa_cols), dtype=torch.uint8, device="cuda",
         ).view(scale_dtype)
 
         sfb_per_expert = round_up(intermediate, SfPaddingBlock) * round_up(
             ceil_div(hidden, sf_vec_size), 4
         )
         self.fc1_weight_sf = torch.empty(
-            (experts, sfb_per_expert),
-            dtype=torch.uint8,
-            device="cuda",
+            (experts, sfb_per_expert), dtype=torch.uint8, device="cuda",
         ).view(scale_dtype)
 
         sfb2_per_expert = round_up(hidden, SfPaddingBlock) * round_up(
             ceil_div(intermediate // 2, sf_vec_size), 4
         )
         self.fc2_weight_sf = torch.empty(
-            (experts, sfb2_per_expert),
-            dtype=torch.uint8,
-            device="cuda",
+            (experts, sfb2_per_expert), dtype=torch.uint8, device="cuda",
         ).view(scale_dtype)
 
         # -- global scales / norm_const --
-        self.activation_global_scale = torch.empty(
-            (experts,), dtype=torch.float32, device="cuda"
-        )
-        self.fc1_weight_global_scale = torch.empty(
-            (experts,), dtype=torch.float32, device="cuda"
-        )
-        self.fc2_weight_global_scale = torch.empty(
-            (experts,), dtype=torch.float32, device="cuda"
-        )
+        self.activation_global_scale = torch.empty((experts,), dtype=torch.float32, device="cuda")
+        self.fc1_weight_global_scale = torch.empty((experts,), dtype=torch.float32, device="cuda")
+        self.fc2_weight_global_scale = torch.empty((experts,), dtype=torch.float32, device="cuda")
         self.norm_const = torch.empty((1,), dtype=torch.float32, device="cuda")
 
         # -- topk_scores --
         self.topk_scores = torch.empty(
-            (data_total_rows,),
-            dtype=torch.float32,
-            device="cuda",
+            (data_total_rows,), dtype=torch.float32, device="cuda",
         )
 
         # -- fc2_output --
@@ -849,8 +770,7 @@ class Fc12TesterBase:
         problem = self.problem
         self.fc2_output = torch.empty(
             self._fc2_output_shape(data_total_rows),
-            dtype=problem.fc2_output_dtype,
-            device="cuda",
+            dtype=problem.fc2_output_dtype, device="cuda",
         )
 
     def generate_inputs(self) -> None:
@@ -895,7 +815,9 @@ class Fc12TesterBase:
         #     this step; SF assemble's ``reshape(0, -1)`` is ambiguous when
         #     all experts contribute 0 rows, so dodge it via skeleton.
         if self.misc.run_target_kernel_only or data_total_rows == 0:
-            self._generate_inputs_skeleton(valid_tokens, data_total_rows, sf_total_rows)
+            self._generate_inputs_skeleton(
+                valid_tokens, data_total_rows, sf_total_rows
+            )
             return
 
         # -- 3-5. activation / fc1_weight / fc2_weight (kind-specific) --
@@ -907,15 +829,9 @@ class Fc12TesterBase:
             self.raw_fc1_weight_sf_list,
             self.raw_fc2_weight_sf_list,
         ) = self._generate_raw_scales(valid_tokens)
-        self.activation_sf = assemble_raw_scales_grouped_token(
-            self.raw_activation_sf_list
-        )
-        self.fc1_weight_sf = assemble_raw_scales_stacked_expert(
-            self.raw_fc1_weight_sf_list
-        )
-        self.fc2_weight_sf = assemble_raw_scales_stacked_expert(
-            self.raw_fc2_weight_sf_list
-        )
+        self.activation_sf = assemble_raw_scales_grouped_token(self.raw_activation_sf_list)
+        self.fc1_weight_sf = assemble_raw_scales_stacked_expert(self.raw_fc1_weight_sf_list)
+        self.fc2_weight_sf = assemble_raw_scales_stacked_expert(self.raw_fc2_weight_sf_list)
 
         # -- 7-8. Global scales + norm_const (v1 pinned to 1.0) --
         self._init_global_scales_and_norm()
@@ -940,15 +856,9 @@ class Fc12TesterBase:
         these.
         """
         experts = self.problem.experts
-        self.activation_global_scale = torch.ones(
-            (experts,), dtype=torch.float32, device="cuda"
-        )
-        self.fc1_weight_global_scale = torch.ones(
-            (experts,), dtype=torch.float32, device="cuda"
-        )
-        self.fc2_weight_global_scale = torch.ones(
-            (experts,), dtype=torch.float32, device="cuda"
-        )
+        self.activation_global_scale = torch.ones((experts,), dtype=torch.float32, device="cuda")
+        self.fc1_weight_global_scale = torch.ones((experts,), dtype=torch.float32, device="cuda")
+        self.fc2_weight_global_scale = torch.ones((experts,), dtype=torch.float32, device="cuda")
         self.norm_const = torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def _init_topk_scores(self, data_total_rows: int) -> None:
@@ -962,9 +872,7 @@ class Fc12TesterBase:
         valid_tokens = self.valid_tokens_per_expert
         data_offsets = self.data_physical_offsets
         self.topk_scores = torch.zeros(
-            (data_total_rows,),
-            dtype=torch.float32,
-            device="cuda",
+            (data_total_rows,), dtype=torch.float32, device="cuda",
         )
         for e in range(self.problem.experts):
             v_e = valid_tokens[e]
@@ -1035,8 +943,7 @@ class Fc12TesterBase:
         norm_const_val = float(self.norm_const[0].item())
         sf_vec_size = kind_sf_vec_size(problem.kind)
         gate_up_interleave = (
-            Nvfp4Fc1GateUpInterleave
-            if problem.kind == "nvfp4"
+            Nvfp4Fc1GateUpInterleave if problem.kind == "nvfp4"
             else Mxfp8Fc1GateUpInterleave
         )
         # ``gate_up_clamp`` lives on the NVFP4 ProblemDesc only (None elsewhere).
@@ -1057,8 +964,7 @@ class Fc12TesterBase:
         # backends; bytes + view is bulletproof).
         ref_bytes = torch.zeros(
             (data_total_rows, problem.hidden * problem.fc2_output_dtype.itemsize),
-            dtype=torch.uint8,
-            device="cuda",
+            dtype=torch.uint8, device="cuda",
         )
         self.fc2_output_ref = ref_bytes.view(problem.fc2_output_dtype).reshape(
             data_total_rows, problem.hidden
@@ -1068,6 +974,7 @@ class Fc12TesterBase:
         # (reset each call so a unit-test loop doesn't leak stale entries).
         self._ref_fc1_q_per_expert = [None] * problem.experts
         self._ref_fc1_raw_sf_per_expert = [None] * problem.experts
+        self._ref_fc1_gateup_per_expert = [None] * problem.experts
 
         for expert_idx in range(problem.experts):
             v_e = valid_tokens[expert_idx]
@@ -1085,7 +992,7 @@ class Fc12TesterBase:
             # (deepgemm: topk pre-mult) -> NVFP4 round-trip -> packed fc2 GEMM.
             # ``_quantize_fc1`` is the per-kind quantizer hook; global scales are
             # pinned to 1.0 in v1 so alpha/norm fold them away (no host dequant).
-            fc2_fp32, fc1_q, fc1_sf = reference_expert_fc12(
+            fc2_fp32, fc1_q, fc1_sf, fc1_gateup = reference_expert_fc12(
                 ref_scaled_mm=ref_scaled_mm,
                 quantize_fn=self._quantize_fc1,
                 act_packed=act_slice,
@@ -1098,13 +1005,11 @@ class Fc12TesterBase:
                 hidden=problem.hidden,
                 fc1_alpha=(
                     float(self.fc1_alpha[expert_idx].item())
-                    if self.fc1_alpha is not None
-                    else 1.0
+                    if self.fc1_alpha is not None else 1.0
                 ),
                 fc2_alpha=(
                     float(self.fc2_alpha[expert_idx].item())
-                    if self.fc2_alpha is not None
-                    else 1.0
+                    if self.fc2_alpha is not None else 1.0
                 ),
                 fc1_norm_const=norm_const_val,
                 gate_up_interleave=gate_up_interleave,
@@ -1120,9 +1025,10 @@ class Fc12TesterBase:
                 problem.fc2_output_dtype
             )
 
-            # fc1 NVFP4 hand-off snapshot for the fc1-phase ablation.
+            # fc1 hand-off snapshots for the fc1-phase ablation and generate_c check.
             self._ref_fc1_q_per_expert[expert_idx] = fc1_q
             self._ref_fc1_raw_sf_per_expert[expert_idx] = fc1_sf
+            self._ref_fc1_gateup_per_expert[expert_idx] = fc1_gateup
 
     # ------------------------------------------------------------------
     # Workspace partition helper
@@ -1131,7 +1037,9 @@ class Fc12TesterBase:
     def _partition_workspace(
         self,
         mma_tiler_n: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
+    ]:
         """Slice the opaque byte ``self.workspace`` into per-section views.
 
         The layout MUST match the kernel's ``get_workspace_size_in_bytes``
@@ -1164,18 +1072,21 @@ class Fc12TesterBase:
         data_total_rows = int(self.data_physical_offsets[-1])
 
         # Kind-specific workspace layout to match kernel's get_workspace_size_in_bytes.
-        is_nvfp4 = self.problem.kind == "nvfp4"
-        data_dtype = kind_data_dtype(self.problem.kind)
-        scale_dtype = kind_scale_dtype(self.problem.kind)
-        sf_vec_size = kind_sf_vec_size(self.problem.kind)
+        is_nvfp4 = (self.problem.kind == "nvfp4")
+        data_dtype    = kind_data_dtype(self.problem.kind)
+        scale_dtype   = kind_scale_dtype(self.problem.kind)
+        sf_vec_size   = kind_sf_vec_size(self.problem.kind)
         # For FP4: 4-bit = 2 per byte. For FP8: 8-bit = 1 per byte.
         elem_bits = 4 if is_nvfp4 else 8
 
         sf_total_rows_upper = data_total_rows + experts * SfPaddingBlock
-        sf_block_cols = ((intermediate_downproj // sf_vec_size) + 3) // 4 * 4
+        sf_block_cols = (
+            (intermediate_downproj // sf_vec_size) + 3
+        ) // 4 * 4
         counter_slots_upper = (
-            data_total_rows + mma_tiler_n - 1
-        ) // mma_tiler_n + experts
+            (data_total_rows + mma_tiler_n - 1) // mma_tiler_n
+            + experts
+        )
 
         fc1_output_byte_count = data_total_rows * intermediate_downproj * elem_bits // 8
         fc1_output_sf_byte_count = sf_total_rows_upper * sf_block_cols
@@ -1212,8 +1123,9 @@ class Fc12TesterBase:
 
         # -- fc1_done_counter: Int32 1D, zero-init (host responsibility,
         # done by ``self.workspace.zero_()`` in run_kernel above).
-        fc1_done_counter_torch = ws[offset : offset + fc1_done_counter_byte_count].view(
-            torch.int32
+        fc1_done_counter_torch = (
+            ws[offset : offset + fc1_done_counter_byte_count]
+            .view(torch.int32)
         )
         offset += fc1_done_counter_byte_count
 
@@ -1262,22 +1174,20 @@ class Fc12TesterBase:
         import cutlass.utils as utils
 
         required = (
-            self.activation,
-            self.fc1_weight,
-            self.fc2_weight,
-            self.activation_sf,
-            self.fc1_weight_sf,
-            self.fc2_weight_sf,
-            self.topk_scores,
-            self.fc2_output,
-            self.offs,
+            self.activation, self.fc1_weight, self.fc2_weight,
+            self.activation_sf, self.fc1_weight_sf, self.fc2_weight_sf,
+            self.topk_scores, self.fc2_output, self.offs,
         )
         if any(t is None for t in required):
             raise RuntimeError("run_kernel requires generate_inputs first.")
 
         # Cluster size + max_active_clusters + group_hint default fill.
-        cluster_size = self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
-        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
+        cluster_size = (
+            self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
+        )
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
+        )
         group_hint = self.impl.group_hint
         if group_hint is None:
             group_hint = max_active_clusters
@@ -1398,6 +1308,10 @@ class Fc12TesterBase:
             runtime_kwargs["fc1_alpha"] = _to_cute(self.fc1_alpha, assumed_align=4)
         if self.fc2_alpha is not None:
             runtime_kwargs["fc2_alpha"] = _to_cute(self.fc2_alpha, assumed_align=4)
+
+        # Subclass hook: inject extra tensor kwargs (e.g. generate_c output).
+        for k, v in self._extra_runtime_kwargs().items():
+            runtime_kwargs[k] = v
 
         compile_kwargs = dict(runtime_kwargs)
         compile_kwargs["max_active_clusters"] = max_active_clusters
@@ -1591,12 +1505,9 @@ class Fc12TesterBase:
                 )
                 ref = ref_fp32[d_start : d_start + v_e]
                 compare_and_report_mismatches(
-                    actual,
-                    ref,
+                    actual, ref,
                     name=f"fc2_output_expert{expert_idx}",
-                    atol=atol,
-                    rtol=rtol,
-                    max_mismatches=8,
+                    atol=atol, rtol=rtol, max_mismatches=8,
                 )
         else:
             print("Validation PASSED (fc2_output within tolerance)")
@@ -1629,13 +1540,17 @@ class Fc12TesterBase:
         impl = self.impl
         problem = self.problem
         cta_tile_token = impl.mma_tiler_mnk[1]
-        cluster_tile_n_post_swap = impl.mma_tiler_mnk[0] * impl.cluster_shape_mnk[0]
+        cluster_tile_n_post_swap = (
+            impl.mma_tiler_mnk[0] * impl.cluster_shape_mnk[0]
+        )
         num_fc1_n_blocks = ceil_div(problem.intermediate, cluster_tile_n_post_swap)
         num_fc2_n_blocks = ceil_div(problem.hidden, cluster_tile_n_post_swap)
 
         group_hint = impl.group_hint
         if group_hint is None:
-            cluster_size = impl.cluster_shape_mnk[0] * impl.cluster_shape_mnk[1]
+            cluster_size = (
+                impl.cluster_shape_mnk[0] * impl.cluster_shape_mnk[1]
+            )
             group_hint = HardwareInfo().get_max_active_clusters(cluster_size)
 
         sim = FusedFc12Simulator(
@@ -1698,15 +1613,9 @@ class Fc12TesterBase:
             f"stride={self.workspace.stride()}  dtype={self.workspace.dtype}"
         )
         if not self.misc.run_target_kernel_only:
-            print(
-                f"activation_global_scale: {self.activation_global_scale.cpu().tolist()}"
-            )
-            print(
-                f"fc1_weight_global_scale: {self.fc1_weight_global_scale.cpu().tolist()}"
-            )
-            print(
-                f"fc2_weight_global_scale: {self.fc2_weight_global_scale.cpu().tolist()}"
-            )
+            print(f"activation_global_scale: {self.activation_global_scale.cpu().tolist()}")
+            print(f"fc1_weight_global_scale: {self.fc1_weight_global_scale.cpu().tolist()}")
+            print(f"fc2_weight_global_scale: {self.fc2_weight_global_scale.cpu().tolist()}")
         print(f"offs (valid cumsum): {self.offs.cpu().tolist()}")
         print(f"  valid_tokens_per_expert: {valid_tokens}")
         print(f"  data_physical_offsets:   {data_offsets}")
@@ -1787,6 +1696,14 @@ class Fc12TesterBase:
         """
         return fc2_fp32
 
+    def _extra_runtime_kwargs(self) -> dict:
+        """Return extra kwargs to merge into runtime_kwargs before cute.compile.
+
+        Default returns empty dict.  Subclasses override to inject optional
+        tensors (e.g. the raw fc1 accumulator output buffer for generate_c).
+        """
+        return {}
+
     def _instantiate_kernel(self, common_kwargs: dict):
         """Construct and return the kind-specific fused fc12 kernel object."""
         raise NotImplementedError
@@ -1833,46 +1750,34 @@ def add_common_fc12_arguments(parser: argparse.ArgumentParser) -> None:
     """
     # -- Problem --
     parser.add_argument(
-        "--tokens_after_topk",
-        type=int,
-        default=2048,
+        "--tokens_after_topk", type=int, default=2048,
         help="Total VALID token slots after top-k routing (NOT padded).",
     )
     parser.add_argument("--experts", type=int, default=8)
     parser.add_argument(
-        "--balance_route",
-        action="store_true",
-        default=False,
+        "--balance_route", action="store_true", default=False,
         help="Distribute tokens evenly across experts; otherwise Dirichlet(alpha=0.5).",
     )
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--intermediate", type=int, default=1024)
     parser.add_argument(
-        "--simulate_ep",
-        type=int,
-        default=None,
+        "--simulate_ep", type=int, default=None,
         help="Simulate Expert Parallelism by reducing per-rank tokens.",
     )
     parser.add_argument(
-        "--fc2_output_dtype",
-        type=parse_output_dtype,
-        default=torch.bfloat16,
+        "--fc2_output_dtype", type=parse_output_dtype, default=torch.bfloat16,
         help="fc2 output dtype: bf16 (default) or fp16.",
     )
 
     # -- Impl --
     parser.add_argument(
-        "--mma_tiler_mnk",
-        type=str,
-        default="128,128,256",
+        "--mma_tiler_mnk", type=str, default="128,128,256",
         help="Comma-separated (M, N, K); K is refined at compile time.",
     )
     parser.add_argument("--cluster_shape_mnk", type=str, default="1,1,1")
     parser.add_argument("--use_2cta_instrs", action="store_true", default=False)
     parser.add_argument(
-        "--enable_static_expert_shape",
-        action="store_true",
-        default=False,
+        "--enable_static_expert_shape", action="store_true", default=False,
         help=(
             "Bind ``static_expert_shape = (experts, intermediate, hidden)`` "
             "at codegen time, taken from the ProblemDesc.  Default (off) "
@@ -1880,27 +1785,19 @@ def add_common_fc12_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--dynamic_sched",
-        action="store_true",
-        default=False,
+        "--dynamic_sched", action="store_true", default=False,
         help="Use CLC-based dynamic scheduler (default: static lean 7-warp).",
     )
     parser.add_argument(
-        "--clc_bundle_size",
-        type=int,
-        default=None,
+        "--clc_bundle_size", type=int, default=None,
         help="Static CLC bundle size S (only meaningful when --dynamic_sched).",
     )
     parser.add_argument(
-        "--num_sched_stages",
-        type=int,
-        default=None,
+        "--num_sched_stages", type=int, default=None,
         help="Scheduler pipeline stages (only meaningful when --dynamic_sched).",
     )
     parser.add_argument(
-        "--load_balance_mode",
-        type=str,
-        default="static",
+        "--load_balance_mode", type=str, default="static",
         choices=["static", "atomic_counter"],
         help=(
             "Load-balance strategy for the fused-fc12 scheduler.  "
@@ -1909,30 +1806,22 @@ def add_common_fc12_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--group_hint",
-        type=int,
-        default=None,
+        "--group_hint", type=int, default=None,
         help="Per-group fc1 tile threshold; None means defer to "
         "HardwareInfo().get_max_active_clusters(cluster_size).",
     )
 
     # -- Misc --
     parser.add_argument(
-        "--perf_run",
-        action="store_true",
-        default=False,
+        "--perf_run", action="store_true", default=False,
         help="Use random-byte FP4/FP8 data instead of sparse {0, +/-1} (data switch only).",
     )
     parser.add_argument(
-        "--skip_ref_check",
-        action="store_true",
-        default=False,
+        "--skip_ref_check", action="store_true", default=False,
         help="Skip both compute_reference and validate.",
     )
     parser.add_argument(
-        "--run_target_kernel_only",
-        action="store_true",
-        default=False,
+        "--run_target_kernel_only", action="store_true", default=False,
         help="Only for perf simulators: all tensors except offs are empty / undefined.",
     )
     parser.add_argument(
@@ -1956,11 +1845,9 @@ def add_common_fc12_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--enable_iket",
-        action="store_true",
-        default=False,
+        "--enable_iket", action="store_true", default=False,
         help=(
-            'Compile with ``options="iket"`` so ``iket.range_push`` / '
+            "Compile with ``options=\"iket\"`` so ``iket.range_push`` / "
             "``iket.range_pop`` / ``iket.mark`` ops survive ``strip-iket-ops`` "
             "and reach LLVM lowering.  Pair with ``run-iket --output-dir ... "
             "profile -- env DKG_IKET_INSTRUMENTATION_METHOD=NativeDump python "
@@ -1969,9 +1856,7 @@ def add_common_fc12_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
-        "--verbose",
-        action="store_true",
-        default=False,
+        "--verbose", action="store_true", default=False,
         help=(
             "Print the per-tensor layout dump (shape/stride/dtype) and the "
             "scheduler-layout preview before the kernel runs.  Off by default."

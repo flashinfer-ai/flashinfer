@@ -77,6 +77,7 @@ def cleanup_kernel(
     expert_recv_count_sum: cute.Tensor,
     l1_arrival_count: cute.Tensor,
     nvlink_barrier_signal: cute.Tensor,
+    nvlink_barrier_counter: cute.Tensor,
     grid_sync_counter: cute.Tensor,
     num_total_experts: cutlass.Constexpr[int],
     num_experts_per_rank: cutlass.Constexpr[int],
@@ -90,7 +91,8 @@ def cleanup_kernel(
     Mirrors ``sm100_fp8_fp4_mega_moe.cuh`` lines 723-766. SM 0 clears the
     small counter region (``expert_send_count``, ``expert_recv_count``,
     ``expert_recv_count_sum``, ``nvlink_barrier_signal`` slot 0 + slot 1,
-    ``grid_sync_counter``); SMs 1..num_sms-1 cooperatively clear
+    ``nvlink_barrier_counter``, ``grid_sync_counter``); SMs 1..num_sms-1
+    cooperatively clear
     ``l1_arrival_count``.
     """
     sm_idx = cute.arch.block_idx()[0]
@@ -122,15 +124,19 @@ def cleanup_kernel(
             if i < Int32(nvlink_signal_total):
                 nvlink_barrier_signal[i] = Int32(0)
 
+        # Sense-reversing barrier phase counter (single Int32).
+        if tid == Int32(0):
+            nvlink_barrier_counter[0] = Int32(0)
+
         for offset in cutlass.range(0, grid_sync_counter_len, _CLEANUP_THREADS_PER_CTA):
             i = Int32(offset) + tid
             if i < Int32(grid_sync_counter_len):
                 grid_sync_counter[i] = Uint32(0)
     else:
         # SMs 1..num_sms-1 split l1_arrival_count clearing. The
-        slot_per_sm: cutlass.Constexpr[int] = (num_max_task_tiles + num_sms - 2) // (
-            num_sms - 1
-        )
+        slot_per_sm: cutlass.Constexpr[int] = (
+            num_max_task_tiles + num_sms - 2
+        ) // (num_sms - 1)
         my_start = (sm_idx - Int32(1)) * Int32(slot_per_sm)
         my_end_unclamped = my_start + Int32(slot_per_sm)
         end_limit = Int32(num_max_task_tiles)

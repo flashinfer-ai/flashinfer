@@ -177,19 +177,18 @@ class MegaMoENvfp4Config:
     def token_back_by_dispatch(self) -> bool:
         return self.token_back_mode != "epi_warps"
 
-    @property
-    def combine_is_quantized(self) -> bool:
-        return self.token_back_by_dispatch and self.combine_dtype != "bf16"
-
 
 @dataclasses.dataclass
 class MegaMoENvfp4Inputs:
     """Per-rank tensors for one NVFP4 MegaMoE launch.
 
     Symmetric-heap tensors (``activation``, ``activation_sf``, ``topk_idx``,
-    ``topk_weights``, ``combine_output``, and optional quantized combine staging)
-    must be allocated via NVSHMEM (or plain CUDA when ``MEGA_NO_DIST=1``).
-    Weights and epilogue scalars are rank-local.
+    ``topk_weights``) must be allocated via NVSHMEM (or plain CUDA when
+    ``MEGA_NO_DIST=1``).  Weights and epilogue scalars are rank-local.
+
+    ``output_activation`` is the kernel's single 2D ``(T, hidden)`` bf16 output;
+    the kernel reduces the top-k combine internally (the drop replaced the old
+    form-A ``combine_output`` + separate reduce with this in-kernel reduce).
     """
 
     activation: torch.Tensor
@@ -203,35 +202,17 @@ class MegaMoENvfp4Inputs:
     fc1_alpha: torch.Tensor
     fc2_alpha: torch.Tensor
     fc1_norm_const: torch.Tensor
-    combine_output: torch.Tensor
-    combine_reduced_output: Optional[torch.Tensor] = None
-    combine_output_q: Optional[torch.Tensor] = None
-    combine_sf_q: Optional[torch.Tensor] = None
-    combine_global_q: Optional[torch.Tensor] = None
-    topk_score_for_reduce: Optional[torch.Tensor] = None
-
-
-@dataclasses.dataclass
-class _CompiledTopk:
-    compiled: Any
-    combine_cute: Any
-    reduced_cute: Any
-    topk_score_cute: Any
-    mxfp8_scale_cute: Any
-    nvfp4_sfc_scale_cute: Any
-    nvfp4_global_scale_cute: Any
+    output_activation: torch.Tensor
 
 
 class MegaMoENvfp4Frontend:
-    """Lazy-compile host wrapper for ``Sm100MegaMoEKernel`` (+ optional topk reduce)."""
+    """Lazy-compile host wrapper for ``Sm100MegaMoEKernel``."""
 
     def __init__(self, config: MegaMoENvfp4Config) -> None:
         self._config = config
         self._gate_up_clamp = config.gate_up_clamp
         self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
-        self._topk_key: Optional[tuple] = None
-        self._topk: Optional[_CompiledTopk] = None
 
     @property
     def config(self) -> MegaMoENvfp4Config:
@@ -264,8 +245,6 @@ class MegaMoENvfp4Frontend:
         if launch_inputs is None:
             return None
         self._ensure_mega_compiled(inputs)
-        if not self.config.fc2_reduces_topk:
-            self._ensure_topk_compiled(inputs)
 
     def run(
         self,
@@ -276,49 +255,30 @@ class MegaMoENvfp4Frontend:
         reset_counters: bool = True,
         reduce_topk: bool = True,
     ) -> Optional[torch.Tensor]:
-        """Launch NVFP4 MegaMoE (+ topk reduce when configured).
+        """Launch NVFP4 MegaMoE and return the 2D ``(T, hidden)`` bf16 output.
 
         ``num_tokens`` limits the active token rows when the input buffers are
         sized for ``config.num_tokens_per_rank`` but fewer tokens are live.
 
-        Returns ``combine_reduced_output`` (bf16 ``(T, hidden)``) when the
-        separate top-k reduce runs; otherwise ``combine_output.squeeze(1)``
-        when ``in_kernel_fc2_reduce=True``. If ``reduce_topk=False`` with
-        ``in_kernel_fc2_reduce=False``, returns form-A ``combine_output`` with
-        shape ``(T, top_k, hidden)`` and skips the separate reduce kernel.
+        The kernel drop reduces the top-k combine internally, so the result is
+        always the reduced ``output_activation`` (the old form-A + separate
+        top-k-reduce path is gone).  ``reduce_topk`` is accepted for backward
+        API compatibility and ignored.
         """
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return None
-        if (
-            not self.config.fc2_reduces_topk
-            and reduce_topk
-            and launch_inputs.combine_reduced_output is None
-        ):
-            raise ValueError(
-                "combine_reduced_output is required when in_kernel_fc2_reduce=False."
-            )
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
-        topk_kwargs = None
-        if not self.config.fc2_reduces_topk and reduce_topk:
-            topk = self._ensure_topk_compiled(inputs)
-            topk_kwargs = self._build_topk_runtime_kwargs(topk)
 
         if reset_counters:
             self._reset_workspaces(mega)
 
         mega.compiled(**runtime_kwargs)
-        if topk_kwargs is not None:
-            topk.compiled(**topk_kwargs)
 
         if sync:
             torch.cuda.synchronize()
-        if self.config.fc2_reduces_topk:
-            return launch_inputs.combine_output.squeeze(1)
-        if not reduce_topk:
-            return launch_inputs.combine_output
-        return launch_inputs.combine_reduced_output
+        return launch_inputs.output_activation
 
     # ------------------------------------------------------------------
     # Compile cache
@@ -353,17 +313,6 @@ class MegaMoENvfp4Frontend:
             c.enable_iket,
         )
 
-    def _topk_compile_key(self, inputs: MegaMoENvfp4Inputs) -> tuple:
-        c = self.config
-        combine_k = 1 if c.fc2_reduces_topk else c.num_topk
-        return (
-            c.num_tokens_per_rank,
-            combine_k,
-            c.hidden,
-            c.combine_dtype,
-            inputs.topk_score_for_reduce is not None,
-        )
-
     def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
         key = self._mega_compile_key()
         if self._mega is not None and self._mega_key == key:
@@ -377,8 +326,17 @@ class MegaMoENvfp4Frontend:
         from common.megamoe_constants import SfPaddingBlock
         from moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue
         from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel
+        from src.token_comm import CombineFormat
 
         c = self.config
+        # The kernel now takes a CombineFormat object (was a combine_dtype string)
+        # and derives local_rank from the peer mapper (was a ctor arg).
+        _COMBINE_FORMAT_NAMES = {
+            "bf16": "bf16",
+            "mxfp8": "32e4m3xe8m0",
+            "nvfp4": "16e2m1xbf16",
+        }
+        combine_format = CombineFormat.parse(_COMBINE_FORMAT_NAMES[c.combine_dtype])
         token_padding_block = SwapABSwigluFp4Epilogue._EpilogueTokenTileSize
         static_expert_shape = (
             c.num_experts_per_rank,
@@ -406,7 +364,6 @@ class MegaMoENvfp4Frontend:
             clc_bundle_size=c.clc_bundle_size,
             num_sched_stages=c.num_sched_stages,
             world_size=c.world_size,
-            local_rank=c.rank,
             num_topk=c.num_topk,
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
@@ -418,7 +375,7 @@ class MegaMoENvfp4Frontend:
             gate_up_clamp=self._gate_up_clamp,
             flag_batch=c.flag_batch,
             epi_flag_batch=c.epi_flag_batch,
-            combine_dtype=c.combine_dtype,
+            combine_format=combine_format,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -451,76 +408,11 @@ class MegaMoENvfp4Frontend:
         self._mega = mega
         return self._mega
 
-    def _ensure_topk_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledTopk:
-        key = self._topk_compile_key(inputs)
-        if self._topk is not None and self._topk_key == key:
-            return self._topk
-
-        import cuda.bindings.driver as cuda
-        from moe_nvfp4_swapab.topk_reduce import compile_topk_reduce, nvfp4_pack6_views
-
-        c = self.config
-        if inputs.combine_reduced_output is None:
-            raise ValueError(
-                "combine_reduced_output is required when in_kernel_fc2_reduce=False."
-            )
-
-        has_topk_score = inputs.topk_score_for_reduce is not None  # noqa: F841
-        has_combine_sf_q = inputs.combine_sf_q is not None
-        has_combine_global_q = inputs.combine_global_q is not None
-        if c.combine_dtype == "mxfp8":
-            if not has_combine_sf_q:
-                raise ValueError(
-                    f"combine_dtype={c.combine_dtype!r} requires combine_sf_q."
-                )
-        elif c.combine_dtype == "nvfp4":
-            if not has_combine_sf_q or not has_combine_global_q:
-                raise ValueError(
-                    f"combine_dtype={c.combine_dtype!r} requires combine_sf_q "
-                    "and combine_global_q."
-                )
-
-        if c.combine_dtype == "mxfp8":
-            combine_input = inputs.combine_output_q
-            mxfp8_scale = inputs.combine_sf_q
-            nvfp4_sfc = None
-            nvfp4_global = None
-        elif c.combine_dtype == "nvfp4":
-            combine_input = inputs.combine_output_q.view(torch.uint8)
-            mxfp8_scale = None
-            nvfp4_global, nvfp4_sfc = nvfp4_pack6_views(inputs.combine_global_q)
-        else:
-            combine_input = inputs.combine_output
-            mxfp8_scale = None
-            nvfp4_sfc = None
-            nvfp4_global = None
-
-        if combine_input is None:
-            raise ValueError(
-                f"combine_dtype={c.combine_dtype!r} requires combine staging tensors."
-            )
-
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        plan = compile_topk_reduce(
-            combine_input,
-            inputs.combine_reduced_output,
-            inputs.topk_score_for_reduce,
-            mxfp8_scale=mxfp8_scale,
-            nvfp4_sfc_scale=nvfp4_sfc,
-            nvfp4_global_scale=nvfp4_global,
-            stream=stream,
-        )
-        self._topk_key = key
-        self._topk = _CompiledTopk(
-            compiled=plan[0],
-            combine_cute=plan[1],
-            reduced_cute=plan[2],
-            topk_score_cute=plan[3],
-            mxfp8_scale_cute=plan[4],
-            nvfp4_sfc_scale_cute=plan[5],
-            nvfp4_global_scale_cute=plan[6],
-        )
-        return self._topk
+    # NOTE: the new kernel drop reduces the top-k combine INSIDE the mega kernel
+    # (Sm100MegaMoEKernel.__call__), so there is no separate topk-reduce launch.
+    # The drop's moe_nvfp4_swapab.topk_reduce.TopkReduce class covers the
+    # standalone combine-reduce path, which moe_ep does not use; port it here
+    # (with a test) if a caller ever needs in_kernel_fc2_reduce=False combine.
 
     # ------------------------------------------------------------------
     # Launch helpers
@@ -529,8 +421,6 @@ class MegaMoENvfp4Frontend:
     def _invalidate_compile_cache(self) -> None:
         self._mega_key = None
         self._mega = None
-        self._topk_key = None
-        self._topk = None
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
@@ -577,9 +467,6 @@ class MegaMoENvfp4Frontend:
     ) -> MegaMoENvfp4Inputs:
         tok = slice(None, num_tokens)
 
-        def _slice_optional(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            return None if t is None else t[tok]
-
         return MegaMoENvfp4Inputs(
             activation=inputs.activation[tok],
             activation_sf=inputs.activation_sf[tok],
@@ -592,12 +479,7 @@ class MegaMoENvfp4Frontend:
             fc1_alpha=inputs.fc1_alpha,
             fc2_alpha=inputs.fc2_alpha,
             fc1_norm_const=inputs.fc1_norm_const,
-            combine_output=inputs.combine_output[tok],
-            combine_reduced_output=_slice_optional(inputs.combine_reduced_output),
-            combine_output_q=_slice_optional(inputs.combine_output_q),
-            combine_sf_q=_slice_optional(inputs.combine_sf_q),
-            combine_global_q=_slice_optional(inputs.combine_global_q),
-            topk_score_for_reduce=_slice_optional(inputs.topk_score_for_reduce),
+            output_activation=inputs.output_activation[tok],
         )
 
     def _validate_inputs(
@@ -651,7 +533,7 @@ class MegaMoENvfp4Frontend:
             ("activation_sf", inputs.activation_sf),
             ("topk_idx", inputs.topk_idx),
             ("topk_weights", inputs.topk_weights),
-            ("combine_output", inputs.combine_output),
+            ("output_activation", inputs.output_activation),
         )
         for name, tensor in token_tensors:
             _require_cuda(name, tensor)
@@ -661,16 +543,16 @@ class MegaMoENvfp4Frontend:
                     f"activation.shape[0] ({buf_tokens})."
                 )
 
-        combine_k = 1 if c.fc2_reduces_topk else c.num_topk
-        if inputs.combine_output.shape != (buf_tokens, combine_k, c.hidden):
+        if inputs.output_activation.shape != (buf_tokens, c.hidden):
             raise ValueError(
-                "combine_output must have shape "
-                f"({buf_tokens}, {combine_k}, {c.hidden}), "
-                f"got {tuple(inputs.combine_output.shape)}."
+                "output_activation must have shape "
+                f"({buf_tokens}, {c.hidden}), "
+                f"got {tuple(inputs.output_activation.shape)}."
             )
-        if inputs.combine_output.dtype != torch.bfloat16:
+        if inputs.output_activation.dtype != torch.bfloat16:
             raise ValueError(
-                f"combine_output must be bfloat16, got {inputs.combine_output.dtype}."
+                "output_activation must be bfloat16, got "
+                f"{inputs.output_activation.dtype}."
             )
         if inputs.topk_idx.shape != (buf_tokens, c.num_topk):
             raise ValueError(
@@ -688,24 +570,6 @@ class MegaMoENvfp4Frontend:
             raise ValueError(
                 f"topk_weights must be float32, got {inputs.topk_weights.dtype}."
             )
-        if not c.fc2_reduces_topk and inputs.combine_reduced_output is None:
-            raise ValueError(
-                "combine_reduced_output is required when in_kernel_fc2_reduce=False."
-            )
-        if inputs.combine_reduced_output is not None:
-            expected = (buf_tokens, c.hidden)
-            _require_cuda("combine_reduced_output", inputs.combine_reduced_output)
-            if tuple(inputs.combine_reduced_output.shape) != expected:
-                raise ValueError(
-                    "combine_reduced_output must have shape "
-                    f"{expected}, got {tuple(inputs.combine_reduced_output.shape)}."
-                )
-            if inputs.combine_reduced_output.dtype != torch.bfloat16:
-                raise ValueError(
-                    "combine_reduced_output must be bfloat16, got "
-                    f"{inputs.combine_reduced_output.dtype}."
-                )
-
         hidden_sf_cols = (c.hidden + Nvfp4BlockSize - 1) // Nvfp4BlockSize
         if inputs.activation_sf.dtype != _ScaleDtype:
             raise ValueError(
@@ -771,43 +635,6 @@ class MegaMoENvfp4Frontend:
             if tensor.dtype != torch.float32:
                 raise ValueError(f"{name} must be float32, got {tensor.dtype}.")
 
-        if inputs.topk_score_for_reduce is not None:
-            expected = (buf_tokens, c.num_topk)
-            _require_cuda("topk_score_for_reduce", inputs.topk_score_for_reduce)
-            if tuple(inputs.topk_score_for_reduce.shape) != expected:
-                raise ValueError(
-                    "topk_score_for_reduce must have shape "
-                    f"{expected}, got {tuple(inputs.topk_score_for_reduce.shape)}."
-                )
-            if inputs.topk_score_for_reduce.dtype != torch.float32:
-                raise ValueError(
-                    "topk_score_for_reduce must be float32, got "
-                    f"{inputs.topk_score_for_reduce.dtype}."
-                )
-
-        if c.combine_is_quantized:
-            if inputs.combine_output_q is None or inputs.combine_sf_q is None:
-                raise ValueError(
-                    f"combine_dtype={c.combine_dtype!r} requires combine_output_q "
-                    "and combine_sf_q."
-                )
-            _require_cuda("combine_output_q", inputs.combine_output_q)
-            _require_cuda("combine_sf_q", inputs.combine_sf_q)
-            if inputs.combine_output_q.shape[0] != buf_tokens:
-                raise ValueError(
-                    "combine_output_q.shape[0] must match activation buffer size "
-                    f"({buf_tokens}), got {inputs.combine_output_q.shape[0]}."
-                )
-            if c.combine_dtype == "nvfp4" and inputs.combine_global_q is None:
-                raise ValueError("combine_dtype='nvfp4' requires combine_global_q.")
-            if inputs.combine_global_q is not None:
-                _require_cuda("combine_global_q", inputs.combine_global_q)
-                if inputs.combine_global_q.shape[0] != buf_tokens:
-                    raise ValueError(
-                        "combine_global_q.shape[0] must match activation buffer size "
-                        f"({buf_tokens}), got {inputs.combine_global_q.shape[0]}."
-                    )
-
     @staticmethod
     def _to_cute(
         tensor: torch.Tensor, assumed_align: int = 16, *, static_layout: bool = False
@@ -835,27 +662,6 @@ class MegaMoENvfp4Frontend:
                 "must be a multiple of 4."
             )
 
-        if c.combine_is_quantized:
-            if inputs.combine_output_q is None or inputs.combine_sf_q is None:
-                raise ValueError(
-                    f"combine_dtype={c.combine_dtype!r} requires combine_output_q "
-                    "and combine_sf_q."
-                )
-            combine_output_q_cute = self._to_cute(
-                inputs.combine_output_q.view(torch.uint8)
-            )
-            combine_sf_q_cute = self._to_cute(inputs.combine_sf_q.view(torch.uint8))
-            if c.combine_dtype == "nvfp4":
-                if inputs.combine_global_q is None:
-                    raise ValueError("combine_dtype='nvfp4' requires combine_global_q.")
-                combine_global_q_cute = self._to_cute(inputs.combine_global_q)
-            else:
-                combine_global_q_cute = self._to_cute(inputs.combine_output)
-        else:
-            combine_output_q_cute = self._to_cute(inputs.combine_output)
-            combine_sf_q_cute = self._to_cute(inputs.combine_output)
-            combine_global_q_cute = self._to_cute(inputs.combine_output)
-
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         peer_rank_ptr_mapper_host = SymBufferHost(
             base_addr=mega.symmetric_base,
@@ -876,32 +682,30 @@ class MegaMoENvfp4Frontend:
             fc1_alpha=self._to_cute(inputs.fc1_alpha, assumed_align=4),
             fc2_alpha=self._to_cute(inputs.fc2_alpha, assumed_align=4),
             fc1_norm_const=self._to_cute(inputs.fc1_norm_const, assumed_align=4),
-            combine_output=self._to_cute(inputs.combine_output),
-            combine_output_q=combine_output_q_cute,
-            combine_sf_q=combine_sf_q_cute,
-            combine_global_q=combine_global_q_cute,
-            local_workspace=self._to_cute(
-                mega.local_workspace,
-                static_layout=True,
-            ),
-            shared_workspace=self._to_cute(mega.shared_workspace),
+            output_activation=self._to_cute(inputs.output_activation),
+            # Opaque byte workspaces are passed as raw uint8 gmem base pointers
+            # (not cute tensors): the kernel addresses them by base + Int64 byte
+            # offset, and a tensor shape would overflow cute's 32-bit memref
+            # field once internalized combine staging pushes shared_workspace
+            # past 2 GiB (mirrors the drop's mega_runner).
+            local_workspace=self._to_cute_ptr(mega.local_workspace),
+            shared_workspace=self._to_cute_ptr(mega.shared_workspace),
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
             stream=stream,
         )
 
     @staticmethod
-    def _build_topk_runtime_kwargs(topk: _CompiledTopk) -> dict:
-        import cuda.bindings.driver as cuda
+    def _to_cute_ptr(tensor: torch.Tensor, assumed_align: int = 16):
+        """Raw uint8 gmem base pointer for an opaque byte workspace."""
+        import cutlass
+        import cutlass.cute as cute
+        from cutlass.cute.typing import AddressSpace
 
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        return dict(
-            combine_cute=topk.combine_cute,
-            reduced_cute=topk.reduced_cute,
-            topk_score_cute=topk.topk_score_cute,
-            mxfp8_scale_cute=topk.mxfp8_scale_cute,
-            nvfp4_sfc_scale_cute=topk.nvfp4_sfc_scale_cute,
-            nvfp4_global_scale_cute=topk.nvfp4_global_scale_cute,
-            stream=stream,
+        return cute.runtime.make_ptr(
+            cutlass.Uint8,
+            tensor.data_ptr(),
+            AddressSpace.gmem,
+            assumed_align=assumed_align,
         )
 
     @staticmethod
@@ -1012,8 +816,7 @@ class MegaMoESymmBuffer:
     x_sf: torch.Tensor
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
-    combine_output: torch.Tensor
-    combine_reduced_output: torch.Tensor
+    output_activation: torch.Tensor
     fc1_alpha: torch.Tensor
     fc2_alpha: torch.Tensor
     fc1_norm_const: torch.Tensor
@@ -1052,6 +855,7 @@ def get_symm_buffer_for_mega_moe(
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
+    knobs: Optional[dict] = None,
 ) -> MegaMoESymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
 
@@ -1097,6 +901,10 @@ def get_symm_buffer_for_mega_moe(
         gate_up_clamp=clamp,
         apply_topk_in_fc1=apply_topk_in_fc1,
     )
+    if knobs:
+        from .tuner import with_knobs
+
+        cfg = with_knobs(cfg, knobs)
     frontend = MegaMoENvfp4Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
@@ -1114,12 +922,10 @@ def get_symm_buffer_for_mega_moe(
     sym_roots.append(topk_idx)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     sym_roots.append(topk_weights)
-    combine_output = sym_zeros(
-        (num_max_tokens, num_topk, hidden),
-        torch.bfloat16,
-    )
-    sym_roots.append(combine_output)
-    combine_reduced_output = torch.empty(
+    # Single 2D (T, hidden) bf16 output; the kernel reduces the top-k combine
+    # internally.  With in_kernel_fc2_reduce=False (default) it is a rank-local
+    # buffer (not the in-kernel cross-rank REDG target, so not on the sym heap).
+    output_activation = torch.zeros(
         (num_max_tokens, hidden),
         dtype=torch.bfloat16,
         device="cuda",
@@ -1152,8 +958,7 @@ def get_symm_buffer_for_mega_moe(
         x_sf=x_sf,
         topk_idx=topk_idx,
         topk_weights=topk_weights,
-        combine_output=combine_output,
-        combine_reduced_output=combine_reduced_output,
+        output_activation=output_activation,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
@@ -1234,36 +1039,16 @@ def nvfp4_mega_moe(
         fc1_alpha=symm_buffer.fc1_alpha,
         fc2_alpha=symm_buffer.fc2_alpha,
         fc1_norm_const=symm_buffer.fc1_norm_const,
-        combine_output=symm_buffer.combine_output,
-        combine_reduced_output=symm_buffer.combine_reduced_output,
+        output_activation=symm_buffer.output_activation,
     )
 
-    if symm_buffer._frontend.config.fc2_reduces_topk:
-        out = symm_buffer._frontend.run(inputs, num_tokens=n)
-    else:
-        out = symm_buffer._frontend.run(
-            inputs,
-            num_tokens=None,
-            reduce_topk=False,
-        )
+    # The kernel reduces the top-k combine internally and writes the final 2D
+    # (T, hidden) output; no host-side form-A reduction is needed.  Launch the
+    # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
+    # live [:n] rows out -- matches the reference driver, which does not slice.
+    out = symm_buffer._frontend.run(inputs, num_tokens=None)
     if out is not None:
-        if symm_buffer._frontend.config.fc2_reduces_topk:
-            y.copy_(out[:n])
-        else:
-            active_form_a = out[:n]
-            active_form_a_fp32 = active_form_a.to(torch.float32)
-            if symm_buffer._frontend.config.apply_topk_in_fc1:
-                reduced = active_form_a_fp32.sum(dim=1).to(y.dtype)
-            else:
-                reduced = (
-                    (
-                        active_form_a_fp32
-                        * symm_buffer.topk_weights[:n, :, None].to(torch.float32)
-                    )
-                    .sum(dim=1)
-                    .to(y.dtype)
-                )
-            y.copy_(reduced)
+        y.copy_(out[:n])
 
 
 def make_dummy_epilogue_params(

@@ -1,21 +1,29 @@
 # Dynamic UMMA N for fused fc1+fc2 swap-AB MegaMoE kernel.
 #
-# Emits raw ``nvvm.tcgen05_mma_block_scale(...)`` so the instruction descriptor
-# (``idesc``) is under our control -- specifically so its ``n_dim_`` bitfield
-# becomes a runtime SSA value (= ``align16(valid_tokens_in_tile) >> 3``).
+# Emits the block-scaled UMMA instruction as literal PTX text (via
+# ``llvm.inline_asm``) so the instruction descriptor (``idesc``) is under our
+# control -- specifically so its ``n_dim_`` bitfield becomes a runtime SSA
+# value (= ``align16(valid_tokens_in_tile) >> 3``).
+#
+# Why PTX text instead of ``cutlass._mlir.dialects.nvvm`` (the dialect Python
+# binding): that binding is a private/unstable surface that has already
+# broken once across a cutedsl upgrade (enum classes and kwargs renamed:
+# ``Tcgen05GroupKind``/``mma_kind``/``Tcgen05MMAScaleVecSize.X4`` ->
+# ``CTAGroupKind``/``kind``/``Tcgen05MMABlockScale.BLOCK16``). The PTX ISA
+# text syntax for ``tcgen05.mma...block_scale`` has been stable across CUDA
+# 12.9-13.3 (PTX ISA 8.8-9.3): the only change in that window was the
+# addition of the ``.block16``/``.block32`` aliases in 8.8, and the old
+# spelling was never removed. This module targets CUDA >= 13 and always
+# emits the ``.block16`` spelling.
 
 from typing import Optional
 
-import cutlass  # noqa: F401
+import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import dsl_user_op, Int32, Boolean
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import builtin
 from cutlass._mlir.dialects import llvm
-from cutlass._mlir.dialects import nvvm as _nvvm_raw
-
-# auto-Int32/Boolean -> ir.Value wrapper for nvvm.* calls.
-from cutlass.cute.arch.nvvm_wrappers import nvvm
 
 
 # =============================================================================
@@ -162,15 +170,64 @@ def _tmem_ptr_to_i32(tmem_ptr_value: ir.Value) -> ir.Value:
     return builtin.unrealized_conversion_cast([i32_ty], [tmem_ptr_value])
 
 
-def _i32_to_tmem_llvm_ptr(i32_value: ir.Value) -> ir.Value:
-    """Cast i32 TMEM address -> ``!llvm.ptr<6>``."""
-    tmem_llvm_ptr_ty = llvm.PointerType.get(cute.AddressSpace.tmem.value)
-    return llvm.inttoptr(tmem_llvm_ptr_ty, i32_value)
-
-
 def _as_value(it) -> ir.Value:
     """Unwrap to underlying ir.Value (cute Pointer has .value)."""
     return it.value if hasattr(it, "value") else it
+
+
+# =============================================================================
+# PTX-text MMA emission (see module docstring for why this isn't the nvvm
+# dialect binding)
+# =============================================================================
+
+
+@dsl_user_op
+def _tcgen05_mma_mxf4nvf4_block_scale_block16(
+    *,
+    cta_group: int,  # 1 or 2 (Python int, folds into the asm mnemonic)
+    d_tmem_i32,  # ir.Value (i32) -- accumulator TMEM address
+    a_desc_i64,  # ir.Value (i64) -- A operand smem descriptor
+    b_desc_i64,  # ir.Value (i64) -- B operand smem descriptor
+    idesc_i32,  # ir.Value (i32) -- instruction descriptor
+    enable_input_d_i32,  # ir.Value (i32) -- 0/1, D = A@B (+ C if nonzero)
+    sfa_tmem_i32,  # ir.Value (i32) -- SFA TMEM address
+    sfb_tmem_i32,  # ir.Value (i32) -- SFB TMEM address
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Emit ``tcgen05.mma.cta_group::{1,2}.kind::mxf4nvf4.block_scale.block16``.
+
+    Mirrors CUTLASS's own reference lowering for this instruction
+    (``cute/arch/mma_sm100_umma.hpp``, ``SM100_MMA_MXF4_2x1SM_SS::fma``):
+    ``enable_input_d`` travels as a plain u32 register and is turned into the
+    hardware predicate in-asm via ``setp.ne.b32``, so no operand needs a
+    dialect-specific predicate type.
+    """
+    assert cta_group in (1, 2), f"cta_group must be 1 or 2, got {cta_group}"
+    llvm.inline_asm(
+        None,
+        [
+            d_tmem_i32,
+            a_desc_i64,
+            b_desc_i64,
+            idesc_i32,
+            enable_input_d_i32,
+            sfa_tmem_i32,
+            sfb_tmem_i32,
+        ],
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, $4, 0;\n\t"
+        f"tcgen05.mma.cta_group::{cta_group}.kind::mxf4nvf4.block_scale.block16 "
+        "[$0], $1, $2, $3, [$5], [$6], p;\n\t"
+        "}\n",
+        "r,l,l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 # =============================================================================
@@ -222,9 +279,8 @@ def issue_dynamic_block_scaled_mma_tile(
 
     num_k_inner = mma_tiler_mnk[2] // _UMMA_K_NVFP4  # = 4 for NVFP4 K=256
 
-    compatible_to_old_nvvm = False
-    if hasattr(_nvvm_raw, "Tcgen05GroupKind"):
-        compatible_to_old_nvvm = True
+    # 256 -> 2cta, 128 -> 1cta (kernel constraint per_cta_m == 128).
+    cta_group = 2 if mma_tiler_mnk[0] == 256 else 1
 
     # m / n inner indices both 0 for v1 (m_count = n_count = 1).
     m_inner = 0
@@ -239,7 +295,7 @@ def issue_dynamic_block_scaled_mma_tile(
         sfb_atom = sfb_tensor[(None, n_inner, k_inner)]
         acc_atom = acc_tensor[(None, m_inner, n_inner)]
 
-        # Cast operands to NVVM-op-acceptable types.
+        # Cast operands to plain integer registers (PTX operand types).
         a_iter_val = _as_value(a_atom.iterator)
         b_iter_val = _as_value(b_atom.iterator)
         acc_iter_val = _as_value(acc_atom.iterator)
@@ -251,10 +307,6 @@ def issue_dynamic_block_scaled_mma_tile(
         operand_sfa_i32 = _tmem_ptr_to_i32(sfa_iter_val)
         operand_sfb_i32 = _tmem_ptr_to_i32(sfb_iter_val)
         operand_acc_i32 = _tmem_ptr_to_i32(acc_iter_val)
-
-        operand_d_ptr = _i32_to_tmem_llvm_ptr(operand_acc_i32)
-        operand_sfa_ptr = _i32_to_tmem_llvm_ptr(operand_sfa_i32)
-        operand_sfb_ptr = _i32_to_tmem_llvm_ptr(operand_sfb_i32)
 
         idesc = compute_idesc(
             static_base=static_idesc_base,
@@ -271,34 +323,13 @@ def issue_dynamic_block_scaled_mma_tile(
             accum_flag = True
 
         with cute.arch.elect_one():
-            if compatible_to_old_nvvm:
-                nvvm_args = {
-                    "mma_kind": _nvvm_raw.Tcgen05MMAKind.MXF4NVF4,
-                    "cta_group": _nvvm_raw.Tcgen05GroupKind.CTA_2
-                    if mma_tiler_mnk[0] == 256
-                    else _nvvm_raw.Tcgen05GroupKind.CTA_1,
-                    "d": operand_d_ptr,
-                    "a": operand_a,
-                    "b": operand_b,
-                    "idesc": idesc.ir_value(),
-                    "enable_input_d": Boolean(accum_flag).ir_value(),
-                    "scale_a": operand_sfa_ptr,
-                    "scale_b": operand_sfb_ptr,
-                    "scale_vec_size": _nvvm_raw.Tcgen05MMAScaleVecSize.X4,
-                }
-            else:
-                nvvm_args = {
-                    "kind": _nvvm_raw.Tcgen05MMAKind.MXF4NVF4,
-                    "cta_group": _nvvm_raw.CTAGroupKind.CTA_2
-                    if mma_tiler_mnk[0] == 256
-                    else _nvvm_raw.CTAGroupKind.CTA_1,
-                    "matrix_d": operand_d_ptr,
-                    "matrix_a": operand_a,
-                    "matrix_b": operand_b,
-                    "idesc": idesc.ir_value(),
-                    "enable_input_d": Boolean(accum_flag).ir_value(),
-                    "scale_a": operand_sfa_ptr,
-                    "scale_b": operand_sfb_ptr,
-                    "block_scale": _nvvm_raw.Tcgen05MMABlockScale.BLOCK16,
-                }
-            nvvm.tcgen05_mma_block_scale(**nvvm_args)
+            _tcgen05_mma_mxf4nvf4_block_scale_block16(
+                cta_group=cta_group,
+                d_tmem_i32=operand_acc_i32,
+                a_desc_i64=operand_a,
+                b_desc_i64=operand_b,
+                idesc_i32=idesc.ir_value(),
+                enable_input_d_i32=Int32(Boolean(accum_flag)).ir_value(),
+                sfa_tmem_i32=operand_sfa_i32,
+                sfb_tmem_i32=operand_sfb_i32,
+            )

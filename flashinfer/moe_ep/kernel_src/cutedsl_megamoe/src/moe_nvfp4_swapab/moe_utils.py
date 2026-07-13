@@ -36,11 +36,11 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.arch import nvvm_wrappers
-from cutlass.cutlass_dsl import dsl_user_op, Boolean, Int32, Float32, T  # noqa: F401
+from cutlass.cutlass_dsl import dsl_user_op, Boolean, Int32, Float32, T
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import cute as _cute_ir
-from cutlass._mlir.dialects import vector, arith  # noqa: F401
+from cutlass._mlir.dialects import vector, arith
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 from dataclasses import dataclass
 
@@ -91,7 +91,8 @@ def spin_wait(
     ip: Optional[ir.InsertionPoint] = None,
 ) -> Boolean:
     """Spin until condition is true, or do one condition check with peek_only."""
-    current = cute.arch.load(ptr, ptr.dtype, cop="cg", loc=loc, ip=ip)
+    # The first load must be acquire to build the mem order.
+    current = cute.arch.load(ptr, ptr.dtype, sem="acquire", scope="gpu")
     if cutlass.const_expr(peek_only):
         # One-shot peek: forward the condition Boolean to the caller.
         return Boolean(condition(current))
@@ -99,7 +100,7 @@ def spin_wait(
         # Load with L1 cache bypass (ld.global.cg)
         if cutlass.const_expr(fail_sleep_cycles > 0):
             _nanosleep(fail_sleep_cycles, loc=loc, ip=ip)
-        current = cute.arch.load(ptr, ptr.dtype, cop="cg", loc=loc, ip=ip)
+        current = cute.arch.load(ptr, ptr.dtype, sem="acquire", scope="gpu")
     # Spin-path: condition was satisfied; uniformize return type with the
     # peek path so callers always see a Boolean.
     return Boolean(True)
@@ -1144,7 +1145,7 @@ class MoEScaledGroupedGemmTensormapConstructor(OnlineTensormapDescCreator):
         """
         c1 = cutlass.Int32(1)
 
-        a_chunks_to_move = (  # noqa: F841
+        a_chunks_to_move = (
             padded_offset
             // self.sf_vec_size
             * cute.size(self.sfa_tensor, mode=[0])
@@ -1153,7 +1154,7 @@ class MoEScaledGroupedGemmTensormapConstructor(OnlineTensormapDescCreator):
         a_elems_to_move = (
             cute.size(self.sfa_tensor, mode=[0]) * padded_offset // self.sf_vec_size
         )
-        b_chunks_to_move = (  # noqa: F841
+        b_chunks_to_move = (
             padded_offset
             // self.sf_vec_size
             * cute.size(self.sfb_tensor, mode=[0])
