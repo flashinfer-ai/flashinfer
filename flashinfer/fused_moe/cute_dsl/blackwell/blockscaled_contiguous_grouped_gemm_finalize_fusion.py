@@ -1156,6 +1156,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
+        tmem.allocate(self.num_tmem_alloc_cols)
 
         # Cluster arrive after barrier init
         if cute.size(self.cluster_shape_mn) > 1:
@@ -1356,7 +1357,58 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         tCgC = thr_mma.partition_C(gC_mnl)
 
         #
-        # Cluster wait before tensor memory alloc
+        # Persistent tile scheduler state. Emit the first tile before the
+        # cluster/grid dependency wait so consumers can start as soon as the
+        # wait completes; the main scheduler loop resumes from the next tile.
+        #
+        tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+        work_tile = tile_sched.initial_work_tile_info()
+
+        tile_info_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.num_tile_stage
+        )
+
+        num_valid_tiles = num_non_exiting_tiles[0]
+        is_continue = cutlass.Boolean(1)
+
+        if warp_idx == self.sched_warp_id:
+            if work_tile.is_valid_tile:
+                cur_tile_coord = work_tile.tile_idx
+                mma_tile_coord_m = cur_tile_coord[0] // cute.size(
+                    tiled_mma.thr_id.shape
+                )
+                expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
+                tile_idx = mma_tile_coord_m
+
+                if tile_idx < num_valid_tiles:
+                    tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                    mn_limit = tile_idx_to_mn_limit[tile_idx]
+                    with cute.arch.elect_one():
+                        sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
+                        sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
+                        sInfo[(2, tile_info_producer_state.index)] = expert_idx
+                        sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
+                            work_tile.is_valid_tile
+                        )
+                        sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                    cute.arch.fence_proxy(
+                        "async.shared",
+                        space="cta",
+                    )
+                    self.sched_sync_barrier.arrive_and_wait()
+                    tile_info_pipeline.producer_commit(tile_info_producer_state)
+                    tile_info_producer_state.advance()
+                else:
+                    if cutlass.const_expr(not self.raster_along_m):
+                        is_continue = cutlass.Boolean(0)
+
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+
+        #
+        # Cluster wait after early scheduler/TMEM setup
         #
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_wait()
@@ -1370,20 +1422,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         #
         if warp_idx == self.sched_warp_id:
             #
-            # Persistent tile scheduling loop
+            # Persistent tile scheduling loop, starting after the pre-emitted
+            # first tile.
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            # First tile
-            work_tile = tile_sched.initial_work_tile_info()
-
-            tile_info_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_tile_stage
-            )
-
-            num_valid_tiles = num_non_exiting_tiles[0]
-
             if cutlass.const_expr(self.raster_along_m):
                 while work_tile.is_valid_tile:
                     cur_tile_coord = work_tile.tile_idx
@@ -1420,7 +1461,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
             else:
-                is_continue = cutlass.Boolean(1)
                 while work_tile.is_valid_tile and is_continue:
                     cur_tile_coord = work_tile.tile_idx
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(
@@ -1938,11 +1978,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         #
         if warp_idx < self.mma_warp_id:
             #
-            # Alloc tensor memory buffer
-            #
-            tmem.allocate(self.num_tmem_alloc_cols)
-
-            #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
             tmem.wait_for_alloc()
@@ -2077,6 +2112,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     "async.shared",
                     space="cta",
                 )
+                is_partial_tile = (
+                    tile_info[4] < tile_m_start + self.cta_tile_shape_mnk[0]
+                )
                 #
                 # Async arrive accumulator buffer empty
                 #
@@ -2085,28 +2123,41 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
+                if is_partial_tile:
+                    self.epilog_sync_barrier.arrive_and_wait()
+
                 # Whole-row async bulk reduce (smem -> global scatter-add).
-                if is_valid_row:
+                reduce_row = epi_tidx
+                if is_partial_tile:
+                    reduce_row = (epi_tidx % self.threads_per_warp) * len(
+                        self.epilog_warp_id
+                    ) + (epi_tidx // self.threads_per_warp)
+                reduce_permuted_row = tile_m_start + reduce_row
+                is_valid_reduce_row = reduce_permuted_row < tile_info[4]
+                if is_valid_reduce_row:
+                    reduce_token_idx = sMetaTokenIdx[
+                        (reduce_row, meta_consumer_state.index)
+                    ]
                     coord_n = tile_info[1] * self.cta_tile_shape_mnk[1]
                     scatter_out_offset = cute.domain_offset(
-                        (token_idx, coord_n, 0), out
+                        (reduce_token_idx, coord_n, 0), out
                     )
                     if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
                         blk_reduce_bf16(
                             scatter_out_offset,
-                            sC[epi_tidx, None, 0],
+                            sC[reduce_row, None, 0],
                             cutlass.Int32(self.copy_size),
                         )
                     elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
                         blk_reduce_fp32(
                             scatter_out_offset,
-                            sC[epi_tidx, None, 0],
+                            sC[reduce_row, None, 0],
                             cutlass.Int32(self.copy_size),
                         )
                     elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
                         blk_reduce_fp16(
                             scatter_out_offset,
-                            sC[epi_tidx, None, 0],
+                            sC[reduce_row, None, 0],
                             cutlass.Int32(self.copy_size),
                         )
 
