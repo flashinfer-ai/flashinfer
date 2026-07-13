@@ -1,9 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Put ``kernel/cutedsl_backend_kernels`` on ``sys.path`` for legacy imports.
+"""Put ``kernel_src/cutedsl_megamoe/src`` on ``sys.path`` so kernel packages resolve.
 
-Called automatically when
-:mod:`flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels` is imported
+Called automatically when :mod:`flashinfer.moe_ep.kernel_src.cutedsl_megamoe` is imported
 so kernel modules (``src``, ``common``, ``moe_nvfp4_swapab``, ``moe_mxfp8_glu``)
 resolve without a separate editable install.
 """

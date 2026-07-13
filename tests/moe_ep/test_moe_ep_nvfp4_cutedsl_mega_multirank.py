@@ -5,7 +5,7 @@ Launched via torchrun:
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels``.
+``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -23,7 +23,7 @@ import os
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -69,7 +69,7 @@ def _make_inputs(
 def _make_epilogue_params(rank: int, num_local_experts: int):
     import torch
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         make_dummy_epilogue_params,
     )
 
@@ -207,7 +207,7 @@ def _reference_nvfp4_mega_moe_staged(problem: dict, *, destroy_buffer: bool = Tr
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -276,7 +276,7 @@ def _reference_nvfp4_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -386,7 +386,7 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
                 get_symm_buffer_for_mega_moe,
             )
 

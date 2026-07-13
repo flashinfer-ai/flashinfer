@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class Nvfp4CutedslMegaMoeConfig:
-    """Kernel params for ``cutedsl_backend_kernels.frontend.nvfp4_mega_moe``.
+    """Kernel params for ``kernel_src.cutedsl_megamoe.nvfp4_mega_moe``.
 
     Expert weights must be NVFP4 at kernel launch; supply bf16 ``MoEWeightPack``
     and enable ``MegaConfig.preprocess_weights`` (default), or pass pre-quantized

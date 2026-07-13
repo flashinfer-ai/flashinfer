@@ -94,7 +94,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ..cutedsl_backend_kernels.frontend import get_symm_buffer_for_mega_moe
+        from .....kernel_src.cutedsl_megamoe import get_symm_buffer_for_mega_moe
 
         k = self._kernel_config
         fp = fleet_params
@@ -188,7 +188,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from ..cutedsl_backend_kernels.frontend import nvfp4_mega_moe
+        from .....kernel_src.cutedsl_megamoe import nvfp4_mega_moe
 
         kcfg = self._kernel_config
         nvfp4_mega_moe(

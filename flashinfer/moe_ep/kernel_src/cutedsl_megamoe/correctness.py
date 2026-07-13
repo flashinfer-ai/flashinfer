@@ -35,13 +35,13 @@ import sys
 
 import torch
 
-from . import (
+from .megamoe_frontend import (
     MegaMoENvfp4Config,
     MegaMoENvfp4Frontend,
     MegaMoENvfp4Inputs,
     bootstrap_dist,
 )
-from .common import free_sym_tensor
+from .megamoe_frontend.common import free_sym_tensor
 from moe_nvfp4_swapab.mega_runner import (
     _build_arg_parser,
     build_tester_from_args,

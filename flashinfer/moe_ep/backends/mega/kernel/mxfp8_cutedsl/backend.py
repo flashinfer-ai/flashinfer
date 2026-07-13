@@ -96,7 +96,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ..cutedsl_backend_kernels.frontend import (
+        from .....kernel_src.cutedsl_megamoe import (
             get_symm_buffer_for_mxfp8_mega_moe,
         )
 
@@ -187,7 +187,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from ..cutedsl_backend_kernels.frontend import mxfp8_mega_moe
+        from .....kernel_src.cutedsl_megamoe import mxfp8_mega_moe
 
         kcfg = self._kernel_config
         mxfp8_mega_moe(

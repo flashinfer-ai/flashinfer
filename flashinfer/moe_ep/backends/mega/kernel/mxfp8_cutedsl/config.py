@@ -8,7 +8,7 @@ from typing import Literal
 
 @dataclass
 class Mxfp8CutedslMegaMoeConfig:
-    """Kernel params for ``cutedsl_backend_kernels.frontend.mxfp8_mega_moe``.
+    """Kernel params for ``kernel_src.cutedsl_megamoe.mxfp8_mega_moe``.
 
     ``intermediate_size`` is the post-SwiGLU width, matching NVFP4 and SGLang.
     The MXFP8 kernel's full FC1 gate+up width is derived internally as

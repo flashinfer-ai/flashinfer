@@ -8,7 +8,7 @@ from .....core.validation.common import MoEEpConfigError
 
 
 def _require_cutedsl_paths() -> None:
-    from ..cutedsl_backend_kernels import bootstrap_paths
+    from .....kernel_src.cutedsl_megamoe.src._bootstrap_paths import bootstrap_paths
 
     bootstrap_paths()
 

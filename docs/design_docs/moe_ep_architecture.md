@@ -21,6 +21,12 @@ moe_ep/
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,…}
+  kernel_src/cutedsl/          ← CuTeDSL kernel src (kernel team) + FI shim APIs
+    src/                       ← kernel team drop zone (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
+    nvfp4.py, mxfp8.py        ← FI shim APIs consumed by nvfp4_cutedsl / mxfp8_cutedsl backends
+    megamoe_frontend/          ← internal FI implementation
+    correctness.py             ← optional correctness runner (not used by moe_ep)
+    SKILL.md                   ← how to resync src/ when kernel team drops a new version
   modes/{split_layer,mega_layer,config}.py
 ```
 

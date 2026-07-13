@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""CuTeDSL MegaMoE thin frontend API (shipped with FlashInfer ``moe_ep``).
+"""CuTeDSL MegaMoE thin shim API (shipped with FlashInfer ``moe_ep``).
 
 Library use (NVFP4)::
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         create_dummy_inputs,
         get_symm_buffer_for_mega_moe,
         init_dist,
@@ -13,7 +13,7 @@ Library use (NVFP4)::
 
 Library use (MXFP8)::
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         create_dummy_mxfp8_inputs,
         get_symm_buffer_for_mxfp8_mega_moe,
         init_dist,
@@ -27,7 +27,7 @@ kernel-ready ``(weight, scale)`` tuples.
 
 from __future__ import annotations
 
-from .._bootstrap_paths import bootstrap_paths
+from .src._bootstrap_paths import bootstrap_paths
 
 bootstrap_paths()
 
