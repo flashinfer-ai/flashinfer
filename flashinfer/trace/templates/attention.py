@@ -3725,10 +3725,125 @@ cute_dsl_batch_prefill_run_trace = TraceTemplate(
 
 
 # ── MagiAttention Flex Flash Attention (optional dependency) ─────────────────
-# No reference= is provided on purpose: the per-range mask semantics
-# (causal / inverse-causal / bidirectional-causal alignment) are owned by
-# MagiAttention, and the adapter's real-path tests in tests/ffa compare
-# directly against MagiAttention's native flex_flash_attn_func instead.
+# The NHD template carries a reference for the mask types it can model
+# soundly (0=full, 1=causal, bottom-right aligned); inverse-causal /
+# bidirectional-causal alignment is owned by MagiAttention and is covered by
+# the adapter's real-path tests in tests/ffa, which compare directly against
+# MagiAttention's native flex_flash_attn_func. The HND template stays
+# schema-only (the semantics are defined in token-major form).
+
+
+def _magi_ffa_flex_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/ffa/test_flex_flash_attn.py::test_matches_torch_reference_*
+    # (bf16 kernel vs fp32 reference).
+    rtol = 2e-2 if rtol is None else rtol
+    atol = 2e-2 if atol is None else atol
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+@torch.no_grad()
+def _magi_ffa_flex_reference(
+    q, k, v, q_ranges, k_ranges, attn_type_map=None, return_lse=None
+):
+    """Ranged attention reference (NHD layout, single-output form).
+
+    Builds the (num_tokens_q, num_tokens_kv) allow-mask from the ranges, then
+    runs one softmax over each query row's union of allowed keys — the same
+    semantics MagiAttention realizes with online-softmax merging, including
+    overlapping ``q_ranges``. Covers mask types 0 (full) and 1 (causal,
+    bottom-right aligned); types 2/3 are owned by MagiAttention and are not
+    modeled here.
+    """
+    del return_lse  # reference models the single-output (out-only) form
+    num_tokens_q, num_qo_heads, head_dim = q.shape
+    num_tokens_kv, num_kv_heads, _ = k.shape
+    scale = 1.0 / math.sqrt(head_dim)
+
+    mask = torch.zeros(num_tokens_q, num_tokens_kv, dtype=torch.bool, device=q.device)
+    types = [0] * q_ranges.shape[0] if attn_type_map is None else attn_type_map.tolist()
+    for (qs, qe), (ks, ke), attn_type in zip(
+        q_ranges.tolist(), k_ranges.tolist(), types, strict=True
+    ):
+        if attn_type == 0:
+            mask[qs:qe, ks:ke] = True
+        elif attn_type == 1:
+            sq, sk = qe - qs, ke - ks
+            qi = torch.arange(sq, device=q.device).unsqueeze(1)
+            ki = torch.arange(sk, device=q.device).unsqueeze(0)
+            mask[qs:qe, ks:ke] |= ki - qi <= sk - sq
+        else:
+            raise NotImplementedError(
+                "reference covers attn types 0 (full) and 1 (causal) only"
+            )
+
+    gqa_ratio = num_qo_heads // num_kv_heads
+    k_h = k.repeat_interleave(gqa_ratio, dim=1).to(torch.float32)
+    v_h = v.repeat_interleave(gqa_ratio, dim=1).to(torch.float32)
+    scores = torch.einsum("qhd,khd->hqk", q.to(torch.float32), k_h) * scale
+    scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    # Query rows outside every q_range have no allowed keys; FFA leaves them zero.
+    probs = torch.nan_to_num(probs, nan=0.0)
+    out = torch.einsum("hqk,khd->qhd", probs, v_h)
+    return out.to(q.dtype)
+
+
+def _magi_ffa_flex_init(
+    *,
+    num_tokens_q: int,
+    num_tokens_kv: int = 0,
+    num_ranges: int = 0,
+    num_qo_heads: int = 2,
+    num_kv_heads: int = 2,
+    head_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.magi_ffa.flex_flash_attn`` (NHD layout).
+
+    Sourced from ``tests/ffa/test_flex_flash_attn.py`` (real-path cases):
+    self-attention (``num_tokens_kv = num_tokens_q``) split into two ranges,
+    the first full and the second causal.
+    """
+    del num_tokens_kv, num_ranges  # derived: = num_tokens_q / fixed at 2
+    torch.manual_seed(seed)
+    seq_len = num_tokens_q
+    half = seq_len // 2
+    return {
+        "q": torch.randn(
+            seq_len, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+        ),
+        "k": torch.randn(
+            seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        ),
+        "v": torch.randn(
+            seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        ),
+        "q_ranges": torch.tensor(
+            [[0, half], [half, seq_len]], dtype=torch.int32, device=device
+        ),
+        "k_ranges": torch.tensor(
+            [[0, half], [0, seq_len]], dtype=torch.int32, device=device
+        ),
+        "attn_type_map": torch.tensor([0, 1], dtype=torch.int32, device=device),
+    }
 
 
 def _make_magi_ffa_flex_trace(tensor_layout: str) -> TraceTemplate:
@@ -3811,6 +3926,10 @@ def _make_magi_ffa_flex_trace(tensor_layout: str) -> TraceTemplate:
             "backend:magi-attention",
             f"layout:{layout}",
         ],
+        # Reference/init/check are NHD-only (see the section comment above).
+        reference=_magi_ffa_flex_reference if tensor_layout == "NHD" else None,
+        init=_magi_ffa_flex_init if tensor_layout == "NHD" else None,
+        check=_magi_ffa_flex_check if tensor_layout == "NHD" else None,
     )
 
 
