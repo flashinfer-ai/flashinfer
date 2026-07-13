@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Minimal smoke test for :mod:`cutedsl_megamoe_front_end.megamoe_frontend`.
+"""Minimal smoke test for the CuTeDSL NVFP4 MegaMoE frontend.
 
 Reuses ``mega_runner`` for deterministic input + reference generation, then
 launches via :class:`MegaMoENvfp4Frontend`.
 
-Install once::
-
-    cd cutedsl_megamoe/front_end && pip install -e .
-
 Single-rank (no NVSHMEM)::
 
-    cd cutedsl_megamoe
     MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 python -u \\
-        -m cutedsl_megamoe_front_end.megamoe_frontend.run \\
+        -m flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim \\
         --num_tokens_per_rank 128 --num_topk 4 --num_total_experts 32 \\
         --hidden 2048 --intermediate 1024
 
 Multi-rank::
 
-    cd cutedsl_megamoe
     PYTHONUNBUFFERED=1 torchrun --standalone --nproc_per_node=4 \\
-        -m cutedsl_megamoe_front_end.megamoe_frontend.run \\
+        -m flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim \\
         --num_tokens_per_rank 256 --num_topk 4 --num_total_experts 32 \\
         --hidden 2048 --intermediate 1024 --route_distribution balanced
 """
@@ -35,13 +29,12 @@ import sys
 
 import torch
 
-from .megamoe_frontend import (
+from .nvfp4 import (
     MegaMoENvfp4Config,
     MegaMoENvfp4Frontend,
     MegaMoENvfp4Inputs,
-    bootstrap_dist,
 )
-from .megamoe_frontend.common import free_sym_tensor
+from .comm import bootstrap_dist, free_sym_tensor
 from moe_nvfp4_swapab.mega_runner import (
     _build_arg_parser,
     build_tester_from_args,

@@ -1,39 +1,43 @@
-# Updating the CuTeDSL kernel src
+# Updating the CuTeDSL MegaMoE kernel src
 
 ## Layout
 
 ```
-kernel_src/cutedsl/
+kernel_src/cutedsl_megamoe/
 ├── src/                    ← kernel team code (treat as read-only; replace whole dir on update)
 │   ├── _bootstrap_paths.py ← adds src/ to sys.path; keep as-is
 │   ├── common/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, …)
 │   ├── moe_mxfp8_glu/      ← MXFP8 kernel implementation
 │   └── moe_nvfp4_swapab/   ← NVFP4 kernel implementation
-├── __init__.py             ← public API re-exports (our shim; do not replace)
-├── _util.py                ← resolve_gate_up_clamp helper (our shim)
-├── nvfp4.py                ← NVFP4 shim called by backends/mega/kernel/nvfp4_cutedsl/
-├── mxfp8.py                ← MXFP8 shim called by backends/mega/kernel/mxfp8_cutedsl/
-├── megamoe_frontend/       ← internal FI shim implementation (our code)
-├── correctness.py          ← standalone correctness runner (not used by moe_ep)
+├── __init__.py             ← public API for moe_ep; talks ONLY to shim/ (our code)
+├── shim/                   ← thin adapters over src/ (our code)
+│   ├── comm.py             ← dist bootstrap, sym heap, compile state, resolve_gate_up_clamp
+│   ├── nvfp4.py            ← NVFP4 frontend + symm-buffer/launch wrappers (self-contained)
+│   ├── mxfp8.py            ← MXFP8 frontend + symm-buffer/launch wrappers (self-contained)
+│   └── correctness.py      ← standalone NVFP4 smoke runner (not used by moe_ep)
 └── SKILL.md                ← this file
 ```
+
+Layering: `moe_ep` backends import from the package (`__init__.py`) only →
+`__init__.py` re-exports from `shim/` → `shim/` imports the raw kernel packages
+from `src/` via sys.path.
 
 ## When the kernel team drops a new version of src/
 
 1. **Replace `src/`** with the new drop (preserve `_bootstrap_paths.py` or diff it):
    ```bash
-   rm -rf flashinfer/moe_ep/kernel_src/cutedsl/src/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab}
+   rm -rf flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab}
    cp -r <new_drop>/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab} \
-       flashinfer/moe_ep/kernel_src/cutedsl/src/
+       flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/
    ```
 
 2. **Check `_bootstrap_paths.py`** — it must add `src/` (i.e. `dirname(__file__)`) to `sys.path`.
    If the new drop ships its own bootstrap, keep ours or merge carefully.
 
-3. **Audit shim compatibility** — the shim files (`nvfp4.py`, `mxfp8.py`, `megamoe_frontend/`) call
-   into `common`, `moe_nvfp4_swapab`, `moe_mxfp8_glu`, and `src` via sys.path imports.
-   Check these entrypoints after updating src/:
+3. **Audit shim compatibility** — `shim/nvfp4.py` and `shim/mxfp8.py` call into `common`,
+   `moe_nvfp4_swapab`, `moe_mxfp8_glu`, and `src` via sys.path imports. Check these
+   entrypoints after updating src/:
 
    | Shim import | Kernel src file |
    |---|---|
@@ -57,7 +61,9 @@ kernel_src/cutedsl/
 
 ## What NOT to update here
 
+- `__init__.py` / `shim/` — our adapter layer. The public surface moe_ep depends on
+  is `__init__.py`; keep it stable across kernel drops.
 - `backends/mega/kernel/nvfp4_cutedsl/` and `mxfp8_cutedsl/` — those are the FI backend
-  wrappers; they import from this shim but are not part of it.
+  wrappers; they import from the package (`__init__.py`) but are not part of this drop.
 - `core/runtime/bootstrap.py` — imports `bootstrap_paths` from `src/_bootstrap_paths.py`;
   only change if `_bootstrap_paths.py` itself is removed or renamed.
