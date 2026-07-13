@@ -69,8 +69,10 @@ def _preprocess_humming_e8m0_weight_scale(
         raise ValueError(f"raw_scale must be uint8 E8M0 bytes; got {raw_scale.dtype}")
     if not raw_scale.is_cuda:
         raise ValueError("raw_scale must live on CUDA")
-    if max_range < 0 or max_range > 255:
-        raise ValueError(f"max_range must fit in uint8; got {max_range}")
+    # The fused conversion adds max_range + 1 to FP4 exponent code 3;
+    # E4M3 exponent code 15 therefore limits max_range to 11.
+    if max_range < 0 or max_range > 11:
+        raise ValueError(f"max_range must be in [0, 11]; got {max_range}")
 
     num_experts = raw_scale.shape[0]
     scale_view = raw_scale.contiguous().view(num_experts, -1)
