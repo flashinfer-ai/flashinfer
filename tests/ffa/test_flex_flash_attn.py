@@ -232,10 +232,13 @@ def _assert_matches_direct_magi_attention(
     k_ranges_list,
     attn_type_map_list,
     extra_kwargs=None,
+    deterministic=False,
 ):
     from magi_attention.api import flex_flash_attn_func
 
-    extra_kwargs = extra_kwargs or {}
+    extra_kwargs = dict(extra_kwargs or {})
+    if deterministic:
+        extra_kwargs["deterministic"] = True
     device = torch.device("cuda")
     head_dim = 128
 
@@ -273,8 +276,17 @@ def _assert_matches_direct_magi_attention(
         **extra_kwargs,
     )
 
-    torch.testing.assert_close(out, direct_out, rtol=0, atol=0)
-    torch.testing.assert_close(lse, direct_meta.lse, rtol=0, atol=0)
+    if deterministic:
+        # With deterministic=True on both calls, the adapter must be a pure
+        # pass-through: results are required to be bit-identical.
+        torch.testing.assert_close(out, direct_out, rtol=0, atol=0)
+        torch.testing.assert_close(lse, direct_meta.lse, rtol=0, atol=0)
+    else:
+        # FFA's default path uses atomic reductions, so two independent kernel
+        # launches are not guaranteed bit-identical; compare with the repo's
+        # standard bf16 tolerances (see flashinfer.trace.template.default_tolerances).
+        torch.testing.assert_close(out, direct_out, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lse, direct_meta.lse, rtol=1e-2, atol=1e-2)
 
 
 def test_matches_direct_magi_attention_full_forward():
@@ -288,6 +300,33 @@ def test_matches_direct_magi_attention_full_forward():
         k_ranges_list=[[0, 64]],
         attn_type_map_list=[0],
     )
+
+
+def test_matches_direct_magi_attention_deterministic_bitwise():
+    """With deterministic=True on both sides the adapter must be bit-exact.
+
+    This is the strict proof that the adapter is a pure pass-through; the
+    default-path tests above use tolerances because FFA's atomic reductions
+    make independent launches non-bit-identical.
+    """
+    _skip_without_magi_attention_cuda()
+    torch.manual_seed(52)
+    try:
+        _assert_matches_direct_magi_attention(
+            seq_len=64,
+            num_qo_heads=2,
+            num_kv_heads=2,
+            q_ranges_list=[[0, 64]],
+            k_ranges_list=[[0, 64]],
+            attn_type_map_list=[1],
+            deterministic=True,
+        )
+    except TypeError as exc:
+        if "deterministic" in str(exc):
+            pytest.skip(
+                "installed MagiAttention does not support the deterministic= kwarg"
+            )
+        raise
 
 
 @pytest.mark.parametrize(
@@ -391,7 +430,11 @@ def test_hnd_layout_matches_nhd_on_real_kernel():
         attn_type_map=attn_type_map,
         tensor_layout="HND",
     )
-    torch.testing.assert_close(hnd_out.transpose(0, 1).contiguous(), nhd_out)
+    # Two independent kernel launches (atomic reductions): compare with bf16
+    # tolerances rather than torch's default atol=1e-5.
+    torch.testing.assert_close(
+        hnd_out.transpose(0, 1).contiguous(), nhd_out, rtol=1e-2, atol=1e-2
+    )
 
 
 def test_matches_torch_reference_full_forward():
