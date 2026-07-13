@@ -150,8 +150,8 @@ __device__ __forceinline__ void load_B(SmemT& smem, CheckpointingSsuParams const
 // smem.old_B via cp.async — the N-operand of the C6 MMA (compute_cb_old_2warp).
 // Called on the NO-WRITE path only, by W2/3 (the warps that run the old MMA);
 // each loads the full tile (idempotent).  Valid rows = prev_k (the buffered
-// tokens); the rest are masked by load_tile_async.  old_B is double-buffered:
-// (state_cache_size, 2, MAX_WINDOW, ngroups, dstate).
+// tokens) gathered from the ring at (start+t) % L; the rest zero-fill.  old_B
+// is the single-buffered ring B_cache: (state_cache_size, ngroups, L, dstate).
 template <typename input_t, int MAX_WINDOW, int DSTATE, typename SmemT>
 __device__ __forceinline__ void load_old_B(SmemT& smem, CheckpointingSsuParams const& params,
                                            int lane, int64_t cache_slot, int ring_start,
@@ -177,7 +177,7 @@ template <typename dt_t, typename weight_t, typename matrixA_t, int NPREDICTED, 
 __device__ __forceinline__ void load_phase1_coeffs(SmemT& smem,
                                                    CheckpointingSsuParams const& params, int warp,
                                                    int lane, int first_head, int seq_len,
-                                                   int64_t outer, int64_t cache_slot,
+                                                   int64_t outer, int seq, int64_t cache_slot,
                                                    int ring_start, bool must_checkpoint,
                                                    int prev_k) {
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
@@ -204,36 +204,46 @@ __device__ __forceinline__ void load_phase1_coeffs(SmemT& smem,
     smem.A[flat_tid] = toFloat(A_ptr[first_head + flat_tid]);
     smem.dt_bias[flat_tid] = dt_bias_ptr ? toFloat(dt_bias_ptr[first_head + flat_tid]) : 0.f;
   }
-  // NO-WRITE only: old dt from the RING (t < prev_k, ring row (start+t) % L;
-  // the rest zeroed) — then recompute old_cumAdt = A · inclusive_scan(old_dt)
-  // per head (prefix sums are not ring-shift-invariant, so no decay is
-  // cached).  One thread per head runs the ≤ MAX_WINDOW serial scan after a
-  // __syncthreads publishes the dt rows; smem.A is written above by the same
-  // barrier's producers.
-  if (!must_checkpoint) {
+  // Old dt from the RING (row (start+t) % L, t < prev_k) → per-head inclusive
+  // scan → old_cumAdt = A · cumsum(old_dt) (prefix sums are not
+  // ring-shift-invariant, so no decay is cached).  Runs on BOTH paths: the
+  // MAIN reads cumAdt_old from the scratch for its decay (full rows on write,
+  // the β tail float on no-write), so the recompute lives HERE — in the
+  // coefficient kernel, which is under-utilized — rather than on the main's
+  // replay critical path (measured: precompute-side is cheaper end-to-end than
+  // main-side; see .plans/ssu_persistent_main.md).  The no-write cb_old scaling
+  // ALSO reads smem.old_dt/old_cumAdt (published by the PHASE-2 __syncthreads
+  // below); on the write path those smem rows have no consumer, so they're
+  // skipped.  WARP-PER-HEAD: each warp loads its head's dt ring rows (lane = t)
+  // and scans them in-register — warp-local, NO in-block barrier — with A read
+  // straight from gmem (smem.A isn't published until PHASE 2).
+  {
     auto const* __restrict__ dtc_ptr = reinterpret_cast<float const*>(params.dt_cache);
     int64_t const dtc_base = cache_slot * params.dt_cache_stride_seq;
-    constexpr int OLD_N = HEADS_PER_CTA * MAX_WINDOW;
+    auto* __restrict__ ca_gmem = reinterpret_cast<float*>(params.cumAdt_old);
+    int const scan_warp = flat_tid >> 5;
+    int const scan_lane = flat_tid & 31;
+    constexpr int NWARPS = CTA_THREADS / 32;
+    for (int h = scan_warp; h < HEADS_PER_CTA; h += NWARPS) {
+      int64_t const hh = (int64_t)(first_head + h);
+      float const a = toFloat(A_ptr[hh]);
+      int rr = ring_start + scan_lane;
+      if (rr >= params.ring_buffer_len) rr -= params.ring_buffer_len;
+      float const dv =
+          (scan_lane < prev_k) ? dtc_ptr[dtc_base + hh * params.dt_cache_stride_head + rr] : 0.f;
+      float scan = dv;
 #pragma unroll
-    for (int idx = flat_tid; idx < OLD_N; idx += CTA_THREADS) {
-      int const h = idx / MAX_WINDOW;
-      int const t = idx % MAX_WINDOW;
-      float dv = 0.f;
-      if (t < prev_k) {
-        int64_t const hh = (int64_t)(first_head + h);
-        int rr = ring_start + t;
-        if (rr >= params.ring_buffer_len) rr -= params.ring_buffer_len;
-        dv = dtc_ptr[dtc_base + hh * params.dt_cache_stride_head + rr];
+      for (int off = 1; off < MAX_WINDOW; off <<= 1) {
+        float const up = __shfl_up_sync(constants::MASK_ALL_LANES, scan, off);
+        if (scan_lane >= off) scan += up;
       }
-      smem.old_dt[h][t] = dv;
-    }
-    __syncthreads();
-    if (flat_tid < HEADS_PER_CTA) {
-      float const a = smem.A[flat_tid];
-      float acc = 0.f;
-      for (int t = 0; t < MAX_WINDOW; ++t) {
-        acc += smem.old_dt[flat_tid][t];
-        smem.old_cumAdt[flat_tid][t] = (t < prev_k) ? a * acc : 0.f;
+      if (scan_lane < MAX_WINDOW) {
+        float const cav = (scan_lane < prev_k) ? a * scan : 0.f;
+        ca_gmem[((int64_t)seq * params.nheads + hh) * MAX_WINDOW + scan_lane] = cav;
+        if (!must_checkpoint) {  // cb_old (no-write) scales by these in PHASE 2
+          smem.old_dt[h][scan_lane] = dv;
+          smem.old_cumAdt[h][scan_lane] = cav;
+        }
       }
     }
   }
@@ -566,7 +576,7 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // the wait, so its LDGs fill the conv1d wait window.  No-op without programmatic conv1d.
   if constexpr (ENABLE_PDL) {
     load_phase1_coeffs<dt_t, weight_t, matrixA_t, NPREDICTED, MAX_WINDOW, HEADS_PER_CTA, NUM_WARPS>(
-        smem, params, warp, lane, first_head, seq_len, outer, cache_slot, ring_start,
+        smem, params, warp, lane, first_head, seq_len, outer, seq, cache_slot, ring_start,
         must_checkpoint, prev_k);
     cudaGridDependencySynchronize();
   }
@@ -586,7 +596,7 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // overlap the B/C + old_B cp.async issued above instead of exposing its LDG latency.
   if constexpr (!ENABLE_PDL) {
     load_phase1_coeffs<dt_t, weight_t, matrixA_t, NPREDICTED, MAX_WINDOW, HEADS_PER_CTA, NUM_WARPS>(
-        smem, params, warp, lane, first_head, seq_len, outer, cache_slot, ring_start,
+        smem, params, warp, lane, first_head, seq_len, outer, seq, cache_slot, ring_start,
         must_checkpoint, prev_k);
   }
 

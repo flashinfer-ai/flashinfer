@@ -79,6 +79,7 @@ def _get_module(
         "cb_scaled",
         "cumAdt_vec",
         "cb_old",
+        "cumAdt_old",
     ),
 )
 def _checkpointing_ssu(
@@ -107,6 +108,7 @@ def _checkpointing_ssu(
     cb_scaled: Optional[torch.Tensor],
     cumAdt_vec: Optional[torch.Tensor],
     cb_old: Optional[torch.Tensor],
+    cumAdt_old: Optional[torch.Tensor],
     main_heads_per_cta: int,
     precompute_heads_per_cta: int,
     enable_pdl: bool,
@@ -168,6 +170,7 @@ def _checkpointing_ssu(
         cb_scaled,
         cumAdt_vec,
         cb_old,
+        cumAdt_old,
         main_heads_per_cta,
         precompute_heads_per_cta,
     )
@@ -200,6 +203,7 @@ def _checkpointing_ssu_fake(
     cb_scaled: Optional[torch.Tensor],
     cumAdt_vec: Optional[torch.Tensor],
     cb_old: Optional[torch.Tensor],
+    cumAdt_old: Optional[torch.Tensor],
     main_heads_per_cta: int,
     precompute_heads_per_cta: int,
     enable_pdl: bool,
@@ -251,6 +255,7 @@ def checkpointing_ssu(
     cb_scaled: Optional[torch.Tensor] = None,
     cumAdt_vec: Optional[torch.Tensor] = None,
     cb_old: Optional[torch.Tensor] = None,
+    cumAdt_old: Optional[torch.Tensor] = None,
     main_heads_per_cta: int = 0,
     precompute_heads_per_cta: int = 0,
     algorithm: str = "auto",
@@ -320,12 +325,12 @@ def checkpointing_ssu(
         snapped to the HEADS_PER_GROUP>>k chain).  Tuning knob — two-kernel path only.
     algorithm : str
         Kernel selection: ``"auto"`` (default), ``"monolith"``, or ``"two-kernel"``.
-        ``"auto"`` runs the two-kernel split iff the scratch trio is provided AND
+        ``"auto"`` runs the two-kernel split iff the scratch quartet is provided AND
         ``batch * nheads >= sm_count``.  The crossover collapses in
         ``batch * nheads`` across nheads (measured at TP 8/4/2) and state widths:
         the monolith wins <= 128 work-units and the split wins from 256 on a
         148-SM B200 (mixed-PNAT + conv1d/PDL bench; ties take the split).
-        ``"two-kernel"`` forces the split (scratch trio required); ``"monolith"``
+        ``"two-kernel"`` forces the split (scratch quartet required); ``"monolith"``
         forces the monolith (scratch ignored).  Benches/tests that must pin the
         path should force it.
     enable_pdl : bool
@@ -338,14 +343,22 @@ def checkpointing_ssu(
     cb_scaled : Optional[torch.Tensor]
         Pre-allocated fp32 scratch for the precomputed CB matrix, shape
         (batch, nheads, T_pad, window_pad).  Providing it (together with
-        ``cumAdt_vec`` / ``cb_old``) makes the **two-kernel** (precompute + main)
-        path available — ``algorithm`` decides whether it runs; leaving all three
-        ``None`` always runs the monolithic kernel.  Caller-allocated so the path
-        is CUDA-graph-safe (no in-wrapper allocation, like ``out``).
+        ``cumAdt_vec`` / ``cb_old`` / ``cumAdt_old``) makes the **two-kernel**
+        (precompute + main) path available — ``algorithm`` decides whether it
+        runs; leaving all four ``None`` always runs the monolithic kernel.
+        Caller-allocated so the path is CUDA-graph-safe (no in-wrapper
+        allocation, like ``out``).
     cumAdt_vec : Optional[torch.Tensor]
         Pre-allocated fp32 scratch for the per-head raw cumAdt vector, shape
         (batch, nheads, T_pad); the main kernel exponentiates it on the fly to
         get the decay/β factor.  Must be provided iff ``cb_scaled`` is.
+    cumAdt_old : Optional[torch.Tensor]
+        Pre-allocated fp32 scratch for the old-token decay rows, shape
+        (batch, nheads, max_window).  The ring caches carry no decay (prefix
+        sums are not ring-shift-invariant), so the precompute recomputes
+        cumAdt from the dt ring and stages it here; the main reads it back
+        (full rows on the write path, the β tail float on no-write).  Must be
+        provided iff ``cb_scaled`` is.
 
     Returns
     -------
@@ -454,19 +467,25 @@ def checkpointing_ssu(
     )
 
     # ── Monolith vs two-kernel split (auto unless forced) ──
-    # The split is AVAILABLE iff the caller provides the scratch trio — graph-safe,
-    # the caller pre-allocates like `out` (no wrapper allocation).  All three or
-    # none: cb_scaled (C5) + cumAdt_vec (β) are produced on both paths; cb_old (C6)
-    # is consumed on the no-write path, which the wrapper can't predict per-slot.
+    # The split is AVAILABLE iff the caller provides the scratch quartet —
+    # graph-safe, the caller pre-allocates like `out` (no wrapper allocation).
+    # All four or none: cb_scaled (C5) + cumAdt_vec (β) are produced on both
+    # paths; cb_old (C6) is consumed on the no-write path, which the wrapper
+    # can't predict per-slot; cumAdt_old (C7) carries the precompute's
+    # recomputed old-decay rows to the main (the ring caches no decay).
     # The launcher routes on params.cb_scaled != nullptr.
     scratch_provided = cb_scaled is not None
-    if scratch_provided != (cumAdt_vec is not None) or scratch_provided != (
-        cb_old is not None
+    if (
+        scratch_provided != (cumAdt_vec is not None)
+        or scratch_provided != (cb_old is not None)
+        or scratch_provided != (cumAdt_old is not None)
     ):
         raise ValueError(
-            "cb_scaled, cumAdt_vec, and cb_old must be provided together (they make "
-            f"the two-kernel path available); got cb_scaled set={cb_scaled is not None}, "
-            f"cumAdt_vec set={cumAdt_vec is not None}, cb_old set={cb_old is not None}"
+            "cb_scaled, cumAdt_vec, cb_old, and cumAdt_old must be provided together "
+            f"(they make the two-kernel path available); got "
+            f"cb_scaled set={cb_scaled is not None}, "
+            f"cumAdt_vec set={cumAdt_vec is not None}, cb_old set={cb_old is not None}, "
+            f"cumAdt_old set={cumAdt_old is not None}"
         )
     batch = cu_seqlens.numel() - 1 if cu_seqlens is not None else x.size(0)
     nheads = state.size(1)
@@ -485,11 +504,12 @@ def checkpointing_ssu(
         two_kernel = algorithm == "two-kernel"
         if two_kernel and not scratch_provided:
             raise ValueError(
-                "algorithm='two-kernel' requires the cb_scaled/cumAdt_vec/cb_old "
-                "scratch trio (got none) — allocate them or use 'auto'/'monolith'"
+                "algorithm='two-kernel' requires the cb_scaled/cumAdt_vec/cb_old/"
+                "cumAdt_old scratch quartet (got none) — allocate them or use "
+                "'auto'/'monolith'"
             )
     if not two_kernel:
-        cb_scaled = cumAdt_vec = cb_old = None
+        cb_scaled = cumAdt_vec = cb_old = cumAdt_old = None
 
     # ── d_split selection (v12 §59) ──
     # Auto-heuristic, measured on B200 (mixed-batch bench): d_split=2 pays
@@ -577,6 +597,7 @@ def checkpointing_ssu(
         cb_scaled,
         cumAdt_vec,
         cb_old,
+        cumAdt_old,
         main_heads_per_cta,
         precompute_heads_per_cta,
         enable_pdl,

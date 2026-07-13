@@ -1350,6 +1350,44 @@ Mixed sweeps (bf16 / fp16-philox-5 / f32, b=1..1024, conv1d, K=8), tag
   use the CUDA rows; the Triton rows are correctness references only
   unless/until the six kernels get native ring addressing.
 
+## Ring migration stage 5b — parity resolution (B300, 2026-07-11)
+
+The stage-5 attribution above (serial precompute scan / β full-scan) was
+WRONG.  ncu-per-metric found the real culprit: the ring GATHER's
+synchronous STS pad-tail.  At ring_start=0 (bench + steady state) there is
+no wrap, so only the tail-zero loop ran — zeroing up to MAX_WINDOW−prev_k
+smem rows with raw STS (14× smem-store wavefronts, +22% no-write main at
+pnat=4).  Fix: `load_ring_tile_async` rewritten as a per-row ring cp.async
+whose src-size is 0 on pad rows (ZFILL) — zero STS.  This alone took the
+no-write path to parity AND sped the MONOLITH ~3% (it gathers old_x/old_B
+heavily).
+
+Then Igor's directive — "restore the cumAdt buffer, same perf" — plus his
+follow-up "we only change the store pointers, should be identical." ncu
+proved him half right: the migration added a genuine REDUNDANT read.
+Pre-ring, cumAdt was CROSS-STEP CACHED (computed once as step N−1's
+new-token cumAdt, read in step N); the ring caches only dt, so it is
+recomputed.  It CANNOT be cached back: the coefficients use shift-invariant
+differences (total_old − cumAdt[c]) but β = exp(cumAdt[prev_k−1]) is
+ABSOLUTE, wrong by exp(shift) after a flush.  So the recompute is
+fundamental — the only question is WHERE.
+
+- **fix3 (SHIPPED)**: recompute in the precompute (the under-utilized
+  coefficient kernel), stage to the cumAdt_old scratch, main reads it.
+  Redundant old_dt read (precompute reads it to scan; main reads it for
+  the replay) but the precompute has the slack.  b1024 write TOTAL +2.4%.
+- **fix4 (rejected)**: recompute in the main (which already loads old_dt),
+  precompute skips it → no redundant read.  BUT the scan lands on the
+  replay's critical path: b1024 write main +6.5%, TOTAL +5.6% — worse,
+  because the 120 µs main is the bottleneck and the 11 µs precompute is
+  not.  fix4 did halve the b32 mixed spike (+10→+5%) but regressed b64
+  (−3→+3%) and pure-write; Igor chose fix3 (2 µs / 152 µs is nothing).
+
+Final (fix3, mixed sweep vs pre-ring): no-write parity; large-batch
+~+1.5% (the recompute floor); b32 +10% (low-occupancy exposure of the
+precompute recompute — a head-tiling tune could close it, deferred).
+Monolith 2–4% FASTER (gather fix).  Bit-exact vs monolith across the suite.
+
 ## TODO
 
 - [ ] **SR (philox) perf anomaly on B300** — see the B300-baselines section:

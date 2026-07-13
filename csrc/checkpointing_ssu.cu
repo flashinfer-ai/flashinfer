@@ -56,6 +56,7 @@ void checkpointing_ssu(
     Optional<TensorView> cb_scaled,    // two-kernel: bf16 (batch, nheads, 32, 8) fragA-native
     Optional<TensorView> cumAdt_vec,   // two-kernel: f32 (batch, nheads, T_pad) raw cumAdt
     Optional<TensorView> cb_old,       // two-kernel: bf16 (batch, nheads, 32, K_old/2) fragA-native
+    Optional<TensorView> cumAdt_old,   // two-kernel: f32 (batch, nheads, MAX_WINDOW) old-decay rows
     int64_t main_heads_per_cta,        // two-kernel MAIN: consecutive heads per CTA (host knob)
     int64_t precompute_heads_per_cta) {  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
 
@@ -524,6 +525,21 @@ void checkpointing_ssu(
   if (cb_scaled.has_value()) p.cb_scaled = const_cast<void*>(cb_scaled.value().data_ptr());
   if (cumAdt_vec.has_value()) p.cumAdt_vec = const_cast<void*>(cumAdt_vec.value().data_ptr());
   if (cb_old.has_value()) p.cb_old = const_cast<void*>(cb_old.value().data_ptr());
+  if (cumAdt_old.has_value()) {
+    auto const& ca = cumAdt_old.value();
+    CHECK_CUDA(ca);
+    CHECK_DIM(3, ca);
+    CHECK_CONTIGUOUS(ca);
+    FLASHINFER_CHECK(ca.dtype().code == kDLFloat && ca.dtype().bits == 32,
+                     "cumAdt_old must be float32");
+    FLASHINFER_CHECK(ca.size(0) >= batch, "cumAdt_old batch dim = ", ca.size(0),
+                     ", expected >= batch = ", batch);
+    FLASHINFER_CHECK(ca.size(1) == nheads, "cumAdt_old nheads = ", ca.size(1),
+                     ", expected nheads = ", nheads);
+    FLASHINFER_CHECK(ca.size(2) == max_window, "cumAdt_old rows = ", ca.size(2),
+                     ", expected max_window = ", max_window);
+    p.cumAdt_old = const_cast<void*>(ca.data_ptr());
+  }
 
   // Strides
   p.state_stride_seq = state.stride(0);

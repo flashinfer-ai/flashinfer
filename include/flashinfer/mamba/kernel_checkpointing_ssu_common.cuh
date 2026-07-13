@@ -383,47 +383,49 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
 
 // Ring gather: smem rows j ∈ [0, count_rt) come from gmem ring row
 // (start + j) mod ring_len (row stride `gmem_row_stride`); rows
-// [count_rt, ROWS_PAD) end up zero (the MMA K-pad contract).  Three ops with
-// DISJOINT smem write sets — cp.async ops from one thread to the same smem
-// address within a commit group have no defined order, so no set may overlap:
-//   1. plain (non-ZFILL) copy of rows [0, n1), n1 = min(count, ring_len−start),
-//      from base + start·stride;                       false predicate ⇒ skip
-//   2. plain copy of the wrapped rows [n1, count_rt) from base − n1·stride
-//      (row r reads base + (r−n1)·stride = ring row r−n1);
-//   3. tail zeros [count_rt, ROWS_PAD) via direct smem stores (synchronous,
-//      ≤ 16 short rows; ZFILL can't express "zero ONLY the tail").
-// Predicated-off rows of op 2 compute (never dereference) sub-base addresses —
-// same class as the legacy helper's OOB rows beyond the cache.
+// [count_rt, ROWS_PAD) end up zero (the MMA K-pad contract).  Hand-rolled
+// version of load_tile_async's wide tiled copy (same 4×8 thread layout, same
+// swizzled dst addresses) with two differences:
+//   - the per-row source is the RING row (one cond-subtract per row — the
+//     tiled copy can't express the mod in an affine gmem layout), and
+//   - each 16B element is issued as ONE cp.async whose src-size operand is 0
+//     when predicated off (the ZFILL mechanism), so pad rows zero-fill through
+//     the async path instead of synchronous smem stores.  (A two-segment
+//     copy_if + STS tail was tried first: the tail stores dominated no-write
+//     units — 14× smem-store wavefronts, +22% main at pnat=4, ncu 2026-07-10.)
+// Every element is written by exactly one cp.async — no same-address ordering
+// hazard.  count_rt may be ≤ 0 (callers pass prev_k−8 residues): all rows
+// predicate off and the whole tile zero-fills.
 template <typename SmemShape, int COUNT, typename input_t>
 __device__ __forceinline__ void load_ring_tile_async(input_t* __restrict__ smem_dst,
                                                      input_t const* __restrict__ gmem_base,
                                                      int gmem_row_stride, int lane, int ring_start,
                                                      int ring_len, int count_rt = COUNT) {
-  int const n1 = ring_len - ring_start >= count_rt ? count_rt : ring_len - ring_start;
-  load_tile_async<SmemShape, COUNT, /*ZFILL=*/false>(
-      smem_dst, gmem_base + (int64_t)ring_start * gmem_row_stride, gmem_row_stride, lane, n1);
-  if (n1 < count_rt) {
-    load_tile_async<SmemShape, COUNT, /*ZFILL=*/false>(
-        smem_dst, gmem_base - (int64_t)n1 * gmem_row_stride, gmem_row_stride, lane, count_rt, n1);
-  }
-  // Tail zeros (rows [count_rt, ROWS_PAD)): direct smem stores through the
-  // swizzled layout — synchronous, disjoint from the cp.async rows above.
-  {
-    using namespace cute;
-    constexpr int ROWS_PAD = size<0>(SmemShape{});
-    constexpr int VALID_COLS = size<1>(SmemShape{});
-    constexpr int SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(VALID_COLS);
-    // count_rt may be negative (callers pass prev_k-8 style residues) — clamp
-    // so the zero loop never indexes below row 0.
-    int const zero_from = count_rt < 0 ? 0 : count_rt;
-    if (zero_from < ROWS_PAD) {
-      auto s_full = make_tensor(make_smem_ptr(smem_dst),
-                                make_swizzled_layout_rc<input_t, ROWS_PAD, SMEM_COLS>());
-      for (int r = zero_from; r < ROWS_PAD; ++r) {
-        for (int c = lane; c < SMEM_COLS; c += warpSize) {
-          s_full(r, c) = input_t(0);
-        }
-      }
+  using namespace cute;
+  constexpr int ROWS_PAD = size<0>(SmemShape{});
+  constexpr int VALID_COLS = size<1>(SmemShape{});
+  constexpr int SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(VALID_COLS);
+  constexpr int VAL = Copy_prop::vec_bytes / sizeof(input_t);  // elems per 16B cp.async
+  static_assert(Copy_prop::vec_bytes == 16, "the inline cp.async hardcodes 16B atoms");
+  constexpr int THR_ROWS = 4, THR_COLS = 8;  // wide layout (see load_tile_async)
+  static_assert(SMEM_COLS % (THR_COLS * VAL) == 0, "col passes must tile SMEM_COLS");
+  static_assert(ROWS_PAD % THR_ROWS == 0, "row passes must tile ROWS_PAD");
+  auto s_full =
+      make_tensor(make_smem_ptr(smem_dst), make_swizzled_layout_rc<input_t, ROWS_PAD, SMEM_COLS>());
+  int const tr = lane >> 3, tc = lane & 7;
+  CUTE_UNROLL
+  for (int rp = 0; rp < ROWS_PAD / THR_ROWS; ++rp) {
+    int const r = rp * THR_ROWS + tr;
+    int rr = ring_start + r;
+    if (rr >= ring_len) rr -= ring_len;
+    auto const* src_row = gmem_base + (int64_t)rr * gmem_row_stride;
+    CUTE_UNROLL
+    for (int cp = 0; cp < SMEM_COLS / (THR_COLS * VAL); ++cp) {
+      int const c = (cp * THR_COLS + tc) * VAL;
+      bool const valid = (r < count_rt) && (c < VALID_COLS);
+      uint32_t const dst = cast_smem_ptr_to_uint(&s_full(r, c));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src_row + c),
+                   "r"(valid ? 16 : 0));
     }
   }
 }
@@ -539,17 +541,15 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
   }
 }
 
-// Load this head's buffered old_dt / old_cumAdt (f32) from the double-buffered
-// cache (state_cache_size, 2, nheads, MAX_WINDOW) into the caller's smem slices.
-// Synchronous scalar per-lane LDG of the first `count` entries (lanes >= count
-// untouched).  Shared by the monolithic load_pre/post halves (count =
-// MAX_WINDOW, single per-CTA smem.old_dt/old_cumAdt) and the two-kernel
-// precompute (count = prev_k, per-warp slice &smem.old_dt[warp][0]).
-// Ring dt load + decay recompute.  The ring caches only dt: cumAdt (prefix
-// sums) is not ring-shift-invariant — a flush would invalidate every cached
-// entry — so it is recomputed here as A · inclusive_scan(dt) over the window
-// (≤ 16 lanes, 4 shfl steps).  All `count` lanes must participate in the scan
-// even when their dt is a masked zero, so the shuffles stay convergent.
+// Load this head's old dt from the RING (row (start+t) % L) and recompute its
+// decay into the caller's smem slices (dt_dst / ca_dst).  The ring caches only
+// dt: cumAdt (prefix sums) is not ring-shift-invariant — a flush would
+// invalidate every cached entry — so it is recomputed here as
+// A · inclusive_scan(dt) over the window (≤ 16 lanes, 4 shfl steps).  All 32
+// lanes join the scan (lanes ≥ count contribute masked zeros) so the shuffles
+// stay convergent; only lanes < count write.  Used by the MONOLITH — the
+// two-kernel main reads its decay from the cumAdt_old scratch the precompute
+// stages, not from a live recompute.
 __device__ __forceinline__ void load_old_dt_cumAdt(CheckpointingSsuParams const& params, int lane,
                                                    int64_t cache_slot, int ring_start, int head,
                                                    int count, float A_val,
@@ -1756,7 +1756,7 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
 // frag_y[d, t] = Σ_n state[d,n]·C[t,n].  A = state (K-major smem; 2-byte via
 // LDSM, 4-byte f32 via LDS.64 — dispatched inside pipelined_kloop_gemm by
 // make_a_s2r), B = C (aliased swizzled view, LDSM_N, broadcast across the
-// M-warps).  The monolith counterpart of the main's add_init_out_ring; the
+// M-warps).  The monolith counterpart of the main's add_init_out_main; the
 // caller's tiled_mma splits M = D_PER_CTA across warps (Shape<M_WARPS, 1>).
 // NumStages = 2 (not the main's 3): the monolith's register context is fatter
 // (replay + CB compute inline, no maxnreg cap), and the f32 wide-A staging at
