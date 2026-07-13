@@ -1527,14 +1527,45 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
         if self._backend == "cutile":
             # Pure cuda.tile Python kernel: no C++ module to JIT. Stash the
-            # per-sequence KV lengths and page size; run() reconstructs the dense
-            # block table from the CSR (indptr/indices) plan state.
+            # per-sequence KV lengths and page size, and materialize the dense
+            # block table now (at plan time) so run() is CUDA-graph-capturable --
+            # reconstructing it in run() would require host .item() syncs.
             if logits_soft_cap is not None and logits_soft_cap > 0:
                 raise NotImplementedError(
                     "cuTile decode backend does not support logits_soft_cap."
                 )
             self._page_size = page_size
             self._kv_lens_arr_host = kv_lens_arr_host
+            # Device copy of the per-seq KV lengths, staged once at plan time.
+            # run() must not copy it H2D itself: a CPU->CUDA copy from unpinned
+            # host memory is illegal during CUDA graph capture.
+            self._kv_lens_device = kv_lens_arr_host.to(
+                device=self.device, dtype=torch.int32
+            )
+            if self._block_tables is None:
+                # Build a dense [batch, max_pages] block table from the CSR
+                # (indptr/indices) plan state. Done here, once, outside any CUDA
+                # graph capture, so run() pays no per-call host sync (mirrors the
+                # trtllm-gen plan-time reconstruction below).
+                blocks_per_seq = [
+                    (seq_len + page_size - 1) // page_size
+                    for seq_len in kv_lens_arr_host
+                ]
+                max_num_blocks_per_seq = max(blocks_per_seq)
+                self._block_tables = torch.zeros(
+                    (batch_size, max_num_blocks_per_seq),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                block_id = int(indptr_host[0].item())
+                for i in range(batch_size):
+                    num_blocks_needed = blocks_per_seq[i]
+                    self._block_tables[i, :num_blocks_needed] = (
+                        self._paged_kv_indices_buf[
+                            block_id : block_id + num_blocks_needed
+                        ]
+                    )
+                    block_id += num_blocks_needed
             self._plan_info = None
             # run() reads these; normally set after the module-build branches below.
             self._pos_encoding_mode = pos_encoding_mode
@@ -2068,32 +2099,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 fmha_decode_bsr_cutile,
             )
 
-            page_size = self._page_size
-            indptr = self._paged_kv_indptr_buf
-            indices = self._paged_kv_indices_buf
-            num_pages_per_seq = (indptr[1:] - indptr[:-1]).to(torch.int64)
-            actual_seq_lens = self._kv_lens_arr_host.to(
-                device=q.device, dtype=torch.int32
-            )
-            if self._block_tables is not None:
-                block_tables = self._block_tables.to(
-                    device=q.device, dtype=torch.int32
-                )
-            else:
-                # Reconstruct a dense [batch, max_pages] block table from the CSR
-                # (indptr/indices) plan state. NOTE: the ``.item()`` syncs make this
-                # path incompatible with CUDA graph capture; pass ``block_tables`` to
-                # plan() to avoid the reconstruction.
-                total_pages = int(indptr[-1].item())
-                max_pages = int(num_pages_per_seq.max().item())
-                block_tables = torch.zeros(
-                    (actual_batch_size, max_pages),
-                    dtype=torch.int32,
-                    device=q.device,
-                )
-                col = torch.arange(max_pages, device=q.device)
-                valid = col[None, :] < num_pages_per_seq[:, None]
-                block_tables[valid] = indices[:total_pages].to(torch.int32)
+            # Both the block table and the device KV-lengths are materialized at
+            # plan() time (see the cuTile plan branch), so run() does only
+            # device->device ops (no host .item() sync, no CPU->CUDA copy) and is
+            # safe to capture in a CUDA graph.
+            actual_seq_lens = self._kv_lens_device.to(device=q.device)
+            block_tables = self._block_tables.to(device=q.device, dtype=torch.int32)
 
             return fmha_decode_bsr_cutile(
                 q=q,
