@@ -151,8 +151,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 norm_const=self._kernel_config.input_norm_const,
             )
         else:
-            from common.megamoe_constants import Nvfp4BlockSize
-            from moe_nvfp4_swapab.runner_common import ceil_div, round_up
+            # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+            from .....kernel_src.cutedsl_megamoe import (
+                Nvfp4BlockSize,
+                ceil_div,
+                round_up,
+            )
 
             hidden = workspace.hidden
             hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)

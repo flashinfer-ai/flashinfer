@@ -18,6 +18,10 @@ from __future__ import annotations
 
 import pytest
 
+# This test verifies MXFP8 preprocess + kernel output only through the
+# cutedsl_megamoe shim public API (including the torch reference it re-exports);
+# it never imports the src/ kernel packages directly, so a new src/ drop can't
+# silently break it.
 pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
@@ -182,12 +186,15 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from common.megamoe_constants import Mxfp8BlockSize
-    from moe_mxfp8_glu.mega_runner import (
+    # Verify only against the cutedsl_megamoe shim boundary: pull constants and
+    # reference tensor-makers from the package public API, never from the src/
+    # kernel packages directly (so a new src/ drop can't silently break tests).
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        Mxfp8BlockSize,
+        Mxfp8ScaleDtype,
         _make_e8m0_scale_tensor,
         _make_fp8_tensor,
     )
-    from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype
 
     problem = _single_rank_problem()
     num_experts = problem["num_experts"]
@@ -291,7 +298,12 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from moe_mxfp8_glu.mega_reference_mxfp8 import compute_megamoe_reference_mxfp8
+
+    # The MXFP8 torch reference is consumed via the shim boundary, not the src/
+    # package directly, so tests verify against a stable public surface.
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        compute_megamoe_reference_mxfp8,
+    )
 
     # monkeypatch (not os.environ): restored after the test, so it cannot
     # silently downgrade later nvshmem-path tests in the same process.

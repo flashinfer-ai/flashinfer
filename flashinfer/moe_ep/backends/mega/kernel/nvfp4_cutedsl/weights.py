@@ -15,12 +15,6 @@ TransformedMegaWeights = Tuple[
 ]
 
 
-def _require_cutedsl_paths() -> None:
-    from .....kernel_src.cutedsl_megamoe.src._bootstrap_paths import bootstrap_paths
-
-    bootstrap_paths()
-
-
 def _resolve_gate_up_clamp(
     *,
     gate_up_clamp: float | None,
@@ -47,15 +41,14 @@ def _quantize_expert_weights(
     """Return NVFP4 weight + raw fp8 block scales with K on the trailing dim."""
     import torch
 
-    _require_cutedsl_paths()
-    from moe_nvfp4_swapab.runner_common import nvfp4_quantize_per_block_16
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import nvfp4_quantize_per_block_16
 
     return nvfp4_quantize_per_block_16(weight_k_major.to(torch.float32), norm_const)
 
 
 def _swizzle_expert_scales(raw_sf: "torch.Tensor") -> "torch.Tensor":
-    _require_cutedsl_paths()
-    from moe_nvfp4_swapab.runner_common import to_blocked
+    from .....kernel_src.cutedsl_megamoe import to_blocked
 
     return to_blocked(raw_sf)
 
@@ -117,8 +110,9 @@ def preprocess_mega_weights(
     """bf16 (or pre-quantized) weights → NVFP4 + swizzled-SF mega layout."""
     import torch
 
-    _require_cutedsl_paths()
-    from moe_nvfp4_swapab.mega_runner import _stack_byte_reinterpretable_tensors
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
+    # shim exposes this cutlass-pulling helper lazily via the package boundary.
+    from .....kernel_src.cutedsl_megamoe import _stack_byte_reinterpretable_tensors
 
     norm_const = _resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp,
@@ -236,8 +230,8 @@ def preprocess_mega_weights(
 def _nvfp4_swizzled_flat_sf_size(rows: int, cols: int) -> int:
     import torch
 
-    _require_cutedsl_paths()
-    from moe_nvfp4_swapab.runner_common import to_blocked
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import to_blocked
 
     plain = torch.zeros(rows, cols, dtype=torch.float32)
     return to_blocked(plain).numel()
@@ -281,9 +275,8 @@ def validate_transformed_mega_weights(
     fc1_out = 2 * intermediate_size
     weight_dtype = _nvfp4_kernel_weight_dtype()
 
-    _require_cutedsl_paths()
-    from common.megamoe_constants import Nvfp4BlockSize
-    from moe_nvfp4_swapab.runner_common import ceil_div
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
 
     hidden_sf_cols = ceil_div(hidden_size, Nvfp4BlockSize)
     intermediate_sf_cols = ceil_div(intermediate_size, Nvfp4BlockSize)

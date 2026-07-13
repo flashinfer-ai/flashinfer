@@ -23,6 +23,9 @@ import os
 
 import pytest
 
+# This test verifies the mega path only through the cutedsl_megamoe shim public
+# API (``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``); it never imports the
+# src/ kernel packages directly, so a new src/ drop can't silently break it.
 pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 

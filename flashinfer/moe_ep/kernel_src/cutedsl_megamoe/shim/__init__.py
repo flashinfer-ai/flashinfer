@@ -11,8 +11,9 @@ that FlashInfer ``moe_ep`` consumes.
 from __future__ import annotations
 
 # The per-dtype modules import the raw kernel packages (moe_nvfp4_swapab,
-# common, ...) at module load, so ``src/`` must be on sys.path first.
-from ..src._bootstrap_paths import bootstrap_paths
+# common, ...) at module load, so ``src/`` must be on sys.path first.  The
+# bootstrap lives here in shim/ (not in src/, which is a verbatim kernel drop).
+from ._paths import bootstrap_paths
 
 bootstrap_paths()
 
@@ -22,6 +23,21 @@ from .comm import (
     reset_compiled_mega_workspaces,
     resolve_gate_up_clamp,
     sym_zeros,
+)
+
+# Light kernel helpers/constants the FI backend + tests need (drop-audit point).
+# The heavy mega_runner/mega_reference helpers stay behind kernel_helpers'
+# module ``__getattr__`` and are surfaced lazily by the parent ``__init__``.
+from .kernel_helpers import (
+    Mxfp8BlockSize,
+    Mxfp8ScaleDtype,
+    Nvfp4BlockSize,
+    ceil_div,
+    kind_data_dtype,
+    mxfp8_quantize_per_block_32,
+    nvfp4_quantize_per_block_16,
+    round_up,
+    to_blocked,
 )
 from .nvfp4 import (
     MegaMoENvfp4Config,
@@ -46,12 +62,24 @@ from .mxfp8 import (
 )
 
 __all__ = [
+    # paths
+    "bootstrap_paths",
     # comm
     "bootstrap_dist",
     "free_sym_tensor",
     "reset_compiled_mega_workspaces",
     "resolve_gate_up_clamp",
     "sym_zeros",
+    # kernel_helpers (light)
+    "Mxfp8BlockSize",
+    "Mxfp8ScaleDtype",
+    "Nvfp4BlockSize",
+    "ceil_div",
+    "kind_data_dtype",
+    "mxfp8_quantize_per_block_32",
+    "nvfp4_quantize_per_block_16",
+    "round_up",
+    "to_blocked",
     # nvfp4
     "MegaMoENvfp4Config",
     "MegaMoENvfp4Frontend",

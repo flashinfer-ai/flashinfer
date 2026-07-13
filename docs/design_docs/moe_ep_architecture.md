@@ -22,9 +22,9 @@ moe_ep/
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,…}
   kernel_src/cutedsl_megamoe/  ← CuTeDSL kernel src (kernel team) + FI shim
-    src/                       ← kernel team drop zone (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
+    src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by nvfp4_cutedsl / mxfp8_cutedsl backends
-    shim/                      ← thin adapters over src/ (comm.py, nvfp4.py, mxfp8.py, correctness.py)
+    shim/                      ← thin adapters over src/ (_paths, comm, nvfp4, mxfp8, kernel_helpers, correctness)
     SKILL.md                   ← how to resync src/ when kernel team drops a new version
   modes/{split_layer,mega_layer,config}.py
 ```

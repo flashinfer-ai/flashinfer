@@ -155,8 +155,12 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 kind=self._kernel_config.kind,
             )
         else:
-            from common.megamoe_constants import Mxfp8BlockSize
-            from moe_nvfp4_swapab.runner_common import ceil_div, round_up
+            # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+            from .....kernel_src.cutedsl_megamoe import (
+                Mxfp8BlockSize,
+                ceil_div,
+                round_up,
+            )
 
             hidden = workspace.hidden
             hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)

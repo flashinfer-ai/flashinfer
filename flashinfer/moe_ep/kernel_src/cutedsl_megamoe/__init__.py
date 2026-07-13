@@ -24,26 +24,54 @@ Usage::
 
 from __future__ import annotations
 
-# Put ``kernel_src/cutedsl_megamoe/src`` on sys.path before importing the shim,
-# whose modules resolve the raw kernel packages (moe_nvfp4_swapab, common, ...)
-# at import time.  Idempotent; the shim also bootstraps defensively.
-from .src._bootstrap_paths import bootstrap_paths
-
-bootstrap_paths()
-
+# Importing the shim puts ``kernel_src/cutedsl_megamoe/src`` on sys.path (via
+# shim/_paths.bootstrap_paths) before its modules resolve the raw kernel
+# packages (moe_nvfp4_swapab, common, ...).  ``bootstrap_paths`` is re-exported
+# here so callers (e.g. core runtime) reach it through this public boundary.
 from .shim import (
     MegaMoEMxfp8SymmBuffer,
     MegaMoESymmBuffer,
+    Mxfp8BlockSize,
+    Mxfp8ScaleDtype,
+    Nvfp4BlockSize,
     TransformedWeights,
+    bootstrap_paths,
+    ceil_div,
     create_dummy_mxfp8_inputs,
     create_dummy_nvfp4_inputs,
     get_symm_buffer_for_mega_moe,
     get_symm_buffer_for_mxfp8_mega_moe,
     init_dist,
+    kind_data_dtype,
     make_dummy_epilogue_params,
     mxfp8_mega_moe,
+    mxfp8_quantize_per_block_32,
     nvfp4_mega_moe,
+    nvfp4_quantize_per_block_16,
+    round_up,
+    to_blocked,
 )
+
+# Heavy kernel helpers (``mega_runner`` byte-stacking, ``mega_runner`` fp8/E8M0
+# tensor makers, and the MXFP8 torch reference) pull ``cutlass`` transitively.
+# Expose them lazily so ``import ...cutedsl_megamoe`` stays CPU-safe; the FI
+# backend + verification tests still reach them only through this boundary (the
+# access happens inside their functions).  See ``shim/kernel_helpers.py``.
+_LAZY_HELPERS = (
+    "_make_e8m0_scale_tensor",
+    "_make_fp8_tensor",
+    "_stack_byte_reinterpretable_tensors",
+    "compute_megamoe_reference_mxfp8",
+)
+
+
+def __getattr__(name):  # PEP 562
+    if name in _LAZY_HELPERS:
+        from .shim import kernel_helpers
+
+        return getattr(kernel_helpers, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # Backward-compatible name: ``create_dummy_inputs`` historically meant NVFP4.
 create_dummy_inputs = create_dummy_nvfp4_inputs
@@ -51,15 +79,28 @@ create_dummy_inputs = create_dummy_nvfp4_inputs
 __all__ = [
     "MegaMoEMxfp8SymmBuffer",
     "MegaMoESymmBuffer",
+    "Mxfp8BlockSize",
+    "Mxfp8ScaleDtype",
+    "Nvfp4BlockSize",
     "TransformedWeights",
     "bootstrap_paths",
+    "ceil_div",
+    "compute_megamoe_reference_mxfp8",
     "create_dummy_inputs",
     "create_dummy_mxfp8_inputs",
     "create_dummy_nvfp4_inputs",
     "get_symm_buffer_for_mega_moe",
     "get_symm_buffer_for_mxfp8_mega_moe",
     "init_dist",
+    "kind_data_dtype",
     "make_dummy_epilogue_params",
     "mxfp8_mega_moe",
+    "mxfp8_quantize_per_block_32",
     "nvfp4_mega_moe",
+    "nvfp4_quantize_per_block_16",
+    "round_up",
+    "to_blocked",
+    "_make_e8m0_scale_tensor",
+    "_make_fp8_tensor",
+    "_stack_byte_reinterpretable_tensors",
 ]
