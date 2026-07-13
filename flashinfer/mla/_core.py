@@ -2255,7 +2255,6 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         kv_cache: torch.Tensor,
         workspace_buffer: torch.Tensor,
         sm_count: int,
-        multi_ctas_kv_counter_buffer: Optional[torch.Tensor],
         qk_nope_head_dim: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
@@ -2275,8 +2274,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.kv_cache = kv_cache
         self.workspace_buffer = workspace_buffer
         self.sm_count = sm_count
-        self._multi_ctas_kv_counter_buffer = multi_ctas_kv_counter_buffer
-        self._owns_multi_ctas_kv_counter_buffer = multi_ctas_kv_counter_buffer is None
+        self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
         self.qk_nope_head_dim = qk_nope_head_dim
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -2294,9 +2292,9 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
         self.return_lse = return_lse
         self.lse = lse
-        # A missing buffer is allocated lazily and retained by this runner; internally
-        # owned buffers may grow for an autotune profile batch. A caller-owned buffer
-        # is retained but never replaced. The kernel self-resets the counters after
+        # Allocated lazily for autotune profiling and reused (grown if a later
+        # profile needs more). The final request may instead pass a caller-owned
+        # buffer directly to forward(). The kernel self-resets the counters after
         # each ordered launch, so neither path re-zeros between launches.
 
     def __hash__(self):
@@ -2347,6 +2345,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         inputs,
         tactic: int = -1,
         do_preparation: bool = False,
+        multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         query, block_tables, seq_lens, out = inputs
@@ -2371,24 +2370,26 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
-        counter_buffer = self._multi_ctas_kv_counter_buffer
-        required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
-            batch_size, num_qo_heads, self.sm_count
-        )
-        counter_buffer_bytes = (
-            0
-            if counter_buffer is None
-            else counter_buffer.numel() * counter_buffer.element_size()
-        )
-        if counter_buffer is None or counter_buffer_bytes < required_counter_bytes:
-            counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
-                None if self._owns_multi_ctas_kv_counter_buffer else counter_buffer,
-                batch_size,
-                num_qo_heads,
-                self.sm_count,
-                query.device,
+        counter_buffer = multi_ctas_kv_counter_buffer
+        if counter_buffer is None:
+            counter_buffer = self._multi_ctas_kv_counter_buffer
+            required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                batch_size, num_qo_heads, self.sm_count
             )
-            self._multi_ctas_kv_counter_buffer = counter_buffer
+            counter_buffer_bytes = (
+                0
+                if counter_buffer is None
+                else counter_buffer.numel() * counter_buffer.element_size()
+            )
+            if counter_buffer is None or counter_buffer_bytes < required_counter_bytes:
+                counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+                    None,
+                    batch_size,
+                    num_qo_heads,
+                    self.sm_count,
+                    query.device,
+                )
+                self._multi_ctas_kv_counter_buffer = counter_buffer
         multi_ctas_kv_counter_buffer = counter_buffer
         self._run(
             out,
@@ -2750,7 +2751,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         the current batch size, query-head count, and device SM count; a contiguous
         ``torch.uint8`` tensor created with ``torch.zeros`` is recommended. Reuse
         is safe only for ordered, non-overlapping launches; use a distinct buffer
-        for each concurrently executing CUDA stream or graph.
+        for each concurrently executing CUDA stream or graph. Autotune profiling
+        uses runner-owned internal storage; the caller buffer is used only for the
+        final request.
 
     Note
     ----
@@ -3153,7 +3156,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 kv_cache=kv_cache,
                 workspace_buffer=workspace_buffer,
                 sm_count=sm_count,
-                multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
                 qk_nope_head_dim=qk_nope_head_dim,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
@@ -3218,7 +3220,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
         tuning_config,
         inputs,
     )
-    runner(inputs=inputs, tactic=tactic)
+    if isinstance(runner, TrtllmGenMlaDecodeRunner):
+        runner(
+            inputs=inputs,
+            tactic=tactic,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        )
+    else:
+        runner(inputs=inputs, tactic=tactic)
     if return_lse:
         # Return the lse in the same shape the caller supplied (2D or 3D),
         # or 2D ``(B*q_len, H)`` when we allocated the default.
