@@ -901,10 +901,13 @@ def get_symm_buffer_for_mega_moe(
         gate_up_clamp=clamp,
         apply_topk_in_fc1=apply_topk_in_fc1,
     )
-    if knobs:
-        from .tuner import with_knobs
+    from .tuner import default_knobs, with_knobs
 
-        cfg = with_knobs(cfg, knobs)
+    # Token-count heuristic picks the perf/tile tactic by compile-time buffer
+    # size (num_max_tokens); an explicit knobs= dict overrides it entirely.
+    cfg = with_knobs(
+        cfg, knobs if knobs is not None else default_knobs(num_max_tokens)
+    )
     frontend = MegaMoENvfp4Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)

@@ -727,6 +727,16 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_by_dispatch=token_back_by_dispatch,
     )
+    from .tuner import default_knobs, with_knobs
+
+    # Token-count heuristic picks the perf tactic by compile-time buffer size
+    # (num_max_tokens); an explicit knobs= dict overrides it entirely.  MXFP8's
+    # mma_tiler is kernel-fixed at (256, 256), so the heuristic's NVFP4-tuned
+    # tile is dropped (include_tile=False) -- only the non-tile perf knobs apply.
+    cfg = with_knobs(
+        cfg,
+        knobs if knobs is not None else default_knobs(num_max_tokens, include_tile=False),
+    )
     frontend = MegaMoEMxfp8Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)

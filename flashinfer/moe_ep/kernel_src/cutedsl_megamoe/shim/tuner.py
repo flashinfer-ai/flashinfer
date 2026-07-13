@@ -68,6 +68,54 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
 }
 
 
+# --- token-count heuristic: default perf/tile tactic per compile-time size ----
+# Keyed on the buffer's ``num_max_tokens`` (the kernel compiles once for that
+# size, so the tile/cluster/schedule are fixed at compile).  Sets only the
+# perf/tile knobs; ``in_kernel_fc2_reduce`` and ``combine_format`` stay owned by
+# the config / caller.  Threshold picked from measured perf (small-batch latency
+# vs large-batch throughput tiles).
+_TOKEN_TILE_THRESHOLD = 2048
+
+_SMALL_TOKEN_KNOBS: Dict[str, Any] = {
+    "mma_tiler_mnk": (256, 128, 256),
+    "cluster_shape_mnk": (2, 1, 1),
+    "group_hint": 512,
+    "flag_batch": 4,
+    "epi_flag_batch": (2, 4),
+    "token_back_mode": "epi_warps",
+    "load_balance_mode": "atomic_counter",
+}
+
+_LARGE_TOKEN_KNOBS: Dict[str, Any] = {
+    "mma_tiler_mnk": (256, 256, 256),
+    "cluster_shape_mnk": (2, 1, 1),
+    "group_hint": 512,
+    "flag_batch": 8,
+    "epi_flag_batch": (2, 4),
+    "token_back_mode": "reuse_dispatch_warps",
+    "load_balance_mode": "atomic_counter",
+}
+
+
+def default_knobs(num_tokens: int, *, include_tile: bool = True) -> Dict[str, Any]:
+    """Default perf/tile knobs for a compile-time token count (buffer size).
+
+    ``num_tokens < 2048`` -> the small-batch latency tile (128-wide N,
+    ``epi_warps`` token-back); otherwise the large-batch throughput tile
+    (256-wide N, ``reuse_dispatch_warps``).  Returns a fresh dict each call.
+
+    ``include_tile=False`` drops ``mma_tiler_mnk`` from the profile: the MXFP8
+    kernel hard-requires ``mma_tiler (M, N) = (256, 256)``, so its tile is fixed
+    and must not be overridden by the (NVFP4-tuned) token heuristic; MXFP8 still
+    takes the non-tile perf knobs (schedule / token-back / load balance).
+    """
+    profile = _SMALL_TOKEN_KNOBS if num_tokens < _TOKEN_TILE_THRESHOLD else _LARGE_TOKEN_KNOBS
+    knobs = dict(profile)
+    if not include_tile:
+        knobs.pop("mma_tiler_mnk", None)
+    return knobs
+
+
 def is_valid(knobs: Dict[str, Any], *, combine_format: str = "bf16") -> bool:
     """``True`` if ``knobs`` is a compilable ``Sm100MegaMoEKernel`` combo.
 
@@ -148,6 +196,7 @@ def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
 __all__ = [
     "CORRECTNESS_KNOBS",
     "PERF_KNOBS",
+    "default_knobs",
     "is_valid",
     "iter_candidates",
     "with_knobs",
