@@ -227,7 +227,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             self.num_mma_warps + self.num_dma_warps
         ) * self.num_threads_per_warp
         # SM100/103 expose >= SM120 SMEM/CTA
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
 
         self.ab_stage = None
         self.epi_stage = None
@@ -343,9 +343,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             self.b_compute_dtype = a.element_type
         self.c_dtype = c.element_type
 
-        self.a_layout = utils.LayoutEnum.from_tensor(a)
-        self.b_layout_compute = utils.LayoutEnum.ROW_MAJOR
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(a)
+        self.b_layout_compute = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
 
         if cutlass.const_expr(self.a_dtype.width != 16):
             raise TypeError(f"a_dtype must be 16-bit (bf16/fp16), got {self.a_dtype}")
@@ -517,7 +517,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             + cute.size_in_bytes(cutlass.Uint8, b_sf_smem_layout)
         )
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()

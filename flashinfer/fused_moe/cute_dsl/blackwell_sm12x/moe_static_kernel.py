@@ -86,7 +86,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from cutlass.cutlass_dsl import (
@@ -380,7 +379,7 @@ class MoEStaticKernel:
         self.tma_load_warp_id = self.num_mma_warps
         self.num_threads_per_warp = 32
         self.threads_per_cta = (self.num_mma_warps + 1) * self.num_threads_per_warp
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
         self.buffer_align_bytes = 1024
 
         self.epilog_sync_barrier = pipeline.NamedBarrier(
@@ -629,10 +628,10 @@ class MoEStaticKernel:
         self.a_dtype = packed_a.element_type
         self.b_dtype = b_w13.element_type
         self.sf_dtype = sfa_ptr.dtype
-        self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
-        self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
+        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(packed_a)
+        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b_w13)
         # Compact static always scatters into token-major row-major output.
-        self.c_layout = utils.LayoutEnum.ROW_MAJOR
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
 
         hidden_size = a_input.shape[1]
         self._setup_attributes(hidden_size=hidden_size)
@@ -821,7 +820,7 @@ class MoEStaticKernel:
             self.b_dtype, b_smem_one
         ) + cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         @cute.struct
         class StorageGated:

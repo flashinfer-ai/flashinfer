@@ -1998,7 +1998,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         wg_idx = math_tidx // cutlass.Int32(THREADS_PER_WARP_GROUP)
 
         # ── Smem allocation ───────────────────────────────────────────────────
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
 
         qkv_smem_layout_atom = warpgroup.make_smem_layout_atom(

@@ -390,7 +390,7 @@ class AddRMSNormFP4QuantKernel:
         fp4_max_rcp = rcp_approx_ftz(Float32(FLOAT4_E2M1_MAX))
 
         # Allocate shared memory
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         sX = smem.allocate_tensor(
             mX.element_type,

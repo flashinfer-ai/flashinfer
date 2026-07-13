@@ -154,7 +154,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         self.epilog_sync_bar_id = 1
         self.tmem_alloc_sync_bar_id = 2
         self.tmem_dealloc_sync_bar_id = 3
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_103")
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_103")
         # SM103 TMEM capacity is 512 columns (same as SM100).
         # This replaces cute.arch.get_max_tmem_alloc_cols("sm_103") which
         # may not be available in older cutlass-dsl versions.
@@ -353,9 +353,9 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         self.b_dtype: Type[cutlass.Numeric] = b_tensor.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa_tensor.element_type
         self.c_dtype: Type[cutlass.Numeric] = c_tensor.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c_tensor)
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
@@ -647,7 +647,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         #
         # Alloc and init: a+b full/empty, sfa+sfb full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Initialize mainloop ab_producer and ab_consumer
@@ -710,7 +710,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                 num_threads=32 * len(self.epilogue_warp_id),
             )
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],
@@ -2013,7 +2013,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         mma_tiler: Tuple[int, int, int],
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: cutlass.tensor_utils.LayoutEnum,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         smem_capacity: int,
@@ -2033,7 +2033,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         :param c_dtype: Data type of operand C (output).
         :type c_dtype: type[cutlass.Numeric]
         :param c_layout: Layout enum of operand C.
-        :type c_layout: utils.LayoutEnum
+        :type c_layout: cutlass.tensor_utils.LayoutEnum
         :param sf_dtype: Data type of Scale factor.
         :type sf_dtype: type[cutlass.Numeric]
         :param sf_vec_size: Scale factor vector size.

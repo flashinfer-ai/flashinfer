@@ -714,7 +714,7 @@ class NVFP4QuantizePerTokenKernel:
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         reduction_buffer = smem.allocate_tensor(
             Float32,
             cute.make_layout((1, _PER_TOKEN_WARPS)),
@@ -1097,7 +1097,7 @@ class NVFP4QuantizeTMAKernel:
         elems_per_stage = self.elems_per_stage
 
         # ---- SMEM allocation ----
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_mbar_ptr = storage.load_full_mbar.data_ptr()

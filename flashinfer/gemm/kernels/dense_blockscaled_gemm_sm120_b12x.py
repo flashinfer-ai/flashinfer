@@ -259,7 +259,7 @@ class DenseGemmKernel:
             self.num_mma_warps + 1  # 1 warp for DMA
         ) * self.num_threads_per_warp
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
 
         self.ab_stage = None
         self.epi_stage = None
@@ -397,9 +397,9 @@ class DenseGemmKernel:
         self.c_dtype = c.element_type
         self.sf_dtype = sfa.element_type
 
-        self.a_layout = utils.LayoutEnum.from_tensor(a)
-        self.b_layout = utils.LayoutEnum.from_tensor(b)
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(a)
+        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b)
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
 
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
@@ -886,7 +886,7 @@ class DenseGemmKernel:
             )
 
         # Allocate shared memory
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Pipeline setup

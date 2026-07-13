@@ -109,7 +109,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute import experimental as cute_ext
-import cutlass.utils as utils
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cute.nvgpu import tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -258,7 +257,7 @@ class TgvGemmCuteExtKernel:
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(cutlass.memory.get_smem_capacity_in_bytes("sm_100")),
             stream=stream,
             use_pdl=self.pdl_launch,
         )
@@ -281,11 +280,11 @@ class TgvGemmCuteExtKernel:
         # make_trivial_tiled_mma picks the largest tcgen05.mma atom that fits
         # mma_tiler_mn. 1-CTA bf16 (64,8): Mma_M=(16,4)=64, Mma_N=8, Mma_K=16.
         # 2-CTA bf16 K-major (128,N): Mma_M=128 split across cluster, Mma_K=16.
-        a_major = utils.LayoutEnum.from_tensor(mA).mma_major_mode()
-        b_major = utils.LayoutEnum.from_tensor(mB).mma_major_mode()
+        a_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mA).mma_major_mode()
+        b_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mB).mma_major_mode()
         ab_dtype = mA.element_type  # bf16
         c_dtype = mC.element_type  # bf16
-        d_layout = utils.LayoutEnum.from_tensor(mC)
+        d_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mC)
 
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             ab_dtype,

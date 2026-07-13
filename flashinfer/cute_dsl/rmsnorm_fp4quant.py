@@ -356,7 +356,7 @@ class RMSNormFP4QuantKernel:
         # ==================================================================
         # Allocate shared memory
         # ==================================================================
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         # Shared memory tile for input (for sum-of-squares)
         sX = smem.allocate_tensor(

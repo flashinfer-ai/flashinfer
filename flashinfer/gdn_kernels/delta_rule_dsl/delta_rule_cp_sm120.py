@@ -330,7 +330,7 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
             )
             beta_layout = cute.make_layout(self.BLK)
 
-            allocator = cutlass.utils.SmemAllocator()
+            allocator = cutlass.memory.SmemAllocator()
             storage = allocator.allocate(self.shared_storage)
             sK_DS = storage.smem_k.get_tensor(
                 k_storage_layout_ds.outer, swizzle=k_storage_layout_ds.inner
@@ -1367,7 +1367,7 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
             (self.BLK, AlphaProcessor.NUM_CHANNELS, self.alpha_stage)
         )
 
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
         sV_DS = storage.smem_v.get_tensor(
             v_storage_layout_ds.outer, swizzle=v_storage_layout_ds.inner
@@ -2049,7 +2049,7 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
             stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
         )
         workspace_layout = out_layout
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
         sM = storage.smem_m.get_tensor(
             transfer_layout.outer, swizzle=transfer_layout.inner
@@ -2486,7 +2486,7 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
             stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
         )
         workspace_layout = out_layout
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
         gTransfer = cute.make_tensor(g_transfer_t.iterator.align(128), workspace_layout)
         gLocalState = cute.make_tensor(
@@ -4292,7 +4292,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         math_tidx = tidx - THREADS_PER_WARP_GROUP
         wg_idx = math_tidx // THREADS_PER_WARP_GROUP
 
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
 
         qkv_smem_layout_atom = warpgroup.make_smem_layout_atom(

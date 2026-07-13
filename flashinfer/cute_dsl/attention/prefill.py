@@ -5,7 +5,6 @@ from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
 from cutlass.cute.typing import Int32, Float32
 
 from .config import AttentionConfig, AttentionFusion
@@ -161,10 +160,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.config.is_persistent,
         )
 
-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
-        self.o_layout = utils.LayoutEnum.from_tensor(o)
+        self.q_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(q).mma_major_mode()
+        self.k_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(k).mma_major_mode()
+        self.v_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(v).mma_major_mode()
+        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(o)
 
         if cutlass.const_expr(self.q_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
@@ -232,7 +231,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.shared_storage = lp.SharedStorage
 
         smem_bytes = lp.SharedStorage.size_in_bytes()
-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
         if cutlass.const_expr(smem_bytes > smem_capacity):
             head_dim = self.config.mma_tiler[2]
             raise ValueError(
@@ -389,7 +388,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         pipes = self._create_pipelines(storage)
