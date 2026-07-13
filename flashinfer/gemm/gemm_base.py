@@ -5914,7 +5914,7 @@ def _cute_dsl_gemm_fp4_runner(
                                 )
 
             # Rank configs and autotune the top-N instead of the entire O(100).
-            # Current heuristic cannot predict use_prefetch, so autotuner profiles both.
+            # Current heuristic cannot distinguish use_prefetch, so autotuner profiles both.
             sm_count = get_device_sm_count(a.device)
             config_tactics: dict = defaultdict(list)
             for t in valid_tactics:

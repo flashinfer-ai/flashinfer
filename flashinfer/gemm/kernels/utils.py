@@ -55,10 +55,9 @@ _SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
 def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
     """Compute the best tactic for a specific (M, N, K) on a GPU with sm_count SMs.
 
-    Argmax of _score_sm100_mm_fp4_tactic over (tile, cluster, swap_ab), with
-    prefetch disabled.  Measured against the previous rule-based selection on
-    B200 over the 217 unique shapes of the mm_fp4 tuning + holdout testlists:
-    geomean -2.6%, wins up to 2x.
+    Used for mm_fp4(backend='cute-dsl') without autotune by taking the
+    argmax of _score_sm100_mm_fp4_tactic over (tile, cluster, swap_ab), with
+    prefetch disabled.
     """
     n_aligned = n % 8 == 0
     best_tactic = None
@@ -81,39 +80,31 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
 def _score_sm100_mm_fp4_tactic(
     m, n, real_k, sm_count, mma_tiler_mn, cluster_shape_mn, swap_ab
 ):
-    """Score a mm_fp4 cute-dsl tactic (higher = better), modeling execution
-    time as num_waves x per-CTA-tile time.
-
-    Ranks autotune candidates and drives _compute_tactic_for_m's no-autotune
-    argmax.  Validated against exhaustive per-tactic measurements on B200
-    over 16 (m, n, k) shapes: the top-16 configs by this score contain a
-    tactic within 0.1% of the exhaustive optimum on every shape.
+    """Score a mm_fp4 cute-dsl tactic (higher means better).
+    Used for ranking candidates for both top-1 and autotune scenarios.
     """
     tile_m, tile_n = mma_tiler_mn
     cga_m, cga_n = cluster_shape_mn
     prob_m = n if swap_ab else m
     prob_n = m if swap_ab else n
 
-    # Tile-quantization efficiency: padding waste from rounding the problem
-    # up to tile boundaries.
+    # 1. Check tile-quantization efficiency from padding waste
     m_tiles = (prob_m + tile_m - 1) // tile_m
     n_tiles = (prob_n + tile_n - 1) // tile_n
     m_eff = prob_m / (m_tiles * tile_m)
     n_eff = prob_n / (n_tiles * tile_n)
 
-    # tile_m == 256 runs as 2-CTA cooperative MMA (the reason it requires
-    # cluster_m >= 2), so each output tile occupies two SMs.
+    # tile_m == 256 runs as 2-CTA cooperative MMA
     cta_group = 2 if tile_m == 256 else 1
     ctas_m = m_tiles * cta_group
-    # Wave count over the real CTA grid, padded to the cluster shape:
-    # partially-filled clusters still occupy whole clusters' worth of SMs.
+    # 2. Wave quantization effects: count waves over the real CTA grid
     padded_ctas = ((ctas_m + cga_m - 1) // cga_m * cga_m) * (
         (n_tiles + cga_n - 1) // cga_n * cga_n
     )
     num_waves = (padded_ctas + sm_count - 1) // sm_count
 
-    # Per-CTA tile is (128, tile_n) regardless of tile_m; its throughput
-    # scales ~sqrt(tile_n).  Wide tiles are penalized at small K where the
+    # 3. Calculate per-CTA throughput: per-CTA tile is (128, tile_n).
+    # Wide tiles are penalized at small K where the
     # K-pipeline cannot hide their latency.
     throughput = (tile_n / 256) ** 0.5
     if tile_n > 128:
@@ -124,26 +115,22 @@ def _score_sm100_mm_fp4_tactic(
 
     score = m_eff * n_eff * throughput / (num_waves * tile_n)
 
-    # Tie-breakers keep the ranking strict where the wave model is degenerate
-    # (equal waves and quantization).  Exact values sit on a wide flat
-    # optimum of the validation sweep.
+    # 4. Tie-breaking
     if cta_group == 2:
         # 2-CTA MMA: higher per-SM throughput at equal per-CTA tile
         score *= 1.05
     if prob_m > tile_m:
-        # cluster multicast hurts when the m-grid is thicker than one tile
-        # (measured up to 1.8x slower); cga values 1/2/4 -> exponent 0/1/2
+        # Cluster multicast hurts when the m-grid is thicker than one tile
+        # cga_x.bit_length() for cga_x = 1/2/4 -> exponent 0/1/2
         score *= 0.95 ** (0, 1, 2)[cga_n.bit_length() - 1]
         score *= 0.99 ** (0, 1, 2)[cga_m.bit_length() - 1]
 
-    # Demote (rather than exclude) narrow tiles that cannot cover prob_n,
+    # 5. Demote narrow tiles that cannot cover prob_n,
     # keeping the ranking total over all valid tactics.
     if tile_n < 64 and prob_n > tile_n:
         score *= 1e-6
 
-    # The swap comparison is only roughly calibrated, but large-m swap
-    # winners can beat their twin by 12-16%: penalize deviations from the
-    # swap rule mildly, so both swap variants stay in the profiled top-N.
+    # 6. Penalize deviations from the swap rule mildly, so both swap variants stay in the top-N.
     rule_swap = (n % 8 == 0) and (1 <= m <= 32) and n > m
     if swap_ab != rule_swap:
         score *= 0.95
