@@ -1010,16 +1010,34 @@ def _check_dsv4_sparse_mla_inputs(
     )
 
 
-def _resolve_dsv4_sparse_mla_backend(device: torch.device) -> str:
+def _resolve_dsv4_sparse_mla_backend(
+    device: torch.device,
+    requested_backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse"] = "auto",
+) -> str:
     cc = get_compute_capability(device)
-    if cc[0] == 12:
-        return "sparse"
-    if cc[0] == 10:
-        return "trtllm-gen"
-    raise ValueError(
-        "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
-        f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
-    )
+    is_sm100_family = cc in ((10, 0), (10, 3))
+    is_sm120_family = cc in ((12, 0), (12, 1))
+    if requested_backend == "auto":
+        if is_sm120_family:
+            return "sparse"
+        if is_sm100_family:
+            return "trtllm-gen"
+        raise ValueError(
+            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
+            f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
+        )
+    if requested_backend not in ("trtllm-gen", "cute-dsl", "sparse"):
+        raise ValueError(
+            "backend must be one of 'auto', 'trtllm-gen', 'cute-dsl', or "
+            f"'sparse', got {requested_backend!r}"
+        )
+    if requested_backend in ("trtllm-gen", "cute-dsl") and not is_sm100_family:
+        raise ValueError(
+            f"backend={requested_backend!r} requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+        )
+    if requested_backend == "sparse" and not is_sm120_family:
+        raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
+    return requested_backend
 
 
 def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
@@ -1144,7 +1162,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    sparse_indices: torch.Tensor,
+    sparse_indices: Optional[torch.Tensor] = None,
     compressed_kv_cache: Optional[torch.Tensor] = None,
     sparse_topk_lens: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
@@ -1159,6 +1177,12 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     swa_topk_lens: Optional[torch.Tensor] = None,
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
+    backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse"] = "auto",
+    hca_swa_block_tables: Optional[torch.Tensor] = None,
+    hca_compressed_block_tables: Optional[torch.Tensor] = None,
+    hca_seq_lens: Optional[torch.Tensor] = None,
+    hca_is_causal: bool = True,
+    hca_use_persistent: bool = False,
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -1180,6 +1204,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     ``extra_sparse_indices`` with ``extra_sparse_topk_lens``. The SM120/SM121
     path accepts BF16 query tensors and produces BF16 output.
 
+    With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
+    HCA kernel. This path is explicit because HCA block tables contain page
+    IDs, whereas the TRTLLM-GEN dynamic-token-sparse ABI consumes arbitrary
+    physical token-row indices. Both ABIs can represent logical HCA; the
+    distinction here is the metadata encoding and implementation. HCA currently
+    accepts dense FP8 E4M3 query/KV tensors and produces BF16 output.
+
     Parameters
     ----------
     query : torch.Tensor
@@ -1191,26 +1222,32 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses packed
         uint8 head dim 584. Layout follows ``kv_layout``.
     workspace_buffer : torch.Tensor
-        TRTLLM-GEN workspace buffer. The multi-CTA KV counters are managed in a
-        separate internal buffer.
-    sparse_indices : torch.Tensor
+        Byte workspace used by TRTLLM-GEN or HCA split-K reduction. The
+        TRTLLM-GEN multi-CTA KV counters are managed in a separate internal
+        buffer.
+    sparse_indices : Optional[torch.Tensor]
         TRTLLM-GEN combined sparse table, or the SM120 sparse SWA segment.
+        Pass ``None`` for ``backend="cute-dsl"`` because HCA uses the two
+        block-table arguments instead.
     compressed_kv_cache : Optional[torch.Tensor]
         Primary/compressed KV cache in the same backend layout as
-        ``swa_kv_cache``. Required by ``trtllm-gen`` and by SM120 ``sparse``
-        when ``extra_sparse_indices`` is provided.
+        ``swa_kv_cache``. Required by ``trtllm-gen`` and HCA, and by SM120
+        ``sparse`` when ``extra_sparse_indices`` is provided.
     sparse_topk_lens : Optional[torch.Tensor]
         Flattened total sparse MLA top-k lengths in query-token order, shape
         ``[sum_q]``. Values must already include the fixed 128 SWA entries,
-        matching TRTLLM-GEN ``sparseMlaTopkLengths``, and must not exceed
-        ``sparse_indices.shape[-1]``. Required only by ``trtllm-gen``.
+        matching TRTLLM-GEN ``sparseMlaTopkLengths``. For TRTLLM-GEN they must
+        not exceed ``sparse_indices.shape[-1]``. HCA also requires this tensor;
+        there it describes the visible window-plus-compressed slot count.
     seq_lens : Optional[torch.Tensor]
         Original KV sequence lengths, shape ``[batch_size]`` INT32. Required
         only by ``trtllm-gen``.
     bmm1_scale : Union[float, torch.Tensor]
         Fused per-tensor scale for QK and softmax. Tensor form must be FP32.
+        HCA currently accepts only a Python float.
     bmm2_scale : Union[float, torch.Tensor]
         Fused per-tensor scale for VO. Tensor form must be FP32.
+        HCA currently accepts only a Python float.
     sinks : Optional[torch.Tensor]
         Optional attention sink logits, shape ``[num_heads]`` FP32.
     kv_layout : Literal["HND", "NHD"]
@@ -1226,15 +1263,117 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         Whether to enable Programmatic Dependent Launch. Used by the
         TRTLLM-GEN path.
     swa_topk_lens : Optional[torch.Tensor]
-        Active SWA segment lengths for SM120/SM121, shape ``[sum_q]`` INT32.
+        Active SWA segment lengths, shape ``[sum_q]`` INT32. On SM120/SM121
+        these are sparse-segment lengths. HCA requires them as its per-row
+        visible sliding-window lengths in the range 0 through 128.
     extra_sparse_indices : Optional[torch.Tensor]
         Optional SM120/SM121 compressed segment indices into
         ``compressed_kv_cache``.
     extra_sparse_topk_lens : Optional[torch.Tensor]
         Active compressed segment lengths for SM120/SM121, shape ``[sum_q]``
         INT32.
+    backend : {"auto", "trtllm-gen", "cute-dsl", "sparse"}
+        Backend selection. ``"auto"`` preserves the architecture-based default:
+        TRTLLM-GEN on SM100/SM103 and sparse on SM120/SM121. HCA is selected
+        only when ``"cute-dsl"`` is requested explicitly.
+    hca_swa_block_tables : Optional[torch.Tensor]
+        HCA sliding-window page IDs, shape ``[B * Q, max_pages]`` INT32.
+    hca_compressed_block_tables : Optional[torch.Tensor]
+        HCA compressed-pool page IDs with the same row convention as
+        ``hca_swa_block_tables``, INT32.
+    hca_seq_lens : Optional[torch.Tensor]
+        Per-request total HCA slot counts ``[B]`` INT32. Each value counts the
+        128 window slots plus compressed slots, not original raw KV tokens.
+    hca_is_causal : bool
+        Must currently be ``True``. HCA page-table rows and valid-length
+        tensors are per query token (``B * Q`` rows).
+    hca_use_persistent : bool
+        Select the CuTe DSL persistent tile scheduler. This removes the
+        non-persistent ``B * Q <= 65535`` launch-grid restriction.
     """
-    backend = _resolve_dsv4_sparse_mla_backend(query.device)
+    backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
+
+    if backend == "cute-dsl":
+        if not hca_is_causal:
+            raise ValueError("backend='cute-dsl' currently supports causal HCA only")
+        if sparse_indices is not None:
+            raise ValueError(
+                "backend='cute-dsl' consumes HCA block tables, so "
+                "sparse_indices must be None"
+            )
+        if cum_seq_lens_q is not None or max_q_len is not None:
+            raise ValueError(
+                "backend='cute-dsl' currently supports dense [B, Q, H, D] "
+                "queries only; cum_seq_lens_q and max_q_len must be None"
+            )
+        if seq_lens is not None:
+            raise ValueError(
+                "backend='cute-dsl' uses hca_seq_lens, so seq_lens must be None"
+            )
+        if extra_sparse_indices is not None or extra_sparse_topk_lens is not None:
+            raise ValueError(
+                "backend='cute-dsl' uses HCA block tables and does not accept "
+                "extra_sparse_indices or extra_sparse_topk_lens"
+            )
+        if enable_pdl:
+            raise ValueError("backend='cute-dsl' HCA does not support enable_pdl")
+        required_hca_inputs = {
+            "compressed_kv_cache": compressed_kv_cache,
+            "sparse_topk_lens": sparse_topk_lens,
+            "swa_topk_lens": swa_topk_lens,
+            "hca_swa_block_tables": hca_swa_block_tables,
+            "hca_compressed_block_tables": hca_compressed_block_tables,
+            "hca_seq_lens": hca_seq_lens,
+        }
+        missing = [name for name, value in required_hca_inputs.items() if value is None]
+        if missing:
+            raise ValueError("backend='cute-dsl' requires " + ", ".join(missing))
+        if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+            raise TypeError(
+                "backend='cute-dsl' HCA currently requires Python float "
+                "bmm1_scale and bmm2_scale"
+            )
+
+        normalized_swa_cache = _normalize_dsv4_sparse_mla_kv_cache(
+            swa_kv_cache, kv_layout, "swa_kv_cache"
+        ).squeeze(1)
+        normalized_compressed_cache = _normalize_dsv4_sparse_mla_kv_cache(
+            compressed_kv_cache, kv_layout, "compressed_kv_cache"
+        ).squeeze(1)
+        from ..cute_dsl.attention.wrappers.batch_hca import cute_dsl_hca_decode
+
+        return cute_dsl_hca_decode(
+            query=query,
+            window_kv_cache=normalized_swa_cache,
+            compressed_kv_cache=normalized_compressed_cache,
+            workspace_buffer=workspace_buffer,
+            window_block_tables=hca_swa_block_tables,
+            compressed_block_tables=hca_compressed_block_tables,
+            hca_seq_lens=hca_seq_lens,
+            sparse_topk_lens=sparse_topk_lens,
+            window_valid_lens=swa_topk_lens,
+            softmax_scale=float(bmm1_scale),
+            output_scale=float(bmm2_scale),
+            sinks=sinks,
+            out=out,
+            is_causal=hca_is_causal,
+            is_persistent=hca_use_persistent,
+        )
+
+    unexpected_hca_inputs = {
+        "hca_swa_block_tables": hca_swa_block_tables,
+        "hca_compressed_block_tables": hca_compressed_block_tables,
+        "hca_seq_lens": hca_seq_lens,
+        "hca_use_persistent": hca_use_persistent if hca_use_persistent else None,
+    }
+    unexpected_hca_inputs = [
+        name for name, value in unexpected_hca_inputs.items() if value is not None
+    ]
+    if unexpected_hca_inputs:
+        raise ValueError(
+            f"backend={backend!r} does not accept " + ", ".join(unexpected_hca_inputs)
+        )
+
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
@@ -1254,6 +1393,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
 
     if backend == "sparse":
+        if sparse_indices is None:
+            raise ValueError("backend='sparse' requires sparse_indices")
         return _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             query=query,
             swa_kv_cache=swa_kv_cache,
@@ -1284,6 +1425,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             "backend='trtllm-gen' requires compressed_kv_cache, sparse_topk_lens, "
             "and seq_lens"
         )
+    if sparse_indices is None:
+        raise ValueError("backend='trtllm-gen' requires sparse_indices")
 
     (
         swa_kv_cache,
