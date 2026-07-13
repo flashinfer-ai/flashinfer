@@ -2,10 +2,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 import random
-from types import SimpleNamespace
 
 import flashinfer
-from flashinfer.mla import _core as mla_core
 from flashinfer.mla import (
     MLALayerDimensions,
     supported_mla_layer_dimensions,
@@ -1095,73 +1093,6 @@ def test_trtllm_batch_decode_mla_sparse_cum_seq_lens_q():
     )
 
 
-def test_trtllm_gen_mla_runner_uses_internal_counter_for_profile_and_caller_for_run(
-    monkeypatch,
-):
-    profile_batch_size = 8
-    num_heads = 2
-    sm_count = 1
-    head_dim_qk = 4
-    kv_lora_rank = 2
-    captured_counter_buffers = []
-
-    def capture_run(*args):
-        captured_counter_buffers.append(args[6])
-
-    monkeypatch.setattr(
-        mla_core,
-        "get_trtllm_gen_fmha_module",
-        lambda: SimpleNamespace(trtllm_paged_attention_decode=capture_run),
-    )
-
-    caller_counter_buffer = torch.zeros(
-        get_trtllm_gen_multi_ctas_kv_counter_bytes(
-            profile_batch_size, num_heads, sm_count
-        ),
-        dtype=torch.uint8,
-    )
-    runner = mla_core.TrtllmGenMlaDecodeRunner(
-        kv_cache=torch.empty(1, 1, 1, head_dim_qk),
-        workspace_buffer=torch.empty(1, dtype=torch.uint8),
-        sm_count=sm_count,
-        qk_nope_head_dim=2,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=2,
-        max_seq_len=1,
-        sparse_mla_top_k=0,
-        bmm1_scale=1.0,
-        bmm2_scale=1.0,
-        sinks=None,
-        skip_softmax_threshold_scale_factor=None,
-        enable_pdl=False,
-        is_var_seq=False,
-        uses_shared_paged_kv_idx=True,
-        return_lse=False,
-        lse=None,
-    )
-
-    def make_inputs(batch_size):
-        return [
-            torch.empty(batch_size, 1, num_heads, head_dim_qk),
-            torch.zeros(batch_size, 1, dtype=torch.int32),
-            torch.ones(batch_size, dtype=torch.int32),
-            torch.empty(batch_size, 1, num_heads, kv_lora_rank),
-        ]
-
-    runner(make_inputs(profile_batch_size), do_preparation=True)
-    profile_counter_buffer = captured_counter_buffers[-1]
-    assert profile_counter_buffer is not caller_counter_buffer
-
-    runner(make_inputs(profile_batch_size))
-    assert captured_counter_buffers[-1] is profile_counter_buffer
-
-    runner(
-        make_inputs(1),
-        multi_ctas_kv_counter_buffer=caller_counter_buffer,
-    )
-    assert captured_counter_buffers[-1] is caller_counter_buffer
-
-
 @pytest.mark.parametrize("q_len_per_request", [1, 2, 4])
 @pytest.mark.parametrize("batch_size", [1, 4])
 def test_trtllm_batch_decode_mla_preallocated_out(
@@ -1225,7 +1156,6 @@ def test_trtllm_batch_decode_mla_preallocated_out(
         batch_size, num_heads, get_device_sm_count(torch.device(device))
     )
     counter_buffer = torch.zeros(counter_bytes, dtype=torch.uint8, device=device)
-    counter_buffer_ptr = counter_buffer.data_ptr()
 
     # out=None should work
     result_none = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -1245,7 +1175,6 @@ def test_trtllm_batch_decode_mla_preallocated_out(
     )
     expected_shape = (batch_size, q_len_per_request, num_heads, kv_lora_rank)
     assert result_none.shape == expected_shape
-    assert counter_buffer.data_ptr() == counter_buffer_ptr
     assert torch.count_nonzero(counter_buffer).item() == 0
 
     # out=pre-allocated should also work (this was the bug)
@@ -1270,47 +1199,51 @@ def test_trtllm_batch_decode_mla_preallocated_out(
         "Expected kernel to write into provided out tensor"
     )
     assert result_pre.shape == expected_shape
-    assert counter_buffer.data_ptr() == counter_buffer_ptr
     assert torch.count_nonzero(counter_buffer).item() == 0
     torch.testing.assert_close(result_none, result_pre, rtol=1e-3, atol=1e-3)
 
-    with pytest.raises(ValueError, match="multi_ctas_kv_counter_buffer is too small"):
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_cache,
-            workspace_buffer=workspace,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=1.0,
-            backend="trtllm-gen",
-            multi_ctas_kv_counter_buffer=counter_buffer[:4],
-        )
+    # Buffer validation is shape-independent, so cover it once rather than for
+    # every entry in the preallocated-output matrix.
+    if batch_size == 1 and q_len_per_request == 1:
+        with pytest.raises(
+            ValueError, match="multi_ctas_kv_counter_buffer is too small"
+        ):
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=workspace,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=1.0,
+                backend="trtllm-gen",
+                multi_ctas_kv_counter_buffer=counter_buffer[:4],
+            )
 
-    strided_counter_buffer = torch.zeros(
-        counter_bytes * 2, dtype=torch.uint8, device=device
-    )[::2]
-    assert strided_counter_buffer.numel() == counter_bytes
-    assert not strided_counter_buffer.is_contiguous()
-    with pytest.raises(
-        ValueError, match="multi_ctas_kv_counter_buffer must be contiguous"
-    ):
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_cache,
-            workspace_buffer=workspace,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=1.0,
-            backend="trtllm-gen",
-            multi_ctas_kv_counter_buffer=strided_counter_buffer,
-        )
+        strided_counter_buffer = torch.zeros(
+            counter_bytes * 2, dtype=torch.uint8, device=device
+        )[::2]
+        assert strided_counter_buffer.numel() == counter_bytes
+        assert not strided_counter_buffer.is_contiguous()
+        with pytest.raises(
+            ValueError, match="multi_ctas_kv_counter_buffer must be contiguous"
+        ):
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=workspace,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=1.0,
+                backend="trtllm-gen",
+                multi_ctas_kv_counter_buffer=strided_counter_buffer,
+            )

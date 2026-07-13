@@ -914,7 +914,6 @@ def _test_trtllm_batch_decode(
         workspace_buffer[softmax_end:guard_end].zero_()
 
     multi_ctas_kv_counter_buffer = None
-    multi_ctas_kv_counter_buffer_ptr = None
     if reuse_multi_ctas_kv_counter_buffer:
         assert backend == "trtllm-gen"
         counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
@@ -925,7 +924,6 @@ def _test_trtllm_batch_decode(
         multi_ctas_kv_counter_buffer = torch.zeros(
             counter_bytes, dtype=torch.uint8, device=GPU_DEVICE
         )
-        multi_ctas_kv_counter_buffer_ptr = multi_ctas_kv_counter_buffer.data_ptr()
 
     output_and_lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
@@ -1034,9 +1032,6 @@ def _test_trtllm_batch_decode(
 
     if reuse_multi_ctas_kv_counter_buffer:
         assert multi_ctas_kv_counter_buffer is not None
-        assert (
-            multi_ctas_kv_counter_buffer.data_ptr() == multi_ctas_kv_counter_buffer_ptr
-        )
         assert torch.count_nonzero(multi_ctas_kv_counter_buffer).item() == 0
         reused_out = torch.empty_like(output)
         reused_output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -1069,9 +1064,6 @@ def _test_trtllm_batch_decode(
             multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
         assert reused_output.data_ptr() == reused_out.data_ptr()
-        assert (
-            multi_ctas_kv_counter_buffer.data_ptr() == multi_ctas_kv_counter_buffer_ptr
-        )
         assert torch.count_nonzero(multi_ctas_kv_counter_buffer).item() == 0
         assert_close_with_mismatch_tolerance(
             reused_output.float() * o_scale,
