@@ -63,6 +63,13 @@ def _validate_prerouted_inputs(
                 "(num_tokens, RoutingConfig.top_k) — a column mismatch "
                 "mis-packs against the kernel's top_k-sized buffers."
             )
+    if act.topk_ids.dtype != torch.int32:
+        # The launcher casts data_ptr without a dtype ICHECK, so an int64
+        # tensor here is read as int32 bytes — silent garbage routing.
+        raise TypeError(
+            f"{runner}: topk_ids must be torch.int32, got {act.topk_ids.dtype} "
+            "(torch.topk returns int64 — cast before packing)."
+        )
 
 
 def _validate_logits_inputs(
