@@ -803,6 +803,7 @@ def _bf16_dense_reference(
         tok, nth = torch.where(mask)
         a = x32[tok] @ w1[local_e].float().t()
         inter = F.silu(a[:, intermediate_size:]) * a[:, :intermediate_size]
+        inter = inter.to(torch.bfloat16).float()  # gemm1 output is stored bf16
         out[tok] += final_scales[tok, nth, None].float() * (
             inter @ w2[local_e].float().t()
         )
