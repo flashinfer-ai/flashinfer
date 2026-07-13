@@ -487,8 +487,8 @@ class FakeTensor:
 class TunableRunner(ABC):
     @abstractmethod
     def get_valid_tactics(
-        self, inputs: List[torch.Tensor], profile: OptimizationProfile
-    ) -> List[Any]:
+        self, inputs: list[torch.Tensor], profile: OptimizationProfile
+    ) -> list[Any]:
         """One tactic corresponding to one cuda kernel normally, but how to interpret the meaning
         of tactic is pure internal details of the runner.
 
@@ -527,7 +527,7 @@ class TunableRunner(ABC):
     @abstractmethod
     def forward(
         self,
-        inputs: List[torch.Tensor],
+        inputs: list[torch.Tensor],
         tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs,  # all others are keyword args only
@@ -1314,7 +1314,7 @@ class AutoTuner:
         tuning_config: TuningConfig,
         inputs: list[torch.Tensor],
         **kwargs,
-    ) -> Tuple[TunableRunner, Any]:
+    ) -> tuple[TunableRunner, Any]:
         """Choose the best runner and tactic combination through performance profiling.
 
         Args:
