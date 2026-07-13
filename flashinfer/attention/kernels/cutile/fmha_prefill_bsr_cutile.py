@@ -52,6 +52,15 @@ def _get_prefill_autotune_configs(page_size=None):
         )
 
     for cfg in configs:
+        # Keep BLOCK_N <= page_size (NUM_PAGES == 1). The 2/4/8-page unrolled loader
+        # exists but is UNSAFE for block-sparse: the off-band loop applies no boundary
+        # mask, so a BLOCK_N spanning k>1 pages requires seq_len_kv % BLOCK_N == 0. A
+        # row's selected-block count is generally not a multiple of k, so the tail
+        # iteration reads past the row's page list into the next row's KV (gather
+        # returns page 0, not zeros) and folds it, unmasked, into the softmax.
+        # Verified on B300 (sm103): enabling BLOCK_N=4*C picked NUM_PAGES=4 and gave
+        # 94% element mismatch. Re-enabling needs a boundary mask in the off-band
+        # tail, not just this filter relaxation.
         if page_size is not None and cfg.BLOCK_N > page_size:
             continue
         yield cfg

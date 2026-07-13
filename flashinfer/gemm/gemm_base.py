@@ -1142,6 +1142,7 @@ def _cutile_ragged_block_scaled_bmm_requirement(
     transpose_a: bool = False,
     transpose_b: bool = True,
     out_dtype: Optional[torch.dtype] = None,
+    segment_alignment: int = 128,
     backend: Literal["cutile"] = "cutile",
 ):
     return True
@@ -1164,6 +1165,7 @@ def ragged_block_scaled_bmm(
     transpose_a: bool = False,
     transpose_b: bool = True,
     out_dtype: Optional[torch.dtype] = None,
+    segment_alignment: int = 128,
     backend: Literal["cutile"] = "cutile",
 ) -> torch.Tensor:
     r"""Ragged block-scaled batched matrix multiplication (FP8 block-scaled).
@@ -1188,6 +1190,12 @@ def ragged_block_scaled_bmm(
         Whether ``a`` / ``b`` are stored transposed.
     out_dtype : Optional[torch.dtype]
         Output dtype (e.g. ``torch.bfloat16``).
+    segment_alignment : int
+        Row alignment the caller guarantees for every ``m_indptr`` segment offset
+        (default 128). Bounds the largest internal tile (``BLOCK_M`` must divide it);
+        pass 256, with 256-aligned segments, to enable the large-M fast path. It is a
+        caller contract — it cannot be checked at runtime without a host sync that
+        would break CUDA-graph capture.
     backend : str
         Implementation backend. Currently only ``"cutile"`` is supported.
 
@@ -1212,6 +1220,7 @@ def ragged_block_scaled_bmm(
             transpose_a,
             transpose_b,
             out_dtype,
+            segment_alignment=segment_alignment,
         )
 
     raise ValueError(

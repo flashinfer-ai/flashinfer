@@ -9,6 +9,18 @@ import torch
 
 from ....cutile.cutile_common import cached_replace_hints
 
+# The kernel addresses each segment's rows via a tile index `m_start // BLOCK_M`
+# (it cannot use Array.slice(): cuTile's dynamic-TMA slice path IMAs on
+# runtime-computed offsets). That division is only exact when every segment offset
+# is a multiple of the *selected* BLOCK_M; otherwise it truncates and the kernel
+# silently reads the wrong rows -> corrupt output. A runtime alignment check would
+# need a host sync that breaks this kernel's CUDA-graph capturability, so instead
+# the caller declares the alignment it guarantees via `segment_alignment` and the
+# host only selects BLOCK_M values that divide it. Default 128 matches the minimum
+# cuTile segment alignment; pass 256 (with 256-aligned segments) to re-enable the
+# large-M BLOCK_M=256 fast path.
+_DEFAULT_SEGMENT_ALIGNMENT = 128
+
 
 def _is_large_m(total_m, Q):
     """Determine if average M is large enough for non-swapped configs."""
@@ -88,10 +100,11 @@ def _ragged_block_scaled_bmm_kernel(
         # Only process if this tile is within valid M range
         if pid_m * BLOCK_M < valid_m:
             # Compute tile-level offset into the flattened global A/C tensors.
-            # m_start is always BLOCK_M-aligned (the caller pads each segment to
-            # BLOCK_M), so integer division is exact.  We avoid Array.slice()
-            # because cuTile's dynamic TMA descriptor path for slice has a bug
-            # that causes illegal-memory-access for runtime-computed offsets.
+            # This integer division is exact only when m_start is BLOCK_M-aligned;
+            # the host only selects a BLOCK_M that divides the caller-declared
+            # segment_alignment (see _DEFAULT_SEGMENT_ALIGNMENT) so truncation cannot
+            # occur. We avoid Array.slice() because cuTile's dynamic TMA descriptor
+            # path for slice has a bug that IMAs on runtime-computed offsets.
             m_tile_start = m_start // BLOCK_M
 
             # Initialize accumulator
@@ -232,7 +245,8 @@ def _ragged_block_scaled_bmm_swap_ab_kernel(
 
         if pid_m * BLOCK_M < valid_m:
             # Compute tile-level offset into the flattened global A/C tensors.
-            # m_start is BLOCK_M-aligned, so the division is exact.
+            # m_start is BLOCK_M-aligned (BLOCK_M divides the caller-declared
+            # segment_alignment; see _DEFAULT_SEGMENT_ALIGNMENT), so division is exact.
             # Avoids Array.slice() to sidestep the dynamic TMA descriptor bug.
             m_tile_start = m_start // BLOCK_M
 
@@ -309,10 +323,22 @@ def _ragged_block_scaled_bmm_swap_ab_kernel(
             ct.store(c, index=(m_tile_start + pid_m, pid_n), tile=c_block)
 
 
-def _ragged_block_scaled_bmm_autotune_configs():
+def _ragged_block_scaled_bmm_autotune_configs(segment_alignment=_DEFAULT_SEGMENT_ALIGNMENT):
     """
     Iterator of autotune configurations for ragged_block_scaled_bmm kernel.
+
+    Only configs whose BLOCK_M divides ``segment_alignment`` are yielded (see the
+    module comment): a BLOCK_M that does not divide the caller's segment alignment
+    truncates the ``m_start // BLOCK_M`` tile index and silently corrupts output.
     """
+    for cfg in _ragged_block_scaled_bmm_autotune_configs_unfiltered():
+        if segment_alignment % cfg.BLOCK_M != 0:
+            continue
+        yield cfg
+
+
+def _ragged_block_scaled_bmm_autotune_configs_unfiltered():
+    """Raw config set before the BLOCK_M-alignment safety cap is applied."""
     gpu_capability = torch.cuda.get_device_capability()
 
     if gpu_capability in [(12, 0), (12, 1)]:
@@ -371,9 +397,13 @@ def _ragged_block_scaled_bmm_autotune_configs():
                 )
 
 
-def _get_default_kernel_configs(total_m, Q, VEC_SIZE):
+def _get_default_kernel_configs(total_m, Q, VEC_SIZE, segment_alignment=_DEFAULT_SEGMENT_ALIGNMENT):
     """
     Get GPU-specific default kernel configs for non-autotune path.
+
+    ``segment_alignment`` bounds the largest usable BLOCK_M: the sm90 large-M
+    fast path (BLOCK_M=256) is only selected when the caller guarantees
+    256-aligned segments, otherwise it falls back to the 128 config.
     """
     gpu_capability = torch.cuda.get_device_capability()
     is_large_m = _is_large_m(total_m, Q)
@@ -389,7 +419,10 @@ def _get_default_kernel_configs(total_m, Q, VEC_SIZE):
             "occupancy": 2,
         }
     elif gpu_capability == (9, 0):
-        if is_large_m:
+        # Large-M prefers BLOCK_M=256, but m_start // BLOCK_M requires every
+        # segment offset to be 256-aligned. Only take it when the caller
+        # guarantees that via segment_alignment; else fall back to 128.
+        if is_large_m and segment_alignment % 256 == 0:
             return {
                 "BLOCK_M": 256,
                 "BLOCK_N": 128,
@@ -399,16 +432,15 @@ def _get_default_kernel_configs(total_m, Q, VEC_SIZE):
                 "num_ctas": 2,
                 "occupancy": 1,
             }
-        else:
-            return {
-                "BLOCK_M": 128,
-                "BLOCK_N": 128,
-                "BLOCK_K": VEC_SIZE,
-                "GROUP_SIZE_M": 8,
-                "swap_ab": False,
-                "num_ctas": 1,
-                "occupancy": 1,
-            }
+        return {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": VEC_SIZE,
+            "GROUP_SIZE_M": 8,
+            "swap_ab": False,
+            "num_ctas": 1,
+            "occupancy": 1,
+        }
     else:
         return {
             "BLOCK_M": 128,
@@ -432,6 +464,7 @@ def ragged_block_scaled_bmm(
     transpose_a=False,
     transpose_b=True,
     out_dtype=None,
+    segment_alignment=_DEFAULT_SEGMENT_ALIGNMENT,
     **kwargs,
 ):
     """
@@ -443,6 +476,13 @@ def ragged_block_scaled_bmm(
     underestimates the actual per-batch max. When None, a fallback tensor is
     materialized from `max_m`.
     This mirrors the NVT triton kernel's defensive semantic.
+
+    `segment_alignment` is the alignment (in rows) the caller guarantees for every
+    `m_indptr` segment offset; it bounds the largest BLOCK_M the kernel may select
+    (BLOCK_M must divide it) because the kernel indexes rows as `m_start // BLOCK_M`.
+    Default 128. Pass 256 (with 256-aligned segments) to enable the large-M
+    BLOCK_M=256 fast path. This cannot be validated at runtime without a host sync
+    that would break CUDA-graph capture, so it is a caller contract.
     """
     # Validate inputs
     assert transpose_a == False and transpose_b == True, "Only NT layout is supported"
@@ -485,7 +525,7 @@ def ragged_block_scaled_bmm(
         max_m_device = torch.tensor([max_m], dtype=torch.int32, device=a.device)
 
     # Get kernel configs
-    default_configs = _get_default_kernel_configs(total_m, Q, VEC_SIZE)
+    default_configs = _get_default_kernel_configs(total_m, Q, VEC_SIZE, segment_alignment)
     kernel_configs = {**default_configs, **(kwargs.get("kernel_configs") or {})}
 
     BLOCK_M = kernel_configs.get("BLOCK_M")
@@ -495,6 +535,15 @@ def ragged_block_scaled_bmm(
     swap_ab = kernel_configs.get("swap_ab", False)
     num_ctas = kernel_configs.get("num_ctas", 1)
     occupancy = kernel_configs.get("occupancy", 1)
+
+    # The kernel indexes segment rows as `m_start // BLOCK_M`, so every segment
+    # offset must be a multiple of BLOCK_M. Guard here (also catches an explicit
+    # kernel_configs BLOCK_M override) rather than silently corrupting output.
+    if segment_alignment % BLOCK_M != 0:
+        raise ValueError(
+            f"BLOCK_M ({BLOCK_M}) must divide segment_alignment ({segment_alignment}); "
+            "align m_indptr segments to a multiple of BLOCK_M or pass a smaller BLOCK_M."
+        )
 
     # Calculate grid size for persistent scheduling
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
