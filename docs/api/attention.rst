@@ -148,6 +148,7 @@ PageAttention for MLA
     :toctree: ../generated
 
     trtllm_batch_decode_with_kv_cache_mla
+    trtllm_batch_decode_sparse_mla_dsv4
     xqa_batch_decode_with_kv_cache_mla
 
 .. autoclass:: BatchMLAPagedAttentionWrapper

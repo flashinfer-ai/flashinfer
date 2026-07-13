@@ -88,3 +88,13 @@ CuTe-DSL block-sparse attention forward kernels.
 
     bsa_attn_fwd
     bsa_attn_blk64_fwd
+
+HCA Decode
+----------
+
+.. currentmodule:: flashinfer.cute_dsl.attention.wrappers.batch_hca
+
+.. autosummary::
+    :toctree: ../generated
+
+    cute_dsl_hca_decode

@@ -10,6 +10,11 @@ Both backends therefore read the same FP8 cache rows in the same logical order.
 The benchmark reports raw backend latency and public FlashInfer API latency with
 both hot and flushed L2 caches. JIT compilation and the first launch are always
 excluded from timing.
+
+For causal Q > 1, the current HCA ABI requires one compacted 128-slot window
+pool row per query token. This benchmark materializes that row-private pool
+before timing; its construction cost is intentionally excluded from both
+backends' kernel measurements.
 """
 
 from __future__ import annotations
