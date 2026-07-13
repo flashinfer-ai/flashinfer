@@ -11,7 +11,10 @@ import pytest
 def test_validate_arch_skips_when_cuda_unavailable():
     from flashinfer.moe_ep.core.validation.common import validate_arch_for_backend
 
-    with mock.patch("torch.cuda.is_available", return_value=False):
+    with (
+        mock.patch("torch.version.cuda", "13.0"),
+        mock.patch("torch.cuda.is_available", return_value=False),
+    ):
         validate_arch_for_backend("nccl_ep")
 
 
@@ -21,6 +24,7 @@ def test_validate_arch_rejects_pre_hopper(backend: str):
     from flashinfer.moe_ep.core.validation.common import validate_arch_for_backend
 
     with (
+        mock.patch("torch.version.cuda", "13.0"),
         mock.patch("torch.cuda.is_available", return_value=True),
         mock.patch("torch.cuda.current_device", return_value=0),
         mock.patch("torch.cuda.get_device_capability", return_value=(8, 6)),
@@ -34,6 +38,7 @@ def test_validate_arch_accepts_hopper(backend: str):
     from flashinfer.moe_ep.core.validation.common import validate_arch_for_backend
 
     with (
+        mock.patch("torch.version.cuda", "13.0"),
         mock.patch("torch.cuda.is_available", return_value=True),
         mock.patch("torch.cuda.current_device", return_value=0),
         mock.patch("torch.cuda.get_device_capability", return_value=(9, 0)),

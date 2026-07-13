@@ -17,9 +17,6 @@ import os
 
 import pytest
 
-deep_gemm = pytest.importorskip("deep_gemm")
-pytest.importorskip("triton")
-
 
 def _launcher_ranks() -> tuple[int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -186,6 +183,7 @@ def _mega_problem(rank: int, world_size: int):
 
 def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
     """Reference deep_gemm mega-MoE path for correctness checks."""
+    import deep_gemm
     import torch
 
     from flashinfer.moe_ep import DeepGemmMegaMoeConfig, preprocess_mega_weights
@@ -308,6 +306,8 @@ def _run_mega_layer(rank, world_size):
 @pytest.mark.arch_blackwell
 def test_moe_ep_mega_layer_matches_deep_gemm_reference():
     """MoEEpMegaLayer matches the deep_gemm mega-MoE reference."""
+    pytest.importorskip("deep_gemm")
+    pytest.importorskip("triton")
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:

@@ -173,7 +173,10 @@ def test_split_layer_rejects_nixl_oversized_tokens_at_init(dist_not_initialized)
         NvepConfig,
     )
 
-    with pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"):
+    with (
+        mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"),
+        pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"),
+    ):
         MoEEpSplitLayer(
             bootstrap=BootstrapConfig(
                 world_size=1,
@@ -206,7 +209,10 @@ def test_split_layer_rejects_nixl_topology_capacity_mismatch_at_init(
         NvepConfig,
     )
 
-    with pytest.raises(MoEEpConfigError, match="topology capacity"):
+    with (
+        mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"),
+        pytest.raises(MoEEpConfigError, match="topology capacity"),
+    ):
         MoEEpSplitLayer(
             bootstrap=BootstrapConfig(
                 world_size=2,
@@ -260,6 +266,8 @@ def test_split_layer_forward_rejects_token_overflow(stubbed_fleet_registry):
 
 
 def test_split_layer_nixl_rejects_missing_tcp_store_at_init(dist_not_initialized):
+    from unittest import mock
+
     from flashinfer.moe_ep import (
         BootstrapConfig,
         MoEEpConfigError,
@@ -269,7 +277,10 @@ def test_split_layer_nixl_rejects_missing_tcp_store_at_init(dist_not_initialized
         dummy_moe_weights,
     )
 
-    with pytest.raises(MoEEpConfigError, match="tcp_store"):
+    with (
+        mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"),
+        pytest.raises(MoEEpConfigError, match="tcp_store"),
+    ):
         MoEEpSplitLayer(
             bootstrap=BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False),
             fleet_params=FleetParams(

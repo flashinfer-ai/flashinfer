@@ -90,6 +90,11 @@ def _mega_config(*, preprocess_weights: bool = False):
 
 
 def test_factory_returns_split_for_string_backend():
+    import torch
+
+    if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
+        pytest.skip("EP runtime wheels require CUDA 13+")
+
     from flashinfer.moe_ep import BootstrapConfig, MoEEpLayer, MoEEpSplitLayer
 
     layer = MoEEpLayer(
@@ -102,6 +107,11 @@ def test_factory_returns_split_for_string_backend():
 
 
 def test_factory_returns_split_for_nvep_config():
+    import torch
+
+    if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
+        pytest.skip("EP runtime wheels require CUDA 13+")
+
     from flashinfer.moe_ep import (
         BootstrapConfig,
         MoEEpLayer,
@@ -123,7 +133,9 @@ def test_factory_returns_mega_for_mega_config(dist_not_initialized):
 
     from flashinfer.moe_ep import BootstrapConfig, MoEEpLayer, MoEEpMegaLayer
 
-    with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
+    with mock.patch(
+        "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+    ):
         layer = MoEEpLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
             fleet_params=_mega_fleet_params(),
@@ -144,7 +156,9 @@ def test_factory_mega_ignores_fleet_knobs_warns(dist_not_initialized):
     )
 
     with (
-        mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"),
+        mock.patch(
+            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+        ),
         pytest.warns(UserWarning, match="fleet_knobs are ignored"),
     ):
         layer = MoEEpLayer(

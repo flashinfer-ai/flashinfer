@@ -43,7 +43,9 @@ def _mega_layer(
         MoEWeightPack,
     )
 
-    with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
+    with mock.patch(
+        "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+    ):
         if transformed_weights is None:
             transformed_weights = _fake_deep_gemm_transformed()
         return MoEEpMegaLayer(
@@ -317,7 +319,9 @@ def test_mega_layer_init_rejects_bad_fleet_weights(dist_not_initialized):
     )
 
     with (
-        mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"),
+        mock.patch(
+            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+        ),
         pytest.raises(MoEEpConfigError, match="num_experts // world_size"),
     ):
         MoEEpMegaLayer(
@@ -352,7 +356,9 @@ def test_mega_layer_init_skips_fleet_weights_when_transformed_supplied(
         MoEWeightPack,
     )
 
-    with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
+    with mock.patch(
+        "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+    ):
         layer = MoEEpMegaLayer(
             bootstrap=BootstrapConfig(world_size=4, rank=0, auto_bootstrap=False),
             fleet_params=FleetParams(

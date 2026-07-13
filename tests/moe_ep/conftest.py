@@ -41,6 +41,8 @@ def dist_not_initialized():
 @pytest.fixture
 def stubbed_fleet_registry():
     """Inject a stub Fleet class that records dispatch/combine/destroy calls."""
+    from unittest import mock
+
     from flashinfer.moe_ep.core.comm.fleet import _BACKEND_REGISTRY
 
     log: list[str] = []
@@ -85,7 +87,8 @@ def stubbed_fleet_registry():
     saved_nixl = _BACKEND_REGISTRY.get("nixl_ep")
     _BACKEND_REGISTRY["nccl_ep"] = _StubFleet
     _BACKEND_REGISTRY["nixl_ep"] = _StubFleet
-    yield log
+    with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
+        yield log
     if saved_nccl is not None:
         _BACKEND_REGISTRY["nccl_ep"] = saved_nccl
     else:

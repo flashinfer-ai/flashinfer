@@ -134,9 +134,12 @@ def capturing_stub_fleet():
         def destroy(self):
             pass
 
+    from unittest import mock
+
     saved = _BACKEND_REGISTRY.get("nccl_ep")
     _BACKEND_REGISTRY["nccl_ep"] = _StubFleet
-    yield captured
+    with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
+        yield captured
     if saved is not None:
         _BACKEND_REGISTRY["nccl_ep"] = saved
     else:
