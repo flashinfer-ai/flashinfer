@@ -221,8 +221,8 @@ def bench_cute_dsl(
     """
     import contextlib
 
-    from flashinfer.autotuner import autotune
     from flashinfer import SfLayout, nvfp4_quantize
+    from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
@@ -1075,7 +1075,7 @@ def main():
     parser.add_argument(
         "--use-per-token-activation",
         action="store_true",
-        help=("Use per-token NVFP4 activation scaling for supported FP4 MoE backends."),
+        help="Use per-token NVFP4 activation scaling for supported FP4 MoE backends.",
     )
     parser.add_argument(
         "--routing-bias-scale",

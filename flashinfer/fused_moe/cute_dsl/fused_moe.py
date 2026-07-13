@@ -218,6 +218,7 @@ def _moe_core_impl(
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
+
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
@@ -908,6 +909,7 @@ def cute_dsl_fused_moe_nvfp4(
     per_token_scale : Optional[torch.Tensor]
         Per-token input row scale for GEMM1. Passing this enables the
         per-token activation path.
+
     Returns
     -------
     torch.Tensor
