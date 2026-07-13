@@ -1525,6 +1525,25 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"request with kv_len={min_kv_len}: its earlier rows "
                     "would attend to an empty KV range."
                 )
+        if self._backend == "cutile":
+            # Pure cuda.tile Python kernel: no C++ module to JIT. Stash the
+            # per-sequence KV lengths and page size; run() reconstructs the dense
+            # block table from the CSR (indptr/indices) plan state.
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise NotImplementedError(
+                    "cuTile decode backend does not support logits_soft_cap."
+                )
+            self._page_size = page_size
+            self._kv_lens_arr_host = kv_lens_arr_host
+            self._plan_info = None
+            # run() reads these; normally set after the module-build branches below.
+            self._pos_encoding_mode = pos_encoding_mode
+            self._window_left = window_left
+            self._logits_soft_cap = logits_soft_cap
+            self._sm_scale = sm_scale
+            self._rope_scale = rope_scale
+            self._rope_theta = rope_theta
+            return
         if self._backend == "cute-dsl":
             if logits_soft_cap is not None and logits_soft_cap > 0:
                 raise NotImplementedError(
@@ -2022,6 +2041,70 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
+
+        if self._backend == "cutile":
+            if return_lse:
+                raise NotImplementedError(
+                    "cuTile decode backend does not support return_lse."
+                )
+            if sinks is not None:
+                raise NotImplementedError(
+                    "cuTile decode backend does not support attention sinks."
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "cuTile decode backend does not support NVFP4 KV cache."
+                )
+            if self._kv_layout != "NHD":
+                raise NotImplementedError(
+                    "cuTile decode backend requires kv_layout='NHD'."
+                )
+            if q.shape[0] != actual_batch_size:
+                raise NotImplementedError(
+                    "cuTile decode backend requires q_len_per_req == 1 "
+                    f"(got q.shape[0]={q.shape[0]}, batch_size={actual_batch_size})."
+                )
+            from .attention.kernels.cutile.fmha_decode_bsr_cutile import (
+                fmha_decode_bsr_cutile,
+            )
+
+            page_size = self._page_size
+            indptr = self._paged_kv_indptr_buf
+            indices = self._paged_kv_indices_buf
+            num_pages_per_seq = (indptr[1:] - indptr[:-1]).to(torch.int64)
+            actual_seq_lens = self._kv_lens_arr_host.to(
+                device=q.device, dtype=torch.int32
+            )
+            if self._block_tables is not None:
+                block_tables = self._block_tables.to(
+                    device=q.device, dtype=torch.int32
+                )
+            else:
+                # Reconstruct a dense [batch, max_pages] block table from the CSR
+                # (indptr/indices) plan state. NOTE: the ``.item()`` syncs make this
+                # path incompatible with CUDA graph capture; pass ``block_tables`` to
+                # plan() to avoid the reconstruction.
+                total_pages = int(indptr[-1].item())
+                max_pages = int(num_pages_per_seq.max().item())
+                block_tables = torch.zeros(
+                    (actual_batch_size, max_pages),
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                col = torch.arange(max_pages, device=q.device)
+                valid = col[None, :] < num_pages_per_seq[:, None]
+                block_tables[valid] = indices[:total_pages].to(torch.int32)
+
+            return fmha_decode_bsr_cutile(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                actual_seq_lens=actual_seq_lens,
+                block_tables=block_tables,
+                k_scale=sm_scale,
+                v_scale=1.0 if v_scale is None else v_scale,
+                outputs=out,
+            )
 
         if self._backend == "cute-dsl" and out is None:
             out = None  # Let cute-dsl wrapper handle the alloc

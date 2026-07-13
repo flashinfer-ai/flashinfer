@@ -87,6 +87,7 @@ def warmup_jit():
     yield
 
 
+@pytest.mark.parametrize("backend", ["fa2", "cutile"])
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
 @pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
@@ -101,6 +102,7 @@ def warmup_jit():
 @pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("contiguous_kv", [True])
 def test_batch_decode_with_paged_kv_cache(
+    backend,
     batch_size,
     kv_len,
     page_size,
@@ -115,6 +117,23 @@ def test_batch_decode_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
+    # cuTile decode backend capability bounds (mirror the NotImplemented guards
+    # in BatchDecodeWithPagedKVCacheWrapper.run for backend=="cutile").
+    if backend == "cutile":
+        if kv_layout != "NHD":
+            pytest.skip("cuTile decode requires kv_layout='NHD'.")
+        if pos_encoding_mode != "NONE":
+            pytest.skip("cuTile decode does not apply RoPE (pos_encoding_mode must be NONE).")
+        if kv_dtype == torch.float8_e4m3fn:
+            pytest.skip("cuTile decode fp8 KV not covered yet.")
+        if head_dim > 256:
+            pytest.skip("cuTile decode head_dim>256 not covered yet.")
+        if page_size == 1:
+            # fmha_decode_bsr_cutile._load_page only implements NUM_PAGES in
+            # {1, 2, 4}; page_size=1 makes NUM_PAGES = BLOCK_N (up to 32) for the
+            # GQA autotune configs, which overflows those branches. Track the
+            # kernel fix separately (generalize _load_page to arbitrary NUM_PAGES).
+            pytest.skip("cuTile decode kernel does not support page_size=1 yet.")
     skip_if_head_dim_dtype_unsupported(head_dim, kv_dtype)
     q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
@@ -152,7 +171,7 @@ def test_batch_decode_with_paged_kv_cache(
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer, kv_layout, backend=backend
     )
     wrapper.plan(
         kv_indptr,
@@ -167,7 +186,10 @@ def test_batch_decode_with_paged_kv_cache(
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
-    if return_lse:
+    # cuTile decode backend does not support return_lse; the reference
+    # comparison below only checks `o`, so drop the LSE request for it.
+    want_lse = return_lse and backend != "cutile"
+    if want_lse:
         o, _ = wrapper.run(q, kv_data, return_lse=True)
     else:
         o = wrapper.run(q, kv_data)
