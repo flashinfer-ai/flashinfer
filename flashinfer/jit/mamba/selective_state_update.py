@@ -173,7 +173,7 @@ def gen_selective_state_update_module(
     # "No supported CUDA architectures found" instead of failing in nvcc.
     compilation_context = CompilationContext()
     nvcc_flags = compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[8, 9, 10, 11, 12]
+        supported_major_versions=[8, 9, 10, 11]
     )
     return _gen_module(
         uri,
@@ -226,7 +226,7 @@ def gen_selective_state_update_sm90_module(
     )
     compilation_context = CompilationContext()
     nvcc_flags = compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 11, 12]
+        supported_major_versions=[9, 10, 11]
     )
     nvcc_flags += ["-DFLASHINFER_MAMBA_ENABLE_SM90"]
     return _gen_module(
