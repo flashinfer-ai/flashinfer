@@ -423,11 +423,18 @@ if CUDNN_AVAILABLE:
                 cudnn_cu_seq_lens_kv.set_uid(UIDs.ACTUAL_SEQ_LENS_KV_UID.value)
 
                 padding_mask = True
-                # cu_seq_len kwargs are gated behind cudnn-frontend 1.25+, so
-                # only mention them when the direct path is taken.
+                # These kwargs need a newer cudnn-frontend than the declared
+                # >=1.13 floor (cu_seq_len_*: 1.25+; implementation /
+                # attention_implementation: 1.14+), so they are only mentioned
+                # on this path, which _cudnn_supports_direct_seqlens guards.
                 seq_len_kwargs = {
                     "cu_seq_len_q": cudnn_cu_seq_lens_q,
                     "cu_seq_len_kv": cudnn_cu_seq_lens_kv,
+                    # cu_seq_lens are unified-engine-only; pin the
+                    # implementation so an unsupported config fails with the
+                    # unified engine's specific error instead of
+                    # auto-selection's generic failure.
+                    "implementation": cudnn.attention_implementation.UNIFIED,
                 }
             else:
                 if actual_seq_lens_q is not None:
