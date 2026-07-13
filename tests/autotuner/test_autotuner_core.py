@@ -821,6 +821,31 @@ def test_prepare_input_tensors_none_input_preserved():
     assert prepared[1] is None  # None stays None
 
 
+@pytest.mark.parametrize(
+    "non_tensor",
+    [torch.bfloat16, None],
+    ids=["dtype", "none"],
+)
+def test_prepare_input_tensors_with_batches_preserves_non_tensor(
+    monkeypatch, non_tensor
+):
+    """Cold-L2 batches clone tensors while preserving scalar and optional inputs."""
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4)
+    inputs = [torch.ones(1), non_tensor]
+
+    batches = tuner._prepare_input_tensors_with_batches(
+        inputs, TuningConfig(use_cold_l2_cache=True)
+    )
+
+    assert batches[0] is inputs
+    assert len(batches) > 1
+    for batch in batches[1:]:
+        assert batch[0] is not inputs[0]
+        torch.testing.assert_close(batch[0], inputs[0])
+        assert batch[1] is non_tensor
+
+
 def test_choose_one_with_none_input_no_crash():
     """choose_one inference path should not crash when an input tensor is None."""
     tuner = reset_autotuner()
