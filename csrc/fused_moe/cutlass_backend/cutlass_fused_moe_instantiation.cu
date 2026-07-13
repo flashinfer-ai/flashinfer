@@ -46,6 +46,7 @@ template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat1
 #ifdef ENABLE_FP4
 template class CutlassMoeFCRunner<Fp4Type, Fp4Type, half>;
 template class CutlassMoeFCRunner<Fp4Type, Fp4Type, half, half>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, half>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, half, half, half, false,
                                   Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>;
 // PHASE3_POST_MMA_PLACEHOLDER: future post-MMA MXFP4 x FP8/MXFP8 paths should
@@ -55,6 +56,7 @@ template class CutlassMoeFCRunner<half, Fp4Type>;
 #ifdef ENABLE_BF16
 template class CutlassMoeFCRunner<Fp4Type, Fp4Type, __nv_bfloat16>;
 template class CutlassMoeFCRunner<Fp4Type, Fp4Type, __nv_bfloat16, __nv_bfloat16>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16, __nv_bfloat16,
                                   __nv_bfloat16, false, Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>;
 template class CutlassMoeFCRunner<__nv_bfloat16, Fp4Type>;
