@@ -236,7 +236,11 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
   // perform the best for mixed type gemms.
 
 #if defined(ENABLE_FP4)
-  TLLM_CHECK(sizeof(T) == (std::is_same_v<WeightType, Fp4Type>) ? 2 : 1);
+  static constexpr size_t ExpectedActivationBytes =
+      Sm90Wfp4Afp8Mode != Sm90Wfp4Afp8ScaleMode::kDisabled
+          ? 1
+          : (std::is_same_v<WeightType, Fp4Type> ? 2 : 1);
+  TLLM_CHECK(sizeof(T) == ExpectedActivationBytes);
 #else
   TLLM_CHECK(sizeof(T) == 1);
 #endif

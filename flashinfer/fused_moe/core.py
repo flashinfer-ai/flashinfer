@@ -973,6 +973,11 @@ def cutlass_fused_moe(
     major, minor = torch.cuda.get_device_capability()
     device_arch = f"{major * 10 + minor}"
 
+    if use_wfp4afp8_humming and device_arch != "90":
+        raise NotImplementedError(
+            "Humming-style MXFP4 x FP8 fused MoE is only implemented for SM90."
+        )
+
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
 
