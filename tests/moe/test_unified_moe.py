@@ -1296,3 +1296,60 @@ class TestTrtllmEPOffset:
             f"offset={local_expert_offset}: EP-shard output diverges from the "
             f"offset-0 baseline ({pct * 100:.2f}% within tolerance, atol={atol:.4f})"
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. prepare_trtllm_bf16_weights input contract
+# ---------------------------------------------------------------------------
+# Validation fires before any CUDA work, so the negative tests are CPU-only.
+
+
+class TestPrepareTrtllmBf16Weights:
+    _E, _I, _H = 2, 64, 128
+
+    def _weights(self, dtype=torch.bfloat16):
+        E, I, H = self._E, self._I, self._H
+        return (
+            torch.randn(E, 2 * I, H).to(dtype),
+            torch.randn(E, H, I).to(dtype),
+        )
+
+    def _prepare(self, w1, w2, **overrides):
+        kwargs = dict(
+            num_local_experts=self._E,
+            hidden_size=self._H,
+            intermediate_size=self._I,
+        )
+        kwargs.update(overrides)
+        return TrtllmBf16Config.prepare_weights(w1, w2, **kwargs)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+    def test_rejects_non_bf16_dtype(self, dtype):
+        w1, w2 = self._weights(dtype)
+        with pytest.raises(ValueError, match="bf16"):
+            self._prepare(w1, w2)
+
+    def test_rejects_wrong_shape(self):
+        w1, w2 = self._weights()
+        with pytest.raises(ValueError, match="shape"):
+            self._prepare(w1[:, : self._I], w2)  # missing the gate half of gemm1
+
+    @sm100_required
+    def test_normalizes_noncontiguous_and_cpu_inputs(self):
+        """Non-contiguous and CPU-resident inputs yield the same views as the
+        contiguous on-device call (the .to(device).contiguous() normalization)."""
+        w1, w2 = self._weights()
+        w1, w2 = w1.cuda(), w2.cuda()
+        base = self._prepare(w1, w2)
+
+        # Same values, non-contiguous layout.
+        w1_nc = w1.transpose(1, 2).contiguous().transpose(1, 2)
+        assert not w1_nc.is_contiguous()
+        nc = self._prepare(w1_nc, w2)
+
+        # CPU-resident inputs with an explicit device target.
+        cpu = self._prepare(w1.cpu(), w2.cpu(), device=torch.device("cuda"))
+
+        for view in (nc, cpu):
+            for key in ("gemm1_weights", "gemm2_weights"):
+                assert torch.equal(view[key], base[key])
