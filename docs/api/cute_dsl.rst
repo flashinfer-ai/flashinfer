@@ -63,3 +63,10 @@ CuTe-DSL implementations of the batch attention wrappers.
     :members:
 
     .. automethod:: __init__
+
+.. currentmodule:: flashinfer.cute_dsl.attention.wrappers.batch_hca
+
+.. autosummary::
+    :toctree: ../generated
+
+    cute_dsl_hca_decode
