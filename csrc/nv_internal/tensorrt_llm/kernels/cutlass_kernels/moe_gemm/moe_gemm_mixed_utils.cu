@@ -43,13 +43,13 @@ __global__ void interleave_fp4_weights_for_sm90_mixed_gemm_kernel(uint8_t* fp4_w
       int third_fp4_id = first_fp4_id + 4;
       int fourth_fp4_id = second_fp4_id + 4;
 
-      uint8_t fp4x2[4];
+      uint32_t fp4x8_raw = 0;
+      uint8_t* fp4x2 = reinterpret_cast<uint8_t*>(&fp4x8_raw);
       fp4x2[0] = fp4_weight[first_fp4_id];
       fp4x2[1] = fp4_weight[second_fp4_id];
       fp4x2[2] = fp4_weight[third_fp4_id];
       fp4x2[3] = fp4_weight[fourth_fp4_id];
 
-      uint32_t fp4x8_raw = *reinterpret_cast<uint32_t*>(fp4x2);
       uint32_t fp4x8_interleaved = 0;
       uint32_t mask;
 

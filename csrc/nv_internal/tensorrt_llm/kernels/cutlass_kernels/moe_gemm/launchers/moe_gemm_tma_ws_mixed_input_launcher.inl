@@ -357,8 +357,11 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
   static constexpr int CurrentClusterShapeM = cute::size<0>(ClusterShape{});
   static constexpr int CurrentClusterShapeN = cute::size<1>(ClusterShape{});
   int64_t const total_routed_tokens = hopper_inputs.precomputed_scheduler_total_routed_tokens;
-  TLLM_CHECK_WITH_INFO(total_routed_tokens > 0,
-                       "Precomputed scheduler requires total routed token count.");
+  TLLM_CHECK_WITH_INFO(total_routed_tokens >= 0,
+                       "Precomputed scheduler requires a nonnegative routed token count.");
+  if (total_routed_tokens == 0) {
+    return;
+  }
   auto precomputed_workspace =
       detail::partition_precomputed_scheduler_workspace<CurrentTileShapeM, CurrentTileShapeN,
                                                         CurrentClusterShapeM, CurrentClusterShapeN,
