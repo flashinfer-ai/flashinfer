@@ -128,12 +128,6 @@ def test_batch_decode_with_paged_kv_cache(
             pytest.skip("cuTile decode fp8 KV not covered yet.")
         if head_dim > 256:
             pytest.skip("cuTile decode head_dim>256 not covered yet.")
-        if page_size == 1:
-            # fmha_decode_bsr_cutile._load_page only implements NUM_PAGES in
-            # {1, 2, 4}; page_size=1 makes NUM_PAGES = BLOCK_N (up to 32) for the
-            # GQA autotune configs, which overflows those branches. Track the
-            # kernel fix separately (generalize _load_page to arbitrary NUM_PAGES).
-            pytest.skip("cuTile decode kernel does not support page_size=1 yet.")
     skip_if_head_dim_dtype_unsupported(head_dim, kv_dtype)
     q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
