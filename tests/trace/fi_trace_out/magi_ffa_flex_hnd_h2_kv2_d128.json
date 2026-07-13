@@ -40,6 +40,13 @@
       "description": "Always 2: [start, end) bounds of a range."
     }
   },
+  "constraints": [
+    "num_tokens_q > 0",
+    "num_tokens_kv > 0",
+    "num_ranges > 0",
+    "num_ranges <= num_tokens_q",
+    "num_qo_heads % num_kv_heads == 0"
+  ],
   "inputs": {
     "q": {
       "shape": [
@@ -91,9 +98,9 @@
     },
     "return_lse": {
       "shape": null,
-      "dtype": "int32",
+      "dtype": "bool",
       "optional": true,
-      "description": "Bool: also return LSE."
+      "description": "Also return LSE."
     }
   },
   "outputs": {

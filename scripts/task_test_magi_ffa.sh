@@ -29,8 +29,21 @@ python - <<'PY'
 from importlib import import_module
 from importlib.metadata import version
 
-print(f"magi_attention={version('magi_attention')}")
-print(f"nvidia-cutlass-dsl={version('nvidia-cutlass-dsl')}")
+from packaging.version import Version
+
+expected_magi = Version("1.1.0.post10")
+installed_magi = Version(version("magi_attention"))
+installed_cutlass_dsl = Version(version("nvidia-cutlass-dsl"))
+
+assert Version(installed_magi.public) == expected_magi, (
+    f"expected magi_attention {expected_magi}, got {installed_magi}"
+)
+assert installed_cutlass_dsl >= Version("4.5.0"), (
+    f"expected nvidia-cutlass-dsl>=4.5.0, got {installed_cutlass_dsl}"
+)
+
+print(f"magi_attention={installed_magi}")
+print(f"nvidia-cutlass-dsl={installed_cutlass_dsl}")
 
 import_module("flashinfer")
 magi_api = import_module("magi_attention.api")
@@ -40,3 +53,5 @@ print("FlashInfer and MagiAttention imports OK")
 PY
 
 FLASHINFER_TEST_MAGI_FFA_EXTENDED=1 python -m pytest -s tests/ffa
+FLASHINFER_TEST_MAGI_FFA_EXTENDED=1 \
+  python -m pytest -s tests/trace/test_flex_flash_attn_reference_correctness.py

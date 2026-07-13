@@ -3760,9 +3760,9 @@ def _magi_ffa_flex_check(
 
 @torch.no_grad()
 def _magi_ffa_flex_reference(
-    q, k, v, q_ranges, k_ranges, attn_type_map=None, return_lse=None
+    q, k, v, q_ranges, k_ranges, attn_type_map=None, return_lse=False
 ):
-    """Ranged attention reference (NHD layout, single-output form).
+    """Ranged attention reference for the NHD adapter surface.
 
     Builds the (num_tokens_q, num_tokens_kv) allow-mask from the ranges, then
     runs one softmax over each query row's union of allowed keys — the same
@@ -3771,7 +3771,6 @@ def _magi_ffa_flex_reference(
     bottom-right aligned); types 2/3 are owned by MagiAttention and are not
     modeled here.
     """
-    del return_lse  # reference models the single-output (out-only) form
     num_tokens_q, num_qo_heads, head_dim = q.shape
     num_tokens_kv, num_kv_heads, _ = k.shape
     scale = 1.0 / math.sqrt(head_dim)
@@ -3798,11 +3797,13 @@ def _magi_ffa_flex_reference(
     v_h = v.repeat_interleave(gqa_ratio, dim=1).to(torch.float32)
     scores = torch.einsum("qhd,khd->hqk", q.to(torch.float32), k_h) * scale
     scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1).transpose(0, 1).contiguous()
     probs = torch.softmax(scores, dim=-1)
     # Query rows outside every q_range have no allowed keys; FFA leaves them zero.
     probs = torch.nan_to_num(probs, nan=0.0)
     out = torch.einsum("hqk,khd->qhd", probs, v_h)
-    return out.to(q.dtype)
+    out = out.to(q.dtype)
+    return (out, lse) if return_lse else out
 
 
 def _magi_ffa_flex_init(
@@ -3813,37 +3814,74 @@ def _magi_ffa_flex_init(
     num_qo_heads: int = 2,
     num_kv_heads: int = 2,
     head_dim: int = 128,
+    return_lse: bool = False,
     device: str = "cuda",
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.magi_ffa.flex_flash_attn`` (NHD layout).
 
-    Sourced from ``tests/ffa/test_flex_flash_attn.py`` (real-path cases):
-    self-attention (``num_tokens_kv = num_tokens_q``) split into two ranges,
-    the first full and the second causal.
+    ``num_tokens_kv=0`` defaults to self-attention and ``num_ranges=0``
+    defaults to two ranges. Query tokens are partitioned into non-overlapping
+    ranges; each attends the full KV sequence, alternating full and causal
+    mask types so the reference exercises both supported semantics.
     """
-    del num_tokens_kv, num_ranges  # derived: = num_tokens_q / fixed at 2
+    if num_tokens_q <= 0:
+        raise ValueError("num_tokens_q must be positive")
+    if num_tokens_kv == 0:
+        num_tokens_kv = num_tokens_q
+    if num_tokens_kv <= 0:
+        raise ValueError("num_tokens_kv must be positive")
+    if num_ranges == 0:
+        num_ranges = min(2, num_tokens_q)
+    if num_ranges <= 0 or num_ranges > num_tokens_q:
+        raise ValueError("num_ranges must satisfy 1 <= num_ranges <= num_tokens_q")
+    if num_qo_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("num_qo_heads and num_kv_heads must be positive")
+    if num_qo_heads % num_kv_heads != 0:
+        raise ValueError("num_qo_heads must be divisible by num_kv_heads")
+    if head_dim <= 0:
+        raise ValueError("head_dim must be positive")
+
     torch.manual_seed(seed)
-    seq_len = num_tokens_q
-    half = seq_len // 2
-    return {
+    q_ranges = [
+        [
+            range_idx * num_tokens_q // num_ranges,
+            (range_idx + 1) * num_tokens_q // num_ranges,
+        ]
+        for range_idx in range(num_ranges)
+    ]
+    inputs = {
         "q": torch.randn(
-            seq_len, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+            num_tokens_q,
+            num_qo_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
         ),
         "k": torch.randn(
-            seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+            num_tokens_kv,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
         ),
         "v": torch.randn(
-            seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+            num_tokens_kv,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
         ),
-        "q_ranges": torch.tensor(
-            [[0, half], [half, seq_len]], dtype=torch.int32, device=device
-        ),
+        "q_ranges": torch.tensor(q_ranges, dtype=torch.int32, device=device),
         "k_ranges": torch.tensor(
-            [[0, half], [0, seq_len]], dtype=torch.int32, device=device
+            [[0, num_tokens_kv]] * num_ranges,
+            dtype=torch.int32,
+            device=device,
         ),
-        "attn_type_map": torch.tensor([0, 1], dtype=torch.int32, device=device),
+        "attn_type_map": torch.arange(num_ranges, dtype=torch.int32, device=device) % 2,
+        "return_lse": return_lse,
     }
+    return inputs
 
 
 def _make_magi_ffa_flex_trace(tensor_layout: str) -> TraceTemplate:
@@ -3903,9 +3941,7 @@ def _make_magi_ffa_flex_trace(tensor_layout: str) -> TraceTemplate:
                     "full attention."
                 ),
             ),
-            "return_lse": Scalar(
-                "int32", optional=True, description="Bool: also return LSE."
-            ),
+            "return_lse": Scalar("bool", optional=True, description="Also return LSE."),
         },
         outputs={
             "out": Tensor(
@@ -3925,6 +3961,13 @@ def _make_magi_ffa_flex_trace(tensor_layout: str) -> TraceTemplate:
             "stage:prefill",
             "backend:magi-attention",
             f"layout:{layout}",
+        ],
+        constraints=[
+            "num_tokens_q > 0",
+            "num_tokens_kv > 0",
+            "num_ranges > 0",
+            "num_ranges <= num_tokens_q",
+            "num_qo_heads % num_kv_heads == 0",
         ],
         # Reference/init/check are NHD-only (see the section comment above).
         reference=_magi_ffa_flex_reference if tensor_layout == "NHD" else None,
