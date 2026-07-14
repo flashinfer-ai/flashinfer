@@ -235,9 +235,6 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
     @pytest.mark.parametrize("trans_a, trans_b", [(False, True)])
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op(self, num_groups, m, n, k, dtype, out_dtype, trans_a, trans_b, backend):
-        if torch.cuda.get_device_capability(0) == (10, 3):
-            pytest.xfail("Skip on sm103: due to CUDA error: unspecified launch failure")
-
         if torch.cuda.get_device_capability()[0] == 8 and "float8" in dtype.__repr__():
             pytest.skip("FP8 is not supported on sm80 (Ampere).")
 
