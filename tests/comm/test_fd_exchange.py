@@ -86,8 +86,7 @@ def _make_file(rank: int) -> tuple[int, str]:
 
 
 def _read_fd(fd: int) -> str:
-    os.lseek(fd, 0, 0)
-    return os.read(fd, 128).decode()
+    return os.pread(fd, 128, 0).decode()
 
 
 def _worker_exchange(rank: int, size: int, barrier: Any, shared: Any, q: Any) -> None:
