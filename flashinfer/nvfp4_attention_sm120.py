@@ -134,7 +134,7 @@ def _preprocess_qkv(
     return q.contiguous(), k.contiguous(), v.contiguous(), qk_correction
 
 
-@supported_compute_capability([120])
+@supported_compute_capability([120, 121])
 @flashinfer_api(trace=nvfp4_attention_sm120_quantize_qkv_trace)
 def nvfp4_attention_sm120_quantize_qkv(
     q: torch.Tensor,
@@ -306,7 +306,7 @@ def _check_inputs(
     return batch, num_heads, seq_len, head_dim
 
 
-@supported_compute_capability([120])
+@supported_compute_capability([120, 121])
 @flashinfer_api(trace=nvfp4_attention_sm120_fwd_trace)
 def nvfp4_attention_sm120_fwd(
     q_fp4: torch.Tensor,

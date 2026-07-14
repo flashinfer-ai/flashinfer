@@ -34,14 +34,15 @@ def _patch_cutlass_dsl_operand_major_mode():
 _patch_cutlass_dsl_operand_major_mode()
 
 import flashinfer
-from flashinfer.utils import is_sm120a_supported
+from flashinfer.utils import is_sm120a_supported, is_sm121a_supported
 
 
 def _require_sm120():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if not is_sm120a_supported(torch.device("cuda")):
-        pytest.skip("SM120 GPU is required")
+    device = torch.device("cuda")
+    if not (is_sm120a_supported(device) or is_sm121a_supported(device)):
+        pytest.skip("SM120 or SM121 GPU is required")
 
 
 def _pad_seq_len_to_128(x):
