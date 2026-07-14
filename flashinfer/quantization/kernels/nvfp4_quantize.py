@@ -1482,16 +1482,21 @@ def _get_compiled_kernel_nvfp4_per_token(
 
 
 _TMA_MIN_M = 1024
-# TMA wins when the total problem is large enough to amortize pipeline overhead.
-# Empirically, floor(log2(M)) + floor(log2(K)) >= 25 is the crossover where TMA
-# outperforms the default vectorized-load kernel, validated on B200 and SM120.
-# We use bit_length()-1 (i.e., floor(log2)) rather than m*k to keep the boundary
-# aligned with the power-of-2 grid it was tuned on.
 _TMA_LOG2_MK_THRESHOLD = 25
 
 
 def _should_use_tma(m: int, k: int, dtype: torch.dtype) -> bool:
-    """Determine if TMA kernel should be used based on problem dimensions."""
+    """Determine if the TMA kernel should be used based on problem dimensions.
+
+    The TMA path is disabled by default: a full M/K sweep across all three SF
+    layouts on B200/SM100 found the vectorized-load kernel to be as fast or
+    faster than the TMA kernel everywhere, with the old ``log2(M)+log2(K) >= 25``
+    gate selecting TMA in regions where it was up to ~21% slower (flashinfer#3905).
+    Set ``FLASHINFER_NVFP4_QUANTIZE_USE_TMA=1`` to re-enable the heuristic for
+    re-tuning on other hardware.
+    """
+    if not _env_flag_enabled("FLASHINFER_NVFP4_QUANTIZE_USE_TMA"):
+        return False
     if dtype == torch.float8_e4m3fn:
         return False
     if k % _TMA_COLS_PER_STAGE != 0:
