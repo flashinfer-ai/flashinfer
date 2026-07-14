@@ -943,11 +943,7 @@ bool use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken;
 template <typename T, int NRanks, bool AllReduceOut, bool ResidualOut, bool NormOut, bool QuantOut>
 __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     MoeReductionAllReduceFusionParams<T> params) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   cg::grid_group grid = cg::this_grid();
@@ -1082,10 +1078,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
   }
   comm.update(params.size * NRanks);
   cudaTriggerProgrammaticLaunchCompletion();
-#endif
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
@@ -1244,7 +1236,7 @@ template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut,
           typename ScaleType = T>
 __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
     MoeFinalizeAllReduceFusionParams<T> params) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   cg::grid_group grid = cg::this_grid();
