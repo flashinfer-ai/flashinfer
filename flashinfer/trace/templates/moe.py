@@ -2963,6 +2963,12 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             dtype="float32",
             description="Per-expert FC2 global scale.",
         ),
+        "per_token_scale": Tensor(
+            ["num_tokens"],
+            dtype="float32",
+            optional=True,
+            description="Optional per-token input row scale.",
+        ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
         "local_expert_offset": Scalar(
@@ -3223,6 +3229,7 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
     swiglu_beta=DEFAULT_SWIGLU_BETA,
     swiglu_limit=DEFAULT_SWIGLU_LIMIT,
+    per_token_scale=None,
     **_unused,
 ):
     """Reference for CuteDSL NvFP4 fused MoE — bridges to the FP4
@@ -3233,6 +3240,8 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
     W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=False)
     W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=False)
+    if per_token_scale is not None:
+        hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
     W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
     W2 = W2 * w2_alpha.to(torch.float32).view(E_local, 1, 1)
     return _moe_bf16_run_experts(
