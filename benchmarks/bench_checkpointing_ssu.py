@@ -191,16 +191,27 @@ def _build_tensors(
 
     nheads/ngroups are already TP-split (i.e. full_nheads // tp_size).
 
-    Returns:
+    Returns (in tuple order); ring_len = max_window + mtp_len,
+    conv_dim = nheads*head_dim + 2*ngroups*d_state, d_conv = 4:
       state0                   : (batch, nheads, head_dim, d_state) – initial SSM state
+      state_scale              : (batch, nheads, head_dim) f32 decode-scale for
+                                 quantized state, else None
       intermediate_update_inputs: (batch, mtp_len, nheads*head_dim + nheads + ngroups*d_state)
                                    packed [x | dt_base | B] baseline caches
+      x_cache                  : (batch, nheads, ring_len, head_dim) ring x cache
+      B_cache                  : (batch, ngroups, ring_len, d_state) ring B cache
+      dt_cache                 : (batch, nheads, ring_len) f32 ring dt cache
+      ring_start               : (batch,) int32 per-slot ring head (zeros here)
       x, dt, B, C              : (batch, mtp_len, ...) – token inputs for both kernels
       A, dt_bias, D            : SSM parameters (float32, tie_hdim strides)
       prev_tokens              : (batch,)
       out_incr                 : pre-allocated output for the CUDA kernels (batch, mtp_len, nheads, head_dim)
       out_base                 : pre-allocated output for baseline kernel   (batch, mtp_len, nheads, head_dim)
       intermediate_states_buffer: for baseline kernel (batch, mtp_len, nheads, head_dim, d_state)
+      xbc_input                : (batch, conv_dim, mtp_len) conv1d input (in_proj layout)
+      conv_state               : (batch, conv_dim, d_conv) conv1d state cache
+      conv_weight              : (conv_dim, d_conv) conv1d weight
+      conv_bias                : (conv_dim,) conv1d bias
     """
     device = "cuda"
 
