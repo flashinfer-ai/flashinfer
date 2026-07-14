@@ -33,7 +33,7 @@ from .gemm_base import (
     _get_cudnn_workspace_size,
     _cudnn_graph_engine_knob_tactics,
     _finalize_cudnn_graph_for_tactic,
-    _is_cudnn_engine_knob_tactic,
+    _tactic_for_graph_cache,
     _torch_data_type_to_cudnn_data_type,
     _is_cudnn_override_shape_available,
     _check_cudnn_override_shape_availability,
@@ -109,7 +109,7 @@ def _build_bf16_fp4_graph_common(
     return c_final_cudnn_tensor
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def build_cudnn_bf16_fp4_graph(
     batch,
     m,
@@ -170,7 +170,7 @@ def build_cudnn_bf16_fp4_graph(
         return graph
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def build_cudnn_bf16_fp4_graph_override_shape(
     batch,
     n,
@@ -407,10 +407,7 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                 alpha_is_not_none=alpha is not None,
                 use_nvfp4=use_nvfp4,
                 cache_m=cache_m,
-                # tactic value only be 0 or -1 to hit the graph cache
-                tactic=(
-                    0 if _is_cudnn_engine_knob_tactic(tactic) or tactic >= 0 else -1
-                ),
+                tactic=_tactic_for_graph_cache(tactic),
             )
 
         def get_valid_tactics(
