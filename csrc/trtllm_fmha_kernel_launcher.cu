@@ -20,9 +20,13 @@
 #include <nvrtc.h>
 #include <tvm/ffi/container/variant.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 #include <flashinfer/utils.cuh>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 
@@ -51,8 +55,15 @@ enum class TllmPagedAttentionMode {
 // gating behind a debug flag.
 constexpr size_t kTrtllmGenSoftmaxStatsGuardBytes = 1 * 1024 * 1024;
 
-#include <memory>
-#include <mutex>
+inline size_t getTrtllmGenMultiCtasKvCounterBytes(int64_t batch_size, int64_t num_qo_heads,
+                                                  int64_t sm_count) {
+  size_t const request_counter_slots =
+      static_cast<size_t>(batch_size) * static_cast<size_t>(num_qo_heads);
+  size_t const sm_counter_slots = static_cast<size_t>(sm_count);
+  size_t const num_semaphores =
+      round_up(std::max(request_counter_slots, sm_counter_slots), static_cast<size_t>(8));
+  return num_semaphores * sizeof(uint32_t);
+}
 
 class TllmGenFmhaRunnerCache {
  public:
@@ -95,14 +106,15 @@ class TllmGenFmhaRunnerCache {
 
 void trtllm_paged_attention_launcher(
     void* out, void* out_scale_factor, void* query, void* key_cache, void* value_cache,
-    void* workspace_buffer, int* block_tables, const void* k_block_scales_ptr,
-    const void* v_block_scales_ptr, int* seq_lens, int* cum_seq_lens_q, int* cum_seq_lens_kv,
-    float* attention_sinks, float* lse, Data_type q_data_type, Data_type kv_data_type,
-    Data_type o_data_type, TllmPagedAttentionMode mode, int64_t batch_size, int64_t max_q_len,
-    int64_t max_kv_len, int64_t num_pages_in_mem_pool, int64_t num_qo_heads, int64_t num_kv_heads,
-    int64_t head_dim_qk, int64_t head_dim_vo, int64_t page_size, int64_t q_stride_tokens,
-    int64_t q_stride_heads, int64_t kv_stride_keys_values, int64_t kv_stride_heads,
-    int64_t kv_stride_batch, int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
+    void* workspace_buffer, void* multi_ctas_kv_counter_buffer, int64_t multi_ctas_kv_counter_size,
+    int* block_tables, const void* k_block_scales_ptr, const void* v_block_scales_ptr,
+    int* seq_lens, int* cum_seq_lens_q, int* cum_seq_lens_kv, float* attention_sinks, float* lse,
+    Data_type q_data_type, Data_type kv_data_type, Data_type o_data_type,
+    TllmPagedAttentionMode mode, int64_t batch_size, int64_t max_q_len, int64_t max_kv_len,
+    int64_t num_pages_in_mem_pool, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
+    int64_t head_dim_vo, int64_t page_size, int64_t q_stride_tokens, int64_t q_stride_heads,
+    int64_t kv_stride_keys_values, int64_t kv_stride_heads, int64_t kv_stride_batch,
+    int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
     const float* bmm1_scale_log2_ptr, const float* bmm2_scale_ptr, double o_sf_scale,
     int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left, int64_t sum_seq_q,
     int64_t sparse_mla_top_k, void* sliding_window_kv_pool, int* sparse_mla_top_k_lens,
@@ -121,7 +133,7 @@ void trtllm_paged_attention_launcher(
   // For paged attention, K and V have the same dtype (kv_data_type).
   auto fmha_runner =
       TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, kv_data_type, o_data_type);
-  TllmGenFmhaRunnerParams runner_params;
+  TllmGenFmhaRunnerParams runner_params{};
 
   // Common params
   runner_params.qPtr = query;
@@ -222,14 +234,17 @@ void trtllm_paged_attention_launcher(
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = nullptr;
 
-    size_t max_batch_size = 8192;   // todo(Yingyi): get from dlfw
-    size_t max_num_qo_heads = 256;  // todo(Yingyi): get from dlfw, in total 8MB
-    size_t num_semaphores =
-        round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
-    // Workspace layout for generation: counter | (softmax if lse) | scratch. The counter slab is
-    // kept at a fixed 8MB so test guard regions around the first 8MB remain stable.
-    runner_params.multiCtasKvCounterPtr = float_allocator.aligned_alloc<int32_t>(
-        num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
+    size_t const counter_bytes =
+        getTrtllmGenMultiCtasKvCounterBytes(batch_size, num_qo_heads, sm_count);
+    TVM_FFI_CHECK(multi_ctas_kv_counter_buffer != nullptr,
+                  "trtllm-gen multi-CTA KV counter buffer must not be null");
+    TVM_FFI_CHECK(reinterpret_cast<std::uintptr_t>(multi_ctas_kv_counter_buffer) % 16 == 0,
+                  "trtllm-gen multi-CTA KV counter buffer must be 16-byte aligned");
+    TVM_FFI_CHECK(static_cast<size_t>(multi_ctas_kv_counter_size) >= counter_bytes,
+                  "trtllm-gen multi-CTA KV counter buffer is too small: got " +
+                      std::to_string(multi_ctas_kv_counter_size) + " bytes, need " +
+                      std::to_string(counter_bytes) + " bytes");
+    runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(multi_ctas_kv_counter_buffer);
   }
 
   // Only allocate the softmax stats buffer when LSE is requested. The kernel's write layout is
@@ -299,8 +314,8 @@ inline bool is_4bit(Data_type data_type) { return data_type == Data_type::DATA_T
 
 void trtllm_paged_attention_decode(
     TensorView out, Optional<TensorView> out_scale_factor, TensorView query, TensorView key_cache,
-    TensorView value_cache, TensorView workspace_buffer, TensorView block_tables,
-    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+    TensorView value_cache, TensorView workspace_buffer, TensorView multi_ctas_kv_counter_buffer,
+    TensorView block_tables, TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
     Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
     double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
     int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count, bool enable_pdl,
@@ -424,8 +439,10 @@ void trtllm_paged_attention_decode(
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
-      workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()), k_block_scales_ptr,
-      v_block_scales_ptr, static_cast<int*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr,
+      workspace_buffer.data_ptr(), multi_ctas_kv_counter_buffer.data_ptr(),
+      multi_ctas_kv_counter_buffer.numel() * get_element_size(multi_ctas_kv_counter_buffer),
+      static_cast<int*>(block_tables.data_ptr()), k_block_scales_ptr, v_block_scales_ptr,
+      static_cast<int*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr,
       /*cum_seq_lens_kv*/ nullptr, attention_sinks_ptr, lse_ptr, q_data_type, kv_data_type,
       o_data_type, TllmPagedAttentionMode::ForGen, batch_size, max_q_len, max_kv_len,
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q, head_dim_o, page_size,
@@ -441,8 +458,8 @@ void trtllm_paged_attention_decode(
 
 void trtllm_paged_attention_context(
     TensorView out, Optional<TensorView> out_scale_factor, TensorView query, TensorView key_cache,
-    TensorView value_cache, TensorView workspace_buffer, TensorView block_tables,
-    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+    TensorView value_cache, TensorView workspace_buffer, TensorView multi_ctas_kv_counter_buffer,
+    TensorView block_tables, TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
     Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
     double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
     int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
@@ -560,8 +577,10 @@ void trtllm_paged_attention_context(
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
-      workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()), k_block_scales_ptr,
-      v_block_scales_ptr, static_cast<int*>(seq_lens.data_ptr()),
+      workspace_buffer.data_ptr(), multi_ctas_kv_counter_buffer.data_ptr(),
+      multi_ctas_kv_counter_buffer.numel() * get_element_size(multi_ctas_kv_counter_buffer),
+      static_cast<int*>(block_tables.data_ptr()), k_block_scales_ptr, v_block_scales_ptr,
+      static_cast<int*>(seq_lens.data_ptr()),
       /*cum_seq_lens_q=*/static_cast<int*>(cum_seq_lens_q.data_ptr()),
       /*cum_seq_lens_kv=*/static_cast<int*>(cum_seq_lens_kv.data_ptr()), attention_sinks_ptr,
       lse_ptr, q_data_type, kv_data_type, o_data_type, TllmPagedAttentionMode::Context, batch_size,
@@ -600,7 +619,7 @@ void trtllm_ragged_attention_launcher(
   auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, k_data_type, v_data_type, o_data_type,
                                                  num_elts_sage_q, num_elts_sage_k, num_elts_sage_p,
                                                  num_elts_sage_v);
-  TllmGenFmhaRunnerParams runner_params;
+  TllmGenFmhaRunnerParams runner_params{};
 
   runner_params.qPtr = query;
   runner_params.kPtr = key;
@@ -649,14 +668,6 @@ void trtllm_ragged_attention_launcher(
       is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
-  size_t max_batch_size = 8192;
-  size_t max_num_qo_heads = 256;
-  size_t num_semaphores =
-      round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
-  // Workspace layout: counter | (softmax if lse) | scratch. Keep the 8MB counter at the head so
-  // test guard regions around the first 8MB remain stable across LSE on/off calls.
-  runner_params.multiCtasKvCounterPtr = float_allocator.aligned_alloc<int32_t>(
-      num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
   // Only allocate the softmax stats slab when LSE is requested; size with the same
   // tile-aligned upper bound used by the paged launcher to prevent OOB writes on
   // variable-q workloads.
@@ -803,8 +814,9 @@ void trtllm_ragged_attention(
 
 void trtllm_paged_attention_decode_sparse_mla_dsv4(
     TensorView out, TensorView query, TensorView primary_kv_cache,
-    TensorView sliding_window_kv_cache, TensorView workspace_buffer, TensorView sparse_indices,
-    TensorView seq_lens, TensorView sparse_mla_top_k_lens, Variant<double, ffi::Tensor> bmm1_scale,
+    TensorView sliding_window_kv_cache, TensorView workspace_buffer,
+    TensorView multi_ctas_kv_counter_buffer, TensorView sparse_indices, TensorView seq_lens,
+    TensorView sparse_mla_top_k_lens, Variant<double, ffi::Tensor> bmm1_scale,
     Variant<double, ffi::Tensor> bmm2_scale, int64_t batch_size, int64_t max_q_len,
     int64_t sm_count, bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> cum_seq_lens_q) {
@@ -909,6 +921,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
   trtllm_paged_attention_launcher(
       out.data_ptr(), /*out_scale_factor=*/nullptr, query.data_ptr(), primary_kv_cache.data_ptr(),
       primary_kv_cache.data_ptr(), workspace_buffer.data_ptr(),
+      multi_ctas_kv_counter_buffer.data_ptr(),
+      multi_ctas_kv_counter_buffer.numel() * get_element_size(multi_ctas_kv_counter_buffer),
       static_cast<int*>(sparse_indices.data_ptr()), /*k_block_scales_ptr=*/nullptr,
       /*v_block_scales_ptr=*/nullptr, static_cast<int*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr,
       /*cum_seq_lens_kv=*/nullptr, attention_sinks_ptr, /*lse=*/nullptr, q_data_type, kv_data_type,

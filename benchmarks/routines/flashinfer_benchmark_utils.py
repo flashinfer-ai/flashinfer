@@ -27,6 +27,8 @@ output_column_dict = {
         "kv_dtype",
         "avg_actual_seq_len",
         "random_actual_seq_len",
+        "is_var_seq",
+        "cute_dsl_impl",
     ],
     "gemm": [
         "n",
@@ -135,6 +137,16 @@ output_column_dict = {
         "has_z",
         "dt_softplus",
     ],
+    "gdn": [
+        "num_q_heads",
+        "num_k_heads",
+        "num_v_heads",
+        "head_size",
+        "state_layout",
+        "pool_mode",
+        "update_state",
+        "use_qk_l2norm",
+    ],
     "general": [
         "batch_size",
         "hidden_size",
@@ -172,6 +184,7 @@ full_output_columns = (
     + output_column_dict["sampling"]
     + output_column_dict["rope"]
     + output_column_dict["mamba"]
+    + output_column_dict["gdn"]
     + output_column_dict["general"]
 )
 
@@ -186,8 +199,10 @@ benchmark_apis = {
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
         "bmm_fp8",
+        "mm_fp8",
         "bmm_mxfp8",
         "mm_fp4",
+        "mm_bf16_fp4",
         "mm_mxfp8",
         "mm_bf16",
         "bmm_bf16",
@@ -200,6 +215,7 @@ benchmark_apis = {
         "cutlass_fused_moe",
         "cute_dsl_fp4_block_scale_moe",
         "b12x_fused_moe",
+        "unified_nvfp4_moe",
         "bgmv_moe",
     ],
     "moe_comm": [
@@ -259,6 +275,11 @@ benchmark_apis = {
     ],
     "mamba": [
         "selective_state_update",
+    ],
+    "gdn": [
+        "gated_delta_rule_decode",
+        "gated_delta_rule_mtp",
+        "chunk_gated_delta_rule",
     ],
 }
 
@@ -391,7 +412,7 @@ routine_cc_to_supported_backends = {
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
         "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
-        "10.3": ["fa2", "cutlass", "trtllm-native"],
+        "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
         "12.0": ["fa2"],
         "12.1": ["fa2"],
     },
@@ -453,7 +474,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # Note: bmm_fp8, mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
+    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -520,6 +541,12 @@ routine_cc_to_supported_backends = {
         "10.3": [],
         "12.0": ["b12x"],
         "12.1": ["b12x"],
+    },
+    # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
+    # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
+    "unified_nvfp4_moe": {
+        "10.0": ["unified"],
+        "10.3": ["unified"],
     },
     # NORM
     "rmsnorm": {
@@ -925,6 +952,43 @@ routine_cc_to_supported_backends = {
         "11.0": ["flashinfer", "triton"],
         "12.0": ["flashinfer", "triton"],
         "12.1": ["flashinfer", "triton"],
+    },
+    # GDN (Gated Delta Net)
+    "gated_delta_rule_decode": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["flashinfer", "triton"],
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+        "11.0": ["triton"],
+        "12.0": ["triton"],
+        "12.1": ["triton"],
+    },
+    "gated_delta_rule_mtp": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["flashinfer", "triton"],
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+        "11.0": ["triton"],
+        "12.0": ["triton"],
+        "12.1": ["triton"],
+    },
+    "chunk_gated_delta_rule": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["flashinfer", "fla"],
+        "10.0": ["flashinfer", "fla"],
+        "10.3": ["flashinfer", "fla"],
+        "11.0": [],
+        "12.0": [],
+        "12.1": [],
     },
 }
 

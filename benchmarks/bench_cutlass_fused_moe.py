@@ -219,9 +219,10 @@ if __name__ == "__main__":
 
     configs = AutoTuner.get().profiling_cache
     if args.update_config and configs:
-        # The original key contains a runner's hash in k[2] which might be different across machines.
-        # So, we remove it for now. v[0] and v[1] are the runner id and the tactic.
-        converted = {str((k[0], k[1], k[3])): (v[0], v[1]) for k, v in configs.items()}
+        # ProfilingCacheKey.file_key excludes the runner's hash, which might be
+        # different across machines, and matches the lookup format used by
+        # load_from_file. v[0] and v[1] are the runner id and the tactic.
+        converted = {k.file_key: (v[0], v[1]) for k, v in configs.items()}
         config_path = get_config_path(is_module=False)
         with open(config_path, "w") as f:
             f.write("best_configs = ")

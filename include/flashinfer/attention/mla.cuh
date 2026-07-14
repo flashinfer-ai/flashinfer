@@ -32,6 +32,10 @@ namespace mla {
 
 struct StandardAttention : AttentionVariantBase {
   float sm_scale_log2;
+  // Per-tensor symmetric-quantization scales for the FP8 KV path. Both 1.0 on
+  // the BF16/FP16 path so they are no-ops there.
+  float ckv_scale;
+  float kpe_scale;
 
   PROFILER_CLOSURE_PARAMS_DECL
 
@@ -39,6 +43,8 @@ struct StandardAttention : AttentionVariantBase {
   __device__ __host__ StandardAttention(const Params& params, uint32_t batch_idx,
                                         uint8_t* smem_ptr) {
     sm_scale_log2 = params.sm_scale * math::log2e;
+    ckv_scale = params.ckv_scale;
+    kpe_scale = params.kpe_scale;
   }
 };
 

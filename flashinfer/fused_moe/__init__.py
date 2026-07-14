@@ -14,6 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# Unified MoE API
+from .api import (  # noqa: F401
+    ActivationConfig,
+    BackendOptions,
+    CuteDslConfig,
+    CutlassConfig,
+    ExecutionConfig,
+    ExpertConfig,
+    MoEActivationPack,
+    MoEConfig,
+    MoEWeightPack,
+    QuantConfig,
+    QuantVariant,
+    RoutingConfig,
+    TrtllmBf16Config,
+    TrtllmFp4Config,
+    TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
+)
+from .layer import MoELayer  # noqa: F401
+from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner  # noqa: F401
+
+# Legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
     convert_to_block_layout,
     cutlass_fused_moe,
@@ -47,12 +71,27 @@ from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
 )
 
+from .hash_topk import (  # noqa: F401
+    hash_topk as hash_topk,
+)
+
 from .bgmv_moe import (  # noqa: F401
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
     bgmv_moe_expand as bgmv_moe_expand,
     fill_w_ptr as fill_w_ptr,
     has_bgmv_moe as has_bgmv_moe,
+)
+from .moe_lora_delta import (  # noqa: F401
+    bgmv_moe_gemm1_lora_delta as bgmv_moe_gemm1_lora_delta,
+    bgmv_moe_gemm2_lora_delta as bgmv_moe_gemm2_lora_delta,
+)
+from .monomoe import (  # noqa: F401
+    mono_moe as mono_moe,
+    has_monomoe as has_monomoe,
+    alloc_scratchpad as alloc_scratchpad,
+    get_scratchpad_size_bytes as get_scratchpad_size_bytes,
+    interleave_for_tma_wgmma_up as interleave_for_tma_wgmma_up,
 )
 
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
@@ -69,6 +108,28 @@ except ImportError:
     _cute_dsl_available = False
 
 __all__ = [
+    # Unified API
+    "ActivationConfig",
+    "BackendOptions",
+    "CuteDslConfig",
+    "CutlassConfig",
+    "ExecutionConfig",
+    "ExpertConfig",
+    "CuteDslNvfp4Runner",
+    "MoEActivationPack",
+    "MoEConfig",
+    "MoELayer",
+    "MoEWeightPack",
+    "TrtllmFp4RoutedRunner",
+    "QuantConfig",
+    "QuantVariant",
+    "RoutingConfig",
+    "TrtllmBf16Config",
+    "TrtllmFp4Config",
+    "TrtllmFp8BlockConfig",
+    "TrtllmFp8PerTensorConfig",
+    "TrtllmMxInt4Config",
+    # Legacy flat APIs
     "ActivationType",
     "Fp8QuantizationType",
     "RoutingMethodType",
@@ -93,11 +154,19 @@ __all__ = [
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
+    "hash_topk",
     "bgmv_moe",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",
+    "bgmv_moe_gemm1_lora_delta",
+    "bgmv_moe_gemm2_lora_delta",
     "fill_w_ptr",
     "has_bgmv_moe",
+    "mono_moe",
+    "has_monomoe",
+    "alloc_scratchpad",
+    "get_scratchpad_size_bytes",
+    "interleave_for_tma_wgmma_up",
 ]
 
 # Add CuteDSL exports if available

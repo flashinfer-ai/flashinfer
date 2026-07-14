@@ -14,10 +14,11 @@ import functools
 
 from ..api_logging import flashinfer_api
 
-from .mnnvl import MnnvlMemory, MnnvlConfig
+from .mnnvl import CommBackend, MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
 from ..utils import register_custom_op
+from ..tllm_enums import SfLayout
 
 
 @dataclass
@@ -107,6 +108,10 @@ def get_moe_alltoall_module():
         top_k: int,
         combine_payload_offset: int,
         payload_in_workspace: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
+        output_scales: Optional[torch.Tensor] = None,
+        output_scalar_scale: float = 1.0,
+        sf_layout: Optional[SfLayout] = None,
     ) -> torch.Tensor:
         """
         Combine expert outputs back to originating tokens.
@@ -122,7 +127,16 @@ def get_moe_alltoall_module():
             top_k: Number of experts per token
             combine_payload_offset: Offset from dispatch
             payload_in_workspace: If True, payload is workspace-backed
-
+            output_dtype: Optional output data type. Supported types:
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.uint8 (packed fp4)
+            output_scales: Optional output scale tensor for quantized outputs. Support types:
+                torch.uint8 (packed ue8m0), vector size of 32
+                torch.float8_e4m3fn, vector size of 16
+            output_scalar_scale: Per-tensor global scale applied before FP4 block scaling
+                (NVFP4 SFScaleVal). Defaults to 1.0; ignored by MXFP8/MXFP4 paths.
+            sf_layout: Output swizzle layout. Defaults to linear.
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
         """
@@ -137,6 +151,49 @@ def get_moe_alltoall_module():
             top_k,
             combine_payload_offset,
             payload_in_workspace,
+            output_dtype,
+            output_scales,
+            output_scalar_scale,
+            sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
+        )
+
+    @register_custom_op(
+        "flashinfer::moe_a2a_combine_into",
+        mutates_args=("workspace", "output"),
+    )
+    def moe_a2a_combine_into(
+        payload: torch.Tensor,
+        local_num_tokens: int,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        combine_payload_offset: int,
+        payload_in_workspace: bool,
+        output_dtype: Optional[torch.dtype],
+        output_scales: Optional[torch.Tensor],
+        output_scalar_scale: float,
+        sf_layout: Optional[SfLayout],
+        output: torch.Tensor,
+    ) -> None:
+        module.moe_a2a_combine_into(
+            payload,
+            local_num_tokens,
+            workspace,
+            metainfo,
+            runtime_max_tokens_per_rank,
+            ep_rank,
+            ep_size,
+            top_k,
+            combine_payload_offset,
+            payload_in_workspace,
+            output_dtype,
+            output_scales,
+            output_scalar_scale,
+            sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
+            output,
         )
 
     @register_custom_op(
@@ -192,6 +249,7 @@ def get_moe_alltoall_module():
         moe_a2a_initialize=moe_a2a_initialize,
         moe_a2a_dispatch=moe_a2a_dispatch,
         moe_a2a_combine=moe_a2a_combine,
+        moe_a2a_combine_into=moe_a2a_combine_into,
         moe_a2a_sanitize_expert_ids=moe_a2a_sanitize_expert_ids,
         moe_a2a_get_metainfo_index_pairs=moe_a2a_get_metainfo_index_pairs,
         moe_a2a_get_aux_data_size=moe_a2a_get_aux_data_size,
@@ -378,6 +436,11 @@ def moe_a2a_combine(
     top_k: int,
     combine_payload_offset: int,
     payload_in_workspace: bool = False,
+    output_dtype: Optional[torch.dtype] = None,
+    output_scales: Optional[torch.Tensor] = None,
+    output_scalar_scale: float = 1.0,
+    sf_layout: SfLayout = SfLayout.layout_linear,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Combine per-expert outputs back to the originating ranks.
 
@@ -412,13 +475,38 @@ def moe_a2a_combine(
     payload_in_workspace : bool
         ``True`` if ``payload`` is already a workspace-backed view (skips
         the staging copy).  Defaults to ``False``.
+    output_dtype : Optional[torch.dtype]
+        Optional output data type.  Currently supports ``torch.bfloat16``
+        and ``torch.float8_e4m3fn``.
+    output_scales : Optional[torch.Tensor]
+        Optional output scale tensor for quantized outputs.  Currently
+        supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+    output_scalar_scale : float
+        Per-tensor global scale applied before FP4 block scaling
+        (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
+        paths.
+    sf_layout : SfLayout
+        Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
+    output : Optional[torch.Tensor]
+        Caller-provided contiguous output tensor. Its shape and dtype must
+        match the requested combine output, and it must be on the same device
+        as ``payload``.
 
     Returns
     -------
     torch.Tensor
         ``[local_num_tokens, *]`` tensor with the combined outputs.
     """
-    return get_moe_alltoall_module().moe_a2a_combine(
+    if output is not None:
+        if not output.is_cuda:
+            raise ValueError(
+                f"output must be a CUDA tensor, got device={output.device}"
+            )
+        if not output.is_contiguous():
+            raise ValueError(f"output must be contiguous, got stride={output.stride()}")
+
+    module = get_moe_alltoall_module()
+    args = (
         payload,
         local_num_tokens,
         workspace,
@@ -429,7 +517,15 @@ def moe_a2a_combine(
         top_k,
         combine_payload_offset,
         payload_in_workspace,
+        output_dtype,
+        output_scales,
+        output_scalar_scale,
+        sf_layout,
     )
+    if output is None:
+        return module.moe_a2a_combine(*args)
+    module.moe_a2a_combine_into(*args, output)
+    return output
 
 
 @flashinfer_api
@@ -720,8 +816,76 @@ class MoeAlltoAll:
         self.metainfo = self._WORKSPACE["metainfo"]
         self._state = _A2AState()
 
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Unmap MNNVL handles for checkpointing; repeated calls are no-ops."""
+        record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
+        if not record.mapped:
+            return
+        if self._state.phase != "idle":
+            raise RuntimeError(
+                "Cannot unmap MNNVL handles during an active all-to-all phase"
+            )
+
+        # Every rank must stop using the workspace before releasing its backing.
+        torch.cuda.synchronize()
+        record.comm.barrier()
+        MnnvlMemory._unmap_and_release_handles(record)
+        record.mem_handles = [None] * record.comm_size
+        record.mapped = False
+        # Do not return until every rank has released its handles.
+        record.comm.barrier()
+
+    @flashinfer_api
+    def checkpoint_restore(
+        self,
+        comm_backend: CommBackend,
+    ) -> None:
+        """Remap MNNVL handles after restore; repeated calls are no-ops."""
+        record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
+        if record.mapped:
+            return
+
+        comm_size = comm_backend.Get_size()
+        comm_rank = comm_backend.Get_rank()
+        if comm_size != record.comm_size or comm_rank != record.comm_rank:
+            raise RuntimeError(
+                "Cannot remap MNNVL handles because the communicator does not "
+                "match the graph-visible allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{record.comm_rank}/{record.comm_size}"
+            )
+        # CUDA work must quiesce before the workspace is remapped.
+        torch.cuda.synchronize()
+        record.mem_handles = MnnvlMemory._create_and_map_handles(
+            comm_backend,
+            record.aligned_size,
+            record.start_address,
+            record.rank_stride,
+            record.address_offset,
+        )
+        record.comm = comm_backend
+        MnnvlMemory.comm = comm_backend
+        record.mapped = True
+        refreshed_metainfo = moe_a2a_initialize(
+            self.workspace,
+            self.ep_rank,
+            self.ep_size,
+            self.max_num_tokens,
+        )
+        if not torch.equal(refreshed_metainfo, self.metainfo):
+            raise RuntimeError(
+                "MoeAlltoAll metainfo changed during MNNVL handle remap; "
+                "existing CUDA graphs are not safe to replay"
+            )
+        torch.cuda.synchronize()
+        comm_backend.barrier()
+        self._state = _A2AState()
+
     def _reset_workspace(self):
         """Reset the workspace to free up its state. This is mainly used for testing. Use this with caution. This object is no longer usable after this."""
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         torch.cuda.synchronize()
         del self._WORKSPACE
         del self._WORKSPACE_CACHE[
@@ -768,6 +932,8 @@ class MoeAlltoAll:
             Workspace-backed receive tensors, one per ``input_payloads``
             entry, each shaped ``[ep_size, runtime_max_tokens_per_rank, *]``.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "idle", "dispatch called twice without combine"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "runtime_max_tokens_per_rank exceeds max_num_tokens"
@@ -812,6 +978,11 @@ class MoeAlltoAll:
         payload: torch.Tensor,
         runtime_max_tokens_per_rank: int,
         payload_in_workspace: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
+        output_scales: Optional[torch.Tensor] = None,
+        output_scalar_scale: float = 1.0,
+        sf_layout: SfLayout = SfLayout.layout_linear,
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the MoE all-to-all combine phase.
 
@@ -826,12 +997,30 @@ class MoeAlltoAll:
         payload_in_workspace : bool
             ``True`` if ``payload`` is already a workspace-backed view (skips
             the staging copy).  Defaults to ``False``.
+        output_dtype : Optional[torch.dtype]
+            Optional output data type.  Currently supports ``torch.bfloat16``
+            and ``torch.float8_e4m3fn``.
+        output_scales : Optional[torch.Tensor]
+            Optional output scale tensor for quantized outputs.  Currently
+            supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+        output_scalar_scale : float
+            Per-tensor global scale applied before FP4 block scaling
+            (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
+            paths.
+        sf_layout : SfLayout
+            Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
+        output : Optional[torch.Tensor]
+            Caller-provided contiguous output tensor. Its shape and dtype must
+            match the requested combine output, and it must be on the same
+            device as ``payload``.
 
         Returns
         -------
         torch.Tensor
             ``[local_num_tokens, elements_per_token]`` combined tensor.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "dispatched", (
             "combine called before successful dispatch"
         )
@@ -850,6 +1039,11 @@ class MoeAlltoAll:
             self.top_k,
             self._state.combine_payload_offset,
             payload_in_workspace,
+            output_dtype,
+            output_scales,
+            output_scalar_scale,
+            sf_layout,
+            output,
         )
 
         # Reset state for next round
@@ -891,6 +1085,8 @@ class MoeAlltoAll:
         RuntimeError
             If called before a successful :meth:`dispatch`.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         if self._state.phase != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before successful dispatch"

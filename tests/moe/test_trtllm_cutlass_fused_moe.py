@@ -41,6 +41,8 @@ from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
 
 from . import utils as moe_utils
 
+pytestmark = pytest.mark.solo
+
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
@@ -443,6 +445,161 @@ def test_moe(
     )
 
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
+def compute_with_experts_gelu_tanh(
+    num_experts,
+    x,
+    w31_weight,
+    w2_weight,
+    selected_experts,
+    routing_weights,
+):
+    """Reference for gated tanh-GELU MoE.
+
+    Mirrors ``compute_with_experts`` (the SwiGLU reference) exactly, including
+    the gated weight split convention: ``w31`` is split along dim 0 into
+    ``(w3, w1)`` where ``w3`` is the first half and ``w1`` is the second half.
+    The gate branch (``w1``) is activated and multiplied by the linear branch
+    (``w3``). The only difference vs SwiGLU is the activation:
+    ``F.gelu(gate, approximate="tanh")`` instead of ``F.silu(gate)``.
+    """
+    results = torch.zeros_like(x)
+    for expert_id in range(num_experts):
+        mask = selected_experts == expert_id
+        if not mask.sum():
+            continue
+        batch_idx, nth_expert = torch.where(mask)
+        w31_expert = w31_weight[expert_id]  # [2 * intermediate_size, hidden_size]
+        w2_expert = w2_weight[expert_id]  # [hidden_size, intermediate_size]
+
+        # Same split as compute_with_experts: w3 = first half, w1 = second half.
+        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+
+        expert_inputs = x[batch_idx]
+        gate = expert_inputs @ w1_expert.t()
+        linear = expert_inputs @ w3_expert.t()
+        inter = F.gelu(gate, approximate="tanh") * linear
+        output = inter @ w2_expert.t()
+        results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+    return results.view_as(x)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate_size):
+    """Gated tanh-GELU activation (ActivationType.GegluTanh) on the bf16 CUTLASS
+    MoE path. Same shapes / weight-split convention as the SwiGLU ``test_moe``,
+    but activation = GELU_tanh(gate) * linear, compared against a torch
+    ``F.gelu(..., approximate="tanh")`` gated reference.
+    """
+    # Skip invalid configurations
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    x = torch.randn(batch_size, hidden_size, dtype=dtype).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=dtype).cuda()
+        / 5
+    )
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda() / 5
+    )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output = compute_with_experts_gelu_tanh(
+        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
+    )
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        flash_output.dtype,
+        output=flash_output,
+        quant_scales=None,
+        activation_type=ActivationType.GegluTanh,
+    )
+
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+def test_moe_unfused_finalize(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size
+):
+    """``use_fused_finalize=False`` selects the non-fused finalize path.
+
+    Unlike the fused GEMM2 epilogue (which reduces expert outputs via non-associative
+    atomics), this path must be bit-wise reproducible run-to-run while still matching
+    the reference.
+    """
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = (
+        torch.randn(
+            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.float16
+        ).cuda()
+        / 5
+    )
+    w2_weight = (
+        torch.randn(
+            num_experts, hidden_size, intermediate_size, dtype=torch.float16
+        ).cuda()
+        / 5
+    )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output = compute_with_experts(
+        num_experts,
+        x,
+        w31_weight,
+        w2_weight,
+        selected_experts,
+        routing_weights,
+    )
+
+    def run_unfused():
+        out = torch.empty_like(ref_output)
+        return fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            out.dtype,
+            output=out,
+            quant_scales=None,
+            use_fused_finalize=False,
+        )[0]
+
+    out1 = run_unfused()
+    out2 = run_unfused()
+
+    torch.testing.assert_close(ref_output, out1, rtol=1e-2, atol=1e-2)
+    assert torch.equal(out1, out2), (
+        "non-fused finalize path must produce deterministic results"
+    )
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -1471,6 +1628,10 @@ def test_moe_mxfp8_mxfp4(
 @pytest.mark.parametrize(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
+# use_autotune=True is the regression coverage for issue #3558: the gemm
+# profiler used to prepare per-tensor FP8 quant params and a null
+# activation-SF buffer for MXFP8xMXFP8, crashing the tuning pass.
+@pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10],
     reason="MXFP8xMXFP8 is only supported on SM100 for now",
@@ -1485,6 +1646,7 @@ def test_moe_mxfp8_mxfp8(
     alpha,
     beta,
     limit,
+    use_autotune,
 ):
     """Test MoE with MXFP8 activations and MXFP8 weights."""
     if top_k > num_experts:
@@ -1530,21 +1692,22 @@ def test_moe_mxfp8_mxfp8(
         limit_t = None
         beta_t = None
 
-    _ = fused_moe.cutlass_fused_moe(
-        mxfp8_x,
-        selected_experts.to(torch.int),
-        routing_weights,
-        mxfp8_w1.contiguous(),
-        mxfp8_w2.contiguous(),
-        otype,
-        swiglu_alpha=alpha_t,
-        swiglu_limit=limit_t,
-        swiglu_beta=beta_t,
-        quant_scales=quant_scales,
-        input_sf=mxfp8_x_sf,
-        use_mxfp8_act_scaling=True,
-        output=flash_output,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            mxfp8_x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            mxfp8_w1.contiguous(),
+            mxfp8_w2.contiguous(),
+            otype,
+            swiglu_alpha=alpha_t,
+            swiglu_limit=limit_t,
+            swiglu_beta=beta_t,
+            quant_scales=quant_scales,
+            input_sf=mxfp8_x_sf,
+            use_mxfp8_act_scaling=True,
+            output=flash_output,
+        )
 
     dq_mxfp8_x = (
         mxfp8_dequantize_host(

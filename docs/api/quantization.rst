@@ -59,6 +59,7 @@ GPU-accelerated quantization / dequantization for KV-cache data using the
 linear (non-swizzled) block-scale layout.
 
 - :func:`nvfp4_kv_dequantize`: SM80+ (Ampere and later)
+- :func:`nvfp4_kv_dequantize_paged`: SM80+ (Ampere and later)
 - :func:`nvfp4_kv_quantize`: SM100+ (Blackwell and later)
 - :func:`nvfp4_quantize_paged_kv_cache`
 
@@ -67,6 +68,7 @@ linear (non-swizzled) block-scale layout.
 
     nvfp4_kv_quantize
     nvfp4_kv_dequantize
+    nvfp4_kv_dequantize_paged
     nvfp4_quantize_paged_kv_cache
 
 FP8 Quantization
@@ -76,7 +78,14 @@ FP8 Quantization
     :toctree: ../generated
 
     mxfp8_quantize
+    mxfp8_grouped_quantize
     mxfp8_dequantize_host
+
+.. note::
+
+    ``mxfp8_grouped_quantize`` uses a cuTile backend and requires SM100+ and
+    ``cuda.tile`` (a ``requirements.txt`` dependency). ``K`` must be divisible
+    by 32 and is padded internally to 128-column tiles.
 
 CuTe-DSL Quantization Kernels (experimental)
 --------------------------------------------
@@ -94,6 +103,7 @@ importable.
     :toctree: ../generated
 
     nvfp4_quantize_cute_dsl
+    nvfp4_quantize_per_token_cute_dsl
 
 .. currentmodule:: flashinfer.quantization.kernels.mxfp4_quantize
 

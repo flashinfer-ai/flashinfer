@@ -15,4 +15,6 @@ Append new K/V tensors to Paged KV-Cache
 
   append_paged_kv_cache
   append_paged_mla_kv_cache
+  nvfp4_quantize_append_paged_kv_cache
+  nvfp4_quantize_append_paged_kv_cache_with_slot_mapping
   get_batch_indices_positions

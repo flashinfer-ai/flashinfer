@@ -4,13 +4,12 @@
 #   - Last matching pattern wins (GitHub semantics).
 #   - Catch-all ensures every PR gets at least one core-maintainer review.
 #   - Prefer @flashinfer-ai/<team> over individual users. (currently working around this)
-#   - Keep entries sorted alphabetically within each section.
 
 # ── Catch-all: core maintainers review everything not covered below ──
-* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113
+* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113 @qsang-nv @jiahanc @qiching
 
 # ── Attention ──
-csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho
 csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
@@ -32,6 +31,10 @@ flashinfer/fused_moe/                 @aleozlx @yzh119 @jiahanc @IwakuraRein @nv
 include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
 tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
 
+# ── MOE_EP ──
+flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @agopal @Anerudhan @mhoqueanik
+tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @agopal @Anerudhan @mhoqueanik
+
 # ── Communication ──
 flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq
 include/flashinfer/comm/       @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq
@@ -42,14 +45,14 @@ flashinfer/norm.py             @kahyunnam @yzh119 @bkryu @yongwww
 tests/norm/                    @kahyunnam @yzh119 @bkryu @yongwww
 
 # ── GDN ──
-benchmarks/gdn/                          @kahyunnam @yzh119 @bkryu @yongwww
-csrc/gdn_prefill_launcher.cu             @kahyunnam @yzh119 @bkryu @yongwww
-csrc/gdn_prefill_sm90_kernel_inst.jinja  @kahyunnam @yzh119 @bkryu @yongwww
-flashinfer/gdn_decode.py                 @kahyunnam @yzh119 @bkryu @yongwww
-flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww
-flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww
-flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww
-tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww
+benchmarks/gdn/                          @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+csrc/gdn_prefill_launcher.cu             @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+csrc/gdn_prefill_sm90_kernel_inst.jinja  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/gdn_decode.py                 @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
 
 # ── MAMBA ──
 csrc/checkpointing_ssu*         @kahyunnam @yzh119 @jimmyzho @ishovkun
