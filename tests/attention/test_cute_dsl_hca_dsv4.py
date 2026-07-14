@@ -46,6 +46,136 @@ def _cpu_hca_inputs():
     }
 
 
+def _cpu_page_aligned_sparse_hca_inputs():
+    args = _cpu_hca_inputs()
+    rows = args["query"].shape[0] * args["query"].shape[1]
+    window_page_size = args["swa_kv_cache"].shape[1]
+    compressed_page_size = args["compressed_kv_cache"].shape[1]
+    window_tables = torch.tensor([[0, 1, 2, 3]] * rows, dtype=torch.int32)
+    compressed_tables = torch.tensor([[0, 1]] * rows, dtype=torch.int32)
+
+    def expand(tables, page_size):
+        offsets = torch.arange(page_size, dtype=torch.int32)
+        return (tables.unsqueeze(-1) * page_size + offsets).flatten(1)
+
+    sparse_indices = torch.cat(
+        (
+            expand(window_tables, window_page_size),
+            expand(compressed_tables, compressed_page_size),
+        ),
+        dim=1,
+    )
+    window_valid_lens = args["swa_topk_lens"]
+    sparse_topk_lens = args["sparse_topk_lens"]
+    window_columns = torch.arange(128)
+    sparse_indices[:, :128].masked_fill_(
+        window_columns.unsqueeze(0) >= window_valid_lens.unsqueeze(1), -1
+    )
+    compressed_columns = torch.arange(sparse_indices.shape[1] - 128)
+    sparse_indices[:, 128:].masked_fill_(
+        compressed_columns.unsqueeze(0) >= (sparse_topk_lens - 128).unsqueeze(1),
+        0,
+    )
+
+    args["sparse_indices"] = sparse_indices
+    args["seq_lens"] = torch.tensor([128, 16512], dtype=torch.int32)
+    args["hca_sparse_indices_format"] = "page-aligned"
+    args["swa_topk_lens"] = None
+    args["hca_swa_block_tables"] = None
+    args["hca_compressed_block_tables"] = None
+    args["hca_seq_lens"] = None
+    expected = {
+        "window_block_tables": window_tables,
+        "compressed_block_tables": torch.tensor(
+            [[0, 0], [0, 0], [0, 0], [0, 1]], dtype=torch.int32
+        ),
+        "hca_seq_lens": torch.tensor([129, 257], dtype=torch.int32),
+        "window_valid_lens": window_valid_lens,
+    }
+    return args, expected
+
+
+def _cpu_page_aligned_conversion_inputs(
+    window_page_size, compressed_page_size, extra_padding=0
+):
+    rows, head_dim = 4, 512
+    seq_lens = torch.tensor([128, 16512], dtype=torch.int32)
+    sparse_topk_lens = torch.tensor([128, 129, 256, 257], dtype=torch.int32)
+    window_valid_lens = torch.tensor([127, 128, 128, 128], dtype=torch.int32)
+    window_page_count = 128 // window_page_size
+    compressed_table_capacity = 256
+    compressed_input_capacity = 132
+    compressed_page_count = compressed_table_capacity // compressed_page_size
+    window_tables = (
+        torch.arange(rows * window_page_count, dtype=torch.int32).reshape(rows, -1) + 3
+    ) % 32
+    compressed_tables = (
+        torch.arange(rows * compressed_page_count, dtype=torch.int32).reshape(rows, -1)
+        + 5
+    ) % 32
+
+    def expand(tables, page_size):
+        offsets = torch.arange(page_size, dtype=torch.int32)
+        return (tables.unsqueeze(-1) * page_size + offsets).flatten(1)
+
+    window_indices = expand(window_tables, window_page_size)
+    compressed_indices = expand(compressed_tables, compressed_page_size)[
+        :, :compressed_input_capacity
+    ]
+    window_positions = torch.arange(128)
+    compressed_positions = torch.arange(compressed_input_capacity)
+    window_indices.masked_fill_(
+        window_positions.unsqueeze(0) >= window_valid_lens.unsqueeze(1),
+        torch.iinfo(torch.int32).max,
+    )
+    active_compressed_lens = sparse_topk_lens - 128
+    compressed_indices.masked_fill_(
+        compressed_positions.unsqueeze(0) >= active_compressed_lens.unsqueeze(1),
+        torch.iinfo(torch.int32).max,
+    )
+    if extra_padding:
+        compressed_indices = torch.cat(
+            (
+                compressed_indices,
+                torch.full(
+                    (rows, extra_padding),
+                    torch.iinfo(torch.int32).max,
+                    dtype=torch.int32,
+                ),
+            ),
+            dim=1,
+        )
+
+    sparse_indices = torch.cat((window_indices, compressed_indices), dim=1)
+    expected_window = torch.where(
+        (torch.arange(window_page_count) * window_page_size).unsqueeze(0)
+        < window_valid_lens.unsqueeze(1),
+        window_tables,
+        0,
+    )
+    expected_compressed = torch.where(
+        (torch.arange(compressed_page_count) * compressed_page_size).unsqueeze(0)
+        < active_compressed_lens.unsqueeze(1),
+        compressed_tables,
+        0,
+    )
+    return {
+        "sparse_indices": sparse_indices,
+        "sparse_topk_lens": sparse_topk_lens,
+        "seq_lens": seq_lens,
+        "swa_kv_cache": torch.empty(
+            (32, window_page_size, head_dim), dtype=torch.float8_e4m3fn
+        ),
+        "compressed_kv_cache": torch.empty(
+            (32, compressed_page_size, head_dim), dtype=torch.float8_e4m3fn
+        ),
+        "q_len": 2,
+        "expected_window": expected_window,
+        "expected_compressed": expected_compressed,
+        "expected_window_lens": window_valid_lens,
+    }
+
+
 def test_dsv4_backend_resolution_is_explicit(monkeypatch):
     monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
     assert (
@@ -74,7 +204,10 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
 
 def test_dsv4_backend_neutral_alias_is_backward_compatible():
     assert batch_decode_sparse_mla_dsv4 is trtllm_batch_decode_sparse_mla_dsv4
-    assert batch_decode_sparse_mla_dsv4.__name__ == "batch_decode_sparse_mla_dsv4"
+    assert (
+        trtllm_batch_decode_sparse_mla_dsv4.__name__
+        == "trtllm_batch_decode_sparse_mla_dsv4"
+    )
 
 
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
@@ -97,7 +230,7 @@ def test_dsv4_hca_public_api_forwards_block_tables(monkeypatch, kv_layout):
     monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
     monkeypatch.setattr(batch_hca, "cute_dsl_hca_decode", fake_hca_decode)
 
-    result = batch_decode_sparse_mla_dsv4(**args)
+    result = trtllm_batch_decode_sparse_mla_dsv4(**args)
     assert result is args["out"]
     assert captured["window_block_tables"] is args["hca_swa_block_tables"]
     assert captured["compressed_block_tables"] is args["hca_compressed_block_tables"]
@@ -111,6 +244,193 @@ def test_dsv4_hca_public_api_forwards_block_tables(monkeypatch, kv_layout):
         captured["compressed_kv_cache"].data_ptr()
         == args["compressed_kv_cache"].data_ptr()
     )
+
+
+def test_dsv4_hca_generates_metadata_from_page_aligned_sparse_indices(monkeypatch):
+    pytest.importorskip("cutlass")
+    from flashinfer.cute_dsl.attention.wrappers import batch_hca
+
+    args, expected = _cpu_page_aligned_sparse_hca_inputs()
+    captured = {}
+
+    def fake_hca_decode(**kwargs):
+        captured.update(kwargs)
+        return kwargs["out"]
+
+    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
+    monkeypatch.setattr(batch_hca, "cute_dsl_hca_decode", fake_hca_decode)
+
+    result = trtllm_batch_decode_sparse_mla_dsv4(**args)
+    assert result is args["out"]
+    for name, value in expected.items():
+        torch.testing.assert_close(captured[name], value)
+    assert captured["is_causal"] is True
+
+
+def test_dsv4_hca_rejects_non_page_aligned_sparse_indices(monkeypatch):
+    args, _ = _cpu_page_aligned_sparse_hca_inputs()
+    args["sparse_indices"][1, 0] = 1
+    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
+    with pytest.raises(ValueError, match="canonical page-aligned expansion"):
+        trtllm_batch_decode_sparse_mla_dsv4(**args)
+
+
+@pytest.mark.parametrize(
+    ("window_page_size", "compressed_page_size"),
+    [(32, 128), (16, 32), (32, 16)],
+)
+def test_dsv4_hca_page_aligned_conversion_ignores_inactive_padding(
+    window_page_size, compressed_page_size
+):
+    minimal = _cpu_page_aligned_conversion_inputs(
+        window_page_size, compressed_page_size
+    )
+    padded = _cpu_page_aligned_conversion_inputs(
+        window_page_size, compressed_page_size, extra_padding=512
+    )
+
+    def convert(inputs):
+        return mla_core.convert_page_aligned_sparse_indices_to_hca_metadata(
+            inputs["sparse_indices"],
+            inputs["sparse_topk_lens"],
+            inputs["seq_lens"],
+            inputs["swa_kv_cache"],
+            inputs["compressed_kv_cache"],
+            q_len=inputs["q_len"],
+        )
+
+    minimal_metadata = convert(minimal)
+    padded_metadata = convert(padded)
+    for field in (
+        "hca_swa_block_tables",
+        "hca_compressed_block_tables",
+        "hca_seq_lens",
+        "swa_topk_lens",
+    ):
+        minimal_value = getattr(minimal_metadata, field)
+        padded_value = getattr(padded_metadata, field)
+        torch.testing.assert_close(minimal_value, padded_value)
+
+    torch.testing.assert_close(
+        minimal_metadata.hca_swa_block_tables, minimal["expected_window"]
+    )
+    torch.testing.assert_close(
+        minimal_metadata.hca_compressed_block_tables,
+        minimal["expected_compressed"],
+    )
+    torch.testing.assert_close(
+        minimal_metadata.swa_topk_lens, minimal["expected_window_lens"]
+    )
+    assert minimal_metadata.hca_compressed_block_tables.shape[1] == (
+        256 // compressed_page_size
+    )
+
+
+def test_dsv4_hca_page_aligned_conversion_rejects_in_page_reordering():
+    inputs = _cpu_page_aligned_conversion_inputs(32, 16)
+    inputs["sparse_indices"][3, 129] += 16
+    with pytest.raises(ValueError, match="canonical page-aligned expansion"):
+        mla_core.convert_page_aligned_sparse_indices_to_hca_metadata(
+            inputs["sparse_indices"],
+            inputs["sparse_topk_lens"],
+            inputs["seq_lens"],
+            inputs["swa_kv_cache"],
+            inputs["compressed_kv_cache"],
+            q_len=inputs["q_len"],
+        )
+
+
+def test_dsv4_hca_page_aligned_conversion_checks_across_chunks(monkeypatch):
+    monkeypatch.setattr(mla_core, "_DSV4_HCA_CANONICAL_CHECK_MAX_ELEMENTS", 8)
+    inputs = _cpu_page_aligned_conversion_inputs(32, 16)
+
+    mla_core.convert_page_aligned_sparse_indices_to_hca_metadata(
+        inputs["sparse_indices"],
+        inputs["sparse_topk_lens"],
+        inputs["seq_lens"],
+        inputs["swa_kv_cache"],
+        inputs["compressed_kv_cache"],
+        q_len=inputs["q_len"],
+    )
+    inputs["sparse_indices"][3, 128 + 17] += 16
+    with pytest.raises(ValueError, match="canonical page-aligned expansion"):
+        mla_core.convert_page_aligned_sparse_indices_to_hca_metadata(
+            inputs["sparse_indices"],
+            inputs["sparse_topk_lens"],
+            inputs["seq_lens"],
+            inputs["swa_kv_cache"],
+            inputs["compressed_kv_cache"],
+            q_len=inputs["q_len"],
+        )
+
+
+def test_dsv4_hca_page_aligned_conversion_fills_fully_inactive_pages():
+    window_page_size = 32
+    offsets = torch.arange(window_page_size, dtype=torch.int32)
+    sparse_indices = (
+        torch.arange(4, dtype=torch.int32).unsqueeze(-1) * window_page_size + offsets
+    ).reshape(1, 128)
+    sparse_indices[:, 1:] = torch.iinfo(torch.int32).max
+    metadata = mla_core.convert_page_aligned_sparse_indices_to_hca_metadata(
+        sparse_indices,
+        torch.tensor([128], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+        torch.empty((4, window_page_size, 512), dtype=torch.float8_e4m3fn),
+        torch.empty((1, 128, 512), dtype=torch.float8_e4m3fn),
+        q_len=1,
+    )
+    torch.testing.assert_close(
+        metadata.hca_swa_block_tables,
+        torch.tensor([[0, 0, 0, 0]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata.hca_compressed_block_tables,
+        torch.tensor([[0]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata.hca_seq_lens, torch.tensor([128], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        metadata.swa_topk_lens, torch.tensor([1], dtype=torch.int32)
+    )
+
+
+def test_dsv4_hca_page_aligned_conversion_rejects_out_of_range_page():
+    inputs = _cpu_page_aligned_conversion_inputs(32, 16)
+    inputs["sparse_indices"][3, 128] = 32 * 16
+    with pytest.raises(ValueError, match="valid physical page IDs"):
+        mla_core.convert_page_aligned_sparse_indices_to_hca_metadata(
+            inputs["sparse_indices"],
+            inputs["sparse_topk_lens"],
+            inputs["seq_lens"],
+            inputs["swa_kv_cache"],
+            inputs["compressed_kv_cache"],
+            q_len=inputs["q_len"],
+        )
+
+
+def test_dsv4_hca_page_aligned_tag_rejects_query_batch_mismatch(monkeypatch):
+    args, _ = _cpu_page_aligned_sparse_hca_inputs()
+    args["seq_lens"] = torch.tensor([16512], dtype=torch.int32)
+    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
+    with pytest.raises(ValueError, match="seq_lens with 2 entries"):
+        trtllm_batch_decode_sparse_mla_dsv4(**args)
+
+
+@pytest.mark.arch_blackwell
+def test_dsv4_hca_page_aligned_conversion_rejects_mixed_devices():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    inputs = _cpu_page_aligned_conversion_inputs(32, 128)
+    with pytest.raises(ValueError, match="swa_kv_cache must be on cpu"):
+        mla_core.convert_page_aligned_sparse_indices_to_hca_metadata(
+            inputs["sparse_indices"],
+            inputs["sparse_topk_lens"],
+            inputs["seq_lens"],
+            inputs["swa_kv_cache"].cuda(),
+            inputs["compressed_kv_cache"],
+            q_len=inputs["q_len"],
+        )
 
 
 def test_dsv4_hca_rejects_legacy_token_indices(monkeypatch):
@@ -335,6 +655,33 @@ def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch):
     workspace = torch.empty(8 << 20, dtype=torch.uint8, device=device)
     softmax_scale = 1.0 / math.sqrt(head_dim)
     output_scale = 1.0
+    window_offsets = torch.arange(32, dtype=torch.int32, device=device)
+    compressed_offsets = torch.arange(128, dtype=torch.int32, device=device)
+    page_aligned_sparse_indices = torch.cat(
+        (
+            (window_tables.unsqueeze(-1) * 32 + window_offsets).flatten(1),
+            (compressed_tables.unsqueeze(-1) * 128 + compressed_offsets).flatten(1),
+        ),
+        dim=1,
+    )
+    window_positions = torch.arange(128, device=device)
+    compressed_positions = torch.arange(256, device=device)
+    page_aligned_sparse_indices[:, :128].masked_fill_(
+        window_positions.unsqueeze(0) >= window_valid_lens.unsqueeze(1), -1
+    )
+    page_aligned_sparse_indices[:, 128:].masked_fill_(
+        compressed_positions.unsqueeze(0) >= (sparse_topk_lens - 128).unsqueeze(1),
+        0,
+    )
+    raw_seq_lens = torch.tensor([128, 16512], dtype=torch.int32, device=device)
+    precomputed_metadata = mla_core.convert_page_aligned_sparse_indices_to_hca_metadata(
+        page_aligned_sparse_indices,
+        sparse_topk_lens,
+        raw_seq_lens,
+        window_cache,
+        compressed_cache,
+        q_len=q_len,
+    )
 
     for sinks in (
         torch.zeros(num_heads, dtype=torch.float32, device=device),
@@ -359,6 +706,23 @@ def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch):
             hca_is_causal=True,
             hca_use_persistent=True,
         )
+        tagged_output = trtllm_batch_decode_sparse_mla_dsv4(
+            query=query,
+            swa_kv_cache=window_cache,
+            workspace_buffer=workspace,
+            sparse_indices=page_aligned_sparse_indices,
+            compressed_kv_cache=compressed_cache,
+            sparse_topk_lens=sparse_topk_lens,
+            seq_lens=raw_seq_lens,
+            out=None,
+            bmm1_scale=softmax_scale,
+            bmm2_scale=output_scale,
+            sinks=sinks,
+            backend="cute-dsl",
+            hca_sparse_indices_format="page-aligned",
+            hca_is_causal=True,
+            hca_use_persistent=True,
+        )
         reference = _reference_hca(
             query,
             window_cache,
@@ -375,6 +739,86 @@ def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch):
         assert output.shape == query.shape
         assert torch.isfinite(output).all()
         torch.testing.assert_close(output.float(), reference, atol=0.13, rtol=1e-5)
+        torch.testing.assert_close(tagged_output, output, atol=0.00390625, rtol=0)
+
+    explicit_output = torch.empty_like(query, dtype=torch.bfloat16)
+    precomputed_output = torch.empty_like(explicit_output)
+    trtllm_batch_decode_sparse_mla_dsv4(
+        query=query,
+        swa_kv_cache=window_cache,
+        workspace_buffer=workspace,
+        sparse_indices=None,
+        compressed_kv_cache=compressed_cache,
+        sparse_topk_lens=sparse_topk_lens,
+        out=explicit_output,
+        bmm1_scale=softmax_scale,
+        swa_topk_lens=window_valid_lens,
+        backend="cute-dsl",
+        hca_swa_block_tables=window_tables,
+        hca_compressed_block_tables=compressed_tables,
+        hca_seq_lens=hca_seq_lens,
+        hca_use_persistent=True,
+    )
+
+    def run_precomputed_metadata():
+        return trtllm_batch_decode_sparse_mla_dsv4(
+            query=query,
+            swa_kv_cache=window_cache,
+            workspace_buffer=workspace,
+            sparse_indices=None,
+            compressed_kv_cache=compressed_cache,
+            sparse_topk_lens=sparse_topk_lens,
+            out=precomputed_output,
+            bmm1_scale=softmax_scale,
+            swa_topk_lens=precomputed_metadata.swa_topk_lens,
+            backend="cute-dsl",
+            hca_swa_block_tables=precomputed_metadata.hca_swa_block_tables,
+            hca_compressed_block_tables=(
+                precomputed_metadata.hca_compressed_block_tables
+            ),
+            hca_seq_lens=precomputed_metadata.hca_seq_lens,
+            hca_is_causal=precomputed_metadata.hca_is_causal,
+            hca_use_persistent=True,
+        )
+
+    run_precomputed_metadata()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_precomputed_metadata()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        precomputed_output, explicit_output, atol=0.00390625, rtol=0
+    )
+
+    with monkeypatch.context() as capture_monkeypatch:
+        capture_monkeypatch.setattr(
+            torch.cuda, "is_current_stream_capturing", lambda: True
+        )
+        with pytest.raises(RuntimeError, match="not CUDA Graph capture safe"):
+            mla_core.convert_page_aligned_sparse_indices_to_hca_metadata(
+                page_aligned_sparse_indices,
+                sparse_topk_lens,
+                raw_seq_lens,
+                window_cache,
+                compressed_cache,
+                q_len=q_len,
+            )
+        with pytest.raises(RuntimeError, match="not CUDA Graph capture safe"):
+            trtllm_batch_decode_sparse_mla_dsv4(
+                query=query,
+                swa_kv_cache=window_cache,
+                workspace_buffer=workspace,
+                sparse_indices=page_aligned_sparse_indices,
+                compressed_kv_cache=compressed_cache,
+                sparse_topk_lens=sparse_topk_lens,
+                seq_lens=raw_seq_lens,
+                bmm1_scale=softmax_scale,
+                backend="cute-dsl",
+                hca_sparse_indices_format="page-aligned",
+                hca_use_persistent=True,
+            )
 
     # Capture the private LSE scratch/result to verify the all-empty split-K
     # reduction. The public DSV4 API intentionally returns output only.
