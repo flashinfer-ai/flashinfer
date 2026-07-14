@@ -40,6 +40,10 @@ def sm12x_gpu_arch(device: str | torch.device = "cuda") -> cute.GPUArch:
     on-device either.
     """
     d = torch.device(device)
+    # Resolve "cuda" / device(type='cuda') to the active index so the cache key
+    # is not shared across process-wide current_device() changes.
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
     return _sm12x_gpu_arch_cached(d.type, d.index)
 
 
