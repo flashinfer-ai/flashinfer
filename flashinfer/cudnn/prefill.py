@@ -636,15 +636,25 @@ def cudnn_batch_prefill_with_kv_cache(
     v_scale : Optional[torch.Tensor]
         FP8 dequantization scale for the value, shape ``(1, 1, 1, 1)`` on GPU.
     batch_offsets_q : Optional[torch.Tensor]
-        Per-request offsets into the query tensor, shape ``(batch_size,)`` on GPU.
+        Cumulative per-request start offsets into the packed query tensor, in
+        **elements** (``token_offset * num_heads_qo * head_dim_qk``), shape
+        ``(batch_size + 1,)``, int32, on GPU.  Required when ``batch_size > 1``
+        on the cuDNN graph path; may be omitted only for ``batch_size == 1``.
     batch_offsets_o : Optional[torch.Tensor]
-        Per-request offsets into the output tensor, shape ``(batch_size,)`` on GPU.
+        Cumulative per-request start offsets into the packed output tensor, in
+        elements (``token_offset * num_heads_qo * head_dim_vo``), shape
+        ``(batch_size + 1,)``, int32, on GPU.  Required when ``batch_size > 1``
+        on the cuDNN graph path.
     batch_offsets_k : Optional[torch.Tensor]
-        Per-request offsets into the key tensor, shape ``(batch_size,)`` on GPU.
+        Cumulative per-request start offsets into the key tensor, in elements,
+        shape ``(batch_size + 1,)`` on GPU.  Only used for non-paged (3-D) KV.
     batch_offsets_v : Optional[torch.Tensor]
-        Per-request offsets into the value tensor, shape ``(batch_size,)`` on GPU.
+        Cumulative per-request start offsets into the value tensor, in
+        elements, shape ``(batch_size + 1,)`` on GPU.  Only used for non-paged
+        (3-D) KV.
     batch_offsets_stats : Optional[torch.Tensor]
-        Per-request offsets into the LSE / stats tensor, shape ``(batch_size,)``.
+        Cumulative per-request start offsets into the LSE / stats tensor, in
+        elements, shape ``(batch_size + 1,)``.
     out : Optional[torch.Tensor]
         Pre-allocated output tensor, shape
         ``(total_qo_tokens, num_heads_qo, head_dim_vo)``.  Allocated internally
@@ -714,6 +724,19 @@ def cudnn_batch_prefill_with_kv_cache(
         out = torch.empty(out_shape, device=q.device, dtype=o_data_type)
 
     if CUDNN_AVAILABLE and backend != "cubin":
+        # The cuDNN graph declares packed q/out with THD nominal strides
+        # (batch stride == one token), which is only addressable through ragged
+        # offsets. Without them the graph is well-formed but reads/writes batch
+        # b at token offset b, silently corrupting every batch except the
+        # first, so reject instead (batch_size == 1 needs no offsets: the only
+        # batch starts at 0).
+        if num_sequences > 1 and (batch_offsets_q is None or batch_offsets_o is None):
+            raise ValueError(
+                "batch_offsets_q and batch_offsets_o are required when batch_size > 1: "
+                "packed q/out cannot be addressed without ragged offsets. Pass "
+                "cumulative element offsets of shape (batch_size + 1,), e.g. "
+                "cumsum([0, *actual_seq_lens_q]) * num_qo_heads * head_dim."
+            )
         return _batch_prefill_with_kv_cache(
             q=q,
             k_cache=k_cache,
