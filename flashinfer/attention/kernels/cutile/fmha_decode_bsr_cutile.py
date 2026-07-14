@@ -846,7 +846,10 @@ def _get_gqa_decode_autotune_configs(query_group_size: int, page_size: int = 128
     cache_key = (query_group_size, page_size)
     if cache_key not in _gqa_decode_autotune_cache:
         configs = []
-        for BLOCK_H in [8, 16, 32, 64]:
+        # Include small BLOCK_H (2, 4) so common GQA ratios (e.g. 32 qo / 8 kv
+        # heads => query_group_size=4, as in Llama-3) get a real autotune space
+        # instead of collapsing to the single BLOCK_N=page_size fallback below.
+        for BLOCK_H in [2, 4, 8, 16, 32, 64]:
             if BLOCK_H <= query_group_size and query_group_size % BLOCK_H == 0:
                 # Allow BLOCK_N values that are multiples of page_size for multi-page loading
                 for BLOCK_N in [32, 64, 128]:
