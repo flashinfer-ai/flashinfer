@@ -1876,34 +1876,18 @@ def testMmMxfp8(args):
     mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
     for backend in backends:
         ## Prepare input tensors
-        # Use swizzled layout for optimal performance
-        is_sf_swizzled_layout = backend in [
-            "cutlass",
-            "cute-dsl",
-            "trtllm",
-            "cudnn",
-        ]
-
-        if not is_sf_swizzled_layout:
-            sf_layout_input = flashinfer.SfLayout.layout_linear
-        elif backend in ("cutlass", "cute-dsl", "cudnn") or args.use_128x4_sf_layout:
-            # CUTLASS, CuTe DSL, and cuDNN use the F8_128x4 swizzled scale
-            # layout here.
+        # Every backend consumes swizzled scales; trtllm optionally uses 8x4 for A.
+        if backend == "trtllm" and not args.use_128x4_sf_layout:
+            sf_layout_input = flashinfer.SfLayout.layout_8x4
+        else:
             sf_layout_input = flashinfer.SfLayout.layout_128x4
-        elif backend == "trtllm":
-            if not args.use_128x4_sf_layout:
-                sf_layout_input = flashinfer.SfLayout.layout_8x4
-            else:
-                sf_layout_input = flashinfer.SfLayout.layout_128x4
         input_mxfp8, input_scale = mxfp8_quantize(
             input, sf_swizzle_layout=sf_layout_input
         )
         # when using trtllm, the shuffle_matrix_sf_a will swizzle the layout.
         mat2_mxfp8, mat2_scale = mxfp8_quantize(
             mat2,
-            is_sf_swizzled_layout=False
-            if backend == "trtllm"
-            else is_sf_swizzled_layout,
+            is_sf_swizzled_layout=backend != "trtllm",
         )
 
         if backend == "trtllm":
