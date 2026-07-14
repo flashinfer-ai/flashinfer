@@ -27,6 +27,10 @@ Usage:
     # Disable CUPTI (use CUDA events for timing instead)
     python bench_moe_deepseek.py --no-cupti
 
+    # Compare deterministic two-stage and atomic fused CuTe DSL finalize
+    python bench_moe_deepseek.py --functional-api
+    python bench_moe_deepseek.py --functional-api --use-fused-finalize
+
 Metrics:
     - ms: Latency in milliseconds
     - TFLOPS: Computational throughput
@@ -206,6 +210,7 @@ def bench_cute_dsl(
     use_wrapper=False,
     do_autotune=True,
     use_per_token_activation=False,
+    use_fused_finalize=False,
 ):
     """Benchmark CuteDSL MoE.
 
@@ -218,6 +223,8 @@ def bench_cute_dsl(
                     choose_one cache lookups don't appear inside the CUDA-event
                     interval when bench_gpu_time falls back to events (i.e. when
                     both CUDA graphs and CUPTI are disabled).
+        use_fused_finalize: Use the atomic fused finalize instead of the default
+                    deterministic two-stage finalize. Functional API only.
     """
     import contextlib
 
@@ -234,6 +241,8 @@ def bench_cute_dsl(
 
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
+    if use_wrapper and use_fused_finalize:
+        raise ValueError("use_fused_finalize requires the functional API")
 
     n, sv, dev = inputs["router_logits"].shape[0], 16, "cuda"
     gs1 = torch.tensor([1.0], device=dev)
@@ -363,6 +372,7 @@ def bench_cute_dsl(
                 num_local_experts=num_local_experts,
                 local_expert_offset=local_expert_offset,
                 per_token_scale=hidden_per_token_scale,
+                use_fused_finalize=use_fused_finalize,
             )
 
     # Pass input tensors via input_kwargs for cold L2 cache rotation
@@ -714,6 +724,7 @@ def run_benchmark(
     use_wrapper=True,
     routing_bias_scale=0.01,
     use_per_token_activation=False,
+    use_fused_finalize=False,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -744,6 +755,8 @@ def run_benchmark(
         routing_bias_scale: Scale for random routing bias generation
         use_per_token_activation: Whether supported FP4 MoE backends should use
             per-token NVFP4 activation scaling.
+        use_fused_finalize: Whether CuTe DSL should use the atomic fused finalize
+            instead of the deterministic two-stage finalize.
 
     Returns:
         List of BenchResult objects
@@ -771,6 +784,7 @@ def run_benchmark(
             routing_bias_scale=routing_bias_scale,
             do_autotune=do_autotune,
             use_per_token_activation=use_per_token_activation,
+            use_fused_finalize=use_fused_finalize,
         )
         results.extend(row)
         rows_and_histograms.append((row, histogram_record))
@@ -783,6 +797,7 @@ def run_benchmark(
             use_cupti,
             routing_bias_scale,
             use_per_token_activation=use_per_token_activation,
+            use_fused_finalize=use_fused_finalize,
         )
         for row, histogram_record in rows_and_histograms:
             _print_row(row, histogram_record)
@@ -803,6 +818,7 @@ def _benchmark_single(
     routing_bias_scale=0.01,
     do_autotune=True,
     use_per_token_activation=False,
+    use_fused_finalize=False,
 ):
     """Benchmark all backends for a single token count.
 
@@ -825,6 +841,7 @@ def _benchmark_single(
         use_wrapper=use_wrapper,
         do_autotune=do_autotune,
         use_per_token_activation=use_per_token_activation,
+        use_fused_finalize=use_fused_finalize,
     )
     if not use_per_token_activation:
         lat["CUTLASS"] = bench_cutlass(
@@ -870,6 +887,7 @@ def _print_header(
     use_cupti,
     routing_bias_scale,
     use_per_token_activation=False,
+    use_fused_finalize=False,
 ):
     """Print benchmark header."""
     print("\n" + "=" * 120)
@@ -893,6 +911,10 @@ def _print_header(
     print(
         f"Routing bias scale: {routing_bias_scale} "
         f"(larger values tend to create expert imbalance)"
+    )
+    print(
+        "CuteDSL finalize: "
+        f"{'atomic fused' if use_fused_finalize else 'deterministic two-stage'}"
     )
     if use_per_token_activation:
         print("CUTLASS omitted: it does not consume the per-token activation scale.")
@@ -1078,12 +1100,20 @@ def main():
         help="Use per-token NVFP4 activation scaling for supported FP4 MoE backends.",
     )
     parser.add_argument(
+        "--use-fused-finalize",
+        action="store_true",
+        help="Use atomic CuTe DSL fused finalize instead of deterministic two-stage finalize (requires --functional-api).",
+    )
+    parser.add_argument(
         "--routing-bias-scale",
         type=float,
         default=0.01,
         help="Scale for random routing bias. Larger values tend to create expert imbalance.",
     )
     args = parser.parse_args()
+
+    if args.use_fused_finalize and not args.functional_api:
+        parser.error("--use-fused-finalize requires --functional-api")
 
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
@@ -1101,6 +1131,10 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Per-token activation: {args.use_per_token_activation}")
+    print(
+        "CuteDSL finalize: "
+        f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
+    )
 
     run_benchmark(
         token_counts=tokens,
@@ -1114,6 +1148,7 @@ def main():
         use_wrapper=not args.functional_api,
         routing_bias_scale=args.routing_bias_scale,
         use_per_token_activation=args.use_per_token_activation,
+        use_fused_finalize=args.use_fused_finalize,
     )
 
     return 0
