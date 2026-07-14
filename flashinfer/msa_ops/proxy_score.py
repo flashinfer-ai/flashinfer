@@ -247,7 +247,6 @@ def _run_proxy_autotuned(
     runner_sel(inputs=tensors, tactic=tactic)
 
 
-@flashinfer_api(trace=msa_proxy_score_trace)
 @functools.cache
 def _proxy_dummies(device_index: int):
     # Signature fillers for paths that never read them; cached so repeat decode
@@ -259,6 +258,7 @@ def _proxy_dummies(device_index: int):
     )
 
 
+@flashinfer_api(trace=msa_proxy_score_trace)
 def msa_proxy_score(
     q: torch.Tensor,
     k: torch.Tensor,
