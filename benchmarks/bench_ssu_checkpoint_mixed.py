@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 from pathlib import Path
 
@@ -55,8 +56,9 @@ import torch
 
 # Import the in-process benchmarking helpers from bench_checkpointing_ssu.
 SCRIPT_DIR = Path(__file__).parent
-# Shared results dir with collect_checkpointing_ssu_runs.py.
-CSV_DIR = Path("/home/scratch.ishovkun_gpu/benchmarks/mamba_decode")
+# Shared results dir with collect_checkpointing_ssu_runs.py:
+# FLASHINFER_SSU_BENCH_OUTDIR if set, else cwd.
+CSV_DIR = Path(os.environ.get("FLASHINFER_SSU_BENCH_OUTDIR", ".")).expanduser()
 IMG_DIR = CSV_DIR / "img"
 sys.path.insert(0, str(SCRIPT_DIR))
 

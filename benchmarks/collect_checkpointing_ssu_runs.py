@@ -24,13 +24,15 @@ overrides to pin any regime when isolating kernels.
 
 import argparse
 import csv
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 # RESULTS_DIR = SCRIPT_DIR
-RESULTS_DIR = Path("/home/scratch.ishovkun_gpu/benchmarks/mamba_decode/")
+# Shared with bench_ssu_checkpoint_mixed.py: FLASHINFER_SSU_BENCH_OUTDIR else cwd.
+RESULTS_DIR = Path(os.environ.get("FLASHINFER_SSU_BENCH_OUTDIR", ".")).expanduser()
 IMG_DIR = RESULTS_DIR / "img"
 BENCH_SCRIPT = SCRIPT_DIR / "bench_checkpointing_ssu.py"
 

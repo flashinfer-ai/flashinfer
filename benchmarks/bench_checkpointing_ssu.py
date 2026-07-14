@@ -2028,9 +2028,9 @@ if __name__ == "__main__":
         _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         _fname = f"bench_checkpointing_ssu_{_spec_tag(_args)}_{_ts}.txt"
         if _args.output is None:
-            _out_path = os.path.expanduser(
-                f"/home/scratch.ishovkun_gpu/benchmarks/mamba_decode/{_fname}"
-            )
+            # Default output dir: FLASHINFER_SSU_BENCH_OUTDIR if set, else cwd.
+            _out_dir = os.environ.get("FLASHINFER_SSU_BENCH_OUTDIR", ".")
+            _out_path = os.path.join(os.path.expanduser(_out_dir), _fname)
         elif os.path.isdir(_args.output) or _args.output.endswith("/"):
             _out_path = os.path.join(_args.output, _fname)
         else:
