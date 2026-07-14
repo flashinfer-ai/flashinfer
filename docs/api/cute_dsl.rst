@@ -72,6 +72,17 @@ CuTe-DSL implementations of the batch attention wrappers.
     cute_dsl_hca_decode
 
 The recommended public entry point is
-``flashinfer.mla.batch_decode_sparse_mla_dsv4`` with
+``flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4`` with
 ``backend="cute-dsl"``. ``cute_dsl_hca_decode`` is the lower-level wrapper for
 callers that already use the HCA page-table metadata ABI.
+
+Callers whose existing ``sparse_indices`` are a canonical page-aligned HCA
+expansion may set ``hca_sparse_indices_format="page-aligned"`` to generate the
+block tables and HCA lengths. This one-shot compatibility path validates
+values, allocates metadata, synchronizes the device, immediately launches the
+decode, and is not CUDA Graph capture safe. It is not a hot-loop path.
+Latency-sensitive callers must precompute with
+``convert_page_aligned_sparse_indices_to_hca_metadata`` and reuse the returned
+metadata through the explicit HCA arguments. Arbitrary TRTLLM-GEN token-row
+selections cannot be represented by HCA page tables without repacking the KV
+pools.

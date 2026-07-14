@@ -317,7 +317,7 @@ def make_dkg_runners(inputs: HcaInputs) -> BackendRunners:
     from cutlass import Float32, Int32
     from flashinfer.cute_dsl.attention.wrappers import batch_hca
     from flashinfer.cute_dsl.utils import get_max_active_clusters
-    from flashinfer.mla import batch_decode_sparse_mla_dsv4
+    from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 
     case = inputs.case
     if not case.dkg_persistent:
@@ -380,7 +380,7 @@ def make_dkg_runners(inputs: HcaInputs) -> BackendRunners:
         )
 
     def run_public() -> None:
-        batch_decode_sparse_mla_dsv4(
+        trtllm_batch_decode_sparse_mla_dsv4(
             query=inputs.query,
             swa_kv_cache=inputs.window_cache_hnd,
             workspace_buffer=inputs.workspace,
@@ -407,7 +407,7 @@ def make_dkg_runners(inputs: HcaInputs) -> BackendRunners:
 
 
 def make_trtllm_runners(inputs: HcaInputs) -> BackendRunners:
-    from flashinfer.mla import batch_decode_sparse_mla_dsv4
+    from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
     from flashinfer.mla._core import (
         _get_trtllm_gen_multi_ctas_kv_counter_buffer,
         get_trtllm_gen_fmha_module,
@@ -447,7 +447,7 @@ def make_trtllm_runners(inputs: HcaInputs) -> BackendRunners:
         )
 
     def run_public() -> None:
-        batch_decode_sparse_mla_dsv4(
+        trtllm_batch_decode_sparse_mla_dsv4(
             query=inputs.query,
             swa_kv_cache=inputs.window_cache_hnd,
             workspace_buffer=inputs.workspace,

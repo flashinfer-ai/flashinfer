@@ -172,7 +172,7 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
     sm_scale = d_qk**-0.5
 
     def fn():
-        flashinfer.mla.batch_decode_sparse_mla_dsv4(
+        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
             query=q.unsqueeze(1),
             swa_kv_cache=kv_packed,
             workspace_buffer=workspace,
@@ -277,7 +277,7 @@ def bench_sparse_mla_sm120_dsv4_dual(
         extra_lens = indices.new_full(
             (num_tokens,), _actual_extra_topk(topk_extra, extra_topk_length)
         )
-        flashinfer.mla.batch_decode_sparse_mla_dsv4(
+        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
             query=q.unsqueeze(1),
             swa_kv_cache=kv_main,
             workspace_buffer=workspace,
