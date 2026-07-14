@@ -15,8 +15,10 @@ limitations under the License.
 
 Chunked count-rank MSA top-K KV-block selection for SM120/SM121: independent
 CTAs rank chunks of candidate blocks, then a second kernel merges the
-survivors. Exists for grids too small to fill the GPU, where the
-single-CTA-per-row kernels serialize each row's whole scan.
+survivors. Serves grids too small to fill the GPU, where the
+single-CTA-per-row kernels serialize each row's whole scan, and full grids,
+where reading the scores exactly once beats the radix kernel's pass per
+stage and shortens the count-rank kernel's per-candidate scan.
 """
 
 import cuda.bindings.driver as cuda
@@ -37,11 +39,19 @@ _MIN_CHUNKS = 2
 # Dispatch floor: under this many middle blocks the second launch never pays
 # for itself.
 _MIN_BLOCKS = 32
-# Dispatch row cap: covers saturated decode batches while bounding the
-# per-call candidate scratch (rows * _MAX_CHUNKS * topk * 8 bytes).
+# Partial-kernel boundary: at or below this many rows the grid needs
+# row-per-CTA fan-out to fill the GPU; above it the q-tiled partial takes
+# over for coalesced score reads.
 _MAX_CHUNKED_ROWS = 2048
+# Candidate-scratch ceiling (rows * num_chunks * topk * 8 bytes per call);
+# grids that would exceed it fall back to the single-kernel paths.
+_MAX_CHUNKED_SCRATCH_BYTES = 512 << 20
 _NTHREADS_PARTIAL = 128
 _NTHREADS_MERGE = 256
+# Queries per CTA in the full-grid partial kernel: one warp lane per query
+# turns the (H, P, S) score reads coalesced (S is the contiguous axis, so a
+# single row's block scores are S floats apart).
+_QTILE = 32
 _SENTINEL = 0x7FFFFFFF  # INT32_MAX: empty slots sort to the tail, unlike -1
 # Empty-slot key. Detection must use the index: a NaN score can legitimately
 # produce this key.
@@ -53,10 +63,14 @@ class TopKSelectChunkedSm12x:
     Uses the count-rank kernel's (bit-key, block index) order, so the two
     produce identical selections."""
 
-    def __init__(self, topk: int):
+    def __init__(self, topk: int, tiled: bool = False):
         if topk != 16:
             raise ValueError(f"topk must be 16, got {topk}")
         self._topk = topk
+        # Tiled = full-grid variant: the partial kernel covers _QTILE queries
+        # per CTA for coalesced score reads. The row-per-CTA variant stays for
+        # small grids, where those extra CTAs are the needed parallelism.
+        self._tiled = tiled
 
     @cute.jit
     def __call__(
@@ -76,13 +90,39 @@ class TopKSelectChunkedSm12x:
     ):
         mBits = cute.recast_tensor(mMaxScore, cutlass.Uint32)
         mKey = cute.recast_tensor(mCandKey, cutlass.Uint32)
-        self.kernel_partial(
-            mBits, mKey, mCandIdx, num_valid_pages, force_begin, force_end, chunk_len
-        ).launch(
-            grid=(total_qo_len, num_qo_heads, num_chunks),
-            block=(_NTHREADS_PARTIAL, 1, 1),
-            stream=stream,
-        )
+        if cutlass.const_expr(self._tiled):
+            self.kernel_partial_tiled(
+                mBits,
+                mKey,
+                mCandIdx,
+                num_valid_pages,
+                force_begin,
+                force_end,
+                chunk_len,
+                total_qo_len,
+            ).launch(
+                grid=(
+                    (total_qo_len + _QTILE - 1) // _QTILE,
+                    num_qo_heads,
+                    num_chunks,
+                ),
+                block=(_NTHREADS_PARTIAL, 1, 1),
+                stream=stream,
+            )
+        else:
+            self.kernel_partial(
+                mBits,
+                mKey,
+                mCandIdx,
+                num_valid_pages,
+                force_begin,
+                force_end,
+                chunk_len,
+            ).launch(
+                grid=(total_qo_len, num_qo_heads, num_chunks),
+                block=(_NTHREADS_PARTIAL, 1, 1),
+                stream=stream,
+            )
         self.kernel_merge(
             mKey, mCandIdx, mOut, num_valid_pages, force_begin, force_end, num_chunks
         ).launch(
@@ -177,6 +217,98 @@ class TopKSelectChunkedSm12x:
 
         # PDL: let the merge grid start its preamble now; its griddepcontrol
         # wait holds off the candidate reads until these stores land.
+        cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.kernel
+    def kernel_partial_tiled(
+        self,
+        mBits: cute.Tensor,  # (H, P, S) uint32, raw bits of max_score
+        mKey: cute.Tensor,  # (S, H, C*topk) uint32 candidate keys
+        mIdx: cute.Tensor,  # (S, H, C*topk) int32 candidate block indices
+        num_valid_pages: cutlass.Int32,
+        force_begin: cutlass.Int32,
+        force_end: cutlass.Int32,
+        chunk_len: cutlass.Int32,
+        total_qo_len: cutlass.Int32,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        qb, h, c = cute.arch.block_idx()
+
+        # Row-major (block, query) staging: a warp stages one block for 32
+        # consecutive queries in a single coalesced line, and the rank scan
+        # walks blocks down a bank-aligned column.
+        @cute.struct
+        class SharedStorage:
+            score: cute.struct.MemRange[cutlass.Uint32, _MAX_CHUNK_BLOCKS * _QTILE]
+
+        smem = cutlass.utils.SmemAllocator()
+        st = smem.allocate(SharedStorage)
+        score = st.score.get_tensor(cute.make_layout(_MAX_CHUNK_BLOCKS * _QTILE))
+
+        q0 = qb * _QTILE
+        lane = tid % _QTILE
+        grp = tid // _QTILE
+        n_grp = _NTHREADS_PARTIAL // _QTILE
+        q = q0 + lane
+        q_ok = q < total_qo_len
+
+        mid_hi = num_valid_pages - force_end
+        n_forced = force_begin + force_end
+        target = cutlass.Int32(self._topk) - n_forced
+
+        c_lo = force_begin + c * chunk_len
+        c_hi = c_lo + chunk_len
+        if c_hi > mid_hi:
+            c_hi = mid_hi
+        n_local = c_hi - c_lo
+        n_pad = (n_local + 3) & ~cutlass.Int32(3)
+        cand_base = c * cutlass.Int32(self._topk)
+
+        # Sentinel-fill every covered row's candidate slots; the barrier below
+        # orders the fill before any thread's survivor stores.
+        i = cutlass.Int32(tid)
+        while i < cutlass.Int32(_QTILE * self._topk):
+            qq = q0 + i // self._topk
+            if qq < total_qo_len:
+                mKey[qq, h, cand_base + i % self._topk] = cutlass.Uint32(_SENTINEL_KEY)
+                mIdx[qq, h, cand_base + i % self._topk] = cutlass.Int32(_SENTINEL)
+            i += _NTHREADS_PARTIAL
+
+        # Out-of-range queries stage sentinels so no lane reads out of bounds.
+        l = cutlass.Int32(grp)
+        while l < n_pad:
+            k = cutlass.Uint32(_SENTINEL_KEY)
+            if (l < n_local) and q_ok:
+                k = _radix_key(mBits[h, c_lo + l, q])
+            score[l * _QTILE + lane] = k
+            l += n_grp
+        cute.arch.barrier()
+
+        # Same rank-as-slot emit as the row-per-CTA kernel, per lane's query.
+        l = cutlass.Int32(grp)
+        while l < n_local:
+            kb = score[l * _QTILE + lane]
+            rank = cutlass.Int32(0)
+            j = cutlass.Int32(0)
+            while j < n_pad:
+                k0 = score[j * _QTILE + lane]
+                k1 = score[(j + 1) * _QTILE + lane]
+                k2 = score[(j + 2) * _QTILE + lane]
+                k3 = score[(j + 3) * _QTILE + lane]
+                if (k0 < kb) or ((k0 == kb) and (j < l)):
+                    rank += 1
+                if (k1 < kb) or ((k1 == kb) and (j + 1 < l)):
+                    rank += 1
+                if (k2 < kb) or ((k2 == kb) and (j + 2 < l)):
+                    rank += 1
+                if (k3 < kb) or ((k3 == kb) and (j + 3 < l)):
+                    rank += 1
+                j += 4
+            if q_ok and (rank < target):
+                mKey[q, h, cand_base + rank] = kb
+                mIdx[q, h, cand_base + rank] = c_lo + l
+            l += n_grp
+
         cute.arch.griddepcontrol_launch_dependents()
 
     @cute.kernel

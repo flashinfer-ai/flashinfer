@@ -883,10 +883,11 @@ def test_sparse_decode_nvfp4_scale_size_guard():
 # ---------------------------------------------------------------------------
 
 
-# nvp = P - 56 lands each case on a different kernel: P=88 count-rank with a
-# tiny middle region, P=128 count-rank with a multi-pass scan (the S=1200 grid
-# is past the chunked row cap), P=256 chunked, P=2560 radix (past the chunked
-# block coverage).
+# nvp = P - 56 lands each case on a different dispatch: P=88 count-rank with
+# a tiny middle region, P=128 with S=1200 chunked on a full grid (rows past
+# the chunking-policy boundary, longest-chunk regime), P=256 chunked on a
+# small grid (short-chunk regime), P=2560 radix (past the chunked block
+# coverage).
 @pytest.mark.parametrize("P,S", [(88, 64), (128, 1200), (256, 64), (2560, 64)])
 def test_msa_topk_select_forced_and_clamped(P, S):
     """Forced begin/end blocks are always selected within the topk budget;
@@ -1664,11 +1665,12 @@ def test_msa_topk_select_countrank_matches_radix_on_nan():
     chunk_len = (P + num_chunks - 1) // num_chunks
     cand_key = torch.empty(S, H, num_chunks * topk, dtype=torch.int32, device=dev)
     cand_idx = torch.empty_like(cand_key)
-    for _ in range(2):
+    for tiled in (False, False, True):
         out = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
-        _get_compiled_topk_chunked(topk)(
+        _get_compiled_topk_chunked(topk, tiled)(
             score, cand_key, cand_idx, out, P, 0, 0, num_chunks, chunk_len, S, H
         )
         outs.append(out.cpu())
     assert torch.equal(outs[3], outs[4]), "chunked nondeterministic on NaN"
     assert torch.equal(outs[0], outs[3]), "chunked != count-rank on NaN scores"
+    assert torch.equal(outs[0], outs[5]), "tiled chunked != count-rank on NaN scores"

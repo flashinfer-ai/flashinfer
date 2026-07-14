@@ -69,10 +69,12 @@ def _get_compiled_topk(topk: int, small: bool):
     return compiled
 
 
-def _get_compiled_topk_chunked(topk: int):
+def _get_compiled_topk_chunked(topk: int, tiled: bool):
     """Two-kernel (per-chunk rank + merge) variant; selections match the
-    count-rank kernel exactly (same bit-key and tie order)."""
-    key = (topk, "chunked")
+    count-rank kernel exactly (same bit-key and tie order). ``tiled`` picks
+    the full-grid partial kernel (coalesced q-tile staging) over the
+    row-per-CTA one."""
+    key = (topk, "chunked", tiled)
     compiled = _topk_compile_cache.get(key)
     if compiled is not None:
         return compiled
@@ -81,7 +83,7 @@ def _get_compiled_topk_chunked(topk: int):
 
     # Tensors: max_score, candidate keys, candidate indices, out. Scalars: nvp,
     # force_begin/end, num_chunks, chunk_len, total_q, heads.
-    compiled = _compile_topk(TopKSelectChunkedSm12x(topk=topk), 4, 7)
+    compiled = _compile_topk(TopKSelectChunkedSm12x(topk=topk, tiled=tiled), 4, 7)
     _topk_compile_cache[key] = compiled
     return compiled
 
@@ -198,6 +200,7 @@ def msa_topk_select(
         _CHUNK_BLOCKS,
         _MAX_CHUNK_BLOCKS,
         _MAX_CHUNKED_ROWS,
+        _MAX_CHUNKED_SCRATCH_BYTES,
         _MAX_CHUNKS,
         _MIN_BLOCKS,
         _MIN_CHUNKS,
@@ -205,19 +208,23 @@ def msa_topk_select(
     from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
 
     # Dispatch on the runtime valid-page count: the kernels only ever touch
-    # blocks below num_valid_pages. The chunked path serves grids too small to
-    # fill the GPU, and still wins at full ones by reading the scores once
-    # where the radix kernel makes a pass per stage; prefill-sized grids keep
-    # the single-kernel paths. Everything here is shape-constant, so the
-    # choice is CUDA-graph safe.
+    # blocks below num_valid_pages. The chunked path serves every grid with
+    # enough middle blocks to amortize its second launch: small grids because
+    # the single-CTA-per-row kernels cannot fill the GPU, full grids because
+    # it reads the scores exactly once where the radix kernel makes a pass
+    # per stage. ``tiled`` swaps in the coalesced q-tile partial kernel once
+    # the grid is large enough to fill the GPU without row-per-CTA fan-out.
+    # Everything here is shape-constant, so the choice is CUDA-graph safe.
     small = int(num_valid_pages) <= _MAX_BLOCKS
+    rows = total_qo_len * num_qo_heads
     n_mid = int(num_valid_pages) - force_begin_blocks - force_end_blocks
-    chunked = (
-        total_qo_len * num_qo_heads <= _MAX_CHUNKED_ROWS
-        and _MIN_BLOCKS < n_mid <= _MAX_CHUNKS * _MAX_CHUNK_BLOCKS
-    )
+    chunked = _MIN_BLOCKS < n_mid <= _MAX_CHUNKS * _MAX_CHUNK_BLOCKS
+    tiled = rows > _MAX_CHUNKED_ROWS
     if chunked:
         num_chunks = max(_MIN_CHUNKS, min(_MAX_CHUNKS, -(-n_mid // _CHUNK_BLOCKS)))
+        if rows * num_chunks * topk * 8 > _MAX_CHUNKED_SCRATCH_BYTES:
+            chunked = False
+    if chunked:
         chunk_len = -(-n_mid // num_chunks)
         # One allocation for both candidate buffers keeps this hot path at a
         # single allocator call.
@@ -227,7 +234,7 @@ def msa_topk_select(
             device=max_score.device,
         )
         cand_key, cand_idx = cand[0], cand[1]
-        _get_compiled_topk_chunked(topk)(
+        _get_compiled_topk_chunked(topk, tiled)(
             max_score,
             cand_key,
             cand_idx,
