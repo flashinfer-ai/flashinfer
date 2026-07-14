@@ -494,7 +494,7 @@ match what the code uses today; values are strings unless noted.
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
 | `FLASHINFER_CUBIN_DIR` | `<FLASHINFER_WORKSPACE_BASE>/.cache/flashinfer/cubins` | `flashinfer/jit/env.py` (exposed via `flashinfer/__main__.py show-config`) | Local directory used to cache downloaded cubins. Override to share a cache between users. |
-| `FLASHINFER_CUBINS_REPOSITORY` | `https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local` | `flashinfer/jit/cubin_loader.py` | Base URL the loader downloads cubins from. Point to a mirror for offline or air-gapped setups. |
+| `FLASHINFER_CUBINS_REPOSITORY` | `https://artifactory.nvidia.com/artifactory/sw-kernelinferencelibrary-generic-local` | `flashinfer/jit/cubin_loader.py` | Base URL the loader downloads cubins from. Point to a mirror for offline or air-gapped setups. |
 | `FLASHINFER_CUBIN_CHECKSUM_DISABLED` | unset | `flashinfer/jit/cubin_loader.py` | If set, skip SHA checksum verification of downloaded cubins. Debug aid only. |
 | `FLASHINFER_CUBIN_DOWNLOAD_THREADS` | `4` | `flashinfer/artifacts.py` | Thread-pool size used by `flashinfer artifacts download`. |
 | `FLASHINFER_NO_DOWNLOAD` | unset | `flashinfer/jit/cubin_loader.py` | Hard-fail if a cubin is missing locally instead of attempting to download. Useful in CI / locked-down environments. |

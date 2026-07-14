@@ -34,7 +34,7 @@ from .env import FLASHINFER_CUBIN_DIR
 # with a local path for testing.
 FLASHINFER_CUBINS_REPOSITORY = os.environ.get(
     "FLASHINFER_CUBINS_REPOSITORY",
-    "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/",
+    "https://artifactory.nvidia.com/artifactory/sw-kernelinferencelibrary-generic-local/",
 )
 
 
