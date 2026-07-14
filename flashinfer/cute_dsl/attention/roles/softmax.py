@@ -143,9 +143,7 @@ class SoftmaxRole:
         kv_head_idx = qo_head_idx // self.num_repeat_kv_heads
         kv_tile_idx = cS[0][1] // self.qk_mma_tiler[1]
 
-        seqlen_q, seqlen_k, scale_softmax_log2, window_left, window_right = (
-            value_args
-        )
+        seqlen_q, seqlen_k, scale_softmax_log2, window_left, window_right = value_args
         (
             mma_si_consumer,
             si_corr_producer,
@@ -450,9 +448,7 @@ class SoftmaxRole:
 
         # P = 0 so the PV gemm adds nothing (zero f32 backing = packed
         # bf16/fp16 zeros).
-        tTMEM_STORErS_x4 = cute.make_rmem_tensor(
-            tTMEM_STOREcS.shape, self.qk_acc_dtype
-        )
+        tTMEM_STORErS_x4 = cute.make_rmem_tensor(tTMEM_STOREcS.shape, self.qk_acc_dtype)
         for idx in range(cute.size(tTMEM_STORErS_x4)):
             tTMEM_STORErS_x4[idx] = 0.0
 

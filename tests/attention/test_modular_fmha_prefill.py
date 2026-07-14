@@ -1025,9 +1025,7 @@ def test_attention_prefill_sliding_window_top_level_wrapper(causal):
         batch_size * seq_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
     )
     v = torch.randn_like(k)
-    indptr = (
-        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * seq_len
-    )
+    indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * seq_len
 
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
