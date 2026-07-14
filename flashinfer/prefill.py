@@ -3498,22 +3498,42 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     )
                 variant = SoftCappingAttention(cap=logits_soft_cap)
 
-            self._cute_dsl_wrapper.plan(
-                qo_indptr,
-                kv_indptr,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim_qk,
-                head_dim_vo=head_dim_qk,
-                causal=causal,
-                sm_scale=sm_scale
-                if sm_scale is not None
-                else 1.0 / math.sqrt(head_dim_qk),
-                q_data_type=q_data_type,
-                kv_data_type=kv_data_type if kv_data_type is not None else q_data_type,
-                window_left=window_left,
-                variant=variant,
+            _sm_scale = (
+                sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk)
             )
+            # Route compatible calls to faster trtllm CuTe DSL FMHA kernels.
+            self._cute_dsl_use_fmha = variant is None and head_dim_qk == 128
+            if self._cute_dsl_use_fmha:
+                q_lens = qo_indptr[1:] - qo_indptr[:-1]
+                k_lens = kv_indptr[1:] - kv_indptr[:-1]
+                self._cute_dsl_fmha_plan = {
+                    "qo_indptr": qo_indptr,
+                    "kv_indptr": kv_indptr,
+                    "seq_lens": k_lens.to(torch.int32),
+                    "batch_size": qo_indptr.shape[0] - 1,
+                    "max_q_len": int(q_lens.max().item()),
+                    "max_kv_len": int(k_lens.max().item()),
+                    "sm_scale": _sm_scale,
+                    "causal": causal,
+                    "window_left": window_left,
+                }
+            else:
+                self._cute_dsl_wrapper.plan(
+                    qo_indptr,
+                    kv_indptr,
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim_qk,
+                    head_dim_vo=head_dim_qk,
+                    causal=causal,
+                    sm_scale=_sm_scale,
+                    q_data_type=q_data_type,
+                    kv_data_type=kv_data_type
+                    if kv_data_type is not None
+                    else q_data_type,
+                    window_left=window_left,
+                    variant=variant,
+                )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
@@ -3794,16 +3814,39 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "out",
             )
         if self._backend == "cute-dsl":
-            # These checks live here (not in plan()) because return_lse and
-            # scale parameters are run()-time arguments that can vary between
-            # calls on the same planned wrapper.
-            if return_lse:
-                raise NotImplementedError(
-                    "cute-dsl backend does not support return_lse"
-                )
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
                 raise NotImplementedError(
                     "cute-dsl backend does not support FP8 scale parameters"
+                )
+            if self._cute_dsl_use_fmha:
+                # Delegate to the trtllm CuTe DSL FMHA kernel (supports LSE).
+                p = self._cute_dsl_fmha_plan
+                return trtllm_ragged_attention_deepseek(
+                    query=q,
+                    key=k,
+                    value=v,
+                    workspace_buffer=self._float_workspace_buffer,
+                    seq_lens=p["seq_lens"],
+                    max_q_len=p["max_q_len"],
+                    max_kv_len=p["max_kv_len"],
+                    bmm1_scale=p["sm_scale"],
+                    bmm2_scale=1.0,
+                    o_sf_scale=1.0,
+                    batch_size=p["batch_size"],
+                    window_left=p["window_left"],
+                    cum_seq_lens_q=p["qo_indptr"],
+                    cum_seq_lens_kv=p["kv_indptr"],
+                    enable_pdl=enable_pdl,
+                    is_causal=p["causal"],
+                    return_lse=return_lse,
+                    out=out,
+                    lse=lse,
+                    backend="cute-dsl",
+                )
+            # Generic JIT (ALiBi / soft-cap): prefill.py-based wrapper (no LSE).
+            if return_lse:
+                raise NotImplementedError(
+                    "cute-dsl backend does not support return_lse with ALiBi / soft-cap"
                 )
             out = self._cute_dsl_wrapper.run(q, k, v, out=out)
             return out
