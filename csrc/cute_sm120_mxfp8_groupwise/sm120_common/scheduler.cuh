@@ -15,11 +15,15 @@
  */
 
 #pragma once
-#include <cuda_runtime.h>
-
+// clang-format off
 #include <cstdint>
 
-namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled {
+#include <cute/config.hpp>
+#include <cute/layout.hpp>
+// clang-format on
+
+namespace flashinfer::gemm::mxfp8_cute_sm120 {
+namespace sm120_common {
 
 enum class GemmType {
   Normal,
@@ -36,6 +40,19 @@ enum class GemmType {
 constexpr bool is_flat_gemm(GemmType t) {
   return t == GemmType::Normal || t == GemmType::Batched || t == GemmType::MGroupedMasked;
 }
+
+namespace utils {
+
+template <bool kSwapAB>
+CUTE_DEVICE auto make_blk_coord(int32_t sched_m, int32_t sched_n, int32_t expert_idx) {
+  if constexpr (kSwapAB) {
+    return cute::make_coord(sched_n, sched_m, expert_idx);
+  } else {
+    return cute::make_coord(sched_m, sched_n, expert_idx);
+  }
+}
+
+}  // namespace utils
 
 // Compile-time SM count hint for L2 swizzle group size selection.
 // Override at build time via -DSM120_DEFAULT_NUM_SMS=N (CMakeLists auto-detects
@@ -215,4 +232,5 @@ struct Scheduler {
   }
 };
 
-}  // namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled
+}  // namespace sm120_common
+}  // namespace flashinfer::gemm::mxfp8_cute_sm120
