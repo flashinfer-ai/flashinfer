@@ -518,7 +518,7 @@ def gen_all_modules(
             add_oai_oss,
         )
     )
-    if has_sm120:
+    if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
 
     if add_act:

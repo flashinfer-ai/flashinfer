@@ -130,7 +130,7 @@ def fake_nixl_ep_module(fake_buffer_cls):
 @pytest.fixture
 def patched_loader(fake_nixl_ep_module):
     """Bypass _load_nixl_ep so we don't need libnixl.so on the dev box."""
-    from flashinfer.moe_ep.nixl_ep import fleet
+    from flashinfer.moe_ep.backends.split.comm.nixl_ep import fleet
 
     with (
         mock.patch.object(fleet, "_load_nixl_ep", return_value=fake_nixl_ep_module),
@@ -224,7 +224,11 @@ def test_update_topology_diffs_ranks(patched_loader, fake_buffer_cls):
     )
 
     bootstrap = BootstrapConfig(world_size=4, rank=0, tcp_store=mock.Mock())
-    params = FleetParams(num_experts=8, max_tokens_per_rank=64, token_hidden_size=4096)
+    params = FleetParams(
+        num_experts=8,
+        max_tokens_per_rank=64,
+        token_hidden_size=4096,
+    )
     fleet = create_fleet(bootstrap, params, [], backend="nixl_ep")
 
     # Grow from 4 → 6 ranks: new ranks [4, 5] should appear in connect_ranks.

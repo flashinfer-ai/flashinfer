@@ -1,23 +1,23 @@
 """Config dataclasses + I/O envelopes for moe_ep.
 
 Frozen dataclasses for `BootstrapConfig` (the inputs each backend needs at
-construction), `FleetParams` (durable transport sizing), `HandleParams`
+construction), `FleetParams` (EP sizing; split transport fields
+have defaults mega ignores), `HandleParams`
 (per-iteration topk_ids), and the four envelope types
 :class:`DispatchInputParams` / :class:`DispatchOutput` /
 :class:`CombineInputParams` / :class:`CombineOutput` that the Handle
 interface passes around.
 
-Validation: ctors enforce non-negative ints. Backend-specific constraints
-(`max_tokens_per_rank ≤ 1024` for nixl_ep, `num_experts % world_size == 0`,
-etc.) live in :mod:`flashinfer.moe_ep._validators` and run inside each
+Backend-specific constraints live in
+:mod:`flashinfer.moe_ep.core.validation` and run inside each
 backend's Fleet __init__.
 """
 
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 if TYPE_CHECKING:
     import torch
@@ -66,6 +66,11 @@ class BootstrapConfig:
     ``tcp_store``). Carrying all of them here lets a single bootstrap config
     drive either backend.
 
+    ``world_size`` and ``rank`` describe the EP comm domain. When the host
+    framework uses a non-WORLD process group (e.g. vLLM expert parallel within
+    a PP stage), pass that group via ``process_group``; mega kernels then use
+    it for symmetric-memory setup and collectives instead of WORLD.
+
     Communicator resolution (NCCL-EP), in priority order:
 
     * ``nccl_comm`` — an existing ``ncclComm_t`` (as an int). The Fleet
@@ -82,12 +87,17 @@ class BootstrapConfig:
     world_size: int
     rank: int
     stream: int = 0  # int representation of a cudaStream_t; 0 = default stream
+    auto_bootstrap: bool = True
     nccl_comm: Optional[int] = (
         None  # int representation of ncclComm_t; None = derive from PG
     )
     # Torch process group to mirror when nccl_comm is not supplied. None =
     # default group. Adopting an existing nccl_comm takes precedence.
-    process_group: Optional["torch.distributed.ProcessGroup"] = None
+    process_group: Optional["torch.distributed.ProcessGroup"] = field(
+        default=None,
+        compare=False,
+        hash=False,
+    )
     tcp_store: Optional["torch.distributed.TCPStore"] = None
 
     def __post_init__(self) -> None:
@@ -99,12 +109,16 @@ class BootstrapConfig:
 
 @dataclass(frozen=True)
 class FleetParams:
-    """Durable sizing for an EP Fleet.
+    """EP sizing and split-path transport defaults.
 
-    `num_channels`, `num_qp_per_rank`, `rdma_buffer_size` are exposed as
+    Canonical expert weights are NOT carried here; pass the
+    :class:`~flashinfer.moe_ep.weights.MoEWeightPack` as the ``weights``
+    argument at layer construction (:func:`~flashinfer.moe_ep.layer.MoEEpLayer`).
+
+    ``num_channels``, ``num_qp_per_rank``, ``rdma_buffer_size`` are exposed as
     :mod:`flashinfer.moe_ep.algo_knobs` Fleet-level knobs rather than top-level
-    fields, since they're backend-specific tuning rather than contract-level
-    sizing.
+    fields. Split-only fields ``dtype_bytes``, ``algorithm``, and ``layout`` are
+    ignored by the mega path.
     """
 
     num_experts: int
@@ -112,7 +126,6 @@ class FleetParams:
     token_hidden_size: int
     dtype_bytes: int = 2  # bf16 default; FP8 path overrides
     algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
-    # LL receive layout. Ignored by HT (always FLAT). RANK_MAJOR is LL-only.
     layout: EpLayout = EpLayout.EXPERT_MAJOR
 
     def __post_init__(self) -> None:
@@ -160,8 +173,9 @@ class DispatchInputParams:
 class DispatchOutput:
     """Outputs from :meth:`Handle.dispatch`.
 
-    ``expert_tensors`` is the dispatched token tensor on the local rank
-    (shape: ``[num_recv_tokens, hidden]``).
+    ``expert_tensors`` is the dispatched token tensor on the local rank.
+    ``num_tokens`` is the actual receive count (= ``max_tokens_per_rank`` in
+    fixed-size LL mode; queried via ``ncclEpHandleGetNumRecvTokens`` otherwise).
 
     ``recv_topk_idx`` / ``recv_topk_weights`` are the per-received-token routing
     returned by the LL RANK_MAJOR (and HT) layouts — ``[num_recv_tokens, top_k]``
@@ -185,10 +199,16 @@ class DispatchOutput:
     """
 
     expert_tensors: "torch.Tensor"
+    num_tokens: Union[int, Callable[[], int]]
     recv_topk_idx: Optional["torch.Tensor"] = None
     recv_topk_weights: Optional["torch.Tensor"] = None
     expert_counts: Optional["torch.Tensor"] = None
     recv_total_counter: Optional["torch.Tensor"] = None
+
+    def get_num_tokens(self) -> int:
+        """Resolve ``num_tokens`` to an int, evaluating a deferred thunk if present."""
+        nt = self.num_tokens
+        return nt() if callable(nt) else nt
 
 
 @dataclass(frozen=True)

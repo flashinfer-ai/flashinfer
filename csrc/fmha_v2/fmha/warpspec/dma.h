@@ -153,7 +153,7 @@ struct DMA {
 
     static inline __device__ bool decode_exact_dynamic_tile_id(
         bert::Fused_multihead_attention_params_v2 const& params, uint32_t tile_id, int& bidb,
-        int& bidh, int& q_step_offset) {
+        int& bidh, int& q_step_offset, bool reverse = false) {
       int remaining = static_cast<int>(tile_id);
 
 #pragma unroll 1
@@ -165,7 +165,11 @@ struct DMA {
         if (remaining < batch_tiles) {
           bidb = batch_idx;
           bidh = remaining / q_tiles_per_head;
-          q_step_offset = (remaining % q_tiles_per_head) * NUM_COMPUTE_GROUPS;
+          int local_q = remaining % q_tiles_per_head;
+          if (reverse) {
+            local_q = q_tiles_per_head - 1 - local_q;
+          }
+          q_step_offset = local_q * NUM_COMPUTE_GROUPS;
           return true;
         }
         remaining -= batch_tiles;
@@ -210,7 +214,10 @@ struct DMA {
         } else {
           if constexpr (DMA_GROUP_TRANSPOSE_V) {
             q_steps = NUM_COMPUTE_GROUPS;
-            if (!decode_exact_dynamic_tile_id(params, tile_id_, bidb, bidh, q_step_offset)) {
+            bool reverse =
+                CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling;
+            if (!decode_exact_dynamic_tile_id(params, tile_id_, bidb, bidh, q_step_offset,
+                                              reverse)) {
               break;
             }
           } else {
@@ -367,7 +374,9 @@ struct DMA {
         } else if constexpr (DMA_GROUP_TRANSPOSE_V) {
           q_steps = NUM_COMPUTE_GROUPS;
           int q_step_offset;
-          if (!decode_exact_dynamic_tile_id(params, tile_id_, bidb, bidh, q_step_offset)) {
+          bool reverse =
+              CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling;
+          if (!decode_exact_dynamic_tile_id(params, tile_id_, bidb, bidh, q_step_offset, reverse)) {
             break;
           }
           local_q_tile_offset = q_step_offset * STEP_Q;
