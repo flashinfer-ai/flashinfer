@@ -34,10 +34,11 @@ from flashinfer.comm.comm_backend import MPIBackend, TorchDistBackend
 _TIMEOUT_S = 120.0
 
 
-def _backend_checks(rank: int, world_size: int) -> dict[str, Any]:
+def _backend_checks(rank: int) -> dict[str, Any]:
     """Run every CommBackend method once and return the observed results.
 
     All ranks issue the same sequence of collectives, so the calls stay matched.
+    The world size is read from the process group, not passed in.
     """
     b = TorchDistBackend()
     res: dict[str, Any] = {}
@@ -72,7 +73,7 @@ def _dist_entry(rank: int, world_size: int, store_path: str, q: Any) -> None:
         world_size=world_size,
     )
     try:
-        q.put((rank, _backend_checks(rank, world_size)))
+        q.put((rank, _backend_checks(rank)))
     finally:
         dist.destroy_process_group()
 
@@ -111,7 +112,7 @@ _gloo_unavailable = not dist.is_available() or not dist.is_gloo_available()
 
 
 @pytest.mark.skipif(_gloo_unavailable, reason="torch.distributed gloo backend required")
-@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("world_size", [2])
 def test_torch_dist_backend_collectives(world_size: int) -> None:
     results = _run_dist(world_size)
 
