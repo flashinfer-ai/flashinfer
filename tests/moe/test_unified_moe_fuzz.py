@@ -141,7 +141,6 @@ from __future__ import annotations
 
 import os
 import random
-import warnings
 from dataclasses import dataclass
 from typing import Callable
 
@@ -168,7 +167,18 @@ from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.utils import get_compute_capability
 
+from tests.test_helpers.fuzz_ledger import FuzzLedger
+
 NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "80"))
+# Debug knob: comma-separated backend_key allowlist (e.g. "cute_dsl_nvfp4") to run a
+# backend-scoped sequence -- used to bisect cross-call state corruption by backend (gh #3957).
+_BACKEND_FILTER = {
+    b for b in os.environ.get("FLASHINFER_UMOE_FUZZ_BACKENDS", "").split(",") if b
+}
+# Debug knob: skip the autotune(True) production-path step entirely -- used to isolate whether
+# cross-call corruption accumulates in the profiling path (cudagraph captures) or the plain
+# forward/tactic path (gh #3957).
+_NO_AUTOTUNE = bool(os.environ.get("FLASHINFER_UMOE_FUZZ_NO_AUTOTUNE"))
 BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
 
 # --- CI gate: ON by default (FLASHINFER_UMOE_FUZZ=0 is the emergency waiver) ----------------
@@ -199,21 +209,21 @@ _DETERMINISTIC = {
     "cute_dsl_nvfp4": False,  # atomic scatter-add finalize -> non-bit-exact by design
 }
 
-# Known-bug ledger: (backend_key, predicate(cfg)) -> reason. A matching (backend, config) is run but
-# its correctness failure is TOLERATED (xfail) -- this keeps the suite green on a filed-and-tracked
-# bug while still EXERCISING it, so the day the bug is fixed the case starts passing and we get a loud
-# "unexpectedly passed -> remove this entry" signal. A crash is never tolerated (only wrong answers).
-_KNOWN_FAILURES = [
-    # Entries: (backend_key, predicate(cfg), "reason; gh #NNNN").
-    # Empty since the gh #3547 EP-offset double-subtraction fix.
-]
-
-
-def _known_failure(backend_key, cfg):
-    for bk, predicate, reason in _KNOWN_FAILURES:
-        if bk == backend_key and predicate(cfg):
-            return reason
-    return None
+# Known-bug ledger (shared mechanism: tests/test_helpers/fuzz_ledger.py). Two severities:
+# quarantine=False entries are RUN with a tolerated wrong answer (xpass flags the fix);
+# quarantine=True entries are xfailed up front and never launch (crash / device-state class --
+# one such config poisons the CUDA context for every later test in the process).
+LEDGER = FuzzLedger(
+    "unified-moe",
+    findings=(
+        # Finding(match=..., reason="...; gh #NNNN", quarantine=..., backend=...)
+        # Wrong-answer entries: empty since the gh #3547 EP-offset double-subtraction fix.
+        # NOTE on gh #3957 (cross-call device-state corruption around the ~50th config): it is NOT
+        # quarantinable by config predicate -- the failing config is a moving VICTIM (quarantining
+        # seed 46 was tried and the failure shifted to the next configs), and no 25-config subset
+        # reproduces. Expect this file red on SM100-family runners until #3957 is fixed.
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +510,9 @@ def _is_unsupported(e):
 def test_unified_moe_fuzz(cfg):
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
+    # Crash-class quarantine gate: MUST precede any kernel launch (a quarantined config would
+    # poison the CUDA context for every later test in this process).
+    LEDGER.xfail_if_quarantined(cfg)
     # Full per-config determinism so any failure reproduces from the seed in the test id alone.
     # Shapes (random.Random(seed)) and the input tensors (a per-config torch.Generator) are already
     # seeded; this also pins the two GLOBAL-RNG draws -- the poison garbage and the device probe --
@@ -519,6 +532,12 @@ def test_unified_moe_fuzz(cfg):
         for BackendCfg in handler.candidate_configs
         if BackendCfg in _BACKEND_RUNNERS and BackendCfg.supported(sm)
     ]
+    if _BACKEND_FILTER:
+        wired_backends = [
+            B
+            for B in wired_backends
+            if _BACKEND_RUNNERS[B].backend_key in _BACKEND_FILTER
+        ]
     if not wired_backends:
         pytest.skip(f"no wired backend for {cfg.variant} on SM{sm}")
 
@@ -644,17 +663,13 @@ def test_unified_moe_fuzz(cfg):
         tag = f"{runner.backend_key} {cfg.label}"
         n_ran += 1
 
-        known = _known_failure(runner.backend_key, cfg)
+        known = LEDGER.find(cfg, backend=runner.backend_key)
         if known:  # tracked bug -> run it, tolerate a wrong answer, but flag if it starts passing
             try:
                 check_backend(runner, out, tag)
             except (AssertionError, pytest.fail.Exception):
                 continue
-            warnings.warn(
-                f"{tag}: KNOWN-FAILURE unexpectedly PASSED -- fixed? remove from "
-                f"_KNOWN_FAILURES ({known})",
-                stacklevel=2,
-            )
+            LEDGER.flag_xpass(known, tag)
         else:
             check_backend(runner, out, tag)
 
@@ -665,8 +680,13 @@ def test_unified_moe_fuzz(cfg):
     # tactic of every runner (the #3168 profiling-IMA class) then selects + caches a winner; the
     # autotuned output must match the authoritative reference. Gated to a subset (profiling is slow)
     # and skipped if a candidate has a known failure (the tuner could pick the broken backend).
-    autotune_due = cfg.seed % 4 == 0 and not any(
-        _known_failure(_BACKEND_RUNNERS[B].backend_key, cfg) for B in wired_backends
+    autotune_due = (
+        not _NO_AUTOTUNE
+        and cfg.seed % 4 == 0
+        and not any(
+            LEDGER.find(cfg, backend=_BACKEND_RUNNERS[B].backend_key)
+            for B in wired_backends
+        )
     )
     if autotune_due:
         with autotune(True):
