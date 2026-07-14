@@ -520,11 +520,59 @@ void checkpointing_ssu(
   }
 
   // Two-kernel split scratch (presence of cb_scaled selects precompute+main).
-  // Caller-allocated (graph-safe); both/neither of cb_scaled+cumAdt_vec, plus
-  // cb_old for the no-write path — validated in the Python wrapper.
-  if (cb_scaled.has_value()) p.cb_scaled = const_cast<void*>(cb_scaled.value().data_ptr());
-  if (cumAdt_vec.has_value()) p.cumAdt_vec = const_cast<void*>(cumAdt_vec.value().data_ptr());
-  if (cb_old.has_value()) p.cb_old = const_cast<void*>(cb_old.value().data_ptr());
+  // Caller-allocated (graph-safe).  The Python wrapper enforces the all-or-none
+  // quartet; shape/device/contiguity/dtype are validated here (like cumAdt_old
+  // below) so a bad scratch fails loudly instead of corrupting memory or
+  // faulting inside the kernel.  Expected layouts (see the wrapper / bench
+  // allocator): cb_scaled/cb_old are input-dtype fragA-native (., ., 32, regs);
+  // cumAdt_vec is f32 (., ., T_pad).
+  // fragA-native scratch: each (batch, head)'s CB is one MMA A-fragment stored
+  // as [warp lane, register].  The lane axis is a full warp; the register axis
+  // is the A-operand size — kCbScaledRegs for the new-token m16n8k16 CB,
+  // k_old_half (= K_old/2) for the old-token m16n8k{K_old} CB.
+  constexpr int64_t kWarpSize = 32;
+  constexpr int64_t kCbScaledRegs = 8;                          // m16n8k16 A-operand regs/lane
+  int64_t const t_pad = ((npredicted + 15) / 16) * 16;          // cumAdt_vec: next_multiple_of<16>
+  int64_t const k_old_half = (((max_window + 7) / 8) * 8) / 2;  // K_old/2, K_old=next_mult<8>
+  if (cb_scaled.has_value()) {
+    auto const& cb = cb_scaled.value();
+    CHECK_CUDA(cb);
+    CHECK_DIM(4, cb);
+    CHECK_CONTIGUOUS(cb);
+    FLASHINFER_CHECK(cb.dtype().code == x.dtype().code && cb.dtype().bits == x.dtype().bits,
+                     "cb_scaled dtype must match x (input dtype)");
+    FLASHINFER_CHECK(cb.size(0) >= batch && cb.size(1) == nheads && cb.size(2) == kWarpSize &&
+                         cb.size(3) == kCbScaledRegs,
+                     "cb_scaled must be (>=batch, nheads, ", kWarpSize, ", ", kCbScaledRegs,
+                     "), got (", cb.size(0), ", ", cb.size(1), ", ", cb.size(2), ", ", cb.size(3),
+                     ")");
+    p.cb_scaled = const_cast<void*>(cb.data_ptr());
+  }
+  if (cumAdt_vec.has_value()) {
+    auto const& cv = cumAdt_vec.value();
+    CHECK_CUDA(cv);
+    CHECK_DIM(3, cv);
+    CHECK_CONTIGUOUS(cv);
+    FLASHINFER_CHECK(cv.dtype().code == kDLFloat && cv.dtype().bits == 32,
+                     "cumAdt_vec must be float32");
+    FLASHINFER_CHECK(cv.size(0) >= batch && cv.size(1) == nheads && cv.size(2) == t_pad,
+                     "cumAdt_vec must be (>=batch, nheads, ", t_pad, "), got (", cv.size(0), ", ",
+                     cv.size(1), ", ", cv.size(2), ")");
+    p.cumAdt_vec = const_cast<void*>(cv.data_ptr());
+  }
+  if (cb_old.has_value()) {
+    auto const& cbo = cb_old.value();
+    CHECK_CUDA(cbo);
+    CHECK_DIM(4, cbo);
+    CHECK_CONTIGUOUS(cbo);
+    FLASHINFER_CHECK(cbo.dtype().code == x.dtype().code && cbo.dtype().bits == x.dtype().bits,
+                     "cb_old dtype must match x (input dtype)");
+    FLASHINFER_CHECK(cbo.size(0) >= batch && cbo.size(1) == nheads && cbo.size(2) == kWarpSize &&
+                         cbo.size(3) == k_old_half,
+                     "cb_old must be (>=batch, nheads, ", kWarpSize, ", ", k_old_half, "), got (",
+                     cbo.size(0), ", ", cbo.size(1), ", ", cbo.size(2), ", ", cbo.size(3), ")");
+    p.cb_old = const_cast<void*>(cbo.data_ptr());
+  }
   if (cumAdt_old.has_value()) {
     auto const& ca = cumAdt_old.value();
     CHECK_CUDA(ca);
