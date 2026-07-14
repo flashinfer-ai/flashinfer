@@ -43,9 +43,12 @@ _MIN_BLOCKS = 32
 # row-per-CTA fan-out to fill the GPU; above it the q-tiled partial takes
 # over for coalesced score reads.
 _MAX_CHUNKED_ROWS = 2048
-# Candidate-scratch ceiling (rows * num_chunks * topk * 8 bytes per call);
-# grids that would exceed it fall back to the single-kernel paths.
-_MAX_CHUNKED_SCRATCH_BYTES = 512 << 20
+# Candidate-scratch ceiling (rows * num_chunks * topk * 8 bytes per call).
+# Sized to cover the benchmarked range (32k-token prefill needs ~67MB) with
+# margin; larger grids keep the allocation-free single-kernel paths so a
+# memory-tight serving setup never sees a surprise multi-hundred-MB
+# allocation from a top-k call.
+_MAX_CHUNKED_SCRATCH_BYTES = 128 << 20
 _NTHREADS_PARTIAL = 128
 _NTHREADS_MERGE = 256
 # Queries per CTA in the full-grid partial kernel: one warp lane per query

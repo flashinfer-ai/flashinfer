@@ -209,17 +209,19 @@ def msa_topk_select(
 
     # Dispatch on the runtime valid-page count: the kernels only ever touch
     # blocks below num_valid_pages. The chunked path serves every grid with
-    # enough middle blocks to amortize its second launch: small grids because
-    # the single-CTA-per-row kernels cannot fill the GPU, full grids because
-    # it reads the scores exactly once where the radix kernel makes a pass
-    # per stage. ``tiled`` swaps in the coalesced q-tile partial kernel once
-    # the grid is large enough to fill the GPU without row-per-CTA fan-out.
-    # Everything here is shape-constant, so the choice is CUDA-graph safe.
+    # enough middle blocks to amortize its second launch (why it wins on both
+    # small and full grids is explained in topk_select_chunked_sm12x);
+    # ``tiled`` swaps in the coalesced q-tile partial kernel once the grid
+    # fills the GPU without row-per-CTA fan-out. Everything here is
+    # shape-constant, so the choice is CUDA-graph safe.
     small = int(num_valid_pages) <= _MAX_BLOCKS
     rows = total_qo_len * num_qo_heads
     n_mid = int(num_valid_pages) - force_begin_blocks - force_end_blocks
     chunked = _MIN_BLOCKS < n_mid <= _MAX_CHUNKS * _MAX_CHUNK_BLOCKS
-    tiled = rows > _MAX_CHUNKED_ROWS
+    # Keyed on queries, not rows: the tiled kernel's lanes parallelize over
+    # queries only, so a head-heavy grid with few queries would run it with
+    # mostly idle lanes even though rows is large.
+    tiled = total_qo_len > _MAX_CHUNKED_ROWS
     if chunked:
         num_chunks = max(_MIN_CHUNKS, min(_MAX_CHUNKS, -(-n_mid // _CHUNK_BLOCKS)))
         if rows * num_chunks * topk * 8 > _MAX_CHUNKED_SCRATCH_BYTES:

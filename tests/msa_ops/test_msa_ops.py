@@ -884,11 +884,10 @@ def test_sparse_decode_nvfp4_scale_size_guard():
 
 
 # nvp = P - 56 lands each case on a different dispatch: P=88 count-rank with
-# a tiny middle region, P=128 with S=1200 chunked on a full grid (rows past
-# the chunking-policy boundary, longest-chunk regime), P=256 chunked on a
-# small grid (short-chunk regime), P=2560 radix (past the chunked block
-# coverage).
-@pytest.mark.parametrize("P,S", [(88, 64), (128, 1200), (256, 64), (2560, 64)])
+# a tiny middle region, P=128 with S=2400 the q-tiled chunked kernel (queries
+# past the tiled boundary, with a ragged 32-query tail), P=256 chunked on a
+# small grid (row-per-CTA), P=2560 radix (past the chunked block coverage).
+@pytest.mark.parametrize("P,S", [(88, 64), (128, 2400), (256, 64), (2560, 64)])
 def test_msa_topk_select_forced_and_clamped(P, S):
     """Forced begin/end blocks are always selected within the topk budget;
     num_valid_pages clamps the candidate range."""
@@ -1186,15 +1185,18 @@ def test_msa_proxy_score(B, Hq, Hkv, seqs_q, seqs_k, causal):
 
 
 @pytest.mark.parametrize(
-    "B,Hq,Hkv,seqlen_q,seqlen_k,causal",
+    "B,Hq,Hkv,seqlen_q,seqlen_k,causal,explicit_qoff",
     [
-        (4, 4, 1, 1, 8192, True),  # group 4, q_len 1 -> packed (4 x 16 tile)
-        (2, 4, 1, 16, 4096, True),  # group 4, q_len at the gate edge (16)
-        (3, 8, 2, 8, 2048, True),  # group 4 (Hq/Hkv), q_len 8
-        (2, 4, 1, 16, 4096, False),  # non-causal packed
+        (4, 4, 1, 1, 8192, True, False),  # group 4, q_len 1 -> packed (4 x 16 tile)
+        (2, 4, 1, 16, 4096, True, False),  # group 4, q_len at the gate edge (16)
+        (3, 8, 2, 8, 2048, True, False),  # group 4 (Hq/Hkv), q_len 8
+        (2, 4, 1, 16, 4096, False, False),  # non-causal packed
+        (2, 4, 1, 8, 4096, True, True),  # explicit q_offset masks mid-sequence
     ],
 )
-def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
+def test_msa_proxy_score_decode_packed(
+    B, Hq, Hkv, seqlen_q, seqlen_k, causal, explicit_qoff
+):
     """Short-q decode dispatches the head-fused packed bf16 kernel; group 4 with
     q_len <= 16 is the MiniMax-M3 indexer shape."""
     _skip_if_unsupported()
@@ -1208,11 +1210,36 @@ def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
     total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
     q = torch.randn(total_q, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
     k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
-    out = msa_proxy_score(q, k, cu_q, cu_k, causal=causal)
+    qoff = None
+    if explicit_qoff:
+        # Positions strictly inside each sequence so the causal limit bites.
+        qoff = torch.tensor(
+            [seqlen_k // 2 + 37 * b for b in range(B)], dtype=torch.int32, device=dev
+        )
+    out = msa_proxy_score(q, k, cu_q, cu_k, causal=causal, q_offset=qoff)
     torch.cuda.synchronize()
-    ref = _ref_proxy_score(
-        q.cpu(), k.cpu(), cu_q.cpu(), cu_k.cpu(), causal, out.shape[1]
-    )
+    if explicit_qoff:
+        # Same reference, with the causal diagonal moved to the given offset:
+        # query token t of batch b may see kv positions <= t + qoff[b].
+        mkt = out.shape[1]
+        G = Hq // Hkv
+        ref = torch.full((Hq, mkt, total_q), float("-inf"), dtype=torch.float32)
+        for b in range(B):
+            qlo = b * seqlen_q
+            for h in range(Hq):
+                kb = k[b * seqlen_k : (b + 1) * seqlen_k, h // G].float().cpu()
+                s = q[qlo : qlo + seqlen_q, h].float().cpu() @ kb.T
+                qi = torch.arange(seqlen_q).unsqueeze(1) + int(qoff[b])
+                ki = torch.arange(seqlen_k).unsqueeze(0)
+                s = s.masked_fill(ki > qi, float("-inf"))
+                for t in range(-(-seqlen_k // BLK_KV)):
+                    ref[h, t, qlo : qlo + seqlen_q] = s[
+                        :, t * BLK_KV : (t + 1) * BLK_KV
+                    ].amax(dim=1)
+    else:
+        ref = _ref_proxy_score(
+            q.cpu(), k.cpu(), cu_q.cpu(), cu_k.cpu(), causal, out.shape[1]
+        )
     got = out.cpu()
     assert ((got == float("-inf")) == (ref == float("-inf"))).all(), "-inf pattern"
     fin = ref != float("-inf")
@@ -1665,7 +1692,7 @@ def test_msa_topk_select_countrank_matches_radix_on_nan():
     chunk_len = (P + num_chunks - 1) // num_chunks
     cand_key = torch.empty(S, H, num_chunks * topk, dtype=torch.int32, device=dev)
     cand_idx = torch.empty_like(cand_key)
-    for tiled in (False, False, True):
+    for tiled in (False, False, True, True):
         out = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
         _get_compiled_topk_chunked(topk, tiled)(
             score, cand_key, cand_idx, out, P, 0, 0, num_chunks, chunk_len, S, H
@@ -1673,4 +1700,32 @@ def test_msa_topk_select_countrank_matches_radix_on_nan():
         outs.append(out.cpu())
     assert torch.equal(outs[3], outs[4]), "chunked nondeterministic on NaN"
     assert torch.equal(outs[0], outs[3]), "chunked != count-rank on NaN scores"
+    assert torch.equal(outs[5], outs[6]), "tiled chunked nondeterministic on NaN"
     assert torch.equal(outs[0], outs[5]), "tiled chunked != count-rank on NaN scores"
+
+
+def test_msa_topk_select_countrank_near_block_cap():
+    """Count-rank near its 128-block ceiling with forced blocks is only reachable
+    through the dispatcher via the scratch-cap fallback (multi-million-row grids),
+    so pin the kernel directly and check it still matches the chunked selection."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_topk_select
+    from flashinfer.msa_ops.sparse_topk_select import _get_compiled_topk
+
+    dev = "cuda"
+    H, S, topk = 2, 96, 16
+    nvp, fb, fe = 120, 3, 2
+    torch.manual_seed(11)
+    score = torch.randn(H, 128, S, device=dev, dtype=torch.float32)
+    score[:, nvp:, :] = float("-inf")
+    api_out = msa_topk_select(
+        score, topk, num_valid_pages=nvp, force_begin_blocks=fb, force_end_blocks=fe
+    )
+    direct = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
+    _get_compiled_topk(topk, True)(score, direct, nvp, fb, fe, S, H)
+    torch.cuda.synchronize()
+    forced = set(range(fb)) | set(range(nvp - fe, nvp))
+    for h in range(H):
+        for qi in range(0, S, 7):
+            assert forced <= set(direct[qi, h][direct[qi, h] >= 0].tolist())
+    assert torch.equal(api_out, direct), "count-rank != chunked selection"

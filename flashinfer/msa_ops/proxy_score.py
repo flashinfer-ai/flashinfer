@@ -698,7 +698,7 @@ def msa_proxy_score_fp4(
         if k_fp4.ndim != 3:
             raise ValueError("flat k_fp4 must be (total_k, num_kv_heads, 64)")
         cu_k = cu_seqlens_k.to(dev)
-        pt_dev = torch.zeros((1, 1), dtype=torch.int32, device=dev)
+        pt_dev = _proxy_dummies(dev.index)[0]
         batch_size = cu_k.numel() - 1
 
     cu_q_dev = cu_seqlens_q.to(dev)

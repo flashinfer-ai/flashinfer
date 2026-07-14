@@ -474,9 +474,8 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
         # factorization compiles to its own kernel.
         self._qhead_per_kv = qhead_per_kv
         self._pack_q_len = pack_q_len
-        # Right-aligned decode (q_offset=None): the causal offset is
-        # seqlen_k - seqlen_q, computed in-kernel so the wrapper does not
-        # launch tensor-arithmetic kernels to build an offset tensor.
+        # True: right-aligned decode; the causal offset (seqlen_k - seqlen_q)
+        # is computed in-kernel instead of read from mQOffset.
         self._qoff_default = qoff_default
 
     @cute.jit
@@ -549,6 +548,12 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
         k_start = mCuK[batch_idx]
         seqlen_k = mCuK[batch_idx + 1] - k_start
         num_kv_blocks = cute.ceil_div(seqlen_k, self._n_block_size)
+        q_off = cutlass.Int32(0)
+        if cutlass.const_expr(self._is_causal):
+            if cutlass.const_expr(self._qoff_default):
+                q_off = seqlen_k - seqlen_q
+            else:
+                q_off = mQOffset[batch_idx]
 
         sQ_layout = self._make_sq_layout()
         sK_layout = self._make_sk_layout()
@@ -738,10 +743,6 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
 
                 # A packed row maps to (local_head, token); a packed query's causal
                 # position is its token index (the decode q within this step).
-                if cutlass.const_expr(self._qoff_default):
-                    q_off = seqlen_k - seqlen_q
-                else:
-                    q_off = mQOffset[batch_idx]
                 for r in cutlass.range_constexpr(n_rows):
                     row = tScS_mn[r, 0][0]
                     token = row % self._pack_q_len
