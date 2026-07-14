@@ -117,9 +117,7 @@ void CutlassGemmGroupwiseScaledSM100(TensorView float_workspace_buffer, TensorVi
               cudaError_t status;
               // Small-batch-size kernel is not compatible with (scale_granularity_m=128).
               constexpr bool can_use_small_batch = (SCALE_GRANULARITY_M == 1);
-              // The transpose trick maps original M to transposed N. CUTLASS blockwise
-              // kernels need extra SFB/TMEM handling when transposed N == 32; the
-              // low-latency path is incorrect for K-major scales there (flashinfer#3944).
+              // Low-latency path is incorrect for K-major scales at m==32 (flashinfer#3944).
               const bool low_latency_k_major_n32_unsupported = SCALE_MAJOR_K && m == 32;
               if (can_use_small_batch && m <= 32 && !low_latency_k_major_n32_unsupported) {
                 status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM100LowLatency<
