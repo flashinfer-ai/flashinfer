@@ -124,11 +124,14 @@ class _CompiledMega:
     symmetric_base: int
     peer_offsets_list: Tuple[int, ...]
     # Launch-kwargs cache: rebuilding the cute tensor views (12x from_dlpack +
-    # SymBufferHost) costs real host time per launch, and the launch inputs are
-    # stable session buffers in steady state.  Keyed on the input data_ptrs +
-    # shape + stream; lives here so a recompile naturally drops it.
+    # SymBufferHost) and re-validating inputs costs real host time per launch,
+    # and the launch inputs are stable session buffers in steady state.  Keyed
+    # on the input data_ptrs + token count + stream; a hit skips validation
+    # entirely (the same tensors were validated when the entry was built).
+    # Lives here so a recompile naturally drops it.
     launch_key: Optional[tuple] = None
     launch_kwargs: Optional[dict] = None
+    launch_output: Optional[torch.Tensor] = None
 
 
 def _zero_local_workspace_preserving_phase(mega: _CompiledMega) -> None:

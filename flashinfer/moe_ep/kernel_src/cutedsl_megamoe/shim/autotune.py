@@ -188,6 +188,8 @@ def autotune_nvfp4_mega_moe(
     from .nvfp4 import nvfp4_mega_moe
 
     def launch() -> None:
+        # sync=True: the tune loop times launches with perf_counter, so the
+        # call must block until the kernel (and output copy) complete.
         nvfp4_mega_moe(
             y,
             transformed_l1,
@@ -196,6 +198,7 @@ def autotune_nvfp4_mega_moe(
             num_tokens=num_tokens,
             gate_up_clamp=gate_up_clamp,
             activation_clamp=activation_clamp,
+            sync=True,
         )
 
     return autotune_knobs(
@@ -225,6 +228,8 @@ def autotune_mxfp8_mega_moe(
     from .mxfp8 import mxfp8_mega_moe
 
     def launch() -> None:
+        # sync=True: the tune loop times launches with perf_counter, so the
+        # call must block until the kernel (and output copy) complete.
         mxfp8_mega_moe(
             y,
             transformed_l1,
@@ -233,6 +238,7 @@ def autotune_mxfp8_mega_moe(
             num_tokens=num_tokens,
             gate_up_clamp=gate_up_clamp,
             activation_clamp=activation_clamp,
+            sync=True,
         )
 
     return autotune_knobs(

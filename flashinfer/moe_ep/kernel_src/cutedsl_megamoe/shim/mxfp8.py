@@ -238,21 +238,33 @@ class MegaMoEMxfp8Frontend:
         kernel-team drivers and tester never host-reset), so no per-launch
         reset is needed.  Pass ``True`` only to recover after an aborted /
         interrupted launch left the workspaces dirty.
+
+        Steady state (same session buffers, same token count, same stream) is
+        a validated-once fast path: validation and cute-tensor construction
+        run only when the launch cache misses.
         """
-        launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
-        if launch_inputs is None:
+        resolved = self._resolve_num_tokens(inputs, num_tokens)
+        if resolved == 0:
             return None
-        mega = self._ensure_mega_compiled(inputs)
-        key = self._launch_cache_key(launch_inputs)
-        if mega.launch_key != key:
+        key = self._launch_cache_key(inputs, resolved)
+        mega = self._mega
+        if mega is None or mega.compiled is None or mega.launch_key != key:
+            # Slow path: full validation + (re)compile + launch-kwargs build.
+            # Any config change (apply_knobs / set_gate_up_clamp) nulls
+            # self._mega, so a live cache entry always matches the config.
+            launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
+            if launch_inputs is None:
+                return None
+            mega = self._ensure_mega_compiled(inputs)
             mega.launch_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
             mega.launch_key = key
+            mega.launch_output = launch_inputs.output_activation
         if reset_counters:
             reset_compiled_mega_workspaces(mega)
         mega.compiled(**mega.launch_kwargs)
         if sync:
             torch.cuda.synchronize()
-        return launch_inputs.output_activation
+        return mega.launch_output
 
     def make_launch_thunk(
         self,
@@ -282,7 +294,10 @@ class MegaMoEMxfp8Frontend:
         return thunk
 
     @staticmethod
-    def _launch_cache_key(inputs: MegaMoEMxfp8Inputs) -> tuple:
+    def _launch_cache_key(inputs: MegaMoEMxfp8Inputs, num_tokens: int) -> tuple:
+        # Keyed on the RAW (pre-slice) input pointers + the resolved token
+        # count: _slice_inputs slices from row 0, so the sliced views keep
+        # these data_ptrs and the count captures the shape.
         t = inputs
         return (
             t.activation.data_ptr(),
@@ -294,7 +309,7 @@ class MegaMoEMxfp8Frontend:
             t.fc2_weight.data_ptr(),
             t.fc2_weight_sf.data_ptr(),
             t.output_activation.data_ptr(),
-            t.activation.shape[0],
+            num_tokens,
             torch.cuda.current_stream().cuda_stream,
         )
 
@@ -863,6 +878,7 @@ def mxfp8_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
+    sync: bool = False,
 ) -> None:
     """Launch the fused CuTeDSL MXFP8 MegaMoE kernel (dispatch + fc1 + fc2 + combine).
 
@@ -877,6 +893,12 @@ def mxfp8_mega_moe(
     ``gate_up_clamp`` updates the kernel clamp for this session when set.
     ``activation_clamp`` is a deprecated alias for ``gate_up_clamp``.
     ``fast_math`` is accepted for DeepGEMM API parity and has no effect here.
+
+    ``sync=False`` (default): the kernel launch and the ``y`` copy are
+    enqueued on the current stream and this function returns without a host
+    sync -- ``y`` is ready under normal stream semantics (synchronize or
+    stream-order before reading it on the host).  Pass ``True`` for a
+    blocking call (e.g. host-side timing).
     """
     if not fast_math:
         warnings.warn(
@@ -928,9 +950,11 @@ def mxfp8_mega_moe(
     # (T, hidden) output; no host-side form-A reduction is needed.  Launch the
     # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
     # live [:n] rows out -- matches the reference driver, which does not slice.
-    out = symm_buffer._frontend.run(inputs, num_tokens=None)
+    out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
     if out is not None:
         y.copy_(out[:n])
+    if sync:
+        torch.cuda.synchronize()
 
 
 def mxfp8_mega_launch_thunk(
