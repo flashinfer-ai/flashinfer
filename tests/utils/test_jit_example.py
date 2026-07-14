@@ -168,11 +168,7 @@ def test_flash_sigmoid():
 
 @pytest.mark.xfail(
     get_compute_capability(torch.device("cuda:0")) == (12, 1),
-    reason=(
-        "DumpLogits FA2 variant still drifts on SM121 (GB10/DGX Spark): "
-        "~2% of dumped logits mismatch vs reference at rtol/atol=2e-2 "
-        "(revalidated 2026-07-14)."
-    ),
+    reason="SM121 DumpLogits logits still drift (~2% mismatch at rtol/atol=2e-2)",
 )
 def test_dump_logits():
     torch.manual_seed(42)

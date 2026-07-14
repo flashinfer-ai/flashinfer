@@ -16,7 +16,6 @@ _in_mem_compile_cache: dict = {}
 def _sm12x_gpu_arch_cached(
     device_type: str, device_index: int | None
 ) -> cute.GPUArch:
-    """Cached CuteDSL GPUArch lookup for an SM12x device identity."""
     device = (
         torch.device(device_type)
         if device_index is None
@@ -32,16 +31,8 @@ def _sm12x_gpu_arch_cached(
 
 
 def sm12x_gpu_arch(device: str | torch.device = "cuda") -> cute.GPUArch:
-    """Return the CuteDSL GPUArch that can execute on this SM12x device.
-
-    CuteDSL treats mismatched arch-specific targets as cross-compilation and
-    produces no execution engine. SM120 must use ``sm_120a`` and SM121 (GB10 /
-    DGX Spark) must use ``sm_121a``; family targets like ``sm_120f`` do not run
-    on-device either.
-    """
+    """Return the on-device CuteDSL arch for SM12x (``sm_120a`` / ``sm_121a``)."""
     d = torch.device(device)
-    # Resolve "cuda" / device(type='cuda') to the active index so the cache key
-    # is not shared across process-wide current_device() changes.
     if d.type == "cuda" and d.index is None:
         d = torch.device("cuda", torch.cuda.current_device())
     return _sm12x_gpu_arch_cached(d.type, d.index)
@@ -50,7 +41,6 @@ def sm12x_gpu_arch(device: str | torch.device = "cuda") -> cute.GPUArch:
 def sm12x_compile_options(
     device: str | torch.device = "cuda",
 ) -> tuple[cute.GPUArch]:
-    """Compile options for SM12x GDN kernels on the given device."""
     return (sm12x_gpu_arch(device),)
 
 
