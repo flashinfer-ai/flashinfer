@@ -376,7 +376,6 @@ class SoftmaxRole:
     def dead_step(
         self,
         stage: int,
-        store_zero_p: bool,
         cS: cute.Tensor,
         row_max: Float32,
         row_sum: Float32,
@@ -394,12 +393,6 @@ class SoftmaxRole:
         max, so the correction rescale factor is exactly 1), honor the
         s0/s1 sequence tokens, and store a zero P so the still-running PV
         gemm accumulates nothing.  row_max/row_sum pass through unchanged.
-
-        ``store_zero_p`` (compile-time): dead-prefix blocks (stage 1's first
-        trip) keep the zero-P store because their PV gemm is the
-        ACCUMULATE=False overwrite that initializes O1; dead-suffix blocks
-        (stage 0's last trip) pass False — the MMA skips their PV gemm
-        entirely (see MmaRole.run), so nothing reads that P tile.
 
         Standard path only (callers gate on not has_logits_transform and
         not has_statistics_update).  Kept as a separate function so the
@@ -456,21 +449,19 @@ class SoftmaxRole:
             sequence_consumer_handle = s0_s1_sequence_consumer.wait_and_advance()
 
         # P = 0 so the PV gemm adds nothing (zero f32 backing = packed
-        # bf16/fp16 zeros).  Skipped when the MMA skips the PV gemm.
-        if cutlass.const_expr(store_zero_p):
-            tTMEM_STORErS_x4 = cute.make_rmem_tensor(
-                tTMEM_STOREcS.shape, self.qk_acc_dtype
-            )
-            for idx in range(cute.size(tTMEM_STORErS_x4)):
-                tTMEM_STORErS_x4[idx] = 0.0
+        # bf16/fp16 zeros).
+        tTMEM_STORErS_x4 = cute.make_rmem_tensor(
+            tTMEM_STOREcS.shape, self.qk_acc_dtype
+        )
+        for idx in range(cute.size(tTMEM_STORErS_x4)):
+            tTMEM_STORErS_x4[idx] = 0.0
 
         if cutlass.const_expr(stage == 0):
             sequence_producer_handle.commit()
         else:
             sequence_consumer_handle.release()
-        if cutlass.const_expr(store_zero_p):
-            cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
-            cute.arch.fence_view_async_tmem_store()
+        cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
+        cute.arch.fence_view_async_tmem_store()
         si_handle.release()
 
         vec_i_handle = si_corr_producer.acquire_and_advance()
@@ -784,7 +775,6 @@ class SoftmaxRole:
                             s0_s1_sequence_producer,
                         ) = self.dead_step(
                             stage,
-                            True,  # store_zero_p: prefix PV1 is the O1 init
                             cS_iter,
                             row_max,
                             row_sum,
@@ -935,7 +925,6 @@ class SoftmaxRole:
                             s0_s1_sequence_producer,
                         ) = self.dead_step(
                             stage,
-                            False,  # store_zero_p: MMA skips the suffix PV0
                             cS_iter,
                             row_max,
                             row_sum,
