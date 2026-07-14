@@ -298,7 +298,7 @@ void layernorm_quant(TensorView output, TensorView input, TensorView gamma, Tens
   // generalLayerNorm indexes as bidx * hidden_size + i and takes no strides
   TVM_FFI_ICHECK_EQ(input.stride(0), hidden_size) << "input must be contiguous";
   TVM_FFI_ICHECK_EQ(output.stride(0), hidden_size) << "output must be contiguous";
-  // TODO(kaixih): This is currently our only use case; Add more if needed.
+  // Match the layernorm binding: bf16 input with fp32 gamma/beta only.
   TVM_FFI_ICHECK_EQ(input.dtype(), dl_bfloat16) << "input must be bfloat16";
   TVM_FFI_ICHECK_EQ(gamma.dtype(), dl_float32) << "gamma must be float32";
   TVM_FFI_ICHECK_EQ(beta.dtype(), dl_float32) << "beta must be float32";

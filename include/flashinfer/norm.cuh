@@ -972,7 +972,6 @@ cudaError_t LayerNorm(T* input, Tw* gemma, Tw* beta, T* out, uint32_t tokens, ui
                             (std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value);
 
   // Enable min_scaling factor if it is fp8 row-wise per-token quantization
-  // TODO(kaixih): add support for fp8 quantization if needed
   bool has_fp8_min_scaling = false;
   float* clamp_ptr = nullptr;
   float* scale = nullptr;
