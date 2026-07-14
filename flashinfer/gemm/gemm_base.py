@@ -4021,7 +4021,25 @@ def _cudnn_gemm_bf16_runner(
                     policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
                 )
 
-            return list(range(graph.get_execution_plan_count()))
+            tactics = list(range(graph.get_execution_plan_count()))
+            # cuDNN 9.23.0 miscomputes bf16 GEMM/BMM split-k plans on SM90 (the same
+            # split-k output-layout bug _cudnn_bf16_gemm_usable_or_skip hard-bans for
+            # fp16 output). For bf16 output the DEFAULT plan is correct and only the
+            # split-k plans (knob k17 = CUDNN_KNOB_TYPE_SPLIT_K_SLC) are broken -- but
+            # they win the autotuner's timing race on tall-K shapes and then silently
+            # return garbage (verified per-plan: exactly the eng7_k17=4_* plans fail,
+            # ratio ~1.4; all plans correct on 9.23.1+). Drop them from the tuning
+            # space instead of banning the whole backend. Plan names need
+            # cudnn-frontend >= 1.25; without the API, fall back to the full list.
+            if (
+                cudnn.backend_version() == 92300
+                and get_compute_capability(a.device)[0] == 9
+                and hasattr(graph, "get_plan_name_at_index")
+            ):
+                tactics = [
+                    t for t in tactics if "k17=" not in graph.get_plan_name_at_index(t)
+                ]
+            return tactics
 
         def forward(
             self,
