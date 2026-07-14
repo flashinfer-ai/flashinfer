@@ -427,6 +427,8 @@ class CuteDslMoEWrapper:
         intermediate_size: Intermediate dimension size.
         use_cuda_graph: Whether the wrapper holds persistent stream/event
             resources for CUDA graph capture.
+        use_fused_finalize: Whether to use the atomic fused finalize instead of
+            the deterministic two-stage finalize.
         max_num_tokens: Deprecated; accepted for backwards compatibility
             but ignored.
 
@@ -474,6 +476,7 @@ class CuteDslMoEWrapper:
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        use_fused_finalize: bool = False,
     ):
         r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
 
@@ -515,6 +518,9 @@ class CuteDslMoEWrapper:
         swiglu_alpha, swiglu_beta, swiglu_limit : float
             SwiGLU parameters. ``swiglu_oai`` is represented as
             ``ActivationType.Swiglu`` with non-default values.
+        use_fused_finalize : bool
+            Use the atomic fused finalize instead of the deterministic
+            two-stage finalize. Defaults to ``False``.
         """
         normalized_activation_type, gated = normalize_cute_dsl_moe_activation_type(
             activation_type
@@ -537,6 +543,7 @@ class CuteDslMoEWrapper:
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.use_fused_finalize = use_fused_finalize
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -565,7 +572,7 @@ class CuteDslMoEWrapper:
             top_k=top_k,
             num_local_experts=self.num_local_experts,
             local_expert_offset=local_expert_offset,
-            use_fused_finalize=False,
+            use_fused_finalize=use_fused_finalize,
             output_dtype=output_dtype,
             enable_pdl=enable_pdl,
             activation_type=normalized_activation_type.value,
@@ -580,7 +587,7 @@ class CuteDslMoEWrapper:
             top_k=top_k,
             num_local_experts=self.num_local_experts,
             local_expert_offset=local_expert_offset,
-            use_fused_finalize=False,
+            use_fused_finalize=use_fused_finalize,
             output_dtype=output_dtype,
             enable_pdl=enable_pdl,
             activation_type=normalized_activation_type.value,

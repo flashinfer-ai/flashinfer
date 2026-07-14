@@ -224,7 +224,7 @@ def bench_cute_dsl(
                     interval when bench_gpu_time falls back to events (i.e. when
                     both CUDA graphs and CUPTI are disabled).
         use_fused_finalize: Use the atomic fused finalize instead of the default
-                    deterministic two-stage finalize. Functional API only.
+                    deterministic two-stage finalize.
     """
     import contextlib
 
@@ -241,9 +241,6 @@ def bench_cute_dsl(
 
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
-    if use_wrapper and use_fused_finalize:
-        raise ValueError("use_fused_finalize requires the functional API")
-
     n, sv, dev = inputs["router_logits"].shape[0], 16, "cuda"
     gs1 = torch.tensor([1.0], device=dev)
 
@@ -313,6 +310,7 @@ def bench_cute_dsl(
             max_num_tokens=n,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            use_fused_finalize=use_fused_finalize,
         )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
@@ -1102,7 +1100,7 @@ def main():
     parser.add_argument(
         "--use-fused-finalize",
         action="store_true",
-        help="Use atomic CuTe DSL fused finalize instead of deterministic two-stage finalize (requires --functional-api).",
+        help="Use atomic CuTe DSL fused finalize instead of deterministic two-stage finalize.",
     )
     parser.add_argument(
         "--routing-bias-scale",
@@ -1111,9 +1109,6 @@ def main():
         help="Scale for random routing bias. Larger values tend to create expert imbalance.",
     )
     args = parser.parse_args()
-
-    if args.use_fused_finalize and not args.functional_api:
-        parser.error("--use-fused-finalize requires --functional-api")
 
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")

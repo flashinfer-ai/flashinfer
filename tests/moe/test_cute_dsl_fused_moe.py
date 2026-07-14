@@ -1443,6 +1443,21 @@ class TestCuteDslFusedMoeFunctional:
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
+    def test_fused_finalize_configuration(self):
+        from flashinfer import CuteDslMoEWrapper
+
+        moe = CuteDslMoEWrapper(
+            num_experts=256,
+            top_k=2,
+            hidden_size=256,
+            intermediate_size=512,
+            use_fused_finalize=True,
+        )
+
+        assert moe.use_fused_finalize
+        assert moe._runner.use_fused_finalize
+        assert moe._per_token_runner.use_fused_finalize
+
     def test_per_token_decode_is_bitwise_deterministic(self):
         from flashinfer import CuteDslMoEWrapper
 
