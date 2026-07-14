@@ -22,12 +22,12 @@ import pytest
 
 
 def _skip_unless_ep_capable():
-    """Skip on hosts that can't construct an EP Fleet even with mocks.
+    """Skip on hosts that can't run the CUDA tensor parts of these tests.
 
-    ``create_fleet`` runs ``validate_arch_for_backend``, which requires a
-    CUDA device and a CUDA-13 torch build (the EP runtime wheels ship
-    CUDA-13 binaries only), so on older stacks these tests would fail in
-    validation before reaching the mocked Buffer.
+    The backend arch check is mocked below because these tests validate Buffer
+    call sequencing and argument marshaling, not sm_90+ runtime support.
+    They still allocate CUDA tensors in the handle tests, and the EP runtime
+    wheels require a CUDA-13 torch build.
     """
     import torch
 
@@ -135,6 +135,7 @@ def patched_loader(fake_nixl_ep_module):
     with (
         mock.patch.object(fleet, "_load_nixl_ep", return_value=fake_nixl_ep_module),
         mock.patch.object(fleet, "_require_built", return_value=None),
+        mock.patch.object(fleet, "validate_arch_for_backend", return_value=None),
     ):
         yield fake_nixl_ep_module
 

@@ -90,6 +90,8 @@ def _mega_config(*, preprocess_weights: bool = False):
 
 
 def test_factory_returns_split_for_string_backend():
+    from unittest import mock
+
     import torch
     import torch.distributed
 
@@ -99,18 +101,24 @@ def test_factory_returns_split_for_string_backend():
     from flashinfer.moe_ep import BootstrapConfig, MoEEpLayer, MoEEpSplitLayer
 
     try:
-        layer = MoEEpLayer(
-            bootstrap=BootstrapConfig(world_size=1, rank=0),
-            fleet_params=_split_fleet_params(),
-            weights=_split_weights(),
-            backend="nccl_ep",
-        )
+        with mock.patch(
+            "flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend",
+            return_value=None,
+        ):
+            layer = MoEEpLayer(
+                bootstrap=BootstrapConfig(world_size=1, rank=0),
+                fleet_params=_split_fleet_params(),
+                weights=_split_weights(),
+                backend="nccl_ep",
+            )
     except torch.distributed.DistNetworkError as e:
         pytest.skip(f"No usable network address in this Slurm environment: {e}")
     assert isinstance(layer, MoEEpSplitLayer)
 
 
 def test_factory_returns_split_for_nvep_config():
+    from unittest import mock
+
     import torch
     import torch.distributed
 
@@ -125,12 +133,16 @@ def test_factory_returns_split_for_nvep_config():
     )
 
     try:
-        layer = MoEEpLayer(
-            bootstrap=BootstrapConfig(world_size=1, rank=0, tcp_store=object()),
-            fleet_params=_nvep_fleet_params(),
-            weights=_nvep_weights(),
-            backend=NvepConfig(),
-        )
+        with mock.patch(
+            "flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend",
+            return_value=None,
+        ):
+            layer = MoEEpLayer(
+                bootstrap=BootstrapConfig(world_size=1, rank=0, tcp_store=object()),
+                fleet_params=_nvep_fleet_params(),
+                weights=_nvep_weights(),
+                backend=NvepConfig(),
+            )
     except torch.distributed.DistNetworkError as e:
         pytest.skip(f"No usable network address in this Slurm environment: {e}")
     assert isinstance(layer, MoEEpSplitLayer)
