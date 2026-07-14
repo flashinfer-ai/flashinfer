@@ -1,43 +1,33 @@
 """Multi-GPU functional correctness for the HT (High-Throughput) FLAT path (bf16).
 
-Mirrors tests/moe_ep/test_moe_ep_compute_correctness.py (the LL test) but for
-``EpAlgorithm.HIGH_THROUGHPUT`` / ``nccl.ep.Layout.FLAT``. Each rank runs
-``dispatch -> compute -> combine`` over its own tokens and compares the combined
-output against the SAME unified ``MoELayer`` kernel run non-EP (all experts local,
-real top_k) — immune to kernel-convention/weight-shuffle quirks, so it isolates EP
-dispatch/compute/combine correctness.
+Mirrors ``test_moe_ep_compute_correctness.py`` but for
+``EpAlgorithm.HIGH_THROUGHPUT`` / ``nccl.ep.Layout.FLAT``.
 
-Geometry follows the upstream ``contrib/nccl_ep/ep_test.py`` (the config the
-nccl_ep_b200_ib HT benchmark uses): rank-derived
-  top_k = min(8, world);  num_experts = min(256, top_k*world);
-  num_local_experts = num_experts // world;  hidden = 7168;  bf16.
-``-t`` is PER-RANK tokens; we test the benchmark's 4096 and 8192 per-rank sizes.
-intermediate_size = 2048 (DeepSeek-class; ep_test.py does no FFN so it is our choice).
-
-Launch (Pre-Nyx B200; HT multi-rank works on the current nccl4py wheel):
-    torchrun --nproc_per_node=8 -m pytest \\
-        tests/moe_ep/test_moe_ep_ht_correctness.py -v -s -m "nvep and gpu_8"
-
-Or directly:
-    torchrun --nproc_per_node=8 tests/moe_ep/test_moe_ep_ht_correctness.py
+Launch (4 GPU):
+    torchrun --nproc_per_node=4 -m pytest \\
+        tests/moe_ep/test_moe_ep_ht_correctness.py -v -s -m "nvep and gpu_4"
 """
 
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import pytest
 
+# First-use JIT compile of reference kernels (e.g. fused_moe_trtllm_sm100)
+# can exceed torch's 10-min default watchdog while other ranks wait in a
+# collective; a cold cache is not a hang.
+_PG_TIMEOUT = timedelta(minutes=60)
+
 HIDDEN = 7168
 INTERMEDIATE = 2048
-# bf16 tolerance (weights ~1/sqrt(fan_in) -> activations O(1), precision-bound).
 RTOL = 3e-2
 ATOL = 3e-2
 PER_RANK_SIZES = [4096, 8192]
 
 
 def _geometry(world_size):
-    """Rank-derived HT geometry, matching contrib/nccl_ep/ep_test.py."""
     top_k = min(8, world_size)
     num_experts = min(256, top_k * world_size)
     num_local_experts = num_experts // world_size
@@ -45,7 +35,6 @@ def _geometry(world_size):
 
 
 def _block_major_k(w):
-    """BlockMajorK shuffle for the trtllm bf16 routed runner (epilogue_tile_m=64)."""
     import torch
 
     from flashinfer import shuffle_matrix_a
@@ -58,20 +47,19 @@ def _block_major_k(w):
     return torch.stack(out).view(torch.bfloat16)
 
 
-def _build_bf16_compute(w1, w2, *, num_experts, top_k, offset, local_n, max_tokens):
+def _build_bf16_moe_config(*, num_experts, top_k, offset, local_n, max_tokens):
     from flashinfer.fused_moe.api import (
         BackendOptions,
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
-        MoEWeightPack,
         QuantConfig,
         QuantVariant,
         RoutingConfig,
         TrtllmBf16Config,
     )
 
-    cfg = MoEConfig(
+    return MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
         quant=QuantConfig(variant=QuantVariant.BF16),
         experts=ExpertConfig(
@@ -82,32 +70,35 @@ def _build_bf16_compute(w1, w2, *, num_experts, top_k, offset, local_n, max_toke
         backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
         execution=ExecutionConfig(tune_max_num_tokens=max_tokens),
     )
+
+
+def _build_fused_moe_weights(w1, w2):
+    from flashinfer.fused_moe.api import MoEWeightPack
+
     wp = MoEWeightPack()
     wp.prepare_for(
         "trtllm_bf16_routed",
         {"gemm1_weights": _block_major_k(w1), "gemm2_weights": _block_major_k(w2)},
     )
-    return cfg, wp
+    return wp
 
 
 def _kernel_full_moe_reference(
     x, w1_full, w2_full, topk_ids, topk_weights, num_experts, top_k
 ):
-    """Full MoE via the SAME kernel, all experts local (offset 0), real top_k."""
     import torch
 
     from flashinfer.fused_moe.api import MoEActivationPack
     from flashinfer.fused_moe.layer import MoELayer
 
-    cfg, wp = _build_bf16_compute(
-        w1_full,
-        w2_full,
+    cfg = _build_bf16_moe_config(
         num_experts=num_experts,
         top_k=top_k,
         offset=0,
         local_n=num_experts,
         max_tokens=x.shape[0],
     )
+    wp = _build_fused_moe_weights(w1_full, w2_full)
     act = MoEActivationPack(
         hidden_states_q=x,
         hidden_states_scale=torch.empty(0, device=x.device),
@@ -125,8 +116,12 @@ def _run_ht(per_rank):
         BootstrapConfig,
         EpAlgorithm,
         FleetParams,
+        FusedMoeKernelConfig,
         MoEEpLayer,
         MoEEpTensors,
+        MoEWeightPack,
+        NcclEpConfig,
+        SplitConfig,
     )
 
     rank = dist.get_rank()
@@ -137,7 +132,6 @@ def _run_ht(per_rank):
     top_k, num_experts, local_n = _geometry(world)
     offset = rank * local_n
 
-    # Full weights, identical on every rank (constant seed), ~1/sqrt(fan_in).
     gw = torch.Generator(device="cuda").manual_seed(2024)
     w1 = (
         torch.randn(num_experts, 2 * INTERMEDIATE, HIDDEN, device="cuda", generator=gw)
@@ -156,15 +150,18 @@ def _run_ht(per_rank):
         torch.randn(per_rank, top_k, device="cuda", generator=g), dim=-1
     )
 
-    cfg, wp = _build_bf16_compute(
-        w1[offset : offset + local_n].contiguous(),
-        w2[offset : offset + local_n].contiguous(),
+    moe_config = _build_bf16_moe_config(
         num_experts=num_experts,
         top_k=top_k,
         offset=offset,
         local_n=local_n,
         max_tokens=per_rank * local_n,
     )
+    canonical_weights = MoEWeightPack(
+        w13=w1[offset : offset + local_n].contiguous(),
+        w2=w2[offset : offset + local_n].contiguous(),
+    )
+
     layer = MoEEpLayer(
         BootstrapConfig(
             world_size=world,
@@ -179,17 +176,17 @@ def _run_ht(per_rank):
             dtype_bytes=2,
             algorithm=EpAlgorithm.HIGH_THROUGHPUT,
         ),
-        backend="nccl_ep",
-        compute_config=cfg,
-        weights=wp,
+        weights=canonical_weights,
+        backend=SplitConfig(
+            comm=NcclEpConfig(),
+            kernel=FusedMoeKernelConfig(moe_config=moe_config),
+        ),
     )
     y = layer.forward(
         MoEEpTensors(hidden_states=x, topk_ids=topk_ids, topk_weights=topk_weights)
     )
     torch.cuda.synchronize()
-    assert y.shape == x.shape, (
-        f"HT t={per_rank}: shape {tuple(y.shape)} != {tuple(x.shape)}"
-    )
+    assert y.shape == x.shape
 
     y_kernel = _kernel_full_moe_reference(
         x, w1, w2, topk_ids, topk_weights, num_experts, top_k
@@ -197,19 +194,10 @@ def _run_ht(per_rank):
     yf, kf = y.float(), y_kernel.float()
     rel = (yf - kf).abs().amax().item() / kf.abs().amax().clamp_min(1e-6).item()
     if rank == 0:
-        import contextlib
-
-        msg = (
-            f"[HT t/rank={per_rank} world={world} experts={num_experts} top_k={top_k} "
-            f"local={local_n}] EP-vs-kernel rel-err={rel:.4f}  EP mean|.|={yf.abs().mean():.4f} "
-            f"kernel mean|.|={kf.abs().mean():.4f}\n"
+        print(
+            f"[HT t/rank={per_rank} world={world} experts={num_experts} top_k={top_k}] "
+            f"EP-vs-kernel rel-err={rel:.4f}"
         )
-        print(msg)
-        with (
-            contextlib.suppress(OSError),
-            open(f"/host/logs/relerr_ht_t{per_rank}_w{world}.txt", "w") as fh,
-        ):
-            fh.write(msg)
     torch.testing.assert_close(yf, kf, rtol=RTOL, atol=ATOL)
     layer.destroy()
     return rank, rel
@@ -221,14 +209,13 @@ def pytest_generate_tests(metafunc):
 
 
 @pytest.mark.nvep
-@pytest.mark.gpu_8
+@pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_ht_matches_dense_reference(per_rank):
-    """High-throughput (HT, FLAT) bf16 dispatch->compute->combine equals a non-EP MoE reference."""
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=_PG_TIMEOUT)
     rank, rel = _run_ht(per_rank)
     dist.barrier()
     print(f"rank {rank}: HT t/rank={per_rank} OK (rel-err={rel:.4f})")
@@ -238,7 +225,7 @@ def _main():
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=_PG_TIMEOUT)
     for per_rank in PER_RANK_SIZES:
         r, rel = _run_ht(per_rank)
         dist.barrier()
