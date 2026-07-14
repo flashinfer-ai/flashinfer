@@ -690,7 +690,6 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
 
   int32_t const totalNumExperts = args.num_experts + args.num_fused_shared_experts;
   int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
-  int32_t const totalLocalExperts = args.local_num_experts + args.num_fused_shared_experts;
 
   // Setup activation data
   activationData.mDtypeElt = args.mDtypeElt;
@@ -710,8 +709,6 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.ctaIdxXyToMnLimit = workspace.cta_idx_xy_to_mn_limit;
   activationData.numNonExitingCtas = workspace.num_non_exiting_ctas;
   activationData.tileTokensDim = mPermuteGemm1.mTileTokensDim;
-  activationData.maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(
-      args.num_tokens, totalExpertsPerToken, totalLocalExperts, mPermuteGemm1.mTileTokensDim);
 
   // Setup finalize data
   if (args.do_finalize) {

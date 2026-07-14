@@ -220,105 +220,107 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 
   int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
   int const numNonExitingCtas = params.numNonExitingCtas[0];
+  int const groupsPerTile = params.tileTokensDim / NumTokensPerCta;
+  int const totalGroups = numNonExitingCtas * groupsPerTile;
   int const hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x;
   int const outputDim = params.innerDim / 2;
 
-  for (int ctaIdx = blockIdx.y; ctaIdx < numNonExitingCtas; ctaIdx += gridDim.y) {
-    int const tileRowBegin = ctaIdx * params.tileTokensDim;
+  for (int groupIdx = blockIdx.y; groupIdx < totalGroups; groupIdx += gridDim.y) {
+    int const ctaIdx = groupIdx / groupsPerTile;
+    int const groupInTile = groupIdx - ctaIdx * groupsPerTile;
+    int const rowBegin = ctaIdx * params.tileTokensDim + groupInTile * NumTokensPerCta;
     int const rowLimit = params.ctaIdxXyToMnLimit[ctaIdx];
 
-    for (int rowBegin = tileRowBegin; rowBegin < rowLimit; rowBegin += NumTokensPerCta) {
-      float scale1Arr[NumTokensPerCta];
-      float scale2Arr[NumTokensPerCta];
-      float dataX1Arr[NumTokensPerCta];
-      float dataX2Arr[NumTokensPerCta];
-      float outArr[NumTokensPerCta];
-      float absOutArr[NumTokensPerCta];
-      int permutedIdxArr[NumTokensPerCta];
+    float scale1Arr[NumTokensPerCta];
+    float scale2Arr[NumTokensPerCta];
+    float dataX1Arr[NumTokensPerCta];
+    float dataX2Arr[NumTokensPerCta];
+    float outArr[NumTokensPerCta];
+    float absOutArr[NumTokensPerCta];
+    int permutedIdxArr[NumTokensPerCta];
 
 #pragma unroll
-      for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-        int const permutedIdx = rowBegin + tokenInCtaIdx;
-        permutedIdxArr[tokenInCtaIdx] = permutedIdx < rowLimit ? permutedIdx : -1;
-        scale1Arr[tokenInCtaIdx] = 0.0f;
-        scale2Arr[tokenInCtaIdx] = 0.0f;
-        dataX1Arr[tokenInCtaIdx] = 0.0f;
-        dataX2Arr[tokenInCtaIdx] = 0.0f;
-        outArr[tokenInCtaIdx] = 0.0f;
-        absOutArr[tokenInCtaIdx] = 0.0f;
-      }
-
-      if (hiddenIdx < outputDim) {
-#pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-          if (permutedIdx == -1) {
-            continue;
-          }
-
-          // Use int64_t to avoid overflow when permutedIdx * innerDim > INT32_MAX
-          int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
-
-          int64_t const scale1Idx =
-              (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
-          int64_t const scale2Idx =
-              (int64_t)permutedIdx +
-              (int64_t)totalNumPaddedTokens * ((hiddenIdx / 128) + (outputDim / 128));
-
-          scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
-          scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
-          dataX1Arr[tokenInCtaIdx] = static_cast<float>(params.inPtr[baseIdx]);
-          dataX2Arr[tokenInCtaIdx] = static_cast<float>(params.inPtr[baseIdx + outputDim]);
-        }
-      }
-
-#pragma unroll
-      for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-        float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx];
-        float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx];
-        float act = silu(x2);
-        float out = act * x1;
-        outArr[tokenInCtaIdx] = out;
-        absOutArr[tokenInCtaIdx] = fabsf(out);
-      }
-
-      auto absOutPacked = packedTypeFromArray<PackedType, NumTokensPerCta>(absOutArr);
-      auto aMaxPacked = BlockReduce(tempStorage).Reduce(absOutPacked, MaxOp{});
-      auto aMaxArr = arrayFromPackedType<PackedType, NumTokensPerCta>(aMaxPacked);
-
-#pragma unroll
-      for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-        if (threadIdx.x == 0) {
-          int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-          if (permutedIdx == -1) {
-            continue;
-          }
-          // Make sure the scale is strictly positive to avoid division by zero in case the
-          // maximum is zero.
-          float scaleOut =
-              fmaxf(aMaxArr[tokenInCtaIdx] / E4m3MaxVal, std::numeric_limits<float>::min());
-          s_scaleOutArr[tokenInCtaIdx] = scaleOut;
-          int64_t const scaleOutIdx =
-              (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
-          params.outDqSfsPtr[scaleOutIdx] = scaleOut;
-        }
-      }
-      __syncthreads();
-
-      if (hiddenIdx < outputDim) {
-#pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-          if (permutedIdx == -1) {
-            continue;
-          }
-          float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
-          int64_t const outIdx = (int64_t)permutedIdx * outputDim + hiddenIdx;
-          params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
-        }
-      }
-      __syncthreads();
+    for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+      int const permutedIdx = rowBegin + tokenInCtaIdx;
+      permutedIdxArr[tokenInCtaIdx] = permutedIdx < rowLimit ? permutedIdx : -1;
+      scale1Arr[tokenInCtaIdx] = 0.0f;
+      scale2Arr[tokenInCtaIdx] = 0.0f;
+      dataX1Arr[tokenInCtaIdx] = 0.0f;
+      dataX2Arr[tokenInCtaIdx] = 0.0f;
+      outArr[tokenInCtaIdx] = 0.0f;
+      absOutArr[tokenInCtaIdx] = 0.0f;
     }
+
+    if (hiddenIdx < outputDim) {
+#pragma unroll
+      for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+        int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+        if (permutedIdx == -1) {
+          continue;
+        }
+
+        // Use int64_t to avoid overflow when permutedIdx * innerDim > INT32_MAX
+        int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
+
+        int64_t const scale1Idx =
+            (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+        int64_t const scale2Idx =
+            (int64_t)permutedIdx +
+            (int64_t)totalNumPaddedTokens * ((hiddenIdx / 128) + (outputDim / 128));
+
+        scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
+        scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
+        dataX1Arr[tokenInCtaIdx] = static_cast<float>(params.inPtr[baseIdx]);
+        dataX2Arr[tokenInCtaIdx] = static_cast<float>(params.inPtr[baseIdx + outputDim]);
+      }
+    }
+
+#pragma unroll
+    for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+      float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx];
+      float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx];
+      float act = silu(x2);
+      float out = act * x1;
+      outArr[tokenInCtaIdx] = out;
+      absOutArr[tokenInCtaIdx] = fabsf(out);
+    }
+
+    auto absOutPacked = packedTypeFromArray<PackedType, NumTokensPerCta>(absOutArr);
+    auto aMaxPacked = BlockReduce(tempStorage).Reduce(absOutPacked, MaxOp{});
+    auto aMaxArr = arrayFromPackedType<PackedType, NumTokensPerCta>(aMaxPacked);
+
+#pragma unroll
+    for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+      if (threadIdx.x == 0) {
+        int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+        if (permutedIdx == -1) {
+          continue;
+        }
+        // Make sure the scale is strictly positive to avoid division by zero in case the
+        // maximum is zero.
+        float scaleOut =
+            fmaxf(aMaxArr[tokenInCtaIdx] / E4m3MaxVal, std::numeric_limits<float>::min());
+        s_scaleOutArr[tokenInCtaIdx] = scaleOut;
+        int64_t const scaleOutIdx =
+            (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+        params.outDqSfsPtr[scaleOutIdx] = scaleOut;
+      }
+    }
+    __syncthreads();
+
+    if (hiddenIdx < outputDim) {
+#pragma unroll
+      for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+        int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+        if (permutedIdx == -1) {
+          continue;
+        }
+        float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
+        int64_t const outIdx = (int64_t)permutedIdx * outputDim + hiddenIdx;
+        params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
+      }
+    }
+    __syncthreads();
   }
 }
 
@@ -365,11 +367,10 @@ void run(Data const& data, void* stream) {
     FLASHINFER_CHECK(
         data.tileTokensDim >= numTokensPerCta && data.tileTokensDim % numTokensPerCta == 0,
         "tileTokensDim must be divisible by numTokensPerCta.");
-    FLASHINFER_CHECK(data.maxNumCtasInBatchDim > 0, "maxNumCtasInBatchDim must be positive.");
 
-    // Assign one block to each routing/GEMM1 tile, up to the existing grid-y limit. The
-    // grid-stride loop is only needed when the host-side tile bound exceeds that limit.
-    int const gridSizeY = std::min(8192, data.maxNumCtasInBatchDim);
+    int const gridSizeY =
+        std::min(8192, (data.numTokens + numTokensPerCta - 1) / numTokensPerCta * data.topK);
+
     const dim3 grid(gridSizeX, gridSizeY, 1);
 
     LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
