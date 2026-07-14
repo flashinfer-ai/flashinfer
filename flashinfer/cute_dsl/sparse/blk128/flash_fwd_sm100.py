@@ -2040,30 +2040,6 @@ class FlashAttentionForwardSm100:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         mma_tile_coord_v = thr_mma_qk.thr_idx
 
-        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
-        tStScale_layout = cute.composition(
-            tStS.layout, cute.make_layout((self.m_block_size, 1))
-        )
-        tStScales = tuple(
-            cute.make_tensor(
-                tStS.iterator + self.tmem_vec_offset[stage], tStScale_layout
-            )
-            for stage in range(self.s_stage)
-        )
-        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
-        tmem_load_v_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)), self.qk_acc_dtype
-        )
-        thr_tmem_load_vec = tcgen05.make_tmem_copy(
-            tmem_load_v_atom, tStScales[0]
-        ).get_slice(tidx)
-
-        [
-            thr_tmem_load_vec.partition_S(tStScales[stage])
-            for stage in range(self.s_stage)
-        ]
-        tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
-
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled
         for stage in cutlass.range(self.s_stage):
@@ -2117,7 +2093,6 @@ class FlashAttentionForwardSm100:
                 sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
 
-                cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
                 # q_stage=1 correction loop
                 if const_expr(mBlockNums is not None):
                     block_iter_count = (
@@ -2370,7 +2345,6 @@ class FlashAttentionForwardSm100:
         tOtO_r2t = thr_tmem_store.partition_D(tOtO_i)
 
         frg_count = self.head_dim_v_padded // corr_tile_size
-        tOrO_frg = cute.make_rmem_tensor((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
         for i in cutlass.range_constexpr(frg_count):
             tOrO_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
             tOtO_t2r_i = cute.make_tensor(
