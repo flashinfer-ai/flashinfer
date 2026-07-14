@@ -19,6 +19,10 @@ kernel_src/cutedsl_megamoe/
 │   │                          reference the FI backend + tests need (drop-audit point)
 │   ├── tuner.py            ← kernel tuning knobs (tactic enumeration + config apply);
 │   │                          mirrors tester/solvers/inference_solver knob taxonomy
+│   ├── autotune.py         ← online (warmup-time) COLLECTIVE knob autotuning:
+│   │                          times a curated candidate set on the live problem,
+│   │                          all-reduces (MAX) across ranks, applies the winner
+│   │                          (backends trigger it via config knobs="auto")
 │   └── correctness.py      ← standalone NVFP4 smoke runner (not used by moe_ep)
 └── SKILL.md                ← this file
 ```

@@ -96,24 +96,38 @@ _LARGE_TOKEN_KNOBS: Dict[str, Any] = {
     "load_balance_mode": "atomic_counter",
 }
 
+# MXFP8 profile (all token counts).  Measured 2026-07-14 on 4x GB200
+# (256 experts, top-8, hidden 7168, inter 2048) via the online autotuner:
+# flag_batch=4 + epi_warps wins at BOTH 8 and 2048 tokens; the NVFP4 large
+# profile's fb8 + dispatch-warp token-back is ~5% slower for MXFP8 at 2048.
+# The MXFP8 kernel's mma tile is fixed at (256, 256), so no tile knob here.
+_MXFP8_TOKEN_KNOBS: Dict[str, Any] = {
+    "cluster_shape_mnk": (2, 1, 1),
+    "group_hint": 512,
+    "flag_batch": 4,
+    "epi_flag_batch": (2, 4),
+    "token_back_mode": "epi_warps",
+    "load_balance_mode": "atomic_counter",
+}
 
-def default_knobs(num_tokens: int, *, include_tile: bool = True) -> Dict[str, Any]:
+
+def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     """Default perf/tile knobs for a compile-time token count (buffer size).
 
-    ``num_tokens < 2048`` -> the small-batch latency tile (128-wide N,
+    NVFP4: ``num_tokens < 2048`` -> the small-batch latency tile (128-wide N,
     ``epi_warps`` token-back); otherwise the large-batch throughput tile
-    (256-wide N, ``reuse_dispatch_warps``).  Returns a fresh dict each call.
+    (256-wide N, ``reuse_dispatch_warps``).
 
-    ``include_tile=False`` drops ``mma_tiler_mnk`` from the profile: the MXFP8
-    kernel hard-requires ``mma_tiler (M, N) = (256, 256)``, so its tile is fixed
-    and must not be overridden by the (NVFP4-tuned) token heuristic; MXFP8 still
-    takes the non-tile perf knobs (schedule / token-back / load balance).
+    ``dtype="mxfp8"`` -> the measured MXFP8 schedule (one profile for all
+    sizes; see ``_MXFP8_TOKEN_KNOBS``) with no ``mma_tiler_mnk``: the MXFP8
+    kernel hard-requires ``mma_tiler (M, N) = (256, 256)``.
+
+    Returns a fresh dict each call.
     """
+    if dtype == "mxfp8":
+        return dict(_MXFP8_TOKEN_KNOBS)
     profile = _SMALL_TOKEN_KNOBS if num_tokens < _TOKEN_TILE_THRESHOLD else _LARGE_TOKEN_KNOBS
-    knobs = dict(profile)
-    if not include_tile:
-        knobs.pop("mma_tiler_mnk", None)
-    return knobs
+    return dict(profile)
 
 
 def is_valid(knobs: Dict[str, Any], *, combine_format: str = "bf16") -> bool:

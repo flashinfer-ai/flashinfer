@@ -455,7 +455,12 @@ def _run_mega_layer(
             scales=t_scales,
             **tensor_kwargs,
         )
-        y_layer = mega.forward(t)
+        y_layer = mega.forward(t).clone()
+        # Repeated forward on the same session: with no per-launch host reset
+        # (run() default reset_counters=False) the second launch relies on the
+        # kernel's tail cleanup of its workspace counters/flags -- this is the
+        # regression guard for that contract.
+        y_layer2 = mega.forward(t)
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -471,6 +476,7 @@ def _run_mega_layer(
         assert y_layer.dtype == torch.bfloat16
         assert torch.isfinite(y_layer).all()
         torch.testing.assert_close(y_layer, y_ref, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(y_layer2, y_ref, atol=0.0, rtol=0.0)
         mega.destroy()
         return rank
     finally:

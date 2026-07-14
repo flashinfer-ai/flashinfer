@@ -270,7 +270,7 @@ def _reference_mxfp8_mega_moe_prestaged(
     return y
 
 
-def _megakernel_config(problem: dict):
+def _megakernel_config(problem: dict, knobs: dict | None = None):
     from flashinfer.moe_ep import Mxfp8CutedslMegaMoeConfig
 
     return Mxfp8CutedslMegaMoeConfig(
@@ -279,11 +279,18 @@ def _megakernel_config(problem: dict):
         kind=problem["kind"],
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
+        knobs=knobs,
     )
 
 
 def _run_mega_layer(
-    rank, world_size, *, quantize_input: bool, num_tokens: int = 64, max_tokens: int = 64
+    rank,
+    world_size,
+    *,
+    quantize_input: bool,
+    num_tokens: int = 64,
+    max_tokens: int = 64,
+    knobs: dict | None = None,
 ):
     import torch
     import torch.distributed as dist
@@ -311,7 +318,7 @@ def _run_mega_layer(
     problem = _mega_problem(
         rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
     )
-    kernel = create_mega_kernel(_megakernel_config(problem))
+    kernel = create_mega_kernel(_megakernel_config(problem, knobs=knobs))
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
         kernel.runtime_requirements(bootstrap),
@@ -378,7 +385,12 @@ def _run_mega_layer(
             topk_weights=problem["topk_weights"],
             scales=t_scales,
         )
-        y_layer = mega.forward(t)
+        y_layer = mega.forward(t).clone()
+        # Repeated forward on the same session: with no per-launch host reset
+        # (run() default reset_counters=False) the second launch relies on the
+        # kernel's tail cleanup of its workspace counters/flags -- this is the
+        # regression guard for that contract.
+        y_layer2 = mega.forward(t)
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -394,6 +406,7 @@ def _run_mega_layer(
         assert y_layer.dtype == torch.bfloat16
         assert torch.isfinite(y_layer).all()
         torch.testing.assert_close(y_layer, y_ref, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(y_layer2, y_ref, atol=0.0, rtol=0.0)
         mega.destroy()
         return rank
     finally:
@@ -427,21 +440,35 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_large_tokens_matches_reference():
-    """Large-token (>=2048) path: exercises the tuner's LARGE profile for MXFP8.
+    """Large-token (>=2048) dispatch-warp token-back for MXFP8.
 
-    With num_max_tokens >= 2048 the heuristic selects flag_batch=8 and
-    token_back reuse_dispatch_warps (-> token_back_by_dispatch=True); MXFP8's
-    mma_tiler stays kernel-fixed at (256,256). This is the regression guard for
-    whether MXFP8 large-token dispatch-warp token-back compiles + runs (it has
-    no non_ubulk_fc2_store knob); if the kernel rejects the combo we pin MXFP8
-    to epi_warps in the large profile.
+    The MXFP8 default heuristic now uses flag_batch=4 + epi_warps at all sizes
+    (measured faster 2026-07-14), so the dispatch-warp combo is pinned here
+    explicitly via knobs: this stays the regression guard for whether MXFP8
+    large-token dispatch-warp token-back (token_back_by_dispatch=True, which
+    has no non_ubulk_fc2_store escape hatch) compiles + runs bit-exact.
+    MXFP8's mma_tiler stays kernel-fixed at (256,256).
     """
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(
-        rank, world_size, quantize_input=True, num_tokens=2048, max_tokens=2048
+        rank,
+        world_size,
+        quantize_input=True,
+        num_tokens=2048,
+        max_tokens=2048,
+        # The full pre-2026-07-14 LARGE profile (explicit knobs skip the
+        # heuristic entirely, so pin every knob the old profile set).
+        knobs={
+            "cluster_shape_mnk": (2, 1, 1),
+            "group_hint": 512,
+            "flag_batch": 8,
+            "epi_flag_batch": (2, 4),
+            "token_back_mode": "reuse_dispatch_warps",
+            "load_balance_mode": "atomic_counter",
+        },
     )
     print(f"rank {rank}: mxfp8_cutedsl mega layer (large tokens) matches reference")
 

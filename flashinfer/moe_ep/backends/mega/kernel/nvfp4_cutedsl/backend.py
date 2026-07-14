@@ -45,6 +45,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Nvfp4CutedslMegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Nvfp4CutedslMegaMoeConfig = config
+        # knobs="auto": tune at the first compute() (weights + staged inputs
+        # exist there), then keep the winner for the session.
+        self._autotune_pending = config.knobs == "auto"
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -112,6 +115,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
+            knobs=None if k.knobs == "auto" else k.knobs,
         )
 
     def validate_forward(
@@ -195,6 +199,21 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         from .....kernel_src.cutedsl_megamoe import nvfp4_mega_moe
 
         kcfg = self._kernel_config
+        if self._autotune_pending:
+            # COLLECTIVE: every EP rank reaches this first compute() together,
+            # so the candidate sweep stays in lockstep (see shim/autotune.py).
+            self._autotune_pending = False
+            from .....kernel_src.cutedsl_megamoe import autotune_nvfp4_mega_moe
+
+            autotune_nvfp4_mega_moe(
+                output,
+                transformed_weights[0],
+                transformed_weights[1],
+                workspace,
+                num_tokens=output.shape[0],
+                gate_up_clamp=_resolve_gate_up_clamp(kcfg),
+                activation_clamp=kcfg.activation_clamp,
+            )
         nvfp4_mega_moe(
             output,
             transformed_weights[0],

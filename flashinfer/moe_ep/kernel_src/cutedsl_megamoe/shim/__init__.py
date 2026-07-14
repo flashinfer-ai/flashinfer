@@ -50,6 +50,7 @@ from .nvfp4 import (
     get_symm_buffer_for_mega_moe,
     init_dist,
     make_dummy_epilogue_params,
+    nvfp4_mega_launch_thunk,
     nvfp4_mega_moe,
 )
 from .mxfp8 import (
@@ -59,6 +60,7 @@ from .mxfp8 import (
     MegaMoEMxfp8SymmBuffer,
     create_dummy_inputs as create_dummy_mxfp8_inputs,
     get_symm_buffer_for_mxfp8_mega_moe,
+    mxfp8_mega_launch_thunk,
     mxfp8_mega_moe,
 )
 
@@ -69,6 +71,13 @@ from .tuner import (
     PERF_KNOBS,
     iter_candidates,
     with_knobs,
+)
+
+# Online (warmup-time) collective knob autotuning.
+from .autotune import (
+    autotune_knobs,
+    autotune_mxfp8_mega_moe,
+    autotune_nvfp4_mega_moe,
 )
 
 __all__ = [
@@ -101,6 +110,7 @@ __all__ = [
     "get_symm_buffer_for_mega_moe",
     "init_dist",
     "make_dummy_epilogue_params",
+    "nvfp4_mega_launch_thunk",
     "nvfp4_mega_moe",
     # mxfp8
     "MegaMoEMxfp8Config",
@@ -109,6 +119,7 @@ __all__ = [
     "MegaMoEMxfp8SymmBuffer",
     "create_dummy_mxfp8_inputs",
     "get_symm_buffer_for_mxfp8_mega_moe",
+    "mxfp8_mega_launch_thunk",
     "mxfp8_mega_moe",
     # tuner
     "tuner",
@@ -116,4 +127,8 @@ __all__ = [
     "PERF_KNOBS",
     "iter_candidates",
     "with_knobs",
+    # autotune
+    "autotune_knobs",
+    "autotune_mxfp8_mega_moe",
+    "autotune_nvfp4_mega_moe",
 ]

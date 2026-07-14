@@ -29,3 +29,10 @@ class Nvfp4CutedslMegaMoeConfig:
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None
+    # Kernel tuning knobs (see kernel_src.cutedsl_megamoe.shim.tuner); overrides
+    # the token-count default heuristic entirely when set, e.g. a winner from the
+    # kernel repo's tester sweep. None -> tuner.default_knobs(num_max_tokens).
+    # "auto" -> online autotune at the first forward: collectively time the
+    # shim.autotune candidate set on the live problem and keep the winner
+    # (one cute.compile per candidate, paid once per session).
+    knobs: dict | str | None = None

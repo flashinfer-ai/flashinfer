@@ -8,7 +8,7 @@ import dataclasses
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, Tuple  # noqa: F401
+from typing import Any, Callable, Literal, Optional, Tuple  # noqa: F401
 
 import torch
 
@@ -186,6 +186,23 @@ class MegaMoEMxfp8Frontend:
         self._gate_up_clamp = clamp
         self._invalidate_compile_cache()
 
+    def apply_knobs(self, knobs: Optional[dict]) -> None:
+        """Apply tuner knobs (see :mod:`.tuner`) to the session config.
+
+        Invalidates the compile cache when the effective config changes; the
+        next ``run()``/``warmup()`` recompiles.  Used by :mod:`.autotune`.
+        ``token_back_mode`` is translated to this config's
+        ``token_back_by_dispatch`` bool by ``with_knobs``.
+        """
+        from .tuner import with_knobs
+
+        new_config = with_knobs(self.config, knobs)
+        if new_config == self._config:
+            return
+        self._release_workspace()
+        self._config = new_config
+        self._invalidate_compile_cache()
+
     def release(self) -> None:
         self._release_workspace()
         self._invalidate_compile_cache()
@@ -207,7 +224,7 @@ class MegaMoEMxfp8Frontend:
         *,
         num_tokens: Optional[int] = None,
         sync: bool = True,
-        reset_counters: bool = True,
+        reset_counters: bool = False,
         reduce_topk: bool = True,
     ) -> Optional[torch.Tensor]:
         """Launch MXFP8 MegaMoE and return the 2D ``(T, hidden)`` bf16 output.
@@ -215,18 +232,71 @@ class MegaMoEMxfp8Frontend:
         The kernel drop reduces the top-k combine internally, so the result is
         always the reduced ``output_activation`` (the old form-A path is gone).
         ``reduce_topk`` is accepted for backward API compatibility and ignored.
+
+        ``reset_counters=False`` (default): workspaces are allocated zeroed and
+        the kernel tail-cleans its own counters/flags after every launch (the
+        kernel-team drivers and tester never host-reset), so no per-launch
+        reset is needed.  Pass ``True`` only to recover after an aborted /
+        interrupted launch left the workspaces dirty.
         """
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return None
         mega = self._ensure_mega_compiled(inputs)
-        runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
+        key = self._launch_cache_key(launch_inputs)
+        if mega.launch_key != key:
+            mega.launch_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
+            mega.launch_key = key
         if reset_counters:
             reset_compiled_mega_workspaces(mega)
-        mega.compiled(**runtime_kwargs)
+        mega.compiled(**mega.launch_kwargs)
         if sync:
             torch.cuda.synchronize()
         return launch_inputs.output_activation
+
+    def make_launch_thunk(
+        self,
+        inputs: MegaMoEMxfp8Inputs,
+        *,
+        num_tokens: Optional[int] = None,
+    ) -> Callable[[], None]:
+        """Zero-arg launcher with args prebuilt (compiles if needed).
+
+        Steady-state fast path for timing loops and tuners, mirroring the
+        kernel tester's ``launch_plan`` contract: no per-call Python arg
+        rebuild, no workspace reset (the kernel tail-cleans its own
+        counters/flags), no sync.  Output lands in
+        ``inputs.output_activation``.  Invalid after the compile cache is
+        invalidated (knobs/clamp change) or the buffers are freed.
+        """
+        launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
+        if launch_inputs is None:
+            return lambda: None
+        mega = self._ensure_mega_compiled(inputs)
+        runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
+        compiled = mega.compiled
+
+        def thunk() -> None:
+            compiled(**runtime_kwargs)
+
+        return thunk
+
+    @staticmethod
+    def _launch_cache_key(inputs: MegaMoEMxfp8Inputs) -> tuple:
+        t = inputs
+        return (
+            t.activation.data_ptr(),
+            t.activation_sf.data_ptr(),
+            t.topk_idx.data_ptr(),
+            t.topk_weights.data_ptr(),
+            t.fc1_weight.data_ptr(),
+            t.fc1_weight_sf.data_ptr(),
+            t.fc2_weight.data_ptr(),
+            t.fc2_weight_sf.data_ptr(),
+            t.output_activation.data_ptr(),
+            t.activation.shape[0],
+            torch.cuda.current_stream().cuda_stream,
+        )
 
     def _mega_compile_key(self) -> tuple:
         c = self.config
@@ -729,13 +799,12 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     )
     from .tuner import default_knobs, with_knobs
 
-    # Token-count heuristic picks the perf tactic by compile-time buffer size
-    # (num_max_tokens); an explicit knobs= dict overrides it entirely.  MXFP8's
-    # mma_tiler is kernel-fixed at (256, 256), so the heuristic's NVFP4-tuned
-    # tile is dropped (include_tile=False) -- only the non-tile perf knobs apply.
+    # Default tactic: the measured MXFP8 schedule (dtype="mxfp8"; one profile
+    # for all token counts, no tile knob -- MXFP8's mma_tiler is kernel-fixed
+    # at (256, 256)).  An explicit knobs= dict overrides it entirely.
     cfg = with_knobs(
         cfg,
-        knobs if knobs is not None else default_knobs(num_max_tokens, include_tile=False),
+        knobs if knobs is not None else default_knobs(num_max_tokens, dtype="mxfp8"),
     )
     frontend = MegaMoEMxfp8Frontend(cfg)
 
@@ -862,6 +931,38 @@ def mxfp8_mega_moe(
     out = symm_buffer._frontend.run(inputs, num_tokens=None)
     if out is not None:
         y.copy_(out[:n])
+
+
+def mxfp8_mega_launch_thunk(
+    transformed_l1: TransformedWeights,
+    transformed_l2: TransformedWeights,
+    symm_buffer: MegaMoEMxfp8SymmBuffer,
+) -> Callable[[], None]:
+    """Prebuilt zero-arg MXFP8 mega launcher for steady-state timing loops.
+
+    Tester-parity timed region (``tester/solver.py perf_run``): the returned
+    thunk is a bare compiled-kernel launch -- args prebuilt once, no per-call
+    Python, no workspace reset (the kernel tail-cleans), no sync, no output
+    copy.  The reduced bf16 output lands in ``symm_buffer.output_activation``.
+    Compiles on this call if needed.  Rebuild the thunk after knob/clamp
+    changes or buffer destruction.
+    """
+    if symm_buffer._destroyed:
+        raise RuntimeError("symm_buffer.destroy() was already called.")
+    fc1_weight, fc1_weight_sf = transformed_l1
+    fc2_weight, fc2_weight_sf = transformed_l2
+    inputs = MegaMoEMxfp8Inputs(
+        activation=symm_buffer.x,
+        activation_sf=symm_buffer.x_sf,
+        topk_idx=symm_buffer.topk_idx,
+        topk_weights=symm_buffer.topk_weights,
+        fc1_weight=fc1_weight,
+        fc1_weight_sf=fc1_weight_sf,
+        fc2_weight=fc2_weight,
+        fc2_weight_sf=fc2_weight_sf,
+        output_activation=symm_buffer.output_activation,
+    )
+    return symm_buffer._frontend.make_launch_thunk(inputs)
 
 
 def _create_dummy_weights(
