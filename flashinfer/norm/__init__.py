@@ -1791,6 +1791,7 @@ __all__ = [
     "gemma_rmsnorm",
     "gemma_fused_add_rmsnorm",
     "layernorm",
+    "layernorm_quant",
     "fused_rmsnorm_silu",
     # Fused DIT LayerNorm (diffusion transformer)
     "fused_dit_gate_residual_layernorm_gamma_beta",

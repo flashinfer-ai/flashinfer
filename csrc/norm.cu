@@ -302,6 +302,7 @@ void layernorm_quant(TensorView output, TensorView input, TensorView gamma, Tens
   TVM_FFI_ICHECK_EQ(input.dtype(), dl_bfloat16) << "input must be bfloat16";
   TVM_FFI_ICHECK_EQ(gamma.dtype(), dl_float32) << "gamma must be float32";
   TVM_FFI_ICHECK_EQ(beta.dtype(), dl_float32) << "beta must be float32";
+  TVM_FFI_ICHECK_EQ(scale.dtype(), dl_float32) << "scale must be float32";
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
   const cudaStream_t stream = get_stream(input.device());
 

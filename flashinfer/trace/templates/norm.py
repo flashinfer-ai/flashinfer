@@ -660,6 +660,8 @@ layernorm_quant_trace = TraceTemplate(
     outputs={
         "out": Tensor(
             ["batch_size", "hidden_size"],
+            dtype_from="out",
+            dtype="float8_e4m3fn",
             description="Quantized output (dtype matches pre-allocated out tensor).",
         ),
     },

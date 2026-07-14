@@ -50,7 +50,7 @@
         "batch_size",
         "hidden_size"
       ],
-      "dtype": "bfloat16",
+      "dtype": "float8_e4m3fn",
       "description": "Quantized output (dtype matches pre-allocated out tensor)."
     }
   },
