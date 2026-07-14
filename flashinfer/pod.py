@@ -436,6 +436,7 @@ class PODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             0,  # num_colocated_ctas
+            0,  # uniform_q_len
         )
 
         self._indptr_type = indptr.dtype
@@ -1083,6 +1084,7 @@ class BatchPODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             0,  # num_colocated_ctas
+            0,  # uniform_q_len
         )
 
         num_colocated_ctas = self._plan_info_d[0]
@@ -1109,6 +1111,7 @@ class BatchPODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             num_colocated_ctas,
+            0,  # uniform_q_len
         )
         self._indptr_type = kv_indptr_p.dtype
         self._pos_encoding_mode = pos_encoding_mode

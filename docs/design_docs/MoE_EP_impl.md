@@ -13,12 +13,12 @@ lives in dispatch/combine).
 
 | Symbol | Role |
 |---|---|
-| `MoEEpLayer(bootstrap, fleet_params, backend, compute_config, weights)` | the layer (`nn.Module`) |
+| `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backend=...)` | the layer (`nn.Module`) |
 | `MoEEpTensors(hidden_states, topk_ids, topk_weights)` | per-rank forward inputs |
 | `BootstrapConfig(world_size, rank, stream, nccl_comm)` | transport bootstrap |
 | `FleetParams(num_experts, max_tokens_per_rank, token_hidden_size, dtype_bytes, algorithm, layout)` | EP geometry |
 | `EpAlgorithm.{LOW_LATENCY, HIGH_THROUGHPUT}`, `EpLayout.{EXPERT_MAJOR, RANK_MAJOR, FLAT}` | algorithm / receive layout |
-| `compute_config: MoEConfig`, `weights: MoEWeightPack` | the expert GEMM (from `flashinfer.fused_moe.api`) |
+| `weights: MoEWeightPack` (layer arg) + `SplitConfig(kernel=FusedMoeKernelConfig(moe_config: MoEConfig))` | the expert GEMM (config from `flashinfer.fused_moe.api`) |
 
 `create_fleet(...)` raises `MoEEpNotBuiltError` (with rebuild hint) if the backend extension
 isn't present; `available_backends()` lists what's built.
@@ -99,7 +99,8 @@ Step by step (`_run_one_layout`):
        BootstrapConfig(world_size, rank, stream=torch.cuda.current_stream().cuda_stream, nccl_comm=None),
        FleetParams(num_experts, max_tokens_per_rank=TOKENS_PER_RANK, token_hidden_size=HIDDEN,
                    dtype_bytes=2, algorithm=EpAlgorithm.LOW_LATENCY, layout=layout),
-       backend="nccl_ep", compute_config=cfg, weights=wp,
+       weights=wp,
+       backend=SplitConfig(comm=NcclEpConfig(), kernel=FusedMoeKernelConfig(moe_config=cfg)),
    )
    ```
 5. **Run** — `y = layer.forward(MoEEpTensors(hidden_states=x, topk_ids=topk_ids,
