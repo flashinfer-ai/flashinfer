@@ -535,6 +535,36 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_large_tokens_matches_reference():
     print(f"rank {rank}: nvfp4_cutedsl mega layer (large tokens) matches reference")
 
 
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("num_tokens", [512, 1024])
+def test_moe_ep_nvfp4_cutedsl_mega_layer_mid_tokens_matches_reference(num_tokens):
+    """Mid-token paths: exercise the tuner's MID / MID-LARGE profiles.
+
+    512 selects the mid tactic (mma_tiler (256,128,256), flag_batch 4,
+    token_back reuse_dispatch_warps); 1024 selects the mid-large tactic
+    (mma_tiler (256,256,256), flag_batch 4, token_back standalone_warps) --
+    the 2026-07-14 autotune winners at those sizes.  Confirms each profile
+    compiles + runs and the layer path stays bit-exact with the direct-kernel
+    reference.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        num_tokens=num_tokens,
+        max_tokens=num_tokens,
+    )
+    print(
+        f"rank {rank}: nvfp4_cutedsl mega layer (mid tokens={num_tokens}) "
+        "matches reference"
+    )
+
+
 @pytest.mark.arch_blackwell
 def test_nvfp4_cutedsl_preprocess_accepts_sglang_packed_weights():
     _require_cuda()

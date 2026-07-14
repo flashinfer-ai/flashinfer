@@ -72,11 +72,14 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
 # Keyed on the buffer's ``num_max_tokens`` (the kernel compiles once for that
 # size, so the tile/cluster/schedule are fixed at compile).  Sets only the
 # perf/tile knobs; ``in_kernel_fc2_reduce`` and ``combine_format`` stay owned by
-# the config / caller.  Threshold picked from measured perf (small-batch latency
-# vs large-batch throughput tiles).
-_TOKEN_TILE_THRESHOLD = 2048
-
-_SMALL_TOKEN_KNOBS: Dict[str, Any] = {
+# the config / caller.
+#
+# NVFP4 profiles from measured winners (online autotune, 4x GB200, 256 experts,
+# top-8, hidden 7168, inter 2048, 2026-07-14).  The dominant axis is
+# ``token_back_mode``: ``epi_warps`` wins at small batch but falls off a cliff
+# mid-range (+18% at 512 tokens, +35% at 1024 -- every dispatch-warp candidate
+# beat every epi_warps candidate there); tile/flag_batch are second-order.
+_SMALL_TOKEN_KNOBS: Dict[str, Any] = {  # < 512 tokens (winner at 8)
     "mma_tiler_mnk": (256, 128, 256),
     "cluster_shape_mnk": (2, 1, 1),
     "group_hint": 512,
@@ -86,7 +89,27 @@ _SMALL_TOKEN_KNOBS: Dict[str, Any] = {
     "load_balance_mode": "atomic_counter",
 }
 
-_LARGE_TOKEN_KNOBS: Dict[str, Any] = {
+_MID_TOKEN_KNOBS: Dict[str, Any] = {  # 512..1023 (winner at 512)
+    "mma_tiler_mnk": (256, 128, 256),
+    "cluster_shape_mnk": (2, 1, 1),
+    "group_hint": 512,
+    "flag_batch": 4,
+    "epi_flag_batch": (2, 4),
+    "token_back_mode": "reuse_dispatch_warps",
+    "load_balance_mode": "atomic_counter",
+}
+
+_MID_LARGE_TOKEN_KNOBS: Dict[str, Any] = {  # 1024..2047 (winner at 1024)
+    "mma_tiler_mnk": (256, 256, 256),
+    "cluster_shape_mnk": (2, 1, 1),
+    "group_hint": 512,
+    "flag_batch": 4,
+    "epi_flag_batch": (2, 4),
+    "token_back_mode": "standalone_warps",
+    "load_balance_mode": "atomic_counter",
+}
+
+_LARGE_TOKEN_KNOBS: Dict[str, Any] = {  # >= 2048 (validated at 2048)
     "mma_tiler_mnk": (256, 256, 256),
     "cluster_shape_mnk": (2, 1, 1),
     "group_hint": 512,
@@ -114,9 +137,12 @@ _MXFP8_TOKEN_KNOBS: Dict[str, Any] = {
 def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     """Default perf/tile knobs for a compile-time token count (buffer size).
 
-    NVFP4: ``num_tokens < 2048`` -> the small-batch latency tile (128-wide N,
-    ``epi_warps`` token-back); otherwise the large-batch throughput tile
-    (256-wide N, ``reuse_dispatch_warps``).
+    NVFP4: four measured profiles keyed on token count -- <512 small-batch
+    latency (128-wide N tile, ``epi_warps``), 512..1023 mid
+    (``reuse_dispatch_warps``), 1024..2047 mid-large (256-wide N tile,
+    ``standalone_warps``), >=2048 large throughput (``flag_batch=8``,
+    ``reuse_dispatch_warps``).  See the profile dicts above for measurement
+    provenance.
 
     ``dtype="mxfp8"`` -> the measured MXFP8 schedule (one profile for all
     sizes; see ``_MXFP8_TOKEN_KNOBS``) with no ``mma_tiler_mnk``: the MXFP8
@@ -126,8 +152,13 @@ def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     """
     if dtype == "mxfp8":
         return dict(_MXFP8_TOKEN_KNOBS)
-    profile = _SMALL_TOKEN_KNOBS if num_tokens < _TOKEN_TILE_THRESHOLD else _LARGE_TOKEN_KNOBS
-    return dict(profile)
+    if num_tokens < 512:
+        return dict(_SMALL_TOKEN_KNOBS)
+    if num_tokens < 1024:
+        return dict(_MID_TOKEN_KNOBS)
+    if num_tokens < 2048:
+        return dict(_MID_LARGE_TOKEN_KNOBS)
+    return dict(_LARGE_TOKEN_KNOBS)
 
 
 def is_valid(knobs: Dict[str, Any], *, combine_format: str = "bf16") -> bool:
