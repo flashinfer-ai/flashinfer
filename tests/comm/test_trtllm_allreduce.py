@@ -49,7 +49,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
     try:
         device = torch.device(f"cuda:{rank}")
-        token_nums = [64, 128]
+        # 8 tokens is below LamportTokenNumThreshold (16), so ONESHOT +
+        # RESIDUAL_RMS_NORM dispatches to the lamport-style kernel.
+        token_nums = [8, 64, 128]
         strategy_codes = [
             comm.AllReduceStrategyType.ONESHOT,
             comm.AllReduceStrategyType.TWOSHOT,
@@ -89,9 +91,30 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         test_loop = 2  # could be any number
 
         # NOTE: the barrier flag should be initialized to 1, and incremented by 1 for each AR
+        lamport_buffer_size = (
+            world_size
+            * comm.trtllm_ar.LamportTokenNumThreshold
+            * world_size
+            * maxHiddenSize
+            * 2
+        )
         flag_value = 1
         for token_num in token_nums:
             for hidden_size in hidden_sizes:
+                # The lamport protocol assumes a fixed message layout per
+                # workspace; re-init the buffers when the shape changes so a
+                # lamport call never reads stale data from a previous shape.
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
+                comm.trtllm_lamport_initialize_all(
+                    workspace[4][rank],
+                    workspace[5][rank],
+                    workspace[6][rank],
+                    lamport_buffer_size // 2,
+                    torch.float16,
+                )
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
                 for strategy_code in strategy_codes:
                     for config_code in config_codes:
                         for fusion_op_code in fusion_op_codes:
