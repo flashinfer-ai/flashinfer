@@ -1,9 +1,23 @@
 import random
+import tracemalloc
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+import flashinfer.fused_moe.core as core_mod
 from flashinfer import autotune
+from flashinfer.autotuner.initializers import autotuner_initializer_randn
+from flashinfer.fused_moe.core import MoeRunnerInputs, _moe_topk_ids_init
+from flashinfer.fused_moe.utils import (
+    get_hybrid_num_tokens_buckets,
+    make_hybrid_bucket_mapper,
+)
+from flashinfer.mla._core import (
+    _build_mla_decode_tuning_config,
+    _mla_decode_tuning_config,
+)
+from flashinfer.tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
 from flashinfer.autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -1117,8 +1131,6 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     though the shape and bucketing logic are identical, so the cache grows by
     exactly N — the original memory leak.
     """
-    import tracemalloc
-
     AutoTuner._find_nearest_profile.cache_clear()
 
     shapes = ((1024, 128),)
@@ -1162,12 +1174,6 @@ def _build_moe_style_tuning_config(topk_ids_initializer):
     """Build a config with tensor_initializers present, MoE-style.
     Mimics ``_make_tuning_config`` in fused_moe/core.py.
     """
-    from flashinfer.autotuner.initializers import autotuner_initializer_randn
-    from flashinfer.fused_moe.utils import (
-        get_hybrid_num_tokens_buckets,
-        make_hybrid_bucket_mapper,
-    )
-
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
@@ -1188,8 +1194,6 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     """Regression test: rebuilt MoE-style configs with tensor_initializers
     must collapse to a single cache entry.
     """
-    from flashinfer.fused_moe.core import _moe_topk_ids_init
-
     # The factory must return the identical object for the same expert count.
     assert _moe_topk_ids_init(128) is _moe_topk_ids_init(128)
 
@@ -1219,12 +1223,6 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
     """_make_tuning_config must return configs whose topk_ids initializer is the
     same object across calls for the same num_experts.
     """
-    from unittest.mock import MagicMock, patch
-
-    import flashinfer.fused_moe.core as core_mod
-    from flashinfer.fused_moe.core import MoeRunnerInputs
-    from flashinfer.tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
-
     fn = core_mod.get_trtllm_moe_sm100_module
     fn.cache_clear()
     try:
@@ -1312,3 +1310,80 @@ def test_find_nearest_profile_cache_grows_with_fresh_closure_initializer():
     assert cache_growth == N, (
         f"Expected {N} new cache entries (one per fresh closure), got {cache_growth}."
     )
+
+
+def _call_build_mla_decode_tuning_config():
+    """Call _build_mla_decode_tuning_config with fresh (equivalent) tensors.
+
+    runner_names is restricted to trtllm-gen so bucket computation stays
+    host-only (no SM count query), letting the test run without a GPU.
+    """
+    num_pages, page_size, head_dim = 128, 32, 576
+    return _build_mla_decode_tuning_config(
+        kv_cache=torch.empty((num_pages, page_size, head_dim)),
+        block_tables=torch.zeros((8, 64), dtype=torch.int32),
+        workspace_buffer=torch.empty(1024, dtype=torch.uint8),
+        runner_names=("trtllm-gen",),
+        q_len=4,
+        num_heads=128,
+        kv_lora_rank=512,
+        max_seq_len=1024,
+        device=torch.device("cpu"),
+    )
+
+
+def test_mla_decode_tuning_config_is_memoized():
+    """Equivalent MLA-decode dispatcher calls must reuse one TuningConfig object.
+
+    A fresh config per call embeds two fresh initializer closures; those hash
+    identically to but never compare equal with previous ones, so each call
+    would leak one _find_nearest_profile cache entry and lookups would scan the
+    whole collision chain (observed as GC gen-2 pause growth and decaying
+    decode throughput in serving).
+    """
+    _mla_decode_tuning_config.cache_clear()
+    try:
+        config_a = _call_build_mla_decode_tuning_config()
+        config_b = _call_build_mla_decode_tuning_config()
+
+        assert config_a is config_b, (
+            "_build_mla_decode_tuning_config returned a different TuningConfig "
+            "object for equivalent arguments. It must memoize on "
+            "(buckets, num_pages, profile_seq_len) so rebuilt configs collapse to "
+            "the same _find_nearest_profile lru_cache key — a per-call config "
+            "reintroduces the memory leak."
+        )
+    finally:
+        _mla_decode_tuning_config.cache_clear()
+
+
+def test_find_nearest_profile_cache_dedups_mla_decode_config():
+    """Regression test: rebuilt MLA-decode configs must collapse to a single
+    _find_nearest_profile cache entry.
+    """
+    AutoTuner._find_nearest_profile.cache_clear()
+    _mla_decode_tuning_config.cache_clear()
+    try:
+        # [query, block_tables, seq_lens, out] as passed by the MLA dispatcher.
+        shapes = ((8, 4, 128, 576), (8, 64), (8,), (8, 4, 128, 512))
+
+        AutoTuner._find_nearest_profile(shapes, _call_build_mla_decode_tuning_config())
+        cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+        N = 1_000
+        for _ in range(N):
+            AutoTuner._find_nearest_profile(
+                shapes, _call_build_mla_decode_tuning_config()
+            )
+
+        cache_growth = (
+            AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+        )
+
+        assert cache_growth == 0, (
+            f"Cache grew by {cache_growth} entries across {N} rebuilds of an "
+            "equivalent MLA-decode tuning config with a fixed shape."
+        )
+    finally:
+        AutoTuner._find_nearest_profile.cache_clear()
+        _mla_decode_tuning_config.cache_clear()
