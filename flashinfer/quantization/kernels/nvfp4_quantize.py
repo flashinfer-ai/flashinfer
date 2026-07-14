@@ -1486,12 +1486,9 @@ _TMA_LOG2_MK_THRESHOLD = 25
 
 
 def _should_use_tma(m: int, k: int, dtype: torch.dtype) -> bool:
-    """Determine if the TMA kernel should be used based on problem dimensions.
+    """TODO: disabled TMA for now due to perf sweep showing the vectorized-load
+    kernel is as fast/at parity.
 
-    The TMA path is disabled by default: a full M/K sweep across all three SF
-    layouts on B200/SM100 found the vectorized-load kernel to be as fast or
-    faster than the TMA kernel everywhere, with the old ``log2(M)+log2(K) >= 25``
-    gate selecting TMA in regions where it was up to ~21% slower (flashinfer#3905).
     Set ``FLASHINFER_NVFP4_QUANTIZE_USE_TMA=1`` to re-enable the heuristic for
     re-tuning on other hardware.
     """
