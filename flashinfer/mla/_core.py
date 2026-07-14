@@ -1023,7 +1023,7 @@ def _resolve_dsv4_sparse_mla_backend(
         if is_sm100_family:
             return "trtllm-gen"
         raise ValueError(
-            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
+            "batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
             f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend not in ("trtllm-gen", "cute-dsl", "sparse"):
@@ -1158,7 +1158,7 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     return result
 
 
-def trtllm_batch_decode_sparse_mla_dsv4(
+def batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
@@ -1185,6 +1185,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     hca_use_persistent: bool = False,
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA.
+
+    ``trtllm_batch_decode_sparse_mla_dsv4`` is retained as the exact same
+    callable for backwards compatibility.
 
     The implementation is selected from the query device architecture.
 
@@ -1509,7 +1512,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     return out
 
 
-_trtllm_batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
+# Keep the TRTLLM-prefixed public spelling and the historical private spelling
+# as the same object for backwards compatibility.
+trtllm_batch_decode_sparse_mla_dsv4 = batch_decode_sparse_mla_dsv4
+_trtllm_batch_decode_sparse_mla_dsv4 = batch_decode_sparse_mla_dsv4
 
 
 @functools.cache

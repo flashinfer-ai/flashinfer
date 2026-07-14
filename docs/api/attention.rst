@@ -148,8 +148,15 @@ PageAttention for MLA
     :toctree: ../generated
 
     trtllm_batch_decode_with_kv_cache_mla
-    trtllm_batch_decode_sparse_mla_dsv4
+    batch_decode_sparse_mla_dsv4
     xqa_batch_decode_with_kv_cache_mla
+
+.. note::
+
+    ``batch_decode_sparse_mla_dsv4`` is the backend-neutral entry point for
+    the ``"auto"``, ``"trtllm-gen"``, ``"cute-dsl"``, and ``"sparse"``
+    implementations. ``trtllm_batch_decode_sparse_mla_dsv4`` remains
+    available as the exact same callable for backwards compatibility.
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:

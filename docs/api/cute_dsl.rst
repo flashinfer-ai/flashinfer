@@ -70,3 +70,8 @@ CuTe-DSL implementations of the batch attention wrappers.
     :toctree: ../generated
 
     cute_dsl_hca_decode
+
+The recommended public entry point is
+``flashinfer.mla.batch_decode_sparse_mla_dsv4`` with
+``backend="cute-dsl"``. ``cute_dsl_hca_decode`` is the lower-level wrapper for
+callers that already use the HCA page-table metadata ABI.

@@ -33,7 +33,7 @@ DSv3.2 (d_qk=576) and DSv4 (d_qk=512) decode go through dedicated warp-spec
 standalone kernels; prefill is dispatched through the shared orchestrator.
 
 The user-facing sparse MLA entry points are
-``flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4`` for DeepSeek V4 and
+``flashinfer.mla.batch_decode_sparse_mla_dsv4`` for DeepSeek V4 and
 ``flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(..., sparse_mla_top_k=...)``
 for the DSv3.2 / GLM sparse top-k path. This module keeps only the SM120
 implementation hooks used by those dispatchers and focused kernel
