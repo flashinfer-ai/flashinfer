@@ -400,8 +400,14 @@ def cute_dsl_fmha_ragged_prefill(
 
     if kernel_fn is None:
         gpu_arch = _get_gpu_arch(q.device)
+        # Q and K feed the same GEMM operand dtype: neither the prebuilt
+        # artifacts nor the JIT compile (single qk_dtype) support q != k.
+        if q.dtype != k.dtype:
+            raise ValueError(
+                f"cute-dsl FMHA requires q.dtype == k.dtype, got {q.dtype} and {k.dtype}"
+            )
         try:
-            if q.dtype != k.dtype or k.dtype != v.dtype:
+            if k.dtype != v.dtype:
                 raise RuntimeError("Separate dtype_qk / dtype_vo requires JIT")
             if window_left != -1 or window_right != -1:
                 # The exported artifact matrix has no window axis: every
