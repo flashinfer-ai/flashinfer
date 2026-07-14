@@ -1321,11 +1321,10 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             resolved_backends[backend] = backend_wrappers[backend]._backend
         elif backend in ("trtllm-fmha-v2-wrapper", "trtllm-fmha-v2-wrapper-e2e"):
             # Standalone FMHAv2 wrapper (flashinfer/fmha_v2.py): plan() is one
-            # fused prep launch; run() is a single kernel launch fed by
-            # device-resident scales/tile-counter (no host set_alpha /
-            # per-launch tile-counter memset). The plain "-wrapper" backend
-            # plans once here (plan cost amortized); the "-e2e" backend
-            # re-plans inside every timed iteration.
+            # fused prep launch; run() is a single kernel launch fed by the
+            # device-resident scale words the prep kernel wrote. The plain
+            # "-wrapper" backend plans once here (plan cost amortized); the
+            # "-e2e" backend re-plans inside every timed iteration.
             _q_scale = q_scale if q_scale is not None else 1.0
             _k_scale = k_scale if k_scale is not None else 1.0
             _v_scale = v_scale if v_scale is not None else 1.0

@@ -1630,9 +1630,8 @@ def test_batch_prefill_paged_trtllm_fmhav2_wrapper(
     """End-to-end test for ``FmhaV2BatchPrefillWithPagedKVCacheWrapper``.
 
     Drives the fused ``prepare_paged`` device kernel through ``wrapper.plan()``
-    (paged→dense block-table scatter + cum-scan / tile reset / scale encode in
-    one launch) and the device-resident scale/tile-counter feed into
-    ``wrapper.run()``.
+    (paged→dense block-table scatter + cum-scan / scale encode in one launch)
+    and the device-resident scale-word feed into ``wrapper.run()``.
     """
     _skip_unless_trtllm_fmhav2_supported()
 
@@ -1667,10 +1666,11 @@ def test_batch_prefill_paged_trtllm_fmhav2_plan_reuse(
 
     On SM90 the warp-specialized kernel's tile scheduler consumes
     ``tile_id_counter`` via atomicAdd (dma.h), leaving it at ``num_tiles``
-    after each launch. Since the wrapper skips the launcher-side memset
-    (``tile_id_counter_external_zeroed``), run() must re-zero the counter
-    itself or every run after the first reads a stale value and schedules
-    nothing. This test fails if that re-zero is ever dropped.
+    after each launch; plan-once/run-many correctness relies on the
+    launcher's per-launch cudaMemsetAsync re-zeroing it
+    (kernel_hopper_ws.jinja). This test fails if that re-zero is ever
+    dropped — e.g. by reintroducing an externally-zeroed counter without a
+    per-run reset.
     """
     _skip_unless_trtllm_fmhav2_supported()
 

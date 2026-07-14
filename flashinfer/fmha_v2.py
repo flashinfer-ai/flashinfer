@@ -39,7 +39,9 @@ from .utils import (
 
 @functools.cache
 def get_trtllm_fmha_v2_module(
-    input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None
+    input_layout: str,
+    input_dtype: torch.dtype,
+    output_dtype: Optional[torch.dtype] = None,
 ):
     # Layout/dtype-specialised FMHAv2 module exposing prepare(), prepare_paged()
     # and run().
@@ -49,10 +51,10 @@ def get_trtllm_fmha_v2_module(
 class _FmhaV2PrefillWrapperBase:
     """Shared engine and scaffolding for the FMHAv2 prefill wrappers.
 
-    Owns the device buffers the fused prep kernel writes (cum-seq-lens, tile
-    counter, encoded BMM scales) and all per-plan state consumed by
-    :meth:`_run_impl`. A subclass plan() stores the per-plan state and issues
-    the single fused prep launch; its run() is a single FMHA kernel launch via
+    Owns the device buffers the fused prep kernel writes (cum-seq-lens,
+    encoded BMM scales) and all per-plan state consumed by :meth:`_run_impl`.
+    A subclass plan() stores the per-plan state and issues the single fused
+    prep launch; its run() is a single FMHA kernel launch via
     :meth:`_run_impl` and may be called many times per plan().
 
     Layouts follow :func:`flashinfer.prefill.trtllm_fmha_v2_prefill`: the same
@@ -75,7 +77,6 @@ class _FmhaV2PrefillWrapperBase:
         # Prep-kernel device buffers; (re)allocated lazily by _prep_args().
         self._cum_seq_lens_q: Optional[torch.Tensor] = None
         self._cum_seq_lens_kv: Optional[torch.Tensor] = None
-        self._tile_id_counter: Optional[torch.Tensor] = None
         self._scale_bmm1_d: Optional[torch.Tensor] = None
         self._scale_bmm2_d: Optional[torch.Tensor] = None
         # Per-plan state consumed by _run_impl(); set by the subclass plan().
@@ -86,7 +87,6 @@ class _FmhaV2PrefillWrapperBase:
         self._logits_soft_cap: float = 0.0
         self._bmm1_scale: float = 1.0
         self._bmm2_scale: float = 1.0
-        self._seq_lens_q: Optional[torch.Tensor] = None
         self._kv_lens: Optional[torch.Tensor] = None
         self._block_tables: Optional[torch.Tensor] = None
         self._page_size: int = 0
@@ -94,16 +94,38 @@ class _FmhaV2PrefillWrapperBase:
         self._max_kv_len: int = 0
         self._batch_size: int = 0
 
-    def _check_gates(self, pos_encoding_mode: str) -> None:
-        """Feature gates shared by all plan() paths."""
+    def _check_gates(
+        self,
+        pos_encoding_mode: str,
+        q_dtype: torch.dtype,
+        causal: bool,
+        window_left: int,
+    ) -> None:
+        """Feature gates shared by all plan() paths.
+
+        Mirrors the validation :func:`flashinfer.prefill.trtllm_fmha_v2_prefill`
+        performs per call, so unsupported configurations fail at plan() with a
+        readable error instead of an obscure JIT/dispatch failure (or, for the
+        sliding-window case, silently ignoring the window).
+        """
         cc = get_compute_capability(self.device)
         if cc[0] not in (9, 12):
             raise NotImplementedError(
                 f"FMHAv2 prefill requires SM90 or SM120; got SM{cc[0]}{cc[1]}"
             )
+        if q_dtype == torch.float8_e4m3fn and cc[0] == 12:
+            raise NotImplementedError(
+                "FP8 (e4m3) is not yet supported for FMHAv2 on SM120 (Blackwell); "
+                "use fp16 or bf16 instead."
+            )
         if pos_encoding_mode not in ("NONE", "ALIBI"):
             raise NotImplementedError(
                 "FMHAv2 does not apply RoPE; pre-apply it to Q/K and pass NONE or ALIBI."
+            )
+        if window_left >= 0 and not causal:
+            raise ValueError(
+                "window_left >= 0 requires causal=True: the FMHAv2 kernel only "
+                "implements sliding-window-causal masking."
             )
 
     def _prep_args(
@@ -138,8 +160,7 @@ class _FmhaV2PrefillWrapperBase:
             self._cum_seq_lens_kv = torch.empty(
                 batch_size + 1, dtype=torch.int32, device=device
             )
-        if self._tile_id_counter is None:
-            self._tile_id_counter = torch.zeros(1, dtype=torch.uint32, device=device)
+        if self._scale_bmm1_d is None:
             self._scale_bmm1_d = torch.empty(1, dtype=torch.uint32, device=device)
             self._scale_bmm2_d = torch.empty(1, dtype=torch.uint32, device=device)
 
@@ -156,7 +177,6 @@ class _FmhaV2PrefillWrapperBase:
             self._logits_soft_cap,
             self._cum_seq_lens_q,
             self._cum_seq_lens_kv,
-            self._tile_id_counter,
             self._scale_bmm1_d,
             self._scale_bmm2_d,
         )
@@ -174,62 +194,23 @@ class _FmhaV2PrefillWrapperBase:
         )
         return q_dtype
 
-    def _alloc_out_lse(
+    def _normalize_slots(
         self,
         q: torch.Tensor,
-        v_head_dim: int,
-        out: Optional[torch.Tensor],
-        lse: Optional[torch.Tensor],
-        return_lse: bool,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        assert self._module is not None, "plan() must be called before run()"
-        if return_lse and lse is None:
-            # FMHAv2 softmax stats: (max, sum_exp) per token/head, ragged format.
-            lse = torch.empty(
-                (q.size(0), q.size(1), 2), dtype=torch.float32, device=q.device
-            )
-        out_shape = q.shape[:-1] + (v_head_dim,)
-        out_dtype = self._o_dtype or q.dtype
-        if out is None:
-            out = torch.empty(out_shape, dtype=out_dtype, device=q.device)
-        else:
-            check_shape_dtype_device(out, out_shape, out_dtype, q.device, "out")
-        return out, lse
-
-    def _zero_tile_counter(self) -> None:
-        # Re-zero tile_id_counter before every run: atomicAdd in dma.h leaves it
-        # at num_tiles after each launch, so plan-once/run-many would read a
-        # stale value on run #2+. zero_() is async on the current stream — no
-        # D2H sync.
-        assert self._tile_id_counter is not None, "plan() must run before run()"
-        self._tile_id_counter.zero_()
-
-    def _run_impl(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor] = None,
-        v: Optional[torch.Tensor] = None,
-        *,
-        out: torch.Tensor,
-        window_left: Optional[int] = None,
-        lse: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Single FMHAv2 kernel launch; prep ran in the subclass plan().
-
-        ``window_left`` overrides the value recorded at plan time when given;
-        everything else per-plan (layout, mask mode, scales, lens) comes from
-        the state stored by plan().
-
-        The FFI has three tensor slots whose meaning follows the planned
-        layout (fmha_v2_run.cu:381-410); unused slots expect dummy tensors,
-        not None, and are filled in here so callers pass only what their
-        layout actually has:
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Validate the layout-dependent tensor slots and normalize unused
+        ones to the dummy tensors the FFI expects (fmha_v2_run.cu:381-410):
 
         - PAGED:           q [T,H,D], k/v = paged K/V pools
         - SEPARATE_Q_K_V:  q/k/v all [T,H,D]
         - PACKED_QKV:      q = packed qkv [T,3,H,D] (k/v omitted)
         - CONTIGUOUS_Q_KV: q [T,H,D], k = packed kv [T,2,H_kv,D] (v omitted)
+
+        Returns ``(q, k, v, q_for_out, v_head_dim)`` where ``q_for_out`` is
+        the [T,H,·]-shaped view the output/lse allocation is sized from. Runs
+        before any allocation so misuse fails with a readable Python error.
         """
         assert self._module is not None and self._input_layout, (
             "plan() must be called before run()"
@@ -239,23 +220,70 @@ class _FmhaV2PrefillWrapperBase:
                 raise ValueError(
                     f"PACKED_QKV expects qkv of shape [total_tokens, 3, H, D]; got {tuple(q.shape)}"
                 )
-            k = v = q
-        elif self._input_layout == "CONTIGUOUS_Q_KV":
+            return q, q, q, q[:, 0], q.shape[-1]
+        if self._input_layout == "CONTIGUOUS_Q_KV":
             if k is None or k.dim() != 4 or k.shape[1] != 2:
                 raise ValueError(
                     "CONTIGUOUS_Q_KV expects kv of shape [total_tokens, 2, H_kv, D] in the k slot"
                 )
-            v = k
-        elif k is None or v is None:
+            return q, k, k, q, k.shape[-1]
+        if k is None or v is None:
             raise ValueError(f"layout {self._input_layout} requires k and v tensors")
+        return q, k, v, q, v.shape[-1]
 
+    def _alloc_out_lse(
+        self,
+        q: torch.Tensor,
+        v_head_dim: int,
+        out: Optional[torch.Tensor],
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # FMHAv2 softmax stats: (max, sum_exp) per token/head, ragged format.
+        lse_shape = (q.size(0), q.size(1), 2)
+        if lse is not None:
+            check_shape_dtype_device(lse, lse_shape, torch.float32, q.device, "lse")
+        elif return_lse:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
+        out_shape = q.shape[:-1] + (v_head_dim,)
+        out_dtype = self._o_dtype or q.dtype
+        if out is None:
+            out = torch.empty(out_shape, dtype=out_dtype, device=q.device)
+        else:
+            check_shape_dtype_device(out, out_shape, out_dtype, q.device, "out")
+        return out, lse
+
+    def _run_impl(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        window_left: Optional[int] = None,
+        lse: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Single FMHAv2 kernel launch; prep ran in the subclass plan() and
+        the tensor slots were validated/normalized by :meth:`_normalize_slots`.
+
+        ``window_left`` overrides the value recorded at plan time when given;
+        everything else per-plan (layout, mask mode, scales, lens) comes from
+        the state stored by plan().
+        """
         window_left = window_left if window_left is not None else self._window_left
         if self._causal:
             mask_mode = "sliding_window" if window_left >= 0 else "causal"
         else:
+            # plan() already rejects this combination; it can only reappear here
+            # via the run()-time window_left override.
+            if window_left >= 0:
+                raise ValueError(
+                    "window_left >= 0 requires a causal plan: the FMHAv2 kernel "
+                    "only implements sliding-window-causal masking."
+                )
             mask_mode = "padding"
 
-        self._zero_tile_counter()
         self._module.run(
             q,
             k,
@@ -284,10 +312,10 @@ class _FmhaV2PrefillWrapperBase:
             0.0,  # skip_softmax_threshold_scale_factor
             lse,
             sinks,
-            # Device-resident scratch from prep kernel; bypasses host set_alpha + memset.
+            # Device-resident scale words written by the prep kernel; the
+            # kernel-side read sites prefer them over the host-encoded scales.
             self._scale_bmm1_d,
             self._scale_bmm2_d,
-            self._tile_id_counter,
         )
 
 
@@ -298,8 +326,8 @@ class FmhaV2BatchPrefillWithPagedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
     :class:`flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper` backed by
     the TRT-LLM FMHAv2 kernels (SM90 / SM120). plan() runs one fused prep
     kernel on device (paged indptr/indices -> dense block_tables + kv lens +
-    cum-seq-lens scan + tile-counter reset + BMM scale encode); run() is a
-    single FMHA kernel launch and may be called many times per plan().
+    cum-seq-lens scan + BMM scale encode); run() is a single FMHA kernel
+    launch and may be called many times per plan().
 
     Following :func:`flashinfer.prefill.trtllm_fmha_v2_prefill`, the caller
     provides ``max_q_len`` / ``max_kv_len`` and the fused ``bmm1_scale`` /
@@ -316,7 +344,9 @@ class FmhaV2BatchPrefillWithPagedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
         _check_kv_layout(kv_layout)
         super().__init__(float_workspace_buffer)
         self._kv_layout = kv_layout
+        # Reused across plans, grown on demand; written by the prep kernel.
         self._kv_lens_buffer: Optional[torch.Tensor] = None
+        self._block_tables_buffer: Optional[torch.Tensor] = None
 
     def plan(
         self,
@@ -337,8 +367,8 @@ class FmhaV2BatchPrefillWithPagedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
         q_data_type: Union[str, torch.dtype] = "float16",
         o_data_type: Optional[Union[str, torch.dtype]] = None,
     ) -> None:
-        self._check_gates(pos_encoding_mode)
         q_data_type = self._resolve_dtypes(q_data_type, o_data_type)
+        self._check_gates(pos_encoding_mode, q_data_type, causal, window_left)
         batch_size = qo_indptr.shape[0] - 1
         # ceil is monotonic, so the widest block-table row is ceil(max_kv_len / page_size).
         max_blocks_per_seq = (max_kv_len + page_size - 1) // page_size
@@ -347,8 +377,19 @@ class FmhaV2BatchPrefillWithPagedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
             self._kv_lens_buffer = torch.empty(
                 batch_size, dtype=torch.int32, device=self.device
             )
-        block_tables = torch.zeros(
-            (batch_size, max_blocks_per_seq), dtype=torch.int32, device=self.device
+        # The prep kernel writes every entry of each block-table row (page
+        # indices, then zero padding), so the reused buffer needs no host-side
+        # zeroing and plan() does no per-plan allocation in steady state.
+        num_block_entries = batch_size * max_blocks_per_seq
+        if (
+            self._block_tables_buffer is None
+            or self._block_tables_buffer.numel() < num_block_entries
+        ):
+            self._block_tables_buffer = torch.empty(
+                num_block_entries, dtype=torch.int32, device=self.device
+            )
+        block_tables = self._block_tables_buffer[:num_block_entries].view(
+            batch_size, max_blocks_per_seq
         )
 
         input_layout = (
@@ -362,7 +403,6 @@ class FmhaV2BatchPrefillWithPagedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
         self._input_layout = input_layout
         self._causal = causal
         self._window_left = window_left
-        self._seq_lens_q = None
         self._kv_lens = self._kv_lens_buffer[:batch_size]
         self._block_tables = block_tables
         self._page_size = page_size
@@ -374,8 +414,8 @@ class FmhaV2BatchPrefillWithPagedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
         # because its prep genuinely differs: prepare_paged derives q/kv lens
         # from the indptrs (the q lens feed the cum-scan in-register, no
         # intermediate tensor), writes kv_lens into _kv_lens_buffer for run(),
-        # scatters the dense block_tables, zeroes the tile counter, and
-        # encodes the BMM scales.
+        # scatters the dense block_tables (zero-padding each row), and encodes
+        # the BMM scales.
         self._module.prepare_paged(
             qo_indptr,
             paged_kv_indptr,
@@ -402,10 +442,9 @@ class FmhaV2BatchPrefillWithPagedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
         sinks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
-        out, lse = self._alloc_out_lse(q, v_cache.shape[-1], out, lse, return_lse)
-        self._run_impl(
-            q, k_cache, v_cache, out=out, window_left=window_left, lse=lse, sinks=sinks
-        )
+        q, k, v, q_out, v_head_dim = self._normalize_slots(q, k_cache, v_cache)
+        out, lse = self._alloc_out_lse(q_out, v_head_dim, out, lse, return_lse)
+        self._run_impl(q, k, v, out=out, window_left=window_left, lse=lse, sinks=sinks)
         return (out, lse) if return_lse else out
 
 
@@ -419,8 +458,8 @@ class FmhaV2BatchPrefillWithRaggedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
     per-sequence lens (int32 device tensors of shape ``[batch_size]``),
     ``max_q_len`` / ``max_kv_len``, and the fused BMM scales; the fused prep
     kernel computes the cum-seq-lens on device. Same restrictions as the
-    paged wrapper (no in-kernel RoPE); additionally ``logits_soft_cap`` is not
-    supported for the SEPARATE_Q_K_V layout.
+    paged wrapper (no in-kernel RoPE); additionally ``logits_soft_cap`` and
+    FP8 (e4m3) are not supported for the SEPARATE_Q_K_V layout.
 
     All three non-paged layouts share the same prep; ``input_layout`` selects
     the codegen module and the run()-time tensor slots (see :meth:`run`):
@@ -450,12 +489,20 @@ class FmhaV2BatchPrefillWithRaggedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
                 f"input_layout {input_layout!r} is not a ragged layout; use "
                 "FmhaV2BatchPrefillWithPagedKVCacheWrapper for paged KV."
             )
-        self._check_gates(pos_encoding_mode)
-        if input_layout == "SEPARATE_Q_K_V" and logits_soft_cap:
-            raise NotImplementedError(
-                "logits_soft_cap is not supported for the SEPARATE_Q_K_V layout."
-            )
         q_data_type = self._resolve_dtypes(q_data_type, o_data_type)
+        if input_layout == "SEPARATE_Q_K_V":
+            # Layout-specific kernel limitations, checked before the generic
+            # gates so the most specific error wins.
+            if logits_soft_cap:
+                raise NotImplementedError(
+                    "logits_soft_cap is not supported for the SEPARATE_Q_K_V layout."
+                )
+            if q_data_type == torch.float8_e4m3fn:
+                raise NotImplementedError(
+                    "FP8 (e4m3) is not supported for the SEPARATE_Q_K_V layout; "
+                    "use PACKED_QKV, CONTIGUOUS_Q_KV, or the paged wrapper."
+                )
+        self._check_gates(pos_encoding_mode, q_data_type, causal, window_left)
         batch_size = seq_lens_q.shape[0]
 
         self._module = get_trtllm_fmha_v2_module(
@@ -466,9 +513,7 @@ class FmhaV2BatchPrefillWithRaggedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
         self._input_layout = input_layout
         self._causal = causal
         self._window_left = window_left
-        # Hold references so the tensors aren't freed before the async prep
-        # kernel (and run()) consume them.
-        self._seq_lens_q = seq_lens_q
+        # run() passes seq_lens_kv to the FFI as the kernel's kv_lens tensor.
         self._kv_lens = seq_lens_kv
         self._block_tables = None
         self._page_size = 0
@@ -494,17 +539,13 @@ class FmhaV2BatchPrefillWithRaggedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Tensor slots follow the planned layout (see :meth:`_run_impl`):
+        """Tensor slots follow the planned layout (see :meth:`_normalize_slots`):
         SEPARATE_Q_K_V → ``run(q, k, v)``; PACKED_QKV → ``run(qkv)``;
         CONTIGUOUS_Q_KV → ``run(q, kv)``.
         """
-        if self._input_layout == "PACKED_QKV":
-            # q is the packed qkv [T, 3, H, D]; out/lse are sized off its Q slice.
-            out, lse = self._alloc_out_lse(q[:, 0], q.shape[-1], out, lse, return_lse)
-        elif self._input_layout == "CONTIGUOUS_Q_KV":
-            out, lse = self._alloc_out_lse(q, k.shape[-1], out, lse, return_lse)
-        else:
-            out, lse = self._alloc_out_lse(q, v.shape[-1], out, lse, return_lse)
-        self._run_impl(q, k, v, out=out, window_left=window_left, lse=lse)
+        q, k, v, q_out, v_head_dim = self._normalize_slots(q, k, v)
+        out, lse = self._alloc_out_lse(q_out, v_head_dim, out, lse, return_lse)
+        self._run_impl(q, k, v, out=out, window_left=window_left, lse=lse, sinks=sinks)
         return (out, lse) if return_lse else out

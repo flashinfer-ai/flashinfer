@@ -5187,11 +5187,10 @@ def trtllm_fmha_v2_prefill(
         skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
         lse,  # Optional LSE tensor (None if not saving softmax stats)
         sinks,  # Optional sinks tensor
-        # The legacy free function does not run the prep kernel; pass None so the launcher
-        # falls back to host set_alpha + per-launch cudaMemsetAsync (current behaviour).
+        # The legacy free function does not run the prep kernel; pass None so the kernel
+        # reads the host-encoded scales (current behaviour).
         None,  # scale_bmm1_d
         None,  # scale_bmm2_d
-        None,  # tile_id_counter
     )
 
     if save_softmax_stats:

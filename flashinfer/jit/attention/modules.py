@@ -2052,7 +2052,9 @@ def gen_trtllm_fmha_v2_sm120_module() -> JitSpec:
 
 
 def gen_fmha_v2_module(
-    input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None
+    input_layout: str,
+    input_dtype: torch.dtype,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> JitSpec:
     # Setup generated source directory
     if output_dtype is None:
@@ -2086,9 +2088,9 @@ def gen_fmha_v2_module(
 
     # Copy the static launcher/binding sources so one loaded module exposes
     # run() (called once per run) plus prepare()/prepare_paged() — two
-    # instantiations of the same fused prep kernel (cum-scan + tile reset +
-    # scale encode; the paged variant also derives kv_lens/block_tables),
-    # called once per plan().
+    # instantiations of the same fused prep kernel (cum-scan + scale encode;
+    # the paged variant also derives kv_lens/block_tables), called once per
+    # plan().
     for fname in [
         "fmha_v2_run.cu",
         "fmha_v2_jit_binding.cu",

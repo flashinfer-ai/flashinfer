@@ -254,9 +254,6 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
   uint32_t num_tiles;
   uint32_t num_tiles_per_head;
   bool use_balanced_scheduling;
-  // When true, tile_id_counter_ptr was zeroed by an external prep kernel (fmha_v2_prepare) and
-  // the per-launch cudaMemsetAsync in kernel_hopper_ws launchers can be skipped.
-  bool tile_id_counter_external_zeroed = false;
 
   // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV
   // head

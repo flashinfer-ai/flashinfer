@@ -17,9 +17,8 @@
 // Single fused prep kernel for FMHAv2.
 //
 // Mirrors TensorRT-LLM's computeSeqAndPaddingOffsets pattern: one block per
-// launch performs an exclusive-sum scan over per-batch q/kv lengths, zeroes the
-// FMHA tile counter, and stores the BMM1/BMM2 scale words into device-resident
-// uint32 buffers.
+// launch performs an exclusive-sum scan over per-batch q/kv lengths and stores
+// the BMM1/BMM2 scale words into device-resident uint32 buffers.
 //
 // The scale words are encoded on the HOST in the launchers below with the real
 // set_alpha() from fused_multihead_attention_utils.h, using the scale-type
@@ -31,10 +30,11 @@
 // The kernel is templated on PAGED. The paged instantiation additionally
 // derives the q/kv lengths from (qo_indptr, paged_kv_indptr,
 // paged_kv_last_page_len) and scatters paged_kv_indices into a dense
-// block_tables[B, max_blocks_per_seq] — the lengths feed the scan in-register,
-// so the whole paged plan() prep is one kernel launch with no seq-lens
-// intermediate in global memory. The ragged instantiation compiles all of the
-// paged work out via `if constexpr`.
+// block_tables[B, max_blocks_per_seq] (zero-padding each row past its last
+// page, so callers can reuse an uninitialized buffer) — the lengths feed the
+// scan in-register, so the whole paged plan() prep is one kernel launch with
+// no seq-lens intermediate in global memory. The ragged instantiation compiles
+// all of the paged work out via `if constexpr`.
 
 #include <cuda_runtime.h>
 #include <fused_multihead_attention_utils.h>  // Data_type, set_alpha, CudaDevice
@@ -49,7 +49,6 @@
 #endif
 
 namespace ffi = tvm::ffi;
-using tvm::ffi::Optional;
 
 namespace {
 
@@ -78,8 +77,7 @@ __global__ void prepare_fmha_v2_inputs_kernel(
     int batch_size, uint32_t scale_bmm1_word, uint32_t scale_bmm2_word,
     // outputs
     int* __restrict__ cum_seq_lens_q, int* __restrict__ cum_seq_lens_kv,
-    uint32_t* __restrict__ tile_id_counter, uint32_t* __restrict__ scale_bmm1_d,
-    uint32_t* __restrict__ scale_bmm2_d) {
+    uint32_t* __restrict__ scale_bmm1_d, uint32_t* __restrict__ scale_bmm2_d) {
   __shared__ PrepShared smem;
   // Running prefix across iterations of the strided loop below.
   int prefix_q = 0;
@@ -97,15 +95,21 @@ __global__ void prepare_fmha_v2_inputs_kernel(
       if constexpr (PAGED) {
         // Derive lengths from the paged representation and feed them straight
         // into the scan; kv_lens is also materialized for run(), and this
-        // sequence's page indices are scattered into its dense block-table row.
+        // sequence's page indices are scattered into its dense block-table
+        // row. The row remainder past num_pages is zero-filled so the caller
+        // can hand in a reused, uninitialized block_tables buffer.
         q_len = qo_indptr[b + 1] - qo_indptr[b];
         int page_begin = paged_kv_indptr[b];
         int num_pages = paged_kv_indptr[b + 1] - page_begin;
         kv_len = max(num_pages - 1, 0) * page_size + paged_kv_last_page_len[b];
         kv_lens_out[b] = kv_len;
         int row_offset = b * max_blocks_per_seq;
-        for (int j = 0; j < num_pages && j < max_blocks_per_seq; ++j) {
+        int j = 0;
+        for (; j < num_pages && j < max_blocks_per_seq; ++j) {
           block_tables[row_offset + j] = paged_kv_indices[page_begin + j];
+        }
+        for (; j < max_blocks_per_seq; ++j) {
+          block_tables[row_offset + j] = 0;
         }
       } else {
         q_len = seq_lens_q[b];
@@ -131,19 +135,12 @@ __global__ void prepare_fmha_v2_inputs_kernel(
   }
 
   // Single-thread tail: write the [batch_size] entry of the exclusive-sum and
-  // store the FMHA prep scalars (words pre-encoded on the host).
+  // store the scale words (pre-encoded on the host).
   if (tid == 0) {
     cum_seq_lens_q[batch_size] = prefix_q;
     cum_seq_lens_kv[batch_size] = prefix_kv;
-    if (tile_id_counter) {
-      tile_id_counter[0] = 0u;
-    }
-    if (scale_bmm1_d) {
-      scale_bmm1_d[0] = scale_bmm1_word;
-    }
-    if (scale_bmm2_d) {
-      scale_bmm2_d[0] = scale_bmm2_word;
-    }
+    scale_bmm1_d[0] = scale_bmm1_word;
+    scale_bmm2_d[0] = scale_bmm2_word;
   }
 }
 
@@ -185,37 +182,6 @@ void encode_scale_words(float scale_bmm1, float scale_bmm2, bool has_alibi, floa
   set_alpha(s2_word, scale_bmm2, scale_type2);
 }
 
-struct PrepCommonPtrs {
-  int* cum_q;
-  int* cum_kv;
-  uint32_t* tile;
-  uint32_t* s1;
-  uint32_t* s2;
-};
-
-PrepCommonPtrs unpack_prep_common(Optional<ffi::TensorView> const& cum_seq_lens_q,
-                                  Optional<ffi::TensorView> const& cum_seq_lens_kv,
-                                  Optional<ffi::TensorView> const& tile_id_counter,
-                                  Optional<ffi::TensorView> const& scale_bmm1_d,
-                                  Optional<ffi::TensorView> const& scale_bmm2_d) {
-  PrepCommonPtrs p;
-  p.cum_q =
-      cum_seq_lens_q.has_value() ? static_cast<int*>(cum_seq_lens_q.value().data_ptr()) : nullptr;
-  p.cum_kv =
-      cum_seq_lens_kv.has_value() ? static_cast<int*>(cum_seq_lens_kv.value().data_ptr()) : nullptr;
-  p.tile = tile_id_counter.has_value() ? static_cast<uint32_t*>(tile_id_counter.value().data_ptr())
-                                       : nullptr;
-  p.s1 =
-      scale_bmm1_d.has_value() ? static_cast<uint32_t*>(scale_bmm1_d.value().data_ptr()) : nullptr;
-  p.s2 =
-      scale_bmm2_d.has_value() ? static_cast<uint32_t*>(scale_bmm2_d.value().data_ptr()) : nullptr;
-  // cum_seq_lens_{q,kv} must be writable buffers of length B+1: the kernel
-  // always scans both arrays.
-  TVM_FFI_ICHECK(p.cum_q != nullptr) << "cum_seq_lens_q is required";
-  TVM_FFI_ICHECK(p.cum_kv != nullptr) << "cum_seq_lens_kv is required";
-  return p;
-}
-
 }  // namespace
 
 // Host entry points exposed via TVM-FFI. Two exports, one kernel:
@@ -226,8 +192,10 @@ PrepCommonPtrs unpack_prep_common(Optional<ffi::TensorView> const& cum_seq_lens_
 //
 // seq_lens_q / seq_lens_kv : int32 [B]   (device-resident)
 // cum_seq_lens_q / kv     : int32 [B+1] (device-resident output)
-// tile_id_counter         : uint32 [1]  (optional; zeroed if provided)
-// scale_bmm1_d / scale_bmm2_d : uint32 [1] (optional; set_alpha-encoded scalars)
+// scale_bmm1_d / scale_bmm2_d : uint32 [1] (set_alpha-encoded scalar outputs)
+//
+// All buffer arguments are required — the wrapper is the only caller and
+// always provides them.
 //
 // Note on scale_bmm1_d layout: this buffer is length 1, not the length-2
 // {scale, scale*log2e} pair described in fmha_v2_fused_prep_kernel.md §1.
@@ -237,14 +205,9 @@ PrepCommonPtrs unpack_prep_common(Optional<ffi::TensorView> const& cum_seq_lens_
 // expand to length-2 without updating those read sites.
 void fmha_v2_prepare(ffi::TensorView seq_lens_q, ffi::TensorView seq_lens_kv, int batch_size,
                      double scale_bmm1, double scale_bmm2, bool has_alibi, double softcapping_scale,
-                     Optional<ffi::TensorView> cum_seq_lens_q,
-                     Optional<ffi::TensorView> cum_seq_lens_kv,
-                     Optional<ffi::TensorView> tile_id_counter,
-                     Optional<ffi::TensorView> scale_bmm1_d,
-                     Optional<ffi::TensorView> scale_bmm2_d) {
+                     ffi::TensorView cum_seq_lens_q, ffi::TensorView cum_seq_lens_kv,
+                     ffi::TensorView scale_bmm1_d, ffi::TensorView scale_bmm2_d) {
   cudaStream_t stream = static_cast<cudaStream_t>(get_stream(seq_lens_q.device()));
-  PrepCommonPtrs p = unpack_prep_common(cum_seq_lens_q, cum_seq_lens_kv, tile_id_counter,
-                                        scale_bmm1_d, scale_bmm2_d);
   uint32_t s1_word, s2_word;
   encode_scale_words(static_cast<float>(scale_bmm1), static_cast<float>(scale_bmm2), has_alibi,
                      static_cast<float>(softcapping_scale), s1_word, s2_word);
@@ -253,27 +216,25 @@ void fmha_v2_prepare(ffi::TensorView seq_lens_q, ffi::TensorView seq_lens_kv, in
       static_cast<int*>(seq_lens_q.data_ptr()), static_cast<int*>(seq_lens_kv.data_ptr()),
       /*qo_indptr=*/nullptr, /*paged_kv_indptr=*/nullptr, /*paged_kv_last_page_len=*/nullptr,
       /*paged_kv_indices=*/nullptr, /*kv_lens_out=*/nullptr, /*block_tables=*/nullptr,
-      /*page_size=*/0, /*max_blocks_per_seq=*/0, batch_size, s1_word, s2_word, p.cum_q, p.cum_kv,
-      p.tile, p.s1, p.s2);
+      /*page_size=*/0, /*max_blocks_per_seq=*/0, batch_size, s1_word, s2_word,
+      static_cast<int*>(cum_seq_lens_q.data_ptr()), static_cast<int*>(cum_seq_lens_kv.data_ptr()),
+      static_cast<uint32_t*>(scale_bmm1_d.data_ptr()),
+      static_cast<uint32_t*>(scale_bmm2_d.data_ptr()));
 }
 
 // Paged variant: everything fmha_v2_prepare does, plus deriving the q/kv
 // lengths from (qo_indptr, paged_kv_indptr, paged_kv_last_page_len), emitting
 // kv_lens_out [B] for run(), and scattering paged_kv_indices into
-// block_tables_out [B, max_blocks_per_seq].
+// block_tables_out [B, max_blocks_per_seq] (rows zero-padded past their last
+// page; block_tables_out may be an uninitialized reused buffer).
 void fmha_v2_prepare_paged(ffi::TensorView qo_indptr, ffi::TensorView paged_kv_indptr,
                            ffi::TensorView paged_kv_last_page_len, ffi::TensorView paged_kv_indices,
                            ffi::TensorView kv_lens_out, ffi::TensorView block_tables_out,
                            int page_size, int max_blocks_per_seq, int batch_size, double scale_bmm1,
                            double scale_bmm2, bool has_alibi, double softcapping_scale,
-                           Optional<ffi::TensorView> cum_seq_lens_q,
-                           Optional<ffi::TensorView> cum_seq_lens_kv,
-                           Optional<ffi::TensorView> tile_id_counter,
-                           Optional<ffi::TensorView> scale_bmm1_d,
-                           Optional<ffi::TensorView> scale_bmm2_d) {
+                           ffi::TensorView cum_seq_lens_q, ffi::TensorView cum_seq_lens_kv,
+                           ffi::TensorView scale_bmm1_d, ffi::TensorView scale_bmm2_d) {
   cudaStream_t stream = static_cast<cudaStream_t>(get_stream(qo_indptr.device()));
-  PrepCommonPtrs p = unpack_prep_common(cum_seq_lens_q, cum_seq_lens_kv, tile_id_counter,
-                                        scale_bmm1_d, scale_bmm2_d);
   uint32_t s1_word, s2_word;
   encode_scale_words(static_cast<float>(scale_bmm1), static_cast<float>(scale_bmm2), has_alibi,
                      static_cast<float>(softcapping_scale), s1_word, s2_word);
@@ -284,5 +245,8 @@ void fmha_v2_prepare_paged(ffi::TensorView qo_indptr, ffi::TensorView paged_kv_i
       static_cast<int*>(paged_kv_last_page_len.data_ptr()),
       static_cast<int*>(paged_kv_indices.data_ptr()), static_cast<int*>(kv_lens_out.data_ptr()),
       static_cast<int*>(block_tables_out.data_ptr()), page_size, max_blocks_per_seq, batch_size,
-      s1_word, s2_word, p.cum_q, p.cum_kv, p.tile, p.s1, p.s2);
+      s1_word, s2_word, static_cast<int*>(cum_seq_lens_q.data_ptr()),
+      static_cast<int*>(cum_seq_lens_kv.data_ptr()),
+      static_cast<uint32_t*>(scale_bmm1_d.data_ptr()),
+      static_cast<uint32_t*>(scale_bmm2_d.data_ptr()));
 }
