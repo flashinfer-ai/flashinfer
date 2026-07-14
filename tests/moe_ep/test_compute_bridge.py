@@ -3,12 +3,12 @@
 Verifies the token-major translation of both LL dispatch layouts:
 
 * EXPERT_MAJOR: flatten ``[E_local, cap, hidden] → [E_local*cap, hidden]``,
-  synthesized ``selected_experts = row // cap + local_expert_offset``.
+  synthesized ``topk_ids = row // cap + local_expert_offset``.
 * RANK_MAJOR: flatten ``[world, per_rank, hidden] → [world*per_rank, hidden]``,
   driven by the received per-token ``topk_idx`` / ``topk_weights`` at the real
   model ``top_k`` with non-local picks masked to weight 0.
 
-EXPERT_MAJOR synthesizes ``final_scales == 1`` / ``top_k == 1``; both reshape back
+EXPERT_MAJOR synthesizes ``topk_weights == 1`` / ``top_k == 1``; both reshape back
 to the 3D combine layout.
 
 The bf16 path is host-checkable (no quant kernel); the NVFP4 path needs an
@@ -126,8 +126,8 @@ def test_rank_major_masks_out_of_range_local_expert_ids():
         is_nvfp4=False,
     )
 
-    assert torch.all(pack.selected_experts == offset)
-    assert torch.all(pack.final_scales == 0.0)
+    assert torch.all(pack.topk_ids == offset)
+    assert torch.all(pack.topk_weights == 0.0)
 
 
 def test_build_activation_pack_rank_major_rejects_2d():
