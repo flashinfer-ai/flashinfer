@@ -59,7 +59,7 @@ def dsa_indexer_topk(
     cand_cnt = torch.empty(num_q, dtype=torch.int32, device=dev)
     seed_prep(
         sample_logits, num_buckets, top_k, cand_cap, origin, inv_delta,
-        th_bucket, bcount, cand_val, cand_idx, cand_cnt, emit_limit=0,
+        th_bucket, bcount, cand_val, cand_idx, cand_cnt,
     )
     cu_start = torch.zeros(num_q, dtype=torch.int32, device=dev)
     scan(
@@ -82,13 +82,12 @@ def seed_prep(
     cand_val: torch.Tensor,
     cand_idx: torch.Tensor,
     cand_cnt: torch.Tensor,
-    emit_limit: int = -1,
     headroom: float = 0.0,
     probe_stride_tok: int = 0,
     hist_stride: int = 1,
 ) -> None:
     get_dsa_indexer_module().seed_prep(
-        slog, num_buckets, top_k, cand_cap, emit_limit, float(headroom),
+        slog, num_buckets, top_k, cand_cap, 0, float(headroom),
         probe_stride_tok, hist_stride, origin, inv_delta, th_bucket, bcount,
         cand_val, cand_idx, cand_cnt, 0, None, None,
     )
