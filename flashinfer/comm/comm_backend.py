@@ -20,6 +20,7 @@ so any object exposing the same methods (rank/size/allgather/bcast/barrier/
 Split) is a valid backend. Nothing here depends on CUDA.
 """
 
+from collections.abc import Sequence
 from typing import Any
 
 
@@ -83,6 +84,25 @@ class MPIBackend:
         split = MPIBackend()
         split._mpicomm = self._mpicomm.Split(color, key)
         return split
+
+
+def _split_partition(all_info: Sequence[tuple[int, int, int]]) -> list[list[int]]:
+    """Full color partition for an MPI-style ``Split``.
+
+    ``all_info`` is the allgathered ``(color, key, global_rank)`` from every rank.
+    Returns one rank-list per color (colors sorted ascending); within each color,
+    ranks are ordered by ``(key, global_rank)`` -- lower key first, ties broken by
+    rank, matching ``MPI_Comm_split``. The result is independent of the calling
+    rank: every rank must build the *same* partition, because
+    ``torch.distributed.new_group`` names each sub-group by a global counter (not
+    by its member ranks), so ranks that create only their own sub-group get
+    colliding rendezvous keys and deadlock.
+    """
+    colors = sorted({c for c, _, _ in all_info})
+    return [
+        [r for _, r in sorted((k, r) for c, k, r in all_info if c == col)]
+        for col in colors
+    ]
 
 
 class TorchDistBackend:
@@ -152,21 +172,11 @@ class TorchDistBackend:
         Returns:
             New TorchDistBackend with the split process group
         """
-        # Gather (color, key, global_rank) from every process.
-        global_rank = self.Get_rank()
-        all_info = self.allgather((color, key, global_rank))
-
-        # Only our own sub-group is needed, so skip bucketing every color: take
-        # the ranks sharing my color, ordered by key (lower key = lower rank).
-        # Kept as a list -- new_group() iterates `ranks` twice (membership check,
-        # then sort), so a lazy generator won't do, and its parameter is list[int].
-        my_group_ranks = [
-            r
-            for _, r in sorted(
-                ((k, r) for c, k, r in all_info if c == color),
-                key=lambda kr: kr[0],
-            )
-        ]
-
-        new_group = self._dist.new_group(ranks=my_group_ranks)  # pyright: ignore
-        return TorchDistBackend(group=new_group)  # pyright: ignore
+        # Gather (color, key, global_rank) from every rank, then create the full
+        # color partition on *every* rank (see _split_partition) and let
+        # new_subgroups_by_enumeration hand back the sub-group this rank is in.
+        all_info = self.allgather((color, key, self.Get_rank()))
+        cur_group, _ = self._dist.new_subgroups_by_enumeration(
+            _split_partition(all_info)
+        )  # pyright: ignore
+        return TorchDistBackend(group=cur_group)  # pyright: ignore

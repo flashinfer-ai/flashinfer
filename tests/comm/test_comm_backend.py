@@ -29,7 +29,11 @@ from typing import Any
 import pytest
 import torch.distributed as dist
 
-from flashinfer.comm.comm_backend import MPIBackend, TorchDistBackend
+from flashinfer.comm.comm_backend import (
+    MPIBackend,
+    TorchDistBackend,
+    _split_partition,  # pyright: ignore[reportPrivateUsage]
+)
 
 _TIMEOUT_S = 120.0
 
@@ -112,7 +116,7 @@ _gloo_unavailable = not dist.is_available() or not dist.is_gloo_available()
 
 
 @pytest.mark.skipif(_gloo_unavailable, reason="torch.distributed gloo backend required")
-@pytest.mark.parametrize("world_size", [2])
+@pytest.mark.parametrize("world_size", [2, 4])
 def test_torch_dist_backend_collectives(world_size: int) -> None:
     results = _run_dist(world_size)
 
@@ -133,6 +137,104 @@ def test_torch_dist_backend_collectives(world_size: int) -> None:
         assert res["sub_type"] == "TorchDistBackend"
         assert res["sub_size"] == len(peers)
         assert res["sub_rank"] == peers.index(rank)
+
+
+class _FakeGroup:
+    def __init__(self, ranks: tuple[int, ...]) -> None:
+        self.ranks = ranks
+
+
+class _FakeDist:
+    """Single-process stand-in for torch.distributed, driving one logical rank."""
+
+    def __init__(
+        self, rank: int, world_size: int, all_info: list[tuple[int, int, int]]
+    ) -> None:
+        self._rank = rank
+        self._world = world_size
+        self._all_info = all_info
+        self.created: list[tuple[int, ...]] = []  # sub-groups created, in order
+
+    def get_rank(self, group: Any = None) -> int:
+        return self._rank if group is None else group.ranks.index(self._rank)
+
+    def get_world_size(self, group: Any = None) -> int:
+        return self._world if group is None else len(group.ranks)
+
+    def all_gather_object(
+        self, out_list: list[Any], data: Any, group: Any = None
+    ) -> None:
+        # Simulate the collective: every rank observes all ranks' contributions,
+        # and its own slot must match what it put in.
+        assert data == self._all_info[self._rank]
+        for i, info in enumerate(self._all_info):
+            out_list[i] = info
+
+    def new_subgroups_by_enumeration(
+        self, ranks_per_subgroup_list: list[list[int]]
+    ) -> tuple[Any, list[Any]]:
+        subs = [_FakeGroup(tuple(r)) for r in ranks_per_subgroup_list]
+        self.created.extend(g.ranks for g in subs)
+        cur = next((g for g in subs if self._rank in g.ranks), None)
+        return cur, subs
+
+    def new_group(self, ranks: list[int]) -> Any:
+        # Unused by the fixed Split, but recorded so a regression to the buggy
+        # "create only my own color" implementation is caught by the same
+        # created-sequence assertion below.
+        g = _FakeGroup(tuple(ranks))
+        self.created.append(g.ranks)
+        return g
+
+
+def _drive_split(
+    colors_keys: list[tuple[int, int]],
+) -> list[tuple[_FakeDist, TorchDistBackend]]:
+    """Run Split once per logical rank against a fake torch.distributed.
+
+    Caller must stub ``dist.is_initialized`` -- the child TorchDistBackend that
+    Split constructs goes through the real ``__init__`` guard.
+    """
+    world_size = len(colors_keys)
+    all_info = [(c, k, r) for r, (c, k) in enumerate(colors_keys)]
+    out: list[tuple[_FakeDist, TorchDistBackend]] = []
+    for rank, (color, key) in enumerate(colors_keys):
+        fake = _FakeDist(rank, world_size, all_info)
+        b = object.__new__(TorchDistBackend)
+        b._group = None  # pyright: ignore[reportPrivateUsage]
+        b._dist = fake  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+        out.append((fake, b.Split(color, key)))
+    return out
+
+
+def test_torch_dist_backend_split_creates_every_subgroup_on_every_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 4 ranks, 2 colors, 2 ranks each
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    driven = _drive_split([(r % 2, r) for r in range(4)])
+
+    # Full color partition, ranks ordered by (key, rank) within each color.
+    expected = [(0, 2), (1, 3)]
+    for rank, (fake, sub) in enumerate(driven):
+        # Every rank creates the SAME sequence of sub-groups (all colors, in
+        # order) -- the invariant new_group requires; "own color only" breaks it.
+        assert fake.created == expected, f"rank {rank}: {fake.created}"
+        # ...and gets back a backend scoped to its own color's sub-group.
+        assert sub._group.ranks == expected[rank % 2]  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
+
+
+def test_split_partition_covers_all_colors_ordered_by_key() -> None:
+    # The rank-independent core of Split, tested directly (no dist needed).
+    # allgathered (color, key, global_rank) from 4 ranks, 2 colors.
+    all_info = [(0, 0, 0), (1, 1, 1), (0, 2, 2), (1, 3, 3)]
+    # Full partition, colors ascending; within a color, ranks by (key, rank).
+    assert _split_partition(all_info) == [[0, 2], [1, 3]]
+
+    # Single color, keys reverse the natural order: lower key -> lower rank,
+    # ties broken by global rank -- matching MPI_Comm_split.
+    reversed_keys = [(0, 10, 0), (0, 5, 1), (0, 20, 2), (0, 0, 3)]
+    assert _split_partition(reversed_keys) == [[3, 1, 0, 2]]
 
 
 class _FakeMpiComm:
