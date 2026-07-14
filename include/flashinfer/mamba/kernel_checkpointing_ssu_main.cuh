@@ -13,36 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// =============================================================================
-// Two-kernel split: MAIN kernel (.plans/ssu_split.md, S4).  Validated bit-exact
-// vs the monolithic via test_two_kernel_matches_monolithic (T0).
-//
-// The CONSUMER of the precompute's scratch.  Grid (D_SPLIT, batch, nheads) —
-// per (batch, head, d-tile), like the monolithic (per-head state recurrence).
-// Reuses the monolithic's ssu_checkpoint / ssu_nocheckpoint (replay + output)
-// with READ_PRECOMPUTED_CB=true: the matmul-4 CB A-operand is LDG'd from gmem
-// (cb_scaled / cb_old, fragA-native) instead of computed+LDSM'd, and β comes
-// from the loaded raw cumAdt (cumAdt_vec → smem.cumAdt, exp'd on the fly by the
-// existing epilogue).  No CB compute, no C1/C2 here.
-//
-// Load (load_main_data): a SUBSET of the monolithic's load_data composed from
-// the shared building blocks — load_state_*, load_tile_async (C, x, old_x,
-// old_B, z), the old_dt/cumAdt_old row loads — MINUS new-B and dt (+ the C1/C2 compute),
-// PLUS the cumAdt_vec → smem.cumAdt load.  Kept as composable pieces so a
-// future persistent variant can loop (batch, head) reusing them.
-//
-// Cache ownership (see precompute header): the main writes old_x (it loads x)
-// and state (the replay's C8); the precompute owns old_B / old_dt / old_cumAdt.
-//
-// PDL overlap: the CACHED loads (state, old_*, z) + the state replay run BEFORE
-// gdc_wait, so under the PDL chain they overlap the precompute (the replay is the
-// heaviest work — folding old tokens into state + the C8 HBM write).  The conv1d
-// OUTPUTS (C, new-token x) and the precompute outputs (cb_scaled / cumAdt_vec)
-// load + are consumed POST-gdc_wait: they are NOT available earlier — when the
-// main co-launches, conv1d may still be writing x/C (the precompute is itself
-// blocked on its conv1d gdc_wait), so a pre-wait load would read stale data.
-// gdc_wait is a no-op without a programmatic predecessor (T0 / non-PDL)
-// =============================================================================
 #ifndef FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_MAIN_CUH_
 #define FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_MAIN_CUH_
 
@@ -54,21 +24,6 @@
 
 namespace flashinfer::mamba::checkpointing {
 
-// -----------------------------------------------------------------------------
-// Lean smem storage for the MAIN kernel.  Same layout as CheckpointingSsuStorage EXCEPT it
-// omits the three buffers the main never touches — it reads cb_scaled / cb_old from gmem
-// (fragA-native, the READ_PRECOMPUTED_CB path in compute_*_output), never loads new-B (CB is
-// precomputed), and uses the precomputed cumAdt instead of computing dt_proc:
-//   • CB_scaled (~2 KB)   • B (~2 KB)   • dt_proc (tiny)
-// Dropping ~4 KB takes the main from 7 → 8 resident blocks/SM (smem was the co-limiter with
-// regs), adding a wave of warps to hide its DRAM-latency stalls (long_scoreboard ~39%,
-// eligible-warps 0.71).  The static constexpr layout constants mirror CheckpointingSsuStorage
-// exactly so the shared load/compute helpers (templated on SmemT) bind unchanged.
-// STATE_PIPE = ring depth (STAGES).  >1 makes EVERY per-tile buffer (C, old_B, z, old_x, old_dt,
-// old_cumAdt, cumAdt, x, state) STATE_PIPE-slotted so the persistent all-async ring can prefetch a
-// whole work-unit's bundle (incl per-GROUP C / old_B) into one slot — a grid-stride CTA's
-// consecutive work-units are different groups, so there's no same-group C/old_B reuse to preserve.
-// STATE_PIPE=1 ⇒ single slot == the original layout, bit-identical (the monolith's use).
 template <typename input_t, typename state_t, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA,
           int DSTATE, int STATE_PIPE = 1, bool VARLEN = false>
 struct CheckpointingSsuMainStorage {
@@ -132,28 +87,6 @@ struct CheckpointingSsuMainStorage {
   int32_t meta_cu[VARLEN ? META_RING : 1];  // (cu[seq] << 8) | (cu[seq+1] - cu[seq])
 };
 
-// -----------------------------------------------------------------------------
-// Main-kernel load — the conv1d-INDEPENDENT (pre-gdc_wait) set: state, old_x, z
-// always; old_B + old_dt + old_cumAdt only when must_checkpoint (they feed the
-// replay).  On the no-write path the precompute baked old_B/old_dt/old_cumAdt
-// into cb_old, so only the tail old_cumAdt[prev_k-1] is loaded (for the β).  All
-// are cached from the previous step (or z, which bypasses conv1d), so they are
-// safe to load before gdc_wait and overlap the precompute.
-//
-// The conv1d OUTPUTS — C and the new-token x — are deliberately NOT loaded here.
-// They are produced by conv1d, which the main co-launches ahead of (the
-// precompute is still blocked on its own conv1d gdc_wait when the main starts),
-// so a pre-wait load would race conv1d's writes.  They load POST-gdc_wait via
-// load_conv_inputs (Triton does the same: history pre-wait, new x / C post-wait,
-// replay_selective_state_update.py:1845 vs 1857).  cumAdt (precompute output)
-// likewise loads post-wait, in the kernel.  Drops the monolithic's new-B
-// (cb_scaled is precomputed) and dt + cumAdt scan.  Single async group, drained
-// by one commit + wait + syncwarp (like load_data).
-// load_head: the per-head PRE-gdc_wait cached loads (old_x / z / old_B / old_dt).  ISSUE ONLY —
-// no __pipeline_commit / wait / syncwarp; process_head owns the cp.async pipeline so these loads
-// and the state prefetch can be committed + drained together at the right depth.  State is NOT
-// loaded here — its sole loader is prefetch_state (the one tile the cross-head pipeline
-// double-buffers).
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int NUM_WARPS, bool IS_FIRST, typename SmemT>
 __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams const& params,
@@ -187,17 +120,6 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
   auto* z_slot = smem.z + tile_buf * SmemT::Z_ELEMS;
   auto* old_B_slot = smem.old_B + tile_buf * SmemT::OLD_B_ELEMS;
 
-  // Per-head load distribution: one tensor per warp, each a single-warp (conflict-free)
-  // load_tile_async.  old_x is the variable / largest small tensor (up to max_window rows), so
-  // it gets two warps; x and z (each seq_len valid rows) get one each:
-  //   W0 → old_x[0:SR)   W1 → old_x[SR:2·SR)   W2 → x (load_x)   W3 → z
-  // where SR = SWIZZLE_ROWS = the Swizzle<3,3,3> atom-row count (8), which by design equals the
-  // small MMA's K (MMA_prop::K_SMALL) that old_x pads to.  The split MUST land on the swizzle
-  // atom boundary so W1's sub-tile — written at smem offset SR·D_SMEM_COLS — maps to exactly the
-  // same swizzled addresses as rows [SR, 2·SR) of the full layout.  old_x is PREDICATED to prev_k
-  // (PNAT): prev_k=0 loads nothing, high PNAT fills both halves — DRAM scales with window
-  // occupancy instead of always reading max_window rows.  W1's half ZFILLs when prev_k≤SR (cheap),
-  // and at max_window=SR (no upper half) W1 is idle — accepted, not generalized per combination.
   constexpr int SWIZZLE_ROWS = SmemSwizzle<input_t>::ATOM_ROWS;
   using OxHalfShape = cute::Shape<cute::Int<SWIZZLE_ROWS>, cute::Int<D_PER_CTA>>;
   int const ring_start_hi = ring_start + SWIZZLE_ROWS >= params.ring_buffer_len
@@ -268,16 +190,8 @@ __device__ __forceinline__ void prefetch_state(SmemT& smem, CheckpointingSsuPara
     load_state_cta<state_t, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, tid,
                                                           state_buf);
   }
-  // NOTE: issue ONLY — no __pipeline_commit / wait here.  process_head owns the whole cp.async
-  // pipeline (commit + wait_prior) so the prefetched states can stay in flight across the
-  // gdc_wait / replay; committing here would let an internal drain complete them too early.
 }
 
-// load_x: loads x (and C for IS_FIRST) from gmem → smem slot tile_buf.  ISSUE ONLY —
-// no __pipeline_commit / wait / syncwarp.  process_head owns the whole cp.async pipeline.
-// Per-head load distribution (see load_head): C per-GROUP on W1 (IS_FIRST only); x per-HEAD on
-// W2, single-warp (conflict-free).  old_x (W0-1) and z (W3) load in parallel — all 4 warps busy
-// without the CTA-wide multi-warp writes that caused the d_split=2 LDGSTS bank conflict.
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, bool IS_FIRST,
           typename SmemT>
 __device__ __forceinline__ void load_x(SmemT& smem, CheckpointingSsuParams const& params, int lane,
@@ -301,13 +215,8 @@ __device__ __forceinline__ void load_x(SmemT& smem, CheckpointingSsuParams const
   if (warp == 2)
     load_tile_async<XShape, NPREDICTED>(x_slot, x_ptr + x_base, params.x_stride_token, lane,
                                         seq_len);
-  // NOTE: NO commit/wait — process_head owns the pipeline.
 }
 
-// load_cumAdt: load ONE work-unit's cumAdt (precompute output) gmem → smem ring slot tile_buf.
-// WARP-0 ONLY (the caller guards with `if (warp == 0)`); lanes 0..seq_len-1 each carry one element.
-// Plain stores (not cp.async) → never touches the cp.async ring FIFO; the caller's __syncthreads()
-// broadcasts to all warps.  MUST run AFTER the gdc_wait that makes cumAdt_vec globally visible.
 template <typename SmemT>
 __device__ __forceinline__ void load_cumAdt(SmemT& smem, CheckpointingSsuParams const& params,
                                             int lane, int seq, int first_head, int seq_len,
@@ -320,11 +229,6 @@ __device__ __forceinline__ void load_cumAdt(SmemT& smem, CheckpointingSsuParams 
         cumAdt_ptr[(int64_t)(seq * params.nheads + first_head) * NPREDICTED_PAD_MMA_M + lane];
 }
 
-// load_cumAdt_async: cp.async variant of load_cumAdt — joins the post-gdc cp.async group instead of
-// a synchronous LDG+STS (which was the #1 long_scoreboard pole: the STS stalled on its feeding
-// LDG). WARP-0 ONLY; lanes 0..seq_len-1 each cp.async one float.  Drained + published by the
-// caller's pipeline_wait + __syncthreads, same as the rest of the bundle.  ISSUE ONLY — caller
-// commits.
 template <typename SmemT>
 __device__ __forceinline__ void load_cumAdt_async(SmemT& smem, CheckpointingSsuParams const& params,
                                                   int lane, int seq, int first_head, int seq_len,
@@ -339,14 +243,6 @@ __device__ __forceinline__ void load_cumAdt_async(SmemT& smem, CheckpointingSsuP
         sizeof(float));
 }
 
-// load_cb_async: cp.async the per-(seq,head) CB blocks (precompute outputs, fragA-native,
-// lane-major) gmem → smem ring slot tile_buf, so the output MMA's A-operand loads from smem (LDS,
-// short scoreboard) instead of a just-in-time LDG straight to registers — the latter was the #1
-// long_scoreboard pole (the HMMA stalled on the cb LDG).  All NUM_WARPS warps consume the SAME 32
-// Packs, so ONE warp's cp.async (32) feeds them all, replacing 128 redundant LDGs.  cb_scaled
-// always; cb_old only on the no-write path (mirrors old_B's gating).  W3 (idle in load_x's post-gdc
-// set) issues both.  Precompute output ⇒ MUST run AFTER gdc_wait.  ISSUE ONLY — caller commits
-// (joins the post-gdc cp.async group).
 template <typename input_t, typename SmemT>
 __device__ __forceinline__ void load_cb_async(SmemT& smem, CheckpointingSsuParams const& params,
                                               int lane, int warp, int seq, int head,
@@ -407,13 +303,6 @@ __device__ __forceinline__ void output_head(SmemT& smem, CheckpointingSsuParams 
                                                      tile_buf);
 }
 
-// add_init_out_main (OPERAND SWAP): OUT.1 = state @ Cᵀ → frag_y[d, t] = Σ_n state[d,n]·C[t,n].
-// A = state (2-byte: SM75_U32x4_LDSM_N; 4-byte f32: LDS.64 float2 pairs + in-reg narrow — see
-// make_a_s2r; state smem is dstate=K contiguous → non-transpose either way), B = C
-// (SM75_U32x2_LDSM_N).  Reuses the shared, operand-generic pipelined_kloop_gemm with A/B swapped
-// (the monolith's add_init_out call A=C,B=state is untouched).  Warps split M=DIM (tiled_mma
-// Shape<NUM_WARPS,1>); C is the broadcast B operand.  Both C and state are slot-indexed for the
-// persistent ring.
 template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
           typename TiledMma, typename ThrMma, typename... FragY>
 __device__ __forceinline__ void add_init_out_main(SmemT const& smem, TiledMma const& tiled_mma,
@@ -425,12 +314,7 @@ __device__ __forceinline__ void add_init_out_main(SmemT const& smem, TiledMma co
   constexpr int NUM_K_TILES = DSTATE / K_TILE;
   constexpr int M_TILE = cute::tile_size<0>(TiledMma{});  // 16·NUM_WARPS = D_PER_CTA
   static_assert(sizeof(state_t) != 1, "8-bit state goes through the dedicated 8-bit kernel");
-  // 2-byte state smem is VIEWED as the MMA operand type so the 16-bit LDSM atom matches; the
-  // actual element type (state_t — may be f16) is recovered in-registers by
-  // pipelined_kloop_gemm's convert_frag<state_t, MmaT> after the load (no-op when state_t is
-  // bf16).  4-byte (f32) state keeps its native view: the k-loop loads k-adjacent float2
-  // pairs via LDS.64 and narrows to bf16 in registers (no A-operand ldmatrix exists for
-  // 32-bit elements — see make_a_s2r).  Mirrors the monolith's add_init_out B-side treatment.
+
   using AView = std::conditional_t<sizeof(state_t) == 2, MMA_prop::operand_t, state_t>;
   // A = state [D_PER_CTA, DSTATE] (dstate contiguous = K-major → x4 non-transpose LDSM),
   // slot-indexed.
@@ -449,11 +333,6 @@ __device__ __forceinline__ void add_init_out_main(SmemT const& smem, TiledMma co
   pipelined_kloop_gemm<3, NUM_K_TILES, state_t, input_t, MMA_prop::operand_t>(
       tiled_mma, thr_mma, tid, smem_state_ktiled, smem_C, frag_y...);
 }
-
-// ── OPERAND-SWAP output helpers ([DIM,NPRED]) ────────────────────────────────
-// add_cbx_swapped / add_D_skip_swapped / compute_z_gating_swapped moved to
-// kernel_checkpointing_ssu_common.cuh — shared with the monolith's swapped
-// output path.
 
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS, bool MUST_CHECKPOINT,
@@ -511,7 +390,6 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
   auto s2r_thr_A_x = s2r_A_x.get_slice(tid);
 
   // ── Gmem output base (token 0, d = head·DIM + d_tile·D_PER_CTA); M=d stride 1, N=t stride token
-  // ──
   auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
   int64_t const out_base = out_seq_base + (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
 
@@ -819,37 +697,22 @@ __device__ __forceinline__ void replay_state_mma_main(SmemT& smem,
         int const col = get<1>(id_part(i)) + n_base;
         int const off = layout_state_swz(row, col);
 
-        // Smem write — always nearest-even (output's matmul 3 reads this).
+        // Smem write is always RN (matmul-3 reads it); only the gmem store is SR'd.
         pair_t const q = pack_float2<state_t>(make_float2(frag_h(i), frag_h(i + 1)));
         *reinterpret_cast<pair_t*>(&state_base[off]) = q;
 
         if constexpr (kPhiloxF16) {
           static_assert(sizeof(state_t) == 2, "STG.64 cooperative path requires 2-byte state_t");
           int const pair_idx = n * PAIRS_PER_PASS + i / 2;
-          // Per-lane philox_off is unique per (thread, refresh group) — each
-          // pair gets its own randint bits.  Always computed; only consumed
-          // by the refresh branch inside the helper.
+          // Per-pair philox offset (consumed only by the helper's refresh branch).
           int64_t const philox_off =
               state_ptr_offset + (int64_t)(d_tile * D_PER_CTA + row) * DSTATE + col;
-          // Buffer the SR'd packed u32 — store happens after BOTH passes.
           my_packed[local_n][i / 2] = stochastic_round_pair_with_philox_refresh<PHILOX_ROUNDS>(
               frag_h(i), frag_h(i + 1), pair_idx, rand_seed, philox_off, rand_idx);
         }
       }
     }
 
-    // ── Cross-pass STG.64: all 32 lanes active. ─────────────────────────
-    // m16n8 lane layout: lane k → row k/4, cols (k%4)*2..(k%4)*2+1.  Lanes
-    // (2k, 2k+1) hold adjacent col-pairs of the same row.  After shfl_xor,
-    // the even/odd lane each has a 4-col contiguous block (in different
-    // bit-orders).  Even lane STG.64s the n0-pass block at its own col
-    // base; odd lane STG.64s the n1-pass block at the peer's (lower) col
-    // — both 8-byte aligned for state_t = f16.
-    // Runtime-gated on must_checkpoint: non-checkpoint steps skip the gmem
-    // STGs entirely (state HBM remains the prior checkpoint).  The cvt_rs
-    // SR + philox refresh above still ran — only the STGs are elided —
-    // because skipping them would require routing must_checkpoint into the
-    // pair_idx amortization logic, which lives across the n-loop.
     if constexpr (kPhiloxF16) {
       if (must_checkpoint) {
         exchange_ntile_state_store_global<PAIRS_PER_PASS, N_PER_PASS, DSTATE>(
@@ -878,9 +741,6 @@ struct HeadCoords {
   int64_t outer;
 };
 
-// derive_head: expand the ring entry into the working scalars.  Pure ALU for BOTH layouts — the
-// tile unflatten is constexpr divides and pnat / ring_start (varlen: + seq_len / bos) were batched
-// into the ring at fill_meta — so re-deriving at a use site costs no memory traffic.
 template <int NHEADS, int HEADS_PER_GROUP, int D_SPLIT, int NPREDICTED, bool VARLEN>
 __device__ __forceinline__ HeadCoords derive_head(CheckpointingSsuParams const& /*params*/,
                                                   HeadMetaSSU const& meta) {
@@ -949,8 +809,6 @@ __device__ __forceinline__ void prefetch_async(SmemT& smem, CheckpointingSsuPara
       smem, params, lane, warp, coords, slot, must_checkpoint);
 }
 
-// replay_state: write-path state-checkpoint replay for one work-unit, reading its ring slot `slot`.
-// The bundle (state + old-tiles) must already be drained and published cross-warp by the caller.
 template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
           int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS, int NHEADS,
           int HEADS_PER_GROUP, bool VARLEN, typename SmemT>
@@ -1059,9 +917,6 @@ __device__ __forceinline__ void compute_output_and_store(SmemT& smem,
       out_seq_base, write_offset, seq_len, D_val, beta_extra, slot, frag_CB_new, frag_CB_old);
 }
 
-// process_head: PURE CONSUMER of a prefetched ring slot — replay (write path) then output.  The
-// slot's bundle is already drained by the caller's pipeline_wait; this issues NO cp.async (only the
-// on-the-fly scalar derives + cb LDGs).  The barriers publish the drained slot cross-warp.
 template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
           int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS, int NHEADS,
           int HEADS_PER_GROUP, bool VARLEN, bool MUST_CHECKPOINT, typename SmemT>
@@ -1148,27 +1003,6 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
   auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
   auto const* __restrict__ rsp = reinterpret_cast<int32_t const*>(params.ring_start);
 
-  // ── META PIPELINE: gmem →(32-wide, once per window)→ SMEM RING →(1 LDS/unit, STAGES early)→
-  // REGISTER QUEUE ──
-  // Level 1 — smem ring (slot = unit % META_RING): fill_meta(base) resolves units
-  // [base, base+META_RING) warp-wide — lane l owns unit base+l — so the sbi[seq] →
-  // {prev_num_accepted, ring_start} dependent chase (+ D/A[head]) runs 32-wide ONCE per window
-  // instead of per unit (was the top-2 long_scoreboard sites).  ALL warps fill redundantly with
-  // identical values: each warp writes the full window and reads only its own smem writes, so
-  // __syncwarp() is the only fence needed (no block barrier).  Refill every META_RING−STAGES
-  // units: the loop's smem read is load_meta(tile+STAGES) at the iteration bottom, so window
-  // [f, f+32) serves iterations f .. f+31−STAGES; the refill at f rewrites the still-live overlap
-  // units [f, f+STAGES) with identical values (same unit → same slot), so a lagging warp's
-  // concurrent read races benignly, and every older slot is dead past the previous iteration's
-  // closing __syncthreads.
-  // Level 2 — register queue meta_q[STAGES] (meta_q[k] == meta(tile+k)): the ring LDS is
-  // appended at the iteration BOTTOM and not consumed as a process-meta for STAGES iterations,
-  // so is_valid / derive_head / the prefetch address math read pure registers (v27: the raw-LDS
-  // consumers were the #1 short_scoreboard sites — ISETP 12.3%, widen-SHF 10.2%).  CRITICAL:
-  // meta_q is indexed ONLY by compile-time-constant subscripts (meta_q[0], unrolled shift,
-  // meta_q[STAGES-1]) so SROA keeps it in registers — a runtime subscript would demote it to
-  // local memory, reintroducing the very latency this hides (measured on the original
-  // shift-register).
   constexpr int STAGES = NUM_STAGES;
   constexpr int META_RING = SmemT::META_RING;
   static_assert(STAGES < META_RING, "meta window must cover the process+prefetch span");

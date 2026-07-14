@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 by FlashInfer team.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,39 +14,6 @@
  * limitations under the License.
  */
 // =============================================================================
-// Two-kernel split: PRECOMPUTE kernel (.plans/ssu_split.md, S3).  Validated
-// bit-exact vs the monolithic via test_two_kernel_matches_monolithic (T0).
-//
-// Computes the conv1d-coefficient block (equations C1/C2/C5/C6) and owns the
-// cache writes for the data only IT holds — old_dt/old_cumAdt (C7, from its
-// dt/cumAdt) and old_B (from smem.B; the main reads cb_scaled and never loads
-// B).  The main owns old_x (it loads x) and state.  Stores three scratch
-// tensors the `main` kernel consumes:
-//   cb_scaled : bf16, FRAGMENT-NATIVE [batch, nheads, lane(0..31), reg(0..7)] —
-//               equation C5 laid out as matmul-4's fragA, so the main reads it
-//               with one LDG.128 per thread straight into fragA.
-//   cb_old    : bf16, same fragA-native layout — equation C6 (NO-WRITE path
-//               only; the write path folds old tokens into state via the
-//               replay).  Main does OUT.3 = cb_old @ old_x.
-//   cumAdt_vec: f32, (batch, nheads, NPREDICTED_PAD_MMA_M) — raw cumAdt[t].  The
-//               main loads it into smem.cumAdt; the existing exp(smem.cumAdt)
-//               epilogue computes β on the fly (OUT.1) — no decay branch.
-//
-// Launch granularity (see .plans/ssu_split.md "Granularity"):
-//   grid = (batch, ngroups, ceil(HEADS_PER_GROUP / HEADS_PER_CTA))
-//   First cut: HEADS_PER_CTA == HEADS_PER_GROUP → tiles=1 → 1 CTA/group.
-//   The raw C·B matmul (C5's C·B contraction over DSTATE) is PER-GROUP — B/C
-//   are (.,.,ngroups,dstate) — so it is computed ONCE per CTA and the result
-//   (frag_acc, registers) is reused across the tile's heads; only the per-head
-//   decay scaling differs.  That is the whole point of the per-group grid.
-//
-// CB handling: the 2-warp MMA writes raw C·B as FP32 to swizzled smem.CB
-// (scale in fp32, like the monolithic).  Each warp then scales its head and
-// writes the result to gmem with one STG.128/thread in fragA-native layout —
-// the MAIN never LDSMs CB; it reads its 8-bf16 fragment with one LDG.128
-// straight into matmul-4's fragA.  bf16 conversion happens only at the gmem
-// store, so numerics match the monolithic.
-// =============================================================================
 #ifndef FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_PRECOMPUTE_CUH_
 #define FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_PRECOMPUTE_CUH_
 
@@ -58,17 +25,6 @@
 
 namespace flashinfer::mamba::checkpointing {
 
-// -----------------------------------------------------------------------------
-// Lean precompute smem: only the C·B-path buffers (B, C, CB) + PER-HEAD
-// coefficients (every head's inputs loaded up front in PHASE 1).  Drops the
-// monolithic CheckpointingSsuStorage's state / old_x / old_B / x / z — none
-// touched here — so the precompute uses far less smem → more CTAs/SM.
-//
-// B / C / CB_scaled keep byte-identical swizzled layouts to
-// CheckpointingSsuStorage, so the same `make_swizzled_layout_rc` accessors in
-// the MMA / LDSM helpers index them unchanged.  dt / cumAdt / old_dt / old_cumAdt
-// are PER-HEAD (PHASE 1 loads every head's inputs with all 128 threads; PHASE 2
-// scans + scales per head) — see the storage struct + kernel body below.
 template <typename input_t, int NPREDICTED, int MAX_WINDOW, int DSTATE, int NUM_WARPS,
           int HEADS_PER_CTA>
 struct CheckpointingSsuPrecomputeStorage {
@@ -77,15 +33,6 @@ struct CheckpointingSsuPrecomputeStorage {
   static constexpr int MAX_WINDOW_PAD_MMA_K = next_multiple_of<MMA_prop::K_SMALL>(MAX_WINDOW);
   static constexpr int NPREDICTED_SWIZZLE_R =
       next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NPREDICTED);
-  // Raw C·B (C5) / C·old_B (C6) kept FP32 (scale in fp32 like the monolithic; cast
-  // to bf16 only at the gmem STG).  Stored ELEMENT-MAJOR in matmul-4 fragA order —
-  // smem[e*32 + lane] — NOT swizzled.  The C·B m16n8 accumulator (regs d0..d3)
-  // IS the matmul-4 m16n8k16 A-fragment, same lane: W0 → fragA[0..3] (cols 0-7),
-  // W1 → fragA[4..7] (cols 8-15).  So no relayout: compute_cb stores its 4
-  // accumulator regs element-major (per element, 32 lanes → 32 contiguous f32 =
-  // conflict-free), and scale_store reads the whole fragA back with one
-  // conflict-free element-major load (once per warp, not per head).  REGS = K/2 =
-  // matmul-4 A-frag size.
   static constexpr int CB_NEW_REGS = NPREDICTED_PAD_MMA_M / 2;  // m16n8k16 → 8
   static constexpr int CB_OLD_REGS = MAX_WINDOW_PAD_MMA_K / 2;  // m16n8k{K_old} → 4 or 8
   float CB[CB_NEW_REGS * warpSize];      // C5 new-token raw C·B, fragA element-major (e*W+lane)
@@ -95,14 +42,6 @@ struct CheckpointingSsuPrecomputeStorage {
   alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];      // matmul-1 A-operand (C, swizzled)
   alignas(16) input_t old_B[MAX_WINDOW_PAD_MMA_K * DSTATE];  // C6 N-operand (old B, no-write only)
 
-  // Per-HEAD coefficients, indexed by the LOCAL head (0..HEADS_PER_CTA).  PHASE 1
-  // loads ALL heads' dt / old_dt / old_cumAdt / dt_bias / A up front with all 128
-  // threads; PHASE 2's warp-per-head loop reads them — so it issues NO gmem loads
-  // and can't stall on tiny per-head fetches (was the #1 long_scoreboard source,
-  // the per-head old_dt/old_cumAdt load).  No `decay` slot: exp(cumAdt) is
-  // computed on the fly by scale_store_cb / the main's OUT.1; cumAdt itself is
-  // what cumAdt_vec stores.  Smem scales with HEADS_PER_CTA (~4 KB at 16 heads);
-  // a large HEADS_PER_GROUP (e.g. 64) would need head tiling to stay in budget.
   float dt[HEADS_PER_CTA][NPREDICTED];      // C1: raw dt (PHASE 1) → softplus in place (PHASE 2)
   float cumAdt[HEADS_PER_CTA][NPREDICTED];  // C2 scan output (PHASE 2)
   float old_dt[HEADS_PER_CTA][MAX_WINDOW];  // C6/C7 (NO-WRITE)
@@ -111,16 +50,6 @@ struct CheckpointingSsuPrecomputeStorage {
   float A[HEADS_PER_CTA];                       // per-head A   (PHASE 1)
 };
 
-// -----------------------------------------------------------------------------
-// Load this group's C (conv1d output) into the swizzled smem.C via cp.async —
-// gmem→smem direct, no register footprint for the ~4 KB tile.  C is the A-operand
-// of BOTH the new-token MMA (W0/1, compute_cb_2warp) and the old-token MMA (W2/3,
-// compute_cb_old_2warp on the no-write path), so it is loaded by ALL warps (each
-// warp's own cp.async — no cross-warp sync before the MMA — idempotent same-payload
-// writes, exactly like load_post_pdl_wait_data, common.cuh:671).
-// Committed, NOT drained here — the caller waits ONCE before the CB matmul so C/B
-// overlap old_B (load_old_B) in flight instead of serializing.  Caller must have
-// gdc_wait'd first (C is a conv1d output).
 template <typename input_t, int NPREDICTED, int DSTATE, typename SmemT>
 __device__ __forceinline__ void load_C(SmemT& smem, CheckpointingSsuParams const& params, int lane,
                                        int group_idx, int64_t outer, int seq_len) {
@@ -131,11 +60,6 @@ __device__ __forceinline__ void load_C(SmemT& smem, CheckpointingSsuParams const
   __pipeline_commit();
 }
 
-// -----------------------------------------------------------------------------
-// Load this group's B (conv1d output) into the swizzled smem.B via cp.async.  B
-// (new) is the N-operand of the new-token MMA, only read by W0/1 — so only they
-// call this (the caller gates on warp < 2, the same warps that store_old_B).
-// Committed, NOT drained here (see load_C).  Caller must have gdc_wait'd first.
 template <typename input_t, int NPREDICTED, int DSTATE, typename SmemT>
 __device__ __forceinline__ void load_B(SmemT& smem, CheckpointingSsuParams const& params, int lane,
                                        int group_idx, int64_t outer, int seq_len) {
@@ -146,12 +70,6 @@ __device__ __forceinline__ void load_B(SmemT& smem, CheckpointingSsuParams const
   __pipeline_commit();
 }
 
-// Load this group's OLD B (cache, the buffered input-proj) into swizzled
-// smem.old_B via cp.async — the N-operand of the C6 MMA (compute_cb_old_2warp).
-// Called on the NO-WRITE path only, by W2/3 (the warps that run the old MMA);
-// each loads the full tile (idempotent).  Valid rows = prev_k (the buffered
-// tokens) gathered from the ring at (start+t) % L; the rest zero-fill.  old_B
-// is the single-buffered ring B_cache: (state_cache_size, ngroups, L, dstate).
 template <typename input_t, int MAX_WINDOW, int DSTATE, typename SmemT>
 __device__ __forceinline__ void load_old_B(SmemT& smem, CheckpointingSsuParams const& params,
                                            int lane, int64_t cache_slot, int ring_start,
@@ -166,12 +84,6 @@ __device__ __forceinline__ void load_old_B(SmemT& smem, CheckpointingSsuParams c
   __pipeline_commit();  // NOT drained here — see load_C/load_B; caller drains once before the MMA.
 }
 
-// -----------------------------------------------------------------------------
-// PHASE 1: load ALL heads' scalar coefficients into per-head smem, ALL 128 threads
-// (dt + dt_bias + A always; old_dt / old_cumAdt on the no-write path).  Batching every
-// head's LDGs lets the global-load latency OVERLAP; PHASE 2 then does ZERO gmem loads.
-// bias + softplus deferred to PHASE 2 (smem).  conv1d-INDEPENDENT (only B/C are conv1d
-// outputs), so WHERE the caller runs it is a free choice — see the two call sites.
 template <typename dt_t, typename weight_t, typename matrixA_t, int NPREDICTED, int MAX_WINDOW,
           int HEADS_PER_CTA, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_phase1_coeffs(SmemT& smem,
@@ -204,19 +116,6 @@ __device__ __forceinline__ void load_phase1_coeffs(SmemT& smem,
     smem.A[flat_tid] = toFloat(A_ptr[first_head + flat_tid]);
     smem.dt_bias[flat_tid] = dt_bias_ptr ? toFloat(dt_bias_ptr[first_head + flat_tid]) : 0.f;
   }
-  // Old dt from the RING (row (start+t) % L, t < prev_k) → per-head inclusive
-  // scan → old_cumAdt = A · cumsum(old_dt) (prefix sums are not
-  // ring-shift-invariant, so no decay is cached).  Runs on BOTH paths: the
-  // MAIN reads cumAdt_old from the scratch for its decay (full rows on write,
-  // the β tail float on no-write), so the recompute lives HERE — in the
-  // coefficient kernel, which is under-utilized — rather than on the main's
-  // replay critical path (measured: precompute-side is cheaper end-to-end than
-  // main-side; see .plans/ssu_persistent_main.md).  The no-write cb_old scaling
-  // ALSO reads smem.old_dt/old_cumAdt (published by the PHASE-2 __syncthreads
-  // below); on the write path those smem rows have no consumer, so they're
-  // skipped.  WARP-PER-HEAD: each warp loads its head's dt ring rows (lane = t)
-  // and scans them in-register — warp-local, NO in-block barrier — with A read
-  // straight from gmem (smem.A isn't published until PHASE 2).
   {
     auto const* __restrict__ dtc_ptr = reinterpret_cast<float const*>(params.dt_cache);
     int64_t const dtc_base = cache_slot * params.dt_cache_stride_seq;
@@ -249,13 +148,6 @@ __device__ __forceinline__ void load_phase1_coeffs(SmemT& smem,
   }
 }
 
-// -----------------------------------------------------------------------------
-// C1: scalar per-lane LDG of dt[outer, t, head] + bias + softplus → per-warp
-// smem.dt[warp].  dt is tiny (NPREDICTED floats/head, T-axis stride
-// dt_stride_token = nheads), so an on-the-fly strided LDG is fine — no cp.async.
-// Same compute as load_pre_pdl_wait_data's dt→dt_proc block (common.cuh:613).
-// DT_SOFTPLUS is JIT-stamped (the launcher reads params.dt_softplus once and
-// dispatches), so the softplus branch folds away at compile time.
 template <typename dt_t, int NPREDICTED, bool DT_SOFTPLUS, typename SmemT>
 __device__ __forceinline__ void load_dt(SmemT& smem, CheckpointingSsuParams const& params, int warp,
                                         int lane, int head, int64_t outer, float dt_bias_val,
@@ -269,11 +161,6 @@ __device__ __forceinline__ void load_dt(SmemT& smem, CheckpointingSsuParams cons
   }
 }
 
-// -----------------------------------------------------------------------------
-// C2: cumAdt = cumsum(A * dt) (inclusive Hillis-Steele warp scan) → per-head
-// smem.cumAdt[h] (h = LOCAL head index).  The scanning warp reads its head's
-// PHASE-1-loaded (and softplus'd) dt.  decay = exp(cumAdt) is NOT materialized —
-// scale_store_cb / the main's OUT.1 exp it on the fly.
 template <int NPREDICTED, typename SmemT>
 __device__ __forceinline__ void compute_cumAdt_pw(SmemT& smem, int h, int lane, float A_val) {
   float val = (lane < NPREDICTED) ? A_val * smem.dt[h][lane] : 0.f;
@@ -286,17 +173,6 @@ __device__ __forceinline__ void compute_cumAdt_pw(SmemT& smem, int h, int lane, 
   }
 }
 
-// -----------------------------------------------------------------------------
-// Raw C·B MMA (matmul-1) for ONE group, 2-warp N-split → fp32 swizzled smem.CB
-// (UNMASKED, UNSCALED).  This is the MMA half of compute_CB_scaled_2warp
-// (kernel_checkpointing_ssu_common.cuh:806) with the scale/mask epilogue
-// dropped — the per-head decay/dt scaling + causal mask are deferred to
-// scale_store_cb.  Reads the same swizzled smem.C / smem.B; stores RAW
-// fp32 via a ROW-MAJOR layout so scale_store reads by logical (t,j) = t*S+j.
-// Run by warps 0/1:
-//   NPREDICTED_PAD_MMA_N == 16: warp 0 → cols [0,8), warp 1 → cols [8,16).
-//   NPREDICTED_PAD_MMA_N == 8 : warp 0 covers all valid j (<NPREDICTED); warp 1
-//     returns (its cols [8,16) are j>=8>=seq_len, never read by scale_store).
 template <typename input_t, int NPREDICTED, int DSTATE, typename SmemT>
 __device__ __forceinline__ void compute_cb_2warp(SmemT& smem, int warp, int lane) {
   using namespace cute;
@@ -352,11 +228,6 @@ __device__ __forceinline__ void compute_cb_2warp(SmemT& smem, int warp, int lane
   }
 
   // ── Store the m16n8 accumulator ELEMENT-MAJOR → smem.CB (no swizzle) ──
-  // No scaling / mask (deferred to scale_store_cb).  This warp's 4 accumulator
-  // regs ARE matmul-4 fragA[warp*4 .. warp*4+3], same lane (W0 → fragA[0..3] =
-  // cols 0-7, W1 → fragA[4..7] = cols 8-15), so we dump them element-major:
-  // smem.CB[(warp*4 + i)*32 + lane].  Per element, 32 lanes write 32 contiguous
-  // f32 → conflict-free; scale_store reads the whole fragA back the same way.
   int const warp_base = warp * (int)size(frag_acc);  // 4 regs/lane (m16n8 C)
 #pragma unroll
   for (int i = 0; i < size(frag_acc); ++i) {
@@ -364,16 +235,6 @@ __device__ __forceinline__ void compute_cb_2warp(SmemT& smem, int warp, int lane
   }
 }
 
-// -----------------------------------------------------------------------------
-// Raw C·old_B MMA (C6, matmul-1 for the OLD tokens) for ONE group → fp32
-// swizzled smem.CB_old (UNMASKED, UNSCALED).  Identical to compute_cb_2warp
-// except the N-operand is smem.old_B (the buffered B, MAX_WINDOW_PAD_MMA_K rows)
-// and the output is smem.CB_old.  The C6 decay/coeff scaling + write are
-// deferred to scale_store_cb (IS_OLD=true, the no-write counterpart of the
-// IS_OLD=false path).  Run by warps 2/3 on the NO-WRITE path only; the
-// `warp_in_pair` arg is (threadIdx.y - 2) ∈ {0,1} so the N-split logic matches
-// compute_cb_2warp's (warp 0 → cols [0,8), warp 1 → cols [8,16)).
-//   MAX_WINDOW_PAD_MMA_K == 8: warp_in_pair 1 returns (only one N-tile).
 template <typename input_t, int NPREDICTED, int MAX_WINDOW, int DSTATE, typename SmemT>
 __device__ __forceinline__ void compute_cb_old_2warp(SmemT& smem, int warp_in_pair, int lane) {
   using namespace cute;
@@ -427,11 +288,6 @@ __device__ __forceinline__ void compute_cb_old_2warp(SmemT& smem, int warp_in_pa
     cute::gemm(tiled_mma, frag_acc, frag_A, frag_B, frag_acc);
   }
 
-  // ── Store the m16n8 accumulator ELEMENT-MAJOR → smem.CB_old (no swizzle) ──
-  // Same scheme as compute_cb_2warp: this N-tile's 4 regs ARE matmul-4-old fragA
-  // [warp_in_pair*4 .. +3], same lane (single N-tile at K=8 → all of fragA[0..3];
-  // two N-tiles at K=16 → W2 fragA[0..3], W3 fragA[4..7]).  Element-major,
-  // conflict-free.
   int const warp_base = warp_in_pair * (int)size(frag_acc);  // 4 regs/lane (m16n8 C)
 #pragma unroll
   for (int i = 0; i < size(frag_acc); ++i) {
@@ -439,42 +295,10 @@ __device__ __forceinline__ void compute_cb_old_2warp(SmemT& smem, int warp_in_pa
   }
 }
 
-// -----------------------------------------------------------------------------
-// FRAGMENT-NATIVE, one STG per lane.  Each thread emits the REGS_B values that ==
-// OUT.2/3's `fragB` for this lane (mma.m16n8k{K} B operand, CB[N=t, K=c]), so the
-// MAIN kernel reads them with a single LDG straight into fragB — no LDSM, no
-// swizzle, neither side puts CB in smem as bf16.  The two paths share the ENTIRE
-// fragB select + pack + STG; only the per-column scale and the mask differ, so
-// those fold behind `if constexpr (IS_OLD)` (zero runtime cost) — the caller just
-// points raw / gmem_head at the right buffers.
-//
-// fragB is a per-lane SELECT of the element-major fragC dump `raw` (the operand
-// swap: CB is fragA≡fragC today, fragB after — see the in-body comment + the proof
-// in frag_proto/cb_fragb_select_probe.cu).  REGS_B = NUM_OUT_NTILES·(K/4): mtp≤8
-// new = 4 (STG.64), old = K/4 (2 @ K=8 STG.32, 4 @ K=16 STG.64); mtp>8 doubles.
-// New (C5): CB_scaled[t,c] = (C·B)·exp(cumAdt[t]−cumAdt[c])·dt[c],  mask c≤t
-//   (causal) ∧ c<seq_len ∧ t<seq_len.
-// Old (C6): CB_old[t,c] = (C·old_B)·exp(cumAdt[t]+Σ_old−old_cumAdt[c])·old_dt[c],
-//   mask c<prev_k ∧ t<seq_len (no causal — old tokens all precede the new ones).
-//   Σ_old = old_cumAdt[prev_k−1] (0 when prev_k==0 → all-zero cb_old).
-// Both use the SINGLE-__expf form, matching the monolithic bit-for-bit
-// (kernel_checkpointing_ssu_common.cuh:933 new / :1054 old).  Scaling is fp32,
-// cast to bf16 only at the pack.
-// `raw` is this lane's element-major fragC dump — the unscaled C·B (C5) / C·old_B
-// (C6), loaded ONCE per warp from smem (raw[e] == CB[(t,c)_e]) and reused across
-// all this group's heads.  REGS = K/2 (the raw dump size, unchanged from fragA).
 template <bool IS_OLD, int REGS, typename input_t, typename SmemT>
 __device__ __forceinline__ void scale_store_cb(SmemT& smem, int h, int lane, int seq_len,
                                                int prev_k, float const (&raw)[REGS],
                                                input_t* __restrict__ gmem_head) {
-  // fragB (OUT.2/3 B-operand) store.  raw[] is the element-major fragC dump (REGS=K/2 =
-  // 2 regs per K-half N-tile).  As the B-operand CB[N=t, K=c], fragB register r within
-  // output N-tile `on` (the t-half) is a PER-LANE SELECT of raw — no smem relayout, no
-  // ldmatrix (proven bit-exact by frag_proto/cb_fragb_select_probe.cu):
-  //   src = ((r>>1)&1)*4 + (on<<1) + (r&1)   // c0/c1 (t=r0) or c2/c3 (t=r0+8) of each K-half
-  //   t   = r0 + on*8,  c = c0 + (((r>>1)&1)<<3) + (r&1)
-  // NUM_OUT_NTILES = NPREDICTED_PAD_MMA_N/N: 1 at mtp≤8 (N-pad 8 → REGS/2 fragB regs, HALF
-  // the old fragA store), 2 at mtp>8 (both t-halves → REGS regs, no shrink but correct).
   constexpr int NUM_OUT_NTILES = SmemT::NPREDICTED_PAD_MMA_N / MMA_prop::N;
   constexpr int REGS_B_PER = REGS / 2;  // fragB regs per output N-tile (= K/4)
   constexpr int REGS_B = NUM_OUT_NTILES * REGS_B_PER;
