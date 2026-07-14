@@ -190,7 +190,7 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
       auto const* src_ptr =
           reinterpret_cast<ElemCopyType const*>(permuted_input) + input_idx * kCopyPerToken;
       *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i];
-      TopKScaleType const scale = topk_scales[token_idx * top_k + k];
+      TopKScaleType const scale = topk_scales[expanded_idx];
 
 #pragma unroll
       for (int32_t j = 0; j < kElemPerCopy; j++) {

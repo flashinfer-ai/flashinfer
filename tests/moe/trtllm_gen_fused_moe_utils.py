@@ -688,6 +688,8 @@ class FP4Moe(Moe):
             output = cuda_graph.launch(hidden_states_orig)[0]
             if check_determinism:
                 reference = output.clone()
+                assert torch.isfinite(reference).all()
+                assert not (reference == 0).all()
                 for _ in range(5):
                     repeated = cuda_graph.launch(hidden_states_orig)[0]
                     assert torch.equal(reference, repeated)
