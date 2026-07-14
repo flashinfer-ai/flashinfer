@@ -1089,6 +1089,32 @@ def test_trtllm_batch_decode_mla_sparse_cum_seq_lens_q():
     )
 
 
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_decode_mla_native_block_table_width(
+    uses_shared_paged_kv_idx: bool,
+):
+    page_size = 32
+    max_seq_len = 1025
+    block_table_width = (max_seq_len + page_size - 1) // page_size
+    assert block_table_width == 33
+    assert block_table_width % (128 // page_size) != 0
+
+    trtllm_batch_decode_mla(
+        supported_mla_layer_dimensions[0],
+        batch_size=1,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=page_size,
+        q_len_per_request=1,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=max_seq_len,
+        skips_softmax=False,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
 @pytest.mark.parametrize("q_len_per_request", [1, 2, 4])
 @pytest.mark.parametrize("batch_size", [1, 4])
 def test_trtllm_batch_decode_mla_preallocated_out(
