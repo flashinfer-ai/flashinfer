@@ -65,11 +65,11 @@ comparison adds no pass/fail power, only redundancy. See the design discussion.)
 
 Coverage today: NVFP4 (CuteDSL + TRTLLM-FP4-routed) on SM100 -- the only wired MVP runners.
 
-OPT-IN: this suite is gated behind FLASHINFER_UMOE_FUZZ (see the pytestmark below) and is
-SKIPPED unless that env var is set -- waived in CI pending root-cause of a
-whole-process device-side-assert abort that would block B200 CI. Run it explicitly:
-  FLASHINFER_UMOE_FUZZ=1 CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<sm100-idx> \
-    pytest tests/moe/test_unified_moe_fuzz.py
+ENABLED BY DEFAULT: this suite runs like any other test (on non-SM100+ arches every config
+skips at the no-wired-backend check, so it is free there). FLASHINFER_UMOE_FUZZ=0 is the
+emergency waiver (see the pytestmark below for the history of the original opt-in gate).
+Run it explicitly:
+  CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<sm100-idx> pytest tests/moe/test_unified_moe_fuzz.py
 NOTE: `pytest --forked` does NOT work here (CUDA inits at collection ->
 "Cannot re-initialize CUDA in forked subprocess"); for crash-isolated enumeration run each
 test id in its own process instead (see var/03-ssh-docker-workflow.md).
@@ -171,22 +171,24 @@ from flashinfer.utils import get_compute_capability
 NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "80"))
 BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
 
-# --- CI-safety gate: OPT-IN ----------------------------------------------------------------
-# Waived in CI pending root-cause of a whole-process abort. Running the SM100 fuzzer
-# in a single `pytest` process can hit `CUDA error: device-side assert triggered` ->
-# `Fatal Python error: Aborted`, which would BLOCK B200 CI (an abort fails the whole job, not one
-# test). Notes from triage (2026-06-09): per-config isolation (one process each) passes 68/86
-# incl. EP offset>0 -- so the abort is NOT cleanly attributable to one config (the since-fixed
-# gh #3547 EP case returned tolerated zeros, no assert, under torch.cuda.synchronize); it surfaces
-# only in the accumulated single-process run that CI uses. `pytest --forked` can't isolate it
-# either (CUDA inits at collection -> "Cannot re-initialize CUDA in forked subprocess"). Until the
-# abort is root-caused, this suite is opt-in: set FLASHINFER_UMOE_FUZZ=1
-# to run it (developer / nightly / SM100 box). Unset (CI default) -> collected-and-skipped, so it
-# never launches a kernel and cannot abort the job.
+# --- CI gate: ON by default (FLASHINFER_UMOE_FUZZ=0 is the emergency waiver) ----------------
+# History: this suite was opt-in (FLASHINFER_UMOE_FUZZ=1) while (a) gh #3547 was open and (b) the
+# accumulated single-process run could hit `CUDA error: device-side assert triggered` ->
+# `Fatal Python error: Aborted` (2026-06-09 triage). Both are now understood (2026-07-14, full
+# default run on a B200-class SM100): #3547 is fixed (its EP-offset configs pass), and the abort
+# is root-caused mechanically -- an async device-side assert from one config poisons the CUDA
+# context and the pending c10 error escapes a destructor at interpreter shutdown
+# (std::terminate). It is not a separate Heisenbug: any assert-class *finding* ends this file's
+# pytest process after the failure is reported. CI runners execute each test FILE as its own
+# pytest invocation, so that reds this file only, never the job -- a loud red on a real bug is
+# the point of running the fuzzer, not a hazard to waive. One such finding is currently open:
+# gh #3957 (silent OOB device write by an earlier config; deterministic gather-assert at seed 46,
+# which passes in isolation) -- expect this file RED on SM100-family runners until it is fixed.
+# Set FLASHINFER_UMOE_FUZZ=0 to disable in an emergency; FLASHINFER_UMOE_FUZZ=1 (the old opt-in
+# value) still enables and is now a no-op.
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("FLASHINFER_UMOE_FUZZ"),
-    reason="opt-in fuzzer (set FLASHINFER_UMOE_FUZZ=1); waived in CI pending "
-    "root-cause of the whole-process device-side-assert abort",
+    os.environ.get("FLASHINFER_UMOE_FUZZ", "1") == "0",
+    reason="unified MoE fuzzer disabled via FLASHINFER_UMOE_FUZZ=0",
 )
 
 # Per-backend determinism contract, established empirically (CRC across reruns) + confirmed against

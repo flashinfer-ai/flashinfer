@@ -874,18 +874,20 @@ by `(backend_key, predicate)` — the case is **still run**, so the suite stays
 green yet flags loudly (`xpass` → "remove this entry") the day the bug is fixed.
 A crash is never tolerated, only a wrong answer.
 
-**CI-safety gate (waived, opt-in).** The ledger tolerates a *wrong answer* but
-cannot absorb a *process abort*, and a single-process run of this suite on SM100
-hit `CUDA error: device-side assert triggered` → `Fatal Python error: Aborted`
-(triage 2026-06-09) — which would block B200 CI. Per-config isolation passes
-68/86 incl. EP `offset>0`, so the abort is **not** cleanly attributable to one
-config (the #3547 EP case returns tolerated zeros under `synchronize`, no
-assert); it surfaces only in the accumulated single-process run CI uses, and
-`--forked` can't isolate it (CUDA inits at collection). So the suite is gated
-behind `FLASHINFER_UMOE_FUZZ` (`pytestmark` skip): **unset (CI default) →
-collected-and-skipped, launches no kernel, cannot abort the job**; set → runs
-(developer / nightly). The follow-up PR fixes #3547, root-causes the abort, and
-removes the gate.
+**CI gate (now default-ON).** The suite was initially opt-in
+(`FLASHINFER_UMOE_FUZZ=1`) because a single-process run on SM100 once hit
+`CUDA error: device-side assert triggered` → `Fatal Python error: Aborted`
+(triage 2026-06-09), which would have failed the whole pytest invocation. That
+abort is now root-caused: an async device-side assert from one config poisons
+the CUDA context, and the pending c10 error escaping a destructor at
+interpreter shutdown calls `std::terminate` — i.e. it is the natural downstream
+of an assert-class *finding*, not a separate Heisenbug (the currently open one
+is #3957, a silent OOB device write; its victim config passes in isolation).
+CI runners execute each test file as its own pytest process, so an assert-class
+finding reds only this file, never the job — a loud red on a real bug is the
+point of running the fuzzer. The gate is therefore flipped: the suite runs by
+default, and `FLASHINFER_UMOE_FUZZ=0` remains as an emergency waiver. On
+non-SM100+ arches every config skips at the no-wired-backend check.
 
 **Bugs this fuzzer found + filed** (the EP/scale regimes the prior suite never
 exercised end-to-end):
