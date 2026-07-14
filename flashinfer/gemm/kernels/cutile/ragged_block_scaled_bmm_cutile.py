@@ -513,11 +513,14 @@ def ragged_block_scaled_bmm(
     if out_dtype is None:
         out_dtype = torch.bfloat16
 
-    # The cuTile kernel has an OOB bug on sm100 (B200) when the output tensor is
-    # non-float32 (e.g. bfloat16). The ct.store tile-index path computes wrong
-    # addresses for 2-byte element types. Work around by accumulating into a
-    # float32 intermediate buffer and casting after the kernel.
-    c_internal = torch.empty((total_m, N), device=a.device, dtype=torch.float32)
+    # Allocate the output directly in the requested dtype and let the kernel
+    # store into it. Historically this used a float32 intermediate + post-cast
+    # to dodge an sm100 (B200) OOB bug where ct.store's tile-index path computed
+    # wrong addresses for 2-byte element types. That store path is now correct:
+    # direct bf16 output is bit-identical to the native
+    # group_gemm_fp8_nt_groupwise (trtllm) reference, validated on B300/sm103
+    # (2026-07-13, ocean image dkg-main-55650501). Not re-validated on sm100/B200.
+    c = torch.empty((total_m, N), device=a.device, dtype=out_dtype)
 
     # Materialize fallback max_m_device if the caller didn't pass one. The
     # kernel always reads its grid bound from a device tensor (defense-in-depth).
@@ -580,7 +583,7 @@ def ragged_block_scaled_bmm(
             b,
             a_scale,
             b_scale,
-            c_internal,
+            c,
             m_indptr,
             Q,
             max_m,
@@ -594,6 +597,4 @@ def ragged_block_scaled_bmm(
         ),
     )
 
-    # Cast from float32 intermediate to the requested output dtype
-    c = c_internal.to(out_dtype) if out_dtype != torch.float32 else c_internal
     return c
