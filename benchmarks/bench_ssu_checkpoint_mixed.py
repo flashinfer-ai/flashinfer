@@ -170,6 +170,10 @@ def markov_stationary(al_dist: np.ndarray, T: int, window: int) -> np.ndarray:
             "AL dist may not produce an ergodic chain."
         )
     pi = np.real(eigvecs[:, idx])
+    # eig returns the Perron vector up to sign; flip an all-negative solve so
+    # the clamp below doesn't zero it out into the uniform fallback.
+    if pi.sum() < 0:
+        pi = -pi
     # Iterative refinement: start near the eigenvector, then iterate
     # P^k to clean up any imaginary leakage from the eig solve.
     pi = np.maximum(pi, 0.0)
