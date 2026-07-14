@@ -11,7 +11,11 @@ from cutlass.cute.nvgpu import warpgroup
 from .alpha import AlphaProcessor
 from .collective_inverse_hmma import CollectiveInverse
 from .collective_store_tma import CollectiveStoreTma
-from .custom_compile_cache import KeyedCompileMixin, cached_compile
+from .custom_compile_cache import (
+    KeyedCompileMixin,
+    cached_compile,
+    sm12x_compile_options,
+)
 from .helpers import (
     SM80,
     TF32,
@@ -556,7 +560,7 @@ def cp_delta_rule_t_precompute_dsl_sm120(
         stream,
     )
     compiled = cached_compile(
-        kernel, *kernel_args, compile_options=(cute.GPUArch("sm_120a"),)
+        kernel, *kernel_args, compile_options=sm12x_compile_options()
     )
     compiled(*kernel_args)
     return t
@@ -1728,7 +1732,7 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
         stream,
     )
     compiled = cached_compile(
-        kernel, *kernel_args, compile_options=(cute.GPUArch("sm_120a"),)
+        kernel, *kernel_args, compile_options=sm12x_compile_options()
     )
     compiled(*kernel_args)
     return transfer_t, state_t
@@ -2698,7 +2702,7 @@ def cp_delta_rule_fixup_dsl_sm120(
         stream,
     )
     compiled = cached_compile(
-        kernel, *kernel_args, compile_options=(cute.GPUArch("sm_120a"),)
+        kernel, *kernel_args, compile_options=sm12x_compile_options()
     )
     compiled(*kernel_args)
     return fixed_state
@@ -4830,7 +4834,7 @@ def cp_delta_rule_prefill_dsl_sm120(
         stream,
     )
     compiled = cached_compile(
-        kernel, *kernel_args, compile_options=(cute.GPUArch("sm_120a"),)
+        kernel, *kernel_args, compile_options=sm12x_compile_options()
     )
     compiled(*kernel_args)
 

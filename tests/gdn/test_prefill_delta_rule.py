@@ -28,13 +28,13 @@ from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 from flashinfer.utils import (
     is_sm90a_supported,
     is_sm100a_supported,
-    is_sm120a_supported,
+    is_sm12x_supported,
 )
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 
 def _skip_if_unsupported():
-    """Skip test if not SM90, SM100, or SM120 (with CUDA 13+) architecture."""
+    """Skip test if not SM90, SM100, or SM12x (with CUDA 13+) architecture."""
     device = torch.device("cuda")
     if is_sm100a_supported(device):
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
@@ -42,17 +42,17 @@ def _skip_if_unsupported():
             pytest.skip(
                 f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}"
             )
-    elif is_sm120a_supported(device) or is_sm90a_supported(device):
+    elif is_sm12x_supported(device) or is_sm90a_supported(device):
         pass  # No additional CUDA version requirement
     else:
-        pytest.skip("GDN prefill requires SM90, SM100, or SM120")
+        pytest.skip("GDN prefill requires SM90, SM100, or SM12x")
 
 
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
-    if not (is_sm90a_supported(device) or is_sm120a_supported(device)):
-        pytest.skip("CP GDN prefill requires SM90 or SM120")
+    if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
+        pytest.skip("CP GDN prefill requires SM90 or SM12x")
 
 
 def _skip_if_not_sm100():
