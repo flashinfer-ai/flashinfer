@@ -11,6 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
+
+# Multiprocessing workers (spawn/forkserver) in this directory re-import their
+# test module by dotted path (e.g. ``tests.comm.test_comm_backend``) to unpickle
+# their target, which needs the repo root on ``sys.path``. This repo runs pytest
+# with ``--import-mode=importlib`` (pytest.ini), which does not add it, and plain
+# ``pytest`` (unlike ``python -m pytest``) doesn't put CWD there either -- so the
+# workers fail with ``ModuleNotFoundError: No module named 'tests'``. Put the repo
+# root on the parent's path here; spawn/forkserver capture the parent's sys.path
+# and restore it in the child before unpickling.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import pytest
 import torch.distributed as dist
 
