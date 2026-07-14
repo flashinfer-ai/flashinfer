@@ -211,6 +211,7 @@ def _get_compiled_gather_kernel(
     token_id_ptr,
     num_tiles_ptr,
     norm_const_ptr,
+    a_per_token_scale_ptr,
     max_active_clusters: int,
     stream,
     # Dtype parameters (compile-time - IN cache key)
@@ -232,6 +233,7 @@ def _get_compiled_gather_kernel(
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     gated: bool = True,
+    use_a_per_token_scale: bool = False,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -273,6 +275,7 @@ def _get_compiled_gather_kernel(
         swiglu_beta,
         swiglu_limit,
         gated,
+        use_a_per_token_scale,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -290,14 +293,16 @@ def _get_compiled_gather_kernel(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             gated=gated,
+            use_a_per_token_scale=use_a_per_token_scale,
         )
 
         # Compile with runtime parameters - they can vary across calls
         # Order must match wrapper signature:
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
-        #  num_non_exiting_tiles_ptr, global_sf_ptr, orig_m, m, n, k, l,
-        #  tile_size, scaling_vector_size, max_active_clusters, stream)
+        #  num_non_exiting_tiles_ptr, global_sf_ptr, a_per_token_scale_ptr,
+        #  orig_m, m, n, k, l, tile_size, scaling_vector_size,
+        #  max_active_clusters, stream)
         compiled_gemm = cute.compile(
             gemm.wrapper,
             a_ptr,
@@ -312,6 +317,7 @@ def _get_compiled_gather_kernel(
             token_id_ptr,
             num_tiles_ptr,
             norm_const_ptr,
+            a_per_token_scale_ptr,
             orig_m,
             permuted_m,
             n,
@@ -342,6 +348,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     out_scale: Optional[torch.Tensor] = None,
     global_scale: Optional[torch.Tensor] = None,
     *,
+    a_per_token_scale: Optional[torch.Tensor] = None,
     topk: int = 8,
     ab_dtype: str = "float4_e2m1fn",
     sf_dtype: str = "float8_e4m3fn",
@@ -390,6 +397,9 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
              For FP4 output, shape is (permuted_m, intermediate_size//2) uint8.
         out_scale: Optional output scale factor tensor for FP4 quantized output.
         global_scale: Global scale factor for FP4 quantization, shape (1,), float32.
+        a_per_token_scale: Optional per-token row scale for operand A,
+            shape (seq_len,), float32. Indexed by the original token ID and
+            applied before SwiGLU.
         topk: Number of experts per token. Default: 8
         ab_dtype: Data type for A and B matrices. Default: "float4_e2m1fn"
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
@@ -470,8 +480,33 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     intermediate_size = n // (2 if gated else 1)
     permuted_m = token_id_mapping.shape[0]
 
+    use_a_per_token_scale = a_per_token_scale is not None
+    if use_a_per_token_scale:
+        if a_per_token_scale.device.type != "cuda":
+            raise ValueError("a_per_token_scale must be on CUDA device")
+        if a_per_token_scale.dtype != torch.float32:
+            raise ValueError("a_per_token_scale must have dtype torch.float32")
+        if not a_per_token_scale.is_contiguous():
+            raise ValueError("a_per_token_scale must be contiguous")
+        if a_per_token_scale.shape != (seq_len,):
+            raise ValueError(
+                f"a_per_token_scale must have shape ({seq_len},), "
+                f"got {tuple(a_per_token_scale.shape)}"
+            )
+
     if n % 128 != 0:
         raise ValueError(f"GEMM1 output dim n={n} must be a multiple of 128.")
+
+    # Check if we're doing FP4 quantization
+    generate_sfc = c_dtype == "float4_e2m1fn"
+    if generate_sfc:
+        if global_scale is None:
+            raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
+    elif out_scale is not None or global_scale is not None:
+        raise ValueError(
+            "out_scale and global_scale are only supported when "
+            "c_dtype is 'float4_e2m1fn'"
+        )
 
     # Check compute capability
     major, minor = get_compute_capability(a.device)
@@ -506,12 +541,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             f"sf_vec_size={sf_vec_size}, c_dtype={c_dtype}, mma_tiler_mn={mma_tiler_mn}, "
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
-
-    # Check if we're doing FP4 quantization
-    generate_sfc = c_dtype == "float4_e2m1fn"
-    if generate_sfc:
-        if global_scale is None:
-            raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
 
     # Create output tensor if not provided
     if out is None:
@@ -584,6 +613,14 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         norm_const_ptr = None
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+    if use_a_per_token_scale:
+        a_per_token_scale_ptr = make_ptr(
+            cutlass.Float32,
+            a_per_token_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+        )
+    else:
+        a_per_token_scale_ptr = None
     tile_idx_ptr = make_ptr(
         cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem
     )
@@ -622,6 +659,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         token_id_ptr=token_id_ptr,
         num_tiles_ptr=num_tiles_ptr,
         norm_const_ptr=norm_const_ptr,
+        a_per_token_scale_ptr=a_per_token_scale_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
         # Dtype parameters (compile-time, in cache key)
@@ -642,13 +680,14 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         gated=gated,
+        use_a_per_token_scale=use_a_per_token_scale,
     )
 
     # Execute kernel with runtime parameters
     # Order must match wrapper signature:
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
-    #  orig_m, m, n, k, l, stream)
+    #  a_per_token_scale_ptr, orig_m, m, n, k, l, stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
@@ -662,6 +701,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         token_id_ptr,
         num_tiles_ptr,
         norm_const_ptr,
+        a_per_token_scale_ptr,
         seq_len,  # orig_m
         permuted_m,
         n,

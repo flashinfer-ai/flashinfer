@@ -1156,3 +1156,159 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
         f"Python allocations grew by {allocated_bytes / 1024:.1f} KB "
         f"({allocated_bytes / N:.0f} B/call)."
     )
+
+
+def _build_moe_style_tuning_config(topk_ids_initializer):
+    """Build a config with tensor_initializers present, MoE-style.
+    Mimics ``_make_tuning_config`` in fused_moe/core.py.
+    """
+    from flashinfer.autotuner.initializers import autotuner_initializer_randn
+    from flashinfer.fused_moe.utils import (
+        get_hybrid_num_tokens_buckets,
+        make_hybrid_bucket_mapper,
+    )
+
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1),
+                dim_idx=(0, 0),
+                gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192, 1),
+                map_to_tuning_buckets=make_hybrid_bucket_mapper(8192),
+                tensor_initializers=[
+                    autotuner_initializer_randn,
+                    topk_ids_initializer,
+                ],
+            ),
+        ),
+    )
+
+
+def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
+    """Regression test: rebuilt MoE-style configs with tensor_initializers
+    must collapse to a single cache entry.
+    """
+    from flashinfer.fused_moe.core import _moe_topk_ids_init
+
+    # The factory must return the identical object for the same expert count.
+    assert _moe_topk_ids_init(128) is _moe_topk_ids_init(128)
+
+    AutoTuner._find_nearest_profile.cache_clear()
+    shapes = ((1024, 4096), (1024, 8))
+
+    AutoTuner._find_nearest_profile(
+        shapes, _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+    )
+    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+    N = 1_000
+    for _ in range(N):
+        config = _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+        AutoTuner._find_nearest_profile(shapes, config)
+
+    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    assert cache_growth == 0, (
+        f"Cache grew by {cache_growth} entries across {N} rebuilds of an "
+        "equivalent MoE-style config with a fixed shape."
+    )
+
+
+def test_make_tuning_config_reuses_topk_ids_initializer():
+    """_make_tuning_config must return configs whose topk_ids initializer is the
+    same object across calls for the same num_experts.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import flashinfer.fused_moe.core as core_mod
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+    from flashinfer.tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+
+    fn = core_mod.get_trtllm_moe_sm100_module
+    fn.cache_clear()
+    try:
+        mock_module = MagicMock()
+        mock_module.get_library_path.return_value = "/tmp/fake.so"
+        with (
+            patch.object(
+                core_mod,
+                "gen_trtllm_gen_fused_moe_sm100_module",
+                return_value=mock_module,
+            ),
+            patch.object(core_mod, "setup_cubin_loader"),
+        ):
+            MoERunner = core_mod.get_trtllm_moe_sm100_module().MoERunner
+
+        runner = MoERunner(
+            top_k=8,
+            num_local_experts=128,
+            dtype_act=DtypeTrtllmGen.Bfloat16,
+            dtype_weights=DtypeTrtllmGen.Bfloat16,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+            hidden_size=4096,
+            intermediate_size=14336,
+            num_experts=128,
+        )
+        moe_inputs = MoeRunnerInputs(
+            output=torch.empty((8, 4096)),
+            routing_logits=None,
+            topk_ids=torch.zeros((8, 8), dtype=torch.int32),
+            expert_weights=None,
+            hidden_states=torch.empty((8, 4096)),
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+        config_a = runner._make_tuning_config(moe_inputs)
+        config_b = runner._make_tuning_config(moe_inputs)
+
+        spec_a = config_a.dynamic_tensor_specs[0]
+        spec_b = config_b.dynamic_tensor_specs[0]
+        topk_idx = MoeRunnerInputs.idx("topk_ids")
+        init_a = spec_a.tensor_initializers[spec_a.input_idx.index(topk_idx)]
+        init_b = spec_b.tensor_initializers[spec_b.input_idx.index(topk_idx)]
+
+        assert init_a is init_b, (
+            "_make_tuning_config returned a different topk_ids initializer object "
+            "on each call. It must reuse _moe_topk_ids_init(num_experts) so that "
+            "rebuilt TuningConfigs collapse to the same _find_nearest_profile "
+            "lru_cache key — a per-call closure reintroduces the memory leak."
+        )
+    finally:
+        fn.cache_clear()
+
+
+def test_find_nearest_profile_cache_grows_with_fresh_closure_initializer():
+    """Negative control: a fresh initializer closure per call leaks one
+    entry per call DESPITE equal hashes.
+    """
+    AutoTuner._find_nearest_profile.cache_clear()
+    shapes = ((1024, 4096), (1024, 8))
+
+    def make_fresh_closure():
+        def _init(s, dt, dev):
+            return None
+
+        return _init
+
+    ref_config = _build_moe_style_tuning_config(make_fresh_closure())
+    other_config = _build_moe_style_tuning_config(make_fresh_closure())
+    assert hash(ref_config) == hash(other_config), "hashes should match"
+    assert ref_config != other_config, "equality should fail on fresh closures"
+
+    AutoTuner._find_nearest_profile(shapes, ref_config)
+    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+    N = 1_000
+    for _ in range(N):
+        config = _build_moe_style_tuning_config(make_fresh_closure())
+        AutoTuner._find_nearest_profile(shapes, config)
+
+    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    assert cache_growth == N, (
+        f"Expected {N} new cache entries (one per fresh closure), got {cache_growth}."
+    )

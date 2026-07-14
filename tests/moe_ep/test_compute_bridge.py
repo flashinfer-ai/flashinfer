@@ -21,7 +21,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from flashinfer.moe_ep._compute_bridge import (  # noqa: E402
+from flashinfer.moe_ep.backends.split.kernel.fused_moe.bridge import (  # noqa: E402
     build_activation_pack,
     build_activation_pack_rank_major,
     reshape_for_combine,
@@ -103,6 +103,33 @@ def test_rank_major_pack_faithful_routing_and_masking():
     assert pack.selected_experts.max().item() < offset + num_local_experts
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_rank_major_masks_out_of_range_local_expert_ids():
+    world, per_rank, hidden = 4, 8, 64
+    top_k = 4
+    num_local_experts = 4
+    offset = 8
+    m = world * per_rank
+    et = _dispatch_tensor(world, per_rank, hidden, "cuda")
+
+    recv_idx = torch.full(
+        (m, top_k), num_local_experts, dtype=torch.int64, device="cuda"
+    )
+    recv_w = torch.ones(m, top_k, device="cuda")
+
+    pack = build_activation_pack_rank_major(
+        et,
+        recv_idx,
+        recv_w,
+        num_local_experts=num_local_experts,
+        local_expert_offset=offset,
+        is_nvfp4=False,
+    )
+
+    assert torch.all(pack.selected_experts == offset)
+    assert torch.all(pack.final_scales == 0.0)
+
+
 def test_build_activation_pack_rank_major_rejects_2d():
     bad = torch.zeros(8, 128, dtype=torch.bfloat16)
     idx = torch.zeros(8, 8, dtype=torch.int64)
@@ -125,7 +152,6 @@ def test_reshape_for_combine_roundtrips():
 
 
 def test_build_activation_pack_rejects_2d():
-    pytest.importorskip("torch")
     bad = torch.zeros(8, 128, dtype=torch.bfloat16)
     with pytest.raises(ValueError):
         build_activation_pack(bad, is_nvfp4=False)
@@ -142,7 +168,6 @@ def test_nvfp4_pack_quantizes():
     pack = build_activation_pack(et, local_expert_offset=0, is_nvfp4=True)
 
     m = num_local_experts * cap
-    # Packed FP4: last dim halves; scale factor present.
     assert pack.hidden_states_q.shape[0] == m
     assert pack.hidden_states_q.shape[1] == hidden // 2
     assert pack.hidden_states_scale.numel() > 0

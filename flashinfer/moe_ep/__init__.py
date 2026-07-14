@@ -1,24 +1,16 @@
-"""flashinfer.moe_ep — MoE Expert-Parallel dispatch/combine over NCCL-EP and NIXL-EP.
+"""flashinfer.moe_ep — MoE Expert-Parallel (split + mega kernels).
 
-This package is a thin Python wrapper over two transport backends:
+Package layout::
 
-- ``flashinfer.moe_ep.nccl_ep``  — primary backend, wraps NVIDIA's nccl4py
-  ``nccl.ep`` API (nccl-ep-v0.1.0; provided by the released ``nccl4py`` wheel,
-  a base dependency of flashinfer-python).
-- ``flashinfer.moe_ep.nixl_ep``  — alternate backend, wraps ai-dynamo's
-  ``nixl_ep`` (built in-tree from ``3rdparty/nixl/examples/device/ep``).
-
-NCCL-EP availability is the importability of ``nccl.ep`` (no in-tree
-``libnccl_ep.so`` as of v0.1.0); NIXL-EP ships a staged ``nixl_ep_cpp*.so``.
-Both are enabled by default: plain ``pip install .`` pulls the nccl4py wheel
-and builds NIXL-EP best-effort (skipped with a warning when its build deps —
-meson, UCX, nvcc, ... — are missing). Opt out with ``BUILD_NVEP=0`` (or the
-per-backend ``BUILD_NCCL_EP=0`` / ``BUILD_NIXL_EP=0``); force a hard error on
-missing NIXL-EP build deps with ``BUILD_NIXL_EP=1``.
-
-Without a built backend the package imports succeed but calling
-:func:`create_fleet` raises :class:`MoEEpNotBuiltError` with rebuild
-instructions.
+    moe_ep/
+      core/                 shared comm + kernel abstractions and validation
+      backends/
+        split/
+          comm/             NCCL-EP, NIXL-EP transport
+          kernel/           post-dispatch inner kernels
+        mega/
+          kernel/           fused comm + local MoE kernels
+      modes/                split and mega orchestration layers
 """
 
 from __future__ import annotations
@@ -26,6 +18,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .errors import MoEEpNotBuiltError
 from .algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobAllocator,
@@ -39,6 +32,18 @@ from .algo_knobs import (
     HandleAlgoKnobTopKWeights,
     HandleAlgoKnobUserStream,
 )
+from .backends.mega.kernel.deep_gemm_mega import (
+    DeepGemmMegaMoeConfig,
+    preprocess_mega_weights,
+)
+from .backends.mega.kernel.mxfp8_cutedsl import (
+    Mxfp8CutedslMegaMoeConfig,
+    preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
+)
+from .backends.mega.kernel.nvfp4_cutedsl import (
+    Nvfp4CutedslMegaMoeConfig,
+    preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
+)
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -51,23 +56,56 @@ from .config import (
     HandleParams,
     QuantType,
 )
-from ._validators import (
+from .core.bootstrap_utils import (
+    bootstrap_comm_group,
+    bootstrap_ep_rank_world,
+    bootstrap_ep_world_size,
+)
+from .core.comm.fleet import Fleet, create_fleet
+from .core.comm.handle import Handle
+from .core.runtime import (
+    bootstrap_moe_ep_runtime,
+    ensure_moe_ep_cuda_device,
+    finalize_moe_ep_runtime,
+)
+from .core.validation import (
     MoEEpArchError,
     MoEEpConfigError,
+    ensure_bootstrap_dist_validated,
     validate_arch_for_backend,
+    validate_bootstrap_process_group_ready,
+    validate_bootstrap_world_size,
     validate_fleet_params,
+    validate_fleet_weights,
+    validate_mega_arch,
+    validate_mega_fleet_params,
+    validate_mega_forward_inputs,
+    validate_split_forward_inputs,
 )
-from .fleet import Fleet, create_fleet
-from .handle import Handle
 from .layer import MoEEpLayer
-from .split_backends import NcclEpConfig, NvepConfig
+from .modes import (
+    FusedMoeKernelConfig,
+    IdentityConfig,
+    MegaConfig,
+    MoEEpMegaLayer,
+    MoEEpSplitLayer,
+    NCCLEPConfig,
+    NcclEpConfig,
+    NvepConfig,
+    SplitConfig,
+    SplitKernelContext,
+    kernel_requires_weights,
+    run_split_kernel,
+)
 from .tensors import MoEEpTensors
+from .weights import MoEWeightPack, dummy_moe_weights
 
 __all__ = [
     "AlgoKnob",
     "BootstrapConfig",
     "CombineInputParams",
     "CombineOutput",
+    "DeepGemmMegaMoeConfig",
     "DispatchInputParams",
     "DispatchOutput",
     "EpAlgorithm",
@@ -80,48 +118,80 @@ __all__ = [
     "FleetAlgoKnobRdmaBufferSize",
     "FleetAlgoKnobTopologyCapacity",
     "FleetParams",
+    "FusedMoeKernelConfig",
     "Handle",
     "HandleAlgoKnobNumReceivedTokens",
     "HandleAlgoKnobSplitOperation",
     "HandleAlgoKnobTopKWeights",
     "HandleAlgoKnobUserStream",
     "HandleParams",
+    "IdentityConfig",
+    "MegaConfig",
     "MoEEpArchError",
     "MoEEpConfigError",
     "MoEEpLayer",
+    "MoEEpMegaLayer",
     "MoEEpNotBuiltError",
+    "MoEEpSplitLayer",
     "MoEEpTensors",
+    "MoEWeightPack",
+    "Mxfp8CutedslMegaMoeConfig",
+    "NCCLEPConfig",
     "NcclEpConfig",
+    "Nvfp4CutedslMegaMoeConfig",
     "NvepConfig",
     "QuantType",
+    "SplitConfig",
+    "SplitKernelContext",
     "available_backends",
+    "bootstrap_comm_group",
+    "bootstrap_ep_rank_world",
+    "bootstrap_ep_world_size",
+    "bootstrap_moe_ep_runtime",
     "create_fleet",
+    "dummy_moe_weights",
+    "ensure_bootstrap_dist_validated",
+    "ensure_moe_ep_cuda_device",
+    "finalize_moe_ep_runtime",
     "have_nccl_ep",
     "have_nixl_ep",
+    "kernel_requires_weights",
+    "preprocess_mega_weights",
+    "preprocess_mxfp8_cutedsl_mega_weights",
+    "preprocess_nvfp4_cutedsl_mega_weights",
+    "run_split_kernel",
+    "validate_arch_for_backend",
+    "validate_bootstrap_process_group_ready",
+    "validate_bootstrap_world_size",
+    "validate_fleet_params",
+    "validate_fleet_weights",
+    "validate_mega_arch",
+    "validate_mega_fleet_params",
+    "validate_mega_forward_inputs",
+    "validate_split_forward_inputs",
 ]
 
 
 _pkg_dir = Path(__file__).parent
 _REBUILD_HINT = (
-    "flashinfer.moe_ep is not built. It builds by default; rebuild with:\n"
+    "flashinfer.moe_ep transport libs are not built. They build by default;\n"
+    "rebuild with:\n"
     "    pip install -e .\n"
     "from the FlashInfer source tree (use BUILD_NIXL_EP=1 to turn missing\n"
-    "build deps into hard errors instead of skip-with-warning). See the\n"
-    "moe_ep section of build_backend.py for required system dependencies."
+    "build deps into hard errors instead of skip-with-warning; libs stage\n"
+    "under flashinfer/moe_ep/backends/split/comm/*/_libs/)."
 )
 
 
-class MoEEpNotBuiltError(RuntimeError):
-    """Raised when an EP backend is invoked but its native libs are missing."""
+def _nccl_libs_dir() -> Path:
+    return _pkg_dir / "backends" / "split" / "comm" / "nccl_ep" / "_libs"
+
+
+def _nixl_libs_dir() -> Path:
+    return _pkg_dir / "backends" / "split" / "comm" / "nixl_ep" / "_libs"
 
 
 def _probe_nccl_ep() -> bool:
-    """True if the NCCL-EP backend is available.
-
-    As of nccl-ep-v0.1.0 the backend is the nccl4py ``nccl.ep`` package (no
-    in-tree libnccl_ep.so).  Probe with ``find_spec`` so we don't import/execute
-    ``nccl.ep`` (and pull in its native lib) just to answer availability.
-    """
     import importlib.util
 
     try:
@@ -131,31 +201,19 @@ def _probe_nccl_ep() -> bool:
 
 
 def _probe_nixl_ep() -> bool:
-    """True if the NIXL-EP plugin .so was staged by the build.
-
-    The base libnixl.so + plugins are NOT staged into this package — they
-    come from the pip-installed nixl-cu13 wheel. The runtime loader in
-    flashinfer.moe_ep.nixl_ep loads them explicitly before opening
-    nixl_ep_cpp.so.
-    """
-    libs = _pkg_dir / "nixl_ep" / "_libs"
-    if not libs.is_dir():
-        return False
-    return any(libs.glob("nixl_ep_cpp*.so"))
+    libs = _nixl_libs_dir()
+    return libs.is_dir() and any(libs.glob("nixl_ep_cpp*.so"))
 
 
 def have_nccl_ep() -> bool:
-    """Return True if the NCCL-EP backend native libs are present."""
     return _probe_nccl_ep()
 
 
 def have_nixl_ep() -> bool:
-    """Return True if the NIXL-EP backend native libs are present."""
     return _probe_nixl_ep()
 
 
 def available_backends() -> list[str]:
-    """Names of EP backends with both native libs and python wrappers present."""
     out: list[str] = []
     if have_nccl_ep():
         out.append("nccl_ep")
@@ -165,7 +223,6 @@ def available_backends() -> list[str]:
 
 
 def _require_built(backend: str) -> None:
-    """Raise MoEEpNotBuiltError if `backend` is missing its native libs."""
     probe = {"nccl_ep": _probe_nccl_ep, "nixl_ep": _probe_nixl_ep}.get(backend)
     if probe is None:
         raise ValueError(
@@ -177,11 +234,6 @@ def _require_built(backend: str) -> None:
         )
 
 
-# Quiet diagnostic at import time when a build flag was set but the libs
-# are absent — most likely cause is a partial build (probe failure
-# swallowed in the default best-effort mode). Helpful for first-time
-# users. Covers all three flags: the legacy BUILD_NVEP alias plus the
-# per-backend BUILD_NCCL_EP / BUILD_NIXL_EP.
 _set_build_flags = [
     name
     for name in ("BUILD_NVEP", "BUILD_NCCL_EP", "BUILD_NIXL_EP")
@@ -192,7 +244,7 @@ if _set_build_flags and not available_backends():
 
     warnings.warn(
         f"{'/'.join(_set_build_flags)} was set, but no moe_ep backend "
-        f"libraries were found under {_pkg_dir}. Check the build log "
+        f"libraries were found. Check the build log "
         "for pre-flight probe misses (meson/make/nvcc/git on PATH, "
         "ucx/libibverbs via pkg-config, nixl-cu13 / nvidia-nccl-cu13 "
         "wheels importable) or meson/make compile failures.",
@@ -200,11 +252,6 @@ if _set_build_flags and not available_backends():
         stacklevel=2,
     )
 
-# Trigger backend registration. Importing these modules populates
-# ``_BACKEND_REGISTRY`` via module-level assignments. Both imports are
-# pure-Python and don't touch the nccl.ep native lib / nixl_ep_cpp.so — those
-# only load when a Fleet is actually instantiated. Must happen AFTER
-# MoEEpNotBuiltError / _require_built are defined above (the backend
-# modules `from .. import` them).
-from .nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
-from .nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401
+from . import backends as _backends  # noqa: E402,F401
+from .backends.split.comm.nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
+from .backends.split.comm.nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401

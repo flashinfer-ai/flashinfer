@@ -628,6 +628,7 @@ def _check_trtllm_gen_mla_shape(
     uses_shared_paged_kv_idx: bool = True,
     batch_size: Optional[int] = None,
     max_q_len: Optional[int] = None,
+    require_aligned_block_table: bool = True,
 ) -> torch.Tensor:
     is_flattened_query = False
     if query.ndim == 4:
@@ -692,7 +693,7 @@ def _check_trtllm_gen_mla_shape(
             raise ValueError(
                 f"Expected batch size {num_seqs} for query and block_table, got {num_seqs} and {B_block_table}"
             )
-        if block_num % (128 / block_size) != 0:
+        if require_aligned_block_table and block_num % (128 / block_size) != 0:
             raise ValueError(
                 f"Expected block_num % (128 / block_size) == 0, got {block_num=} and {block_size=}"
             )
@@ -2594,6 +2595,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         For SM120/SM121 sparse v32/GLM, it is the sparse index matrix and must
         have shape ``[batch_size, q_len_per_request, sparse_mla_top_k]`` with
         int32 physical token indices.
+        With ``backend="trtllm-gen"``, the final dimension may use its native
+        width and does not need padding to a multiple of ``128 / page_size``.
     seq_lens : Optional[torch.Tensor]
         Per-request KV sequence lengths for dense and TRTLLM-GEN paths. For
         SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
@@ -2923,6 +2926,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             uses_shared_paged_kv_idx,
             batch_size=batch_size,
             max_q_len=max_q_len,
+            require_aligned_block_table=False,
         )
 
         expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
@@ -2990,6 +2994,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         block_tables,
         block_size,
         uses_shared_paged_kv_idx,
+        require_aligned_block_table=backend != "trtllm-gen",
     )
 
     # Pre-allocate `out` so non-swept dims have a template for autotune
