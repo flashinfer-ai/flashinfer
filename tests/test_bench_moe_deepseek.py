@@ -342,4 +342,6 @@ def test_print_row_supports_backend_subset(capsys):
     )
     output = capsys.readouterr().out
     assert "TRTLLM" in output
-    assert output.count("n/a") == 6
+    # Both upstream CuTe DSL modes are absent, so their value columns and the
+    # two-reference speedup columns must all render as unavailable.
+    assert output.count("n/a") == 10
