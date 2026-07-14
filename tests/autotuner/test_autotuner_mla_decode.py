@@ -9,7 +9,11 @@ import torch
 import flashinfer
 from flashinfer import autotune
 from flashinfer.autotuner import AutoTuner
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    get_compute_capability,
+    get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+)
 
 
 # DeepSeek-V3 MLA layer dimensions. The cute-dsl backend's
@@ -71,6 +75,7 @@ def _call_decode(
     seq_lens,
     workspace_buffer,
     backend: str = "auto",
+    multi_ctas_kv_counter_buffer=None,
 ):
     return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
@@ -84,6 +89,7 @@ def _call_decode(
         max_seq_len=_MAX_SEQ_LEN,
         bmm1_scale=1.0 / (_HEAD_DIM**0.5),
         backend=backend,
+        multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
     )
 
 
@@ -92,15 +98,29 @@ def _call_decode(
 # ---------------------------------------------------------------------------
 
 
-def test_autotune_dispatcher_runs_with_auto_backend():
-    """Smoke test: ``backend='auto'`` runs cleanly under ``autotune(True)``."""
+def test_autotune_dispatcher_runs_with_auto_backend_and_caller_counter():
+    """Autotune profiles use internal counters, not the final-call buffer."""
     _skip_if_not_blackwell()
 
     query, kv_cache, block_tables, seq_lens, workspace_buffer = _make_inputs()
+    counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        query.size(0), query.size(2), get_device_sm_count(query.device)
+    )
+    caller_counter_buffer = torch.zeros(
+        counter_bytes, dtype=torch.uint8, device=query.device
+    )
     AutoTuner.get().clear_cache()
 
     with autotune(True):
-        out = _call_decode(query, kv_cache, block_tables, seq_lens, workspace_buffer)
+        out = _call_decode(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            workspace_buffer,
+            multi_ctas_kv_counter_buffer=caller_counter_buffer,
+        )
 
     assert out.shape == (query.shape[0], 1, _NUM_HEADS, _KV_LORA_RANK)
     assert out.isfinite().all()
+    assert torch.count_nonzero(caller_counter_buffer).item() == 0
