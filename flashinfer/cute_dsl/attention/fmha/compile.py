@@ -79,15 +79,26 @@ def compile_cute_dsl_fmha_kernel(
     enable_skip_softmax: bool,
     use_pdl: bool,
     device: torch.device,
+    has_window_left: bool = False,
+    has_window_right=None,
 ):
     """Compile (and cache) the trtllm FMHA kernel for a static config.
 
     Compiles with the TVM-FFI ABI (the handle takes ``torch.Tensor`` args on the env
     stream) and symbolic batch/seqlen dims, so a single compile serves all shapes for the
     given dtypes / head counts / head_dim / mask.
+
+    Sliding-window bounds follow a presence/value split: only bound *presence*
+    (``has_window_left`` / ``has_window_right``) specializes the kernel — the
+    DSL traces ``Optional[Int32]`` window args as present-or-None — while the
+    bound values are runtime arguments, so one compile serves every window
+    size.  ``has_window_right=None`` derives presence from ``is_causal``
+    (causal is a right bound with runtime value 0).
     """
     from .fmha import BlackwellFusedMultiHeadAttentionForward
 
+    if has_window_right is None:
+        has_window_right = is_causal
     enable_ex2_emulation = _ex2_emulation_enabled(device)
     qk = _CUTLASS_DTYPE[qk_dtype]
     pv = _CUTLASS_DTYPE[v_dtype]
@@ -102,7 +113,8 @@ def compile_cute_dsl_fmha_kernel(
         mma_tiler=(128, 128),
         head_dim=head_dim_arg,
         is_persistent=False,  # varlen ragged
-        mask_type=_mask_type(is_causal),
+        # Any band bound (causal or sliding window) uses the window mask.
+        mask_type=_mask_type(has_window_left or has_window_right),
         enable_ex2_emulation=enable_ex2_emulation,
         enable_skip_correction=True,
         use_tma_store=False,  # varlen -> STG
@@ -161,7 +173,10 @@ def compile_cute_dsl_fmha_kernel(
     problem_size = (1, 1, 1, 1, num_qo_heads, num_kv_heads, d, dv)
     scale_softmax = 1.0 / math.sqrt(d)
     skip_threshold_log2 = Float32(0.0) if enable_skip_softmax else None
-    ws_right = Int32(0) if is_causal else None
+    # Trace-time presence only; the traced 0s are placeholders and the real
+    # bound values arrive as runtime arguments on each call.
+    ws_left = Int32(0) if has_window_left else None
+    ws_right = Int32(0) if has_window_right else None
     stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
 
     return cute.compile(
@@ -179,7 +194,7 @@ def compile_cute_dsl_fmha_kernel(
         scale_softmax,
         1.0,
         skip_threshold_log2,
-        None,
+        ws_left,
         ws_right,
         None,
         None,
