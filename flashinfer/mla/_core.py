@@ -41,6 +41,7 @@ from ..utils import (
     get_compute_capability,
     get_device_sm_count,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
+    _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
     is_sm12x_supported,
     log2e,
@@ -2206,35 +2207,6 @@ def _build_mla_decode_tuning_config(
     )
 
 
-def _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
-    counter_buffer: Optional[torch.Tensor],
-    batch_size: int,
-    num_qo_heads: int,
-    sm_count: int,
-    device: torch.device,
-) -> torch.Tensor:
-    required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
-        batch_size, num_qo_heads, sm_count
-    )
-    if counter_buffer is None:
-        return _get_trtllm_gen_multi_ctas_kv_counter_buffer(
-            batch_size, num_qo_heads, sm_count, device
-        )
-    if counter_buffer.device != device:
-        raise ValueError(
-            "multi_ctas_kv_counter_buffer must be on the same device as query"
-        )
-    if not counter_buffer.is_contiguous():
-        raise ValueError("multi_ctas_kv_counter_buffer must be contiguous")
-    counter_buffer_bytes = counter_buffer.numel() * counter_buffer.element_size()
-    if counter_buffer_bytes < required_counter_bytes:
-        raise ValueError(
-            "multi_ctas_kv_counter_buffer is too small: got "
-            f"{counter_buffer_bytes} bytes, need {required_counter_bytes} bytes"
-        )
-    return counter_buffer
-
-
 class TrtllmGenMlaDecodeRunner(TunableRunner):
     """Wraps ``trtllm_paged_attention_decode`` for the autotuner.
 
@@ -2274,6 +2246,10 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.kv_cache = kv_cache
         self.workspace_buffer = workspace_buffer
         self.sm_count = sm_count
+        # Allocated lazily for autotune profiling and reused (grown if a later
+        # profile needs more). The final request may instead pass a caller-owned
+        # buffer directly to forward(). The kernel self-resets the counters after
+        # each ordered launch, so neither path re-zeros between launches.
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
         self.qk_nope_head_dim = qk_nope_head_dim
         self.kv_lora_rank = kv_lora_rank
@@ -2292,10 +2268,6 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
         self.return_lse = return_lse
         self.lse = lse
-        # Allocated lazily for autotune profiling and reused (grown if a later
-        # profile needs more). The final request may instead pass a caller-owned
-        # buffer directly to forward(). The kernel self-resets the counters after
-        # each ordered launch, so neither path re-zeros between launches.
 
     def __hash__(self):
         # The default `TunableRunner.__hash__` walks `self.__dict__` and falls
@@ -2382,8 +2354,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
                 else counter_buffer.numel() * counter_buffer.element_size()
             )
             if counter_buffer is None or counter_buffer_bytes < required_counter_bytes:
-                counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
-                    None,
+                counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
                     batch_size,
                     num_qo_heads,
                     self.sm_count,
