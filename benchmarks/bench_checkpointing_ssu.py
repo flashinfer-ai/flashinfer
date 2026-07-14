@@ -574,9 +574,9 @@ def build_kernel_inputs(
             f"dt (b,T) dims not row-major packed: stride(0)={dt.stride(0)}, "
             f"expected {mtp_len * dt.stride(1)} — can't view as (1, total, ...)"
         )
-        x = x.view(1, total, nheads, head_dim)
-        B = B.view(1, total, ngroups, d_state)
-        C = C.view(1, total, ngroups, d_state)
+        x = x.reshape(1, total, nheads, head_dim)
+        B = B.reshape(1, total, ngroups, d_state)
+        C = C.reshape(1, total, ngroups, d_state)
         # tie_hdim dt has stride[-1]=0 (einops expand) — .view() rejects it,
         # as_strided merges (b, T) while preserving the 0-stride head_dim.
         dt = dt.as_strided(
