@@ -2192,6 +2192,8 @@ class AutoTuner:
         try:
             with open(abs_path, "r") as f:
                 disk_configs = json.load(f)
+            if not isinstance(disk_configs, dict):
+                disk_configs = {}
             disk_meta = disk_configs.pop(_METADATA_KEY, None)
             hard, soft = (
                 _classify_metadata_mismatches(disk_meta, current_meta)
@@ -2208,11 +2210,12 @@ class AutoTuner:
                     f"cache path for the current environment, or delete "
                     f"the file to re-prime it."
                 )
-                if "hard" in self._warned_cache_mismatch:
-                    logger.debug(message)
-                else:
-                    self._warned_cache_mismatch.add("hard")
-                    logger.warning(message)
+                with self._lock:
+                    if "hard" in self._warned_cache_mismatch:
+                        logger.debug(message)
+                    else:
+                        self._warned_cache_mismatch.add("hard")
+                        logger.warning(message)
                 return
             if not soft:
                 # Same environment: merge on-disk entries and preserve the
@@ -2361,11 +2364,12 @@ class AutoTuner:
                     f"({_format_meta_mismatches({**hard, **soft})}). "
                     f"Ignoring cached configs. {consequence}"
                 )
-                if severity in self._warned_cache_mismatch:
-                    logger.debug(message)
-                else:
-                    self._warned_cache_mismatch.add(severity)
-                    logger.warning(message)
+                with self._lock:
+                    if severity in self._warned_cache_mismatch:
+                        logger.debug(message)
+                    else:
+                        self._warned_cache_mismatch.add(severity)
+                        logger.warning(message)
                 return False
 
         skipped_legacy_cudnn_tactics = 0
