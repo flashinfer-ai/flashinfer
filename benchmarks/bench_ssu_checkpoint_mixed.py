@@ -431,14 +431,10 @@ def run_in_process_bench(
     for batch in batch_sizes:
         print(f"\n[batch={batch}] sampling K={K} PNAT vectors...")
         pnats_np = sample_steady_state_pnat(al, T, window, batch, K, seed=seed)
-        # Per-sample pre-built tensors (int32 for the CUDA kernels,
-        # int64 for fi-replay).  Built on the host once and copied to the
-        # inputs.prev_tokens_* tensors at time_kernel() time.
+        # Per-sample pre-built int32 tensors.  Built on the host once and copied
+        # to the inputs.prev_tokens_* tensors at time_kernel() time.
         pnats_i32 = [
             torch.from_numpy(pnats_np[k].astype(np.int32)).cuda() for k in range(K)
-        ]
-        pnats_i64 = [
-            torch.from_numpy(pnats_np[k].astype(np.int64)).cuda() for k in range(K)
         ]
 
         # Build kernel inputs once per (batch, dtype) — reused across K and kernels.
@@ -459,7 +455,7 @@ def run_in_process_bench(
             print(f"[batch={batch}] timing kernel={kernel}", flush=True)
             per_sample_stats: list[tuple[float, float, float]] = []
             for k in range(K):
-                pt = pnats_i64[k] if kernel == "fi-replay" else pnats_i32[k]
+                pt = pnats_i32[k]
                 tag = f"mixed_b{batch}_T{T}_W{window}_{kernel}_s{k}"
                 # philox applies only to the kernels in _PHILOX_KERNELS.
                 kernel_philox = philox_rounds if kernel in _PHILOX_KERNELS else 0
@@ -616,7 +612,6 @@ def plot_results(rows: list[dict], png_path: Path) -> None:
     colors = {
         "cuda-incr": "#d62728",
         "fi-dump": "#2ca02c",
-        "fi-replay": "#ff7f0e",
         "baseline-triton": "#9467bd",
         "baseline-flashinfer": "#8c564b",
     }
@@ -720,7 +715,7 @@ def main() -> None:
         help=(
             "Comma-separated kernel names from bench_checkpointing_ssu.KernelName: "
             "cuda-incr, cuda-incr-2k, triton-replay, triton-replay-pm, fi-dump, "
-            "fi-replay, baseline-triton, baseline-flashinfer"
+            "baseline-triton, baseline-flashinfer"
         ),
     )
     parser.add_argument(
