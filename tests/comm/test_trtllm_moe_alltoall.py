@@ -678,6 +678,7 @@ def test_moe_alltoall_active_rank_mask_single_gpu(
                 ep_size=world_size,
                 top_k=1,
                 num_experts=num_experts,
+                enable_rank_mask=True,
                 active_rank_mask=active_mask,
             )
             output_tensors[rank] = out
@@ -719,6 +720,7 @@ def test_moe_alltoall_active_rank_mask_single_gpu(
                 top_k=1,
                 combine_payload_offset=combine_offsets[rank],
                 payload_in_workspace=False,
+                enable_rank_mask=True,
                 active_rank_mask=active_mask,
             )
     for rank in active_ranks:
@@ -771,7 +773,59 @@ def test_moe_alltoall_active_rank_mask_rejects_self_inactive():
             ep_size=world_size,
             top_k=1,
             num_experts=world_size,
+            enable_rank_mask=True,
             active_rank_mask=mask,
+        )
+
+
+def test_moe_alltoall_active_rank_mask_requires_enable_rank_mask():
+    """active_rank_mask is only meaningful (and only accepted) when enable_rank_mask=True;
+    passing a mask without opting in should raise rather than silently no-op."""
+    torch.cuda.set_device(0)
+    world_size = 4
+    num_tokens = 8
+    local_rank = 0
+    mask = trtllm_moe_alltoall.moe_a2a_active_rank_mask(range(world_size), world_size)
+
+    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        world_size, num_tokens * world_size, 4 * 2, 0
+    )
+    ws = torch.zeros(world_size, workspace_size, dtype=torch.uint8, device="cuda")
+    metainfo = trtllm_moe_alltoall.moe_a2a_initialize(
+        ws, local_rank, world_size, num_tokens * world_size
+    )
+    experts = torch.zeros(num_tokens, 1, dtype=torch.int32, device="cuda")
+    payload = torch.randn(num_tokens, 4, dtype=torch.bfloat16, device="cuda")
+
+    with pytest.raises(Exception, match="enable_rank_mask"):
+        trtllm_moe_alltoall.moe_a2a_dispatch(
+            experts,
+            [payload],
+            ws,
+            metainfo,
+            num_tokens,
+            ep_rank=local_rank,
+            ep_size=world_size,
+            top_k=1,
+            num_experts=world_size,
+            enable_rank_mask=False,
+            active_rank_mask=mask,
+        )
+
+    # enable_rank_mask=True without a mask should also raise (no silent all-active default).
+    with pytest.raises(Exception, match="active_rank_mask"):
+        trtllm_moe_alltoall.moe_a2a_dispatch(
+            experts,
+            [payload],
+            ws,
+            metainfo,
+            num_tokens,
+            ep_rank=local_rank,
+            ep_size=world_size,
+            top_k=1,
+            num_experts=world_size,
+            enable_rank_mask=True,
+            active_rank_mask=None,
         )
 
 

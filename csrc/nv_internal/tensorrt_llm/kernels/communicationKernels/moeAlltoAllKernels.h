@@ -87,8 +87,9 @@ struct CombineKernelPointers {
   int const* topk_send_indices;  // dst index per k, -1 for duplicates
 
   // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips flag
-  // writes/waits to/from masked peers and also skips per-token accumulation for ranks that
-  // become inactive between dispatch and combine.
+  // writes/waits to/from masked peers. Per-token accumulation does not recheck this mask
+  // (dispatch already dropped masked targets via topk_send_indices == -1); the mask is a
+  // per-collective snapshot, not something that changes between a dispatch and its combine.
   uint64_t active_rank_mask[kRankMaskWords];
 };
 
@@ -137,9 +138,16 @@ struct MoeA2ADispatchParams {
   int const* eplb_local_stats;          // [eplb_stats_num_experts]
   int* eplb_gathered_stats[kMaxRanks];  // [ep_size, eplb_stats_num_experts] per rank
 
-  // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Defaults to all-ones
-  // for backwards-compatible "no masking" behavior. NOTE: this initializer list must have
-  // exactly kRankMaskWords elements; update it alongside any change to kMaxRanks.
+  // Whether to instantiate a kernel variant that checks active_rank_mask at all. Defaults to
+  // false, which compiles out every is_rank_active() branch (dead-rank routing, peer counter
+  // mirroring, EPLB-stat gather, completion-flag write/wait) for the common no-fault-tolerance
+  // case. Must be true to use active_rank_mask for anything other than all-ones.
+  bool enable_rank_mask{false};
+
+  // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Only consulted by the
+  // kernel when enable_rank_mask is true; defaults to all-ones for backwards-compatible
+  // "no masking" behavior. NOTE: this initializer list must have exactly kRankMaskWords
+  // elements; update it alongside any change to kMaxRanks.
   uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}};
 
   // CUDA stream
@@ -213,9 +221,15 @@ struct MoeA2ACombineParams {
                                     // then source rank has signaled the target rank
   void const* recv_buffers[kMaxRanks];  // Per-rank receive buffers (only for single payload)
 
-  // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Defaults to all-ones
-  // for backwards-compatible "no masking" behavior. NOTE: this initializer list must have
-  // exactly kRankMaskWords elements; update it alongside any change to kMaxRanks.
+  // Whether to instantiate a kernel variant that checks active_rank_mask in peer
+  // synchronization. Defaults to false, which compiles out the is_rank_active() branches
+  // (completion-flag write/wait) for the common no-fault-tolerance case.
+  bool enable_rank_mask{false};
+
+  // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Only consulted by the
+  // kernel when enable_rank_mask is true; defaults to all-ones for backwards-compatible
+  // "no masking" behavior. NOTE: this initializer list must have exactly kRankMaskWords
+  // elements; update it alongside any change to kMaxRanks.
   uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}};
 
   // CUDA stream
