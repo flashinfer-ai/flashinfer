@@ -172,14 +172,6 @@ struct CheckpointingSsuParams {
   void* __restrict__ cumAdt_old{nullptr};  // f32 (batch, nheads, MAX_WINDOW), dense
 };
 
-// Forward declaration — defined in kernel_checkpointing_ssu.cuh.
-// `launchCheckpointingSsu` is the public dispatcher: it reads
-// `params.d_split` and routes to the matching `launchCheckpointingSsuImpl`
-// specialization (v12 §59).  Caller side stays single-entry.
-template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t, typename state_scale_t>
-void launchCheckpointingSsu(CheckpointingSsuParams& params, cudaStream_t stream);
-
 }  // namespace flashinfer::mamba::checkpointing
 
 #endif  // FLASHINFER_MAMBA_CHECKPOINTING_SSU_CUH_
