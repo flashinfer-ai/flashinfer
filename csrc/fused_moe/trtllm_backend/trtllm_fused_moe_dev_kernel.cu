@@ -194,6 +194,7 @@ struct KernelTraits<1> {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 constexpr int DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA = 128;
+constexpr int DEEP_SEEK_ACTIVATION_RESIDENT_GRID_ROUNDS = 4;
 
 template <typename KernelParams>
 __global__ void activationDeepSeekKernel(KernelParams params) {
@@ -328,6 +329,55 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <typename Type, int32_t NumTokensPerCta, bool UsePdl>
+int getDeepSeekActivationActiveCtasPerSm(int device) {
+  // Cache by exact kernel instantiation and refresh when this host thread switches devices.
+  static thread_local int cachedDevice{-1};
+  static thread_local int cachedActiveCtasPerSm{0};
+  if (cachedDevice != device) {
+    auto kernel = activationDeepSeekKernel<KernelParams<Type, NumTokensPerCta, UsePdl>>;
+    CHECK_CUDA_ERROR(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &cachedActiveCtasPerSm, kernel, DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0));
+    FLASHINFER_CHECK(cachedActiveCtasPerSm > 0,
+                     "DeepSeek FP8 activation kernel has no resident CTAs.");
+    cachedDevice = device;
+  }
+  return cachedActiveCtasPerSm;
+}
+
+template <typename Type, int32_t NumTokensPerCta>
+int getDeepSeekActivationActiveCtasPerSm(int device, bool usePdl) {
+  return usePdl ? getDeepSeekActivationActiveCtasPerSm<Type, NumTokensPerCta, true>(device)
+                : getDeepSeekActivationActiveCtasPerSm<Type, NumTokensPerCta, false>(device);
+}
+
+template <typename Type>
+int getDeepSeekActivationActiveCtasPerSm(int device, int numTokensPerCta, bool usePdl) {
+  if (numTokensPerCta == 4) {
+    return getDeepSeekActivationActiveCtasPerSm<Type, 4>(device, usePdl);
+  } else if (numTokensPerCta == 2) {
+    return getDeepSeekActivationActiveCtasPerSm<Type, 2>(device, usePdl);
+  }
+  return getDeepSeekActivationActiveCtasPerSm<Type, 1>(device, usePdl);
+}
+
+int getDeepSeekActivationActiveCtasPerSm(Data const& data, int device, int numTokensPerCta) {
+  if (data.mDtypeElt == tg::Dtype::Fp16) {
+    return getDeepSeekActivationActiveCtasPerSm<cutlass::half_t>(device, numTokensPerCta,
+                                                                 data.mUsePdl);
+  } else if (data.mDtypeElt == tg::Dtype::E4m3) {
+    return getDeepSeekActivationActiveCtasPerSm<cutlass::float_e4m3_t>(device, numTokensPerCta,
+                                                                       data.mUsePdl);
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {
+    return getDeepSeekActivationActiveCtasPerSm<cutlass::bfloat16_t>(device, numTokensPerCta,
+                                                                     data.mUsePdl);
+  }
+  FLASHINFER_CHECK(false, "Unsupported dtypeElt for DeepSeek FP8 activation.");
+  return 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void run(Data const& data, void* stream) {
   if (data.mDtypeElt == tg::Dtype::E2m1) {
     // Note: this should be unreachable because the options are checked beforehand.
@@ -346,9 +396,9 @@ void run(Data const& data, void* stream) {
     constexpr int NUM_ELTS_PER_SF = 128;
 
     int device{-1};
-    cudaGetDevice(&device);
+    CHECK_CUDA_ERROR(cudaGetDevice(&device));
     int numSms = 0;
-    cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
+    CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device));
 
     // Output dimension is innerDim / 2, and each scale block is 128 elements
     int const outputDim = data.innerDim / 2;
@@ -370,8 +420,15 @@ void run(Data const& data, void* stream) {
         data.tileTokensDim >= numTokensPerCta && data.tileTokensDim % numTokensPerCta == 0,
         "tileTokensDim must be divisible by numTokensPerCta.");
 
-    int const gridSizeY =
+    int const logicalGridSizeY =
         std::min(8192, (data.numTokens + numTokensPerCta - 1) / numTokensPerCta * data.topK);
+    int const activeCtasPerSm = getDeepSeekActivationActiveCtasPerSm(data, device, numTokensPerCta);
+    int64_t const logicalCtas = static_cast<int64_t>(gridSizeX) * logicalGridSizeY;
+    int64_t const residentCtas = static_cast<int64_t>(numSms) * activeCtasPerSm;
+    int64_t const launchCtas =
+        std::min(logicalCtas, residentCtas * DEEP_SEEK_ACTIVATION_RESIDENT_GRID_ROUNDS);
+    int const gridSizeY = static_cast<int>(
+        std::min<int64_t>(logicalGridSizeY, (launchCtas + gridSizeX - 1) / gridSizeX));
 
     const dim3 grid(gridSizeX, gridSizeY, 1);
 
