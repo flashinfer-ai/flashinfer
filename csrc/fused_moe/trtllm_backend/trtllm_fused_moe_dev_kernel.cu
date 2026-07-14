@@ -320,7 +320,9 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
         params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
       }
     }
-    __syncthreads();
+    if (groupIdx + gridDim.y < totalGroups) {
+      __syncthreads();
+    }
   }
 }
 
