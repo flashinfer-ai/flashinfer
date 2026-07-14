@@ -480,15 +480,20 @@ class TmemCorrResource(DecodeGenResourceBase):
         _ = self
         # Peer CTA writes one 16-byte partial-O vector into owner distributed
         # SMEM and charges the bytes to the owner's transaction mbarrier.
-        prims.st_async(
-            dst_ptr,
-            vals[0],
-            vals[1],
-            vals[2],
-            vals[3],
-            mbar=mbarrier,
-            type=prims.StAsyncType.B32,
-            vec=prims.StAsyncVec.V4,
+        # CTK 13.3 cannot lower the vector form of ``nvvm.store.async``. Keep
+        # the vectorized publication through the public inline-PTX API instead
+        # of falling back to four scalar stores.
+        cute.arch.inline_ptx(
+            "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 "
+            "[{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}}, [{$r5}];",
+            read_only_args=[
+                dst_ptr.ir_value(),
+                vals[0],
+                vals[1],
+                vals[2],
+                vals[3],
+                mbarrier.ir_value(),
+            ],
         )
 
     @cute.jit
@@ -499,13 +504,15 @@ class TmemCorrResource(DecodeGenResourceBase):
         _ = self
         # Peer CTA writes one float2 (max, sum) stats record and signals the
         # same owner mbarrier used by the matching partial-O vectors.
-        prims.st_async(
-            dst_ptr,
-            val0,
-            val1,
-            mbar=mbarrier,
-            type=prims.StAsyncType.F32,
-            vec=prims.StAsyncVec.V2,
+        cute.arch.inline_ptx(
+            "st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 "
+            "[{$r0}], {{$r1}, {$r2}}, [{$r3}];",
+            read_only_args=[
+                dst_ptr.ir_value(),
+                val0,
+                val1,
+                mbarrier.ir_value(),
+            ],
         )
 
     @cute.jit

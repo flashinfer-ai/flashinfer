@@ -65,6 +65,7 @@ from ..helpers.tile_scheduler import (
     MLAStaticTileScheduler,
     MLAStaticTileSchedulerParams,
     create_mla_static_tile_scheduler,
+    divmod_constexpr_power_of_two_or_fdd,
 )
 from ..helpers.math import (
     ceil_div,
@@ -267,6 +268,8 @@ class MlaWorkQueue(WorkQueue):
     groups_tokens_heads_q_ratio: cutlass.Constexpr[int] = 1
     logical_num_heads_q: cutlass.Constexpr[int] = 128
     logical_seq_len_q: cutlass.Constexpr[int] = 1
+    static_problem_shape_b: cutlass.Constexpr[int] = None
+    static_problem_shape_s: cutlass.Constexpr[int] = None
     use_clc_dynamic: cutlass.Constexpr[bool] = False
     work_tile: cutlass.Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     skip_work_tile: cutlass.Constexpr[TaskLocalVariable] = (
@@ -287,6 +290,8 @@ class MlaWorkQueue(WorkQueue):
         groups_tokens_heads_q_ratio=1,
         logical_num_heads_q=128,
         logical_seq_len_q=1,
+        static_problem_shape_b=None,
+        static_problem_shape_s=None,
         use_clc_dynamic=False,
         tile_scheduler_config=None,
         **kwargs,
@@ -314,6 +319,8 @@ class MlaWorkQueue(WorkQueue):
         self.groups_tokens_heads_q_ratio = groups_tokens_heads_q_ratio
         self.logical_num_heads_q = logical_num_heads_q
         self.logical_seq_len_q = logical_seq_len_q
+        self.static_problem_shape_b = static_problem_shape_b
+        self.static_problem_shape_s = static_problem_shape_s
         self.work_tile = TaskLocalVariable(
             dtype=MlaTsWorkTileInfo,
             default=MlaTsWorkTileInfo(
@@ -384,8 +391,9 @@ class MlaWorkQueue(WorkQueue):
         cluster_width = Int32(params.cluster_shape_mnk[0])
         s_idx = query_cluster_idx // cluster_width
         cluster_idx = query_cluster_idx % cluster_width
-        split_kv_idx, b_idx = divmod(
+        split_kv_idx, b_idx = divmod_constexpr_power_of_two_or_fdd(
             split_batch_idx,
+            self.static_problem_shape_b,
             params.problem_shape_b_fdd,
         )
         return self._make_work_tile_info(
@@ -484,12 +492,14 @@ class MlaWorkQueue(WorkQueue):
             current_work_linear_idx // params.cluster_shape_mnk[0],
             current_work_linear_idx % params.cluster_shape_mnk[0],
         )
-        current_work_s_batch, s_idx = divmod(
+        current_work_s_batch, s_idx = divmod_constexpr_power_of_two_or_fdd(
             current_work_cluster_batch,
+            self.static_problem_shape_s,
             params.problem_shape_s_fdd,
         )
-        current_work_b_batch, b_idx = divmod(
+        current_work_b_batch, b_idx = divmod_constexpr_power_of_two_or_fdd(
             current_work_s_batch,
+            self.static_problem_shape_b,
             params.problem_shape_b_fdd,
         )
         if cutlass.const_expr(self.static_split_kv == 1):
@@ -518,7 +528,11 @@ class MlaWorkQueue(WorkQueue):
     @cute.jit
     def _work_tile_from_block_idx(self, block_idx):
         params = self.tile_sched_params
-        s_idx, b_idx = divmod(block_idx[1], params.problem_shape_b_fdd)
+        s_idx, b_idx = divmod_constexpr_power_of_two_or_fdd(
+            block_idx[1],
+            self.static_problem_shape_b,
+            params.problem_shape_b_fdd,
+        )
         return self._make_work_tile_info(
             (block_idx[0], s_idx, b_idx, block_idx[2]),
             Boolean(True),
@@ -544,7 +558,13 @@ class MlaWorkQueue(WorkQueue):
     def advance_tile(self, stage_info: StageInfo):
         """Advance CLC through its response pipeline; static is task-owned."""
         if cutlass.const_expr(self.use_clc_dynamic):
-            return self._get_and_advance_work_tile_impl(stage_info)
+            # CUTLASS DSL 4.7's base implementation decodes the staged CLC
+            # response directly through the tile scheduler, which returns a
+            # generic WorkTileInfo and bypasses this resource's MLA adapter.
+            # Decode through the override here so the task-local value keeps
+            # its MlaTsWorkTileInfo type and cached runtime K-domain fields.
+            stage_response_ptr = self._get_stage_response_ptr(stage_info.stage_idx)
+            return self._work_tile_info_from_clc_response(stage_response_ptr)
         return stage_info.work_tile
 
 

@@ -36,6 +36,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32
 
+from cutlass.experimental.task_scheduling.memory import ResourceContext
 from cutlass.experimental.task_scheduling.schedule_builder import domain_loop, schedule
 from cutlass.experimental.task_scheduling.enums import ScheduleStageType
 from cutlass.experimental.task_scheduling.resources import StageInfo
@@ -84,14 +85,18 @@ class MlaTask(Task):
     """Task subclass that recomputes MLA k-domain per persistent work tile."""
 
     @cute.jit
-    def _run_one_mla_work_tile(self, work_tile) -> None:
+    def _run_one_mla_work_tile(
+        self,
+        work_tile,
+        context: ResourceContext | None = None,
+    ) -> None:
         """Run a persistent work tile using the cached split-KV domain."""
 
         # WorkQueue decomposes the MLA persistent tile and caches the K-domain.
         # Keep task bodies on that cached value so page-offset/TMA/MMA/softmax
         # paths do not each rebuild the same split-KV arithmetic.
         self.domain = work_tile.k_tile_count
-        self._run_task_body_impl(work_tile)
+        self._run_task_body_impl(work_tile, context=context)
 
     @cute.jit
     def _drain_mla_work_tile_tails(self) -> None:
@@ -123,7 +128,10 @@ class MlaTask(Task):
             self.work_queue.producer_tail()
 
     @cute.jit
-    def _run_task_body_persistent(self) -> None:
+    def _run_task_body_persistent(
+        self,
+        context: ResourceContext | None = None,
+    ) -> None:
         """Schedule one or more persistent work tiles for this task instance."""
 
         params = self.work_queue.tile_sched_params
@@ -131,14 +139,14 @@ class MlaTask(Task):
         if cutlass.const_expr(not params.is_persistent):
             work_tile = self.work_queue._work_tile_from_block_idx(cute.arch.block_idx())
             self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
-            self._run_pre_work_loop_entries(work_tile)
-            self._run_one_mla_work_tile(work_tile)
-            self._run_post_work_loop_entries(work_tile)
+            self._run_pre_work_loop_entries(work_tile, context)
+            self._run_one_mla_work_tile(work_tile, context)
+            self._run_post_work_loop_entries(work_tile, context)
             self._drain_mla_work_tile_tails()
             return
 
         if cutlass.const_expr(self.work_queue.use_clc_dynamic):
-            self._run_task_body_clc_persistent()
+            self._run_task_body_clc_persistent(context)
             return
 
         current_work_linear_idx = cute.arch.block_idx()[0]
@@ -151,7 +159,7 @@ class MlaTask(Task):
         work_tile = self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
 
-        self._run_pre_work_loop_entries(work_tile)
+        self._run_pre_work_loop_entries(work_tile, context)
         while current_work_linear_idx < num_blocks:
             work_tile.update_from(
                 self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
@@ -162,7 +170,7 @@ class MlaTask(Task):
             # splits empty. Skip them and continue grid-striding rather than
             # running a captured HEAD/TAIL sequence with domain zero.
             if work_tile.k_tile_count > cutlass.Int32(0):
-                self._run_one_mla_work_tile(work_tile)
+                self._run_one_mla_work_tile(work_tile, context)
 
             # Each warp branch advances from the same scalar tile id, keeping
             # the persistent loop state compact across task bodies.
@@ -174,11 +182,15 @@ class MlaTask(Task):
             self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
         )
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
-        self._run_post_work_loop_entries(work_tile)
+        self._run_post_work_loop_entries(work_tile, context)
         self._drain_mla_work_tile_tails()
 
     @cute.jit
-    def _advance_empty_clc_work_tile(self, work_tile) -> None:
+    def _advance_empty_clc_work_tile(
+        self,
+        work_tile,
+        context: ResourceContext | None = None,
+    ) -> None:
         """Run only WorkQueue tail slots for a zero-K CLC tile."""
 
         for resource, schedule_stage, call_id, label in self.tail_schedule_list:
@@ -204,6 +216,7 @@ class MlaTask(Task):
                     label=label,
                     schedule_stage=schedule_stage,
                     routing_slot=routing_slot,
+                    context=context,
                 )
                 self._run_step(
                     resource,
@@ -214,12 +227,15 @@ class MlaTask(Task):
                 )
 
     @cute.jit
-    def _run_task_body_clc_persistent(self) -> None:
+    def _run_task_body_clc_persistent(
+        self,
+        context: ResourceContext | None = None,
+    ) -> None:
         """Consume cluster-wide CLC responses while preserving MLA domains."""
 
         work_tile = self.work_queue.initial_work_tile_info()
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
-        self._run_pre_work_loop_entries(work_tile)
+        self._run_pre_work_loop_entries(work_tile, context)
 
         # Carry scalar fields through the dynamic loop and reconstruct the
         # value object for each body.  Mutating one Python container in place
@@ -242,12 +258,12 @@ class MlaTask(Task):
                 k_index_base,
             )
             if k_tile_count > Int32(0):
-                self._run_one_mla_work_tile(current_work_tile)
+                self._run_one_mla_work_tile(current_work_tile, context)
             else:
                 # Runtime K may be much shorter than the planned maximum.
                 # Empty splits must still consume/release this response stage
                 # so every warp in both CTAs advances to the same next tile.
-                self._advance_empty_clc_work_tile(current_work_tile)
+                self._advance_empty_clc_work_tile(current_work_tile, context)
             next_work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
             cluster_idx, seq_q_idx, batch_idx, split_kv_idx = next_work_tile.tile_idx
             is_valid = Boolean(next_work_tile.is_valid_tile)
@@ -263,7 +279,7 @@ class MlaTask(Task):
             k_tile_count,
             k_index_base,
         )
-        self._run_post_work_loop_entries(final_work_tile)
+        self._run_post_work_loop_entries(final_work_tile, context)
         self._drain_mla_work_tile_tails()
 
 
@@ -280,7 +296,11 @@ class MlaInterleavedTask(MlaTask):
         self._fixed_loop_end = cutlass.Int32(self.domain_start)
 
     @cute.jit
-    def _run_one_mla_work_tile(self, work_tile) -> None:
+    def _run_one_mla_work_tile(
+        self,
+        work_tile,
+        context: ResourceContext | None = None,
+    ) -> None:
         """Run one tile by mapping its local offsets onto this fixed lane."""
 
         fixed_lane = cutlass.Int32(self.domain_start)
@@ -293,7 +313,7 @@ class MlaInterleavedTask(MlaTask):
         ) // cutlass.Int32(2)
         self._fixed_loop_end = fixed_lane + lane_iterations * cutlass.Int32(2)
         self.domain = self._fixed_loop_end
-        self._run_task_body_impl(work_tile)
+        self._run_task_body_impl(work_tile, context=context)
         self._cumulative_k_parity = (
             self._cumulative_k_parity + self._actual_domain
         ) % cutlass.Int32(2)
@@ -309,6 +329,7 @@ class MlaInterleavedTask(MlaTask):
         label=None,
         schedule_stage=None,
         routing_slot=None,
+        context: ResourceContext | None = None,
     ) -> StageInfo:
         """Return base pipeline state with the work tile's actual K offset."""
 
@@ -322,6 +343,7 @@ class MlaInterleavedTask(MlaTask):
             label,
             schedule_stage,
             routing_slot,
+            context=context,
         )
         actual_loop_offset = self._mapped_domain_start + (
             cutlass.Int32(base_info.loop_offset) - cutlass.Int32(self.domain_start)

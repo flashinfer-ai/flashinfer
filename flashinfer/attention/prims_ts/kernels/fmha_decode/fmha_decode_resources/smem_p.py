@@ -936,7 +936,6 @@ class SmemPResource(DecodeGenResourceBase):
                 self._smem_base_p,
                 leading_byte_offset=Int32(cfg.tile_size_q * 128),
                 stride_byte_offset=1024,
-                version=1,
                 layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
             )
             if cutlass.const_expr(self.inst_id == 0):

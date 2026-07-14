@@ -35,7 +35,10 @@ import cutlass.utils as utils
 from cuda.bindings import driver as cuda_drv
 from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
-from ..tensor_map import create_tensor_map_ragged_from_tensor
+from ..tensor_map import (
+    create_tensor_map_ragged_from_tensor,
+    create_tensor_map_tiled_from_view,
+)
 
 from cutlass.experimental.task_scheduling.enums import PipelineType
 from cutlass.experimental.task_scheduling.memory import (
@@ -2129,19 +2132,19 @@ def fmha_decode_launch(
             q_groups = (
                 (h_r + Int32(cfg.tile_size_q - 1)) // Int32(cfg.tile_size_q)
             ) * q_seq
-        tma_desc_q = cuda.create_tensor_map_tiled_from_tensor(
+        tma_desc_q = create_tensor_map_tiled_from_view(
             q_tma,
             box_dims=q_box_dims,
             stride_order=(0, 1, 2, 3, 4),
             swizzle=tma_swizzle,
         )
-    tma_desc_k = cuda.create_tensor_map_tiled_from_tensor(
+    tma_desc_k = create_tensor_map_tiled_from_view(
         k_tma,
         box_dims=(tma_box0_kv, tma_kv_tokens, 1, 1),
         stride_order=(0, 1, 2, 3),
         swizzle=tma_swizzle,
     )
-    tma_desc_v = cuda.create_tensor_map_tiled_from_tensor(
+    tma_desc_v = create_tensor_map_tiled_from_view(
         v_tma,
         box_dims=(tma_box0_kv, tma_kv_tokens, 1, 1),
         stride_order=(0, 1, 2, 3),

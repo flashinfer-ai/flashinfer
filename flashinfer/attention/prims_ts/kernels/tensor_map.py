@@ -16,6 +16,7 @@ from cutlass.base_dsl.typing import Int8, Int32, Int64, Numeric
 import cutlass.cute as cute
 from cutlass.cute.core import depth, leading_dim
 import cutlass._mlir.ir as ir
+from cutlass.experimental.cuda import tensor_map as _cuda_tensor_map
 
 from cutlass.experimental.cuda.tensor_map import (
     TensorMap,
@@ -29,6 +30,19 @@ from cutlass.experimental.cuda.tensor_map import (
     get_dsl_type_to_tensormap_type,
     get_tensormap_type_to_dsl_type,
 )
+
+
+# The 4.7 release wheel publishes this API as ``*_from_view``.  DKG snapshots
+# predating that public spelling expose the same implementation and signature
+# as ``*_from_tensor``.  Resolve the name once so the kernels use the public
+# API while the unchanged local-development bootstrap remains usable.
+create_tensor_map_tiled_from_view = getattr(
+    _cuda_tensor_map, "create_tensor_map_tiled_from_view", None
+)
+if create_tensor_map_tiled_from_view is None:
+    create_tensor_map_tiled_from_view = (
+        _cuda_tensor_map.create_tensor_map_tiled_from_tensor
+    )
 
 
 # Module-private constants used by the ragged-TMA helpers below. The
@@ -282,7 +296,7 @@ def create_tensor_map_ragged_from_tensor(
     :type tensor: cute.Tensor
     :param box_dims: Tile dimensions in **tensor mode order** (same
         convention as
-        ``create_tensor_map_tiled_from_tensor``).
+        ``create_tensor_map_tiled_from_view``).
         ``box_dims[ragged_dim]`` doubles as the wraparound period of
         the synthetic splice.
     :type box_dims: tuple[Int8 or int, ...]
@@ -292,7 +306,7 @@ def create_tensor_map_ragged_from_tensor(
     :type ragged_dim: int
     :param stride_order: Explicit dimension order from innermost to
         outermost (same semantics as
-        ``create_tensor_map_tiled_from_tensor``).
+        ``create_tensor_map_tiled_from_view``).
     :type stride_order: tuple[int, ...], optional
     :param interleave: Interleave mode, defaults to ``none``.
     :param swizzle: Swizzle mode, defaults to ``none``.

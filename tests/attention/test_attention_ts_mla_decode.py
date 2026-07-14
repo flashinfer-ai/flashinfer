@@ -520,6 +520,21 @@ _MLA_CASES = (
         False,
         id="M9-spec-causal-tail-progressive",
     ),
+    _param(
+        _case(128, 128, 2048, torch.bfloat16, 32009),
+        _policy(
+            "throughput_2cta",
+            128,
+            1,
+            256,
+            cga=False,
+            persistent=True,
+            clc=True,
+        ),
+        None,
+        False,
+        id="M10-bf16-2cta-q128-direct-clc",
+    ),
 )
 
 

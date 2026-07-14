@@ -837,6 +837,38 @@ _FMHA_CASES = (
         "tail",
         id="F9-spec-causal-tail-progressive",
     ),
+    _param(
+        _case(
+            3,
+            2051,
+            32,
+            256,
+            torch.bfloat16,
+            31009,
+            num_kv_heads=4,
+            page_size=16,
+        ),
+        _policy("swaps_mma_ab", 8),
+        None,
+        id="F10-bf16-d256-page16-staged",
+    ),
+    _param(
+        _case(
+            16,
+            2051,
+            96,
+            128,
+            torch.float8_e4m3fn,
+            31010,
+            num_kv_heads=8,
+            seq_len_q=8,
+            page_size=32,
+            mask_type="causal",
+        ),
+        _policy("keeps_mma_ab", 128, splits=1, split=False),
+        "tail",
+        id="F11-fp8-sq8-q128-runtime-causal",
+    ),
 )
 
 

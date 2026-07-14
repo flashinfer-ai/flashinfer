@@ -26,7 +26,10 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cutlass.cute.testing import assert_ as runtime_assert
 from cutlass import Float32, Int32, Int64
-from ...tensor_map import create_tensor_map_ragged_from_tensor
+from ...tensor_map import (
+    create_tensor_map_ragged_from_tensor,
+    create_tensor_map_tiled_from_view,
+)
 from cutlass.experimental import cuda
 from cutlass.experimental import primitives as prims
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
@@ -1877,7 +1880,7 @@ class ThroughputLatencyMlaDecodeTs:
                     ),
                 ),
             )
-            tma_desc_q_latent = cuda.create_tensor_map_tiled_from_tensor(
+            tma_desc_q_latent = create_tensor_map_tiled_from_view(
                 q_latent_tma,
                 box_dims=(tma_box0, cfg.tile_size_q, 1),
                 stride_order=(0, 1, 2),
@@ -1920,7 +1923,7 @@ class ThroughputLatencyMlaDecodeTs:
                     ),
                 ),
             )
-            tma_desc_q_rope = cuda.create_tensor_map_tiled_from_tensor(
+            tma_desc_q_rope = create_tensor_map_tiled_from_view(
                 q_rope_tma,
                 box_dims=(min(tma_box0, cfg.rope_dim), cfg.tile_size_q, 1),
                 stride_order=(0, 1, 2),
@@ -1932,7 +1935,7 @@ class ThroughputLatencyMlaDecodeTs:
             c_latent.iterator,
             cute.select(c_latent.layout, mode=[1, 0, 2]),
         )
-        tma_desc_c_latent = cuda.create_tensor_map_tiled_from_tensor(
+        tma_desc_c_latent = create_tensor_map_tiled_from_view(
             c_latent_tma,
             box_dims=(tma_box0, tma_page_tokens, 1),
             stride_order=(0, 1, 2),
@@ -1947,7 +1950,7 @@ class ThroughputLatencyMlaDecodeTs:
         c_rope_swizzle = cuda.TensorMapSwizzle.s128b
         if cutlass.const_expr(cfg.is_fp8_qkv() and cfg.rope_dim == 64):
             c_rope_swizzle = cuda.TensorMapSwizzle.s64b
-        tma_desc_c_rope = cuda.create_tensor_map_tiled_from_tensor(
+        tma_desc_c_rope = create_tensor_map_tiled_from_view(
             c_rope_tma,
             box_dims=(min(tma_box0, cfg.rope_dim), tma_page_tokens, 1),
             stride_order=(0, 1, 2),

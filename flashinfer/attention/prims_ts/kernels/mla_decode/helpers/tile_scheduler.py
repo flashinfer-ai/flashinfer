@@ -21,6 +21,34 @@ import cutlass
 import cutlass.cute as cute
 
 
+def _is_positive_power_of_two(value: int) -> bool:
+    """Return whether a host-known scheduler extent is a power of two."""
+
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+        and (value & (value - 1)) == 0
+    )
+
+
+@cute.jit
+def divmod_constexpr_power_of_two_or_fdd(
+    dividend,
+    constexpr_divisor: cutlass.Constexpr[int],
+    fallback_divisor: cute.FastDivmodDivisor,
+):
+    """Use shift/mask for a power-of-two constexpr, otherwise the existing FDD."""
+
+    if cutlass.const_expr(_is_positive_power_of_two(constexpr_divisor)):
+        shift = constexpr_divisor.bit_length() - 1
+        return (
+            dividend >> cutlass.Int32(shift),
+            dividend & cutlass.Int32(constexpr_divisor - 1),
+        )
+    return divmod(dividend, fallback_divisor)
+
+
 class MLAStaticTileSchedulerParams:
     """Static scheduler parameters for MLA split-KV work tiles."""
 

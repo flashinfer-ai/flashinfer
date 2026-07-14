@@ -160,14 +160,12 @@ class TmemOResource(MlaResource):
                 self.p0_ref._smem_p,
                 leading_byte_offset=Int32(self.cfg.tile_size_q * SMEM_ROW_BYTES),
                 stride_byte_offset=TCGEN05_BF16_SWIZZLE_STRIDE_BYTES,
-                version=1,
                 layout=qkv_smem_swizzle(self.cfg),
             )
         return cprims.Tcgen05SmemDesc.build(
             self.p1_ref._smem_p,
             leading_byte_offset=Int32(self.cfg.tile_size_q * SMEM_ROW_BYTES),
             stride_byte_offset=TCGEN05_BF16_SWIZZLE_STRIDE_BYTES,
-            version=1,
             layout=qkv_smem_swizzle(self.cfg),
         )
 

@@ -324,7 +324,21 @@ class TmemCorrResource(MlaResource):
         ) + Int64(local_head_dim_byte_offset)
         remote_ptr = self._cga_remote_smem_ptr(owner_rank, byte_offset, Int32)
         remote_barrier = prims.mapa(self._cga_reduction_barrier, owner_rank)
-        prims.store_async(remote_ptr, partial_vec, remote_barrier)
+        # CTK 13.3 cannot lower the vector form of ``nvvm.store.async``. Keep
+        # one 16-byte publication through the public inline-PTX API instead of
+        # expanding it into four scalar stores.
+        cute.arch.inline_ptx(
+            "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 "
+            "[{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}}, [{$r5}];",
+            read_only_args=[
+                remote_ptr.ir_value(),
+                partial_vec[0],
+                partial_vec[1],
+                partial_vec[2],
+                partial_vec[3],
+                remote_barrier.ir_value(),
+            ],
+        )
 
     @cute.jit
     def _store_partial_lse_to_cga_smem(self, local_row_idx, cta_idx_kv, lse_val):
@@ -340,7 +354,15 @@ class TmemCorrResource(MlaResource):
         )
         remote_ptr = self._cga_remote_smem_ptr(owner_rank, byte_offset, Int32)
         remote_barrier = prims.mapa(self._cga_reduction_barrier, owner_rank)
-        prims.store_async(remote_ptr, lse_val.bitcast(Int32), remote_barrier)
+        cute.arch.inline_ptx(
+            "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 "
+            "[{$r0}], {$r1}, [{$r2}];",
+            read_only_args=[
+                remote_ptr.ir_value(),
+                lse_val.bitcast(Int32),
+                remote_barrier.ir_value(),
+            ],
+        )
 
     @cute.jit
     def _store_o_slice_to_gmem(

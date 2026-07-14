@@ -43,7 +43,10 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 from cutlass.experimental.task_scheduling.enums import PipelineType, SignalingThreads
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
-from ...tensor_map import create_tensor_map_ragged_from_tensor
+from ...tensor_map import (
+    create_tensor_map_ragged_from_tensor,
+    create_tensor_map_tiled_from_view,
+)
 
 from .config import (
     LOG2_E,
@@ -664,6 +667,7 @@ from ..helpers.tile_scheduler import (
     MLAStaticTileSchedulerParams,
     MLAStaticTileScheduler,
     create_mla_static_tile_scheduler_params,
+    divmod_constexpr_power_of_two_or_fdd,
 )
 
 
@@ -1109,7 +1113,7 @@ class MlaDecodeTs:
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
         else:
-            tma_desc_q_latent = cuda.create_tensor_map_tiled_from_tensor(
+            tma_desc_q_latent = create_tensor_map_tiled_from_view(
                 q_latent_tma,
                 box_dims=(cfg.mma_qk_tiler[2], cfg.mma_qk_tiler[0] // 2, 1),
                 stride_order=(0, 1, 2),
@@ -1135,7 +1139,7 @@ class MlaDecodeTs:
                     l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
                 )
             else:
-                tma_desc_q_rope = cuda.create_tensor_map_tiled_from_tensor(
+                tma_desc_q_rope = create_tensor_map_tiled_from_view(
                     q_rope_tma,
                     box_dims=(
                         cfg.mma_qk_rope_tiler[2],
@@ -1153,7 +1157,7 @@ class MlaDecodeTs:
             c_latent.iterator,
             cute.select(c_latent.layout, mode=[1, 0, 2]),
         )
-        tma_desc_c_latent = cuda.create_tensor_map_tiled_from_tensor(
+        tma_desc_c_latent = create_tensor_map_tiled_from_view(
             c_latent_tma,
             box_dims=(cfg.mma_qk_tiler[2], cfg.kc_page_tile_size, 1),
             stride_order=(0, 1, 2),
@@ -1169,7 +1173,7 @@ class MlaDecodeTs:
             c_rope_swizzle = cuda.TensorMapSwizzle.s128b
             if cutlass.const_expr(cfg.is_fp8_qkv() and cfg.rope_dim == 64):
                 c_rope_swizzle = cuda.TensorMapSwizzle.s64b
-            tma_desc_c_rope = cuda.create_tensor_map_tiled_from_tensor(
+            tma_desc_c_rope = create_tensor_map_tiled_from_view(
                 c_rope_tma,
                 box_dims=(cfg.mma_qk_rope_tiler[2], cfg.kc_page_tile_size, 1),
                 stride_order=(0, 1, 2),
@@ -1188,7 +1192,7 @@ class MlaDecodeTs:
         )
         # The physical page controls only the GMEM coordinate.  TMA assembles
         # fixed K32 SMEM blocks for PV from one or more page-bounded copies.
-        tma_desc_c_transpose = cuda.create_tensor_map_tiled_from_tensor(
+        tma_desc_c_transpose = create_tensor_map_tiled_from_view(
             c_latent_transpose,
             box_dims=(V_TMA_LATENT_ELEMENTS, cfg.v_tma_token_count, 1),
             stride_order=(0, 1, 2),
@@ -1378,6 +1382,10 @@ class MlaDecodeTs:
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
         )
+        effective_seq_len_q = groups_tokens_heads_q_group_count(
+            self.seq_len_q,
+            self.groups_tokens_heads_q_ratio,
+        )
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
         tiled_mma_qk = None
         if cutlass.const_expr(cfg.is_fp8_qkv()):
@@ -1500,8 +1508,9 @@ class MlaDecodeTs:
             query_cluster_idx, _, split_batch_idx = cute.arch.block_idx()
             seq_q_idx = query_cluster_idx // Int32(cfg.cluster_shape_mnk[0])
             cluster_idx = query_cluster_idx % Int32(cfg.cluster_shape_mnk[0])
-            split_kv_idx, batch_idx = divmod(
+            split_kv_idx, batch_idx = divmod_constexpr_power_of_two_or_fdd(
                 split_batch_idx,
+                self.batch_size,
                 tile_sched_params.problem_shape_b_fdd,
             )
             blk_coord = (cluster_idx, seq_q_idx, batch_idx, split_kv_idx)
@@ -1511,11 +1520,15 @@ class MlaDecodeTs:
                 cfg.cluster_shape_mnk[0]
             )
             cluster_idx = current_work_linear_idx % Int32(cfg.cluster_shape_mnk[0])
-            current_work_after_seq_q, seq_q_idx = divmod(
-                current_work_cluster_batch, tile_sched_params.problem_shape_s_fdd
+            current_work_after_seq_q, seq_q_idx = divmod_constexpr_power_of_two_or_fdd(
+                current_work_cluster_batch,
+                effective_seq_len_q,
+                tile_sched_params.problem_shape_s_fdd,
             )
-            current_work_after_batch, batch_idx = divmod(
-                current_work_after_seq_q, tile_sched_params.problem_shape_b_fdd
+            current_work_after_batch, batch_idx = divmod_constexpr_power_of_two_or_fdd(
+                current_work_after_seq_q,
+                self.batch_size,
+                tile_sched_params.problem_shape_b_fdd,
             )
             _, split_kv_idx = divmod(
                 current_work_after_batch, tile_sched_params.split_kv_fdd
@@ -1523,8 +1536,10 @@ class MlaDecodeTs:
             blk_coord = (cluster_idx, seq_q_idx, batch_idx, split_kv_idx)
         else:
             cluster_idx, seq_batch_idx, split_kv_idx = cute.arch.block_idx()
-            seq_q_idx, batch_idx = divmod(
-                seq_batch_idx, tile_sched_params.problem_shape_b_fdd
+            seq_q_idx, batch_idx = divmod_constexpr_power_of_two_or_fdd(
+                seq_batch_idx,
+                self.batch_size,
+                tile_sched_params.problem_shape_b_fdd,
             )
             blk_coord = (cluster_idx, seq_q_idx, batch_idx, split_kv_idx)
         tile_cluster_idx, tile_seq_q_idx, tile_batch_idx, tile_split_kv_idx = blk_coord
@@ -1687,6 +1702,8 @@ class MlaDecodeTs:
                 groups_tokens_heads_q_ratio=self.groups_tokens_heads_q_ratio,
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=self.seq_len_q,
+                static_problem_shape_b=self.batch_size,
+                static_problem_shape_s=effective_seq_len_q,
                 use_clc_dynamic=use_clc_dynamic,
                 tile_scheduler_config=work_queue_tile_scheduler_config,
                 pipeline_config=work_queue_pipeline_config,

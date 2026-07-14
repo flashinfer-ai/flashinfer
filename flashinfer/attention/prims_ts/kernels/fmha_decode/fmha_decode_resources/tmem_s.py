@@ -642,9 +642,23 @@ class TmemSResource(DecodeGenResourceBase):
         col_base = _keeps_col_base(cfg, lane_idx, num_s_regs)
 
         if cutlass.const_expr(apply_boundary_mask):
-            if not (is_valid_effective_tile and tile_offset_k < seq_len_kv):
-                for reg_idx in cutlass.range_constexpr(num_s_regs):
-                    s_vals[reg_idx] = _neg_max_f32()
+            # Runtime native no-split paging uses the absolute effective tile
+            # index. For active rows, an invalid tile therefore begins at or
+            # beyond the CTA's causal union; each row's upper mask suppresses
+            # the complete tile. Inactive rows are safe only when absent or
+            # guaranteed row-independent and discarded at publication.
+            per_row_paged_upper_mask_covers_invalid_tile = (
+                self.seqlens_kv is not None
+                and cfg.use_paged_kv
+                and not cfg.use_split_kv
+                and cfg.uses_per_row_causal_mask
+                and not cfg.use_sliding_window_causal
+                and (cfg.q_tiles_are_full or cfg.uses_guarded_grouped_keeps_output_rows)
+            )
+            if cutlass.const_expr(not per_row_paged_upper_mask_covers_invalid_tile):
+                if not (is_valid_effective_tile and tile_offset_k < seq_len_kv):
+                    for reg_idx in cutlass.range_constexpr(num_s_regs):
+                        s_vals[reg_idx] = _neg_max_f32()
 
             # A per-row causal endpoint is always <= seq_len_kv and is
             # applied by the loop below. Avoid emitting a second,
@@ -671,10 +685,24 @@ class TmemSResource(DecodeGenResourceBase):
                     causal_start = cute.math.max(
                         causal_end - Int32(cfg.attention_window_size), Int32(0)
                     )
-                for reg_idx in cutlass.range_constexpr(num_s_regs):
-                    token_idx = tile_offset_k + col_base + Int32(reg_idx)
-                    if token_idx < causal_start or token_idx >= causal_end:
-                        s_vals[reg_idx] = _neg_max_f32()
+                if cutlass.const_expr(cfg.tile_size_q == 64):
+                    for reg_idx in cutlass.range_constexpr(num_s_regs):
+                        token_idx = tile_offset_k + col_base + Int32(reg_idx)
+                        if token_idx < causal_start or token_idx >= causal_end:
+                            s_vals[reg_idx] = _neg_max_f32()
+                else:
+                    causal_start_rel = causal_start - tile_offset_k - col_base
+                    causal_end_rel = causal_end - tile_offset_k - col_base
+                    for reg_idx in cutlass.range_constexpr(num_s_regs):
+                        if cutlass.const_expr(cfg.use_sliding_window_causal):
+                            if (
+                                Int32(reg_idx) < causal_start_rel
+                                or Int32(reg_idx) >= causal_end_rel
+                            ):
+                                s_vals[reg_idx] = _neg_max_f32()
+                        else:
+                            if Int32(reg_idx) >= causal_end_rel:
+                                s_vals[reg_idx] = _neg_max_f32()
 
         max_chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
         for chain_idx in cutlass.range_constexpr(4):

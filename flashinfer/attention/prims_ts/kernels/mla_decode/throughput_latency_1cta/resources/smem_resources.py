@@ -152,7 +152,6 @@ class SmemQResource(MlaResource):
                 self._smem_q,
                 leading_byte_offset=q_leading_byte_offset,
                 stride_byte_offset=q_stride_byte_offset,
-                version=1,
                 layout=qkv_smem_swizzle(self.cfg),
             )
 
@@ -310,7 +309,6 @@ class SmemQResource(MlaResource):
             stage_base,
             leading_byte_offset=q_leading_byte_offset,
             stride_byte_offset=q_stride_byte_offset,
-            version=1,
             layout=qkv_smem_swizzle(self.cfg),
         )
         desc_q_rope = desc_q
@@ -327,7 +325,6 @@ class SmemQResource(MlaResource):
                 stride_byte_offset=Int32(
                     qkv_major_k_stride_bytes_for(self.cfg, self.cfg.rope_dim)
                 ),
-                version=1,
                 layout=qkv_smem_swizzle_for_head_dim(self.cfg, self.cfg.rope_dim),
             )
         return desc_q, desc_q_rope
@@ -631,14 +628,12 @@ class SmemKvResource(MlaResource):
                 self._smem_kv,
                 leading_byte_offset=k_leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
-                version=1,
                 layout=qkv_smem_swizzle(self.cfg),
             )
             self._v_desc_base = cprims.Tcgen05SmemDesc.build(
                 self._smem_kv,
                 leading_byte_offset=v_leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
-                version=1,
                 layout=qkv_smem_swizzle(self.cfg),
             )
 
@@ -1003,7 +998,6 @@ class SmemKvResource(MlaResource):
                 self._stage_base(stage_info),
                 leading_byte_offset=v_leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
-                version=1,
                 layout=qkv_smem_swizzle(self.cfg),
             )
             return desc
@@ -1028,7 +1022,6 @@ class SmemKvResource(MlaResource):
                         stride_byte_offset=Int32(
                             qkv_major_k_stride_bytes_for(self.cfg, self.cfg.rope_dim)
                         ),
-                        version=1,
                         layout=qkv_smem_swizzle_for_head_dim(
                             self.cfg, self.cfg.rope_dim
                         ),
@@ -1037,7 +1030,6 @@ class SmemKvResource(MlaResource):
                 self._stage_base(stage_info),
                 leading_byte_offset=k_leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
-                version=1,
                 layout=qkv_smem_swizzle(self.cfg),
             )
             return desc

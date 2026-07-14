@@ -216,7 +216,6 @@ class SmemQResource(DecodeGenResourceBase):
                     smem_ptr,
                     leading_byte_offset=leading_byte_offset,
                     stride_byte_offset=stride_byte_offset,
-                    version=1,
                     layout=_qkv_smem_swizzle(self.cfg),
                 )
         return {"q_desc": cutlass.Int64(0)}
@@ -539,7 +538,6 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 self._smem_base_kv,
                 leading_byte_offset=leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
-                version=1,
                 layout=_qkv_smem_swizzle(self.cfg),
             )
         return {"kv_desc": cutlass.Int64(0), "v_desc": cutlass.Int64(0)}
@@ -1232,14 +1230,12 @@ class SmemKvResource(DecodeGenResourceBase):
                 self._smem_base_kv,
                 leading_byte_offset=k_leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
-                version=1,
                 layout=_qkv_smem_swizzle(self.cfg),
             )
             self._v_desc_base = prims.Tcgen05SmemDesc.build(
                 self._smem_base_kv,
                 leading_byte_offset=v_leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
-                version=1,
                 layout=_qkv_smem_swizzle(self.cfg),
             )
         return {
@@ -1424,14 +1420,18 @@ class SmemKvResource(DecodeGenResourceBase):
                 if prims.elect_sync():
                     stage_base = self._stage_base(stage_info)
                     page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
-                    for chunk_idx in cutlass.range_constexpr(num_chunks):
-                        local_head_dim_offset = chunk_idx * chunk_hd
-                        global_head_dim_offset = (
-                            head_dim_stage_offset + local_head_dim_offset
-                        )
-                        local_tile_offset = chunk_idx * tile_chunk_elems
-                        for page_frag in cutlass.range_constexpr(page_fragments):
-                            page_id = Int32(page_ids[page_frag])
+                    # Consume each cached page ID across every head-dimension
+                    # chunk before advancing. The copies are independent, and
+                    # this order bounds coordinate live ranges in the unrolled
+                    # TMA sequence for every supported page size.
+                    for page_frag in cutlass.range_constexpr(page_fragments):
+                        page_id = Int32(page_ids[page_frag])
+                        for chunk_idx in cutlass.range_constexpr(num_chunks):
+                            local_head_dim_offset = chunk_idx * chunk_hd
+                            global_head_dim_offset = (
+                                head_dim_stage_offset + local_head_dim_offset
+                            )
+                            local_tile_offset = chunk_idx * tile_chunk_elems
                             smem_page_offset = Int32(
                                 local_tile_offset + page_frag * page_chunk_elems
                             )
