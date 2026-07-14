@@ -1,0 +1,52 @@
+diff --git a/flashinfer/dsa_indexer.py b/flashinfer/dsa_indexer.py
+index e605e70..da73970 100644
+--- a/flashinfer/dsa_indexer.py
++++ b/flashinfer/dsa_indexer.py
+@@ -61,18 +61,13 @@ def dsa_indexer_topk(
+         sample_logits, num_buckets, top_k, cand_cap, origin, inv_delta,
+         th_bucket, bcount, cand_val, cand_idx, cand_cnt, emit_limit=0,
+     )
+-    pb = ((-sample_logits - origin[:, None]) * inv_delta[:, None]).floor_().clamp_(
+-        0, num_buckets - 1
+-    ).to(torch.int64)
+-    bcount.scatter_add_(1, pb, torch.full_like(pb, -1, dtype=torch.int32))
+     cu_start = torch.zeros(num_q, dtype=torch.int32, device=dev)
+     scan(
+         q, kv, kv_scales, weights, cu_start, cu_end, origin, inv_delta,
+         th_bucket, cand_val, cand_idx, cand_cnt, bcount, num_buckets, top_k,
+         refresh_every=refresh_every,
+     )
+-    return select(cand_val, cand_idx, cand_cnt, origin, inv_delta, th_bucket,
+-                  num_buckets, top_k)
++    return select(cand_val, cand_idx, cand_cnt, th_bucket, num_buckets, top_k)
+ 
+ 
+ def seed_prep(
+@@ -131,8 +126,6 @@ def select(
+     cand_val: torch.Tensor,
+     cand_idx: torch.Tensor,
+     cand_cnt: torch.Tensor,
+-    origin: torch.Tensor,
+-    inv_delta: torch.Tensor,
+     th_bucket: torch.Tensor,
+     num_buckets: int,
+     top_k: int,
+@@ -142,12 +135,15 @@ def select(
+     probe_add_max: int = 0,
+ ) -> torch.Tensor:
+     R = cand_val.shape[0]
++    dev = cand_val.device
+     if out_idx is None:
+-        out_idx = torch.empty(R, top_k, dtype=torch.int32, device=cand_val.device)
++        out_idx = torch.empty(R, top_k, dtype=torch.int32, device=dev)
+     if out_val is None:
+-        out_val = torch.empty(R, top_k, dtype=torch.float32, device=cand_val.device)
++        out_val = torch.empty(R, top_k, dtype=torch.float32, device=dev)
++    zero = torch.zeros(R, dtype=torch.float32, device=dev)
++    one = torch.ones(R, dtype=torch.float32, device=dev)
+     get_dsa_indexer_module().select(
+-        cand_val, cand_idx, cand_cnt, origin, inv_delta, th_bucket, num_buckets,
++        cand_val, cand_idx, cand_cnt, zero, one, th_bucket, num_buckets,
+         top_k, probe_group, probe_add_max, None, out_val, out_idx,
+     )
+     return out_idx
