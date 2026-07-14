@@ -1000,6 +1000,58 @@ def test_attention_prefill_left_window_only(
     )
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_prefill_sliding_window_top_level_wrapper(causal):
+    """Windowed plans through the public ragged wrapper (backend="cute-dsl").
+
+    Guards the backend routing in flashinfer/prefill.py: windowed plans
+    must reach the modular cute-dsl path.  The trtllm CuTe DSL FMHA route
+    (taken for variant-less head-128 plans) measures slower on sliding
+    windows, and its prebuilt artifact matrix has no windowed variants —
+    a mis-routed windowed plan either JIT-compiles a slower kernel or, on
+    older glue, fails the FFI signature check outright.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    import flashinfer
+
+    batch_size, seq_len, window_left = 1, 512, 128
+    num_kv_heads = 8
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * seq_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * seq_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn_like(k)
+    indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * seq_len
+    )
+
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        backend="cute-dsl",
+    )
+    wrapper.plan(
+        indptr,
+        indptr.clone(),
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        window_left=window_left,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    o = wrapper.run(q, k, v)
+    o_ref = attention_band_mask_ref(
+        batch_size, q, k, v, SM_SCALE, causal, window_left, window_right=-1
+    )
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
 # ---------------------------------------------------------------------------
 #  8. Head dimension 64
 # ---------------------------------------------------------------------------

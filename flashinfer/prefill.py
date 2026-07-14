@@ -3502,7 +3502,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk)
             )
             # Route compatible calls to faster trtllm CuTe DSL FMHA kernels.
-            self._cute_dsl_use_fmha = variant is None and head_dim_qk == 128
+            # Sliding-window plans stay on the modular cute-dsl path: it
+            # measures faster than the FMHA route on windows (its banded
+            # masks skip dead work), and the FMHA route's prebuilt artifact
+            # matrix has no windowed variants (windowed calls there need a
+            # JIT compile).
+            self._cute_dsl_use_fmha = (
+                variant is None and head_dim_qk == 128 and window_left < 0
+            )
             if self._cute_dsl_use_fmha:
                 q_lens = qo_indptr[1:] - qo_indptr[:-1]
                 k_lens = kv_indptr[1:] - kv_indptr[:-1]
