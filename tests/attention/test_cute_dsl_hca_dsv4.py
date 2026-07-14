@@ -9,7 +9,10 @@ import pytest
 import torch
 
 import flashinfer.mla._core as mla_core
-from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+from flashinfer.mla import (
+    batch_decode_sparse_mla_dsv4,
+    trtllm_batch_decode_sparse_mla_dsv4,
+)
 from flashinfer.utils import get_compute_capability
 
 
@@ -69,6 +72,11 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
 
 
+def test_dsv4_backend_neutral_alias_is_backward_compatible():
+    assert batch_decode_sparse_mla_dsv4 is trtllm_batch_decode_sparse_mla_dsv4
+    assert batch_decode_sparse_mla_dsv4.__name__ == "batch_decode_sparse_mla_dsv4"
+
+
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 def test_dsv4_hca_public_api_forwards_block_tables(monkeypatch, kv_layout):
     pytest.importorskip("cutlass")
@@ -89,7 +97,7 @@ def test_dsv4_hca_public_api_forwards_block_tables(monkeypatch, kv_layout):
     monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
     monkeypatch.setattr(batch_hca, "cute_dsl_hca_decode", fake_hca_decode)
 
-    result = trtllm_batch_decode_sparse_mla_dsv4(**args)
+    result = batch_decode_sparse_mla_dsv4(**args)
     assert result is args["out"]
     assert captured["window_block_tables"] is args["hca_swa_block_tables"]
     assert captured["compressed_block_tables"] is args["hca_compressed_block_tables"]
