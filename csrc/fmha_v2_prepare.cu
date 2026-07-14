@@ -18,9 +18,15 @@
 //
 // Mirrors TensorRT-LLM's computeSeqAndPaddingOffsets pattern: one block per
 // launch performs an exclusive-sum scan over per-batch q/kv lengths, zeroes the
-// FMHA tile counter, and encodes the BMM1/BMM2 scales into device-resident
-// uint32 buffers (matching set_alpha() in fused_multihead_attention_utils.h so
-// every existing epilogue that consults scale_bmm{1,2}_d reads identical bits).
+// FMHA tile counter, and stores the BMM1/BMM2 scale words into device-resident
+// uint32 buffers.
+//
+// The scale words are encoded on the HOST in the launchers below with the real
+// set_alpha() from fused_multihead_attention_utils.h, using the scale-type
+// selection mirrored from fmha_v2_run.cu::set_params — so the prep path cannot
+// drift from the legacy host-encoding path. The kernel Data_type is a codegen
+// constant of this module (-DFMHA_V2_DATA_TYPE, set by gen_fmha_v2_module; the
+// module is layout/dtype-specialized).
 //
 // The kernel is templated on PAGED. The paged instantiation additionally
 // derives the q/kv lengths from (qo_indptr, paged_kv_indptr,
@@ -30,52 +36,22 @@
 // intermediate in global memory. The ragged instantiation compiles all of the
 // paged work out via `if constexpr`.
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <fused_multihead_attention_utils.h>  // Data_type, set_alpha, CudaDevice
 
+#include <cmath>
 #include <cub/cub.cuh>
 
 #include "tvm_ffi_utils.h"
 
+#ifndef FMHA_V2_DATA_TYPE
+#error "FMHA_V2_DATA_TYPE must be defined by gen_fmha_v2_module (e.g. DATA_TYPE_FP16)"
+#endif
+
 namespace ffi = tvm::ffi;
 using tvm::ffi::Optional;
 
-// Must match the Data_type enum in csrc/fmha_v2/fused_multihead_attention_utils.h.
-// We don't pull in that header here so the prep kernel stays free of FMHA params.
-enum FmhaV2DType {
-  FMHA_V2_DTYPE_FP16 = 0,
-  FMHA_V2_DTYPE_FP32 = 1,
-  FMHA_V2_DTYPE_INT32 = 2,
-  FMHA_V2_DTYPE_INT8 = 3,
-  FMHA_V2_DTYPE_BF16 = 4,
-  FMHA_V2_DTYPE_E4M3 = 5,
-};
-
 namespace {
-
-// Same encoding as set_alpha() in fused_multihead_attention_utils.h.
-__device__ __forceinline__ uint32_t encode_alpha(float norm, int dtype_code) {
-  switch (dtype_code) {
-    case FMHA_V2_DTYPE_FP16: {
-      __half h = __float2half_rn(norm);
-      uint16_t u = __half_as_ushort(h);
-      return (uint32_t(u) << 16) | uint32_t(u);  // ushort2{u, u} bit-cast
-    }
-    case FMHA_V2_DTYPE_BF16: {
-      __nv_bfloat16 b = __float2bfloat16(norm);
-      uint16_t u = __bfloat16_as_ushort(b);
-      return (uint32_t(u) << 16) | uint32_t(u);
-    }
-    case FMHA_V2_DTYPE_INT32: {
-      int32_t inorm = static_cast<int32_t>(norm);
-      return reinterpret_cast<uint32_t const&>(inorm);
-    }
-    case FMHA_V2_DTYPE_FP32:
-    default:
-      return reinterpret_cast<uint32_t const&>(norm);
-  }
-}
 
 constexpr int kThreadsPerBlock = 256;
 
@@ -99,8 +75,7 @@ __global__ void prepare_fmha_v2_inputs_kernel(
     int* __restrict__ kv_lens_out, int* __restrict__ block_tables, int page_size,
     int max_blocks_per_seq,
     // common
-    int batch_size, int scale_bmm1_dtype_code, int scale_bmm2_dtype_code, float scale_bmm1,
-    float scale_bmm2,
+    int batch_size, uint32_t scale_bmm1_word, uint32_t scale_bmm2_word,
     // outputs
     int* __restrict__ cum_seq_lens_q, int* __restrict__ cum_seq_lens_kv,
     uint32_t* __restrict__ tile_id_counter, uint32_t* __restrict__ scale_bmm1_d,
@@ -156,7 +131,7 @@ __global__ void prepare_fmha_v2_inputs_kernel(
   }
 
   // Single-thread tail: write the [batch_size] entry of the exclusive-sum and
-  // populate the FMHA prep scalars.
+  // store the FMHA prep scalars (words pre-encoded on the host).
   if (tid == 0) {
     cum_seq_lens_q[batch_size] = prefix_q;
     cum_seq_lens_kv[batch_size] = prefix_kv;
@@ -164,12 +139,50 @@ __global__ void prepare_fmha_v2_inputs_kernel(
       tile_id_counter[0] = 0u;
     }
     if (scale_bmm1_d) {
-      scale_bmm1_d[0] = encode_alpha(scale_bmm1, scale_bmm1_dtype_code);
+      scale_bmm1_d[0] = scale_bmm1_word;
     }
     if (scale_bmm2_d) {
-      scale_bmm2_d[0] = encode_alpha(scale_bmm2, scale_bmm2_dtype_code);
+      scale_bmm2_d[0] = scale_bmm2_word;
     }
   }
+}
+
+// Host-side scale encoding for the device-resident scale words. Mirrors the
+// scale-type selection in fmha_v2_run.cu::set_params (scale_type1/scale_type2;
+// acc_type derivation at its call site) so the fused-prep path encodes exactly
+// what the legacy host path would.
+void encode_scale_words(float scale_bmm1, float scale_bmm2, bool has_alibi, float softcapping_scale,
+                        uint32_t& s1_word, uint32_t& s2_word) {
+  constexpr Data_type kDataType = FMHA_V2_DATA_TYPE;
+  constexpr Data_type kAccType =
+      (kDataType == DATA_TYPE_BF16 || kDataType == DATA_TYPE_E4M3) ? DATA_TYPE_FP32 : kDataType;
+  Data_type scale_type1 =
+      (kDataType == DATA_TYPE_FP16 || kDataType == DATA_TYPE_BF16) ? kAccType : DATA_TYPE_FP32;
+  Data_type scale_type2 =
+      (kDataType == DATA_TYPE_FP16 || kDataType == DATA_TYPE_BF16) ? kDataType : DATA_TYPE_FP32;
+  if (kDataType == DATA_TYPE_E4M3) {
+    scale_type1 = kAccType;
+    scale_type2 = kAccType;
+  }
+
+  // Fuse 1 / softcapping_scale into scale_bmm1, exactly like
+  // fmha_v2_run.cu::set_params.
+  bool const enable_softcapping = softcapping_scale != 0.f;
+  float fused_scale_bmm1 = enable_softcapping ? scale_bmm1 / softcapping_scale : scale_bmm1;
+
+  // Warp-specialized SM90 kernels fuse log2e into scale_bmm1 (the
+  // fused_scale_bmm1 branch in fmha_v2_run.cu::set_params); alibi and
+  // softcapping cannot use the exp2f fused-scale optimization.
+  // determine_launch_params reduces warp_specialization to sm == 90 here:
+  // flash_attention is unconditionally on, the force flags default off, and
+  // this module's dtype is one of fp16/bf16/e4m3 by codegen.
+  CudaDevice device;
+  if (device.sm == 90 && !has_alibi && !enable_softcapping) {
+    set_alpha(s1_word, fused_scale_bmm1 * float(M_LOG2E), DATA_TYPE_FP32);
+  } else {
+    set_alpha(s1_word, fused_scale_bmm1, scale_type1);
+  }
+  set_alpha(s2_word, scale_bmm2, scale_type2);
 }
 
 struct PrepCommonPtrs {
@@ -218,20 +231,13 @@ PrepCommonPtrs unpack_prep_common(Optional<ffi::TensorView> const& cum_seq_lens_
 //
 // Note on scale_bmm1_d layout: this buffer is length 1, not the length-2
 // {scale, scale*log2e} pair described in fmha_v2_fused_prep_kernel.md §1.
-// The Python caller pre-multiplies log2e on the host for the warp-spec path
-// (prefill.py plan()) and encodes a single FP32 word here.  compute.h:312
-// and epilogue.h:973 both do a single __ldg/reinterpret_cast<float>, so
-// length-1 is the correct contract.  Do not expand to length-2 without
-// updating those read sites.
-//
-// scale_bmm{1,2}_dtype_code follows the FmhaV2DType enum above (same numeric
-// values as Data_type in fused_multihead_attention_utils.h). When the caller
-// wants the warp-specialized "fused log2e" path for BMM1, it should pass
-// scale_bmm1 = fused_scale_bmm1 * M_LOG2E and scale_bmm1_dtype_code = FP32 so
-// the encoding matches the host-side branch in fmha_v2_run.cu.
+// The launcher applies the warp-spec log2e fusion before encoding, and
+// compute.h:312 and epilogue.h:973 both do a single
+// __ldg/reinterpret_cast<float>, so length-1 is the correct contract. Do not
+// expand to length-2 without updating those read sites.
 void fmha_v2_prepare(ffi::TensorView seq_lens_q, ffi::TensorView seq_lens_kv, int batch_size,
-                     int scale_bmm1_dtype_code, int scale_bmm2_dtype_code, double scale_bmm1,
-                     double scale_bmm2, Optional<ffi::TensorView> cum_seq_lens_q,
+                     double scale_bmm1, double scale_bmm2, bool has_alibi, double softcapping_scale,
+                     Optional<ffi::TensorView> cum_seq_lens_q,
                      Optional<ffi::TensorView> cum_seq_lens_kv,
                      Optional<ffi::TensorView> tile_id_counter,
                      Optional<ffi::TensorView> scale_bmm1_d,
@@ -239,14 +245,16 @@ void fmha_v2_prepare(ffi::TensorView seq_lens_q, ffi::TensorView seq_lens_kv, in
   cudaStream_t stream = static_cast<cudaStream_t>(get_stream(seq_lens_q.device()));
   PrepCommonPtrs p = unpack_prep_common(cum_seq_lens_q, cum_seq_lens_kv, tile_id_counter,
                                         scale_bmm1_d, scale_bmm2_d);
+  uint32_t s1_word, s2_word;
+  encode_scale_words(static_cast<float>(scale_bmm1), static_cast<float>(scale_bmm2), has_alibi,
+                     static_cast<float>(softcapping_scale), s1_word, s2_word);
 
   prepare_fmha_v2_inputs_kernel<false><<<1, kThreadsPerBlock, 0, stream>>>(
       static_cast<int*>(seq_lens_q.data_ptr()), static_cast<int*>(seq_lens_kv.data_ptr()),
       /*qo_indptr=*/nullptr, /*paged_kv_indptr=*/nullptr, /*paged_kv_last_page_len=*/nullptr,
       /*paged_kv_indices=*/nullptr, /*kv_lens_out=*/nullptr, /*block_tables=*/nullptr,
-      /*page_size=*/0, /*max_blocks_per_seq=*/0, batch_size, scale_bmm1_dtype_code,
-      scale_bmm2_dtype_code, static_cast<float>(scale_bmm1), static_cast<float>(scale_bmm2),
-      p.cum_q, p.cum_kv, p.tile, p.s1, p.s2);
+      /*page_size=*/0, /*max_blocks_per_seq=*/0, batch_size, s1_word, s2_word, p.cum_q, p.cum_kv,
+      p.tile, p.s1, p.s2);
 }
 
 // Paged variant: everything fmha_v2_prepare does, plus deriving the q/kv
@@ -256,9 +264,9 @@ void fmha_v2_prepare(ffi::TensorView seq_lens_q, ffi::TensorView seq_lens_kv, in
 void fmha_v2_prepare_paged(ffi::TensorView qo_indptr, ffi::TensorView paged_kv_indptr,
                            ffi::TensorView paged_kv_last_page_len, ffi::TensorView paged_kv_indices,
                            ffi::TensorView kv_lens_out, ffi::TensorView block_tables_out,
-                           int page_size, int max_blocks_per_seq, int batch_size,
-                           int scale_bmm1_dtype_code, int scale_bmm2_dtype_code, double scale_bmm1,
-                           double scale_bmm2, Optional<ffi::TensorView> cum_seq_lens_q,
+                           int page_size, int max_blocks_per_seq, int batch_size, double scale_bmm1,
+                           double scale_bmm2, bool has_alibi, double softcapping_scale,
+                           Optional<ffi::TensorView> cum_seq_lens_q,
                            Optional<ffi::TensorView> cum_seq_lens_kv,
                            Optional<ffi::TensorView> tile_id_counter,
                            Optional<ffi::TensorView> scale_bmm1_d,
@@ -266,6 +274,9 @@ void fmha_v2_prepare_paged(ffi::TensorView qo_indptr, ffi::TensorView paged_kv_i
   cudaStream_t stream = static_cast<cudaStream_t>(get_stream(qo_indptr.device()));
   PrepCommonPtrs p = unpack_prep_common(cum_seq_lens_q, cum_seq_lens_kv, tile_id_counter,
                                         scale_bmm1_d, scale_bmm2_d);
+  uint32_t s1_word, s2_word;
+  encode_scale_words(static_cast<float>(scale_bmm1), static_cast<float>(scale_bmm2), has_alibi,
+                     static_cast<float>(softcapping_scale), s1_word, s2_word);
 
   prepare_fmha_v2_inputs_kernel<true><<<1, kThreadsPerBlock, 0, stream>>>(
       /*seq_lens_q=*/nullptr, /*seq_lens_kv=*/nullptr, static_cast<int*>(qo_indptr.data_ptr()),
@@ -273,6 +284,5 @@ void fmha_v2_prepare_paged(ffi::TensorView qo_indptr, ffi::TensorView paged_kv_i
       static_cast<int*>(paged_kv_last_page_len.data_ptr()),
       static_cast<int*>(paged_kv_indices.data_ptr()), static_cast<int*>(kv_lens_out.data_ptr()),
       static_cast<int*>(block_tables_out.data_ptr()), page_size, max_blocks_per_seq, batch_size,
-      scale_bmm1_dtype_code, scale_bmm2_dtype_code, static_cast<float>(scale_bmm1),
-      static_cast<float>(scale_bmm2), p.cum_q, p.cum_kv, p.tile, p.s1, p.s2);
+      s1_word, s2_word, p.cum_q, p.cum_kv, p.tile, p.s1, p.s2);
 }

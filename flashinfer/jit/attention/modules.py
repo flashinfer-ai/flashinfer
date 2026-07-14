@@ -2111,6 +2111,10 @@ def gen_fmha_v2_module(
             f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}",
             f"-I{jit_env.FLASHINFER_INCLUDE_DIR}",  # For flashinfer headers
             "-Wno-deprecated-gpu-targets",
+            # The module is dtype-specialized; bake the kernel Data_type so the
+            # fmha_v2_prepare launcher can host-encode the BMM scale words with
+            # the same scale-type selection as fmha_v2_run.cu::set_params.
+            f"-DFMHA_V2_DATA_TYPE=DATA_TYPE_{input_dtype_str.upper()}",
         ]
     )
 
