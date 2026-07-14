@@ -76,6 +76,7 @@ top_k_top_p_sampling calls top_p_sampling internally.
 FP4 MoE files are only generated on Blackwell (SM100+) GPUs with fp4_quantize available.
 GDN prefill files require SM90+ (Hopper) GPU.
 MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
+trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 """
 
 import contextlib
@@ -1189,6 +1190,26 @@ with contextlib.suppress(Exception):
         bmm2_scale=1.0,
         is_var_seq=False,
     )
+
+# trtllm_batch_decode_with_kv_cache with block-sparse attention (per-KV-head
+# page tables and seq lens; SM100/103 only).
+with contextlib.suppress(Exception):
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+    from flashinfer.trace.templates.attention import (
+        _trtllm_batch_decode_block_sparse_init,
+    )
+
+    _tbs_inputs = _trtllm_batch_decode_block_sparse_init(
+        num_tokens=4,
+        num_heads=16,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=16,
+        batch_size=4,
+        max_pages_per_seq=8,
+        device=device,
+    )
+    trtllm_batch_decode_with_kv_cache(**_tbs_inputs)
 
 # concat_mla_k (DeepSeek MLA K concat, fixed shape per docstring).
 with contextlib.suppress(Exception):

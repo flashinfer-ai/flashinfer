@@ -26,7 +26,7 @@ from .api_logging import flashinfer_api
 from .trace.templates.attention import (
     gqa_paged_decode_trace,
     single_decode_with_kv_cache_trace,
-    trtllm_batch_decode_trace,
+    trtllm_batch_decode_trace_dispatch,
     xqa_batch_decode_trace,
 )
 
@@ -3001,7 +3001,7 @@ def get_trtllm_gen_decode_module(*args):
     )
 
 
-@flashinfer_api(trace=trtllm_batch_decode_trace)
+@flashinfer_api(trace=trtllm_batch_decode_trace_dispatch)
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
