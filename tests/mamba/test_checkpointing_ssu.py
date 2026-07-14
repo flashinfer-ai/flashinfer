@@ -481,15 +481,10 @@ def test_checkpointing_ssu_heads_per_group(impl):
     )
 
 
-@pytest.mark.parametrize("main_heads_per_cta", [1, 2, 4], ids=["mhc1", "mhc2", "mhc4"])
-def test_two_kernel_matches_monolithic(main_heads_per_cta):
+def test_two_kernel_matches_monolithic():
     """The two-kernel path (caller passes cb_scaled/cumAdt_vec/cb_old scratch)
     must match the monolithic kernel (no scratch) bit-for-bit on out, state, and
-    the mutated caches.  Covers a nowrite case (k=0) and a write case (k=T).
-
-    main_heads_per_cta tiles the MAIN kernel: each CTA loops that many consecutive
-    heads of one group (mhc1 = today's per-head main; mhc2/mhc4 head-tiled).  The
-    monolithic ref is always per-head, so every MHC must match it bit-for-bit."""
+    the mutated caches.  Covers a nowrite case (k=0) and a write case (k=T)."""
     device = "cuda"
     dtype = torch.bfloat16
     nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
@@ -533,7 +528,7 @@ def test_two_kernel_matches_monolithic(main_heads_per_cta):
             dt1_proc[slot],
         )
 
-    def _run(k, *, two_kernel, enable_pdl=False, main_heads_per_cta=1):
+    def _run(k, *, two_kernel, enable_pdl=False):
         torch.manual_seed(k + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
         dt2 = repeat(
@@ -585,17 +580,14 @@ def test_two_kernel_matches_monolithic(main_heads_per_cta):
             dt_bias=dt_bias,
             dt_softplus=True,
             enable_pdl=enable_pdl,
-            main_heads_per_cta=main_heads_per_cta,
             **kw,
         )
         return out, st, xc, bc, dtc
 
     names = ("out", "state", "x_cache", "B_cache", "dt_cache")
     for k in (0, 2, T):  # k=0 nowrite(prev_k=0), k=2 nowrite(prev_k>0), k=T write
-        ref = _run(
-            k, two_kernel=False
-        )  # monolith ref is always per-head (MHC irrelevant)
-        test = _run(k, two_kernel=True, main_heads_per_cta=main_heads_per_cta)
+        ref = _run(k, two_kernel=False)
+        test = _run(k, two_kernel=True)
         for name, r, t in zip(names, ref, test, strict=True):
             torch.testing.assert_close(
                 t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k}"
@@ -605,9 +597,7 @@ def test_two_kernel_matches_monolithic(main_heads_per_cta):
         # gdc_waits).  Exercises the trigger's memory-ordering contract — the
         # main must still see every cb_scaled/cumAdt_vec/cb_old the precompute
         # wrote.  Must match the monolithic ref bit-for-bit.
-        test_pdl = _run(
-            k, two_kernel=True, enable_pdl=True, main_heads_per_cta=main_heads_per_cta
-        )
+        test_pdl = _run(k, two_kernel=True, enable_pdl=True)
         for name, r, t in zip(names, ref, test_pdl, strict=True):
             torch.testing.assert_close(
                 t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k} (PDL)"
@@ -715,122 +705,6 @@ def test_two_kernel_d_split2():
         for name, r, t in zip(names, ref, test, strict=True):
             torch.testing.assert_close(
                 t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k}"
-            )
-
-
-def test_two_kernel_pipeline_stages2(monkeypatch):
-    """STAGES=2 double-buffer path must match STAGES=1 bit-for-bit.
-
-    FLASHINFER_SSU_MAIN_PIPELINE_STAGES=2 activates the two-stage state
-    prefetch pipeline in the MAIN kernel (only when MHC>1; silently ignored at
-    MHC=1).  This test sets the env var, runs the two-kernel path at MHC=2,
-    and asserts the output matches the MHC=1 / STAGES=1 reference.
-
-    The STAGES=2 fix (wait_prior(has_next?3:1) before replay_head) is the
-    specific code path exercised here."""
-    monkeypatch.setenv("FLASHINFER_SSU_MAIN_PIPELINE_STAGES", "2")
-
-    device = "cuda"
-    dtype = torch.bfloat16
-    nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
-    max_window = 8
-    batch = 2
-    cache_size = batch
-
-    torch.manual_seed(42)
-    A_base = -torch.rand(nheads, device=device) - 0.5
-    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
-    dt_bias = repeat(
-        torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim
-    )
-    D = repeat(torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim)
-    state0 = torch.randn(
-        cache_size, nheads, head_dim, d_state, device=device, dtype=dtype
-    )
-
-    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    dt1_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
-    B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-    dt1_proc = dt1_base.float() + dt_bias[:, 0].float()[None, None, :]
-    dt1_proc = torch.where(dt1_proc > 20.0, dt1_proc, torch.log1p(torch.exp(dt1_proc)))
-
-    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
-        cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
-    )
-    for slot in range(cache_size):
-        _seed_ring(
-            x_cache,
-            B_cache,
-            dt_cache,
-            ring_start,
-            slot,
-            x1[slot],
-            B1[slot],
-            dt1_proc[slot],
-        )
-
-    T_pad = 16
-    k_old = ((max_window + 7) // 8) * 8
-
-    def _run(k, *, main_heads_per_cta):
-        torch.manual_seed(k + 200)
-        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-        dt2 = repeat(
-            torch.randn(batch, T, nheads, device=device, dtype=dtype),
-            "b t h -> b t h p",
-            p=head_dim,
-        )
-        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-        st = state0.clone()
-        out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-        xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
-        checkpointing_ssu(
-            st,
-            xc,
-            bc,
-            dtc,
-            ring_start.clone(),
-            torch.full((cache_size,), k, device=device, dtype=torch.int32),
-            x=x2,
-            dt=dt2,
-            A=A,
-            B=B2,
-            C=C2,
-            out=out,
-            D=D,
-            dt_bias=dt_bias,
-            dt_softplus=True,
-            main_heads_per_cta=main_heads_per_cta,
-            cb_scaled=torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-            ),
-            cumAdt_vec=torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            ),
-            cb_old=torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            ),
-            cumAdt_old=torch.empty(
-                batch, nheads, max_window, device=device, dtype=torch.float32
-            ),
-            algorithm="two-kernel",
-        )
-        return out, st, xc, bc, dtc
-
-    names = ("out", "state", "x_cache", "B_cache", "dt_cache")
-    for k in (0, 2, T):
-        # MHC=1 reference: STAGES=2 is ignored at MHC=1 (kernel falls back to STAGES=1).
-        ref = _run(k, main_heads_per_cta=1)
-        # MHC=2 with STAGES=2: exercises the double-buffer pipeline fix.
-        test = _run(k, main_heads_per_cta=2)
-        for name, r, t in zip(names, ref, test, strict=True):
-            torch.testing.assert_close(
-                t,
-                r,
-                rtol=2e-2,
-                atol=5e-1,
-                msg=f"{name} mismatch at k={k} (stages=2, mhc=2)",
             )
 
 

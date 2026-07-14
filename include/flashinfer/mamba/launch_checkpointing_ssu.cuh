@@ -61,8 +61,8 @@ void dispatch_precompute_num_warps(int nw, Fn&& fn) {
 // `launchCheckpointingSsu` (below) is the runtime dispatcher.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int D_SPLIT, bool VARLEN>
-void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_per_cta,
-                                int precompute_heads_per_cta, cudaStream_t stream) {
+void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_heads_per_cta,
+                                cudaStream_t stream) {
   constexpr int NUM_WARPS = 4;
 
   FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
@@ -213,8 +213,8 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
         });
       });
 
-      // ── Persistent main: 1D grid-stride loop over single-head work-units (MHC=1) ──
-      // The grid-stride loop SUBSUMES the old MAIN_HEADS_PER_CTA head-tiling (knob ditched).
+      // ── Persistent main: 1D grid-stride loop over single-head work-units ──
+      // One work-unit = one head; the grid-stride loop is the head-tiling (no host knob).
       // Launch min(cta_per_sm·NUM_SMS, total_work) CTAs; each grid-strides over work-units.
       // Fewer CTAs leave SM room to co-reside with conv1d (closing the no-write gap to
       // triton-replay-pm), and consecutive work-units (head_tile-fastest, see kernel) keep
@@ -223,8 +223,6 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       //
       // MAIN_NUM_WARPS=4: the main is NUM_WARPS-generic but feed-bound (long/short scoreboard),
       // not warp-hideable, so 8 warps buys nothing and costs finer MMA tiling + publish barriers.
-      (void)
-          main_heads_per_cta;  // MHC knob ditched — the main runs MHC=1 (kernel template default).
       constexpr int MAIN_NUM_WARPS = 4;
 
       int const main_total_work =
@@ -394,13 +392,13 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
 // specializations after this commit.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t>
-void launchCheckpointingSsu(CheckpointingSsuParams& params, int main_heads_per_cta,
-                            int precompute_heads_per_cta, cudaStream_t stream) {
+void launchCheckpointingSsu(CheckpointingSsuParams& params, int precompute_heads_per_cta,
+                            cudaStream_t stream) {
   bool const is_varlen = (params.cu_seqlens != nullptr);
   auto launch = [&]<int D_SPLIT, bool VARLEN>() {
     launchCheckpointingSsuImpl<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                               state_scale_t, D_SPLIT, VARLEN>(params, main_heads_per_cta,
-                                                               precompute_heads_per_cta, stream);
+                               state_scale_t, D_SPLIT, VARLEN>(params, precompute_heads_per_cta,
+                                                               stream);
   };
   auto launch_d_split = [&]<int D_SPLIT>() {
     if (is_varlen) {

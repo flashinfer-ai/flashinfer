@@ -850,11 +850,6 @@ def _make_run_closure(
         # Pin the path: "auto" would route small batches to the monolith even
         # with scratch present, silently merging the two rows.
         _algo = "two-kernel" if _two else "monolith"
-        # MAIN head-tiling knob: ignored by the launcher (persistent main is MHC=1);
-        # kept only so old env-driven sweeps don't crash.
-        _mhc = (
-            int(os.environ.get("FLASHINFER_SSU_MAIN_HEADS_PER_CTA", "0")) if _two else 1
-        )
         # PRECOMPUTE head-tiling knob (two-kernel only): 0 = launcher co-residency heuristic;
         # >0 overrides.  Driven via FLASHINFER_SSU_HEADS_PER_CTA, passed as the Python handle.
         _phc = int(os.environ.get("FLASHINFER_SSU_HEADS_PER_CTA", "0")) if _two else 0
@@ -895,7 +890,6 @@ def _make_run_closure(
                     # split's internal precompute→main PDL is unconditional in the
                     # launcher, so it is NOT controlled here.
                     enable_pdl=external_pdl,
-                    main_heads_per_cta=_mhc,
                     precompute_heads_per_cta=_phc,
                     d_split=_ds,
                     cb_scaled=_cb,
@@ -933,7 +927,6 @@ def _make_run_closure(
                     # precompute→main PDL is unconditional in the launcher, so it
                     # is active regardless of this flag.
                     enable_pdl=False,
-                    main_heads_per_cta=_mhc,
                     precompute_heads_per_cta=_phc,
                     d_split=_ds,
                     cb_scaled=_cb,

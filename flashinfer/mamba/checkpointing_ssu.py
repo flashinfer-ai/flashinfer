@@ -109,7 +109,6 @@ def _checkpointing_ssu(
     cumAdt_vec: Optional[torch.Tensor],
     cb_old: Optional[torch.Tensor],
     cumAdt_old: Optional[torch.Tensor],
-    main_heads_per_cta: int,
     precompute_heads_per_cta: int,
     enable_pdl: bool,
     philox_rounds: int,
@@ -171,7 +170,6 @@ def _checkpointing_ssu(
         cumAdt_vec,
         cb_old,
         cumAdt_old,
-        main_heads_per_cta,
         precompute_heads_per_cta,
     )
 
@@ -204,7 +202,6 @@ def _checkpointing_ssu_fake(
     cumAdt_vec: Optional[torch.Tensor],
     cb_old: Optional[torch.Tensor],
     cumAdt_old: Optional[torch.Tensor],
-    main_heads_per_cta: int,
     precompute_heads_per_cta: int,
     enable_pdl: bool,
     philox_rounds: int,
@@ -256,7 +253,6 @@ def checkpointing_ssu(
     cumAdt_vec: Optional[torch.Tensor] = None,
     cb_old: Optional[torch.Tensor] = None,
     cumAdt_old: Optional[torch.Tensor] = None,
-    main_heads_per_cta: int = 0,
     precompute_heads_per_cta: int = 0,
     algorithm: str = "auto",
 ) -> torch.Tensor:
@@ -315,10 +311,6 @@ def checkpointing_ssu(
     d_split : Optional[int]
         Per-head DIM split factor.  This is only exposed for benchmarking.
         Do not use it cause it will make things slow.
-    main_heads_per_cta : int
-        Ignored.  The persistent grid-stride main subsumed MAIN head-tiling
-        (work-unit = one head, MHC=1); the launcher discards this value.  Kept
-        for call-site compatibility.
     precompute_heads_per_cta : int
         Two-kernel PRECOMPUTE head-tiling: heads per precompute CTA.  0 (default) uses the
         launcher's co-residency heuristic; >0 overrides it (must divide nheads/ngroups,
@@ -598,7 +590,6 @@ def checkpointing_ssu(
         cumAdt_vec,
         cb_old,
         cumAdt_old,
-        main_heads_per_cta,
         precompute_heads_per_cta,
         enable_pdl,
         philox_rounds=philox_rounds,

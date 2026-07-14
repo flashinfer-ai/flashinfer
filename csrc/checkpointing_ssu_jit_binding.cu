@@ -49,7 +49,6 @@ void checkpointing_ssu(
     Optional<TensorView> cumAdt_vec,    // two-kernel scratch: f32 (batch, nheads, T_pad)
     Optional<TensorView> cb_old,        // two-kernel scratch: bf16 (batch, nheads, 32, K_old/2)
     Optional<TensorView> cumAdt_old,    // two-kernel scratch: f32 (batch, nheads, MAX_WINDOW)
-    int64_t main_heads_per_cta,         // two-kernel MAIN: consecutive heads per CTA (host knob)
     int64_t precompute_heads_per_cta);  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
 
 }  // namespace flashinfer::mamba::checkpointing
