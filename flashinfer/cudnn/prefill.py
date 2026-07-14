@@ -612,15 +612,15 @@ def cudnn_batch_prefill_with_kv_cache(
     max_sequence_kv : int
         Maximum number of tokens per KV sequence (``s_kv_max``).
     actual_seq_lens_q : torch.Tensor
-        Per-request query lengths, shape ``(batch_size,)``.  When cuDNN is
+        Per-request query lengths, shape ``(batch_size, 1, 1, 1)``.  When cuDNN is
         available (the default backend) this tensor must reside on the same
         CUDA device as ``q``.  Only the fallback non-cuDNN path accepts (and
         internally copies) a CPU tensor; that fallback is also the only path
         that requires a CPU tensor when ``is_cuda_graph_compatible`` is
         ``False``.
     actual_seq_lens_kv : torch.Tensor
-        Per-request KV lengths, shape ``(batch_size,)``.  Same device rules as
-        ``actual_seq_lens_q``.
+        Per-request KV lengths, shape ``(batch_size, 1, 1, 1)``.  Same device
+        rules as ``actual_seq_lens_q``.
     block_tables : Optional[torch.Tensor]
         Paged KV block table, shape ``(batch_size, num_pages_per_seq)`` on GPU.
         Pass ``None`` for non-paged KV layouts.
