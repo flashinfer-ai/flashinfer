@@ -11,7 +11,7 @@ per-API files, built on the same best-practice oracle kit as the unified MoE fuz
     selection #3398, degenerate 1/2/3, occasional unaligned -> clean reject).
   * numeric vs an AUTHORITATIVE reference at a tight per-quant-mode tolerance atol=C*||ref||_inf
     (input quant is lossless, so C is the accumulation/requant floor, NOT the dense-random fp4/fp8
-    quant error); + reference-aware no-spurious-NaN/Inf; + not-(almost)-all-zero (#3398/#3068),
+    quant error); + reference-aware no-spurious-NaN/Inf,
   * output-buffer POISON (NaN-fill so a kernel that doesn't fully write its output is caught),
   * run-to-run determinism (#2514),
   * device-state probe after each config (a context-corrupting IMA -> clean failure),
@@ -58,7 +58,7 @@ Env: FLASHINFER_GEMM_FUZZ_NUM_TESTS (default 2000; autotune-OFF breadth ~0.4s/cf
 Determinism / repro: every config is fully derived from its seed (shapes, modes, input data,
 buffer poison, and the global RNG via torch.manual_seed(seed)), so a failing test reproduces
 bit-for-bit from the REPRO command it prints. Each test prints its full config + repro command;
-on a numeric mismatch it dumps output-vs-oracle stats + the worst <=30 elements (so the CI log
+on a numeric mismatch it dumps output-vs-oracle stats + the worst <=100 elements (so the CI log
 alone shows whether the output is all-zero / all-NaN / Inf, without rerunning).
 """
 
@@ -116,9 +116,15 @@ else:
     _CC = get_compute_capability(torch.device("cuda:0"))
     if _CC[0] < 8:
         _SKIP = f"scaled GEMM needs SM80+, got SM{_CC[0]}{_CC[1]}"
-pytestmark = pytest.mark.skipif(_SKIP is not None, reason=str(_SKIP))
+pytestmark = [
+    # ~15-30 min/leg in CI (full sweep) -> front-load in the parallel queue.
+    pytest.mark.long_running,
+    pytest.mark.skipif(_SKIP is not None, reason=str(_SKIP)),
+]
 _SM = _CC[0] * 10 + _CC[1]
-_CUDNN_VER = torch.backends.cudnn.version() or 0  # e.g. 90300 == 9.23, 93000 == 9.30
+_CUDNN_VER = (
+    torch.backends.cudnn.version() or 0
+)  # e.g. 92300 == 9.23.0, 92301 == 9.23.1
 
 # A clean rejection ("not supported on this shape/arch/dtype") must SKIP, never fail; a crash
 # (CUDA error / illegal access / device assert) is always a finding and re-raises.
@@ -432,6 +438,12 @@ _CONVENTION_DIVERGENCES = [
 # It's gone because flashinfer now precisely bans that envelope ({SM90, bf16->fp16, 9.23.0.x} in
 # gemm_base.py _cudnn_bf16_gemm_usable_or_skip) -> the cuDNN path is skipped there (auto falls
 # back), and 9.23.1+ has it fixed, so the broken path is unreachable. No workaround needed.
+#
+# Each entry is (predicate, reason, crash_capable). crash_capable=True entries are xfailed UP FRONT
+# (the kernel is never launched): the same root cause that yields garbage on one library stack can
+# be an out-of-bounds access on another, and one IMA poisons the CUDA context for every later test
+# in the session (seen live in CI, see the #3604 entry). crash_capable=False entries still RUN and
+# xfail only if an invariant actually fails -> they keep the xpass "fixed -> remove me" signal.
 _KNOWN_FAILURES = [
     (
         lambda cfg: cfg.adapter.key == "bmm_mxfp8" and cfg.b > 1 and (cfg.m % 128) != 0,
@@ -444,15 +456,43 @@ _KNOWN_FAILURES = [
         "scale-factor tile interleaves batch boundaries and is not per-batch-separable; both the cuDNN "
         "override-shape stride math and the CUTLASS kernel then index batch>0's scales wrong. The known "
         "#3455 'b>1 SF-padding' follow-up; real fix = per-batch / rank_preserving 3D SF (#3457), which "
-        "is NOT in tree and is unfixed in 9.23.1. Keep this predicate arch/backend-agnostic; it xpasses "
-        "(a visible 'fixed' signal) once per-batch SF lands. See HANDOFF_SM120_MXFP8_BMM_VERIFY.md.",
+        "is NOT in tree and is unfixed in 9.23.1. Keep this predicate arch/backend-agnostic. On the "
+        "cu129 CI stack this root cause escalates from garbage to an ILLEGAL MEMORY ACCESS (GB200, "
+        "b=16 m=7 n=512 k=2688). To probe fixed-ness, run the REPRO with this entry removed. "
+        "See HANDOFF_SM120_MXFP8_BMM_VERIFY.md.",
+        True,  # crash-capable: IMA'd on GB200/cu129
+    ),
+    (
+        lambda cfg: (
+            cfg.adapter.quant_mode == "bf16"
+            and cfg.backend == "cudnn"
+            and _CC[0] == 9
+            and _CUDNN_VER == 92300
+        ),
+        "cuDNN 9.23.0 SM90 bf16 GEMM: the AUTOTUNER-selected (non-default) tactic returns garbage "
+        "for bf16->bf16 too (found by the autotune-ON winner validation: mm_bf16 m63_n32_k2688 "
+        "seed 1834712400, ratio 0.98 vs 0.0022 at the default tactic). Root-caused by per-plan "
+        "enumeration: of the graph's 15 plans exactly the five 'eng7_k17=4_*' ones (engine 7 with "
+        "CUDNN_KNOB_TYPE_SPLIT_K_SLC=4) miscompute; eng7 WITHOUT split-k is correct, and the tuner "
+        "picks the broken one because split-k wins the timing race on tall-K shapes. Same 9.23.0 "
+        "split-k family as the bf16->fp16 bug that gemm_base.py hard-bans, but bf16-out escapes "
+        "that ban because its DEFAULT tactic is correct -- only autotune(True) reaches the broken "
+        "plan. NOT tactic-index drift: the index was profiled and executed against the same graph "
+        "in the same process. Banning the whole {SM90, bf16-out, 9.23.0} envelope would kill a "
+        "working default path and the requirement layer cannot exclude a single plan, so it is "
+        "ledgered (numeric-only) instead; a tactics-blocklist entry (FLASHINFER_TACTICS_BLOCKLIST) "
+        "is the product-side mitigation for users pinned on 9.23.0. VERIFIED fixed in 9.23.1: the "
+        "same per-plan matrix on 9.23.1.3 and 9.23.2.1 shows all 15 plans (incl. the five "
+        "eng7_k17=4 ones) correct -- so the ==92300 gate is exact. Unreachable in CI (containers "
+        "pin newer cuDNN).",
+        False,  # numeric-only: default tactic is fine; still run, xfail at compare
     ),
 ]
 
 
-def _known_failure(cfg: Cfg) -> Optional[str]:
-    for pred, reason in _KNOWN_FAILURES:
-        if pred(cfg):
+def _known_failure(cfg: Cfg, crash_only: bool = False) -> Optional[str]:
+    for pred, reason, crash_capable in _KNOWN_FAILURES:
+        if (crash_capable or not crash_only) and pred(cfg):
             return reason
     return None
 
@@ -679,7 +719,7 @@ def _out_buffer(cfg: Cfg):
 
 # ---------------------------------------------------------------------------
 # Diagnostics: every test prints its full config + a perfect-repro command; on a numeric
-# mismatch we dump output-vs-oracle stats + the worst <=30 elements, so the CI log alone tells
+# mismatch we dump output-vs-oracle stats + the worst <=100 elements, so the CI log alone tells
 # you whether the output is all-zero / all-NaN / Inf without having to rerun.
 # ---------------------------------------------------------------------------
 def _describe(cfg: Cfg) -> str:
@@ -713,7 +753,7 @@ def _stats(t: torch.Tensor) -> str:
     )
 
 
-def _dump(out: torch.Tensor, ref: torch.Tensor, k: int = 30) -> str:
+def _dump(out: torch.Tensor, ref: torch.Tensor, k: int = 100) -> str:
     of, rf = out.float().reshape(-1), ref.float().reshape(-1)
     diff = (of - rf).abs()
     # rank by |diff|, treating non-finite diffs as worst so NaN/Inf elems surface first.
@@ -777,12 +817,10 @@ def _assert_invariants(cfg: Cfg, res: torch.Tensor, ref: torch.Tensor):
             res,
             ref,
         )
-    # (3) not (almost) all-zero vs a non-trivial reference -- redundant with (2) but a crisp #3398
-    #     signal in the log.
-    if ref.abs().max().item() > 1e-3 and (resf.abs() > 0).float().mean().item() <= 0.01:
-        _fail(
-            cfg, "~all-zero output vs non-trivial oracle (#3398/#3068-class)", res, ref
-        )
+    # (no separate "all-zero output" invariant: an all-zero/all-NaN output necessarily fails (2),
+    # and the failure dump -- output/oracle stats + the worst 100 elements -- makes the pattern
+    # self-evident. A standalone predicate false-positived in CI on a tiny sparse config where the
+    # ORACLE itself was 223/224 zero and the output correctly matched it.)
 
 
 @pytest.fixture(autouse=True)
@@ -817,6 +855,15 @@ def test_unified_gemm_fuzz(cfg: Cfg):
     # failure, or always with `-s`) so a CI log is self-explanatory.
     print("\n" + _describe(cfg))
     print(_repro(cfg))
+
+    # A crash-capable LEDGERED config must not run at all: the same root cause that produces
+    # garbage output can be an out-of-bounds access on another library stack (seen live in CI:
+    # bmm_mxfp8 b=16,m=7 IMA'd on GB200/cu129 and poisoned the CUDA context for all ~1000 later
+    # tests in the session). xfail up front; to probe whether a finding is fixed, run its REPRO
+    # with the ledger entry removed. Numeric-only entries still run (xfail at compare time).
+    known = _known_failure(cfg, crash_only=True)
+    if known:
+        pytest.xfail(f"KNOWN FINDING (not run; crash-capable): {known}")
 
     a, b, ref = _canonical(cfg, salt=1)
     if cfg.noncontig:  # feed value-identical non-contiguous views (oracle unchanged)
@@ -1069,6 +1116,10 @@ def test_autotune_cache_dynshape(akey):
                 fp8_idt=torch.float8_e4m3fn if fp8 else None,
                 fp8_mdt=torch.float8_e4m3fn if fp8 else None,
             )
+            if _known_failure(cfg, crash_only=True):
+                # crash-capable ledgered configs may IMA, not just miscompute (bmm_mxfp8 b>1,
+                # M%128!=0 on GB200/cu129) -> never run them; skip this M, keep the sequence going.
+                continue
             a, b, ref = _canonical(cfg, salt=1)
             out = _out_buffer(cfg)
             try:
