@@ -528,6 +528,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
         use_fused_finalize: bool = True,
+        do_finalize: bool = True,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -616,7 +617,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             if min_latency_mode
             else []
         )
-        run_moe(
+        unreduced_result = run_moe(
             output,
             input,
             token_selected_experts,
@@ -643,7 +644,18 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             [gemm_tactic_1, gemm_tactic_2],
             enable_pdl,
             activation_type,
+            do_finalize,
         )
+
+        if not do_finalize:
+            gemm2_output = torch.from_dlpack(unreduced_result[0])
+            expanded_idx = torch.from_dlpack(unreduced_result[1])
+            # C++ returns idx in slot-major layout [K, N] (slot * N + token).
+            # Reshape to token-major [N, K] (token * K + slot) for downstream use.
+            num_tokens = input.shape[0]
+            top_k = token_selected_experts.shape[1]
+            expanded_idx = expanded_idx.view(top_k, num_tokens).T.contiguous().view(-1)
+            return [gemm2_output, token_final_scales, expanded_idx]
 
         return (
             output
@@ -689,11 +701,20 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
         use_fused_finalize: bool = True,
+        do_finalize: bool = True,
     ) -> List[torch.Tensor]:
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
+        top_k = token_selected_experts.shape[1]
 
-        if min_latency_mode:
+        if not do_finalize:
+            expanded_num_rows = seq_len * top_k
+            return [
+                input.new_empty([expanded_num_rows, hidden_size], dtype=output_dtype),
+                token_final_scales,
+                input.new_empty([expanded_num_rows], dtype=torch.int32),
+            ]
+        elif min_latency_mode:
             num_experts_on_rank = fc2_expert_weights.shape[0]
             output_shape = [seq_len * num_experts_on_rank, hidden_size]
             experts_to_token_score_shape = [num_experts_on_rank, seq_len]
@@ -860,7 +881,8 @@ def cutlass_fused_moe(
     activation_type: ActivationType = ActivationType.Swiglu,
     swizzled_input_sf: bool = True,
     use_fused_finalize: bool = True,
-) -> torch.Tensor:
+    do_finalize: bool = True,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
     This function implements a fused MoE layer that combines expert selection, expert computation,
@@ -1032,6 +1054,17 @@ def cutlass_fused_moe(
     hidden_size = fc2_expert_weights.shape[1]
     output_shape = (num_rows, hidden_size)
 
+    if not do_finalize:
+        if min_latency_mode:
+            raise ValueError("do_finalize=False is not supported with min_latency_mode")
+        if use_deepseek_fp8_block_scale:
+            raise ValueError(
+                "do_finalize=False is not yet supported with "
+                "use_deepseek_fp8_block_scale=True"
+            )
+        # use_fused_finalize must be False when do_finalize=False (C++ assertion)
+        use_fused_finalize = False
+
     if output is None:
         output = torch.empty(output_shape, dtype=output_dtype, device=input.device)
     else:
@@ -1071,6 +1104,7 @@ def cutlass_fused_moe(
         enable_pdl=enable_pdl,
         activation_type=activation_type,
         use_fused_finalize=use_fused_finalize,
+        do_finalize=do_finalize,
     )
 
 

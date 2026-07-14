@@ -247,16 +247,18 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         << ", Output: " << DLDataTypeToString(mOutputDtype);
   }
 
-  void runMoe(TensorView output, TensorView input, TensorView token_selected_experts,
-              Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
-              Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
-              Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
-              Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
-              Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
-              bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
-              int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
-              bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
-              ActivationType base_activation_type = ActivationType::Swiglu) {
+  Array<Tensor> runMoe(TensorView output, TensorView input, TensorView token_selected_experts,
+                       Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
+                       Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
+                       Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
+                       Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
+                       Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
+                       bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
+                       int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank,
+                       bool enable_alltoall, bool min_latency_mode,
+                       Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+                       ActivationType base_activation_type = ActivationType::Swiglu,
+                       bool do_finalize = true) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     TVM_FFI_ICHECK(cluster_size == 1 && cluster_rank == 0)
@@ -428,6 +430,30 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode, min_latency_params,
         enable_pdl, stream);
 #endif
+    // When do_finalize=false, copy fc2_result_ and src_to_dest_map while workspace is alive
+    if (!do_finalize) {
+      int64_t expanded_num_rows = num_rows * experts_per_token;
+      int device_id;
+      check_cuda_error(cudaGetDevice(&device_id));
+
+      void* fc2_result_ptr = mKernelRunner->getGemm2ResultPtr();
+      size_t gemm2_bytes = expanded_num_rows * hidden_size * ((mOutputDtype.bits + 7) / 8);
+      auto gemm2_output = alloc_tensor({expanded_num_rows, hidden_size}, mOutputDtype,
+                                       DLDevice{kDLCUDA, device_id});
+      check_cuda_error(cudaMemcpyAsync(gemm2_output.data_ptr(), fc2_result_ptr, gemm2_bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+
+      auto expanded_idx = alloc_tensor({expanded_num_rows}, dl_int32, DLDevice{kDLCUDA, device_id});
+      check_cuda_error(cudaMemcpyAsync(expanded_idx.data_ptr(), workspace_info.src_to_dest_map,
+                                       expanded_num_rows * sizeof(int32_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+
+      Array<Tensor> result;
+      result.push_back(gemm2_output);
+      result.push_back(expanded_idx);
+      return result;
+    }
+    return Array<Tensor>{};
   }
 
   void runMoeMinLantency(TensorView output, TensorView input, TensorView token_selected_experts,
@@ -755,12 +781,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
                  int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
-                 int64_t base_activation_type) {
-            runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
-                   fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
-                   swiglu_alpha, swiglu_beta, swiglu_limit, swizzled_input_sf, tp_size, tp_rank,
-                   ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall, min_latency_mode,
-                   profile_ids, enable_pdl, static_cast<ActivationType>(base_activation_type));
+                 int64_t base_activation_type, bool do_finalize) -> Array<Tensor> {
+            return runMoe(output, input, token_selected_experts, token_final_scales,
+                          fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+                          fc2_expert_biases, quant_scales, input_sf, swiglu_alpha, swiglu_beta,
+                          swiglu_limit, swizzled_input_sf, tp_size, tp_rank, ep_size, ep_rank,
+                          cluster_size, cluster_rank, enable_alltoall, min_latency_mode,
+                          profile_ids, enable_pdl,
+                          static_cast<ActivationType>(base_activation_type), do_finalize);
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(

@@ -460,6 +460,10 @@ class CutlassMoeFCRunnerInterface {
   // Returns 0 if the config is incompatible with the current device.
   virtual int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) = 0;
 
+  // Returns the internal fc2_result_ pointer (GEMM2 output in permuted layout).
+  // Valid only after runMoe(..., do_finalize=false) and before the next runMoe call.
+  virtual void* getGemm2ResultPtr() const = 0;
+
   virtual void runMoe(void const* input_activations, void const* input_sf,
                       bool const swizzled_input_sf, int const* token_selected_experts,
                       float const* token_final_scales, void const* fc1_expert_weights,
@@ -472,8 +476,8 @@ class CutlassMoeFCRunnerInterface {
                       MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                       bool use_mxfp8_act_scaling, bool min_latency_mode,
-                      MoeMinLatencyParams& min_latency_params, bool enable_pdl,
-                      cudaStream_t stream) = 0;
+                      MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+                      bool do_finalize = true) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -619,6 +623,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   ~CutlassMoeFCRunner() override = default;
 
+  void* getGemm2ResultPtr() const override { return fc2_result_; }
+
   static_assert(std::is_same_v<T, WeightType> || !std::is_same_v<T, float>,
                 "Does not support float with quantized weights");
 
@@ -678,8 +684,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora,
               LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
               bool use_mxfp8_act_scaling, bool min_latency_mode,
-              MoeMinLatencyParams& min_latency_params, bool enable_pdl,
-              cudaStream_t stream) override;
+              MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+              bool do_finalize = true) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
   static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>& gemm_runner,
@@ -726,7 +732,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       void* fc2_lora, cudaStream_t stream, MOEParallelismConfig parallelism_config,
       bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config,
       bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
-      bool enable_pdl);
+      bool enable_pdl, bool do_finalize = true);
 
   // Overrides to allow us to forward on to the internal functions with the pointers using the
   // correct type

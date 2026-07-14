@@ -3292,7 +3292,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     int64_t const k, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
     cudaStream_t stream, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
+    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl, bool do_finalize) {
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
 
   bool const using_tma_ws_gemm2 = gemm_runner.isTmaWarpSpecialized(config);
@@ -3378,6 +3378,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                       stream);
     sync_check_cuda_error(stream);
   }
+
+  // When do_finalize is false, skip finalize — leave GEMM2 output in gemm_output (permuted layout).
+  if (!do_finalize) return;
 
   bool has_different_output_type_ampere = (use_w4afp8 || use_fp8) && !using_tma_ws_gemm2;
   bool using_fused_finalize =
@@ -3635,7 +3638,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
            int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
            bool const enable_alltoall, bool use_lora, LoraParams& lora_params,
            bool use_deepseek_fp8_block_scale, bool use_mxfp8_act_scaling, bool min_latency_mode,
-           MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream) {
+           MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+           bool do_finalize) {
   static constexpr bool int_scales_required = std::is_same<WeightType, uint8_t>::value ||
                                               std::is_same<WeightType, cutlass::uint4b_t>::value ||
                                               use_wfp4a16;
@@ -3907,6 +3911,16 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 
     sync_check_cuda_error(stream);
 
+    // When do_finalize is false, the runner must have been created with
+    // use_fused_finalize=false so that GEMM2 writes to fc2_result_ (workspace)
+    // rather than directly to final_output via atomics.
+    TLLM_CHECK_WITH_INFO(
+        do_finalize || !use_fused_finalize_,
+        "do_finalize=false requires the runner to be created with use_fused_finalize=false");
+    TLLM_CHECK_WITH_INFO(
+        do_finalize || !use_deepseek_fp8_block_scale,
+        "do_finalize=false is not yet supported with the DeepSeek FP8 block-scale path");
+
     auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(
         num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
         inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
@@ -3956,15 +3970,16 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
         applyPrequantScale(smoothed_act_, fc1_result_, quant_params.groupwise.fc2.act_scales,
                            num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream);
     sync_check_cuda_error(stream);
-    Self::gemm2(
-        moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_result_, final_output,
-        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
-        fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params,
-        token_topk_unpermuted_scales, permuted_token_final_scales_, unpermuted_row_to_permuted_row,
-        permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
-        expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
-        experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
-        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
+    Self::gemm2(moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_result_, final_output,
+                expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights,
+                fc2_expert_biases, fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_,
+                quant_params, token_topk_unpermuted_scales, permuted_token_final_scales_,
+                unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
+                token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
+                hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
+                experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
+                parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr,
+                enable_pdl, do_finalize);
     sync_check_cuda_error(stream);
   }
 }
