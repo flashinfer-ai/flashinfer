@@ -24,7 +24,10 @@ kernel_src/cutedsl_megamoe/
 │   │                          all-reduces (MAX) across ranks, applies the winner
 │   │                          (backends trigger it via config knobs="auto")
 │   └── correctness.py      ← standalone NVFP4 smoke runner (not used by moe_ep)
-└── SKILL.md                ← this file
+├── SKILL.md                ← this file (drop-update workflow)
+└── TUNING.md               ← tuning surface + measured profiles + benchmarking
+                               methodology (read before re-tuning or comparing
+                               against deep_gemm / the kernel-repo tester)
 ```
 
 Core principle: **`src/` is a verbatim copy of the kernel-team drop — no injected
