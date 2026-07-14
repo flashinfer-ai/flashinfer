@@ -730,6 +730,24 @@ struct QuantTypeStaticVals<int8_t> {
   static constexpr float MIN_SCALING_FACTOR_RCP = FLT_MAX;
 };
 
+#ifdef ENABLE_FP8
+// Same values as TRT-LLM quantTypeUtils.cuh; MIN_SCALING_FACTOR bound follows
+// https://github.com/pytorch/FBGEMM/blob/main/fbgemm_gpu/experimental/gen_ai/src/quantize/quantize.cu
+template <>
+struct QuantTypeStaticVals<__nv_fp8_e4m3> {
+  static constexpr float MAX_VAL = 448.f;
+  static constexpr float MIN_SCALING_FACTOR = 1.0f / (448.f * 512.f);
+  static constexpr float MIN_SCALING_FACTOR_RCP = 448.f * 512.f;
+};
+
+template <>
+struct QuantTypeStaticVals<__nv_fp8_e5m2> {
+  static constexpr float MAX_VAL = 57344.f;
+  static constexpr float MIN_SCALING_FACTOR = 1.0f / (57344.f * 512.f);
+  static constexpr float MIN_SCALING_FACTOR_RCP = 57344.f * 512.f;
+};
+#endif  // ENABLE_FP8
+
 template <typename Tf, typename T>
 __inline__ __device__ Tf compute_layernorm(Tf val, float s_mean, float s_variance, T const* gemma,
                                            T const* beta, int i) {
@@ -827,8 +845,10 @@ __global__ void generalLayerNorm(T const* input, Tw const* gemma, Tw const* beta
   bool const with_per_tensor_scaling = scale_orig_quant_per_tensor != nullptr;
   bool const with_per_token_sum = sum_per_token != nullptr;
 
-  const float_packed_t scale_orig_quant =
-      cuda_cast<float_packed_t>(with_per_tensor_scaling ? *scale_orig_quant_per_tensor : 0.0f);
+  // The reciprocal makes the per-tensor path follow the flashinfer convention
+  // out = normed / scale, matching RMSNormQuant.
+  const float_packed_t scale_orig_quant = cuda_cast<float_packed_t>(
+      with_per_tensor_scaling ? 1.0f / (*scale_orig_quant_per_tensor) : 0.0f);
   T_scalar amax = 1e-6f;
   local_sum = 0.f;
 
@@ -976,6 +996,49 @@ cudaError_t LayerNorm(T* input, Tw* gemma, Tw* beta, T* out, uint32_t tokens, ui
   }
   return cudaSuccess;
 }
+
+#ifdef ENABLE_FP8
+template <typename T, typename Tw, typename QuantT>
+cudaError_t LayerNormQuant(T* input, Tw* gemma, Tw* beta, QuantT* out_quant, float* scale,
+                           uint32_t tokens, uint32_t hidden_dim, float eps = 1e-5,
+                           cudaStream_t stream = 0) {
+  dim3 grid(tokens);
+  dim3 block(min(hidden_dim, 1024));
+  // Make sure block.x is multiple of 32 for warp shuffle to work
+  block.x = 32 * ((block.x + 31) / 32);
+
+  constexpr size_t vec_size = 2;
+  const size_t shmem_size = hidden_dim * sizeof(T);
+  bool const use_vec_type = (hidden_dim % vec_size == 0) &&
+                            (std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value);
+
+  // Per-tensor scaling path: the non-quantized output is never written and the
+  // fp8 cast saturates, so no extra clamp is needed.
+  T* normed_output = nullptr;
+  bool has_fp8_min_scaling = false;
+  float* clamp_ptr = nullptr;
+  float* dynamic_scale = nullptr;
+  float* sum_per_token = nullptr;
+  bool use_diff_of_squares = false;
+
+  if (use_vec_type) {
+    using Tp = typename packed_as<T, vec_size>::type;
+    using Twp = typename packed_as<Tw, vec_size>::type;
+    // QuantT stays scalar here; the kernel re-packs it via
+    // packed_as<QuantT, num_elems<Tp>::value> to match the vectorized T.
+    dispatch_layernorm_type(
+        reinterpret_cast<Tp const*>(input), reinterpret_cast<Twp const*>(gemma),
+        reinterpret_cast<Twp const*>(beta), reinterpret_cast<Tp*>(normed_output), eps, tokens,
+        hidden_dim, clamp_ptr, scale, dynamic_scale, sum_per_token, out_quant, has_fp8_min_scaling,
+        grid, block, shmem_size, stream, use_diff_of_squares);
+  } else {
+    dispatch_layernorm_type(input, gemma, beta, normed_output, eps, tokens, hidden_dim, clamp_ptr,
+                            scale, dynamic_scale, sum_per_token, out_quant, has_fp8_min_scaling,
+                            grid, block, shmem_size, stream, use_diff_of_squares);
+  }
+  return cudaGetLastError();
+}
+#endif  // ENABLE_FP8
 
 }  // namespace norm
 

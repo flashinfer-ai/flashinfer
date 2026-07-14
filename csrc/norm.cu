@@ -274,6 +274,54 @@ void layernorm(Tensor output, Tensor input, Tensor gamma, Tensor beta, double ep
   });
 }
 
+void layernorm_quant(TensorView output, TensorView input, TensorView gamma, TensorView beta,
+                     TensorView scale, double eps) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(gamma);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(beta);
+  CHECK_DEVICE(input, gamma);
+  CHECK_DEVICE(input, beta);
+  CHECK_DEVICE(input, output);
+  CHECK_DEVICE(input, scale);
+  CHECK_DIM(2, input);   // input: (batch_size, hidden_size)
+  CHECK_DIM(2, output);  // output: (batch_size, hidden_size)
+  CHECK_DIM(1, gamma);   // gamma: (hidden_size)
+  CHECK_DIM(1, beta);    // beta: (hidden_size)
+  TVM_FFI_ICHECK_EQ(input.size(1), gamma.size(0));
+  TVM_FFI_ICHECK_EQ(input.size(1), beta.size(0));
+  TVM_FFI_ICHECK_EQ(scale.numel(), 1);
+  unsigned int batch_size = input.size(0);
+  unsigned int hidden_size = input.size(1);
+  TVM_FFI_ICHECK_EQ(output.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(output.size(1), hidden_size);
+  // generalLayerNorm indexes as bidx * hidden_size + i and takes no strides
+  TVM_FFI_ICHECK_EQ(input.stride(0), hidden_size) << "input must be contiguous";
+  TVM_FFI_ICHECK_EQ(output.stride(0), hidden_size) << "output must be contiguous";
+  // TODO(kaixih): This is currently our only use case; Add more if needed.
+  TVM_FFI_ICHECK_EQ(input.dtype(), dl_bfloat16) << "input must be bfloat16";
+  TVM_FFI_ICHECK_EQ(gamma.dtype(), dl_float32) << "gamma must be float32";
+  TVM_FFI_ICHECK_EQ(beta.dtype(), dl_float32) << "beta must be float32";
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  const cudaStream_t stream = get_stream(input.device());
+
+#ifdef ENABLE_FP8
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(output.dtype(), o_type, [&] {
+      cudaError_t status = norm::LayerNormQuant(
+          static_cast<c_type*>(input.data_ptr()), static_cast<float*>(gamma.data_ptr()),
+          static_cast<float*>(beta.data_ptr()), static_cast<o_type*>(output.data_ptr()),
+          static_cast<float*>(scale.data_ptr()), batch_size, hidden_size, eps, stream);
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "LayerNormQuant failed with error code " << cudaGetErrorString(status);
+      return true;
+    });
+  });
+#else
+  TVM_FFI_THROW(RuntimeError) << "layernorm_quant requires the norm module built with ENABLE_FP8";
+#endif
+}
+
 void fused_dit_layernorm_run(TensorView input, TensorView residual, TensorView gate,
                              TensorView gate_bias, TensorView gamma, TensorView beta,
                              TensorView scale, TensorView scale_bias, TensorView shift,

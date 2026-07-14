@@ -641,6 +641,16 @@ __device__ inline __nv_fp8_e4m3 cuda_cast<__nv_fp8_e4m3, int8_t>(int8_t val) {
   return cuda_cast<__nv_fp8_e4m3>(cuda_cast<__nv_bfloat16>(cuda_cast<float>(val)));
 }
 
+template <>
+__device__ inline __nv_fp8x2_e5m2 cuda_cast<__nv_fp8x2_e5m2, float2>(float2 val) {
+  return __nv_fp8x2_e5m2(val);
+}
+
+template <>
+__device__ inline __nv_fp8_e5m2 cuda_cast<__nv_fp8_e5m2, float>(float val) {
+  return __nv_fp8_e5m2(val);
+}
+
 #endif  // ENABLE_FP8
 
 }  // namespace common
