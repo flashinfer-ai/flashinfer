@@ -8790,7 +8790,8 @@ def _cudnn_gemm_mxfp8(
     )
 
 
-def _cudnn_gemm_mxfp8_runner(scale_reordering):
+def _cudnn_gemm_mxfp8_runner():
+    """Build a cuDNN MXFP8 runner with scale layout supplied as tuner input."""
     m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
         _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
     )
@@ -8800,13 +8801,12 @@ def _cudnn_gemm_mxfp8_runner(scale_reordering):
             super().__init__()
             self._m_bucket_mapper = m_bucket_mapper
             self._use_override_shape = is_cudnn_override_shape_available()
-            self._scale_reordering = scale_reordering
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-            a, b, _, _, out, _ = inputs
-            return (a.dtype, b.dtype, out.dtype, str(self._scale_reordering))
+            a, b, _, _, out, _, scale_reordering = inputs
+            return (a.dtype, b.dtype, out.dtype, str(scale_reordering))
 
-        def _get_override_graph(self, a, b, out):
+        def _get_override_graph(self, a, b, out, scale_reordering):
             batch = a.shape[0]
             actual_m = a.shape[-2]
             k = a.shape[-1]
@@ -8823,7 +8823,7 @@ def _cudnn_gemm_mxfp8_runner(scale_reordering):
                 block_size=32,
                 device=a.device,
                 cache_m=cache_m,
-                scale_reordering=self._scale_reordering,
+                scale_reordering=scale_reordering,
                 policy=cudnn.build_plan_policy.ALL,
             )
 
@@ -8832,9 +8832,9 @@ def _cudnn_gemm_mxfp8_runner(scale_reordering):
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            a, b, _, _, out, _ = inputs
+            a, b, _, _, out, _, scale_reordering = inputs
             if self._use_override_shape:
-                graph = self._get_override_graph(a, b, out)
+                graph = self._get_override_graph(a, b, out, scale_reordering)
             else:
                 graph = build_cudnn_gemm_mxfp8_graph(
                     a_shape=a.shape,
@@ -8846,7 +8846,7 @@ def _cudnn_gemm_mxfp8_runner(scale_reordering):
                     o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
                     block_size=32,
                     device=a.device,
-                    scale_reordering=self._scale_reordering,
+                    scale_reordering=scale_reordering,
                     policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
                 )
 
@@ -8859,9 +8859,9 @@ def _cudnn_gemm_mxfp8_runner(scale_reordering):
             do_preparation: bool = False,
             **kwargs,
         ) -> torch.Tensor:
-            a, b, scale_a, scale_b, out, workspace_buffer = inputs
+            a, b, scale_a, scale_b, out, workspace_buffer, scale_reordering = inputs
             if self._use_override_shape:
-                graph = self._get_override_graph(a, b, out)
+                graph = self._get_override_graph(a, b, out, scale_reordering)
                 execute_cudnn_gemm_mxfp8_graph_override_shape(
                     graph=graph,
                     a=a,
@@ -8882,7 +8882,7 @@ def _cudnn_gemm_mxfp8_runner(scale_reordering):
                     out_dtype=out.dtype,
                     workspace_buffer=workspace_buffer,
                     tactic=-1,
-                    scale_reordering=self._scale_reordering,
+                    scale_reordering=scale_reordering,
                 )
             return out
 
@@ -8903,10 +8903,10 @@ def mxfp8_gemm_sm100(
 
     runners = []
     if "cudnn" in runner_names:
-        runners.append(_cudnn_gemm_mxfp8_runner(scale_reordering))
+        runners.append(_cudnn_gemm_mxfp8_runner())
     assert runners, "No suitable runners found"
 
-    inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
+    inputs = [a, b, scale_a, scale_b, out, workspace_buffer, scale_reordering]
     runner, tactic = tuner.choose_one(
         "mxfp8_gemm",  # TODO: check if this is correct
         runners,
@@ -9022,7 +9022,6 @@ def bmm_mxfp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
-    *,
     sf_layout: SfLayout = SfLayout.layout_128x4,
 ) -> torch.Tensor:
     r"""BMM MXFP8
