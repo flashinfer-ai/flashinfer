@@ -33,7 +33,7 @@ Verification model (single mode, uniform -- every config that runs gets the same
      produces a gross error instead of one averaged away. Tolerance is set to the fp4
      intermediate-requant floor (~0.08), far tighter than a dense-random comparison.
   3. **determinism, per-backend contract.** A backend declared deterministic must reproduce
-     bitwise across reruns; a non-deterministic one (CuteDSL's atomic-scatter finalize) is exempt.
+     bitwise across reruns.
      Flags are established empirically (CRC across runs) -- see ``_DETERMINISTIC``.
   4. **output-buffer poison.** The kernel owns its output (an uninitialized ``new_empty`` inside
      the runner's ``pack_inputs``) and MoE finalize *accumulates* into it -- so the result must not
@@ -194,7 +194,7 @@ pytestmark = pytest.mark.skipif(
 # upstream note), because a deterministic->non-deterministic regression is exactly a bug to catch.
 _DETERMINISTIC = {
     "trtllm_fp4_routed": True,  # bitwise-stable across reruns in calibration
-    "cute_dsl_nvfp4": False,  # atomic scatter-add finalize -> non-bit-exact by design
+    "cute_dsl_nvfp4": True,
 }
 
 # Known-bug ledger: (backend_key, predicate(cfg)) -> reason. A matching (backend, config) is run but
@@ -606,7 +606,7 @@ def test_unified_moe_fuzz(cfg):
         # (1)+(2) no-NaN + numeric vs the authoritative reference, on a clean run.
         assert_correct(out, tag)
         # (3) determinism per the backend's contract: deterministic backends must reproduce
-        # bitwise; non-deterministic ones (atomic-scatter finalize) are exempt.
+        # bitwise.
         if _DETERMINISTIC.get(runner.backend_key, False):
             if not torch.equal(out, run(runner)):
                 drift = (out - run(runner)).abs().max().item()

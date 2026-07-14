@@ -1443,6 +1443,60 @@ class TestCuteDslFusedMoeFunctional:
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
+    def test_per_token_decode_is_bitwise_deterministic(self):
+        from flashinfer import CuteDslMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 1, 2048, 768
+        num_experts, top_k = 32, 8
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            use_per_token_activation=True,
+        )
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=True,
+        )
+        kwargs = {
+            "x": tensors["x"],
+            "x_sf": tensors["x_sf"],
+            "token_selected_experts": tensors["token_selected_experts"],
+            "token_final_scales": tensors["token_final_scales"],
+            "w1_weight": tensors["w1_weight"],
+            "w1_weight_sf": tensors["w1_weight_sf"],
+            "w1_alpha": tensors["w1_alpha"],
+            "fc2_input_scale": tensors["fc2_input_scale"],
+            "w2_weight": tensors["w2_weight"],
+            "w2_weight_sf": tensors["w2_weight_sf"],
+            "w2_alpha": tensors["w2_alpha"],
+            "per_token_scale": tensors["x_per_token_scale"],
+        }
+
+        for _ in range(2):
+            moe.run(**kwargs)
+        eager_reference = moe.run(**kwargs).clone()
+        for _ in range(5):
+            assert torch.equal(eager_reference, moe.run(**kwargs))
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = moe.run(**kwargs)
+        graph.replay()
+        torch.cuda.synchronize()
+        graph_reference = graph_output.clone()
+        assert not (graph_reference == 0).all()
+        for _ in range(5):
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(graph_reference, graph_output)
+
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
     @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("top_k", [2, 8])
@@ -1665,18 +1719,16 @@ class TestCuteDslMoEWrapper:
         assert not torch.isnan(output).any(), "NaN after first replay"
         assert not (output == 0).all(), "All zeros after first replay"
 
-        # Test replay consistency (allow small numerical differences due to FP4 atomics)
+        # Test replay consistency.
         results = []
         for _ in range(3):
             g.replay()
             torch.cuda.synchronize()
             results.append(output.clone())
 
-        # All replays should produce very similar results (small FP4 tolerance)
+        # The default two-stage finalize must be bitwise deterministic.
         for i in range(1, len(results)):
-            max_diff = (results[0] - results[i]).abs().max().item()
-            # FP4 atomics can have small non-determinism
-            assert max_diff < 0.5, f"Replay {i} differs too much: max_diff={max_diff}"
+            assert torch.equal(results[0], results[i]), f"Replay {i} differs"
 
         # Verify accuracy
         ref_output = compute_reference_moe_fp4(

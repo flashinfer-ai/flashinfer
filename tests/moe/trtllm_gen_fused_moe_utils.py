@@ -221,6 +221,7 @@ class CUDAGraphMoE:
             output1_scale_scalar=self.static_data["scale_c_fc1"],
             output1_scale_gate_scalar=self.static_data["scale_gate_fc1"],
             output2_scale_scalar=self.static_data["scale_c_fc2"],
+            per_token_scale=self.config.get("per_token_scale"),
             num_experts=self.config["num_experts"],
             top_k=self.config["top_k"],
             n_group=self.config["n_groups"],
@@ -654,6 +655,8 @@ class FP4Moe(Moe):
         gemm1_bias = static_data["gemm1_bias_shuffled"]
         gemm2_bias = static_data["gemm2_bias_shuffled"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        per_token_scale = kwargs.get("per_token_scale")
+        check_determinism = kwargs.get("check_determinism", False)
 
         # Create CUDA graph configuration
         config = {
@@ -670,6 +673,7 @@ class FP4Moe(Moe):
             "gemm1_bias": gemm1_bias,
             "gemm2_bias": gemm2_bias,
             "norm_topk_prob": norm_topk_prob,
+            "per_token_scale": per_token_scale,
         }
 
         runtime_args = {
@@ -681,8 +685,13 @@ class FP4Moe(Moe):
         cuda_graph = CUDAGraphMoE(self, static_data, **config)
         try:
             cuda_graph.capture(hidden_states_orig, **runtime_args)
-            output = cuda_graph.launch(hidden_states_orig)
-            return output[0].to(torch.float)
+            output = cuda_graph.launch(hidden_states_orig)[0]
+            if check_determinism:
+                reference = output.clone()
+                for _ in range(5):
+                    repeated = cuda_graph.launch(hidden_states_orig)[0]
+                    assert torch.equal(reference, repeated)
+            return output.to(torch.float)
         finally:
             cuda_graph.cleanup()
 
@@ -3295,6 +3304,8 @@ def run_moe_test(
     check_intermediate_output=False,
     gemm1_lora_args=None,
     verify_unfinalized_weight_dtype=False,
+    use_per_token_scaling=False,
+    check_determinism=False,
 ):
     """Common test logic for all routing methods.
 
@@ -3523,6 +3534,12 @@ def run_moe_test(
         num_fused_shared_experts=num_fused_shared_experts,
         norm_topk_prob=norm_topk_prob,
         return_full_output=check_intermediate_output,
+        per_token_scale=(
+            torch.ones(num_tokens, device="cuda", dtype=torch.float32)
+            if use_per_token_scaling
+            else None
+        ),
+        check_determinism=check_determinism,
     )
 
     # When a lora delta is set, the kernel returns the post-activation FC1 output
