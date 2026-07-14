@@ -759,6 +759,17 @@ class TestRunnerBoundaryValidation:
         with pytest.raises(ValueError, match="FromLogits"):
             _validate_prerouted_inputs(pack, 4, 2, "T")
 
+    def test_prerouted_device_mutation_caught_at_runner_boundary(self):
+        from flashinfer.fused_moe.runners import _validate_prerouted_inputs
+
+        x, sf, ids, w, _ = _pack_tensors()
+        pack = MoEActivationPack(x, sf, ids, w)
+        pack.topk_ids = torch.zeros(
+            pack.topk_ids.shape, dtype=torch.int32, device="meta"
+        )
+        with pytest.raises(ValueError, match="device"):
+            _validate_prerouted_inputs(pack, 4, 2, "T")
+
     def _logits_pack(self, logits, bias=None):
         from flashinfer.fused_moe.core import RoutingInputMode
 
@@ -814,6 +825,16 @@ class TestRunnerBoundaryValidation:
             bias=torch.zeros(15, dtype=torch.bfloat16),
         )
         with pytest.raises(ValueError, match="num_experts"):
+            _validate_logits_inputs(pack, 4, 16, "T")
+
+    def test_logits_device_mutation_caught_at_runner_boundary(self):
+        from flashinfer.fused_moe.runners import _validate_logits_inputs
+
+        pack = self._logits_pack(torch.zeros(4, 16, dtype=torch.float32))
+        pack.routing_logits = torch.zeros(
+            pack.routing_logits.shape, dtype=torch.float32, device="meta"
+        )
+        with pytest.raises(ValueError, match="device"):
             _validate_logits_inputs(pack, 4, 16, "T")
 
 

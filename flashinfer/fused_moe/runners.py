@@ -33,6 +33,24 @@ from ..autotuner import TunableRunner
 from .api import MoEActivationPack, MoEConfig, MoEWeightPack, RoutingInputMode
 
 
+def _validate_pack_devices(act: MoEActivationPack, runner: str) -> None:
+    """Recheck pack tensor placement at the mutable runner boundary."""
+    expected = act.hidden_states_q.device
+    for name in (
+        "hidden_states_scale",
+        "topk_ids",
+        "topk_weights",
+        "routing_logits",
+        "routing_bias",
+    ):
+        tensor = getattr(act, name)
+        if tensor is not None and tensor.device != expected:
+            raise ValueError(
+                f"{runner}: {name} is on {tensor.device}, expected {expected} "
+                "(hidden_states_q device)."
+            )
+
+
 def _validate_prerouted_inputs(
     act: MoEActivationPack, num_tokens: int, top_k: int, runner: str
 ) -> None:
@@ -54,6 +72,7 @@ def _validate_prerouted_inputs(
             f"{runner}: routing_logits/routing_bias are only consumed by "
             "in-kernel (FromLogits) routing."
         )
+    _validate_pack_devices(act, runner)
     expected = (num_tokens, top_k)
     for name in ("topk_ids", "topk_weights"):
         shape = tuple(getattr(act, name).shape)
@@ -92,6 +111,7 @@ def _validate_logits_inputs(
             f"{runner}: FromLogits computes topk_ids/topk_weights in-kernel; "
             "leave them None."
         )
+    _validate_pack_devices(act, runner)
     logits = act.routing_logits
     if logits.dtype not in (torch.float32, torch.bfloat16):
         raise TypeError(
