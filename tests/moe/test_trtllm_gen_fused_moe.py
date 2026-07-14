@@ -402,9 +402,7 @@ def test_deepseekv3_routing(
 
 
 @pytest.mark.parametrize("num_tokens", [8, 64, 1024])
-def test_deepseek_fp8_activation_routing_workset(
-    num_tokens, cache_permute_indices
-):
+def test_deepseek_fp8_activation_routing_workset(num_tokens, cache_permute_indices):
     """Exercise the 1/2/4-row activation dispatch on the compact routing workset."""
     run_moe_test(
         num_tokens=num_tokens,

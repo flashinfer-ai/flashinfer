@@ -181,6 +181,7 @@ struct Data {
   int32_t const* ctaIdxXyToMnLimit;
   int32_t const* numNonExitingCtas;
   int32_t tileTokensDim;
+  int32_t maxNumCtasInBatchDim;
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
