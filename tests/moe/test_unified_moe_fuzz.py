@@ -73,7 +73,7 @@ Run it explicitly:
 NOTE: `pytest --forked` does NOT work here (CUDA inits at collection ->
 "Cannot re-initialize CUDA in forked subprocess"); for crash-isolated enumeration run each
 test id in its own process instead (see var/03-ssh-docker-workflow.md).
-Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 80), FLASHINFER_UMOE_FUZZ_SEED (default 0).
+Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 160), FLASHINFER_UMOE_FUZZ_SEED (default 0).
 
 ------------------------------------------------------------------------------------------------
 EXTENDING (cheap, by design):
@@ -169,7 +169,7 @@ from flashinfer.utils import get_compute_capability
 
 from tests.test_helpers.fuzz_ledger import FuzzLedger
 
-NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "80"))
+NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "160"))
 # Debug knob: comma-separated backend_key allowlist (e.g. "cute_dsl_nvfp4") to run a
 # backend-scoped sequence -- used to bisect cross-call state corruption by backend (gh #3957).
 _BACKEND_FILTER = {
