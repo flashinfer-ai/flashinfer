@@ -145,15 +145,19 @@ def _gemm_alpha_beta_kernel_cutile(
             acc0 = ct.extract(acc, index=(0, 0), shape=(BLOCK_M, BLOCK_N // 2))
             acc1 = ct.extract(acc, index=(0, 1), shape=(BLOCK_M, BLOCK_N // 2))
 
-            c_load0 = ct.load(
-                c_ptr,
-                index=(pid_m, pid_n * 2),
-                shape=(BLOCK_M, BLOCK_N // 2),
-                order=(0, 1),
-                padding_mode=zero_pad,
-            )
-            c_load0_f32 = ct.astype(c_load0, ct.float32)
-            result0 = alpha * acc0 + beta * c_load0_f32
+            # beta is a compile-time constant, so beta=0 specializes away C loads.
+            if beta == 0.0:
+                result0 = alpha * acc0
+            else:
+                c_load0 = ct.load(
+                    c_ptr,
+                    index=(pid_m, pid_n * 2),
+                    shape=(BLOCK_M, BLOCK_N // 2),
+                    order=(0, 1),
+                    padding_mode=zero_pad,
+                )
+                c_load0_f32 = ct.astype(c_load0, ct.float32)
+                result0 = alpha * acc0 + beta * c_load0_f32
             c_block0 = ct.astype(result0, c_ptr.dtype)
             ct.store(
                 c_ptr,
@@ -162,15 +166,18 @@ def _gemm_alpha_beta_kernel_cutile(
                 order=(0, 1),
             )
 
-            c_load1 = ct.load(
-                c_ptr,
-                index=(pid_m, pid_n * 2 + 1),
-                shape=(BLOCK_M, BLOCK_N // 2),
-                order=(0, 1),
-                padding_mode=zero_pad,
-            )
-            c_load1_f32 = ct.astype(c_load1, ct.float32)
-            result1 = alpha * acc1 + beta * c_load1_f32
+            if beta == 0.0:
+                result1 = alpha * acc1
+            else:
+                c_load1 = ct.load(
+                    c_ptr,
+                    index=(pid_m, pid_n * 2 + 1),
+                    shape=(BLOCK_M, BLOCK_N // 2),
+                    order=(0, 1),
+                    padding_mode=zero_pad,
+                )
+                c_load1_f32 = ct.astype(c_load1, ct.float32)
+                result1 = alpha * acc1 + beta * c_load1_f32
             c_block1 = ct.astype(result1, c_ptr.dtype)
             ct.store(
                 c_ptr,
@@ -179,15 +186,19 @@ def _gemm_alpha_beta_kernel_cutile(
                 order=(0, 1),
             )
         else:
-            c_load = ct.load(
-                c_ptr,
-                index=(pid_m, pid_n),
-                shape=(BLOCK_M, BLOCK_N),
-                order=(0, 1),
-                padding_mode=zero_pad,
-            )
-            c_load_f32 = ct.astype(c_load, ct.float32)
-            result = alpha * acc + beta * c_load_f32
+            # beta is a compile-time constant, so beta=0 specializes away the C load.
+            if beta == 0.0:
+                result = alpha * acc
+            else:
+                c_load = ct.load(
+                    c_ptr,
+                    index=(pid_m, pid_n),
+                    shape=(BLOCK_M, BLOCK_N),
+                    order=(0, 1),
+                    padding_mode=zero_pad,
+                )
+                c_load_f32 = ct.astype(c_load, ct.float32)
+                result = alpha * acc + beta * c_load_f32
             c_block = ct.astype(result, c_ptr.dtype)
             ct.store(
                 c_ptr,
@@ -328,7 +339,8 @@ def _compute_grid_and_programs(
 
 
 # Module-level tune cache:
-#   key: (M, N, K, transpose_a_int, transpose_b_int, dtype, num_sms, str(device))
+#   key: (M, N, K, transpose_a_int, transpose_b_int, beta_is_zero,
+#         input_dtype, output_dtype, num_sms, str(device))
 #   value: (best_cfg, ct.kernel(...) bound to the chosen num_ctas/occupancy)
 _TUNE_CACHE: dict = {}
 
@@ -489,13 +501,15 @@ def _gemm_alpha_beta_cutile(
 
         # Include ``c.dtype`` because the kernel's store dtype is determined by
         # ``c_ptr.dtype`` — different output dtypes produce different specialized
-        # kernels, so they must autotune separately.
+        # kernels, so they must autotune separately. Likewise, beta=0 removes all
+        # C loads and has a different epilogue cost from beta!=0.
         cache_key = (
             M,
             N,
             K,
             transpose_a_int,
             transpose_b_int,
+            beta == 0.0,
             a.dtype,
             c.dtype,
             num_sms,
@@ -699,26 +713,10 @@ def mm_bf16_cutile(
     cheaply via ``b.transpose(-2, -1)`` (zero-copy on the storage layer that
     `mm_bf16` itself produced).
     """
-    # NaN-poisoning guard: the underlying alpha-beta GEMM kernel computes
-    #   result = alpha * acc + beta * c_load_f32
-    # Even with ``beta == 0.0``, IEEE 754 specifies ``0 * NaN == NaN`` (and
-    # likewise ``0 * Inf == NaN``), so any NaN already sitting in the storage
-    # backing ``out`` poisons every output element.
-    #
-    # ``mm_bf16`` callers typically allocate ``out`` via ``torch.empty(...)``,
-    # which leaves the buffer uninitialized. CUDA's caching allocator may
-    # return memory whose previous occupant left NaN bits — which then leak
-    # through the beta=0 epilogue path and produce all-NaN output non-
-    # deterministically (depending on allocator state).
-    #
-    # Zeroing ``out`` here costs ~one fused memset; on B200 BF16 GEMM shapes
-    # this is well under 1% of total kernel time. The proper long-term fix is
-    # a beta=0 specialization that skips the c_load entirely (follow-up).
     if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
         raise ValueError(
             f"mm_bf16_cutile requires bf16 a and b; got a.dtype={a.dtype}, b.dtype={b.dtype}"
         )
-    out.zero_()
 
     # Recover (N, K) row-major contiguous view that the kernel expects.
     # The upstream caller produces b as `(N, K).transpose(-2, -1)`, so undoing
