@@ -851,6 +851,124 @@ def test_batch_decode_with_paged_kv_cache_nvfp4_large_head():
     )
 
 
+def test_batch_decode_rejects_unequal_kv_strides_nvfp4_contract():
+    """The FA2 CUDA-core decode kernel addresses both K and V through a single
+    set of (K) strides, so ``BatchDecodeWithPagedKVCacheRun`` must reject K/V
+    pools whose stride families differ instead of silently misaddressing V.
+    This is the "reject explicitly" half of the NVFP4 unequal-stride contract:
+    every entry point that cannot consume independently-strided K/V pools (the
+    layout NVFP4/asymmetric caches produce) must fail loudly.
+
+    NVFP4 packed (uint8) KV itself cannot reach this guard — its half-width
+    packed head dim trips the equal-head-dim ICHECK first, and NVFP4 decode
+    routes through the tensor-core prefill path — so the unequal-stride
+    construction uses fp16: two separately allocated pools whose padding
+    differs, giving identical shapes but different stride families.
+
+    A positive control with identically padded (equal-stride, non-contiguous)
+    pools must run and match the reference, proving the negative case fails
+    because of the stride inequality and not the padded allocation.
+    """
+    torch.manual_seed(42)
+    batch_size = 4
+    kv_len = 54
+    page_size = 8
+    num_kv_heads = 4
+    num_qo_heads = 4
+    head_dim = 128
+    dtype = torch.float16
+
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=dtype)
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+
+    def padded_pool(num_padding_heads):
+        parent = torch.randn(
+            total_num_pages,
+            page_size,
+            num_kv_heads + num_padding_heads,
+            head_dim,
+            device="cuda:0",
+            dtype=dtype,
+        )
+        return parent[:, :, :num_kv_heads, :]
+
+    # Positive control: separately allocated K/V pools with IDENTICAL padding.
+    k_equal = padded_pool(1)
+    v_equal = padded_pool(1)
+    assert not k_equal.is_contiguous()
+    assert k_equal.stride() == v_equal.stride()
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD"
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    # The guard under test lives in the CUDA-core decode entry point
+    # (csrc/batch_decode.cu), not the tensor-core prefill path.
+    assert not wrapper.use_tensor_cores
+    o = wrapper.run(q, (k_equal, v_equal))
+
+    kv_indptr_cpu = kv_indptr.cpu()
+    kv_last_page_len_cpu = kv_last_page_len.cpu()
+    for i in range(batch_size):
+        ki = torch.cat(
+            [
+                k_equal[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+                k_equal[kv_indptr_cpu[i + 1] - 1, : kv_last_page_len_cpu[i]].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        )
+        vi = torch.cat(
+            [
+                v_equal[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+                v_equal[kv_indptr_cpu[i + 1] - 1, : kv_last_page_len_cpu[i]].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        )
+        o_ref_i = flashinfer.decode.single_decode_with_kv_cache(
+            q[i], ki, vi, pos_encoding_mode="NONE", logits_soft_cap=0.0
+        )
+        torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
+
+    # Negative case: V pool with different padding — identical shape, unequal
+    # stride family. The kernel would otherwise walk V through K's strides;
+    # the ICHECK must reject the call loudly and name the stride limitation.
+    v_unequal = padded_pool(2)
+    v_unequal.copy_(v_equal)
+    assert v_unequal.shape == k_equal.shape
+    assert v_unequal.stride() != k_equal.stride()
+    with pytest.raises(Exception, match="must have identical strides"):
+        wrapper.run(q, (k_equal, v_unequal))
+
+
 if __name__ == "__main__":
     test_batch_decode_with_paged_kv_cache(
         256,

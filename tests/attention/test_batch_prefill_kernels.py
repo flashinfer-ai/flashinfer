@@ -35,6 +35,15 @@ def skip_if_head_dim_unsupported(head_dim: int):
         pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
 
 
+def skip_if_nvfp4_asymmetric_unsupported(head_dim_qk: int):
+    skip_if_head_dim_unsupported(head_dim_qk)
+    if get_compute_capability(torch.device("cuda:0"))[0] < 10:
+        pytest.skip(
+            "asymmetric NVFP4 KV prefill uses the NVFP4 KV quantization kernel, "
+            "which requires SM100 or newer"
+        )
+
+
 @pytest.fixture(
     autouse=not has_flashinfer_jit_cache(),
     scope="module",
@@ -1528,6 +1537,176 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_strided_scale_views(kv_layout):
             v_scale=v_global_scale.item(),
             kv_cache_sf=(bad_k_sf, bad_v_sf),
         )
+
+
+@pytest.mark.parametrize("head_dim_qk,head_dim_vo", [(512, 256), (256, 128)])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("num_kv_heads", [2, 8])
+@pytest.mark.parametrize("causal", [True])
+def test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric(
+    head_dim_qk,
+    head_dim_vo,
+    page_size,
+    num_kv_heads,
+    causal,
+):
+    """Asymmetric (head_dim_qk != head_dim_vo) NVFP4 paged prefill correctness.
+
+    K pages are ``[.., head_dim_qk // 2]`` and V pages ``[.., head_dim_vo // 2]``,
+    so the separately allocated K and V pools (and their scale-factor tensors)
+    have genuinely different stride families — the layout an asymmetric NVFP4
+    KV cache hands the FA2 paged prefill entry point.
+
+    bf16 K/V are quantized with the in-tree NVFP4 KV quantization kernel and
+    the FA2 output is checked against a float32 reference attention computed on
+    ``nvfp4_kv_dequantize_paged`` output: kernel and reference consume the exact
+    same quantized bytes, so the reference is a dequantization oracle rather
+    than a requantized approximation.
+    """
+    skip_if_nvfp4_asymmetric_unsupported(head_dim_qk)
+
+    kv_layout = "NHD"
+    torch.manual_seed(42)
+    batch_size = 2
+    kv_len = 99
+    qo_len = 33
+    num_qo_heads = 2 * num_kv_heads
+    q_dtype = torch.bfloat16
+
+    # --- query ---
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim_qk, device="cuda:0", dtype=q_dtype
+    )
+    q_indptr_cpu = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+
+    # --- paged KV metadata ---
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr_cpu = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32) * num_pages_per_seq
+    )
+    kv_indices_cpu = torch.arange(0, total_num_pages, dtype=torch.int32)
+    kv_last_page_len_cpu = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    )
+
+    # --- bf16 source K/V, quantized via the in-tree NVFP4 KV quantization
+    # kernel (the helper tests/utils/test_fp4_kv_quantization.py exercises).
+    # It quantizes row-wise over the last dim, so asymmetric K/V widths
+    # quantize naturally. ---
+    k_bf16 = torch.randn(
+        total_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim_qk,
+        device="cuda:0",
+        dtype=q_dtype,
+    )
+    v_bf16 = torch.randn(
+        total_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim_vo,
+        device="cuda:0",
+        dtype=q_dtype,
+    )
+    # global_scale=1.0 avoids FP8 E4M3 block-scale underflow (see
+    # test_nvfp4_kv_roundtrip).
+    k_global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda:0")
+    v_global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda:0")
+    k_packed, k_sf = flashinfer.nvfp4_kv_quantize(
+        k_bf16.reshape(-1, head_dim_qk), k_global_scale
+    )
+    v_packed, v_sf = flashinfer.nvfp4_kv_quantize(
+        v_bf16.reshape(-1, head_dim_vo), v_global_scale
+    )
+    k_packed = k_packed.reshape(
+        total_num_pages, page_size, num_kv_heads, head_dim_qk // 2
+    )
+    k_sf = k_sf.reshape(total_num_pages, page_size, num_kv_heads, head_dim_qk // 16)
+    v_packed = v_packed.reshape(
+        total_num_pages, page_size, num_kv_heads, head_dim_vo // 2
+    )
+    v_sf = v_sf.reshape(total_num_pages, page_size, num_kv_heads, head_dim_vo // 16)
+
+    # The whole point: every consumer reachable from this entry point must
+    # support (or explicitly reject) unequal K/V strides.
+    assert k_packed.stride() != v_packed.stride()
+    assert k_sf.stride() != v_sf.stride()
+
+    # --- run BatchPrefillWithPagedKVCacheWrapper (FA2 NVFP4 paged path) ---
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+    wrapper.plan(
+        q_indptr_cpu.to("cuda:0"),
+        kv_indptr_cpu.to("cuda:0"),
+        kv_indices_cpu.to("cuda:0"),
+        kv_last_page_len_cpu.to("cuda:0"),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        page_size,
+        head_dim_vo=head_dim_vo,
+        causal=causal,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=0.0,
+        kv_data_type=torch.uint8,
+        q_data_type=q_dtype,
+    )
+    o = wrapper.run(
+        q,
+        (k_packed, v_packed),
+        k_scale=k_global_scale.item(),
+        v_scale=v_global_scale.item(),
+        kv_cache_sf=(k_sf, v_sf),
+    )
+    assert o.shape == (batch_size * qo_len, num_qo_heads, head_dim_vo)
+    assert torch.isfinite(o).all()
+
+    # --- dequantization oracle: #3748's paged NVFP4 dequant kernel ---
+    block_tables = (
+        kv_indices_cpu.to("cuda:0").reshape(batch_size, num_pages_per_seq).contiguous()
+    )
+    seq_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device="cuda:0")
+    k_dq = torch.zeros(
+        batch_size, kv_len, num_kv_heads, head_dim_qk, dtype=q_dtype, device="cuda:0"
+    )
+    v_dq = torch.zeros(
+        batch_size, kv_len, num_kv_heads, head_dim_vo, dtype=q_dtype, device="cuda:0"
+    )
+    flashinfer.nvfp4_kv_dequantize_paged(
+        (k_packed, v_packed),
+        (k_sf.view(torch.float8_e4m3fn), v_sf.view(torch.float8_e4m3fn)),
+        block_tables,
+        seq_lens,
+        k_global_scale,
+        v_global_scale,
+        k_dq,
+        v_dq,
+        kv_layout=kv_layout,
+    )
+
+    # --- float32 reference attention on the dequantized K/V ---
+    group_size = num_qo_heads // num_kv_heads
+    sm_scale = head_dim_qk**-0.5
+    for i in range(batch_size):
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()  # [qo, Hq, dqk]
+        ki = k_dq[i].float().repeat_interleave(group_size, dim=1)  # [kv, Hq, dqk]
+        vi = v_dq[i].float().repeat_interleave(group_size, dim=1)  # [kv, Hq, dvo]
+
+        logits = torch.einsum("qhd,khd->hqk", qi, ki) * sm_scale
+        if causal:
+            qpos = torch.arange(qo_len, device="cuda:0").unsqueeze(1)
+            kpos = torch.arange(kv_len, device="cuda:0").unsqueeze(0)
+            allowed = kpos <= qpos + (kv_len - qo_len)
+            logits = logits.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+        o_ref_i = torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), vi)
+        o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()
+
+        # NVFP4 is 4-bit; use relaxed tolerance
+        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-1, atol=1e-1)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
