@@ -96,6 +96,10 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
   FLASHINFER_CHECK(params.nheads / params.ngroups == HEADS_PER_GROUP,
                    "nheads/ngroups (=", params.nheads / params.ngroups,
                    ") must match JIT HEADS_PER_GROUP=", HEADS_PER_GROUP);
+  // NGROUPS is JIT-stamped too; the ratio check above doesn't pin the absolute
+  // group count, and the kernel's unflatten bakes NHEADS = NGROUPS * HEADS_PER_GROUP.
+  FLASHINFER_CHECK(params.ngroups == NGROUPS, "ngroups (=", params.ngroups,
+                   ") must match JIT NGROUPS=", NGROUPS);
   // PDL launch attribute (EXTERNAL chain: a programmatic upstream kernel — e.g.
   // conv1d — overlapping THIS kernel).  ENABLE_PDL is JIT-stamped (see
   // checkpointing_ssu_customize_config.jinja); the kernel body gates its
