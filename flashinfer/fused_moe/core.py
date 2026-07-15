@@ -111,29 +111,6 @@ def _moe_topk_ids_init(num_experts: int):
     return _init
 
 
-@functools.cache
-def _get_moe_tuning_config(
-    input_idx: tuple[int, ...],
-    dim_idx: tuple[int, ...],
-    initializers: tuple[Any, ...],
-    tune_max_num_tokens: int,
-    tuning_config_kwargs: tuple[tuple[str, Any], ...],
-) -> TuningConfig:
-    """Return one identity-stable config for each semantic MoE input layout."""
-    return TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx,
-                dim_idx,
-                get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
-                make_hybrid_bucket_mapper(tune_max_num_tokens),
-                initializers,
-            ),
-        ),
-        **dict(tuning_config_kwargs),
-    )
-
-
 # Routing input modes for FusedMoE launcher
 # Please keep this in sync with the counterpart defined in csrc/trtllm_fused_moe_kernel_launcher.cu
 class RoutingInputMode(IntEnum):
@@ -1344,12 +1321,17 @@ def get_trtllm_moe_sm100_module():
             dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
             initializers = [init for _, _, init in sorted_inputs]
 
-            return _get_moe_tuning_config(
-                input_idx,
-                dim_idx,
-                tuple(initializers),
-                tune_max_num_tokens,
-                tuple(sorted(kwargs.items())),
+            return TuningConfig(
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        input_idx,
+                        dim_idx,
+                        get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
+                        make_hybrid_bucket_mapper(tune_max_num_tokens),
+                        initializers,
+                    ),
+                ),
+                **kwargs,
             )
 
         def get_valid_tactics(

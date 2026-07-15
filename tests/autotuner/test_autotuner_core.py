@@ -1093,7 +1093,15 @@ def test_find_nearest_profile_cache_dedups_equivalent_configs():
 
 
 def test_find_nearest_profile_cache_grows_with_fresh_callable():
-    """A fresh mapper remains a distinct entry because mapper semantics matter."""
+    """Negative control: a fresh callable identity per call leaks one entry/call.
+
+    This documents the failure mode that
+    ``test_find_nearest_profile_cache_dedups_equivalent_configs`` guards against
+    and proves the methodology is sound (the cache genuinely *can* grow per call).
+    A new ``lambda`` each iteration gives each config a distinct cache key even
+    though the shape and bucketing logic are identical, so the cache grows by
+    exactly N — the original memory leak.
+    """
     import tracemalloc
 
     AutoTuner._find_nearest_profile_cached.cache_clear()
@@ -1109,7 +1117,7 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     tracemalloc.start()
     snapshot_before = tracemalloc.take_snapshot()
 
-    # Fresh lambda each iteration -> distinct cache key each call.
+    # Fresh lambda each iteration -> distinct cache key each call -> leak.
     N = 5_000
     for _ in range(N):
         config = _build_num_tokens_tuning_config(lambda x: last_positive_power_of_2(x))
@@ -1128,10 +1136,10 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     assert cache_growth == N, (
         f"Expected {N} new cache entries (one per fresh callable), got {cache_growth}."
     )
-    assert allocated_bytes > 0, "Expected Python allocation growth from cache churn"
+    assert allocated_bytes > 0, "Expected Python allocation growth from the leak"
 
     print(
-        f"\nFresh mapper identities: cache grew by {cache_growth} entries, "
+        f"\nFresh-callable leak: cache grew by {cache_growth} entries, "
         f"Python allocations grew by {allocated_bytes / 1024:.1f} KB "
         f"({allocated_bytes / N:.0f} B/call)."
     )
@@ -1244,7 +1252,6 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
 
         config_a = runner._make_tuning_config(moe_inputs)
         config_b = runner._make_tuning_config(moe_inputs)
-        assert config_a is config_b
 
         spec_a = config_a.dynamic_tensor_specs[0]
         spec_b = config_b.dynamic_tensor_specs[0]
@@ -1254,27 +1261,27 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
 
         assert init_a is init_b, (
             "_make_tuning_config returned a different topk_ids initializer object "
-            "on each call. It must preserve the existing cached initializer "
-            "factory contract."
+            "on each call. It must reuse _moe_topk_ids_init(num_experts) so that "
+            "rebuilt TuningConfigs collapse to the same _find_nearest_profile "
+            "lru_cache key — a per-call closure reintroduces the memory leak."
         )
     finally:
         fn.cache_clear()
 
 
-def _make_fresh_initializer():
-    def _init(shapes, dtype, device):
-        return None
-
-    return _init
-
-
-def test_find_nearest_profile_cache_ignores_fresh_initializer_closures(monkeypatch):
+def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatch):
     """Initializers do not affect profile selection or its cache key."""
     AutoTuner._find_nearest_profile_cached.cache_clear()
     shapes = ((1024, 4096), (1024, 8))
 
-    ref_config = _build_moe_style_tuning_config(_make_fresh_initializer())
-    other_config = _build_moe_style_tuning_config(_make_fresh_initializer())
+    def make_fresh_closure():
+        def _init(s, dt, dev):
+            return None
+
+        return _init
+
+    ref_config = _build_moe_style_tuning_config(make_fresh_closure())
+    other_config = _build_moe_style_tuning_config(make_fresh_closure())
     assert hash(ref_config) == hash(other_config), "hashes should match"
     assert ref_config != other_config, "equality should fail on fresh closures"
 
@@ -1293,7 +1300,7 @@ def test_find_nearest_profile_cache_ignores_fresh_initializer_closures(monkeypat
 
     N = 1_000
     for _ in range(N):
-        config = _build_moe_style_tuning_config(_make_fresh_initializer())
+        config = _build_moe_style_tuning_config(make_fresh_closure())
         AutoTuner._find_nearest_profile(shapes, config)
 
     cache_after = AutoTuner._find_nearest_profile_cached.cache_info()
@@ -1305,8 +1312,8 @@ def test_find_nearest_profile_cache_ignores_fresh_initializer_closures(monkeypat
     assert eq_calls == 0
 
 
-def test_mla_tuning_config_factory_reuses_semantic_configs():
-    """MLA reuses initializer closures and configs for equal scalar inputs."""
+def test_mla_rebuilt_configs_share_nearest_profile_cache(monkeypatch):
+    """MLA initializer closures do not create duplicate profile entries."""
     from flashinfer.mla._core import _build_mla_decode_tuning_config
 
     kwargs = dict(
@@ -1322,11 +1329,9 @@ def test_mla_tuning_config_factory_reuses_semantic_configs():
     )
     config_a = _build_mla_decode_tuning_config(**kwargs)
     config_b = _build_mla_decode_tuning_config(**kwargs)
-    config_other_seq_len = _build_mla_decode_tuning_config(
-        **{**kwargs, "max_seq_len": 256}
-    )
-    assert config_a is config_b
-    assert config_other_seq_len is not config_a
+    assert config_a is not config_b
+    assert hash(config_a) == hash(config_b)
+    assert config_a != config_b
 
     shapes = (
         (4, 1, 128, 576),
@@ -1337,6 +1342,17 @@ def test_mla_tuning_config_factory_reuses_semantic_configs():
     AutoTuner._find_nearest_profile_cached.cache_clear()
     profile_a = AutoTuner._find_nearest_profile(shapes, config_a)
     cache_before = AutoTuner._find_nearest_profile_cached.cache_info()
+
+    original_eq = TuningConfig.__eq__
+    eq_calls = 0
+
+    def counted_eq(self, other):
+        nonlocal eq_calls
+        eq_calls += 1
+        return original_eq(self, other)
+
+    monkeypatch.setattr(TuningConfig, "__eq__", counted_eq)
+
     profile_b = AutoTuner._find_nearest_profile(shapes, config_b)
     cache_after = AutoTuner._find_nearest_profile_cached.cache_info()
     AutoTuner._find_nearest_profile_cached.cache_clear()
@@ -1345,3 +1361,4 @@ def test_mla_tuning_config_factory_reuses_semantic_configs():
     assert cache_after.currsize == cache_before.currsize
     assert cache_after.misses == cache_before.misses
     assert cache_after.hits == cache_before.hits + 1
+    assert eq_calls == 0
