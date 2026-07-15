@@ -1249,6 +1249,7 @@ class TestCuteDslFusedMoeFunctional:
     @pytest.mark.parametrize(
         "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
     )
+    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("top_k", [1, 2, 8])
     @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
@@ -1264,6 +1265,7 @@ class TestCuteDslFusedMoeFunctional:
         hidden_size: int,
         intermediate_size: int,
         num_experts: int,
+        use_fused_finalize: bool,
         use_per_token_activation: bool,
     ):
         """Accuracy test for functional API across configurations."""
@@ -1299,6 +1301,7 @@ class TestCuteDslFusedMoeFunctional:
             top_k=top_k,
             num_local_experts=num_local_experts,
             activation_type=activation_type,
+            use_fused_finalize=use_fused_finalize,
             per_token_scale=tensors["x_per_token_scale"],
         )
 
@@ -1444,6 +1447,7 @@ class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
+    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("top_k", [2, 8])
     @pytest.mark.parametrize("num_experts", [256, 384])
@@ -1452,6 +1456,7 @@ class TestCuteDslMoEWrapper:
         num_tokens: int,
         top_k: int,
         num_experts: int,
+        use_fused_finalize: bool,
         use_per_token_activation: bool,
     ):
         """Accuracy test for wrapper API."""
@@ -1476,6 +1481,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
+            use_fused_finalize=use_fused_finalize,
         )
 
         result = moe.run(
@@ -1587,10 +1593,15 @@ class TestCuteDslMoEWrapper:
         )
 
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
+    @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("num_tokens", [64, 128, 256])
     @pytest.mark.parametrize("num_experts", [256, 384])
     def test_wrapper_cuda_graph(
-        self, num_tokens: int, num_experts: int, use_fused_finalize: bool
+        self,
+        num_tokens: int,
+        num_experts: int,
+        use_per_token_activation: bool,
+        use_fused_finalize: bool,
     ):
         """Test wrapper API with CUDA graph capture and replay."""
         from flashinfer import CuteDslMoEWrapper
@@ -1605,6 +1616,7 @@ class TestCuteDslMoEWrapper:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            use_per_token_activation=use_per_token_activation,
         )
 
         # Create wrapper WITH CUDA graph
@@ -1636,6 +1648,7 @@ class TestCuteDslMoEWrapper:
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
+                per_token_scale=tensors["x_per_token_scale"],
             )
         torch.cuda.synchronize()
 
@@ -1654,6 +1667,7 @@ class TestCuteDslMoEWrapper:
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
+                per_token_scale=tensors["x_per_token_scale"],
             )
         torch.cuda.synchronize()
 
@@ -1703,6 +1717,7 @@ class TestCuteDslMoEWrapper:
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
+            use_per_token_activation=use_per_token_activation,
         )
 
         passed, percent_within, atol = check_accuracy(results[0], ref_output)
@@ -2116,8 +2131,15 @@ class TestExpertParallelism:
             f"offset={local_expert_offset}): {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    @pytest.mark.parametrize("use_fused_finalize", [False, True])
+    @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("ep_size", [8])
-    def test_functional_with_ep(self, ep_size: int):
+    def test_functional_with_ep(
+        self,
+        ep_size: int,
+        use_per_token_activation: bool,
+        use_fused_finalize: bool,
+    ):
         """Test functional API with expert parallelism and numerical accuracy."""
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
@@ -2136,6 +2158,7 @@ class TestExpertParallelism:
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             top_k=top_k,
+            use_per_token_activation=use_per_token_activation,
         )
 
         result = cute_dsl_fused_moe_nvfp4(
@@ -2154,6 +2177,8 @@ class TestExpertParallelism:
             top_k=top_k,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            use_fused_finalize=use_fused_finalize,
+            per_token_scale=tensors["x_per_token_scale"],
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -2162,7 +2187,7 @@ class TestExpertParallelism:
 
         # Numerical accuracy verification
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"].float().cuda(),
+            hidden_states=tensors["x_ref"].float().cuda(),
             gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
             gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
             gemm1_alpha=tensors["w1_alpha"],
@@ -2175,6 +2200,7 @@ class TestExpertParallelism:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
+            use_per_token_activation=use_per_token_activation,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
         )
