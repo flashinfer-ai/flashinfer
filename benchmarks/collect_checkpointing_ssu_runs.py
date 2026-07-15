@@ -52,7 +52,7 @@ def parse_bench_output(text: str) -> list[dict]:
         parts = [p.strip() for p in line.split("|")]
         # parts[0] and parts[-1] are empty from leading/trailing |
         parts = [p for p in parts if p]
-        if len(parts) < 8:
+        if len(parts) < 9:
             continue
         kernel = parts[0]
         batch = int(parts[1])
