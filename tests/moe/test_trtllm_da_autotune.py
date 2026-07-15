@@ -714,6 +714,137 @@ def test_da_captured_selector_survives_conflicting_context_upload():
         ffi.da_destroy_knn_selector(handle_b)
 
 
+def test_da_sparse_register_sort_preserves_zero_tail():
+    """Sparse register sorting must not leak sentinels into selector similarity."""
+    if os.getenv("_FLASHINFER_DA_SPARSE_REGISTER_SORT_CHILD") != "1":
+        # Direct conditional-graph construction leaves process-global CUDA
+        # capture state. Isolate it from the public-wrapper numerical matrix.
+        env = os.environ.copy()
+        env["_FLASHINFER_DA_SPARSE_REGISTER_SORT_CHILD"] = "1"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                f"{__file__}::test_da_sparse_register_sort_preserves_zero_tail",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return
+
+    _require_sm100()
+    ffi = _load_moe_ffi_op()
+    injector = object.__new__(da_single_graph.DAInlineGraphInjector)
+    injector._ffi = ffi
+
+    precision = DA_PRECISION_CONTRACTS[0]
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_local_experts = 128
+    num_tokens_bucket = 64
+    context = da_state.make_context(
+        precision.op_name,
+        device=device,
+        dtype_act=precision.dtype_act,
+        dtype_weights=precision.dtype_weights,
+        quantization_type=precision.quantization_type,
+        top_k=1,
+        num_experts=num_local_experts,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        hidden_size=1024,
+        intermediate_size=1024,
+        activation_type=int(moe_core.ActivationType.Swiglu),
+        weight_layout=moe_core.WeightLayout.MajorK,
+        use_shuffled_weight=True,
+    )
+    selector_handle = da_state.selector_handle(context)
+    tile_sizes = [16, 32]
+
+    # Forty active experts force sort_len=64 and the register-bitonic path.
+    # Exemplar 0 is the correct CPU dot-product winner but has a small dense
+    # tail; leaked INT_MIN sentinels make exemplar 1 win on the broken kernel.
+    dense_tail = torch.cat(
+        (
+            torch.full((20,), 2.0, device=device),
+            torch.ones(20, device=device),
+            torch.full((88,), 0.01, device=device),
+        )
+    )
+    sparse = torch.cat((torch.ones(40, device=device), torch.zeros(88, device=device)))
+    exemplars = torch.stack(
+        (dense_tail / dense_tail.norm(), sparse / sparse.norm())
+    ).flatten()
+    da_profile.upload_exemplars_for_context(
+        ffi,
+        context,
+        exemplars,
+        [0, 1],
+        tile_sizes,
+        [0, 1],
+        tile_sizes,
+        num_local_experts,
+        0,
+        1,
+        num_tokens_bucket,
+    )
+
+    expert_ids = torch.cat(
+        (
+            torch.arange(20, device=device, dtype=torch.int32).repeat(2),
+            torch.arange(20, 40, device=device, dtype=torch.int32),
+        )
+    ).reshape(-1, 1)
+    expected_counts = torch.cat(
+        (
+            torch.full((20,), 2.0, device=device),
+            torch.ones(20, device=device),
+            torch.zeros(88, device=device),
+        )
+    )
+    expected_sims = torch.mv(exemplars.reshape(2, -1), expected_counts)
+    assert int(expected_sims.argmax()) == 0
+
+    output = torch.zeros((), device=device, dtype=torch.int32)
+    side_stream = torch.cuda.Stream(device=device)
+    routing_stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with (
+            torch.cuda.graph(graph),
+            injector.inject(
+                selector_handle=selector_handle,
+                topk_ids=expert_ids,
+                routing_input_mode=int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+                tile_sizes=tile_sizes,
+                num_tokens_bucket=num_tokens_bucket,
+                num_local_experts=num_local_experts,
+                local_expert_offset=0,
+                top_k=1,
+                side_stream=side_stream,
+                routing_stream=routing_stream,
+                pool_handle=torch.cuda.graph_pool_handle(),
+            ) as switch,
+        ):
+            with switch.body(0):
+                output.fill_(1)
+            with switch.body(1):
+                output.fill_(2)
+
+        graph.replay()
+        torch.cuda.synchronize()
+        assert output.item() == 1
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
+        del graph
+        ffi.da_destroy_knn_selector(selector_handle)
+
+
 def _fp4_global_scale(tensor: torch.Tensor) -> torch.Tensor:
     return torch.finfo(torch.float8_e4m3fn).max * 6.0 / tensor.float().abs().max()
 

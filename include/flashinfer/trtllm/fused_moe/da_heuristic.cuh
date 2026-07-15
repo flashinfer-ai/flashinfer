@@ -113,7 +113,11 @@ __device__ __forceinline__ void da_knn_sort_counts_register_bitonic_desc(int* co
       value = keep_max ? max(value, partner) : min(value, partner);
     }
   }
-  if (threadIdx.x < sort_len) counts_int[threadIdx.x] = value;
+  // Inter-warp stages use every block thread as shared-memory scratch, so
+  // lanes outside sort_len temporarily publish INT_MIN above. Restore the
+  // compacted count vector's zero-tail invariant before cosine similarity,
+  // which consumes all num_local_experts entries rather than only sort_len.
+  counts_int[threadIdx.x] = threadIdx.x < sort_len ? value : 0;
   __syncthreads();
 }
 
