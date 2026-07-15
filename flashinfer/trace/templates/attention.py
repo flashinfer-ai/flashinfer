@@ -1616,6 +1616,13 @@ def _trtllm_batch_decode_reference(
     )
 
 
+# Inlined into the dumped JSON so the rendered reference is runnable standalone.
+_trtllm_batch_decode_reference._trace_reference_dependencies = (
+    _trtllm_kv_from_cache,
+    _trtllm_paged_attention_reference,
+)
+
+
 @torch.no_grad()
 def _trtllm_batch_context_reference(
     query,
@@ -1642,6 +1649,13 @@ def _trtllm_batch_context_reference(
         bmm2_scale=bmm2_scale,
         cum_seq_lens_q=cum_seq_lens_q,
     )
+
+
+# Inlined into the dumped JSON so the rendered reference is runnable standalone.
+_trtllm_batch_context_reference._trace_reference_dependencies = (
+    _trtllm_kv_from_cache,
+    _trtllm_paged_attention_reference,
+)
 
 
 def _trtllm_batch_decode_init(
@@ -1880,6 +1894,12 @@ def _trtllm_batch_decode_block_sparse_reference(
     return output.to(query.dtype)
 
 
+# Inlined into the dumped JSON so the rendered reference is runnable standalone.
+_trtllm_batch_decode_block_sparse_reference._trace_reference_dependencies = (
+    _trtllm_kv_from_cache,
+)
+
+
 def _trtllm_batch_decode_block_sparse_init(
     *,
     num_tokens: int,
@@ -1926,6 +1946,12 @@ def _trtllm_batch_decode_block_sparse_init(
     base["max_seq_len"] = int(sparse_lens.max().item())
     base["enable_block_sparse_attention"] = True
     return base
+
+
+# Inlined into the dumped JSON so the rendered init is runnable standalone.
+_trtllm_batch_decode_block_sparse_init._trace_init_dependencies = (  # type: ignore[attr-defined]
+    _trtllm_batch_decode_init,
+)
 
 
 trtllm_batch_decode_block_sparse_trace = TraceTemplate(
