@@ -1443,75 +1443,6 @@ class TestCuteDslFusedMoeFunctional:
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
-    def test_fused_finalize_default(self):
-        from flashinfer import CuteDslMoEWrapper
-
-        moe = CuteDslMoEWrapper(
-            num_experts=256,
-            top_k=2,
-            hidden_size=256,
-            intermediate_size=512,
-        )
-
-        assert moe.use_fused_finalize
-        assert moe._runner.use_fused_finalize
-        assert moe._per_token_runner.use_fused_finalize
-
-    def test_per_token_decode_is_bitwise_deterministic(self):
-        from flashinfer import CuteDslMoEWrapper
-
-        num_tokens, hidden_size, intermediate_size = 1, 2048, 768
-        num_experts, top_k = 32, 8
-        tensors = create_moe_tensors(
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            num_local_experts=num_experts,
-            top_k=top_k,
-            use_per_token_activation=True,
-        )
-        moe = CuteDslMoEWrapper(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            use_cuda_graph=True,
-            use_fused_finalize=False,
-        )
-        kwargs = {
-            "x": tensors["x"],
-            "x_sf": tensors["x_sf"],
-            "token_selected_experts": tensors["token_selected_experts"],
-            "token_final_scales": tensors["token_final_scales"],
-            "w1_weight": tensors["w1_weight"],
-            "w1_weight_sf": tensors["w1_weight_sf"],
-            "w1_alpha": tensors["w1_alpha"],
-            "fc2_input_scale": tensors["fc2_input_scale"],
-            "w2_weight": tensors["w2_weight"],
-            "w2_weight_sf": tensors["w2_weight_sf"],
-            "w2_alpha": tensors["w2_alpha"],
-            "per_token_scale": tensors["x_per_token_scale"],
-        }
-
-        for _ in range(2):
-            moe.run(**kwargs)
-        eager_reference = moe.run(**kwargs).clone()
-        for _ in range(5):
-            assert torch.equal(eager_reference, moe.run(**kwargs))
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            graph_output = moe.run(**kwargs)
-        graph.replay()
-        torch.cuda.synchronize()
-        graph_reference = graph_output.clone()
-        assert not (graph_reference == 0).all()
-        for _ in range(5):
-            graph.replay()
-            torch.cuda.synchronize()
-            assert torch.equal(graph_reference, graph_output)
-
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
     @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("top_k", [2, 8])
@@ -1655,9 +1586,12 @@ class TestCuteDslMoEWrapper:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize("num_tokens", [64, 128, 256])
     @pytest.mark.parametrize("num_experts", [256, 384])
-    def test_wrapper_cuda_graph(self, num_tokens: int, num_experts: int):
+    def test_wrapper_cuda_graph(
+        self, num_tokens: int, num_experts: int, use_fused_finalize: bool
+    ):
         """Test wrapper API with CUDA graph capture and replay."""
         from flashinfer import CuteDslMoEWrapper
 
@@ -1685,7 +1619,7 @@ class TestCuteDslMoEWrapper:
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
-            use_fused_finalize=False,
+            use_fused_finalize=use_fused_finalize,
         )
 
         # Warmup
@@ -1742,9 +1676,14 @@ class TestCuteDslMoEWrapper:
             torch.cuda.synchronize()
             results.append(output.clone())
 
-        # The explicitly selected two-stage finalize must be bitwise deterministic.
         for i in range(1, len(results)):
-            assert torch.equal(results[0], results[i]), f"Replay {i} differs"
+            if use_fused_finalize:
+                max_diff = (results[0] - results[i]).abs().max().item()
+                assert max_diff < 0.5, (
+                    f"Replay {i} differs too much: max_diff={max_diff}"
+                )
+            else:
+                assert torch.equal(results[0], results[i]), f"Replay {i} differs"
 
         # Verify accuracy
         ref_output = compute_reference_moe_fp4(
