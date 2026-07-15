@@ -38,8 +38,12 @@ Lessons applied from the BF16 cuTile port (MR adding ``mm_bf16(cutile)``):
   the zeroing here is a defensive consistency measure to make the cuTile
   family behave uniformly with respect to uninitialized output buffers.
 
-* No TMA variant in v1 — the non-TMA path is simpler to verify. A TMA
-  follow-up will be a separate MR once the baseline is reviewed.
+* Two kernel variants live here: ``_w8a8_block_fp8_matmul_kernel`` (the v1
+  ``ct.gather``/``ct.scatter`` baseline, kept for verification/fallback) and
+  ``_w8a8_block_fp8_matmul_kernel_tma`` (tiled ``ct.load``/``ct.store``, TMA).
+  The launcher defaults to the TMA kernel (``use_tma=True``); it is the perf
+  path that lifts the gather baseline (~0.36x cutlass) toward parity, matching
+  TileGym's production ``w8a8_block_fp8_matmul_kernel_ct_tma``.
 """
 
 from types import SimpleNamespace
@@ -194,6 +198,129 @@ def _w8a8_block_fp8_matmul_kernel(
     ct.scatter(C, (offs_cm[:, None], offs_cn[None, :]), c, check_bounds=True)
 
 
+# TMA-optimized variant, ported from NVIDIA TileGym's production kernel
+# ``w8a8_block_fp8_matmul_kernel_ct_tma``
+# (src/tilegym/suites/unsloth/cutile/fp8.py). The gather kernel above was the
+# v1 baseline (simple to verify); this is the perf path.
+@ct.kernel
+def _w8a8_block_fp8_matmul_kernel_tma(
+    # Tensors
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    # Dimensions
+    M: ct.Constant[int],
+    N: ct.Constant[int],
+    K: ct.Constant[int],
+    # Quantization block sizes
+    GROUP_N: ct.Constant[int],
+    GROUP_K: ct.Constant[int],
+    # Tile parameters
+    BLOCK_SIZE_M: ct.Constant[int],
+    BLOCK_SIZE_N: ct.Constant[int],
+    BLOCK_SIZE_K: ct.Constant[int],
+    GROUP_SIZE_M: ct.Constant[int],
+    OUTPUT_DTYPE: ct.Constant[int],
+    SWAP_AB: ct.Constant[int],
+):
+    """TMA-capable W8A8 block-scaled FP8 matmul.
+
+    Numerically identical to :func:`_w8a8_block_fp8_matmul_kernel` (same
+    swizzle, MMA, scale application, epilogue), but loads the A/B tiles and
+    stores the C tile via the tiled ``ct.load`` / ``ct.store`` path instead of
+    ``ct.gather`` / ``ct.scatter``. That path lowers to TMA and is what lifts
+    this kernel from the gather baseline (~0.36x cutlass) toward parity. The
+    load idiom (``index`` / ``shape`` / ``order`` / ``padding_mode=ZERO`` /
+    ``latency``) mirrors ``mm_bf16_cutile`` so out-of-tile M/N/K are zero-filled
+    on load and clipped on store — arbitrary shapes stay correct.
+
+    Per-block scales stay on ``ct.gather``: they are too small for TMA
+    (contig_dim * elem_size < 16 B), matching the TileGym source.
+
+    Requires BLOCK_SIZE_N == GROUP_N and BLOCK_SIZE_K == GROUP_K (one scale per
+    N-tile / K-tile).
+    """
+    ct.static_assert(
+        BLOCK_SIZE_N == GROUP_N,
+        f"Kernel requires BLOCK_SIZE_N == group_n, got {BLOCK_SIZE_N} vs {GROUP_N}",
+    )
+    ct.static_assert(
+        BLOCK_SIZE_K == GROUP_K,
+        f"Kernel requires BLOCK_SIZE_K == group_k, got {BLOCK_SIZE_K} vs {GROUP_K}",
+    )
+
+    zero_pad = ct.PaddingMode.ZERO
+
+    pid = ct.bid(0)
+    pid_m, pid_n = _gemm_calculate_pid_ct(
+        pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Row indices for the per-token-group activation-scale gather.
+    offs_am = pid_m * BLOCK_SIZE_M + ct.arange(BLOCK_SIZE_M, dtype=ct.int32)
+
+    accumulator = ct.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=ct.float32)
+
+    num_k_tiles = ct.cdiv(K, BLOCK_SIZE_K)
+    for k_tile in range(num_k_tiles):
+        # A: (M, K) -> tile (pid_m, k_tile) of (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        a = ct.load(
+            A,
+            index=(pid_m, k_tile),
+            shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+            order=(0, 1),
+            padding_mode=zero_pad,
+            latency=3,
+        )
+        # B: (N, K) -> tile (pid_n, k_tile) of (BLOCK_SIZE_N, BLOCK_SIZE_K)
+        b = ct.load(
+            B,
+            index=(pid_n, k_tile),
+            shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
+            order=(0, 1),
+            padding_mode=zero_pad,
+            latency=3,
+        )
+
+        # Per-block scales via gather (too small for TMA); latency=4 prefetches
+        # them ahead of the MMA, matching the TileGym source.
+        # As: (M, K_groups) -> (BLOCK_SIZE_M,); Bs: (N_groups, K_groups) -> scalar
+        a_s = ct.gather(
+            As, (offs_am, k_tile), check_bounds=True, padding_value=0.0, latency=4
+        )
+        b_s = ct.gather(
+            Bs, (pid_n, k_tile), check_bounds=True, padding_value=0.0, latency=4
+        )
+        ab_s = a_s[:, None] * b_s
+
+        # MMA with permute for transpose
+        if SWAP_AB:
+            zero_acc = ct.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=ct.float32)
+            a_t = ct.permute(a, (1, 0))
+            dot_result = ct.mma(b, a_t, acc=zero_acc)
+            dot_result = ct.permute(dot_result, (1, 0))
+        else:
+            zero_acc = ct.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=ct.float32)
+            b_t = ct.permute(b, (1, 0))
+            dot_result = ct.mma(a, b_t, acc=zero_acc)
+
+        accumulator = accumulator + dot_result * ab_s
+
+    # Cast to output dtype
+    if OUTPUT_DTYPE == 0:  # torch.float32
+        c = accumulator
+    elif OUTPUT_DTYPE == 1:  # torch.float16
+        c = ct.astype(accumulator, ct.float16)
+    elif OUTPUT_DTYPE == 2:  # torch.bfloat16
+        c = ct.astype(accumulator, ct.bfloat16)
+    else:
+        c = accumulator
+
+    ct.store(C, index=(pid_m, pid_n), tile=c, order=(0, 1))
+
+
 def _w8a8_autotune_configs(block_n_quant, block_k_quant):
     """Yield autotune configurations for the W8A8 FP8 matmul kernel.
 
@@ -234,8 +361,48 @@ def _w8a8_autotune_and_launch(
     block_n,
     block_k,
     output_dtype_int,
+    use_tma=True,
 ):
-    """Launch W8A8 FP8 matmul kernel with exhaustive_search autotuning."""
+    """Launch W8A8 FP8 matmul kernel with exhaustive_search autotuning.
+
+    ``use_tma`` selects the tiled ``ct.load``/``ct.store`` (TMA) kernel — the
+    default perf path — over the ``ct.gather``/``ct.scatter`` baseline. The two
+    kernels differ only in the load/store mechanism (identical math), but the
+    TMA kernel takes no stride arguments, so its launch arg tuple is shorter;
+    ``use_tma`` is part of the cache key so tuned results never cross over.
+    """
+    kernel = (
+        _w8a8_block_fp8_matmul_kernel_tma
+        if use_tma
+        else _w8a8_block_fp8_matmul_kernel
+    )
+
+    def build_args(cfg):
+        head = (A, B, C, As, Bs, M, N, K, block_n, block_k)
+        tail = (
+            cfg.BLOCK_SIZE_M,
+            cfg.BLOCK_SIZE_N,
+            cfg.BLOCK_SIZE_K,
+            cfg.GROUP_SIZE_M,
+            output_dtype_int,
+            int(cfg.swap_ab),
+        )
+        if use_tma:
+            return head + tail
+        strides = (
+            A.stride(-2),
+            A.stride(-1),
+            B.stride(1),
+            B.stride(0),
+            C.stride(-2),
+            C.stride(-1),
+            As.stride(-2),
+            As.stride(-1),
+            Bs.stride(1),
+            Bs.stride(0),
+        )
+        return head + strides + tail
+
     cache_key = (
         M,
         N,
@@ -245,6 +412,7 @@ def _w8a8_autotune_and_launch(
         output_dtype_int,
         A.dtype,
         str(A.device),
+        use_tma,
     )
 
     if cache_key not in _W8A8_TUNE_CACHE:
@@ -258,36 +426,6 @@ def _w8a8_autotune_and_launch(
             grid_n = _cdiv(N, cfg.BLOCK_SIZE_N)
             return (grid_m * grid_n, 1, 1)
 
-        def args_fn(cfg):
-            return (
-                A,
-                B,
-                C,
-                As,
-                Bs,
-                M,
-                N,
-                K,
-                block_n,
-                block_k,
-                A.stride(-2),
-                A.stride(-1),
-                B.stride(1),
-                B.stride(0),
-                C.stride(-2),
-                C.stride(-1),
-                As.stride(-2),
-                As.stride(-1),
-                Bs.stride(1),
-                Bs.stride(0),
-                cfg.BLOCK_SIZE_M,
-                cfg.BLOCK_SIZE_N,
-                cfg.BLOCK_SIZE_K,
-                cfg.GROUP_SIZE_M,
-                output_dtype_int,
-                int(cfg.swap_ab),
-            )
-
         def hints_fn(cfg):
             return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
@@ -295,13 +433,13 @@ def _w8a8_autotune_and_launch(
             configs,
             stream,
             grid_fn,
-            _w8a8_block_fp8_matmul_kernel,
-            args_fn,
+            kernel,
+            build_args,
             hints_fn,
         )
         best_cfg = result.best.config
         tuned_kernel = ct.kernel(
-            _w8a8_block_fp8_matmul_kernel._pyfunc,
+            kernel._pyfunc,
             num_ctas=best_cfg.num_ctas,
             occupancy=best_cfg.occupancy,
         )
@@ -314,34 +452,7 @@ def _w8a8_autotune_and_launch(
         stream,
         (grid_m * grid_n, 1, 1),
         tuned_kernel,
-        (
-            A,
-            B,
-            C,
-            As,
-            Bs,
-            M,
-            N,
-            K,
-            block_n,
-            block_k,
-            A.stride(-2),
-            A.stride(-1),
-            B.stride(1),
-            B.stride(0),
-            C.stride(-2),
-            C.stride(-1),
-            As.stride(-2),
-            As.stride(-1),
-            Bs.stride(1),
-            Bs.stride(0),
-            best_cfg.BLOCK_SIZE_M,
-            best_cfg.BLOCK_SIZE_N,
-            best_cfg.BLOCK_SIZE_K,
-            best_cfg.GROUP_SIZE_M,
-            output_dtype_int,
-            int(best_cfg.swap_ab),
-        ),
+        build_args(best_cfg),
     )
 
 
