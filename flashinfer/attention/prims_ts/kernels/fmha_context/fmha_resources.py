@@ -1880,6 +1880,7 @@ class TmemSPResource(MemoryResource):
                 num=tmem_x,
             )
             s_data[chunk_idx] = _chunk
+        cute.arch.fence_view_async_tmem_load()
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             s_data[chunk_idx] = s_data[chunk_idx][0:tmem_x]
         return s_data
@@ -2068,19 +2069,23 @@ class TmemSPResource(MemoryResource):
             # Some schedules materialize their final score tile in TAIL.
             kv_tile_idx = stage_info.loop_end
         kv_base = kv_tile_idx * self.cfg.kv_tile_n
-        neg_inf = cutlass.vector.full(
-            [tmem_x],
-            self.cfg.qk_acc_dtype(-Float32.inf),
-            dtype=self.cfg.qk_acc_dtype,
-        )
-        for chunk_idx in cutlass.range_constexpr(num_chunks):
-            chunk_base = kv_base + Int32(chunk_idx * tmem_x)
-            valid_in_chunk = cute.math.min(
-                cute.math.max(seqlen_k - chunk_base, Int32(0)),
-                Int32(tmem_x),
+        kv_end = kv_base + Int32(self.cfg.kv_tile_n)
+        if seqlen_k < kv_end:
+            neg_inf = cutlass.vector.full(
+                [tmem_x],
+                self.cfg.qk_acc_dtype(-Float32.inf),
+                dtype=self.cfg.qk_acc_dtype,
             )
-            mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])
-            s_data[chunk_idx] = cutlass.vector.where(mask, s_data[chunk_idx], neg_inf)
+            for chunk_idx in cutlass.range_constexpr(num_chunks):
+                chunk_base = kv_base + Int32(chunk_idx * tmem_x)
+                valid_in_chunk = cute.math.min(
+                    cute.math.max(seqlen_k - chunk_base, Int32(0)),
+                    Int32(tmem_x),
+                )
+                mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])
+                s_data[chunk_idx] = cutlass.vector.where(
+                    mask, s_data[chunk_idx], neg_inf
+                )
         return self._reduce_row_max(s_data, row_max)
 
     @consumer_work(returns=(old_row_max, row_max))
@@ -2716,7 +2721,7 @@ class TmemStatsResource(MemoryResource):
             tmem_ptr_vec,
             vec_data,
         )
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
     def _read_vec(
@@ -2749,6 +2754,7 @@ class TmemStatsResource(MemoryResource):
         vec_rmem[0:tmem_x_vec] = prims.tcgen05_ld(
             tmem_shape_vec, tmem_ptr_vec, num=tmem_x_vec
         )
+        cute.arch.fence_view_async_tmem_load()
 
         scale_ = scale_softmax_log2 * (vec_rmem[0] - vec_rmem[1])
         scale = cute.math.exp2(scale_, fastmath=True)
@@ -3213,11 +3219,12 @@ class TmemOResource(MemoryResource):
 
                 # Load from TMEM as vector, scale, store back
                 o_vec = prims.tcgen05_ld(tmem_shape, tmem_ptr, num=tmem_x)
+                cute.arch.fence_view_async_tmem_load()
                 scale_vec = cutlass.vector.full_like(o_vec, scale)
                 o_scaled = o_vec * scale_vec
                 prims.tcgen05_st(tmem_shape, tmem_ptr, o_scaled)
 
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+            cute.arch.fence_view_async_tmem_store()
         # else: skip TMEM rescale entirely when scale=1.0
 
 
@@ -3431,6 +3438,7 @@ class SmemOResource(MemoryResource):
             )
 
             o_rmem = prims.tcgen05_ld(tmem_shape, tmem_ptr, num=tmem_x)
+            cute.arch.fence_view_async_tmem_load()
 
             scale_vec = cutlass.vector.full_like(o_rmem, scale)
             o_rmem = o_rmem * scale_vec
