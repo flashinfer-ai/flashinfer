@@ -1669,7 +1669,6 @@ class TestCuteDslMoEWrapper:
         assert not torch.isnan(output).any(), "NaN after first replay"
         assert not (output == 0).all(), "All zeros after first replay"
 
-        # Test replay consistency.
         results = []
         for _ in range(3):
             g.replay()

@@ -27,7 +27,7 @@ Usage:
     # Disable CUPTI (use CUDA events for timing instead)
     python bench_moe_deepseek.py --no-cupti
 
-    # Compare deterministic two-stage and atomic fused CuTe DSL finalize
+    # CuTe DSL finalize modes
     python bench_moe_deepseek.py --functional-api  # atomic fused (default)
     python bench_moe_deepseek.py --functional-api --no-fused-finalize  # deterministic
 
@@ -223,8 +223,8 @@ def bench_cute_dsl(
                     choose_one cache lookups don't appear inside the CUDA-event
                     interval when bench_gpu_time falls back to events (i.e. when
                     both CUDA graphs and CUPTI are disabled).
-        use_fused_finalize: Use the atomic fused finalize instead of the
-                    deterministic two-stage finalize.
+        use_fused_finalize: Use atomic fused finalize; otherwise use the
+            deterministic two-stage finalize.
     """
     import contextlib
 
@@ -754,8 +754,8 @@ def run_benchmark(
         routing_bias_scale: Scale for random routing bias generation
         use_per_token_activation: Whether supported FP4 MoE backends should use
             per-token NVFP4 activation scaling.
-        use_fused_finalize: Whether CuTe DSL should use the atomic fused finalize
-            instead of the deterministic two-stage finalize.
+        use_fused_finalize: Use atomic fused finalize; otherwise use the
+            deterministic two-stage finalize.
 
     Returns:
         List of BenchResult objects

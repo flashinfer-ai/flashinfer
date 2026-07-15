@@ -2144,9 +2144,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 if is_partial_tile:
                     self.epilog_sync_barrier.arrive_and_wait()
 
-                # The fused path atomically reduces into token rows. The
-                # deterministic path stores one unique expanded-route row for
-                # a subsequent token-owned reduction.
+                # Write expanded rows directly or atomically reduce into token rows.
                 reduce_row = epi_tidx
                 if is_partial_tile:
                     reduce_row = (epi_tidx % self.threads_per_warp) * len(

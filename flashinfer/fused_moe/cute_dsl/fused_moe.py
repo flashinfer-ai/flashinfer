@@ -178,9 +178,9 @@ def _moe_core_impl(
 
     This function handles:
     1. moe_sort: Token routing computation
-    2. GEMM1 + SwiGLU: First projection with activation
-    3. GEMM2: Write each routed output to its expanded token/top-k row
-    4. Finalize: Apply routing weights and reduce top-k in fixed order
+    2. GEMM1 + activation
+    3. GEMM2 with optional atomic finalize
+    4. Routing-weight reduction in deterministic mode
 
     Args:
         x: Input tensor, NVFP4 quantized.
@@ -213,8 +213,8 @@ def _moe_core_impl(
         memset_event: CUDA event for memset completion.
         output_dtype: Output data type.
         use_async_memset: Use async memset on aux stream.
-        use_fused_finalize: Use the atomic fused finalize instead of the
-            deterministic two-stage finalize. Defaults to ``True``.
+        use_fused_finalize: Use atomic fused finalize; otherwise use the
+            deterministic two-stage finalize.
         activation_type: Activation type to apply after GEMM1. Use
             ActivationType.Swiglu for gated mode and ActivationType.Relu2 for
             non-gated mode; swiglu_oai is represented as Swiglu with
@@ -232,9 +232,6 @@ def _moe_core_impl(
     hidden_size = w2_weight.size(1)
     use_per_token_activation = per_token_scale is not None
 
-    # Allocate output if not provided.  The caller (wrapper or functional
-    # API) should pass a [:num_tokens] slice of the pre-allocated buffer
-    # when using CUDA graphs.  The buffer is zeroed in Step 3 below.
     if moe_output is None:
         moe_output = torch.empty(
             (num_tokens, hidden_size),
@@ -247,7 +244,7 @@ def _moe_core_impl(
             f"_moe_core_impl (got {moe_output.size(0)}, expected {num_tokens})"
         )
 
-    # Get stream resources if using async memset
+    # Fused finalize overlaps output zeroing with GEMM1.
     if use_async_memset and use_fused_finalize:
         if aux_stream is None or main_event is None or memset_event is None:
             resources = _get_cuda_graph_resources()
@@ -275,7 +272,6 @@ def _moe_core_impl(
         **moe_sort_kwargs,
     )
 
-    # Record event for async memset synchronization
     if use_async_memset and use_fused_finalize:
         main_event.record()
         moe_output.record_stream(aux_stream)
@@ -338,19 +334,8 @@ def _moe_core_impl(
             sf_vec_size=16,
         )
 
-    # Step 3: Prepare GEMM2 output storage. The fused finalize uses atomic
-    # scatter-add and therefore requires a zeroed token output. The
-    # deterministic path writes each active expanded route exactly once.
-    #
-    # `moe_output_memset_inplace` mirrors TRT-LLM's `moe_output_memset_inplace`
-    # Path A (dense cudaMemsetAsync). TRT-LLM's Path B (sparse moeOutputMemset
-    # kernel for the internal-alltoall case) is not exposed here — current
-    # callers of this API handle all-to-all outside this function.
-    #
-    # The wrapper issues cudaMemsetAsync on the current PyTorch CUDA stream,
-    # so the `with torch.cuda.stream(aux_stream):` context below correctly
-    # places the memset on the aux stream for overlap with the main-stream
-    # GEMM1.
+    # Atomic finalize requires a zeroed token output. Deterministic finalize
+    # writes each route to a unique expanded row.
     if use_fused_finalize:
         if use_async_memset:
             with torch.cuda.stream(aux_stream):
@@ -368,7 +353,7 @@ def _moe_core_impl(
             device=x.device,
         )
 
-    # Step 4: GEMM2 and optional fused finalize
+    # Step 3: GEMM2 with optional atomic finalize
     blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         a=intermediate,
         b=w2_weight,
@@ -388,6 +373,7 @@ def _moe_core_impl(
         use_fused_finalize=use_fused_finalize,
     )
 
+    # Step 4: Deterministic routing-weight reduction
     if not use_fused_finalize:
         moe_unpermute(
             permuted_input=gemm2_output,
@@ -425,8 +411,8 @@ class CuteDslMoEWrapper:
         intermediate_size: Intermediate dimension size.
         use_cuda_graph: Whether the wrapper holds persistent stream/event
             resources for CUDA graph capture.
-        use_fused_finalize: Whether to use the atomic fused finalize instead of
-            the deterministic two-stage finalize.
+        use_fused_finalize: Use atomic fused finalize; otherwise use the
+            deterministic two-stage finalize.
         max_num_tokens: Deprecated; accepted for backwards compatibility
             but ignored.
 
@@ -517,7 +503,7 @@ class CuteDslMoEWrapper:
             SwiGLU parameters. ``swiglu_oai`` is represented as
             ``ActivationType.Swiglu`` with non-default values.
         use_fused_finalize : bool
-            Use the atomic fused finalize instead of the deterministic
+            Use atomic fused finalize; otherwise use the deterministic
             two-stage finalize. Defaults to ``True``.
         """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
@@ -924,7 +910,7 @@ def cute_dsl_fused_moe_nvfp4(
     output_dtype : torch.dtype
         Output dtype.  Defaults to ``torch.bfloat16``.
     use_fused_finalize : bool
-        Use the atomic fused finalize instead of the deterministic two-stage
+        Use atomic fused finalize; otherwise use the deterministic two-stage
         finalize. Defaults to ``True``.
     moe_output : Optional[torch.Tensor]
         Pre-allocated output buffer.  Allocated internally if ``None``.

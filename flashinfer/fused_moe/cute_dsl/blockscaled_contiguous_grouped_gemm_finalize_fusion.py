@@ -22,8 +22,7 @@
 """
 Contiguous Grouped GEMM kernel for MoE GEMM2 workloads on Blackwell GPUs.
 
-This module provides a FlashInfer-style API wrapper around the TensorRT-LLM CuteDSL
-grouped GEMM kernel with fused finalize operation designed for MoE GEMM2 layers:
+This module wraps the TensorRT-LLM CuteDSL grouped GEMM kernel for MoE GEMM2:
 - Input A: (permuted_m, k) - permuted activations from GEMM1
 - Input B: (num_experts, n, k) - expert down projection weights
 - Output C: finalized token rows or unfinalized expanded token/top-k rows
@@ -293,14 +292,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
-    Performs grouped matrix multiplication with fused finalize (scatter-reduce):
-    out[token_idx] += alpha[group] * (A[row] @ B[group]) * router_scale[token_idx, topk_idx]
-
-    This kernel is designed for Mixture of Experts (MoE) GEMM2 layers where:
-    - Tokens are permuted and contiguously arranged by expert assignment
-    - Each expert has a down projection weight matrix
-    - Fused mode atomically applies routing weights and reduces into token rows
-    - Deterministic mode writes each route to a unique expanded row
+    Fused mode applies routing weights and atomically reduces into token rows.
+    Deterministic mode writes expanded rows before routing-weight reduction.
 
     Args:
         a: Input tensor A (permuted activations), shape (permuted_m, k) for FP4 stored as (permuted_m, k//2) uint8
@@ -329,21 +322,15 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
-        use_fused_finalize: Atomically finalize directly into token rows when
-             True. Write unique expanded rows for a separate deterministic
-             reduction when False. Default: True.
+        use_fused_finalize: Use atomic fused finalize; otherwise write expanded
+             rows for deterministic reduction. Default: True.
 
     Returns:
         out: Output tensor with dtype out_dtype. The shape is ``(seq_len, n)``
              in fused mode and ``(seq_len * topk, n)`` otherwise.
 
     Notes:
-        - In fused mode, the output tensor is modified using atomic adds.
-        - In fused mode, a provided output is NOT zeroed internally; the caller
-          must ensure the buffer is zeroed before each invocation.
-          In the main CuteDSL MoE path, _moe_core_impl handles this by
-          zeroing the active output slice before GEMM2, typically on an
-          auxiliary stream overlapped with GEMM1.
+        - A caller-provided fused output must be zero-initialized.
         - Call create_finalize_fusion_tensors() to create permuted_idx_to_expanded_idx and token_final_scales.
         - Requires SM100 (Blackwell) GPU architecture
         - Deterministic mode requires a separate ``moe_unpermute`` call.
@@ -453,9 +440,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
 
     output_rows = seq_len if use_fused_finalize else seq_len * topk
 
-    # Create output tensor if not provided. The fused path requires zeroed
-    # storage for atomic adds; the deterministic path writes every active
-    # expanded route directly.
+    # Atomic fused finalize requires zero-initialized output.
     if out is None:
         allocator = torch.zeros if use_fused_finalize else torch.empty
         out = allocator(
