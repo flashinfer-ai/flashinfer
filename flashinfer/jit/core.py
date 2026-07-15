@@ -265,13 +265,36 @@ class JitSpec(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def try_load(self) -> Optional[Any]: ...
+    def try_load(self) -> Optional[Any]:
+        """Return the cached artifact, or None when absent or not known-valid.
+
+        Exception contract: must NOT raise for artifact-level problems
+        (missing, stale, corrupt, unloadable) — log and return None so
+        build_and_load() falls through to build(). An exception escaping
+        try_load() is a programming error and propagates.
+        """
+        ...
 
     @abc.abstractmethod
-    def build(self) -> None: ...
+    def build(self) -> None:
+        """Produce or refresh on-disk artifacts.
+
+        Exception contract: must raise when no usable kernel can result
+        (compilation failure, JIT disabled for direct callers). If the
+        kernel compiles but writing it to disk fails, build() may log and
+        continue instead of raising, as long as load() can still return
+        the compiled kernel (e.g. kept in memory).
+        """
+        ...
 
     @abc.abstractmethod
-    def load(self) -> Any: ...
+    def load(self) -> Any:
+        """Load the artifact that build() produced; raises on failure.
+
+        Called by build_and_load() only after a successful build(), so a
+        failure here is a genuine error, not a cache miss.
+        """
+        ...
 
     def build_and_load(self) -> Any:
         cached = self.try_load()
@@ -375,7 +398,14 @@ class JitSpecNvcc(JitSpec):
         # so a cache miss here routes build_and_load() through build(),
         # where ninja no-ops if everything is up to date.
         if self.is_aot:
-            return self.load(self.aot_path)
+            try:
+                return self.load(self.aot_path)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load AOT artifact {self.aot_path}: {e}. "
+                    "Falling back to JIT build."
+                )
+                return None
         return None
 
     def build(self, verbose: Optional[bool] = None, need_lock: bool = False) -> None:

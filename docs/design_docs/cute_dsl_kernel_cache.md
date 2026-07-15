@@ -98,6 +98,29 @@ The exported TVM-FFI symbol is `{module_name}_{kernel_name}`.
 
 ### 2.3 Invalidation
 
+The full precondition set for reusing a cached kernel is spread across the
+path, the module metadata, and the artifact filename — every level must
+match:
+
+```text
+~/.cache/flashinfer/<version>/<nvcc-archs>/cached_ops/   # workspace path:
+│                              #   same flashinfer version
+│                              #   same nvcc arch list (inherited from the
+│                              #   shared workspace; cute-dsl artifacts do not
+│                              #   depend on it — changing
+│                              #   FLASHINFER_CUDA_ARCH_LIST relocates the
+│                              #   cache and conservatively forces recompiles)
+└── <module>_<arch>_cute_dsl/  # module dir: same op family +
+    │                          #   same DSL compile target (CUTE_DSL_ARCH
+    │                          #   else current device)
+    ├── meta.json              # module meta: same arch (tripwire), same
+    │                          #   nvidia-cutlass-dsl* package stack, same
+    │                          #   SHA-256 of the kernel-defining sources
+    └── <kernel_name>.o        # filename: identical per-kernel codegen
+                               #   parameters (dtype, K, layout, flags, ...)
+                               #   — the sole per-kernel key, see Rollout
+```
+
 Invalidation is **module-granular**, mirroring ninja's module rebuilds. The per-module `meta.json` records:
 
 | Field | Invalidates when |
@@ -120,6 +143,7 @@ Hashing whole source files means any edit (even a docstring) invalidates. This i
 - `meta.json` is written **after** the first successful export. A crash between the two leaves an `.o` without matching metadata, which reads as a miss and is recompiled/overwritten — never loaded.
 - Wiping a stale module while another process has its `.o` mapped is safe on POSIX (the inode survives the unlink).
 - Persistence failures degrade gracefully: the freshly compiled in-process kernel is still returned; only the disk write is lost.
+- Exception contract (uniform across backends, documented on the `JitSpec` ABC): `try_load()` never raises for artifact-level problems — a missing, stale, corrupt, or unloadable artifact logs a warning and reads as a miss, falling through to `build()`; `build()` raises when no usable kernel can result; `load()` raises on failure because it only runs after a successful build.
 
 `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` disables the **on-disk** layer only:
 kernels compile fresh in every new process and nothing is read from or
@@ -203,7 +227,7 @@ compiles on the first run and is compile-free on every subsequent run.
 
 ## 5. Limitations and future work
 
-- **Rollout**: only nvfp4_quantize is currently wired up. Other cute-dsl call sites should follow the same pattern: wrap the existing `cute.compile` call in a closure and name the specialization.
+- **Rollout**: only nvfp4_quantize is currently wired up. Other cute-dsl call sites should follow the same pattern: wrap the existing `cute.compile` call in a closure and name the specialization. The kernel name is the **sole per-kernel cache key** (`meta.json` guards only module-wide facts), so a name function must encode every codegen parameter — new adopters should replicate the naming tests in `tests/jit/test_cute_dsl_cache.py` (signature coverage of the kernel getters + per-argument perturbation) for their own name functions.
 - **No `JitSpecRegistry` / AOT integration**: the registry now *accepts* any `JitSpec` backend, but cute-dsl kernels do not register themselves yet (only `gen_jit_spec()` registers), so they are invisible to the `flashinfer` CLI's module listing and to `flashinfer aot` / `flashinfer-jit-cache` packaging. (`FLASHINFER_DISABLE_JIT` *is* honored — it comes free from the shared `build_and_load()` template method.) AOT support would additionally require the spec to become declarative data (a factory reference + parameters) instead of a compile closure, so specs can be enumerated and prebuilt offline; then prebuild the module directories or link them into `.so`s (see 3.1).
 - **Cross-compile keying**: the arch key mirrors `CUTE_DSL_ARCH`-else-device, but a per-compile `gpu_arch` override passed through `cute.compile` options would not be reflected. No current call site does this.
 - **Single-target-arch assumption (heterogeneous multi-GPU)**: the cache key records what `cute.compile` actually compiles for — the DSL's resolved target (`CUTE_DSL_ARCH`, else the *current* device). Compiling for a non-current device in a mixed-arch process is not supported: it would require steering the compilation itself (per-compile `gpu_arch`) together with the key, not just parameterizing the key. The in-process `@functools.cache` level has the same current-device assumption today, so the disk cache does not regress multi-GPU behavior.
