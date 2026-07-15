@@ -47,9 +47,7 @@ def _make_problem():
 
     gw = torch.Generator(device="cuda").manual_seed(2024)
     w13 = (
-        torch.randn(
-            NUM_EXPERTS, 2 * INTERMEDIATE, HIDDEN, device="cuda", generator=gw
-        )
+        torch.randn(NUM_EXPERTS, 2 * INTERMEDIATE, HIDDEN, device="cuda", generator=gw)
         * (HIDDEN**-0.5)
     ).to(torch.bfloat16)
     w2 = (
@@ -58,9 +56,7 @@ def _make_problem():
     ).to(torch.bfloat16)
 
     g = torch.Generator(device="cuda").manual_seed(1000)
-    x = torch.randn(NUM_TOKENS, HIDDEN, device="cuda", generator=g).to(
-        torch.bfloat16
-    )
+    x = torch.randn(NUM_TOKENS, HIDDEN, device="cuda", generator=g).to(torch.bfloat16)
     scores = torch.randn(NUM_TOKENS, NUM_EXPERTS, device="cuda", generator=g)
     topk_ids = scores.topk(TOP_K, dim=-1).indices.to(torch.int64)
     topk_weights = torch.softmax(
@@ -245,9 +241,9 @@ def test_split_nvfp4_kernel_matches_torch_reference():
     w13_deq = _fp4_quant_dequant(
         w13.reshape(NUM_EXPERTS * 2 * INTERMEDIATE, HIDDEN)
     ).reshape(NUM_EXPERTS, 2 * INTERMEDIATE, HIDDEN)
-    w2_deq = _fp4_quant_dequant(
-        w2.reshape(NUM_EXPERTS * HIDDEN, INTERMEDIATE)
-    ).reshape(NUM_EXPERTS, HIDDEN, INTERMEDIATE)
+    w2_deq = _fp4_quant_dequant(w2.reshape(NUM_EXPERTS * HIDDEN, INTERMEDIATE)).reshape(
+        NUM_EXPERTS, HIDDEN, INTERMEDIATE
+    )
 
     y_ref = _dense_moe_reference(
         x_deq,

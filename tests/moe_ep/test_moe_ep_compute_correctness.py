@@ -68,9 +68,7 @@ def _build_fused_moe_weights(w1_local, w2_local):
     cfg = _build_bf16_moe_config(
         offset=0, local_num_experts=w1_local.shape[0], max_tokens=1
     )
-    return materialize_fused_moe_weights(
-        MoEWeightPack(w13=w1_local, w2=w2_local), cfg
-    )
+    return materialize_fused_moe_weights(MoEWeightPack(w13=w1_local, w2=w2_local), cfg)
 
 
 def _kernel_full_moe_reference(x, w1_full, w2_full, topk_ids, topk_weights):

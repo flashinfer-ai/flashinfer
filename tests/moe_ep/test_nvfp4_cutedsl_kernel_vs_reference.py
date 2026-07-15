@@ -102,8 +102,24 @@ def _e2m1_decode_table(device):
     # Standard E2M1 code points, low nibble = even element (matches the
     # kernel-side pack/unpack convention).
     return torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
         dtype=torch.float32,
         device=device,
     )
@@ -124,8 +140,8 @@ def _dequant_nvfp4(packed, sf_fp8, *, logical_cols):
     vals[:, 1::2] = hi
     vals = vals[:, :logical_cols]
     n_blocks = logical_cols // NVFP4_BLOCK
-    scales = sf_fp8[:, :n_blocks].to(torch.float32).repeat_interleave(
-        NVFP4_BLOCK, dim=-1
+    scales = (
+        sf_fp8[:, :n_blocks].to(torch.float32).repeat_interleave(NVFP4_BLOCK, dim=-1)
     )
     return vals * scales
 

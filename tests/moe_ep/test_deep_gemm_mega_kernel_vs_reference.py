@@ -48,8 +48,24 @@ def _e2m1_decode_table(device):
     import torch
 
     return torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
         dtype=torch.float32,
         device=device,
     )
@@ -118,9 +134,7 @@ def _torch_dg_mega_reference(problem):
         swiglu = swiglu * topk_weights[tokens, slots].unsqueeze(-1)
 
         swiglu_rt = _fp8_gran32_roundtrip(swiglu)
-        out.index_put_(
-            (tokens,), swiglu_rt @ w2_d.transpose(0, 1), accumulate=True
-        )
+        out.index_put_((tokens,), swiglu_rt @ w2_d.transpose(0, 1), accumulate=True)
 
     return out.to(torch.bfloat16)
 
@@ -144,28 +158,22 @@ def _make_problem():
     topk_weights = torch.softmax(topk_weights, dim=-1)
 
     gw = torch.Generator(device="cuda").manual_seed(13)
-    w13_bf16 = (
-        torch.randn(
-            NUM_EXPERTS,
-            2 * INTERMEDIATE,
-            HIDDEN,
-            dtype=torch.bfloat16,
-            device="cuda",
-            generator=gw,
-        )
-        * (HIDDEN**-0.5)
-    )
-    w2_bf16 = (
-        torch.randn(
-            NUM_EXPERTS,
-            HIDDEN,
-            INTERMEDIATE,
-            dtype=torch.bfloat16,
-            device="cuda",
-            generator=gw,
-        )
-        * (INTERMEDIATE**-0.5)
-    )
+    w13_bf16 = torch.randn(
+        NUM_EXPERTS,
+        2 * INTERMEDIATE,
+        HIDDEN,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=gw,
+    ) * (HIDDEN**-0.5)
+    w2_bf16 = torch.randn(
+        NUM_EXPERTS,
+        HIDDEN,
+        INTERMEDIATE,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=gw,
+    ) * (INTERMEDIATE**-0.5)
 
     w13 = torch.empty(
         NUM_EXPERTS, 2 * INTERMEDIATE, HIDDEN // 2, dtype=torch.int8, device="cuda"
@@ -174,12 +182,18 @@ def _make_problem():
         NUM_EXPERTS, HIDDEN, INTERMEDIATE // 2, dtype=torch.int8, device="cuda"
     )
     w13_sf = torch.empty(
-        NUM_EXPERTS, 2 * INTERMEDIATE, HIDDEN // GRAN_K,
-        dtype=torch.float32, device="cuda",
+        NUM_EXPERTS,
+        2 * INTERMEDIATE,
+        HIDDEN // GRAN_K,
+        dtype=torch.float32,
+        device="cuda",
     )
     w2_sf = torch.empty(
-        NUM_EXPERTS, HIDDEN, INTERMEDIATE // GRAN_K,
-        dtype=torch.float32, device="cuda",
+        NUM_EXPERTS,
+        HIDDEN,
+        INTERMEDIATE // GRAN_K,
+        dtype=torch.float32,
+        device="cuda",
     )
     for e in range(NUM_EXPERTS):
         w13[e], w13_sf[e] = per_token_cast_to_fp4(
@@ -255,9 +269,7 @@ def test_deep_gemm_mega_kernel_matches_torch_reference():
             hidden_size=HIDDEN,
         )
 
-        y_kernel = torch.empty(
-            NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda"
-        )
+        y_kernel = torch.empty(NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
         kernel = DeepGemmMegaKernelBackend(
             DeepGemmMegaMoeConfig(
                 intermediate_size=INTERMEDIATE,
