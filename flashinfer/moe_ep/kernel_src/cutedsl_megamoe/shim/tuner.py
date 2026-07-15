@@ -13,7 +13,10 @@ Two knob classes:
   * **correctness knobs** change a code path / output, so an autotuner must keep
     the value it validated against (``in_kernel_fc2_reduce``, ``token_back_mode``,
     ``non_ubulk_fc2_store``, ``load_balance_mode``, ``mma_tiler_mnk``,
-    ``cluster_shape_mnk``);
+    ``cluster_shape_mnk``).  ``in_kernel_fc2_reduce`` additionally makes the
+    output accumulation order nondeterministic (validate with a tolerance);
+    :mod:`.autotune` sweeps it for NVFP4 because the sym-heap output serves
+    both modes;
   * **perf knobs** do not change the output and are free to sweep for speed
     (``group_hint``, ``flag_batch``, ``epi_flag_batch``).
 
@@ -178,6 +181,10 @@ def is_valid(knobs: Dict[str, Any], *, combine_format: str = "bf16") -> bool:
 
     # quantized combine uses the explicit topk-reduce path; no in-kernel REDG.
     if combine_quantized and in_kernel:
+        return False
+    # quantized combine wires are only wired for dispatch-warp token-back
+    # (mirrors the NVFP4 config validation).
+    if combine_quantized and token_back_mode != "reuse_dispatch_warps":
         return False
     # FP4 combine data cannot use the UBLK fc2 store (sub-byte scalar deref).
     if combine_format == "16e2m1xbf16" and not non_ubulk:

@@ -66,6 +66,16 @@ from moe_nvfp4_swapab.runner_common import (
 )
 
 
+# Config combine_dtype -> kernel CombineFormat spelling.  The quantized wire
+# formats shrink the cross-rank combine traffic 2x (fp8+e8m0 SF) / 4x
+# (fp4+bf16 SF) at a numerics cost (see MegaMoENvfp4Config.combine_dtype).
+COMBINE_FORMAT_NAMES = {
+    "bf16": "bf16",
+    "mxfp8": "32e4m3xe8m0",
+    "nvfp4": "16e2m1xbf16",
+}
+
+
 @dataclasses.dataclass(frozen=True)
 class MegaMoENvfp4Config:
     """Compile-time / launch-time NVFP4 MegaMoE configuration."""
@@ -148,6 +158,13 @@ class MegaMoENvfp4Config:
                     "token_back_mode='reuse_dispatch_warps'; got "
                     f"{self.token_back_mode!r}."
                 )
+        if self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1:
+            # Mirrors the kernel ctor check; fail at config build, not compile.
+            raise ValueError(
+                "in_kernel_fc2_reduce requires apply_topk_in_fc1=True; the REDG "
+                "path can only atomic-add terms whose topk score was already "
+                "absorbed before fc2."
+            )
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
                 f"group_hint must be positive when set, got {self.group_hint}."
@@ -310,6 +327,13 @@ class MegaMoENvfp4Frontend:
         if reset_counters:
             self._reset_workspaces(mega)
 
+        if self.config.fc2_reduces_topk:
+            # ikr accumulate-from-zero contract: output_activation is the
+            # cross-rank REDG atomic-add target, so it must be zeroed before
+            # every launch (stream-ordered; ~10 us at 2048 tokens).  Zero the
+            # full raw buffer so stale rows beyond a partial num_tokens can't
+            # leak from an earlier, larger launch.
+            inputs.output_activation.zero_()
         mega.compiled(**mega.launch_kwargs)
 
         if sync:
@@ -330,6 +354,10 @@ class MegaMoENvfp4Frontend:
         counters/flags), no sync.  Output lands in
         ``inputs.output_activation``.  Invalid after the compile cache is
         invalidated (knobs/clamp change) or the buffers are freed.
+
+        With ``in_kernel_fc2_reduce`` the thunk is two stream-ordered nodes --
+        ``output_activation.zero_()`` then the kernel launch (accumulate-from-
+        zero contract of the REDG target); both are CUDA-graph capturable.
         """
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
@@ -338,8 +366,17 @@ class MegaMoENvfp4Frontend:
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
 
-        def thunk() -> None:
-            compiled(**runtime_kwargs)
+        if self.config.fc2_reduces_topk:
+            output_activation = inputs.output_activation
+
+            def thunk() -> None:
+                output_activation.zero_()
+                compiled(**runtime_kwargs)
+
+        else:
+
+            def thunk() -> None:
+                compiled(**runtime_kwargs)
 
         return thunk
 
@@ -417,12 +454,7 @@ class MegaMoENvfp4Frontend:
         c = self.config
         # The kernel now takes a CombineFormat object (was a combine_dtype string)
         # and derives local_rank from the peer mapper (was a ctor arg).
-        _COMBINE_FORMAT_NAMES = {
-            "bf16": "bf16",
-            "mxfp8": "32e4m3xe8m0",
-            "nvfp4": "16e2m1xbf16",
-        }
-        combine_format = CombineFormat.parse(_COMBINE_FORMAT_NAMES[c.combine_dtype])
+        combine_format = CombineFormat.parse(COMBINE_FORMAT_NAMES[c.combine_dtype])
         token_padding_block = SwapABSwigluFp4Epilogue._EpilogueTokenTileSize
         static_expert_shape = (
             c.num_experts_per_rank,
@@ -938,6 +970,8 @@ def get_symm_buffer_for_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
+    in_kernel_fc2_reduce: bool = False,
+    combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
@@ -954,6 +988,20 @@ def get_symm_buffer_for_mega_moe(
 
     ``apply_topk_in_fc1`` mirrors ``mega_runner``'s
     ``ref_compute_graph == "deepgemm"`` behaviour when ``True`` (default).
+
+    ``in_kernel_fc2_reduce`` collapses the top-k combine in flight via
+    cross-rank REDG atomic-add instead of staging the per-topk ``(T, K, H)``
+    tensor + explicit tail reduce: ~1-2% faster end to end and the multi-GB
+    internal combine staging disappears from ``shared_workspace``.  Requires
+    ``apply_topk_in_fc1=True`` and a bf16 combine wire; the accumulation order
+    is nondeterministic (compare with a tolerance, not bit-exact).
+
+    ``combine_dtype`` selects the cross-rank combine wire format: ``"bf16"``
+    (default, exact), ``"mxfp8"`` (fp8+e8m0 SF, 2x less combine traffic), or
+    ``"nvfp4"`` (fp4+bf16 SF, 4x less).  Quantized wires are a numerics
+    tradeoff and require the explicit-reduce path
+    (``in_kernel_fc2_reduce=False``) with dispatch-warp token-back (applied
+    automatically to the default knobs; explicit ``knobs`` must be compatible).
 
     ``fc1_alpha``, ``fc2_alpha``, and ``fc1_norm_const`` are per-local-expert
     fp32 epilogue scalars with shape ``(num_total_experts // world_size,)``.
@@ -976,6 +1024,18 @@ def get_symm_buffer_for_mega_moe(
     )
     num_experts_per_rank = num_total_experts // world_size
 
+    from .tuner import default_knobs, with_knobs
+
+    # Token-count heuristic picks the perf/tile tactic by compile-time buffer
+    # size (num_max_tokens); an explicit knobs= dict overrides it entirely.
+    resolved_knobs = dict(knobs) if knobs is not None else default_knobs(num_max_tokens)
+    if knobs is None and combine_dtype != "bf16":
+        # The measured profiles pick the token-back mode freely, but a
+        # quantized combine wire is only wired for dispatch-warp token-back;
+        # explicit knobs are the caller's contract and are left untouched (the
+        # config validation rejects incompatible combos).
+        resolved_knobs["token_back_mode"] = "reuse_dispatch_warps"
+
     cfg = MegaMoENvfp4Config(
         rank=rank,
         world_size=world_size,
@@ -986,14 +1046,15 @@ def get_symm_buffer_for_mega_moe(
         intermediate=intermediate,
         gate_up_clamp=clamp,
         apply_topk_in_fc1=apply_topk_in_fc1,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        combine_dtype=combine_dtype,
+        # Constructed valid even before knobs land: quantized combine rejects
+        # the default epi_warps token-back in __post_init__.
+        token_back_mode=(
+            "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps"
+        ),
     )
-    from .tuner import default_knobs, with_knobs
-
-    # Token-count heuristic picks the perf/tile tactic by compile-time buffer
-    # size (num_max_tokens); an explicit knobs= dict overrides it entirely.
-    cfg = with_knobs(
-        cfg, knobs if knobs is not None else default_knobs(num_max_tokens)
-    )
+    cfg = with_knobs(cfg, resolved_knobs)
     frontend = MegaMoENvfp4Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
@@ -1012,13 +1073,15 @@ def get_symm_buffer_for_mega_moe(
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     sym_roots.append(topk_weights)
     # Single 2D (T, hidden) bf16 output; the kernel reduces the top-k combine
-    # internally.  With in_kernel_fc2_reduce=False (default) it is a rank-local
-    # buffer (not the in-kernel cross-rank REDG target, so not on the sym heap).
-    output_activation = torch.zeros(
-        (num_max_tokens, hidden),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    # internally.  Allocated on the symmetric heap unconditionally: under
+    # in_kernel_fc2_reduce it IS the cross-rank REDG atomic-add target (hard
+    # requirement), and in explicit-reduce mode a sym allocation behaves like
+    # plain CUDA memory locally.  Always-sym keeps the session ikr-capable so
+    # the knob can flip per-compile (autotune / apply_knobs) without
+    # reallocating; the cost ((T, hidden) bf16) is negligible next to the
+    # internal combine staging.
+    output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
+    sym_roots.append(output_activation)
     fc1_alpha = _resolve_per_expert_epilogue(
         "fc1_alpha",
         fc1_alpha,

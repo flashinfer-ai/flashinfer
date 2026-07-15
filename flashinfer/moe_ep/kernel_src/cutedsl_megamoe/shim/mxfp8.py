@@ -261,6 +261,12 @@ class MegaMoEMxfp8Frontend:
             mega.launch_output = launch_inputs.output_activation
         if reset_counters:
             reset_compiled_mega_workspaces(mega)
+        if self.config.in_kernel_fc2_reduce:
+            # ikr accumulate-from-zero contract: output_activation is the
+            # cross-rank REDG atomic-add target, so it must be zeroed before
+            # every launch.  Zero the full raw buffer so stale rows beyond a
+            # partial num_tokens can't leak from an earlier, larger launch.
+            inputs.output_activation.zero_()
         mega.compiled(**mega.launch_kwargs)
         if sync:
             torch.cuda.synchronize()
@@ -280,6 +286,10 @@ class MegaMoEMxfp8Frontend:
         counters/flags), no sync.  Output lands in
         ``inputs.output_activation``.  Invalid after the compile cache is
         invalidated (knobs/clamp change) or the buffers are freed.
+
+        With ``in_kernel_fc2_reduce`` the thunk is two stream-ordered nodes --
+        ``output_activation.zero_()`` then the kernel launch (accumulate-from-
+        zero contract of the REDG target); both are CUDA-graph capturable.
         """
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
@@ -288,8 +298,17 @@ class MegaMoEMxfp8Frontend:
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
 
-        def thunk() -> None:
-            compiled(**runtime_kwargs)
+        if self.config.in_kernel_fc2_reduce:
+            output_activation = inputs.output_activation
+
+            def thunk() -> None:
+                output_activation.zero_()
+                compiled(**runtime_kwargs)
+
+        else:
+
+            def thunk() -> None:
+                compiled(**runtime_kwargs)
 
         return thunk
 
@@ -842,12 +861,14 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     sym_roots.append(topk_weights)
     # Single 2D (T, hidden) bf16 output; the kernel reduces top-k internally.
-    # in_kernel_fc2_reduce=False (default) -> rank-local buffer (not sym heap).
-    output_activation = torch.zeros(
-        (num_max_tokens, hidden),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    # Allocated on the symmetric heap unconditionally: under
+    # in_kernel_fc2_reduce it IS the cross-rank REDG atomic-add target (a
+    # rank-local buffer here was a latent crash for ikr sessions), and in
+    # explicit-reduce mode a sym allocation behaves like plain CUDA memory
+    # locally.  Always-sym also lets apply_knobs flip the ikr knob per-compile
+    # without reallocating.
+    output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
+    sym_roots.append(output_activation)
 
     return MegaMoEMxfp8SymmBuffer(
         num_total_experts=num_total_experts,

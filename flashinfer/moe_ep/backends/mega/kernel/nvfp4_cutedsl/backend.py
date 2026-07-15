@@ -112,6 +112,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
+            in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
+            combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
