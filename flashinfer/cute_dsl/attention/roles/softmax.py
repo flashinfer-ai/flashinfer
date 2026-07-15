@@ -28,7 +28,7 @@ from ..config import AttentionConfig, AttentionFusion
 from ..tmem_layout import TmemLayout
 from ..fusion.mask import (
     apply_mask,
-    get_kv_block_range,
+    get_stage_peel_segments,
     get_trip_segments,
 )
 from ..scheduler.persistent import (
@@ -371,108 +371,6 @@ class SoftmaxRole:
         )
 
     @cute.jit
-    def dead_step(
-        self,
-        stage: int,
-        cS: cute.Tensor,
-        row_max: Float32,
-        row_sum: Float32,
-        vec_i_handle,
-        pipeline_args: tuple,
-        atom_args: tuple,
-        tensor_args: tuple,
-    ):
-        """Fast path for a KV block entirely outside this stage's 128-row band.
-
-        The union trip range covers both 128-row stages; blocks outside this
-        stage's own band contribute nothing (every score would be masked).
-        This step performs only the pipeline obligations of a full step, in
-        the same order: consume Si, publish a no-change vec (old == new row
-        max, so the correction rescale factor is exactly 1), honor the
-        s0/s1 sequence tokens, and store a zero P so the still-running PV
-        gemm accumulates nothing.  row_max/row_sum pass through unchanged.
-
-        Standard path only (callers gate on not has_logits_transform and
-        not has_statistics_update).  Kept as a separate function so the
-        live step() contains no dynamic control flow — guarding the step
-        body with a runtime is-dead branch forces the accumulator fragment
-        across MLIR region boundaries and regresses every masked step.
-        """
-        assert self.q_dtype is not None
-        assert self.o_dtype is not None
-        (
-            mma_si_consumer,
-            si_corr_producer,
-            s0_s1_sequence_consumer,
-            s0_s1_sequence_producer,
-        ) = pipeline_args
-        qk_thr_mma = atom_args[0]
-        tiled_tmem_store = atom_args[2]
-        tiled_tmem_store_vec = atom_args[3]
-        thr_tmem_store = atom_args[5]
-        thr_tmem_store_vec = atom_args[6]
-        tTMEM_STORE_VECtS = tensor_args[1]
-        tTMEM_STOREtS_x4 = tensor_args[2]
-
-        tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.o_dtype.width
-        tScS = qk_thr_mma.partition_C(cS)
-        tScS_vec_layout = cute.composition(tScS.layout, cute.make_layout((128, 2)))
-        tScS_vec = cute.make_tensor(tScS.iterator, tScS_vec_layout)
-        tScS_P_layout = cute.composition(
-            tScS.layout, cute.make_layout((128, tilePlikeFP32))
-        )
-        tScS_P = cute.make_tensor(tScS.iterator, tScS_P_layout)
-        tTMEM_STORE_VECcS = thr_tmem_store_vec.partition_S(tScS_vec)
-        tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P)
-
-        # Wait for Si (release below doubles as "P ready" for the PV gemm)
-        si_handle = mma_si_consumer.wait_and_advance()
-
-        # No-change vec: old == new row max => correction factor 1
-        row_max_safe = row_max
-        if row_max == -cutlass.Float32.inf:
-            row_max_safe = 0.0
-        tTMEM_STORE_VECrS = cute.make_rmem_tensor(
-            tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
-        )
-        tTMEM_STORE_VECrS[0] = row_max
-        tTMEM_STORE_VECrS[1] = row_max_safe
-        cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
-        cute.arch.fence_view_async_tmem_store()
-        vec_i_handle.commit()
-
-        if cutlass.const_expr(stage == 0):
-            sequence_producer_handle = s0_s1_sequence_producer.acquire_and_advance()
-        else:
-            sequence_consumer_handle = s0_s1_sequence_consumer.wait_and_advance()
-
-        # P = 0 so the PV gemm adds nothing (zero f32 backing = packed
-        # bf16/fp16 zeros).
-        tTMEM_STORErS_x4 = cute.make_rmem_tensor(tTMEM_STOREcS.shape, self.qk_acc_dtype)
-        for idx in range(cute.size(tTMEM_STORErS_x4)):
-            tTMEM_STORErS_x4[idx] = 0.0
-
-        if cutlass.const_expr(stage == 0):
-            sequence_producer_handle.commit()
-        else:
-            sequence_consumer_handle.release()
-        cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
-        cute.arch.fence_view_async_tmem_store()
-        si_handle.release()
-
-        vec_i_handle = si_corr_producer.acquire_and_advance()
-
-        return (
-            row_max,
-            row_sum,
-            vec_i_handle,
-            mma_si_consumer,
-            si_corr_producer,
-            s0_s1_sequence_consumer,
-            s0_s1_sequence_producer,
-        )
-
-    @cute.jit
     def softmax_epilog(
         self,
         stage: int,
@@ -696,54 +594,53 @@ class SoftmaxRole:
                     tTMEM_LOADcS_static,
                 )
 
-                (
-                    kv_start_block,
-                    masked_left,
-                    unmask_count,
-                    masked_right,
-                ) = get_trip_segments(
-                    self.mask_spec,
-                    curr_block_coord,
-                    self.cta_tiler,
-                    seqlen_k_,
-                    seqlen_q_,
-                    window_left,
-                    window_right,
-                )
-                kv_start_offset = kv_start_block * self.qk_mma_tiler[1]
-                # Dead-step split: the trip range above is the union over
-                # both 128-row stages' rows.  Union blocks entirely outside
-                # THIS stage's own band contribute nothing; they always form
-                # a prefix (stage 1) and/or suffix (stage 0) of the masked
-                # segments and are routed to dead_step() below, keeping the
-                # live step() free of dynamic control flow.
-                dead_prefix = 0
-                dead_suffix = 0
+                # Per-stage band iteration (head/tail peel): each 128-row
+                # stage runs exactly its own band's trips — stage 0 the
+                # union's head+main blocks, stage 1 the main+tail blocks
+                # (see fusion/mask.py get_peel_sections).  No dead trips
+                # exist; the s0<->s1 sequence tokens stay balanced because
+                # stage 1 pre-consumes stage 0's `head` tokens and stage 0
+                # post-produces `tail` tokens after its final vec (dummies,
+                # a few instructions each).  Variants with per-step side
+                # effects keep full union lockstep (head = tail = 0).
+                seq_dummy_head = Int32(0)
+                seq_dummy_tail = Int32(0)
                 if cutlass.const_expr(
                     not self.has_logits_transform and not self.has_statistics_update
                 ):
-                    stage_lo, stage_hi = get_kv_block_range(
+                    (
+                        kv_start_block,
+                        masked_left,
+                        unmask_count,
+                        masked_right,
+                        seq_dummy_head,
+                        seq_dummy_tail,
+                    ) = get_stage_peel_segments(
                         self.mask_spec,
-                        (
-                            curr_block_coord[0] * 2 + stage,
-                            curr_block_coord[1],
-                            curr_block_coord[2],
-                        ),
-                        (self.qk_mma_tiler[0], self.cta_tiler[1]),
+                        curr_block_coord,
+                        stage,
+                        self.cta_tiler,
                         seqlen_k_,
                         seqlen_q_,
                         window_left,
                         window_right,
                     )
-                    kv_end_block = (
-                        kv_start_block + masked_left + unmask_count + masked_right
+                else:
+                    (
+                        kv_start_block,
+                        masked_left,
+                        unmask_count,
+                        masked_right,
+                    ) = get_trip_segments(
+                        self.mask_spec,
+                        curr_block_coord,
+                        self.cta_tiler,
+                        seqlen_k_,
+                        seqlen_q_,
+                        window_left,
+                        window_right,
                     )
-                    dead_prefix = cutlass.min(
-                        cutlass.max(stage_lo - kv_start_block, 0), masked_left
-                    )
-                    dead_suffix = cutlass.min(
-                        cutlass.max(kv_end_block - stage_hi, 0), masked_right
-                    )
+                kv_start_offset = kv_start_block * self.qk_mma_tiler[1]
                 logical_offset = (
                     curr_block_coord[0] * self.cta_tiler[0]
                     + stage * self.qk_mma_tiler[0],
@@ -755,37 +652,18 @@ class SoftmaxRole:
                     vec_i_handle = si_corr_producer.acquire_and_advance()
                 batch_coord = curr_block_coord[2][1]
                 head_coord = curr_block_coord[2][0]
-                # Dead prefix (stage 1 only): blocks below this stage's band.
+                # Stage 1: consume stage 0's head-trip tokens (it has no
+                # steps of its own for those blocks).
                 if cutlass.const_expr(
-                    not self.has_logits_transform and not self.has_statistics_update
+                    stage == 1
+                    and not self.has_logits_transform
+                    and not self.has_statistics_update
                 ):
-                    for i in cutlass.range(0, dead_prefix, 1, unroll=1):
-                        cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
-                        (
-                            row_max,
-                            row_sum,
-                            vec_i_handle,
-                            mma_si_consumer,
-                            si_corr_producer,
-                            s0_s1_sequence_consumer,
-                            s0_s1_sequence_producer,
-                        ) = self.dead_step(
-                            stage,
-                            cS_iter,
-                            row_max,
-                            row_sum,
-                            vec_i_handle,
-                            (
-                                mma_si_consumer,
-                                si_corr_producer,
-                                s0_s1_sequence_consumer,
-                                s0_s1_sequence_producer,
-                            ),
-                            atom_args,
-                            tensor_args,
-                        )
+                    for _d in cutlass.range(0, seq_dummy_head, 1, unroll=1):
+                        seq_handle = s0_s1_sequence_consumer.wait_and_advance()
+                        seq_handle.release()
                 # Left boundary blocks (window left edge) — masked.
-                for i in cutlass.range(dead_prefix, masked_left, 1, unroll=1):
+                for i in cutlass.range(0, masked_left, 1, unroll=1):
                     cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
                     iter_args = (
                         cS_iter,
@@ -862,7 +740,7 @@ class SoftmaxRole:
                 # or seqlen_k tail) — masked.
                 for i in cutlass.range(
                     masked_left + unmask_count,
-                    masked_left + unmask_count + masked_right - dead_suffix,
+                    masked_left + unmask_count + masked_right,
                     1,
                     unroll=1,
                 ):
@@ -900,40 +778,6 @@ class SoftmaxRole:
                         params,
                     )
 
-                # Dead suffix (stage 0 only): blocks above this stage's band.
-                if cutlass.const_expr(
-                    not self.has_logits_transform and not self.has_statistics_update
-                ):
-                    for i in cutlass.range(
-                        masked_left + unmask_count + masked_right - dead_suffix,
-                        masked_left + unmask_count + masked_right,
-                        1,
-                        unroll=1,
-                    ):
-                        cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
-                        (
-                            row_max,
-                            row_sum,
-                            vec_i_handle,
-                            mma_si_consumer,
-                            si_corr_producer,
-                            s0_s1_sequence_consumer,
-                            s0_s1_sequence_producer,
-                        ) = self.dead_step(
-                            stage,
-                            cS_iter,
-                            row_max,
-                            row_sum,
-                            vec_i_handle,
-                            (
-                                mma_si_consumer,
-                                si_corr_producer,
-                                s0_s1_sequence_consumer,
-                                s0_s1_sequence_producer,
-                            ),
-                            atom_args,
-                            tensor_args,
-                        )
                 si_handle = mma_si_consumer.wait_and_advance()
                 if cutlass.const_expr(not self.has_logits_transform):
                     tTMEM_STORE_VECrS = cute.make_rmem_tensor(
@@ -946,6 +790,16 @@ class SoftmaxRole:
                     )
                     cute.arch.fence_view_async_tmem_store()
                     vec_i_handle.commit()
+                    # Stage 0: produce stage 1's tail-trip tokens (it has no
+                    # steps of its own for those blocks).  After the final
+                    # vec commit so the O0 drain is not gated on stage 1's
+                    # progress.
+                    if cutlass.const_expr(
+                        stage == 0 and not self.has_statistics_update
+                    ):
+                        for _d in cutlass.range(0, seq_dummy_tail, 1, unroll=1):
+                            seq_handle = s0_s1_sequence_producer.acquire_and_advance()
+                            seq_handle.commit()
                     si_corr_producer.acquire()
                     si_handle.release()
                 else:

@@ -922,6 +922,7 @@ SLIDING_WINDOW_PARAMS = [
 # combined with the window left edge.
 CAUSAL_SLIDING_WINDOW_PARAMS = [
     # (batch, qo_len, kv_len, window_left)
+    (1, 256, 256, 0),  # attend-self-only: exercises the head-borrow path
     (1, 256, 256, 64),
     (1, 512, 512, 128),
     (9, 256, 256, 100),

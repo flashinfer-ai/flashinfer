@@ -117,6 +117,120 @@ def get_trip_count(
 
 
 @cute.jit
+def get_peel_sections(
+    spec: MaskSpec,
+    blk_coord: cute.Coord,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+    seqlen_q: Int32,
+    window_left: Int32,
+    window_right: Int32,
+) -> tuple[Int32, Int32, Int32, Int32, Int32]:
+    """Head/main/tail split of the union KV range across the two 128-row halves.
+
+    Returns ``(kv_start, head, main, tail, stage1_lo_extra)``:
+
+    - ``kv_start`` — first union block (== stage 0's band start).
+    - ``head``     — leading blocks visited only by stage 0 (its band starts
+      earlier: ``lo`` is nondecreasing in the row).
+    - ``main``     — blocks visited by both halves.
+    - ``tail``     — trailing blocks visited only by stage 1.
+    - ``stage1_lo_extra`` — blocks by which stage 1's band start was clamped
+      down to keep the three sections contiguous (nonzero only when stage 1's
+      rows are entirely out of the valid Q range and its raw band start lands
+      beyond stage 0's band end).  Stage 1 treats these as extra masked-left
+      blocks; their rows see an empty band and mask to -inf.
+
+    ``head + main + tail`` equals the full-tile ``get_trip_count`` by
+    construction — every role deriving its loop counts from this one helper
+    agrees with the loader's union fetch.
+    """
+    stage_tiler = (tile_shape[0] // 2, tile_shape[1])
+    lo0, hi0 = get_kv_block_range(
+        spec,
+        (blk_coord[0] * 2, blk_coord[1], blk_coord[2]),
+        stage_tiler,
+        seqlen_k,
+        seqlen_q,
+        window_left,
+        window_right,
+    )
+    lo1, hi1 = get_kv_block_range(
+        spec,
+        (blk_coord[0] * 2 + 1, blk_coord[1], blk_coord[2]),
+        stage_tiler,
+        seqlen_k,
+        seqlen_q,
+        window_left,
+        window_right,
+    )
+    # lo is nondecreasing and hi is nondecreasing in the row, so lo0 <= lo1
+    # and hi0 <= hi1; only lo1 can escape past hi0 (OOB stage-1 rows).
+    lo1_clamped = cutlass.min(lo1, hi0)
+    head = lo1_clamped - lo0
+    main = hi0 - lo1_clamped
+    # Borrow one head block into main when the bands don't overlap
+    # (window_left == 0, or fully-OOB stage-1 rows): main >= 1 lets every
+    # consumer keep a straight-line main prologue/epilogue, and stage 1
+    # masks the borrowed block to -inf (it is outside its band).  head >= 1
+    # whenever main == 0, since stage 0's band is never empty.
+    borrow = cutlass.min(head, cutlass.max(0, 1 - main))
+    return (
+        lo0,
+        head - borrow,
+        main + borrow,
+        hi1 - hi0,
+        (lo1 - lo1_clamped) + borrow,
+    )
+
+
+@cute.jit
+def get_stage_peel_segments(
+    spec: MaskSpec,
+    blk_coord: cute.Coord,
+    stage: int,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+    seqlen_q: Int32,
+    window_left: Int32,
+    window_right: Int32,
+) -> tuple[Int32, Int32, Int32, Int32, Int32, Int32]:
+    """One 128-row stage's iteration plan under the head/tail peel.
+
+    Returns ``(start_block, masked_left, unmasked, masked_right,
+    token_pre_consume, token_post_produce)``: the stage's own band segments
+    (stage 0 iterates the union's head+main blocks, stage 1 the main+tail
+    blocks, starting from the clamped band start so blocks folded in by
+    get_peel_sections mask to -inf), plus the sequence-token dummy counts
+    that keep the s0->s1 token ring balanced (stage 1 pre-consumes stage 0's
+    ``head`` tokens; stage 0 post-produces ``tail`` tokens).
+    """
+    union_start, head, _, tail, stage1_extra = get_peel_sections(
+        spec, blk_coord, tile_shape, seqlen_k, seqlen_q, window_left, window_right
+    )
+    _, masked_left, unmasked, masked_right = get_trip_segments(
+        spec,
+        (blk_coord[0] * 2 + stage, blk_coord[1], blk_coord[2]),
+        (tile_shape[0] // 2, tile_shape[1]),
+        seqlen_k,
+        seqlen_q,
+        window_left,
+        window_right,
+    )
+    if cutlass.const_expr(stage == 0):
+        return union_start, masked_left, unmasked, masked_right, Int32(0), tail
+    else:
+        return (
+            union_start + head,
+            masked_left + stage1_extra,
+            unmasked,
+            masked_right,
+            head,
+            Int32(0),
+        )
+
+
+@cute.jit
 def get_trip_segments(
     spec: MaskSpec,
     blk_coord: cute.Coord,
