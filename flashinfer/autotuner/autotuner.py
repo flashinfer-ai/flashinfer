@@ -437,6 +437,49 @@ class TuningConfig:
     inputs_pre_hook: Callable | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _NearestProfileDynamicSpec:
+    """The part of a dynamic tensor spec used for profile lookup.
+
+    The mapper object is retained for as long as this key is cached so that its
+    identity cannot be reused by a different callable.  Equality and hashing use
+    the explicit identity value instead of invoking arbitrary callable equality.
+    """
+
+    input_idx: tuple[int, ...]
+    dim_idx: tuple[int, ...]
+    mapper_identity: int
+    map_to_tuning_buckets: Callable[[int], int] = field(
+        compare=False, hash=False, repr=False
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _NearestProfileKey:
+    """Minimal immutable configuration needed to find a nearest profile."""
+
+    dynamic_specs: tuple[_NearestProfileDynamicSpec, ...]
+    constraint_dims: tuple[tuple[int, int], ...]
+
+    @classmethod
+    def from_tuning_config(cls, tuning_config: TuningConfig) -> "_NearestProfileKey":
+        return cls(
+            dynamic_specs=tuple(
+                _NearestProfileDynamicSpec(
+                    input_idx=tuple(spec.input_idx),
+                    dim_idx=tuple(spec.dim_idx),
+                    mapper_identity=id(spec.map_to_tuning_buckets),
+                    map_to_tuning_buckets=spec.map_to_tuning_buckets,
+                )
+                for spec in tuning_config.dynamic_tensor_specs
+            ),
+            constraint_dims=tuple(
+                (spec.input_idx, spec.dim_idx)
+                for spec in tuning_config.constraint_specs
+            ),
+        )
+
+
 @dataclass(frozen=True)
 class StaticDim:
     val: int
@@ -1885,7 +1928,6 @@ class AutoTuner:
         return generated_profiles
 
     @classmethod
-    @functools.lru_cache(maxsize=16384)
     def _find_nearest_profile(
         cls, shapes: tuple[tuple[int, ...], ...], tuning_config: TuningConfig
     ) -> tuple[tuple[int, ...], ...]:
@@ -1901,9 +1943,21 @@ class AutoTuner:
                 - attributes: Tuple of runner attributes, sorted.
                 - profile: Tuple of input tensor shapes
         """
+        return cls._find_nearest_profile_cached(
+            shapes, _NearestProfileKey.from_tuning_config(tuning_config)
+        )
+
+    @classmethod
+    @functools.lru_cache(maxsize=16384)
+    def _find_nearest_profile_cached(
+        cls,
+        shapes: tuple[tuple[int, ...], ...],
+        profile_key: _NearestProfileKey,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Cached nearest-profile lookup keyed only by lookup-relevant fields."""
         base_profile = list(list(shape) for shape in shapes)
 
-        for spec in tuning_config.dynamic_tensor_specs:
+        for spec in profile_key.dynamic_specs:
             mapped_val = spec.map_to_tuning_buckets(
                 base_profile[spec.input_idx[0]][spec.dim_idx[0]]
             )
@@ -1912,8 +1966,8 @@ class AutoTuner:
                 base_profile[input_i][dim_i] = mapped_val
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
-        for constraint_spec in tuning_config.constraint_specs:
-            base_profile[constraint_spec.input_idx][constraint_spec.dim_idx] = -1
+        for input_idx, dim_idx in profile_key.constraint_dims:
+            base_profile[input_idx][dim_idx] = -1
         return tuple(tuple(shape) for shape in base_profile)
 
     @classmethod
