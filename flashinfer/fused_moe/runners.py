@@ -23,8 +23,7 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 
 from __future__ import annotations
 
-from abc import ABC
-from typing import Any, List
+from typing import Any, ClassVar, List
 
 import torch
 
@@ -142,11 +141,14 @@ def _validate_logits_inputs(
             )
 
 
-class MoERunner(TunableRunner, ABC):
+class MoERunner(TunableRunner):
     """Base class for unified MoE backend runners."""
 
+    backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
-    supported_quant_variants: tuple[QuantVariant, ...] = ()
+    supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
+
+    config: MoEConfig
 
     def check_support(self) -> None:
         """Raise if the initialized runner cannot execute its configuration."""
@@ -742,9 +744,9 @@ class TrtllmBf16RoutedRunner(MoERunner):
 class _B12xRunner(MoERunner):
     """Shared unified adapter over ``B12xMoEWrapper``."""
 
-    backend_key = ""
-    quant_mode = ""
-    required_weight_keys: tuple[str, ...] = (
+    backend_key: ClassVar[str] = ""
+    quant_mode: ClassVar[str] = ""
+    required_weight_keys: ClassVar[tuple[str, ...]] = (
         "w1_weight",
         "w1_weight_sf",
         "w1_alpha",
