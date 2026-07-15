@@ -437,47 +437,50 @@ class TuningConfig:
     inputs_pre_hook: Callable | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class _NearestProfileDynamicSpec:
-    """The part of a dynamic tensor spec used for profile lookup.
+class _CallableIdentity:
+    """Hash and compare a callable by identity while retaining the object."""
 
-    The mapper object is retained for as long as this key is cached so that its
-    identity cannot be reused by a different callable.  Equality and hashing use
-    the explicit identity value instead of invoking arbitrary callable equality.
+    __slots__ = ("callable", "identity")
+
+    def __init__(self, callable_: Callable[[int], int]):
+        self.callable = callable_
+        self.identity = id(callable_)
+
+    def __hash__(self) -> int:
+        return self.identity
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _CallableIdentity) and self.callable is other.callable
+
+
+_NearestProfileDynamicSpec: TypeAlias = tuple[
+    tuple[int, ...], tuple[int, ...], _CallableIdentity
+]
+_NearestProfileKey: TypeAlias = tuple[
+    tuple[_NearestProfileDynamicSpec, ...], tuple[tuple[int, int], ...]
+]
+
+
+def _get_nearest_profile_key(tuning_config: TuningConfig) -> _NearestProfileKey:
+    """Extract only fields that affect nearest-profile selection.
+
+    Tensor initializers and the rest of ``TuningConfig`` are intentionally
+    excluded.  The identity wrappers retain mapper callables while a key is in
+    the LRU, preventing Python from reusing a cached callable's identity.
     """
-
-    input_idx: tuple[int, ...]
-    dim_idx: tuple[int, ...]
-    mapper_identity: int
-    map_to_tuning_buckets: Callable[[int], int] = field(
-        compare=False, hash=False, repr=False
+    return (
+        tuple(
+            (
+                spec.input_idx,
+                spec.dim_idx,
+                _CallableIdentity(spec.map_to_tuning_buckets),
+            )
+            for spec in tuning_config.dynamic_tensor_specs
+        ),
+        tuple(
+            (spec.input_idx, spec.dim_idx) for spec in tuning_config.constraint_specs
+        ),
     )
-
-
-@dataclass(frozen=True, slots=True)
-class _NearestProfileKey:
-    """Minimal immutable configuration needed to find a nearest profile."""
-
-    dynamic_specs: tuple[_NearestProfileDynamicSpec, ...]
-    constraint_dims: tuple[tuple[int, int], ...]
-
-    @classmethod
-    def from_tuning_config(cls, tuning_config: TuningConfig) -> "_NearestProfileKey":
-        return cls(
-            dynamic_specs=tuple(
-                _NearestProfileDynamicSpec(
-                    input_idx=tuple(spec.input_idx),
-                    dim_idx=tuple(spec.dim_idx),
-                    mapper_identity=id(spec.map_to_tuning_buckets),
-                    map_to_tuning_buckets=spec.map_to_tuning_buckets,
-                )
-                for spec in tuning_config.dynamic_tensor_specs
-            ),
-            constraint_dims=tuple(
-                (spec.input_idx, spec.dim_idx)
-                for spec in tuning_config.constraint_specs
-            ),
-        )
 
 
 @dataclass(frozen=True)
@@ -1944,7 +1947,7 @@ class AutoTuner:
                 - profile: Tuple of input tensor shapes
         """
         return cls._find_nearest_profile_cached(
-            shapes, _NearestProfileKey.from_tuning_config(tuning_config)
+            shapes, _get_nearest_profile_key(tuning_config)
         )
 
     @classmethod
@@ -1957,17 +1960,18 @@ class AutoTuner:
         """Cached nearest-profile lookup keyed only by lookup-relevant fields."""
         base_profile = list(list(shape) for shape in shapes)
 
-        for spec in profile_key.dynamic_specs:
-            mapped_val = spec.map_to_tuning_buckets(
-                base_profile[spec.input_idx[0]][spec.dim_idx[0]]
+        dynamic_specs, constraint_dims = profile_key
+        for dynamic_input_idx, dynamic_dim_idx, mapper in dynamic_specs:
+            mapped_val = mapper.callable(
+                base_profile[dynamic_input_idx[0]][dynamic_dim_idx[0]]
             )
             # Apply the same mapped bucket to all linked dimensions in this spec.
-            for input_i, dim_i in zip(spec.input_idx, spec.dim_idx, strict=True):
+            for input_i, dim_i in zip(dynamic_input_idx, dynamic_dim_idx, strict=True):
                 base_profile[input_i][dim_i] = mapped_val
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
-        for input_idx, dim_idx in profile_key.constraint_dims:
-            base_profile[input_idx][dim_idx] = -1
+        for constraint_input_idx, constraint_dim_idx in constraint_dims:
+            base_profile[constraint_input_idx][constraint_dim_idx] = -1
         return tuple(tuple(shape) for shape in base_profile)
 
     @classmethod
