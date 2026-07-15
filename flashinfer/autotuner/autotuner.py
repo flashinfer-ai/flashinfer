@@ -13,6 +13,7 @@ import weakref
 import tqdm
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from types import FunctionType
 from typing import (
     Any,
     Callable,
@@ -454,7 +455,7 @@ class _CallableIdentity:
 
 
 _NearestProfileDynamicSpec: TypeAlias = tuple[
-    tuple[int, ...], tuple[int, ...], _CallableIdentity
+    tuple[int, ...], tuple[int, ...], Callable[[int], int] | _CallableIdentity
 ]
 _NearestProfileKey: TypeAlias = tuple[
     tuple[_NearestProfileDynamicSpec, ...], tuple[tuple[int, int], ...]
@@ -473,7 +474,9 @@ def _get_nearest_profile_key(tuning_config: TuningConfig) -> _NearestProfileKey:
             (
                 spec.input_idx,
                 spec.dim_idx,
-                _CallableIdentity(spec.map_to_tuning_buckets),
+                spec.map_to_tuning_buckets
+                if isinstance(spec.map_to_tuning_buckets, FunctionType)
+                else _CallableIdentity(spec.map_to_tuning_buckets),
             )
             for spec in tuning_config.dynamic_tensor_specs
         ),
@@ -1962,7 +1965,10 @@ class AutoTuner:
 
         dynamic_specs, constraint_dims = profile_key
         for dynamic_input_idx, dynamic_dim_idx, mapper in dynamic_specs:
-            mapped_val = mapper.callable(
+            mapper_callable = (
+                mapper.callable if isinstance(mapper, _CallableIdentity) else mapper
+            )
+            mapped_val = mapper_callable(
                 base_profile[dynamic_input_idx[0]][dynamic_dim_idx[0]]
             )
             # Apply the same mapped bucket to all linked dimensions in this spec.
