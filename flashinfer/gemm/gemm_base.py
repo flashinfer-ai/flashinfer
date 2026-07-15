@@ -15,10 +15,10 @@ limitations under the License.
 """
 
 import functools
-from collections import defaultdict
 import logging
-from dataclasses import replace
 import warnings
+from collections import defaultdict
+from dataclasses import replace
 from enum import Enum
 from types import SimpleNamespace
 from typing import Callable, List, Literal, Optional, Tuple
