@@ -464,6 +464,7 @@ def ragged_block_scaled_bmm(
     transpose_a=False,
     transpose_b=True,
     out_dtype=None,
+    out=None,
     segment_alignment=_DEFAULT_SEGMENT_ALIGNMENT,
     **kwargs,
 ):
@@ -483,6 +484,10 @@ def ragged_block_scaled_bmm(
     Default 128. Pass 256 (with 256-aligned segments) to enable the large-M
     BLOCK_M=256 fast path. This cannot be validated at runtime without a host sync
     that would break CUDA-graph capture, so it is a caller contract.
+
+    `out` is an optional pre-allocated ``(total_m, N)`` output tensor written in
+    place (must be contiguous and match the output dtype). When None, an output is
+    allocated and returned. Passing `out` lets callers avoid an extra copy.
     """
     # Validate inputs
     assert transpose_a == False and transpose_b == True, "Only NT layout is supported"
@@ -511,16 +516,24 @@ def ragged_block_scaled_bmm(
 
     # Determine output dtype
     if out_dtype is None:
-        out_dtype = torch.bfloat16
+        out_dtype = out.dtype if out is not None else torch.bfloat16
 
-    # Allocate the output directly in the requested dtype and let the kernel
-    # store into it. Historically this used a float32 intermediate + post-cast
-    # to dodge an sm100 (B200) OOB bug where ct.store's tile-index path computed
-    # wrong addresses for 2-byte element types. That store path is now correct:
-    # direct bf16 output is bit-identical to the native
-    # group_gemm_fp8_nt_groupwise (trtllm) reference, validated on B300/sm103
-    # (2026-07-13, ocean image dkg-main-55650501). Not re-validated on sm100/B200.
-    c = torch.empty((total_m, N), device=a.device, dtype=out_dtype)
+    # Output tensor. The kernel stores directly into it (no float32 intermediate:
+    # that historical workaround for an sm100/B200 ct.store OOB bug is no longer
+    # needed — direct bf16 store is bit-identical to native group_gemm_fp8_nt_groupwise
+    # (trtllm), validated on B300/sm103 2026-07-13; not re-validated on sm100/B200).
+    # A caller-provided ``out`` is written in place (lets callers like
+    # group_gemm_fp8_nt_groupwise avoid an extra output copy); otherwise allocate.
+    if out is not None:
+        if tuple(out.shape) != (total_m, N):
+            raise ValueError(f"out must be ({total_m}, {N}); got {tuple(out.shape)}")
+        if out.dtype != out_dtype:
+            raise ValueError(f"out.dtype {out.dtype} != out_dtype {out_dtype}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+        c = out
+    else:
+        c = torch.empty((total_m, N), device=a.device, dtype=out_dtype)
 
     # Materialize fallback max_m_device if the caller didn't pass one. The
     # kernel always reads its grid bound from a device tensor (defense-in-depth).

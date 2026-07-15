@@ -869,7 +869,8 @@ def group_gemm_fp8_nt_groupwise_cutile(
     if segment_alignment >= 128 and segment_alignment % 128 == 0:
         from .ragged_block_scaled_bmm_cutile import ragged_block_scaled_bmm
 
-        c = ragged_block_scaled_bmm(
+        # Pass ``out`` so the kernel stores into it directly (no extra copy).
+        ragged_block_scaled_bmm(
             a,
             b,
             a_scale,
@@ -880,9 +881,9 @@ def group_gemm_fp8_nt_groupwise_cutile(
             transpose_a=False,
             transpose_b=True,
             out_dtype=out.dtype,
+            out=out,
             segment_alignment=segment_alignment,
         )
-        out.copy_(c)
         return out
 
     # Flatten B / b_scale on their leading dims so the kernel can gather group
