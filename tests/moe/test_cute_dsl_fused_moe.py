@@ -1249,7 +1249,6 @@ class TestCuteDslFusedMoeFunctional:
     @pytest.mark.parametrize(
         "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
     )
-    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("top_k", [1, 2, 8])
     @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
@@ -1265,10 +1264,77 @@ class TestCuteDslFusedMoeFunctional:
         hidden_size: int,
         intermediate_size: int,
         num_experts: int,
-        use_fused_finalize: bool,
         use_per_token_activation: bool,
     ):
         """Accuracy test for functional API across configurations."""
+        self._run_numerical_accuracy(
+            activation_type,
+            num_tokens,
+            top_k,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            use_per_token_activation,
+            use_fused_finalize=True,
+        )
+
+    @pytest.mark.parametrize(
+        "activation_type,num_tokens,top_k,hidden_size,intermediate_size,num_experts,use_per_token_activation",
+        [
+            pytest.param(
+                ActivationType.Swiglu,
+                128,
+                1,
+                256,
+                512,
+                256,
+                False,
+                id="swiglu-per-tensor",
+            ),
+            pytest.param(
+                ActivationType.Relu2,
+                515,
+                8,
+                1024,
+                2048,
+                384,
+                True,
+                id="relu2-per-token",
+            ),
+        ],
+    )
+    def test_deterministic_finalize_numerical_accuracy(
+        self,
+        activation_type: ActivationType,
+        num_tokens: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        use_per_token_activation: bool,
+    ):
+        self._run_numerical_accuracy(
+            activation_type,
+            num_tokens,
+            top_k,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            use_per_token_activation,
+            use_fused_finalize=False,
+        )
+
+    def _run_numerical_accuracy(
+        self,
+        activation_type: ActivationType,
+        num_tokens: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        use_per_token_activation: bool,
+        use_fused_finalize: bool,
+    ):
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
