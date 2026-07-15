@@ -1499,16 +1499,21 @@ def _compute_page_mask_indptr(
 def _nvfp4_kv_requires_disabled_split_kv(kv_data_type: torch.dtype) -> bool:
     """Whether split-KV must be disabled because the KV cache is NVFP4.
 
-    NVFP4 paged KV is stored as packed ``uint8`` (two E2M1 values per byte) with a
-    per-16-element FP8 block scale. Split-KV (flash-decoding) partitions the KV
-    range into chunks sized by ``kv_chunk_size``, which is *not* aligned to the
-    16-element scale blocks: a chunk boundary that lands mid-block — together with
-    the small per-split chunk tripping the 1-byte-KV ``NUM_MMA_KV`` tile floor —
-    corrupts the dequantized reads. The corruption only surfaces when a short query
-    attends a long KV (``qo_len << kv_len``), i.e. decode and prefix-cache *extend*,
-    so dense full-prefill tests miss it while prefix caching breaks. Until the FP4
-    split path is made scale-block-aware, disable split-KV for NVFP4 KV. FP8 KV has
-    no block scales and is unaffected.
+    This gate is an *empirical workaround*: with split-KV (flash-decoding)
+    enabled, NVFP4 paged KV was observed to produce corrupted outputs whenever
+    a short query attends a long KV range (``qo_len << kv_len``, i.e. decode
+    and prefix-cache extend), while dense full-prefill was unaffected.
+    Disabling split-KV removes the corruption, and decode-throughput
+    measurements showed no cost from the gate.
+
+    The root cause has not been confirmed. The FP8 scale-factor blocks
+    themselves cannot be the mechanism: NVFP4 scales group 16 consecutive
+    *head-dim* elements of a single token, whereas split-KV partitions the
+    *token* axis, so a split boundary never slices a scale block. The current
+    hypothesis (unconfirmed) is that the small per-split KV chunks interact
+    badly with the ``NUM_MMA_KV`` tile floor of the 1-byte-KV FA2 path. Until
+    the failure is root-caused and fixed, force split-KV off for NVFP4 KV.
+    FP8 and 16-bit KV caches are unaffected and keep split-KV.
     """
     if kv_data_type == torch.uint8:  # packed NVFP4 (the run path's convention)
         return True
@@ -2286,10 +2291,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
-            # NOTE(spark-hijinks): the segment_packbits kernel requires the
-            # indptr on the mask's device (CHECK_DEVICE in quantization.cu),
-            # but mask_indptr inherits qo_indptr's device, which callers
-            # (e.g. vLLM) routinely keep on CPU while the mask is on GPU.
+            # The segment_packbits kernel requires the indptr on the mask's
+            # device (CHECK_DEVICE in quantization.cu), but mask_indptr
+            # inherits qo_indptr's device, which callers (e.g. vLLM) routinely
+            # keep on CPU while the mask is on GPU.
             packed_custom_mask, mask_indptr = segment_packbits(
                 custom_mask.contiguous().view(-1),
                 mask_indptr.to(custom_mask.device),
@@ -2506,8 +2511,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
                     kv_data_type
                 ):
-                    # NVFP4 split-KV corrupts prefix-cached / decode reads; force
-                    # it off. See _nvfp4_kv_requires_disabled_split_kv for why.
+                    # Empirical workaround: split-KV corrupted NVFP4 KV reads
+                    # when qo_len << kv_len (decode / prefix-cache extend); see
+                    # _nvfp4_kv_requires_disabled_split_kv for details.
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
@@ -3446,10 +3452,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             mask_indptr = _compute_mask_indptr(qo_indptr, kv_indptr)
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
-            # NOTE(spark-hijinks): segment_packbits requires mask_indptr on the
-            # same device as custom_mask, but mask_indptr inherits qo_indptr's
-            # device (often CPU) while custom_mask is on GPU. Mirror the paged
-            # path's .to(device) so the ragged custom-mask flow doesn't crash.
+            # segment_packbits requires mask_indptr on the same device as
+            # custom_mask, but mask_indptr inherits qo_indptr's device (often
+            # CPU) while custom_mask is on GPU. Mirror the paged path's
+            # .to(device) so the ragged custom-mask flow doesn't crash.
             packed_custom_mask, mask_indptr = segment_packbits(
                 custom_mask.contiguous().view(-1),
                 mask_indptr.to(custom_mask.device),
@@ -3669,8 +3675,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
                     kv_data_type
                 ):
-                    # NVFP4 split-KV corrupts prefix-cached / decode reads; force
-                    # it off. See _nvfp4_kv_requires_disabled_split_kv for why.
+                    # Empirical workaround: split-KV corrupted NVFP4 KV reads
+                    # when qo_len << kv_len (decode / prefix-cache extend); see
+                    # _nvfp4_kv_requires_disabled_split_kv for details.
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
