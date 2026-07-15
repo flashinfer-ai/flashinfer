@@ -36,10 +36,12 @@ artifact — small batch is weight-load bound and fp4-vs-fp4 is a wash);
 the large-token win survives and grows with batch (full corrected sweep
 tables below).  Kernel-mode autotune on the correct layout: no gain over
 the default profile @8 tok (219 us), but @2048 the collective tuner found
-585.2 us (ikr + reuse_dispatch_warps + flag_batch 4) vs 614.4 default.  On the correct layout `in_kernel_fc2_reduce`
-BECOMES the @2048 winner (it lost on the broken layout), so the per-size
-default profiles in `shim/tuner.py` were tuned against the broken layout
-and should be re-derived from the 2026-07-15 sweep.  Accuracy per the
+585.2 us (ikr + reuse_dispatch_warps + flag_batch 4) vs 614.4 default.  The full profile
+re-derivation (2026-07-15, all buckets, both dtypes) confirmed every
+non-ikr NVFP4 default within run noise, found ikr the only NVFP4 win
+(-4..5% at >=2048, kept opt-in for determinism), and yielded one real
+default change: the MXFP8 >=2048 profile now uses dispatch-warp
+token-back (-14.5% — see the knob-system section).  Accuracy per the
 `moe_ep_benchmark` `acc_loss_pct` column (rel-L2 vs a bf16 dense-MoE
 reference on random data; real-model distributions typically fare better).
 
@@ -51,9 +53,15 @@ CSVs `moe_ep_benchmark/results/sweep_20260715_*_fi_mega.csv`:
 | tok/rank | dg     | nvfp4 (vs dg) | mxfp8  |
 |---------:|-------:|--------------:|-------:|
 | 1024     | 473.1  | 428.5 (1.10x) | 749.6  |
-| 2048     | 844.3  | 625.6 (1.35x) | 1209.6 |
-| 4096     | 1490.4 | 1018.4 (1.46x)| 2208.2 |
-| 8192     | 3105.2 | 1923.5 (1.61x)| 4844.0 |
+| 2048     | 844.3  | 625.6 (1.35x) | 1006.6 |
+| 4096     | 1490.4 | 1018.4 (1.46x)| 1742.8 |
+| 8192     | 3105.2 | 1923.5 (1.61x)| 3122.2 |
+
+(mxfp8 rows at >=2048 use the re-derived dispatch-warp default profile
+(2026-07-15); the old epi_warps profile measured 1209.6 / 2208.2 / 4844.0
+there — the profile change alone is worth 17-35%, and brings mxfp8 to dg
+PARITY at 8192 tokens at a 3x better accuracy point (6.4% vs 20.6%
+rel-L2).)
 
 (Below 1024 tok/rank nvfp4 and dg are at parity — 217.9 vs 211.0 @8,
 284.7 vs 286.7 @64, 359.4 vs 345.1 @512 — so the table keeps the
@@ -90,14 +98,19 @@ the whole story.
   `epi_flag_batch`).
 - `default_knobs(num_tokens, dtype=...)` — the measured per-size profiles
   (provenance in the profile dict comments).  NVFP4 has FOUR profiles
-  (**derived on the pre-2026-07-15 broken weight layout — re-derive from
-  the corrected-layout sweeps**); the dominant axis is `token_back_mode`:
+  (re-validated 2026-07-15 on the corrected weight layout: the online
+  autotuner confirmed all four non-ikr NVFP4 defaults within run noise;
+  only ikr candidates beat them, -4..5% at >=2048, kept opt-in for
+  determinism); the dominant axis is `token_back_mode`:
   - `epi_warps` wins at small batch but falls off a cliff mid-range
-    (+18% at 512 tokens, +35% at 1024 — every dispatch-warp candidate beat
-    every epi_warps candidate there).
+    (measured pre-fix as +18% at 512 tokens / +35% at 1024 with every
+    dispatch-warp candidate ahead; the 07-15 re-validation kept the same
+    per-bucket choices).
   - tile (256x128 vs 256x256) and `flag_batch` are second-order (~1-5%).
-  MXFP8 has ONE profile (fb4 + epi_warps at all sizes); the NVFP4-large
-  fb8+dispatch-warp schedule measured ~5% slower for MXFP8 at 2048.
+  MXFP8 has TWO profiles (re-derived 2026-07-15): fb4 + epi_warps below
+  2048 tokens, fb4 + reuse_dispatch_warps at >=2048 (-14.5% at 2048:
+  1010.6 vs 1181.6 us kernel-mode; supersedes the 07-14 "dispatch-warp is
+  ~5% slower for MXFP8" reading, which conflated it with fb8).
 - Backend configs (`Nvfp4/Mxfp8CutedslMegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
