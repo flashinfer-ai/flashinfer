@@ -119,6 +119,33 @@ def test_nvfp4_kv_dequant(shape, dtype):
     torch.testing.assert_close(output.float(), ref.float(), atol=1e-3, rtol=1e-3)
 
 
+# Large, bandwidth-bound shapes that exercise the blockwise dequant kernel's
+# grid-stride loop (well past the launch-overhead regime of the small shapes above).
+LARGE_SHAPES = [(16384, 512), (4096, 2048)]
+
+
+@pytest.mark.parametrize("shape", LARGE_SHAPES)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_nvfp4_kv_dequant_large(shape, dtype):
+    """Dequantization at production scale, checked against the PyTorch reference."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    M, K = shape
+    torch.manual_seed(0)
+    fp4_data = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda")
+    block_scales = torch.randint(1, 120, (M, K // 16), dtype=torch.uint8, device="cuda")
+    global_scale_val = 0.5
+    global_scale = torch.tensor([global_scale_val], dtype=torch.float32, device="cuda")
+
+    output = flashinfer.nvfp4_kv_dequantize(
+        fp4_data, block_scales, global_scale, output_dtype=dtype
+    )
+    ref = reference_dequant(fp4_data, block_scales, global_scale_val, dtype)
+    torch.testing.assert_close(output.float(), ref.float(), atol=1e-3, rtol=1e-3)
+
+
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 @pytest.mark.parametrize("block_table_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("dtype", DTYPES)
