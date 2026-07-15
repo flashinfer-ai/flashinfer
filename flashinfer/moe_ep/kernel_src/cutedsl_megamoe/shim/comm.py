@@ -106,11 +106,32 @@ def _compute_peer_offsets(
         local_base = int(sym_tensor.data_ptr())
         return local_base, tuple(0 for _ in range(world_size))
     import nvshmem.core
+    from nvshmem.core.interop.torch import tensor_get_buffer
 
     local_base = int(sym_tensor.data_ptr())
+    my_pe = int(nvshmem.core.my_pe())
+    buf, _size, _dtype = tensor_get_buffer(sym_tensor)
+
+    def _peer_base(peer: int) -> int:
+        # Own rank maps to the local base (nvshmem_ptr identity).  Skipping
+        # the get_peer_buffer call for it matters: nvshmem4py resolves the
+        # self-peer to the PARENT tracker entry and bumps its ref count, which
+        # defers the real nvshmem free from free_tensor() to GC (the "memory
+        # was not freed explicitly" finalize warnings).
+        if peer == my_pe:
+            return local_base
+        # Deliberately NOT nvshmem.core.get_peer_tensor(): its
+        # ``.view(tensor.shape)`` breaks when the nvshmem heap reuses an
+        # address for a smaller allocation while the nvshmem4py tracker still
+        # holds a stale larger peer entry (first hit when in_kernel_fc2_reduce
+        # shrank shared_workspace from ~1 MiB to ~8 KiB at a reused address).
+        # Only the peer BASE ADDRESS is needed here, and the nvshmem_ptr
+        # address mapping is deterministic, so read it off the peer Buffer.
+        peer_buf = nvshmem.core.get_peer_buffer(buf, peer)
+        return int(torch.utils.dlpack.from_dlpack(peer_buf).data_ptr())
+
     peer_offsets_list = tuple(
-        int(nvshmem.core.get_peer_tensor(sym_tensor, peer).data_ptr()) - local_base
-        for peer in range(world_size)
+        _peer_base(peer) - local_base for peer in range(world_size)
     )
     return local_base, peer_offsets_list
 
