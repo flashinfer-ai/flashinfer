@@ -1012,16 +1012,34 @@ def _check_dsv4_sparse_mla_inputs(
     )
 
 
-def _resolve_dsv4_sparse_mla_backend(device: torch.device) -> str:
+def _resolve_dsv4_sparse_mla_backend(
+    device: torch.device,
+    requested_backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse"] = "auto",
+) -> str:
     cc = get_compute_capability(device)
-    if cc[0] == 12:
-        return "sparse"
-    if cc[0] == 10:
-        return "trtllm-gen"
-    raise ValueError(
-        "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
-        f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
-    )
+    is_sm100_family = cc in ((10, 0), (10, 3))
+    is_sm120_family = cc in ((12, 0), (12, 1))
+    if requested_backend == "auto":
+        if is_sm120_family:
+            return "sparse"
+        if is_sm100_family:
+            return "trtllm-gen"
+        raise ValueError(
+            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
+            f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
+        )
+    if requested_backend not in ("trtllm-gen", "cute-dsl", "sparse"):
+        raise ValueError(
+            "backend must be one of 'auto', 'trtllm-gen', 'cute-dsl', or "
+            f"'sparse', got {requested_backend!r}"
+        )
+    if requested_backend in ("trtllm-gen", "cute-dsl") and not is_sm100_family:
+        raise ValueError(
+            f"backend={requested_backend!r} requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+        )
+    if requested_backend == "sparse" and not is_sm120_family:
+        raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
+    return requested_backend
 
 
 def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
@@ -1142,11 +1160,313 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     return result
 
 
+_DSV4_HCA_WINDOW_CAPACITY = 128
+
+
+@dataclass(frozen=True)
+class DSV4HCAMetadata:
+    """HCA metadata generated from a canonical page-aligned sparse table."""
+
+    hca_swa_block_tables: torch.Tensor
+    hca_compressed_block_tables: torch.Tensor
+    hca_seq_lens: torch.Tensor
+    swa_topk_lens: torch.Tensor
+    hca_is_causal: bool = True
+
+
+def _check_hca_page_size(page_size: int, name: str) -> None:
+    if page_size <= 1 or _DSV4_HCA_WINDOW_CAPACITY % page_size != 0:
+        raise ValueError(
+            f"{name} must be greater than 1 and divide "
+            f"{_DSV4_HCA_WINDOW_CAPACITY}, got {page_size}"
+        )
+
+
+def _reject_hca_conversion_during_capture(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "page-aligned HCA metadata conversion is not CUDA Graph "
+                "capture safe; precompute HCA metadata before capture"
+            )
+
+
+_DSV4_HCA_CANONICAL_CHECK_MAX_ELEMENTS = 4 * 1024 * 1024
+
+
+def _recover_hca_page_ids(
+    segment: torch.Tensor,
+    active_lens: torch.Tensor,
+    *,
+    max_active_len: int,
+    page_size: int,
+    num_pages: int,
+    name: str,
+) -> torch.Tensor:
+    """Recover active page IDs while bounding strict-validation temporaries."""
+    rows = segment.shape[0]
+    if max_active_len == 0:
+        return torch.empty((rows, 0), dtype=torch.int32, device=segment.device)
+    if max_active_len > segment.shape[1]:
+        raise ValueError(
+            f"sparse_indices capacity is too small for the active {name} segment"
+        )
+
+    page_offsets = torch.arange(
+        0,
+        max_active_len,
+        page_size,
+        dtype=torch.int64,
+        device=segment.device,
+    )
+    page_starts = segment.index_select(1, page_offsets)
+    page_ids = torch.div(page_starts, page_size, rounding_mode="floor")
+    active_pages = page_offsets.unsqueeze(0) < active_lens.unsqueeze(1)
+    invalid = (
+        active_pages
+        & (
+            (torch.remainder(page_starts, page_size) != 0)
+            | (page_ids < 0)
+            | (page_ids >= num_pages)
+        )
+    ).any()
+
+    chunk_size = max(
+        1,
+        min(
+            max_active_len,
+            _DSV4_HCA_CANONICAL_CHECK_MAX_ELEMENTS // max(rows, 1),
+        ),
+    )
+    for start in range(0, max_active_len, chunk_size):
+        stop = min(start + chunk_size, max_active_len)
+        positions = torch.arange(start, stop, dtype=torch.int64, device=segment.device)
+        values = segment[:, start:stop]
+        expected_page_ids = page_ids.index_select(
+            1, torch.div(positions, page_size, rounding_mode="floor")
+        )
+        expected_offsets = torch.remainder(positions, page_size).to(segment.dtype)
+        active = positions.unsqueeze(0) < active_lens.unsqueeze(1)
+        canonical = (
+            torch.div(values, page_size, rounding_mode="floor") == expected_page_ids
+        ) & (torch.remainder(values, page_size) == expected_offsets.unsqueeze(0))
+        invalid = invalid | (active & ~canonical).any()
+
+    if invalid.item():
+        raise ValueError(
+            f"active {name} sparse_indices are not a canonical page-aligned "
+            "expansion with valid physical page IDs"
+        )
+    return torch.where(active_pages, page_ids, torch.zeros_like(page_ids)).to(
+        torch.int32
+    )
+
+
+def _convert_page_aligned_sparse_indices_to_hca_metadata(
+    sparse_indices: torch.Tensor,
+    sparse_topk_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    q_len: int,
+    swa_page_size: int,
+    compressed_page_size: int,
+    num_swa_pages: int,
+    num_compressed_pages: int,
+) -> DSV4HCAMetadata:
+    """Convert a canonical HCA token-row expansion back to HCA page tables."""
+    _reject_hca_conversion_during_capture(sparse_indices.device)
+    if q_len <= 0:
+        raise ValueError(f"q_len must be positive, got {q_len}")
+    _check_hca_page_size(swa_page_size, "SWA page size")
+    _check_hca_page_size(compressed_page_size, "compressed page size")
+    page_size_ratio = max(swa_page_size, compressed_page_size) // min(
+        swa_page_size, compressed_page_size
+    )
+    if page_size_ratio & (page_size_ratio - 1):
+        raise ValueError(
+            "The ratio between SWA and compressed page sizes must be a power "
+            f"of two, got {swa_page_size} and {compressed_page_size}"
+        )
+    if num_swa_pages <= 0 or num_compressed_pages <= 0:
+        raise ValueError("SWA and compressed KV caches must each contain a page")
+
+    for tensor, name in (
+        (sparse_indices, "sparse_indices"),
+        (sparse_topk_lens, "sparse_topk_lens"),
+        (seq_lens, "seq_lens"),
+    ):
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+        if tensor.device != sparse_indices.device:
+            raise ValueError(
+                f"{name} must be on {sparse_indices.device}, got {tensor.device}"
+            )
+    if sparse_indices.ndim != 2:
+        raise ValueError(
+            f"sparse_indices must be 2D, got shape {tuple(sparse_indices.shape)}"
+        )
+    if seq_lens.ndim != 1 or seq_lens.numel() == 0:
+        raise ValueError(
+            f"seq_lens must be non-empty and 1D, got {tuple(seq_lens.shape)}"
+        )
+    batch_size = seq_lens.numel()
+    rows = batch_size * q_len
+    if sparse_indices.shape[0] != rows:
+        raise ValueError(
+            f"sparse_indices must have B * Q = {rows} rows, got "
+            f"{sparse_indices.shape[0]}"
+        )
+    if sparse_topk_lens.shape != (rows,):
+        raise ValueError(
+            f"sparse_topk_lens must have shape ({rows},), got "
+            f"{tuple(sparse_topk_lens.shape)}"
+        )
+    sparse_capacity = sparse_indices.shape[1]
+    if sparse_capacity < _DSV4_HCA_WINDOW_CAPACITY or sparse_capacity % 4 != 0:
+        raise ValueError(
+            "sparse_indices capacity must include 128 SWA entries and be a "
+            f"multiple of 4, got {sparse_capacity}"
+        )
+
+    query_positions = torch.arange(
+        q_len, dtype=torch.int32, device=sparse_indices.device
+    )
+    visible_raw_lens = seq_lens.unsqueeze(1) - q_len + query_positions.unsqueeze(0) + 1
+    if (visible_raw_lens <= 0).any().item():
+        raise ValueError("seq_lens must be at least q_len for causal dense queries")
+    swa_topk_lens = visible_raw_lens.clamp(max=_DSV4_HCA_WINDOW_CAPACITY).reshape(-1)
+    expected_sparse_topk_lens = (
+        _DSV4_HCA_WINDOW_CAPACITY
+        + torch.div(
+            visible_raw_lens,
+            _DSV4_HCA_WINDOW_CAPACITY,
+            rounding_mode="floor",
+        )
+    ).reshape(-1)
+    if (expected_sparse_topk_lens > sparse_capacity).any().item():
+        raise ValueError(
+            "sparse_indices capacity is too small for the HCA lengths derived "
+            "from seq_lens"
+        )
+    if (sparse_topk_lens != expected_sparse_topk_lens).any().item():
+        raise ValueError(
+            "hca_sparse_indices_format='page-aligned' requires "
+            "sparse_topk_lens == 128 + floor(visible_raw_len / 128)"
+        )
+    hca_seq_lens = (
+        _DSV4_HCA_WINDOW_CAPACITY
+        + torch.div(seq_lens, _DSV4_HCA_WINDOW_CAPACITY, rounding_mode="floor")
+    ).contiguous()
+
+    window_page_count = _DSV4_HCA_WINDOW_CAPACITY // swa_page_size
+    window_indices = sparse_indices[:, :_DSV4_HCA_WINDOW_CAPACITY]
+    max_active_window_len = int(swa_topk_lens.max().item())
+    recovered_window_page_ids = _recover_hca_page_ids(
+        window_indices,
+        swa_topk_lens,
+        max_active_len=max_active_window_len,
+        page_size=swa_page_size,
+        num_pages=num_swa_pages,
+        name="SWA",
+    )
+    hca_swa_block_tables = torch.zeros(
+        (rows, window_page_count),
+        dtype=torch.int32,
+        device=sparse_indices.device,
+    )
+    hca_swa_block_tables[:, : recovered_window_page_ids.shape[1]] = (
+        recovered_window_page_ids
+    )
+
+    compressed_indices = sparse_indices[:, _DSV4_HCA_WINDOW_CAPACITY:]
+    max_compressed_slots = int((hca_seq_lens.max() - _DSV4_HCA_WINDOW_CAPACITY).item())
+    compressed_tiles = (
+        max_compressed_slots + _DSV4_HCA_WINDOW_CAPACITY - 1
+    ) // _DSV4_HCA_WINDOW_CAPACITY
+    compressed_pages_per_tile = _DSV4_HCA_WINDOW_CAPACITY // compressed_page_size
+    compressed_table_columns = max(1, compressed_tiles * compressed_pages_per_tile)
+    hca_compressed_block_tables = torch.zeros(
+        (rows, compressed_table_columns),
+        dtype=torch.int32,
+        device=sparse_indices.device,
+    )
+    active_compressed_lens = expected_sparse_topk_lens - _DSV4_HCA_WINDOW_CAPACITY
+    recovered_compressed_page_ids = _recover_hca_page_ids(
+        compressed_indices,
+        active_compressed_lens,
+        max_active_len=max_compressed_slots,
+        page_size=compressed_page_size,
+        num_pages=num_compressed_pages,
+        name="compressed",
+    )
+    hca_compressed_block_tables[:, : recovered_compressed_page_ids.shape[1]] = (
+        recovered_compressed_page_ids
+    )
+
+    return DSV4HCAMetadata(
+        hca_swa_block_tables=hca_swa_block_tables,
+        hca_compressed_block_tables=hca_compressed_block_tables.contiguous(),
+        hca_seq_lens=hca_seq_lens,
+        swa_topk_lens=swa_topk_lens.contiguous(),
+    )
+
+
+def convert_page_aligned_sparse_indices_to_hca_metadata(
+    sparse_indices: torch.Tensor,
+    sparse_topk_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    compressed_kv_cache: torch.Tensor,
+    *,
+    q_len: int,
+    kv_layout: Literal["HND", "NHD"] = "HND",
+) -> DSV4HCAMetadata:
+    r"""Convert canonical HCA token-row indices into reusable HCA metadata.
+
+    This conversion is only valid when each active SWA and compressed segment
+    is the canonical expansion ``page_id * page_size + page_offset``. For a
+    dense causal query, it requires
+    ``visible_raw_len = seq_len - q_len + query_position + 1`` and
+    ``sparse_topk_len = 128 + floor(visible_raw_len / 128)``.
+
+    The conversion validates tensor values, allocates metadata, and
+    synchronizes the device. It is not CUDA Graph capture safe and must not be
+    repeated in a latency-sensitive decode loop. Run it during setup, then
+    reuse the returned block tables with ``backend="cute-dsl"``.
+    """
+    normalized_swa_cache = _normalize_dsv4_sparse_mla_kv_cache(
+        swa_kv_cache, kv_layout, "swa_kv_cache"
+    )
+    normalized_compressed_cache = _normalize_dsv4_sparse_mla_kv_cache(
+        compressed_kv_cache, kv_layout, "compressed_kv_cache"
+    )
+    for cache, name in (
+        (normalized_swa_cache, "swa_kv_cache"),
+        (normalized_compressed_cache, "compressed_kv_cache"),
+    ):
+        if cache.device != sparse_indices.device:
+            raise ValueError(
+                f"{name} must be on {sparse_indices.device}, got {cache.device}"
+            )
+    return _convert_page_aligned_sparse_indices_to_hca_metadata(
+        sparse_indices,
+        sparse_topk_lens,
+        seq_lens,
+        q_len=q_len,
+        swa_page_size=normalized_swa_cache.shape[2],
+        compressed_page_size=normalized_compressed_cache.shape[2],
+        num_swa_pages=normalized_swa_cache.shape[0],
+        num_compressed_pages=normalized_compressed_cache.shape[0],
+    )
+
+
 def trtllm_batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    sparse_indices: torch.Tensor,
+    sparse_indices: Optional[torch.Tensor] = None,
     compressed_kv_cache: Optional[torch.Tensor] = None,
     sparse_topk_lens: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
@@ -1161,6 +1481,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     swa_topk_lens: Optional[torch.Tensor] = None,
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
+    backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse"] = "auto",
+    hca_swa_block_tables: Optional[torch.Tensor] = None,
+    hca_compressed_block_tables: Optional[torch.Tensor] = None,
+    hca_seq_lens: Optional[torch.Tensor] = None,
+    hca_is_causal: bool = True,
+    hca_use_persistent: bool = False,
+    hca_sparse_indices_format: Optional[Literal["page-aligned"]] = None,
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -1182,6 +1509,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     ``extra_sparse_indices`` with ``extra_sparse_topk_lens``. The SM120/SM121
     path accepts BF16 query tensors and produces BF16 output.
 
+    With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
+    HCA kernel. This path is explicit because HCA block tables contain page
+    IDs, whereas the TRTLLM-GEN dynamic-token-sparse ABI consumes arbitrary
+    physical token-row indices. Both ABIs can represent logical HCA; the
+    distinction here is the metadata encoding and implementation. HCA currently
+    accepts dense FP8 E4M3 query/KV tensors and produces BF16 output.
+
     Parameters
     ----------
     query : torch.Tensor
@@ -1193,26 +1527,33 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses packed
         uint8 head dim 584. Layout follows ``kv_layout``.
     workspace_buffer : torch.Tensor
-        TRTLLM-GEN workspace buffer. The multi-CTA KV counters are managed in a
-        separate internal buffer.
-    sparse_indices : torch.Tensor
+        Byte workspace used by TRTLLM-GEN or HCA split-K reduction. The
+        TRTLLM-GEN multi-CTA KV counters are managed in a separate internal
+        buffer.
+    sparse_indices : Optional[torch.Tensor]
         TRTLLM-GEN combined sparse table, or the SM120 sparse SWA segment.
+        Pass ``None`` for the explicit ``backend="cute-dsl"`` block-table
+        path. Canonical page-aligned HCA expansions may instead be converted
+        by setting ``hca_sparse_indices_format="page-aligned"``.
     compressed_kv_cache : Optional[torch.Tensor]
         Primary/compressed KV cache in the same backend layout as
-        ``swa_kv_cache``. Required by ``trtllm-gen`` and by SM120 ``sparse``
-        when ``extra_sparse_indices`` is provided.
+        ``swa_kv_cache``. Required by ``trtllm-gen`` and HCA, and by SM120
+        ``sparse`` when ``extra_sparse_indices`` is provided.
     sparse_topk_lens : Optional[torch.Tensor]
         Flattened total sparse MLA top-k lengths in query-token order, shape
         ``[sum_q]``. Values must already include the fixed 128 SWA entries,
-        matching TRTLLM-GEN ``sparseMlaTopkLengths``, and must not exceed
-        ``sparse_indices.shape[-1]``. Required only by ``trtllm-gen``.
+        matching TRTLLM-GEN ``sparseMlaTopkLengths``. For TRTLLM-GEN they must
+        not exceed ``sparse_indices.shape[-1]``. HCA also requires this tensor;
+        there it describes the visible window-plus-compressed slot count.
     seq_lens : Optional[torch.Tensor]
         Original KV sequence lengths, shape ``[batch_size]`` INT32. Required
-        only by ``trtllm-gen``.
+        by ``trtllm-gen`` and by page-aligned HCA metadata conversion.
     bmm1_scale : Union[float, torch.Tensor]
         Fused per-tensor scale for QK and softmax. Tensor form must be FP32.
+        HCA currently accepts only a Python float.
     bmm2_scale : Union[float, torch.Tensor]
         Fused per-tensor scale for VO. Tensor form must be FP32.
+        HCA currently accepts only a Python float.
     sinks : Optional[torch.Tensor]
         Optional attention sink logits, shape ``[num_heads]`` FP32.
     kv_layout : Literal["HND", "NHD"]
@@ -1228,15 +1569,200 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         Whether to enable Programmatic Dependent Launch. Used by the
         TRTLLM-GEN path.
     swa_topk_lens : Optional[torch.Tensor]
-        Active SWA segment lengths for SM120/SM121, shape ``[sum_q]`` INT32.
+        Active SWA segment lengths, shape ``[sum_q]`` INT32. On SM120/SM121
+        these are sparse-segment lengths. HCA requires them as its per-row
+        visible sliding-window lengths in the range 0 through 128.
     extra_sparse_indices : Optional[torch.Tensor]
         Optional SM120/SM121 compressed segment indices into
         ``compressed_kv_cache``.
     extra_sparse_topk_lens : Optional[torch.Tensor]
         Active compressed segment lengths for SM120/SM121, shape ``[sum_q]``
         INT32.
+    backend : {"auto", "trtllm-gen", "cute-dsl", "sparse"}
+        Backend selection. ``"auto"`` preserves the architecture-based default:
+        TRTLLM-GEN on SM100/SM103 and sparse on SM120/SM121. HCA is selected
+        only when ``"cute-dsl"`` is requested explicitly.
+    hca_swa_block_tables : Optional[torch.Tensor]
+        HCA sliding-window page IDs, shape ``[B * Q, max_pages]`` INT32.
+    hca_compressed_block_tables : Optional[torch.Tensor]
+        HCA compressed-pool page IDs with the same row convention as
+        ``hca_swa_block_tables``, INT32.
+    hca_seq_lens : Optional[torch.Tensor]
+        Per-request total HCA slot counts ``[B]`` INT32. Each value counts the
+        128 window slots plus compressed slots, not original raw KV tokens.
+    hca_is_causal : bool
+        Must currently be ``True``. HCA page-table rows and valid-length
+        tensors are per query token (``B * Q`` rows).
+    hca_use_persistent : bool
+        Select the CuTe DSL persistent tile scheduler. This removes the
+        non-persistent ``B * Q <= 65535`` launch-grid restriction.
+    hca_sparse_indices_format : Optional[Literal["page-aligned"]]
+        Opt-in compatibility mode for legacy TRTLLM-GEN metadata. With
+        ``"page-aligned"``, the active token-row indices must be the canonical
+        expansion ``page_id * page_size + page_offset`` of causal HCA pages.
+        The dispatcher validates and converts them into HCA block tables,
+        ``hca_seq_lens``, and ``swa_topk_lens``. This tagged path is a one-shot
+        compatibility path: it allocates, synchronizes the device, immediately
+        launches the decode, and is not CUDA Graph capture safe.
+        Performance-sensitive callers must precompute with
+        :func:`convert_page_aligned_sparse_indices_to_hca_metadata` and reuse
+        the returned metadata through the explicit HCA arguments.
     """
-    backend = _resolve_dsv4_sparse_mla_backend(query.device)
+    backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
+
+    if backend == "cute-dsl":
+        if not hca_is_causal:
+            raise ValueError("backend='cute-dsl' currently supports causal HCA only")
+        if cum_seq_lens_q is not None or max_q_len is not None:
+            raise ValueError(
+                "backend='cute-dsl' currently supports dense [B, Q, H, D] "
+                "queries only; cum_seq_lens_q and max_q_len must be None"
+            )
+        if extra_sparse_indices is not None or extra_sparse_topk_lens is not None:
+            raise ValueError(
+                "backend='cute-dsl' uses HCA block tables and does not accept "
+                "extra_sparse_indices or extra_sparse_topk_lens"
+            )
+        if enable_pdl:
+            raise ValueError("backend='cute-dsl' HCA does not support enable_pdl")
+        if hca_sparse_indices_format not in (None, "page-aligned"):
+            raise ValueError(
+                "hca_sparse_indices_format must be None or 'page-aligned', got "
+                f"{hca_sparse_indices_format!r}"
+            )
+
+        normalized_swa_cache = _normalize_dsv4_sparse_mla_kv_cache(
+            swa_kv_cache, kv_layout, "swa_kv_cache"
+        ).squeeze(1)
+        if compressed_kv_cache is None:
+            raise ValueError("backend='cute-dsl' requires compressed_kv_cache")
+        normalized_compressed_cache = _normalize_dsv4_sparse_mla_kv_cache(
+            compressed_kv_cache, kv_layout, "compressed_kv_cache"
+        ).squeeze(1)
+
+        if hca_sparse_indices_format == "page-aligned":
+            generated_inputs = {
+                "hca_swa_block_tables": hca_swa_block_tables,
+                "hca_compressed_block_tables": hca_compressed_block_tables,
+                "hca_seq_lens": hca_seq_lens,
+                "swa_topk_lens": swa_topk_lens,
+            }
+            conflicts = [
+                name for name, value in generated_inputs.items() if value is not None
+            ]
+            if conflicts:
+                raise ValueError(
+                    "hca_sparse_indices_format='page-aligned' generates "
+                    + ", ".join(conflicts)
+                    + "; do not pass them explicitly"
+                )
+            if sparse_indices is None or sparse_topk_lens is None or seq_lens is None:
+                raise ValueError(
+                    "hca_sparse_indices_format='page-aligned' requires "
+                    "sparse_indices, sparse_topk_lens, and seq_lens"
+                )
+            if query.ndim != 4:
+                raise ValueError(
+                    "hca_sparse_indices_format='page-aligned' requires dense "
+                    "query shape [B, Q, H, D]"
+                )
+            if seq_lens.numel() != query.shape[0]:
+                raise ValueError(
+                    "hca_sparse_indices_format='page-aligned' requires "
+                    f"seq_lens with {query.shape[0]} entries, got {seq_lens.numel()}"
+                )
+            for tensor, name in (
+                (sparse_indices, "sparse_indices"),
+                (sparse_topk_lens, "sparse_topk_lens"),
+                (seq_lens, "seq_lens"),
+                (normalized_swa_cache, "swa_kv_cache"),
+                (normalized_compressed_cache, "compressed_kv_cache"),
+            ):
+                if tensor.device != query.device:
+                    raise ValueError(
+                        f"{name} must be on {query.device}, got {tensor.device}"
+                    )
+            _reject_hca_conversion_during_capture(query.device)
+            metadata = _convert_page_aligned_sparse_indices_to_hca_metadata(
+                sparse_indices,
+                sparse_topk_lens,
+                seq_lens,
+                q_len=query.shape[1],
+                swa_page_size=normalized_swa_cache.shape[1],
+                compressed_page_size=normalized_compressed_cache.shape[1],
+                num_swa_pages=normalized_swa_cache.shape[0],
+                num_compressed_pages=normalized_compressed_cache.shape[0],
+            )
+            hca_swa_block_tables = metadata.hca_swa_block_tables
+            hca_compressed_block_tables = metadata.hca_compressed_block_tables
+            hca_seq_lens = metadata.hca_seq_lens
+            swa_topk_lens = metadata.swa_topk_lens
+        else:
+            if sparse_indices is not None:
+                raise ValueError(
+                    "backend='cute-dsl' consumes HCA block tables, so "
+                    "sparse_indices must be None unless "
+                    "hca_sparse_indices_format='page-aligned'"
+                )
+            if seq_lens is not None:
+                raise ValueError(
+                    "backend='cute-dsl' uses hca_seq_lens, so seq_lens must be "
+                    "None unless hca_sparse_indices_format='page-aligned'"
+                )
+
+        required_hca_inputs = {
+            "compressed_kv_cache": compressed_kv_cache,
+            "sparse_topk_lens": sparse_topk_lens,
+            "swa_topk_lens": swa_topk_lens,
+            "hca_swa_block_tables": hca_swa_block_tables,
+            "hca_compressed_block_tables": hca_compressed_block_tables,
+            "hca_seq_lens": hca_seq_lens,
+        }
+        missing = [name for name, value in required_hca_inputs.items() if value is None]
+        if missing:
+            raise ValueError("backend='cute-dsl' requires " + ", ".join(missing))
+        if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+            raise TypeError(
+                "backend='cute-dsl' HCA currently requires Python float "
+                "bmm1_scale and bmm2_scale"
+            )
+
+        from ..cute_dsl.attention.wrappers.batch_hca import cute_dsl_hca_decode
+
+        return cute_dsl_hca_decode(
+            query=query,
+            window_kv_cache=normalized_swa_cache,
+            compressed_kv_cache=normalized_compressed_cache,
+            workspace_buffer=workspace_buffer,
+            window_block_tables=hca_swa_block_tables,
+            compressed_block_tables=hca_compressed_block_tables,
+            hca_seq_lens=hca_seq_lens,
+            sparse_topk_lens=sparse_topk_lens,
+            window_valid_lens=swa_topk_lens,
+            softmax_scale=float(bmm1_scale),
+            output_scale=float(bmm2_scale),
+            sinks=sinks,
+            out=out,
+            is_causal=hca_is_causal,
+            is_persistent=hca_use_persistent,
+        )
+
+    unexpected_hca_inputs = {
+        "hca_swa_block_tables": hca_swa_block_tables,
+        "hca_compressed_block_tables": hca_compressed_block_tables,
+        "hca_seq_lens": hca_seq_lens,
+        "hca_is_causal": hca_is_causal if not hca_is_causal else None,
+        "hca_use_persistent": hca_use_persistent if hca_use_persistent else None,
+        "hca_sparse_indices_format": hca_sparse_indices_format,
+    }
+    unexpected_hca_inputs = [
+        name for name, value in unexpected_hca_inputs.items() if value is not None
+    ]
+    if unexpected_hca_inputs:
+        raise ValueError(
+            f"backend={backend!r} does not accept " + ", ".join(unexpected_hca_inputs)
+        )
+
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
@@ -1256,6 +1782,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
 
     if backend == "sparse":
+        if sparse_indices is None:
+            raise ValueError("backend='sparse' requires sparse_indices")
         return _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             query=query,
             swa_kv_cache=swa_kv_cache,
@@ -1286,6 +1814,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             "backend='trtllm-gen' requires compressed_kv_cache, sparse_topk_lens, "
             "and seq_lens"
         )
+    if sparse_indices is None:
+        raise ValueError("backend='trtllm-gen' requires sparse_indices")
 
     (
         swa_kv_cache,
@@ -1367,6 +1897,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     return out
 
 
+# Keep the backend-neutral spelling as a compatibility alias, while the
+# existing TRTLLM-prefixed API remains the canonical public callable.
+batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
 _trtllm_batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
 
 

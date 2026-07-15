@@ -148,7 +148,17 @@ PageAttention for MLA
     :toctree: ../generated
 
     trtllm_batch_decode_with_kv_cache_mla
+    trtllm_batch_decode_sparse_mla_dsv4
+    convert_page_aligned_sparse_indices_to_hca_metadata
+    DSV4HCAMetadata
     xqa_batch_decode_with_kv_cache_mla
+
+.. note::
+
+    With ``backend="cute-dsl"``, canonical page-aligned token-row tables can
+    opt into HCA metadata conversion with
+    ``hca_sparse_indices_format="page-aligned"``. Arbitrary sparse token
+    indices are not convertible without repacking the KV pools.
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:
