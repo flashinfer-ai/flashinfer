@@ -167,7 +167,7 @@ def _moe_core_impl(
     # Options
     output_dtype: torch.dtype = torch.bfloat16,
     use_async_memset: bool = True,
-    use_fused_finalize: bool = False,
+    use_fused_finalize: bool = True,
     enable_pdl: bool = True,
     activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
@@ -214,7 +214,7 @@ def _moe_core_impl(
         output_dtype: Output data type.
         use_async_memset: Use async memset on aux stream.
         use_fused_finalize: Use the atomic fused finalize instead of the
-            deterministic two-stage finalize. Defaults to ``False``.
+            deterministic two-stage finalize. Defaults to ``True``.
         activation_type: Activation type to apply after GEMM1. Use
             ActivationType.Swiglu for gated mode and ActivationType.Relu2 for
             non-gated mode; swiglu_oai is represented as Swiglu with
@@ -476,7 +476,7 @@ class CuteDslMoEWrapper:
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-        use_fused_finalize: bool = False,
+        use_fused_finalize: bool = True,
     ):
         r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
 
@@ -520,7 +520,7 @@ class CuteDslMoEWrapper:
             ``ActivationType.Swiglu`` with non-default values.
         use_fused_finalize : bool
             Use the atomic fused finalize instead of the deterministic
-            two-stage finalize. Defaults to ``False``.
+            two-stage finalize. Defaults to ``True``.
         """
         normalized_activation_type, gated = normalize_cute_dsl_moe_activation_type(
             activation_type
@@ -625,7 +625,7 @@ class CuteDslMoEWrapper:
         gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
         gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
         output_dtype: torch.dtype = torch.bfloat16,
-        use_fused_finalize: bool = False,
+        use_fused_finalize: bool = True,
         moe_output: Optional[torch.Tensor] = None,
         per_token_scale: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
@@ -807,7 +807,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
     output_dtype: torch.dtype = torch.bfloat16,
-    use_fused_finalize: bool = False,
+    use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
     per_token_scale: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
@@ -872,7 +872,7 @@ def cute_dsl_fused_moe_nvfp4(
     num_local_experts: Optional[int] = None,
     local_expert_offset: int = 0,
     output_dtype: torch.dtype = torch.bfloat16,
-    use_fused_finalize: bool = False,
+    use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
@@ -929,7 +929,7 @@ def cute_dsl_fused_moe_nvfp4(
         Output dtype.  Defaults to ``torch.bfloat16``.
     use_fused_finalize : bool
         Use the atomic fused finalize instead of the deterministic two-stage
-        finalize. Defaults to ``False``.
+        finalize. Defaults to ``True``.
     moe_output : Optional[torch.Tensor]
         Pre-allocated output buffer.  Allocated internally if ``None``.
     aux_stream : Optional[torch.cuda.Stream]

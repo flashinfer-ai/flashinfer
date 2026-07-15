@@ -1443,7 +1443,7 @@ class TestCuteDslFusedMoeFunctional:
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
-    def test_fused_finalize_configuration(self):
+    def test_fused_finalize_default(self):
         from flashinfer import CuteDslMoEWrapper
 
         moe = CuteDslMoEWrapper(
@@ -1451,7 +1451,6 @@ class TestCuteDslMoEWrapper:
             top_k=2,
             hidden_size=256,
             intermediate_size=512,
-            use_fused_finalize=True,
         )
 
         assert moe.use_fused_finalize
@@ -1478,6 +1477,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=True,
+            use_fused_finalize=False,
         )
         kwargs = {
             "x": tensors["x"],
@@ -1685,6 +1685,7 @@ class TestCuteDslMoEWrapper:
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
+            use_fused_finalize=False,
         )
 
         # Warmup
@@ -1741,7 +1742,7 @@ class TestCuteDslMoEWrapper:
             torch.cuda.synchronize()
             results.append(output.clone())
 
-        # The default two-stage finalize must be bitwise deterministic.
+        # The explicitly selected two-stage finalize must be bitwise deterministic.
         for i in range(1, len(results)):
             assert torch.equal(results[0], results[i]), f"Replay {i} differs"
 

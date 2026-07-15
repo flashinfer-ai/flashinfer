@@ -28,8 +28,8 @@ Usage:
     python bench_moe_deepseek.py --no-cupti
 
     # Compare deterministic two-stage and atomic fused CuTe DSL finalize
-    python bench_moe_deepseek.py --functional-api
-    python bench_moe_deepseek.py --functional-api --use-fused-finalize
+    python bench_moe_deepseek.py --functional-api  # atomic fused (default)
+    python bench_moe_deepseek.py --functional-api --no-fused-finalize  # deterministic
 
 Metrics:
     - ms: Latency in milliseconds
@@ -210,7 +210,7 @@ def bench_cute_dsl(
     use_wrapper=False,
     do_autotune=True,
     use_per_token_activation=False,
-    use_fused_finalize=False,
+    use_fused_finalize=True,
 ):
     """Benchmark CuteDSL MoE.
 
@@ -223,7 +223,7 @@ def bench_cute_dsl(
                     choose_one cache lookups don't appear inside the CUDA-event
                     interval when bench_gpu_time falls back to events (i.e. when
                     both CUDA graphs and CUPTI are disabled).
-        use_fused_finalize: Use the atomic fused finalize instead of the default
+        use_fused_finalize: Use the atomic fused finalize instead of the
                     deterministic two-stage finalize.
     """
     import contextlib
@@ -722,7 +722,7 @@ def run_benchmark(
     use_wrapper=True,
     routing_bias_scale=0.01,
     use_per_token_activation=False,
-    use_fused_finalize=False,
+    use_fused_finalize=True,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -816,7 +816,7 @@ def _benchmark_single(
     routing_bias_scale=0.01,
     do_autotune=True,
     use_per_token_activation=False,
-    use_fused_finalize=False,
+    use_fused_finalize=True,
 ):
     """Benchmark all backends for a single token count.
 
@@ -885,7 +885,7 @@ def _print_header(
     use_cupti,
     routing_bias_scale,
     use_per_token_activation=False,
-    use_fused_finalize=False,
+    use_fused_finalize=True,
 ):
     """Print benchmark header."""
     print("\n" + "=" * 120)
@@ -1098,9 +1098,10 @@ def main():
         help="Use per-token NVFP4 activation scaling for supported FP4 MoE backends.",
     )
     parser.add_argument(
-        "--use-fused-finalize",
-        action="store_true",
-        help="Use atomic CuTe DSL fused finalize instead of deterministic two-stage finalize.",
+        "--no-fused-finalize",
+        action="store_false",
+        dest="use_fused_finalize",
+        help="Use deterministic two-stage CuTe DSL finalize instead of atomic fused finalize.",
     )
     parser.add_argument(
         "--routing-bias-scale",
