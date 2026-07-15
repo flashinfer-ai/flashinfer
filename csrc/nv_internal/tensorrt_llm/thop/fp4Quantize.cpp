@@ -341,11 +341,92 @@ void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, 
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
         << "nvfp4_quant_and_per_token_scale: BFloat16 support is not enabled.";
 #endif
+  } else if (in_dtype == dl_float32) {
+    tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<float>(
+        m, n, reinterpret_cast<float const*>(input.data_ptr()), scale_inv,
+        expanded_idx_to_permuted_idx_ptr, reinterpret_cast<uint8_t*>(output.data_ptr()),
+        reinterpret_cast<uint8_t*>(output_scale.data_ptr()),
+        reinterpret_cast<float*>(output_per_token_scale.data_ptr()), sfLayout, stream);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "unsupported input dtype for nvfp4_quant_and_per_token_scale, only fp16 and bf16 are "
-           "supported.";
+        << "unsupported input dtype for nvfp4_quant_and_per_token_scale, only fp16, bf16 and fp32 "
+           "are supported.";
   }
+}
+
+// Like nvfp4_quant_and_per_token_scale, but the raw nvfp4 input is not available. Instead the
+// per-block amaxes are provided directly as fp32 scales (one per SF_VEC_SIZE=16 group, laid out
+// linearly per row as [m, n / 16]). The kernel finds the row-wise amax over those scales, writes
+// the per-token scale, and quantizes the block scales to e4m3. No quantized weights are produced.
+void scale_only_quant_and_per_token_scale(TensorView const scale_input, double scale_inv_,
+                                          TensorView output_scale,
+                                          TensorView output_per_token_scale,
+                                          Optional<TensorView> expanded_idx_to_permuted_idx,
+                                          int64_t sfLayout_) {
+  static constexpr int kSfVecSize = 16;
+  CHECK_CUDA(scale_input);
+  CHECK_CONTIGUOUS(scale_input);
+  CHECK_CUDA(output_scale);
+  CHECK_CONTIGUOUS(output_scale);
+  CHECK_CUDA(output_per_token_scale);
+  CHECK_CONTIGUOUS(output_per_token_scale);
+  TVM_FFI_ICHECK_EQ(scale_input.dtype(), dl_float32) << "scale_input must be float32";
+  TVM_FFI_ICHECK_EQ(output_per_token_scale.dtype(), dl_float32)
+      << "output_per_token_scale must be float32";
+  TVM_FFI_ICHECK_EQ(scale_input.ndim(), 2) << "scale_input must be 2-dimensional [m, n / 16]";
+
+  auto const& inputShape = scale_input.sizes();
+  auto m = inputShape[0];
+  // scale_input holds one fp32 scale per SF_VEC_SIZE block, so recover the logical column count.
+  auto n = inputShape[1] * kSfVecSize;
+  if (!expanded_idx_to_permuted_idx.has_value()) {
+    TVM_FFI_ICHECK_EQ(output_per_token_scale.numel(), m)
+        << "output_per_token_scale must have shape [m]";
+  }
+
+  auto const& sfOutputShape = output_scale.sizes();
+  auto sf_m = sfOutputShape[0];
+  auto sf_n = sfOutputShape[1];
+  auto sfLayout = static_cast<flashinfer::QuantizationSFLayout>(sfLayout_);
+  switch (sfLayout) {
+    case flashinfer::QuantizationSFLayout::LINEAR:
+      break;
+    case flashinfer::QuantizationSFLayout::SWIZZLED_128x4:
+      TVM_FFI_ICHECK(sf_m % 128 == 0) << "For SWIZZLED_128x4 layout, the first dimension of "
+                                         "output_scale must be a multiple of 128";
+      TVM_FFI_ICHECK(sf_n % 4 == 0) << "For SWIZZLED_128x4 layout, the second dimension of "
+                                       "output_scale must be a multiple of 4";
+      break;
+    case flashinfer::QuantizationSFLayout::SWIZZLED_8x4:
+      TVM_FFI_ICHECK(sf_m % 8 == 0)
+          << "For SWIZZLED_8x4 layout, the first dimension of output_scale must be a multiple of 8";
+      TVM_FFI_ICHECK(sf_n % 4 == 0) << "For SWIZZLED_8x4 layout, the second dimension of "
+                                       "output_scale must be a multiple of 4";
+      break;
+    default:
+      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Invalid sfLayout value: " << sfLayout_;
+      break;
+  }
+
+  const cudaStream_t stream = get_stream(scale_input.device());
+  const float scale_inv = static_cast<float>(scale_inv_);
+
+  int32_t* expanded_idx_to_permuted_idx_ptr = nullptr;
+  if (expanded_idx_to_permuted_idx.has_value()) {
+    CHECK_CUDA(expanded_idx_to_permuted_idx.value());
+    CHECK_CONTIGUOUS(expanded_idx_to_permuted_idx.value());
+    TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.value().dtype(), dl_int32)
+        << "expanded_idx_to_permuted_idx must be int32";
+    TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.value().ndim(), 1)
+        << "expanded_idx_to_permuted_idx must be 1-dimensional";
+    expanded_idx_to_permuted_idx_ptr =
+        reinterpret_cast<int32_t*>(expanded_idx_to_permuted_idx.value().data_ptr());
+  }
+
+  tensorrt_llm::kernels::invokeScaleOnlyQuantAndPerTokenScale(
+      m, n, reinterpret_cast<float const*>(scale_input.data_ptr()), scale_inv,
+      expanded_idx_to_permuted_idx_ptr, reinterpret_cast<uint8_t*>(output_scale.data_ptr()),
+      reinterpret_cast<float*>(output_per_token_scale.data_ptr()), sfLayout, stream);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_quantize, fp4_quantize);
@@ -353,3 +434,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_batched_quantize, fp4_batched_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_scaled_nvfp4_experts_quantize,
                               silu_and_mul_scaled_nvfp4_experts_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quant_and_per_token_scale, nvfp4_quant_and_per_token_scale);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(scale_only_quant_and_per_token_scale,
+                              scale_only_quant_and_per_token_scale);

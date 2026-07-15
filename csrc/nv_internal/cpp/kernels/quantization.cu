@@ -413,6 +413,32 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   });
 }
 
+void invokeScaleOnlyQuantAndPerTokenScale(uint32_t m, uint32_t n, float const* scaleInput,
+                                          float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
+                                          uint8_t* scaleOutput, float* perTokenScaleOutput,
+                                          QuantizationSFLayout sfLayout, cudaStream_t stream) {
+  TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
+  constexpr uint32_t SF_VEC_SIZE = 16;
+  constexpr uint32_t BLOCK_SIZE = 128;
+  constexpr bool CACHE_SCALE_IN_SMEM = true;
+
+  // Cache the per-block scales (num_sf_vecs_per_row floats) in shared memory so the quantization
+  // pass reads them back from SMEM instead of issuing a second global load of `scaleInput`.
+  uint32_t const num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
+  uint32_t const smem_size = CACHE_SCALE_IN_SMEM ? num_sf_vecs_per_row * sizeof(float) : 0;
+
+  dim3 block(BLOCK_SIZE);
+  dim3 grid(m);
+
+  dispatchSFLayout(sfLayout, [&](auto sfLayoutTag) {
+    constexpr QuantizationSFLayout SF_LAYOUT = decltype(sfLayoutTag)::value;
+    scaleOnlyQuantAndPerTokenScaleKernel<BLOCK_SIZE, SF_LAYOUT, CACHE_SCALE_IN_SMEM>
+        <<<grid, block, smem_size, stream>>>(m, n, scaleInput, globalScaleInv,
+                                             expandedIdxToPermutedIdx, scaleOutput,
+                                             perTokenScaleOutput);
+  });
+}
+
 // Instantiate the function.
 template void invokeNvfp4QuantAndPerTokenScale<float>(
     uint32_t m, uint32_t n, float const* input, float globalScaleInv,

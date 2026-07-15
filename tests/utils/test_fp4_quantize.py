@@ -20,6 +20,7 @@ from flashinfer import (
     mxfp4_quantize,
     mxfp4_dequantize,
     nvfp4_quantize,
+    nvfp4_scale_only_quantize,
     nvfp4_batched_quantize,
     scaled_fp4_grouped_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,
@@ -911,6 +912,105 @@ def test_nvfp4_quantize_te_reference(
     q_out, scale_out = _run_quantize(expected_per_token_scale)
     torch.testing.assert_close(q_out, _te_ref_fp4_bytes(q_ref), rtol=0, atol=0)
     torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shape", NVFP4_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_scale_only_per_token_quantize(
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    init_data: str,
+    device: str,
+) -> None:
+    """Scale-only per-token NVFP4 quantization.
+
+    The scale-only kernel takes the per-block amaxes directly (the raw activation
+    is not needed) and reproduces the block scales / per-token scale that the full
+    per-token NVFP4 kernel derives from those amaxes.  Because the scale-only
+    kernel is the second half of ``nvfp4QuantAndPerTokenScaleFP32Kernel`` fed the
+    same amaxes, feeding the same fp32 ``x`` to the full kernel and ``amax(x)`` to
+    the scale-only kernel must match bitwise.  We therefore use the full FP32
+    per-token kernel as an exact reference (its approximate-reciprocal math is
+    identical, so no tolerance is needed), and additionally check the per-token
+    scale against an independent Python reference.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    block_size = 16
+    if init_data == "random":
+        x = torch.randn((m, n), dtype=torch.float32)
+        if m > 1:
+            x[0].zero_()  # exercise the all-zero row (amax == 0) edge case
+    elif init_data == "boundary":
+        base = torch.linspace(-12.0, 12.0, steps=n // 2, dtype=torch.float32)
+        eps = torch.full_like(base, 1e-3)
+        eps = torch.maximum(eps, 1e-4 * torch.ones_like(base))
+        row = torch.empty(n, dtype=torch.float32)
+        row[0::2] = base - eps
+        row[1::2] = base + eps
+        x = row.unsqueeze(0).repeat(m, 1)
+    elif init_data == "zeros":
+        x = torch.zeros((m, n), dtype=torch.float32)
+    elif init_data == "maxes":
+        x = torch.full((m, n), torch.finfo(torch.float32).max, dtype=torch.float32)
+    else:
+        raise ValueError(f"Unknown init_data: {init_data}")
+
+    # Per-token base scale multiplier, matching nvfp4_quantize(per_token_activation=True):
+    # 1 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) == 1 / (448 * 6).
+    global_scale_inv = float(
+        nvfp4_global_decode_scale_te(
+            torch.ones((), dtype=torch.float32, device=x.device)
+        ).item()
+    )
+
+    # Per-block amaxes (fp32), one per 16-element scale-factor block, linear [m, n // 16].
+    block_amax = (
+        x.view(m, n // block_size, block_size)
+        .abs()
+        .amax(dim=-1)
+        .to(torch.float32)
+        .contiguous()
+    )
+
+    # Exact reference: the full FP32 per-token kernel derives the same block amaxes
+    # from x, so its scale / per-token-scale outputs must match the scale-only kernel
+    # bitwise (identical device math, including the approximate reciprocal).
+    _, scale_ref, per_token_scale_ref = nvfp4_quantize(
+        x,
+        global_scale_inv,
+        sfLayout=sf_layout,
+        per_token_activation=True,
+        backend="cuda",
+    )
+
+    scale_out, per_token_scale_out = nvfp4_scale_only_quantize(
+        block_amax,
+        global_scale_inv,
+        sfLayout=sf_layout,
+    )
+
+    torch.testing.assert_close(scale_out, scale_ref, rtol=0, atol=0)
+    torch.testing.assert_close(per_token_scale_out, per_token_scale_ref, rtol=0, atol=0)
+
+    # Independent check of the per-token scale against the Python reference.
+    row_amax = block_amax.amax(dim=1)
+    expected_per_token_scale = torch.where(
+        row_amax == 0,
+        torch.zeros_like(row_amax),
+        nvfp4_global_decode_scale_te(row_amax),
+    )
+    torch.testing.assert_close(
+        per_token_scale_out, expected_per_token_scale, rtol=1e-3, atol=0
+    )
 
 
 @pytest.mark.parametrize("backend", NVFP4_BACKENDS)
