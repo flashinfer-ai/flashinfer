@@ -765,6 +765,7 @@ def group_gemm_fp8_nt_groupwise_cutile(
     out: torch.Tensor,
     scale_granularity_mnk: tuple = (1, 128, 128),
     scale_major_mode: str = "K",
+    segment_alignment: int = 1,
 ) -> torch.Tensor:
     """Group GEMM with FP8 block-scaled inputs via cuTile — single fused launch.
 
@@ -787,6 +788,11 @@ def group_gemm_fp8_nt_groupwise_cutile(
     scale_granularity_mnk : (m_g, n_g, k_g). Requires ``m_g == 1``; ``n_g`` becomes
         ``block_n`` and ``k_g`` becomes ``block_k``.
     scale_major_mode : must be ``"K"``.
+    segment_alignment : row alignment the caller GUARANTEES for every ``m_indptr``
+        segment offset. Default 1 (arbitrary) uses the gather kernel. Pass a
+        multiple of 128 (segments padded to that many rows) to take the faster
+        aligned-segment TMA path. Cannot be validated at runtime without a host
+        sync that would break CUDA-graph capture, so it is a caller contract.
 
     Returns
     -------
@@ -848,6 +854,36 @@ def group_gemm_fp8_nt_groupwise_cutile(
     # stays CUDA-graph-capturable. The kernel reads this for its persistent bound.
     seg_sizes = m_indptr[1:] - m_indptr[:-1]
     max_m_device = seg_sizes.max().to(torch.int32).reshape(1)
+
+    # TMA fast path (opt-in). The default fused kernel gathers A/C on runtime row
+    # offsets so it handles ARBITRARY segment sizes, but gather is bandwidth-bound
+    # (~0.3x cutlass). When the caller GUARANTEES every m_indptr segment offset is
+    # a multiple of ``segment_alignment`` (>=128, the common MoE case where token
+    # counts are padded), the aligned-segment TMA kernel in
+    # ``ragged_block_scaled_bmm`` can address rows as a tiled ``m_start // BLOCK_M``
+    # ct.load/ct.store (TMA) — much faster and already validated bit-identical to
+    # native ``group_gemm_fp8_nt_groupwise(trtllm)``. It is graph-safe (reads the
+    # device-side max_m_device for its loop bound; ``max_m=total_m`` is a safe host
+    # grid overestimate capped at NUM_SMS). This cannot be auto-detected without a
+    # host sync that would break capture, so it is a caller contract.
+    if segment_alignment >= 128 and segment_alignment % 128 == 0:
+        from .ragged_block_scaled_bmm_cutile import ragged_block_scaled_bmm
+
+        c = ragged_block_scaled_bmm(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            m_indptr,
+            max_m=total_m,
+            max_m_device=max_m_device,
+            transpose_a=False,
+            transpose_b=True,
+            out_dtype=out.dtype,
+            segment_alignment=segment_alignment,
+        )
+        out.copy_(c)
+        return out
 
     # Flatten B / b_scale on their leading dims so the kernel can gather group
     # ``q``'s rows as ``q*N + offs_n`` / ``q*N_groups + pid_n`` (both contiguous).
