@@ -79,7 +79,7 @@ _DECODE_MAX_TOKENS = 64
 _DECODE_DSV4_DISPATCH = frozenset(
     {
         (8, 128),
-        (8, 256,
+        (8, 256),
         (8, 512),
         (8, 1024),
         (16, 128),
