@@ -1,3 +1,9 @@
+# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
+# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
+# extend its axes/adapters. This file exists for the quant x routing x layout
+# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
+# as deliberate regression anchors.
+
 """
 Copyright (c) 2025 by FlashInfer team.
 
@@ -51,9 +57,12 @@ def cache_permute_indices():
 
 
 # Test: Sigmoid routing (Sigmoid -> TopK, no renormalization)
-@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+# Shape fan-out kept minimal (boundary tokens/intermediate only): the quant x
+# weight-layout x activation matrix is the coverage; shape breadth lives in
+# tests/moe/test_unified_moe_fuzz.py.
+@pytest.mark.parametrize("num_tokens", [8, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
+@pytest.mark.parametrize("intermediate_size", [1024, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -164,9 +173,14 @@ def test_sigmoid_routing(
 
 
 # Test: DeepSeekV3 routing
-@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+# Shape fan-out kept minimal: intermediate values form a hitting set of every
+# routing config's compatible_intermediate_size (so each config still runs), and
+# token counts are the boundary pair. Shape breadth lives in
+# tests/moe/test_unified_moe_fuzz.py; the impl x routing x layout matrix is the
+# coverage this grid exists for.
+@pytest.mark.parametrize("num_tokens", [8, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [2688, 2048, 1024, 768, 512, 384])
+@pytest.mark.parametrize("intermediate_size", [2688, 2048, 512, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [

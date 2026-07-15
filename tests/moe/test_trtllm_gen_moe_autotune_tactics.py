@@ -1,3 +1,9 @@
+# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
+# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
+# extend its axes/adapters. This file exists for the quant x routing x layout
+# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
+# as deliberate regression anchors.
+
 """
 Copyright (c) 2026 by FlashInfer team.
 
@@ -333,9 +339,12 @@ def _enumerate_valid_tactics(
     )
 
 
+# Per-tactic enumeration is expensive (every valid tactic runs per case); keep the
+# odd-token anchor (23) + one production shape point per axis. The fuzzer's
+# autotune-ON leg covers winner-correctness breadth.
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
-@pytest.mark.parametrize("num_tokens", [16, 23, 128])
-@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize("num_tokens", [23, 128])
+@pytest.mark.parametrize("hidden_size", [7168])
 @pytest.mark.parametrize("intermediate_size", [3072])
 @pytest.mark.parametrize("num_experts", [128, 384])
 @pytest.mark.parametrize("top_k", [4, 6])

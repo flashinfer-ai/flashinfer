@@ -1,3 +1,8 @@
+# NOTE for future contributors (incl. AI agents): keep this file a SMALL curated
+# smoke set. New coverage (shapes, dtypes, backends, randomized breadth) belongs in
+# tests/gemm/test_unified_gemm_fuzz.py -- extend an adapter/axis there. Add cases
+# here only as deliberate regression anchors or for paths the fuzzer cannot express.
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -8,16 +13,32 @@ from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability
 
 
-@pytest.mark.parametrize("m", [1, 8, 16, 32, 64])
-@pytest.mark.parametrize("n", [1024, 2048, 4096])
-@pytest.mark.parametrize("k", [1024, 2048, 3072])
-@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("enable_bias", [True, False])
-@pytest.mark.parametrize("pdl", [True, False])
+# Curated smoke set. Randomized breadth over {m,n,k} x out-dtype x backend (tight
+# elementwise oracle, determinism, autotune-winner validation) lives in
+# tests/gemm/test_unified_gemm_fuzz.py's mm_bf16 adapter. The bias and pdl epilogue
+# axes are NOT fuzzed -- each supported backend keeps a bias=True and pdl=True case
+# here; plus one plain case per backend / out dtype / autotune mode.
+_SMOKE_CASES = [
+    # m, n, k, res_dtype, enable_bias, pdl, backend, auto_tuning
+    (1, 1024, 2048, torch.bfloat16, True, False, "cudnn", False),
+    (16, 4096, 1024, torch.float16, False, True, "cudnn", True),
+    (64, 2048, 3072, torch.float32, True, True, "cudnn", False),
+    (8, 1024, 1024, torch.bfloat16, False, False, "cutlass", True),
+    (32, 4096, 3072, torch.float32, False, False, "cutlass", False),
+    (1, 2048, 1024, torch.bfloat16, True, True, "tgv", False),
+    (64, 1024, 2048, torch.bfloat16, False, True, "tgv", True),
+    (16, 2048, 2048, torch.bfloat16, False, False, "cublaslt", True),
+    (8, 4096, 3072, torch.float16, False, False, "cublaslt", False),
+    (1, 1024, 3072, torch.bfloat16, True, False, "tinygemm", False),
+    (32, 1024, 1024, torch.bfloat16, False, False, "cutile", False),
+    (64, 4096, 2048, torch.bfloat16, False, False, "auto", True),
+    (1, 2048, 3072, torch.float16, False, False, "auto", False),
+]
+
+
 @pytest.mark.parametrize(
-    "backend", ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"]
+    "m,n,k,res_dtype,enable_bias,pdl,backend,auto_tuning", _SMOKE_CASES
 )
-@pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_bf16(
     m: int,
     n: int,

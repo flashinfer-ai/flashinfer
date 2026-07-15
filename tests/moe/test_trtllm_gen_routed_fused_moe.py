@@ -1,3 +1,9 @@
+# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
+# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
+# extend its axes/adapters. This file exists for the quant x routing x layout
+# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
+# as deliberate regression anchors.
+
 """
 Copyright (c) 2025 by FlashInfer team.
 
@@ -53,11 +59,14 @@ from .trtllm_gen_fused_moe_utils import (
 pytestmark = pytest.mark.solo
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
-@pytest.mark.parametrize("hidden_size", [1024, 2048, 3072, 4096])
-@pytest.mark.parametrize("intermediate_size", [1024, 2048, 3072, 4096])
+# Routed-vs-logits parity: the coverage is routing_method x quant x routing_format;
+# shape fan-out kept to the boundary corners (shape breadth is fuzzed in
+# tests/moe/test_unified_moe_fuzz.py).
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 4096])
+@pytest.mark.parametrize("intermediate_size", [3072])
 @pytest.mark.parametrize("num_experts", [128, 256])
-@pytest.mark.parametrize("top_k", [4, 8])
+@pytest.mark.parametrize("top_k", [8])
 @pytest.mark.parametrize(
     "routing_method_type",
     [

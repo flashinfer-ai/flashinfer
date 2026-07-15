@@ -1,3 +1,8 @@
+# NOTE for future contributors (incl. AI agents): keep this file a SMALL curated
+# smoke set. New coverage (shapes, dtypes, backends, randomized breadth) belongs in
+# tests/gemm/test_unified_gemm_fuzz.py -- extend an adapter/axis there. Add cases
+# here only as deliberate regression anchors or for paths the fuzzer cannot express.
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -186,17 +191,28 @@ def _prepare_mxfp8_tensors(
     return input_mxfp8, weight_mxfp8, input_scale, weight_scale
 
 
-@pytest.mark.parametrize("m", [128, 256, 512, 1024])
-@pytest.mark.parametrize("n", [128, 256, 512, 1024])
-@pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048, 2560, 3200])
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm"])
-@pytest.mark.parametrize("auto_tuning", [True, False])
-def test_mm_mxfp8(
-    m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend, auto_tuning
-):
+# Curated smoke set. Randomized breadth over {m,n,k} x layout x backend (tight
+# elementwise oracle, determinism, autotune-winner validation) lives in
+# tests/gemm/test_unified_gemm_fuzz.py's mm_mxfp8 adapter. Keep per backend: one
+# swizzled + one linear scale layout, both out dtypes, autotune on/off, non-pow2 K
+# anchors (2560/3200), and the trtllm 8x4-A + weight-shuffle path.
+_SMOKE_CASES = [
+    # m, n, k, is_sf_swizzled_layout, out_dtype, backend, auto_tuning
+    # (trtllm: swizzled + k%256 + bf16-out only; cute-dsl: swizzled only)
+    (128, 256, 2560, True, torch.bfloat16, "cutlass", True),
+    (512, 1024, 128, False, torch.float16, "cutlass", False),
+    (256, 128, 3200, True, torch.float16, "cute-dsl", False),
+    (1024, 512, 512, True, torch.bfloat16, "cute-dsl", True),
+    (128, 1024, 1024, True, torch.bfloat16, "trtllm", True),
+    (1024, 128, 2048, True, torch.bfloat16, "trtllm", False),
+]
+
+
+@pytest.mark.parametrize(
+    "m,n,k,is_sf_swizzled_layout,out_dtype,backend,auto_tuning", _SMOKE_CASES
+)
+def test_mm_mxfp8(m, n, k, is_sf_swizzled_layout, out_dtype, backend, auto_tuning):
+    input_dtype = torch.bfloat16
     _run_mm_mxfp8(
         m,
         n,
@@ -211,16 +227,21 @@ def test_mm_mxfp8(
     )
 
 
-@pytest.mark.parametrize("m", [128, 256, 1024, 2048, 4096])
-@pytest.mark.parametrize("n", [2688, 5376, 8192, 12288, 16384])
-@pytest.mark.parametrize("k", [4096, 8192])
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm", "auto"])
-def test_mm_mxfp8_large_dimensions(
-    m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend
-):
+# One fat-shape sanity case per backend (workspace/stride scaling); the fuzzer's
+# shape distribution covers the mid range, so keep only the extremes here.
+_LARGE_DIM_CASES = [
+    # m, n, k, is_sf_swizzled_layout, backend
+    (4096, 16384, 8192, True, "cutlass"),
+    (2048, 12288, 4096, False, "cute-dsl"),
+    (4096, 5376, 8192, True, "trtllm"),
+    (128, 2688, 4096, True, "auto"),
+]
+
+
+@pytest.mark.parametrize("m,n,k,is_sf_swizzled_layout,backend", _LARGE_DIM_CASES)
+def test_mm_mxfp8_large_dimensions(m, n, k, is_sf_swizzled_layout, backend):
+    input_dtype = torch.bfloat16
+    out_dtype = torch.bfloat16
     _run_mm_mxfp8(
         m,
         n,
@@ -390,15 +411,13 @@ def test_mm_mxfp8_find_minimum_cosine_similarity(is_sf_swizzled_layout):
     assert not fail_test, "One or more cosine similarities are too low"
 
 
-@pytest.mark.parametrize("m", [256, 512, 1024])  # Skip M=128 (edge case issues)
-@pytest.mark.parametrize("n", [4096, 14336])
-@pytest.mark.parametrize("k", [4096])  # Focus on common hidden_size
+# One shape per statistics regime; the shape x stats cross-product added nothing.
 @pytest.mark.parametrize(
-    "input_std,weight_std",
+    "m,n,k,input_std,weight_std",
     [
-        (0.1, 0.02),  # Typical trained model statistics
-        (0.5, 0.1),  # Larger activations
-        (1.0, 1.0),  # Random normal (baseline)
+        (256, 4096, 4096, 0.1, 0.02),  # Typical trained model statistics
+        (512, 14336, 4096, 0.5, 0.1),  # Larger activations
+        (1024, 4096, 4096, 1.0, 1.0),  # Random normal (baseline)
     ],
 )
 def test_mm_mxfp8_realistic_model_statistics(m, n, k, input_std, weight_std):
