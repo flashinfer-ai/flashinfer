@@ -218,7 +218,12 @@ struct KernelTraits {
 
   static constexpr bool IsInvalid() {
     // The first clause prunes (CTA_TILE_Q, head_dim) pairs FA2DetermineCtaTileQ
-    // never selects: {16, 32} for head_dim_qk >= 512, {16, 64, 128} otherwise.
+    // never selects: it picks from {16, 32} when head_dim_vo >= 512 (VO-split),
+    // {16} when head_dim_qk >= 512 with a smaller head_dim_vo, and
+    // {16, 64, 128} otherwise. The clause keys on HEAD_DIM_QK (which bounds
+    // CTA_TILE_Q <= 32 in both large-head cases); the kernel-instantiation
+    // lists additionally drop the never-selected CTA_TILE_Q=32 for
+    // head_dim_qk >= 512 with head_dim_vo < 512.
     return ((HEAD_DIM_QK >= 512 ? (CTA_TILE_Q > 32) : (CTA_TILE_Q == 32)) || (NUM_MMA_D_VO < 4) ||
             (NUM_MMA_D_VO == 4 && NUM_MMA_KV % 2 == 1) ||
             (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && NUM_MMA_D_VO > 4 &&
