@@ -2317,18 +2317,13 @@ def _get_cudnn_override_shape_workspace_size(
     override_shapes,
     override_strides,
 ) -> int:
-    if cudnn.backend_version() >= 92300:
-        if plan_index < 0:
-            return graph.get_workspace_size(
-                cudnn_handle, override_uids, override_shapes, override_strides
-            )
-        return graph.get_workspace_size_plan_at_index(
-            plan_index, cudnn_handle, override_uids, override_shapes, override_strides
+    if plan_index < 0:
+        return graph.get_workspace_size(
+            cudnn_handle, override_uids, override_shapes, override_strides
         )
-    else:
-        if plan_index < 0:
-            return graph.get_workspace_size()
-        return graph.get_workspace_size_plan_at_index(plan_index)
+    return graph.get_workspace_size_plan_at_index(
+        plan_index, cudnn_handle, override_uids, override_shapes, override_strides
+    )
 
 
 def _cudnn_graph_engine_knob_tactics(graph) -> List[tuple]:
