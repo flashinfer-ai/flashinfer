@@ -1055,6 +1055,8 @@ def test_two_kernel_f16_state(philox_rounds):
     (convert_frag<state_t>) — reinterpreting f16 bits as bf16 silently corrupts
     the output (caught 2026-07-02).  philox_rounds=5 exercises the SR state
     store (shared store code + same seed ⇒ the two paths bit-match)."""
+    if philox_rounds > 0 and not is_cvt_rs_supported():
+        pytest.skip("fp16 Philox SR requires HW cvt.rs (sm_100a+)")
     _run_two_kernel_state_dtype_case(torch.float16, philox_rounds)
 
 
