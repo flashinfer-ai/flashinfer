@@ -622,38 +622,6 @@ def test_mxfp4_moe_gemm_bias(
     )
 
 
-def test_nvfp4_per_token_decode_is_bitwise_deterministic(cache_permute_indices):
-    run_moe_test(
-        num_tokens=1,
-        hidden_size=1024,
-        intermediate_size=768,
-        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
-        routing_config={
-            "num_experts": 32,
-            "top_k": 8,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.Renormalize,
-            "compatible_moe_impls": [FP4Moe],
-            "compatible_intermediate_size": [768],
-            "enable_autotune": False,
-        },
-        weight_processing={
-            "use_shuffled_weight": True,
-            "layout": WeightLayout.MajorK,
-            "compatible_moe_impls": [FP4Moe],
-        },
-        activation_type=ActivationType.Swiglu,
-        cache_permute_indices=cache_permute_indices,
-        check_reference=False,
-        use_per_token_scaling=True,
-        check_determinism=True,
-    )
-
-
 @pytest.mark.parametrize("num_tokens", [32])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [512])

@@ -241,6 +241,7 @@ def bench_cute_dsl(
 
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
+
     n, sv, dev = inputs["router_logits"].shape[0], 16, "cuda"
     gs1 = torch.tensor([1.0], device=dev)
 
