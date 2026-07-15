@@ -184,15 +184,6 @@ BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
 # abort is root-caused, this suite is opt-in: set FLASHINFER_UMOE_FUZZ=1
 # to run it (developer / nightly / SM100 box). Unset (CI default) -> collected-and-skipped, so it
 # never launches a kernel and cannot abort the job.
-# DETERMINISTIC REPRO for the accumulated-run fault (2026-07-09, bf16 path): running
-#   [bf16_uniform_e256_k8_t256_h1024_i512_s900005] +
-#   [bf16_imbalanced_e128_k6_t2048_h1024_i1024_s900006] +
-#   [bf16_imbalanced_e160_k6_t129_h1536_i256_s0]      (NUM_TESTS=12)
-# in ONE process hits `CUDA error: an illegal memory access` inside the
-# graph-captured trtllm_bf16_routed autotune-profiling replay of s0; each test
-# passes in isolation, so the failure is order/state-dependent (allocator layout,
-# global autotuner cache, or CUDA process state -- root cause UNRESOLVED).
-# CUDA_LAUNCH_BLOCKING cannot localize it (graph replays ignore it).
 pytestmark = pytest.mark.skipif(
     not os.environ.get("FLASHINFER_UMOE_FUZZ"),
     reason="opt-in fuzzer (set FLASHINFER_UMOE_FUZZ=1); waived in CI pending "

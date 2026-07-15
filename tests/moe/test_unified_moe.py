@@ -710,6 +710,8 @@ def _compute_ref(act_pack, tensors, shape):
         hidden_states=tensors["x_bf16"].float().cuda(),
         gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
         gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+        gemm1_alpha=tensors["w1_alpha"],
+        gemm2_alpha=tensors["w2_alpha"],
         token_selected_experts=act_pack.selected_experts,
         token_final_scales=act_pack.final_scales,
         num_tokens=act_pack.num_tokens,
