@@ -117,9 +117,8 @@ void CutlassGemmGroupwiseScaledSM100(TensorView float_workspace_buffer, TensorVi
               cudaError_t status;
               // Small-batch-size kernel is not compatible with (scale_granularity_m=128).
               constexpr bool can_use_small_batch = (SCALE_GRANULARITY_M == 1);
-              // Low-latency path is incorrect for K-major scales at m==32 (flashinfer#3944).
-              const bool low_latency_k_major_n32_unsupported = SCALE_MAJOR_K && m == 32;
-              if (can_use_small_batch && m <= 32 && !low_latency_k_major_n32_unsupported) {
+              // Low-latency path has a K-major cluster-launch misconfig (flashinfer#3944); MN only.
+              if (can_use_small_batch && !SCALE_MAJOR_K && m <= 32) {
                 status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM100LowLatency<
                     SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
                     MMA_SM>(
