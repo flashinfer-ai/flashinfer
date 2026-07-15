@@ -13,9 +13,7 @@ _in_mem_compile_cache: dict = {}
 
 
 @lru_cache(maxsize=8)
-def _sm12x_gpu_arch_cached(
-    device_type: str, device_index: int | None
-) -> cute.GPUArch:
+def _sm12x_gpu_arch_cached(device_type: str, device_index: int | None) -> cute.GPUArch:
     device = (
         torch.device(device_type)
         if device_index is None
