@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+from collections import defaultdict
 from dataclasses import replace
 from enum import Enum
 from types import SimpleNamespace
@@ -50,7 +51,12 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from .kernels.utils import _select_sm100_mm_fp4_cute_dsl_tactic
+from .kernels.utils import (
+    _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
+    _SM100_MMA_TILER_MN_CANDIDATES,
+    _score_sm100_mm_fp4_tactic,
+    _select_sm100_mm_fp4_cute_dsl_tactic,
+)
 from ..utils import (
     get_device_sm_count,
     get_native_fp4_dtype,
@@ -4517,34 +4523,11 @@ def _cudnn_mm_mxfp8_requirement(
 
 
 # Shared helpers for CuTe DSL block-scaled GEMM runners (mxfp8 & mxfp4/nvfp4)
-_SM100_MMA_TILER_MN_CANDIDATES = [
-    (128, 8),
-    (128, 16),
-    (128, 32),
-    (128, 64),
-    (256, 64),
-    (128, 128),
-    (256, 128),
-    (128, 192),
-    (256, 192),
-    (128, 256),
-    (256, 256),
-]
-
-_SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
-    (1, 1),
-    (1, 2),
-    (1, 4),
-    (2, 1),
-    (2, 2),
-    (2, 4),
-    (4, 1),
-    (4, 2),
-    (4, 4),
-]
-
 _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
+
+# Max distinct configs the autotuner profiles mm_fp4(backend='cute-dsl')
+_MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS = 32
 
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
@@ -5948,7 +5931,29 @@ def _cute_dsl_gemm_fp4_runner(
                                     )
                                 )
 
-            return valid_tactics
+            # Rank configs and autotune the top-N instead of the entire O(100).
+            # Current heuristic cannot distinguish use_prefetch, so autotuner profiles both.
+            sm_count = get_device_sm_count(a.device)
+            config_tactics = defaultdict(list)
+            for t in valid_tactics:
+                # group by everything except use_prefetch (t[3])
+                tile, cluster, swap_ab, _, kernel_type, tma_store = t
+                config_key = (tile, cluster, swap_ab, kernel_type, tma_store)
+                config_tactics[config_key].append(t)
+            ranked_configs = sorted(
+                config_tactics.values(),
+                key=lambda ts: _score_sm100_mm_fp4_tactic(
+                    m, n, real_k, sm_count, ts[0][0], ts[0][1], ts[0][2]
+                ),
+                reverse=True,
+            )
+            return [
+                t
+                for ts in ranked_configs[
+                    : _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS // 2
+                ]  # // 2 for prefetch and non-prefetch
+                for t in ts
+            ]
 
         def forward(
             self,
@@ -5971,7 +5976,7 @@ def _cute_dsl_gemm_fp4_runner(
                 # Use analytical heuristic to pick the best tactic based on
                 # tile and wave quantization efficiency.
                 tactic = _select_sm100_mm_fp4_cute_dsl_tactic(
-                    m, n, real_k, get_device_sm_count(a.device)
+                    m, n, real_k, get_device_sm_count(a.device), sf_vec_size
                 )
 
             (
