@@ -50,7 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 import weakref
 
@@ -169,7 +169,7 @@ def _moe_core_impl(
     use_async_memset: bool = True,
     use_fused_finalize: bool = True,
     enable_pdl: bool = True,
-    activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
+    activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
@@ -226,7 +226,7 @@ def _moe_core_impl(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
-    activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
@@ -314,7 +314,7 @@ def _moe_core_impl(
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
             enable_pdl=enable_pdl,
-            activation_type=activation_type.value,
+            activation_type=activation.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -470,7 +470,7 @@ class CuteDslMoEWrapper:
         output_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         enable_pdl: bool = True,
-        activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
+        activation_type: int = ActivationType.Swiglu.value,
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
@@ -520,7 +520,7 @@ class CuteDslMoEWrapper:
             Use the atomic fused finalize instead of the deterministic
             two-stage finalize. Defaults to ``True``.
         """
-        activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -534,7 +534,7 @@ class CuteDslMoEWrapper:
         self.output_dtype = output_dtype
         self.device = device
         self.enable_pdl = enable_pdl
-        self.activation_type = activation_type
+        self.activation_type = activation
         self.gated = gated
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
@@ -571,7 +571,7 @@ class CuteDslMoEWrapper:
             use_fused_finalize=use_fused_finalize,
             output_dtype=output_dtype,
             enable_pdl=enable_pdl,
-            activation_type=activation_type.value,
+            activation_type=activation.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -586,7 +586,7 @@ class CuteDslMoEWrapper:
             use_fused_finalize=use_fused_finalize,
             output_dtype=output_dtype,
             enable_pdl=enable_pdl,
-            activation_type=activation_type.value,
+            activation_type=activation.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -872,7 +872,7 @@ def cute_dsl_fused_moe_nvfp4(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
-    activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
+    activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
@@ -949,7 +949,7 @@ def cute_dsl_fused_moe_nvfp4(
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
-    activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -976,7 +976,7 @@ def cute_dsl_fused_moe_nvfp4(
         use_fused_finalize=use_fused_finalize,
         output_dtype=output_dtype,
         enable_pdl=enable_pdl,
-        activation_type=activation_type.value,
+        activation_type=activation.value,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
@@ -1001,7 +1001,7 @@ def cute_dsl_fused_moe_nvfp4(
     inputs.append(moe_output)
 
     _, best_tactic = tuner.choose_one(
-        f"CuteDslFusedMoE::run_moe_nvfp4::{activation_type.name}",
+        f"CuteDslFusedMoE::run_moe_nvfp4::{activation.name}",
         [runner],
         runner.tuning_config,
         inputs,
