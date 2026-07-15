@@ -1505,7 +1505,7 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
 # elided.  Strongest signal: state remains byte-identical to state0.
 @pytest.mark.skipif(
     not is_cvt_rs_supported(),
-    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM103a only — "
     "not SM120a / consumer Blackwell)",
 )
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
@@ -1748,7 +1748,7 @@ def test_checkpointing_ssu_philox_no_checkpoint(
 # capacity.
 @pytest.mark.skipif(
     not is_cvt_rs_supported(),
-    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM103a only — "
     "not SM120a / consumer Blackwell)",
 )
 # 4-tuple subset of the 16-element cartesian (was: 4 (np,mw,pk) × 2 paged ×
@@ -2493,7 +2493,7 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
     """
     if with_philox and not is_cvt_rs_supported():
         pytest.skip(
-            "Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+            "Philox stochastic rounding requires cvt.rs PTX (SM100a/SM103a only — "
             "not SM120a / consumer Blackwell)"
         )
 
@@ -3643,7 +3643,7 @@ def test_checkpointing_ssu_fp8_philox_unbiased():
 # which require sm >= 100.
 _skip_pre_sm100 = pytest.mark.skipif(
     not is_cvt_rs_supported(),
-    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM103a only — "
     "not SM120a / consumer Blackwell)",
 )
 
@@ -3683,7 +3683,7 @@ def _dequantize_state(state_quant: torch.Tensor, decode_scale: torch.Tensor):
 
 def _maybe_skip_dtype(state_dtype, use_sr):
     """Skip on insufficient SM.  fp8 e4m3fn (any) needs SM 89+; fp16/fp8 SR
-    uses cvt.rs PTX which only exists on SM100a/SM110a (datacenter Blackwell);
+    uses cvt.rs PTX which only exists on SM100a/SM103a (datacenter Blackwell);
     int8/int16 (RN or SR) runs anywhere."""
     if state_dtype == torch.float8_e4m3fn and _get_sm_version() < 89:
         pytest.skip("fp8_e4m3fn requires SM 89+ (Ada Lovelace / Hopper / Blackwell)")
@@ -3694,7 +3694,7 @@ def _maybe_skip_dtype(state_dtype, use_sr):
     ):
         pytest.skip(
             f"{state_dtype} stochastic rounding requires cvt.rs PTX "
-            f"(SM100a/SM110a only — not SM120a / consumer Blackwell)"
+            f"(SM100a/SM103a only — not SM120a / consumer Blackwell)"
         )
 
 
