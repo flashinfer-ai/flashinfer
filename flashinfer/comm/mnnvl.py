@@ -715,15 +715,16 @@ class MnnvlMemory:  # type: ignore[no-redef]
         available_links = 0
         for link_idx in range(link_count):
             try:
-                if pynvml.nvmlDeviceGetNvLinkCapability(
+                if not pynvml.nvmlDeviceGetNvLinkCapability(
                     handle, link_idx, pynvml.NVML_NVLINK_CAP_P2P_SUPPORTED
                 ):
-                    available_links += 1
-                    is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
-                    if is_active:
-                        active_links += 1
+                    continue
+                is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
             except pynvml.NVMLError_NotSupported:
                 continue
+            available_links += 1
+            if is_active:
+                active_links += 1
         return (
             active_links == available_links and available_links > 0
             if need_all_up
