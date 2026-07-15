@@ -28,7 +28,7 @@ PAD_SLOT_ID = -1
 
 
 def get_sm_version() -> int:
-    prop = torch.cuda.get_device_properties(0)
+    prop = torch.cuda.get_device_properties(torch.cuda.current_device())
     return prop.major * 10 + prop.minor
 
 
