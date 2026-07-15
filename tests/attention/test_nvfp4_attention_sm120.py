@@ -376,11 +376,12 @@ def test_nvfp4_attention_sm120_causal_mask_column_order():
 def test_nvfp4_split_kv_gate_dtype_logic():
     """The split-KV gate must fire for NVFP4 KV and only for NVFP4 KV.
 
-    NVFP4 split-KV corrupts prefix-cached / decode reads (a split boundary can land
-    mid 16-element scale block; the small per-split chunk also trips the 1-byte-KV
-    NUM_MMA_KV tile floor), so plan() force-disables split-KV when the KV cache is
-    NVFP4. FP8 / 16-bit KV have no block scales and must keep split-KV. This is a
-    pure dtype-classification check (no GPU required) guarding that contract.
+    Split-KV was empirically observed to corrupt NVFP4 KV reads when a short
+    query attends a long KV range (decode / prefix-cache extend), so plan()
+    force-disables split-KV when the KV cache is NVFP4 as a workaround (see
+    _nvfp4_kv_requires_disabled_split_kv for the state of the root-cause
+    analysis). FP8 / 16-bit KV are unaffected and must keep split-KV. This is
+    a pure dtype-classification check (no GPU required) guarding that contract.
     """
     from flashinfer.prefill import _nvfp4_kv_requires_disabled_split_kv
 
