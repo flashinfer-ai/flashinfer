@@ -93,6 +93,7 @@ TmemPtr: TypeAlias = cutlass.Array
 SoftmaxScalar: TypeAlias = Float32
 SoftmaxChunk: TypeAlias = cutlass.Vector
 SoftmaxChunks: TypeAlias = list[SoftmaxChunk]
+SoftmaxRowSumContribution: TypeAlias = SoftmaxChunks | SoftmaxScalar
 
 # Trace-time storage for TmemSP s_data vectors (S/P chunks).
 # Stored at module level (not on self) to avoid adding a non-dynamic-expression
@@ -244,6 +245,11 @@ class FmhaConfig:
     # reusing the unified FMHA context implementation.
     head_paired: bool = False
 
+    # Concrete kernel policy derived from paired geometry and V dtype.  The
+    # resource consumes this flag directly so the row-sum algorithm and the
+    # register budget selected by FmhaTs cannot diverge.
+    enable_early_tile_sum: bool = False
+
     seq_tile_n: int = 128
     tmem_x_load_s: int = 32
     # Causal S_q < S_kv shifts Q rows right by q_offset = S_kv - S_q.
@@ -282,6 +288,20 @@ class FmhaConfig:
     def single_qkv_instance(self) -> bool:
         """Return whether one work tile carries a single Q/KV/O instance."""
         return self.num_qkv_instances == 1
+
+    @property
+    def uses_early_tile_sum(self) -> bool:
+        """Return whether paired M128 geometry supports early V-tile reduction."""
+        return (
+            not self.single_qkv_instance
+            and self.q_tile_m == 128
+            and self.v_dtype
+            in (
+                cutlass.Float16,
+                cutlass.BFloat16,
+                cutlass.Float8E4M3FN,
+            )
+        )
 
     @property
     def cta_tiler(self) -> tuple[int, int, int]:
@@ -1399,6 +1419,7 @@ class TmemSPResource(MemoryResource):
     tmem_p_offset: Constexpr[int] = field(init=False, default=None)
     # 0 for SP0 (uses Q0), 1 for SP1 (uses Q1).
     q_half: Constexpr[int] = 0
+    enable_early_tile_sum: Constexpr[bool] = False
     q_offset_default: int | Int32 = field(init=False, default=0)
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_k: cute.Tensor | None = field(init=False, default=None)
@@ -1439,6 +1460,7 @@ class TmemSPResource(MemoryResource):
         self.tmem_s_offset = tmem_s_offset
         self.tmem_p_offset = tmem_p_offset
         self.q_half = q_half
+        self.enable_early_tile_sum = cfg.enable_early_tile_sum
         self.q_offset_default = q_offset
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
@@ -1466,11 +1488,18 @@ class TmemSPResource(MemoryResource):
             default=Float32(0.0),
             docs="Accumulated softmax denominator for the current row.",
         )
-        self.p_chunk = TaskLocalVariable(
-            dtype=list,
-            default_factory=lambda: _placeholder_softmax_chunks(cfg),
-            docs="Register chunks of the P tile for post-release reduction.",
-        )
+        if self.enable_early_tile_sum:
+            self.p_chunk = TaskLocalVariable(
+                dtype=Float32,
+                default=Float32(0.0),
+                docs="FP32 sum of the current probability tile.",
+            )
+        else:
+            self.p_chunk = TaskLocalVariable(
+                dtype=list,
+                default_factory=lambda: _placeholder_softmax_chunks(cfg),
+                docs="P fragments retained for post-release row-sum reduction.",
+            )
         self.q_offset = TaskLocalVariable(
             dtype=Int32,
             default=Int32(self.q_offset_default),
@@ -1711,7 +1740,9 @@ class TmemSPResource(MemoryResource):
         _ = stage_info
 
     @cute.jit
-    def _default_p_chunk(self) -> SoftmaxChunks:
+    def _default_p_chunk(self) -> SoftmaxRowSumContribution:
+        if cutlass.const_expr(self.enable_early_tile_sum):
+            return Float32(0.0)
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
 
@@ -1735,9 +1766,15 @@ class TmemSPResource(MemoryResource):
     def init_mma_state(self, stage_info: StageInfo) -> None:
         self._init_function_state(stage_info)
 
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_softmax_state_early(self, stage_info: StageInfo) -> None:
+        """Initialize softmax TMEM state without a function-lifetime P value."""
+        self._init_function_state(stage_info)
+
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=p_chunk)
     @cute.jit
-    def init_softmax_state(self, stage_info: StageInfo) -> SoftmaxChunks:
+    def init_softmax_state(self, stage_info: StageInfo) -> SoftmaxRowSumContribution:
         self._init_function_state(stage_info)
         return self._default_p_chunk()
 
@@ -1876,7 +1913,7 @@ class TmemSPResource(MemoryResource):
         stage_col_offset: TmemAddr,
         row_max: SoftmaxScalar,
         scale_softmax_log2: SoftmaxScalar,
-    ) -> SoftmaxChunks:
+    ) -> SoftmaxRowSumContribution:
         """Apply exp2 softmax P, fold the PV P scale, and store P to TMEM."""
         tmem_p_addr = self.tmem_p_addr_cached + stage_col_offset
         tmem_shape = "32x32b"
@@ -1893,6 +1930,14 @@ class TmemSPResource(MemoryResource):
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
         minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
         s_data = _tmem_sp_sdata[id(self)]
+        if cutlass.const_expr(self.enable_early_tile_sum):
+            local_sum_chains = cutlass.Array(
+                Float32,
+                4,
+                space=cutlass.AddressSpace.rmem,
+            )
+            for chain_idx in cutlass.range_constexpr(4):
+                local_sum_chains[chain_idx] = Float32(0.0)
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             p_vals = ()
             for elem_idx in cutlass.range_constexpr(0, tmem_x, 2):
@@ -1905,9 +1950,16 @@ class TmemSPResource(MemoryResource):
                 )
                 p0 = fma_pair[0]
                 p1 = fma_pair[1]
+                p0 = cute.math.exp2(p0, fastmath=True)
+                p1 = cute.math.exp2(p1, fastmath=True)
+                if cutlass.const_expr(self.enable_early_tile_sum):
+                    pair_idx = chunk_idx * (tmem_x // 2) + elem_idx // 2
+                    chain_base = (pair_idx % 2) * 2
+                    local_sum_chains[chain_base] += p0
+                    local_sum_chains[chain_base + 1] += p1
                 p_vals += (
-                    cute.math.exp2(p0, fastmath=True),
-                    cute.math.exp2(p1, fastmath=True),
+                    p0,
+                    p1,
                 )
             s_data[chunk_idx] = cutlass.Vector.from_elements(
                 p_vals, self.cfg.qk_acc_dtype
@@ -1928,7 +1980,24 @@ class TmemSPResource(MemoryResource):
                 prims.make_tmem_ptr(tmem_p_addr + pair_idx * tmem_x, cutlass.Int8),
                 p_data_f32[0:tmem_x],
             )
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        if cutlass.const_expr(self.enable_early_tile_sum):
+            local_sum_pair = prims.add_packed_f32x2(
+                (local_sum_chains[0], local_sum_chains[1]),
+                (local_sum_chains[2], local_sum_chains[3]),
+                rnd="rn",
+                ftz=False,
+            )
+            tile_sum = local_sum_pair[0] + local_sum_pair[1]
+        if cutlass.const_expr(self.enable_early_tile_sum):
+            # Publish STTM through the task-pipeline barrier without a blocking
+            # store wait.  The consumer runs on a different warp.
+            cute.arch.fence_view_async_tmem_store()
+        else:
+            # Preserve the legacy publication sequence for paths that retain
+            # P fragments until after SP release.
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        if cutlass.const_expr(self.enable_early_tile_sum):
+            return tile_sum
         result = []
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             result.append(s_data[chunk_idx])
@@ -2111,7 +2180,7 @@ class TmemSPResource(MemoryResource):
         *,
         row_max: SoftmaxScalar,
         scale_softmax_log2: SoftmaxScalar,
-    ) -> SoftmaxChunks:
+    ) -> SoftmaxRowSumContribution:
         """Apply exp2 using the runtime scale cached before the K/V loop."""
         return self._exp2_p_store(
             self._stage_col_offset(stage_info), row_max, scale_softmax_log2
@@ -2283,7 +2352,7 @@ class TmemSPResource(MemoryResource):
         *,
         row_max: SoftmaxScalar,
         scale_softmax_log2: SoftmaxScalar,
-    ) -> SoftmaxChunks:
+    ) -> SoftmaxRowSumContribution:
         """Tail stage: apply exp2 using the cached runtime softmax scale."""
         return self._exp2_p_store(
             self._stage_col_offset(stage_info), row_max, scale_softmax_log2
@@ -2324,19 +2393,24 @@ class TmemSPResource(MemoryResource):
         old_row_max: SoftmaxScalar,
         row_max: SoftmaxScalar,
         row_sum: SoftmaxScalar,
-        p_chunk: SoftmaxChunks,
+        p_chunk: SoftmaxRowSumContribution,
         scale_softmax_log2: SoftmaxScalar,
     ) -> SoftmaxScalar:
-        """Accumulate row_sum using the cached runtime softmax scale."""
+        """Accumulate row_sum from vector P fragments or their scalar sum."""
         _ = stage_info
-        row_sum = self._row_sum_reduction(
+        if cutlass.const_expr(self.enable_early_tile_sum):
+            acc_scale = cute.math.exp2(
+                scale_softmax_log2 * (old_row_max - row_max),
+                fastmath=True,
+            )
+            return row_sum * acc_scale + p_chunk
+        return self._row_sum_reduction(
             old_row_max=old_row_max,
             row_max=row_max,
             row_sum=row_sum,
             p_chunk=p_chunk,
             scale_softmax_log2=scale_softmax_log2,
         )
-        return row_sum
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=old_row_max)
     @cute.jit

@@ -1262,6 +1262,41 @@ def _configure_pipeline_stages(cfg: FmhaConfig) -> None:
     cfg.softmax_warpgroup_count = cfg.num_qkv_instances
 
 
+_EARLY_TILE_SUM_REGISTER_BUDGET = (176, 80, 80)
+
+
+def _configure_early_tile_sum_policy(
+    cfg: FmhaConfig,
+    *,
+    is_persistent: bool,
+) -> None:
+    """Couple the concrete early-sum algorithm to its register budget."""
+    # This fork currently has the Q2/KV1 paired topology and the D256
+    # single-instance topology.  Q2/KV1 benefits across scheduler and head
+    # mappings; keep the persistence condition explicit for parity with the
+    # upstream policy if another paired geometry is added later.
+    # DKG 4baa has no paged-KV schedule.  On this fork, moving the reduction
+    # onto P publication regresses the static-persistent paged pipeline, so it
+    # retains the cd442fd8 algorithm and register split.
+    cfg.enable_early_tile_sum = (
+        cfg.uses_early_tile_sum
+        and not cfg.use_paged_kv
+        and (not cfg.single_qkv_instance or is_persistent)
+    )
+    if cfg.single_qkv_instance:
+        return
+    if not cfg.enable_early_tile_sum:
+        # Preserve the cd442fd8 register split for unsupported paired paths.
+        # Upstream's legacy 192/96/32 fallback serves Q1/KV2, which this fork
+        # does not implement.
+        return
+    (
+        cfg.num_regs_softmax,
+        cfg.num_regs_correction,
+        cfg.num_regs_other,
+    ) = _EARLY_TILE_SUM_REGISTER_BUDGET
+
+
 def _configure_smem_shapes(cfg: FmhaConfig) -> None:
     """Derive per-stage SMEM element counts from the configured tile shapes."""
     kv_head_dim = (
@@ -1863,6 +1898,7 @@ class FmhaTs:
                 balance_causal_workload=balance_causal_workload,
                 window_size_left=window_size_left,
             )
+            _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
             return
 
         # MMA tiler: (M, N, K) = (128, 128, 128)
@@ -1929,6 +1965,7 @@ class FmhaTs:
             balance_causal_workload=balance_causal_workload,
             window_size_left=window_size_left,
         )
+        _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
 
     # ---------------------------------------------------------------------------
     # Host entry point

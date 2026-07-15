@@ -1340,7 +1340,12 @@ def create_softmax_task(
         wq: WorkQueue | None = None,
     ) -> None:
         """Captured schedule for one softmax warp group."""
-        p_chunk = sp.init_softmax_state()
+        if tmem_sp.enable_early_tile_sum:
+            # The contribution is produced and consumed inside each iteration;
+            # do not carry even the scalar tile sum through the persistent loop.
+            sp.init_softmax_state_early()
+        else:
+            p_chunk = sp.init_softmax_state()
         scale_softmax_log2 = sp.load_scale_softmax_log2()
         vec.init_store_state()
         with _work_tile_schedule_loop(wq):

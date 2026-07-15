@@ -955,18 +955,18 @@ def test_attention_ts_context_head_paired_output_tma_uses_output_width(
 @pytest.mark.parametrize(
     ("is_causal", "single_kv_tile", "dtype_name", "expected"),
     (
-        pytest.param(False, False, "fp16", (184, 88, 56), id="dense_fp16"),
-        pytest.param(False, False, "bf16", (184, 88, 56), id="dense_bf16"),
-        pytest.param(False, False, "fp8", (184, 88, 56), id="dense_fp8"),
-        pytest.param(True, True, "fp16", (192, 96, 32), id="single_fp16"),
-        pytest.param(True, True, "bf16", (192, 96, 32), id="single_bf16"),
-        pytest.param(True, True, "fp8", (184, 88, 56), id="single_fp8"),
-        pytest.param(True, False, "fp16", (192, 96, 32), id="causal_fp16"),
-        pytest.param(True, False, "bf16", (192, 96, 32), id="causal_bf16"),
-        pytest.param(True, False, "fp8", (184, 88, 56), id="causal_fp8"),
+        pytest.param(False, False, "fp16", (176, 80, 80), id="dense_fp16"),
+        pytest.param(False, False, "bf16", (176, 80, 80), id="dense_bf16"),
+        pytest.param(False, False, "fp8", (176, 80, 80), id="dense_fp8"),
+        pytest.param(True, True, "fp16", (176, 80, 80), id="single_fp16"),
+        pytest.param(True, True, "bf16", (176, 80, 80), id="single_bf16"),
+        pytest.param(True, True, "fp8", (176, 80, 80), id="single_fp8"),
+        pytest.param(True, False, "fp16", (176, 80, 80), id="causal_fp16"),
+        pytest.param(True, False, "bf16", (176, 80, 80), id="causal_bf16"),
+        pytest.param(True, False, "fp8", (176, 80, 80), id="causal_fp8"),
     ),
 )
-def test_attention_ts_context_register_budget_matches_cd442fd8(
+def test_attention_ts_context_early_tile_sum_register_budget(
     is_causal: bool,
     single_kv_tile: bool,
     dtype_name: str,
@@ -989,8 +989,79 @@ def test_attention_ts_context_register_budget_matches_cd442fd8(
         out_dtype=dtype,
     ).cfg
     actual = (cfg.num_regs_softmax, cfg.num_regs_correction, cfg.num_regs_other)
+    assert cfg.uses_early_tile_sum
+    assert cfg.enable_early_tile_sum
     assert actual == expected
     assert 8 * actual[0] + 4 * actual[1] + 4 * actual[2] == 2048
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        pytest.param({}, id="static_persistent"),
+        pytest.param(
+            {"is_persistent": False, "is_clc_dynamic": False},
+            id="nonpersistent",
+        ),
+        pytest.param({"is_clc_dynamic": True}, id="clc_dynamic"),
+        pytest.param({"head_paired": True, "h_r": 8}, id="head_paired"),
+    ),
+)
+def test_attention_ts_context_early_tile_sum_covers_q2_schedulers(kwargs):
+    import cutlass
+
+    from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import FmhaTs
+
+    cfg = FmhaTs(
+        d=128,
+        in_dtype=cutlass.Float8E4M3FN,
+        out_dtype=cutlass.BFloat16,
+        **kwargs,
+    ).cfg
+    assert cfg.uses_early_tile_sum
+    assert cfg.enable_early_tile_sum
+    assert (cfg.num_regs_softmax, cfg.num_regs_correction, cfg.num_regs_other) == (
+        176,
+        80,
+        80,
+    )
+
+
+def test_attention_ts_context_early_tile_sum_dtype_and_resource_policy():
+    import cutlass
+
+    from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import FmhaTs
+    from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
+        TmemSPResource,
+    )
+
+    unsupported = FmhaTs(
+        d=128,
+        in_dtype=cutlass.Float8E5M2,
+        out_dtype=cutlass.BFloat16,
+    ).cfg
+    assert not unsupported.uses_early_tile_sum
+    assert not unsupported.enable_early_tile_sum
+    assert (
+        unsupported.num_regs_softmax,
+        unsupported.num_regs_correction,
+        unsupported.num_regs_other,
+    ) == (184, 88, 56)
+
+    paged = FmhaTs(
+        d=128,
+        in_dtype=cutlass.Float8E4M3FN,
+        out_dtype=cutlass.BFloat16,
+        use_paged_kv=True,
+    ).cfg
+    assert paged.uses_early_tile_sum
+    assert not paged.enable_early_tile_sum
+    assert (
+        paged.num_regs_softmax,
+        paged.num_regs_correction,
+        paged.num_regs_other,
+    ) == (184, 88, 56)
+    assert "enable_early_tile_sum" not in inspect.signature(TmemSPResource).parameters
 
 
 def test_attention_ts_context_single_kv_tile_uses_static_zero_loop_domains():
@@ -1196,6 +1267,28 @@ def test_attention_ts_context_fp8_head_dim_kv_layout_schedule_builds(
     assert tasks["EpilogueTask"].warp_idx == cfg.epilogue_warp_id
     assert tasks[auxiliary_task_name].warp_idx == cfg.empty_warp_id
     assert task_manager._tmem_allocator.total_tmem_columns == 512
+
+    tmem_sp_resources = {
+        resource.name: resource
+        for task in task_manager.tasks
+        for resource in (*task.src_resources, *task.dst_resources)
+        if resource.name in ("tmem_sp0", "tmem_sp1")
+    }
+    assert set(tmem_sp_resources) == (
+        {"tmem_sp0", "tmem_sp1"} if head_dim == 128 else {"tmem_sp0"}
+    )
+    expected_early_tile_sum = head_dim == 128 and not use_paged_kv
+    assert cfg.enable_early_tile_sum is expected_early_tile_sum
+    assert all(
+        resource.enable_early_tile_sum is cfg.enable_early_tile_sum
+        for resource in tmem_sp_resources.values()
+    )
+    if head_dim == 128:
+        assert (
+            cfg.num_regs_softmax,
+            cfg.num_regs_correction,
+            cfg.num_regs_other,
+        ) == ((176, 80, 80) if expected_early_tile_sum else (184, 88, 56))
 
     load_resource_names = {
         resource.name for resource in tasks["LoadTask"].src_resources
