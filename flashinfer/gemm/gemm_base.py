@@ -15,11 +15,8 @@ limitations under the License.
 """
 
 import functools
-<<<<<<< HEAD
 from collections import defaultdict
-=======
 import logging
->>>>>>> 1990cae7 (fix_comments)
 from dataclasses import replace
 import warnings
 from enum import Enum
