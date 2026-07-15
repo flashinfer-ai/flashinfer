@@ -1244,6 +1244,7 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
 
         config_a = runner._make_tuning_config(moe_inputs)
         config_b = runner._make_tuning_config(moe_inputs)
+        assert config_a is config_b
 
         spec_a = config_a.dynamic_tensor_specs[0]
         spec_b = config_b.dynamic_tensor_specs[0]
@@ -1304,8 +1305,8 @@ def test_find_nearest_profile_cache_ignores_fresh_initializer_closures(monkeypat
     assert eq_calls == 0
 
 
-def test_mla_tuning_configs_with_fresh_initializers_share_profile_cache():
-    """MLA's per-call initializer closures must not churn the profile cache."""
+def test_mla_tuning_config_factory_reuses_semantic_configs():
+    """MLA reuses initializer closures and configs for equal scalar inputs."""
     from flashinfer.mla._core import _build_mla_decode_tuning_config
 
     kwargs = dict(
@@ -1321,7 +1322,11 @@ def test_mla_tuning_configs_with_fresh_initializers_share_profile_cache():
     )
     config_a = _build_mla_decode_tuning_config(**kwargs)
     config_b = _build_mla_decode_tuning_config(**kwargs)
-    assert config_a != config_b, "MLA builds fresh initializer closures per call"
+    config_other_seq_len = _build_mla_decode_tuning_config(
+        **{**kwargs, "max_seq_len": 256}
+    )
+    assert config_a is config_b
+    assert config_other_seq_len is not config_a
 
     shapes = (
         (4, 1, 128, 576),

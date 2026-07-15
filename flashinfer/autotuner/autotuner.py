@@ -436,6 +436,9 @@ class TuningConfig:
     # for inputs whose default tensor_initializer would be random
     # (e.g. token_selected_experts in MoE workloads).
     inputs_pre_hook: Callable | None = None
+    _nearest_profile_key: Any = field(
+        default=None, init=False, repr=False, compare=False, hash=False
+    )
 
 
 class _CallableIdentity:
@@ -457,33 +460,60 @@ class _CallableIdentity:
 _NearestProfileDynamicSpec: TypeAlias = tuple[
     tuple[int, ...], tuple[int, ...], Callable[[int], int] | _CallableIdentity
 ]
-_NearestProfileKey: TypeAlias = tuple[
-    tuple[_NearestProfileDynamicSpec, ...], tuple[tuple[int, int], ...]
-]
+
+
+class _NearestProfileKey:
+    """Immutable nearest-profile key with a precomputed hash."""
+
+    __slots__ = ("dynamic_specs", "constraint_dims", "_hash")
+
+    def __init__(
+        self,
+        dynamic_specs: tuple[_NearestProfileDynamicSpec, ...],
+        constraint_dims: tuple[tuple[int, int], ...],
+    ):
+        self.dynamic_specs = dynamic_specs
+        self.constraint_dims = constraint_dims
+        self._hash = hash((dynamic_specs, constraint_dims))
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, _NearestProfileKey)
+            and self.dynamic_specs == other.dynamic_specs
+            and self.constraint_dims == other.constraint_dims
+        )
 
 
 def _get_nearest_profile_key(tuning_config: TuningConfig) -> _NearestProfileKey:
     """Extract only fields that affect nearest-profile selection.
 
     Tensor initializers and the rest of ``TuningConfig`` are intentionally
-    excluded.  The identity wrappers retain mapper callables while a key is in
-    the LRU, preventing Python from reusing a cached callable's identity.
+    excluded.  Each ``TuningConfig`` memoizes its key, including retained mapper
+    callables, so the warm path avoids rebuilding or recursively hashing it.
     """
-    return (
-        tuple(
-            (
-                spec.input_idx,
-                spec.dim_idx,
-                spec.map_to_tuning_buckets
-                if isinstance(spec.map_to_tuning_buckets, FunctionType)
-                else _CallableIdentity(spec.map_to_tuning_buckets),
-            )
-            for spec in tuning_config.dynamic_tensor_specs
-        ),
-        tuple(
-            (spec.input_idx, spec.dim_idx) for spec in tuning_config.constraint_specs
-        ),
-    )
+    key = tuning_config._nearest_profile_key
+    if key is None:
+        key = _NearestProfileKey(
+            tuple(
+                (
+                    spec.input_idx,
+                    spec.dim_idx,
+                    spec.map_to_tuning_buckets
+                    if isinstance(spec.map_to_tuning_buckets, FunctionType)
+                    else _CallableIdentity(spec.map_to_tuning_buckets),
+                )
+                for spec in tuning_config.dynamic_tensor_specs
+            ),
+            tuple(
+                (spec.input_idx, spec.dim_idx)
+                for spec in tuning_config.constraint_specs
+            ),
+        )
+        tuning_config._nearest_profile_key = key
+    return key
 
 
 @dataclass(frozen=True)
@@ -1963,8 +1993,7 @@ class AutoTuner:
         """Cached nearest-profile lookup keyed only by lookup-relevant fields."""
         base_profile = list(list(shape) for shape in shapes)
 
-        dynamic_specs, constraint_dims = profile_key
-        for dynamic_input_idx, dynamic_dim_idx, mapper in dynamic_specs:
+        for dynamic_input_idx, dynamic_dim_idx, mapper in profile_key.dynamic_specs:
             mapper_callable = (
                 mapper.callable if isinstance(mapper, _CallableIdentity) else mapper
             )
@@ -1976,7 +2005,7 @@ class AutoTuner:
                 base_profile[input_i][dim_i] = mapped_val
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
-        for constraint_input_idx, constraint_dim_idx in constraint_dims:
+        for constraint_input_idx, constraint_dim_idx in profile_key.constraint_dims:
             base_profile[constraint_input_idx][constraint_dim_idx] = -1
         return tuple(tuple(shape) for shape in base_profile)
 
