@@ -2927,6 +2927,7 @@ def build_cudnn_gemm_mxfp8_graph_override_shape(
     block_size,
     device,
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
+    scale_reordering=None,
     policy=None,
 ):
     """Build a cuDNN MXFP8 GEMM graph with override-shape support.
@@ -2937,6 +2938,8 @@ def build_cudnn_gemm_mxfp8_graph_override_shape(
     _check_cudnn_override_shape_availability()
     if policy is None:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    if scale_reordering is None:
+        scale_reordering = cudnn.tensor_reordering.F8_128x4
 
     if a_type not in [cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2]:
         raise ValueError(f"A type must be FP8_E4M3 or FP8_E5M2, got {a_type}")
@@ -2980,14 +2983,14 @@ def build_cudnn_gemm_mxfp8_graph_override_shape(
         dim=a_descale_shape,
         stride=a_descale_stride,
         data_type=scale_type,
-        reordering_type=cudnn.tensor_reordering.F8_128x4,
+        reordering_type=scale_reordering,
     )
     block_descale_b_cudnn_tensor = graph.tensor(
         name="block_descale_b",
         dim=b_descale_shape,
         stride=b_descale_stride,
         data_type=scale_type,
-        reordering_type=cudnn.tensor_reordering.F8_128x4,
+        reordering_type=scale_reordering,
     )
 
     dequant_a_tensor = graph.block_scale_dequantize(
@@ -8651,10 +8654,13 @@ def build_cudnn_gemm_mxfp8_graph(
     block_size,
     o_type,  # cudnn.data_type, BF16 or FP16
     device,
+    scale_reordering=None,
     policy=None,
 ):
     if policy is None:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    if scale_reordering is None:
+        scale_reordering = cudnn.tensor_reordering.F8_128x4
 
     if len(a_shape) != 3:
         raise ValueError(f"A shape must be 3D, got {a_shape}")
@@ -8721,14 +8727,14 @@ def build_cudnn_gemm_mxfp8_graph(
             dim=a_descale_shape,
             stride=a_descale_stride,
             data_type=scale_type,
-            reordering_type=cudnn.tensor_reordering.F8_128x4,
+            reordering_type=scale_reordering,
         )
         block_descale_b_cudnn_tensor = graph.tensor(
             name="block_descale_b",
             dim=b_descale_shape,
             stride=b_descale_stride,
             data_type=scale_type,
-            reordering_type=cudnn.tensor_reordering.F8_128x4,
+            reordering_type=scale_reordering,
         )
 
         # Dequantize the input tensors
@@ -8784,6 +8790,7 @@ def _cudnn_gemm_mxfp8(
     out: Optional[torch.Tensor] = None,
     workspace_buffer: torch.Tensor = None,
     tactic: int = -1,
+    scale_reordering=None,
 ):
     # mxfp8 block size is 32
     block_size = 32
@@ -8803,6 +8810,7 @@ def _cudnn_gemm_mxfp8(
         o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
         block_size=block_size,
         device=a.device,
+        scale_reordering=scale_reordering,
         policy=policy,
     )
     # execute the mxfp8 cudnn graph
@@ -8818,7 +8826,7 @@ def _cudnn_gemm_mxfp8(
     )
 
 
-def _cudnn_gemm_mxfp8_runner():
+def _cudnn_gemm_mxfp8_runner(scale_reordering):
     m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
         _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
     )
@@ -8828,10 +8836,11 @@ def _cudnn_gemm_mxfp8_runner():
             super().__init__()
             self._m_bucket_mapper = m_bucket_mapper
             self._use_override_shape = is_cudnn_override_shape_available()
+            self._scale_reordering = scale_reordering
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             a, b, _, _, out, _ = inputs
-            return (a.dtype, b.dtype, out.dtype)
+            return (a.dtype, b.dtype, out.dtype, str(self._scale_reordering))
 
         def _get_override_graph(self, a, b, out):
             batch = a.shape[0]
@@ -8850,6 +8859,7 @@ def _cudnn_gemm_mxfp8_runner():
                 block_size=32,
                 device=a.device,
                 cache_m=cache_m,
+                scale_reordering=self._scale_reordering,
                 policy=cudnn.build_plan_policy.ALL,
             )
 
@@ -8872,6 +8882,7 @@ def _cudnn_gemm_mxfp8_runner():
                     o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
                     block_size=32,
                     device=a.device,
+                    scale_reordering=self._scale_reordering,
                     policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
                 )
 
@@ -8907,6 +8918,7 @@ def _cudnn_gemm_mxfp8_runner():
                     out_dtype=out.dtype,
                     workspace_buffer=workspace_buffer,
                     tactic=-1,
+                    scale_reordering=self._scale_reordering,
                 )
             return out
 
@@ -8921,12 +8933,13 @@ def mxfp8_gemm_sm100(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
+    scale_reordering,
 ) -> None:
     tuner = AutoTuner.get()
 
     runners = []
     if "cudnn" in runner_names:
-        runners.append(_cudnn_gemm_mxfp8_runner())
+        runners.append(_cudnn_gemm_mxfp8_runner(scale_reordering))
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
@@ -8949,7 +8962,11 @@ def _cudnn_bmm_mxfp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "auto"] = "cudnn",
+    sf_layout: SfLayout = SfLayout.layout_128x4,
 ):
+    sf_layout = SfLayout(sf_layout)
+    if sf_layout not in (SfLayout.layout_linear, SfLayout.layout_128x4):
+        return False
     return _cudnn_available_or_raise_for_backend(backend)
 
 
@@ -8970,6 +8987,7 @@ def _check_bmm_mxfp8_problem_size(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn"] = "cudnn",
+    sf_layout: SfLayout = SfLayout.layout_128x4,
 ):
     # Check input tensors
     if A.ndim != 3 or B.ndim != 3:
@@ -9005,8 +9023,11 @@ def _cutlass_bmm_mxfp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+    sf_layout: SfLayout = SfLayout.layout_128x4,
 ):
     # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales.
+    if SfLayout(sf_layout) != SfLayout.layout_128x4:
+        return False
     if A_scale.ndim != 1 or B_scale.ndim != 1:
         return False
     return True
@@ -9021,6 +9042,7 @@ def _heuristic_func_bmm_mxfp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+    sf_layout: SfLayout = SfLayout.layout_128x4,
 ):
     heuristic_backends = []
     major, _ = get_compute_capability(A.device)
@@ -9048,6 +9070,8 @@ def bmm_mxfp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+    *,
+    sf_layout: SfLayout = SfLayout.layout_128x4,
 ) -> torch.Tensor:
     r"""BMM MXFP8
 
@@ -9077,6 +9101,10 @@ def bmm_mxfp8(
         be 1D swizzled (``SfLayout.layout_128x4``). Pass ``B`` in the standard
         shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
 
+    sf_layout: SfLayout
+        Layout of ``A_scale`` and ``B_scale``. The cuDNN backend passes linear
+        scales with ``cudnn.tensor_reordering.NONE``.
+
     Returns
     -------
     out: torch.Tensor
@@ -9101,6 +9129,10 @@ def bmm_mxfp8(
         resolved_backend = bmm_mxfp8.suitable_auto_backends[0]
 
     if resolved_backend == "cutlass":
+        if SfLayout(sf_layout) != SfLayout.layout_128x4:
+            raise ValueError(
+                "bmm_mxfp8 cutlass backend requires 128x4 swizzled scales."
+            )
         # SM120/121 CUTLASS path.
         # B is [b, k, n] col-major; CUTLASS expects mat2 as [B, N, K].
         # col-major [b, k, n] with strides (k*n, 1, k) → .transpose(1,2) → [b, n, k]
@@ -9115,6 +9147,13 @@ def bmm_mxfp8(
     if resolved_backend == "cudnn":
         if not CUDNN_AVAILABLE:
             raise ValueError("cudnn is not available")
+        sf_layout = SfLayout(sf_layout)
+        if sf_layout == SfLayout.layout_linear:
+            scale_reordering = cudnn.tensor_reordering.NONE
+        elif sf_layout == SfLayout.layout_128x4:
+            scale_reordering = cudnn.tensor_reordering.F8_128x4
+        else:
+            raise ValueError("bmm_mxfp8 cudnn backend supports linear or 128x4 scales.")
         mxfp8_gemm_sm100(
             A,
             B,
@@ -9123,6 +9162,7 @@ def bmm_mxfp8(
             out,
             workspace_buffer,
             ["cudnn"],
+            scale_reordering=scale_reordering,
         )
         return out
 
