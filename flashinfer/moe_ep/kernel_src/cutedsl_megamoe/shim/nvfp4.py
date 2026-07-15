@@ -625,9 +625,18 @@ class MegaMoENvfp4Frontend:
         intermediate_down = c.intermediate // 2
         e = c.num_experts_per_rank
 
+        current_device = torch.cuda.current_device()
+
         def _require_cuda(name: str, tensor: torch.Tensor) -> None:
             if not tensor.is_cuda:
                 raise ValueError(f"{name} must be a CUDA tensor.")
+            # Workspace and stream are bound to the current device; a tensor
+            # from another GPU would launch with an invalid pointer.
+            if tensor.device.index != current_device:
+                raise ValueError(
+                    f"{name} must be on the current CUDA device "
+                    f"(cuda:{current_device}), got {tensor.device}."
+                )
 
         _require_cuda("activation", inputs.activation)
         if inputs.activation.ndim != 2 or inputs.activation.shape[0] != buf_tokens:
@@ -1069,6 +1078,10 @@ def get_symm_buffer_for_mega_moe(
     )
     sym_roots.append(x_sf_root)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
+    # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
+    # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
+    # tail, but start from the masked state so a partial first staging is safe.
+    topk_idx.fill_(-1)
     sym_roots.append(topk_idx)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     sym_roots.append(topk_weights)
@@ -1457,6 +1470,9 @@ def create_dummy_inputs(
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     symm_buffer.x_sf[:num_tokens, :hidden_sf_cols].copy_(activation_sf)
     symm_buffer.topk_idx[:num_tokens].copy_(topk_idx.to(torch.int64))
+    # Mask pad rows (and stale routes from a previous larger staging): the
+    # launch covers the full buffer and relies on topk_idx[n:] == -1.
+    symm_buffer.topk_idx[num_tokens:].fill_(-1)
     symm_buffer.topk_weights[:num_tokens].copy_(topk_weights.to(torch.float32))
 
     y = torch.empty(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)

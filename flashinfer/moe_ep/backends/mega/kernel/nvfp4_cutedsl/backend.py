@@ -204,7 +204,6 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
             # so the candidate sweep stays in lockstep (see shim/autotune.py).
-            self._autotune_pending = False
             from .....kernel_src.cutedsl_megamoe import autotune_nvfp4_mega_moe
 
             autotune_nvfp4_mega_moe(
@@ -216,6 +215,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 gate_up_clamp=_resolve_gate_up_clamp(kcfg),
                 activation_clamp=kcfg.activation_clamp,
             )
+            # Cleared only on success: if the collective tune raises, a retried
+            # compute() re-attempts it (all ranks fail together, so lockstep holds).
+            self._autotune_pending = False
         nvfp4_mega_moe(
             output,
             transformed_weights[0],
