@@ -400,20 +400,49 @@ def cute_dsl_fmha_ragged_prefill(
 
     if kernel_fn is None:
         gpu_arch = _get_gpu_arch(q.device)
-        kernel_fn = get_cute_dsl_fmha_kernel(
-            gpu_arch,
-            q.dtype,
-            o.dtype,
-            D,
-            is_causal,
-            is_persistent=False,  # varlen always uses non-persistent
-            varlen=True,
-            enable_tvm_ffi=enable_tvm_ffi,
-            with_lse=lse is not None,
-            enable_skip_softmax=use_skip_softmax,
-            enable_sink=attention_sinks is not None,
-            use_pdl=enable_pdl,
-        )
+        try:
+            if q.dtype != k.dtype or k.dtype != v.dtype:
+                raise RuntimeError("Separate dtype_qk / dtype_vo requires JIT")
+            kernel_fn = get_cute_dsl_fmha_kernel(
+                gpu_arch,
+                q.dtype,
+                o.dtype,
+                D,
+                is_causal,
+                is_persistent=False,  # varlen always uses non-persistent
+                varlen=True,
+                enable_tvm_ffi=enable_tvm_ffi,
+                with_lse=lse is not None,
+                enable_skip_softmax=use_skip_softmax,
+                enable_sink=attention_sinks is not None,
+                use_pdl=enable_pdl,
+            )
+        except (RuntimeError, FileNotFoundError) as e:
+            # Cubin variant not available / repo unreachable.
+            # JIT-compile the trtllm kernel instead.
+            logger.info(f"DSL FMHA cubin unavailable ({e}); JIT-compiling the kernel.")
+            from flashinfer.cute_dsl.attention.fmha.compile import (
+                compile_cute_dsl_fmha_kernel,
+            )
+
+            kernel_fn = compile_cute_dsl_fmha_kernel(
+                q.dtype,
+                v.dtype,
+                o.dtype,
+                H_q,
+                H_k,
+                D,
+                D_v,
+                is_causal,
+                lse is not None,
+                attention_sinks is not None,
+                use_skip_softmax,
+                enable_pdl,
+                q.device,
+            )
+            # JIT kernels are compiled with --enable-tvm-ffi; the CuTe-native branch
+            # would not accept them.
+            enable_tvm_ffi = True
 
     # Compute scale factors
     if sm_scale is None:

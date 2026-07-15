@@ -26,7 +26,12 @@ Utility Functions
     reorder_rows_for_gated_act_gemm
     interleave_moe_weights_for_sm90_mixed_gemm
     interleave_moe_scales_for_sm90_mixed_gemm
+    preprocess_moe_weights_for_sm90_mixed_gemm_humming
     fused_topk_deepseek
+
+The E8M0 range-clamping, residual-scale factorization, and FP4 payload-rewrite
+scheme used by ``preprocess_moe_weights_for_sm90_mixed_gemm_humming`` is adapted
+from `Humming <https://github.com/inclusionAI/humming>`_.
 
 Multi-LoRA MoE (BGMV)
 ---------------------
