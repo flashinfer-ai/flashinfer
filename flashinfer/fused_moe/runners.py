@@ -893,8 +893,13 @@ class _B12xRunner(MoERunner):
         )
         if tuple(act.selected_experts.shape) != expected_routing_shape:
             raise ValueError(
-                f"expected routing shape {expected_routing_shape}, got "
+                f"expected selected_experts shape {expected_routing_shape}, got "
                 f"{tuple(act.selected_experts.shape)}."
+            )
+        if tuple(act.final_scales.shape) != expected_routing_shape:
+            raise ValueError(
+                f"expected final_scales shape {expected_routing_shape}, got "
+                f"{tuple(act.final_scales.shape)}."
             )
 
         self._prepared_weights = v
