@@ -165,8 +165,8 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
           };
       static int const num_sms = [] {
         int dev = 0, n = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        FLASHINFER_CUDA_CHECK(cudaGetDevice(&dev));
+        FLASHINFER_CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
         return n;
       }();
 
