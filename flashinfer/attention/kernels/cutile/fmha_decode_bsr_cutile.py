@@ -49,6 +49,32 @@ ConstBool = ct.Constant[bool]
 ConstFloat = ct.Constant[float]
 
 
+def _tileiras_supports_advanced_indexing() -> bool:
+    """True iff the active cuTile toolchain can compile ``ct.load_advanced_indexing``.
+
+    That op requires tileiras >= 13.3. ``_get_max_supported_bytecode_version`` returns
+    >= 13.3 only when BOTH the cuda-tile Python frontend lists 13.3 in its supported
+    versions AND the resolved tileiras binary accepts it — exactly the condition under
+    which the gather-TMA loader below will compile. Any probe failure falls back to the
+    per-page tree loader (works on 13.2), so decode never hard-fails on older toolchains.
+    """
+    try:
+        import tempfile
+
+        from cuda.tile._bytecode.version import BytecodeVersion
+        from cuda.tile._compile import _get_max_supported_bytecode_version
+
+        return _get_max_supported_bytecode_version(tempfile.gettempdir()) >= BytecodeVersion.V_13_3
+    except Exception:
+        return False
+
+
+# Computed once at import. When True, _load_page uses the single gather-TMA
+# ct.load_advanced_indexing (Ocean-faithful, handles arbitrary NUM_PAGES incl.
+# page_size==1); otherwise it falls back to the per-page ct.cat tree loader.
+_SUPPORTS_ADVANCED_INDEXING = _tileiras_supports_advanced_indexing()
+
+
 @ct.kernel
 def _splitk_reduce_kernel(
     attn_splitk_out,
@@ -171,29 +197,61 @@ def _load_page(
     Returns:
         Loaded tensor of shape [NUM_PAGES * LOAD_BLOCK_N, BLOCK_D]
     """
-    # The migration had hardcoded NUM_PAGES in {1,2,4} with no fallback, which
-    # silently dropped configs like page_size<=16 + BLOCK_N=128 -> NUM_PAGES=8 and
-    # crashed on page_size=1 (NUM_PAGES up to BLOCK_N). The Ocean source uses a
-    # single gather-TMA (ct.load_advanced_indexing), but that lowering needs
-    # tileiras >= 13.3 (this toolchain is 13.2), so we generalize the per-page TMA
-    # loads instead: _load_page_tree recursively builds a balanced ct.cat over the
-    # NUM_PAGES page loads. NUM_PAGES is a compile-time constant so it fully unrolls
-    # at trace time for any value. (Recursion produces single-assignment nested cat
-    # expressions -- the same structure as the original hardcoded NUM_PAGES==4 case;
-    # an incremental `data = ct.cat((data, di))` reassignment would instead make the
-    # tracer see `data` change shape each step and fail to give it one type.)
-    return _load_page_tree(
-        cache,
-        block_tables,
-        page_table_offset,
-        page,
-        token,
-        off_kv_h,
-        0,
-        NUM_PAGES,
-        LOAD_BLOCK_N,
-        BLOCK_D,
-    )
+    # Multi-page load path. On tileiras >= 13.3 (see _SUPPORTS_ADVANCED_INDEXING)
+    # use Ocean's single gather-TMA `ct.load_advanced_indexing`, which gathers all
+    # NUM_PAGES pages in one op and handles arbitrary NUM_PAGES (incl. page_size==1).
+    # On 13.2 fall back to _load_page_tree (a balanced ct.cat over per-page TMA
+    # loads) so decode still compiles. NOTE: the two paths are perf-equivalent on
+    # B200 (both ~1.7 TB/s, memory-latency bound); advanced-indexing is preferred
+    # only for correctness/generality, not speed. `_SUPPORTS_ADVANCED_INDEXING` is a
+    # module-level Python bool, so exactly one branch is traced at compile time.
+    if NUM_PAGES == 1:
+        page_id = ct.gather(
+            block_tables, (page_table_offset + page,), padding_value=0
+        ).item()
+        data = ct.reshape(
+            ct.load(
+                cache,
+                index=(page_id, token // LOAD_BLOCK_N, off_kv_h, 0),
+                shape=(1, LOAD_BLOCK_N, 1, BLOCK_D),
+                order=(0, 1, 2, 3),
+                allow_tma=True,
+                latency=2,
+            ),
+            (LOAD_BLOCK_N, BLOCK_D),
+        )
+    elif _SUPPORTS_ADVANCED_INDEXING:
+        p_idx = ct.arange(NUM_PAGES, dtype=ct.int32)
+        page_ids = ct.gather(
+            block_tables, (page_table_offset + page + p_idx,), padding_value=0
+        )
+        data = ct.reshape(
+            ct.load_advanced_indexing(
+                cache,
+                (
+                    page_ids,
+                    ct.Slice(token, LOAD_BLOCK_N),
+                    ct.Slice(off_kv_h, 1),
+                    ct.Slice(0, BLOCK_D),
+                ),
+                padding_mode=ct.PaddingMode.ZERO,
+            ),
+            (NUM_PAGES * LOAD_BLOCK_N, BLOCK_D),
+        )
+    else:
+        data = _load_page_tree(
+            cache,
+            block_tables,
+            page_table_offset,
+            page,
+            token,
+            off_kv_h,
+            0,
+            NUM_PAGES,
+            LOAD_BLOCK_N,
+            BLOCK_D,
+        )
+    return data
 
 
 def _load_page_tree(
