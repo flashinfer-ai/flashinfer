@@ -1633,8 +1633,9 @@ def test_moe_mxfp8_mxfp4(
 # activation-SF buffer for MXFP8xMXFP8, crashing the tuning pass.
 @pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10],
-    reason="MXFP8xMXFP8 is only supported on SM100 for now",
+    not is_sm100a_supported(torch.device("cuda"))
+    and not is_sm12x_supported(torch.device("cuda")),
+    reason="MXFP8xMXFP8: SM100, and SM120/121 with the W-MXFP8 grouped-MoE enablement patch",
 )
 def test_moe_mxfp8_mxfp8(
     batch_size,

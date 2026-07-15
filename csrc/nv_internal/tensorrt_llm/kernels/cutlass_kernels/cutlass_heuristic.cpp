@@ -613,14 +613,17 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
                           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
   }
 #else
-  if ((config & CutlassGemmConfig::FP4_ONLY) == 0) {
+  // W-MXFP8 enablement: accept W-MXFP8 (MXFP8_ONLY) alongside nvfp4 — both are
+  // block-scaled SM120 grouped paths and share the candidate-tile set below.
+  if ((config & CutlassGemmConfig::FP4_ONLY) == 0 &&
+      (config & CutlassGemmConfig::MXFP8_ONLY) == 0) {
     if (config & CutlassGemmConfig::GROUPED_GEMM) {
-      TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");
+      TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4 or mxfp8.");
     }
-    TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
+    TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4 or mxfp8.");
   }
-  // All candidate tiles for SM120 FP4. Invalid tiles for a given path are skipped
-  // gracefully by the try-catch in calcMaxWorkspaceSize.
+  // All candidate tiles for SM120 block-scaled (FP4 / MXFP8). Invalid tiles for a given path are
+  // skipped gracefully by the try-catch in calcMaxWorkspaceSize.
   static constexpr CutlassTileConfigSM120 all_tiles[] = {
       CutlassTileConfigSM120::CtaShape128x128x128B, CutlassTileConfigSM120::CtaShape128x128x64B,
       CutlassTileConfigSM120::CtaShape256x128x64B,  CutlassTileConfigSM120::CtaShape128x256x64B,
