@@ -52,6 +52,8 @@ import cuda.tile as ct
 import torch
 from cuda.tile.tune import exhaustive_search
 
+from ....cutile.cutile_common import cached_replace_hints
+
 
 # Module-level tune cache:
 #   key:   (M, N, K, block_n, block_k, output_dtype_int, dtype, str(device))
@@ -579,6 +581,181 @@ def gemm_fp8_nt_groupwise_cutile(
     return out
 
 
+@ct.kernel
+def _w8a8_group_fp8_matmul_kernel(
+    # Tensors
+    A,  # (total_m, K) FP8
+    B,  # (Q * N, K) FP8 — the (Q, N, K) weights flattened on the first two dims
+    C,  # (total_m, N) output
+    As,  # (total_m, K_groups) FP32
+    Bs,  # (Q * N_groups, K_groups) FP32 — b_scale flattened on (Q, N_groups)
+    m_indptr,  # (Q + 1,) int32 row-segment boundaries (prefix sums)
+    # Dimensions
+    Q: ct.Constant[int],
+    TOTAL_M: ct.Constant[int],  # A/C row count == C.shape[0]; also the OOB store sentinel
+    max_m_device,  # (1,) int32 device tensor: max over groups of (m_indptr[i+1]-m_indptr[i])
+    N: ct.Constant[int],
+    K: ct.Constant[int],
+    GROUP_N: ct.Constant[int],
+    GROUP_K: ct.Constant[int],
+    # Tile parameters
+    BLOCK_SIZE_M: ct.Constant[int],
+    BLOCK_SIZE_N: ct.Constant[int],
+    BLOCK_SIZE_K: ct.Constant[int],
+    GROUP_SIZE_M: ct.Constant[int],
+    OUTPUT_DTYPE: ct.Constant[int],
+    SWAP_AB: ct.Constant[int],
+):
+    """Fused, CUDA-graph-safe grouped W8A8 block-scaled FP8 matmul.
+
+    Computes, for each group ``q`` defined by ``m_indptr`` boundaries,
+    ``C[rows_q] = (A[rows_q] @ B[q].T) * scales`` in a SINGLE persistent launch
+    — replacing the old host loop that did a ``m_indptr.cpu()`` D2H sync + one
+    launch per group (illegal under CUDA-graph capture, and launch-latency-bound
+    for small groups).
+
+    Design — the two constraints that shape this kernel:
+    * **No host sync.** All segment boundaries are read on-device
+      (``ct.load(m_indptr, ...)``); the persistent-loop tile count uses the
+      device-side ``max_m_device`` (mirrors ragged_block_scaled_bmm's
+      defense-in-depth). The grid is a fixed NUM_SMS multiple, independent of any
+      per-group size, so the launch needs nothing host-side about ``m_indptr``.
+    * **Arbitrary (non-aligned) segments.** Group sizes are arbitrary token
+      counts (e.g. MoE), so A/C rows are addressed with ``ct.gather``/``ct.scatter``
+      on runtime row offsets (``m_start + pid_m*BLOCK_M + arange``), NOT the tiled
+      ct.load path that ragged_block_scaled_bmm uses (that needs BLOCK_M-aligned
+      segments). A tile's tail rows can spill past ``m_end`` into the next group;
+      the store index for those rows is set to the OOB sentinel ``TOTAL_M`` so
+      ``ct.scatter(check_bounds=True)`` drops them (the row_valid->OOB idiom from
+      TileGym's MoE grouped_gemm). The spilled rows' MMA output is simply unused.
+
+    B / b_scale are gathered from the (Q, N, K) / (Q, N_groups, K_groups) tensors
+    flattened on their leading two dims (row ``pid_q*N + offs_n`` / ``pid_q*N_groups
+    + pid_n``): N and K are quant-block aligned, so no masking is needed there.
+
+    Requires BLOCK_SIZE_N == GROUP_N and BLOCK_SIZE_K == GROUP_K (one scale per
+    N-tile / K-tile), same as the single-GEMM kernels.
+    """
+    ct.static_assert(
+        BLOCK_SIZE_N == GROUP_N,
+        f"Kernel requires BLOCK_SIZE_N == group_n, got {BLOCK_SIZE_N} vs {GROUP_N}",
+    )
+    ct.static_assert(
+        BLOCK_SIZE_K == GROUP_K,
+        f"Kernel requires BLOCK_SIZE_K == group_k, got {BLOCK_SIZE_K} vs {GROUP_K}",
+    )
+
+    pid = ct.bid(0)
+
+    # Persistent-loop bound from device-side ground truth (no host sync).
+    max_m_runtime = ct.load(max_m_device, index=(0,), shape=(1,)).item()
+    num_pid_m = ct.cdiv(max_m_runtime, BLOCK_SIZE_M)
+    num_pid_n = ct.cdiv(N, BLOCK_SIZE_N)
+    tiles_per_batch = num_pid_m * num_pid_n
+    total_tiles = tiles_per_batch * Q
+    num_programs = ct.num_blocks(0)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    offs_k_base = ct.arange(BLOCK_SIZE_K, dtype=ct.int32)
+
+    for current_pid in range(pid, total_tiles, num_programs):
+        pid_q = current_pid // tiles_per_batch
+        pid_in_batch = current_pid % tiles_per_batch
+
+        group_id = pid_in_batch // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m_actual = ct.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid_in_batch % group_size_m_actual)
+        pid_n = (pid_in_batch % num_pid_in_group) // group_size_m_actual
+
+        m_start = ct.load(m_indptr, index=(pid_q,), shape=(1,)).item()
+        m_end = ct.load(m_indptr, index=(pid_q + 1,), shape=(1,)).item()
+        valid_m = m_end - m_start
+
+        if pid_m * BLOCK_SIZE_M < valid_m:
+            local_m = pid_m * BLOCK_SIZE_M + ct.arange(BLOCK_SIZE_M, dtype=ct.int32)
+            offs_am = m_start + local_m  # global rows into flattened A / As / C
+            row_valid = local_m < valid_m
+            offs_bn = pid_n * BLOCK_SIZE_N + ct.arange(BLOCK_SIZE_N, dtype=ct.int32)
+            b_rows = pid_q * N + offs_bn  # rows into the (Q*N, K) flattened B
+            bs_row = pid_q * num_pid_n + pid_n  # row into (Q*N_groups, K_groups) Bs
+
+            accumulator = ct.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=ct.float32)
+
+            num_k_tiles = ct.cdiv(K, BLOCK_SIZE_K)
+            for k_tile in range(num_k_tiles):
+                offs_k = offs_k_base + k_tile * BLOCK_SIZE_K
+
+                # A: gather this group's rows (arbitrary offset)
+                a = ct.gather(
+                    A,
+                    (offs_am[:, None], offs_k[None, :]),
+                    check_bounds=True,
+                    padding_value=ct.float8_e4m3fn(0.0),
+                )
+                # B: gather group pid_q's (BLOCK_N, BLOCK_K) tile from flattened B
+                b = ct.gather(
+                    B,
+                    (b_rows[:, None], offs_k[None, :]),
+                    check_bounds=True,
+                    padding_value=ct.float8_e4m3fn(0.0),
+                )
+
+                # As: (total_m, K_groups) -> (BLOCK_M,); Bs: scalar for (group, n-tile, k-tile)
+                a_s = ct.gather(
+                    As, (offs_am, k_tile), check_bounds=True, padding_value=0.0, latency=4
+                )
+                b_s = ct.gather(
+                    Bs, (bs_row, k_tile), check_bounds=True, padding_value=0.0, latency=4
+                )
+                ab_s = a_s[:, None] * b_s
+
+                # MMA with permute for transpose
+                if SWAP_AB:
+                    zero_acc = ct.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=ct.float32)
+                    a_t = ct.permute(a, (1, 0))
+                    dot_result = ct.mma(b, a_t, acc=zero_acc)
+                    dot_result = ct.permute(dot_result, (1, 0))
+                else:
+                    zero_acc = ct.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=ct.float32)
+                    b_t = ct.permute(b, (1, 0))
+                    dot_result = ct.mma(a, b_t, acc=zero_acc)
+
+                accumulator = accumulator + dot_result * ab_s
+
+            if OUTPUT_DTYPE == 1:  # torch.float16
+                c = ct.astype(accumulator, ct.float16)
+            elif OUTPUT_DTYPE == 2:  # torch.bfloat16
+                c = ct.astype(accumulator, ct.bfloat16)
+            else:  # torch.float32
+                c = accumulator
+
+            # Drop tail rows that spilled past this group (route to OOB row TOTAL_M).
+            offs_cm = ct.where(row_valid, offs_am, TOTAL_M)
+            ct.scatter(
+                C, (offs_cm[:, None], offs_bn[None, :]), c, check_bounds=True
+            )
+
+
+def _group_gemm_default_config(total_m, num_groups):
+    """Static kernel config for the fused grouped kernel (no exhaustive_search
+    at call time — that would break CUDA-graph capture).
+
+    BLOCK_SIZE_N / BLOCK_SIZE_K are locked to the quant block (128) for correct
+    scale indexing, so only BLOCK_M / swap / occupancy vary. Small average-M
+    groups take a swap_ab config with a smaller BLOCK_M (fewer wasted tile rows
+    and better MMA shape); large groups take the straight BLOCK_M=128 path.
+    """
+    avg_m = total_m / max(num_groups, 1)
+    if avg_m >= 256:
+        return SimpleNamespace(
+            BLOCK_SIZE_M=128, GROUP_SIZE_M=8, swap_ab=False, num_ctas=1, occupancy=1
+        )
+    return SimpleNamespace(
+        BLOCK_SIZE_M=64, GROUP_SIZE_M=8, swap_ab=True, num_ctas=1, occupancy=1
+    )
+
+
 def group_gemm_fp8_nt_groupwise_cutile(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -589,10 +766,14 @@ def group_gemm_fp8_nt_groupwise_cutile(
     scale_granularity_mnk: tuple = (1, 128, 128),
     scale_major_mode: str = "K",
 ) -> torch.Tensor:
-    """Group GEMM with FP8 block-scaled inputs via cuTile.
+    """Group GEMM with FP8 block-scaled inputs via cuTile — single fused launch.
 
-    Iterates over groups defined by ``m_indptr`` and dispatches each group
-    to :func:`gemm_fp8_nt_groupwise_cutile`.
+    For every group ``q`` defined by ``m_indptr``, computes
+    ``out[rows_q] = (a[rows_q] @ b[q].T)`` with per-block FP8 dequant scales,
+    in one persistent :func:`_w8a8_group_fp8_matmul_kernel` launch. All segment
+    boundaries are read on-device, so this is CUDA-graph-capturable — unlike the
+    previous host loop, which did a ``m_indptr.cpu()`` D2H sync (illegal during
+    capture) and one launch + one ``.contiguous()`` copy per group.
 
     Parameters
     ----------
@@ -600,38 +781,116 @@ def group_gemm_fp8_nt_groupwise_cutile(
     b : (batch_size, n, k) FP8 e4m3, row-major.
     a_scale : (cum_m, k // block_k) float32, K-major scale for ``a``.
     b_scale : (batch_size, n // block_n, k // block_k) float32, K-major scale for ``b``.
-    m_indptr : (batch_size + 1,) int32 row-segment boundaries.
-    out : (cum_m, n) output buffer; written in place per group.
-    scale_granularity_mnk : (m_g, n_g, k_g) — forwarded to each group call.
-    scale_major_mode : must be ``"K"`` (the only mode supported by the cuTile kernel).
+    m_indptr : (batch_size + 1,) int32 row-segment boundaries (prefix sums).
+    out : (cum_m, n) output buffer; written in place. Every row belongs to exactly
+        one group and is written, so no pre-zeroing is required.
+    scale_granularity_mnk : (m_g, n_g, k_g). Requires ``m_g == 1``; ``n_g`` becomes
+        ``block_n`` and ``k_g`` becomes ``block_k``.
+    scale_major_mode : must be ``"K"``.
 
     Returns
     -------
     The same ``out`` tensor.
     """
-    num_groups = m_indptr.shape[0] - 1
-    m_indptr_cpu = m_indptr.cpu()
-
-    for i in range(num_groups):
-        m_start = int(m_indptr_cpu[i])
-        m_end = int(m_indptr_cpu[i + 1])
-        if m_start == m_end:
-            continue
-
-        a_i = a[m_start:m_end].contiguous()
-        b_i = b[i].contiguous()
-        a_scale_i = a_scale[m_start:m_end].contiguous()
-        b_scale_i = b_scale[i].contiguous()
-        out_i = out[m_start:m_end]
-
-        gemm_fp8_nt_groupwise_cutile(
-            a=a_i,
-            b=b_i,
-            a_scale=a_scale_i,
-            b_scale=b_scale_i,
-            out=out_i,
-            scale_granularity_mnk=scale_granularity_mnk,
-            scale_major_mode=scale_major_mode,
+    if scale_major_mode != "K":
+        raise NotImplementedError(
+            f"cuTile group_gemm_fp8_nt_groupwise only supports scale_major_mode='K'; "
+            f"got {scale_major_mode!r}."
         )
+    m_g, n_g, k_g = scale_granularity_mnk
+    if m_g != 1:
+        raise NotImplementedError(
+            f"cuTile group_gemm_fp8_nt_groupwise requires scale_granularity_mnk[0] == 1; "
+            f"got {m_g}."
+        )
+    block_n, block_k = n_g, k_g
+
+    if not (a.is_contiguous() and b.is_contiguous()):
+        raise ValueError("a and b must be contiguous")
+    if a.dim() != 2:
+        raise ValueError("a must be 2D (cum_m, k)")
+    if b.dim() != 3:
+        raise ValueError("b must be 3D (batch_size, n, k)")
+    total_m, K = a.shape
+    Q, N, KB = b.shape
+    if K != KB:
+        raise ValueError(f"a.shape[-1] ({K}) must match b.shape[-1] ({KB})")
+    if m_indptr.dim() != 1 or m_indptr.shape[0] != Q + 1:
+        raise ValueError(f"m_indptr must be 1D with {Q + 1} elements")
+    if out.shape != (total_m, N):
+        raise ValueError(f"out must be ({total_m},{N}); got {tuple(out.shape)}")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if a_scale.dim() != 2 or a_scale.shape != (total_m, _cdiv(K, block_k)):
+        raise ValueError(
+            f"a_scale must be ({total_m}, {_cdiv(K, block_k)}); got {tuple(a_scale.shape)}"
+        )
+    n_groups = _cdiv(N, block_n)
+    if b_scale.dim() != 3 or b_scale.shape != (Q, n_groups, _cdiv(K, block_k)):
+        raise ValueError(
+            f"b_scale must be ({Q}, {n_groups}, {_cdiv(K, block_k)}); "
+            f"got {tuple(b_scale.shape)}"
+        )
+    out_dtype_int = _DTYPE_INT_MAP.get(out.dtype)
+    if out_dtype_int is None:
+        raise ValueError(
+            f"out.dtype {out.dtype} not supported; expected bf16 / fp16 / fp32"
+        )
+
+    if not (a_scale.is_contiguous() and b_scale.is_contiguous()):
+        raise ValueError("a_scale and b_scale must be contiguous")
+
+    # m_indptr must be int32 for the on-device index loads. Cast on device (no sync).
+    if m_indptr.dtype != torch.int32:
+        m_indptr = m_indptr.to(torch.int32)
+
+    # Device-side max group size — computed without a host sync, so the launch
+    # stays CUDA-graph-capturable. The kernel reads this for its persistent bound.
+    seg_sizes = m_indptr[1:] - m_indptr[:-1]
+    max_m_device = seg_sizes.max().to(torch.int32).reshape(1)
+
+    # Flatten B / b_scale on their leading dims so the kernel can gather group
+    # ``q``'s rows as ``q*N + offs_n`` / ``q*N_groups + pid_n`` (both contiguous).
+    b_flat = b.reshape(Q * N, K)
+    b_scale_flat = b_scale.reshape(Q * n_groups, _cdiv(K, block_k))
+
+    cfg = _group_gemm_default_config(total_m, Q)
+
+    num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+    # Persistent grid, independent of any per-group size (no host max_m needed).
+    num_programs = max(1, (num_sms // cfg.num_ctas)) * cfg.occupancy
+
+    kernel = cached_replace_hints(
+        _w8a8_group_fp8_matmul_kernel,
+        num_ctas=cfg.num_ctas,
+        occupancy=cfg.occupancy,
+    )
+
+    ct.launch(
+        torch.cuda.current_stream(a.device),
+        (num_programs, 1, 1),
+        kernel,
+        (
+            a,
+            b_flat,
+            out,
+            a_scale,
+            b_scale_flat,
+            m_indptr,
+            Q,
+            total_m,
+            max_m_device,
+            N,
+            K,
+            block_n,
+            block_k,
+            cfg.BLOCK_SIZE_M,
+            block_n,
+            block_k,
+            cfg.GROUP_SIZE_M,
+            out_dtype_int,
+            int(cfg.swap_ab),
+        ),
+    )
 
     return out
