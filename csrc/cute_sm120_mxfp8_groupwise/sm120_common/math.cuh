@@ -10,9 +10,12 @@
 
 #pragma once
 
-#include <cute/util/type_traits.hpp>
+// clang-format off
+#include <cute/config.hpp>
+// clang-format on
 
-namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled {
+namespace flashinfer::gemm::mxfp8_cute_sm120 {
+namespace sm120_common {
 namespace math {
 
 CUTE_HOST_DEVICE
@@ -28,4 +31,5 @@ CUTE_HOST_DEVICE T_offset compute_padded_offset(T_offset offset, T_index problem
 }
 
 }  // namespace math
-}  // namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled
+}  // namespace sm120_common
+}  // namespace flashinfer::gemm::mxfp8_cute_sm120
