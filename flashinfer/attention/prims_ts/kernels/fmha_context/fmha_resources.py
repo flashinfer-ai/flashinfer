@@ -52,7 +52,7 @@ GMEM resources (no pipeline)
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, TypeAlias
 
 import cutlass
@@ -93,7 +93,6 @@ TmemPtr: TypeAlias = cutlass.Array
 SoftmaxScalar: TypeAlias = Float32
 SoftmaxChunk: TypeAlias = cutlass.Vector
 SoftmaxChunks: TypeAlias = list[SoftmaxChunk]
-
 
 # Trace-time storage for TmemSP s_data vectors (S/P chunks).
 # Stored at module level (not on self) to avoid adding a non-dynamic-expression
@@ -142,13 +141,19 @@ class FmhaConfig:
     # Tile shapes
     qk_mma_tiler: tuple[int, int, int] = (128, 128, 64)
     pv_mma_tiler: tuple[int, int, int] = (128, 64, 128)
-    cta_tiler: tuple[int, int, int] = (256, 128, 64)
     epi_tile: tuple[int, int] = (128, 64)
+    # Number of interleaved Q/KV/O instances per CTA: two selects the paired
+    # schedule, while one selects the single-instance schedule used for D>128.
+    num_qkv_instances: int = 2
 
     # Pipeline stages
     q_stage: int = 2
     kv_stage: int = 3
     mma_softmax_stage: int = 1
+    # Use the two-stage loop-carried S/P schedule and an independent P-ready
+    # handoff, allowing QK(i+1) and PV(i) to operate on opposite S/P stages.
+    has_tmem_p_pipeline: bool = False
+    stage_scoped_tmem_stats: bool = False
     softmax_corr_stage: int = 1
     mma_corr_stage: int = 2
     epi_stage: int = 2
@@ -186,6 +191,7 @@ class FmhaConfig:
 
     # TMEM layout
     tmem_alloc_cols: int = 512
+    tmem_stats_cols: int = 4
     tmem_s0_offset: int = 0
     tmem_s1_offset: int = 128
     tmem_o0_offset: int = 256
@@ -207,12 +213,17 @@ class FmhaConfig:
     tmem_bar_threads: int = 160
     softmax_warpgroup_count: int = 2
     cluster_shape_mn: tuple[int, int] = (1, 1)
+    block_warps: int = 16
 
     # GQA: head ratio h_q // h_kv (1 = MHA, >1 = GQA)
     h_r: int = 1
 
     # Causal masking: when True, mask out positions where k_idx > q_idx
     is_causal: bool = False
+    # Causal balancing uses head_batch_seq logical tile order and reverses Q
+    # sequence tiles.
+    balance_causal_workload: bool = False
+    num_seq_tiles: int | Int32 = 0
 
     # Skip correction optimization: when True, skip rescale if old_max == new_max
     enable_skip_correction: bool = True
@@ -247,9 +258,76 @@ class FmhaConfig:
     # does not use the fixed dense-tail mask).
     fixed_dense_k_tail: int = 0
 
+    # ------------------------------------------------------------------
+    # Paged KV cache (vLLM-style logical->physical page indirection)
+    #
+    # Mirrors decode FmhaDecodeConfig: when use_paged_kv is True, K/V live in
+    # a fixed-size page pool [num_pages_in_pool, h_kv, num_tokens_per_page, d]
+    # and the kernel follows page_idx_kv[b, 2, max_num_pages_per_seq_kv] to
+    # resolve logical (b, s) -> physical page id at TMA-issue time.
+    #
+    # The configuration's empty/padding warp owns page-offset prefetch. It is
+    # warp 15 for D128 and warp 11 for the staged D256 schedule.
+    # ------------------------------------------------------------------
+    use_paged_kv: bool = False
+    num_tokens_per_page: int = 32
+    max_num_pages_per_seq_kv: int = 1
+    page_offsets_num_warps: int = 1
+    page_offsets_stages: int = 6
+
     # Work-tile mapping for the two peer Q/O tiles handled by each CTA:
     # query-paired maps peers to two sequence tiles in one Q head, while
     # head-paired mode maps peers to two Q heads at one sequence tile.
+    @property
+    def single_qkv_instance(self) -> bool:
+        """Return whether one work tile carries a single Q/KV/O instance."""
+        return self.num_qkv_instances == 1
+
+    @property
+    def cta_tiler(self) -> tuple[int, int, int]:
+        """Derive the CTA tile from the MMA tile and work-tile mapping."""
+        if self.single_qkv_instance or self.head_paired:
+            return self.qk_mma_tiler
+        return (
+            self.num_qkv_instances * self.qk_mma_tiler[0],
+            self.qk_mma_tiler[1],
+            self.qk_mma_tiler[2],
+        )
+
+    @property
+    def uses_causal_reversed_head_batch_seq_tile_order(self) -> bool:
+        """Return whether causal head_batch_seq tiles reverse Q sequence order."""
+        return self.is_causal and self.balance_causal_workload
+
+    @property
+    def uses_paired_fp8_head_batch_seq_tile_order(self) -> bool:
+        """Return whether paired FP8 causal tiles use head_batch_seq order."""
+        return (
+            self.is_causal
+            and not self.single_qkv_instance
+            and self.q_dtype is not None
+            and self.k_dtype is not None
+            and self.v_dtype is not None
+            and self.q_dtype.width == 8
+            and self.k_dtype.width == 8
+            and self.v_dtype.width == 8
+        )
+
+    @property
+    def uses_causal_head_batch_seq_tile_order(self) -> bool:
+        """Return whether causal work tiles use head_batch_seq coordinates."""
+        return self.is_causal and (
+            self.balance_causal_workload
+            or self.uses_paired_fp8_head_batch_seq_tile_order
+        )
+
+    @property
+    def work_tile_coord_indices(self) -> tuple[int, int, int]:
+        """Return work-tile indices for logical ``(seq, head, batch)``."""
+        if self.uses_causal_head_batch_seq_tile_order:
+            return 2, 0, 1
+        return 0, 1, 2
+
     @property
     def pv_p_scale(self) -> float:
         """Return the P scale applied before PV MMA."""
@@ -268,27 +346,31 @@ class FmhaConfig:
     @property
     def work_tile_q_heads(self) -> int:
         """Return the number of Q heads represented by one work tile."""
+        if self.single_qkv_instance:
+            return 1
         return 2 if self.head_paired else 1
 
     @property
     def work_tile_q_seq_tiles(self) -> int:
         """Return the number of Q sequence tiles represented by one work tile."""
+        if self.single_qkv_instance:
+            return 1
         return 1 if self.head_paired else 2
 
     @property
     def peer_q_head_stride(self) -> int:
         """Return the Q-head stride between the two peer Q/O tiles."""
-        return 1 if self.head_paired else 0
+        return 1 if self.head_paired and not self.single_qkv_instance else 0
 
     @property
     def peer_q_seq_tile_stride(self) -> int:
         """Return the Q-sequence tile stride between the two peer Q/O tiles."""
-        return 0 if self.head_paired else 1
+        return 0 if self.head_paired or self.single_qkv_instance else 1
 
     @property
     def gmem_o_store_wait_after_write(self) -> bool:
         """Return whether each O store must wait for the matching SMEM write."""
-        return self.head_paired
+        return self.head_paired or self.stage_o_by_head_dim
 
     @property
     def skip_causal_invalid_peer0(self) -> bool:
@@ -297,6 +379,7 @@ class FmhaConfig:
             not self.is_causal
             or self.head_paired
             or self.has_q_offset
+            or self.single_qkv_instance
             or self.causal_single_kv_tile
         ):
             return False
@@ -320,6 +403,21 @@ class FmhaConfig:
 # ---------------------------------------------------------------------------
 # S0S1SequenceResource -- S0-S1 sequence barrier (PipelineAsync, 1 stage)
 # ---------------------------------------------------------------------------
+
+
+@cute.jit
+def _resolve_work_tile_coords(
+    cfg: Constexpr[FmhaConfig],
+    tile_idx: cute.Coord,
+) -> tuple[Int32, Int32, Int32]:
+    """Return ``(seq, head, batch)`` for the configured tile order."""
+    seq_idx, head_idx, batch_idx = cfg.work_tile_coord_indices
+    seq_coord = tile_idx[seq_idx]
+    head_coord = tile_idx[head_idx]
+    batch_coord = tile_idx[batch_idx]
+    if cutlass.const_expr(cfg.uses_causal_reversed_head_batch_seq_tile_order):
+        seq_coord = cfg.num_seq_tiles - seq_coord - Int32(1)
+    return seq_coord, head_coord, batch_coord
 
 
 @dataclass(kw_only=True)
@@ -377,6 +475,8 @@ class GmemQKVResource(MemoryResource):
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_k: cute.Tensor | None = field(init=False, default=None)
     q_offset_default: int | Int32 = field(init=False, default=0)
+    seqlens_kv: cute.Pointer | None = field(init=False, default=None)
+    max_seq_len_kv: Optional[Int32 | int] = field(init=False, default=None)
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     seq_coord: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     head_coord: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -389,6 +489,7 @@ class GmemQKVResource(MemoryResource):
     seqlen_q: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     seqlen_k: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     kv_tile_start: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    cached_seqlen_kv: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def __init__(
         self,
@@ -399,6 +500,8 @@ class GmemQKVResource(MemoryResource):
         cum_seqlen_k: cute.Tensor | None,
         q_offset: int | Int32,
         cfg: FmhaConfig,
+        seqlens_kv: cute.Pointer | None = None,
+        max_seq_len_kv: Int32 | int | None = None,
         **kwargs: Any,
     ) -> None:
         """Bind Q/K/V descriptors, optional varlen metadata, and FMHA config."""
@@ -409,6 +512,8 @@ class GmemQKVResource(MemoryResource):
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
         self.q_offset_default = q_offset
+        self.seqlens_kv = seqlens_kv
+        self.max_seq_len_kv = max_seq_len_kv
         self.cfg = cfg
         self.seq_coord = TaskLocalVariable(
             dtype=Int32,
@@ -465,6 +570,11 @@ class GmemQKVResource(MemoryResource):
             default=Int32(0),
             docs="First K/V loop tile for sliding-window FMHA.",
         )
+        self.cached_seqlen_kv = TaskLocalVariable(
+            dtype=Int32,
+            default=Int32(0),
+            docs="seq_len_kv cached in a register so paged K/V fires reuse one GMEM load.",
+        )
 
     @consumer_work(
         returns=(
@@ -494,12 +604,9 @@ class GmemQKVResource(MemoryResource):
         GQA: head_coord indexes Q/O heads (h_q), kv_head_coord indexes K/V
         heads (h_kv). For MHA (h_r=1) they are identical.
         """
-        # Coordinate unpacking depends on tile scheduling order:
-        # causal uses HBM (head, batch, seq), dense uses MHB (seq, head, batch)
-        if cutlass.const_expr(self.cfg.is_causal):
-            head_coord, batch_coord, seq_coord = stage_info.work_tile.tile_idx
-        else:
-            seq_coord, head_coord, batch_coord = stage_info.work_tile.tile_idx
+        seq_coord, head_coord, batch_coord = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
 
         kv_head_coord = (head_coord * self.cfg.work_tile_q_heads) // self.cfg.h_r
         seq_coord_q = seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
@@ -555,6 +662,22 @@ class GmemQKVResource(MemoryResource):
             kv_tile_start,
         )
 
+    @consumer_work(returns=cached_seqlen_kv)
+    @cute.jit
+    def cache_seqlen_kv(self, stage_info: StageInfo, *, batch_coord: Int32) -> Int32:
+        """Cache seqlens_kv[batch_coord] once per work tile for paged-KV.
+
+        K/V loop fires reuse the register instead of re-reading the GMEM
+        seqlens_kv pointer every iteration. When seqlens_kv is None, falls
+        back to the static max_seq_len_kv.
+        """
+        from .helpers_paged import _load_runtime_seq_len_kv
+
+        _ = stage_info
+        return _load_runtime_seq_len_kv(
+            self.seqlens_kv, self.max_seq_len_kv, batch_coord
+        )
+
 
 def _qkv_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
     """Return the byte width of one Q/K/V tile inner dimension."""
@@ -586,7 +709,12 @@ def _pv_smem_desc_offsets(cfg: FmhaConfig) -> SmemDescOffsets:
     """Return V descriptor leading and stride byte offsets for PV MMA."""
     leading_byte_offset = 0
     if cfg.tma_copy_qkv_iters != 1:
-        leading_byte_offset = cfg.tma_copy_kv_bytes // cfg.tma_copy_qkv_iters
+        tma_copy_kv_iters = (
+            cfg.tma_copy_kv_stage_iters
+            if cfg.stage_kv_by_head_dim
+            else cfg.tma_copy_qkv_iters
+        )
+        leading_byte_offset = cfg.tma_copy_kv_bytes // tma_copy_kv_iters
     stride_byte_offset = (
         cfg.pv_mma_tiler[1] * cfg.v_dtype.width // cfg.tma_copy_qkv_iters
     )
@@ -595,7 +723,7 @@ def _pv_smem_desc_offsets(cfg: FmhaConfig) -> SmemDescOffsets:
 
 def _smem_o_swizzle(cfg: FmhaConfig) -> cutlass.Swizzle:
     """Return the shared-memory swizzle used when staging O for TMA store."""
-    inner_dim_size = cfg.tma_copy_o_granu_inner * cfg.o_dtype.width // 8
+    inner_dim_size = _qkv_inner_dim_size_bytes(cfg)
     if inner_dim_size % 128 == 0:
         return cutlass.Swizzle(3, 4, 3)
     if inner_dim_size == 64:
@@ -764,6 +892,205 @@ class SmemQResource(MemoryResource):
 
 
 # ---------------------------------------------------------------------------
+# SmemPageOffsetsKvResource -- paged-KV page-table cache in SMEM
+# ---------------------------------------------------------------------------
+
+
+@dataclass(kw_only=True)
+class SmemPageOffsetsKvResource(MemoryResource):
+    """Paged-KV logical-to-physical page IDs staged in SMEM (context kernel).
+
+    Mirrors the decode-side resource: a dedicated warp prefetches page-table
+    entries for the next K/V tile so the TMA load warp can read SMEM-cached
+    offsets. Each pipeline stage holds 32 i32 page IDs from one side of the
+    page table; all 32 lanes co-load one cache-line per fire. ``page_ids``
+    slices ``pages_per_tile`` entries for the current tile.
+
+    Differences from decode:
+    - Single ``load_k`` / ``load_v`` producer pair (context has no
+      ``num_insts_kv > 1`` four-way split).
+    - Consumer release labels bind to ``{"k_load", "v_load"}`` (matching
+      ``SmemKVResource`` producer names).
+    - Driven by ``cfg.empty_warp_id`` (warp 15 for D128, warp 11 for D256).
+    """
+
+    cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
+    page_idx_kv: cute.Pointer | None = field(init=False, default=None)
+    _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
+    _smem_page_offsets: cutlass.Array = field(init=False, default=None)
+
+    def __init__(
+        self,
+        page_idx_kv: cute.Pointer | None,
+        pipeline_config: PipelineConfig,
+        cfg: FmhaConfig,
+        **kwargs: Any,
+    ) -> None:
+        # ``page_ids`` runs from the downstream K/V resource, after this
+        # resource's ConsumerWait has advanced its read cursor.  Preserve the
+        # stage that was actually waited on so the nested lookup reads the
+        # matching page-table window instead of remaining pinned to stage 0.
+        # The exact 4.7 AsyncAsync factory does not expose this flag.
+        pipeline_config = replace(pipeline_config, advance_on_wait=True)
+        super().__init__(pipeline_config=pipeline_config, **kwargs)
+        self.cfg = cfg
+        self.page_idx_kv = page_idx_kv
+        num_stages = pipeline_config.num_stages if pipeline_config is not None else 1
+        # 32 i32 page IDs per stage = one cache line.
+        self._alloc = SmemAllocation(
+            "smem_page_offsets_kv",
+            size_bytes=num_stages * 32 * 4,
+            alignment=16,
+        )
+        self._smem_page_offsets = _placeholder_smem_array(Int32, num_stages * 32)
+
+    def get_smem_requirements(self) -> list[SmemAllocation]:
+        return [self._alloc]
+
+    @cute.jit
+    def _init_smem_state(self, stage_info: StageInfo) -> None:
+        smem_base = stage_info.context.smem_base
+        num_stages = (
+            self.pipeline_config.num_stages if self.pipeline_config is not None else 1
+        )
+        self._smem_page_offsets = cutlass.Array(
+            smem_base.data_ptr() + self._alloc.offset,
+            dtype=cutlass.Int32,
+            shape=(num_stages * 32,),
+            addrspace=3,
+        )
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_load_state(self, stage_info: StageInfo) -> None:
+        self._init_smem_state(stage_info)
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_read_state(self, stage_info: StageInfo) -> None:
+        self._init_smem_state(stage_info)
+
+    @cute.jit
+    def page_ids(self, tile_idx: Int32) -> cutlass.Array:
+        """Slice ``pages_per_tile`` entries from the cached 32-entry stage.
+
+        ``tile_idx`` is the runtime-resolved K/V tile index (same expression
+        the page-offsets producer uses). The 32-page-aligned base is implicit
+        in the stage's contents; this LDS picks the per-tile entries.
+        """
+        cfg = self.cfg
+        pages_per_tile = cfg.kv_tile_n // cfg.num_tokens_per_page
+        group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(31)
+        offset = self.consumer_work_stage * Int32(32) + group_page_idx
+        if cutlass.const_expr(pages_per_tile == 4):
+            return self._smem_page_offsets.load(offset, vector_size=4, alignment=16)
+        if cutlass.const_expr(pages_per_tile == 2):
+            return self._smem_page_offsets.load(offset, vector_size=2, alignment=8)
+        return self._smem_page_offsets.load(offset, vector_size=1, alignment=4)
+
+    @cute.jit
+    def _producer_load_page_offsets(
+        self,
+        stage_info: StageInfo,
+        is_v: int,
+        tile_offset: cutlass.Constexpr[int] = 0,
+        *,
+        batch_coord: Int32,
+        kv_tile_start: Int32,
+        cached_seqlen_kv: Int32,
+    ) -> None:
+        from .helpers_paged import (
+            _runtime_last_valid_page_idx,
+            _resolve_kv_tile_idx_context,
+        )
+
+        cfg = self.cfg
+        # Context's K/V tile index is kv_tile_start + loop_offset; for V the
+        # producer runs one tile ahead in TAIL, so reuse the same expression
+        # but consult kv_tile_start with the loop's stage_info.
+        tile_idx = _resolve_kv_tile_idx_context(
+            stage_info, kv_tile_start, tile_offset=tile_offset
+        )
+        pages_per_tile = Int32(cfg.kv_tile_n // cfg.num_tokens_per_page)
+        page_idx_ub = _runtime_last_valid_page_idx(cfg, cached_seqlen_kv)
+
+        # K and V page tables are interleaved per batch:
+        #   [b][0][p] = K page at logical position p
+        #   [b][1][p] = V page at logical position p
+        page_table_offset = batch_coord * Int32(2 * cfg.max_num_pages_per_seq_kv)
+        if cutlass.const_expr(is_v):
+            page_table_offset += Int32(cfg.max_num_pages_per_seq_kv)
+
+        page_idx_kv = self.page_idx_kv
+        smem_page_offsets = self._smem_page_offsets
+        lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
+        # All 32 lanes coalesce one cache-line read aligned to a 32-page
+        # window; subsequent producer fires that target the same window hit
+        # L2. Consumers slice per-tile entries via ``page_ids``.
+        grouped_base_page_idx = ((tile_idx * pages_per_tile) >> Int32(5)) << Int32(5)
+        grouped_logical_page_idx = cute.math.min(
+            grouped_base_page_idx + lane_idx, page_idx_ub
+        )
+        grouped_smem_offset = stage_info.stage_idx * Int32(32) + lane_idx
+        smem_page_offsets[grouped_smem_offset] = Int32(
+            page_idx_kv[page_table_offset + grouped_logical_page_idx]
+        )
+
+    @producer_work
+    @cute.jit
+    def load_k(
+        self,
+        stage_info: StageInfo,
+        *,
+        batch_coord: Int32,
+        kv_tile_start: Int32,
+        cached_seqlen_kv: Int32,
+    ) -> None:
+        """Prefetch K-side page IDs for the current K tile."""
+        self._producer_load_page_offsets(
+            stage_info,
+            is_v=0,
+            batch_coord=batch_coord,
+            kv_tile_start=kv_tile_start,
+            cached_seqlen_kv=cached_seqlen_kv,
+        )
+
+    @producer_work
+    @cute.jit
+    def load_v(
+        self,
+        stage_info: StageInfo,
+        *,
+        previous: cutlass.Constexpr[bool] = False,
+        batch_coord: Int32,
+        kv_tile_start: Int32,
+        cached_seqlen_kv: Int32,
+    ) -> None:
+        """Prefetch V-side page IDs for the current V tile."""
+        self._producer_load_page_offsets(
+            stage_info,
+            is_v=1,
+            tile_offset=-1 if previous else 0,
+            batch_coord=batch_coord,
+            kv_tile_start=kv_tile_start,
+            cached_seqlen_kv=cached_seqlen_kv,
+        )
+
+    @consumer_work
+    @cute.jit
+    def read_offsets(self, stage_info: StageInfo) -> None:
+        return
+
+    def dma_consumer_release_labels_for(
+        self, downstream: MemoryResource
+    ) -> set[str] | None:
+        """Bind page-offset releases to the K/V TMA loads that consumed them."""
+        if isinstance(downstream, SmemKVResource):
+            return {"k_load", "v_load", "k_load_stage", "v_load_stage"}
+        return None
+
+
+# ---------------------------------------------------------------------------
 # SmemKVResource -- SMEM K/V tile buffer with TMA pipeline
 # ---------------------------------------------------------------------------
 
@@ -780,6 +1107,9 @@ class SmemKVResource(MemoryResource):
     sK_array: cutlass.Array = field(init=False, default=None)
     tma_k_desc: cutlass.Pointer | None = field(init=False, default=None)
     tma_v_desc: cutlass.Pointer | None = field(init=False, default=None)
+    page_offsets_kv: Optional["SmemPageOffsetsKvResource"] = field(
+        init=False, default=None
+    )
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     desc_k_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -791,12 +1121,14 @@ class SmemKVResource(MemoryResource):
         tma_v_desc: cutlass.Pointer | None,
         pipeline_config: PipelineConfig,
         cfg: FmhaConfig,
+        page_offsets_kv: Optional["SmemPageOffsetsKvResource"] = None,
         **kwargs: Any,
     ) -> None:
         """Bind K/V TMA descriptors and reserve shared SMEM staging."""
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.tma_k_desc = tma_k_desc
         self.tma_v_desc = tma_v_desc
+        self.page_offsets_kv = page_offsets_kv
         self.cfg = cfg
         total_elements = cfg.sK_shape[0] * cfg.sK_shape[1]
         size_bytes = total_elements * cfg.k_dtype.width // 8
@@ -852,6 +1184,9 @@ class SmemKVResource(MemoryResource):
         self,
         stage_info: StageInfo,
         tma_desc: cutlass.Pointer | None,
+        is_v: cutlass.Constexpr[bool] = False,
+        tile_offset: cutlass.Constexpr[int] = 0,
+        head_dim_stage_idx: cutlass.Constexpr[int] = 0,
         *,
         kv_head_coord: Int32,
         batch_coord: Int32,
@@ -859,14 +1194,50 @@ class SmemKVResource(MemoryResource):
         kv_tile_start: Int32,
     ) -> None:
         """Issue TMA bulk-copy for one K or V tile."""
-        seq_offset = (kv_tile_start + stage_info.loop_offset) * self.cfg.kv_tile_n
+        seq_offset = (
+            kv_tile_start + stage_info.loop_offset + tile_offset
+        ) * self.cfg.kv_tile_n
         smem_stage_elements = self.cfg.tma_copy_kv_elements
-        d_granu_inner = self.cfg.tma_copy_kv_granu_inner
-        seq_coord_kv = cuseqlen_k + seq_offset
         sK_curr = self.sK_array.subview(stage_info.stage_idx * smem_stage_elements)
 
-        for i in cutlass.range_constexpr(self.cfg.tma_copy_qkv_iters):
-            d_offset = i * d_granu_inner
+        if cutlass.const_expr(self.cfg.use_paged_kv):
+            # Paged-KV path: read pre-staged page IDs and issue one TMA per
+            # (page fragment, d fragment). The descriptor is shaped
+            # (d_inner, num_tokens_per_page, h_kv, total_pages); coords are
+            # (d_off, 0, kv_head_coord, page_id). SMEM layout per stage matches
+            # the contiguous path: two d-halves (tma_copy_kv_granu_elems each)
+            # with page fragments concatenated along the seq axis inside each
+            # d-half.
+            tile_idx = kv_tile_start + stage_info.loop_offset + tile_offset
+            pages_per_tile = self.cfg.kv_tile_n // self.cfg.num_tokens_per_page
+            d_granu_inner = self.cfg.tma_copy_kv_granu_inner
+            page_d_elems = self.cfg.num_tokens_per_page * d_granu_inner
+            d_iter_elems = self.cfg.tma_copy_kv_granu_elems
+            if prims.elect_sync():
+                page_ids = self.page_offsets_kv.page_ids(tile_idx)
+                for frag in cutlass.range_constexpr(pages_per_tile):
+                    page_id = Int32(page_ids[frag])
+                    for i in cutlass.range_constexpr(self.cfg.tma_copy_kv_stage_iters):
+                        d_offset = Int32(
+                            head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
+                            + i * d_granu_inner
+                        )
+                        smem_offset = Int32(i * d_iter_elems + frag * page_d_elems)
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            sK_curr.subview(smem_offset),
+                            tma_desc,
+                            (d_offset, Int32(0), kv_head_coord, page_id),
+                            stage_info.barrier,
+                        )
+            return
+
+        d_granu_inner = self.cfg.tma_copy_kv_granu_inner
+        seq_coord_kv = cuseqlen_k + seq_offset
+
+        for i in cutlass.range_constexpr(self.cfg.tma_copy_kv_stage_iters):
+            d_offset = (
+                head_dim_stage_idx * self.cfg.head_dim_per_stage_kv + i * d_granu_inner
+            )
             kv_coords = (d_offset, kv_head_coord, seq_coord_kv, batch_coord)
             if cutlass.const_expr(self.cfg.has_varlen):
                 kv_coords = (d_offset, kv_head_coord, seq_coord_kv)
@@ -884,6 +1255,7 @@ class SmemKVResource(MemoryResource):
         self,
         stage_info: StageInfo,
         *,
+        head_dim_stage_idx: cutlass.Constexpr[int] = 0,
         kv_head_coord: Int32,
         batch_coord: Int32,
         cuseqlen_k: Int32,
@@ -893,6 +1265,31 @@ class SmemKVResource(MemoryResource):
         self._tma_load(
             stage_info,
             self.tma_k_desc,
+            head_dim_stage_idx=head_dim_stage_idx,
+            kv_head_coord=kv_head_coord,
+            batch_coord=batch_coord,
+            cuseqlen_k=cuseqlen_k,
+            kv_tile_start=kv_tile_start,
+        )
+
+    @producer_work
+    @cute.jit
+    def k_load_stage(
+        self,
+        stage_info: StageInfo,
+        *,
+        stage_id: Constexpr[int],
+        kv_head_coord: Int32,
+        batch_coord: Int32,
+        cuseqlen_k: Int32,
+        kv_tile_start: Int32,
+    ) -> None:
+        """TMA load one K head-dim stage for split D scheduling."""
+        self._tma_load(
+            stage_info,
+            self.tma_k_desc,
+            False,
+            head_dim_stage_idx=stage_id,
             kv_head_coord=kv_head_coord,
             batch_coord=batch_coord,
             cuseqlen_k=cuseqlen_k,
@@ -905,6 +1302,7 @@ class SmemKVResource(MemoryResource):
         self,
         stage_info: StageInfo,
         *,
+        head_dim_stage_idx: cutlass.Constexpr[int] = 0,
         kv_head_coord: Int32,
         batch_coord: Int32,
         cuseqlen_k: Int32,
@@ -914,6 +1312,34 @@ class SmemKVResource(MemoryResource):
         self._tma_load(
             stage_info,
             self.tma_v_desc,
+            True,
+            head_dim_stage_idx=head_dim_stage_idx,
+            kv_head_coord=kv_head_coord,
+            batch_coord=batch_coord,
+            cuseqlen_k=cuseqlen_k,
+            kv_tile_start=kv_tile_start,
+        )
+
+    @producer_work
+    @cute.jit
+    def v_load_stage(
+        self,
+        stage_info: StageInfo,
+        *,
+        stage_id: Constexpr[int],
+        previous: Constexpr[bool] = False,
+        kv_head_coord: Int32,
+        batch_coord: Int32,
+        cuseqlen_k: Int32,
+        kv_tile_start: Int32,
+    ) -> None:
+        """TMA load one current or previous V head-dim stage."""
+        self._tma_load(
+            stage_info,
+            self.tma_v_desc,
+            True,
+            tile_offset=-1 if previous else 0,
+            head_dim_stage_idx=stage_id,
             kv_head_coord=kv_head_coord,
             batch_coord=batch_coord,
             cuseqlen_k=cuseqlen_k,
@@ -958,7 +1384,7 @@ class SmemKVResource(MemoryResource):
 
 @dataclass(kw_only=True)
 class TmemSPResource(MemoryResource):
-    """TMEM S/P ping-pong buffer with UmmaAsync pipeline (1 stage).
+    """TMEM S/P ping-pong buffer with UmmaAsync pipeline.
 
     Producer: MMA warp writes S = Q*K scores, then reads P for P*V.
     Consumer: Softmax warp reads S, computes P = softmax(S), writes P back.
@@ -1017,7 +1443,10 @@ class TmemSPResource(MemoryResource):
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
         self.scale_softmax_log2 = scale_softmax_log2
-        self._alloc = TmemAllocation(f"tmem_sp_q{q_half}", 128)
+        self._alloc = TmemAllocation(
+            f"tmem_sp_q{q_half}",
+            cfg.qk_mma_tiler[1] * cfg.mma_softmax_stage,
+        )
         self.tmem_addr_cached = Int32(0)
         self.tmem_ptr_s_cached = _placeholder_tmem_ptr()
         self.tmem_s_addr_cached = Int32(0)
@@ -1139,6 +1568,14 @@ class TmemSPResource(MemoryResource):
         """Return whether peer0 needs the extra wholly-invalid tail slot."""
         return self.cfg.skip_causal_invalid_peer0 and self.q_half == 0
 
+    @cute.jit
+    def _stage_col_offset(self, stage_info: StageInfo) -> Int32 | int:
+        """Return the TMEM column offset for a pipelined S/P stage."""
+        stage_col_offset = Int32(0)
+        if cutlass.const_expr(self.cfg.mma_softmax_stage > 1):
+            stage_col_offset = stage_info.stage_idx * self.cfg.qk_mma_tiler[1]
+        return stage_col_offset
+
     @producer_work
     @cute.jit
     def qk_mma(
@@ -1148,6 +1585,7 @@ class TmemSPResource(MemoryResource):
         desc_q_base: prims.Tcgen05SmemDesc,
         desc_k_base: prims.Tcgen05SmemDesc,
         section: cutlass.Constexpr[FmhaStage],
+        head_dim_stage_idx: cutlass.Constexpr[int] = 0,
         is_tail: cutlass.Constexpr[bool] = False,
     ) -> None:
         """QK MMA: compute Q*K -> S in TMEM.
@@ -1170,7 +1608,9 @@ class TmemSPResource(MemoryResource):
                     )
 
         if not skip_qk0_invalid:
-            tmem_ptr_s = self.tmem_ptr_s_cached
+            tmem_ptr_s = self.tmem_ptr_s_cached.subview(
+                self._stage_col_offset(stage_info)
+            )
 
             if cutlass.const_expr(self.cfg.q_dtype.width == 8):
                 mma_kind = prims.Tcgen05MMAKind.F8F6F4
@@ -1197,12 +1637,15 @@ class TmemSPResource(MemoryResource):
             num_kphases_qk = self.cfg.qk_mma_tiler[2] // k_dim_per_mma
             inc_bytes_qk = k_dim_per_mma * self.cfg.q_dtype.width // 8
 
-            if cutlass.const_expr(self.cfg.tma_copy_qkv_iters == 1):
-                extra_bytes_qk = inc_bytes_qk * (num_kphases_qk // 2)
-            else:
-                extra_bytes_qk = (
-                    self.cfg.tma_copy_kv_bytes // self.cfg.tma_copy_qkv_iters
+            num_kphases_per_tma = num_kphases_qk // self.cfg.tma_copy_qkv_iters
+            chunk_bytes_qk = inc_bytes_qk * num_kphases_per_tma
+            if cutlass.const_expr(self.cfg.tma_copy_qkv_iters != 1):
+                chunk_bytes_qk = (
+                    self.cfg.tma_copy_kv_bytes // self.cfg.tma_copy_kv_stage_iters
                 )
+            num_tma_iters_qk = self.cfg.tma_copy_qkv_iters
+            if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
+                num_tma_iters_qk = self.cfg.tma_copy_kv_stage_iters
 
             # Prevent LLVM from rematerializing descriptor
             # computations inside each elect_sync basic block.
@@ -1213,35 +1656,27 @@ class TmemSPResource(MemoryResource):
             desc_k_base_ = freeze_smem_descriptor(desc_k_base)
 
             scale_d = False
-            for k_idx in cutlass.range_constexpr(num_kphases_qk // 2):
-                increment = (inc_bytes_qk * k_idx) >> 4
-                dq = desc_q_base_ + increment
-                dk = desc_k_base_ + increment
-                if prims.elect_sync():
-                    prims.tcgen05_mma(
-                        mma_kind,
-                        prims.CTAGroup.CTA_1,
-                        tmem_ptr_s,
-                        dq,
-                        dk,
-                        idesc_qk,
-                        scale_d,
-                    )
-                scale_d = True
-            for k_idx in cutlass.range_constexpr(num_kphases_qk // 2):
-                increment = (inc_bytes_qk * k_idx + extra_bytes_qk) >> 4
-                dq = desc_q_base_ + increment
-                dk = desc_k_base_ + increment
-                if prims.elect_sync():
-                    prims.tcgen05_mma(
-                        mma_kind,
-                        prims.CTAGroup.CTA_1,
-                        tmem_ptr_s,
-                        dq,
-                        dk,
-                        idesc_qk,
-                        scale_d,
-                    )
+            if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
+                scale_d = head_dim_stage_idx != 0
+            for tma_iter in cutlass.range_constexpr(num_tma_iters_qk):
+                q_tma_iter = head_dim_stage_idx * num_tma_iters_qk + tma_iter
+                q_tma_iter_offset = chunk_bytes_qk * q_tma_iter
+                k_tma_iter_offset = chunk_bytes_qk * tma_iter
+                for k_idx in cutlass.range_constexpr(num_kphases_per_tma):
+                    local_increment = inc_bytes_qk * k_idx
+                    dq = desc_q_base_ + ((local_increment + q_tma_iter_offset) >> 4)
+                    dk = desc_k_base_ + ((local_increment + k_tma_iter_offset) >> 4)
+                    if prims.elect_sync():
+                        prims.tcgen05_mma(
+                            mma_kind,
+                            prims.CTAGroup.CTA_1,
+                            tmem_ptr_s,
+                            dq,
+                            dk,
+                            idesc_qk,
+                            scale_d,
+                        )
+                    scale_d = True
 
     @producer_work
     @cute.jit
@@ -1290,7 +1725,7 @@ class TmemSPResource(MemoryResource):
         # changes (ptxas sees more live values at scf.while boundary), and
         # pipeline warm-up timing shifts.
         p_chunk = []
-        for chunk_idx in cutlass.range_constexpr(num_chunks):  # noqa: B007
+        for _chunk_idx in cutlass.range_constexpr(num_chunks):
             zeros = tuple(self.cfg.qk_acc_dtype(0.0) for _ in range(tmem_x))
             p_chunk.append(cutlass.Vector.from_elements(zeros, self.cfg.qk_acc_dtype))
         return p_chunk
@@ -1360,9 +1795,10 @@ class TmemSPResource(MemoryResource):
     @cute.jit
     def _varlen_batch_coord(self, stage_info: StageInfo) -> Int32:
         """Return the batch coordinate for the active tile-order policy."""
-        if cutlass.const_expr(self.cfg.is_causal):
-            return stage_info.work_tile.tile_idx[1]
-        return stage_info.work_tile.tile_idx[2]
+        _, _, batch_coord = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
+        return batch_coord
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=q_offset)
     @cute.jit
@@ -1390,9 +1826,9 @@ class TmemSPResource(MemoryResource):
         return Int32(self.cum_seqlen_k[batch_coord + Int32(1)]) - cuseqlen_k
 
     @cute.jit
-    def _load_s_chunks(self) -> SoftmaxChunks:
+    def _load_s_chunks(self, stage_info: StageInfo) -> SoftmaxChunks:
         """Load ALL S chunks from TMEM into register vectors."""
-        tmem_s_addr = self.tmem_s_addr_cached
+        tmem_s_addr = self.tmem_s_addr_cached + self._stage_col_offset(stage_info)
         tmem_shape = "32x32b"
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
@@ -1437,11 +1873,12 @@ class TmemSPResource(MemoryResource):
     @cute.jit
     def _exp2_p_store(
         self,
+        stage_col_offset: TmemAddr,
         row_max: SoftmaxScalar,
         scale_softmax_log2: SoftmaxScalar,
     ) -> SoftmaxChunks:
         """Apply exp2 softmax P, fold the PV P scale, and store P to TMEM."""
-        tmem_p_addr = self.tmem_p_addr_cached
+        tmem_p_addr = self.tmem_p_addr_cached + stage_col_offset
         tmem_shape = "32x32b"
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
@@ -1506,7 +1943,7 @@ class TmemSPResource(MemoryResource):
         row_max: SoftmaxScalar,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Main K-loop stage: load S from TMEM and compute unmasked row_max."""
-        s_data = self._load_s_chunks()
+        s_data = self._load_s_chunks(stage_info)
         return self._reduce_row_max(s_data, row_max)
 
     @consumer_work(returns=(old_row_max, row_max))
@@ -1520,7 +1957,7 @@ class TmemSPResource(MemoryResource):
         """Exclude TMA zero-fill lanes in a partial fixed dense K/V tile."""
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
-        s_data = self._load_s_chunks()
+        s_data = self._load_s_chunks(stage_info)
 
         if stage_info.loop_offset == stage_info.loop_end - Int32(1):
             neg_inf = cutlass.vector.full(
@@ -1552,15 +1989,10 @@ class TmemSPResource(MemoryResource):
         seqlen_k: Int32,
         section: cutlass.Constexpr[FmhaStage],
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """Mask scores beyond one packed request's K/V right edge.
-
-        Packed requests share the maximum K-tile domain. Consequently this
-        must mask both a request's partial final tile and any later tiles that
-        are wholly outside that request but still address packed storage.
-        """
+        """Mask scores beyond one packed request's K/V right edge."""
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
-        s_data = self._load_s_chunks()
+        s_data = self._load_s_chunks(stage_info)
         if cutlass.const_expr(section == FmhaStage.Loop):
             kv_tile_idx = stage_info.loop_offset
         else:
@@ -1599,9 +2031,11 @@ class TmemSPResource(MemoryResource):
         tmem_row_id = warp_id_in_sg * cute.arch.WARP_SIZE
         row_in_tile = tmem_row_id + cute.arch.lane_idx()
 
-        s_data = self._load_s_chunks()
+        s_data = self._load_s_chunks(stage_info)
 
-        seq_tile_coord = stage_info.work_tile.tile_idx[2]
+        seq_tile_coord, _, _ = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
         index_q = seq_tile_coord * self.cfg.q_tile_m + row_in_tile
         if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
             window_bound_left = bottom_right_window_left_bound(
@@ -1617,8 +2051,7 @@ class TmemSPResource(MemoryResource):
                 window_size_left=self.cfg.window_size_left,
             )
         else:
-            # Exact cd442 fixed equal-length fast path. Avoid threading the
-            # runtime q_offset through the hot LOOP when it is statically zero.
+            # Exact fixed equal-length fast path: q_offset is constexpr zero.
             window_bound_left = index_q - Int32(self.cfg.window_size_left)
             kv_tile_start = cute.math.max(
                 Int32(0),
@@ -1641,9 +2074,7 @@ class TmemSPResource(MemoryResource):
             mask = left_mask_inverted ^ all_true_mask
             if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
                 # Packed requests share a worst-case window span, and fixed
-                # bottom-right windows can start at a non-tile-aligned Q/K
-                # offset. In either case a LOOP tile can overlap the causal
-                # right edge instead of lying wholly before the masked TAIL.
+                # bottom-right windows can begin at a non-aligned Q/K offset.
                 window_bound_right = index_q + q_offset
                 right_oob_start_idx = window_bound_right + Int32(1) - base_k
                 right_oob_start_idx = cute.math.min(
@@ -1666,7 +2097,7 @@ class TmemSPResource(MemoryResource):
         q_offset: Int32,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Loop stage: apply causal masking for mixed Q right-offset batches."""
-        s_data = self._load_s_chunks()
+        s_data = self._load_s_chunks(stage_info)
         s_data = self._apply_causal_mask_for_kv_tile(
             stage_info, s_data, kv_tile_idx=stage_info.loop_offset, q_offset=q_offset
         )
@@ -1682,8 +2113,9 @@ class TmemSPResource(MemoryResource):
         scale_softmax_log2: SoftmaxScalar,
     ) -> SoftmaxChunks:
         """Apply exp2 using the runtime scale cached before the K/V loop."""
-        _ = stage_info
-        return self._exp2_p_store(row_max, scale_softmax_log2)
+        return self._exp2_p_store(
+            self._stage_col_offset(stage_info), row_max, scale_softmax_log2
+        )
 
     @consumer_work(returns=(old_row_max, row_max))
     @cute.jit
@@ -1706,9 +2138,11 @@ class TmemSPResource(MemoryResource):
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         num_softmax_warps = 4
         warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
-        s_data = self._load_s_chunks()
+        s_data = self._load_s_chunks(stage_info)
         if cutlass.const_expr(self.cfg.is_causal):
-            seq_tile_coord = stage_info.work_tile.tile_idx[2]
+            seq_tile_coord, _, _ = _resolve_work_tile_coords(
+                self.cfg, stage_info.work_tile.tile_idx
+            )
             tmem_row_id = warp_id_in_sg * cute.arch.WARP_SIZE
             row_in_tile = tmem_row_id + cute.arch.lane_idx()
             index_q = seq_tile_coord * self.cfg.q_tile_m + row_in_tile
@@ -1786,23 +2220,19 @@ class TmemSPResource(MemoryResource):
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         num_softmax_warps = 4
         warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
-        seq_coord = stage_info.work_tile.tile_idx[2]
+        seq_coord, _, _ = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
+        kv_base = kv_tile_idx * self.cfg.kv_tile_n
         q_min = (
             q_offset
             + seq_coord * self.cfg.cta_tiler[0]
             + self.q_half * self.cfg.q_tile_m
         )
-        kv_base = kv_tile_idx * self.cfg.kv_tile_n
         k_max = kv_base + self.cfg.qk_mma_tiler[1] - Int32(1)
         need_mask = q_min <= k_max
         if need_mask:
-            q_idx = (
-                q_offset
-                + seq_coord * self.cfg.cta_tiler[0]
-                + self.q_half * self.cfg.q_tile_m
-                + warp_id_in_sg * cute.arch.WARP_SIZE
-                + cute.arch.lane_idx()
-            )
+            q_idx = q_min + warp_id_in_sg * cute.arch.WARP_SIZE + cute.arch.lane_idx()
             for chunk_idx in cutlass.range_constexpr(num_chunks):
                 k_chunk_base = kv_base + chunk_idx * tmem_x
                 num_valid = cute.math.min(
@@ -1840,7 +2270,7 @@ class TmemSPResource(MemoryResource):
         q_offset: Int32,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Tail stage: load S, apply causal mask, and compute row_max."""
-        s_data = self._load_s_chunks()
+        s_data = self._load_s_chunks(stage_info)
         if cutlass.const_expr(self.cfg.is_causal):
             s_data = self._apply_causal_mask(stage_info, s_data, q_offset)
         return self._reduce_row_max(s_data, row_max)
@@ -1855,8 +2285,9 @@ class TmemSPResource(MemoryResource):
         scale_softmax_log2: SoftmaxScalar,
     ) -> SoftmaxChunks:
         """Tail stage: apply exp2 using the cached runtime softmax scale."""
-        _ = stage_info
-        return self._exp2_p_store(row_max, scale_softmax_log2)
+        return self._exp2_p_store(
+            self._stage_col_offset(stage_info), row_max, scale_softmax_log2
+        )
 
     @consumer_work(returns=(old_row_max, row_max))
     @cute.jit
@@ -1951,6 +2382,62 @@ class TmemSPResource(MemoryResource):
 
 
 # ---------------------------------------------------------------------------
+# TmemPResource -- P-ready handoff from softmax to UMMA
+# ---------------------------------------------------------------------------
+
+
+@dataclass(kw_only=True)
+class TmemPResource(MemoryResource):
+    """Pipeline-only P handoff for split S/P scheduling.
+
+    Softmax stores P into the TMEM columns owned by ``TmemSPResource`` and
+    commits this AsyncUmma resource. The MMA task waits on it before issuing
+    PV, so the next QK can use the other S/P stage without using the S acquire
+    as an implicit P-ready wait.
+    """
+
+    cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
+    tmem_p_offset: Constexpr[int] = field(init=False, default=None)
+    tmem_p_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    def __init__(
+        self,
+        pipeline_config: PipelineConfig,
+        cfg: FmhaConfig,
+        tmem_p_offset: int,
+        **kwargs: Any,
+    ) -> None:
+        """Bind the base P TMEM offset used by the split S/P pipeline."""
+        super().__init__(pipeline_config=pipeline_config, **kwargs)
+        self.cfg = cfg
+        self.tmem_p_offset = tmem_p_offset
+        self.tmem_p_base = TaskLocalVariable(
+            dtype=Int32,
+            default=Int32(tmem_p_offset),
+            docs="Selected staged P TMEM column base for PV MMA.",
+        )
+
+    def get_tmem_requirements(self) -> list[TmemAllocation]:
+        """Return no allocation because P aliases the TmemSP allocation."""
+        return []
+
+    @cute.jit
+    def create_function_variables(self, context: Optional[Any] = None) -> Int32:
+        """Create the staged P-base dataflow slot."""
+        _ = context
+        return Int32(self.tmem_p_offset)
+
+    @consumer_work(returns=("tmem_p_base",))
+    @cute.jit
+    def p_base(self, stage_info: StageInfo) -> Int32:
+        """Return the staged P column base for the MMA PV producer."""
+        tmem_p_base = Int32(self.tmem_p_offset)
+        if cutlass.const_expr(self.cfg.mma_softmax_stage > 1):
+            tmem_p_base = tmem_p_base + stage_info.stage_idx * self.cfg.qk_mma_tiler[1]
+        return tmem_p_base
+
+
+# ---------------------------------------------------------------------------
 # TmemStatsResource -- TMEM correction statistics with AsyncAsync pipeline
 # ---------------------------------------------------------------------------
 
@@ -1993,7 +2480,7 @@ class TmemStatsResource(MemoryResource):
         self.tmem_vec_offset = tmem_vec_offset
         self.scale_softmax_log2 = scale_softmax_log2
         self.output_scale = output_scale
-        self._alloc = TmemAllocation(f"tmem_vec_{tmem_vec_offset}", 4)
+        self._alloc = TmemAllocation(f"tmem_vec_{tmem_vec_offset}", cfg.tmem_stats_cols)
         self.tmem_addr_cached = Int32(0)
         self.tmem_vec_addr_cached = Int32(0)
         self.tmem_ptr_vec_cached = _placeholder_tmem_ptr()
@@ -2112,6 +2599,14 @@ class TmemStatsResource(MemoryResource):
     def init_read_work_tile_state(self, stage_info: StageInfo) -> None:
         self._init_work_tile_state(stage_info)
 
+    @cute.jit
+    def _stage_col_offset(self, stage_info: StageInfo) -> Int32 | int:
+        """Return the TMEM column offset for stage-scoped stats."""
+        stage_col_offset = Int32(0)
+        if cutlass.const_expr(self.cfg.stage_scoped_tmem_stats):
+            stage_col_offset = stage_info.stage_idx * self.cfg.qk_mma_tiler[1]
+        return stage_col_offset
+
     @producer_work
     @cute.jit
     def store_vec(
@@ -2138,9 +2633,13 @@ class TmemStatsResource(MemoryResource):
             (old_row_max, row_max, row_sum, Float32(0.0)),
             self.cfg.qk_acc_dtype,
         )
+        tmem_ptr_vec = prims.make_tmem_ptr(
+            self.tmem_vec_addr_cached + self._stage_col_offset(stage_info),
+            cutlass.Int8,
+        )
         prims.tcgen05_st(
             "32x32b",
-            self.tmem_ptr_vec_cached,
+            tmem_ptr_vec,
             vec_data,
         )
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
@@ -2166,10 +2665,11 @@ class TmemStatsResource(MemoryResource):
         """
         tmem_shape_vec = "32x32b"
         # Vector layout: [old_max, new_max, row_sum, pad].
-        tmem_x_vec = 4
+        tmem_x_vec = self.cfg.tmem_stats_cols
 
         tmem_ptr_vec = prims.make_tmem_ptr(
-            self.tmem_vec_addr_cached, self.cfg.qk_acc_dtype
+            self.tmem_vec_addr_cached + self._stage_col_offset(stage_info),
+            self.cfg.qk_acc_dtype,
         )
         vec_rmem = cutlass.Array(self.cfg.qk_acc_dtype, tmem_x_vec)
         vec_rmem[0:tmem_x_vec] = prims.tcgen05_ld(
@@ -2218,6 +2718,8 @@ class TmemOResource(MemoryResource):
     # Precomputed per-warp TMEM O address base: (row_id << 16) | tmem_base_col.
     # consumer_work adds tmem_o_offset to get the final O0/O1 address.
     tmem_o_addr_base_cached: TmemAddr | None = field(init=False, default=None)
+    # P-stage base supplied by TmemPResource for split S/P scheduling.
+    tmem_p_base_cached: TmemAddr | None = field(init=False, default=None)
     # References to TmemStats resources for reading cached correction stats.
     # consumer_work reads stats from these instead of from TMEM, because
     # the stats TMEM region overlaps with S0/S1 and can be overwritten by
@@ -2279,6 +2781,7 @@ class TmemOResource(MemoryResource):
             self.tmem_addr_cached, cutlass.Int8
         )
         self.tmem_o_addr_base_cached = Int32(0)
+        self.tmem_p_base_cached = Int32(0)
         _ = stage_info
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -2313,6 +2816,13 @@ class TmemOResource(MemoryResource):
     def init_correction_work_tile_state(self, stage_info: StageInfo) -> None:
         self._init_work_tile_state(stage_info)
 
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def set_p_base(self, stage_info: StageInfo, *, tmem_p_base: Int32) -> None:
+        """Cache the P TMEM column base selected by TmemPResource."""
+        _ = stage_info
+        self.tmem_p_base_cached = tmem_p_base
+
     @producer_work
     @cute.jit
     def pv_mma(
@@ -2321,6 +2831,7 @@ class TmemOResource(MemoryResource):
         *,
         desc_v_base: prims.Tcgen05SmemDesc,
         section: cutlass.Constexpr[FmhaStage],
+        head_dim_stage_idx: cutlass.Constexpr[int] = 0,
         inst_idx: cutlass.Constexpr[int] = 0,
         is_tail: cutlass.Constexpr[bool] = False,
     ) -> None:
@@ -2377,11 +2888,28 @@ class TmemOResource(MemoryResource):
                 c_dtype=cutlass.Float32,
                 a_dtype=ab_format,
                 b_dtype=ab_format,
-                n_dim=self.cfg.pv_mma_tiler[1],
+                n_dim=(
+                    self.cfg.head_dim_per_stage_kv
+                    if self.cfg.single_qkv_instance and self.cfg.pv_mma_tiler[1] == 256
+                    else self.cfg.pv_mma_tiler[1]
+                ),
                 m_dim=self.cfg.pv_mma_tiler[0],
                 # V is row-major / MN-major.
                 b_major=1,
             )
+
+            pv_n_dim = self.cfg.pv_mma_tiler[1]
+            num_head_dim_stages = 1
+            if cutlass.const_expr(
+                self.cfg.single_qkv_instance and self.cfg.pv_mma_tiler[1] == 256
+            ):
+                pv_n_dim = self.cfg.head_dim_per_stage_kv
+                num_head_dim_stages = self.cfg.pv_mma_tiler[1] // pv_n_dim
+            head_dim_stage_start = 0
+            num_head_dim_stages_to_issue = num_head_dim_stages
+            if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
+                num_head_dim_stages_to_issue = 1
+                head_dim_stage_start = head_dim_stage_idx
 
             k_dim_per_mma = 16
             if cutlass.const_expr(self.cfg.v_dtype.width != 16):
@@ -2390,20 +2918,31 @@ class TmemOResource(MemoryResource):
             inc_tmem_p = (
                 k_dim_per_mma * self.cfg.v_dtype.width // self.cfg.qk_acc_dtype.width
             )
+            tma_copy_iters_per_head_dim_stage = (
+                self.cfg.tma_copy_qkv_iters // num_head_dim_stages
+            )
+            if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
+                tma_copy_iters_per_head_dim_stage = self.cfg.tma_copy_kv_stage_iters
             inc_bytes_v = (
                 k_dim_per_mma
-                * (self.cfg.pv_mma_tiler[1] // self.cfg.tma_copy_qkv_iters)
+                * (pv_n_dim // tma_copy_iters_per_head_dim_stage)
                 * self.cfg.v_dtype.width
                 // 8
             )
+            kv_chunk_bytes = (
+                self.cfg.tma_copy_kv_bytes // self.cfg.tma_copy_kv_stage_iters
+            )
+            head_dim_stage_bytes_v = kv_chunk_bytes * tma_copy_iters_per_head_dim_stage
 
             # Select O buffer and P offset at trace time (compile-time constant)
-            if cutlass.const_expr(writes_o0):
+            if cutlass.const_expr(self.cfg.single_qkv_instance or writes_o0):
                 tmem_ptr_o = tmem_ptr_raw.subview(self.tmem_o0_offset)
                 tmem_p_base = self.cfg.tmem_p0_offset
             else:
                 tmem_ptr_o = tmem_ptr_raw.subview(self.tmem_o1_offset)
                 tmem_p_base = self.cfg.tmem_p1_offset
+            if cutlass.const_expr(self.cfg.single_qkv_instance):
+                tmem_p_base = self.tmem_p_base_cached
 
             # scale_d at trace time.
             # O0 (even counters): HEAD initializes O0, so all
@@ -2413,7 +2952,21 @@ class TmemOResource(MemoryResource):
             # may be the first O1 write (loop_offset=0 → scale_d=False).
             # TAIL O1: always accumulates because LOOP or the peeled iteration
             # already wrote O1 before TAIL runs.
-            if cutlass.const_expr(first_o0_write):
+            if cutlass.const_expr(self.cfg.single_qkv_instance):
+                if cutlass.const_expr(self.cfg.has_tmem_p_pipeline):
+                    if cutlass.const_expr(section == FmhaStage.Loop):
+                        scale_d = stage_info.loop_offset > stage_info.loop_start
+                    elif cutlass.const_expr(is_tail):
+                        scale_d = stage_info.loop_end > stage_info.loop_start
+                    else:
+                        scale_d = False
+                elif cutlass.const_expr(is_tail):
+                    scale_d = stage_info.loop_end > 0
+                elif cutlass.const_expr(section == FmhaStage.Loop):
+                    scale_d = stage_info.loop_offset > 0
+                else:
+                    scale_d = False
+            elif cutlass.const_expr(first_o0_write):
                 # Head O0 is the first O0 write.
                 scale_d = False
             elif cutlass.const_expr(first_o1_write_maybe and section == FmhaStage.Tail):
@@ -2431,21 +2984,48 @@ class TmemOResource(MemoryResource):
             # each elect_sync block (same pattern as QK MMA above).
             desc_v_base_ = freeze_smem_descriptor(desc_v_base)
 
-            for k_idx in cutlass.range_constexpr(num_kphases_pv):
-                dp = tmem_ptr_raw.subview(tmem_p_base + k_idx * inc_tmem_p)
-                increment = (inc_bytes_v * k_idx) >> 4
-                dv = desc_v_base_ + increment
-                if prims.elect_sync():
-                    prims.tcgen05_mma(
-                        mma_kind,
-                        prims.CTAGroup.CTA_1,
-                        tmem_ptr_o,
-                        dp,
-                        dv,
-                        idesc_pv,
-                        scale_d,
-                    )
-                scale_d = True
+            if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
+                tmem_ptr_o_stage = tmem_ptr_o.subview(head_dim_stage_start * pv_n_dim)
+                scale_d_stage = scale_d
+                for k_idx in cutlass.range_constexpr(num_kphases_pv):
+                    dp = tmem_ptr_raw.subview(tmem_p_base + k_idx * inc_tmem_p)
+                    increment = (inc_bytes_v * k_idx) >> 4
+                    dv = desc_v_base_ + increment
+                    if prims.elect_sync():
+                        prims.tcgen05_mma(
+                            mma_kind,
+                            prims.CTAGroup.CTA_1,
+                            tmem_ptr_o_stage,
+                            dp,
+                            dv,
+                            idesc_pv,
+                            scale_d_stage,
+                        )
+                    scale_d_stage = True
+            else:
+                for head_dim_stage_idx in cutlass.range_constexpr(
+                    num_head_dim_stages_to_issue
+                ):
+                    tmem_ptr_o_stage = tmem_ptr_o.subview(head_dim_stage_idx * pv_n_dim)
+                    v_stage_increment = (
+                        head_dim_stage_bytes_v * head_dim_stage_idx
+                    ) >> 4
+                    scale_d_stage = scale_d
+                    for k_idx in cutlass.range_constexpr(num_kphases_pv):
+                        dp = tmem_ptr_raw.subview(tmem_p_base + k_idx * inc_tmem_p)
+                        increment = v_stage_increment + ((inc_bytes_v * k_idx) >> 4)
+                        dv = desc_v_base_ + increment
+                        if prims.elect_sync():
+                            prims.tcgen05_mma(
+                                mma_kind,
+                                prims.CTAGroup.CTA_1,
+                                tmem_ptr_o_stage,
+                                dp,
+                                dv,
+                                idesc_pv,
+                                scale_d_stage,
+                            )
+                        scale_d_stage = True
 
     @consumer_work
     @cute.jit
@@ -2492,16 +3072,15 @@ class TmemOResource(MemoryResource):
         region overlaps with S0/S1, and MMA's QK->S can overwrite it
         between O commit and the time Correction reads here.
 
-        Uses captured loop call index: call 0 = O0+TmemStats0,
-        call 1 = O1+TmemStats1. Also forwards row_sum to SmemO.producer_vars
-        for the tail epilog.
+        Uses inst_idx to select O0/O1 and forwards row_sum to
+        SmemO.producer_vars for the tail epilog.
 
         With skip_correction enabled: uses vote_ballot_sync to check if
         old_max == new_max across all threads. If true, scale=1.0 and
         we skip the expensive TMEM load+rescale+store.
         """
         # Select O offset from captured correction-call position.
-        if cutlass.const_expr(inst_idx == 0):
+        if cutlass.const_expr(self.cfg.single_qkv_instance or inst_idx == 0):
             tmem_o_offset = self.tmem_o0_offset
         else:
             tmem_o_offset = self.tmem_o1_offset
@@ -2510,7 +3089,11 @@ class TmemOResource(MemoryResource):
         # in the last LOOP iteration. The task domain pads partial final CTAs so
         # this slot is always outside peer0's causal reach.
         skip_o0_invalid = False
-        if cutlass.const_expr(self.cfg.skip_causal_invalid_peer0 and inst_idx == 0):
+        if cutlass.const_expr(
+            self.cfg.skip_causal_invalid_peer0
+            and not self.cfg.single_qkv_instance
+            and inst_idx == 0
+        ):
             # This is O0 correction; check if this is the last LOOP iteration.
             if not is_tail:
                 skip_o0_invalid = stage_info.loop_offset == (stage_info.loop_end - 1)
@@ -2698,6 +3281,7 @@ class SmemOResource(MemoryResource):
         vec_row_sum: SoftmaxScalar,
         vec_scale: SoftmaxScalar,
         output_scale: SoftmaxScalar,
+        head_dim_stage_idx: cutlass.Constexpr[int] = 0,
     ) -> None:
         """Store O using the output scale cached before the loop."""
         self._store_o(
@@ -2705,6 +3289,7 @@ class SmemOResource(MemoryResource):
             vec_row_sum=vec_row_sum,
             vec_scale=vec_scale,
             output_scale=output_scale,
+            head_dim_stage_idx=head_dim_stage_idx,
         )
 
     @cute.jit
@@ -2715,6 +3300,7 @@ class SmemOResource(MemoryResource):
         vec_row_sum: SoftmaxScalar,
         vec_scale: SoftmaxScalar,
         output_scale: SoftmaxScalar,
+        head_dim_stage_idx: cutlass.Constexpr[int] = 0,
     ) -> None:
         """Correction + epilog: load O from TMEM, apply correction
         rescale and 1/row_sum in a single pass, convert to output
@@ -2740,15 +3326,25 @@ class SmemOResource(MemoryResource):
         tidx, _, _ = cute.arch.thread_idx()
         tid_in_wg = tidx % (cute.arch.WARP_SIZE * num_correction_warps)
 
-        tmem_offset_o = self.tmem_o_addr_base_cached + tmem_o_offset
+        o_head_dim = self.cfg.epi_tile[1]
+        tma_copy_o_iters = self.cfg.tma_copy_o_iters
+        if cutlass.const_expr(self.cfg.stage_o_by_head_dim):
+            o_head_dim = self.cfg.head_dim_per_stage_kv
+            tma_copy_o_iters = self.cfg.tma_copy_o_stage_iters
+
+        tmem_offset_o = (
+            self.tmem_o_addr_base_cached
+            + tmem_o_offset
+            + head_dim_stage_idx * o_head_dim
+        )
 
         tmem_shape = "32x32b"
         tmem_x = 16
-        num_iters = self.cfg.epi_tile[1] // tmem_x
+        num_iters = o_head_dim // tmem_x
 
         smem_o_swizzle = _smem_o_swizzle(self.cfg)
 
-        d_block_size = self.cfg.epi_tile[1] // self.cfg.tma_copy_o_iters
+        d_block_size = o_head_dim // tma_copy_o_iters
         row_offset = tid_in_wg * d_block_size
 
         for i in cutlass.range_constexpr(num_iters):
@@ -2794,10 +3390,9 @@ class SmemOResource(MemoryResource):
         self, stage_info: StageInfo
     ) -> tuple[Int32, Int32, Int32]:
         """Return output-tile coordinates for downstream GMEM TMA store."""
-        if cutlass.const_expr(self.cfg.is_causal):
-            head_coord, batch_coord, seq_coord = stage_info.work_tile.tile_idx
-        else:
-            seq_coord, head_coord, batch_coord = stage_info.work_tile.tile_idx
+        seq_coord, head_coord, batch_coord = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
         seq_coord_q = seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
         return head_coord, batch_coord, seq_coord_q
 
@@ -2875,6 +3470,7 @@ class GmemOResource(MemoryResource):
         head_coord: Int32,
         batch_coord: Int32,
         seq_coord_q: Int32,
+        head_dim_stage_idx: cutlass.Constexpr[int] = 0,
     ) -> None:
         """TMA store O from SMEM to GMEM.
 
@@ -2901,8 +3497,15 @@ class GmemOResource(MemoryResource):
             q_seq_extent = seq_end - seq_offset_o
             should_store = seq_offset_o < seq_end
 
-        for i in cutlass.range_constexpr(self.cfg.tma_copy_o_iters):
-            d_offset = i * self.cfg.tma_copy_o_granu_inner
+        tma_copy_o_iters = self.cfg.tma_copy_o_iters
+        if cutlass.const_expr(self.cfg.stage_o_by_head_dim):
+            tma_copy_o_iters = self.cfg.tma_copy_o_stage_iters
+
+        for i in cutlass.range_constexpr(tma_copy_o_iters):
+            d_offset = (
+                head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
+                + i * self.cfg.tma_copy_o_granu_inner
+            )
             o_coords = (d_offset, head_coord, seq_offset_o, batch_coord)
             if cutlass.const_expr(self.cfg.has_varlen):
                 o_coords = (d_offset, head_coord, seq_offset_o)

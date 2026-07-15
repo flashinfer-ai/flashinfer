@@ -24,6 +24,8 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from typing import Any
 
+from cutlass import Int32
+
 from ..stage import FmhaStage
 from cutlass.experimental.task_scheduling.schedule_builder import (
     domain_loop,
@@ -39,8 +41,10 @@ from .fmha_resources import (
     S0S1SequenceResource,
     SmemKVResource,
     SmemOResource,
+    SmemPageOffsetsKvResource,
     SmemQResource,
     TmemOResource,
+    TmemPResource,
     TmemSPResource,
     TmemStatsResource,
     TmemStatsDoneResource,
@@ -90,19 +94,24 @@ def _work_tile_schedule_loop(
 
 
 def _captured_loop_bounds(
+    task_class: type[Task],
     task_kwargs: dict[str, object],
 ) -> tuple[object, object, object]:
-    """Infer loop bounds for captured schedules from task kwargs."""
+    """Infer ``(start, end, step)`` loop bounds for a captured schedule.
+
+    Dense schedules pass a static ``domain``; causal schedules pass
+    ``num_kv_tiles`` and use the task class's ``get_domain`` as a dynamic end.
+    """
     loop_start = task_kwargs.pop("domain_start", 0)
     loop_step = task_kwargs.pop("step", 1)
     loop_end = task_kwargs.pop("domain", None)
-    if loop_end is None and "num_kv_tiles" in task_kwargs:
-        loop_end = task_kwargs["num_kv_tiles"] - task_kwargs.get("offset", 0)
-        if isinstance(loop_end, int):
-            loop_end = max(loop_end, 0)
     if loop_end is None:
-        # Structural fallback only; real runtime domain still comes from task kwargs.
-        loop_end = 1
+        if "num_kv_tiles" not in task_kwargs:
+            raise ValueError(
+                "create_*_task requires a 'domain' or 'num_kv_tiles' kwarg to "
+                "determine the loop end."
+            )
+        loop_end = task_class.get_domain
     return loop_start, loop_end, loop_step
 
 
@@ -112,23 +121,267 @@ def create_load_task(
     smem_kv: SmemKVResource,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
+    smem_page_offsets_kv: SmemPageOffsetsKvResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
-    """Create the one-warp TMA load task."""
-    loop_start, loop_end, loop_step = _captured_loop_bounds(task_kwargs)
+    """Create the one-warp TMA load task.
+
+    When ``smem_page_offsets_kv`` is provided (paged-KV mode), each K/V TMA
+    load is wrapped with a ``wait``/``read_offsets`` before and a ``release``
+    after, so the load warp consumes the page IDs prefetched by the configured
+    auxiliary warp.
+    """
+    loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     src = _src_resources(gmem_qkv, work_queue=work_queue)
     dst = [smem_q, smem_kv]
+    if smem_page_offsets_kv is not None:
+        src.append(smem_page_offsets_kv)
 
-    @schedule
-    def load_schedule(
+    if smem_q.cfg.single_qkv_instance and smem_q.cfg.has_tmem_p_pipeline:
+        num_head_dim_stages_k = smem_kv.cfg.num_head_dim_stages_k
+        num_head_dim_stages_v = smem_kv.cfg.num_head_dim_stages_v
+
+        def load_schedule_body(
+            gqkv: GmemQKVResource,
+            sq: SmemQResource,
+            skv: SmemKVResource,
+            spo: SmemPageOffsetsKvResource | None,
+            wq: WorkQueue | None,
+        ) -> None:
+            sq.init_load_state()
+            skv.init_load_state()
+            if spo is not None:
+                spo.init_read_state()
+            with _work_tile_schedule_loop(wq):
+                coords = gqkv.compute_coords()
+                (
+                    _seq_coord,
+                    head_coord,
+                    kv_head_coord,
+                    _head_coord_kv,
+                    batch_coord,
+                    seq_coord_q,
+                    cuseqlen_q,
+                    cuseqlen_k,
+                    seqlen_q,
+                    _seqlen_k,
+                    kv_tile_start,
+                ) = coords
+                sq.acquire()
+                sq.tma_load(
+                    seq_coord_q=seq_coord_q,
+                    head_coord=head_coord,
+                    batch_coord=batch_coord,
+                    cuseqlen_q=cuseqlen_q,
+                    seqlen_q=seqlen_q,
+                    inst_idx=0,
+                )
+                sq.commit()
+
+                for head_dim_stage_idx in range(num_head_dim_stages_k):
+                    skv.try_acquire()
+                    if spo is not None and head_dim_stage_idx == 0:
+                        spo.wait()
+                        spo.read_offsets()
+                    skv.acquire()
+                    skv.k_load_stage(
+                        stage_id=head_dim_stage_idx,
+                        kv_head_coord=kv_head_coord,
+                        batch_coord=batch_coord,
+                        cuseqlen_k=cuseqlen_k,
+                        kv_tile_start=kv_tile_start,
+                    )
+                    skv.commit()
+                if spo is not None:
+                    spo.release()
+
+                with domain_loop(loop_start + 1, loop_end, loop_step):
+                    for head_dim_stage_idx in range(num_head_dim_stages_k):
+                        skv.try_acquire()
+                        if spo is not None and head_dim_stage_idx == 0:
+                            spo.wait()
+                            spo.read_offsets()
+                        skv.acquire()
+                        skv.k_load_stage(
+                            stage_id=head_dim_stage_idx,
+                            kv_head_coord=kv_head_coord,
+                            batch_coord=batch_coord,
+                            cuseqlen_k=cuseqlen_k,
+                            kv_tile_start=kv_tile_start,
+                        )
+                        skv.commit()
+                    if spo is not None:
+                        spo.release()
+
+                    for head_dim_stage_idx in range(num_head_dim_stages_v):
+                        skv.try_acquire()
+                        if spo is not None and head_dim_stage_idx == 0:
+                            spo.wait()
+                            spo.read_offsets()
+                        skv.acquire()
+                        skv.v_load_stage(
+                            stage_id=head_dim_stage_idx,
+                            previous=True,
+                            kv_head_coord=kv_head_coord,
+                            batch_coord=batch_coord,
+                            cuseqlen_k=cuseqlen_k,
+                            kv_tile_start=kv_tile_start,
+                        )
+                        skv.commit()
+                    if spo is not None:
+                        spo.release()
+
+                for head_dim_stage_idx in range(num_head_dim_stages_v):
+                    skv.try_acquire()
+                    if spo is not None and head_dim_stage_idx == 0:
+                        spo.wait()
+                        spo.read_offsets()
+                    skv.acquire()
+                    skv.v_load_stage(
+                        stage_id=head_dim_stage_idx,
+                        previous=False,
+                        kv_head_coord=kv_head_coord,
+                        batch_coord=batch_coord,
+                        cuseqlen_k=cuseqlen_k,
+                        kv_tile_start=kv_tile_start,
+                    )
+                    skv.commit()
+                if spo is not None:
+                    spo.release()
+
+        @schedule
+        def load_schedule(
+            gqkv: GmemQKVResource,
+            sq: SmemQResource,
+            skv: SmemKVResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            load_schedule_body(gqkv, sq, skv, None, wq)
+
+        @schedule
+        def load_page_offsets_schedule(
+            gqkv: GmemQKVResource,
+            sq: SmemQResource,
+            skv: SmemKVResource,
+            spo: SmemPageOffsetsKvResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            load_schedule_body(gqkv, sq, skv, spo, wq)
+
+        if smem_page_offsets_kv is None:
+            captured_schedule = _schedule_with_work_queue(
+                load_schedule, gmem_qkv, smem_q, smem_kv, work_queue=work_queue
+            )
+        else:
+            captured_schedule = _schedule_with_work_queue(
+                load_page_offsets_schedule,
+                gmem_qkv,
+                smem_q,
+                smem_kv,
+                smem_page_offsets_kv,
+                work_queue=work_queue,
+            )
+        return task_class(
+            src_resources=src,
+            dst_resources=dst,
+            warp_idx=smem_kv.cfg.load_warp_id,
+            num_warps=1,
+            schedule=captured_schedule,
+            num_registers=smem_kv.cfg.num_regs_other,
+            name="LoadTask",
+            **task_kwargs,
+        )
+
+    if smem_q.cfg.single_qkv_instance:
+        num_head_dim_stages_k = smem_kv.cfg.num_head_dim_stages_k
+        num_head_dim_stages_v = smem_kv.cfg.num_head_dim_stages_v
+
+        @schedule
+        def load_schedule(
+            gqkv: GmemQKVResource,
+            sq: SmemQResource,
+            skv: SmemKVResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            coords = gqkv.create_function_variables()
+            sq.create_function_variables()
+            skv.create_function_variables()
+            with _work_tile_schedule_loop(wq):  # noqa: SIM117
+                with domain_loop(loop_start, loop_end, loop_step) as d:
+                    with d.first_iter():
+                        coords = gqkv.compute_coords()
+                        (
+                            _seq_coord,
+                            head_coord,
+                            kv_head_coord,
+                            _head_coord_kv,
+                            batch_coord,
+                            seq_coord_q,
+                            cuseqlen_q,
+                            cuseqlen_k,
+                            seqlen_q,
+                            _seqlen_k,
+                            kv_tile_start,
+                        ) = coords
+                        sq.acquire()
+                        sq.tma_load(
+                            seq_coord_q=seq_coord_q,
+                            head_coord=head_coord,
+                            batch_coord=batch_coord,
+                            cuseqlen_q=cuseqlen_q,
+                            seqlen_q=seqlen_q,
+                            inst_idx=0,
+                        )
+                        sq.commit()
+                    for head_dim_stage_idx in range(num_head_dim_stages_k):
+                        skv.try_acquire()
+                        skv.acquire()
+                        skv.k_load(
+                            kv_head_coord=kv_head_coord,
+                            batch_coord=batch_coord,
+                            cuseqlen_k=cuseqlen_k,
+                            kv_tile_start=kv_tile_start,
+                            head_dim_stage_idx=head_dim_stage_idx,
+                        )
+                        skv.commit()
+                    for head_dim_stage_idx in range(num_head_dim_stages_v):
+                        skv.try_acquire()
+                        skv.acquire()
+                        skv.v_load(
+                            kv_head_coord=kv_head_coord,
+                            batch_coord=batch_coord,
+                            cuseqlen_k=cuseqlen_k,
+                            kv_tile_start=kv_tile_start,
+                            head_dim_stage_idx=head_dim_stage_idx,
+                        )
+                        skv.commit()
+
+        captured_schedule = _schedule_with_work_queue(
+            load_schedule, gmem_qkv, smem_q, smem_kv, work_queue=work_queue
+        )
+        return task_class(
+            src_resources=src,
+            dst_resources=dst,
+            warp_idx=smem_kv.cfg.load_warp_id,
+            num_warps=1,
+            schedule=captured_schedule,
+            num_registers=smem_kv.cfg.num_regs_other,
+            name="LoadTask",
+            **task_kwargs,
+        )
+
+    def load_schedule_body(
         gqkv: GmemQKVResource,
         sq: SmemQResource,
         skv: SmemKVResource,
-        wq: WorkQueue | None = None,
+        spo: SmemPageOffsetsKvResource | None,
+        wq: WorkQueue | None,
     ) -> None:
-        """Captured schedule for Q/K/V TMA loads."""
+        """Shared body — paged variant adds page-offsets wait/release."""
         sq.init_load_state()
         skv.init_load_state()
+        if spo is not None:
+            spo.init_read_state()
         with _work_tile_schedule_loop(wq):  # noqa: SIM117
             # The first K-loop iteration also loads Q0/Q1. Later iterations
             # only stream the next K/V tiles through the SmemKV pipeline.
@@ -161,6 +414,9 @@ def create_load_task(
                 # Throttle TMA before reserving a KV stage.
                 skv.try_acquire()
                 # Load Ki, with K0 handled by the first iteration.
+                if spo is not None:
+                    spo.wait()
+                    spo.read_offsets()
                 skv.acquire()
                 skv.k_load(
                     kv_head_coord=kv_head_coord,
@@ -169,6 +425,8 @@ def create_load_task(
                     kv_tile_start=kv_tile_start,
                 )
                 skv.commit()
+                if spo is not None:
+                    spo.release()
                 with d.first_iter():
                     # Load Q1 for the second Q tile in this work tile.
                     sq.acquire()
@@ -184,6 +442,9 @@ def create_load_task(
                 # Throttle TMA before reserving a KV stage.
                 skv.try_acquire()
                 # Load Vi, with V0 handled by the first iteration.
+                if spo is not None:
+                    spo.wait()
+                    spo.read_offsets()
                 skv.acquire()
                 skv.v_load(
                     kv_head_coord=kv_head_coord,
@@ -192,17 +453,50 @@ def create_load_task(
                     kv_tile_start=kv_tile_start,
                 )
                 skv.commit()
+                if spo is not None:
+                    spo.release()
 
-    captured_schedule = _schedule_with_work_queue(
-        load_schedule, gmem_qkv, smem_q, smem_kv, work_queue=work_queue
-    )
+    @schedule
+    def load_schedule(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Contiguous-KV captured schedule."""
+        load_schedule_body(gqkv, sq, skv, None, wq)
+
+    @schedule
+    def load_page_offsets_schedule(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        spo: SmemPageOffsetsKvResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Paged-KV captured schedule — load warp also waits/releases page IDs."""
+        load_schedule_body(gqkv, sq, skv, spo, wq)
+
+    if smem_page_offsets_kv is None:
+        captured_schedule = _schedule_with_work_queue(
+            load_schedule, gmem_qkv, smem_q, smem_kv, work_queue=work_queue
+        )
+    else:
+        captured_schedule = _schedule_with_work_queue(
+            load_page_offsets_schedule,
+            gmem_qkv,
+            smem_q,
+            smem_kv,
+            smem_page_offsets_kv,
+            work_queue=work_queue,
+        )
     return task_class(
         src_resources=src,
         dst_resources=dst,
-        warp_idx=13,
+        warp_idx=smem_kv.cfg.load_warp_id,
         num_warps=1,
         schedule=captured_schedule,
-        num_registers=gmem_qkv.cfg.num_regs_other,
+        num_registers=smem_kv.cfg.num_regs_other,
         name="LoadTask",
         **task_kwargs,
     )
@@ -212,17 +506,248 @@ def create_mma_task(
     smem_q: SmemQResource,
     smem_kv: SmemKVResource,
     tmem_sp0: TmemSPResource,
-    tmem_sp1: TmemSPResource,
+    tmem_sp1: TmemSPResource | None,
+    tmem_p0: TmemPResource | None,
     tmem_o: TmemOResource,
     tmem_vec_done_0: TmemStatsDoneResource,
-    tmem_vec_done_1: TmemStatsDoneResource,
+    tmem_vec_done_1: TmemStatsDoneResource | None,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp MMA compute task."""
-    loop_start, loop_end, loop_step = _captured_loop_bounds(task_kwargs)
+    loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     src = _src_resources(smem_q, smem_kv, work_queue=work_queue)
+
+    if (
+        smem_q.cfg.single_qkv_instance
+        and smem_q.cfg.has_tmem_p_pipeline
+        and tmem_p0 is not None
+    ):
+        split_src = _src_resources(smem_q, smem_kv, tmem_p0, work_queue=work_queue)
+        num_head_dim_stages_k = smem_kv.cfg.num_head_dim_stages_k
+        num_head_dim_stages_v = smem_kv.cfg.num_head_dim_stages_v
+        loop_carried_head_dim_stages = 2
+        if (
+            num_head_dim_stages_k != loop_carried_head_dim_stages
+            or num_head_dim_stages_v != loop_carried_head_dim_stages
+        ):
+            raise ValueError("loop-carried split S/P scheduling expects two K/V stages")
+
+        @schedule
+        def mma_schedule(
+            sq: SmemQResource,
+            skv: SmemKVResource,
+            sp0: TmemSPResource,
+            tp0: TmemPResource,
+            to: TmemOResource,
+            vd0: TmemStatsDoneResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            sq.init_descriptor_state()
+            skv.init_descriptor_state()
+            sp0.init_mma_state()
+            to.init_mma_state()
+            with _work_tile_schedule_loop(wq):
+                sp0.init_mma_work_tile_state()
+                to.init_mma_work_tile_state()
+
+                sq.wait()
+                desc_q0_base = sq.q0_desc(inst_idx=0)
+                vd0.acquire()
+                sp0.acquire()
+                for head_dim_stage_idx in range(num_head_dim_stages_k):
+                    skv.wait()
+                    desc_k_base = skv.k_desc()
+                    sp0.qk_mma(
+                        desc_q_base=desc_q0_base,
+                        desc_k_base=desc_k_base,
+                        section=FmhaStage.Head,
+                        head_dim_stage_idx=head_dim_stage_idx,
+                    )
+                    skv.release()
+                sp0.commit()
+                vd0.commit()
+                sp0.acquire()
+
+                # Loop offset i is local to the steady state. LoadTask has
+                # already advanced K by one tile, so these waits consume K(i+1)
+                # for QK and V(i) for PV.
+                with domain_loop(loop_start, loop_end, loop_step):
+                    vd0.acquire()
+                    skv.wait()
+                    desc_k_base = skv.k_desc()
+                    sp0.qk_mma(
+                        desc_q_base=desc_q0_base,
+                        desc_k_base=desc_k_base,
+                        section=FmhaStage.Loop,
+                        head_dim_stage_idx=0,
+                    )
+                    skv.release()
+
+                    skv.wait()
+                    desc_k_base = skv.k_desc()
+                    sp0.qk_mma(
+                        desc_q_base=desc_q0_base,
+                        desc_k_base=desc_k_base,
+                        section=FmhaStage.Loop,
+                        head_dim_stage_idx=1,
+                    )
+                    skv.release()
+                    sp0.commit()
+                    vd0.commit()
+                    sp0.acquire()
+
+                    to.acquire()
+                    tp0.wait()
+                    tmem_p_base = tp0.p_base()
+                    to.set_p_base(tmem_p_base=tmem_p_base)
+
+                    skv.wait()
+                    desc_v_base = skv.v_desc()
+                    to.pv_mma(
+                        desc_v_base=desc_v_base,
+                        section=FmhaStage.Loop,
+                        head_dim_stage_idx=0,
+                    )
+                    skv.release()
+
+                    skv.wait()
+                    desc_v_base = skv.v_desc()
+                    to.pv_mma(
+                        desc_v_base=desc_v_base,
+                        section=FmhaStage.Loop,
+                        head_dim_stage_idx=1,
+                    )
+                    skv.release()
+                    to.commit()
+                    tp0.release()
+
+                sq.release()
+                to.acquire()
+                tp0.wait()
+                tmem_p_base = tp0.p_base()
+                to.set_p_base(tmem_p_base=tmem_p_base)
+                for head_dim_stage_idx in range(num_head_dim_stages_v):
+                    skv.wait()
+                    desc_v_base = skv.v_desc()
+                    to.pv_mma(
+                        desc_v_base=desc_v_base,
+                        section=FmhaStage.Tail,
+                        head_dim_stage_idx=head_dim_stage_idx,
+                        is_tail=True,
+                    )
+                    skv.release()
+                to.commit()
+                tp0.release()
+                vd0.acquire()
+                sp0.commit()
+                vd0.commit()
+                tp0.wait()
+                tp0.release()
+
+        captured_schedule = _schedule_with_work_queue(
+            mma_schedule,
+            smem_q,
+            smem_kv,
+            tmem_sp0,
+            tmem_p0,
+            tmem_o,
+            tmem_vec_done_0,
+            work_queue=work_queue,
+        )
+        return task_class(
+            src_resources=split_src,
+            dst_resources=[tmem_sp0, tmem_o, tmem_vec_done_0],
+            warp_idx=smem_q.cfg.mma_warp_id,
+            num_warps=1,
+            schedule=captured_schedule,
+            name="MmaTask",
+            num_registers=smem_q.cfg.num_regs_other,
+            **task_kwargs,
+        )
+
+    if smem_q.cfg.single_qkv_instance:
+        num_head_dim_stages_k = smem_kv.cfg.num_head_dim_stages_k
+        num_head_dim_stages_v = smem_kv.cfg.num_head_dim_stages_v
+
+        @schedule
+        def mma_schedule(
+            sq: SmemQResource,
+            skv: SmemKVResource,
+            sp0: TmemSPResource,
+            to: TmemOResource,
+            vd0: TmemStatsDoneResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            desc_q0_base, _desc_q1_base = sq.create_function_variables()
+            desc_k_base, desc_v_base = skv.create_function_variables()
+            sp0.create_function_variables()
+            to.create_function_variables()
+            vd0.create_function_variables()
+            with _work_tile_schedule_loop(wq):
+                if wq is not None:
+                    sp0.create_work_tile_variables()
+                    to.create_work_tile_variables()
+
+                with domain_loop(loop_start, loop_end, loop_step) as d:
+                    with d.first_iter():
+                        sq.wait()
+                        desc_q0_base = sq.q0_desc(inst_idx=0)
+                        vd0.acquire()
+                        sp0.acquire()
+                    for head_dim_stage_idx in range(num_head_dim_stages_k):
+                        skv.wait()
+                        desc_k_base = skv.k_desc()
+                        sp0.qk_mma(
+                            desc_q_base=desc_q0_base,
+                            desc_k_base=desc_k_base,
+                            section=FmhaStage.Loop,
+                            head_dim_stage_idx=head_dim_stage_idx,
+                        )
+                        skv.release()
+                    sp0.commit()
+                    with d.first_iter():
+                        vd0.commit()
+                    to.acquire()
+                    sp0.acquire()
+                    sp0.p_read()
+                    for head_dim_stage_idx in range(num_head_dim_stages_v):
+                        skv.wait()
+                        desc_v_base = skv.v_desc()
+                        to.pv_mma(
+                            desc_v_base=desc_v_base,
+                            section=FmhaStage.Loop,
+                            head_dim_stage_idx=head_dim_stage_idx,
+                        )
+                        skv.release()
+                    to.commit()
+
+                sq.release()
+                sp0.commit()
+
+        captured_schedule = _schedule_with_work_queue(
+            mma_schedule,
+            smem_q,
+            smem_kv,
+            tmem_sp0,
+            tmem_o,
+            tmem_vec_done_0,
+            work_queue=work_queue,
+        )
+        return task_class(
+            src_resources=src,
+            dst_resources=[tmem_sp0, tmem_o, tmem_vec_done_0],
+            warp_idx=smem_q.cfg.mma_warp_id,
+            num_warps=1,
+            schedule=captured_schedule,
+            name="MmaTask",
+            num_registers=smem_q.cfg.num_regs_other,
+            **task_kwargs,
+        )
+
+    if tmem_sp1 is None or tmem_vec_done_1 is None:
+        raise ValueError("paired MMA scheduling requires peer-1 resources")
 
     @schedule
     def mma_schedule(
@@ -372,7 +897,8 @@ def create_softmax_task(
     index: int,
     tmem_sp: TmemSPResource,
     tmem_vec: TmemStatsResource,
-    s0s1_seq: S0S1SequenceResource,
+    tmem_p: TmemPResource | None,
+    s0s1_seq: S0S1SequenceResource | None,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
     **task_kwargs: Any,
@@ -385,7 +911,419 @@ def create_softmax_task(
     Args:
         task_class: Task subclass used to instantiate the softmax schedule.
     """
-    loop_start, loop_end, loop_step = _captured_loop_bounds(task_kwargs)
+    loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
+
+    # A missing S0-S1 sequence resource selects the single-QKV-instance path.
+    # For D>128, the TMEM P pipeline gives S and P independent readiness
+    # handoffs. MMA can issue next-tile QK on one stage while previous-tile PV
+    # uses the other.
+    if s0s1_seq is None:
+        if tmem_p is not None and tmem_sp.cfg.has_tmem_p_pipeline:
+            src = _src_resources(tmem_sp, work_queue=work_queue)
+            dst = [tmem_vec, tmem_p]
+
+            @schedule
+            def softmax_schedule(
+                sp: TmemSPResource,
+                vec: TmemStatsResource,
+                tp: TmemPResource,
+                wq: WorkQueue | None = None,
+            ) -> None:
+                p_chunk = sp.init_softmax_state()
+                scale_softmax_log2 = sp.load_scale_softmax_log2()
+                vec.init_store_state()
+                with _work_tile_schedule_loop(wq):
+                    old_row_max, row_max, row_sum, q_offset = (
+                        sp.init_softmax_work_tile_state()
+                    )
+                    vec.init_store_work_tile_state()
+                    if tmem_sp.uses_varlen_q_offset_cache:
+                        q_offset = sp.cache_q_offset()
+                    if tmem_sp.uses_packed_dense_k_mask:
+                        seqlen_k = sp.cache_seqlen_k()
+                    vec.acquire()
+                    with domain_loop(loop_start, loop_end, loop_step):
+                        # Softmax(i): wait for QK(Q,Ki) -> S(i).
+                        sp.wait()
+                        if tmem_sp.uses_left_window_loop_mask:
+                            old_row_max, row_max = sp.left_masked_row_max(
+                                row_max=row_max,
+                                q_offset=q_offset,
+                            )
+                        elif tmem_sp.uses_varlen_loop_right_mask:
+                            old_row_max, row_max = sp.right_masked_row_max(
+                                row_max=row_max,
+                                q_offset=q_offset,
+                            )
+                        elif tmem_sp.uses_query_paired_q_offset_loop_mask:
+                            old_row_max, row_max = sp.loop_masked_row_max(
+                                row_max=row_max,
+                                q_offset=q_offset,
+                            )
+                        elif tmem_sp.uses_fixed_dense_k_tail_mask:
+                            old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
+                                row_max=row_max,
+                            )
+                        elif tmem_sp.uses_packed_dense_k_mask:
+                            old_row_max, row_max = sp.packed_dense_k_masked_row_max(
+                                row_max=row_max,
+                                seqlen_k=seqlen_k,
+                                section=FmhaStage.Loop,
+                            )
+                        else:
+                            old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                        # Stats(i): S(i) -> row max/sum for correction.
+                        vec.store_vec(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                        )
+                        vec.commit()
+                        # P(i): acquire the matching P-ready handoff stage.
+                        tp.acquire()
+                        # P(i): exp2(S(i)) -> P(i) in the same TMEM stage.
+                        p_chunk = sp.exp2_p(
+                            row_max=row_max,
+                            scale_softmax_log2=scale_softmax_log2,
+                        )
+                        # P(i) ready: P(i) -> PV(Pi,Vi).
+                        tp.commit()
+                        # S/P(i): release softmax ownership for the next QK stage.
+                        sp.release()
+                        # Aux(i): finish the row-sum reduction after releasing SP.
+                        row_sum = sp.softmax_aux_reduce(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                            p_chunk=p_chunk,
+                            scale_softmax_log2=scale_softmax_log2,
+                        )
+                        vec.acquire()
+
+                    if tmem_sp.uses_head_paired_causal_tail_mask:
+                        # Tail S: consume and mask the final head-paired score tile.
+                        sp.wait()
+                        old_row_max, row_max = sp.right_masked_row_max(
+                            row_max=row_max,
+                            q_offset=q_offset,
+                        )
+                        vec.store_vec(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                        )
+                        vec.commit()
+                        # Tail P: publish the final probability tile to PV.
+                        tp.acquire()
+                        p_chunk = sp.exp2_p(
+                            row_max=row_max,
+                            scale_softmax_log2=scale_softmax_log2,
+                        )
+                        tp.commit()
+                        sp.release()
+                        row_sum = sp.softmax_aux_reduce(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                            p_chunk=p_chunk,
+                            scale_softmax_log2=scale_softmax_log2,
+                        )
+                        vec.acquire()
+                        # Drain the final SP/P-ready slots and publish identity stats.
+                        sp.wait()
+                        sp.release()
+                        tp.acquire()
+                        tp.commit()
+                        old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                        vec.store_vec(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                        )
+                        vec.commit()
+                    elif tmem_sp.uses_query_paired_causal_tail_mask:
+                        # Tail S: consume and mask the final query-paired score tile.
+                        sp.wait()
+                        old_row_max, row_max = sp.masked_row_max(
+                            row_max=row_max,
+                            q_offset=q_offset,
+                        )
+                        vec.store_vec(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                        )
+                        vec.commit()
+                        # Tail P: publish the final probability tile to PV.
+                        tp.acquire()
+                        p_chunk = sp.masked_exp2_p(
+                            row_max=row_max,
+                            scale_softmax_log2=scale_softmax_log2,
+                        )
+                        tp.commit()
+                        sp.release()
+                        row_sum = sp.softmax_aux_reduce(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                            p_chunk=p_chunk,
+                            scale_softmax_log2=scale_softmax_log2,
+                        )
+                        if tmem_sp.uses_query_paired_invalid_tail:
+                            # Invalid peer tail: consume its padded SP slot without PV.
+                            sp.wait()
+                            old_row_max, row_max = sp.invalid_row_max(row_max=row_max)
+                            vec.acquire()
+                            vec.store_vec(
+                                old_row_max=old_row_max,
+                                row_max=row_max,
+                                row_sum=row_sum,
+                            )
+                            vec.commit()
+                            sp.invalid_exp2_p(row_max=row_max)
+                            sp.release()
+                        # Drain the final SP/P-ready slots and publish identity stats.
+                        sp.wait()
+                        sp.release()
+                        tp.acquire()
+                        tp.commit()
+                        old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                        vec.acquire()
+                        vec.store_vec(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                        )
+                        vec.commit()
+                    elif tmem_sp.cfg.is_causal:
+                        # Tail S: consume and causally mask the final score tile.
+                        sp.wait()
+                        old_row_max, row_max = sp.masked_row_max(
+                            row_max=row_max,
+                            q_offset=q_offset,
+                        )
+                        vec.store_vec(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                        )
+                        vec.commit()
+                        # Tail P: publish the final probability tile to PV.
+                        tp.acquire()
+                        p_chunk = sp.masked_exp2_p(
+                            row_max=row_max,
+                            scale_softmax_log2=scale_softmax_log2,
+                        )
+                        tp.commit()
+                        sp.release()
+                        row_sum = sp.softmax_aux_reduce(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                            p_chunk=p_chunk,
+                            scale_softmax_log2=scale_softmax_log2,
+                        )
+                        # Drain the final SP/P-ready slots and publish identity stats.
+                        sp.wait()
+                        sp.release()
+                        tp.acquire()
+                        tp.commit()
+                        old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                        vec.acquire()
+                        vec.store_vec(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                        )
+                        vec.commit()
+                    else:
+                        # Non-causal cleanup: drain SP and the matching P-ready slot.
+                        sp.wait()
+                        sp.release()
+                        tp.acquire()
+                        tp.commit()
+                        old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                        vec.store_vec(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                        )
+                        vec.commit()
+
+            captured_schedule = _schedule_with_work_queue(
+                softmax_schedule, tmem_sp, tmem_vec, tmem_p, work_queue=work_queue
+            )
+            return task_class(
+                src_resources=src,
+                dst_resources=dst,
+                warp_idx=index * 4,
+                num_warps=4,
+                schedule=captured_schedule,
+                num_registers=tmem_sp.cfg.num_regs_softmax,
+                name=f"Softmax{index}Task",
+                **task_kwargs,
+            )
+
+        # Non-split single-instance fallback: softmax writes P into the current
+        # SP stage and releases that same resource for MMA to consume directly.
+        src = _src_resources(tmem_sp, work_queue=work_queue)
+        dst = [tmem_vec]
+
+        @schedule
+        def softmax_schedule(
+            sp: TmemSPResource,
+            vec: TmemStatsResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            old_row_max, row_max, row_sum, p_chunk, q_offset = (
+                sp.create_function_variables()
+            )
+            vec.create_function_variables()
+            with _work_tile_schedule_loop(wq):
+                if wq is not None:
+                    old_row_max, row_max, row_sum, q_offset = (
+                        sp.create_work_tile_variables(
+                            old_row_max=old_row_max,
+                            row_max=row_max,
+                            row_sum=row_sum,
+                            q_offset=q_offset,
+                        )
+                    )
+                    vec.create_work_tile_variables()
+                if tmem_sp.uses_varlen_q_offset_cache:
+                    q_offset = sp.cache_q_offset()
+                if tmem_sp.uses_packed_dense_k_mask:
+                    seqlen_k = sp.cache_seqlen_k()
+                vec.acquire()
+                with domain_loop(loop_start, loop_end, loop_step):
+                    sp.wait()
+                    if tmem_sp.uses_left_window_loop_mask:
+                        old_row_max, row_max = sp.left_masked_row_max(
+                            row_max=row_max,
+                            q_offset=q_offset,
+                        )
+                    elif tmem_sp.uses_varlen_loop_right_mask:
+                        old_row_max, row_max = sp.right_masked_row_max(
+                            row_max, q_offset
+                        )
+                    elif tmem_sp.uses_query_paired_q_offset_loop_mask:
+                        old_row_max, row_max = sp.loop_masked_row_max(
+                            row_max=row_max,
+                            q_offset=q_offset,
+                        )
+                    elif tmem_sp.uses_fixed_dense_k_tail_mask:
+                        old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
+                            row_max=row_max
+                        )
+                    elif tmem_sp.uses_packed_dense_k_mask:
+                        old_row_max, row_max = sp.packed_dense_k_masked_row_max(
+                            row_max=row_max,
+                            seqlen_k=seqlen_k,
+                            section=FmhaStage.Loop,
+                        )
+                    else:
+                        old_row_max, row_max = sp.row_max(row_max)
+                    vec.store_vec(old_row_max, row_max, row_sum)
+                    vec.commit()
+                    p_chunk = sp.exp2_p(row_max)
+                    sp.release()
+                    row_sum = sp.softmax_post_release_reduce(
+                        old_row_max, row_max, row_sum, p_chunk
+                    )
+                    vec.acquire()
+
+                if tmem_sp.uses_head_paired_causal_tail_mask:
+                    sp.wait()
+                    old_row_max, row_max = sp.right_masked_row_max(
+                        row_max=row_max,
+                        q_offset=q_offset,
+                    )
+                    vec.store_vec(old_row_max, row_max, row_sum)
+                    vec.commit()
+                    p_chunk = sp.exp2_p(row_max)
+                    sp.release()
+                    row_sum = sp.softmax_post_release_reduce(
+                        old_row_max, row_max, row_sum, p_chunk
+                    )
+                    vec.acquire()
+                    sp.wait()
+                    sp.release()
+                    old_row_max = sp.softmax_post_release_identity(row_max)
+                    vec.store_vec(old_row_max, row_max, row_sum)
+                    vec.commit()
+                elif tmem_sp.uses_query_paired_causal_tail_mask:
+                    sp.wait()
+                    old_row_max, row_max = sp.masked_row_max(
+                        row_max=row_max,
+                        q_offset=q_offset,
+                    )
+                    vec.store_vec(old_row_max, row_max, row_sum)
+                    vec.commit()
+                    p_chunk = sp.masked_exp2_p(
+                        row_max=row_max,
+                    )
+                    sp.release()
+                    row_sum = sp.softmax_post_release_reduce(
+                        old_row_max, row_max, row_sum, p_chunk
+                    )
+                    if tmem_sp.uses_query_paired_invalid_tail:
+                        sp.wait()
+                        old_row_max, row_max = sp.invalid_row_max(row_max)
+                        vec.acquire()
+                        vec.store_vec(old_row_max, row_max, row_sum)
+                        vec.commit()
+                        sp.invalid_exp2_p(row_max=row_max)
+                        sp.release()
+                    sp.wait()
+                    sp.release()
+                    old_row_max = sp.softmax_post_release_identity(row_max)
+                    vec.acquire()
+                    vec.store_vec(old_row_max, row_max, row_sum)
+                    vec.commit()
+                elif tmem_sp.cfg.is_causal:
+                    sp.wait()
+                    old_row_max, row_max = sp.masked_row_max(
+                        row_max=row_max,
+                        q_offset=q_offset,
+                    )
+                    vec.store_vec(old_row_max, row_max, row_sum)
+                    vec.commit()
+                    p_chunk = sp.masked_exp2_p(
+                        row_max=row_max,
+                    )
+                    sp.release()
+                    row_sum = sp.softmax_post_release_reduce(
+                        old_row_max, row_max, row_sum, p_chunk
+                    )
+                    sp.wait()
+                    sp.release()
+                    old_row_max = sp.softmax_post_release_identity(row_max)
+                    vec.acquire()
+                    vec.store_vec(old_row_max, row_max, row_sum)
+                    vec.commit()
+                else:
+                    sp.wait()
+                    sp.release()
+                    old_row_max = sp.softmax_post_release_identity(row_max)
+                    vec.store_vec(old_row_max, row_max, row_sum)
+                    vec.commit()
+
+        captured_schedule = _schedule_with_work_queue(
+            softmax_schedule, tmem_sp, tmem_vec, work_queue=work_queue
+        )
+        return task_class(
+            src_resources=src,
+            dst_resources=dst,
+            warp_idx=index * 4,
+            num_warps=4,
+            schedule=captured_schedule,
+            num_registers=tmem_sp.cfg.num_regs_softmax,
+            name=f"Softmax{index}Task",
+            **task_kwargs,
+        )
+
+    # Paired QKV instances use separate SP resources. S0S1SequenceResource
+    # orders their P stores, so this path does not need the TMEM P handoff.
     if s0s1_seq is not None and index == 1:
         src = _src_resources(tmem_sp, s0s1_seq, work_queue=work_queue)
     else:
@@ -452,7 +1390,9 @@ def create_softmax_task(
                     row_sum=row_sum,
                 )
                 vec.commit()
-                if index == 0:
+                if s0s1_seq is None:
+                    pass
+                elif index == 0:
                     # Softmax0 is the S0-S1 producer: acquire/commit sequence.
                     seq.acquire()
                 else:
@@ -463,7 +1403,9 @@ def create_softmax_task(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                if index == 0:
+                if s0s1_seq is None:
+                    pass
+                elif index == 0:
                     seq.commit()
                 else:
                     seq.release()
@@ -481,9 +1423,8 @@ def create_softmax_task(
 
             if tmem_sp.uses_head_paired_causal_tail_mask:
                 # Head-paired maps Q0/Q1 to adjacent Hq slices at the same S
-                # tile. Its tail mask uses right_masked_row_max(), which keeps
-                # that mapping and applies both sliding-window bounds when
-                # enabled.
+                # tile. Its tail mask uses right_masked_row_max(), which does
+                # not add the query-paired q_half * q_tile_m sequence advance.
                 sp.wait()
                 old_row_max, row_max = sp.right_masked_row_max(
                     row_max=row_max,
@@ -496,7 +1437,9 @@ def create_softmax_task(
                     row_sum=row_sum,
                 )
                 vec.commit()
-                if index == 0:
+                if s0s1_seq is None:
+                    pass
+                elif index == 0:
                     seq.acquire()
                 else:
                     seq.wait()
@@ -504,7 +1447,9 @@ def create_softmax_task(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                if index == 0:
+                if s0s1_seq is None:
+                    pass
+                elif index == 0:
                     seq.commit()
                 else:
                     seq.release()
@@ -541,12 +1486,14 @@ def create_softmax_task(
                     row_sum=row_sum,
                 )
                 vec.commit()
-                seq.acquire()
+                if s0s1_seq is not None:
+                    seq.acquire()
                 p_chunk = sp.masked_exp2_p(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                seq.commit()
+                if s0s1_seq is not None:
+                    seq.commit()
                 sp.release()
                 row_sum = sp.softmax_aux_reduce(
                     old_row_max=old_row_max,
@@ -565,9 +1512,11 @@ def create_softmax_task(
                         row_sum=row_sum,
                     )
                     vec.commit()
-                    seq.acquire()
+                    if s0s1_seq is not None:
+                        seq.acquire()
                     sp.invalid_exp2_p(row_max=row_max)
-                    seq.commit()
+                    if s0s1_seq is not None:
+                        seq.commit()
                     sp.release()
                 sp.wait()
                 sp.release()
@@ -592,12 +1541,14 @@ def create_softmax_task(
                     row_sum=row_sum,
                 )
                 vec.commit()
-                seq.wait()
+                if s0s1_seq is not None:
+                    seq.wait()
                 p_chunk = sp.masked_exp2_p(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                seq.release()
+                if s0s1_seq is not None:
+                    seq.release()
                 sp.release()
                 row_sum = sp.softmax_aux_reduce(
                     old_row_max=old_row_max,
@@ -646,250 +1597,400 @@ def create_softmax_task(
 
 def create_correction_task(
     tmem_vec0: TmemStatsResource,
-    tmem_vec1: TmemStatsResource,
+    tmem_vec1: TmemStatsResource | None,
     tmem_o: TmemOResource,
     smem_o_0: SmemOResource,
-    smem_o_1: SmemOResource,
+    smem_o_1: SmemOResource | None,
     tmem_vec_done_0: TmemStatsDoneResource,
-    tmem_vec_done_1: TmemStatsDoneResource,
+    tmem_vec_done_1: TmemStatsDoneResource | None,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
     **task_kwargs: Any,
 ) -> Task:
     """Create the four-warp Correction task (warps 8-11)."""
-    loop_start, loop_end, loop_step = _captured_loop_bounds(task_kwargs)
-    src = _src_resources(
-        tmem_vec0,
-        tmem_vec1,
-        tmem_o,
-        tmem_vec_done_0,
-        tmem_vec_done_1,
-        work_queue=work_queue,
-    )
+    loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
 
-    @schedule
-    def correction_schedule(
-        v0: TmemStatsResource,
-        v1: TmemStatsResource,
-        to: TmemOResource,
-        so0: SmemOResource,
-        so1: SmemOResource,
-        vd0: TmemStatsDoneResource,
-        vd1: TmemStatsDoneResource,
-        wq: WorkQueue | None = None,
-    ) -> None:
-        """Captured schedule for O rescale and SMEM staging."""
-        v0.init_read_state()
-        v1.init_read_state()
-        scale_softmax_log2_v0 = v0.load_scale_softmax_log2()
-        scale_softmax_log2_v1 = v1.load_scale_softmax_log2()
-        output_scale0 = v0.load_output_scale()
-        output_scale1 = v1.load_output_scale()
-        to.init_correction_state()
-        so0.init_store_state()
-        so1.init_store_state()
-        with _work_tile_schedule_loop(wq):
-            # Per-tile TMEM/SMEM cached addresses are computed here.
-            v0.init_read_work_tile_state()
-            v1.init_read_work_tile_state()
-            to.init_correction_work_tile_state()
-            so0.init_store_work_tile_state()
-            so1.init_store_work_tile_state()
-            # No tmem-stats-done priming is needed because the pipeline starts empty.
-            # Discard the first TmemStats0 slot and hold TmemStats1 for cross-release in the
-            # first K-loop correction step.
-            v0.wait()
-            v0.release()
-            v1.wait()
-            # The correction loop consumes vec/O pairs in alternating order so
-            # each half can unblock the other half's next producer.
-            with domain_loop(loop_start, loop_end, loop_step):
-                # Part 1: consume TmemStats0 + O0, release TmemStats1.
+    def _create_single_instance_task() -> Task:
+        src = _src_resources(
+            tmem_vec0,
+            tmem_o,
+            tmem_vec_done_0,
+            work_queue=work_queue,
+        )
+        num_o_head_dim_stages = smem_o_0.cfg.num_o_head_dim_stages
+
+        @schedule
+        def correction_schedule(
+            v0: TmemStatsResource,
+            to: TmemOResource,
+            so0: SmemOResource,
+            vd0: TmemStatsDoneResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            v0.init_read_state()
+            scale_softmax_log2 = v0.load_scale_softmax_log2()
+            output_scale = v0.load_output_scale()
+            to.init_correction_state()
+            so0.init_store_state()
+            with _work_tile_schedule_loop(wq):
+                v0.init_read_work_tile_state()
+                to.init_correction_work_tile_state()
+                so0.init_store_work_tile_state()
+
                 v0.wait()
-                vec_old_max, vec_new_max, _, vec_scale = v0.read_vec(
+                v0.release()
+                vd0.wait()
+                vd0.release()
+                with domain_loop(loop_start, loop_end, loop_step):
+                    v0.wait()
+                    vec_old_max, vec_new_max, _, vec_scale = v0.read_vec(
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
+                    vd0.wait()
+                    vd0.release()
+                    to.wait()
+                    to.correct(
+                        vec_old_max=vec_old_max,
+                        vec_new_max=vec_new_max,
+                        vec_scale=vec_scale,
+                        inst_idx=0,
+                    )
+                    v0.release()
+                    to.release()
+
+                v0.wait()
+                _, _, vec_row_sum, vec_scale = v0.read_vec(
+                    scale_softmax_log2=scale_softmax_log2,
+                )
+                vd0.wait()
+                vd0.release()
+                v0.release()
+                to.wait()
+                for head_dim_stage_idx in range(num_o_head_dim_stages):
+                    so0.acquire()
+                    so0.store_o(
+                        vec_row_sum=vec_row_sum,
+                        vec_scale=vec_scale,
+                        output_scale=output_scale,
+                        head_dim_stage_idx=head_dim_stage_idx,
+                    )
+                    so0.commit()
+                to.release()
+
+        captured_schedule = _schedule_with_work_queue(
+            correction_schedule,
+            tmem_vec0,
+            tmem_o,
+            smem_o_0,
+            tmem_vec_done_0,
+            work_queue=work_queue,
+        )
+        return task_class(
+            src_resources=src,
+            dst_resources=[smem_o_0],
+            warp_idx=smem_o_0.cfg.correction_warp_ids[0],
+            num_warps=4,
+            schedule=captured_schedule,
+            num_registers=smem_o_0.cfg.num_regs_correction,
+            name="CorrectionTask",
+            **task_kwargs,
+        )
+
+    def _create_paired_task() -> Task:
+        if tmem_vec1 is None or smem_o_1 is None or tmem_vec_done_1 is None:
+            raise ValueError("paired correction scheduling requires peer-1 resources")
+
+        src = _src_resources(
+            tmem_vec0,
+            tmem_vec1,
+            tmem_o,
+            tmem_vec_done_0,
+            tmem_vec_done_1,
+            work_queue=work_queue,
+        )
+
+        @schedule
+        def correction_schedule(
+            v0: TmemStatsResource,
+            v1: TmemStatsResource,
+            to: TmemOResource,
+            so0: SmemOResource,
+            so1: SmemOResource,
+            vd0: TmemStatsDoneResource,
+            vd1: TmemStatsDoneResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Captured schedule for O rescale and SMEM staging."""
+            v0.init_read_state()
+            v1.init_read_state()
+            scale_softmax_log2_v0 = v0.load_scale_softmax_log2()
+            scale_softmax_log2_v1 = v1.load_scale_softmax_log2()
+            output_scale0 = v0.load_output_scale()
+            output_scale1 = v1.load_output_scale()
+            to.init_correction_state()
+            so0.init_store_state()
+            so1.init_store_state()
+            with _work_tile_schedule_loop(wq):
+                # Per-tile TMEM/SMEM cached addresses are computed here.
+                v0.init_read_work_tile_state()
+                v1.init_read_work_tile_state()
+                to.init_correction_work_tile_state()
+                so0.init_store_work_tile_state()
+                so1.init_store_work_tile_state()
+                # No tmem-stats-done priming is needed because the pipeline starts empty.
+                # Discard the first TmemStats0 slot and hold TmemStats1 for cross-release in the
+                # first K-loop correction step.
+                v0.wait()
+                v0.release()
+                v1.wait()
+                # The correction loop consumes vec/O pairs in alternating order so
+                # each half can unblock the other half's next producer.
+                with domain_loop(loop_start, loop_end, loop_step):
+                    # Part 1: consume TmemStats0 + O0, release TmemStats1.
+                    v0.wait()
+                    vec_old_max, vec_new_max, _, vec_scale = v0.read_vec(
+                        scale_softmax_log2=scale_softmax_log2_v0,
+                    )
+                    to.wait()
+                    to.correct(
+                        vec_old_max=vec_old_max,
+                        vec_new_max=vec_new_max,
+                        vec_scale=vec_scale,
+                        inst_idx=0,
+                    )
+                    v1.release()
+                    to.release()
+                    # Part 2: consume TmemStats1 + O1, release TmemStats0.
+                    v1.wait()
+                    vec_old_max, vec_new_max, _, vec_scale = v1.read_vec(
+                        scale_softmax_log2=scale_softmax_log2_v1,
+                    )
+                    to.wait()
+                    to.correct(
+                        vec_old_max=vec_old_max,
+                        vec_new_max=vec_new_max,
+                        vec_scale=vec_scale,
+                        inst_idx=1,
+                    )
+                    v0.release()
+                    to.release()
+                # TAIL: consume remaining stats, release tmem-stats-done gates, and
+                # stage corrected O0/O1 into SMEM for the epilogue task.
+                v1.release()
+                v0.wait()
+                _, _, vec_row_sum, vec_scale = v0.read_vec(
                     scale_softmax_log2=scale_softmax_log2_v0,
                 )
+                vd0.wait()
+                vd0.release()
+                v0.release()
                 to.wait()
-                to.correct(
-                    vec_old_max=vec_old_max,
-                    vec_new_max=vec_new_max,
+                so0.acquire()
+                so0.store_o(
+                    vec_row_sum=vec_row_sum,
                     vec_scale=vec_scale,
-                    inst_idx=0,
+                    output_scale=output_scale0,
                 )
-                v1.release()
+                so0.commit()
                 to.release()
-                # Part 2: consume TmemStats1 + O1, release TmemStats0.
                 v1.wait()
-                vec_old_max, vec_new_max, _, vec_scale = v1.read_vec(
+                _, _, vec_row_sum, vec_scale = v1.read_vec(
                     scale_softmax_log2=scale_softmax_log2_v1,
                 )
+                vd1.wait()
+                vd1.release()
+                v1.release()
                 to.wait()
-                to.correct(
-                    vec_old_max=vec_old_max,
-                    vec_new_max=vec_new_max,
+                so1.acquire()
+                so1.store_o(
+                    vec_row_sum=vec_row_sum,
                     vec_scale=vec_scale,
-                    inst_idx=1,
+                    output_scale=output_scale1,
                 )
-                v0.release()
+                so1.commit()
                 to.release()
-            # TAIL: consume remaining stats, release tmem-stats-done gates, and
-            # stage corrected O0/O1 into SMEM for the epilogue task.
-            v1.release()
-            v0.wait()
-            _, _, vec_row_sum, vec_scale = v0.read_vec(
-                scale_softmax_log2=scale_softmax_log2_v0,
-            )
-            vd0.wait()
-            vd0.release()
-            v0.release()
-            to.wait()
-            so0.acquire()
-            so0.store_o(
-                vec_row_sum=vec_row_sum,
-                vec_scale=vec_scale,
-                output_scale=output_scale0,
-            )
-            so0.commit()
-            to.release()
-            v1.wait()
-            _, _, vec_row_sum, vec_scale = v1.read_vec(
-                scale_softmax_log2=scale_softmax_log2_v1,
-            )
-            vd1.wait()
-            vd1.release()
-            v1.release()
-            to.wait()
-            so1.acquire()
-            so1.store_o(
-                vec_row_sum=vec_row_sum,
-                vec_scale=vec_scale,
-                output_scale=output_scale1,
-            )
-            so1.commit()
-            to.release()
 
-    captured_schedule = _schedule_with_work_queue(
-        correction_schedule,
-        tmem_vec0,
-        tmem_vec1,
-        tmem_o,
-        smem_o_0,
-        smem_o_1,
-        tmem_vec_done_0,
-        tmem_vec_done_1,
-        work_queue=work_queue,
-    )
-    return task_class(
-        src_resources=src,
-        dst_resources=[smem_o_0, smem_o_1],
-        warp_idx=8,
-        num_warps=4,
-        schedule=captured_schedule,
-        num_registers=tmem_vec0.cfg.num_regs_correction,
-        name="CorrectionTask",
-        **task_kwargs,
-    )
+        captured_schedule = _schedule_with_work_queue(
+            correction_schedule,
+            tmem_vec0,
+            tmem_vec1,
+            tmem_o,
+            smem_o_0,
+            smem_o_1,
+            tmem_vec_done_0,
+            tmem_vec_done_1,
+            work_queue=work_queue,
+        )
+        return task_class(
+            src_resources=src,
+            dst_resources=[smem_o_0, smem_o_1],
+            warp_idx=8,
+            num_warps=4,
+            schedule=captured_schedule,
+            num_registers=smem_o_0.cfg.num_regs_correction,
+            name="CorrectionTask",
+            **task_kwargs,
+        )
+
+    if smem_o_0.cfg.single_qkv_instance:
+        return _create_single_instance_task()
+    return _create_paired_task()
 
 
 def create_epilogue_task(
     smem_o_0: SmemOResource,
-    smem_o_1: SmemOResource,
+    smem_o_1: SmemOResource | None,
     gmem_o_0: GmemOResource,
-    gmem_o_1: GmemOResource,
+    gmem_o_1: GmemOResource | None,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp Epilogue store task (warp 14)."""
-    loop_start, loop_end, loop_step = _captured_loop_bounds(task_kwargs)
-    src = _src_resources(smem_o_0, smem_o_1, work_queue=work_queue)
+    loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
 
-    @schedule
-    def epilogue_schedule(
-        so0: SmemOResource,
-        so1: SmemOResource,
-        go0: GmemOResource,
-        go1: GmemOResource,
-        wq: WorkQueue | None = None,
-    ) -> None:
-        """Captured schedule for GMEM O stores."""
-        so0.init_output_state()
-        so1.init_output_state()
-        go0.init_store_state()
-        go1.init_store_state()
-        with _work_tile_schedule_loop(wq):
-            # Per-tile SMEM O address base is computed in work vars.
-            so0.init_output_work_tile_state()
-            so1.init_output_work_tile_state()
-            with domain_loop(loop_start, loop_end, loop_step):
-                pass
-            # Store the first corrected O tile through gmem_o_0.
-            so0.wait()
-            head_coord, batch_coord, seq_coord_q = so0.compute_output_coords()
-            go0.tma_store(
-                head_coord=head_coord,
-                batch_coord=batch_coord,
-                seq_coord_q=seq_coord_q,
-            )
-            so0.release()
-            # Store the second corrected O tile through gmem_o_1.
-            so1.wait()
-            head_coord, batch_coord, seq_coord_q = so1.compute_output_coords()
-            go1.tma_store(
-                head_coord=head_coord,
-                batch_coord=batch_coord,
-                seq_coord_q=seq_coord_q,
-            )
-            so1.release()
+    def _create_single_instance_task() -> Task:
+        src = _src_resources(smem_o_0, work_queue=work_queue)
+        num_o_head_dim_stages = smem_o_0.cfg.num_o_head_dim_stages
 
-    captured_schedule = _schedule_with_work_queue(
-        epilogue_schedule,
-        smem_o_0,
-        smem_o_1,
-        gmem_o_0,
-        gmem_o_1,
-        work_queue=work_queue,
-    )
-    return task_class(
-        src_resources=src,
-        dst_resources=[gmem_o_0, gmem_o_1],
-        warp_idx=14,
-        num_warps=1,
-        schedule=captured_schedule,
-        num_registers=smem_o_0.cfg.num_regs_other,
-        name="EpilogueTask",
-        **task_kwargs,
-    )
+        @schedule
+        def epilogue_schedule(
+            so0: SmemOResource,
+            go0: GmemOResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            so0.init_output_state()
+            go0.init_store_state()
+            with _work_tile_schedule_loop(wq):
+                so0.init_output_work_tile_state()
+                with domain_loop(loop_start, loop_end, loop_step):
+                    pass
+                for head_dim_stage_idx in range(num_o_head_dim_stages):
+                    so0.wait()
+                    head_coord, batch_coord, seq_coord_q = so0.compute_output_coords()
+                    go0.tma_store(
+                        head_coord=head_coord,
+                        batch_coord=batch_coord,
+                        seq_coord_q=seq_coord_q,
+                        head_dim_stage_idx=head_dim_stage_idx,
+                    )
+                    so0.release()
+
+        captured_schedule = _schedule_with_work_queue(
+            epilogue_schedule,
+            smem_o_0,
+            gmem_o_0,
+            work_queue=work_queue,
+        )
+        return task_class(
+            src_resources=src,
+            dst_resources=[gmem_o_0],
+            warp_idx=gmem_o_0.cfg.epilogue_warp_id,
+            num_warps=1,
+            schedule=captured_schedule,
+            num_registers=gmem_o_0.cfg.num_regs_other,
+            name="EpilogueTask",
+            **task_kwargs,
+        )
+
+    def _create_paired_task() -> Task:
+        if smem_o_1 is None or gmem_o_1 is None:
+            raise ValueError("paired epilogue scheduling requires peer-1 resources")
+
+        src = _src_resources(smem_o_0, smem_o_1, work_queue=work_queue)
+
+        @schedule
+        def epilogue_schedule(
+            so0: SmemOResource,
+            so1: SmemOResource,
+            go0: GmemOResource,
+            go1: GmemOResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Captured schedule for GMEM O stores."""
+            so0.init_output_state()
+            so1.init_output_state()
+            go0.init_store_state()
+            go1.init_store_state()
+            with _work_tile_schedule_loop(wq):
+                # Per-tile SMEM O address base is computed in work vars.
+                so0.init_output_work_tile_state()
+                so1.init_output_work_tile_state()
+                with domain_loop(loop_start, loop_end, loop_step):
+                    pass
+                # Store the first corrected O tile through gmem_o_0.
+                so0.wait()
+                head_coord, batch_coord, seq_coord_q = so0.compute_output_coords()
+                go0.tma_store(
+                    head_coord=head_coord,
+                    batch_coord=batch_coord,
+                    seq_coord_q=seq_coord_q,
+                )
+                so0.release()
+                # Store the second corrected O tile through gmem_o_1.
+                so1.wait()
+                head_coord, batch_coord, seq_coord_q = so1.compute_output_coords()
+                go1.tma_store(
+                    head_coord=head_coord,
+                    batch_coord=batch_coord,
+                    seq_coord_q=seq_coord_q,
+                )
+                so1.release()
+
+        captured_schedule = _schedule_with_work_queue(
+            epilogue_schedule,
+            smem_o_0,
+            smem_o_1,
+            gmem_o_0,
+            gmem_o_1,
+            work_queue=work_queue,
+        )
+        return task_class(
+            src_resources=src,
+            dst_resources=[gmem_o_0, gmem_o_1],
+            warp_idx=14,
+            num_warps=1,
+            schedule=captured_schedule,
+            num_registers=gmem_o_0.cfg.num_regs_other,
+            name="EpilogueTask",
+            **task_kwargs,
+        )
+
+    if smem_o_0.cfg.single_qkv_instance:
+        return _create_single_instance_task()
+    return _create_paired_task()
 
 
 def create_padding_task(
     work_queue: WorkQueue | None,
+    warp_idx: int = 15,
+    num_warps: int = 1,
     num_registers: int = 32,
+    name: str = "PaddingTask",
     task_class: type[Task] = Task,
     **task_kwargs: Any,
 ) -> Task:
-    """Create the one-warp padding task (warp 15).
+    """Create the one-warp padding task (warp 15 in the D128 schedule).
 
     Required in ALL modes (persistent and non-persistent) because
     ``setmaxnreg.sync`` requires every warp in the warp group to
-    participate.  Warps 12-15 form warp group 3; without the padding
-    task warp 15 never calls ``setmaxregister``, deadlocking the group.
+    participate. In D128, warps 12-15 form warp group 3; without the padding
+    task its final warp never calls ``setmaxregister``, deadlocking the group.
 
     In persistent mode the task also consumes work_queue tiles so that
-    warp 15 participates in the persistent outer loop.
+    the auxiliary warp participates in the persistent outer loop.
 
-    In CLC dynamic mode, warp 15 is replaced by a scheduler task
+    In CLC dynamic mode, the padding task is replaced by a scheduler task
     (see ``create_scheduler_task``).
     """
-    loop_start, loop_end, loop_step = _captured_loop_bounds(task_kwargs)
+    loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     src = _src_resources(work_queue=work_queue)
 
     @schedule
     def padding_schedule(wq: WorkQueue | None = None) -> None:
         """Captured schedule for warp-group register participation."""
-        with _work_tile_schedule_loop(wq):  # noqa: SIM117
-            with domain_loop(loop_start, loop_end, loop_step):
-                pass
+        with _work_tile_schedule_loop(wq), domain_loop(loop_start, loop_end, loop_step):
+            pass
 
     captured_schedule = _schedule_with_work_queue(
         padding_schedule, work_queue=work_queue
@@ -897,29 +1998,172 @@ def create_padding_task(
     return task_class(
         src_resources=src,
         dst_resources=[],
-        warp_idx=15,
+        warp_idx=warp_idx,
+        num_warps=num_warps,
+        schedule=captured_schedule,
+        num_registers=num_registers,
+        name=name,
+        **task_kwargs,
+    )
+
+
+def _prefetch_page_offsets_for_work_tile(
+    spo: SmemPageOffsetsKvResource,
+    *,
+    batch_coord: Int32,
+    kv_tile_start: Int32,
+    cached_seqlen_kv: Int32,
+    loop_start: int,
+    loop_end: int,
+    loop_step: int,
+    staged_single_instance: bool,
+) -> None:
+    """Produce page-ID stages in the same logical order as the load task."""
+    if staged_single_instance:
+        # D>128 overlaps QK(i) with PV(i-1): K0, then K_i/V_{i-1}, then V_last.
+        # One page-ID stage is shared by all head-dimension slices of a logical
+        # K or V tile, so this producer fires once per tile rather than per slice.
+        spo.acquire()
+        spo.load_k(
+            batch_coord=batch_coord,
+            kv_tile_start=kv_tile_start,
+            cached_seqlen_kv=cached_seqlen_kv,
+        )
+        spo.commit()
+        with domain_loop(loop_start + 1, loop_end, loop_step):
+            spo.acquire()
+            spo.load_k(
+                batch_coord=batch_coord,
+                kv_tile_start=kv_tile_start,
+                cached_seqlen_kv=cached_seqlen_kv,
+            )
+            spo.commit()
+            spo.acquire()
+            spo.load_v(
+                previous=True,
+                batch_coord=batch_coord,
+                kv_tile_start=kv_tile_start,
+                cached_seqlen_kv=cached_seqlen_kv,
+            )
+            spo.commit()
+        spo.acquire()
+        spo.load_v(
+            previous=False,
+            batch_coord=batch_coord,
+            kv_tile_start=kv_tile_start,
+            cached_seqlen_kv=cached_seqlen_kv,
+        )
+        spo.commit()
+        return
+
+    with domain_loop(loop_start, loop_end, loop_step):
+        spo.acquire()
+        spo.load_k(
+            batch_coord=batch_coord,
+            kv_tile_start=kv_tile_start,
+            cached_seqlen_kv=cached_seqlen_kv,
+        )
+        spo.commit()
+        spo.acquire()
+        spo.load_v(
+            batch_coord=batch_coord,
+            kv_tile_start=kv_tile_start,
+            cached_seqlen_kv=cached_seqlen_kv,
+        )
+        spo.commit()
+
+
+def create_page_offsets_task(
+    gmem_qkv: GmemQKVResource,
+    smem_page_offsets_kv: SmemPageOffsetsKvResource,
+    work_queue: WorkQueue | None,
+    task_class: type[Task] = Task,
+    num_registers: int = 32,
+    **task_kwargs: Any,
+) -> Task:
+    """Create the one-warp paged-KV page-offsets prefetch task.
+
+    Replaces ``create_padding_task`` when ``cfg.use_paged_kv`` is True. The
+    configuration's empty/scheduler warp prefetches page-table entries into
+    SMEM so the load warp can read cached page IDs when issuing paged TMA
+    copies. This also preserves that warp's ``setmaxnreg.sync`` participation.
+
+    Paged context uses non-persistent or static-persistent scheduling because
+    the exact CUTLASS DSL 4.7 TaskManager does not allow one task to own both
+    the dynamic work queue and page-offset production.
+    """
+    loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
+    src = _src_resources(gmem_qkv, work_queue=work_queue)
+    dst = [smem_page_offsets_kv]
+    staged_single_instance = (
+        smem_page_offsets_kv.cfg.single_qkv_instance
+        and smem_page_offsets_kv.cfg.has_tmem_p_pipeline
+    )
+
+    @schedule
+    def page_offsets_schedule(
+        gqkv: GmemQKVResource,
+        spo: SmemPageOffsetsKvResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Captured schedule for K/V page-table prefetch."""
+        spo.init_load_state()
+        with _work_tile_schedule_loop(wq):
+            (
+                _seq_coord,
+                _head_coord,
+                _kv_head_coord,
+                _head_coord_kv,
+                batch_coord,
+                _seq_coord_q,
+                _cuseqlen_q,
+                _cuseqlen_k,
+                _seqlen_q,
+                _seqlen_k,
+                kv_tile_start,
+            ) = gqkv.compute_coords()
+            cached_seqlen_kv = gqkv.cache_seqlen_kv(batch_coord=batch_coord)
+            _prefetch_page_offsets_for_work_tile(
+                spo,
+                batch_coord=batch_coord,
+                kv_tile_start=kv_tile_start,
+                cached_seqlen_kv=cached_seqlen_kv,
+                loop_start=loop_start,
+                loop_end=loop_end,
+                loop_step=loop_step,
+                staged_single_instance=staged_single_instance,
+            )
+
+    captured_schedule = _schedule_with_work_queue(
+        page_offsets_schedule, gmem_qkv, smem_page_offsets_kv, work_queue=work_queue
+    )
+    return task_class(
+        src_resources=src,
+        dst_resources=dst,
+        warp_idx=smem_page_offsets_kv.cfg.empty_warp_id,
         num_warps=1,
         schedule=captured_schedule,
         num_registers=num_registers,
-        name="PaddingTask",
+        name="PageOffsetsTask",
         **task_kwargs,
     )
 
 
 def create_scheduler_task(
     work_queue: WorkQueue,
+    warp_idx: int = 15,
     num_registers: int = 32,
     task_class: type[Task] = Task,
     **task_kwargs: Any,
 ) -> Task:
-    """Create the one-warp CLC scheduler task (warp 15).
+    """Create the one-warp CLC scheduler task (warp 15 in D128).
 
     Replaces the padding task in CLC dynamic persistent mode.
     Issues CLC tile-fetch queries (producer side) and participates in
     the persistent outer loop.  Still satisfies the ``setmaxnreg.sync``
-    requirement for warp group 3 (warps 12-15).
+    requirement for the final warp group.
     """
-    loop_start, loop_end, loop_step = _captured_loop_bounds(task_kwargs)
+    loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
 
     @schedule
     def scheduler_schedule(wq: WorkQueue) -> None:
@@ -936,7 +2180,7 @@ def create_scheduler_task(
     return task_class(
         src_resources=[work_queue],
         dst_resources=[work_queue],
-        warp_idx=15,
+        warp_idx=warp_idx,
         num_warps=1,
         schedule=captured_schedule,
         num_registers=num_registers,

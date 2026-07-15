@@ -26,7 +26,9 @@ import torch
 
 import flashinfer.attention.prims_ts.context as _context_api
 from flashinfer.attention.prims_ts import (
+    BatchPrefillPagedTSWrapper,
     BatchPrefillTSWrapper,
+    batch_prefill_with_paged_kv_cache,
     batch_prefill_with_kv_cache,
 )
 
@@ -63,6 +65,19 @@ class _ContextCase:
         return self.qo_indptr is not None
 
 
+@dataclass(frozen=True)
+class _PagedContextCase:
+    """Paged storage plus its independent packed logical reference."""
+
+    reference: _ContextCase
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    qo_indptr: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    paged_kv_indices: torch.Tensor
+    paged_kv_last_page_len: torch.Tensor
+
+
 def _cumulative(lengths: Sequence[int]) -> tuple[int, ...]:
     offsets = [0]
     for length in lengths:
@@ -79,6 +94,7 @@ def _make_context_case(
     qkv_dtype: torch.dtype,
     packed: bool,
     mask_type: str,
+    head_dim: int = _HEAD_DIM,
     window_left: int = -1,
     output_dtype: Optional[torch.dtype] = None,
     output_scale: float = 0.75,
@@ -100,11 +116,11 @@ def _make_context_case(
     generator = torch.Generator(device=device).manual_seed(seed)
     input_scale = 0.125 if qkv_dtype == _FP8 else 0.2
     if packed:
-        q_shape = (sum(q_lengths), num_qo_heads, _HEAD_DIM)
-        kv_shape = (sum(k_lengths), num_kv_heads, _HEAD_DIM)
+        q_shape = (sum(q_lengths), num_qo_heads, head_dim)
+        kv_shape = (sum(k_lengths), num_kv_heads, head_dim)
     else:
-        q_shape = (len(q_lengths), q_lengths[0], num_qo_heads, _HEAD_DIM)
-        kv_shape = (len(k_lengths), k_lengths[0], num_kv_heads, _HEAD_DIM)
+        q_shape = (len(q_lengths), q_lengths[0], num_qo_heads, head_dim)
+        kv_shape = (len(k_lengths), k_lengths[0], num_kv_heads, head_dim)
 
     q = (
         input_scale
@@ -139,9 +155,114 @@ def _make_context_case(
         k_lengths=k_lengths,
         mask_type=mask_type,
         window_left=window_left,
-        sm_scale=1.0 / math.sqrt(_HEAD_DIM),
+        sm_scale=1.0 / math.sqrt(head_dim),
         output_scale=output_scale,
         output_dtype=qkv_dtype if output_dtype is None else output_dtype,
+    )
+
+
+def _make_paged_context_case(
+    *,
+    q_lengths: Sequence[int],
+    k_lengths: Sequence[int],
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    qkv_dtype: torch.dtype,
+    mask_type: str,
+    window_left: int = -1,
+    output_scale: float = 0.75,
+    seed: int = 0,
+) -> _PagedContextCase:
+    """Create nonidentity HND pages and the matching packed logical tensors."""
+
+    q_lengths = tuple(int(length) for length in q_lengths)
+    k_lengths = tuple(int(length) for length in k_lengths)
+    if not q_lengths or len(q_lengths) != len(k_lengths):
+        raise ValueError("Q and KV lengths must describe the same non-empty batch")
+    if min(q_lengths) <= 0 or min(k_lengths) <= 0:
+        raise ValueError("sequence lengths must be positive")
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    input_scale = 0.125 if qkv_dtype == _FP8 else 0.2
+
+    def random_tensor(shape: tuple[int, ...]) -> torch.Tensor:
+        return (
+            input_scale
+            * torch.randn(
+                shape, generator=generator, device=device, dtype=torch.float32
+            )
+        ).to(qkv_dtype)
+
+    q = random_tensor((sum(q_lengths), num_qo_heads, head_dim)).contiguous()
+    logical_k = random_tensor((sum(k_lengths), num_kv_heads, head_dim)).contiguous()
+    logical_v = random_tensor((sum(k_lengths), num_kv_heads, head_dim)).contiguous()
+    page_counts = tuple(math.ceil(length / 32) for length in k_lengths)
+    page_indptr = _cumulative(page_counts)
+    num_used_pages = page_indptr[-1]
+    num_physical_pages = num_used_pages + 2
+    page_indices = tuple(reversed(range(1, num_used_pages + 1)))
+    if page_indices == tuple(range(num_used_pages)):
+        raise AssertionError("paged test requires a nonidentity page table")
+
+    cache_shape = (num_physical_pages, num_kv_heads, 32, head_dim)
+    k_staging = torch.full(
+        cache_shape, float("nan"), dtype=torch.float16, device=device
+    )
+    v_staging = torch.full_like(k_staging, float("nan"))
+    logical_offset = 0
+    for batch_idx, k_length in enumerate(k_lengths):
+        for page_in_request in range(page_counts[batch_idx]):
+            physical_page = page_indices[page_indptr[batch_idx] + page_in_request]
+            page_begin = page_in_request * 32
+            page_extent = min(32, k_length - page_begin)
+            k_staging[physical_page].zero_()
+            v_staging[physical_page].zero_()
+            logical_slice = slice(
+                logical_offset + page_begin,
+                logical_offset + page_begin + page_extent,
+            )
+            k_staging[physical_page, :, :page_extent].copy_(
+                logical_k[logical_slice].permute(1, 0, 2).to(torch.float16)
+            )
+            v_staging[physical_page, :, :page_extent].copy_(
+                logical_v[logical_slice].permute(1, 0, 2).to(torch.float16)
+            )
+        logical_offset += k_length
+
+    qo_indptr = torch.tensor(_cumulative(q_lengths), dtype=torch.int32, device=device)
+    paged_kv_indptr = torch.tensor(page_indptr, dtype=torch.int32, device=device)
+    paged_kv_indices = torch.tensor(page_indices, dtype=torch.int32, device=device)
+    paged_kv_last_page_len = torch.tensor(
+        tuple((length - 1) % 32 + 1 for length in k_lengths),
+        dtype=torch.int32,
+        device=device,
+    )
+    reference = _ContextCase(
+        q=q,
+        k=logical_k,
+        v=logical_v,
+        qo_indptr=qo_indptr,
+        kv_indptr=torch.tensor(
+            _cumulative(k_lengths), dtype=torch.int32, device=device
+        ),
+        q_lengths=q_lengths,
+        k_lengths=k_lengths,
+        mask_type=mask_type,
+        window_left=window_left,
+        sm_scale=1.0 / math.sqrt(head_dim),
+        output_scale=output_scale,
+        output_dtype=qkv_dtype,
+    )
+    return _PagedContextCase(
+        reference=reference,
+        k_cache=k_staging.to(qkv_dtype),
+        v_cache=v_staging.to(qkv_dtype),
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=paged_kv_indices,
+        paged_kv_last_page_len=paged_kv_last_page_len,
     )
 
 
@@ -458,6 +579,12 @@ def _build_static_task_graph(
     q_offset: int = 0,
     causal_single_kv_tile: bool = False,
     has_varlen: bool = False,
+    head_dim: int = _HEAD_DIM,
+    qkv_dtype_name: str = "fp16",
+    use_paged_kv: bool = False,
+    num_tokens_per_page: int = 32,
+    max_num_pages_per_seq_kv: int = 8,
+    exhaustive_deadlock_race_check: bool = False,
 ):
     import cutlass
 
@@ -466,18 +593,26 @@ def _build_static_task_graph(
         build_fmha_task_manager,
     )
 
+    qkv_dtype = {
+        "fp16": cutlass.Float16,
+        "bf16": cutlass.BFloat16,
+        "fp8": cutlass.Float8E4M3FN,
+    }[qkv_dtype_name]
     fmha = FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
-        in_dtype=cutlass.Float16,
-        out_dtype=cutlass.Float16,
-        d=_HEAD_DIM,
+        in_dtype=qkv_dtype,
+        out_dtype=qkv_dtype,
+        d=head_dim,
         is_persistent=is_persistent,
         is_causal=is_causal,
         is_clc_dynamic=is_clc_dynamic,
         head_paired=head_paired,
         window_size_left=window_size_left,
         h_r=8 if head_paired else 1,
+        use_paged_kv=use_paged_kv,
+        num_tokens_per_page=num_tokens_per_page,
+        max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
         causal_single_kv_tile=causal_single_kv_tile,
     )
     fmha.cfg.has_varlen = has_varlen
@@ -493,9 +628,12 @@ def _build_static_task_graph(
         cum_seqlen_k=None,
         num_kv_tiles=num_kv_tiles,
         q_offset=q_offset,
+        g_page_idx_kv=None,
+        g_seq_lens_kv=None,
+        max_seq_len_kv=(num_kv_tiles * fmha.cfg.kv_tile_n if use_paged_kv else None),
         is_persistent=is_persistent,
         is_clc_dynamic=is_clc_dynamic,
-        exhaustive_deadlock_race_check=False,
+        exhaustive_deadlock_race_check=exhaustive_deadlock_race_check,
     )
     return fmha, task_manager
 
@@ -903,6 +1041,24 @@ def test_attention_ts_context_single_kv_tile_rejects_invalid_private_use():
             h_r=8,
             causal_single_kv_tile=True,
         )
+    with pytest.raises(ValueError, match="fixed contiguous K/V"):
+        FmhaTs(
+            d=_HEAD_DIM,
+            is_causal=True,
+            use_paged_kv=True,
+            causal_single_kv_tile=True,
+        )
+    with pytest.raises(ValueError, match="fixed contiguous K/V"):
+        _build_static_task_graph(
+            is_persistent=True,
+            is_clc_dynamic=False,
+            is_causal=True,
+            head_paired=False,
+            window_size_left=0,
+            num_kv_tiles=1,
+            causal_single_kv_tile=True,
+            has_varlen=True,
+        )
     with pytest.raises(ValueError, match="exactly one compile-time K/V tile"):
         _build_static_task_graph(
             is_persistent=True,
@@ -915,19 +1071,148 @@ def test_attention_ts_context_single_kv_tile_rejects_invalid_private_use():
         )
 
 
-def test_attention_ts_context_d256_rejects_oversized_tmem_layout():
+def test_attention_ts_context_paged_private_contract_matches_public_policy():
+    from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import FmhaTs
+
+    fmha = FmhaTs(d=_HEAD_DIM, use_paged_kv=True)
+    assert fmha.cfg.num_tokens_per_page == 32
+    assert not fmha.is_clc_dynamic
+
+    with pytest.raises(ValueError, match="does not support CLC dynamic"):
+        FmhaTs(
+            d=_HEAD_DIM,
+            use_paged_kv=True,
+            is_persistent=True,
+            is_clc_dynamic=True,
+        )
+    for page_size in (16, 64, 128):
+        with pytest.raises(ValueError, match="num_tokens_per_page=32"):
+            FmhaTs(
+                d=_HEAD_DIM,
+                use_paged_kv=True,
+                num_tokens_per_page=page_size,
+            )
+
+
+def test_attention_ts_context_d256_uses_single_instance_staged_tmem_layout():
     import cutlass
 
     from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import FmhaTs
 
-    with pytest.raises(ValueError, match="requires 768 TMEM columns"):
-        FmhaTs(
-            d=256,
-            qk_acc_dtype=cutlass.Float32,
-            pv_acc_dtype=cutlass.Float32,
-            in_dtype=cutlass.Float8E4M3FN,
-            out_dtype=cutlass.Float8E4M3FN,
-        )
+    cfg = FmhaTs(
+        d=256,
+        qk_acc_dtype=cutlass.Float32,
+        pv_acc_dtype=cutlass.Float32,
+        in_dtype=cutlass.Float8E4M3FN,
+        out_dtype=cutlass.Float8E4M3FN,
+    ).cfg
+
+    assert cfg.num_qkv_instances == 1
+    assert cfg.single_qkv_instance
+    assert cfg.cta_tiler == (128, 128, 256)
+    assert cfg.head_dim_per_stage_kv == 128
+    assert cfg.num_head_dim_stages_k == 2
+    assert cfg.num_head_dim_stages_v == 2
+    assert cfg.num_o_head_dim_stages == 2
+    assert cfg.stage_kv_by_head_dim
+    assert cfg.stage_o_by_head_dim
+
+    assert cfg.q_stage == 1
+    assert cfg.kv_stage == 4
+    assert cfg.mma_softmax_stage == 2
+    assert cfg.softmax_corr_stage == 2
+    assert cfg.epi_stage == 2
+    assert cfg.has_tmem_p_pipeline
+    assert cfg.stage_scoped_tmem_stats
+    assert cfg.sQ_shape == (1, 128 * 256)
+    assert cfg.sK_shape == (4, 128 * 128)
+    assert cfg.sO_shape == (2, 128 * 128)
+
+    assert cfg.tmem_alloc_cols == 512
+    assert cfg.tmem_o0_offset == 0
+    assert cfg.tmem_s0_offset == 256
+    assert cfg.tmem_p0_offset == 288
+    assert cfg.tmem_vec0_offset == cfg.tmem_s0_offset
+    assert cfg.softmax0_warp_ids == (0, 1, 2, 3)
+    assert cfg.softmax1_warp_ids == ()
+    assert cfg.correction_warp_ids == (4, 5, 6, 7)
+    assert (cfg.mma_warp_id, cfg.load_warp_id, cfg.epilogue_warp_id) == (8, 9, 10)
+    assert cfg.empty_warp_id == 11
+    assert cfg.block_warps == 12
+    assert (cfg.num_regs_softmax, cfg.num_regs_correction, cfg.num_regs_other) == (
+        200,
+        192,
+        112,
+    )
+
+
+@pytest.mark.parametrize("head_dim", (128, 256))
+@pytest.mark.parametrize("use_paged_kv", (False, True), ids=("ragged", "paged32"))
+def test_attention_ts_context_fp8_head_dim_kv_layout_schedule_builds(
+    head_dim: int,
+    use_paged_kv: bool,
+):
+    fmha, task_manager = _build_static_task_graph(
+        is_persistent=True,
+        is_clc_dynamic=False,
+        is_causal=False,
+        head_paired=False,
+        window_size_left=0,
+        num_kv_tiles=2,
+        head_dim=head_dim,
+        qkv_dtype_name="fp8",
+        use_paged_kv=use_paged_kv,
+        has_varlen=not use_paged_kv,
+        num_tokens_per_page=32,
+        max_num_pages_per_seq_kv=8,
+        exhaustive_deadlock_race_check=True,
+    )
+    cfg = fmha.cfg
+    tasks = {task.name: task for task in task_manager.tasks}
+    auxiliary_task_name = "PageOffsetsTask" if use_paged_kv else "PaddingTask"
+    expected_tasks = {
+        "Softmax0Task",
+        "CorrectionTask",
+        "MmaTask",
+        "LoadTask",
+        "EpilogueTask",
+        auxiliary_task_name,
+    }
+    if head_dim == 128:
+        expected_tasks.add("Softmax1Task")
+
+    assert set(tasks) == expected_tasks
+    assert cfg.num_qkv_instances == (2 if head_dim == 128 else 1)
+    assert cfg.cta_tiler == ((256, 128, 128) if head_dim == 128 else (128, 128, 256))
+    assert cfg.use_paged_kv is use_paged_kv
+    assert cfg.has_varlen is (not use_paged_kv)
+    assert cfg.num_tokens_per_page == 32
+    assert tasks["Softmax0Task"].warp_idx == cfg.softmax0_warp_ids[0]
+    if head_dim == 128:
+        assert tasks["Softmax1Task"].warp_idx == cfg.softmax1_warp_ids[0]
+    assert tasks["CorrectionTask"].warp_idx == cfg.correction_warp_ids[0]
+    assert tasks["MmaTask"].warp_idx == cfg.mma_warp_id
+    assert tasks["LoadTask"].warp_idx == cfg.load_warp_id
+    assert tasks["EpilogueTask"].warp_idx == cfg.epilogue_warp_id
+    assert tasks[auxiliary_task_name].warp_idx == cfg.empty_warp_id
+    assert task_manager._tmem_allocator.total_tmem_columns == 512
+
+    load_resource_names = {
+        resource.name for resource in tasks["LoadTask"].src_resources
+    }
+    assert ("smem_page_offsets_kv" in load_resource_names) is use_paged_kv
+    if use_paged_kv:
+        page_offsets_resources = {
+            resource.name: resource
+            for resource in tasks["PageOffsetsTask"].dst_resources
+        }
+        assert set(page_offsets_resources) == {"smem_page_offsets_kv"}
+        # The downstream K/V resource reads the stage captured by
+        # ConsumerWait. Without this flag every work tile remains pinned to
+        # page-offset stage zero, which corrupts B>1 and sufficiently long KV.
+        assert page_offsets_resources[
+            "smem_page_offsets_kv"
+        ].pipeline_config.advance_on_wait
 
 
 # ---------------------------------------------------------------------------
@@ -950,7 +1235,7 @@ def test_attention_ts_context_public_rejections():
         seed=2026071401,
     )
 
-    with pytest.raises(NotImplementedError, match="head_dim=128"):
+    with pytest.raises(NotImplementedError, match=r"head_dim in \(128, 256\)"):
         BatchPrefillTSWrapper().plan(
             torch.empty((1, 8, 4, 64), dtype=base.q.dtype, device="cuda"),
             torch.empty((1, 8, 2, 64), dtype=base.k.dtype, device="cuda"),
@@ -1341,6 +1626,113 @@ def test_attention_ts_context_fixed_window_loop_excludes_right_marker():
     actual = _run_one_shot(case)
     _assert_context_correct(actual, case)
     assert torch.count_nonzero(actual[0, 0]) == 0
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_d256_fixed_causal_single_tile_runtime():
+    case = _make_context_case(
+        q_lengths=(65,),
+        k_lengths=(65,),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=256,
+        qkv_dtype=torch.bfloat16,
+        packed=False,
+        mask_type="causal",
+        output_dtype=torch.bfloat16,
+        device="cuda",
+        seed=2026071519,
+    )
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    assert dict(wrapper._policy)["causal_single_kv_tile"] is True
+    output = wrapper.run(case.q, case.k, case.v)
+    _assert_context_correct(output, case)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
+    case = _make_paged_context_case(
+        q_lengths=(17, 65),
+        k_lengths=(49, 97),
+        num_qo_heads=8,
+        num_kv_heads=4,
+        head_dim=256,
+        qkv_dtype=_FP8,
+        mask_type="causal",
+        seed=2026071520,
+    )
+    output = torch.full_like(case.reference.q, float("nan"))
+    returned = batch_prefill_with_paged_kv_cache(
+        case.reference.q,
+        case.k_cache,
+        case.v_cache,
+        case.qo_indptr,
+        case.paged_kv_indptr,
+        case.paged_kv_indices,
+        case.paged_kv_last_page_len,
+        page_size=32,
+        mask_type="causal",
+        sm_scale=case.reference.sm_scale,
+        output_scale=case.reference.output_scale,
+        out_dtype=case.reference.output_dtype,
+        out=output,
+    )
+    assert returned is output
+    assert case.paged_kv_last_page_len.tolist() == [17, 1]
+    assert case.paged_kv_indices.tolist() != list(range(case.paged_kv_indices.numel()))
+    _assert_context_correct(output, case.reference)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_paged_window_graph_replay_writes_fresh_output():
+    case = _make_paged_context_case(
+        q_lengths=(33,),
+        k_lengths=(65,),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        qkv_dtype=_FP8,
+        mask_type="causal",
+        window_left=31,
+        seed=2026071521,
+    )
+    wrapper = BatchPrefillPagedTSWrapper()
+    wrapper.plan(
+        case.reference.q,
+        case.k_cache,
+        case.v_cache,
+        case.qo_indptr,
+        case.paged_kv_indptr,
+        case.paged_kv_indices,
+        case.paged_kv_last_page_len,
+        page_size=32,
+        mask_type="causal",
+        window_left=case.reference.window_left,
+        sm_scale=case.reference.sm_scale,
+        output_scale=case.reference.output_scale,
+        out_dtype=case.reference.output_dtype,
+    )
+    assert dict(wrapper._policy)["pairing"] == "head"
+
+    output = torch.full_like(case.reference.q, float("nan"))
+    assert (
+        wrapper.run(case.reference.q, case.k_cache, case.v_cache, out=output) is output
+    )
+    _assert_context_correct(output, case.reference)
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = wrapper.run(case.reference.q, case.k_cache, case.v_cache, out=output)
+    assert captured is output
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_context_correct(output, case.reference)
 
 
 @pytest.mark.arch_blackwell
