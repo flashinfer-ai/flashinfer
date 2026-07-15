@@ -333,17 +333,26 @@ def checkpointing_ssu(
         Caller's responsibility: upstream/downstream kernels must also be
         PDL-paired for the wait/signal to have effect.  Defaults to False.
     cb_scaled : Optional[torch.Tensor]
-        Pre-allocated fp32 scratch for the precomputed CB matrix, shape
-        (batch, nheads, T_pad, window_pad).  Providing it (together with
-        ``cumAdt_vec`` / ``cb_old`` / ``cumAdt_old``) makes the **two-kernel**
-        (precompute + main) path available — ``algorithm`` decides whether it
-        runs; leaving all four ``None`` always runs the monolithic kernel.
-        Caller-allocated so the path is CUDA-graph-safe (no in-wrapper
+        Pre-allocated input-dtype (same as ``x``) scratch for the precomputed
+        new-token CB matrix, fragment-native layout
+        (batch, nheads, WARP_SIZE, MMA_FRAG_SIZE) — each (batch, head)'s CB is
+        one m16n8k16 MMA A-fragment stored as [warp lane, register].  Providing
+        it (together with ``cumAdt_vec`` / ``cb_old`` / ``cumAdt_old``) makes the
+        **two-kernel** (precompute + main) path available — ``algorithm`` decides
+        whether it runs; leaving all four ``None`` always runs the monolithic
+        kernel.  Caller-allocated so the path is CUDA-graph-safe (no in-wrapper
         allocation, like ``out``).
     cumAdt_vec : Optional[torch.Tensor]
         Pre-allocated fp32 scratch for the per-head raw cumAdt vector, shape
         (batch, nheads, T_pad); the main kernel exponentiates it on the fly to
         get the decay/β factor.  Must be provided iff ``cb_scaled`` is.
+    cb_old : Optional[torch.Tensor]
+        Pre-allocated input-dtype (same as ``x``) scratch for the precomputed
+        old-token CB matrix, fragment-native layout
+        (batch, nheads, WARP_SIZE, K_old // 2) where
+        K_old = next_multiple_of_8(max_window) — the m16n8k{K_old} MMA
+        A-fragment consumed on the no-write (replay) path, stored as
+        [warp lane, register].  Must be provided iff ``cb_scaled`` is.
     cumAdt_old : Optional[torch.Tensor]
         Pre-allocated fp32 scratch for the old-token decay rows, shape
         (batch, nheads, max_window).  The ring caches carry no decay (prefix
