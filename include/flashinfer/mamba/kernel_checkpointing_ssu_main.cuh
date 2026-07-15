@@ -266,43 +266,6 @@ __device__ __forceinline__ void load_cb_async(SmemT& smem, CheckpointingSsuParam
   }
 }
 
-template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
-          int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS,
-          bool MUST_CHECKPOINT, typename SmemT>
-__device__ __forceinline__ void output_head(SmemT& smem, CheckpointingSsuParams const& params,
-                                            int lane, int warp, int d_tile, int head, int seq,
-                                            int64_t cache_slot, int ring_start, int prev_k,
-                                            int64_t outer, int seq_len, int64_t out_seq_base,
-                                            int write_offset, int64_t rand_seed, int tile_buf,
-                                            float D_val) {
-  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
-  constexpr int CB_NEW_REGS = NPREDICTED_PAD_MMA_M / 2;
-  constexpr int CB_OLD_REGS = SmemT::MAX_WINDOW_PAD_MMA_K / 2;
-  auto const* __restrict__ cb_gmem_head =
-      reinterpret_cast<input_t const*>(params.cb_scaled) +
-      (int64_t)(seq * params.nheads + head) * warpSize * CB_NEW_REGS;
-
-  if constexpr (MUST_CHECKPOINT) {
-    compute_and_store_output<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                             PHILOX_ROUNDS, /*READ_PRECOMPUTED_CB=*/true>(
-        smem, params, warp, lane, d_tile, out_seq_base, head, cache_slot, D_val,
-        /*must_checkpoint=*/true, seq_len, cb_gmem_head, tile_buf);
-  } else {
-    auto const* __restrict__ cb_old_head =
-        reinterpret_cast<input_t const*>(params.cb_old) +
-        (int64_t)(seq * params.nheads + head) * warpSize * CB_OLD_REGS;
-    compute_no_write_output<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                            NUM_WARPS, /*READ_PRECOMPUTED_CB=*/true>(
-        smem, params, warp, lane, prev_k, d_tile, out_seq_base, head, cache_slot, D_val, seq_len,
-        cb_gmem_head, cb_old_head, tile_buf);
-  }
-  // store_old_x: 128-thread cooperative copy (16×8 layout), only first 4 warps participate.
-  if (warp < 4)
-    store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
-                                                     cache_slot, ring_start, write_offset, seq_len,
-                                                     tile_buf);
-}
-
 template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
           typename TiledMma, typename ThrMma, typename... FragY>
 __device__ __forceinline__ void add_init_out_main(SmemT const& smem, TiledMma const& tiled_mma,
