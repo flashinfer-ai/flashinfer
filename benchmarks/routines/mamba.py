@@ -179,14 +179,6 @@ def parse_mamba_args(line, parser):
         choices=["flashinfer", "triton"],
         help="Kernel backends to benchmark. Default: flashinfer",
     )
-    parser.add_argument(
-        "--philox-rounds",
-        type=int,
-        required=False,
-        default=0,
-        help="Philox stochastic rounding rounds on state writeback (0 = disabled). "
-        "Only supported for fp16/int8/fp8 state dtypes. Triton backend is skipped when enabled.",
-    )
 
     args = parser.parse_args(line)
 
@@ -215,7 +207,7 @@ def parse_mamba_args(line, parser):
         )
 
     # Validate nheads/ngroups ratio is supported by the CUDA kernel
-    supported_ratios = [1, 2, 4, 8, 16, 32, 64]
+    supported_ratios = [1, 8, 16]
     ratio = args.nheads // args.ngroups
     if ratio not in supported_ratios:
         raise ValueError(
@@ -232,18 +224,6 @@ def parse_mamba_args(line, parser):
         raise ValueError(
             f"MTP/varlen mode only supports 'auto' or 'simple' algorithm, got '{args.algorithm}'"
         )
-
-    _philox_state_dtypes = ("float16", "int8", "fp8")
-    if args.philox_rounds > 0 and args.state_dtype not in _philox_state_dtypes:
-        raise ValueError(
-            f"--philox-rounds requires a quantized/reduced state dtype, got '{args.state_dtype}'. "
-            f"Supported: {_philox_state_dtypes}."
-        )
-    if args.philox_rounds > 0 and "triton" in args.backends:
-        print(
-            "[INFO] --philox-rounds: Triton backend does not support stochastic rounding, skipping it."
-        )
-        args.backends = [b for b in args.backends if b != "triton"]
 
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -297,7 +277,6 @@ def testSelectiveStateUpdate(args):
     dt_softplus = args.dt_softplus
     is_varlen = args.varlen
     algorithm = args.algorithm
-    philox_rounds = args.philox_rounds
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -310,11 +289,6 @@ def testSelectiveStateUpdate(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     state_dtype = dtype_str_to_torch_dtype(args.state_dtype)
     weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
-    rand_seed = (
-        torch.tensor([0xDECAFBAD], device="cuda", dtype=torch.int64)
-        if philox_rounds > 0
-        else None
-    )
     ## Done parsing input arguments
 
     ## Determine mode
@@ -449,8 +423,6 @@ def testSelectiveStateUpdate(args):
                     num_accepted_tokens=num_accepted,
                     cu_seqlens=cu_seqlens,
                     cache_steps=cache_steps,
-                    rand_seed=rand_seed,
-                    philox_rounds=philox_rounds,
                 )
             elif backend == "triton":
                 return selective_state_update_varlen_triton(
