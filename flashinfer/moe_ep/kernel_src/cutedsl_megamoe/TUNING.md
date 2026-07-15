@@ -50,21 +50,32 @@ reference on random data; real-model distributions typically fare better).
 Corrected K-major nvfp4 weights, speedup vs `deep_gemm_mega` in parens;
 CSVs `moe_ep_benchmark/results/sweep_20260715_*_fi_mega.csv`:
 
-| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 | mxfp8  |
-|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|-------:|
-| 1024     | 473.1  | 428.5 (1.10x)  | 431.1 (1.10x)  | **375.8 (1.26x)**  | 386.0 (1.23x)  | 749.6  |
-| 2048     | 844.3  | 625.6 (1.35x)  | 619.8 (1.36x)  | **549.9 (1.54x)**  | 582.6 (1.45x)  | 1006.6 |
-| 4096     | 1490.4 | 1018.4 (1.46x) | 998.7 (1.49x)  | **901.6 (1.65x)**  | 936.5 (1.59x)  | 1742.8 |
-| 8192     | 3105.2 | 1923.5 (1.61x) | 1914.9 (1.62x) | **1644.0 (1.89x)** | 1783.3 (1.74x) | 3122.2 |
+NVFP4 combine-leg variants:
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 1024     | 473.1  | 428.5 (1.10x)  | 431.1 (1.10x)  | **375.8 (1.26x)**  | 386.0 (1.23x)  |
+| 2048     | 844.3  | 625.6 (1.35x)  | 619.8 (1.36x)  | **549.9 (1.54x)**  | 582.6 (1.45x)  |
+| 4096     | 1490.4 | 1018.4 (1.46x) | 998.7 (1.49x)  | **901.6 (1.65x)**  | 936.5 (1.59x)  |
+| 8192     | 3105.2 | 1923.5 (1.61x) | 1914.9 (1.62x) | **1644.0 (1.89x)** | 1783.3 (1.74x) |
 
 [ikr = in_kernel_fc2_reduce; +combine_nvfp4 / +combine_mxfp8 = the fc2
 epilogue quantizes each partial in registers to fp4 (e2m1 + bf16 scale per
-16) or fp8 (e4m3 + e8m0 scale per 32) just for the wire.  The mxfp8 column
-is the `mxfp8_cutedsl` backend; its >=2048 rows use the re-derived
-dispatch-warp default profile (2026-07-15) — the old epi_warps profile
-measured 1209.6 / 2208.2 / 4844.0 there, so the profile change alone is
-worth 17-35% and brings mxfp8 to dg PARITY at 8192 tokens at a 3x better
-accuracy point (6.4% vs 20.6% rel-L2).]
+16) or fp8 (e4m3 + e8m0 scale per 32) just for the wire]
+
+Backend summary — dg vs the best nvfp4 config (`+combine_nvfp4`) vs the
+`mxfp8_cutedsl` backend (its >=2048 rows use the re-derived dispatch-warp
+default profile, 2026-07-15 — the old epi_warps profile measured
+1209.6 / 2208.2 / 4844.0 there, so the profile change alone is worth
+17-35% and brings mxfp8 to dg PARITY at 8192 tokens at a 3x better
+accuracy point, 6.4% vs 20.6% rel-L2):
+
+| tok/rank | dg     | nvfp4 best (vs dg) | mxfp8 (vs dg)   |
+|---------:|-------:|-------------------:|----------------:|
+| 1024     | 473.1  | 375.8 (1.26x)      | 749.6 (0.63x)   |
+| 2048     | 844.3  | 549.9 (1.54x)      | 1006.6 (0.84x)  |
+| 4096     | 1490.4 | 901.6 (1.65x)      | 1742.8 (0.86x)  |
+| 8192     | 3105.2 | 1644.0 (1.89x)     | 3122.2 (0.99x)  |
 
 (Below 1024 tok/rank nvfp4 and dg are at parity — 217.9 vs 211.0 @8,
 284.7 vs 286.7 @64, 359.4 vs 345.1 @512 — so the table keeps the
