@@ -1,10 +1,18 @@
 # CuTeDSL MegaMoE tuning + performance notes
 
-What was changed, measured, and learned while tuning the cutedsl mega
-backends (2026-07-14, 4x GB200, DeepSeek-V3-like geometry: 256 experts,
-top-8, hidden 7168, inter 2048, EP=4, unless noted).  Companion to
-`SKILL.md` (which covers the drop-update workflow); this file covers the
-tuning surface and the measurement methodology.
+This document collects the performance work on the CuTeDSL mega
+backends: the tuning surface (knobs, per-size default profiles, online
+autotuning), how tuning resolves at runtime, the measured results for
+each backend and combine-leg variant, and the benchmark methodology
+behind those numbers — including the measurement pitfalls we hit and how
+to avoid them.  It is the companion to `SKILL.md`, which covers the
+kernel drop-update workflow.
+
+Unless noted otherwise, all measurements were taken 2026-07-14 on a
+single GB200 node (4x GPUs, EP=4) at a DeepSeek-V3-like geometry:
+256 experts, top-8, hidden 7168, intermediate 2048.  A full reproduce
+recipe (hardware, container, versions, harness invocation) is in the
+"Sweep methodology" and "Runbook" sections below.
 
 ## Headline result
 
@@ -118,14 +126,14 @@ sequenceDiagram
     B->>S: get_symm_buffer_for_mega_moe(..., ikr, combine_dtype, knobs)
     alt knobs is an explicit dict
         S->>T: with_knobs(cfg, knobs) — overrides heuristic ENTIRELY
-    else knobs is None (how the backend's "auto" arrives too)
+    else knobs is None (how the backend's auto mode arrives too)
         S->>T: with_knobs(cfg, default_knobs(num_max_tokens, dtype))
         Note over S,T: a quantized combine_dtype auto-adjusts the default<br/>token_back_mode to reuse_dispatch_warps
     end
-    Note over S: in_kernel_fc2_reduce / combine_dtype are config<br/>params (not knobs); output_activation always sym-heap
+    Note over S: in_kernel_fc2_reduce / combine_dtype are config<br/>params (not knobs) — output_activation always sym-heap
     S-->>B: MegaMoESymmBuffer (frontend + staging tensors)
 
-    Note over L,C: every forward (any num_tokens <= capacity)
+    Note over L,C: every forward (any num_tokens up to capacity)
     L->>B: stage_inputs() then compute()
     B->>F: nvfp4_mega_moe(...) -> frontend.run()
     alt compile-key miss (first launch / config changed)
