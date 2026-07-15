@@ -64,6 +64,10 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
                  is_contiguous_3d(v_quant))
       << "quantized outputs must be contiguous";
 
+  TVM_FFI_ICHECK(q_block_size == 1 || q_block_size == 4 || q_block_size == 16)
+      << "q_block_size must be 1, 4, or 16";
+  TVM_FFI_ICHECK(k_block_size == 1 || k_block_size == 4 || k_block_size == 16)
+      << "k_block_size must be 1, 4, or 16";
   TVM_FFI_ICHECK_EQ(q_scale.dtype(), dl_float32);
   TVM_FFI_ICHECK_EQ(k_scale.dtype(), dl_float32);
   TVM_FFI_ICHECK_EQ(v_scale.dtype(), dl_float32);
@@ -72,10 +76,6 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
   TVM_FFI_ICHECK_EQ(k_scale.numel(),
                     key.size(1) * ((key.size(0) + k_block_size - 1) / k_block_size));
   TVM_FFI_ICHECK_EQ(v_scale.numel(), value.size(1) * value.size(2));
-  TVM_FFI_ICHECK(q_block_size == 1 || q_block_size == 4 || q_block_size == 16)
-      << "q_block_size must be 1, 4, or 16";
-  TVM_FFI_ICHECK(k_block_size == 1 || k_block_size == 4 || k_block_size == 16)
-      << "k_block_size must be 1, 4, or 16";
   TVM_FFI_ICHECK_GT(sm_count, 0);
 
   auto const stream = get_stream(query.device());
