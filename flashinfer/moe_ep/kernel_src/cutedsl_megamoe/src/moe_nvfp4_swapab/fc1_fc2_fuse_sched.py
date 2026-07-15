@@ -18,6 +18,7 @@ from cutlass.cutlass_dsl import (
     dsl_user_op,
 )
 from cutlass._mlir import ir
+
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
@@ -148,7 +149,9 @@ class _FusedFc12SchedState:
         values.extend(extract_mlir_values(self.current_work_linear_tile_idx))
         return values
 
-    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "_FusedFc12SchedState":
+    def __new_from_mlir_values__(
+        self, values: List[ir.Value]
+    ) -> "_FusedFc12SchedState":
         idx = 0
 
         def _take(obj):
@@ -161,15 +164,21 @@ class _FusedFc12SchedState:
         return _FusedFc12SchedState(
             current_group_idx=_take(self.current_group_idx),
             current_group_first_expert=_take(self.current_group_first_expert),
-            current_group_last_expert_exclusive=_take(self.current_group_last_expert_exclusive),
+            current_group_last_expert_exclusive=_take(
+                self.current_group_last_expert_exclusive
+            ),
             current_phase=_take(self.current_phase),
             current_expert_idx=_take(self.current_expert_idx),
             current_expert_tile_start=_take(self.current_expert_tile_start),
             current_expert_tile_end=_take(self.current_expert_tile_end),
             current_group_fc1_subphase_end=_take(self.current_group_fc1_subphase_end),
             current_group_end=_take(self.current_group_end),
-            cumulative_fc1_tiles_at_group_end=_take(self.cumulative_fc1_tiles_at_group_end),
-            cumulative_fc2_tiles_at_group_end=_take(self.cumulative_fc2_tiles_at_group_end),
+            cumulative_fc1_tiles_at_group_end=_take(
+                self.cumulative_fc1_tiles_at_group_end
+            ),
+            cumulative_fc2_tiles_at_group_end=_take(
+                self.cumulative_fc2_tiles_at_group_end
+            ),
             current_data_cumul=_take(self.current_data_cumul),
             current_sf_cumul=_take(self.current_sf_cumul),
             current_token_block_cumul=_take(self.current_token_block_cumul),
@@ -216,7 +225,9 @@ class _DynamicLoadBalanceState:
         values.extend(extract_mlir_values(self.atomic_res))
         return values
 
-    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "_DynamicLoadBalanceState":
+    def __new_from_mlir_values__(
+        self, values: List[ir.Value]
+    ) -> "_DynamicLoadBalanceState":
         idx = 0
 
         def _take(obj):
@@ -392,16 +403,12 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         # prototype (``self``), Int32 fields consume from ``values``.
         idx = 0
         if isinstance(self.expert_cnt, Int32):
-            result.expert_cnt = new_from_mlir_values(
-                self.expert_cnt, [values[idx]]
-            )
+            result.expert_cnt = new_from_mlir_values(self.expert_cnt, [values[idx]])
             idx += 1
         else:
             result.expert_cnt = self.expert_cnt
         if isinstance(self.intermediate, Int32):
-            result.intermediate = new_from_mlir_values(
-                self.intermediate, [values[idx]]
-            )
+            result.intermediate = new_from_mlir_values(self.intermediate, [values[idx]])
             idx += 1
         else:
             result.intermediate = self.intermediate
@@ -544,7 +551,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             ]
             cluster_pipeline_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             cluster_broadcast_slot: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 1], 16,
+                cute.struct.MemRange[cutlass.Int32, 1],
+                16,
             ]
 
         if params.load_balance_mode == "atomic_counter":
@@ -773,9 +781,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             # Cluster-wide broadcast pipeline for the leader CTA's atom.add.
             self._cluster_pipeline = pipeline.PipelineAsync.create(
                 num_stages=1,
-                producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 1
-                ),
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
                 consumer_group=pipeline.CooperativeGroup(
                     pipeline.Agent.Thread, 32 * cluster_size
                 ),
@@ -787,14 +793,12 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             if warp_idx == sched_warp_id:
                 tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
                 atomic_res = Int32(0)
-                if (
-                    self._dynamic_state.is_leader_cta
-                    and tidx % 32 == Int32(0)
-                ):
+                if self._dynamic_state.is_leader_cta and tidx % 32 == Int32(0):
                     atomic_res = cute.arch.atomic_add(
                         self._dynamic_state.counter_ptr,
                         Int32(1),
-                        loc=loc, ip=ip,
+                        loc=loc,
+                        ip=ip,
                     )
                 atomic_res = cute.arch.shuffle_sync(
                     atomic_res,
@@ -809,12 +813,10 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         elif const_expr(self.params.load_balance_mode == "static"):
             # Static mode eagerly decodes the first tile.
             if warp_idx == sched_warp_id:
-                cluster_linear_tile_idx = (
-                    self._advance_work_linear_tile_idx_static(loc=loc, ip=ip)
+                cluster_linear_tile_idx = self._advance_work_linear_tile_idx_static(
+                    loc=loc, ip=ip
                 )
-                self._gen_work_from_cluster_idx(
-                    cluster_linear_tile_idx, loc=loc, ip=ip
-                )
+                self._gen_work_from_cluster_idx(cluster_linear_tile_idx, loc=loc, ip=ip)
                 self._fused_state = self._fused_state  # DSL carry
                 self.current_work = self.current_work
             else:
@@ -883,12 +885,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         """
         ds = self._dynamic_state
         cluster_pipeline = self._cluster_pipeline
-        broadcast_tensor = cute.make_tensor(
-            ds.broadcast_ptr, cute.make_layout((1,))
-        )
-        cluster_size = (
-            self.params.cluster_shape_mn[0] * self.params.cluster_shape_mn[1]
-        )
+        broadcast_tensor = cute.make_tensor(ds.broadcast_ptr, cute.make_layout((1,)))
+        cluster_size = self.params.cluster_shape_mn[0] * self.params.cluster_shape_mn[1]
 
         # --- Producer side (leader CTA only) ---
         if ds.is_leader_cta:
@@ -908,7 +906,10 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 atomic_idx = Int32(0)
                 if lane_idx == Int32(0):
                     atomic_idx = cute.arch.atomic_add(
-                        ds.counter_ptr, Int32(1), loc=loc, ip=ip,
+                        ds.counter_ptr,
+                        Int32(1),
+                        loc=loc,
+                        ip=ip,
                     )
                 atomic_idx = cute.arch.shuffle_sync(
                     atomic_idx,
@@ -925,7 +926,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                     atomic_idx,
                     full_barrier_ptr,
                     lane_idx,
-                    loc=loc, ip=ip,
+                    loc=loc,
+                    ip=ip,
                 )
                 # Set expect_tx on the peer mbarrier to match the 4-byte
                 # store above; pairs with the consumer_wait below.
@@ -933,7 +935,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                     full_barrier_ptr,
                     Int32(4),
                     lane_idx,
-                    loc=loc, ip=ip,
+                    loc=loc,
+                    ip=ip,
                 )
         ds.producer_state.advance()
 
@@ -941,9 +944,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         cluster_pipeline.consumer_wait(ds.consumer_state)
         cluster_idx = broadcast_tensor[0]
         cute.arch.fence_acq_rel_cta()
-        cluster_pipeline.sync_object_empty.arrive(
-            ds.consumer_state.index, Int32(0)
-        )
+        cluster_pipeline.sync_object_empty.arrive(ds.consumer_state.index, Int32(0))
         ds.consumer_state.advance()
 
         return cluster_idx
@@ -990,9 +991,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         #     finishing group first, so no random jumps).
         state.current_expert_idx = state.current_expert_idx + Int32(1)
         if cutlass.const_expr(self.params.expert_token_sizes is not None):
-            state.current_token_offset = (
-                state.current_token_offset + prev_valid
-            )
+            state.current_token_offset = state.current_token_offset + prev_valid
             this_expert_token_cnt = compute_expert_token_count_from_sizes(
                 self.params.expert_token_sizes,
                 state.current_expert_idx,
@@ -1126,12 +1125,11 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                     loc=loc,
                     ip=ip,
                 )
-            token_block_count_e = (
-                token_count_e + Int32(cluster_tile_m) - 1
-            ) // Int32(cluster_tile_m)
+            token_block_count_e = (token_count_e + Int32(cluster_tile_m) - 1) // Int32(
+                cluster_tile_m
+            )
             cumulative_fc1 = (
-                cumulative_fc1
-                + token_block_count_e * self._num_fc1_intermediate_blocks
+                cumulative_fc1 + token_block_count_e * self._num_fc1_intermediate_blocks
             )
             cumulative_fc2 = (
                 cumulative_fc2 + token_block_count_e * self._num_fc2_hidden_blocks
@@ -1147,9 +1145,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
         # Previous group's end = this group's start in tile space.
         group_start_tile = state.current_group_end
-        state.current_group_fc1_subphase_end = (
-            group_start_tile + group_total_fc1_tiles
-        )
+        state.current_group_fc1_subphase_end = group_start_tile + group_total_fc1_tiles
         state.current_group_end = (
             state.current_group_fc1_subphase_end + group_total_fc2_tiles
         )
@@ -1247,11 +1243,13 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             remaining_cluster = cutlass.max(
                 state.current_this_expert_token_cnt - cluster_start, Int32(0)
             )
-            valid_tokens_in_cluster_tile = cutlass.min(remaining_cluster, Int32(cluster_tile_m))
+            valid_tokens_in_cluster_tile = cutlass.min(
+                remaining_cluster, Int32(cluster_tile_m)
+            )
             # Pack: high 16b = per-CTA tile count, low 16b = cluster-level count.
             valid_tokens_in_cta_cluster_tile = (
-                (valid_tokens_in_cta_tile << Int32(16)) | valid_tokens_in_cluster_tile
-            )
+                valid_tokens_in_cta_tile << Int32(16)
+            ) | valid_tokens_in_cluster_tile
             return self._ext.WorkTileInfo(
                 expert_idx=state.current_expert_idx,
                 tile_m_idx=tile_m_idx,
@@ -1327,9 +1325,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 and cluster_linear_tile_idx >= state.current_group_fc1_subphase_end
             ):
                 self._switch_to_fc2(loc=loc, ip=ip)
-                self._fused_state = (
-                    self._fused_state
-                )  # DSL carry
+                self._fused_state = self._fused_state  # DSL carry
             else:
                 self._fused_state = self._fused_state  # balanced else-side rebind
             state = self._fused_state  # re-bind alias
@@ -1391,27 +1387,24 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         # const_expr-forks on _first_advance_pending to consume the cached
         # atomic_res on its own first trace site.
         if cutlass.const_expr(
-            self._first_advance_pending
-            and self.params.load_balance_mode == "static"
+            self._first_advance_pending and self.params.load_balance_mode == "static"
         ):
             pass
         else:
             if const_expr(self.params.load_balance_mode == "atomic_counter"):
-                cluster_linear_tile_idx = (
-                    self._advance_work_linear_tile_idx_dynamic(loc=loc, ip=ip)
+                cluster_linear_tile_idx = self._advance_work_linear_tile_idx_dynamic(
+                    loc=loc, ip=ip
                 )
             elif const_expr(self.params.load_balance_mode == "static"):
-                cluster_linear_tile_idx = (
-                    self._advance_work_linear_tile_idx_static(loc=loc, ip=ip)
+                cluster_linear_tile_idx = self._advance_work_linear_tile_idx_static(
+                    loc=loc, ip=ip
                 )
             else:  # "clc"
                 raise NotImplementedError(
                     "load_balance_mode='clc' is reserved; CLC scheduler is "
                     "MoEDynamicPersistentTileScheduler, not the mega scheduler"
                 )
-            self._gen_work_from_cluster_idx(
-                cluster_linear_tile_idx, loc=loc, ip=ip
-            )
+            self._gen_work_from_cluster_idx(cluster_linear_tile_idx, loc=loc, ip=ip)
 
         # Codegen-time flip after the first trace site so subsequent traces
         # (the while-body call) pick the vanilla path.  This Python

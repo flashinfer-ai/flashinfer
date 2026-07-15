@@ -14,12 +14,9 @@ from common.megamoe_constants import (
     Fp8E4M3FNMax,
     Nvfp4E2M1Max,
     Nvfp4BlockSize,
-    Mxfp8BlockSize,
     SfPaddingBlock,
     TmaLeadingDimByteAlign,
     Nvfp4E2M1RcpLimit,
-    Fp8E4M3RcpLimit,
-    Fp8E5M2RcpLimit,
 )
 
 ### TO BE REMOVED
@@ -46,9 +43,6 @@ def round_up(a: int, b: int) -> int:
     return ceil_div(a, b) * b
 
 
-from common.host_utils import kind_data_dtype, kind_scale_dtype, kind_sf_vec_size
-
-
 def kind_data_max(kind: str) -> float:
     if kind == "nvfp4":
         return Nvfp4E2M1Max
@@ -72,10 +66,12 @@ def leading_dim_bytes(leading_elems: int, dtype: torch.dtype) -> int:
         return leading_elems * 2
     if dtype == torch.float32:
         return leading_elems * 4
-    if dtype in (Nvfp4ScaleDtype,
-                 Mxfp8DataDtype_e4m3,
-                 Mxfp8DataDtype_e5m2,
-                 Mxfp8ScaleDtype):
+    if dtype in (
+        Nvfp4ScaleDtype,
+        Mxfp8DataDtype_e4m3,
+        Mxfp8DataDtype_e5m2,
+        Mxfp8ScaleDtype,
+    ):
         return leading_elems
     raise ValueError(f"leading_dim_bytes: unsupported dtype {dtype!r}.")
 
@@ -107,8 +103,22 @@ def offs_to_group_sizes(offs: torch.Tensor) -> List[int]:
 
 _Fp4DecodeTable: torch.Tensor = torch.tensor(
     [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
     ],
     dtype=torch.float32,
 )
@@ -172,7 +182,11 @@ def dequant_block_scale_to_fp32(
     global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dequantize one 2D NVFP4 tensor using raw block scales."""
-    data_fp32 = unpack_fp4_to_f32(data) if data.dtype == Nvfp4DataDtype else data.to(torch.float32)
+    data_fp32 = (
+        unpack_fp4_to_f32(data)
+        if data.dtype == Nvfp4DataDtype
+        else data.to(torch.float32)
+    )
     if data_fp32.dim() != 2 or raw_scale.dim() != 2:
         raise ValueError(
             f"Expected 2D tensors, got data={data_fp32.dim()}D raw_scale={raw_scale.dim()}D."
@@ -328,6 +342,7 @@ def _create_raw_scale_tensor(
     scales = scale_values[indices]
     return scales.to(scale_dtype).reshape(non_k_size, scale_cols)
 
+
 def make_nvfp4_tensor_from_torch_rng(
     rng: torch.Generator,
     logical_shape: Tuple[int, ...],
@@ -350,13 +365,21 @@ def make_nvfp4_tensor_from_torch_rng(
         for dim_size in logical_shape:
             total_elements *= dim_size
         flat_bytes = torch.randint(
-            0, 256, (total_elements // 2,),
-            dtype=torch.uint8, device=device, generator=rng,
+            0,
+            256,
+            (total_elements // 2,),
+            dtype=torch.uint8,
+            device=device,
+            generator=rng,
         )
     else:
         random_u8 = torch.randint(
-            0, 100, logical_shape,
-            dtype=torch.uint8, device=device, generator=rng,
+            0,
+            100,
+            logical_shape,
+            dtype=torch.uint8,
+            device=device,
+            generator=rng,
         )
         nibbles = torch.zeros_like(random_u8)
         nibbles[(random_u8 >= 80) & (random_u8 < 90)] = 0x2
@@ -366,7 +389,8 @@ def make_nvfp4_tensor_from_torch_rng(
         if need_perm:
             perm_to_last = list(range(ndim))
             perm_to_last[packed_dim], perm_to_last[-1] = (
-                perm_to_last[-1], perm_to_last[packed_dim],
+                perm_to_last[-1],
+                perm_to_last[packed_dim],
             )
             nibbles = nibbles.permute(perm_to_last).contiguous()
         even, odd = nibbles[..., 0::2], nibbles[..., 1::2]
@@ -376,14 +400,16 @@ def make_nvfp4_tensor_from_torch_rng(
     need_perm = packed_dim != ndim - 1
     if need_perm:
         storage_shape[packed_dim], storage_shape[-1] = (
-            storage_shape[-1], storage_shape[packed_dim],
+            storage_shape[-1],
+            storage_shape[packed_dim],
         )
     storage_shape[-1] //= 2
     tensor = flat_bytes.view(Nvfp4DataDtype).reshape(storage_shape)
     if need_perm:
         permute_back = list(range(ndim))
         permute_back[packed_dim], permute_back[-1] = (
-            permute_back[-1], permute_back[packed_dim],
+            permute_back[-1],
+            permute_back[packed_dim],
         )
         tensor = tensor.permute(permute_back)
     return tensor
@@ -661,11 +687,11 @@ def nvfp4_quantize_per_block_16(
 
     fp32_max = torch.finfo(torch.float32).max
     acc_scale = float(norm_const) * _rcp_approx_ftz_f32_cuda(sfc_fp32_rt)
-    acc_scale = torch.nan_to_num(acc_scale, nan=fp32_max, posinf=fp32_max, neginf=fp32_max)
-    acc_scale = torch.clamp(acc_scale, max=fp32_max)
-    acc_scale = torch.where(
-        sfc_fp32_rt > 0, acc_scale, torch.zeros_like(acc_scale)
+    acc_scale = torch.nan_to_num(
+        acc_scale, nan=fp32_max, posinf=fp32_max, neginf=fp32_max
     )
+    acc_scale = torch.clamp(acc_scale, max=fp32_max)
+    acc_scale = torch.where(sfc_fp32_rt > 0, acc_scale, torch.zeros_like(acc_scale))
 
     scaled = c_swiglu * acc_scale.unsqueeze(-1).expand_as(blocked).reshape(M, N)
     c_fp4 = _pack_f32_to_fp4(scaled)

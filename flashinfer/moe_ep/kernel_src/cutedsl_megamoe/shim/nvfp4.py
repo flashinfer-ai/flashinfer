@@ -44,7 +44,7 @@ import dataclasses
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Optional, Tuple, Union
+from typing import Callable, Literal, Optional, Tuple, Union
 
 import torch
 

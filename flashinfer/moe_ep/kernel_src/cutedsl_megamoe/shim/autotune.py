@@ -71,9 +71,7 @@ def nvfp4_candidates(
                 "standalone_warps",
                 "reuse_dispatch_warps",
             ):
-                for ikr in (
-                    (False, True) if allow_in_kernel_fc2_reduce else (False,)
-                ):
+                for ikr in (False, True) if allow_in_kernel_fc2_reduce else (False,):
                     knobs = dict(
                         _SWEEP_BASE,
                         mma_tiler_mnk=tile,
@@ -181,10 +179,8 @@ def autotune_knobs(
     winner = candidates[best]
     frontend.apply_knobs(winner)
     if rank == 0:
-        ranked = sorted(zip(t.tolist(), candidates), key=lambda kv: kv[0])
-        summary = "\n".join(
-            f"    {us * 1e6:10.1f} us  {knobs}" for us, knobs in ranked
-        )
+        ranked = sorted(zip(t.tolist(), candidates, strict=False), key=lambda kv: kv[0])
+        summary = "\n".join(f"    {us * 1e6:10.1f} us  {knobs}" for us, knobs in ranked)
         print(
             f"[cutedsl-autotune] {label}: winner {winner} "
             f"({float(t[best]) * 1e6:.1f} us median, max across ranks) "

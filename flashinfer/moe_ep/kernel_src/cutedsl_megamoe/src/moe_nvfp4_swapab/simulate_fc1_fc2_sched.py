@@ -5,7 +5,6 @@
 
 import sys
 from enum import IntEnum
-from math import ceil
 from typing import IO, Iterator, List, Optional, Tuple
 
 
@@ -30,7 +29,7 @@ class FusedFc12Simulator:
     ):
         if any(off < 0 for off in offsets):
             raise ValueError("offsets entries must be non-negative")
-        if any(b < a for a, b in zip(offsets, offsets[1:])):
+        if any(b < a for a, b in zip(offsets, offsets[1:], strict=False)):
             raise ValueError("offsets must be non-decreasing (it's a cumsum)")
         if cta_tile_token <= 0 or num_fc1_n_blocks <= 0 or num_fc2_n_blocks <= 0:
             raise ValueError("tile / block counts must be positive")
@@ -94,10 +93,13 @@ class FusedFc12Simulator:
         if self.current_expert_idx >= self.current_group_last_expert_exclusive:
             return
         self.current_token_offset = (
-            0 if self.current_expert_idx == 0
+            0
+            if self.current_expert_idx == 0
             else self.offsets[self.current_expert_idx - 1]
         )
-        self.current_this_expert_token_cnt = self._get_token_count(self.current_expert_idx)
+        self.current_this_expert_token_cnt = self._get_token_count(
+            self.current_expert_idx
+        )
         self.current_token_block_count = ceil_div(
             self.current_this_expert_token_cnt, self.cta_tile_token
         )
@@ -126,7 +128,9 @@ class FusedFc12Simulator:
         self.current_group_idx += 1
         self.current_group_first_expert = self.current_group_last_expert_exclusive
         next_end, new_fc1, new_fc2 = self._find_next_group_end(
-            self.current_group_first_expert, base_fc1, base_fc2,
+            self.current_group_first_expert,
+            base_fc1,
+            base_fc2,
         )
         self.current_group_last_expert_exclusive = next_end
         self.cumulative_fc1_tiles_at_group_end = new_fc1
@@ -172,8 +176,10 @@ class FusedFc12Simulator:
             self._advance_group()
             if self.exhausted:
                 return None
-        if (self.current_phase == BlockPhase.Linear1
-                and linear_idx >= self.current_group_fc1_subphase_end):
+        if (
+            self.current_phase == BlockPhase.Linear1
+            and linear_idx >= self.current_group_fc1_subphase_end
+        ):
             self._switch_to_fc2()
         while linear_idx >= self.current_expert_tile_end:
             self._advance_expert_within_phase()
@@ -210,12 +216,8 @@ class FusedFc12Simulator:
                 "fc1_end_exclusive": self.current_group_fc1_subphase_end,
                 "fc2_start": self.current_group_fc1_subphase_end,
                 "fc2_end_exclusive": self.current_group_end,
-                "group_total_fc1": (
-                    self.cumulative_fc1_tiles_at_group_end - prev_fc1
-                ),
-                "group_total_fc2": (
-                    self.cumulative_fc2_tiles_at_group_end - prev_fc2
-                ),
+                "group_total_fc1": (self.cumulative_fc1_tiles_at_group_end - prev_fc1),
+                "group_total_fc2": (self.cumulative_fc2_tiles_at_group_end - prev_fc2),
             }
 
     # ------------------------------------------------------------------
@@ -224,9 +226,7 @@ class FusedFc12Simulator:
     # shell-comment style (``"# "``) and plain-text style coexist.
     # ------------------------------------------------------------------
 
-    def print_header(
-        self, *, prefix: str = "", file: Optional[IO[str]] = None
-    ) -> None:
+    def print_header(self, *, prefix: str = "", file: Optional[IO[str]] = None) -> None:
         """Print a one-line summary of the simulator parameters."""
         if file is None:
             file = sys.stdout
@@ -282,8 +282,7 @@ class FusedFc12Simulator:
         if file is None:
             file = sys.stdout
         print(
-            f"{prefix}group layout "
-            f"(greedy cut at cumulative fc1 >= group_hint):",
+            f"{prefix}group layout (greedy cut at cumulative fc1 >= group_hint):",
             file=file,
         )
         print(
@@ -293,9 +292,7 @@ class FusedFc12Simulator:
             file=file,
         )
         for g in self.enumerate_groups():
-            experts_str = (
-                f"[e{g['first_expert']}..e{g['last_expert_exclusive'] - 1}]"
-            )
+            experts_str = f"[e{g['first_expert']}..e{g['last_expert_exclusive'] - 1}]"
             fc1_str = f"[{g['fc1_start']}..{g['fc1_end_exclusive'] - 1}]"
             fc2_str = f"[{g['fc2_start']}..{g['fc2_end_exclusive'] - 1}]"
             total = g["group_total_fc1"] + g["group_total_fc2"]
@@ -306,9 +303,7 @@ class FusedFc12Simulator:
                 file=file,
             )
 
-    def print_layout(
-        self, *, prefix: str = "", file: Optional[IO[str]] = None
-    ) -> None:
+    def print_layout(self, *, prefix: str = "", file: Optional[IO[str]] = None) -> None:
         """Convenience: header + per-expert layout + group layout + total tiles.
 
         This is the entry point external callers (e.g. ``runner_fc12``)
@@ -317,9 +312,7 @@ class FusedFc12Simulator:
         if file is None:
             file = sys.stdout
         self.print_header(prefix=prefix, file=file)
-        total_fc1, total_fc2 = self.print_per_expert_layout(
-            prefix=prefix, file=file
-        )
+        total_fc1, total_fc2 = self.print_per_expert_layout(prefix=prefix, file=file)
         self.print_group_layout(prefix=prefix, file=file)
         print(f"{prefix}total tiles = {total_fc1 + total_fc2}", file=file)
 
@@ -335,13 +328,16 @@ def _format_tile(tile: dict) -> str:
 
 def main() -> None:
     import argparse
+
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--offsets",
-        nargs="+", type=int, required=True,
+        nargs="+",
+        type=int,
+        required=True,
         help="cumsum of token counts per expert (each diff must be multiple of cta-tile-token)",
     )
     parser.add_argument("--cta-tile-token", type=int, required=True)
@@ -349,9 +345,11 @@ def main() -> None:
     parser.add_argument("--num-fc2-n-blocks", type=int, required=True)
     parser.add_argument("--group-hint", type=int, required=True)
     parser.add_argument(
-        "--num-clusters", type=int, default=0,
+        "--num-clusters",
+        type=int,
+        default=0,
         help="if >0, also print the per-cluster sub-stream "
-             "(cluster c gets linear_idx in {c, c+C, c+2C, ...})",
+        "(cluster c gets linear_idx in {c, c+C, c+2C, ...})",
     )
     args = parser.parse_args()
 
@@ -375,7 +373,7 @@ def main() -> None:
         num_clusters = args.num_clusters
         print(
             f"# per-cluster dispatch (cluster c gets linear_idx in "
-            f"{{c, c+{num_clusters}, c+{2*num_clusters}, ...}}):"
+            f"{{c, c+{num_clusters}, c+{2 * num_clusters}, ...}}):"
         )
         for cluster_idx in range(num_clusters):
             print(f"# --- cluster {cluster_idx} ---")

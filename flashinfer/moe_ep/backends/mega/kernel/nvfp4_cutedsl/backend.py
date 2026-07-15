@@ -117,7 +117,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
-            knobs=None if k.knobs == "auto" else k.knobs,
+            knobs=k.knobs if isinstance(k.knobs, dict) else None,
         )
 
     def validate_forward(

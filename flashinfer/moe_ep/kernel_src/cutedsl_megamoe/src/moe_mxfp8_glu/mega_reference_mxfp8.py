@@ -46,15 +46,15 @@ from src.token_comm import CombineFormat
 
 def compute_megamoe_reference_mxfp8(
     # MXFP8 tensors carry LOGICAL shape (fp8 = 1 byte/element, no packing).
-    input_activation: torch.Tensor,        # (num_ranks, num_tokens_per_rank, hidden) fp8
-    input_activation_sf: torch.Tensor,     # (num_ranks, num_tokens_per_rank, hidden//32) E8M0
-    input_topk_idx: torch.Tensor,          # (num_ranks, num_tokens_per_rank, num_topk) int64
-    input_topk_weights: torch.Tensor,      # (num_ranks, num_tokens_per_rank, num_topk) fp32
-    fc1_weight: torch.Tensor,              # (num_ranks, num_experts_per_rank, hidden, intermediate) fp8, hidden stride-1
-    fc1_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, intermediate, hidden//32) E8M0
-    fc2_weight: torch.Tensor,              # (num_ranks, num_experts_per_rank, intermediate//2, hidden) fp8, inter//2 stride-1
-    fc2_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//32) E8M0
-    ab_dtype: torch.dtype,                 # torch.float8_e4m3fn or torch.float8_e5m2
+    input_activation: torch.Tensor,  # (num_ranks, num_tokens_per_rank, hidden) fp8
+    input_activation_sf: torch.Tensor,  # (num_ranks, num_tokens_per_rank, hidden//32) E8M0
+    input_topk_idx: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) int64
+    input_topk_weights: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) fp32
+    fc1_weight: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, intermediate) fp8, hidden stride-1
+    fc1_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate, hidden//32) E8M0
+    fc2_weight: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate//2, hidden) fp8, inter//2 stride-1
+    fc2_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//32) E8M0
+    ab_dtype: torch.dtype,  # torch.float8_e4m3fn or torch.float8_e5m2
     norm_const: float = 1.0,
     ref_compute_graph: Literal["transformers", "deepgemm"] = "deepgemm",
     fc2_output_dtype: torch.dtype = torch.bfloat16,
@@ -161,8 +161,8 @@ def compute_megamoe_reference_mxfp8(
             Mxfp8BlockSize,
             global_scale=None,
         )
-        fc1_weight_fp32 = fc1_weight_t_fp32.transpose(0, 1)         # (hidden, intermediate)
-        fc1_output_fp32 = gathered_act @ fc1_weight_fp32           # (R, intermediate)
+        fc1_weight_fp32 = fc1_weight_t_fp32.transpose(0, 1)  # (hidden, intermediate)
+        fc1_output_fp32 = gathered_act @ fc1_weight_fp32  # (R, intermediate)
 
         if return_fc1_gateup:
             fc1_gateup_per_expert[global_expert] = fc1_output_fp32.to(torch.bfloat16)
@@ -180,13 +180,15 @@ def compute_megamoe_reference_mxfp8(
             _up = _up.clamp(min=-limit, max=limit)
         swiglu_output = _swiglu_pair_hw_match_cuda(_gate, _up).reshape(
             _M, _N // 2
-        )                                                          # (R, intermediate//2)
+        )  # (R, intermediate//2)
 
         if apply_topk_in_fc1:
             # Mirror the kernel: weight applied before fp8 quantisation.
-            topk_w = input_topk_weights[
-                source_ranks, source_tokens, source_topk_slots
-            ].float().unsqueeze(-1)                                # (R, 1)
+            topk_w = (
+                input_topk_weights[source_ranks, source_tokens, source_topk_slots]
+                .float()
+                .unsqueeze(-1)
+            )  # (R, 1)
             swiglu_output = swiglu_output * topk_w
 
         # fc1-out MXFP8 round-trip (the only step that introduces kernel-vs-ref
@@ -202,8 +204,8 @@ def compute_megamoe_reference_mxfp8(
             Mxfp8BlockSize,
             global_scale=None,
         )
-        fc2_weight_fp32 = fc2_weight_t_fp32.transpose(0, 1)        # (intermediate//2, hidden)
-        fc2_output_fp32 = fc1_dequant @ fc2_weight_fp32            # (R, hidden)
+        fc2_weight_fp32 = fc2_weight_t_fp32.transpose(0, 1)  # (intermediate//2, hidden)
+        fc2_output_fp32 = fc1_dequant @ fc2_weight_fp32  # (R, hidden)
 
         # Quantized combine: the device epilogue quantizes the raw fp32
         # accumulator directly (quant_sfd_row's r_acc is acc_dtype=Float32,

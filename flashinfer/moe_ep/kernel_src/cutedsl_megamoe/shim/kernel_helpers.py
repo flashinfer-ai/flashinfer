@@ -51,7 +51,7 @@ def __getattr__(name):  # PEP 562: keep cutlass out of the import-time path
     try:
         module, attr = _LAZY[name]
     except KeyError:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
     return getattr(importlib.import_module(module), attr)
 
 
@@ -67,8 +67,8 @@ __all__ = [
     "round_up",
     "to_blocked",
     "_stack_byte_reinterpretable_tensors",
-    # lazy
-    "_make_e8m0_scale_tensor",
-    "_make_fp8_tensor",
-    "compute_megamoe_reference_mxfp8",
+    # lazy (resolved via PEP 562 __getattr__ above)
+    "_make_e8m0_scale_tensor",  # noqa: F822
+    "_make_fp8_tensor",  # noqa: F822
+    "compute_megamoe_reference_mxfp8",  # noqa: F822
 ]

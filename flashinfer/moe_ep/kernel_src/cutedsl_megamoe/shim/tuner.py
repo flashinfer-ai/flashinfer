@@ -216,7 +216,7 @@ def iter_candidates(
     names = list(space)
     for values in itertools.product(*(space[n] for n in names)):
         knobs = dict(base or {})
-        knobs.update(zip(names, values))
+        knobs.update(zip(names, values, strict=False))
         if is_valid(knobs, combine_format=combine_format):
             yield knobs
 

@@ -32,7 +32,6 @@ import torch
 from .nvfp4 import (
     MegaMoENvfp4Config,
     MegaMoENvfp4Frontend,
-    MegaMoENvfp4Inputs,
 )
 from .comm import bootstrap_dist, free_sym_tensor
 from moe_nvfp4_swapab.mega_runner import _build_arg_parser
@@ -72,33 +71,6 @@ def _config_from_args(
         apply_topk_in_fc1=args.ref_compute_graph == "deepgemm",
         gate_up_clamp=args.gate_up_clamp,
         enable_iket=args.enable_iket,
-    )
-
-
-def _inputs_from_tester(tester) -> MegaMoENvfp4Inputs:
-    topk_score = (
-        tester.my_topk_weights
-        if tester.misc.ref_compute_graph == "transformers"
-        else None
-    )
-    return MegaMoENvfp4Inputs(
-        activation=tester.my_activation,
-        activation_sf=tester.my_activation_sf,
-        topk_idx=tester.my_topk_idx,
-        topk_weights=tester.my_topk_weights,
-        fc1_weight=tester.my_fc1_weight,
-        fc1_weight_sf=tester.my_fc1_weight_sf,
-        fc2_weight=tester.my_fc2_weight,
-        fc2_weight_sf=tester.my_fc2_weight_sf,
-        fc1_alpha=tester.my_fc1_alpha,
-        fc2_alpha=tester.my_fc2_alpha,
-        fc1_norm_const=tester.my_fc1_norm_const,
-        combine_output=tester.combine_output,
-        combine_reduced_output=tester.combine_reduced_output,
-        combine_output_q=tester.combine_output_q,
-        combine_sf_q=tester.combine_sf_q,
-        combine_global_q=tester.combine_global_q,
-        topk_score_for_reduce=topk_score,
     )
 
 
@@ -163,49 +135,21 @@ def main(argv: list[str] | None = None) -> int:
         default=1e-2,
         help="Relative tolerance for reference compare (default: 1e-2).",
     )
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
 
     _, rank, world_size, _ = bootstrap_dist()
     # The new kernel drop removed build_tester_from_args(); the tester is now
     # constructed as MegaMoETester(problem, impl, misc, rank=rank) from
     # moe_nvfp4_swapab.mega_runner. This standalone smoke runner (not used by
     # moe_ep) has not been ported to build those problem/impl/misc objects.
+    # To restore: build the tester, map its tensors into MegaMoENvfp4Inputs,
+    # then wrap the run in try/finally around _finalize(runner, tester);
+    # generate_inputs / compute_reference / runner.run / _validate as before.
     raise NotImplementedError(
         "correctness.py is not ported to the new kernel drop's MegaMoETester API "
         "(moe_nvfp4_swapab.mega_runner.MegaMoETester). Build problem/impl/misc and "
         "construct MegaMoETester(problem, impl, misc, rank=rank) to restore it."
     )
-    cfg = _config_from_args(args, rank=rank, world_size=world_size)
-    runner = MegaMoENvfp4Frontend(cfg)
-    rc = 1
-
-    try:
-        if rank == 0:
-            print(f"MegaMoENvfp4Frontend smoke: rank={rank} world_size={world_size}")
-            print(cfg)
-
-        tester.generate_inputs()
-        if not args.skip_ref_check:
-            tester.compute_reference()
-
-        inputs = _inputs_from_tester(tester)
-        runner.run(inputs)
-
-        rc = 0
-        if not args.skip_ref_check:
-            if not _validate(tester, atol=args.val_atol, rtol=args.val_rtol):
-                rc = 1
-                if rank == 0:
-                    print("FAIL: output mismatch vs reference", file=sys.stderr)
-            elif rank == 0:
-                print("PASS")
-
-        if rank == 0:
-            print("DONE")
-    finally:
-        _finalize(runner, tester)
-
-    return rc
 
 
 if __name__ == "__main__":

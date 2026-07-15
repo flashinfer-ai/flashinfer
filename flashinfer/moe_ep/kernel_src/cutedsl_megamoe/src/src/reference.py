@@ -25,7 +25,13 @@ from typing import List
 
 import numpy as np
 
-from .config import DSV4Config, DSV4, MAX_SLOT, TOKEN_METADATA_BYTES, transform_sf_token_idx_numpy
+from .config import (
+    DSV4Config,
+    DSV4,
+    MAX_SLOT,
+    TOKEN_METADATA_BYTES,
+    transform_sf_token_idx_numpy,
+)
 
 
 _METADATA_PAD_BYTE: int = 0xFF
@@ -35,15 +41,19 @@ _METADATA_PAD_BYTE: int = 0xFF
 class ExpectedBuffers:
     """Expected state of the nine workspace buffers for one receiving rank."""
 
-    expert_send_count: np.ndarray            # (num_total_experts,)              uint64 (bit-packed)
-    expert_recv_count: np.ndarray            # (num_ranks, num_experts_per_rank) uint64
-    expert_recv_count_sum: np.ndarray        # (num_experts_per_rank,)           uint64 (bit-packed)
-    src_token_topk_idx: np.ndarray           # (num_experts_per_rank, num_ranks, MAX_SLOT) uint32
-    token_src_metadata: np.ndarray           # (num_max_pool_tokens, 8)          uint8
-    l1_arrival_count: np.ndarray             # (num_max_task_tiles,)             uint32
-    l1_token_buffer: np.ndarray              # (num_max_pool_tokens, hidden_bytes) uint8
-    l1_sf_buffer: np.ndarray                 # (sf_uint32_per_token, num_padded_sf_pool_tokens) uint32
-    l1_topk_weights_buf: np.ndarray          # (num_max_pool_tokens,)            float32
+    expert_send_count: (
+        np.ndarray
+    )  # (num_total_experts,)              uint64 (bit-packed)
+    expert_recv_count: np.ndarray  # (num_ranks, num_experts_per_rank) uint64
+    expert_recv_count_sum: (
+        np.ndarray
+    )  # (num_experts_per_rank,)           uint64 (bit-packed)
+    src_token_topk_idx: np.ndarray  # (num_experts_per_rank, num_ranks, MAX_SLOT) uint32
+    token_src_metadata: np.ndarray  # (num_max_pool_tokens, 8)          uint8
+    l1_arrival_count: np.ndarray  # (num_max_task_tiles,)             uint32
+    l1_token_buffer: np.ndarray  # (num_max_pool_tokens, hidden_bytes) uint8
+    l1_sf_buffer: np.ndarray  # (sf_uint32_per_token, num_padded_sf_pool_tokens) uint32
+    l1_topk_weights_buf: np.ndarray  # (num_max_pool_tokens,)            float32
 
 
 def _pack_metadata(rank_idx: int, token_idx: int, topk_idx: int) -> np.ndarray:
@@ -147,7 +157,9 @@ def dispatch_oracle(
                 expert_recv_count=np.zeros((R, E_local), dtype=np.uint64),
                 expert_recv_count_sum=np.zeros((E_local,), dtype=np.uint64),
                 src_token_topk_idx=np.zeros((E_local, R, MAX_SLOT), dtype=np.uint32),
-                token_src_metadata=np.full((P_TOK, TOKEN_METADATA_BYTES), _METADATA_PAD_BYTE, dtype=np.uint8),
+                token_src_metadata=np.full(
+                    (P_TOK, TOKEN_METADATA_BYTES), _METADATA_PAD_BYTE, dtype=np.uint8
+                ),
                 l1_arrival_count=np.zeros((P_TT,), dtype=np.uint32),
                 l1_token_buffer=np.zeros((P_TOK, H_BYTES), dtype=np.uint8),
                 l1_sf_buffer=np.zeros((SFU, P_SF), dtype=np.uint32),
@@ -161,7 +173,9 @@ def dispatch_oracle(
     for src_rank in range(R):
         for expert_id in range(E_total):
             tokens = np.uint64(int(per_src_send[src_rank, expert_id]))
-            expected[src_rank].expert_send_count[expert_id] = (publisher_per_rank << np.uint64(32)) | tokens
+            expected[src_rank].expert_send_count[expert_id] = (
+                publisher_per_rank << np.uint64(32)
+            ) | tokens
 
     # expert_recv_count[recv_rank][src_rank, local_expert]: low 32 = token count,
     # high 32 = 0 (high half is delivered to expert_recv_count_sum instead).
@@ -180,8 +194,8 @@ def dispatch_oracle(
             global_expert = recv_rank * E_local + local_expert
             tokens = np.uint64(int(per_src_send[:, global_expert].sum()))
             expected[recv_rank].expert_recv_count_sum[local_expert] = (
-                (publishers_global << np.uint64(32)) | tokens
-            )
+                publishers_global << np.uint64(32)
+            ) | tokens
 
     # Populate src_token_topk_idx by replaying each source rank's topk scan.
     # Slot is per (local_expert, src_rank): the advertise-table layout already
@@ -199,7 +213,9 @@ def dispatch_oracle(
                 slot = int(cursor[expert_id])
                 cursor[expert_id] += 1
                 token_topk_word = np.uint32(src_token * K + src_topk)
-                expected[dst_rank].src_token_topk_idx[local_expert, src_rank, slot] = token_topk_word
+                expected[dst_rank].src_token_topk_idx[local_expert, src_rank, slot] = (
+                    token_topk_word
+                )
 
     # Pool layout per receiving rank: experts in order; within each expert the
     # per-rank counts decide a round-robin order matching the kernel scheduler.
@@ -222,22 +238,27 @@ def dispatch_oracle(
                 token_idx_in_rank = int(per_rank_cursor[src_rank])
                 per_rank_cursor[src_rank] += 1
 
-                src_token_topk = int(eb.src_token_topk_idx[local_expert, src_rank, token_idx_in_rank])
+                src_token_topk = int(
+                    eb.src_token_topk_idx[local_expert, src_rank, token_idx_in_rank]
+                )
                 src_token = src_token_topk // K
                 src_topk = src_token_topk % K
 
                 pool_token_idx = pool_block_offset * BM + token_idx_in_expert
 
-                eb.l1_token_buffer[pool_token_idx, :] = input_token_buffer[src_rank, src_token, :]
+                eb.l1_token_buffer[pool_token_idx, :] = input_token_buffer[
+                    src_rank, src_token, :
+                ]
                 eb.l1_topk_weights_buf[pool_token_idx] = input_topk_weights_buffer[
                     src_rank, src_token, src_topk
                 ]
 
-                sf_pool_token_idx = (
-                    pool_block_offset * SFBM
-                    + int(transform_sf_token_idx_numpy(token_idx_in_expert))
+                sf_pool_token_idx = pool_block_offset * SFBM + int(
+                    transform_sf_token_idx_numpy(token_idx_in_expert)
                 )
-                eb.l1_sf_buffer[:, sf_pool_token_idx] = input_sf_buffer[src_rank, src_token, :]
+                eb.l1_sf_buffer[:, sf_pool_token_idx] = input_sf_buffer[
+                    src_rank, src_token, :
+                ]
 
                 eb.token_src_metadata[pool_token_idx, :] = _pack_metadata(
                     src_rank, src_token, src_topk
@@ -290,7 +311,9 @@ def assert_buffer_equal(
         if np.issubdtype(actual.dtype, np.floating):
             if np.allclose(actual, expected, rtol=1e-5, atol=1e-6, equal_nan=True):
                 return
-            diff_mask = ~np.isclose(actual, expected, rtol=1e-5, atol=1e-6, equal_nan=True)
+            diff_mask = ~np.isclose(
+                actual, expected, rtol=1e-5, atol=1e-6, equal_nan=True
+            )
         else:
             if np.array_equal(actual, expected):
                 return

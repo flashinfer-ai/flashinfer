@@ -22,8 +22,9 @@ _FINISH_SUM_TAG = 0x80000000
 
 @dsl_user_op
 @cute.jit
-def software_grid_sync(counter_ptr, sm_idx, num_sms, tid_in_group,
-                       *, num_threads=None, loc=None, ip=None):
+def software_grid_sync(
+    counter_ptr, sm_idx, num_sms, tid_in_group, *, num_threads=None, loc=None, ip=None
+):
     """Grid-wide barrier replacing cooperative_groups::this_grid().sync().
 
     counter_ptr  : Pointer to a single u32 in global memory, zero-initialised
@@ -73,8 +74,7 @@ def software_grid_sync(counter_ptr, sm_idx, num_sms, tid_in_group,
         cute.arch.sync_threads(loc=loc, ip=ip)
     else:
         # TODO: Remove this hardcode.
-        cute.arch.barrier(barrier_id=10, number_of_threads=num_threads,
-                          loc=loc, ip=ip)
+        cute.arch.barrier(barrier_id=10, number_of_threads=num_threads, loc=loc, ip=ip)
 
     # PTX add.u32 treats the operand as a raw 32-bit bit pattern so signed
     # underflow of (kFinishSumTag - (num_sms - 1)) is benign and matches mega_moe.
@@ -131,5 +131,4 @@ def software_grid_sync(counter_ptr, sm_idx, num_sms, tid_in_group,
     if cutlass.const_expr(num_threads is None):
         cute.arch.sync_threads(loc=loc, ip=ip)
     else:
-        cute.arch.barrier(barrier_id=10, number_of_threads=num_threads,
-                          loc=loc, ip=ip)
+        cute.arch.barrier(barrier_id=10, number_of_threads=num_threads, loc=loc, ip=ip)

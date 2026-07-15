@@ -186,6 +186,7 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
         preprocess_mega_weights,
     )
+
     # Verify only against the cutedsl_megamoe shim boundary: pull constants and
     # reference tensor-makers from the package public API, never from the src/
     # kernel packages directly (so a new src/ drop can't silently break tests).

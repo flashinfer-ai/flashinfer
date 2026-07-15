@@ -98,7 +98,9 @@ def _make_bf16_weights(
     return w13, w2
 
 
-def _mega_problem(rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64):
+def _mega_problem(
+    rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64
+):
     hidden = 2048
     intermediate = 1024
     num_experts = 8

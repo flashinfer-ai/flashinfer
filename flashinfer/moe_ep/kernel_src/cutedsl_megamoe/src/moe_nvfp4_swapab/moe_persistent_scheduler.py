@@ -34,6 +34,7 @@ from typing import List, Optional, Tuple, Literal
 
 import cutlass
 import cutlass.cute as cute
+
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
@@ -412,16 +413,12 @@ class MoEStaticSchedulerParams(MoESchedulerParamsBase):
         # prototype (``self``), Int32 fields consume from ``values``.
         idx = 0
         if isinstance(self.expert_cnt, Int32):
-            result.expert_cnt = new_from_mlir_values(
-                self.expert_cnt, [values[idx]]
-            )
+            result.expert_cnt = new_from_mlir_values(self.expert_cnt, [values[idx]])
             idx += 1
         else:
             result.expert_cnt = self.expert_cnt
         if isinstance(self.intermediate, Int32):
-            result.intermediate = new_from_mlir_values(
-                self.intermediate, [values[idx]]
-            )
+            result.intermediate = new_from_mlir_values(self.intermediate, [values[idx]])
             idx += 1
         else:
             result.intermediate = self.intermediate
@@ -562,16 +559,12 @@ class MoEDynamicSchedulerParams(MoESchedulerParamsBase):
         # Type-discriminated rebind (see ``MoEStaticSchedulerParams``).
         idx = 0
         if isinstance(self.expert_cnt, Int32):
-            result.expert_cnt = new_from_mlir_values(
-                self.expert_cnt, [values[idx]]
-            )
+            result.expert_cnt = new_from_mlir_values(self.expert_cnt, [values[idx]])
             idx += 1
         else:
             result.expert_cnt = self.expert_cnt
         if isinstance(self.intermediate, Int32):
-            result.intermediate = new_from_mlir_values(
-                self.intermediate, [values[idx]]
-            )
+            result.intermediate = new_from_mlir_values(self.intermediate, [values[idx]])
             idx += 1
         else:
             result.intermediate = self.intermediate

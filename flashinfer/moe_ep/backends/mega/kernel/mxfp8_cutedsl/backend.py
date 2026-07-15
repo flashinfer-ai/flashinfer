@@ -118,7 +118,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             activation_clamp=k.activation_clamp,
             in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
             token_back_by_dispatch=k.token_back_by_dispatch,
-            knobs=None if k.knobs == "auto" else k.knobs,
+            knobs=k.knobs if isinstance(k.knobs, dict) else None,
         )
 
     def validate_forward(

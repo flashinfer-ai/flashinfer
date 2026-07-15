@@ -97,7 +97,7 @@ class DataPreprocess:
         # nvfp4 encode constants (see `nvfp4_quant_and_process_impl`):
         #   stored E4M3 block scale = block_amax * rcp_limit * norm_const
         #   norm_const at amax        = (E4M3_max * E2M1_max) / amax_tensor
-        self._nvfp4_rcp_limit = float(Nvfp4E2M1RcpLimit)          # 1 / 6
+        self._nvfp4_rcp_limit = float(Nvfp4E2M1RcpLimit)  # 1 / 6
         self._nvfp4_norm_numer = float(Fp8E4M3FNMax * Nvfp4E2M1Max)  # 448 * 6
 
     # -- launcher -------------------------------------------------------------
@@ -106,19 +106,19 @@ class DataPreprocess:
     def __call__(
         self,
         # inputs
-        activation_bf16: cute.Tensor,               # (token, hidden)
-        topk_idx: cute.Tensor,                      # (token, topk)
-        topk_weights: cute.Tensor,                  # (token, topk)
+        activation_bf16: cute.Tensor,  # (token, hidden)
+        topk_idx: cute.Tensor,  # (token, topk)
+        topk_weights: cute.Tensor,  # (token, topk)
         token_padding_info: Optional[cute.Tensor],  # (token,) ; None => no padding
         # outputs
-        activation_quant: cute.Tensor,      # (token, hidden) fp4/fp8 elements
-                                            # (cute sees the real fp4 dtype, not
-                                            # torch's pack2 uint8 -> full hidden)
-        activation_sf: cute.Tensor,         # (token, hidden // sf_vec) block scales,
-                                            # rebuilt below into a (token, hidden)
-                                            # broadcast view over the block dim
-        topk_idx_output: cute.Tensor,       # (token, topk)
-        topk_weights_output: cute.Tensor,   # (token, topk)
+        activation_quant: cute.Tensor,  # (token, hidden) fp4/fp8 elements
+        # (cute sees the real fp4 dtype, not
+        # torch's pack2 uint8 -> full hidden)
+        activation_sf: cute.Tensor,  # (token, hidden // sf_vec) block scales,
+        # rebuilt below into a (token, hidden)
+        # broadcast view over the block dim
+        topk_idx_output: cute.Tensor,  # (token, topk)
+        topk_weights_output: cute.Tensor,  # (token, topk)
         cuda_stream: cuda.CUstream,
         # nvfp4 only: exactly one of the two is valid (see class docstring).
         #   online:  (1,) output buffer -- caller does NOT zero it; staging zeros
@@ -131,7 +131,9 @@ class DataPreprocess:
         # Mode invariants resolve at trace time (the scale args are None-or-not
         # when the kernel is compiled).
         if cutlass.const_expr(self.is_nvfp4):
-            if cutlass.const_expr((online_norm_const is None) == (offline_norm_const is None)):
+            if cutlass.const_expr(
+                (online_norm_const is None) == (offline_norm_const is None)
+            ):
                 raise ValueError(
                     "nvfp4 staging needs exactly one of `online_norm_const` "
                     "(output buffer, staging-zeroed) or `offline_norm_const` "
@@ -184,7 +186,9 @@ class DataPreprocess:
         # launch. Perf-critical callers should calibrate offline.
         if cutlass.const_expr(online_norm_const is not None):
             self._init_online_scale_impl(online_norm_const).launch(
-                grid=[1, 1, 1], block=[1, 1, 1], stream=cuda_stream,
+                grid=[1, 1, 1],
+                block=[1, 1, 1],
+                stream=cuda_stream,
             )
             self.nvfp4_amax_impl(
                 activation_bf16,
@@ -242,7 +246,9 @@ class DataPreprocess:
             if cutlass.const_expr(token_padding_info is not None):
                 is_padding = token_padding_info[token_idx] != Int32(0)
             idx = Int64(-1) if is_padding else Int64(topk_idx[token_idx, tid])
-            weight = Float32(0.0) if is_padding else Float32(topk_weights[token_idx, tid])
+            weight = (
+                Float32(0.0) if is_padding else Float32(topk_weights[token_idx, tid])
+            )
             topk_idx_output[token_idx, tid] = idx
             topk_weights_output[token_idx, tid] = weight
 
@@ -297,7 +303,9 @@ class DataPreprocess:
                 chunk = cute.make_rmem_tensor((load_vec,), cutlass.BFloat16)
                 # Each chunk starts at c*16 B (16 B aligned); re-tag so the
                 # 128-bit copy's static alignment check passes.
-                cute.copy(load_atom, self._mark_alignment(a_chunks[(None,), (c,)], 16), chunk)
+                cute.copy(
+                    load_atom, self._mark_alignment(a_chunks[(None,), (c,)], 16), chunk
+                )
                 pairs = cute.recast_tensor(chunk, Int32)
                 for p in cutlass.range_constexpr(load_vec // 2):
                     acc_pair = max_abs_bf16x2(acc_pair, pairs[p])
@@ -343,7 +351,9 @@ class DataPreprocess:
         activation_sf: cute.Tensor,
         topk_idx_output: cute.Tensor,
         topk_weights_output: cute.Tensor,
-        norm_const: Union[cute.Tensor, cutlass.Float32],  # online (1,) tensor or offline f32 scalar
+        norm_const: Union[
+            cute.Tensor, cutlass.Float32
+        ],  # online (1,) tensor or offline f32 scalar
     ) -> None:
         threads: cutlass.Constexpr[int] = self._threads_per_cta
         sf_vec: cutlass.Constexpr[int] = self.sf_vec
@@ -351,8 +361,12 @@ class DataPreprocess:
         load_vec: cutlass.Constexpr[int] = 8  # 8 bf16 = 16 B per cp.async
         num_blocks: cutlass.Constexpr[int] = hidden // sf_vec
         num_chunks: cutlass.Constexpr[int] = hidden // load_vec
-        chunks_per_thread: cutlass.Constexpr[int] = (num_chunks + threads - 1) // threads
-        blocks_per_thread: cutlass.Constexpr[int] = (num_blocks + threads - 1) // threads
+        chunks_per_thread: cutlass.Constexpr[int] = (
+            num_chunks + threads - 1
+        ) // threads
+        blocks_per_thread: cutlass.Constexpr[int] = (
+            num_blocks + threads - 1
+        ) // threads
         token_idx = cute.arch.block_idx()[0]
         tid = cute.arch.thread_idx()[0]
 
@@ -403,7 +417,9 @@ class DataPreprocess:
             cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
         )
         store_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), cutlass.Float4E2M1FN, num_bits_per_copy=sf_vec * 4
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Float4E2M1FN,
+            num_bits_per_copy=sf_vec * 4,
         )
         for j in cutlass.range_constexpr(blocks_per_thread):
             # A dummy commit each round keeps the target group a fixed depth from
@@ -441,7 +457,9 @@ class DataPreprocess:
                 fp4.store(scaled.load().to(cutlass.Float4E2M1FN))
 
                 cute.copy(
-                    store_atom, fp4, self._mark_alignment(q_blk[(None,), (b,)], sf_vec // 2)
+                    store_atom,
+                    fp4,
+                    self._mark_alignment(q_blk[(None,), (b,)], sf_vec // 2),
                 )
                 activation_sf[token_idx, (0, b)] = sfc_e4m3
 
@@ -477,8 +495,12 @@ class DataPreprocess:
         rounds_per_group: cutlass.Constexpr[int] = sf_vec // load_vec
         num_blocks: cutlass.Constexpr[int] = hidden // sf_vec
         num_chunks: cutlass.Constexpr[int] = hidden // load_vec
-        chunks_per_thread: cutlass.Constexpr[int] = (num_chunks + threads - 1) // threads
-        blocks_per_thread: cutlass.Constexpr[int] = (num_blocks + threads - 1) // threads
+        chunks_per_thread: cutlass.Constexpr[int] = (
+            num_chunks + threads - 1
+        ) // threads
+        blocks_per_thread: cutlass.Constexpr[int] = (
+            num_blocks + threads - 1
+        ) // threads
         num_groups: cutlass.Constexpr[int] = (
             chunks_per_thread + rounds_per_group - 1
         ) // rounds_per_group
@@ -583,7 +605,9 @@ class DataPreprocess:
 # =============================================================================
 
 
-def _run_case(quant_type: str, mode: str, num_tokens: int, hidden: int, topk: int) -> bool:
+def _run_case(
+    quant_type: str, mode: str, num_tokens: int, hidden: int, topk: int
+) -> bool:
     import torch
     import cuda.bindings.driver as cuda_driver
     from cutlass.torch import from_dlpack
@@ -604,19 +628,23 @@ def _run_case(quant_type: str, mode: str, num_tokens: int, hidden: int, topk: in
     }.get(quant_type)
 
     x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
-    topk_idx_in = torch.randint(0, 64, (num_tokens, topk), dtype=torch.int32, device="cuda")
+    topk_idx_in = torch.randint(
+        0, 64, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
     topk_w_in = torch.rand(num_tokens, topk, dtype=torch.float32, device="cuda")
 
     if is_nvfp4:
-        quant = torch.empty(num_tokens, hidden // 2, dtype=torch.uint8, device="cuda").view(
-            torch.float4_e2m1fn_x2
-        )
-        sf = torch.empty(num_tokens, num_blocks, dtype=torch.float8_e8m0fnu, device="cuda").view(
-            torch.float8_e4m3fn
-        )
+        quant = torch.empty(
+            num_tokens, hidden // 2, dtype=torch.uint8, device="cuda"
+        ).view(torch.float4_e2m1fn_x2)
+        sf = torch.empty(
+            num_tokens, num_blocks, dtype=torch.float8_e8m0fnu, device="cuda"
+        ).view(torch.float8_e4m3fn)
     else:
         quant = torch.empty(num_tokens, hidden, dtype=torch_quant_dtype, device="cuda")
-        sf = torch.empty(num_tokens, num_blocks, dtype=torch.float8_e8m0fnu, device="cuda")
+        sf = torch.empty(
+            num_tokens, num_blocks, dtype=torch.float8_e8m0fnu, device="cuda"
+        )
     idx_out = torch.empty(num_tokens, topk, dtype=torch.int64, device="cuda")
     w_out = torch.empty(num_tokens, topk, dtype=torch.float32, device="cuda")
 
@@ -659,10 +687,10 @@ def _run_case(quant_type: str, mode: str, num_tokens: int, hidden: int, topk: in
 
     # -- routing (exact) --
     if not torch.equal(idx_out, topk_idx_in.to(torch.int64)):
-        print(f"  [FAIL] topk_idx mismatch")
+        print("  [FAIL] topk_idx mismatch")
         ok = False
     if not torch.equal(w_out, topk_w_in):
-        print(f"  [FAIL] topk_weights mismatch")
+        print("  [FAIL] topk_weights mismatch")
         ok = False
 
     # -- quant vs reference quantizer --
@@ -672,9 +700,11 @@ def _run_case(quant_type: str, mode: str, num_tokens: int, hidden: int, topk: in
             norm_const_used = float(online_t[0].item())
             expected = 2688.0 / x_fp32.abs().amax().item()
             rel = abs(norm_const_used - expected) / expected
-            print(f"  online norm_const={norm_const_used:.4g} expected={expected:.4g} rel={rel:.2e}")
+            print(
+                f"  online norm_const={norm_const_used:.4g} expected={expected:.4g} rel={rel:.2e}"
+            )
             if rel > 1e-2:
-                print(f"  [FAIL] online norm_const off")
+                print("  [FAIL] online norm_const off")
                 ok = False
         ref_q, ref_sf = nvfp4_quantize_per_block_16(x_fp32, norm_const_used)
         deq_ker = dequant_block_scale_to_fp32(quant, sf, sf_vec)
@@ -692,7 +722,7 @@ def _run_case(quant_type: str, mode: str, num_tokens: int, hidden: int, topk: in
     max_abs = (deq_ker - deq_ref).abs().max().item()
     print(f"  sf_exact={sf_exact} quant_snr={snr_db:.1f}dB max_abs_diff={max_abs:.3e}")
     if not sf_exact or snr_db < 40.0:
-        print(f"  [FAIL] quant vs reference")
+        print("  [FAIL] quant vs reference")
         ok = False
 
     return ok
@@ -722,7 +752,9 @@ def main() -> int:
 
     all_ok = True
     for quant_type, mode in cases:
-        print(f"[case] {quant_type} {mode} (tokens={args.tokens} hidden={args.hidden} topk={args.topk})")
+        print(
+            f"[case] {quant_type} {mode} (tokens={args.tokens} hidden={args.hidden} topk={args.topk})"
+        )
         try:
             case_ok = _run_case(quant_type, mode, args.tokens, args.hidden, args.topk)
         except Exception as exc:  # noqa: BLE001 -- smoke harness, report and continue

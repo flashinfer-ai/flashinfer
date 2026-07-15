@@ -154,7 +154,9 @@ def _make_packed_weights(
     return w13, w2, w13_scale, w2_scale
 
 
-def _mega_problem(rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64):
+def _mega_problem(
+    rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64
+):
     hidden = 2048
     intermediate = 1024
     num_experts = 8
@@ -842,9 +844,7 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
         )
     # ikr requires the topk score folded before fc2.
     with pytest.raises(ValueError, match="apply_topk_in_fc1"):
-        MegaMoENvfp4Config(
-            **base, in_kernel_fc2_reduce=True, apply_topk_in_fc1=False
-        )
+        MegaMoENvfp4Config(**base, in_kernel_fc2_reduce=True, apply_topk_in_fc1=False)
     # quantized combine wires are only wired for dispatch-warp token-back.
     with pytest.raises(ValueError, match="reuse_dispatch_warps"):
         MegaMoENvfp4Config(**base, combine_dtype="mxfp8")
@@ -870,9 +870,7 @@ def test_tuner_is_valid_quantized_combine_rules():
     )
     # bf16 combine composes ikr with every token-back mode.
     for mode in ("epi_warps", "standalone_warps", "reuse_dispatch_warps"):
-        assert tuner.is_valid(
-            {"in_kernel_fc2_reduce": True, "token_back_mode": mode}
-        )
+        assert tuner.is_valid({"in_kernel_fc2_reduce": True, "token_back_mode": mode})
 
 
 def test_autotune_nvfp4_candidates_cover_ikr():
@@ -889,8 +887,7 @@ def test_autotune_nvfp4_candidates_cover_ikr():
     qcands = nvfp4_candidates(combine_format="16e2m1xbf16")
     assert qcands
     assert all(
-        not k["in_kernel_fc2_reduce"]
-        and k["token_back_mode"] == "reuse_dispatch_warps"
+        not k["in_kernel_fc2_reduce"] and k["token_back_mode"] == "reuse_dispatch_warps"
         for k in qcands
     )
 

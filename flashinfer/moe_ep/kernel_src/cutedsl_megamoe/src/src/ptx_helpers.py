@@ -43,7 +43,9 @@ def tma_load_1d(dst_smem, src_gmem, mbar_smem, num_bytes, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def tma_load_1d_raw(dst_smem, src_gmem_addr: Int64, mbar_smem, num_bytes, *, loc=None, ip=None):
+def tma_load_1d_raw(
+    dst_smem, src_gmem_addr: Int64, mbar_smem, num_bytes, *, loc=None, ip=None
+):
     """Variant of ``tma_load_1d`` that takes a raw int64 GMEM byte address.
 
     Used for cross-rank TMA load via ``peer_rank_ptr_mapper.map`` style: source
@@ -283,9 +285,17 @@ def stg_e8m0_from_f32(addr: Int64, fp32_val: Float32, *, loc=None, ip=None) -> N
 @dsl_user_op
 def stg_e8m0x8_from_f32(
     addr: Int64,
-    v0: Float32, v1: Float32, v2: Float32, v3: Float32,
-    v4: Float32, v5: Float32, v6: Float32, v7: Float32,
-    *, loc=None, ip=None,
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    v4: Float32,
+    v5: Float32,
+    v6: Float32,
+    v7: Float32,
+    *,
+    loc=None,
+    ip=None,
 ) -> None:
     """Convert 8 fp32 values to E8M0 and store them as 8 contiguous bytes in one shot.
 
@@ -300,8 +310,14 @@ def stg_e8m0x8_from_f32(
         None,
         [
             addr.ir_value(),
-            v0.ir_value(), v1.ir_value(), v2.ir_value(), v3.ir_value(),
-            v4.ir_value(), v5.ir_value(), v6.ir_value(), v7.ir_value(),
+            v0.ir_value(),
+            v1.ir_value(),
+            v2.ir_value(),
+            v3.ir_value(),
+            v4.ir_value(),
+            v5.ir_value(),
+            v6.ir_value(),
+            v7.ir_value(),
         ],
         "{\n"
         "  .reg .b16 p0, p1, p2, p3;\n"
@@ -459,7 +475,9 @@ def red_min_relaxed_gpu_u32_from_f32_raw(
 
 
 @dsl_user_op
-def red_async_add_release_sys_u32_raw(addr: Int64, val: Int32, *, loc=None, ip=None) -> None:
+def red_async_add_release_sys_u32_raw(
+    addr: Int64, val: Int32, *, loc=None, ip=None
+) -> None:
     """``red.async.release.sys.global.add.u32`` via raw int64 byte address.
 
     sm_90+ async reduction — fire-and-forget; the issuing SM does NOT
@@ -496,6 +514,7 @@ def read_clock64(*, loc=None, ip=None) -> Int64:
         )
     )
 
+
 @dsl_user_op
 def _fence_rel_sys(
     *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
@@ -506,6 +525,7 @@ def _fence_rel_sys(
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-membar>`__.
     """
     llvm.fence(llvm.AtomicOrdering.release, loc=loc, ip=ip)
+
 
 @dsl_user_op
 def _fence_rel_gpu(

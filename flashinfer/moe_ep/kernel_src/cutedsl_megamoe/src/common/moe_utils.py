@@ -28,22 +28,15 @@
 
 """Shared MoE scheduler utilities and online TMA descriptor helpers."""
 
-from abc import ABC, abstractmethod
-from typing import Any, Callable, Literal, Optional, Tuple, Type, Union
+from typing import Optional, Union
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import AddressSpace, Numeric, Pointer
-from cutlass.cute.nvgpu import cpasync
-from cutlass.cute.arch import nvvm_wrappers
-from cutlass.cutlass_dsl import dsl_user_op, Boolean, Int32, Float32, T
+from cutlass.cutlass_dsl import Float32, T
 from cutlass._mlir import ir
 from common.megamoe_constants import Log2E, Fp32Max, Fp8E4M3RcpLimit, Fp8E5M2RcpLimit
 from cutlass._mlir.dialects import llvm
-from cutlass._mlir.dialects import cute as _cute_ir
 from cutlass._mlir.dialects import vector, arith
-from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
-from dataclasses import dataclass
 
 
 # -----------------------------------------------------------------
@@ -65,7 +58,7 @@ def swiglu_act(
         t_swiglu_log2e = cute.arch.mul_packed_f32x2(
             (t_gate[i], t_gate[i + 1]),
             (-Log2E, -Log2E),
-            rnd='rn',
+            rnd="rn",
             ftz=False,
         )
         (
@@ -86,7 +79,7 @@ def swiglu_act(
         ) = cute.arch.mul_packed_f32x2(
             (t_swiglu[i], t_swiglu[i + 1]),
             (t_gate[i + 0], t_gate[i + 1]),
-            rnd='rn',
+            rnd="rn",
             ftz=False,
         )
         (
@@ -95,7 +88,7 @@ def swiglu_act(
         ) = cute.arch.mul_packed_f32x2(
             (t_swiglu[i], t_swiglu[i + 1]),
             (t_up[i], t_up[i + 1]),
-            rnd='rn',
+            rnd="rn",
             ftz=False,
         )
         if cutlass.const_expr(prob is not None):
@@ -105,7 +98,7 @@ def swiglu_act(
             ) = cute.arch.mul_packed_f32x2(
                 (t_swiglu[i], t_swiglu[i + 1]),
                 (prob, prob),
-                rnd='rn',
+                rnd="rn",
                 ftz=False,
             )
 
@@ -119,15 +112,15 @@ def fmin(
     ip=None,
 ) -> Float32:
     if nan:
-        ptx_instr = f"min.NaN.f32 $0, $1, $2;"
+        ptx_instr = "min.NaN.f32 $0, $1, $2;"
     else:
-        ptx_instr = f"min.f32 $0, $1, $2;"
+        ptx_instr = "min.f32 $0, $1, $2;"
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
             f"{ptx_instr}",
-            f"=f,f,f",
+            "=f,f,f",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -144,15 +137,15 @@ def fmax(
     ip=None,
 ) -> Float32:
     if nan:
-        ptx_instr = f"max.NaN.f32 $0, $1, $2;"
+        ptx_instr = "max.NaN.f32 $0, $1, $2;"
     else:
-        ptx_instr = f"max.f32 $0, $1, $2;"
+        ptx_instr = "max.f32 $0, $1, $2;"
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
             f"{ptx_instr}",
-            f"=f,f,f",
+            "=f,f,f",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -205,7 +198,6 @@ def cvt_f32_to_f8_to_f32(fp32x1, fp8_type, loc=None, ip=None):
     return dst_f32
 
 
-
 @cute.jit
 def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, loc=None, ip=None):
     fp32x4 = fp32x4.load()
@@ -254,8 +246,12 @@ def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, loc=None, ip=None):
 
 @cute.jit
 def quant_sfd_row(
-    src, dst, norm_const,
-    sf_vec_size, sf_dtype, d_dtype,
+    src,
+    dst,
+    norm_const,
+    sf_vec_size,
+    sf_dtype,
+    d_dtype,
 ) -> None:
     rcp_limit = Fp8E4M3RcpLimit if d_dtype == cutlass.Float8E4M3FN else Fp8E5M2RcpLimit
     acc_frg = src.load()
@@ -263,14 +259,18 @@ def quant_sfd_row(
     abs_acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
     avg_fp32 = (
         abs_acc_frg.reduce(cute.ReductionOp.MAX, Float32(0.0), 0)
-        * rcp_limit * norm_const
+        * rcp_limit
+        * norm_const
     )
     qpvscale_up = cvt_f32_to_f8_to_f32(avg_fp32, sf_dtype)
     acc_scale = norm_const * cute.arch.rcp_approx(qpvscale_up)
     acc_scale = fmin(acc_scale, Fp32Max, nan=True)
     for ei in cutlass.range_constexpr(0, sf_vec_size, 2):
         src[ei], src[ei + 1] = cute.arch.mul_packed_f32x2(
-            (src[ei], src[ei + 1]), (acc_scale, acc_scale), rnd="rn", ftz=False,
+            (src[ei], src[ei + 1]),
+            (acc_scale, acc_scale),
+            rnd="rn",
+            ftz=False,
         )
     dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
     for ei in cutlass.range_constexpr(0, sf_vec_size, 4):

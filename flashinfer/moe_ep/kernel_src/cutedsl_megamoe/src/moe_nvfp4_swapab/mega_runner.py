@@ -59,13 +59,13 @@ import triton
 import triton.language as tl
 
 
-_FORM_B_PERM_K_LIMIT = 4   # K! perms: K<=4 -> <=24, manageable
+_FORM_B_PERM_K_LIMIT = 4  # K! perms: K<=4 -> <=24, manageable
 
 
 @triton.jit
 def _form_b_all_perms_kernel(
-    src_ptr,    # (T, K, H) bf16, contiguous
-    dst_ptr,    # (T, H, n_perms) bf16, contiguous
+    src_ptr,  # (T, K, H) bf16, contiguous
+    dst_ptr,  # (T, H, n_perms) bf16, contiguous
     perms_ptr,  # (n_perms, K) int32
     T,
     K,
@@ -92,12 +92,14 @@ def _form_b_all_perms_kernel(
             k = tl.load(perms_ptr + p * K_const + k_pos)
             v = tl.load(
                 src_ptr + t * K * H + k * H + h_off,
-                mask=mask, other=0,
+                mask=mask,
+                other=0,
             ).to(tl.bfloat16)
             acc = acc + v
         tl.store(
             dst_ptr + t * H * n_perms_const + h_off * n_perms_const + p,
-            acc, mask=mask,
+            acc,
+            mask=mask,
         )
 
 
@@ -119,13 +121,22 @@ def _form_b_enumerate_perms(ref_K_terms: torch.Tensor) -> torch.Tensor:
     perms_t = torch.tensor(perms, dtype=torch.int32, device=ref_K_terms.device)
     src = ref_K_terms.contiguous()
     dst = torch.empty(
-        (T, H, n_perms), dtype=torch.bfloat16, device=ref_K_terms.device,
+        (T, H, n_perms),
+        dtype=torch.bfloat16,
+        device=ref_K_terms.device,
     )
     BLOCK_H = 256
     grid = (T, triton.cdiv(H, BLOCK_H))
     _form_b_all_perms_kernel[grid](
-        src, dst, perms_t, T, K, H,
-        BLOCK_H=BLOCK_H, K_const=K, n_perms_const=n_perms,
+        src,
+        dst,
+        perms_t,
+        T,
+        K,
+        H,
+        BLOCK_H=BLOCK_H,
+        K_const=K,
+        n_perms_const=n_perms,
     )
     return dst
 
@@ -138,15 +149,20 @@ def _quantile_compat(x: torch.Tensor, qs: List[float]) -> List[float]:
     and has no such cap.  Both paths return the same fp64 quantiles.
     """
     if x.numel() <= 16_777_216:
-        return torch.quantile(
-            x, torch.tensor(qs, dtype=x.dtype, device=x.device),
-        ).cpu().tolist()
+        return (
+            torch.quantile(
+                x,
+                torch.tensor(qs, dtype=x.dtype, device=x.device),
+            )
+            .cpu()
+            .tolist()
+        )
     return np.quantile(x.cpu().numpy(), np.asarray(qs)).tolist()
 
 
 def _form_b_bitwise_match(
     actual_reduced: torch.Tensor,  # (T, H) bf16 or fp32 (bit cast via .to(bf16))
-    ref_K_terms: torch.Tensor,     # (T, K, H) bf16
+    ref_K_terms: torch.Tensor,  # (T, K, H) bf16
 ) -> Tuple[torch.Tensor, int]:
     """For each (t, h) cell, return True iff ``actual_reduced[t, h]`` is
     bit-exactly equal to SOME of the K! bf16-sequential-add permutations
@@ -174,8 +190,8 @@ def _form_b_bitwise_match(
 
 @triton.jit
 def _bf16_seq_sum_k_kernel(
-    src_ptr,    # (T, K, H) bf16 contiguous
-    dst_ptr,    # (T, H)    bf16 contiguous
+    src_ptr,  # (T, K, H) bf16 contiguous
+    dst_ptr,  # (T, H)    bf16 contiguous
     T: tl.constexpr,
     K: tl.constexpr,
     H: tl.constexpr,
@@ -193,9 +209,9 @@ def _bf16_seq_sum_k_kernel(
     mask = h_off < H
     acc = tl.zeros((BLOCK_H,), dtype=tl.bfloat16)
     for k in tl.static_range(K):
-        v = tl.load(
-            src_ptr + t * K * H + k * H + h_off, mask=mask, other=0
-        ).to(tl.bfloat16)
+        v = tl.load(src_ptr + t * K * H + k * H + h_off, mask=mask, other=0).to(
+            tl.bfloat16
+        )
         acc = acc + v
     tl.store(dst_ptr + t * H + h_off, acc, mask=mask)
 
@@ -212,6 +228,7 @@ def _bf16_seq_sum_k(src: torch.Tensor) -> torch.Tensor:
     grid = (T, triton.cdiv(H, BLOCK_H))
     _bf16_seq_sum_k_kernel[grid](src, dst, T, K, H, BLOCK_H=BLOCK_H)
     return dst
+
 
 # Ensure absolute package imports work when run as a script.
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -244,9 +261,7 @@ from moe_nvfp4_swapab.runner_fc12 import (
 )
 
 _SwapABEpilogueTokenTile = _SwapABEpilogue._EpilogueTokenTileSize
-_SwapABEpilogueIntermediateAlignment = (
-    2 * _SwapABEpilogue._EpilogueFc1GateUpInterleave
-)
+_SwapABEpilogueIntermediateAlignment = 2 * _SwapABEpilogue._EpilogueFc1GateUpInterleave
 
 
 # =============================================================================
@@ -384,8 +399,7 @@ class TokenCommProblemDesc:
             )
         if self.gate_up_clamp is not None and self.gate_up_clamp < 0.0:
             raise ValueError(
-                f"gate_up_clamp must be None or non-negative, got "
-                f"{self.gate_up_clamp}."
+                f"gate_up_clamp must be None or non-negative, got {self.gate_up_clamp}."
             )
 
     def __str__(self) -> str:
@@ -393,10 +407,7 @@ class TokenCommProblemDesc:
         route_str = self.route_distribution
         if self.route_distribution == "power_law":
             route_str = f"power_law(exponent={self.power_law_exponent:.3g})"
-        clamp_str = (
-            "off" if self.gate_up_clamp is None
-            else f"{self.gate_up_clamp:.4g}"
-        )
+        clamp_str = "off" if self.gate_up_clamp is None else f"{self.gate_up_clamp:.4g}"
         return (
             f"TokenCommProblemDesc: world={self.world_size} "
             f"tokens_per_rank={self.num_tokens_per_rank} topk={self.num_topk} "
@@ -450,19 +461,21 @@ def _generate_topk_idx_balanced(
     expert_permutations = rng.random(
         (num_ranks, num_blocks, num_total_experts)
     ).argsort(axis=-1)
-    topk_offsets = rng.random(
-        (num_ranks, num_blocks, num_total_experts)
-    ).argsort(axis=-1)[..., :num_topk]
+    topk_offsets = rng.random((num_ranks, num_blocks, num_total_experts)).argsort(
+        axis=-1
+    )[..., :num_topk]
 
     token_offsets = np.arange(num_total_experts)[None, None, :, None]
-    expert_indices = (
-        token_offsets + topk_offsets[:, :, None, :]
-    ) % num_total_experts
+    expert_indices = (token_offsets + topk_offsets[:, :, None, :]) % num_total_experts
     topk_blocks = np.take_along_axis(
-        expert_permutations[..., None], expert_indices, axis=2,
+        expert_permutations[..., None],
+        expert_indices,
+        axis=2,
     )
     return topk_blocks.reshape(
-        num_ranks, num_padded_tokens_per_rank, num_topk,
+        num_ranks,
+        num_padded_tokens_per_rank,
+        num_topk,
     )[:, :num_tokens_per_rank, :].astype(np.int64)
 
 
@@ -557,7 +570,9 @@ def _print_remote_rank_comm_matrices(
 ) -> None:
     """Print remote rank-to-rank routed-token counts for route inspection."""
     dispatch, fc2_return = _get_remote_rank_comm_matrices(
-        topk_idx, world_size, num_total_experts,
+        topk_idx,
+        world_size,
+        num_total_experts,
     )
 
     def _print_matrix(title: str, matrix: np.ndarray) -> None:
@@ -601,10 +616,15 @@ def _generate_topk_weights(
     see the same tensor so the absolute scale doesn't affect correctness,
     only the local numerical regime.
     """
-    return torch.rand(
-        (num_ranks, num_tokens_per_rank, num_topk),
-        dtype=torch.float32, device="cuda", generator=rng,
-    ) + 0.5
+    return (
+        torch.rand(
+            (num_ranks, num_tokens_per_rank, num_topk),
+            dtype=torch.float32,
+            device="cuda",
+            generator=rng,
+        )
+        + 0.5
+    )
 
 
 # =============================================================================
@@ -638,13 +658,15 @@ def _sym_zeros(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     if _NO_DIST:
         return torch.zeros(shape, dtype=dtype, device="cuda")
     import nvshmem.core
+
     tensor = nvshmem.core.tensor(shape, dtype=dtype)
     tensor.zero_()
     return tensor
 
 
 def _sym_zeros_byte_view(
-    logical_shape: Tuple[int, ...], target_dtype: torch.dtype,
+    logical_shape: Tuple[int, ...],
+    target_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Sym-heap allocation for dtypes nvshmem4py doesn't natively support
     (NVFP4 / fp8): allocate uint8 byte buffer, ``.view(target_dtype)``.
@@ -671,7 +693,11 @@ def _sym_zeros_byte_view(
     total_bytes = 1
     for dim_size in storage_shape:
         total_bytes *= dim_size
-    return _sym_zeros((total_bytes,), torch.uint8).view(target_dtype).reshape(storage_shape)
+    return (
+        _sym_zeros((total_bytes,), torch.uint8)
+        .view(target_dtype)
+        .reshape(storage_shape)
+    )
 
 
 def _compute_peer_offsets(
@@ -704,10 +730,10 @@ def _compute_peer_offsets(
         local_base = int(sym_tensor.data_ptr())
         return local_base, tuple(0 for _ in range(world_size))
     import nvshmem.core
+
     local_base = int(sym_tensor.data_ptr())
     peer_offsets_list = tuple(
-        int(nvshmem.core.get_peer_tensor(sym_tensor, peer).data_ptr())
-        - local_base
+        int(nvshmem.core.get_peer_tensor(sym_tensor, peer).data_ptr()) - local_base
         for peer in range(world_size)
     )
     return local_base, peer_offsets_list
@@ -796,7 +822,7 @@ class MegaMoETester:
         self._global_fc2_alpha: Optional[torch.Tensor] = None
         self._global_fc1_norm_const: Optional[torch.Tensor] = None
 
-        # Public 2D (T, hidden) combined output the kernel produces.  
+        # Public 2D (T, hidden) combined output the kernel produces.
         self.output_activation: Optional[torch.Tensor] = None
         self.combine_output_ref: Optional[torch.Tensor] = None
         self.combine_reduced_output_ref: Optional[torch.Tensor] = None
@@ -833,14 +859,17 @@ class MegaMoETester:
     def _check_cuda_rng_consistency(self) -> None:
         """Weakly verify CUDA RNG streams stayed aligned across ranks."""
         if not (
-            torch.distributed.is_available()
-            and torch.distributed.is_initialized()
+            torch.distributed.is_available() and torch.distributed.is_initialized()
         ):
             return
 
         random_parts = torch.randint(
-            0, 1 << 31, (2, 16),
-            dtype=torch.int64, device="cuda", generator=self._torch_cuda_rng,
+            0,
+            1 << 31,
+            (2, 16),
+            dtype=torch.int64,
+            device="cuda",
+            generator=self._torch_cuda_rng,
         )
         sentinel = (random_parts[0] << 31) ^ random_parts[1]
         gathered = [torch.empty_like(sentinel) for _ in range(self.world_size)]
@@ -848,7 +877,8 @@ class MegaMoETester:
 
         reference = gathered[0]
         mismatched_ranks = [
-            rank for rank, value in enumerate(gathered)
+            rank
+            for rank, value in enumerate(gathered)
             if not torch.equal(value, reference)
         ]
         if mismatched_ranks:
@@ -881,32 +911,48 @@ class MegaMoETester:
         # before fc1 reads it; the boundary stays plain so the host
         # reference can dequant directly.
         self._global_activation = _make_nvfp4_tensor_from_torch_rng(
-            self._torch_cuda_rng, (num_ranks, num_tokens_per_rank, hidden),
-            packed_dim=-1, perf_run=self.misc.perf_run,
+            self._torch_cuda_rng,
+            (num_ranks, num_tokens_per_rank, hidden),
+            packed_dim=-1,
+            perf_run=self.misc.perf_run,
         )
         self._global_activation_sf = _make_raw_scale_tensor_from_torch_rng(
             self._torch_cuda_rng,
-            num_ranks * num_tokens_per_rank, hidden, blocksize=scale_blocksize,
-            strict=True
+            num_ranks * num_tokens_per_rank,
+            hidden,
+            blocksize=scale_blocksize,
+            strict=True,
         ).reshape(num_ranks, num_tokens_per_rank, hidden_sf_cols)
 
         # ---- Routing table.
         if problem.route_distribution == "balanced":
             topk_idx_np = _generate_topk_idx_balanced(
-                num_ranks, num_tokens_per_rank, num_topk,
-                problem.num_total_experts, rng,
+                num_ranks,
+                num_tokens_per_rank,
+                num_topk,
+                problem.num_total_experts,
+                rng,
             )
         else:
             topk_idx_np = _generate_topk_idx_power_law(
-                num_ranks, num_tokens_per_rank, num_topk,
-                problem.num_total_experts, problem.power_law_exponent, rng,
+                num_ranks,
+                num_tokens_per_rank,
+                num_topk,
+                problem.num_total_experts,
+                problem.power_law_exponent,
+                rng,
             )
         topk_weights = _generate_topk_weights(
-            num_ranks, num_tokens_per_rank, num_topk, self._torch_cuda_rng,
+            num_ranks,
+            num_tokens_per_rank,
+            num_topk,
+            self._torch_cuda_rng,
         )
         if self.rank == 0:
             _print_remote_rank_comm_matrices(
-                topk_idx_np, num_ranks, problem.num_total_experts,
+                topk_idx_np,
+                num_ranks,
+                problem.num_total_experts,
             )
         self._global_topk_idx = torch.from_numpy(topk_idx_np).cuda()
         self._global_topk_weights = topk_weights
@@ -916,37 +962,66 @@ class MegaMoETester:
         self._global_fc1_weight = _make_nvfp4_tensor_from_torch_rng(
             self._torch_cuda_rng,
             (num_ranks, num_experts_per_rank, hidden, intermediate),
-            packed_dim=2, perf_run=self.misc.perf_run,
+            packed_dim=2,
+            perf_run=self.misc.perf_run,
         )
         self._global_fc1_weight_sf = _make_raw_scale_tensor_from_torch_rng(
             self._torch_cuda_rng,
             num_ranks * num_experts_per_rank * intermediate,
-            hidden, blocksize=scale_blocksize, strict=True
+            hidden,
+            blocksize=scale_blocksize,
+            strict=True,
         ).reshape(num_ranks, num_experts_per_rank, intermediate, hidden_sf_cols)
 
         self._global_fc2_weight = _make_nvfp4_tensor_from_torch_rng(
             self._torch_cuda_rng,
             (num_ranks, num_experts_per_rank, intermediate_downproj, hidden),
-            packed_dim=2, perf_run=self.misc.perf_run,
+            packed_dim=2,
+            perf_run=self.misc.perf_run,
         )
         self._global_fc2_weight_sf = _make_raw_scale_tensor_from_torch_rng(
             self._torch_cuda_rng,
             num_ranks * num_experts_per_rank * hidden,
-            intermediate_downproj, blocksize=scale_blocksize,
-            strict=True
+            intermediate_downproj,
+            blocksize=scale_blocksize,
+            strict=True,
         ).reshape(
-            num_ranks, num_experts_per_rank, hidden, intermediate_downproj_sf_cols,
+            num_ranks,
+            num_experts_per_rank,
+            hidden,
+            intermediate_downproj_sf_cols,
         )
         epi_arg_shape = (num_ranks, num_experts_per_rank)
-        self._global_fc1_alpha = torch.randint(
-            1, 5, epi_arg_shape, generator=self._torch_cuda_rng, device="cuda",
-        ).to(torch.float32) * 0.5
-        self._global_fc2_alpha = torch.randint(
-            1, 5, epi_arg_shape, generator=self._torch_cuda_rng, device="cuda",
-        ).to(torch.float32) * 0.5
-        self._global_fc1_norm_const = torch.randint(
-            2, 5, epi_arg_shape, generator=self._torch_cuda_rng, device="cuda",
-        ).to(torch.float32) * 0.5
+        self._global_fc1_alpha = (
+            torch.randint(
+                1,
+                5,
+                epi_arg_shape,
+                generator=self._torch_cuda_rng,
+                device="cuda",
+            ).to(torch.float32)
+            * 0.5
+        )
+        self._global_fc2_alpha = (
+            torch.randint(
+                1,
+                5,
+                epi_arg_shape,
+                generator=self._torch_cuda_rng,
+                device="cuda",
+            ).to(torch.float32)
+            * 0.5
+        )
+        self._global_fc1_norm_const = (
+            torch.randint(
+                2,
+                5,
+                epi_arg_shape,
+                generator=self._torch_cuda_rng,
+                device="cuda",
+            ).to(torch.float32)
+            * 0.5
+        )
 
         # ---- Atom-swizzle the weight SFs.  fc1_weight / fc2_weight are
         # consumed by the base kernel directly (NOT routed through dispatch
@@ -963,10 +1038,9 @@ class MegaMoETester:
             for e in range(num_experts_per_rank)
         ]
         fc1_flat_sf_size = fc1_sf_swizzled[0].numel()
-        self._global_fc1_weight_sf_swizzled = (
-            _stack_byte_reinterpretable_tensors(fc1_sf_swizzled, dim=0)
-            .view(num_ranks, num_experts_per_rank, fc1_flat_sf_size)
-        )
+        self._global_fc1_weight_sf_swizzled = _stack_byte_reinterpretable_tensors(
+            fc1_sf_swizzled, dim=0
+        ).view(num_ranks, num_experts_per_rank, fc1_flat_sf_size)
 
         fc2_sf_swizzled = [
             to_blocked(self._global_fc2_weight_sf[r, e])
@@ -974,10 +1048,9 @@ class MegaMoETester:
             for e in range(num_experts_per_rank)
         ]
         fc2_flat_sf_size = fc2_sf_swizzled[0].numel()
-        self._global_fc2_weight_sf_swizzled = (
-            _stack_byte_reinterpretable_tensors(fc2_sf_swizzled, dim=0)
-            .view(num_ranks, num_experts_per_rank, fc2_flat_sf_size)
-        )
+        self._global_fc2_weight_sf_swizzled = _stack_byte_reinterpretable_tensors(
+            fc2_sf_swizzled, dim=0
+        ).view(num_ranks, num_experts_per_rank, fc2_flat_sf_size)
 
         # ---- Stage own-rank inputs into the symmetric heap.
         own_activation = self._global_activation[self.rank]
@@ -989,7 +1062,8 @@ class MegaMoETester:
         # natively support these dtypes); copy via uint8 to dodge any
         # NVFP4-to-NVFP4 assignment quirks between allocators.
         self.my_activation = _sym_zeros_byte_view(
-            (num_tokens_per_rank, hidden), _DataDtype,
+            (num_tokens_per_rank, hidden),
+            _DataDtype,
         )
         self.my_activation.view(torch.uint8).copy_(own_activation.view(torch.uint8))
 
@@ -1008,7 +1082,8 @@ class MegaMoETester:
         # tensor-indexing assignment across torch versions.
         hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
         self.my_activation_sf = _sym_zeros_byte_view(
-            (num_tokens_per_rank, hidden_sf_cols_padded), _ScaleDtype,
+            (num_tokens_per_rank, hidden_sf_cols_padded),
+            _ScaleDtype,
         )
         self.my_activation_sf.view(torch.uint8)[:, :hidden_sf_cols].copy_(
             own_activation_sf.view(torch.uint8)
@@ -1094,9 +1169,9 @@ class MegaMoETester:
             gate_up_clamp=self.problem.gate_up_clamp,
         )
         self.combine_output_ref = reference.combine_output[self.rank].contiguous()
-        self.combine_reduced_output_ref = (
-            reference.combine_reduced_output[self.rank].contiguous()
-        )
+        self.combine_reduced_output_ref = reference.combine_reduced_output[
+            self.rank
+        ].contiguous()
 
     # ------------------------------------------------------------------
     # Step 3: workspace allocation
@@ -1129,11 +1204,14 @@ class MegaMoETester:
         local_ws_bytes, shared_ws_bytes = self._kernel.get_workspace_sizes()
 
         self.local_workspace = torch.zeros(
-            (local_ws_bytes,), dtype=torch.uint8, device="cuda",
+            (local_ws_bytes,),
+            dtype=torch.uint8,
+            device="cuda",
         )
         self.shared_workspace = _sym_zeros((shared_ws_bytes,), torch.uint8)
         self.symmetric_base, self.peer_offsets_list = _compute_peer_offsets(
-            self.shared_workspace, self.world_size,
+            self.shared_workspace,
+            self.world_size,
         )
 
     # ------------------------------------------------------------------
@@ -1184,15 +1262,12 @@ class MegaMoETester:
             if topk_time_us == 0.0:
                 topk_time_us = float("nan")
         finite_parts = [
-            time_us
-            for time_us in (mega_time_us, topk_time_us)
-            if np.isfinite(time_us)
+            time_us for time_us in (mega_time_us, topk_time_us) if np.isfinite(time_us)
         ]
         total_time_us = sum(finite_parts) if finite_parts else float("nan")
 
         dist_active = (
-            torch.distributed.is_available()
-            and torch.distributed.is_initialized()
+            torch.distributed.is_available() and torch.distributed.is_initialized()
         )
         if dist_active:
             local_times = torch.tensor(
@@ -1355,12 +1430,8 @@ class MegaMoETester:
             self.problem.hidden,
         )
 
-        cluster_size = (
-            self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
-        )
-        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
-            cluster_size
-        )
+        cluster_size = self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
         group_hint = self.impl.group_hint
         if group_hint is None:
             group_hint = max_active_clusters
@@ -1398,9 +1469,12 @@ class MegaMoETester:
         # -- 3. Torch -> cute --
         # Same align defaults as runner_fc12: 16 B for general tensors,
         # 4 B for the i32 / fp32 counter / sized buffers.
-        def _to_cute(tensor: torch.Tensor, assumed_align: int = 16, force_static_layout = False):
+        def _to_cute(
+            tensor: torch.Tensor, assumed_align: int = 16, force_static_layout=False
+        ):
             cute_tensor = cutlass_torch.from_dlpack(
-                tensor, assumed_align=assumed_align,
+                tensor,
+                assumed_align=assumed_align,
             )
             if force_static_layout:
                 return cute_tensor
@@ -1428,7 +1502,9 @@ class MegaMoETester:
 
         def _to_cute_ptr(tensor: torch.Tensor, assumed_align: int = 16):
             return cute.runtime.make_ptr(
-                cutlass.Uint8, tensor.data_ptr(), _AddressSpace.gmem,
+                cutlass.Uint8,
+                tensor.data_ptr(),
+                _AddressSpace.gmem,
                 assumed_align=assumed_align,
             )
 
@@ -1522,8 +1598,7 @@ class MegaMoETester:
 
             torch.cuda.synchronize()
             _dist_active = (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
+                torch.distributed.is_available() and torch.distributed.is_initialized()
             )
             if _dist_active:
                 torch.distributed.barrier()
@@ -1599,9 +1674,7 @@ class MegaMoETester:
         if self.impl.fc2_reduces_topk:
             # in_kernel_reduce: K already collapsed on device; the reference is
             # the host bf16 sequential K-sum of the per-topk reference cells.
-            ref_reduced = _bf16_seq_sum_k(
-                self.combine_output_ref
-            ).to(torch.float32)
+            ref_reduced = _bf16_seq_sum_k(self.combine_output_ref).to(torch.float32)
         else:
             ref_reduced = self.combine_reduced_output_ref.to(torch.float32)
 
@@ -1623,7 +1696,8 @@ class MegaMoETester:
             K = self.combine_output_ref.shape[1]
             if K <= _FORM_B_PERM_K_LIMIT:
                 match_mask, n_perms = _form_b_bitwise_match(
-                    actual_reduced, self.combine_output_ref,
+                    actual_reduced,
+                    self.combine_output_ref,
                 )
                 n_matched = int(match_mask.sum().item())
                 n_total = match_mask.numel()
@@ -1652,13 +1726,10 @@ class MegaMoETester:
                         dtype=torch.int32,
                     )
                     gathered_passes = [
-                        torch.empty_like(pass_tensor)
-                        for _ in range(self.world_size)
+                        torch.empty_like(pass_tensor) for _ in range(self.world_size)
                     ]
                     torch.distributed.all_gather(gathered_passes, pass_tensor)
-                    rank_bitwise_passes = [
-                        bool(t.item()) for t in gathered_passes
-                    ]
+                    rank_bitwise_passes = [bool(t.item()) for t in gathered_passes]
                 if all(rank_bitwise_passes):
                     if self.rank == 0:
                         print(
@@ -1670,16 +1741,14 @@ class MegaMoETester:
                 if not local_bitwise_pass:
                     bad = (~match_mask).nonzero(as_tuple=False)
                     n_local_bad = int(bad.shape[0])
-                    sample = bad[:min(8, n_local_bad)].cpu().tolist()
+                    sample = bad[: min(8, n_local_bad)].cpu().tolist()
                     print(
                         f"[rank {self.rank}] form-B bitwise miss: "
                         f"{n_local_bad} cell(s); sample "
                         f"(token, hidden)={sample}"
                     )
                     sys.stdout.flush()
-                failed_ranks = [
-                    r for r, ok in enumerate(rank_bitwise_passes) if not ok
-                ]
+                failed_ranks = [r for r, ok in enumerate(rank_bitwise_passes) if not ok]
                 n_bad = int((diff > atol).sum().item())
                 raise AssertionError(
                     f"[rank {self.rank}] form-B bitwise check failed on ranks "
@@ -1758,9 +1827,9 @@ class MegaMoETester:
                 # Gather per-cell K terms (n_verify, K) then sum of |x|.
                 # combine_output_ref is (T, K, H) bf16; advanced index
                 # combines suspect_t and suspect_h elementwise.
-                cells_ref_K = self.combine_output_ref[
-                    suspect_t, :, suspect_h
-                ].to(torch.float32)
+                cells_ref_K = self.combine_output_ref[suspect_t, :, suspect_h].to(
+                    torch.float32
+                )
                 cells_abs_sum = cells_ref_K.abs().sum(dim=1)
                 bound = SAFETY * K * cells_abs_sum / 256.0
                 suspect_abs_diff = abs_diff.flatten()[top_indices].cpu()
@@ -1800,7 +1869,10 @@ class MegaMoETester:
         bitwise_mismatch_count = None
         if self.impl.fc2_reduces_topk:
             local_pass = torch.allclose(
-                actual_reduced, ref_reduced, atol=atol, rtol=rtol,
+                actual_reduced,
+                ref_reduced,
+                atol=atol,
+                rtol=rtol,
             )
         else:
             bitwise_mismatch_count = int((diff != 0).sum().item())
@@ -1809,8 +1881,7 @@ class MegaMoETester:
         rank_max_diffs = [float(local_max_diff.item())]
         rank_passes = [local_pass]
         _dist_active = (
-            torch.distributed.is_available()
-            and torch.distributed.is_initialized()
+            torch.distributed.is_available() and torch.distributed.is_initialized()
         )
         if _dist_active:
             gathered_diffs = [
@@ -1854,10 +1925,7 @@ class MegaMoETester:
                 f"rank {rank}: max_diff={max_diff:.4g}"
                 for rank, max_diff in enumerate(rank_max_diffs)
             )
-            print(
-                f"Validation PASSED on all ranks "
-                f"({diff_summary})"
-            )
+            print(f"Validation PASSED on all ranks ({diff_summary})")
 
     # ------------------------------------------------------------------
     # Workspace peek (MEGA_PEEK_WORKSPACE=1)
@@ -1893,12 +1961,15 @@ class MegaMoETester:
         def _region(ws, by_name, offsets, name, torch_dtype):
             spec = by_name[name]
             off = offsets[name]
-            return ws[off:off + spec.nbytes].view(torch_dtype)
+            return ws[off : off + spec.nbytes].view(torch_dtype)
 
         # ---- 1. expert routing counters (low32=tokens, high32=publishers*ranks).
         ercs = _region(
-            self.shared_workspace, shared_by_name, shared_offsets,
-            "expert_recv_count_sum", torch.int64,
+            self.shared_workspace,
+            shared_by_name,
+            shared_offsets,
+            "expert_recv_count_sum",
+            torch.int64,
         )
         print("---- expert_recv_count_sum ----")
         for i in range(ercs.shape[0]):
@@ -1910,25 +1981,28 @@ class MegaMoETester:
 
         # ---- 2. token_src_metadata: (pool_slot) -> (src_rank, src_token, src_topk).
         mbuf = _region(
-            self.local_workspace, local_by_name, local_offsets,
-            "token_src_metadata", torch.int32,
+            self.local_workspace,
+            local_by_name,
+            local_offsets,
+            "token_src_metadata",
+            torch.int32,
         )
         md_u32 = mbuf.reshape(-1, 3)
         n_slots = md_u32.shape[0]
-        sample_rows = sorted(set(
-            list(range(min(8, n_slots)))
-            + [n_slots // 2 - 1, n_slots // 2, n_slots // 2 + 1]
-            + list(range(max(0, n_slots - 4), n_slots))
-        ))
+        sample_rows = sorted(
+            set(
+                list(range(min(8, n_slots)))
+                + [n_slots // 2 - 1, n_slots // 2, n_slots // 2 + 1]
+                + list(range(max(0, n_slots - 4), n_slots))
+            )
+        )
         print(
             f"---- token_src_metadata (pool_slot -> (src_rank, src_token, src_topk)) "
             f"n_slots={n_slots} ----"
         )
         for s in sample_rows:
             r = md_u32[s].cpu().tolist()
-            print(
-                f"  slot[{s}]: src_rank={r[0]} src_token={r[1]} src_topk={r[2]}"
-            )
+            print(f"  slot[{s}]: src_rank={r[0]} src_token={r[1]} src_topk={r[2]}")
 
         # ---- 2a. duplicate (src_rank, src_token, src_topk) detection.
         #
@@ -1963,8 +2037,7 @@ class MegaMoETester:
         coll_mask = counts > 1
         n_collisions = int(coll_mask.sum().item())
         print(
-            f"---- duplicate metadata triples (n_collision_triples="
-            f"{n_collisions}) ----"
+            f"---- duplicate metadata triples (n_collision_triples={n_collisions}) ----"
         )
         if n_collisions == 0:
             print("  (no duplicates -- metadata is 1:1 with combine_output cells)")
@@ -1983,7 +2056,7 @@ class MegaMoETester:
                 src_topk = k & 0xFFFF
                 # Find which pool_slots map here.
                 slot_ids = (key == k).nonzero(as_tuple=False).squeeze(-1)
-                slot_sample = slot_ids[:min(8, slot_ids.numel())].tolist()
+                slot_sample = slot_ids[: min(8, slot_ids.numel())].tolist()
                 tag = ""
                 if src_rank == 0 and src_token == 0 and src_topk == 0:
                     tag = "  [LIKELY PADDING / UNWRITTEN]"
@@ -1991,16 +2064,12 @@ class MegaMoETester:
                     f"  (src_rank={src_rank}, src_token={src_token}, "
                     f"src_topk={src_topk}) x {c}{tag}"
                 )
-                print(
-                    f"    first {len(slot_sample)} slot ids: {slot_sample}"
-                )
+                print(f"    first {len(slot_sample)} slot ids: {slot_sample}")
                 shown += 1
                 if shown >= shown_limit:
                     remaining = n_collisions - shown
                     if remaining > 0:
-                        print(
-                            f"  ... ({remaining} more collision triples elided)"
-                        )
+                        print(f"  ... ({remaining} more collision triples elided)")
                     break
 
         # ---- 2b. expected-vs-actual (src_token, src_topk) reverse check.
@@ -2032,15 +2101,10 @@ class MegaMoETester:
         fc1_spec_rc = local_by_name["fc1_output"]
         fc1_off_rc = local_offsets["fc1_output"]
         fc1_raw_rc = self.local_workspace[
-            fc1_off_rc:fc1_off_rc + fc1_spec_rc.nbytes
+            fc1_off_rc : fc1_off_rc + fc1_spec_rc.nbytes
         ].view(torch.uint8)
-        row_bytes_rc = (
-            fc1_spec_rc.shape[1] // 2 if len(fc1_spec_rc.shape) >= 2 else 0
-        )
-        rc_ready = (
-            row_bytes_rc > 0
-            and fc1_raw_rc.numel() % row_bytes_rc == 0
-        )
+        row_bytes_rc = fc1_spec_rc.shape[1] // 2 if len(fc1_spec_rc.shape) >= 2 else 0
+        rc_ready = row_bytes_rc > 0 and fc1_raw_rc.numel() % row_bytes_rc == 0
         if rc_ready:
             fc1_2d_rc = fc1_raw_rc.view(-1, row_bytes_rc).cpu()
             valid_slot_mask = (fc1_2d_rc != 0).any(dim=1)
@@ -2050,9 +2114,7 @@ class MegaMoETester:
             # (t, k) on different source ranks lives in different
             # pool slots on the receiver).  Single-rank degenerates to
             # the previous behaviour (src_rank == 0 everywhere).
-            seen_triples = set(
-                map(tuple, md_cpu[valid_slot_mask, :].tolist())
-            )
+            seen_triples = set(map(tuple, md_cpu[valid_slot_mask, :].tolist()))
             # Expected universe: every (src_rank, src_token, src_topk)
             # whose routed expert lands on THIS rank.  Per-rank
             # routing is built by replaying ``_generate_topk_idx_*``;
@@ -2060,14 +2122,9 @@ class MegaMoETester:
             # tensor in ``self._global_topk_idx`` (shape
             # ``(num_ranks, T, K)``).  Filter by
             # ``expert // num_experts_per_rank == self.rank``.
-            num_experts_per_rank = (
-                self.problem.num_total_experts // self.world_size
-            )
+            num_experts_per_rank = self.problem.num_total_experts // self.world_size
             expected_triples = set()
-            if (
-                hasattr(self, "_global_topk_idx")
-                and self._global_topk_idx is not None
-            ):
+            if hasattr(self, "_global_topk_idx") and self._global_topk_idx is not None:
                 gti = self._global_topk_idx.cpu()  # (R, T, K)
                 for sr in range(self.world_size):
                     for t in range(T):
@@ -2125,8 +2182,8 @@ class MegaMoETester:
                 print(f"  first 16 extras (src_rank, src_token, src_topk): {sample}")
         else:
             print(
-                f"---- expected-vs-actual reverse check skipped "
-                f"(fc1_output peek unavailable) ----"
+                "---- expected-vs-actual reverse check skipped "
+                "(fc1_output peek unavailable) ----"
             )
 
         # ---- 3. fc1_output non-zero row mask (per pool_slot) + hash.
@@ -2139,9 +2196,9 @@ class MegaMoETester:
         # differs the race is on the read / fc2 phase side.
         fc1_spec = local_by_name["fc1_output"]
         fc1_off = local_offsets["fc1_output"]
-        fc1_raw = self.local_workspace[
-            fc1_off:fc1_off + fc1_spec.nbytes
-        ].view(torch.uint8)
+        fc1_raw = self.local_workspace[fc1_off : fc1_off + fc1_spec.nbytes].view(
+            torch.uint8
+        )
         row_bytes = fc1_spec.shape[1] // 2 if len(fc1_spec.shape) >= 2 else 0
         if row_bytes > 0 and fc1_raw.numel() % row_bytes == 0:
             fc1_2d = fc1_raw.view(-1, row_bytes).cpu()
@@ -2159,12 +2216,8 @@ class MegaMoETester:
                 f"hash=0x{fc1_hash:08x} ----"
             )
             if zero_rows:
-                print(
-                    f"  first 16 zero rows: {zero_rows[:16]}"
-                )
-                print(
-                    f"  last 16 zero rows : {zero_rows[-16:]}"
-                )
+                print(f"  first 16 zero rows: {zero_rows[:16]}")
+                print(f"  last 16 zero rows : {zero_rows[-16:]}")
 
             # ---- 3b. fc1_output * SF dequant sample (head/tail rows).
             #
@@ -2180,9 +2233,11 @@ class MegaMoETester:
             K_atoms = (K_sf_blocks_total + 3) // 4
             sf_spec = local_by_name["fc1_output_sf"]
             sf_off = local_offsets["fc1_output_sf"]
-            sf_raw = self.local_workspace[
-                sf_off:sf_off + sf_spec.nbytes
-            ].view(torch.uint8).cpu()
+            sf_raw = (
+                self.local_workspace[sf_off : sf_off + sf_spec.nbytes]
+                .view(torch.uint8)
+                .cpu()
+            )
 
             def _sf_byte_offset(m: int, sf_block: int) -> int:
                 return (
@@ -2197,8 +2252,10 @@ class MegaMoETester:
             n_show_cells = 16
             n_rows_total = fc1_2d.shape[0]
             sample_row_ids = list(range(min(n_show_rows, n_rows_total))) + [
-                r for r in range(
-                    max(0, n_rows_total - n_show_rows), n_rows_total,
+                r
+                for r in range(
+                    max(0, n_rows_total - n_show_rows),
+                    n_rows_total,
                 )
                 if r >= n_show_rows  # avoid duplicates when rows < 2*n_show
             ]
@@ -2215,10 +2272,7 @@ class MegaMoETester:
                 fp4_vals = _Fp4DecodeTable[fp4_idx]
                 # SF bytes for this row (one byte per sf_block).
                 sf_byte_idxs = torch.tensor(
-                    [
-                        _sf_byte_offset(r, sb)
-                        for sb in range(K_sf_blocks_total)
-                    ],
+                    [_sf_byte_offset(r, sb) for sb in range(K_sf_blocks_total)],
                     dtype=torch.int64,
                 )
                 sf_bytes = sf_raw[sf_byte_idxs]
@@ -2230,9 +2284,7 @@ class MegaMoETester:
                 ).reshape(-1)
 
                 n_cells_actual = min(n_show_cells, dequant.numel())
-                head_cells = [
-                    f"{v:+.2f}" for v in dequant[:n_cells_actual].tolist()
-                ]
+                head_cells = [f"{v:+.2f}" for v in dequant[:n_cells_actual].tolist()]
                 sf_show = [f"{s:+.3f}" for s in sf_fp32.tolist()]
                 print(
                     f"  row[{r}]: dequant min={dequant.min().item():+.3f} "
@@ -2257,7 +2309,8 @@ class MegaMoETester:
                 full_lo = (fc1_2d & 0x0F).to(torch.int64)
                 full_hi = ((fc1_2d >> 4) & 0x0F).to(torch.int64)
                 full_fp4_idx = torch.stack(
-                    [full_lo, full_hi], dim=-1,
+                    [full_lo, full_hi],
+                    dim=-1,
                 ).reshape(fc1_2d.shape[0], -1)
                 full_fp4_vals = _Fp4DecodeTable[full_fp4_idx]
                 # Per-(valid_row, sf_block) SF byte offsets, gathered
@@ -2271,15 +2324,16 @@ class MegaMoETester:
                     dtype=torch.int64,
                 )
                 sf_bytes_all = sf_raw[sf_offsets_all].view(
-                    n_valid, K_sf_blocks_total,
+                    n_valid,
+                    K_sf_blocks_total,
                 )
-                sf_fp32_all = (
-                    sf_bytes_all.view(torch.float8_e4m3fn).to(torch.float32)
-                )
+                sf_fp32_all = sf_bytes_all.view(torch.float8_e4m3fn).to(torch.float32)
                 valid_fp4 = full_fp4_vals[valid_row_ids]
                 dequant_all = (
                     valid_fp4.reshape(
-                        n_valid, K_sf_blocks_total, sf_vec_size,
+                        n_valid,
+                        K_sf_blocks_total,
+                        sf_vec_size,
                     )
                     * sf_fp32_all.unsqueeze(-1)
                 ).reshape(n_valid, -1)
@@ -2326,7 +2380,7 @@ class MegaMoETester:
         for buf_name in ("fc1_output_sf", "l1_sf_buffer"):
             spec = local_by_name[buf_name]
             off = local_offsets[buf_name]
-            raw = self.local_workspace[off:off + spec.nbytes].view(torch.uint8)
+            raw = self.local_workspace[off : off + spec.nbytes].view(torch.uint8)
             u32 = raw.view(torch.int32).cpu().to(torch.int64)
             buf_hash = int((u32 & 0xFFFFFFFF).sum().item()) % 0x7FFFFFFF
             print(
@@ -2345,8 +2399,7 @@ class MegaMoETester:
         if hasattr(self, "_global_topk_idx") and self._global_topk_idx is not None:
             host_diff_per_token = diff.sum(dim=-1).cpu()  # (T,)
             bad_token_ids = (
-                (host_diff_per_token > 0).nonzero(as_tuple=False)
-                .squeeze(-1).tolist()
+                (host_diff_per_token > 0).nonzero(as_tuple=False).squeeze(-1).tolist()
             )
             n_bad_tokens = len(bad_token_ids)
             topk_idx_cpu = self._global_topk_idx[self.rank].cpu()
@@ -2360,12 +2413,9 @@ class MegaMoETester:
             # rank's ``num_experts_per_rank`` experts; global expert
             # ids that route to OTHER ranks have no entry here).
             n_local_e = ercs.shape[0]
-            num_experts_per_rank = (
-                self.problem.num_total_experts // self.world_size
-            )
+            num_experts_per_rank = self.problem.num_total_experts // self.world_size
             expert_recv_local = [
-                int(ercs[i].item()) & 0xFFFFFFFF
-                for i in range(n_local_e)
+                int(ercs[i].item()) & 0xFFFFFFFF for i in range(n_local_e)
             ]
 
             def _recv_for(e_global):
@@ -2392,12 +2442,8 @@ class MegaMoETester:
                         if topk_w_cpu is not None
                         else ""
                     )
-                    pieces.append(
-                        f"k{k_idx}=e{e_int}(recv={_recv_for(e_int)},{wt})"
-                    )
-                print(
-                    f"  token[{t}] diff_sum={ds:.4g}  " + " ".join(pieces)
-                )
+                    pieces.append(f"k{k_idx}=e{e_int}(recv={_recv_for(e_int)},{wt})")
+                print(f"  token[{t}] diff_sum={ds:.4g}  " + " ".join(pieces))
 
         # ---- 4. worst-diff tokens (on UNREDUCED (T, K, H) abs diff).
         #
@@ -2420,12 +2466,14 @@ class MegaMoETester:
             per_token_diff_sum = unreduced_diff.sum(dim=-1)  # (T,)
         else:
             combine_quant_raw = _region(
-                self.shared_workspace, shared_by_name, shared_offsets,
-                "combine_quant", self.problem.fc2_output_dtype,
+                self.shared_workspace,
+                shared_by_name,
+                shared_offsets,
+                "combine_quant",
+                self.problem.fc2_output_dtype,
             )
-            actual_full = (
-                combine_quant_raw.reshape(self.combine_output_ref.shape)
-                .to(torch.float32)
+            actual_full = combine_quant_raw.reshape(self.combine_output_ref.shape).to(
+                torch.float32
             )
             ref_full = self.combine_output_ref.to(torch.float32)
             unreduced_diff = (actual_full - ref_full).abs()  # (T, K, H)
@@ -2444,7 +2492,7 @@ class MegaMoETester:
                 f"top {n_worst_cells_per_token} hidden cells; K already "
                 "reduced on device) ----"
             )
-            for t, ds in zip(bad_tokens, bad_diff_sums):
+            for t, ds in zip(bad_tokens, bad_diff_sums, strict=False):
                 token_diff = unreduced_diff[t]  # (H,)
                 n_cells = min(n_worst_cells_per_token, token_diff.numel())
                 top_cells = torch.topk(token_diff, k=n_cells)
@@ -2458,8 +2506,7 @@ class MegaMoETester:
                     r = float(ref_full[t, h].item())
                     d = float(token_diff[h].item())
                     print(
-                        f"    (hidden={h}): "
-                        f"actual={a:.4g}  ref={r:.4g}  diff={d:.4g}"
+                        f"    (hidden={h}): actual={a:.4g}  ref={r:.4g}  diff={d:.4g}"
                     )
         else:
             print(
@@ -2467,7 +2514,7 @@ class MegaMoETester:
                 f"{n_worst_tokens} by sum over (topk, hidden); per token: "
                 f"top {n_worst_cells_per_token} (topk, hidden) cells) ----"
             )
-            for t, ds in zip(bad_tokens, bad_diff_sums):
+            for t, ds in zip(bad_tokens, bad_diff_sums, strict=False):
                 token_diff = unreduced_diff[t]  # (K, H)
                 flat = token_diff.flatten()
                 n_cells = min(n_worst_cells_per_token, flat.numel())
@@ -2546,8 +2593,11 @@ def _parse_tuple(argument: str) -> Tuple[int, ...]:
 
 def _parse_output_dtype(argument: str) -> torch.dtype:
     mapping = {
-        "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
-        "fp16": torch.float16, "float16": torch.float16, "half": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "half": torch.float16,
     }
     if argument not in mapping:
         raise argparse.ArgumentTypeError(
@@ -2560,7 +2610,7 @@ def _parse_combine_format(argument: str) -> CombineFormat:
     try:
         return CombineFormat.parse(argument)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc))
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -2574,45 +2624,60 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--intermediate", type=int, default=1024)
     parser.add_argument(
-        "--fc2_output_dtype", type=_parse_output_dtype, default=torch.bfloat16,
+        "--fc2_output_dtype",
+        type=_parse_output_dtype,
+        default=torch.bfloat16,
     )
     parser.add_argument(
-        "--combine_format", type=_parse_combine_format,
+        "--combine_format",
+        type=_parse_combine_format,
         default=CombineFormat.parse("bf16"),
         help="Cross-rank combine wire format: 'bf16' (no-quant baseline), "
-             "'16e2m1xbf16' (fp4 + per-16 bf16 amax), or '32e4m3xe8m0' (MXFP8).",
+        "'16e2m1xbf16' (fp4 + per-16 bf16 amax), or '32e4m3xe8m0' (MXFP8).",
     )
     parser.add_argument(
-        "--route_distribution", type=str, default="balanced",
+        "--route_distribution",
+        type=str,
+        default="balanced",
         choices=["balanced", "power_law"],
     )
     parser.add_argument(
-        "--power_law_exponent", type=float, default=1.0,
+        "--power_law_exponent",
+        type=float,
+        default=1.0,
         help="Zipf exponent for --route_distribution power_law; 1.0 = classic "
-             "Zipf, larger = more skewed, 0 = uniform.",
+        "Zipf, larger = more skewed, 0 = uniform.",
     )
     parser.add_argument(
-        "--gate_up_clamp", type=float, default=None,
+        "--gate_up_clamp",
+        type=float,
+        default=None,
         help="DeepSeek-V4 swiglu_limit: asymmetric clamp on the real gate/up "
-             "pre-activations (gate<=limit, |up|<=limit) before SiLU. "
-             "Omitted/None disables the clamp; must be non-negative.",
+        "pre-activations (gate<=limit, |up|<=limit) before SiLU. "
+        "Omitted/None disables the clamp; must be non-negative.",
     )
 
     parser.add_argument("--mma_tiler_mnk", type=str, default="128,128,256")
     parser.add_argument("--cluster_shape_mnk", type=str, default="1,1,1")
     parser.add_argument("--use_2cta_instrs", action="store_true", default=False)
-    parser.add_argument("--enable_static_expert_shape", action="store_true", default=False)
+    parser.add_argument(
+        "--enable_static_expert_shape", action="store_true", default=False
+    )
     parser.add_argument("--dynamic_sched", action="store_true", default=False)
     parser.add_argument("--clc_bundle_size", type=int, default=None)
     parser.add_argument("--num_sched_stages", type=int, default=None)
     parser.add_argument(
-        "--load_balance_mode", type=str, default="static",
+        "--load_balance_mode",
+        type=str,
+        default="static",
         choices=["static", "atomic_counter"],
     )
     parser.add_argument("--group_hint", type=int, default=None)
     parser.add_argument("--flag_batch", type=int, default=4)
     parser.add_argument(
-        "--epi_flag_batch", type=str, default="1,1",
+        "--epi_flag_batch",
+        type=str,
+        default="1,1",
         help="(fc1,fc2) done-counter publish batch in comma form",
     )
     parser.add_argument(
@@ -2631,8 +2696,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="epi_warps",
         choices=["epi_warps", "standalone_warps", "reuse_dispatch_warps"],
         help="Where the cross-rank fc2 push-back runs: epi_warps (epilogue "
-             "STG redirect, default), standalone_warps (dedicated warps "
-             "12-15), or reuse_dispatch_warps (dispatch warps 8-11).",
+        "STG redirect, default), standalone_warps (dedicated warps "
+        "12-15), or reuse_dispatch_warps (dispatch warps 8-11).",
     )
     parser.add_argument("--perf_run", action="store_true", default=False)
     parser.add_argument("--skip_ref_check", action="store_true", default=False)
@@ -2643,7 +2708,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--perf_iters", type=int, default=1)
     parser.add_argument("--enable_debug_checks", action="store_true", default=False)
     parser.add_argument(
-        "--ref_compute_graph", type=str, default="deepgemm",
+        "--ref_compute_graph",
+        type=str,
+        default="deepgemm",
         choices=["transformers", "deepgemm"],
     )
     parser.add_argument("--enable_iket", action="store_true", default=False)
@@ -2671,6 +2738,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         world_size = 1
     else:
         from src.bootstrap import init_dist_and_nvshmem
+
         _local_rank, rank, world_size, _ = init_dist_and_nvshmem()
 
     problem = TokenCommProblemDesc(

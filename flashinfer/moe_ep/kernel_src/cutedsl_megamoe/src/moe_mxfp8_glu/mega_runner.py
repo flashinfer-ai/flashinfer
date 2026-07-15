@@ -54,7 +54,6 @@ from moe_nvfp4_swapab.mega_runner import (
     _generate_topk_weights,
     _print_remote_rank_comm_matrices,
     _sym_zeros,
-    _compute_peer_offsets,
     _parse_tuple,
     _parse_output_dtype,
     _NO_DIST,
@@ -76,6 +75,7 @@ _KIND_TO_TORCH_DTYPE = {
 
 def _kind_to_cutlass_dtype(kind: str):
     import cutlass
+
     return {
         "mxfp8_e4m3": cutlass.Float8E4M3FN,
         "mxfp8_e5m2": cutlass.Float8E5M2,
@@ -117,13 +117,21 @@ def _make_fp8_tensor(
         if data_dtype == torch.float8_e4m3fn:
             # E4M3FN NaN: 0x7F, 0xFF → sample 254 codes, skip 127.
             idx = torch.randint(
-                0, 254, (n,), device="cuda", generator=torch_rng,
+                0,
+                254,
+                (n,),
+                device="cuda",
+                generator=torch_rng,
             )
             flat_bytes = torch.where(idx < 127, idx, idx + 1).to(torch.uint8)
         elif data_dtype == torch.float8_e5m2:
             # E5M2 Inf/NaN: 0x7C-0x7F, 0xFC-0xFF → sample 248 codes, skip 4.
             idx = torch.randint(
-                0, 248, (n,), device="cuda", generator=torch_rng,
+                0,
+                248,
+                (n,),
+                device="cuda",
+                generator=torch_rng,
             )
             flat_bytes = torch.where(idx < 124, idx, idx + 4).to(torch.uint8)
         else:
@@ -158,7 +166,8 @@ def _make_e8m0_scale_tensor(
 
 
 def _sym_zeros_byte_view_1b(
-    logical_shape: Tuple[int, ...], target_dtype: torch.dtype,
+    logical_shape: Tuple[int, ...],
+    target_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Sym-heap allocation for 1-byte dtypes (fp8 e4m3/e5m2, E8M0) that
     nvshmem4py doesn't natively support: allocate a uint8 byte buffer and
@@ -200,7 +209,11 @@ class MegaMoEMxfp8Tester(MegaMoETester):
         self.kind = kind
         self.torch_ab_dtype = _KIND_TO_TORCH_DTYPE[kind]
         self._apply_topk_in_fc1 = True
-        self._combine_format = combine_format if combine_format is not None else CombineFormat.parse("bf16")
+        self._combine_format = (
+            combine_format
+            if combine_format is not None
+            else CombineFormat.parse("bf16")
+        )
         if impl.in_kernel_fc2_reduce and impl.token_back_by_dispatch:
             raise ValueError(
                 "in_kernel_fc2_reduce and token_back_by_dispatch cannot both be True."
@@ -234,31 +247,47 @@ class MegaMoEMxfp8Tester(MegaMoETester):
         # re-stage it into the SFB atom layout inside l1_sf_buffer before fc1
         # reads it, so the host reference can dequant from the plain layout.
         self._global_activation = _make_fp8_tensor(
-            self._torch_cuda_rng, (num_ranks, num_tokens_per_rank, hidden),
-            data_dtype, perf_run=self.misc.perf_run,
+            self._torch_cuda_rng,
+            (num_ranks, num_tokens_per_rank, hidden),
+            data_dtype,
+            perf_run=self.misc.perf_run,
         )
         self._global_activation_sf = _make_e8m0_scale_tensor(
             self._torch_cuda_rng,
-            num_ranks * num_tokens_per_rank, hidden, blocksize=scale_blocksize,
+            num_ranks * num_tokens_per_rank,
+            hidden,
+            blocksize=scale_blocksize,
         ).reshape(num_ranks, num_tokens_per_rank, hidden_sf_cols)
 
         # ---- Routing table.
         if problem.route_distribution == "balanced":
             topk_idx_np = _generate_topk_idx_balanced(
-                num_ranks, num_tokens_per_rank, num_topk,
-                problem.num_total_experts, rng,
+                num_ranks,
+                num_tokens_per_rank,
+                num_topk,
+                problem.num_total_experts,
+                rng,
             )
         else:
             topk_idx_np = _generate_topk_idx_power_law(
-                num_ranks, num_tokens_per_rank, num_topk,
-                problem.num_total_experts, problem.power_law_exponent, rng,
+                num_ranks,
+                num_tokens_per_rank,
+                num_topk,
+                problem.num_total_experts,
+                problem.power_law_exponent,
+                rng,
             )
         topk_weights = _generate_topk_weights(
-            num_ranks, num_tokens_per_rank, num_topk, self._torch_cuda_rng,
+            num_ranks,
+            num_tokens_per_rank,
+            num_topk,
+            self._torch_cuda_rng,
         )
         if self.rank == 0:
             _print_remote_rank_comm_matrices(
-                topk_idx_np, num_ranks, problem.num_total_experts,
+                topk_idx_np,
+                num_ranks,
+                problem.num_total_experts,
             )
         self._global_topk_idx = torch.from_numpy(topk_idx_np).cuda()
         self._global_topk_weights = topk_weights
@@ -270,25 +299,32 @@ class MegaMoEMxfp8Tester(MegaMoETester):
         self._global_fc1_weight = _make_fp8_tensor(
             self._torch_cuda_rng,
             (num_ranks, num_experts_per_rank, intermediate, hidden),
-            data_dtype, perf_run=self.misc.perf_run,
+            data_dtype,
+            perf_run=self.misc.perf_run,
         ).permute(0, 1, 3, 2)
         self._global_fc1_weight_sf = _make_e8m0_scale_tensor(
             self._torch_cuda_rng,
             num_ranks * num_experts_per_rank * intermediate,
-            hidden, blocksize=scale_blocksize,
+            hidden,
+            blocksize=scale_blocksize,
         ).reshape(num_ranks, num_experts_per_rank, intermediate, hidden_sf_cols)
 
         self._global_fc2_weight = _make_fp8_tensor(
             self._torch_cuda_rng,
             (num_ranks, num_experts_per_rank, hidden, intermediate_downproj),
-            data_dtype, perf_run=self.misc.perf_run,
+            data_dtype,
+            perf_run=self.misc.perf_run,
         ).permute(0, 1, 3, 2)
         self._global_fc2_weight_sf = _make_e8m0_scale_tensor(
             self._torch_cuda_rng,
             num_ranks * num_experts_per_rank * hidden,
-            intermediate_downproj, blocksize=scale_blocksize,
+            intermediate_downproj,
+            blocksize=scale_blocksize,
         ).reshape(
-            num_ranks, num_experts_per_rank, hidden, intermediate_downproj_sf_cols,
+            num_ranks,
+            num_experts_per_rank,
+            hidden,
+            intermediate_downproj_sf_cols,
         )
 
         # ---- Atom-swizzle the weight SFs (the base kernel consumes weight SFs
@@ -301,10 +337,9 @@ class MegaMoEMxfp8Tester(MegaMoETester):
             for e in range(num_experts_per_rank)
         ]
         fc1_flat_sf_size = fc1_sf_swizzled[0].numel()
-        self._global_fc1_weight_sf_swizzled = (
-            _stack_byte_reinterpretable_tensors(fc1_sf_swizzled, dim=0)
-            .view(num_ranks, num_experts_per_rank, fc1_flat_sf_size)
-        )
+        self._global_fc1_weight_sf_swizzled = _stack_byte_reinterpretable_tensors(
+            fc1_sf_swizzled, dim=0
+        ).view(num_ranks, num_experts_per_rank, fc1_flat_sf_size)
 
         fc2_sf_swizzled = [
             to_blocked(self._global_fc2_weight_sf[r, e])
@@ -312,10 +347,9 @@ class MegaMoEMxfp8Tester(MegaMoETester):
             for e in range(num_experts_per_rank)
         ]
         fc2_flat_sf_size = fc2_sf_swizzled[0].numel()
-        self._global_fc2_weight_sf_swizzled = (
-            _stack_byte_reinterpretable_tensors(fc2_sf_swizzled, dim=0)
-            .view(num_ranks, num_experts_per_rank, fc2_flat_sf_size)
-        )
+        self._global_fc2_weight_sf_swizzled = _stack_byte_reinterpretable_tensors(
+            fc2_sf_swizzled, dim=0
+        ).view(num_ranks, num_experts_per_rank, fc2_flat_sf_size)
 
         # ---- Stage own-rank inputs into the symmetric heap.
         own_activation = self._global_activation[self.rank]
@@ -326,7 +360,8 @@ class MegaMoEMxfp8Tester(MegaMoETester):
         # fp8 goes through a uint8 byte-buf view (nvshmem4py doesn't natively
         # support fp8); copy via uint8 to dodge fp8 assignment quirks.
         self.my_activation = _sym_zeros_byte_view_1b(
-            (num_tokens_per_rank, hidden), data_dtype,
+            (num_tokens_per_rank, hidden),
+            data_dtype,
         )
         self.my_activation.view(torch.uint8).copy_(own_activation.view(torch.uint8))
 
@@ -336,7 +371,8 @@ class MegaMoEMxfp8Tester(MegaMoETester):
         # the trailing padded SFs pair with fp8 data in TMA's OOB-fill-0 region.
         hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
         self.my_activation_sf = _sym_zeros_byte_view_1b(
-            (num_tokens_per_rank, hidden_sf_cols_padded), Mxfp8ScaleDtype,
+            (num_tokens_per_rank, hidden_sf_cols_padded),
+            Mxfp8ScaleDtype,
         )
         self.my_activation_sf.view(torch.uint8)[:, :hidden_sf_cols].copy_(
             own_activation_sf.view(torch.uint8)
@@ -369,11 +405,14 @@ class MegaMoEMxfp8Tester(MegaMoETester):
         #     only receives the local TopkReduce, so allocate it locally.
         if self.impl.in_kernel_fc2_reduce:
             self.output_activation = _sym_zeros(
-                (num_tokens_per_rank, hidden), torch.bfloat16,
+                (num_tokens_per_rank, hidden),
+                torch.bfloat16,
             )
         else:
             self.output_activation = torch.zeros(
-                (num_tokens_per_rank, hidden), dtype=torch.bfloat16, device="cuda",
+                (num_tokens_per_rank, hidden),
+                dtype=torch.bfloat16,
+                device="cuda",
             )
         self.combine_sf = None  # lives inside shared_workspace; None for free-list
 
@@ -487,7 +526,9 @@ class MegaMoEMxfp8Tester(MegaMoETester):
         doff = self._c_data_physical_offsets
 
         print(f"\n{'=' * 60}")
-        print(f"[generate_c][rank{self.rank}] kernel c_output vs reference fc1 gate+up:")
+        print(
+            f"[generate_c][rank{self.rank}] kernel c_output vs reference fc1 gate+up:"
+        )
         any_checked = False
         for e in range(self.problem.num_experts_per_rank):
             v_e = valid[e]
@@ -540,7 +581,6 @@ class MegaMoEMxfp8Tester(MegaMoETester):
             )
 
         import cuda.bindings.driver as cuda
-        import cutlass
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
         import cutlass.utils as utils
@@ -557,12 +597,8 @@ class MegaMoEMxfp8Tester(MegaMoETester):
             self.problem.hidden,
         )
 
-        cluster_size = (
-            self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
-        )
-        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
-            cluster_size
-        )
+        cluster_size = self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
         group_hint = self.impl.group_hint
         if group_hint is None:
             group_hint = max_active_clusters
@@ -620,7 +656,8 @@ class MegaMoEMxfp8Tester(MegaMoETester):
             # (unlike lean fc12 where it's the post-SwiGLU half-size).
             self._c_output = torch.zeros(
                 (tokens_sum, self.problem.intermediate),
-                dtype=torch.bfloat16, device="cuda",
+                dtype=torch.bfloat16,
+                device="cuda",
             )
             self._c_valid_tokens_per_expert = valid_tokens
             self._c_data_physical_offsets = doff[:-1]
@@ -629,9 +666,12 @@ class MegaMoEMxfp8Tester(MegaMoETester):
         self.allocate_workspaces()
 
         # -- 3. Torch -> cute --
-        def _to_cute(tensor: torch.Tensor, assumed_align: int = 16, force_static_layout=False):
+        def _to_cute(
+            tensor: torch.Tensor, assumed_align: int = 16, force_static_layout=False
+        ):
             cute_tensor = cutlass_torch.from_dlpack(
-                tensor, assumed_align=assumed_align,
+                tensor,
+                assumed_align=assumed_align,
             )
             if force_static_layout:
                 return cute_tensor
@@ -689,10 +729,10 @@ class MegaMoEMxfp8Tester(MegaMoETester):
         # -- 5. Launch (with optional profile-friendly barriers) --
         if self.misc.profile_friendly:
             import nvtx
+
             torch.cuda.synchronize()
             _dist_active = (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
+                torch.distributed.is_available() and torch.distributed.is_initialized()
             )
             if _dist_active:
                 torch.distributed.barrier()
@@ -715,7 +755,6 @@ class MegaMoEMxfp8Tester(MegaMoETester):
 # =============================================================================
 
 
-
 def _parse_combine_format(argument: str) -> CombineFormat:
     try:
         return CombineFormat.parse(argument)
@@ -729,7 +768,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--kind", type=str, default="mxfp8_e4m3",
+        "--kind",
+        type=str,
+        default="mxfp8_e4m3",
         choices=["mxfp8_e4m3", "mxfp8_e5m2"],
         help="MXFP8 element format for activations and weights.",
     )
@@ -739,18 +780,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--intermediate", type=int, default=1024)
     parser.add_argument(
-        "--fc2_output_dtype", type=_parse_output_dtype, default=torch.bfloat16,
+        "--fc2_output_dtype",
+        type=_parse_output_dtype,
+        default=torch.bfloat16,
     )
     parser.add_argument(
-        "--route_distribution", type=str, default="balanced",
+        "--route_distribution",
+        type=str,
+        default="balanced",
         choices=["balanced", "power_law"],
     )
     parser.add_argument(
-        "--power_law_exponent", type=float, default=1.0,
+        "--power_law_exponent",
+        type=float,
+        default=1.0,
         help="Zipf exponent for --route_distribution power_law.",
     )
     parser.add_argument(
-        "--gate_up_clamp", type=float, default=None,
+        "--gate_up_clamp",
+        type=float,
+        default=None,
         help="DeepSeek-V4 swiglu_limit: clamp gate/up pre-activations before SiLU.",
     )
 
@@ -758,12 +807,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mma_tiler_mnk", type=str, default="256,256,128")
     parser.add_argument("--cluster_shape_mnk", type=str, default="2,1,1")
     parser.add_argument("--use_2cta_instrs", action="store_true", default=True)
-    parser.add_argument("--enable_static_expert_shape", action="store_true", default=False)
+    parser.add_argument(
+        "--enable_static_expert_shape", action="store_true", default=False
+    )
     parser.add_argument("--dynamic_sched", action="store_true", default=False)
     parser.add_argument("--clc_bundle_size", type=int, default=None)
     parser.add_argument("--num_sched_stages", type=int, default=None)
     parser.add_argument(
-        "--load_balance_mode", type=str, default="static",
+        "--load_balance_mode",
+        type=str,
+        default="static",
         choices=["static", "atomic_counter"],
     )
     parser.add_argument("--group_hint", type=int, default=None)
@@ -775,44 +828,57 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--perf_iters", type=int, default=10)
     parser.add_argument("--enable_debug_checks", action="store_true", default=False)
     parser.add_argument(
-        "--ref_compute_graph", type=str, default="deepgemm",
+        "--ref_compute_graph",
+        type=str,
+        default="deepgemm",
         choices=["transformers", "deepgemm"],
     )
     parser.add_argument("--enable_iket", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
-        "--in_kernel_fc2_reduce", action="store_true", default=False,
+        "--in_kernel_fc2_reduce",
+        action="store_true",
+        default=False,
         help="Form B: REDG in-kernel topk-reduce to combine_output[t, 0, :]",
     )
     parser.add_argument(
-        "--generate_c", action="store_true", default=False,
+        "--generate_c",
+        action="store_true",
+        default=False,
         help="Store raw pre-SwiGLU fc1 accumulator (gate+up, BF16) to a separate tensor.",
     )
     parser.add_argument(
-        "--use_stg_fc1", action="store_true", default=False,
+        "--use_stg_fc1",
+        action="store_true",
+        default=False,
         help="Write fc1 FP8 output directly to GMEM via STG.256 instead of R2S+TMA. "
-             "Eliminates sD SMEM staging (saves 16 KB); may increase AB pipeline stages.",
+        "Eliminates sD SMEM staging (saves 16 KB); may increase AB pipeline stages.",
     )
     parser.add_argument(
-        "--combine_format", type=_parse_combine_format,
+        "--combine_format",
+        type=_parse_combine_format,
         default=CombineFormat.parse("bf16"),
         help="Wire format for the cross-rank combine payload. "
-             "Choices: 'bf16' (no quantization, default), "
-             "'32e4m3xe8m0' (MXFP8 e4m3: fp8 e4m3 data + E8M0 block scale, ~2x bandwidth saving), "
-             "'32e5m2xe8m0' (MXFP8 e5m2: fp8 e5m2 data + E8M0 block scale, ~2x bandwidth saving). "
-             "e.g. --combine_format 32e4m3xe8m0",
+        "Choices: 'bf16' (no quantization, default), "
+        "'32e4m3xe8m0' (MXFP8 e4m3: fp8 e4m3 data + E8M0 block scale, ~2x bandwidth saving), "
+        "'32e5m2xe8m0' (MXFP8 e5m2: fp8 e5m2 data + E8M0 block scale, ~2x bandwidth saving). "
+        "e.g. --combine_format 32e4m3xe8m0",
     )
     parser.add_argument(
-        "--token_back_mode", type=str, default="standalone_warps",
+        "--token_back_mode",
+        type=str,
+        default="standalone_warps",
         choices=["epi_warps", "standalone_warps", "reuse_dispatch_warps"],
         help="Where the cross-rank fc2 push-back runs: epi_warps (epilogue "
-             "STG redirect), standalone_warps (dedicated warps 12-15), "
-             "or reuse_dispatch_warps (dispatch warps 8-11, default).",
+        "STG redirect), standalone_warps (dedicated warps 12-15), "
+        "or reuse_dispatch_warps (dispatch warps 8-11, default).",
     )
     parser.add_argument(
-        "--epi_flag_batch", type=str, default="2,4",
+        "--epi_flag_batch",
+        type=str,
+        default="2,4",
         help="Done-counter publish batching as 'fc1,fc2' (e.g. '2,4'). "
-             "Each component must be in [1, 32].",
+        "Each component must be in [1, 32].",
     )
     return parser
 
@@ -830,6 +896,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             init_dist_and_nvshmem,
             finalize_dist_and_nvshmem,
         )
+
         _local_rank, rank, world_size, _ = init_dist_and_nvshmem()
 
     problem = TokenCommProblemDesc(
@@ -876,7 +943,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     tester = MegaMoEMxfp8Tester(
-        problem, impl, misc, rank=rank, kind=args.kind,
+        problem,
+        impl,
+        misc,
+        rank=rank,
+        kind=args.kind,
         combine_format=args.combine_format,
     )
     tester.set_torch_profiler_enabled(args.use_torch_profiler)
@@ -896,11 +967,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         torch.cuda.synchronize()
         try:
             import nvshmem.core
+
             # output_activation is on the sym heap only under in_kernel_reduce
             for sym_tensor in (
-                tester.my_activation, tester.my_activation_sf,
-                tester.my_topk_idx, tester.my_topk_weights,
-                tester.output_activation, tester.combine_sf, tester.shared_workspace,
+                tester.my_activation,
+                tester.my_activation_sf,
+                tester.my_topk_idx,
+                tester.my_topk_weights,
+                tester.output_activation,
+                tester.combine_sf,
+                tester.shared_workspace,
             ):
                 if sym_tensor is not None:
                     try:

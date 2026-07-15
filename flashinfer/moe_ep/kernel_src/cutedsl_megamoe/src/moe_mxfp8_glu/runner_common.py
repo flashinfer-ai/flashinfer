@@ -25,7 +25,4 @@ class TrainingImplDesc(ImplDesc):
 
     def __str__(self) -> str:
         base = super().__str__().replace("ImplDesc:", "TrainingImplDesc:", 1)
-        return (
-            f"{base} generate_c={self.generate_c} "
-            f"use_stg_fc1={self.use_stg_fc1}"
-        )
+        return f"{base} generate_c={self.generate_c} use_stg_fc1={self.use_stg_fc1}"
