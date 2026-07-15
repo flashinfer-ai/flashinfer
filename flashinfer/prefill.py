@@ -3862,6 +3862,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             # K+V into [num_tokens, 2, num_kv_heads, head_dim]. This avoids
             # the 3-way torch.stack copy that PACKED_QKV requires.
             # (fmha_v2 auto-selection already requires MHA, so Q/K head counts match)
+            #
+            # CONTIGUOUS_Q_KV requires Q to be contiguous. torch.stack() below
+            # materializes a contiguous kv_packed, but Q is forwarded directly, so a
+            # non-contiguous (e.g. packed/strided) Q would be read with the wrong
+            # strides and yield garbage. .contiguous() is a no-op when Q is already
+            # contiguous (the common hot path), so it restores correctness for
+            # non-contiguous Q with no cost otherwise.
+            q = q.contiguous()
             kv_packed = torch.stack([k, v], dim=1)
             # Pass window_left and sinks for sliding-window + attention sink
             # support. sinks is stored on the wrapper by vLLM's metadata builder.
