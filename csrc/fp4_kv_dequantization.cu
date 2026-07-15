@@ -34,29 +34,52 @@ __device__ __constant__ float E2M1_LUT[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f, 
                                               4.0f,  6.0f,  -0.0f, -0.5f, -1.0f, -1.5f,
                                               -2.0f, -3.0f, -4.0f, -6.0f};
 
-// Exact fp32 E2M1 value from a nibble, with no constant-memory table. Produces the
-// same values as E2M1_LUT bit-for-bit: e in {1,2,3} -> 2^(e-1)*(1 + 0.5*m); e==0 -> 0.5*m.
+// Exact fp32 E2M1 value from a nibble, with no constant-memory table and no exp2f.
+// Produces the same values as E2M1_LUT bit-for-bit: e in {1,2,3} -> 2^(e-1)*(1 + 0.5*m);
+// e==0 -> 0.5*m. The shift is only evaluated on the e!=0 branch (e in {1,2,3} -> shift 0..2).
 __device__ __forceinline__ float e2m1_to_f32(uint32_t n) {
-  uint32_t e = (n >> 1) & 0x3u;
-  uint32_t m = n & 0x1u;
-  float mag = (e == 0u) ? (0.5f * m) : (exp2f(static_cast<float>(static_cast<int>(e) - 1)) *
-                                        (1.0f + 0.5f * m));
+  const uint32_t e = (n >> 1) & 0x3u;
+  const uint32_t m = n & 0x1u;
+  const float mag = (e == 0u) ? (0.5f * static_cast<float>(m))
+                              : (static_cast<float>(1u << (e - 1u)) *
+                                 (1.0f + 0.5f * static_cast<float>(m)));
   return (n & 0x8u) ? -mag : mag;
 }
 
-// Blockwise dequant: one thread per 16-element NVFP4 block. Each thread does a single
-// uint2 load (8 packed bytes = 16 nibbles), reads the one FP8 E4M3 block scale it needs,
-// dequantizes in fp32 (multiply-then-round — numerically identical to the previous
-// LUT-based kernel, which also multiplied in fp32 and rounded once), and writes 16 outputs
-// as two 128-bit float4 stores. Grid-strided over all M*(K/16) blocks.
-//
-// This replaces the row-per-block mapping (grid(M), shared-memory scale staging) which is
-// memory-latency bound and reaches only ~20% of peak bandwidth on large tensors; the
-// blockwise mapping with wide vectorized loads/stores reaches ~65% (~3x faster) while
-// producing byte-identical output. Block scales/data/output are all contiguous and K is a
-// multiple of 16, so the flat block index addresses each cleanly.
+// Decode the 16 nibbles of one NVFP4 block (two packed words) into `res`, applying the
+// scale in the SAME fp32 order the original kernel used, (e2m1 * block_scale) * global_scale,
+// and rounding once — so the output is byte-for-byte identical to the previous kernel.
 template <typename OutType>
-__global__ void nvfp4_dequant_blockwise_kernel(const uint2* __restrict__ fp4_data,
+__device__ __forceinline__ void decode_block(uint32_t w0, uint32_t w1, float block_scale,
+                                             float global_scale, OutType* res) {
+  const uint32_t words[2] = {w0, w1};
+#pragma unroll
+  for (int w = 0; w < 2; ++w) {
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+      const uint32_t byte = (words[w] >> (b * 8)) & 0xFFu;
+      float2 o;
+      o.x = (e2m1_to_f32(byte & 0xFu) * block_scale) * global_scale;
+      o.y = (e2m1_to_f32((byte >> 4) & 0xFu) * block_scale) * global_scale;
+      if constexpr (std::is_same_v<OutType, __nv_bfloat16>) {
+        *reinterpret_cast<__nv_bfloat162*>(&res[w * 8 + b * 2]) = __float22bfloat162_rn(o);
+      } else {
+        *reinterpret_cast<half2*>(&res[w * 8 + b * 2]) = __float22half2_rn(o);
+      }
+    }
+  }
+}
+
+// Blockwise dequant: one thread per 16-element NVFP4 block, grid-strided over all M*(K/16)
+// blocks. This replaces the row-per-block mapping (grid(M), shared-memory scale staging),
+// which is memory-latency bound and reaches only ~20% of peak bandwidth; the blockwise
+// mapping reaches ~65% (~3x faster) with byte-identical output.
+//
+// ALIGNED selects a fast path with a 128-bit uint2 load + two 128-bit float4 stores, used
+// only when the caller's pointers are suitably aligned. Otherwise (e.g. a contiguous tensor
+// with a nonzero storage offset) the safe path uses byte loads and scalar stores.
+template <typename OutType, bool ALIGNED>
+__global__ void nvfp4_dequant_blockwise_kernel(const uint8_t* __restrict__ fp4_data,
                                                const uint8_t* __restrict__ block_scales,
                                                const float* __restrict__ global_scale_ptr,
                                                OutType* __restrict__ output,
@@ -65,32 +88,31 @@ __global__ void nvfp4_dequant_blockwise_kernel(const uint2* __restrict__ fp4_dat
   const long stride = static_cast<long>(gridDim.x) * blockDim.x;
   for (long bidx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
        bidx < num_blocks_total; bidx += stride) {
-    uint2 packed = fp4_data[bidx];
+    const uint8_t* src = fp4_data + bidx * 8;
+    uint32_t w0, w1;
+    if constexpr (ALIGNED) {
+      const uint2 p = *reinterpret_cast<const uint2*>(src);
+      w0 = p.x;
+      w1 = p.y;
+    } else {
+      w0 = static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) |
+           (static_cast<uint32_t>(src[2]) << 16) | (static_cast<uint32_t>(src[3]) << 24);
+      w1 = static_cast<uint32_t>(src[4]) | (static_cast<uint32_t>(src[5]) << 8) |
+           (static_cast<uint32_t>(src[6]) << 16) | (static_cast<uint32_t>(src[7]) << 24);
+    }
     __nv_fp8_e4m3 sc;
     sc.__x = __ldg(&block_scales[bidx]);
-    const float scale = static_cast<float>(sc) * global_scale;
+    alignas(16) OutType res[16];
+    decode_block<OutType>(w0, w1, static_cast<float>(sc), global_scale, res);
 
-    OutType res[16];
-    const uint32_t words[2] = {packed.x, packed.y};
+    OutType* dst = output + bidx * 16;
+    if constexpr (ALIGNED) {
+      reinterpret_cast<float4*>(dst)[0] = reinterpret_cast<const float4*>(res)[0];
+      reinterpret_cast<float4*>(dst)[1] = reinterpret_cast<const float4*>(res)[1];
+    } else {
 #pragma unroll
-    for (int w = 0; w < 2; ++w) {
-#pragma unroll
-      for (int b = 0; b < 4; ++b) {
-        const uint32_t byte = (words[w] >> (b * 8)) & 0xFFu;
-        float2 o;
-        o.x = e2m1_to_f32(byte & 0xFu) * scale;
-        o.y = e2m1_to_f32((byte >> 4) & 0xFu) * scale;
-        if constexpr (std::is_same_v<OutType, __nv_bfloat16>) {
-          *reinterpret_cast<__nv_bfloat162*>(&res[w * 8 + b * 2]) = __float22bfloat162_rn(o);
-        } else {
-          *reinterpret_cast<half2*>(&res[w * 8 + b * 2]) = __float22half2_rn(o);
-        }
-      }
+      for (int j = 0; j < 16; ++j) dst[j] = res[j];
     }
-    float4* out_vec = reinterpret_cast<float4*>(output + bidx * 16);
-    const float4* res_vec = reinterpret_cast<const float4*>(res);
-    out_vec[0] = res_vec[0];
-    out_vec[1] = res_vec[1];
   }
 }
 
@@ -102,7 +124,11 @@ __global__ void nvfp4_dequant_blockwise_kernel(const uint2* __restrict__ fp4_dat
 // out-of-range page) are skipped without writing, exactly as before. This replaces the
 // one-block-per-(batch,token,head) mapping with scalar 1-byte loads, which is memory-latency
 // bound; the blockwise mapping with wide transactions is ~2.7x faster on large caches.
-template <typename OutType, typename IdType>
+//
+// ALIGNED selects the 128-bit uint2 load + float4 stores; the safe path (byte loads, scalar
+// stores) handles callers passing views with a nonzero storage offset or non-multiple-of-16
+// strides (which the API allows: it only requires the last dim to be contiguous).
+template <typename OutType, typename IdType, bool ALIGNED>
 __global__ void nvfp4_paged_dequant_blockwise_kernel(
     const uint8_t* __restrict__ paged_cache, const uint8_t* __restrict__ paged_scales,
     const IdType* __restrict__ block_tables, const int32_t* __restrict__ seq_lens,
@@ -134,37 +160,34 @@ __global__ void nvfp4_paged_dequant_blockwise_kernel(
     const int64_t scale_base = static_cast<int64_t>(page) * scale_stride_page +
                                static_cast<int64_t>(entry_idx) * scale_stride_n +
                                static_cast<int64_t>(head) * scale_stride_h;
-    uint2 packed =
-        *reinterpret_cast<const uint2*>(paged_cache + cache_base + static_cast<int64_t>(blk) * 8);
+    const uint8_t* src = paged_cache + cache_base + static_cast<int64_t>(blk) * 8;
+    uint32_t w0, w1;
+    if constexpr (ALIGNED) {
+      const uint2 p = *reinterpret_cast<const uint2*>(src);
+      w0 = p.x;
+      w1 = p.y;
+    } else {
+      w0 = static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) |
+           (static_cast<uint32_t>(src[2]) << 16) | (static_cast<uint32_t>(src[3]) << 24);
+      w1 = static_cast<uint32_t>(src[4]) | (static_cast<uint32_t>(src[5]) << 8) |
+           (static_cast<uint32_t>(src[6]) << 16) | (static_cast<uint32_t>(src[7]) << 24);
+    }
     __nv_fp8_e4m3 sc;
     sc.__x = __ldg(paged_scales + scale_base + blk);
-    const float scale = static_cast<float>(sc);
+    alignas(16) OutType res[16];
+    decode_block<OutType>(w0, w1, static_cast<float>(sc), global_scale, res);
 
-    OutType res[16];
-    const uint32_t words[2] = {packed.x, packed.y};
-#pragma unroll
-    for (int w = 0; w < 2; ++w) {
-#pragma unroll
-      for (int b = 0; b < 4; ++b) {
-        const uint32_t byte = (words[w] >> (b * 8)) & 0xFFu;
-        float2 o;
-        o.x = e2m1_to_f32(byte & 0xFu) * scale * global_scale;
-        o.y = e2m1_to_f32((byte >> 4) & 0xFu) * scale * global_scale;
-        if constexpr (std::is_same_v<OutType, __nv_bfloat16>) {
-          *reinterpret_cast<__nv_bfloat162*>(&res[w * 8 + b * 2]) = __float22bfloat162_rn(o);
-        } else {
-          *reinterpret_cast<half2*>(&res[w * 8 + b * 2]) = __float22half2_rn(o);
-        }
-      }
-    }
     OutType* row_out = output +
                        ((static_cast<int64_t>(batch) * max_seq_len + token) * num_heads + head) *
                            head_dim +
                        static_cast<int64_t>(blk) * 16;
-    float4* out_vec = reinterpret_cast<float4*>(row_out);
-    const float4* res_vec = reinterpret_cast<const float4*>(res);
-    out_vec[0] = res_vec[0];
-    out_vec[1] = res_vec[1];
+    if constexpr (ALIGNED) {
+      reinterpret_cast<float4*>(row_out)[0] = reinterpret_cast<const float4*>(res)[0];
+      reinterpret_cast<float4*>(row_out)[1] = reinterpret_cast<const float4*>(res)[1];
+    } else {
+#pragma unroll
+      for (int j = 0; j < 16; ++j) row_out[j] = res[j];
+    }
   }
 }
 
@@ -209,13 +232,51 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   if (blocks > MAX_BLOCKS) blocks = MAX_BLOCKS;
   if (blocks < 1) blocks = 1;
 
+  // Vectorized fast path requires 8-byte-aligned input (uint2 load) and 16-byte-aligned
+  // output (float4 store). fp4_data/output are contiguous but may have a nonzero storage
+  // offset, so check the actual base pointers; otherwise use the byte-safe path.
+  const auto* fp4_ptr = static_cast<const uint8_t*>(fp4_data.data_ptr());
+  const bool aligned = (reinterpret_cast<uintptr_t>(fp4_ptr) % 8 == 0) &&
+                       (reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 == 0);
+
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output.dtype(), c_type, [&] {
-    nvfp4_dequant_blockwise_kernel<c_type><<<blocks, THREADS, 0, stream>>>(
-        reinterpret_cast<const uint2*>(fp4_data.data_ptr()),
-        static_cast<const uint8_t*>(block_scales.data_ptr()), scale_ptr,
-        static_cast<c_type*>(output.data_ptr()), num_blocks_total);
+    auto* out_ptr = static_cast<c_type*>(output.data_ptr());
+    const auto* bs_ptr = static_cast<const uint8_t*>(block_scales.data_ptr());
+    if (aligned) {
+      nvfp4_dequant_blockwise_kernel<c_type, true>
+          <<<blocks, THREADS, 0, stream>>>(fp4_ptr, bs_ptr, scale_ptr, out_ptr, num_blocks_total);
+    } else {
+      nvfp4_dequant_blockwise_kernel<c_type, false>
+          <<<blocks, THREADS, 0, stream>>>(fp4_ptr, bs_ptr, scale_ptr, out_ptr, num_blocks_total);
+    }
     return true;
   });
+}
+
+// Dispatch the paged blockwise kernel on a runtime-computed alignment flag.
+template <typename OutType, typename IdType>
+static void launch_paged_blockwise(bool aligned, unsigned int grid, int threads,
+                                   cudaStream_t stream, const uint8_t* cache, const uint8_t* scales,
+                                   const IdType* bt, const int32_t* sl, const float* gs,
+                                   OutType* out, int B, int S, int bts, int NP, int PS, int NH,
+                                   int HD, int64_t sp, int64_t sn, int64_t sh, int64_t ssp,
+                                   int64_t ssn, int64_t ssh) {
+  if (aligned) {
+    nvfp4_paged_dequant_blockwise_kernel<OutType, IdType, true><<<grid, threads, 0, stream>>>(
+        cache, scales, bt, sl, gs, out, B, S, bts, NP, PS, NH, HD, sp, sn, sh, ssp, ssn, ssh);
+  } else {
+    nvfp4_paged_dequant_blockwise_kernel<OutType, IdType, false><<<grid, threads, 0, stream>>>(
+        cache, scales, bt, sl, gs, out, B, S, bts, NP, PS, NH, HD, sp, sn, sh, ssp, ssn, ssh);
+  }
+}
+
+// True when a uint2 cache load (8-byte) and float4 output store (16-byte) are safe: the base
+// pointer and all element strides that scale the block index are appropriately aligned.
+static inline bool paged_vec_aligned(const void* cache_ptr, const void* out_ptr, int64_t sp,
+                                     int64_t sn, int64_t sh) {
+  auto ok8 = [](int64_t v) { return v % 8 == 0; };
+  return reinterpret_cast<uintptr_t>(cache_ptr) % 8 == 0 && ok8(sp) && ok8(sn) && ok8(sh) &&
+         reinterpret_cast<uintptr_t>(out_ptr) % 16 == 0;
 }
 
 void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, TensorView k_scales,
@@ -377,27 +438,31 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
 
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(block_tables.dtype(), id_type, [&] {
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output_k.dtype(), out_type, [&] {
-      nvfp4_paged_dequant_blockwise_kernel<out_type, id_type>
-          <<<grid_for(k_head_dim), THREADS, 0, stream>>>(
-              static_cast<const uint8_t*>(paged_k_cache.data_ptr()),
-              static_cast<const uint8_t*>(k_scales.data_ptr()),
-              static_cast<const id_type*>(block_tables.data_ptr()),
-              static_cast<const int32_t*>(seq_lens.data_ptr()),
-              static_cast<const float*>(k_global_scale.data_ptr()),
-              static_cast<out_type*>(output_k.data_ptr()), batch_size, max_seq_len,
-              block_tables.size(1), num_pages, page_size, num_heads, k_head_dim, k_stride_page,
-              k_stride_n, k_stride_h, k_scale_stride_page, k_scale_stride_n, k_scale_stride_h);
+      const bool k_aligned = paged_vec_aligned(paged_k_cache.data_ptr(), output_k.data_ptr(),
+                                               k_stride_page, k_stride_n, k_stride_h);
+      const bool v_aligned = paged_vec_aligned(paged_v_cache.data_ptr(), output_v.data_ptr(),
+                                               v_stride_page, v_stride_n, v_stride_h);
+      launch_paged_blockwise<out_type, id_type>(
+          k_aligned, grid_for(k_head_dim), THREADS, stream,
+          static_cast<const uint8_t*>(paged_k_cache.data_ptr()),
+          static_cast<const uint8_t*>(k_scales.data_ptr()),
+          static_cast<const id_type*>(block_tables.data_ptr()),
+          static_cast<const int32_t*>(seq_lens.data_ptr()),
+          static_cast<const float*>(k_global_scale.data_ptr()),
+          static_cast<out_type*>(output_k.data_ptr()), batch_size, max_seq_len,
+          block_tables.size(1), num_pages, page_size, num_heads, k_head_dim, k_stride_page,
+          k_stride_n, k_stride_h, k_scale_stride_page, k_scale_stride_n, k_scale_stride_h);
       FLASHINFER_CUDA_CHECK(cudaGetLastError());
-      nvfp4_paged_dequant_blockwise_kernel<out_type, id_type>
-          <<<grid_for(v_head_dim), THREADS, 0, stream>>>(
-              static_cast<const uint8_t*>(paged_v_cache.data_ptr()),
-              static_cast<const uint8_t*>(v_scales.data_ptr()),
-              static_cast<const id_type*>(block_tables.data_ptr()),
-              static_cast<const int32_t*>(seq_lens.data_ptr()),
-              static_cast<const float*>(v_global_scale.data_ptr()),
-              static_cast<out_type*>(output_v.data_ptr()), batch_size, max_seq_len,
-              block_tables.size(1), num_pages, page_size, num_heads, v_head_dim, v_stride_page,
-              v_stride_n, v_stride_h, v_scale_stride_page, v_scale_stride_n, v_scale_stride_h);
+      launch_paged_blockwise<out_type, id_type>(
+          v_aligned, grid_for(v_head_dim), THREADS, stream,
+          static_cast<const uint8_t*>(paged_v_cache.data_ptr()),
+          static_cast<const uint8_t*>(v_scales.data_ptr()),
+          static_cast<const id_type*>(block_tables.data_ptr()),
+          static_cast<const int32_t*>(seq_lens.data_ptr()),
+          static_cast<const float*>(v_global_scale.data_ptr()),
+          static_cast<out_type*>(output_v.data_ptr()), batch_size, max_seq_len,
+          block_tables.size(1), num_pages, page_size, num_heads, v_head_dim, v_stride_page,
+          v_stride_n, v_stride_h, v_scale_stride_page, v_scale_stride_n, v_scale_stride_h);
       FLASHINFER_CUDA_CHECK(cudaGetLastError());
       return true;
     });

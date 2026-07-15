@@ -123,11 +123,26 @@ def test_nvfp4_kv_dequant(shape, dtype):
 # grid-stride loop (well past the launch-overhead regime of the small shapes above).
 LARGE_SHAPES = [(16384, 512), (4096, 2048)]
 
+# Non-power-of-two global scales. These matter: with a power-of-two scale (e.g. 0.5) the
+# products stay exactly representable, which would hide a multiplication-order change. The
+# dequant computes (e2m1 * block_scale) * global_scale in fp32, matching reference_dequant,
+# so the result must be bit-for-bit identical to the reference.
+NON_POW2_SCALES = [0.3, 1.7, 0.7601996]
+
+
+def assert_bit_identical(output, ref):
+    """Compare via the integer bit pattern: exact, and distinguishes +0.0 from -0.0."""
+    assert output.dtype == ref.dtype
+    torch.testing.assert_close(
+        output.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0
+    )
+
 
 @pytest.mark.parametrize("shape", LARGE_SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_nvfp4_kv_dequant_large(shape, dtype):
-    """Dequantization at production scale, checked against the PyTorch reference."""
+@pytest.mark.parametrize("global_scale_val", NON_POW2_SCALES)
+def test_nvfp4_kv_dequant_large(shape, dtype, global_scale_val):
+    """Dequant at production scale with non-power-of-two scales; bit-exact vs reference."""
     cc = get_compute_capability()
     if cc < 80:
         pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
@@ -136,14 +151,46 @@ def test_nvfp4_kv_dequant_large(shape, dtype):
     torch.manual_seed(0)
     fp4_data = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda")
     block_scales = torch.randint(1, 120, (M, K // 16), dtype=torch.uint8, device="cuda")
-    global_scale_val = 0.5
     global_scale = torch.tensor([global_scale_val], dtype=torch.float32, device="cuda")
 
     output = flashinfer.nvfp4_kv_dequantize(
         fp4_data, block_scales, global_scale, output_dtype=dtype
     )
     ref = reference_dequant(fp4_data, block_scales, global_scale_val, dtype)
-    torch.testing.assert_close(output.float(), ref.float(), atol=1e-3, rtol=1e-3)
+    assert_bit_identical(output, ref)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("global_scale_val", NON_POW2_SCALES)
+def test_nvfp4_kv_dequant_all_e2m1_values_and_unaligned(dtype, global_scale_val):
+    """Cover every E2M1 codepoint, and a contiguous input with a nonzero storage offset.
+
+    The offset makes the base pointer non-16-byte-aligned, exercising the kernel's
+    byte-safe fallback path (rather than the vectorized fast path). Output must still be
+    bit-identical to the reference.
+    """
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    M, K = 256, 128
+    # Every byte value 0..255 appears -> every (lo, hi) E2M1 nibble pair is covered.
+    base = (torch.arange(M * (K // 2), device="cuda") % 256).to(torch.uint8)
+    # Allocate one extra byte and slice it off so the view has a nonzero storage offset
+    # (still contiguous), i.e. an unaligned base pointer.
+    padded = torch.empty(M * (K // 2) + 1, dtype=torch.uint8, device="cuda")
+    padded[1:].copy_(base)
+    fp4_data = padded[1:].view(M, K // 2)
+    assert fp4_data.is_contiguous() and fp4_data.storage_offset() == 1
+
+    block_scales = torch.randint(1, 120, (M, K // 16), dtype=torch.uint8, device="cuda")
+    global_scale = torch.tensor([global_scale_val], dtype=torch.float32, device="cuda")
+
+    output = flashinfer.nvfp4_kv_dequantize(
+        fp4_data, block_scales, global_scale, output_dtype=dtype
+    )
+    ref = reference_dequant(fp4_data, block_scales, global_scale_val, dtype)
+    assert_bit_identical(output, ref)
 
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
