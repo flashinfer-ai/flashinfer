@@ -8,37 +8,78 @@ behind those numbers — including the measurement pitfalls we hit and how
 to avoid them.  It is the companion to `SKILL.md`, which covers the
 kernel drop-update workflow.
 
-Unless noted otherwise, all measurements were taken 2026-07-14 on a
+Unless noted otherwise, all measurements were taken 2026-07-15 (corrected
+nvfp4 weight layout) on a
 single GB200 node (4x GPUs, EP=4) at a DeepSeek-V3-like geometry:
 256 experts, top-8, hidden 7168, intermediate 2048.  A full reproduce
 recipe (hardware, container, versions, harness invocation) is in the
 "Sweep methodology" and "Runbook" sections below.
 
-## Headline result
+## Headline result (2026-07-15, corrected weight layout)
 
-`nvfp4_cutedsl` is **1.5-1.7x FASTER than `deep_gemm_mega` at every token
-count 1..8192** through the full FI forward path (steady-state timing) in
-its default configuration, and **up to 2.08x with the fp4 combine wire**
-(`combine_dtype="nvfp4"`, the large-token winner — see "TRT-LLM-import
-knobs" below).  An earlier "cutedsl is 2x slower than dg" reading was a
-measurement artifact — see "Benchmarking lessons" below.  `mxfp8_cutedsl`
-trails dg 0.5-0.7x by construction (fp8 weights move 2x the bytes of dg's
-fp4; different accuracy point — dg is not its fair baseline).
+**All `nvfp4_cutedsl` measurements taken before 2026-07-15 were invalid**
+and have been removed (raw CSVs archived under
+`moe_ep_benchmark/results/archive_pre20260715_broken_nvfp4_layout/`).
+The FI preprocess materialized fc1/fc2 weights N-stride-1
+(`.transpose().contiguous()`) while the frontend compiles the kernel's TMA
+layout from the tensor's actual strides, so those runs used a
+faster-but-wrong N-major load pattern and produced incorrect results.
+Caught by the torch-oracle tests
+(`tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py`); fixed in
+`backends/mega/kernel/nvfp4_cutedsl/weights.py` (K-major transpose views,
+the same contract the pre-quantized weights path documents).
+`deep_gemm_mega` / `mxfp8_cutedsl` numbers were unaffected and reproduce.
 
-Backend comparison, default configs (bf16 combine wire), full-sweep p50
-(e2e_pipelined, µs; `moe_ep_benchmark/results/sweep_20260714_141327_fi_mega.csv`):
+Corrected picture: at small batch (8-512 tok/rank) nvfp4 is at PARITY with
+dg (e.g. 217.9 vs 211.0 us @8 tok; the old "1.6x" there was the layout
+artifact — small batch is weight-load bound and fp4-vs-fp4 is a wash);
+the large-token win survives and grows with batch (full corrected sweep
+tables below).  Kernel-mode autotune on the correct layout: no gain over
+the default profile @8 tok (219 us), but @2048 the collective tuner found
+585.2 us (ikr + reuse_dispatch_warps + flag_batch 4) vs 614.4 default.  On the correct layout `in_kernel_fc2_reduce`
+BECOMES the @2048 winner (it lost on the broken layout), so the per-size
+default profiles in `shim/tuner.py` were tuned against the broken layout
+and should be re-derived from the 2026-07-15 sweep.  Accuracy per the
+`moe_ep_benchmark` `acc_loss_pct` column (rel-L2 vs a bf16 dense-MoE
+reference on random data; real-model distributions typically fare better).
+
+### Corrected full sweep (2026-07-15, e2e_pipelined p50 µs)
+
+Default configs (bf16 combine wire), corrected K-major nvfp4 weights;
+CSVs `moe_ep_benchmark/results/sweep_20260715_*_fi_mega.csv`:
 
 | tok/rank | dg     | nvfp4 (vs dg) | mxfp8  |
 |---------:|-------:|--------------:|-------:|
-| 8        | 213.0  | 133.4 (1.60x) | 380.5  |
-| 64       | 286.7  | 165.9 (1.73x) | 538.7  |
-| 512      | 346.1  | 234.5 (1.48x) | 626.7  |
-| 1024     | 475.1  | 332.3 (1.43x) | 769.0  |
-| 2048     | 823.3  | 537.6 (1.53x) | 1198.5 |
-| 8192     | 3055.8 | 1841.1 (1.66x)| 4716.3 |
+| 1024     | 473.1  | 428.5 (1.10x) | 749.6  |
+| 2048     | 844.3  | 625.6 (1.35x) | 1209.6 |
+| 4096     | 1490.4 | 1018.4 (1.46x)| 2208.2 |
+| 8192     | 3105.2 | 1923.5 (1.61x)| 4844.0 |
 
-For the combine-leg variants of `nvfp4_cutedsl` (ikr / quantized wires),
-see the "Measured results" table further down.
+(Below 1024 tok/rank nvfp4 and dg are at parity — 217.9 vs 211.0 @8,
+284.7 vs 286.7 @64, 359.4 vs 345.1 @512 — so the table keeps the
+throughput regime where the backends actually separate.)
+
+Accuracy per variant (`acc_loss_pct`, rel-L2 vs bf16 dense reference on
+random data — constant across token counts):
+
+| variant                | acc loss |
+|------------------------|---------:|
+| deep_gemm_mega         | 20.6%    |
+| nvfp4 (bf16 wire)      | 23.2%    |
+| nvfp4 `+ikr`           | 23.2%    |
+| nvfp4 `+combine_mxfp8` | 23.3%    |
+| nvfp4 `+combine_nvfp4` | 25.0%    |
+| mxfp8_cutedsl          | 6.4%     |
+
+Shape of the corrected curve: **parity with dg through ~512 tok/rank,
+crossover between 512 and 1024, win growing to 1.61x at 8192** (1.89x with
+the fp4 combine wire — see "Measured results").  The old "uniform 1.5-1.7x
+at every token count" was the broken-layout artifact; the small-batch
+regime is genuinely weight-load bound and fp4-vs-fp4 there is a wash.
+`acc_loss_pct` is the benchmark's global rel-L2 vs a bf16 dense reference
+on random data (worst case; real-model distributions fare better) — note
+mxfp8's 6.4% vs the fp4-weight backends' ~21-23%: the perf ranking is not
+the whole story.
 
 ## The knob system (`shim/tuner.py`, `shim/autotune.py`)
 
@@ -48,8 +89,9 @@ see the "Measured results" table further down.
   ...); perf knobs are output-invariant (`group_hint`, `flag_batch`,
   `epi_flag_batch`).
 - `default_knobs(num_tokens, dtype=...)` — the measured per-size profiles
-  (provenance in the profile dict comments).  NVFP4 has FOUR profiles; the
-  dominant axis is `token_back_mode`:
+  (provenance in the profile dict comments).  NVFP4 has FOUR profiles
+  (**derived on the pre-2026-07-15 broken weight layout — re-derive from
+  the corrected-layout sweeps**); the dominant axis is `token_back_mode`:
   - `epi_warps` wins at small batch but falls off a cliff mid-range
     (+18% at 512 tokens, +35% at 1024 — every dispatch-warp candidate beat
     every epi_warps candidate there).
@@ -66,11 +108,11 @@ see the "Measured results" table further down.
   (~1-2 min), once per session.  Candidates mirror the tester sweep
   restriction; for NVFP4 that now INCLUDES `in_kernel_fc2_reduce`
   (24 candidates — the symm buffer's output is always sym-heap allocated,
-  so the knob flips per-compile).  Note ikr won the tester's sweep at the
-  tester geometry (7168/3072/384/top-6) but measured SLOWER at the FI
-  default geometry (see "Measured results" below) — that is exactly why it
-  is a sweep candidate rather than a default: the tuner keeps it only if
-  it wins the live problem.  An ikr winner makes the output accumulation
+  so the knob flips per-compile).  On the corrected weight layout ikr
+  is ~par with the bf16 wire at the FI default geometry (ahead at 4096+,
+  and the @2048 autotune winner with dispatch-warp token-back — see
+  "Measured results" below); it stays a sweep candidate rather than a
+  default because the tuner keeps it only if it wins the live problem.  An ikr winner makes the output accumulation
   order nondeterministic — pin `in_kernel_fc2_reduce=False` via explicit
   knobs if bit-reproducibility matters.  MXFP8 keeps ikr config-owned
   (its kernel rejects ikr + dispatch-warp token-back).
@@ -282,35 +324,45 @@ output is 2D `(T, hidden)` **bf16 in every variant**:
   REDG-atomic-added into the output as it arrives.  Exact terms, bf16
   unordered sum, nondeterministic; deletes the multi-GB staging region.
 
-### Measured results (2026-07-14)
+### Measured results
 
-Kernel-mode p50 µs (speedup vs `deep_gemm_mega` in parens);
-`e2e_pipelined` tracks within a few µs.  CSVs
-`moe_ep_benchmark/results/sweep_20260714_{162351,162641,162830,163020}_fi_mega.csv`
-(kernel mode) and `..._{163210,163452,163641,163832}_...` (e2e_pipelined):
+Corrected (2026-07-15, K-major weights) `nvfp4_cutedsl` combine-leg
+variants, e2e_pipelined p50 µs (speedup vs `deep_gemm_mega` in parens);
+CSVs `moe_ep_benchmark/results/sweep_20260715_*_fi_mega.csv`:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
-| 8        | 213.0  | 133.8 (1.59x)  | 158.7 (1.34x)  | 142.2 (1.50x)      | 142.3 (1.50x)  |
-| 64       | 286.7  | 164.9 (1.74x)  | 212.1 (1.35x)  | 185.2 (1.55x)      | 185.3 (1.55x)  |
-| 512      | 345.1  | 227.3 (1.52x)  | 233.2 (1.48x)  | **209.9 (1.64x)**  | 214.8 (1.61x)  |
-| 2048     | 847.4  | 528.2 (1.60x)  | 543.7 (1.56x)  | **444.9 (1.90x)**  | 472.2 (1.79x)  |
-| 8192     | 3046.9 | 1804.2 (1.69x) | 1841.1 (1.66x) | **1467.7 (2.08x)** | 1545.2 (1.97x) |
+| 1024     | 473.1  | 428.5 (1.10x)  | 431.1 (1.10x)  | **375.8 (1.26x)**  | 386.0 (1.23x)  |
+| 2048     | 844.3  | 625.6 (1.35x)  | 619.8 (1.36x)  | **549.9 (1.54x)**  | 582.6 (1.45x)  |
+| 4096     | 1490.4 | 1018.4 (1.46x) | 998.7 (1.49x)  | **901.6 (1.65x)**  | 936.5 (1.59x)  |
+| 8192     | 3105.2 | 1923.5 (1.61x) | 1914.9 (1.62x) | **1644.0 (1.89x)** | 1783.3 (1.74x) |
+
+(Small batch, for reference: plain nvfp4 is dg-parity at 8-64 tok/rank
+[217.9/284.7 us vs dg 211.0/286.7] and every variant is slightly slower
+than plain there — ikr +15/+30 us, the quantized wires +6/+17 us — so the
+bf16 wire is the small-batch default.)
+
+Accuracy cost of the wires (`acc_loss_pct`, rel-L2 vs bf16 dense
+reference): bf16 wire / +ikr 23.2%, `+combine_mxfp8` 23.3%,
+`+combine_nvfp4` 25.0% — the fp4 wire buys its ~15-19% large-token speedup
+for ~1.8pt of extra quantization loss.
 
 Takeaways at this (single-node NVLink) geometry:
-- `combine_nvfp4` is the throughput winner at >=512 tokens: -8% @512,
-  -16% @2048, -19% @8192 vs the bf16 wire (2.08x vs dg at 8192; 22.3
-  Mtok/s).  Slightly slower at small batch (the wire forces dispatch-warp
-  token-back while the SMALL profile prefers epi_warps).  Expect larger
-  wins multi-node where combine bytes dominate.
-- `combine_mxfp8` sits between bf16 and the fp4 wire everywhere — the fp4
-  wire dominates it at this scale.
-- `+ikr` does NOT win at this geometry with the default (non-ikr-tuned)
-  profiles: +19%/+29% at 8/64 tokens, ~par at 512+.  The tester's "+1-2%
-  overall winner" reading was at 7168/3072/384/top-6 against a full knob
-  sweep.  Its value here is the multi-GB shared-workspace saving and the
-  autotune candidate space (the tuner only keeps it if it measures
-  fastest for the live problem).
+- `combine_nvfp4` is the throughput winner across this range (-12%
+  @1024-2048, -11..-15% @4096-8192 vs the bf16 wire; 1.89x vs dg and
+  19.9 Mtok/s at 8192).  Expect larger wins multi-node where combine
+  bytes dominate.
+- `+ikr` is ~par with the bf16 wire here, edging ahead at 4096+ with the
+  default profiles; with autotuned knobs it won @2048 (585.2 kernel-mode).
+- `combine_mxfp8` sits between the bf16 and fp4 wires everywhere.
+- `+ikr` with the DEFAULT profiles is ~par with the bf16 wire at every
+  size.  With autotuned knobs it wins @2048 (585.2 kernel-mode:
+  ikr + reuse_dispatch_warps + flag_batch 4, the collective-autotune
+  winner) — on the corrected layout ikr IS worth keeping in the autotune
+  candidate set, and the per-size default profiles should be re-derived
+  (they were tuned on the broken layout).  An ikr winner makes the output
+  accumulation order nondeterministic — pin `in_kernel_fc2_reduce=False`
+  if bit-reproducibility matters.
 
 ### Sweep methodology + environment (reproduce recipe)
 
@@ -325,7 +377,7 @@ editable-installed inside the container
 (`PIP_CONSTRAINT="" BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`).
 
 **Harness.**  `moe_ep_benchmark/bench_moe_ep_mega.py` via
-`SECTION=fi_mega GPUS=4 SEQ_LENS="8 64 512 2048 8192" run_sweep.sh`
+`SECTION=fi_mega GPUS=4 SEQ_LENS="1024 2048 4096 8192" run_sweep.sh`
 (see that repo's RUNBOOK.md), one `torch.multiprocessing.spawn` of 4 EP
 ranks per (variant, token-count) point — every point pays a fresh
 `cute.compile` (amortized by cute's on-disk cache).  Variants selected
@@ -372,7 +424,7 @@ srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
     PIP_CONSTRAINT="" BUILD_NIXL_EP=0 python -m pip install --no-build-isolation -e .
     python -m pip install --upgrade "nvidia-cutlass-dsl[cu13]"   # >= 4.6.1
     export SECTION=fi_mega GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3
-    export SEQ_LENS="8 64 512 2048 8192"
+    export SEQ_LENS="1024 2048 4096 8192"
     for MODE in kernel e2e_pipelined; do
       export MEGA_TIMING=$MODE
       MEGA_LIST="deep_gemm_mega nvfp4_cutedsl" \
