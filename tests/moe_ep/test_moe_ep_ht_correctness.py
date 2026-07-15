@@ -3,6 +3,10 @@
 Mirrors ``test_moe_ep_compute_correctness.py`` but for
 ``EpAlgorithm.HIGH_THROUGHPUT`` / ``nccl.ep.Layout.FLAT``.
 
+Asserts ``EP == non-EP kernel``; HT shares the ``trtllm_bf16_routed`` compute
+kernel with LL, so its ``non-EP kernel == torch oracle`` anchor is the
+single-GPU ``test_split_fused_moe_kernel_vs_reference.py`` bf16 test.
+
 Launch (4 GPU):
     torchrun --nproc_per_node=4 -m pytest \\
         tests/moe_ep/test_moe_ep_ht_correctness.py -v -s -m "nvep and gpu_4"
@@ -34,19 +38,6 @@ def _geometry(world_size):
     return top_k, num_experts, num_local_experts
 
 
-def _block_major_k(w):
-    import torch
-
-    from flashinfer import shuffle_matrix_a
-    from flashinfer.fused_moe.core import convert_to_block_layout
-
-    out = []
-    for i in range(w.shape[0]):
-        s = shuffle_matrix_a(w[i].view(torch.uint8), 64)
-        out.append(convert_to_block_layout(s, 128))
-    return torch.stack(out).view(torch.bfloat16)
-
-
 def _build_bf16_moe_config(*, num_experts, top_k, offset, local_n, max_tokens):
     from flashinfer.fused_moe.api import (
         BackendOptions,
@@ -72,15 +63,21 @@ def _build_bf16_moe_config(*, num_experts, top_k, offset, local_n, max_tokens):
     )
 
 
-def _build_fused_moe_weights(w1, w2):
-    from flashinfer.fused_moe.api import MoEWeightPack
-
-    wp = MoEWeightPack()
-    wp.prepare_for(
-        "trtllm_bf16_routed",
-        {"gemm1_weights": _block_major_k(w1), "gemm2_weights": _block_major_k(w2)},
+def _build_fused_moe_weights(w1, w2, *, num_experts, top_k):
+    # Same weight prep as the EP layer (gated-act reorder + shuffle + BlockMajorK).
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
     )
-    return wp
+
+    cfg = _build_bf16_moe_config(
+        num_experts=num_experts,
+        top_k=top_k,
+        offset=0,
+        local_n=w1.shape[0],
+        max_tokens=1,
+    )
+    return materialize_fused_moe_weights(MoEWeightPack(w13=w1, w2=w2), cfg)
 
 
 def _kernel_full_moe_reference(
@@ -98,7 +95,9 @@ def _kernel_full_moe_reference(
         local_n=num_experts,
         max_tokens=x.shape[0],
     )
-    wp = _build_fused_moe_weights(w1_full, w2_full)
+    wp = _build_fused_moe_weights(
+        w1_full, w2_full, num_experts=num_experts, top_k=top_k
+    )
     act = MoEActivationPack(
         hidden_states_q=x,
         hidden_states_scale=torch.empty(0, device=x.device),
