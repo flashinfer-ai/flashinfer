@@ -1821,6 +1821,218 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
             )
 
 
+def run_gdn_decode_bf16_wy_output_only_benchmark(args, dtype, use_qk_l2norm):
+    """OUTPUT-ONLY head-to-head: branch bf16_state MTP vs no-prepack v18 kernel.
+
+    Both kernels share the same bf16 (pool, HV, V, K) state and inputs and are
+    timed output-only (disable_state_update=True, disable_output=False,
+    recovery_steps=0) via cuda-graph replay = true kernel GPU time (the
+    production decode pattern; excludes per-call Python wrapper overhead), with a
+    cold-L2 cuda-event fallback if a config can't be captured.
+
+    v18 is a fixed T=16-tile kernel, so for T<16 it stages inputs into persistent
+    T=16 buffers. v18 is timed KERNEL-ONLY (the eager correctness call pre-stages
+    the buffers, then _RESTAGE=False skips the per-call copy) — i.e. assuming the
+    fixed-buffer serving pattern where the producer writes into the T=16 buffers.
+    This matches how the avo harness measures (time_one(compiled(*cargs))). The
+    branch needs no padding and is timed its natural way. Reports the v18 speedup,
+    the max abs output diff (<=1 bf16 ULP cross-check), and the timing mode.
+    """
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        print("Error: branch BF16 state kernel is not available.")
+        return
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+        gated_delta_rule_mtp as _branch_mtp,
+    )
+
+    try:
+        from flashinfer.gdn_kernels.gdn_decode_bf16_wy_output_only import (
+            gated_delta_rule_mtp as _v18_mtp,
+        )
+        import flashinfer.gdn_kernels.gdn_decode_bf16_wy_output_only as _v18mod
+    except (ImportError, RuntimeError) as e:
+        print(f"Error: gdn_decode_bf16_wy_output_only not available: {e}")
+        return
+
+    valid_seq_lens = [t for t in args.seq_len if t >= 1]
+    if not valid_seq_lens:
+        print("Error: --seq-len must include values >= 1")
+        return
+
+    num_o_heads = max(args.num_q_heads, args.num_v_heads)
+    num_sab = num_o_heads
+    scale = 1.0 / (args.head_size**0.5)
+
+    print("\n" + "=" * 100)
+    print(
+        f"BF16 State OUTPUT-ONLY head-to-head: branch vs wy_output_only (v18)  T={valid_seq_lens}"
+    )
+    print(
+        f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
+        f"v_heads={args.num_v_heads}, head_size={args.head_size}, dtype={args.dtype}, "
+        f"qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}"
+    )
+    print("=" * 100)
+    print(
+        f"{'batch':>6} {'T':>4} {'branch(us)':>12} {'v18(us)':>12} "
+        f"{'speedup':>10} {'max|d|':>11} {'mode':>6}"
+    )
+    print("-" * 100)
+
+    for batch_size in args.batch_size:
+        for T in valid_seq_lens:
+            try:
+                _v18mod._RESTAGE = True  # default: stage inputs; flipped off only for the v18 timed run
+                q = torch.randn(
+                    batch_size,
+                    T,
+                    args.num_q_heads,
+                    args.head_size,
+                    dtype=dtype,
+                    device="cuda",
+                )
+                k = torch.randn(
+                    batch_size,
+                    T,
+                    args.num_k_heads,
+                    args.head_size,
+                    dtype=dtype,
+                    device="cuda",
+                )
+                v = torch.randn(
+                    batch_size,
+                    T,
+                    args.num_v_heads,
+                    args.head_size,
+                    dtype=dtype,
+                    device="cuda",
+                )
+                # Scale gating inputs by 0.1 (matches the correctness test): raw
+                # std-1 randn drives the gated recurrence unstable over many
+                # tokens (-> Inf/NaN at large T), which would pollute the max|d|
+                # cross-check. Magnitude does not affect kernel timing.
+                A_log = torch.randn(num_sab, dtype=torch.float32, device="cuda") * 0.1
+                dt_bias = torch.randn(num_sab, dtype=torch.float32, device="cuda") * 0.1
+                a = (
+                    torch.randn(batch_size, T, num_sab, dtype=dtype, device="cuda")
+                    * 0.1
+                )
+                b = torch.randn(batch_size, T, num_sab, dtype=dtype, device="cuda")
+                state = torch.randn(
+                    batch_size,
+                    num_sab,
+                    args.head_size,
+                    args.head_size,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                idx = torch.arange(batch_size, dtype=torch.int32, device="cuda")
+
+                common = dict(
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    q=q,
+                    k=k,
+                    v=v,
+                    b=b,
+                    initial_state_indices=idx,
+                    disable_state_update=True,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm,
+                    scale=scale,
+                )
+
+                # output=None exercises each kernel's natural allocation path;
+                # v18 then returns a zero-copy [:, :T] view (its optimized path),
+                # and the T<16 inputs go through v18's persistent staging buffers.
+                def _time(fn, graph):
+                    return (
+                        np.median(
+                            bench_gpu_time(
+                                lambda: fn(initial_state_source=state, **common),
+                                dry_run_iters=(5 if graph else args.warmup),
+                                repeat_iters=args.iters,
+                                use_cuda_graph=graph,
+                                enable_cupti=False,
+                                cold_l2_cache=(not graph),
+                            )
+                        )
+                        * 1000
+                    )
+
+                # Eager correctness cross-check (expect <= 1 bf16 ULP).
+                try:
+                    o_br = _branch_mtp(initial_state_source=state.clone(), **common)
+                except Exception as e:
+                    o_br = None
+                    print(f"  [branch B={batch_size} T={T}] {type(e).__name__}: {e}")
+                try:
+                    o_v18 = _v18_mtp(initial_state_source=state.clone(), **common)
+                except Exception as e:
+                    o_v18 = None
+                    print(f"  [v18 B={batch_size} T={T}] {type(e).__name__}: {e}")
+                torch.cuda.synchronize()
+                max_d = (
+                    (o_br.float() - o_v18.float()).abs().max().item()
+                    if (o_br is not None and o_v18 is not None)
+                    else float("nan")
+                )
+
+                # Prefer cuda-graph replay = true kernel GPU time (the production
+                # decode pattern; excludes the per-call Python wrapper overhead
+                # — 10x from_dlpack, contiguous, alloc, cache lookup — that
+                # otherwise dominates v18 at small batch). Fall back to cold-L2
+                # event timing for BOTH kernels if either can't be captured
+                # (v18's T<16 pad path allocates during capture), so the row's
+                # speedup stays apples-to-apples. 'mode' tags which was used.
+                # Time v18 KERNEL-ONLY: the eager calls above already staged the
+                # inputs into v18's persistent T=16 buffers, so skip the per-call
+                # restage copy (the fixed-buffer serving pattern, and exactly how
+                # avo's time_one(compiled(*cargs)) measures). The branch ignores
+                # this flag and is timed its natural way (native T, no padding).
+                _v18mod._RESTAGE = False
+                t_br = t_v18 = None
+                mode = "graph"
+                if o_br is not None and o_v18 is not None:
+                    try:
+                        t_br = _time(_branch_mtp, True)
+                        t_v18 = _time(_v18_mtp, True)
+                    except Exception:
+                        mode = "event"
+                        try:
+                            t_br = _time(_branch_mtp, False)
+                        except Exception:
+                            t_br = None
+                        try:
+                            t_v18 = _time(_v18_mtp, False)
+                        except Exception:
+                            t_v18 = None
+                else:
+                    mode = "event"
+                    if o_br is not None:
+                        try:
+                            t_br = _time(_branch_mtp, False)
+                        except Exception:
+                            t_br = None
+                    if o_v18 is not None:
+                        try:
+                            t_v18 = _time(_v18_mtp, False)
+                        except Exception:
+                            t_v18 = None
+
+                spd = (t_br / t_v18) if (t_br and t_v18) else float("nan")
+                br_s = f"{t_br:>12.2f}" if t_br is not None else f"{'ERR':>12}"
+                v18_s = f"{t_v18:>12.2f}" if t_v18 is not None else f"{'ERR':>12}"
+                print(
+                    f"{batch_size:>6} {T:>4} {br_s} {v18_s} "
+                    f"{spd:>9.2f}x {max_d:>11.2e} {mode:>6}"
+                )
+            except Exception as e:
+                print(f"{batch_size:>6} {T:>4} {'ERROR':>12} - {type(e).__name__}: {e}")
+    print("-" * 100)
+    print()
+
+
 # ============================================================================
 # Main Entry Points
 # ============================================================================
@@ -2167,10 +2379,12 @@ Examples:
             "nontranspose",
             "mtp",
             "bf16_state",
+            "bf16_wy_output_only",
             "all",
         ],
         default="nontranspose",
-        help="Kernel version: pretranspose, nontranspose, mtp, bf16_state, or all",
+        help="Kernel version: pretranspose, nontranspose, mtp, bf16_state, "
+        "bf16_wy_output_only (v18 head-to-head), or all",
     )
     parser.add_argument(
         "--seq-len",
@@ -2313,6 +2527,9 @@ Examples:
     elif args.version == "bf16_state":
         # BF16 state benchmark: T=1 and MTP T>=2 vs FP32 MTP
         run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm)
+    elif args.version == "bf16_wy_output_only":
+        # OUTPUT-ONLY head-to-head: branch bf16_state MTP vs no-prepack v18
+        run_gdn_decode_bf16_wy_output_only_benchmark(args, dtype, use_qk_l2norm)
     else:
         # Non-MTP: always run all layouts comparison (FlashInfer/Triton x pretranspose/nontranspose + gdn_decode_bf16_state)
         run_all_layouts_benchmark(args, dtype, use_qk_l2norm)

@@ -15,9 +15,11 @@ limitations under the License.
 """
 
 import functools
+from collections import defaultdict
+from dataclasses import replace
 from enum import Enum
 from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple
+from typing import Callable, List, Literal, Optional, Tuple
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
@@ -49,7 +51,12 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from .kernels.utils import _select_sm100_mm_fp4_cute_dsl_tactic
+from .kernels.utils import (
+    _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
+    _SM100_MMA_TILER_MN_CANDIDATES,
+    _score_sm100_mm_fp4_tactic,
+    _select_sm100_mm_fp4_cute_dsl_tactic,
+)
 from ..utils import (
     get_device_sm_count,
     get_native_fp4_dtype,
@@ -339,6 +346,8 @@ def _cudnn_mm_bf16_requirement(
     ] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
+    if not _cudnn_bf16_gemm_usable_or_skip(a, out_dtype, backend):
+        return False
     return _cudnn_available_or_raise_for_backend(backend)
 
 
@@ -684,6 +693,8 @@ def _cudnn_bmm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
+    if not _cudnn_bf16_gemm_usable_or_skip(A, out_dtype, backend):
+        return False
     return _cudnn_available_or_raise_for_backend(backend)
 
 
@@ -1284,6 +1295,8 @@ def get_mm_bf16_cublaslt_module():
 
 
 _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -2255,6 +2268,33 @@ def _cudnn_available_or_raise_for_backend(backend):
     if backend == "cudnn":
         _check_cudnn_availability()
     return False
+
+
+def _cudnn_bf16_gemm_usable_or_skip(
+    a: torch.Tensor, out_dtype: torch.dtype, backend: str
+) -> bool:
+    """Precise ban for the cuDNN 9.23.0.x bf16-GEMM bug. cuDNN 9.23.0 (backend_version 92300)
+    miscomputes bf16 GEMM/BMM with **fp16 output on SM90/Hopper** for non-power-of-2 M: the split-k
+    partial-reduce kernel assumes row-major output, but Hopper swaps A<->B so the output is
+    column-major -> wrong reduce dims -> garbage (ratio ~1). bf16 OUTPUT, SM80/89/100, and the
+    non-bf16 dtype paths are all UNAFFECTED, and it's fixed in 9.23.1 (92301). So disable exactly
+    {SM90, fp16-out, 9.23.0.x}: auto falls back to cutlass/cublas, explicit cudnn raises a clear,
+    skippable error. (Envelope deliberately drops the non-pow2-M condition -- the actual trigger --
+    for robustness against the split-k tile heuristic; the over-restriction is only pow2-M
+    bf16->fp16 on SM90/9.23.0, which simply falls back.)"""
+    if (
+        CUDNN_AVAILABLE
+        and out_dtype == torch.float16
+        and cudnn.backend_version() == 92300
+        and get_compute_capability(a.device)[0] == 9
+    ):
+        if backend == "cudnn":
+            raise RuntimeError(
+                "cuDNN 9.23.0 miscomputes bf16->fp16 GEMM/BMM on SM90/Hopper (non-power-of-2 M); "
+                "not supported. Use bf16 output, another backend, or upgrade to cuDNN >= 9.23.1."
+            )
+        return False
+    return True
 
 
 def _is_cublas_fp4_available_in_cudnn():
@@ -4483,34 +4523,11 @@ def _cudnn_mm_mxfp8_requirement(
 
 
 # Shared helpers for CuTe DSL block-scaled GEMM runners (mxfp8 & mxfp4/nvfp4)
-_SM100_MMA_TILER_MN_CANDIDATES = [
-    (128, 8),
-    (128, 16),
-    (128, 32),
-    (128, 64),
-    (256, 64),
-    (128, 128),
-    (256, 128),
-    (128, 192),
-    (256, 192),
-    (128, 256),
-    (256, 256),
-]
-
-_SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
-    (1, 1),
-    (1, 2),
-    (1, 4),
-    (2, 1),
-    (2, 2),
-    (2, 4),
-    (4, 1),
-    (4, 2),
-    (4, 4),
-]
-
 _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
+
+# Max distinct configs the autotuner profiles mm_fp4(backend='cute-dsl')
+_MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS = 32
 
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
@@ -4606,6 +4623,7 @@ def _compile_block_scaled_gemm(
     sf_n,
     sf_k,
     batch_size,
+    cluster_shape_k=1,
 ):
     """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
 
@@ -4671,9 +4689,8 @@ def _compile_block_scaled_gemm(
         cutlass.Float32, (1,), assumed_align=4
     )
 
-    max_active_clusters = get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
+    launch_cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1] * cluster_shape_k
+    max_active_clusters = get_max_active_clusters(launch_cluster_size)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     compiled_gemm = cute.compile(
@@ -4743,6 +4760,11 @@ def _cute_dsl_gemm_mxfp8_runner(
     from .kernels.dense_blockscaled_gemm_sm100 import (
         Sm100BlockScaledPersistentDenseGemmKernel,
     )
+    from .kernels.dense_blockscaled_gemm_sm100_splitk import (
+        Sm100BlockScaledSplitKGemmKernel,
+    )
+
+    split_k_kernel_cls = Sm100BlockScaledSplitKGemmKernel
 
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
@@ -4760,22 +4782,51 @@ def _cute_dsl_gemm_mxfp8_runner(
     _ = sm_major, sm_minor
 
     class CuteDSLMxfp8GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            _, _, _, _, _, out, _ = inputs
+            return (str(out.dtype), enable_pdl)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> list:
             (a, b, a_descale, b_descale, _, out, _) = inputs
-            return _get_sm100_block_scaled_tactics(
-                m=a.shape[0],
-                n=b.shape[1],
-                real_k=a.shape[1],
-                ab_dtype=cutlass.Float8E4M3FN,
+            m = a.shape[0]
+            n = b.shape[1]
+            real_k = a.shape[1]
+            ab_dtype = cutlass.Float8E4M3FN
+            base_tactics = _get_sm100_block_scaled_tactics(
+                m=m,
+                n=n,
+                real_k=real_k,
+                ab_dtype=ab_dtype,
                 sf_dtype=cutlass.Float8E8M0FNU,
                 sf_vec_size=32,
                 c_cutlass_dtype=c_cutlass_dtype,
                 device=a.device,
             )
+            valid_tactics = [(*tactic, 1) for tactic in base_tactics]
+            if not out.is_contiguous():
+                return valid_tactics
+
+            for split_k_slices in split_k_kernel_cls.SUPPORTED_SPLIT_K_SLICES:
+                if split_k_kernel_cls.is_valid_tactic(
+                    m,
+                    real_k,
+                    ab_dtype,
+                    split_k_slices,
+                ):
+                    valid_tactics.append(
+                        (
+                            split_k_kernel_cls.mma_tiler_mn_for_m(m),
+                            (1, 1),
+                            True,
+                            False,
+                            split_k_slices,
+                        )
+                    )
+            return valid_tactics
 
         def forward(
             self,
@@ -4794,14 +4845,50 @@ def _cute_dsl_gemm_mxfp8_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                tactic = (
-                    _SM100_DEFAULT_MMA_TILER_MN,
-                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                    False,
-                    False,
-                )
+                if split_k_kernel_cls.supports_m(m) and out.is_contiguous():
+                    # Untuned low-M execution uses the corresponding base tactic.
+                    tactic = (
+                        split_k_kernel_cls.mma_tiler_mn_for_m(m),
+                        (1, 1),
+                        True,
+                        False,
+                        1,
+                    )
+                else:
+                    tactic = (
+                        _SM100_DEFAULT_MMA_TILER_MN,
+                        _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                        False,
+                        False,
+                        1,
+                    )
 
-            (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch) = tactic
+            (
+                mma_tiler_mn,
+                cluster_shape_mn,
+                swap_ab,
+                use_prefetch,
+                split_k_slices,
+            ) = tactic
+            if split_k_slices < 1:
+                raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
+            is_split_k = split_k_slices > 1
+
+            if is_split_k:
+                if (
+                    cluster_shape_mn != (1, 1)
+                    or not swap_ab
+                    or use_prefetch
+                    or not out.is_contiguous()
+                    or not split_k_kernel_cls.is_valid_tactic(
+                        m,
+                        real_k,
+                        cutlass.Float8E4M3FN,
+                        split_k_slices,
+                    )
+                    or mma_tiler_mn != split_k_kernel_cls.mma_tiler_mn_for_m(m)
+                ):
+                    raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
@@ -4827,18 +4914,31 @@ def _cute_dsl_gemm_mxfp8_runner(
                 use_prefetch,
                 enable_pdl,
                 out_dtype,
+                split_k_slices,
             )
 
-            compiled_gemm, _ = _compile_block_scaled_gemm(
-                _CUTE_DSL_MM_MXFP8_KERNEL_CACHE,
-                cache_key,
-                lambda: Sm100BlockScaledPersistentDenseGemmKernel(
+            make_kernel: Callable[[], object]
+            kernel_cache = _CUTE_DSL_MM_MXFP8_KERNEL_CACHE
+            if is_split_k:
+                make_kernel = lambda: split_k_kernel_cls(
+                    sf_vec_size,
+                    mma_tiler_mn,
+                    split_k_slices,
+                    enable_pdl,
+                )
+            else:
+                make_kernel = lambda: Sm100BlockScaledPersistentDenseGemmKernel(
                     sf_vec_size,
                     mma_tiler_mn,
                     cluster_shape_mn,
                     use_prefetch,
                     enable_pdl,
-                ),
+                )
+
+            compiled_gemm, _ = _compile_block_scaled_gemm(
+                kernel_cache,
+                cache_key,
+                make_kernel,
                 ab_cutlass_dtype=cutlass.Float8E4M3FN,
                 sf_dtype=sf_dtype,
                 c_cutlass_dtype=c_cutlass_dtype,
@@ -4849,6 +4949,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                 sf_n=sf_n,
                 sf_k=sf_k,
                 batch_size=batch_size,
+                cluster_shape_k=split_k_slices,
             )
 
             alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
@@ -4856,6 +4957,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             launch_out = (
                 out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
             )
+
             compiled_gemm(
                 kernel_a,
                 kernel_b,
@@ -5163,7 +5265,11 @@ def mm_mxfp8(
 
     tuner = AutoTuner.get()
 
-    tuning_config = _MM_MXFP8_TUNING_CONFIG
+    tuning_config = (
+        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
+        if backends == ["cute-dsl"]
+        else _MM_MXFP8_TUNING_CONFIG
+    )
 
     inputs = [
         a,
@@ -5825,7 +5931,29 @@ def _cute_dsl_gemm_fp4_runner(
                                     )
                                 )
 
-            return valid_tactics
+            # Rank configs and autotune the top-N instead of the entire O(100).
+            # Current heuristic cannot distinguish use_prefetch, so autotuner profiles both.
+            sm_count = get_device_sm_count(a.device)
+            config_tactics = defaultdict(list)
+            for t in valid_tactics:
+                # group by everything except use_prefetch (t[3])
+                tile, cluster, swap_ab, _, kernel_type, tma_store = t
+                config_key = (tile, cluster, swap_ab, kernel_type, tma_store)
+                config_tactics[config_key].append(t)
+            ranked_configs = sorted(
+                config_tactics.values(),
+                key=lambda ts: _score_sm100_mm_fp4_tactic(
+                    m, n, real_k, sm_count, ts[0][0], ts[0][1], ts[0][2]
+                ),
+                reverse=True,
+            )
+            return [
+                t
+                for ts in ranked_configs[
+                    : _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS // 2
+                ]  # // 2 for prefetch and non-prefetch
+                for t in ts
+            ]
 
         def forward(
             self,
@@ -5848,7 +5976,7 @@ def _cute_dsl_gemm_fp4_runner(
                 # Use analytical heuristic to pick the best tactic based on
                 # tile and wave quantization efficiency.
                 tactic = _select_sm100_mm_fp4_cute_dsl_tactic(
-                    m, n, real_k, get_device_sm_count(a.device)
+                    m, n, real_k, get_device_sm_count(a.device), sf_vec_size
                 )
 
             (
@@ -6321,6 +6449,12 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
             lambda shapes: shapes[0][0],
         ),
     ),
+)
+
+_MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
+    _MM_MXFP8_TUNING_CONFIG,
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
 )
 
 
@@ -8844,6 +8978,18 @@ def _check_bmm_mxfp8_problem_size(
     if A.shape[2] != B.shape[1]:
         raise ValueError(
             f"K dimension (last dim of A) mismatch in bmm_mxfp8. got {A.shape=}, {B.shape=}"
+        )
+
+    # mxfp8 GEMM needs n,k >= 128 (smaller dims can produce NaN/Inf garbage). mm_mxfp8 enforces this
+    # in its common check (_check_mm_mxfp8_problem_size) but bmm_mxfp8 historically did not, so the
+    # cuDNN bmm path SILENTLY returned garbage for 32<=n<128 instead of rejecting. Mirror the guard.
+    # (B is [b, k, n] here -> n = B.shape[2], k = A.shape[2].)
+    min_n = 128
+    min_k = 128
+    if B.shape[2] < min_n or A.shape[2] < min_k:
+        raise ValueError(
+            f"MXFP8 requires n >= {min_n} and k >= {min_k}. "
+            f"got b={A.shape[0]}, m={A.shape[1]}, n={B.shape[2]}, k={A.shape[2]}."
         )
 
     _validate_mxfp8_output_dtype(dtype)

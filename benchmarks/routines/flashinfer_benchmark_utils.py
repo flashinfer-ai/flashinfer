@@ -199,6 +199,7 @@ benchmark_apis = {
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
         "bmm_fp8",
+        "mm_fp8",
         "bmm_mxfp8",
         "mm_fp4",
         "mm_bf16_fp4",
@@ -411,7 +412,7 @@ routine_cc_to_supported_backends = {
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
         "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
-        "10.3": ["fa2", "cutlass", "trtllm-native"],
+        "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
         "12.0": ["fa2"],
         "12.1": ["fa2"],
     },
@@ -473,7 +474,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # Note: bmm_fp8, mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
+    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],

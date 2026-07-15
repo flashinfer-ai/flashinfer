@@ -14,15 +14,14 @@ import torch
 from typing_extensions import deprecated
 
 from flashinfer.comm.mapping import Mapping
-from flashinfer.comm.mnnvl import TorchDistBackend
+from flashinfer.api_logging import flashinfer_api
 
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
 from ..fp4_quantization import _compute_swizzled_layout_sf_size
-from .mnnvl import CommBackend, MPIBackend
+from .mnnvl import CommBackend, McastGPUBuffer, MPIBackend, SymmDeviceMemory
 from .trtllm_ar import QuantizationSFLayout
 from .workspace_base import AllReduceFusionWorkspace
-from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 
 
 def mpi_barrier():
@@ -147,26 +146,16 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # support base_gpu_id != 0 scenarios where the actual CUDA device
         # index differs from the TP rank / local_rank.
         device = torch.device("cuda", torch.cuda.current_device())
-        if isinstance(comm_backend, TorchDistBackend):
-            group = (
-                comm_backend._group
-                if comm_backend._group is not None
-                else torch.distributed.group.WORLD
-            )
-            group_name = group.group_name
-        else:
-            group_name = torch.distributed.group.WORLD.group_name
-        self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
-            requested_workspace_size,
-            mapping.tp_size,
-            torch.float32,
-            device,
-            group_name,
+        self.handle = McastGPUBuffer(
+            buf_size=requested_workspace_size,
+            group_size=mapping.tp_size,
+            group_rank=mapping.tp_rank,
+            device=device,
+            comm_backend_for_handle_transfer=comm_backend,
         )
+        self.ptrs = self.handle.mcast_device_memory.get_buffer_ptrs_host()
 
-        # handle.buffer_size is the usable data size. torch symmetric memory
-        # allocator places signal_pad on top of it, not carved from within.
-        allocated_size = self.handle.buffer_size
+        allocated_size = self.handle.buf_size
         # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
         self.buffer_size_bytes = (
             math.floor(allocated_size / self.NUM_LAMPORT_BUFFERS) // 16 * 16
@@ -178,9 +167,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             f"[MNNVL Allreduce] Actual allocated size: {allocated_size} bytes, Actual buffer size per lamport buffer: {self.buffer_size_bytes} bytes, total workspace: {self.workspace_size_bytes} bytes."
         )
 
-        # lamport initialize tensor to negative zero.
-        self.tensor.fill_(-0.0)
-        # Wait until the initialization is done
+        self.handle.lamport_initialize(self.rank, torch.float32)
         torch.cuda.synchronize()
         comm_backend.barrier()
 
@@ -195,9 +182,9 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             device=torch.device("cuda", torch.cuda.current_device()),
         )
 
-        self.uc_ptrs_dev = self.handle.buffer_ptrs_dev
-        self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
-        self.mc_ptr = self.handle.multicast_ptr
+        self.uc_ptrs_dev = self.handle.get_buffer_ptrs_dev()
+        self.uc_ptr_local = self.handle.get_unicast_ptr(self.rank)
+        self.mc_ptr = self.handle.get_multicast_ptr()
 
     @functools.cache
     def is_buffer_size_sufficient(
@@ -252,6 +239,53 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     def backend(self) -> str:
         return "mnnvl"
 
+    def _require_handles_attached(self) -> None:
+        memory = getattr(self.handle, "mcast_device_memory", None)
+        if isinstance(memory, SymmDeviceMemory) and not memory.mapped:
+            raise RuntimeError("MNNVL handles are not attached")
+
+    def _initialize_protocol(self) -> None:
+        self.handle.lamport_initialize(self.rank, torch.float32)
+        num_bytes_to_clear = [0] * 4
+        self.buffer_flags.copy_(
+            torch.tensor(
+                [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+                dtype=torch.uint32,
+                device=self.buffer_flags.device,
+            )
+        )
+        torch.cuda.synchronize()
+
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Detach physical backing; repeated successful calls are no-ops."""
+        memory = getattr(self.handle, "mcast_device_memory", None)
+        if not isinstance(memory, SymmDeviceMemory):
+            raise NotImplementedError(
+                "Stable-VA checkpointing is unavailable for workspaces backed "
+                "by torch symmetric memory"
+            )
+        if not memory.mapped:
+            return
+        memory._unmap_and_release_handles()
+        # Do not return until every rank has released its workspace handles.
+        memory.comm_backend.barrier()
+
+    @flashinfer_api
+    def checkpoint_restore(self, comm_backend: CommBackend) -> None:
+        """Restore physical backing; repeated successful calls are no-ops."""
+        memory = getattr(self.handle, "mcast_device_memory", None)
+        if not isinstance(memory, SymmDeviceMemory):
+            raise NotImplementedError(
+                "Stable-VA checkpointing is unavailable for workspaces backed "
+                "by torch symmetric memory"
+            )
+        if memory.mapped:
+            return
+        memory._create_and_map_handles(comm_backend)
+        self._initialize_protocol()
+        comm_backend.barrier()
+
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
         if getattr(self, "_destroyed", False):
@@ -261,7 +295,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         del self.uc_ptrs_dev
         del self.uc_ptr_local
         del self.mc_ptr
-        del self.tensor
         del self.handle
         del self.ptrs
         self._destroyed = True
@@ -433,6 +466,8 @@ def trtllm_mnnvl_allreduce(
             f"The output tensor must be 2D, got {len(output.shape)}D. The shape is {output.shape}."
         )
 
+    workspace._require_handles_attached()
+
     module = get_trtllm_mnnvl_comm_module()
 
     if strategy == MNNVLAllreduceFusionStrategy.AUTO:
@@ -532,6 +567,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         raise ValueError(
             f"The residual output tensor must be 2D, got {len(residual_out.shape)}D. The shape is {residual_out.shape}."
         )
+
+    workspace._require_handles_attached()
 
     module = get_trtllm_mnnvl_comm_module()
 
@@ -772,6 +809,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
     else:
         raise ValueError(f"Unsupported MNNVL quant_type: {quant_type}")
 
+    workspace._require_handles_attached()
+
     if strategy == MNNVLAllreduceFusionStrategy.AUTO:
         strategy = MNNVLAllreduceFusionStrategy.select_strategy(
             workspace.tp_size, token_num, hidden_dim, input.dtype
@@ -845,7 +884,7 @@ def get_allreduce_mnnvl_workspace(
 
     Returns:
         Tuple containing:
-        - MNNVLAllReduceFusionWorkspace: The workspace object backed by torch symmetric memory
+        - MNNVLAllReduceFusionWorkspace: The CUDA VMM-backed workspace object
         - torch.Tensor: Buffer flags tensor tracking state
         - int: Maximum number of elements that can fit in buffer
     """

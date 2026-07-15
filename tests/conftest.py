@@ -156,7 +156,9 @@ def pytest_configure(config):
         for fn in TORCH_COMPILE_FNS:
             _monkeypatch_add_torch_compile(fn)
     # moe_ep markers (Part B of the EP API design integration).
-    config.addinivalue_line("markers", "nvep: requires BUILD_NVEP=1 install")
+    config.addinivalue_line(
+        "markers", "nvep: requires a moe_ep-enabled install (default)"
+    )
     config.addinivalue_line("markers", "gpu_2: requires >=2 GPUs")
     config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")
@@ -174,9 +176,9 @@ def pytest_collection_modifyitems(config, items):
     """Skip moe_ep tests on hosts that lack the requisite env / GPUs / arch."""
     nvep_built = False
     try:
-        from flashinfer.moe_ep import available_backends
+        from importlib import import_module
 
-        nvep_built = bool(available_backends())
+        nvep_built = bool(import_module("flashinfer.moe_ep").available_backends())
     except ImportError:
         pass
 
@@ -191,12 +193,22 @@ def pytest_collection_modifyitems(config, items):
         if "nvep" in item.keywords and not nvep_built:
             item.add_marker(
                 pytest.mark.skip(
-                    reason="needs BUILD_NCCL_EP=1 / BUILD_NIXL_EP=1 install"
+                    reason="no moe_ep backend built (EP builds by default; "
+                    "check install log for skipped-backend warnings)"
                 )
             )
         for mk, req in (("gpu_2", 2), ("gpu_4", 4), ("gpu_8", 8)):
             if mk in item.keywords and ngpu < req:
                 item.add_marker(pytest.mark.skip(reason=f"needs >= {req} GPUs"))
+            elif mk in item.keywords and "WORLD_SIZE" not in os.environ:
+                # Multi-rank tests must be launched via torchrun (see
+                # tests/moe_ep/run_tests.sh); under plain pytest auto-discovery
+                # (e.g. CI unit-test sweeps) they would hang on dist init.
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason="requires torchrun launch (WORLD_SIZE unset)"
+                    )
+                )
         if "arch_blackwell" in item.keywords and cc < (10, 0):
             item.add_marker(pytest.mark.skip(reason="needs sm_100+"))
 
