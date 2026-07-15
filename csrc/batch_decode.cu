@@ -176,6 +176,13 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
   auto k_strides = paged_k_cache.strides();
   auto v_strides = paged_v_cache.strides();
   TVM_FFI_ICHECK_EQ(k_strides.size(), v_strides.size());
+  for (int i = 0; i < k_strides.size(); ++i) {
+    TVM_FFI_ICHECK_EQ(k_strides[i], v_strides[i])
+        << "K/V strides differ at dim " << i
+        << ": the FA2 decode kernel addresses both K and V through a single set of "
+           "(K) strides, so paged_k_cache and paged_v_cache must have identical strides; "
+           "NVFP4/asymmetric decode with independent K/V strides is not yet supported.";
+  }
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
