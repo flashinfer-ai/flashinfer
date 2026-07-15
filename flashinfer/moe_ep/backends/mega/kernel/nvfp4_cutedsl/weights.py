@@ -114,10 +114,19 @@ def preprocess_mega_weights(
     # shim exposes this cutlass-pulling helper lazily via the package boundary.
     from .....kernel_src.cutedsl_megamoe import _stack_byte_reinterpretable_tensors
 
-    norm_const = _resolve_gate_up_clamp(
+    # Reject conflicting clamp aliases; the clamp itself is a kernel-side
+    # nonlinearity parameter and must NOT scale the weight quantization.
+    _resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp,
         activation_clamp=activation_clamp,
     )
+    # Kernel contract (see src alpha_swiglu_clamp): the fc1 raw accumulator is
+    # dequanted to REAL values by fc1_alpha (default 1.0) before clamp+SwiGLU,
+    # so weight SFs must be unscaled (norm_const=1.0). Quantizing with
+    # norm_const=gate_up_clamp scaled every weight SF by the clamp value and
+    # diverged from the pre-quantized-weights path below, which consumes
+    # caller scales verbatim.
+    norm_const = 1.0
     fc1_out = 2 * intermediate_size
     num_experts = weights.w13.shape[0]
 
@@ -205,13 +214,20 @@ def preprocess_mega_weights(
                 weights.w2[expert],
                 norm_const=norm_const,
             )
-            fc1_q_parts.append(fc1_q.transpose(0, 1).contiguous())
+            fc1_q_parts.append(fc1_q)
             fc1_sf_parts.append(fc1_sf)
-            fc2_q_parts.append(fc2_q.transpose(0, 1).contiguous())
+            fc2_q_parts.append(fc2_q)
             fc2_sf_parts.append(fc2_sf)
 
-        fc1_weight = torch.stack(fc1_q_parts, dim=0)
-        fc2_weight = torch.stack(fc2_q_parts, dim=0)
+        # Stack in K-major memory (E, N, K//2) and expose the kernel's logical
+        # (E, K//2, N) via a transpose VIEW, exactly like the pre-quantized
+        # branch above: the kernel's TMA descriptors need the packed K axis
+        # stride-1.  The previous per-expert ``.transpose(0, 1).contiguous()``
+        # materialized N-stride-1 memory, which the kernel read as K-major —
+        # scrambling every weight (bit-exact EP-vs-shim tests could not see it;
+        # caught by the torch-oracle test).
+        fc1_weight = torch.stack(fc1_q_parts, dim=0).transpose(1, 2)
+        fc2_weight = torch.stack(fc2_q_parts, dim=0).transpose(1, 2)
         fc1_sf_swizzled = [_swizzle_expert_scales(sf) for sf in fc1_sf_parts]
         fc2_sf_swizzled = [_swizzle_expert_scales(sf) for sf in fc2_sf_parts]
 
