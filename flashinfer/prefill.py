@@ -2914,11 +2914,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "scale_v_scalar": scale_v_scalar,
                         "token_pos_in_items_len": self._token_pos_in_items_len,
                     }
-                    scalar_start = max(
-                        0,
-                        len(additional_args) - len(self._jit_additional_tensor_names),
+                    # prepare_jit_additional_args returns one entry per declared
+                    # tensor name plus any scalars the caller passed
+                    # positionally, so the number of scalars already provided is
+                    # exactly the excess over the tensor-name count.
+                    num_scalars_provided = len(additional_args) - len(
+                        self._jit_additional_tensor_names
                     )
-                    for name in self._jit_additional_scalar_names[scalar_start:]:
+                    for name in self._jit_additional_scalar_names[
+                        num_scalars_provided:
+                    ]:
+                        if name not in jit_scalar_values:
+                            raise ValueError(
+                                f"JIT module declares additional scalar {name!r}, "
+                                "which was not passed positionally to run() and "
+                                "cannot be derived automatically; derivable "
+                                f"scalars are: {sorted(jit_scalar_values)}"
+                            )
                         additional_args.append(jit_scalar_values[name])
                 run_args.extend(additional_args)
             else:
