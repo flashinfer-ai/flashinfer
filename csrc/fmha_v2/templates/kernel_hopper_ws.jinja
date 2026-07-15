@@ -348,6 +348,17 @@ void {{ launcher_name }}(
             // 2 * {{ bytes_per_elt }} stands for kv cache and {{ bytes_per_elt }} bytes per element.
             size_t size_in_bytes = params.b * params.h * params.s * params.d * 2 * {{ bytes_per_elt }};
             params.use_balanced_scheduling = {{ "true" if fp8_kernel else "(size_in_bytes <= launch_params.device_l2_cache_size)" }};
+            // Head-first tile order streams many heads' KV at once, so require the whole KV
+            // working set to fit in L2 (with 2x headroom, a measured heuristic).
+            // h_kv counts each GQA group's shared KV once. total_kv_seqlen is
+            // b * max_kv_len, so past KV (chunked prefill) is measured; fall back
+            // to the max Q seqlen if the caller did not set it.
+            size_t kv_tokens = launch_params.total_kv_seqlen > 0
+                ? static_cast<size_t>(launch_params.total_kv_seqlen)
+                : params.b * params.s;
+            size_t kv_size_in_bytes = kv_tokens * params.h_kv * params.d * 2 * {{ bytes_per_elt }};
+            params.use_head_first_scheduling =
+                (2 * kv_size_in_bytes <= launch_params.device_l2_cache_size);
         }
 
         block_size.x = 1;

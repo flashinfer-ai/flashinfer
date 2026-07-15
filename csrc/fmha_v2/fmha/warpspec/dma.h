@@ -154,25 +154,32 @@ struct DMA {
     static inline __device__ bool decode_exact_dynamic_tile_id(
         bert::Fused_multihead_attention_params_v2 const& params, uint32_t tile_id, int& bidb,
         int& bidh, int& q_step_offset, bool reverse = false) {
-      int remaining = static_cast<int>(tile_id);
-      // Detect uniform seqlens and skip the per-tile O(b) loop.
-      // cu_q_seqlens[0]=0 always, so if cu_q_seqlens[b] == b * cu_q_seqlens[1],
-      // then all batch elements have uniform seqlen.
-      int const first_q_seqlen = params.cu_q_seqlens[1];
-      int const total_q_seqlen = params.cu_q_seqlens[params.b];
-      if (first_q_seqlen * params.b == total_q_seqlen) {
-        int const q_tiles_per_head = compute_dynamic_q_tiles_per_head(first_q_seqlen);
-        int const tiles_per_batch = q_tiles_per_head * params.h;
-        bidb = static_cast<int>(tile_id) / tiles_per_batch;
-        int const within_batch = static_cast<int>(tile_id) - bidb * tiles_per_batch;
-        // balanced (reverse-Q-first) for causal+use_balanced_scheduling.
-        if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling) {
-          bidh = within_batch % params.h;
+      // Avoid looping over cu_q_seqlens when seqlens are uniform (computed on host).
+      if (params.is_uniform_q) {
+        int const q_tiles_per_head = compute_dynamic_q_tiles_per_head(params.cu_q_seqlens[1]);
+        if (reverse && params.use_head_first_scheduling) {
+          // Globally reverse-Q: the heaviest (largest-q) tile of every batch/head is
+          // emitted before any lighter one (best tail schedule), matching the static
+          // balanced path in run_packed_qkv. This interleaves many heads' KV streams
+          // across concurrent CTAs, so the host enables it only when the distinct KV
+          // working set fits in L2 (use_head_first_scheduling).
           q_step_offset =
-              (q_tiles_per_head - 1 - within_batch / params.h) * NUM_COMPUTE_GROUPS;
+              (q_tiles_per_head - 1 - static_cast<int>(tile_id) / (params.b * params.h)) *
+              NUM_COMPUTE_GROUPS;
+          int const tmp = static_cast<int>(tile_id) % (params.b * params.h);
+          bidh = tmp / params.b;
+          bidb = tmp % params.b;
         } else {
+          int const tiles_per_batch = q_tiles_per_head * params.h;
+          bidb = static_cast<int>(tile_id) / tiles_per_batch;
+          int const within_batch = static_cast<int>(tile_id) - bidb * tiles_per_batch;
           bidh = within_batch / q_tiles_per_head;
-          q_step_offset = (within_batch % q_tiles_per_head) * NUM_COMPUTE_GROUPS;
+          int local_q = within_batch % q_tiles_per_head;
+          if (reverse) {
+            // Per-head reversal: heaviest tile first within each head.
+            local_q = q_tiles_per_head - 1 - local_q;
+          }
+          q_step_offset = local_q * NUM_COMPUTE_GROUPS;
         }
         return true;
       }
@@ -235,16 +242,13 @@ struct DMA {
           bidh = tile_id_ % params.h;
           bidb = tile_id_ / params.h;
         } else {
-          // For b==1 or padded-seqlen batches (is_s_padded), seqlens are trivially
-          // uniform and the balanced scheduler can run directly without the dynamic
-          // decoder. For all other cases, use decode_exact_dynamic_tile_id, which
-          // supports true varlen batches and includes a uniform-seqlen fast path
-          // that also restores balanced (reverse-Q) ordering.
-          bool use_varlen_decoder = false;
+          // Padded batches tile by the padded seqlen (static paths below); everything
+          // else decodes tile ids from the actual seqlens in cu_q_seqlens.
+          bool use_exact_decoder = false;
           if constexpr (DMA_GROUP_TRANSPOSE_V) {
-            use_varlen_decoder = !(params.b == 1 || params.is_s_padded);
+            use_exact_decoder = !params.is_s_padded;
           }
-          if (use_varlen_decoder) {
+          if (use_exact_decoder) {
             q_steps = NUM_COMPUTE_GROUPS;
             bool reverse =
                 CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling;
@@ -977,4 +981,3 @@ struct DMA {
 
 }  // namespace ws
 }  // namespace fmha
-
