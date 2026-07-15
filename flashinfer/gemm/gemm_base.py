@@ -6405,14 +6405,12 @@ def _heuristic_func_mm_fp4(
     enable_pdl: bool = True,  # unused
 ):
     r"""
-    Heuristic function for mm_fp4 backend selection.
+    Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass.
     Note: trtllm is not considered in the backend selection because it requires a specific
     input quantization (swizzling/shuffling) that differs from the preparation used
     for cudnn and cutlass backends.
 
     Logic for which comes first:
-    - If CUDA version is 13+ and device is SM12x with NVFP4 - use b12x,
-      then cutlass, then cudnn.
     - If cuda version is 12 - use cutlass.
     - If cuda version is 13 and cudnn version is less than 9.15 - use cutlass.
     - If cuda version is 13 and cudnn version is 9.15 or greater:
@@ -6424,14 +6422,12 @@ def _heuristic_func_mm_fp4(
     # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
     major, minor = get_compute_capability(a.device)
     is_sm103 = major == 10 and minor == 3
-    is_sm12x = major == 12
+    is_sm120 = major == 12 and minor == 0
 
-    # SM12x + CUDA 13: prefer b12x (warp-level MMA, underfill tile selection).
-    # We enable BOTH SM120 and SM121 (GB10): upstream defaults SM121 to
-    # cutlass/cudnn for perf, but the campaign's VO-split / NVFP4 KV path needs
-    # b12x dispatch on GB10 (sm_121). SM120 and SM121 share the 12.x execution
-    # constraints; JIT/AOT arch selection is handled by the compilation context.
-    if is_sm12x and use_nvfp4 and cuda_major >= 13:
+    # SM120 + CUDA 13: prefer b12x. SM121 (GB10) is intentionally excluded -- b12x
+    # is supported there as an explicit backend, but cutlass/cudnn are faster in
+    # most cases, so `auto` keeps using them.
+    if is_sm120 and use_nvfp4 and cuda_major >= 13:
         return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
     # If cuda version is 13 or greater and cudnn version is 9.15 or greater:
@@ -6626,7 +6622,7 @@ def mm_fp4(
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"]
-        Backend to use, defaults to ``"auto"``. On SM12x, ``"auto"`` prefers
+        Backend to use, defaults to ``"auto"``. On SM120, ``"auto"`` prefers
         ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. On other
         architectures, ``"auto"`` selects between ``"cudnn"`` and ``"cutlass"``
         based on the current CUDA and cuDNN versions. The ``"trtllm"`` and
