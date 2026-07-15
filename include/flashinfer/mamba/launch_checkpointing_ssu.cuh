@@ -194,14 +194,15 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
       // Overrides (both snap to the HEADS_PER_GROUP>>k chain in dispatch_heads_per_cta):
       //  • precompute_heads_per_cta — the exposed HOST handle (Python-tunable; 0 = heuristic);
       //  • FLASHINFER_SSU_HEADS_PER_CTA — an ad-hoc env for quick sweeps.
-      // Precedence: explicit handle > env > heuristic.
-      static int const hc_env = [] {
+      // Precedence: explicit handle > env > heuristic.  Envs are read PER LAUNCH
+      // (getenv is ~ns against a launch; not static, so sweeps/tests see each change).
+      int const hc_env = [] {
         char const* e = std::getenv("FLASHINFER_SSU_HEADS_PER_CTA");
         return e ? std::atoi(e) : 0;
       }();
       if (hc_env > 0) hc = hc_env;
       if (precompute_heads_per_cta > 0) hc = precompute_heads_per_cta;
-      static int const pnw_env = [] {
+      int const pnw_env = [] {
         char const* e = std::getenv("FLASHINFER_SSU_PRECOMPUTE_NUM_WARPS");
         return e ? std::atoi(e) : 0;
       }();
