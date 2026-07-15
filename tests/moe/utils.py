@@ -22,7 +22,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from flashinfer import ActivationType, RoutingMethodType, is_gated_activation
+from flashinfer import RoutingMethodType, is_gated_activation
 from flashinfer.fused_moe import WeightLayout
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     normalize_cute_dsl_moe_activation_type,
@@ -540,7 +540,15 @@ def create_moe_tensors(
             sf_vec_size=sf_vec_size,
             is_sf_swizzled_layout=False,
         )
-        x_ref = x_bf16.float()
+        x_ref = e2m1_and_ufp8sf_scale_to_float(
+            x_quantized.cpu(),
+            x_sf.view(torch.uint8).cpu().reshape(-1),
+            torch.ones(1, dtype=torch.float32),
+            sf_vec_size=sf_vec_size,
+            ufp8_type=1,
+            is_sf_swizzled_layout=False,
+        ).to(device)
+        x_ref = x_ref.float()
     x_sf = x_sf.unsqueeze(-1)
 
     # Routing
@@ -828,7 +836,7 @@ def compute_reference_moe_relu2(
             expert_idx = token_selected_experts[token_idx, k].item()
             scale = token_final_scales[token_idx, k].item()
 
-            if expert_idx >= num_experts:
+            if expert_idx >= num_experts or expert_idx < 0:
                 continue
 
             w1 = fc1_weights[expert_idx]
