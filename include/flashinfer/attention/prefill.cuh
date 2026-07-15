@@ -507,7 +507,7 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
   }
 }
 
-template <typename KTraits, typename PagedKV>
+template <bool produce_v, typename KTraits, typename PagedKV>
 __device__ __forceinline__ size_t get_paged_kv_offset_for_logical_row(
     const PagedKV& paged_kv, const uint32_t packed_page_iter_base,
     const typename KTraits::IdType last_indptr, const uint32_t kv_head_idx,
@@ -517,9 +517,16 @@ __device__ __forceinline__ size_t get_paged_kv_offset_for_logical_row(
   constexpr uint32_t KV_THR_LAYOUT_COL = KTraits::KV_THR_LAYOUT_COL;
   uint32_t page_iter, entry_idx;
   paged_kv.page_size.divmod(packed_page_iter_base + logical_row, page_iter, entry_idx);
-  return paged_kv.protective_get_kv_offset(
-      page_iter, kv_head_idx, entry_idx,
-      (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DType>() / (IS_FP4 ? 2 : 1), last_indptr);
+  const uint32_t feat_idx = (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DType>() / (IS_FP4 ? 2 : 1);
+  // The K and V pools may carry different strides (e.g. NVFP4 VO-split caches
+  // where head_dim_qk != head_dim_vo), so route V rows through the V strides.
+  if constexpr (produce_v) {
+    return paged_kv.protective_get_v_offset(page_iter, kv_head_idx, entry_idx, feat_idx,
+                                            last_indptr);
+  } else {
+    return paged_kv.protective_get_k_offset(page_iter, kv_head_idx, entry_idx, feat_idx,
+                                            last_indptr);
+  }
 }
 
 template <bool produce_v, typename KTraits, typename SmemStorage, typename PagedKV>
@@ -550,7 +557,7 @@ __device__ __forceinline__ void page_produce_kv_on_the_fly(
     for (uint32_t i = 0; i < NUM_MMA_KV * ROWS_PER_ITER / NUM_WARPS_Q; ++i) {
       const uint32_t logical_row =
           warp_idx * ROWS_PER_ITER + lane_idx / 8 + NUM_WARPS * ROWS_PER_ITER * i;
-      DType* gptr = kv_ptr + get_paged_kv_offset_for_logical_row<KTraits>(
+      DType* gptr = kv_ptr + get_paged_kv_offset_for_logical_row<produce_v, KTraits>(
                                  paged_kv, packed_page_iter_base, last_indptr, kv_head_idx,
                                  logical_row, lane_idx);
 #pragma unroll
@@ -577,7 +584,7 @@ __device__ __forceinline__ void page_produce_kv_on_the_fly(
     for (uint32_t i = 0; i < NUM_MMA_KV * (ROWS_PER_ITER / 4) / NUM_WARPS_Q; ++i) {
       const uint32_t logical_row =
           warp_idx * ROWS_PER_ITER + lane_idx / 4 + NUM_WARPS * ROWS_PER_ITER * i;
-      DType* gptr = kv_ptr + get_paged_kv_offset_for_logical_row<KTraits>(
+      DType* gptr = kv_ptr + get_paged_kv_offset_for_logical_row<produce_v, KTraits>(
                                  paged_kv, packed_page_iter_base, last_indptr, kv_head_idx,
                                  logical_row, lane_idx);
       if constexpr (IS_FP4) {
