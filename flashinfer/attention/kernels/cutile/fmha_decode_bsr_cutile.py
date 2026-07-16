@@ -879,11 +879,13 @@ def _get_gqa_decode_autotune_configs(query_group_size: int, page_size: int = 128
                     for occupancy in [1, 2]:
                         configs.append(SimpleNamespace(BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, occupancy=occupancy))
         if not configs:
-            BLOCK_H = query_group_size if query_group_size > 0 else 1
-            if not _is_power_of_2(BLOCK_H):
-                BLOCK_H = _next_power_of_2(BLOCK_H) // 2
-                if BLOCK_H == 0:
-                    BLOCK_H = 1
+            # Reached only for odd query_group_size (any even ratio >= 2 gets
+            # BLOCK_H=2 from the loop above). BLOCK_H must DIVIDE query_group_size
+            # or the head-block grid over/under-covers query heads -- so pick the
+            # largest power-of-two divisor (n & -n), which always divides it and
+            # is >= 1. The old _next_power_of_2(n)//2 rounded to a non-divisor
+            # (e.g. ratio 3 -> 2, which splits 3 heads into a 2+2 grid).
+            BLOCK_H = (query_group_size & -query_group_size) if query_group_size > 0 else 1
             configs.append(SimpleNamespace(BLOCK_H=BLOCK_H, BLOCK_N=min(64, page_size), occupancy=1))
         _gqa_decode_autotune_cache[cache_key] = configs
     return _gqa_decode_autotune_cache[cache_key]
