@@ -239,6 +239,31 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
         return output
 
-    def destroy(self, workspace: Any) -> None:
-        if workspace is not None:
-            workspace.destroy()
+    def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        k = self._kernel_config
+        if k.knobs == "auto":
+            # Autotune retunes (and recompiles) the workspace's shared
+            # frontend at first compute; give each session its own buffer.
+            return None
+        import torch
+
+        from .....core.kernel.workspace_pool import knobs_pool_key
+
+        fp = fleet_params
+        return (
+            "mxfp8_cutedsl",
+            torch.cuda.current_device(),
+            self.ep_rank,
+            self.ep_world_size,
+            id(self._ep_comm_group),
+            fp.num_experts,
+            fp.max_tokens_per_rank,
+            k.top_k,
+            fp.token_hidden_size,
+            k.intermediate_size,
+            k.kind,
+            _resolve_gate_up_clamp(k),
+            k.in_kernel_fc2_reduce,
+            k.token_back_by_dispatch,
+            knobs_pool_key(k.knobs),
+        )

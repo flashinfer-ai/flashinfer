@@ -154,13 +154,34 @@ class MegaKernelBackend(ABC):
         bootstrap: "BootstrapConfig",
         fleet_params: "FleetParams",
     ) -> Any:
-        """Bind EP bootstrap (once) and allocate symmetric-memory workspace."""
+        """Bind EP bootstrap (once) and allocate symmetric-memory workspace.
+
+        Workspaces are shared across layer instances through the process-level
+        pool when the backend provides a pool key (see
+        :mod:`.workspace_pool`): all MoE layers of a model typically have
+        identical EP geometry, and per-layer symm buffers multiply NVSHMEM
+        heap use and compiled sessions by the layer count.
+        """
         self._ensure_ep_bootstrap(bootstrap)
-        return self._allocate_workspace(fleet_params)
+        key = self._workspace_pool_key(fleet_params)
+        if key is None:
+            return self._allocate_workspace(fleet_params)
+        from .workspace_pool import acquire_workspace
+
+        return acquire_workspace(key, lambda: self._allocate_workspace(fleet_params))
 
     @abstractmethod
     def _allocate_workspace(self, fleet_params: "FleetParams") -> Any:
         """Backend-specific symmetric-memory / workspace allocation."""
+
+    def _workspace_pool_key(self, fleet_params: "FleetParams") -> Any:
+        """Hashable sharing key for the workspace pool, or ``None`` (no pool).
+
+        Must capture EVERYTHING baked into the workspace at allocation:
+        geometry, EP identity, dtype/kind, clamp, combine wire, config-level
+        epilogue scalars, and knobs. Default is unpooled.
+        """
+        return None
 
     def validate_forward(  # noqa: B027 - intentional no-op default
         self,
@@ -197,5 +218,11 @@ class MegaKernelBackend(ABC):
         output: "torch.Tensor",
     ) -> "torch.Tensor": ...
 
-    def destroy(self, workspace: Any) -> None:  # noqa: B027 - intentional no-op default
-        """Release durable workspace resources."""
+    def destroy(self, workspace: Any) -> None:
+        """Release durable workspace resources (pool-aware, refcounted)."""
+        if workspace is None:
+            return
+        from .workspace_pool import release_workspace
+
+        if release_workspace(workspace):
+            workspace.destroy()

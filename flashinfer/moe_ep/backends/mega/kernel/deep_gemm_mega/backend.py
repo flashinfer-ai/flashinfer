@@ -155,6 +155,18 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
         )
         return output
 
-    def destroy(self, workspace: Any) -> None:
-        if workspace is not None:
-            workspace.destroy()
+    def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        import torch
+
+        k = self._kernel_config
+        fp = fleet_params
+        return (
+            "deep_gemm_mega",
+            torch.cuda.current_device(),
+            id(self.ep_comm_group),
+            fp.num_experts,
+            fp.max_tokens_per_rank,
+            k.top_k,
+            fp.token_hidden_size,
+            k.intermediate_size,
+        )
