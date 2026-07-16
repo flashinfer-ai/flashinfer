@@ -20,10 +20,12 @@ backend-native ``MoEWeightPack`` views, so that preparation lives in the
 implementation surface rather than being copy-pasted into tests and benchmarks
 (design doc CR2/CR7; reviewer comments C6, C7, C31, C32).
 
-The canonical NVFP4 helpers are exposed as
-``TrtllmFp4Config.prepare_weights(...)`` / ``CuteDslConfig.prepare_weights(...)``
-static helpers (see ``api.py``).  The SM90 Humming-style MXFP4 x FP8 helper is
-currently exposed as a flat helper for the CUTLASS fused-MoE path.
+The canonical NVFP4 and BF16 helpers are exposed as
+``TrtllmFp4Config.prepare_weights(...)`` /
+``CuteDslConfig.prepare_weights(...)`` /
+``TrtllmBf16Config.prepare_weights(...)`` static helpers (see ``api.py``).
+The SM90 Humming-style MXFP4 x FP8 helper is currently exposed as a flat helper
+for the CUTLASS fused-MoE path.
 """
 
 from __future__ import annotations
@@ -533,6 +535,99 @@ def prepare_trtllm_fp4_weights(
         "output1_scale_scalar": ones,
         "output1_scale_gate_scalar": ones,
         "output2_scale_scalar": ones,
+    }
+
+
+def prepare_trtllm_bf16_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+    permute_cache: Optional[dict] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the TRTLLM BF16 ``trtllm_bf16_routed`` weight view.
+
+    Layout is ``BlockMajorK`` — the only layout the bf16 trtllm-gen entry points
+    accept: per-expert fused-gated-activation row reorder chained with the
+    ``epilogue_tile_m=128`` MMA shuffle for gemm1 (the w3_w1 permute), plain
+    shuffle for gemm2, then ``block_k=128`` K-blocking on the uint8 view.  No
+    quantization — weights stay bf16.  The gated-act reorder on gemm1 is
+    required for SwiGLU: the kernel pairs gate/linear rows interleaved, and a
+    shuffle-only layout mis-pairs them (systematically wrong output that still
+    passes kernel-vs-same-kernel parity checks).
+
+    Parameters
+    ----------
+    w1_bf16 : Tensor
+        Gate+up expert weights ``[num_local_experts, 2*intermediate_size, hidden_size]``.
+    w2_bf16 : Tensor
+        Down-projection expert weights ``[num_local_experts, hidden_size, intermediate_size]``.
+    num_local_experts, hidden_size, intermediate_size : int
+        Expert geometry.
+    device : torch.device, optional
+        Target device; defaults to ``w1_bf16.device``.
+    permute_cache : dict, optional
+        Shape-keyed permute-index cache; defaults to a module-level cache.
+
+    Returns
+    -------
+    dict
+        Keys expected by ``TrtllmBf16RoutedRunner.pack_inputs``:
+        ``gemm1_weights``, ``gemm2_weights`` (both bf16, BlockMajorK).
+    """
+    from .core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        convert_to_block_layout,
+        get_w2_permute_indices_with_cache,
+    )
+
+    if device is None:
+        device = w1_bf16.device
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise ValueError(
+            f"prepare_trtllm_bf16_weights expects bf16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype} (the uint8 byte-view below "
+            f"would silently reinterpret other dtypes)"
+        )
+    expect_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expect_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expect_w1 or tuple(w2_bf16.shape) != expect_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expect_w1}/{expect_w2}"
+        )
+    # Honor the documented device target (no-op if already resident); contiguity
+    # is required for the uint8 view below.
+    w1_bf16 = w1_bf16.to(device).contiguous()
+    w2_bf16 = w2_bf16.to(device).contiguous()
+    if permute_cache is None:
+        permute_cache = _TRTLLM_PERMUTE_CACHE
+
+    epilogue_tile_m = 128  # TRTLLM kernel-internal constant
+    block_k = 128
+
+    w1_views, w2_views = [], []
+    for i in range(num_local_experts):
+        w1_u8 = w1_bf16[i].view(torch.uint8)
+        p1 = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache, w1_u8, epilogue_tile_m, is_gated_act_gemm=True
+        )
+        w1_views.append(
+            convert_to_block_layout(w1_u8[p1.to(device)].contiguous(), block_k)
+        )
+
+        w2_u8 = w2_bf16[i].view(torch.uint8)
+        p2 = get_w2_permute_indices_with_cache(permute_cache, w2_u8, epilogue_tile_m)
+        w2_views.append(
+            convert_to_block_layout(w2_u8[p2.to(device)].contiguous(), block_k)
+        )
+
+    return {
+        "gemm1_weights": torch.stack(w1_views).view(torch.bfloat16),
+        "gemm2_weights": torch.stack(w2_views).view(torch.bfloat16),
     }
 
 
