@@ -27,6 +27,9 @@ namespace cutlass_kernels {
 void interleave_fp4_weights_for_sm90_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
                                                 int rows, int cols, cudaStream_t stream = 0);
 
+void interleave_fp4_fp8_weights_for_sm90_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
+                                                    int rows, int cols, cudaStream_t stream = 0);
+
 void interleave_int4_weights_for_sm90_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
                                                  int rows, int cols, cudaStream_t stream = 0);
 

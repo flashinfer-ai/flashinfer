@@ -14,7 +14,14 @@ from tests.test_helpers.sink_attention_reference import sink_attention_unified
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 
 import flashinfer
-from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
+from flashinfer.utils import (
+    FP4Tensor,
+    ceil_div,
+    get_compute_capability,
+    get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    round_up,
+)
 
 pytestmark = pytest.mark.long_running
 
@@ -636,6 +643,7 @@ def _test_trtllm_batch_decode(
     return_lse: bool | None = None,
     provide_lse: bool = False,
     use_bmm1_scale_log2: bool = False,
+    reuse_multi_ctas_kv_counter_buffer: bool = False,
 ) -> None:
     """
     Common function for testing trtllm-gen decode.
@@ -905,6 +913,18 @@ def _test_trtllm_batch_decode(
         guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
         workspace_buffer[softmax_end:guard_end].zero_()
 
+    multi_ctas_kv_counter_buffer = None
+    if reuse_multi_ctas_kv_counter_buffer:
+        assert backend == "trtllm-gen"
+        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size,
+            num_qo_heads,
+            get_device_sm_count(torch.device(GPU_DEVICE)),
+        )
+        multi_ctas_kv_counter_buffer = torch.zeros(
+            counter_bytes, dtype=torch.uint8, device=GPU_DEVICE
+        )
+
     output_and_lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
         kv_cache_arg,
@@ -934,6 +954,7 @@ def _test_trtllm_batch_decode(
         lse=provided_lse,
         return_lse=effective_return_lse,
         bmm1_scale_log2=bmm1_scale_log2,
+        multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
     )
     if expects_lse:
         if effective_return_lse:
@@ -1008,6 +1029,49 @@ def _test_trtllm_batch_decode(
         atol=atol,
         max_mismatched_elements=max_mismatched_elements,
     )
+
+    if reuse_multi_ctas_kv_counter_buffer:
+        assert multi_ctas_kv_counter_buffer is not None
+        assert torch.count_nonzero(multi_ctas_kv_counter_buffer).item() == 0
+        reused_out = torch.empty_like(output)
+        reused_output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            q_input,
+            kv_cache_arg,
+            workspace_buffer,
+            page_table_kernel,
+            seq_lens.to(GPU_DEVICE),
+            torch.max(seq_lens).item(),
+            bmm1_scale,
+            bmm2_scale,
+            window_left,
+            out=reused_out,
+            out_dtype=out_dtype,
+            o_sf_scale=o_sf_scale,
+            o_sf_vec_size=o_sf_vec_size,
+            sinks=(sink if enable_sink else None),
+            kv_layout=kv_layout,
+            enable_pdl=enable_pdl,
+            backend=backend,
+            q_len_per_req=q_len_per_req,
+            o_scale=o_scale,
+            mask=mask,
+            max_q_len=max_q_len if max_q_len is not None else None,
+            cum_seq_lens_q=q_indptr if max_q_len is not None else None,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            kv_cache_sf=kv_cache_sf_kernel,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            bmm1_scale_log2=bmm1_scale_log2,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        )
+        assert reused_output.data_ptr() == reused_out.data_ptr()
+        assert torch.count_nonzero(multi_ctas_kv_counter_buffer).item() == 0
+        assert_close_with_mismatch_tolerance(
+            reused_output.float() * o_scale,
+            output.float() * o_scale,
+            rtol=rtol,
+            atol=atol,
+            max_mismatched_elements=max_mismatched_elements,
+        )
 
     # NVFP4 KV cache: use cosine similarity instead of element-wise comparison.
     # Cosine similarity is scale-invariant, which is important because the
@@ -1301,6 +1365,30 @@ def test_trtllm_batch_decode_bs1(
         device_scale,
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+def test_trtllm_batch_decode_gpt_oss_counter_reuse():
+    _test_trtllm_batch_decode(
+        backend="trtllm-gen",
+        kv_layout="HND",
+        batch_size=1,
+        q_len_per_req=1,
+        page_size=16,
+        num_kv_heads=8,
+        head_grp_size=8,
+        window_left=-1,
+        q_dtype="fp8",
+        o_dtype="fp8",
+        kv_dtype="fp8",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=8192,
+        head_dim=64,
+        device_scale=False,
+        skips_softmax=False,
+        uses_shared_paged_kv_idx=True,
+        reuse_multi_ctas_kv_counter_buffer=True,
     )
 
 
