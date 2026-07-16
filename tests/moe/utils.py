@@ -26,6 +26,7 @@ from flashinfer import RoutingMethodType, is_gated_activation
 from flashinfer.fused_moe import WeightLayout
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
 )
 from flashinfer.tllm_enums import (
     ActivationType,
@@ -335,6 +336,8 @@ def compute_reference_moe_fp4(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     swiglu_limit: float | None = None,
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
     gemm1_alpha: torch.Tensor | None = None,
     gemm2_alpha: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -356,12 +359,16 @@ def compute_reference_moe_fp4(
         num_local_experts: Number of local experts (for EP). Defaults to num_experts.
         local_expert_offset: Starting expert ID for this EP rank. Defaults to 0.
         activation_type: GEMM1 activation type. Use ActivationType.Swiglu for
-            gated SwiGLU/OAI and ActivationType.Relu2 for non-gated ReLU^2.
+            gated SwiGLU/OAI/SiTU, ActivationType.GegluTanh for
+            tanh-approximate GeGLU, and ActivationType.Relu2 for non-gated
+            ReLU^2. Setting situ_beta selects SiTU.
         activation: Optional B12x activation name. When provided, this takes
             precedence over activation_type.
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
+        situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
+        situ_linear_beta: Optional SiTU tanh clamp for the linear branch.
         gemm1_alpha: GEMM1 per-expert scalar scales [num_local_experts]
         gemm2_alpha: GEMM2 per-expert scalar scales [num_local_experts]
 
@@ -369,13 +376,23 @@ def compute_reference_moe_fp4(
         Output tensor [num_tokens, hidden_size]
     """
     if activation is None:
-        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        normalized_activation_type, gated = normalize_cute_dsl_moe_activation_type(
+            activation_type
+        )
+        validate_cute_dsl_moe_situ_config(
+            normalized_activation_type, situ_beta, situ_linear_beta
+        )
+        if situ_beta is not None:
+            activation = "situ"
+        elif normalized_activation_type == ActivationType.GegluTanh:
+            activation = "gelu_tanh"
         swiglu_alpha = DEFAULT_SWIGLU_ALPHA if swiglu_alpha is None else swiglu_alpha
         swiglu_beta = DEFAULT_SWIGLU_BETA if swiglu_beta is None else swiglu_beta
         swiglu_limit = DEFAULT_SWIGLU_LIMIT if swiglu_limit is None else swiglu_limit
     else:
         supported_activations = {
             "silu",
+            "situ",
             "gelu_tanh",
             "swigluoai_uninterleave",
         }
@@ -388,6 +405,12 @@ def compute_reference_moe_fp4(
         if activation == "swigluoai_uninterleave":
             swiglu_alpha = 1.702 if swiglu_alpha is None else swiglu_alpha
             swiglu_beta = 1.0 if swiglu_beta is None else swiglu_beta
+        elif activation == "situ":
+            if situ_beta is None:
+                raise ValueError("situ activation requires situ_beta")
+            validate_cute_dsl_moe_situ_config(
+                ActivationType.Swiglu, situ_beta, situ_linear_beta
+            )
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -432,7 +455,16 @@ def compute_reference_moe_fp4(
             if gated:
                 linear = gemm1_out[:, :intermediate_size]
                 gate = gemm1_out[:, intermediate_size:]
-                if activation == "gelu_tanh":
+                if activation == "situ":
+                    situ_gate = (
+                        situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+                    )
+                    if situ_linear_beta is not None:
+                        linear = situ_linear_beta * torch.tanh(
+                            linear / situ_linear_beta
+                        )
+                    act_out = situ_gate * linear
+                elif activation == "gelu_tanh":
                     act_out = F.gelu(gate, approximate="tanh") * linear
                 elif activation == "silu":
                     act_out = silu(gate) * linear
