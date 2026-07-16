@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .....core.validation.common import MoEEpConfigError
+
+
+def _use_fused_stage() -> bool:
+    # Bisection escape hatch back to the multi-kernel torch staging path.
+    return os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
 
 
 def stage_mega_moe_inputs(
@@ -18,12 +25,18 @@ def stage_mega_moe_inputs(
     *,
     norm_const: float = 1.0,
 ) -> None:
-    """bf16 ``hidden_states`` → NVFP4 activation + fp8 block scales."""
+    """bf16 ``hidden_states`` → NVFP4 activation + fp8 block scales.
+
+    Default path is the fused single-launch ``DataPreprocess`` staging kernel
+    (quant + routing repack in one launch); ``FLASHINFER_MEGA_FUSED_STAGE=0``
+    falls back to the original torch-composed staging below.
+    """
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # package import also bootstraps sys.path for the kernel packages.
     from .....kernel_src.cutedsl_megamoe import (
         Nvfp4BlockSize,
         ceil_div,
+        fused_quant_stage,
         nvfp4_quantize_per_block_16,
         round_up,
     )
@@ -35,6 +48,20 @@ def stage_mega_moe_inputs(
         raise ValueError("hidden_size must be a multiple of 128.")
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
+
+    if _use_fused_stage():
+        fused_quant_stage(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            x_nvfp4,
+            x_sf,
+            topk_idx_out,
+            topk_weights_out,
+            quant_type="nvfp4",
+            norm_const=norm_const,
+        )
+        return
 
     activation_fp32 = hidden_states.to(torch.float32)
     q, sf = nvfp4_quantize_per_block_16(activation_fp32, norm_const)
