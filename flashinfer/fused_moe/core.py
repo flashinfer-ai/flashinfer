@@ -2981,6 +2981,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
 
+        # TODO: This is not correct for gemm1_lora_delta or do_finalize=False
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
     @register_custom_op(
