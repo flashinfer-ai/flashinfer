@@ -257,7 +257,7 @@ def _get_default_kernel_configs():
     gpu_capability = torch.cuda.get_device_capability()
 
     if gpu_capability == (10, 0):
-        # Blackwell SM100 – aggressive config with epilogue subtiling
+        # Blackwell SM100 - aggressive config with epilogue subtiling
         return {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
@@ -268,7 +268,7 @@ def _get_default_kernel_configs():
             "EPILOGUE_SUBTILE": 1,
         }
     elif gpu_capability[0] >= 10:
-        # SM10x / SM12x – conservative default (autotuner finds best)
+        # SM10x / SM12x - conservative default (autotuner finds best)
         return {
             "BLOCK_M": 128,
             "BLOCK_N": 64,
@@ -356,11 +356,18 @@ def gemm_alpha_beta(
     else:
         KB, N = b.shape
 
-    assert K == KB, "incompatible dimensions"
-    assert c.shape == (M, N), "C must have shape [M, N]"
-    assert a.is_contiguous(), "A matrix must be contiguous"
-    assert b.is_contiguous(), "B matrix must be contiguous"
-    assert c.is_contiguous(), "C matrix must be contiguous"
+    # Explicit exceptions (not assert): asserts are stripped under `python -O`,
+    # which would let invalid shapes / non-contiguous tensors reach the launch.
+    if K != KB:
+        raise ValueError(f"incompatible dimensions: A K={K} vs B K={KB}")
+    if tuple(c.shape) != (M, N):
+        raise ValueError(f"C must have shape [{M}, {N}], got {tuple(c.shape)}")
+    if not a.is_contiguous():
+        raise ValueError("A matrix must be contiguous")
+    if not b.is_contiguous():
+        raise ValueError("B matrix must be contiguous")
+    if not c.is_contiguous():
+        raise ValueError("C matrix must be contiguous")
 
     # Convert boolean to int for ct.Constant
     transpose_a_int = 1 if trans_a else 0

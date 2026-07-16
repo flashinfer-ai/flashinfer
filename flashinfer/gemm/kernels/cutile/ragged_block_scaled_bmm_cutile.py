@@ -365,14 +365,16 @@ def _ragged_block_scaled_bmm_autotune_configs_unfiltered():
                         occupancy=occupancy,
                     )
     elif gpu_capability == (9, 0):
+        # NOTE: BLOCK_N must stay <= the FP8 block-scale N-granularity (128). The
+        # kernel loads a SINGLE b_scale entry per (pid_q, offs_bsn, k) and
+        # broadcasts it across the whole BLOCK_N tile, so a BLOCK_N=256 config
+        # would apply the first 128-column group's scale to the second group too
+        # (silent numerical error). Keep all configs at BLOCK_N=128.
         for BM, BN, swap_ab in [
             (256, 128, False),
             (128, 128, False),
             (64, 128, True),
             (32, 128, True),
-            (16, 256, True),
-            (32, 256, True),
-            (64, 256, True),
         ]:
             for BK in [128]:
                 for occupancy in [1, 2]:
@@ -585,9 +587,13 @@ def ragged_block_scaled_bmm(
             "align m_indptr segments to a multiple of BLOCK_M or pass a smaller BLOCK_M."
         )
 
-    # Calculate grid size for persistent scheduling
+    # Calculate grid size for persistent scheduling. Use total_m (a guaranteed
+    # host-side upper bound, always > 0 for nonempty input) rather than the
+    # max_m hint: a stale/zero max_m would make num_programs 0 and leave the
+    # output unwritten. The kernel still reads its per-tile bound from
+    # max_m_device, so this only affects the launched program count.
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    num_pid_m = ct.cdiv(max_m, BLOCK_M)
+    num_pid_m = ct.cdiv(total_m, BLOCK_M)
     num_pid_n = ct.cdiv(N, BLOCK_N)
     tiles_per_batch = num_pid_m * num_pid_n
     total_tiles = tiles_per_batch * Q
