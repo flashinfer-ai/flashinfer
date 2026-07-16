@@ -94,6 +94,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
     --ignore=tests/moe_ep/test_moe_ep_ht_correctness.py \
+    --ignore=tests/moe_ep/test_mega_cuda_graph.py \
     -k "not multirank_roundtrip"
 }
 
@@ -177,6 +178,12 @@ run_oracle() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
+    -m arch_blackwell || rc=1
+
+  # CUDA graph capture/replay for the cutedsl mega layer paths (1 GPU).
+  MEGA_NO_DIST=1 "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_mega_cuda_graph.py -v \
     -m arch_blackwell || rc=1
 
   # deep_gemm's symm buffer needs an initialized process group (no

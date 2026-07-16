@@ -608,3 +608,51 @@ def test_mega_layer_releases_pack_after_preprocess(dist_not_initialized):
     del pack
     gc.collect()
     assert ref() is None, "layer retained the source weight pack after preprocess"
+
+
+def test_mega_layer_workspace_alloc_raises_during_capture():
+    """Lazy workspace alloc must fail loudly inside CUDA graph capture."""
+    import torch
+
+    from flashinfer.moe_ep import MoEEpConfigError, MoEEpTensors
+
+    layer = _mega_layer()  # transformed supplied; workspace still lazy
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(4, 128, dtype=torch.bfloat16),
+        topk_ids=torch.zeros(4, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(4, 2),
+    )
+    with (
+        mock.patch("torch.cuda.is_available", return_value=True),
+        mock.patch("torch.cuda.is_current_stream_capturing", return_value=True),
+        pytest.raises(MoEEpConfigError, match="warmup"),
+    ):
+        layer.forward(t)
+
+
+def test_shim_capture_guard_raises_when_capturing():
+    """ensure_not_capturing raises with a warmup hint during capture."""
+    pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.comm import (
+        ensure_not_capturing,
+    )
+
+    with (
+        mock.patch("torch.cuda.is_available", return_value=True),
+        mock.patch("torch.cuda.is_current_stream_capturing", return_value=True),
+        pytest.raises(RuntimeError, match="warmup"),
+    ):
+        ensure_not_capturing("unit-test path")
+    # Not capturing: a plain no-op.
+    with mock.patch("torch.cuda.is_current_stream_capturing", return_value=False):
+        ensure_not_capturing("unit-test path")
+
+
+def test_mega_layer_warmup_requires_tensors_when_prestaged():
+    """warmup() cannot fabricate a pre-quantized batch (quantize_input=False)."""
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    layer = _mega_layer(quantize_input=False)
+    with pytest.raises(MoEEpConfigError, match="quantize_input=False"):
+        layer.warmup()
