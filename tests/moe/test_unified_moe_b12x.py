@@ -701,6 +701,12 @@ class TestUnifiedB12xConformance:
             source_format=source_format,
         )
         unified = _run_b12x_unified(layer, act_pack, weight_pack).clone()
+        w1_alpha = tensors["w1_alpha"]
+        w2_alpha = tensors["w2_alpha"]
+        if source_format == "compressed_tensors":
+            w1_alpha = w1_alpha.reciprocal()
+            w2_alpha = w2_alpha.reciprocal()
+
         wrapper = B12xMoEWrapper(
             num_experts=256,
             top_k=2,
@@ -713,11 +719,11 @@ class TestUnifiedB12xConformance:
             x=tensors["x_bf16"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
-            w1_alpha=tensors["w1_alpha"],
+            w1_alpha=w1_alpha,
             fc2_input_scale=tensors["fc2_input_scale"],
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
-            w2_alpha=tensors["w2_alpha"],
+            w2_alpha=w2_alpha,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
         )
