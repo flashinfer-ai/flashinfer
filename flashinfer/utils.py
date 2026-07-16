@@ -658,6 +658,9 @@ def determine_mla_backend(device: torch.device) -> str:
 def _check_block_tables_shape(
     block_tables: torch.Tensor,
     uses_shared_paged_kv_idx: bool,
+    block_sparse: bool = False,
+    num_kv_heads: Optional[int] = None,
+    batch_size: Optional[int] = None,
 ) -> None:
     """Validate ``block_tables`` rank against the paged KV index layout.
 
@@ -665,7 +668,35 @@ def _check_block_tables_shape(
     ``[batch_size, max_num_pages_per_seq]``.  Separate layout expects a 3-D
     tensor ``[batch_size, 2, max_num_pages_per_seq]`` where dim1 distinguishes
     K (0) and V (1) page indices.
+
+    Block-sparse attention (``block_sparse=True``) uses per-KV-head page
+    tables and expects a 3-D tensor ``[num_kv_heads, batch_size,
+    max_num_pages_per_seq]`` with the shared layout; the selected sparse
+    pages must be packed densely at the front of each row.
     """
+    if block_sparse:
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "block-sparse attention currently requires the shared paged-KV "
+                "index layout (uses_shared_paged_kv_idx=True)"
+            )
+        if block_tables.ndim != 3:
+            raise ValueError(
+                f"block_tables must be 3D [num_kv_heads, batch_size, "
+                f"max_num_pages_per_seq] for block-sparse attention, "
+                f"got ndim={block_tables.ndim}"
+            )
+        if num_kv_heads is not None and block_tables.shape[0] != num_kv_heads:
+            raise ValueError(
+                f"block_tables must have shape[0]==num_kv_heads ({num_kv_heads}) "
+                f"for block-sparse attention, got shape={block_tables.shape}"
+            )
+        if batch_size is not None and block_tables.shape[1] != batch_size:
+            raise ValueError(
+                f"block_tables must have shape[1]==batch_size ({batch_size}) "
+                f"for block-sparse attention, got shape={block_tables.shape}"
+            )
+        return
     expected_ndim = 2 if uses_shared_paged_kv_idx else 3
     if block_tables.ndim != expected_ndim:
         layout = "shared" if uses_shared_paged_kv_idx else "separate"

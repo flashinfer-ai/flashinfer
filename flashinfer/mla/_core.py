@@ -2395,6 +2395,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse,
             lse_stride_tokens,
             lse_stride_heads,
+            False,  # enable_block_sparse_attention
         )
         return out
 
@@ -3014,6 +3015,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             None,  # lse
             0,  # lse_stride_tokens
             0,  # lse_stride_heads
+            False,  # enable_block_sparse_attention
         )
         return out
 
