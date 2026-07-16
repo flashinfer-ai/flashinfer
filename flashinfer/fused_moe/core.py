@@ -1341,6 +1341,7 @@ def get_trtllm_moe_sm100_module():
                 self.top_k + nfse,
                 self.hidden_size,
                 self.intermediate_size,
+                self.num_experts + nfse,
                 self.num_local_experts + nfse,
                 self.activation_type,
                 self.use_shuffled_weight,
@@ -1359,6 +1360,15 @@ def get_trtllm_moe_sm100_module():
                     return []
                 MoERunner.valid_tactics_dict[instance_key] = valid_tactics
             return MoERunner.valid_tactics_dict[instance_key]
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple[Any, ...]:
+            """Separate persistent tactics across MoE expert geometry."""
+            return (
+                self.num_experts,
+                self.num_local_experts,
+                self.top_k,
+                self.num_fused_shared_experts,
+            )
 
         def forward(
             self,
