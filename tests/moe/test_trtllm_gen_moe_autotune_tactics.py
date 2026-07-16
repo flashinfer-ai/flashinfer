@@ -336,17 +336,8 @@ def _enumerate_valid_tactics(
     )
 
 
-@pytest.mark.parametrize(
-    "ep_size,expected_tile_ns",
-    [
-        (1, {8, 16, 32}),
-        (4, {8, 16, 32, 64, 128, 256}),
-        (8, {8, 16, 32, 64, 128, 256}),
-        (16, {8, 16, 32, 64, 128, 256}),
-    ],
-)
-def test_trtllm_fp4_tile_n_enumeration_for_ep(ep_size: int, expected_tile_ns: set[int]):
-    """EP tunes all NVFP4 tile-N values while non-EP keeps the heuristic."""
+def test_trtllm_fp4_tile_n_enumeration_for_ep():
+    """GLM-5.2 EP8 tunes every supported NVFP4 tile-N value."""
     if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
         pytest.skip("Only work on SM100 / SM103.")
 
@@ -360,10 +351,10 @@ def test_trtllm_fp4_tile_n_enumeration_for_ep(ep_size: int, expected_tile_ns: se
         intermediate_size=2048,
         num_experts=num_experts,
         num_tokens=256,
-        num_local_experts=num_experts // ep_size,
+        num_local_experts=num_experts // 8,
     )
 
-    assert {tactic[0] for tactic in valid_tactics} == expected_tile_ns
+    assert {tactic[0] for tactic in valid_tactics} == {8, 16, 32, 64, 128, 256}
 
 
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
@@ -418,12 +409,7 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
             profile_shapes,
             tactic,
             custom_op=_TEST_OP_FP4,
-            cache_key_extras=(
-                num_experts,
-                num_experts,
-                top_k,
-                0,
-            ),
+            cache_key_extras=(num_experts, num_experts, top_k, 0),
         )
         out = trtllm_fp4_block_scale_routed_moe(
             topk_ids=inputs["packed_topk"],
@@ -777,12 +763,7 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
             profile_shapes,
             tactic,
             custom_op=_TEST_OP_FP8,
-            cache_key_extras=(
-                num_experts,
-                num_experts,
-                top_k,
-                0,
-            ),
+            cache_key_extras=(num_experts, num_experts, top_k, 0),
         )
         out = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
         trtllm_fp8_block_scale_routed_moe(

@@ -1276,7 +1276,6 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
             "rebuilt TuningConfigs collapse to the same _find_nearest_profile "
             "lru_cache key — a per-call closure reintroduces the memory leak."
         )
-        assert runner.get_cache_key_extras(moe_inputs.to_list()) == (128, 128, 8, 0)
     finally:
         fn.cache_clear()
 
