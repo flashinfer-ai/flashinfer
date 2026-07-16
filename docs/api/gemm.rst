@@ -57,6 +57,18 @@ FP8 GEMM
     batch_deepgemm_fp8_nt_groupwise
     fp8_blockscale_gemm_sm90
 
+Low-latency TRT-LLM FP8 GEMM weight prep (also exported from ``flashinfer``):
+
+.. currentmodule:: flashinfer.trtllm_low_latency_gemm
+
+.. autosummary::
+    :toctree: ../generated
+
+    prepare_low_latency_gemm_weights
+
+.. currentmodule:: flashinfer.gemm
+
+
 Mixed Precision GEMM (fp8 x fp4)
 --------------------------------
 

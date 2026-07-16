@@ -488,7 +488,7 @@ class TunableRunner(ABC):
     @abstractmethod
     def get_valid_tactics(
         self, inputs: list[torch.Tensor], profile: OptimizationProfile
-    ) -> list[int]:
+    ) -> list[Any]:
         """One tactic corresponding to one cuda kernel normally, but how to interpret the meaning
         of tactic is pure internal details of the runner.
 
@@ -528,7 +528,7 @@ class TunableRunner(ABC):
     def forward(
         self,
         inputs: list[torch.Tensor],
-        tactic: int = -1,
+        tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs,  # all others are keyword args only
     ) -> Any:
@@ -1314,7 +1314,7 @@ class AutoTuner:
         tuning_config: TuningConfig,
         inputs: list[torch.Tensor],
         **kwargs,
-    ) -> tuple[TunableRunner, int]:
+    ) -> tuple[TunableRunner, Any]:
         """Choose the best runner and tactic combination through performance profiling.
 
         Args:
@@ -1325,9 +1325,9 @@ class AutoTuner:
             **kwargs: Arbitrary keyword arguments, will be passed to get_valid_tactics and forward method of each runner
 
         Returns:
-            Tuple[TunableRunner, int]: A tuple containing:
+            Tuple[TunableRunner, Any]: A tuple containing:
                 - The selected runner implementation
-                - The best tactic ID for that runner (-1 if using fallback)
+                - The best tactic for that runner (-1 if using fallback)
 
         Note:
             The method profiles different implementations and tactics to find the
@@ -2168,13 +2168,31 @@ class AutoTuner:
                 )
                 return False
 
+        skipped_legacy_cudnn_tactics = 0
         with self._lock:
             for key, value in configs.items():
                 runner_name = value[0]
                 tactic = _json_to_tactic(value[1])
+                if (
+                    runner_name.startswith("Cudnn")
+                    and isinstance(tactic, int)
+                    and tactic >= 0
+                ):
+                    skipped_legacy_cudnn_tactics += 1
+                    continue
                 self._file_configs[key] = (runner_name, tactic)
 
-        logger.info(f"[Autotuner]: Loaded {len(configs)} configs from {path}")
+        if skipped_legacy_cudnn_tactics:
+            logger.warning(
+                f"[Autotuner]: Skipped {skipped_legacy_cudnn_tactics} legacy "
+                "cuDNN config(s) using integer plan-index tactics. They will "
+                "be re-tuned when autotuning is enabled."
+            )
+
+        logger.info(
+            f"[Autotuner]: Loaded {len(configs) - skipped_legacy_cudnn_tactics} "
+            f"configs from {path}"
+        )
         return True
 
     def _prepare_input_tensors_with_batches(

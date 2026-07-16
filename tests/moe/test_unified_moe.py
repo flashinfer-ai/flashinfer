@@ -710,6 +710,8 @@ def _compute_ref(act_pack, tensors, shape):
         hidden_states=tensors["x_bf16"].float().cuda(),
         gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
         gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+        gemm1_alpha=tensors["w1_alpha"],
+        gemm2_alpha=tensors["w2_alpha"],
         token_selected_experts=act_pack.selected_experts,
         token_final_scales=act_pack.final_scales,
         num_tokens=act_pack.num_tokens,
@@ -782,47 +784,6 @@ BF16_RTOL = 3e-2
 BF16_ATOL = 3e-2
 
 
-def _bf16_kernel_weight_views(w1: torch.Tensor, w2: torch.Tensor):
-    """BlockMajorK weight views for the trtllm bf16 routed runner (per-expert).
-
-    The authoritative recipe is ``BF16Moe.prepare_static_weights_for_kernel``
-    (tests/moe/trtllm_gen_fused_moe_utils.py) — the only bf16 prep validated
-    against independent dense math: gemm1 rows get the fused-gated-activation
-    reorder chained with the ``epilogue_tile_m=128`` shuffle (the w3_w1
-    permute), gemm2 gets the plain shuffle, then both convert to BlockMajorK
-    (``block_k=128`` on the uint8 view).  Pure layout transform: the dense
-    reference uses the unshuffled weights.  (Do NOT copy the moe_ep /
-    routed-parity recipe of shuffle(64) without the gated reorder — those
-    tests compare kernel-vs-same-kernel, so their layout was never validated
-    against dense math and disagrees with the kernel's gate/linear pairing.)
-    """
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        convert_to_block_layout,
-        get_w2_permute_indices_with_cache,
-    )
-
-    epilogue_tile_m = 128
-    block_k = 128
-    cache: dict = {}
-    w1_views, w2_views = [], []
-    for i in range(w1.shape[0]):
-        p1 = _maybe_get_cached_w3_w1_permute_indices(
-            cache, w1[i].view(torch.uint8), epilogue_tile_m
-        )
-        s1 = w1[i].view(torch.uint8)[p1.to(w1.device)].contiguous()
-        p2 = get_w2_permute_indices_with_cache(
-            cache, w2[i].view(torch.uint8), epilogue_tile_m
-        )
-        s2 = w2[i].view(torch.uint8)[p2.to(w2.device)].contiguous()
-        w1_views.append(convert_to_block_layout(s1, block_k))
-        w2_views.append(convert_to_block_layout(s2, block_k))
-    return (
-        torch.stack(w1_views).view(torch.bfloat16),
-        torch.stack(w2_views).view(torch.bfloat16),
-    )
-
-
 def _bf16_dense_reference(
     x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
 ):
@@ -844,9 +805,9 @@ def _bf16_dense_reference(
         tok, nth = torch.where(mask)
         a = x32[tok] @ w1[local_e].float().t()
         inter = F.silu(a[:, intermediate_size:]) * a[:, :intermediate_size]
-        out[tok] += final_scales[tok, nth, None].float() * (
-            inter @ w2[local_e].float().t()
-        )
+        inter = inter.to(torch.bfloat16).float()  # gemm1 output is stored bf16
+        expert_out = (inter @ w2[local_e].float().t()).to(torch.bfloat16).float()
+        out[tok] += final_scales[tok, nth, None].float() * expert_out
     return out
 
 
@@ -917,14 +878,17 @@ def _make_bf16_packs_and_config(
         final_scales=final_scales,
     )
 
-    w1_view, w2_view = _bf16_kernel_weight_views(w1, w2)
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for(
         "trtllm_bf16_routed",
-        {
-            "gemm1_weights": w1_view,
-            "gemm2_weights": w2_view,
-        },
+        TrtllmBf16Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=local_num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        ),
     )
 
     config = MoEConfig(
@@ -1334,3 +1298,60 @@ class TestTrtllmEPOffset:
             f"offset={local_expert_offset}: EP-shard output diverges from the "
             f"offset-0 baseline ({pct * 100:.2f}% within tolerance, atol={atol:.4f})"
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. prepare_trtllm_bf16_weights input contract
+# ---------------------------------------------------------------------------
+# Validation fires before any CUDA work, so the negative tests are CPU-only.
+
+
+class TestPrepareTrtllmBf16Weights:
+    _E, _I, _H = 2, 64, 128
+
+    def _weights(self, dtype=torch.bfloat16):
+        E, I, H = self._E, self._I, self._H
+        return (
+            torch.randn(E, 2 * I, H).to(dtype),
+            torch.randn(E, H, I).to(dtype),
+        )
+
+    def _prepare(self, w1, w2, **overrides):
+        kwargs = dict(
+            num_local_experts=self._E,
+            hidden_size=self._H,
+            intermediate_size=self._I,
+        )
+        kwargs.update(overrides)
+        return TrtllmBf16Config.prepare_weights(w1, w2, **kwargs)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+    def test_rejects_non_bf16_dtype(self, dtype):
+        w1, w2 = self._weights(dtype)
+        with pytest.raises(ValueError, match="bf16"):
+            self._prepare(w1, w2)
+
+    def test_rejects_wrong_shape(self):
+        w1, w2 = self._weights()
+        with pytest.raises(ValueError, match="shape"):
+            self._prepare(w1[:, : self._I], w2)  # missing the gate half of gemm1
+
+    @sm100_required
+    def test_normalizes_noncontiguous_and_cpu_inputs(self):
+        """Non-contiguous and CPU-resident inputs yield the same views as the
+        contiguous on-device call (the .to(device).contiguous() normalization)."""
+        w1, w2 = self._weights()
+        w1, w2 = w1.cuda(), w2.cuda()
+        base = self._prepare(w1, w2)
+
+        # Same values, non-contiguous layout.
+        w1_nc = w1.transpose(1, 2).contiguous().transpose(1, 2)
+        assert not w1_nc.is_contiguous()
+        nc = self._prepare(w1_nc, w2)
+
+        # CPU-resident inputs with an explicit device target.
+        cpu = self._prepare(w1.cpu(), w2.cpu(), device=torch.device("cuda"))
+
+        for view in (nc, cpu):
+            for key in ("gemm1_weights", "gemm2_weights"):
+                assert torch.equal(view[key], base[key])
