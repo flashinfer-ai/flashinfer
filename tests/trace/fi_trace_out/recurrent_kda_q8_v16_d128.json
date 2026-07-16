@@ -1,0 +1,183 @@
+{
+  "name": "recurrent_kda_q8_v16_d128",
+  "description": "Recurrent Key-Driven Attention decode with per-key-dimension gating and an optional read-only committed-state source.",
+  "op_type": "kda",
+  "tags": [
+    "fi_api:flashinfer.kda_decode.recurrent_kda",
+    "stage:decode",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Number of input batch rows."
+    },
+    "seq_len": {
+      "type": "var",
+      "description": "Tokens carried by each input batch row."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of query and key heads."
+    },
+    "num_v_heads": {
+      "type": "const",
+      "value": 16,
+      "description": "Number of value heads."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Query, key, and value head dimension."
+    },
+    "state_pool_size": {
+      "type": "var",
+      "description": "Number of writable state slots."
+    },
+    "source_pool_size": {
+      "type": "var",
+      "description": "Number of committed-state slots."
+    },
+    "num_sequences": {
+      "type": "var",
+      "description": "Number of state-source indices."
+    }
+  },
+  "constraints": [
+    "num_v_heads % num_q_heads == 0",
+    "head_dim in (64, 128)"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "g": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "beta": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads"
+      ],
+      "dtype": "bfloat16"
+    },
+    "initial_state": {
+      "shape": [
+        "state_pool_size",
+        "num_v_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true
+    },
+    "initial_state_source": {
+      "shape": [
+        "source_pool_size",
+        "num_v_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "Read-only committed-state pool."
+    },
+    "initial_state_indices": {
+      "shape": [
+        "num_sequences"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Committed-state slot selected for each sequence."
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "output_final_state": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "use_qk_l2norm_in_kernel": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "use_gate_in_kernel": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "lower_bound": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "num_spec_tokens": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "beta_is_logit": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "final_state": {
+      "shape": [
+        "state_pool_size",
+        "num_v_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

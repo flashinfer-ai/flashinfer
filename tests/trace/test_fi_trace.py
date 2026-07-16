@@ -164,6 +164,46 @@ def test_attention_trace_check_tolerances_match_unit_tests():
     assert not single_prefill_with_kv_cache_trace.check([ref], [ref + 5e-3])
 
 
+def test_recurrent_kda_fi_trace():
+    import flashinfer.kda_decode
+
+    batch_size, num_q_heads, num_v_heads, head_dim = 4, 8, 16, 128
+    q = torch.empty(batch_size, 1, num_q_heads, head_dim, dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty(batch_size, 1, num_v_heads, head_dim, dtype=torch.bfloat16)
+    g = torch.empty_like(v)
+    beta = torch.empty(batch_size, 1, num_v_heads, dtype=torch.bfloat16)
+    state = torch.empty(
+        batch_size, num_v_heads, head_dim, head_dim, dtype=torch.bfloat16
+    )
+    source = torch.empty(
+        batch_size + 2, num_v_heads, head_dim, head_dim, dtype=torch.bfloat16
+    )
+    source_indices = torch.arange(batch_size, dtype=torch.int32)
+
+    defn = flashinfer.kda_decode.recurrent_kda.fi_trace(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=state,
+        initial_state_source=source,
+        initial_state_indices=source_indices,
+        beta_is_logit=True,
+    )
+
+    _check_defn(defn, "kda", "flashinfer.kda_decode.recurrent_kda")
+    assert defn["inputs"]["initial_state_source"]["shape"] == [
+        "source_pool_size",
+        "num_v_heads",
+        "head_dim",
+        "head_dim",
+    ]
+    assert defn["inputs"]["initial_state_indices"]["shape"] == ["num_sequences"]
+    assert defn["axes"]["head_dim"]["value"] == head_dim
+
+
 # ---------------------------------------------------------------------------
 # rmsnorm
 # ---------------------------------------------------------------------------

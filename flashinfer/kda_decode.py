@@ -27,6 +27,7 @@ from typing import Optional
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.kda import recurrent_kda_trace
 
 try:
     from .kda_kernels.recurrent_kda import run_recurrent_kda as _run_recurrent_kda
@@ -37,7 +38,7 @@ except (ImportError, RuntimeError):
     _RECURRENT_KDA_AVAILABLE = False
 
 
-@flashinfer_api
+@flashinfer_api(trace=recurrent_kda_trace)
 def recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -118,7 +119,8 @@ def recurrent_kda(
         num_accepted_tokens (Optional[torch.Tensor]):
             Per-sequence accepted token count from the previous spec decode
             round. Shape ``[N]`` int32. If ``None``, initial state is loaded
-            from ``ssm_state_indices[n, 0]``.
+            from ``ssm_state_indices[n, 0]``. Values above ``1+S`` are clamped
+            to the final checkpoint slot.
         output (Optional[torch.Tensor]):
             Pre-allocated output tensor. Shape ``[B, 1, HV, V]`` for standard
             decode, ``[1, N*(1+S), HV, V]`` for spec decode with

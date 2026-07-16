@@ -17,8 +17,9 @@ Recurrent KDA (Key-Driven Attention) decode kernels using CuTe DSL for SM100.
 
 Supports single-token decode and fused speculative-token updates with
 per-key-dimension gating.
-State S[V,K] is updated via: S = diag(g_exp) @ S + beta * k * (v - S^T k)
-Output: o = S^T q
+Stored state S[V,K] is updated via:
+S = S @ diag(g_exp) + beta * outer(v - S @ k, k)
+Output: o = S @ q
 
 Inputs:  q,k [B,T,H,K]  v,g [B,T,HV,K]  beta [B,T,HV]
 State:   [N,HV,V,K] bf16, updated in-place with optional separate initial source
@@ -188,6 +189,7 @@ def recurrent_kda_decode_kernel(
     HAS_INITIAL_STATE_SOURCE: cutlass.Constexpr[int],
     BETA_IS_LOGIT: cutlass.Constexpr[int],
     ZERO_PADDED_OUTPUT: cutlass.Constexpr[int],
+    HAS_NUM_ACCEPTED_TOKENS: cutlass.Constexpr[int],
 ):
     """One warp owns a [TILE_ROWS V, HEAD_DIM K] tile in registers.
 
@@ -226,9 +228,15 @@ def recurrent_kda_decode_kernel(
     init_seq_idx = batch_idx
     if USE_CU_SEQLENS == 1:
         init_raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS].to(cutlass.Int32)
-        if NUM_TOKENS > 1:
+        if NUM_TOKENS > 1 and HAS_NUM_ACCEPTED_TOKENS == 1:
             nat_raw = gNumAcceptedTokens[batch_idx].to(cutlass.Int32)
-            nat_offset = cutlass.Int32(0) if nat_raw <= 1 else (nat_raw - 1)
+            nat_offset = nat_raw - 1
+            nat_offset = cutlass.Int32(0) if nat_offset < 0 else nat_offset
+            nat_offset = (
+                cutlass.Int32(NUM_TOKENS - 1)
+                if nat_offset >= NUM_TOKENS
+                else nat_offset
+            )
             init_raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS + nat_offset].to(
                 cutlass.Int32
             )
@@ -286,8 +294,14 @@ def recurrent_kda_decode_kernel(
             raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS + token_t].to(
                 cutlass.Int32
             )
-            is_active = raw_slot >= 0
+            has_token = token_t < seq_len
+            is_active = raw_slot >= 0 and has_token
+            token_offset = token_offset if has_token else cutlass.Int32(0)
             seq_idx = cutlass.Int32(0) if raw_slot < 0 else raw_slot
+        else:
+            seq_idx = batch_idx
+            is_active = seq_len > 0
+        if USE_CU_SEQLENS == 1:
             q_head = gQ[(0, token_offset, query_head_idx, None)]
             k_head = gK[(0, token_offset, query_head_idx, None)]
             gate_head = gG[(0, token_offset, value_head_idx, None)]
@@ -295,8 +309,6 @@ def recurrent_kda_decode_kernel(
             o_head = gO[(0, token_offset, value_head_idx, None)]
             beta = gBeta[(0, token_offset, value_head_idx)].to(cutlass.Float32)
         else:
-            seq_idx = batch_idx
-            is_active = seq_len > 0
             q_head = gQ[(batch_idx, 0, query_head_idx, None)]
             k_head = gK[(batch_idx, 0, query_head_idx, None)]
             gate_head = gG[(batch_idx, 0, value_head_idx, None)]
@@ -392,8 +404,7 @@ def recurrent_kda_decode_kernel(
             v_loaded = v_head[v_offset + tidx].to(cutlass.Float32)
         for j in cutlass.range_constexpr(TILE_ROWS // V_LANES):
             for i in cutlass.range_constexpr(8):
-                h_val = h_reg[j, i] * gate_reg[i]
-                h_reg[j, i] = h_val
+                h_reg[j, i] = h_reg[j, i] * gate_reg[i]
             pred = _reduce_k_group(
                 _dot8_row(h_reg, j, k_reg, DOT_REDUCTION_SCHEDULE), HEAD_DIM
             )
@@ -404,8 +415,7 @@ def recurrent_kda_decode_kernel(
             )
             delta = (v_val - pred) * beta
             for i in cutlass.range_constexpr(8):
-                h_val = k_reg[i] * delta + h_reg[j, i]
-                h_reg[j, i] = h_val
+                h_reg[j, i] = k_reg[i] * delta + h_reg[j, i]
             out = _reduce_k_group(
                 _dot8_row(h_reg, j, q_reg, DOT_REDUCTION_SCHEDULE), HEAD_DIM
             )
@@ -461,6 +471,7 @@ def recurrent_kda_launch(
     HAS_INITIAL_STATE_SOURCE: cutlass.Constexpr[int],
     BETA_IS_LOGIT: cutlass.Constexpr[int],
     ZERO_PADDED_OUTPUT: cutlass.Constexpr[int],
+    HAS_NUM_ACCEPTED_TOKENS: cutlass.Constexpr[int],
 ):
     batch_size = mQ.shape[0]
     if USE_CU_SEQLENS == 1:
@@ -496,6 +507,7 @@ def recurrent_kda_launch(
         HAS_INITIAL_STATE_SOURCE,
         BETA_IS_LOGIT,
         ZERO_PADDED_OUTPUT,
+        HAS_NUM_ACCEPTED_TOKENS,
     ).launch(
         grid=[batch_size * HV * (HEAD_DIM // TILE_ROWS), 1, 1],
         block=[32, 1, 1],
@@ -596,6 +608,7 @@ def _get_compiled_kernel(
     TILE_ROWS,
     DOT_REDUCTION_SCHEDULE,
     ZERO_PADDED_OUTPUT,
+    HAS_NUM_ACCEPTED_TOKENS,
 ):
     """Compile a register-tile specialization."""
     return cute.compile(
@@ -613,6 +626,7 @@ def _get_compiled_kernel(
         HAS_INITIAL_STATE_SOURCE,
         BETA_IS_LOGIT,
         ZERO_PADDED_OUTPUT,
+        HAS_NUM_ACCEPTED_TOKENS,
         options="--enable-tvm-ffi --generate-line-info",
     )
 
@@ -745,6 +759,7 @@ def run_recurrent_kda(
             ``ssm_state_indices[n, 0]``.
             Kernel still writes all T=1+S checkpoint slots. Caller contract:
             ``num_accepted_tokens >= 1`` (the bonus token is always accepted).
+            Values above ``1+S`` are clamped to the final checkpoint slot.
             If ``None``, initial state is loaded from ``ssm_state_indices[n, 0]``.
         output (Optional[torch.Tensor]):
             Pre-allocated output tensor. Shape ``[B, 1, HV, V]`` for standard
@@ -996,6 +1011,12 @@ def run_recurrent_kda(
         else:
             out_buf = torch.empty(B, 1, HV, V, device=device, dtype=q.dtype)
 
+    # With no packed tokens there is no safe address for predicated loads and
+    # no recurrent update to perform. Output initialization above defines the
+    # result while the caller-owned state remains unchanged.
+    if cu_seqlens_i32 is not None and q.shape[1] == 0:
+        return (out_buf, state if output_final_state else None)
+
     # Compile kernel (cached by constexpr config)
     USE_QK_NORM = 1 if use_qk_l2norm_in_kernel else 0
     USE_GATE = 1 if use_gate_in_kernel else 0
@@ -1005,6 +1026,7 @@ def run_recurrent_kda(
     HAS_SOURCE = 1 if initial_state_source is not None else 0
     BETA_LOGIT = 1 if beta_is_logit else 0
     ZERO_PADDED_OUTPUT = 1 if zero_padded_output else 0
+    HAS_NAT = 1 if num_accepted_tokens is not None else 0
     if cu_seqlens is None:
         NUM_TOKENS = 1
 
@@ -1030,6 +1052,7 @@ def run_recurrent_kda(
         tile_rows,
         reduction_schedule,
         ZERO_PADDED_OUTPUT,
+        HAS_NAT,
     )
 
     # Dummy tensors for unused optional args (TVM FFI requires all args present)
@@ -1065,7 +1088,7 @@ def run_recurrent_kda(
         beta,
         state,
         initial_state_source if initial_state_source is not None else state,
-        initial_state_indices.to(torch.int32)
+        initial_state_indices.to(torch.int32).contiguous()
         if initial_state_indices is not None
         else dc["i32_1"],
         out_buf,

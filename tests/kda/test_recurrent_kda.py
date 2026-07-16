@@ -1164,7 +1164,7 @@ def test_spec_decode_separate_source_and_beta_logits(D):
     beta = beta_logits.sigmoid()
     source_values = torch.randn(N + 3, HV, D, D, dtype=torch.bfloat16, device=device)
     source_stride = HV * D * D + 32
-    source_backing = torch.empty(
+    source_backing = torch.zeros(
         (N + 3) * source_stride, dtype=torch.bfloat16, device=device
     )
     source = source_backing.as_strided(
@@ -1172,7 +1172,12 @@ def test_spec_decode_separate_source_and_beta_logits(D):
         stride=(source_stride, D * D, D, 1),
     )
     source.copy_(source_values)
-    source_indices = torch.tensor([3, 1, 5, 0], dtype=torch.int32, device=device)
+    source_backing_before = source_backing.clone()
+    source_indices_storage = torch.tensor(
+        [3, -1, 1, -1, 5, -1, 0, -1], dtype=torch.int32, device=device
+    )
+    source_indices = source_indices_storage[::2]
+    assert not source_indices.is_contiguous()
 
     reference_pool = scratch.clone()
     for batch_idx in range(N):
@@ -1210,6 +1215,7 @@ def test_spec_decode_separate_source_and_beta_logits(D):
     assert_spec_states(
         output_pool, ssm_state_indices, ref_states, N, T, atol=1e-1, rtol=5e-2
     )
+    assert torch.equal(source_backing, source_backing_before)
 
 
 @pytest.mark.parametrize(
@@ -1763,6 +1769,25 @@ def test_spec_decode_num_accepted_tokens():
     assert_spec_states(
         tri_pool_T, ssm_state_indices, ref_states_T, N, T, num_accepted_tokens=nat_T
     )
+
+    # Values above T clamp to the final checkpoint instead of indexing the next row.
+    nat_over = torch.full((N,), T + 2, dtype=torch.int32, device=device)
+    tri_pool_over = state_pool.clone()
+    out_over, _ = recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=tri_pool_over,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_spec_tokens=num_spec_tokens,
+        num_accepted_tokens=nat_over,
+    )
+    assert_close("nat_over_vs_T_out", out_over, out_T, atol=0, rtol=0)
+    assert_close("nat_over_vs_T_state", tri_pool_over, tri_pool_T, atol=0, rtol=0)
 
 
 def test_spec_decode_nat_equals_one_matches_no_nat():
@@ -2351,6 +2376,74 @@ def test_t1_cu_seqlens_all_padded():
     )
 
 
+@pytest.mark.parametrize("D", [64, 128])
+def test_t1_cu_seqlens_zero_length_rows(D):
+    """Middle and trailing empty rows neither read tokens nor update state."""
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    N, H = 3, 8
+    dtype = torch.bfloat16
+
+    q = torch.rand(1, 1, H, D, dtype=dtype, device=device)
+    k = torch.rand(1, 1, H, D, dtype=dtype, device=device)
+    v = torch.rand(1, 1, H, D, dtype=dtype, device=device)
+    g = F.logsigmoid(torch.randn(1, 1, H, D, device=device)).to(dtype)
+    beta = torch.rand(1, 1, H, dtype=dtype, device=device).sigmoid()
+    scale = D**-0.5
+    state_pool = torch.randn(N, H, D, D, dtype=dtype, device=device)
+    state_before = state_pool.clone()
+
+    ref_state = state_pool[1:2].clone()
+    ref_out, _ = recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=ref_state,
+    )
+
+    out, _ = recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=state_pool,
+        cu_seqlens=torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device),
+    )
+
+    assert_close("zero_length_output", out, ref_out, atol=0, rtol=0)
+    assert_close("zero_length_active_state", state_pool[1:2], ref_state, atol=0, rtol=0)
+    assert_close(
+        "zero_length_leading_state", state_pool[0], state_before[0], atol=0, rtol=0
+    )
+    assert_close(
+        "zero_length_trailing_state", state_pool[2], state_before[2], atol=0, rtol=0
+    )
+
+    empty_state = state_before.clone()
+    empty_state_before = empty_state.clone()
+    empty_out, empty_final_state = recurrent_kda(
+        q=q[:, :0],
+        k=k[:, :0],
+        v=v[:, :0],
+        g=g[:, :0],
+        beta=beta[:, :0],
+        scale=scale,
+        initial_state=empty_state,
+        output_final_state=True,
+        cu_seqlens=torch.zeros(N + 1, dtype=torch.int32, device=device),
+    )
+    assert empty_out.shape == (1, 0, H, D)
+    assert empty_final_state is empty_state
+    assert_close(
+        "all_zero_length_state", empty_state, empty_state_before, atol=0, rtol=0
+    )
+
+
 # ==============================================================================
 # 4: Batched spec decode (no cu_seqlens)
 # ==============================================================================
@@ -2459,7 +2552,7 @@ def test_spec_decode_batched_auto_ssi():
 
     # Call with ssm_state_indices=None -- shim auto-generates arange(B*T).reshape(B, T)
     tri_state_pool = state_pool.clone()
-    tri_out, _ = recurrent_kda(
+    tri_out, final_state = recurrent_kda(
         q=q,
         k=k,
         v=v,
@@ -2515,3 +2608,5 @@ def test_spec_decode_batched_auto_ssi():
     assert_spec_states(
         tri_state_pool, expected_ssi, ref_states, B, T, atol=1e-1, rtol=5e-2
     )
+    assert final_state is tri_state_pool
+    assert final_state.shape == (n_pool, HV, D, D)
