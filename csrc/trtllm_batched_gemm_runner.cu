@@ -141,6 +141,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         if (config.mSm != tg::CudaArch::Sm100a && config.mSm != tg::CudaArch::Sm100f) continue;
       }
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
+        // Disable 2-CTA kernels due to the random hang tracked in
+        // https://github.com/flashinfer-ai/flashinfer/issues/3971
+        if (options.mClusterDimX > 1) continue;
         // Skip cubins with clusterZ > 1 due to correctness issues described in
         // https://github.com/flashinfer-ai/flashinfer/issues/3197
         if (options.mClusterDimZ > 1) continue;
