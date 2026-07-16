@@ -1,175 +1,792 @@
-"""Session-scoped JIT pre-warm for the checkpointing-SSU suite.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-Each test lazily JIT-compiles its module URI (~2 min, mostly ONE cicc at a
-time), so after any kernel-header edit a full run spends 30-40 min in
-SEQUENTIAL rebuilds.  This fixture prebuilds the suite's whole URI matrix in
-parallel — on a 28-core box the rebuild takes ~10 min, and cold CI gets the
-same win.
+"""Shared fixtures for the mamba test suite.
 
-Each spec is built via its own ``JitSpec.build()`` (ninja rooted at the URI
-dir) — the SAME invocation ``build_and_load()`` uses at import time — NOT via
-``build_jit_specs``'s single batch graph.  The batch grapher keeps a separate
-ninja db at the JIT root; two dbs over the same outputs invalidate each other
-("stored deps info out of date"), so batch-prebuilt modules were fully
-recompiled AGAIN at load time, once per test, every session.  With per-spec
-builds there is one authoritative db per URI and the load-time ninja is a
-~100ms no-op.  Parallelism comes from a pool of ninjas (each URI is only ~3
-TUs, so a pool of ~nproc/3 keeps ~nproc nvcc's in flight, matching what the
-batch graph achieved).
-
-The matrix below is DATA, regenerable from a warm cache:
-    ls $FLASHINFER_JIT_DIR | grep checkpointing_ssu_ | <parse the URI fields>
-Rows missing from it simply build lazily as before; stale rows cost one no-op
-ninja edge.  Disable with FLASHINFER_TEST_WARM_JIT=0.
+Pre-compiles the ``checkpointing_ssu`` JIT variants the tests exercise in a
+single batched ninja invocation. ``checkpointing_ssu`` is not part of the AOT
+``flashinfer-jit-cache`` package, so a fresh CI container otherwise compiles
+each variant serially on first touch (~60s each x ~40 variants dominates the
+suite's wall time). Batch-building lets ninja schedule all of them in
+parallel across cores, and is a near-free no-op when the modules are already
+present in the JIT disk cache.
 """
 
-import contextlib
-import os
-from concurrent.futures import ThreadPoolExecutor
+import torch
 
-import pytest
-
-# (state, dt, weight, npredicted, max_window, hpg, ng, state_scale, philox, pdl);
-# input=bf16, matrixA=f32, stateIndex=i32, dim=64, dstate=128 throughout.
-_WARM_MATRIX = [
-    ("bf16", "bf16", "bf16", 4, 8, 16, 1, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 4, 16, 16, 1, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 6, 6, 16, 1, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 6, 6, 16, 1, "-", 0, 1),
-    ("bf16", "bf16", "bf16", 6, 8, 16, 1, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 6, 8, 16, 1, "-", 0, 1),
-    ("bf16", "bf16", "bf16", 6, 16, 16, 1, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 8, 16, 16, 1, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 10, 16, 16, 1, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 10, 16, 16, 1, "-", 0, 1),
-    ("bf16", "bf16", "bf16", 16, 16, 8, 2, "-", 0, 0),
-    ("bf16", "bf16", "bf16", 16, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "bf16", 6, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 4, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 6, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 6, 16, 16, 1, "-", 0, 1),
-    ("bf16", "f32", "f32", 8, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 10, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 12, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 14, 16, 16, 1, "-", 0, 0),
-    ("bf16", "f32", "f32", 16, 16, 16, 1, "-", 0, 0),
-    ("e4m3", "bf16", "bf16", 4, 16, 16, 1, "f32", 0, 0),
-    ("e4m3", "bf16", "bf16", 6, 6, 16, 1, "f32", 0, 0),
-    ("e4m3", "bf16", "bf16", 6, 6, 16, 1, "f32", 5, 0),
-    ("e4m3", "bf16", "bf16", 6, 6, 16, 1, "f32", 5, 1),
-    ("e4m3", "bf16", "bf16", 6, 6, 16, 1, "f32", 10, 0),
-    ("e4m3", "bf16", "bf16", 6, 6, 16, 2, "f32", 0, 0),
-    ("e4m3", "bf16", "bf16", 6, 6, 16, 2, "f32", 10, 0),
-    ("e4m3", "bf16", "bf16", 8, 16, 16, 1, "f32", 0, 0),
-    ("e4m3", "bf16", "bf16", 8, 16, 64, 1, "f32", 0, 0),
-    ("e4m3", "bf16", "bf16", 16, 16, 16, 1, "f32", 0, 0),
-    ("e4m3", "bf16", "bf16", 16, 16, 16, 1, "f32", 10, 0),
-    ("e4m3", "bf16", "bf16", 16, 16, 16, 2, "f32", 0, 0),
-    ("e4m3", "bf16", "bf16", 16, 16, 16, 2, "f32", 10, 0),
-    ("f16", "bf16", "bf16", 3, 16, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 4, 8, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 4, 8, 16, 1, "-", 10, 0),
-    ("f16", "bf16", "bf16", 4, 8, 16, 2, "-", 10, 0),
-    ("f16", "bf16", "bf16", 4, 16, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 6, 6, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 6, 6, 16, 1, "-", 10, 0),
-    ("f16", "bf16", "bf16", 6, 6, 16, 2, "-", 0, 0),
-    ("f16", "bf16", "bf16", 6, 6, 16, 2, "-", 10, 0),
-    ("f16", "bf16", "bf16", 6, 16, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 6, 16, 16, 1, "-", 5, 0),
-    ("f16", "bf16", "bf16", 8, 16, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 8, 16, 64, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 10, 16, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 10, 16, 16, 1, "-", 10, 0),
-    ("f16", "bf16", "bf16", 10, 16, 16, 2, "-", 0, 0),
-    ("f16", "bf16", "bf16", 10, 16, 16, 2, "-", 10, 0),
-    ("f16", "bf16", "bf16", 14, 16, 16, 1, "-", 10, 0),
-    ("f16", "bf16", "bf16", 14, 16, 16, 2, "-", 10, 0),
-    ("f16", "bf16", "bf16", 16, 16, 16, 1, "-", 0, 0),
-    ("f16", "bf16", "bf16", 16, 16, 16, 1, "-", 10, 0),
-    ("f16", "bf16", "bf16", 16, 16, 16, 2, "-", 0, 0),
-    ("f16", "bf16", "bf16", 16, 16, 16, 2, "-", 10, 0),
-    ("f16", "f16", "f16", 6, 16, 16, 1, "-", 0, 0),
-    ("f16", "f32", "f32", 6, 16, 16, 1, "-", 0, 1),
-    ("f16", "f32", "f32", 6, 16, 16, 1, "-", 5, 1),
-    ("f32", "bf16", "bf16", 4, 8, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 4, 16, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 6, 6, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 6, 16, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 8, 16, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 10, 16, 16, 1, "-", 0, 0),
-    ("f32", "bf16", "bf16", 16, 16, 16, 1, "-", 0, 0),
-    ("f32", "f32", "f32", 6, 16, 16, 1, "-", 0, 0),
-    ("f32", "f32", "f32", 6, 16, 16, 1, "-", 0, 1),
-    ("f32", "f32", "f32", 8, 16, 16, 1, "-", 0, 0),
-    ("f32", "f32", "f32", 10, 16, 16, 1, "-", 0, 0),
-    ("i8", "bf16", "bf16", 1, 1, 16, 1, "f32", 0, 0),
-    ("i8", "bf16", "bf16", 1, 1, 16, 1, "f32", 5, 0),
-    ("i8", "bf16", "bf16", 4, 16, 16, 1, "f32", 0, 0),
-    ("i8", "bf16", "bf16", 6, 6, 16, 1, "f32", 0, 0),
-    ("i8", "bf16", "bf16", 6, 6, 16, 1, "f32", 10, 0),
-    ("i8", "bf16", "bf16", 6, 6, 16, 2, "f32", 0, 0),
-    ("i8", "bf16", "bf16", 6, 6, 16, 2, "f32", 10, 0),
-    ("i8", "bf16", "bf16", 8, 16, 16, 1, "f32", 0, 0),
-    ("i8", "bf16", "bf16", 16, 16, 16, 1, "f32", 0, 0),
-    ("i8", "bf16", "bf16", 16, 16, 16, 1, "f32", 10, 0),
-    ("i8", "bf16", "bf16", 16, 16, 16, 2, "f32", 0, 0),
-    ("i8", "bf16", "bf16", 16, 16, 16, 2, "f32", 10, 0),
+# Every (state_dtype, input_dtype, dt_dtype, weight_dtype, matrixA_dtype,
+# stateIndex_dtype, state_scale_dtype, dim, dstate, npredicted, max_window,
+# heads_per_group, philox_rounds, enable_pdl) combination requested by
+# tests/mamba/test_checkpointing_ssu.py, captured by instrumenting
+# flashinfer.mamba.checkpointing_ssu._get_module over a full run of the file.
+# Keep in sync when adding parametrizations: a missing entry is harmless (the
+# test falls back to a serial first-touch compile), just slower.
+_CHECKPOINTING_SSU_VARIANTS = [
+    (
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        10,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        16,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        16,
+        16,
+        8,
+        0,
+        False,
+    ),
+    (
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        4,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        4,
+        8,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        6,
+        6,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        6,
+        6,
+        16,
+        0,
+        True,
+    ),
+    (
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        8,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        10,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        10,
+        16,
+        16,
+        10,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        14,
+        16,
+        16,
+        10,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        16,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        16,
+        16,
+        16,
+        10,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        4,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        4,
+        8,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        4,
+        8,
+        16,
+        10,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        6,
+        6,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        6,
+        6,
+        16,
+        10,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        8,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        8,
+        16,
+        64,
+        0,
+        False,
+    ),
+    (
+        torch.float32,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        10,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float32,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        16,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float32,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        4,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float32,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        4,
+        8,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float32,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        6,
+        6,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float32,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        8,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        16,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        16,
+        16,
+        16,
+        10,
+        False,
+    ),
+    (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        4,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        6,
+        6,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        6,
+        6,
+        16,
+        10,
+        False,
+    ),
+    (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        6,
+        6,
+        16,
+        5,
+        False,
+    ),
+    (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        6,
+        6,
+        16,
+        5,
+        True,
+    ),
+    (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        8,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        8,
+        16,
+        64,
+        0,
+        False,
+    ),
+    (
+        torch.int8,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        1,
+        1,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.int8,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        1,
+        1,
+        16,
+        5,
+        False,
+    ),
+    (
+        torch.int8,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        16,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.int8,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        16,
+        16,
+        16,
+        10,
+        False,
+    ),
+    (
+        torch.int8,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        4,
+        16,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.int8,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        6,
+        6,
+        16,
+        0,
+        False,
+    ),
+    (
+        torch.int8,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        6,
+        6,
+        16,
+        10,
+        False,
+    ),
+    (
+        torch.int8,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        torch.float32,
+        64,
+        128,
+        8,
+        16,
+        16,
+        0,
+        False,
+    ),
 ]
 
+# Only prewarm when a substantial chunk of the checkpointing suite is about to
+# run; a developer running one or two tests should not wait for 43 modules.
+_PREWARM_MIN_TESTS = 8
 
-@pytest.fixture(scope="session", autouse=True)
-def warm_checkpointing_jit():
-    if os.environ.get("FLASHINFER_TEST_WARM_JIT", "1") == "0":
-        yield
+
+def pytest_collection_modifyitems(config, items):
+    n_checkpointing = sum(
+        1 for item in items if "test_checkpointing_ssu" in item.nodeid
+    )
+    if n_checkpointing < _PREWARM_MIN_TESTS:
         return
-    import torch
+
+    import concurrent.futures
+    import contextlib
+    import os
+    import warnings
 
     from flashinfer.jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
 
-    dt = {
-        "bf16": torch.bfloat16,
-        "f16": torch.float16,
-        "f32": torch.float32,
-        "i8": torch.int8,
-        "i16": torch.int16,
-        "e4m3": torch.float8_e4m3fn,
-    }
-    specs = []
-    for s, d, w, np_, mw, hpg, ng, sc, pr, pdl in _WARM_MATRIX:
-        with contextlib.suppress(Exception):  # a bad row must not block the suite
-            specs.append(
-                gen_checkpointing_ssu_module(
-                    state_dtype=dt[s],
-                    input_dtype=torch.bfloat16,
-                    dt_dtype=dt[d],
-                    weight_dtype=dt[w],
-                    matrixA_dtype=torch.float32,
-                    stateIndex_dtype=torch.int32,
-                    state_scale_dtype=None if sc == "-" else dt[sc],
-                    dim=64,
-                    dstate=128,
-                    npredicted=np_,
-                    max_window=mw,
-                    heads_per_group=hpg,
-                    num_groups=ng,
-                    philox_rounds=pr,
-                    enable_pdl=bool(pdl),
-                )
+    # The prewarm is purely an optimization: any failure below degrades to
+    # the normal serial first-touch JIT compile at test time (where a real
+    # build error will surface attributed to the test that needs the module),
+    # and must never abort collection.
+    try:
+        # Skip variants whose .so already exists (warm JIT cache / AOT package).
+        specs = [
+            spec
+            for spec in (
+                gen_checkpointing_ssu_module(*variant)
+                for variant in _CHECKPOINTING_SSU_VARIANTS
             )
+            if not spec.get_library_path().exists()
+        ]
+    except Exception as exc:  # noqa: BLE001 — best-effort prewarm
+        warnings.warn(
+            f"checkpointing_ssu prewarm skipped (spec generation failed): {exc}",
+            stacklevel=2,
+        )
+        return
+    if not specs:
+        return
 
-    def _build(spec):
-        if spec.is_aot:
-            return None
-        try:
-            spec.build(verbose=False)
-        except Exception as exc:  # non-fatal: the lazy JIT path still works
-            return f"{spec.name}: {exc}"
-        return None
-
-    workers = max(2, (os.cpu_count() or 8) // 3)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for err in pool.map(_build, specs):
-            if err is not None:
-                print(f"[warm-jit] prebuild failed (will retry lazily): {err}")
-    yield
+    # Build missing modules through the standard per-module path (spec.build),
+    # parallelized with a thread pool. Do NOT use build_jit_specs() here: its
+    # single batched ninja invocation records commands in the cache root's
+    # .ninja_log, while each module's build.ninja sets builddir to the module
+    # directory — so the per-test build_and_load() would find no log entries
+    # for the batch-built outputs and recompile every module serially again.
+    #
+    # Concurrency: total concurrent compiler processes ~= pool workers x
+    # per-module ninja jobs (MAX_JOBS). Scale both from the core count so
+    # small CI runners are not oversubscribed, and treat a pre-set MAX_JOBS
+    # (the documented total ninja-job budget) as a cap.
+    prev_max_jobs = os.environ.get("MAX_JOBS")
+    total_jobs = os.cpu_count() or 4
+    if prev_max_jobs:
+        with contextlib.suppress(ValueError):
+            total_jobs = min(total_jobs, max(1, int(prev_max_jobs)))
+    max_workers = max(1, total_jobs // 2)
+    os.environ["MAX_JOBS"] = str(max(1, total_jobs // max_workers))
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(spec.build, verbose=False): spec for spec in specs}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as exc:  # noqa: BLE001 — best-effort prewarm
+                    warnings.warn(
+                        f"checkpointing_ssu prewarm build failed for "
+                        f"{futures[fut].name}; affected tests fall back to "
+                        f"serial first-touch JIT: {exc}",
+                        stacklevel=2,
+                    )
+    finally:
+        if prev_max_jobs is None:
+            os.environ.pop("MAX_JOBS", None)
+        else:
+            os.environ["MAX_JOBS"] = prev_max_jobs
