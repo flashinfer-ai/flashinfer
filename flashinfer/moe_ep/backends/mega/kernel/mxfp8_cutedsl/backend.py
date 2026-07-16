@@ -48,6 +48,18 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
+        if self._autotune_pending:
+            import warnings
+
+            warnings.warn(
+                "knobs='auto' runs a COLLECTIVE multi-minute compile+timing "
+                "sweep at the first forward — never use it inside a serving "
+                "engine. Tune offline instead (python -m flashinfer.moe_ep.tune"
+                "); winners persist in the knob cache and knobs=None then "
+                "resolves them with a pure lookup.",
+                UserWarning,
+                stacklevel=3,
+            )
 
     @classmethod
     def kernel_name(cls) -> str:

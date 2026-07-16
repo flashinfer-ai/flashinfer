@@ -19,6 +19,7 @@ bootstrap_paths()
 
 from .comm import (
     bootstrap_dist,
+    finalize_dist,
     free_sym_tensor,
     reset_compiled_mega_workspaces,
     resolve_gate_up_clamp,
@@ -83,13 +84,21 @@ from .autotune import (
 # Fused bf16 -> quant + routing staging (single-launch DataPreprocess).
 from .quant_stage import fused_quant_stage
 
+# Persistent offline-tuning knob cache (pure-lookup hot path).
+from .knob_cache import lookup_knobs, record_knobs, resolve_knobs
+
 __all__ = [
     # paths
     "bootstrap_paths",
     # quant_stage
     "fused_quant_stage",
+    # knob_cache
+    "lookup_knobs",
+    "record_knobs",
+    "resolve_knobs",
     # comm
     "bootstrap_dist",
+    "finalize_dist",
     "free_sym_tensor",
     "reset_compiled_mega_workspaces",
     "resolve_gate_up_clamp",

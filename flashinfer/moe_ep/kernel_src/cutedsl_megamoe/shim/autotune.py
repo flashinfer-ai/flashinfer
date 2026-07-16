@@ -120,12 +120,17 @@ def autotune_knobs(
     label: str,
     warmup_iters: int = 3,
     timed_iters: int = 10,
+    on_winner: Optional[Callable[[Dict[str, Any], float], None]] = None,
 ) -> Dict[str, Any]:
     """Time each candidate on the live problem and apply the winner.
 
     ``frontend`` is a NVFP4/MXFP8 mega frontend (must have ``apply_knobs``);
     ``launch`` is a zero-arg closure that runs one synchronized forward with
     the caller's real staged inputs (e.g. a ``nvfp4_mega_moe(...)`` call).
+
+    ``on_winner`` (optional) is called once with ``(winner, p50_seconds)``
+    after the winner is applied — used to persist the result in the knob
+    cache. It runs on every rank; the callback decides who writes.
 
     COLLECTIVE: every EP rank must call this in the same iteration with the
     same ``candidates`` (order included).  Returns the winning knob dict.
@@ -184,6 +189,8 @@ def autotune_knobs(
         )
     winner = candidates[best]
     frontend.apply_knobs(winner)
+    if on_winner is not None:
+        on_winner(winner, float(t[best]))
     if rank == 0:
         ranked = sorted(zip(t.tolist(), candidates, strict=False), key=lambda kv: kv[0])
         summary = "\n".join(f"    {us * 1e6:10.1f} us  {knobs}" for us, knobs in ranked)
@@ -232,14 +239,34 @@ def autotune_nvfp4_mega_moe(
             sync=True,
         )
 
+    cfg = symm_buffer._frontend.config
     if candidates is None:
         # Session-aware default sweep: prune ikr when the config can't run it
         # and quantized-combine-invalid combos up front.
-        cfg = symm_buffer._frontend.config
         candidates = nvfp4_candidates(
             combine_format=COMBINE_FORMAT_NAMES[cfg.combine_dtype],
             allow_in_kernel_fc2_reduce=cfg.apply_topk_in_fc1,
         )
+
+    def _record(winner: Dict[str, Any], p50_s: float) -> None:
+        # Persist for future pure-lookup engine starts; rank 0 writes (the
+        # winner is identical on all ranks after the all_reduce).
+        if cfg.rank == 0:
+            from .knob_cache import record_knobs
+
+            record_knobs(
+                winner,
+                dtype="nvfp4",
+                world_size=cfg.world_size,
+                hidden=cfg.hidden,
+                intermediate=cfg.intermediate,
+                num_experts=cfg.num_total_experts,
+                topk=cfg.num_topk,
+                max_tokens=cfg.num_tokens_per_rank,
+                combine_dtype=cfg.combine_dtype,
+                p50_us=p50_s * 1e6,
+                source="autotune",
+            )
 
     return autotune_knobs(
         symm_buffer._frontend,
@@ -248,6 +275,7 @@ def autotune_nvfp4_mega_moe(
         label="nvfp4_mega",
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
+        on_winner=_record,
     )
 
 
@@ -281,10 +309,30 @@ def autotune_mxfp8_mega_moe(
             sync=True,
         )
 
+    cfg = symm_buffer._frontend.config
     if candidates is None:
         candidates = mxfp8_candidates(
-            in_kernel_fc2_reduce=symm_buffer._frontend.config.in_kernel_fc2_reduce,
+            in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce,
         )
+
+    def _record(winner: Dict[str, Any], p50_s: float) -> None:
+        # Persist for future pure-lookup engine starts; rank 0 writes (the
+        # winner is identical on all ranks after the all_reduce).
+        if cfg.rank == 0:
+            from .knob_cache import record_knobs
+
+            record_knobs(
+                winner,
+                dtype=cfg.kind,
+                world_size=cfg.world_size,
+                hidden=cfg.hidden,
+                intermediate=cfg.intermediate,
+                num_experts=cfg.num_total_experts,
+                topk=cfg.num_topk,
+                max_tokens=cfg.num_tokens_per_rank,
+                p50_us=p50_s * 1e6,
+                source="autotune",
+            )
 
     return autotune_knobs(
         symm_buffer._frontend,
@@ -293,6 +341,7 @@ def autotune_mxfp8_mega_moe(
         label="mxfp8_mega",
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
+        on_winner=_record,
     )
 
 

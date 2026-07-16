@@ -847,15 +847,24 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_by_dispatch=token_back_by_dispatch,
     )
-    from .tuner import default_knobs, with_knobs
+    from .knob_cache import resolve_knobs
+    from .tuner import with_knobs
 
-    # Default tactic: the measured MXFP8 schedule (dtype="mxfp8"; one profile
-    # for all token counts, no tile knob -- MXFP8's mma_tiler is kernel-fixed
-    # at (256, 256)).  An explicit knobs= dict overrides it entirely.
-    cfg = with_knobs(
-        cfg,
-        knobs if knobs is not None else default_knobs(num_max_tokens, dtype="mxfp8"),
-    )
+    # knobs=None -> pure lookup: offline-tuned cache entry for this session
+    # key when present, else the measured MXFP8 heuristic (dtype="mxfp8"; no
+    # tile knob -- MXFP8's mma_tiler is kernel-fixed at (256, 256)).  An
+    # explicit knobs= dict overrides both entirely.
+    if knobs is None:
+        knobs, _ = resolve_knobs(
+            dtype=kind,
+            world_size=world_size,
+            hidden=hidden,
+            intermediate=intermediate,
+            num_experts=num_total_experts,
+            topk=num_topk,
+            max_tokens=num_max_tokens,
+        )
+    cfg = with_knobs(cfg, knobs)
     frontend = MegaMoEMxfp8Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)

@@ -41,6 +41,17 @@ def resolve_gate_up_clamp(
     return None
 
 
+def finalize_dist() -> None:
+    """Tear down torch.distributed + NVSHMEM (no-op under ``MEGA_NO_DIST``)."""
+    import torch.distributed as dist
+
+    if _no_dist() or not dist.is_initialized():
+        return
+    from src.bootstrap import finalize_dist_and_nvshmem
+
+    finalize_dist_and_nvshmem()
+
+
 def ensure_not_capturing(what: str) -> None:
     """Fail loudly if ``what`` would run during CUDA graph stream capture.
 

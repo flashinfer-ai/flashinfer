@@ -1,0 +1,204 @@
+"""Offline knob tuner for the cutedsl mega-MoE path.
+
+Runs the collective autotune sweep OUTSIDE any serving engine and persists
+the winners in the knob cache (see
+``kernel_src/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
+that constructs the mega layer with ``knobs=None`` (the default) resolves the
+recorded winner with a pure dict lookup — no compiles, no collectives, no
+timing on the hot path.
+
+Run with the SAME EP world size, GPU model, and geometry as production.
+Multi-rank (matches a 4-GPU EP deployment)::
+
+    torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \\
+        --dtype nvfp4 --hidden 7168 --intermediate 2048 \\
+        --num-experts 256 --topk 8 --max-tokens 8 512 2048
+
+Single-rank (no torchrun)::
+
+    MEGA_NO_DIST=1 python -m flashinfer.moe_ep.tune --dtype nvfp4 ...
+
+``--intermediate`` is the model's post-SwiGLU width (the
+``*MegaMoeConfig.intermediate_size`` convention); the shim-level conversion
+(NVFP4 sessions size fc1 as ``2 * intermediate``) is applied internally, so
+recorded cache keys match engine-time lookups exactly.
+
+Nondeterministic candidates (``in_kernel_fc2_reduce``) are EXCLUDED by
+default; pass ``--allow-nondeterministic`` to sweep them (a recorded ikr
+winner makes the engine's output accumulation order nondeterministic).
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from typing import Any, List, Optional
+
+
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m flashinfer.moe_ep.tune",
+        description="Offline cutedsl mega-MoE knob tuner (writes the knob cache).",
+    )
+    parser.add_argument(
+        "--dtype", choices=("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"), default="nvfp4"
+    )
+    parser.add_argument("--hidden", type=int, required=True)
+    parser.add_argument(
+        "--intermediate",
+        type=int,
+        required=True,
+        help="model post-SwiGLU intermediate size "
+        "(*MegaMoeConfig.intermediate_size convention)",
+    )
+    parser.add_argument("--num-experts", type=int, required=True)
+    parser.add_argument("--topk", type=int, required=True)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        nargs="+",
+        required=True,
+        help="buffer capacities (tokens/rank) to tune, one "
+        "sweep each — use the engine's actual buffer size(s)",
+    )
+    parser.add_argument(
+        "--combine-dtype",
+        choices=("bf16", "mxfp8", "nvfp4"),
+        default="bf16",
+        help="cross-rank combine wire (nvfp4 dtype only)",
+    )
+    parser.add_argument("--gate-up-clamp", type=float, default=None)
+    parser.add_argument(
+        "--allow-nondeterministic",
+        action="store_true",
+        help="also sweep in_kernel_fc2_reduce candidates",
+    )
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=None,
+        help="truncate the candidate list (smoke testing)",
+    )
+    parser.add_argument("--warmup-iters", type=int, default=3)
+    parser.add_argument("--timed-iters", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=0)
+    return parser.parse_args(argv)
+
+
+def _tune_one(
+    args: argparse.Namespace, rank: int, world_size: int, max_tokens: int
+) -> dict:
+    import json
+
+    from .kernel_src.cutedsl_megamoe import (
+        autotune_mxfp8_mega_moe,
+        autotune_nvfp4_mega_moe,
+        create_dummy_mxfp8_inputs,
+        create_dummy_nvfp4_inputs,
+    )
+    from .kernel_src.cutedsl_megamoe.shim.autotune import (
+        mxfp8_candidates,
+        nvfp4_candidates,
+    )
+
+    is_nvfp4 = args.dtype == "nvfp4"
+    symm_buffer: Any = None
+    try:
+        if is_nvfp4:
+            y, l1, l2, symm_buffer = create_dummy_nvfp4_inputs(
+                rank,
+                world_size,
+                args.num_experts,
+                max_tokens,
+                max_tokens,
+                args.topk,
+                args.hidden,
+                2 * args.intermediate,
+                gate_up_clamp=args.gate_up_clamp,
+                seed=args.seed,
+            )
+            candidates = nvfp4_candidates(
+                combine_format={
+                    "bf16": "bf16",
+                    "nvfp4": "16e2m1xbf16",
+                    "mxfp8": "32e4m3xe8m0",
+                }[args.combine_dtype],
+                allow_in_kernel_fc2_reduce=args.allow_nondeterministic,
+            )
+            tune = autotune_nvfp4_mega_moe
+        else:
+            y, l1, l2, symm_buffer = create_dummy_mxfp8_inputs(
+                rank,
+                world_size,
+                args.num_experts,
+                max_tokens,
+                max_tokens,
+                args.topk,
+                args.hidden,
+                args.intermediate,
+                kind=args.dtype,
+                gate_up_clamp=args.gate_up_clamp,
+                seed=args.seed,
+            )
+            candidates = mxfp8_candidates(
+                in_kernel_fc2_reduce=args.allow_nondeterministic,
+            )
+            tune = autotune_mxfp8_mega_moe
+
+        if args.max_candidates is not None:
+            candidates = candidates[: args.max_candidates]
+        if rank == 0:
+            print(
+                f"[moe_ep-tune] {args.dtype} max_tokens={max_tokens}: "
+                f"{len(candidates)} candidates",
+                flush=True,
+            )
+
+        winner = tune(
+            y,
+            l1,
+            l2,
+            symm_buffer,
+            num_tokens=max_tokens,
+            candidates=candidates,
+            warmup_iters=args.warmup_iters,
+            timed_iters=args.timed_iters,
+        )
+        if rank == 0:
+            print(
+                f"[moe_ep-tune] recorded winner for max_tokens={max_tokens}: "
+                f"{json.dumps(winner, default=list)}",
+                flush=True,
+            )
+        return winner
+    finally:
+        if symm_buffer is not None:
+            symm_buffer.destroy()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = _parse_args(argv)
+    if args.combine_dtype != "bf16" and args.dtype != "nvfp4":
+        print("--combine-dtype is only wired for --dtype nvfp4", file=sys.stderr)
+        return 2
+
+    import torch
+
+    from .kernel_src.cutedsl_megamoe import finalize_dist, init_dist
+    from .kernel_src.cutedsl_megamoe.shim.knob_cache import _cache_path
+
+    rank, world_size = init_dist()
+    try:
+        for max_tokens in args.max_tokens:
+            _tune_one(args, rank, world_size, max_tokens)
+        torch.cuda.synchronize()
+    finally:
+        finalize_dist()
+    if rank == 0:
+        path = _cache_path()
+        print(f"[moe_ep-tune] done; cache: {path or 'DISABLED'}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

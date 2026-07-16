@@ -1,8 +1,25 @@
 # TODO: knob selection flexible enough for vLLM — heuristic, not hot-path tuning
 
-Status: analysis only, nothing implemented yet (2026-07-16). Motivated by the
-2026-07-15 vLLM e2e runs (`$LUSTRE_ROOT/moe_ep_benchmark/vllm_e2e/RUNS.md`,
-run 13 + the "knobs=auto paradox" section).
+Status: PARTIALLY IMPLEMENTED (2026-07-16). The lookup infrastructure
+landed: a persistent knob cache
+(`kernel_src/cutedsl_megamoe/shim/knob_cache.py`,
+`FLASHINFER_MOE_EP_KNOB_CACHE`) keyed on (device, dtype, world_size,
+geometry, combine wire, max_tokens bucket); `get_symm_buffer_for_*` resolves
+`knobs=None` cache-first then falls back to `tuner.default_knobs`; autotune
+winners are auto-recorded (rank 0) so a single offline `knobs="auto"` run
+persists; offline CLI `python -m flashinfer.moe_ep.tune` (deterministic
+candidates by default, `--allow-nondeterministic` for ikr);
+`knobs="auto"` now warns loudly at backend construction pointing to the
+offline flow. Tests: `tests/moe_ep/test_knob_cache.py`.
+STILL OPEN: plan items 1–3 (sweep the DSV4-Flash geometry + production
+grid to actually populate the cache/heuristic table; the skewed-rank
+offline timing mode so tuner winners transfer to the pipelined engine —
+the 07-15 "tuner winner loses 13% e2e" paradox is unresolved) and item 6
+(re-run the vLLM matrix from the cache).
+
+Original analysis (2026-07-16, motivated by the 2026-07-15 vLLM e2e runs —
+`$LUSTRE_ROOT/moe_ep_benchmark/vllm_e2e/RUNS.md`, run 13 + the "knobs=auto
+paradox" section) below.
 
 ## Why the current mechanism doesn't work in an engine
 
