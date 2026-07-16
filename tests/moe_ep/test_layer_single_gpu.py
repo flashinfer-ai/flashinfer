@@ -332,3 +332,41 @@ def test_split_layer_forward_accepts_partial_batch(stubbed_fleet_registry):
     )
     out = split.forward(t)
     assert out.shape == (3, 8)
+
+
+def test_split_layer_releases_pack_after_init():
+    """MoEEpSplitLayer must not pin the source weight pack past __init__."""
+    import gc
+    import weakref
+
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        dummy_moe_weights,
+        IdentityConfig,
+        MoEEpSplitLayer,
+        NCCLEPConfig,
+        SplitConfig,
+    )
+
+    pack = dummy_moe_weights(num_local_experts=2, hidden=8)
+    ref = weakref.ref(pack)
+    split = MoEEpSplitLayer(
+        bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+        fleet_params=FleetParams(
+            num_experts=2,
+            max_tokens_per_rank=4,
+            token_hidden_size=8,
+        ),
+        weights=pack,
+        backend=SplitConfig(comm=NCCLEPConfig(), kernel=IdentityConfig()),
+    )
+    assert split._weights is None
+    del pack
+    gc.collect()
+    assert ref() is None, "split layer retained the source weight pack"

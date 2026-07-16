@@ -29,7 +29,15 @@ if TYPE_CHECKING:
 
 
 class MoEEpMegaLayer(nn.Module):
-    """Fused EP mega kernel — no separate dispatch/combine transport."""
+    """Fused EP mega kernel — no separate dispatch/combine transport.
+
+    Memory invariant: the source ``MoEWeightPack`` is released as soon as the
+    kernel's transformed weights exist — the transformed tensors own the
+    memory. Retaining the pack would hold a per-layer dequant copy (multiple
+    GB at large-model geometry) across every MoE layer and OOM at model load.
+    When ``backend.transformed_weights`` is supplied, the source pack is never
+    stored at all.
+    """
 
     def __init__(
         self,
@@ -61,7 +69,9 @@ class MoEEpMegaLayer(nn.Module):
         if backend.transformed_weights is None:
             validate_fleet_weights(weights, fleet_params, bootstrap.world_size)
 
-        self._weights: MoEWeightPack = weights
+        self._weights: Optional[MoEWeightPack] = (
+            weights if backend.transformed_weights is None else None
+        )
         self._transformed: Optional[Any] = None
         self._workspace: Any = None
 
@@ -78,9 +88,13 @@ class MoEEpMegaLayer(nn.Module):
     def _preprocess_weights(self) -> None:
         if self._transformed is not None:
             return
+        assert self._weights is not None, (
+            "source weight pack was released but no transformed weights exist"
+        )
         self._transformed = self._kernel.preprocess_weights(
             self._weights, self._fleet_params
         )
+        self._weights = None
 
     def _ensure_workspace(self) -> Any:
         if self._workspace is None:

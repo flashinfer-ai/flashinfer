@@ -1,7 +1,15 @@
 # TODO: MoEEpMegaLayer retains source weight pack after preprocess (OOM)
 
-Status: analysis only; fixed downstream in the vLLM wrapper patch, not yet
-upstream (2026-07-16). Found during the 2026-07-15 vLLM e2e integration
+Status: FIXED upstream (2026-07-16) — `MoEEpMegaLayer` no longer stores the
+pack when `transformed_weights` is supplied and releases it at the end of
+`_preprocess_weights()`; `MoEEpSplitLayer` releases it at the end of
+`__init__` (the kernel retains what it needs). Release tests added in
+`tests/moe_ep/test_mega_layer_validation.py` and
+`tests/moe_ep/test_layer_single_gpu.py`. Remaining follow-up: drop the
+`layer._weights = None` workaround from the vLLM integration patch
+(`moe_ep_benchmark/vllm_e2e/patch_0251/fi_utils.py`) — it is now a harmless
+no-op-equivalent (sets an already-None field). Originally found during the
+2026-07-15 vLLM e2e integration
 (run log: `$LUSTRE_ROOT/moe_ep_benchmark/vllm_e2e/RUNS.md`, run 7).
 
 ## Symptom
