@@ -95,9 +95,8 @@ def _force_tactic_in_autotuner_cache(
     profile_shapes: tuple,
     tactic: list[int] | None,
     custom_op: str,
-    cache_key_extras: tuple,
 ) -> None:
-    file_key = str((custom_op, _TEST_RUNNER, profile_shapes, cache_key_extras))
+    file_key = str((custom_op, _TEST_RUNNER, profile_shapes, ()))
     tuner = AutoTuner.get()
     tuner.profiling_cache.clear()
     tuner._file_configs.clear()
@@ -405,12 +404,7 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     profile_shapes = _moe_profile_shapes(inputs, num_tokens, bucket_m)
 
     def _run_kernel_with_tactic(tactic: list[int] | None) -> torch.Tensor:
-        _force_tactic_in_autotuner_cache(
-            profile_shapes,
-            tactic,
-            custom_op=_TEST_OP_FP4,
-            cache_key_extras=(num_experts, num_experts, top_k, 0),
-        )
+        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP4)
         out = trtllm_fp4_block_scale_routed_moe(
             topk_ids=inputs["packed_topk"],
             routing_bias=None,
@@ -759,12 +753,7 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
     )
 
     def _run_kernel_with_tactic(tactic: list[int] | None) -> torch.Tensor:
-        _force_tactic_in_autotuner_cache(
-            profile_shapes,
-            tactic,
-            custom_op=_TEST_OP_FP8,
-            cache_key_extras=(num_experts, num_experts, top_k, 0),
-        )
+        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP8)
         out = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
         trtllm_fp8_block_scale_routed_moe(
             topk_ids=inputs["packed_topk"],
