@@ -105,7 +105,7 @@ class MoELayer:
             runner = runner_cls(config, device=self.device)
             try:
                 runner.check_support()
-            except Exception:
+            except (NotImplementedError, ValueError, RuntimeError):
                 continue
             self.runners.append(runner)
 
