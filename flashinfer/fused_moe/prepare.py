@@ -775,7 +775,7 @@ def prepare_b12x_nvfp4_weights(
     num_local_experts, hidden_size, intermediate_size : int
         Expert geometry.
     activation : str
-        Kernel activation name: ``"silu"`` or ``"relu2"``.
+        Kernel activation name: ``"silu"``, ``"gelu_tanh"``, or ``"relu2"``.
     device : torch.device, optional
         Target device; defaults to ``w1_bf16.device``.
 
@@ -788,7 +788,7 @@ def prepare_b12x_nvfp4_weights(
     """
     from .cute_dsl.blackwell_sm12x.moe_activation import is_gated_activation
 
-    supported_activations = {"silu", "relu2"}
+    supported_activations = {"silu", "gelu_tanh", "relu2"}
     if activation not in supported_activations:
         raise ValueError(
             f"unsupported b12x NVFP4 activation {activation!r}; expected one of "
