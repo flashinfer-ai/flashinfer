@@ -527,7 +527,7 @@ routine_cc_to_supported_backends = {
         "8.0": [],
         "8.6": [],
         "8.9": [],
-        "9.0": [],
+        "9.0": ["cutlass"],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
         "12.0": ["cutlass"],
@@ -1004,6 +1004,16 @@ routine_cc_to_supported_backends = {
         "12.1": [],
     },
 }
+
+
+def validate_cutlass_variant_compute_capability(
+    variant: str, compute_capability: tuple[int, int]
+) -> None:
+    """Validate architecture-specific CUTLASS fused MoE variants."""
+    if variant == "mxfp4_fp8_humming" and compute_capability != (9, 0):
+        raise ValueError("mxfp4_fp8_humming requires an SM90 GPU")
+    if variant == "nvfp4" and compute_capability < (10, 0):
+        raise ValueError("nvfp4 cutlass_fused_moe requires SM100 or newer")
 
 
 def filter_backends_by_compute_capability(backends, routine, device):

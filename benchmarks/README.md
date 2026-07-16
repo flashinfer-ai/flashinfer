@@ -33,7 +33,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
     - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
-    - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
+    - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4/mxfp4_fp8_humming variants with optional TP/EP)
 - MOE Communication:
     - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
 - AllReduce Communication:
@@ -259,7 +259,7 @@ The output CSV will contain detailed metrics including:
 | `--use_routing_scales_on_input` | Whether to use routing scales on input (for Llama4 routing)                                         |
 | `--input_dtype`          | Data type of the input hidden states. Default: bfloat16                                                    |
 | `--weight_dtype`         | Data type of the weights (before quantization). Default: bfloat16                                          |
-| `--cutlass_variant`      | CUTLASS MoE variant: `base` (no quant), `fp8` (per-tensor FP8), `nvfp4` (FP4 block-scale)                   |
+| `--cutlass_variant`      | CUTLASS MoE variant: `base` (no quant), `fp8` (per-tensor FP8), `nvfp4` (FP4 block-scale), `mxfp4_fp8_humming` (SM90 Humming-style MXFP4 x FP8) |
 | `--quantized_input`      | For `nvfp4` only: quantize input activations to FP4                                                         |
 | `--tp_size`              | Tensor-parallel world size                                                                                  |
 | `--tp_rank`              | Tensor-parallel rank                                                                                        |
@@ -516,7 +516,7 @@ Legend:
 | **trtllm_fp4_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
-| **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
+| **cutlass_fused_moe** |  |  |  |  | cutlass | cutlass | cutlass |  |
 | **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
 | **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
