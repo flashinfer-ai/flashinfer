@@ -19,9 +19,9 @@ weight-memory budget so one config never hogs the GPU (parallel-CI-friendly), pl
 larger-end shapes. Large expert counts are reached with small H/I and/or **expert-parallel shards**
 (global>local + ``local_expert_offset``, the real deployment shape), not by filling the GPU.
 
-A small ``_KNOWN_FAILURES`` ledger xfails already-filed bugs (e.g. trtllm EP offset>0 -> all-zero,
-EP_OFFSET_FINDING.md): the case is still *run* so the suite stays green on a tracked bug yet flags
-loudly the day it starts passing (fixed). A crash is never tolerated -- only a wrong answer.
+A small ``_KNOWN_FAILURES`` ledger xfails already-filed bugs (e.g. the since-fixed trtllm EP
+offset>0 all-zero bug, gh #3547): the case is still *run* so the suite stays green on a tracked bug
+yet flags loudly the day it starts passing (fixed). A crash is never tolerated -- only a wrong answer.
 
 Verification model (single mode, uniform -- every config that runs gets the same checks):
   1. **no crash / no NaN-Inf** where the reference is finite.
@@ -66,7 +66,7 @@ comparison adds no pass/fail power, only redundancy. See the design discussion.)
 Coverage today: NVFP4 (CuteDSL + TRTLLM-FP4-routed) on SM100 -- the only wired MVP runners.
 
 OPT-IN: this suite is gated behind FLASHINFER_UMOE_FUZZ (see the pytestmark below) and is
-SKIPPED unless that env var is set -- waived in CI pending gh #3547 and root-cause of a
+SKIPPED unless that env var is set -- waived in CI pending root-cause of a
 whole-process device-side-assert abort that would block B200 CI. Run it explicitly:
   FLASHINFER_UMOE_FUZZ=1 CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<sm100-idx> \
     pytest tests/moe/test_unified_moe_fuzz.py
@@ -129,8 +129,8 @@ OUT OF SCOPE for this single-GPU correctness harness (must live elsewhere, do NO
 POINTERS for future agents (point me at this file and I know the rest):
   * Full context (this fuzzer + the older adapter/GEMM fuzzers + the audit + findings): cuDNN-
     project auto-memory ``flashinfer_quality_fuzzers.md``.
-  * Bugs THIS fuzzer found + filed: gh #3547 (trtllm EP offset>0 all-zero -- encoded in the
-    ``_KNOWN_FAILURES`` ledger below: xfailed but still RUN, so an xpass announces the fix) and
+  * Bugs THIS fuzzer found + filed: gh #3547 (trtllm EP offset>0 all-zero -- tracked in the
+    ``_KNOWN_FAILURES`` ledger below until fixed) and
     gh #3548 (activation global-scale gap == roadmap #5's scale-policy fix).
   * Findings writeups: flashinfer_triage/EP_OFFSET_FINDING.md, flashinfer_triage/WEIGHT_SCALE_FINDING.md.
   * The unified API under test: PR #3093 (branch ``moe_api``); this fuzzer is PR aleozlx/flashinfer#6
@@ -162,6 +162,7 @@ from flashinfer.fused_moe.api import (
     QuantConfig,
     QuantVariant,
     RoutingConfig,
+    TrtllmBf16Config,
     TrtllmFp4Config,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
@@ -172,20 +173,20 @@ NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "80"))
 BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
 
 # --- CI-safety gate: OPT-IN ----------------------------------------------------------------
-# Waived in CI pending gh #3547 + root-cause of a whole-process abort. Running the SM100 fuzzer
+# Waived in CI pending root-cause of a whole-process abort. Running the SM100 fuzzer
 # in a single `pytest` process can hit `CUDA error: device-side assert triggered` ->
 # `Fatal Python error: Aborted`, which would BLOCK B200 CI (an abort fails the whole job, not one
 # test). Notes from triage (2026-06-09): per-config isolation (one process each) passes 68/86
-# incl. EP offset>0 -- so the abort is NOT cleanly attributable to one config (the gh #3547 EP
-# case returns tolerated zeros, no assert, under torch.cuda.synchronize); it surfaces only in the
-# accumulated single-process run that CI uses. `pytest --forked` can't isolate it here either
-# (CUDA inits at collection -> "Cannot re-initialize CUDA in forked subprocess"). Until the abort
-# is root-caused and #3547 fixed (follow-up PR), this suite is opt-in: set FLASHINFER_UMOE_FUZZ=1
+# incl. EP offset>0 -- so the abort is NOT cleanly attributable to one config (the since-fixed
+# gh #3547 EP case returned tolerated zeros, no assert, under torch.cuda.synchronize); it surfaces
+# only in the accumulated single-process run that CI uses. `pytest --forked` can't isolate it
+# either (CUDA inits at collection -> "Cannot re-initialize CUDA in forked subprocess"). Until the
+# abort is root-caused, this suite is opt-in: set FLASHINFER_UMOE_FUZZ=1
 # to run it (developer / nightly / SM100 box). Unset (CI default) -> collected-and-skipped, so it
 # never launches a kernel and cannot abort the job.
 pytestmark = pytest.mark.skipif(
     not os.environ.get("FLASHINFER_UMOE_FUZZ"),
-    reason="opt-in fuzzer (set FLASHINFER_UMOE_FUZZ=1); waived in CI pending gh #3547 and "
+    reason="opt-in fuzzer (set FLASHINFER_UMOE_FUZZ=1); waived in CI pending "
     "root-cause of the whole-process device-side-assert abort",
 )
 
@@ -195,6 +196,7 @@ pytestmark = pytest.mark.skipif(
 _DETERMINISTIC = {
     "trtllm_fp4_routed": True,  # bitwise-stable across reruns in calibration
     "cute_dsl_nvfp4": False,  # atomic scatter-add finalize -> non-bit-exact by design
+    "trtllm_bf16_routed": True,  # same trtllm-gen finalize path as fp4_routed; bitwise-stable in calibration
 }
 
 # Known-bug ledger: (backend_key, predicate(cfg)) -> reason. A matching (backend, config) is run but
@@ -202,11 +204,8 @@ _DETERMINISTIC = {
 # bug while still EXERCISING it, so the day the bug is fixed the case starts passing and we get a loud
 # "unexpectedly passed -> remove this entry" signal. A crash is never tolerated (only wrong answers).
 _KNOWN_FAILURES = [
-    (
-        "trtllm_fp4_routed",
-        lambda c: c.expert_offset > 0,
-        "trtllm EP local_expert_offset>0 -> all-zero output (offset applied twice); gh #3547",
-    ),
+    # Entries: (backend_key, predicate(cfg), "reason; gh #NNNN").
+    # Empty since the gh #3547 EP-offset double-subtraction fix.
 ]
 
 
@@ -258,7 +257,7 @@ class DTypeHandler:
     rtol: float
 
 
-def _nvfp4_poison(buf):
+def _poison_bf16_out(buf):
     """Fill a bf16 output buffer with large garbage + scattered NaN/±Inf. If a kernel reads or
     scatter-adds into an uninitialized output instead of fully writing it, the poison leaks and
     is caught by no-NaN / numeric. This is the torch->JAX buffer-hygiene guard: torch's caching
@@ -309,6 +308,46 @@ def _nvfp4_reference(
     return out
 
 
+def _bf16_snap(t: torch.Tensor) -> torch.Tensor:
+    # bf16 IS the storage grid: the cast is the fixed point (input quant lossless).
+    return t.to(torch.bfloat16)
+
+
+def _bf16_act_pack(x, selected_experts, final_scales):
+    # Raw bf16 activations; the bf16 runner reads hidden_states_q directly and
+    # ignores hidden_states_scale.
+    return MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        selected_experts=selected_experts,
+        final_scales=final_scales,
+    )
+
+
+def _bf16_reference(
+    x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
+):
+    """Dense bf16 MoE authority: same SwiGLU convention as ``_nvfp4_reference``
+    but no fp4 requant -- the only intermediate quantization is the bf16 rounding
+    of the gemm1 and gemm2 outputs, mirrored below.  Routing weights are cast through bf16
+    to match the packed-id truncation in pack_inputs, so the tolerance measures
+    kernel error, not oracle mismatch."""
+    final_scales = final_scales.to(torch.bfloat16).float()
+    x32, half = x.float(), intermediate_size
+    out = torch.zeros_like(x32)
+    for local_e in range(w1.shape[0]):
+        mask = selected_experts == local_e + expert_offset
+        if not mask.any():
+            continue
+        tok, nth = torch.where(mask)
+        gate, up = w1[local_e][half:, :].float(), w1[local_e][:half, :].float()
+        inter = F.silu(x32[tok] @ gate.t()) * (x32[tok] @ up.t())
+        inter = inter.to(torch.bfloat16).float()  # gemm1 output is stored bf16
+        expert_out = (inter @ w2[local_e].float().t()).to(torch.bfloat16).float()
+        out[tok] += final_scales[tok, nth, None] * expert_out
+    return out
+
+
 _DTYPE = {
     QuantVariant.NVFP4: DTypeHandler(
         variant=QuantVariant.NVFP4,
@@ -316,13 +355,31 @@ _DTYPE = {
         snap=_snap_to_nvfp4,
         make_act_pack=_nvfp4_act_pack,
         reference=_nvfp4_reference,
-        poison=_nvfp4_poison,
+        poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
         atol_frac=0.15,  # calibrated: obs ratio ≤0.077 (fp4 intermediate-requant floor)
         rtol=0.1,
     ),
-    # FP8 / MXFP4 / MXINT4 / BF16 add one entry each as their runners are wired upstream.
+    QuantVariant.BF16: DTypeHandler(
+        variant=QuantVariant.BF16,
+        candidate_configs=(TrtllmBf16Config,),
+        snap=_bf16_snap,
+        make_act_pack=_bf16_act_pack,
+        reference=_bf16_reference,
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=0.05,  # initial; calibrate on SM100 (bf16 rounding floor)
+        rtol=0.05,
+    ),
+    # FP8 / MXFP4 / MXINT4 add one entry each as their runners are wired upstream.
 }
+
+# Cfg.variant string <-> handler lookup (labels stay lowercase enum names).
+_VARIANT_IDS = tuple(v.name.lower() for v in _DTYPE)
+
+
+def _handler_for(cfg):
+    return _DTYPE[QuantVariant[cfg.variant.upper()]]
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +478,7 @@ def _gen(seed):
         top_k=rng.choice(
             [t for t in _TOPK if t <= local]
         ),  # route within the local shard
-        variant="nvfp4",  # only wired variant today; expands with _DTYPE
+        variant=rng.choice(_VARIANT_IDS),
         route=rng.choice(_ROUTE),
         seed=seed,
         local_experts=local,
@@ -444,6 +501,12 @@ _CURATED = [
     Cfg(
         512, 512, 512, 512, 4, "nvfp4", "hot1", 900_004
     ),  # max expert count (small H/I)
+    Cfg(
+        256, 1024, 512, 256, 8, "bf16", "uniform", 900_005
+    ),  # DeepSeek-ish shape on the bf16 path
+    Cfg(
+        2048, 1024, 1024, 128, 6, "bf16", "imbalanced", 900_006
+    ),  # bf16 mid size + empty-expert load
 ]
 _CONFIGS = _CURATED + [_gen(BASE_SEED + i) for i in range(NUM_TESTS)]
 
@@ -511,7 +574,7 @@ def test_unified_moe_fuzz(cfg):
     sm = get_compute_capability(torch.device("cuda:0"))
     sm = sm[0] * 10 + sm[1]
 
-    handler = _DTYPE[QuantVariant.NVFP4]
+    handler = _handler_for(cfg)
     dev = torch.device("cuda")
     # Backend *config classes* whose runner is registered in the live MoELayer registry AND valid
     # on this arch. A newly-wired backend lands here automatically.
@@ -549,7 +612,7 @@ def test_unified_moe_fuzz(cfg):
 
     config = MoEConfig(
         routing=RoutingConfig(num_experts=cfg.num_experts, top_k=cfg.top_k),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(variant=handler.variant),
         experts=ExpertConfig(
             intermediate_size=cfg.intermediate,
             local_num_experts=cfg.n_local,
@@ -576,12 +639,24 @@ def test_unified_moe_fuzz(cfg):
         if poison:
             # The output buffer is a kernel-owned `new_empty` tensor inside the inputs list
             # (cute_dsl idx 11, trtllm the `output=`); locate it by dtype+shape and poison it.
+            act_ptrs = {
+                t.data_ptr()
+                for t in (
+                    act_pack.hidden_states_q,
+                    act_pack.hidden_states_scale,
+                    act_pack.selected_experts,
+                    act_pack.final_scales,
+                )
+                if torch.is_tensor(t)
+            }
             bufs = [
                 t
                 for t in inputs
                 if torch.is_tensor(t)
                 and t.dtype == handler.out_dtype
                 and tuple(t.shape) == out_shape
+                and t.data_ptr()
+                not in act_ptrs  # bf16 hidden_states aliases dtype+shape
             ]
             assert bufs, "could not locate the output buffer in pack_inputs to poison"
             for b in bufs:
@@ -709,15 +784,16 @@ _CACHE_TOKEN_SEQ = [
 ]  # buckets + boundaries + cache-hit re-runs
 
 
+@pytest.mark.parametrize("variant", list(_DTYPE), ids=[v.name.lower() for v in _DTYPE])
 @pytest.mark.parametrize(
     "base", _CACHE_BASES, ids=[f"e{e}h{h}i{i}" for e, h, i in _CACHE_BASES]
 )
-def test_autotune_cache_coherence(base):
+def test_autotune_cache_coherence(base, variant):
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
     sm = get_compute_capability(torch.device("cuda:0"))
     sm = sm[0] * 10 + sm[1]
-    handler = _DTYPE[QuantVariant.NVFP4]
+    handler = _DTYPE[variant]
     dev = torch.device("cuda")
     wired = [
         B
@@ -755,7 +831,7 @@ def test_autotune_cache_coherence(base):
     layer = MoELayer(
         MoEConfig(
             routing=RoutingConfig(num_experts=E, top_k=top_k),
-            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            quant=QuantConfig(variant=variant),
             experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
             activation=ActivationConfig(),
             backend=BackendOptions(candidates=tuple(B() for B in wired)),

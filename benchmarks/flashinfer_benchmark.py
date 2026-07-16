@@ -67,6 +67,10 @@ def run_test(args):
         from routines.gdn import run_gdn_test
 
         res = run_gdn_test(args)
+    elif args.routine in benchmark_apis["sparse_attention"]:
+        from routines.sparse_attention import run_sparse_attention_test
+
+        res = run_sparse_attention_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -120,7 +124,8 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["sampling"])
         + list(benchmark_apis["rope"])
         + list(benchmark_apis["mamba"])
-        + list(benchmark_apis["gdn"]),
+        + list(benchmark_apis["gdn"])
+        + list(benchmark_apis["sparse_attention"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -277,6 +282,10 @@ def parse_args(line=sys.argv[1:]):
         from routines.gdn import parse_gdn_args
 
         args = parse_gdn_args(line, parser)
+    elif args.routine in benchmark_apis["sparse_attention"]:
+        from routines.sparse_attention import parse_sparse_attention_args
+
+        args = parse_sparse_attention_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 

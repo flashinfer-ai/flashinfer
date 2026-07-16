@@ -743,7 +743,7 @@ class Timesteps(nn.Module):
         emb = timesteps[:, None].float() * exponent[None, :].exp()
         # Match diffusers get_timestep_embedding: [sin, cos] BEFORE the flip,
         # so flip_sin_to_cos=True yields [cos, sin]. (Starting from [cos, sin]
-        # here would make the flip produce [sin, cos] — swapped halves that
+        # here would make the flip produce [sin, cos] -- swapped halves that
         # silently scramble the timestep conditioning.)
         emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
 

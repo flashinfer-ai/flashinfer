@@ -121,6 +121,18 @@ def next_positive_power_of_2(x: int) -> int:
     return n + 1
 
 
+def last_positive_power_of_2(x: int) -> int:
+    """Return the largest power of 2 that is ``<= x``.
+
+    If *x* is itself a power of 2, returns *x*.
+    """
+    n = next_positive_power_of_2(x)
+    if n == x:
+        return n
+
+    return n // 2
+
+
 def calculate_tile_tokens_dim(
     num_tokens: int, num_experts: int, top_k: int, max_tile_tokens_dim: int = 128
 ) -> int:
@@ -432,6 +444,13 @@ def is_fa3_backend_supported(
     return True
 
 
+def is_fa3_prefill_head_dim_supported(head_dim_qk: int, head_dim_vo: int) -> bool:
+    """Return whether FA3 prefill supports the QK/VO head-dim pair."""
+    if head_dim_qk == head_dim_vo:
+        return head_dim_qk in {64, 128, 256}
+    return (head_dim_qk, head_dim_vo) == (192, 128)
+
+
 def is_cutlass_backend_supported(
     pos_encoding_mode: int,
     use_fp16_qk_reductions: bool,
@@ -480,6 +499,9 @@ def determine_attention_backend(
     use_custom_mask: bool,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
+    *,
+    head_dim_qk: Optional[int] = None,
+    head_dim_vo: Optional[int] = None,
 ) -> str:
     """
     Determine the appropriate attention backend based on the device and parameters.
@@ -500,6 +522,12 @@ def determine_attention_backend(
         The data type of the query tensor.
     dtype_kv : torch.dtype
         The data type of the key-value tensor.
+    head_dim_qk : int, optional
+        The QK head dimension. When provided with ``head_dim_vo``, this is used
+        to avoid selecting FA3 for prefill dimensions that its Hopper kernels do
+        not instantiate.
+    head_dim_vo : int, optional
+        The VO head dimension.
 
     Returns
     -------
@@ -513,9 +541,13 @@ def determine_attention_backend(
         dtype_q,
         dtype_kv,
     ):
-        return "fa3"
+        if head_dim_qk is None or head_dim_vo is None:
+            return "fa3"
+        if is_fa3_prefill_head_dim_supported(head_dim_qk, head_dim_vo):
+            return "fa3"
     else:
         return "fa2"
+    return "fa2"
 
 
 def version_at_least(version: str, base_version: str) -> bool:
@@ -735,6 +767,65 @@ def round_up(x: int, y: int) -> int:
 @functools.cache
 def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def get_trtllm_gen_multi_ctas_kv_counter_bytes(
+    batch_size: int, num_qo_heads: int, sm_count: int
+) -> int:
+    """Return bytes needed by trtllm-gen multi-CTA KV counter semaphores."""
+    num_semaphores = round_up(max(batch_size * num_qo_heads, sm_count), 8)
+    return num_semaphores * 4
+
+
+def _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+    batch_size: int,
+    num_qo_heads: int,
+    sm_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate a fresh, zero-initialized multi-CTA KV counter buffer.
+
+    The trtllm-gen kernel resets these semaphores back to zero at the end of
+    every launch, so the buffer only needs to be zeroed once at allocation and
+    can then be reused across launches without re-zeroing. Callers that reuse a
+    buffer should hold it on their own instance (e.g. a wrapper/runner) rather
+    than a module-global cache, so its lifetime is tied to the owner.
+    """
+    counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    return torch.zeros(counter_bytes, dtype=torch.uint8, device=device)
+
+
+def _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+    counter_buffer: Optional[torch.Tensor],
+    batch_size: int,
+    num_qo_heads: int,
+    sm_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate or validate a trtllm-gen multi-CTA KV counter buffer."""
+    required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    if counter_buffer is None:
+        return _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+            batch_size, num_qo_heads, sm_count, device
+        )
+    if counter_buffer.device != device:
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer must be on the same device as query"
+        )
+    if not counter_buffer.is_contiguous():
+        raise ValueError("multi_ctas_kv_counter_buffer must be contiguous")
+    _check_workspace_buffer_alignment(counter_buffer, "multi_ctas_kv_counter_buffer")
+    counter_buffer_bytes = counter_buffer.numel() * counter_buffer.element_size()
+    if counter_buffer_bytes < required_counter_bytes:
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer is too small: got "
+            f"{counter_buffer_bytes} bytes, need {required_counter_bytes} bytes"
+        )
+    return counter_buffer
 
 
 class FP4Tensor:

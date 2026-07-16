@@ -92,6 +92,31 @@ Unified AllReduce Fusion API
     TRTLLMAllReduceFusionWorkspace
     MNNVLAllReduceFusionWorkspace
 
+All-reduce workspaces backed by ``SymmDeviceMemory`` preserve their CUDA
+virtual addresses across process checkpoint/restore.  After quiescing all
+work, release the physical handles and restore them with a fresh communication
+backend before replaying a captured CUDA graph:
+
+.. code-block:: python
+
+    workspace.checkpoint_prepare()
+    workspace.checkpoint_restore(comm_backend)
+
+Both methods are collective.  Every rank must call them in the same order, and
+``comm_backend`` must reproduce the original rank and world size.  Repeated
+calls are no-ops after the workspace reaches the requested state.  If an
+exception occurs after detach or reattach begins, do not retry or reuse the
+workspace; restart the affected rank.  Workspaces backed by torch symmetric
+memory do not support this lifecycle.
+
+.. autosummary::
+    :toctree: ../generated
+
+    TRTLLMAllReduceFusionWorkspace.checkpoint_prepare
+    TRTLLMAllReduceFusionWorkspace.checkpoint_restore
+    MNNVLAllReduceFusionWorkspace.checkpoint_prepare
+    MNNVLAllReduceFusionWorkspace.checkpoint_restore
+
 vLLM AllReduce
 --------------
 
@@ -285,6 +310,29 @@ MNNVL A2A (Throughput Backend)
     :show-inheritance:
 
     .. automethod:: __init__
+
+``MoeAlltoAll`` preserves its CUDA virtual addresses across process
+checkpoint/restore.  After quiescing all work, call ``checkpoint_prepare`` to
+release the non-checkpointable physical MNNVL handles.  Then call
+``checkpoint_restore`` with a fresh communication backend before replaying a
+captured CUDA graph:
+
+.. code-block:: python
+
+    moe_alltoall.checkpoint_prepare()
+    moe_alltoall.checkpoint_restore(comm_backend)
+
+Both methods are collective.  Every rank must call them in the same order, and
+``comm_backend`` must reproduce the original rank and world size.
+Repeated calls are no-ops after the workspace reaches the requested state.
+If an exception occurs after physical handle unmapping or remapping begins,
+do not retry or reuse the workspace; restart the affected rank.
+
+.. autosummary::
+    :toctree: ../generated
+
+    MoeAlltoAll.checkpoint_prepare
+    MoeAlltoAll.checkpoint_restore
 
 DCP All-to-All (Context-Parallel Attention Reduction)
 -----------------------------------------------------
