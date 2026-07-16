@@ -3543,8 +3543,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 # fmha_v2 outperforms FA2 at longer sequences (S>=256) on SM120
                 # due to optimized tiled flash attention, but has higher CTA
                 # launch overhead for small sequences or high head counts.
-                # Only supports: MHA, standard symmetric head dims, no sliding
-                # window, no softcap, equal q/kv segments, NHD layout.
+                # Only supports: MHA, standard symmetric head dims, matching
+                # q/kv dtype, no sliding window, no softcap, equal q/kv
+                # segments, NHD layout. The kernel reduces QK in fp16 on bf16,
+                # so only auto-select it when the caller allows fp16 QK
+                # reduction (mirrors is_fa3_backend_supported's convention).
                 same_qk_segments = torch.equal(qo_indptr_host, kv_indptr_host)
                 is_standard_shape = head_dim_qk == head_dim_vo and head_dim_qk in (
                     64,
@@ -3557,6 +3560,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     and num_qo_heads == num_kv_heads
                     and same_qk_segments
                     and is_standard_shape
+                    and q_data_type == kv_data_type
+                    and use_fp16_qk_reduction
                     and max_seq_in_batch >= 256
                     and window_left < 0
                     and logits_soft_cap == 0.0
