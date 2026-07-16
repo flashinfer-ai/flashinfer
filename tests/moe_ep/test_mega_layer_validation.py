@@ -511,3 +511,100 @@ def test_deep_gemm_validate_transformed_weights_accepts_preprocess_output():
         world_size=1,
         num_experts=num_experts,
     )
+
+
+def test_mega_layer_does_not_retain_pack_when_transformed_supplied():
+    """Source pack must not be stored when transformed weights are provided."""
+    import gc
+    import weakref
+
+    import torch
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        DeepGemmMegaMoeConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEWeightPack,
+    )
+
+    pack = MoEWeightPack(
+        w13=torch.zeros(1, 256, 128),
+        w2=torch.zeros(1, 128, 128),
+    )
+    ref = weakref.ref(pack)
+    with mock.patch(
+        "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+    ):
+        layer = MoEEpMegaLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=1,
+                max_tokens_per_rank=64,
+                token_hidden_size=128,
+            ),
+            weights=pack,
+            backend=MegaConfig(
+                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                preprocess_weights=False,
+                transformed_weights=_fake_deep_gemm_transformed(),
+            ),
+        )
+    assert layer._weights is None
+    del pack
+    gc.collect()
+    assert ref() is None, "layer retained the source weight pack"
+    assert layer._transformed is not None
+
+
+def test_mega_layer_releases_pack_after_preprocess(dist_not_initialized):
+    """Source pack must be released once preprocess_weights() has run."""
+    import gc
+    import weakref
+
+    import torch
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        DeepGemmMegaMoeConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEWeightPack,
+    )
+
+    pack = MoEWeightPack(
+        w13=torch.zeros(1, 256, 128),
+        w2=torch.zeros(1, 128, 128),
+    )
+    ref = weakref.ref(pack)
+    sentinel = _fake_deep_gemm_transformed()
+    with (
+        mock.patch(
+            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+        ),
+        mock.patch(
+            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend."
+            "DeepGemmMegaKernelBackend.preprocess_weights",
+            return_value=sentinel,
+        ),
+    ):
+        layer = MoEEpMegaLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=1,
+                max_tokens_per_rank=64,
+                token_hidden_size=128,
+            ),
+            weights=pack,
+            backend=MegaConfig(
+                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                preprocess_weights=True,
+            ),
+        )
+    assert layer._weights is None
+    assert layer._transformed is sentinel
+    del pack
+    gc.collect()
+    assert ref() is None, "layer retained the source weight pack after preprocess"
