@@ -1145,7 +1145,8 @@ class FlashInferWanTransformer3DModel(nn.Module):
             import torch.distributed as dist
 
             gathered = [
-                torch.empty_like(hidden_states) for _ in range(ulysses_comm.world_size)
+                torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+                for _ in range(ulysses_comm.world_size)
             ]
             dist.all_gather(
                 gathered, hidden_states.contiguous(), group=ulysses_comm.group

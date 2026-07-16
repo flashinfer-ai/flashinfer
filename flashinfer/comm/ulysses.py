@@ -1006,4 +1006,10 @@ def ulysses_a2a(
             f"inconsistent with [B, S_local, H, D] = {local_shape} "
             f"(batch/D dims and total size must match)"
         )
+    for name, t in (("inp", inp), ("out", out)):
+        if t.numel() > _INT32_MAX:
+            raise ValueError(
+                f"{name} has {t.numel()} elements, exceeding the int32 index "
+                f"range {_INT32_MAX} supported by the ulysses_a2a kernel"
+            )
     get_ulysses_a2a_module().ulysses_a2a(fa, inp, out, B, S_local, H, D, mode)
