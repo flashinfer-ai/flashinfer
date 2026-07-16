@@ -31,6 +31,7 @@
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "nv_internal/tensorrt_llm/kernels/quantization.h"
 #include "nv_internal/tensorrt_llm/thop/utils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer {
@@ -253,6 +254,7 @@ class FusedMoeLauncher {
   tensorrt_llm::kernels::trtllmgen_moe::MoE::MoEWorkspace workspace;
 
   btg::Dtype mDtypeAct{btg::Dtype::Bfloat16};
+  std::optional<btg::Dtype> mDtypeGemm1Output{std::nullopt};
   btg::Dtype mDtypeWeights{btg::Dtype::Bfloat16};
   btg::Dtype mRoutingBiasDtype{
       btg::Dtype::Bfloat16};  // Dtype for expert weights in routing, based on routing bias
@@ -538,9 +540,10 @@ class FusedMoeLauncher {
                                                 usePerTokenScalingGemm2, false, false);
     } else {
       moe_runner = std::make_unique<RunnerType>(
-          this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
-          this->activation_type, this->use_shuffled_weight, this->weight_layout,
-          args->gemm1_bias_type, usePerTokenScalingGemm1, usePerTokenScalingGemm2);
+          this->mDtypeAct, this->mDtypeWeights, this->mDtypeGemm1Output.value_or(this->mDtypeAct),
+          args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim, this->activation_type,
+          this->use_shuffled_weight, this->weight_layout, args->gemm1_bias_type,
+          usePerTokenScalingGemm1, usePerTokenScalingGemm2);
     }
 
     int32_t const effectiveTopK = args->top_k + args->num_fused_shared_experts;
@@ -1912,6 +1915,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
             ? static_cast<float*>(output2_scales_scalar.value().data_ptr())
             : nullptr;
 
+    if (per_token_scales.has_value()) {
+      this->mDtypeGemm1Output = disableFP4QuantFastMath ? btg::Dtype::Bfloat16 : btg::Dtype::E2m1;
+    }
+
     FusedMoeLauncher::prepare_moe_common(moe_tactic);
 
     auto const sf_vec_size = mDtypeWeights == btg::Dtype::MxE2m1 ? 32 : 16;
@@ -1925,26 +1932,37 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
             workspace.total_max_padded_tokens, args->hidden_size,
             btg::dtypeGetNumBits(btg::Dtype::Bfloat16));  // Output is always BF16
 
-    auto const gemm1_output_hidden =
+    auto const gemm1_output_hidden_size =
         mDtypeAct == btg::Dtype::E2m1 ? args->intermediate_size / 2 : args->intermediate_size;
-    if (mDtypeAct == btg::Dtype::E2m1 || mDtypeAct == btg::Dtype::MxE4m3) {
-      int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
-          max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size);
-      gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
-    }
-    if (!per_token_scales.has_value()) {
-      gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
+    int64_t sf_size_swizzled = tensorrt_llm::computeSwizzledLayoutSFSize(
+        max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size);
+    if (!per_token_scales.has_value()) {  // FC1 output is block-scale nvfp4
+      gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden_size},
                                   mDtypeAct == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
                                   hidden_states.device());
-    } else {  // FC1 output is Bfloat16
+      // Allocate FC1 output scale for block-scale quantization dtype
+      if (mDtypeAct == btg::Dtype::E2m1 || mDtypeAct == btg::Dtype::MxE4m3) {
+        gemm1_output_scale = alloc_tensor({sf_size_swizzled}, dl_uint8, hidden_states.device());
+      }
+    } else {
       TVM_FFI_ICHECK(mDtypeAct == btg::Dtype::E2m1)
           << "NvFP4 MoE: currently only support NvFP4 x NvFP4 when using per-token scaling.";
-      // When per-token scales are used, the FC1 output is always BF16 and will be quantized
-      gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
-                                  dl_bfloat16, hidden_states.device());
+      if (disableFP4QuantFastMath) {  // FC1 output is bfloat16 and
+                                      // will be explicitly quantized
+        gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
+                                    dl_bfloat16, hidden_states.device());
+      } else {  // FC1 output is block-scale nvfp4 with fp32 scale
+        // in this case, scale output is linear layout
+        gemm1_output_scale =
+            alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size},
+                         dl_float32, hidden_states.device());
+        gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden_size},
+                                    dl_uint8, hidden_states.device());
+      }
       // The per-token NvFP4 quant needs to stage the output for running the explicit quant kernel
-      activation_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
-                                       hidden_states.device());
+      activation_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden_size},
+                                       dl_uint8, hidden_states.device());
+      activation_output_scale = alloc_tensor({sf_size_swizzled}, dl_uint8, hidden_states.device());
       per_token_scales_fc2 =
           alloc_tensor({max_num_padded_tokens_gemm1}, dl_float32, hidden_states.device());
     }
@@ -1962,7 +1980,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     if (per_token_scales.has_value()) {
       workspace.token_scales = per_token_scales.value().data_ptr();
       workspace.activation_output = activation_output.data_ptr();
-      workspace.activation_output_scale = workspace.gemm1_output_scale;
+      workspace.activation_output_scale =
+          static_cast<float*>(activation_output_scale.value().data_ptr());
       workspace.token_scales_fc2 = per_token_scales_fc2.data_ptr();
     }
     workspace.gemm2_output = gemm2_output.data_ptr();
@@ -1981,8 +2000,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   int32_t max_num_padded_tokens_gemm1{};
   int32_t max_num_padded_tokens_gemm2{};
   Optional<Tensor> gemm1_output_scale;
+  Optional<Tensor> activation_output_scale;
   TensorView topk_ids;      // [num_tokens, top_k] - pre-computed or output top-k expert indices
   TensorView topk_weights;  // [num_tokens, top_k] - pre-computed or output top-k routing weights
+  static bool const disableFP4QuantFastMath;
 
  public:
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
@@ -2069,9 +2090,17 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
 
+    btg::Dtype dtypeGemm1Output = dtype_act;
+    if (use_per_token_scaling) {
+      // currently FP4 MoE always apply per-token scaling to both FC1 and FC2.
+      // when use fast math path, the FC1 will output FP4+FP32 scales; otherwise output BF16, and
+      // then quantize to FP4.
+      dtypeGemm1Output = disableFP4QuantFastMath ? btg::Dtype::Bfloat16 : btg::Dtype::E2m1;
+    }
+
     for (int32_t tile_N : selected_tile_nums) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
-          dtype_act, dtype_weights,
+          dtype_act, dtype_weights, dtypeGemm1Output,
           false,  // useDeepSeekFp8
           tile_N, static_cast<ActivationType>(act_type),
           /*useShuffledMatrix*/ true,
@@ -2093,6 +2122,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     return valid_configs;
   }
 };
+
+bool const FP4BlockScaleLauncher::disableFP4QuantFastMath =
+    tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
 
 Array<Tensor> trtllm_bf16_moe(
     Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
