@@ -425,6 +425,49 @@ class Moe(ABC):
 
 
 # ====================================================================================
+# Shared check_intermediate_output helpers
+# ====================================================================================
+
+
+def _gather_intermediate_by_expanded_idx(raw_kernel_output, reference_args):
+    """Gather the kernel + reference post-activation FC1 output into canonical
+    expanded-index order (``p = token * top_k + slot``).
+
+    Each side is indexed by its own ``expandedTokenIdxToPermutedIdx`` map (length
+    ``num_tokens * top_k``). ``kernel_routed`` keeps the kernel's native dtype/packing
+    (uint8 fp4-packed, e4m3, or bf16); ``ref_routed`` is cast to fp32 (clean, not
+    re-quantized). Returns ``(kernel_routed, ref_routed)``.
+    """
+    kernel_codes = raw_kernel_output[2]
+    kernel_expanded_to_permuted = raw_kernel_output[1].to(torch.int64).cpu()
+    ref_expanded_to_permuted = (
+        reference_args.permute_info["expandedTokenIdxToPermutedIdx"]
+        .to(torch.int64)
+        .cpu()
+    )
+    kernel_routed = kernel_codes[kernel_expanded_to_permuted]
+    ref_routed = reference_args.activation_output[ref_expanded_to_permuted].to(
+        torch.float32
+    )
+    return kernel_routed, ref_routed
+
+
+def _decode_mxfp8_intermediate(kernel_routed, ref_routed):
+    """Decode MxFp8 (e4m3) codes to fp32 using an mx block scale recovered from the
+    reference (the kernel does not return its scale). Compare the result against the
+    CLEAN fp32 ``ref_routed`` — e4m3 is fine-grained enough that clean-fp32 comparison
+    holds (unlike fp4, which needs a round-tripped reference).
+    """
+    _, ref_scale = mxfp8_quantize(ref_routed.to(torch.bfloat16), True)
+    ref_scale_bytes = ref_scale.view(torch.uint8).reshape(-1).cpu()
+    return (
+        mxfp8_dequantize_host(kernel_routed.cpu().view(torch.uint8), ref_scale_bytes)
+        .to(ref_routed.device)
+        .to(torch.float32)
+    )
+
+
+# ====================================================================================
 # FP4 Quantization Implementation
 # ====================================================================================
 
@@ -799,10 +842,92 @@ class FP4Moe(Moe):
                 gemm1_lora_delta=gemm1_lora_delta,
             )
             if isinstance(output, list):
+                if kwargs.get("return_full_output", False):
+                    return output
                 return output[0].to(torch.float)
             return output.to(torch.float)
         finally:
             cuda_graph.cleanup()
+
+    def check_intermediate_output(self, raw_kernel_output, reference_args):
+        """Validate the kernel's exposed post-activation FC1 output for FP4.
+
+        The exposed format differs per quant mode:
+          * NvFp4       -> FP4-packed (uint8, last-dim ``intermediate_size // 2``);
+          * MxFp4xMxFp8 -> MxFp8/e4m3 (same format FP8BlockScaleMoe's MXFP8 decodes);
+          * MxFp4xBf16  -> bf16.
+        We gather both sides into expanded-index order, decode the kernel side to fp32,
+        and compare against the reference activation with the FP4 tolerances.
+        """
+        assert isinstance(raw_kernel_output, list) and len(raw_kernel_output) >= 3, (
+            f"Expected the kernel to return [output, expanded_idx_to_permuted_idx, "
+            f"gemm1_output]; got {type(raw_kernel_output).__name__} of length "
+            f"{len(raw_kernel_output) if isinstance(raw_kernel_output, list) else 'n/a'}"
+        )
+        intermediate_size = reference_args.intermediate_size
+        kernel_routed, ref_routed = _gather_intermediate_by_expanded_idx(
+            raw_kernel_output, reference_args
+        )
+
+        if self.quant_mode == QuantMode.FP4_NVFP4_NVFP4:
+            # FP4-packed: 2 e2m1 values per byte -> last-dim intermediate_size // 2.
+            assert kernel_routed.shape[-1] == intermediate_size // 2, (
+                f"Expected the FP4-packed post-activation FC1 output to have last-dim "
+                f"{intermediate_size // 2} (= intermediate_size // 2); got shape "
+                f"{tuple(kernel_routed.shape)}."
+            )
+            # The kernel does not return its per-block scale, so derive it from the
+            # reference and decode BOTH sides with it. Compare against the fp4-round-
+            # tripped reference (not clean fp32): e2m1 is coarse near zero, so comparing
+            # to un-quantized fp32 would blow past rtol on small values; round-tripping
+            # both sides tests "kernel codes ~= reference codes" at matched precision.
+            sf_vec_size = 16
+            global_sf = reference_args.c_global_sf
+            ref_fp4, ref_sf = fp4_quantize(
+                ref_routed.to(torch.bfloat16).cuda(),
+                global_sf.cuda(),
+                sf_vec_size,
+                False,  # use_ue8m0
+                True,  # is_sf_swizzled_layout
+            )
+
+            def _decode(codes):
+                return (
+                    e2m1_and_ufp8sf_scale_to_float(
+                        codes.cpu(),
+                        ref_sf.cpu().reshape(-1),
+                        (1 / global_sf).cpu(),
+                        sf_vec_size,
+                        1,  # ufp8_type for NvFp4
+                        True,  # is_sf_swizzled_layout
+                    )
+                    .to(ref_routed.device)
+                    .to(torch.float32)
+                )
+
+            ref_compare = _decode(ref_fp4)
+            kernel_dequant = _decode(kernel_routed)
+        else:
+            # MxFp8/bf16: one value per element (last-dim intermediate_size), and both
+            # are fine-grained enough to compare against the clean fp32 reference.
+            assert kernel_routed.shape[-1] == intermediate_size, (
+                f"Expected the post-activation FC1 output to have last-dim "
+                f"{intermediate_size}; got shape {tuple(kernel_routed.shape)}."
+            )
+            ref_compare = ref_routed
+            if self.quant_mode == QuantMode.FP4_MXFP4_MXFP8:
+                kernel_dequant = _decode_mxfp8_intermediate(kernel_routed, ref_routed)
+            else:  # FP4_MXFP4_Bf16
+                kernel_dequant = kernel_routed.to(torch.float32)
+
+        tolerances = self.get_tolerances()
+        check_accuracy(
+            ref_compare,
+            kernel_dequant,
+            atol=tolerances["atol"],
+            rtol=tolerances["rtol"],
+            percent=tolerances["percent"],
+        )
 
     def compute_reference(self, args):
         return run_moe_reference_fp4(args, self.quant_mode)
@@ -1494,24 +1619,13 @@ class FP8BlockScaleMoe(Moe):
         """
         super().check_intermediate_output(raw_kernel_output, reference_args)
 
-        # Gather both sides into canonical expanded-index order.
-        # We index each by its own expanded->permuted map (each exactly
-        # [num_tokens * top_k] long).
-        kernel_codes = raw_kernel_output[2]
-        kernel_expanded_to_permuted = raw_kernel_output[1].to(torch.int64).cpu()
-        ref_expanded_to_permuted = (
-            reference_args.permute_info["expandedTokenIdxToPermutedIdx"]
-            .to(torch.int64)
-            .cpu()
+        kernel_routed, ref_routed = _gather_intermediate_by_expanded_idx(
+            raw_kernel_output, reference_args
         )
-        kernel_routed = kernel_codes[kernel_expanded_to_permuted]
-        ref_routed = reference_args.activation_output[ref_expanded_to_permuted].to(
-            torch.float32
-        )
-        n_rows, intermediate_size = ref_routed.shape
 
         if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
             # Per-(1, 128) linear block scale derived from the reference.
+            n_rows, intermediate_size = ref_routed.shape
             finfo = torch.finfo(torch.float8_e4m3fn)
             n_blocks = intermediate_size // 128
             scale = (
@@ -1528,17 +1642,7 @@ class FP8BlockScaleMoe(Moe):
                 * scale
             ).view(n_rows, intermediate_size)
         else:  # FP8_BLOCK_SCALE_MXFP8
-            # mx-format scale via the mx quantizer;
-            # keep only the scale to decode the kernel's codes.
-            _, ref_scale = mxfp8_quantize(ref_routed.to(torch.bfloat16), True)
-            ref_scale_bytes = ref_scale.view(torch.uint8).reshape(-1).cpu()
-            kernel_dequant = (
-                mxfp8_dequantize_host(
-                    kernel_routed.cpu().view(torch.uint8), ref_scale_bytes
-                )
-                .to(ref_routed.device)
-                .to(torch.float32)
-            )
+            kernel_dequant = _decode_mxfp8_intermediate(kernel_routed, ref_routed)
 
         tolerances = self.get_tolerances()
         check_accuracy(
