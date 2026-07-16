@@ -1,0 +1,52 @@
+name: 🐛 Bug Report
+description: Report a correctness, crash, or performance bug in FlashInfer
+labels: ["bug"]
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >
+        Run `python -m flashinfer.collect_env` (or `flashinfer collect-env`)
+        in the exact environment (same venv/container) where the bug
+        reproduces and paste the full output below. If `import flashinfer` itself is broken, download the
+        standalone script and run it with plain Python:
+        `curl -OL https://raw.githubusercontent.com/flashinfer-ai/flashinfer/main/flashinfer/collect_env.py && python collect_env.py`.
+        The report includes which cuDNN/cuBLAS/CUDA libraries are *actually
+        loaded* vs merely installed — this resolves most "works on my machine"
+        divergence, so please don't trim it.
+      value: |
+        <details>
+        <summary>Output of python -m flashinfer.collect_env</summary>
+
+        ```text
+        PASTE OUTPUT HERE
+        ```
+
+        </details>
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug description
+      description: What happened, and what did you expect to happen instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: >
+        Smallest self-contained script or command that reproduces the issue.
+        Include exact shapes/dtypes and the backend selected (fa2/fa3/cudnn/
+        trtllm/cutlass/...). If the failure involves JIT compilation, re-run
+        with `FLASHINFER_JIT_VERBOSE=1` and attach the log.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Stack traces, logs, related issues, workarounds you tried.
