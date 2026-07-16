@@ -50,17 +50,19 @@ def test_bmm_mxfp8(b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning):
     # Block size is 32 in MXFP8
     assert input_mxfp8.numel() == (input_scale.numel() * 32)
 
-    mat2 = (
-        torch.randn([b, n, k], device="cuda", dtype=input_dtype)
-        .transpose(-2, -1)
-        .contiguous()
-    )
-    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout)
+    # The cuDNN override-shape path requires B as a COLUMN-major [b, k, n] VIEW
+    # (K contiguous): quantize the contiguous [b, n, k] weight and pass the
+    # transpose of the quantized tensor. A .contiguous() on the transpose flips
+    # it back to row-major and is rejected once cudnn-frontend >= 1.24 enables
+    # the override path (CI's older frontend hid this).
+    weight = torch.randn([b, n, k], device="cuda", dtype=input_dtype)
+    weight_mxfp8, mat2_scale = mxfp8_quantize(weight, is_sf_swizzled_layout)
+    mat2_mxfp8 = weight_mxfp8.transpose(-2, -1)
 
-    assert mat2_mxfp8.numel() == (mat2_scale.numel() * 32)
+    assert weight_mxfp8.numel() == (mat2_scale.numel() * 32)
 
     # Compute reference result
-    reference = torch.bmm(input_mat, mat2)
+    reference = torch.bmm(input_mat, weight.transpose(-2, -1))
 
     # Create output tensor
     res = torch.empty([b, m, n], device="cuda", dtype=res_dtype)
