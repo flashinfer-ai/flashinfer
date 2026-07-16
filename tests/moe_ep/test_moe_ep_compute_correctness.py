@@ -27,22 +27,10 @@ HIDDEN = 8192
 INTERMEDIATE = 2048
 RTOL = 3e-2
 ATOL = 3e-2
-
-
-def _block_major_k(w):
-    import torch
-
-    from flashinfer import shuffle_matrix_a
-    from flashinfer.fused_moe.core import convert_to_block_layout
-
-    epilogue_tile_m = 64
-    block_k = 128
-    shuffled = []
-    for i in range(w.shape[0]):
-        s = shuffle_matrix_a(w[i].view(torch.uint8), epilogue_tile_m)
-        s = convert_to_block_layout(s, block_k)
-        shuffled.append(s)
-    return torch.stack(shuffled).view(torch.bfloat16)
+# EP-vs-torch-oracle band: looser than EP-vs-kernel because the oracle runs
+# dense fp32 GEMMs against the kernel's bf16 accumulation on |y|~O(1).
+ORACLE_RTOL = 5e-2
+ORACLE_ATOL = 5e-2
 
 
 def _build_bf16_moe_config(*, offset, local_num_experts, max_tokens):
@@ -71,17 +59,16 @@ def _build_bf16_moe_config(*, offset, local_num_experts, max_tokens):
 
 
 def _build_fused_moe_weights(w1_local, w2_local):
-    from flashinfer.fused_moe.api import MoEWeightPack
-
-    wp = MoEWeightPack()
-    wp.prepare_for(
-        "trtllm_bf16_routed",
-        {
-            "gemm1_weights": _block_major_k(w1_local),
-            "gemm2_weights": _block_major_k(w2_local),
-        },
+    # Same weight prep as the EP layer (gated-act reorder + shuffle + BlockMajorK).
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
     )
-    return wp
+
+    cfg = _build_bf16_moe_config(
+        offset=0, local_num_experts=w1_local.shape[0], max_tokens=1
+    )
+    return materialize_fused_moe_weights(MoEWeightPack(w13=w1_local, w2=w2_local), cfg)
 
 
 def _kernel_full_moe_reference(x, w1_full, w2_full, topk_ids, topk_weights):
@@ -105,12 +92,14 @@ def _kernel_full_moe_reference(x, w1_full, w2_full, topk_ids, topk_weights):
 
 
 def _torch_dense_reference(x, w1, w2, topk_ids, topk_weights):
-    """Textbook dense MoE in fp32 (diagnostic only — convention-sensitive).
+    """Textbook dense MoE in fp32 (asserted torch oracle).
 
-    Mirrors ``tests/moe/test_cute_dsl_fused_moe.py::compute_reference_moe_fp4``
-    (bf16 path): gemm1 → split [linear | gate] → ``silu(gate) * linear`` → gemm2.
-    Used to cross-check the kernel against textbook MoE; NOT the primary assertion
-    (the trtllm-gen gate/up convention may differ from this split).
+    Mirrors the asserted ``tests/moe`` trtllm-gen reference
+    (``run_moe_dequant``): gemm1 → split ``[x1 | x2]`` → ``silu(x2) * x1`` →
+    gemm2 → topk-weighted sum — the same split used here (``linear`` = first
+    half, ``gate`` = second half).  Single-GPU per-dtype oracles live in
+    ``test_split_fused_moe_kernel_vs_reference.py``; this one additionally
+    pins the full EP path against textbook MoE math.
     """
     import os
 
@@ -266,6 +255,9 @@ def _run_one_layout(layout_str):
     # Primary correctness: EP must reproduce the non-EP kernel MoE exactly
     # (immune to kernel-convention quirks; tests dispatch/compute/combine).
     torch.testing.assert_close(yf, kf, rtol=RTOL, atol=ATOL)
+    # Oracle correctness: EP must also match textbook torch MoE math, so a
+    # bug shared by the EP and non-EP kernel paths cannot pass silently.
+    torch.testing.assert_close(yf, tf, rtol=ORACLE_RTOL, atol=ORACLE_ATOL)
     layer.destroy()
     return rank, ep_vs_kernel, kernel_vs_torch, ep_vs_torch
 

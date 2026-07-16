@@ -3,6 +3,10 @@
 Mirrors ``test_moe_ep_compute_correctness.py`` (bf16) but exercises the
 ``trtllm_fp4_routed`` path through ``FusedMoeSplitKernelBackend``.
 
+Asserts ``EP == non-EP kernel``; the ``non-EP kernel == torch oracle`` anchor
+for this dtype path is the single-GPU
+``test_split_fused_moe_kernel_vs_reference.py::test_split_nvfp4_kernel_matches_torch_reference``.
+
 Launch (4 GPU, SM100+):
     torchrun --nproc_per_node=4 -m pytest \\
         tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py -v -s \\

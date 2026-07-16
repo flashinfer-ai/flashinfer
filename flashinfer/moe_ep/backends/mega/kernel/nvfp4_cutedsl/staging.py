@@ -7,12 +7,6 @@ import torch
 from .....core.validation.common import MoEEpConfigError
 
 
-def _require_cutedsl_paths() -> None:
-    from ..cutedsl_backend_kernels import bootstrap_paths
-
-    bootstrap_paths()
-
-
 def stage_mega_moe_inputs(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -25,9 +19,10 @@ def stage_mega_moe_inputs(
     norm_const: float = 1.0,
 ) -> None:
     """bf16 ``hidden_states`` → NVFP4 activation + fp8 block scales."""
-    _require_cutedsl_paths()
-    from common.megamoe_constants import Nvfp4BlockSize
-    from moe_nvfp4_swapab.runner_common import (
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
+    # package import also bootstraps sys.path for the kernel packages.
+    from .....kernel_src.cutedsl_megamoe import (
+        Nvfp4BlockSize,
         ceil_div,
         nvfp4_quantize_per_block_16,
         round_up,
@@ -116,9 +111,8 @@ def validate_nvfp4_forward_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise MoEEpConfigError("topk_weights and topk_ids must have the same shape")
 
-    _require_cutedsl_paths()
-    from common.megamoe_constants import Nvfp4BlockSize
-    from moe_nvfp4_swapab.runner_common import ceil_div
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     if scales.ndim != 2 or scales.shape[0] != num_tokens:
