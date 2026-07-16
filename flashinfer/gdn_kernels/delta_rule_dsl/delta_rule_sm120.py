@@ -2119,6 +2119,6 @@ def delta_rule_prefill_dsl(
     compiled_delta_rule_kernel = cached_compile(
         delta_rule_kernel,
         *kernel_args,
-        compile_options=sm12x_compile_options(),
+        compile_options=sm12x_compile_options(q.device),
     )
     compiled_delta_rule_kernel(*kernel_args)

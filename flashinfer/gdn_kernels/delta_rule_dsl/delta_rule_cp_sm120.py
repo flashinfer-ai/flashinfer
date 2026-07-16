@@ -560,7 +560,7 @@ def cp_delta_rule_t_precompute_dsl_sm120(
         stream,
     )
     compiled = cached_compile(
-        kernel, *kernel_args, compile_options=sm12x_compile_options()
+        kernel, *kernel_args, compile_options=sm12x_compile_options(k.device)
     )
     compiled(*kernel_args)
     return t
@@ -1732,7 +1732,7 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
         stream,
     )
     compiled = cached_compile(
-        kernel, *kernel_args, compile_options=sm12x_compile_options()
+        kernel, *kernel_args, compile_options=sm12x_compile_options(k.device)
     )
     compiled(*kernel_args)
     return transfer_t, state_t
@@ -2702,7 +2702,9 @@ def cp_delta_rule_fixup_dsl_sm120(
         stream,
     )
     compiled = cached_compile(
-        kernel, *kernel_args, compile_options=sm12x_compile_options()
+        kernel,
+        *kernel_args,
+        compile_options=sm12x_compile_options(local_transfer.device),
     )
     compiled(*kernel_args)
     return fixed_state
@@ -4834,7 +4836,7 @@ def cp_delta_rule_prefill_dsl_sm120(
         stream,
     )
     compiled = cached_compile(
-        kernel, *kernel_args, compile_options=sm12x_compile_options()
+        kernel, *kernel_args, compile_options=sm12x_compile_options(q.device)
     )
     compiled(*kernel_args)
 
