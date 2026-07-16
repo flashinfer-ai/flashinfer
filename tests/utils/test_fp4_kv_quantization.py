@@ -316,6 +316,77 @@ def test_nvfp4_kv_dequantize_paged(kv_layout, block_table_dtype, dtype, non_cont
 
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_nvfp4_kv_dequantize_paged_bitexact_unaligned(kv_layout, dtype):
+    """Paged dequant: bit-exact at non-power-of-two scales, with non-contiguous cache
+    inputs AND an output view with a nonzero storage offset -- i.e. exercising the
+    byte-safe fallback on both the load and the store side."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    torch.manual_seed(7)
+    num_pages, page_size, batch_size, max_seq_len, num_kv_heads = 8, 3, 2, 7, 2
+    k_head_dim, v_head_dim = 64, 128
+
+    def rand_cache(hd):
+        return torch.randint(0, 256, (num_pages, page_size, num_kv_heads, hd // 2),
+                             dtype=torch.uint8, device="cuda")
+
+    def rand_scales(hd):
+        return torch.randint(1, 120, (num_pages, page_size, num_kv_heads, hd // 16),
+                             dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+
+    k_cache_nhd, v_cache_nhd = rand_cache(k_head_dim), rand_cache(v_head_dim)
+    k_scales_nhd, v_scales_nhd = rand_scales(k_head_dim), rand_scales(v_head_dim)
+
+    def to_layout(x):
+        return x if kv_layout == "NHD" else x.permute(0, 2, 1, 3).contiguous()
+
+    # non-contiguous last-dim views -> misaligned base / non-multiple strides -> fallback
+    k_cache = make_non_contiguous_last_dim_view(to_layout(k_cache_nhd))
+    v_cache = make_non_contiguous_last_dim_view(to_layout(v_cache_nhd))
+    k_scales = make_non_contiguous_last_dim_view(to_layout(k_scales_nhd))
+    v_scales = make_non_contiguous_last_dim_view(to_layout(v_scales_nhd))
+
+    block_tables = torch.tensor([[2, 5, 1], [6, 3, 0]], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([7, 4], dtype=torch.int32, device="cuda")
+    k_scale_val, v_scale_val = 0.7601996, 0.31234
+    k_scale = torch.tensor([k_scale_val], dtype=torch.float32, device="cuda")
+    v_scale = torch.tensor([v_scale_val], dtype=torch.float32, device="cuda")
+
+    # output views with a nonzero (odd-element) storage offset -> unaligned base -> fallback
+    def offset_output(hd):
+        numel = batch_size * max_seq_len * num_kv_heads * hd
+        buf = torch.full((numel + 1,), 123.0, dtype=dtype, device="cuda")
+        view = buf[1:].view(batch_size, max_seq_len, num_kv_heads, hd)
+        assert view.is_contiguous() and view.storage_offset() == 1
+        return view
+
+    output_k, output_v = offset_output(k_head_dim), offset_output(v_head_dim)
+
+    flashinfer.nvfp4_kv_dequantize_paged(
+        (k_cache, v_cache), (k_scales, v_scales), block_tables, seq_lens, k_scale, v_scale,
+        output_k, output_v, kv_layout=kv_layout,
+    )
+
+    ref_k = torch.full_like(output_k, 123.0)
+    ref_v = torch.full_like(output_v, 123.0)
+    for batch_idx, seq_len in enumerate(seq_lens.cpu().tolist()):
+        for token_idx in range(seq_len):
+            page = int(block_tables[batch_idx, token_idx // page_size].item())
+            entry = token_idx % page_size
+            ref_k[batch_idx, token_idx] = reference_dequant(
+                k_cache_nhd[page, entry], k_scales_nhd[page, entry], k_scale_val, dtype)
+            ref_v[batch_idx, token_idx] = reference_dequant(
+                v_cache_nhd[page, entry], v_scales_nhd[page, entry], v_scale_val, dtype)
+
+    # invalid rows are left at the sentinel in both, so a full bit-exact compare is valid
+    assert_bit_identical(output_k, ref_k)
+    assert_bit_identical(output_v, ref_v)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 def test_nvfp4_kv_dequantize_paged_long_context(kv_layout):
     """Exercise a long single-request cached-prefill style page walk."""
     cc = get_compute_capability()
