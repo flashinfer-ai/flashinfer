@@ -1209,6 +1209,22 @@ def fmha_decode_bsr_cutile(
     num_kv_heads = k_cache.shape[2]
     head_dim_vo = v_cache.shape[-1]
 
+    if num_qo_heads % num_kv_heads != 0:
+        # QUERY_GROUP_SIZE below is a floor division; a non-integral GQA ratio
+        # would silently drop the trailing query heads.
+        raise ValueError(
+            "cuTile decode requires num_qo_heads % num_kv_heads == 0 "
+            f"(num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads})."
+        )
+    if head_dim_qk != head_dim_vo:
+        # The kernel uses a single BLOCK_D (= head_dim_qk) for Q/K loads, the
+        # attention accumulator, V loads, and the output store; a different
+        # head_dim_vo would produce incorrect output.
+        raise NotImplementedError(
+            "cuTile decode requires head_dim_qk == head_dim_vo (got "
+            f"{head_dim_qk} vs {head_dim_vo})."
+        )
+
     QUERY_GROUP_SIZE = num_qo_heads // num_kv_heads
     TRANS_QK = QUERY_GROUP_SIZE < 64
 
@@ -1232,7 +1248,11 @@ def fmha_decode_bsr_cutile(
     if force_split_kv:
         should_use_split_kv = True
     else:
-        should_use_split_kv = not persistent and max_seq_len > 2048
+        # force_persistent (persistent scheduling) is mutually exclusive with
+        # split-KV; honor it here so the caller can actually disable split-KV.
+        should_use_split_kv = (
+            not force_persistent and not persistent and max_seq_len > 2048
+        )
 
     if should_use_split_kv:
         num_split_kv_estimated = max(NUM_SMS // num_batch, 1)
@@ -1580,9 +1600,11 @@ def decode_mla_kv_paged_cutile(
         BLOCK_H = BLOCK_H // 2
 
     if not _is_power_of_2(BLOCK_H):
-        BLOCK_H = _next_power_of_2(BLOCK_H) // 2
-        if BLOCK_H == 0:
-            BLOCK_H = 1
+        # The divisor from the loop above may be non-power-of-2 (e.g.
+        # QUERY_GROUP_SIZE=6 -> BLOCK_H=6). Rounding it (next_pow2//2) can break
+        # divisibility (6 -> 4) and drop query heads. The largest power-of-two
+        # divisor (n & -n) is both a power of two and divides QUERY_GROUP_SIZE.
+        BLOCK_H = QUERY_GROUP_SIZE & -QUERY_GROUP_SIZE
 
     BLOCK_N = page_size if page_size >= 16 else 16
     LOAD_BLOCK_N = min(BLOCK_N, page_size)
