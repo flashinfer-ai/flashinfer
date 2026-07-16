@@ -80,9 +80,14 @@ from .autotune import (
     autotune_nvfp4_mega_moe,
 )
 
+# Fused bf16 -> quant + routing staging (single-launch DataPreprocess).
+from .quant_stage import fused_quant_stage
+
 __all__ = [
     # paths
     "bootstrap_paths",
+    # quant_stage
+    "fused_quant_stage",
     # comm
     "bootstrap_dist",
     "free_sym_tensor",
