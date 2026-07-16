@@ -231,9 +231,37 @@ def test_search_cache_hit_and_miss():
     assert miss == (False, 0, -1, None)
 
     key = AutoTuner._get_cache_key("dummy", runner, shapes, config)
-    tuner.profiling_cache[key] = (0, 1, None)
+    tuner.profiling_cache[key] = (1, None)
     hit = tuner.search_cache("dummy", [runner], shapes, config)
     assert hit == (True, 0, 1, None)
+
+
+def test_search_cache_hit_resolves_runner_id_against_current_list():
+    """A cache hit must dispatch to the runner matching its key, not to a
+    position recorded at tuning time (issue #3999 regression test)."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    winner = DummyRunner()
+    other = OtherDummyRunner()
+    shapes = (torch.Size([8, 16]),)
+    tuple_tactic = (7, ((1, 2),))  # non-int tactic, like cuDNN engine/knobs
+
+    # Entry recorded when `winner` was tuned alone (position 0 at tuning time).
+    key = AutoTuner._get_cache_key("dummy", winner, shapes, config)
+    tuner.profiling_cache[key] = (tuple_tactic, None)
+
+    # A later call sees a longer runner list where `winner` sits at position 1.
+    hit = tuner.search_cache("dummy", [other, winner], shapes, config)
+    assert hit == (True, 1, tuple_tactic, None)
+
+    inputs = [torch.zeros(8, 16)]
+    chosen_runner, tactic = tuner.choose_one("dummy", [other, winner], config, inputs)
+    assert chosen_runner is winner
+    assert tactic == tuple_tactic
 
 
 def test_search_cache_preserving_leading_dims_hits_while_flattened_misses(monkeypatch):
@@ -306,7 +334,7 @@ def test_choose_one_inference_uses_cache_or_fallback():
 
     # Seed cache -> cache hit.
     key = AutoTuner._get_cache_key("dummy", runner, (inputs[0].shape,), config)
-    tuner.profiling_cache[key] = (0, 2, None)
+    tuner.profiling_cache[key] = (2, None)
     chosen_runner, tactic = tuner.choose_one("dummy", [runner], config, inputs)
     assert chosen_runner is runner
     assert tactic == 2

@@ -959,7 +959,10 @@ class AutoTunerStatistics:
 
 
 @functools.lru_cache(maxsize=16384)
-def load_from_file(file_key: str) -> tuple[bool, int, int, None]:
+def load_from_file(file_key: str) -> tuple[bool, int, Any, None]:
+    # Returns (is_cache_hit, runner_id, tactic, profile). The runner_id slot
+    # is a legacy placeholder from the on-disk format; the caller resolves
+    # the runner from the file_key and ignores this slot.
     module_name = get_config_path(is_module=True)
     try:
         module = importlib.import_module(module_name)
@@ -1019,7 +1022,7 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache: dict[
-            ProfilingCacheKey, tuple[int, int, OptimizationProfile]
+            ProfilingCacheKey, tuple[Any, OptimizationProfile | None]
         ] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
@@ -1194,7 +1197,7 @@ class AutoTuner:
         input_shapes: tuple[tuple[int, ...], ...],
         tuning_config: TuningConfig,
         inputs: list[torch.Tensor] | None = None,
-    ) -> tuple[bool, int, int, OptimizationProfile | None]:
+    ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search for cached profiling results matching the current configuration.
 
         Searches the following sources in priority order:
@@ -1226,14 +1229,15 @@ class AutoTuner:
             synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
-            for r in runners:
+            for r_id, r in enumerate(runners):
                 extras = r.get_cache_key_extras(inputs) if inputs is not None else ()
                 cache_key = AutoTuner._get_cache_key(
                     custom_op, r, input_shapes, tuning_config, extras
                 )
                 # 1. In-memory cache (from live tuning)
                 if cache_key in self.profiling_cache:
-                    return True, *self.profiling_cache[cache_key]
+                    tactic, stored_profile = self.profiling_cache[cache_key]
+                    return True, r_id, tactic, stored_profile
 
                 # Build the hash-free file key used by both user configs and bundled configs.
                 # Include extras (index 4) so that runner specific parameters
@@ -1267,9 +1271,9 @@ class AutoTuner:
                     os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
                     and not self.is_tuning_mode
                 ):
-                    output = load_from_file(cache_key.file_key)
-                    if output[0]:  # is_cache_hit
-                        return output
+                    is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
+                    if is_hit:
+                        return True, r_id, file_tactic, None
 
             # 4. Fallback
             return False, 0, -1, None
@@ -1634,8 +1638,7 @@ class AutoTuner:
                                 tuning_config,
                                 runners[runner_id].get_cache_key_extras(tensors),
                             )
-                            # inspect call stack
-                            self.profiling_cache[cache_key] = (runner_id, tactic, p)
+                            self.profiling_cache[cache_key] = (tactic, p)
                             self._dirty = True
                             self._dirty_seq += 1
                             self.stats.tuned_op_successful_configs[custom_op] = (
@@ -2080,7 +2083,7 @@ class AutoTuner:
 
             # Overlay in-memory profiling results (take priority over loaded configs)
             for cache_key, cache_value in self.profiling_cache.items():
-                _, tactic, _ = cache_value
+                tactic, _ = cache_value
 
                 # Use hash-free key including extras so runner specific parameters
                 # are preserved across save or load.
