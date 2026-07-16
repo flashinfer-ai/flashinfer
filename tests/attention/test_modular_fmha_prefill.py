@@ -1051,6 +1051,77 @@ def test_attention_prefill_sliding_window_top_level_wrapper(causal):
     torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
 
 
+# Mixed per-sequence lengths: every sequence in a batch gets its own band
+# geometry (kv_start, head/main/tail peel counts, borrow rule) and short
+# sequences exercise the item-skip path — none of which uniform batches
+# cover.  Patterns include a tiny sequence, uneven multi-sequence batches,
+# and non-tile-aligned lengths.
+WINDOW_VARLEN_INDPTR_PARAMS = [
+    [0, 7, 1291, 1547, 3083],  # tiny seq + uneven lengths
+    [0, 1350, 2667, 4003, 5347, 6631, 7919, 9208, 10524],  # 8 uneven seqs
+    [0, 300, 556, 2604],  # non-tile-aligned mix
+]
+
+
+@pytest.mark.parametrize("indptr", WINDOW_VARLEN_INDPTR_PARAMS)
+@pytest.mark.parametrize(
+    "causal,window_left,window_right",
+    [
+        (True, 100, -1),  # causal + sliding window (serving SWA)
+        (False, 64, -1),  # left-bound-only window
+    ],
+)
+def test_attention_prefill_sliding_window_varlen(
+    indptr,
+    causal,
+    window_left,
+    window_right,
+):
+    """Windowed masks over mixed-length ragged batches."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(indptr[-1], NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn_like(k)
+    qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
+    kv_indptr = qo_indptr
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        window_left=window_left,
+        window_right=window_right,
+    )
+    o = wrapper.run(q, k, v)
+
+    # Per-sequence reference: the band mask depends only on each
+    # sequence's own lengths, so apply the uniform-batch reference to
+    # each slice with batch_size=1.
+    o_ref = torch.empty_like(o)
+    for i in range(len(indptr) - 1):
+        lo, hi = indptr[i], indptr[i + 1]
+        o_ref[lo:hi] = attention_band_mask_ref(
+            1, q[lo:hi], k[lo:hi], v[lo:hi], SM_SCALE, causal,
+            window_left, window_right,
+        )
+
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
 # ---------------------------------------------------------------------------
 #  8. Head dimension 64
 # ---------------------------------------------------------------------------
