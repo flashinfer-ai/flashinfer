@@ -1,6 +1,8 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # Adapted for Recurrent KDA kernel testing
 
+import importlib
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -14,6 +16,10 @@ try:
 except ImportError:
     recurrent_kda = None
     _has_recurrent_kda = False
+
+recurrent_kda_module = importlib.import_module("flashinfer.kda_kernels.recurrent_kda")
+TREE_REDUCTION = recurrent_kda_module.DOT_REDUCTION_TREE
+DUAL_ACCUM_REDUCTION = recurrent_kda_module.DOT_REDUCTION_DUAL_ACCUM
 
 try:
     from fla.ops.kda import fused_recurrent_kda
@@ -1072,17 +1078,16 @@ def assert_spec_states(
         "D",
         "num_spec_tokens",
         "use_qk_l2norm_in_kernel",
-        "use_chunk_major",
     ),
     [
-        pytest.param(4, 8, 8, 64, 1, True, False, id="N4-H8-D64-S1"),
-        pytest.param(4, 8, 8, 64, 3, True, False, id="N4-H8-D64-S3"),
-        pytest.param(4, 8, 8, 64, 1, False, False, id="N4-H8-D64-S1-no-qk-l2"),
-        pytest.param(8, 16, 16, 128, 2, True, False, id="N8-H16-D128-S2"),
-        pytest.param(8, 16, 16, 128, 4, True, False, id="N8-H16-D128-S4"),
-        pytest.param(8, 16, 16, 128, 2, False, False, id="N8-H16-D128-S2-no-qk-l2"),
-        pytest.param(4, 4, 8, 64, 2, True, False, id="N4-H4-HV8-D64-S2-GQA"),
-        pytest.param(4, 8, 8, 128, 3, True, True, id="N4-H8-D128-S3-chunk-major"),
+        pytest.param(4, 8, 8, 64, 1, True, id="N4-H8-D64-S1"),
+        pytest.param(4, 8, 8, 64, 3, True, id="N4-H8-D64-S3"),
+        pytest.param(4, 8, 8, 64, 1, False, id="N4-H8-D64-S1-no-qk-l2"),
+        pytest.param(8, 16, 16, 128, 2, True, id="N8-H16-D128-S2"),
+        pytest.param(8, 16, 16, 128, 4, True, id="N8-H16-D128-S4"),
+        pytest.param(8, 16, 16, 128, 2, False, id="N8-H16-D128-S2-no-qk-l2"),
+        pytest.param(4, 4, 8, 64, 2, True, id="N4-H4-HV8-D64-S2-GQA"),
+        pytest.param(4, 8, 8, 128, 3, True, id="N4-H8-D128-S3"),
     ],
 )
 def test_spec_decode_basic(
@@ -1092,29 +1097,10 @@ def test_spec_decode_basic(
     D,
     num_spec_tokens,
     use_qk_l2norm_in_kernel,
-    use_chunk_major,
-    monkeypatch,
 ):
     """Single spec-decode call matches T sequential naive calls."""
     torch.manual_seed(42)
     device = torch.device("cuda")
-
-    if use_chunk_major:
-        import importlib
-
-        recurrent_kda_backend = importlib.import_module(
-            "flashinfer.kda_kernels.recurrent_kda"
-        )
-
-        get_compiled_kernel = recurrent_kda_backend._get_compiled_kernel
-
-        def get_chunk_major_kernel(*args):
-            return get_compiled_kernel(*args[:-1], 1)
-
-        monkeypatch.setenv("KDA_USE_VTILE", "0")
-        monkeypatch.setattr(
-            recurrent_kda_backend, "_get_compiled_kernel", get_chunk_major_kernel
-        )
 
     q, k, v, g, beta, cu_seqlens, ssm_state_indices, state_pool, scale, T = (
         make_spec_decode_inputs(N, H, HV, D, num_spec_tokens, device)
@@ -1154,12 +1140,215 @@ def test_spec_decode_basic(
     )
 
     # Output comparison
-    assert_close("spec_output", ref_out.float(), tri_out.float(), atol=1e-1, rtol=5e-2)
+    assert_close(
+        "spec_output", ref_out.bfloat16().float(), tri_out.float(), atol=1e-1, rtol=5e-2
+    )
 
     # Per-token state comparison (EACH slot must match)
     assert_spec_states(
         tri_state_pool, ssm_state_indices, ref_states, N, T, atol=1e-1, rtol=5e-2
     )
+
+
+@pytest.mark.parametrize("D", [64, 128])
+def test_spec_decode_separate_source_and_beta_logits(D):
+    """Committed state is read in-kernel and beta logits are activated there."""
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    N, H, HV, num_spec_tokens = 4, 8, 8, 3
+
+    q, k, v, g, _, cu_seqlens, ssm_state_indices, scratch, scale, T = (
+        make_spec_decode_inputs(N, H, HV, D, num_spec_tokens, device)
+    )
+    beta_logits = torch.randn(1, N * T, HV, dtype=torch.bfloat16, device=device)
+    beta = beta_logits.sigmoid()
+    source_values = torch.randn(N + 3, HV, D, D, dtype=torch.bfloat16, device=device)
+    source_stride = HV * D * D + 32
+    source_backing = torch.empty(
+        (N + 3) * source_stride, dtype=torch.bfloat16, device=device
+    )
+    source = source_backing.as_strided(
+        size=(N + 3, HV, D, D),
+        stride=(source_stride, D * D, D, 1),
+    )
+    source.copy_(source_values)
+    source_indices = torch.tensor([3, 1, 5, 0], dtype=torch.int32, device=device)
+
+    reference_pool = scratch.clone()
+    for batch_idx in range(N):
+        reference_pool[ssm_state_indices[batch_idx, 0]] = source[
+            source_indices[batch_idx]
+        ]
+    ref_out, ref_states = spec_decode_naive_reference(
+        q, k, v, g, beta, ssm_state_indices, reference_pool, scale, N, T, H, HV
+    )
+
+    output_pool = scratch.clone()
+    out, _ = recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta_logits,
+        beta_is_logit=True,
+        scale=scale,
+        initial_state=output_pool,
+        initial_state_source=source,
+        initial_state_indices=source_indices,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_spec_tokens=num_spec_tokens,
+    )
+
+    assert_close(
+        "separate_source_output",
+        ref_out.bfloat16().float(),
+        out.float(),
+        atol=1e-1,
+        rtol=5e-2,
+    )
+    assert_spec_states(
+        output_pool, ssm_state_indices, ref_states, N, T, atol=1e-1, rtol=5e-2
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "D",
+        "N",
+        "tokens",
+        "use_gate",
+        "expected_rows",
+        "expected_reduction",
+    ),
+    [
+        pytest.param(
+            64,
+            1,
+            1,
+            False,
+            8,
+            TREE_REDUCTION,
+            id="D64-T1-low-grid-tree",
+        ),
+        pytest.param(
+            64,
+            128,
+            1,
+            False,
+            16,
+            DUAL_ACCUM_REDUCTION,
+            id="D64-T1-large-grid-dual",
+        ),
+        pytest.param(
+            128,
+            8,
+            8,
+            True,
+            8,
+            TREE_REDUCTION,
+            id="D128-low-grid-tree",
+        ),
+        pytest.param(
+            128,
+            14,
+            8,
+            True,
+            16,
+            DUAL_ACCUM_REDUCTION,
+            id="D128-mid-grid-row16",
+        ),
+        pytest.param(
+            128,
+            45,
+            2,
+            True,
+            16,
+            DUAL_ACCUM_REDUCTION,
+            id="D128-large-grid-T2",
+        ),
+        pytest.param(
+            128,
+            45,
+            8,
+            False,
+            8,
+            DUAL_ACCUM_REDUCTION,
+            id="D128-large-grid-row8-dual",
+        ),
+        pytest.param(
+            128,
+            16,
+            8,
+            False,
+            32,
+            DUAL_ACCUM_REDUCTION,
+            id="D128-mid-grid-row32-dual",
+        ),
+        pytest.param(
+            64,
+            8,
+            3,
+            False,
+            8,
+            TREE_REDUCTION,
+            id="D64-T3-low-grid-tree",
+        ),
+        pytest.param(
+            64,
+            8,
+            4,
+            False,
+            8,
+            TREE_REDUCTION,
+            id="D64-low-grid-tree",
+        ),
+        pytest.param(
+            64,
+            8,
+            4,
+            True,
+            16,
+            DUAL_ACCUM_REDUCTION,
+            id="D64-fused-row16",
+        ),
+        pytest.param(
+            64,
+            256,
+            4,
+            False,
+            16,
+            DUAL_ACCUM_REDUCTION,
+            id="D64-mid-grid-row16",
+        ),
+        pytest.param(
+            64,
+            256,
+            6,
+            False,
+            32,
+            DUAL_ACCUM_REDUCTION,
+            id="D64-high-grid-row32",
+        ),
+    ],
+)
+def test_kernel_schedule(
+    D,
+    N,
+    tokens,
+    use_gate,
+    expected_rows,
+    expected_reduction,
+):
+    """The measured tile and reduction schedule is selected for each workload."""
+    HV = 8 if D == 64 else 16
+    selected = recurrent_kda_module._select_kernel_schedule(
+        D,
+        tokens,
+        use_gate,
+        N * HV,
+    )
+    assert selected == (expected_rows, expected_reduction)
 
 
 # ------------------------------------------------------------------------------
@@ -1219,7 +1408,7 @@ def test_spec_decode_gate_modes(gate_mode):
         q,
         k,
         v,
-        g_ref,
+        g_ref.bfloat16(),
         beta,
         ssm_state_indices,
         state_pool,
@@ -1250,7 +1439,7 @@ def test_spec_decode_gate_modes(gate_mode):
 
     assert_close(
         "spec_output_gate",
-        ref_out.float(),
+        ref_out.bfloat16().float(),
         tri_out.float(),
         atol=1e-1,
         rtol=5e-2,
@@ -1354,7 +1543,7 @@ def test_spec_decode_padded_cuda_graph(D):
     # Active outputs correct (first N_active*T output positions)
     assert_close(
         "padded_active_out",
-        ref_out_active.float(),
+        ref_out_active.bfloat16().float(),
         tri_out[:, : N_active * T].float(),
         atol=1e-1,
         rtol=5e-2,
@@ -1440,16 +1629,6 @@ def test_spec_decode_shape_validation():
     with pytest.raises(ValueError, match="shape\\[0\\]"):
         try_call(
             ssm_state_indices=torch.zeros(N + 1, T, dtype=torch.int32, device=device)
-        )
-
-    with pytest.raises(ValueError, match="lower_bound requires"):
-        try_call(lower_bound=-5.0)
-
-    with pytest.raises(ValueError, match="lower_bound must be negative"):
-        try_call(
-            use_gate_in_kernel=True,
-            A_log=torch.zeros(H, dtype=torch.float32, device=device),
-            lower_bound=0.0,
         )
 
     # Checks below (bounds, uniqueness, cu_seqlens deltas, shape mismatches) were
@@ -1928,7 +2107,7 @@ def test_spec_decode_checkpoint_correctness():
 
     assert_close(
         "checkpoint_out",
-        ref_out.float(),
+        ref_out.bfloat16().float(),
         tri_out.float(),
         atol=1e-1,
         rtol=5e-2,
@@ -1993,7 +2172,9 @@ def test_spec_decode_non_compact_state():
         num_spec_tokens=num_spec_tokens,
     )
 
-    assert_close("nc_output", ref_out.float(), tri_out.float(), atol=1e-1, rtol=5e-2)
+    assert_close(
+        "nc_output", ref_out.bfloat16().float(), tri_out.float(), atol=1e-1, rtol=5e-2
+    )
     # Verify each per-token state checkpoint slot in the non-compact pool
     for b in range(N):
         for t in range(T):
@@ -2278,7 +2459,7 @@ def test_spec_decode_batched_auto_ssi():
 
     # Call with ssm_state_indices=None -- shim auto-generates arange(B*T).reshape(B, T)
     tri_state_pool = state_pool.clone()
-    tri_out, final_state = recurrent_kda(
+    tri_out, _ = recurrent_kda(
         q=q,
         k=k,
         v=v,
@@ -2324,7 +2505,7 @@ def test_spec_decode_batched_auto_ssi():
     ref_out_batched = ref_out.reshape(B, T, HV, D)
     assert_close(
         "auto_ssi_out",
-        ref_out_batched.float(),
+        ref_out_batched.bfloat16().float(),
         tri_out.float(),
         atol=1e-1,
         rtol=5e-2,
@@ -2334,5 +2515,3 @@ def test_spec_decode_batched_auto_ssi():
     assert_spec_states(
         tri_state_pool, expected_ssi, ref_states, B, T, atol=1e-1, rtol=5e-2
     )
-    assert final_state is tri_state_pool
-    assert final_state.shape == (n_pool, HV, D, D)

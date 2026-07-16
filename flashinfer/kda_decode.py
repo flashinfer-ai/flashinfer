@@ -57,6 +57,9 @@ def recurrent_kda(
     num_spec_tokens: Optional[int] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    initial_state_source: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
+    beta_is_logit: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Key-Driven Attention) decode kernel.
 
@@ -79,7 +82,7 @@ def recurrent_kda(
             Log-space if pre-computed, raw input if ``use_gate_in_kernel=True``.
         beta (torch.Tensor):
             Delta-rule learning rate of shape ``[B, 1, HV]``. Must be bfloat16.
-            Pre-sigmoided.
+            Pre-sigmoided unless ``beta_is_logit=True``.
         A_log (Optional[torch.Tensor]):
             Log decay parameter of shape ``[H]``. Must be float32.
             Required when ``use_gate_in_kernel=True``.
@@ -120,6 +123,15 @@ def recurrent_kda(
             Pre-allocated output tensor. Shape ``[B, 1, HV, V]`` for standard
             decode, ``[1, N*(1+S), HV, V]`` for spec decode with
             ``cu_seqlens``. If ``None``, a new tensor is allocated.
+        initial_state_source (Optional[torch.Tensor]):
+            Optional read-only committed state pool ``[N0, HV, V, K]``. When
+            provided, token 0 is loaded from this pool instead of
+            ``initial_state``.
+        initial_state_indices (Optional[torch.Tensor]):
+            Source slot per sequence, shape ``[N]`` int32. Required together
+            with ``initial_state_source``.
+        beta_is_logit (bool):
+            If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -149,4 +161,7 @@ def recurrent_kda(
         num_spec_tokens=num_spec_tokens,
         num_accepted_tokens=num_accepted_tokens,
         output=output,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        beta_is_logit=beta_is_logit,
     )

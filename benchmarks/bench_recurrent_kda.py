@@ -15,9 +15,9 @@
 """
 Recurrent KDA (Key-Driven Attention) Benchmark
 
-Benchmarks recurrent KDA decode with per-K-dimension gating. T=1 uses the
-standard decode path; T>1 uses fused speculative decode with
-num_spec_tokens=T-1.
+Benchmarks the recurrent KDA register-tile kernel with per-K-dimension gating.
+T=1 is standard decode; T>1 is fused speculative decode with
+``num_spec_tokens=T-1``.
 KDA differs from GDN by having gate g[B, T, HV, K] instead of a scalar gate.
 
 Usage:
