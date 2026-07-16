@@ -1040,16 +1040,30 @@ def get_symm_buffer_for_mega_moe(
     )
     num_experts_per_rank = num_total_experts // world_size
 
-    from .tuner import default_knobs, with_knobs
+    from .knob_cache import resolve_knobs
+    from .tuner import with_knobs
 
-    # Token-count heuristic picks the perf/tile tactic by compile-time buffer
-    # size (num_max_tokens); an explicit knobs= dict overrides it entirely.
-    resolved_knobs = dict(knobs) if knobs is not None else default_knobs(num_max_tokens)
-    if knobs is None and combine_dtype != "bf16":
+    # knobs=None -> pure lookup: offline-tuned cache entry for this session
+    # key when present, else the built-in token-count heuristic.  An explicit
+    # knobs= dict overrides both entirely.
+    if knobs is not None:
+        resolved_knobs, knob_source = dict(knobs), "explicit"
+    else:
+        resolved_knobs, knob_source = resolve_knobs(
+            dtype="nvfp4",
+            world_size=world_size,
+            hidden=hidden,
+            intermediate=intermediate,
+            num_experts=num_total_experts,
+            topk=num_topk,
+            max_tokens=num_max_tokens,
+            combine_dtype=combine_dtype,
+        )
+    if knob_source == "heuristic" and combine_dtype != "bf16":
         # The measured profiles pick the token-back mode freely, but a
         # quantized combine wire is only wired for dispatch-warp token-back;
-        # explicit knobs are the caller's contract and are left untouched (the
-        # config validation rejects incompatible combos).
+        # explicit/cached knobs are the caller's/tuner's contract and are left
+        # untouched (the config validation rejects incompatible combos).
         resolved_knobs["token_back_mode"] = "reuse_dispatch_warps"
 
     cfg = MegaMoENvfp4Config(
