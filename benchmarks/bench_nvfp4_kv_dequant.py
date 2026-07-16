@@ -1,7 +1,8 @@
 """Benchmark NVFP4 KV-cache dequantization (dense + paged).
 
 Reports effective DRAM bandwidth (GB/s) on large, bandwidth-bound shapes for both the dense
-(`nvfp4_kv_dequantize`) and paged (`nvfp4_kv_dequantize_paged`) kernels. Runs on any CUDA GPU.
+(`nvfp4_kv_dequantize`) and paged (`nvfp4_kv_dequantize_paged`) kernels. Requires SM80+
+(FP8 E4M3 support).
 
     python benchmarks/bench_nvfp4_kv_dequant.py
 """
@@ -75,6 +76,11 @@ def bench_paged():
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA GPU required"
+    major, minor = torch.cuda.get_device_capability(0)
+    if major * 10 + minor < 80:
+        raise SystemExit(
+            f"NVFP4 KV dequant requires SM80+ (FP8 E4M3); got SM{major}{minor}."
+        )
     print(f"device: {torch.cuda.get_device_name(0)}  torch: {torch.__version__}")
     bench_dense()
     bench_paged()
