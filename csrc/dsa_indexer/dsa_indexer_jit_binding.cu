@@ -10,17 +10,14 @@ void dsa_indexer_seed_prep(TensorView slog, int64_t num_buckets, int64_t topk, i
                            int64_t emit_limit, double headroom, int64_t probe_stride_tok,
                            int64_t hist_stride, TensorView origin, TensorView inv_delta,
                            TensorView th_bucket, TensorView bcount, TensorView cand_val,
-                           TensorView cand_idx, TensorView cand_cnt, int64_t k_safe,
-                           Optional<TensorView> th_safe, Optional<TensorView> seed_pred_cnt);
+                           TensorView cand_idx, TensorView cand_cnt);
 
 void dsa_indexer_scan(TensorView q, TensorView kv, TensorView kv_scales, TensorView weights,
                       TensorView cu_start, TensorView cu_end, TensorView origin,
                       TensorView inv_delta, TensorView th_bucket, TensorView cand_val,
                       TensorView cand_idx, TensorView cand_cnt, TensorView bcount,
                       int64_t num_buckets, int64_t topk, int64_t refresh_every,
-                      int64_t num_kv_splits_override, int64_t probe_group, int64_t probe_add_max,
-                      int64_t repair, Optional<TensorView> th_safe, Optional<TensorView> seed_total,
-                      Optional<TensorView> seed_pred);
+                      int64_t num_kv_splits_override, int64_t probe_group, int64_t probe_add_max);
 
 void dsa_indexer_select(TensorView cand_val, TensorView cand_idx, TensorView cand_cnt,
                         TensorView origin, TensorView inv_delta, TensorView th_bucket,

@@ -89,7 +89,7 @@ def seed_prep(
     get_dsa_indexer_module().seed_prep(
         slog, num_buckets, top_k, cand_cap, 0, float(headroom),
         probe_stride_tok, hist_stride, origin, inv_delta, th_bucket, bcount,
-        cand_val, cand_idx, cand_cnt, 0, None, None,
+        cand_val, cand_idx, cand_cnt,
     )
 
 
@@ -117,7 +117,7 @@ def scan(
     get_dsa_indexer_module().scan(
         q, kv, kv_scales, weights, cu_start, cu_end, origin, inv_delta, th_bucket,
         cand_val, cand_idx, cand_cnt, bcount, num_buckets, top_k, refresh_every,
-        num_kv_splits, probe_group, probe_add_max, 0, None, None, None,
+        num_kv_splits, probe_group, probe_add_max,
     )
 
 

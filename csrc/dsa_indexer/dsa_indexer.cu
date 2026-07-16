@@ -14,9 +14,7 @@ void dsa_indexer_seed_prep(TensorView slog, int64_t num_buckets, int64_t topk,
                            int64_t cand_cap, int64_t emit_limit, double headroom,
                            int64_t probe_stride_tok, int64_t hist_stride, TensorView origin,
                            TensorView inv_delta, TensorView th_bucket, TensorView bcount,
-                           TensorView cand_val, TensorView cand_idx, TensorView cand_cnt,
-                           int64_t k_safe, Optional<TensorView> th_safe,
-                           Optional<TensorView> seed_pred_cnt) {
+                           TensorView cand_val, TensorView cand_idx, TensorView cand_cnt) {
   CHECK_INPUT(slog);
   CHECK_DIM(2, slog);
   const int Q = static_cast<int>(slog.size(0));
@@ -26,9 +24,6 @@ void dsa_indexer_seed_prep(TensorView slog, int64_t num_buckets, int64_t topk,
   const int cap = static_cast<int>(cand_cap);
   TVM_FFI_ICHECK(NB >= 2 && NB <= 4096) << "num_buckets out of range";
   TVM_FFI_ICHECK(K >= 1 && cap >= K) << "need cap >= topk >= 1";
-  const int ks = static_cast<int>(k_safe);
-  TVM_FFI_ICHECK(ks <= 0 || (th_safe.has_value() && seed_pred_cnt.has_value()))
-      << "certificate mode needs th_safe and seed_pred_cnt";
 
   cudaSetDevice(slog.device().device_id);
   cudaStream_t stream = get_stream(slog.device());
@@ -47,11 +42,9 @@ void dsa_indexer_seed_prep(TensorView slog, int64_t num_buckets, int64_t topk,
 
   seed_prep_kernel<<<Q, 1024, seed_smem, stream>>>(
       static_cast<float*>(slog.data_ptr()), static_cast<int>(slog.stride(0)), head, NB, K, cap,
-      emit_lim, pst, hst, static_cast<float>(headroom), ks,
+      emit_lim, pst, hst, static_cast<float>(headroom),
       static_cast<float*>(origin.data_ptr()), static_cast<float*>(inv_delta.data_ptr()),
       static_cast<int32_t*>(th_bucket.data_ptr()),
-      ks > 0 ? static_cast<int32_t*>(th_safe.value().data_ptr()) : nullptr,
-      ks > 0 ? static_cast<int32_t*>(seed_pred_cnt.value().data_ptr()) : nullptr,
       static_cast<int32_t*>(bcount.data_ptr()), static_cast<float*>(cand_val.data_ptr()),
       static_cast<int32_t*>(cand_idx.data_ptr()), static_cast<int32_t*>(cand_cnt.data_ptr()));
 }
@@ -61,9 +54,7 @@ void dsa_indexer_scan(TensorView q, TensorView kv, TensorView kv_scales, TensorV
                       TensorView inv_delta, TensorView th_bucket, TensorView cand_val,
                       TensorView cand_idx, TensorView cand_cnt, TensorView bcount,
                       int64_t num_buckets, int64_t topk, int64_t refresh_every,
-                      int64_t num_kv_splits_override, int64_t probe_group, int64_t probe_add_max,
-                      int64_t repair, Optional<TensorView> th_safe, Optional<TensorView> seed_total,
-                      Optional<TensorView> seed_pred) {
+                      int64_t num_kv_splits_override, int64_t probe_group, int64_t probe_add_max) {
   CHECK_INPUT(q);
   CHECK_INPUT(kv);
   CHECK_INPUT(kv_scales);
@@ -97,10 +88,6 @@ void dsa_indexer_scan(TensorView q, TensorView kv, TensorView kv_scales, TensorV
                                                     SPEC_THREADS, MATH_THREADS>;
   cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
-  const int repair_i = static_cast<int>(repair);
-  TVM_FFI_ICHECK(repair_i == 0 ||
-                 (th_safe.has_value() && seed_total.has_value() && seed_pred.has_value()))
-      << "repair mode needs th_safe/seed_total/seed_pred";
   const int num_q_blocks = (seq_len + BLOCK_Q - 1) / BLOCK_Q;
   const int total_kv_blocks = (seq_len_kv + BLOCK_KV - 1) / BLOCK_KV;
   int num_kv_splits;
@@ -126,11 +113,7 @@ void dsa_indexer_scan(TensorView q, TensorView kv, TensorView kv_scales, TensorV
       probe_group > 0 ? (((1ULL << 42) + (uint64_t)probe_group - 1) / (uint64_t)probe_group) : 0ULL,
       (uint32_t)probe_add_max, static_cast<float*>(cand_val.data_ptr()),
       static_cast<int32_t*>(cand_idx.data_ptr()), static_cast<int32_t*>(cand_cnt.data_ptr()),
-      (uint32_t)cand_cap, (uint32_t)repair_i,
-      repair_i ? static_cast<int32_t*>(th_safe.value().data_ptr()) : nullptr,
-      repair_i ? static_cast<int32_t*>(seed_total.value().data_ptr()) : nullptr,
-      repair_i ? static_cast<int32_t*>(seed_pred.value().data_ptr()) : nullptr, tm_q, tm_kv, tm_ks,
-      tm_w);
+      (uint32_t)cand_cap, tm_q, tm_kv, tm_ks, tm_w);
 
   if (external_refresh) {
     int block = 128;
