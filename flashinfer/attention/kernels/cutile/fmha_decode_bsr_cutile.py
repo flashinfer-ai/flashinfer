@@ -567,12 +567,52 @@ def _decode_attention_kv_paged_kernel(
         ct.scatter(lse_out, lse_indices, lse)
 
 
+def _load_page_mla_tree(
+    cache, block_tables, page_table_offset, page, token, lo, hi, LOAD_BLOCK_N, BLOCK_DIM
+):
+    """Load MLA pages [lo, hi) and return them concatenated along axis 0.
+
+    Balanced-tree recursion over the compile-time page range (mirrors
+    ``_load_page_tree`` for the 4D KV cache) so the result is a single nested
+    ct.cat expression -- never a reassigned variable, which the cuTile tracer
+    rejects. Page ``lo`` starts at the intra-page token offset; later pages
+    start at row 0.
+    """
+    if hi - lo == 1:
+        page_id = ct.gather(
+            block_tables, (page_table_offset + page + lo,), padding_value=0
+        ).item()
+        row = token // LOAD_BLOCK_N if lo == 0 else 0
+        return ct.reshape(
+            ct.load(
+                cache,
+                index=(page_id, row, 0),
+                shape=(1, LOAD_BLOCK_N, BLOCK_DIM),
+                order=(0, 1, 2),
+                allow_tma=True,
+                latency=2,
+            ),
+            (LOAD_BLOCK_N, BLOCK_DIM),
+        )
+    mid = (lo + hi) // 2
+    left = _load_page_mla_tree(
+        cache, block_tables, page_table_offset, page, token, lo, mid, LOAD_BLOCK_N, BLOCK_DIM
+    )
+    right = _load_page_mla_tree(
+        cache, block_tables, page_table_offset, page, token, mid, hi, LOAD_BLOCK_N, BLOCK_DIM
+    )
+    return ct.cat((left, right), 0)
+
+
 def _load_page_mla(cache, block_tables, page_table_offset, page, token, NUM_PAGES, LOAD_BLOCK_N, BLOCK_DIM, _PAGE_SIZE):
     """
     Load data from paged MLA cache (3D: [total_num_pages, PAGE_SIZE, dim]) via TMA.
 
-    For single page, issues one TMA load.
-    For multiple pages, issues N independent TMA loads and concatenates via ct.cat.
+    Issues one TMA load per page and concatenates via a balanced ct.cat tree,
+    supporting arbitrary NUM_PAGES. A small page_size yields NUM_PAGES up to 16
+    (BLOCK_N // page_size), so the loader must not be limited to a fixed set of
+    page counts -- the previous {1, 2, 4} branches fell through to an undefined
+    ``data`` for NUM_PAGES in {8, 16} and failed during tracing.
 
     Args:
         cache: cache array [total_num_pages, PAGE_SIZE, dim]
@@ -580,7 +620,7 @@ def _load_page_mla(cache, block_tables, page_table_offset, page, token, NUM_PAGE
         page_table_offset: offset into block_tables for current batch
         page: starting page index in the page table
         token: token offset within page
-        NUM_PAGES: number of pages to load (1, 2, or 4)
+        NUM_PAGES: number of pages to load (any positive compile-time integer)
         LOAD_BLOCK_N: tokens per page load (== PAGE_SIZE)
         BLOCK_DIM: feature dimension (BLOCK_D or BLOCK_R)
         _PAGE_SIZE: tokens per page (unused; LOAD_BLOCK_N is used instead)
@@ -588,97 +628,9 @@ def _load_page_mla(cache, block_tables, page_table_offset, page, token, NUM_PAGE
     Returns:
         Loaded tensor of shape [NUM_PAGES * LOAD_BLOCK_N, BLOCK_DIM]
     """
-    if NUM_PAGES == 1:
-        page_id = ct.gather(block_tables, (page_table_offset + page,), padding_value=0).item()
-        data = ct.reshape(
-            ct.load(
-                cache,
-                index=(page_id, token // LOAD_BLOCK_N, 0),
-                shape=(1, LOAD_BLOCK_N, BLOCK_DIM),
-                order=(0, 1, 2),
-                allow_tma=True,
-                latency=2,
-            ),
-            (LOAD_BLOCK_N, BLOCK_DIM),
-        )
-    elif NUM_PAGES == 2:
-        pg0 = ct.gather(block_tables, (page_table_offset + page,), padding_value=0).item()
-        d0 = ct.reshape(
-            ct.load(
-                cache,
-                index=(pg0, token // LOAD_BLOCK_N, 0),
-                shape=(1, LOAD_BLOCK_N, BLOCK_DIM),
-                order=(0, 1, 2),
-                allow_tma=True,
-                latency=2,
-            ),
-            (LOAD_BLOCK_N, BLOCK_DIM),
-        )
-        pg1 = ct.gather(block_tables, (page_table_offset + page + 1,), padding_value=0).item()
-        d1 = ct.reshape(
-            ct.load(
-                cache,
-                index=(pg1, 0, 0),
-                shape=(1, LOAD_BLOCK_N, BLOCK_DIM),
-                order=(0, 1, 2),
-                allow_tma=True,
-                latency=2,
-            ),
-            (LOAD_BLOCK_N, BLOCK_DIM),
-        )
-        data = ct.cat((d0, d1), 0)
-    elif NUM_PAGES == 4:
-        pg0 = ct.gather(block_tables, (page_table_offset + page,), padding_value=0).item()
-        d0 = ct.reshape(
-            ct.load(
-                cache,
-                index=(pg0, token // LOAD_BLOCK_N, 0),
-                shape=(1, LOAD_BLOCK_N, BLOCK_DIM),
-                order=(0, 1, 2),
-                allow_tma=True,
-                latency=2,
-            ),
-            (LOAD_BLOCK_N, BLOCK_DIM),
-        )
-        pg1 = ct.gather(block_tables, (page_table_offset + page + 1,), padding_value=0).item()
-        d1 = ct.reshape(
-            ct.load(
-                cache,
-                index=(pg1, 0, 0),
-                shape=(1, LOAD_BLOCK_N, BLOCK_DIM),
-                order=(0, 1, 2),
-                allow_tma=True,
-                latency=2,
-            ),
-            (LOAD_BLOCK_N, BLOCK_DIM),
-        )
-        pg2 = ct.gather(block_tables, (page_table_offset + page + 2,), padding_value=0).item()
-        d2 = ct.reshape(
-            ct.load(
-                cache,
-                index=(pg2, 0, 0),
-                shape=(1, LOAD_BLOCK_N, BLOCK_DIM),
-                order=(0, 1, 2),
-                allow_tma=True,
-                latency=2,
-            ),
-            (LOAD_BLOCK_N, BLOCK_DIM),
-        )
-        pg3 = ct.gather(block_tables, (page_table_offset + page + 3,), padding_value=0).item()
-        d3 = ct.reshape(
-            ct.load(
-                cache,
-                index=(pg3, 0, 0),
-                shape=(1, LOAD_BLOCK_N, BLOCK_DIM),
-                order=(0, 1, 2),
-                allow_tma=True,
-                latency=2,
-            ),
-            (LOAD_BLOCK_N, BLOCK_DIM),
-        )
-        # ct.cat takes exactly a pair; chain for 4 pages
-        data = ct.cat((ct.cat((d0, d1), 0), ct.cat((d2, d3), 0)), 0)
-    return data
+    return _load_page_mla_tree(
+        cache, block_tables, page_table_offset, page, token, 0, NUM_PAGES, LOAD_BLOCK_N, BLOCK_DIM
+    )
 
 
 def _load_page_mla_wrapper(curr_n, cache, block_tables, page_table_offset, PAGE_SIZE, BLOCK_N, BLOCK_DIM, LOAD_BLOCK_N):
@@ -1472,8 +1424,6 @@ def decode_mla_kv_paged_cutile(
             block_tables_flat,
             Att_Out,
             LSE_Out_arg,
-            num_batch,
-            total_num_pages,
             k_scale,
             v_scale,
             page_size,

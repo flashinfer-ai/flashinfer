@@ -1534,6 +1534,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "cuTile decode backend does not support logits_soft_cap."
                 )
+            if window_left >= 0:
+                # The kernel receives no window_left; a sliding window would be
+                # silently ignored and run as full attention.
+                raise NotImplementedError(
+                    "cuTile decode backend does not support sliding window "
+                    f"(window_left={window_left})."
+                )
+            if pos_encoding_mode != "NONE":
+                # The kernel applies no positional encoding; anything other than
+                # "NONE" would be silently dropped.
+                raise NotImplementedError(
+                    "cuTile decode backend does not apply position encoding "
+                    f"(pos_encoding_mode must be 'NONE'); got {pos_encoding_mode!r}."
+                )
             self._page_size = page_size
             self._kv_lens_arr_host = kv_lens_arr_host
             # Device copy of the per-seq KV lengths, staged once at plan time.
@@ -1548,7 +1562,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 # graph capture, so run() pays no per-call host sync (mirrors the
                 # trtllm-gen plan-time reconstruction below).
                 blocks_per_seq = [
-                    (seq_len + page_size - 1) // page_size
+                    (int(seq_len) + page_size - 1) // page_size
                     for seq_len in kv_lens_arr_host
                 ]
                 max_num_blocks_per_seq = max(blocks_per_seq)

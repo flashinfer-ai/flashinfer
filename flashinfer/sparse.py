@@ -484,6 +484,27 @@ class BlockSparseAttentionWrapper:
                     "cuTile block-sparse backend does not support causal masking "
                     "under the block-sparse (gathered-block) mapping."
                 )
+            if num_qo_heads % num_kv_heads != 0:
+                # run() maps each (block-row, kv-head) onto QUERY_GROUP_SIZE =
+                # num_qo_heads // num_kv_heads query heads; a non-multiple would
+                # silently drop the remainder heads.
+                raise ValueError(
+                    "cuTile block-sparse backend requires num_qo_heads % "
+                    f"num_kv_heads == 0 (num_qo_heads={num_qo_heads}, "
+                    f"num_kv_heads={num_kv_heads})."
+                )
+            num_col_blocks = N // C
+            if indices.numel() > 0:
+                # Each index selects a column-block gathered as a page; an
+                # out-of-range value would issue an invalid page load.
+                idx_min = int(indices.min().item())
+                idx_max = int(indices.max().item())
+                if idx_min < 0 or idx_max >= num_col_blocks:
+                    raise ValueError(
+                        "cuTile block-sparse backend requires all indices in "
+                        f"[0, N // C) = [0, {num_col_blocks}); got "
+                        f"[{idx_min}, {idx_max}]."
+                    )
             self._R = R
             self._C = C
             self._M = M

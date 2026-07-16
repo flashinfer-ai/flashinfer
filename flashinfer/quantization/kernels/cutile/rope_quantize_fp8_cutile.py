@@ -320,6 +320,14 @@ def rope_quantize_fp8_cutile(
     """
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
+    if k_rope.ndim != 2:
+        # The kernel loads k_rope as a 2D [tokens, rope_dim] latent (the MLA
+        # single-shared-K-head case). A 3D GQA/MHA key would compile to an
+        # opaque TileTypeError, so reject it up front.
+        raise NotImplementedError(
+            "rope_quantize_fp8_cutile supports MLA-style 2D key tensors "
+            f"(single shared K head) only; got {k_rope.ndim}D key."
+        )
 
     nnz = q_rope.shape[0]
     num_qo_heads = q_rope.shape[1]
