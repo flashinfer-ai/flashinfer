@@ -103,6 +103,36 @@ on random data (worst case; real-model distributions fare better) — note
 mxfp8's 6.4% vs the fp4-weight backends' ~21-23%: the perf ranking is not
 the whole story.
 
+### CuTe-DSL runtime sensitivity: `nvidia-cutlass-dsl[cu13]==4.5.2` (2026-07-15)
+
+Same recipe, geometry and runbook as the table above, with the only change
+being the CuTe-DSL runtime pinned to 4.5.2 instead of >= 4.6.1
+(CSVs `moe_ep_benchmark/results/sweep_20260715_1634*..1641*_fi_mega.csv`):
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 1024     | 468.8  | 583.7 (0.80x)  | 580.9 (0.81x)  | **564.2 (0.83x)**  | 566.3 (0.83x)  |
+| 2048     | 813.1  | 878.6 (0.93x)  | 869.2 (0.94x)  | **834.6 (0.97x)**  | 842.8 (0.96x)  |
+| 4096     | 1538.1 | 1453.1 (1.06x) | 1430.2 (1.08x) | **1385.5 (1.11x)** | 1394.7 (1.10x) |
+| 8192     | 3060.7 | 2579.5 (1.19x) | 2529.0 (1.21x) | **2473.0 (1.24x)** | 2492.4 (1.23x) |
+
+Takeaways:
+
+- 4.5.2 **compiles and runs** this kernel drop (4.5.0 fails outright at
+  `cute.compile`), and every variant/point completed without error.
+- But the 4.5.2-generated code is **34-54% slower** than 4.6.1 across every
+  nvfp4 variant and token count (e.g. bf16 wire 583.7 vs 428.5 µs @1024,
+  2579.5 vs 1923.5 @8192; `+combine_nvfp4` ~+50% everywhere).  The dg
+  baseline reproduces within noise (468.8-3060.7 vs 473.1-3105.2, ≤1%),
+  so the delta is the DSL runtime, not the run.
+- The perf shape regresses qualitatively too: the dg crossover moves from
+  ~512-1024 tok/rank out past 2048 (nvfp4 *loses* at 1024, 0.80-0.83x),
+  and the 8192 win shrinks from 1.61-1.89x to 1.19-1.24x.
+
+Conclusion: treat **4.6.1 as a performance floor**, not just a
+compile-compatibility floor — 4.5.2 is functional but leaves ~1.3-1.5x of
+nvfp4 kernel performance on the table.
+
 ## The knob system (`shim/tuner.py`, `shim/autotune.py`)
 
 - `tuner.py` mirrors the kernel team's `tester/solvers/inference_solver.py`
