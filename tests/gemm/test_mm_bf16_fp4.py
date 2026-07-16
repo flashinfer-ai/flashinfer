@@ -270,6 +270,51 @@ def test_backend_out_dtype_override(backend):
     assert out.dtype == torch.float16
 
 
+@pytest.mark.parametrize("m,n,k", [(1, 2048, 7168), (16, 10304, 2688)])
+def test_cute_dsl_every_tactic_matches_reference(m, n, k):
+    """Run every enumerated cute-dsl tactic explicitly and twice.
+
+    The autotuner only exercises whichever tactic wins, so split-K and other
+    non-default configs need direct coverage.  The double run checks each
+    tactic is deterministic (a requirement split-K can silently break).
+    The shapes cover an even and an uneven K split plus padded M rows.
+    """
+    _skip_if_backend_unavailable("cute-dsl")
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _bf16_fp4_cute_dsl_tactic_configs,
+        _cute_dsl_bf16_fp4_runner,
+        _prepare_bf16_fp4_alpha,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl"
+    )
+
+    weight_fp32 = _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
+    ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
+
+    runner = _cute_dsl_bf16_fp4_runner(enable_pdl=True)
+    sf_u8 = sf_p.view(torch.uint8).contiguous()
+    alpha_l = _prepare_bf16_fp4_alpha(alpha_p, device)
+    for tactic, cfg in enumerate(_bf16_fp4_cute_dsl_tactic_configs(n, k)):
+        outs = []
+        for _ in range(2):
+            out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+            runner.forward(
+                [a, b_p, sf_u8, alpha_l, torch.bfloat16, out, 16], tactic=tactic
+            )
+            outs.append(out)
+        torch.cuda.synchronize()
+        _assert_close_to_reference(outs[0], ref, f"cute-dsl tactic {tactic} {cfg}")
+        assert torch.equal(outs[0], outs[1]), (
+            f"tactic {tactic} {cfg} is not deterministic across runs"
+        )
+
+
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_backend_preallocated_out(backend):
     """Caller-provided out tensor is written in place."""

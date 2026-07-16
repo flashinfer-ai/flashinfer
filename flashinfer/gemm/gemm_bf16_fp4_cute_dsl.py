@@ -79,6 +79,18 @@ def _select_bf16_fp4_tile_shape(
 
 _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE: dict = {}
 
+# Placeholder for the kernel's split-K partials argument when k_splits == 1.
+_SPLIT_K_DUMMY_CACHE: dict = {}
+
+
+def _get_split_k_dummy(device: torch.device) -> torch.Tensor:
+    key = (device.type, device.index)
+    t = _SPLIT_K_DUMMY_CACHE.get(key)
+    if t is None:
+        t = torch.empty(4, device=device, dtype=torch.float32)
+        _SPLIT_K_DUMMY_CACHE[key] = t
+    return t
+
 
 def _get_cute_dsl_bf16_fp4_gemm(
     tile_shape_mnk: Tuple[int, int, int],
@@ -89,6 +101,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
     use_fp16_mma: int = 1,
     enable_pdl: bool = True,
     tile_swizzle: int = 1,
+    k_splits: int = 1,
 ):
     # Normalize to a tuple (callers may pass a list) so the cache key is hashable.
     atom_layout = cast(Tuple[int, int, int], tuple(atom_layout))
@@ -96,6 +109,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
     use_fp16_mma = int(use_fp16_mma)
     enable_pdl = bool(enable_pdl)
     tile_swizzle = int(tile_swizzle)
+    k_splits = int(k_splits)
     cache_key = (
         tile_shape_mnk,
         a_dtype,
@@ -105,6 +119,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
         use_fp16_mma,
         enable_pdl,
         tile_swizzle,
+        k_splits,
     )
     cached = _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -146,6 +161,10 @@ def _get_cute_dsl_bf16_fp4_gemm(
     c_fake = cute.runtime.make_fake_compact_tensor(
         c_cutlass_dtype, (sym_m, sym_n), stride_order=(1, 0), assumed_align=16
     )
+    sym_partial = cute.sym_int()
+    partial_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (sym_partial,), assumed_align=16
+    )
     alpha_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (1,), assumed_align=4
     )
@@ -159,6 +178,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
         use_fp16_mma=use_fp16_mma,
         enable_pdl=enable_pdl,
         tile_swizzle=tile_swizzle,
+        k_splits=k_splits,
     )
     max_active_clusters = get_max_active_clusters(1)
 
@@ -168,6 +188,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
         b_packed_fake,
         b_sf_fake,
         c_fake,
+        partial_fake,
         alpha_fake,
         1,  # l (batch)
         max_active_clusters,
@@ -284,11 +305,11 @@ def _prepare_cute_dsl(
 
 def _bf16_fp4_cute_dsl_tactic_configs(
     n: int, k: int
-) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int]]:
+) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int]]:
     """Enumerate cute-DSL tactic configs for a given ``(N, K)``.
 
     Returns a list of ``(tile_shape_mnk, atom_layout, pipeline_depth,
-    use_fp16_mma)`` tuples.
+    use_fp16_mma, tile_swizzle, k_splits)`` tuples.
     """
     tile_k = 128 if k % 128 == 0 else 64
 
@@ -300,18 +321,21 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     tile_m_atoms.append((32, (2, 2, 1)))
     tile_m_atoms.append((64, (2, 2, 1)))
 
-    configs: List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int]] = []
+    configs: List[
+        Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int]
+    ] = []
     seen = set()
 
-    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None, swz=1):
+    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None, swz=1, splits=1):
         cfg = (
             (tile_m, tile_n, tile_k if tk is None else tk),
             atom,
             pdepth,
             fp16,
             swz,
+            splits,
         )
-        key = (cfg[0], cfg[1], pdepth, fp16, swz)
+        key = (cfg[0], cfg[1], pdepth, fp16, swz, splits)
         if key not in seen:
             seen.add(key)
             configs.append(cfg)
@@ -321,6 +345,16 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     add(base_tile_m, base_atom, 0, 1)  # no dequant prefetch (helps short-K)
     for tile_m, atom in tile_m_atoms[1:]:
         add(tile_m, atom, 1, 1)
+
+    # Split-K variants: small-N decode shapes launch too few CTAs to fill
+    # the GPU; splitting the K loop across CTAs restores parallelism.  Only
+    # worth trying when the plain grid is small, and each split must own at
+    # least one K-tile.
+    if n // 64 <= 256:
+        k_tiles = k // tile_k
+        for splits in (2, 4, 8):
+            if splits <= k_tiles:
+                add(base_tile_m, base_atom, 1, 1, splits=splits)
 
     # tile_N=128 halves the (m,n)-tile count but needs large wave count.
     if tile_k == 128 and n >= 12288 and n % 128 == 0:
@@ -401,7 +435,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             if tactic < 0:
                 # Fallback == pre-autotuner heuristic (M-aware), default knobs.
                 tile_shape_mnk, atom_layout = _select_bf16_fp4_tile_shape(m, n, k)
-                pipeline_depth, use_fp16_mma, tile_swizzle = 1, 1, 1
+                pipeline_depth, use_fp16_mma, tile_swizzle, k_splits = 1, 1, 1, 1
             else:
                 (
                     tile_shape_mnk,
@@ -409,6 +443,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     pipeline_depth,
                     use_fp16_mma,
                     tile_swizzle,
+                    k_splits,
                 ) = _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic]
             compiled = _get_cute_dsl_bf16_fp4_gemm(
                 tile_shape_mnk,
@@ -419,8 +454,19 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 use_fp16_mma,
                 enable_pdl=enable_pdl,
                 tile_swizzle=tile_swizzle,
+                k_splits=k_splits,
             )
-            compiled(a, b, b_sf_u8, out, alpha_for_launch)
+            if k_splits > 1:
+                partial = torch.empty(
+                    k_splits * m * n, device=a.device, dtype=torch.float32
+                )
+            else:
+                partial = _get_split_k_dummy(a.device)
+            compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)
+            if k_splits > 1:
+                # Fixed-order sum keeps split-K deterministic run-to-run
+                # (atomic accumulation is not).
+                out.copy_(partial.view(k_splits, m, n).sum(dim=0))
             return out
 
     return CuteDslBf16Fp4Runner()
