@@ -133,6 +133,12 @@ def autotune_knobs(
     if not candidates:
         raise ValueError("autotune_knobs needs a non-empty candidate list.")
 
+    from .comm import ensure_not_capturing
+
+    # The sweep barriers, compiles per candidate, wall-clock times with
+    # internal syncs, and all_reduces -- none of it can run mid-capture.
+    ensure_not_capturing("knobs='auto' collective autotune sweep")
+
     import torch.distributed as dist
 
     collective = dist.is_available() and dist.is_initialized()

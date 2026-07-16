@@ -41,6 +41,23 @@ def resolve_gate_up_clamp(
     return None
 
 
+def ensure_not_capturing(what: str) -> None:
+    """Fail loudly if ``what`` would run during CUDA graph stream capture.
+
+    Guards host-side compile / symmetric-heap alloc / free paths: silently
+    running them mid-capture corrupts the graph (and NVSHMEM collectives
+    deadlock ranks that are not capturing). Callers place this AFTER their
+    no-op early returns so a steady-state hit inside a capture stays legal.
+    """
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"{what} requires host-side compile/alloc/free and cannot run "
+            "during CUDA graph capture. Run one eager forward on ALL EP ranks "
+            "first (e.g. MoEEpMegaLayer.warmup()) so compile, workspace "
+            "allocation, and autotune complete before capture."
+        )
+
+
 def _no_dist() -> bool:
     # Read at call time, not import time: callers (e.g. single-rank pytest
     # tests) set MEGA_NO_DIST=1 after this module is already imported.

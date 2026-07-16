@@ -52,6 +52,7 @@ from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
+    ensure_not_capturing,
     free_sym_tensor,
     reset_compiled_mega_workspaces,
     resolve_gate_up_clamp,
@@ -242,6 +243,7 @@ class MegaMoENvfp4Frontend:
         """Update ``gate_up_clamp`` and invalidate compile cache when it changes."""
         if self._gate_up_clamp == clamp:
             return
+        ensure_not_capturing("set_gate_up_clamp (clamp change)")
         self._release_workspace()
         self._gate_up_clamp = clamp
         self._invalidate_compile_cache()
@@ -257,6 +259,7 @@ class MegaMoENvfp4Frontend:
         new_config = with_knobs(self.config, knobs)
         if new_config == self._config:
             return
+        ensure_not_capturing("apply_knobs (config change)")
         self._release_workspace()
         self._config = new_config
         self._invalidate_compile_cache()
@@ -336,7 +339,9 @@ class MegaMoENvfp4Frontend:
             inputs.output_activation.zero_()
         mega.compiled(**mega.launch_kwargs)
 
-        if sync:
+        # Zero-break capture gate: a device synchronize would abort stream
+        # capture, so skip it there (the graph replays under stream semantics).
+        if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
         return mega.launch_output
 
@@ -441,6 +446,7 @@ class MegaMoENvfp4Frontend:
         if self._mega is not None and self._mega_key == key:
             return self._mega
 
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
         self._release_workspace()
 
         import cutlass
@@ -542,6 +548,7 @@ class MegaMoENvfp4Frontend:
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
+            ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
 
     @staticmethod
@@ -1221,7 +1228,7 @@ def nvfp4_mega_moe(
     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
     if out is not None:
         y.copy_(out[:n])
-    if sync:
+    if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
 
 
