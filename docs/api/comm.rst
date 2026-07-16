@@ -106,12 +106,12 @@ vLLM AllReduce
     vllm_get_graph_buffer_ipc_meta
     vllm_meta_size
 
-Ulysses Sequence-Parallel All-to-All
-------------------------------------
+Ulysses Context-Parallel All-to-All
+-----------------------------------
 
 .. currentmodule:: flashinfer.comm
 
-Communication for Ulysses sequence parallelism over the 4-D layout
+Communication for Ulysses context parallelism over the 4-D layout
 ``[B, S, H, D]``. Two layout transforms are provided; a typical attention
 layer makes four collective calls (q/k/v through ``scatter_heads``, the
 output through ``gather_heads``):

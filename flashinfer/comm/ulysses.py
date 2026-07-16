@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from ..api_logging import flashinfer_api
 from ..jit.comm import gen_ulysses_a2a_module
 from ..utils import register_custom_op
 from .ulysses_topology import (
@@ -46,7 +47,7 @@ _OPEN, _CLOSING, _CLOSED = "open", "closing", "closed"
 
 
 class UlyssesCommunicator:
-    r"""Ulysses sequence-parallelism all-to-all communicator.
+    r"""Ulysses context-parallelism all-to-all communicator.
 
     Provides the two layout transforms of Ulysses attention over the 4-D
     layout ``[B, S, H, D]`` (a typical attention layer makes four collective
@@ -138,6 +139,7 @@ class UlyssesCommunicator:
     ...     o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
     """
 
+    @flashinfer_api
     def __init__(
         self,
         group: Optional[ProcessGroup] = None,
@@ -149,6 +151,8 @@ class UlyssesCommunicator:
     ):
         self._state = _CLOSED  # flipped to OPEN only when construction succeeds
         self._nvlink_armed = False  # joint property: set on all ranks or none
+        # opaque NVLink-backend handle (a C++ UlyssesA2A* as an int) from
+        # init_ulysses_a2a; None until armed and after teardown
         self._fa: Optional[int] = None
         self._out_ptrs: Optional[List[int]] = None
         self._sig_ptrs: Optional[List[int]] = None
@@ -637,6 +641,7 @@ class UlyssesCommunicator:
 
     # ---- collectives -----------------------------------------------------------
 
+    @flashinfer_api
     def scatter_heads(self, x: torch.Tensor) -> torch.Tensor:
         r"""``[B, S_local, H, D] -> [B, S_global, H_local, D]``.
 
@@ -669,6 +674,7 @@ class UlyssesCommunicator:
             return out
         return self._nccl_scatter_heads(x)
 
+    @flashinfer_api
     def gather_heads(self, x: torch.Tensor) -> torch.Tensor:
         r"""``[B, S_global, H_local, D] -> [B, S_local, H, D]``.
 
@@ -814,6 +820,7 @@ def get_ulysses_a2a_module():
     )
 
 
+@flashinfer_api
 def init_ulysses_a2a(
     out_ipc_ptrs: List[int],
     signal_ipc_ptrs: List[int],
@@ -900,11 +907,23 @@ def init_ulysses_a2a(
     return fa
 
 
+@flashinfer_api
 def dispose_ulysses_a2a(fa: int) -> None:
-    r"""Release a handle returned by :func:`init_ulysses_a2a`."""
+    r"""Release a handle returned by :func:`init_ulysses_a2a`.
+
+    Parameters
+    ----------
+    fa : int
+        The opaque backend handle previously returned by
+        :func:`init_ulysses_a2a`. It is a C++ ``UlyssesA2A*`` reinterpreted as
+        an integer (``fptr_t``), not a device pointer or a Python object, so it
+        is only meaningful to this module. After this call the handle is
+        dangling and must not be passed to :func:`ulysses_a2a` again.
+    """
     get_ulysses_a2a_module().dispose_ulysses_a2a(fa)
 
 
+@flashinfer_api
 def ulysses_a2a(
     fa: int,
     inp: torch.Tensor,
@@ -922,6 +941,10 @@ def ulysses_a2a(
         :meth:`UlyssesCommunicator.scatter_heads` (``mode == 0``) and
         :meth:`UlyssesCommunicator.gather_heads` (``mode == 1``), which derive
         the geometry from the tensor shapes and validate operands.
+
+    ``fa`` is the opaque backend handle returned by :func:`init_ulysses_a2a`
+    (a C++ ``UlyssesA2A*`` reinterpreted as an integer ``fptr_t``); it selects
+    the all-to-all context to run on and is not a device pointer.
 
     The result for this rank is written into ``out`` (bit-identical to the
     equivalent NCCL all-to-all followed by the layout permutation).

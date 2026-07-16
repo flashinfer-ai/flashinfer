@@ -55,13 +55,14 @@ fptr_t init_ulysses_a2a(Array<fptr_t> out_ipc_ptrs, Array<fptr_t> signal_ipc_ptr
   }
   // The multi_gpu_barrier counters must start at zero, and cudaMalloc does not
   // zero memory. Each rank owns signals[rank] (the others are IPC-mapped peer
-  // buffers), so every rank zeroes its own signal here. cudaMemset is
-  // asynchronous with respect to the host (the missing "Async" suffix does
-  // NOT make it a host fence), so callers MUST (1) synchronize this device
-  // after init returns and (2) issue a process-group barrier before the first
-  // all-to-all, so the zeroing is complete and globally visible.
-  // UlyssesCommunicator does both inside its init transaction.
-  auto st = cudaMemset(signals[rank], 0, sizeof(fi::Signal));
+  // buffers), so every rank zeroes its own signal here. The zeroing is enqueued
+  // on the current stream (the Python caller sets the target device current
+  // before calling init); it is asynchronous with respect to the host, so
+  // callers MUST (1) synchronize this device after init returns and (2) issue a
+  // process-group barrier before the first all-to-all, so the zeroing is
+  // complete and globally visible. UlyssesCommunicator does both inside its
+  // init transaction.
+  auto st = cudaMemsetAsync(signals[rank], 0, sizeof(fi::Signal), get_current_stream());
   TVM_FFI_ICHECK(st == cudaSuccess) << "failed to zero the ulysses a2a signal buffer";
   return (fptr_t) new fi::UlyssesA2A(signals, out_bufs, static_cast<int>(rank),
                                      static_cast<int>(world_size), full_nvlink);
@@ -119,41 +120,41 @@ void ulysses_a2a(fptr_t _fa, TensorView inp, TensorView out, int64_t B, int64_t 
   const int threads = fi::kUlyssesThreads;
   const size_t out_bytes = out.numel() * get_element_size(out);
 
-#define LAUNCH_ULYSSES_A2A(T, NG, MD)                                                              \
-  fi::ulysses_a2a_kernel<T, NG, MD><<<blocks, threads, 0, stream>>>(                               \
+#define LAUNCH_ULYSSES_A2A(T, NG, MODE)                                                            \
+  fi::ulysses_a2a_kernel<T, NG, MODE><<<blocks, threads, 0, stream>>>(                             \
       reinterpret_cast<const T*>(inp.data_ptr()), fa->out_ptrs_, fa->sg_, fa->self_sg_, fa->rank_, \
       static_cast<int>(B), static_cast<int>(S_local), H_local, static_cast<int>(D))
 
-#define DISPATCH_NGPUS(T, MD)                                                       \
+#define DISPATCH_NGPUS(T, MODE)                                                     \
   switch (W) {                                                                      \
     case 2:                                                                         \
-      LAUNCH_ULYSSES_A2A(T, 2, MD);                                                 \
+      LAUNCH_ULYSSES_A2A(T, 2, MODE);                                               \
       break;                                                                        \
     case 4:                                                                         \
-      LAUNCH_ULYSSES_A2A(T, 4, MD);                                                 \
+      LAUNCH_ULYSSES_A2A(T, 4, MODE);                                               \
       break;                                                                        \
     case 6:                                                                         \
-      LAUNCH_ULYSSES_A2A(T, 6, MD);                                                 \
+      LAUNCH_ULYSSES_A2A(T, 6, MODE);                                               \
       break;                                                                        \
     case 8:                                                                         \
-      LAUNCH_ULYSSES_A2A(T, 8, MD);                                                 \
+      LAUNCH_ULYSSES_A2A(T, 8, MODE);                                               \
       break;                                                                        \
     default:                                                                        \
       TVM_FFI_ICHECK(false) << "ulysses_a2a only supports world size in (2,4,6,8)"; \
   }
 
-#define DISPATCH_DTYPE(MD)                                                                \
+#define DISPATCH_DTYPE(MODE)                                                              \
   switch (encode_dlpack_dtype(out.dtype())) {                                             \
     case float32_code: {                                                                  \
-      DISPATCH_NGPUS(float, MD);                                                          \
+      DISPATCH_NGPUS(float, MODE);                                                        \
       break;                                                                              \
     }                                                                                     \
     case float16_code: {                                                                  \
-      DISPATCH_NGPUS(half, MD);                                                           \
+      DISPATCH_NGPUS(half, MODE);                                                         \
       break;                                                                              \
     }                                                                                     \
     case bfloat16_code: {                                                                 \
-      DISPATCH_NGPUS(nv_bfloat16, MD);                                                    \
+      DISPATCH_NGPUS(nv_bfloat16, MODE);                                                  \
       break;                                                                              \
     }                                                                                     \
     default:                                                                              \

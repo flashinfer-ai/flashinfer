@@ -291,7 +291,7 @@ class WanRotaryPosEmbed(nn.Module):
         return freqs_cos, freqs_sin
 
 
-# ---- Ulysses sequence-parallel wiring (example mechanism) --------------------
+# ---- Ulysses context-parallel wiring (example mechanism) ---------------------
 # Process-global and non-reentrant: one communicator per process, installed by
 # the launcher around the sequence-sharded forward passes and cleared (in a
 # finally block, BEFORE the communicator is closed) when done. The default
@@ -459,7 +459,7 @@ class FlashInferWanAttention(nn.Module):
             key = key.to(torch.bfloat16)
             value = value.to(torch.bfloat16)
 
-        # Ulysses sequence parallelism (self-attention only): the sequence dim
+        # Ulysses context parallelism (self-attention only): the sequence dim
         # is sharded across ranks; all-to-all scatters heads / gathers sequence
         # so each rank attends over the full sequence with H/world_size heads,
         # then the inverse all-to-all restores the [B, S_local, H, D] layout.
@@ -1079,7 +1079,7 @@ class FlashInferWanTransformer3DModel(nn.Module):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        # Ulysses sequence parallelism: shard the token sequence across ranks.
+        # Ulysses context parallelism: shard the token sequence across ranks.
         # Every rank runs the full block stack on its shard; self-attention
         # inside the blocks uses the all-to-all to attend over the full
         # sequence (see FlashInferWanAttention). The rotary tables are sliced

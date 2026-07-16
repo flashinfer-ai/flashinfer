@@ -20,7 +20,7 @@
 // Fused-transpose Ulysses all-to-all over NVLink P2P (CUDA IPC).
 //
 // Implements the head-scatter / sequence-gather collective used by Ulysses
-// sequence parallelism, with the layout permutation folded directly into the
+// context parallelism, with the layout permutation folded directly into the
 // cross-GPU write addresses. It reuses the Signal / multi_gpu_barrier machinery
 // from the (vLLM-derived) custom all-reduce kernel for inter-GPU sync.
 //
