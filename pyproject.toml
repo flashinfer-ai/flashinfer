@@ -104,8 +104,21 @@ exclude = [
   "flashinfer-jit-cache/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
+  "flashinfer/cute_dsl/attention/fmha/fmha.py",
+  "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
+  "flashinfer/cute_dsl/attention/fmha/helpers/",
   "build/",
 ]
+
+
+# CuTe DSL FMHA kernels from TRTLLM VisualGen; kept as-is for clean re-sync.
+[tool.ruff]
+extend-exclude = [
+  "flashinfer/cute_dsl/attention/fmha/fmha.py",
+  "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
+  "flashinfer/cute_dsl/attention/fmha/helpers",
+]
+force-exclude = true
 
 
 [tool.ruff.lint]

@@ -205,6 +205,7 @@ def bench_cute_dsl(
     use_cupti=True,
     use_wrapper=False,
     do_autotune=True,
+    use_per_token_activation=False,
 ):
     """Benchmark CuteDSL MoE.
 
@@ -220,10 +221,15 @@ def bench_cute_dsl(
     """
     import contextlib
 
+    from flashinfer import SfLayout, nvfp4_quantize
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
     from flashinfer.testing.utils import bench_gpu_time
 
     if num_local_experts is None:
@@ -235,8 +241,23 @@ def bench_cute_dsl(
     tv = torch.empty(n, CFG.top_k, dtype=torch.float32, device=dev)
     ti = torch.empty(n, CFG.top_k, dtype=torch.int32, device=dev)
 
-    xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
-    xs = xs.unsqueeze(-1)
+    if use_per_token_activation:
+        hidden_global_scale = make_nvfp4_global_scale(
+            inputs["hidden_bf16"],
+            per_token_activation=True,
+            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        )
+        xf, xs, hidden_per_token_scale = nvfp4_quantize(
+            inputs["hidden_bf16"],
+            hidden_global_scale,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+    else:
+        xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
+        hidden_per_token_scale = None
+    xs = xs.view(torch.float8_e4m3fn).reshape(n, CFG.hidden_size // sv).unsqueeze(-1)
 
     # Expert range for this EP partition
     expert_start = local_expert_offset
@@ -308,6 +329,7 @@ def bench_cute_dsl(
                 w2_weight=w2q,
                 w2_weight_sf=w2s,
                 w2_alpha=alpha,
+                per_token_scale=hidden_per_token_scale,
             )
     else:
         # Use functional API
@@ -340,6 +362,7 @@ def bench_cute_dsl(
                 top_k=CFG.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=local_expert_offset,
+                per_token_scale=hidden_per_token_scale,
             )
 
     # Pass input tensors via input_kwargs for cold L2 cache rotation
@@ -507,6 +530,7 @@ def bench_trtllm(
     use_cuda_graph=True,
     use_cupti=True,
     do_autotune=True,
+    use_per_token_activation=False,
 ):
     """Benchmark TRT-LLM-Gen MoE.
 
@@ -515,6 +539,7 @@ def bench_trtllm(
     """
     import contextlib
 
+    from flashinfer import SfLayout, nvfp4_quantize
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe, RoutingMethodType
     from flashinfer.fused_moe.core import (
@@ -522,6 +547,10 @@ def bench_trtllm(
         get_w2_permute_indices_with_cache,
     )
     from flashinfer.fp4_quantization import fp4_quantize, block_scale_interleave
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
     from flashinfer.testing.utils import bench_gpu_time
 
     if num_local_experts is None:
@@ -535,7 +564,22 @@ def bench_trtllm(
     expert_end = local_expert_offset + num_local_experts
 
     hg = inputs["hidden_gs"]
-    hfp, hsf = fp4_quantize(inputs["hidden_bf16"], hg, sv, False, True)
+    if use_per_token_activation:
+        hidden_global_scale = make_nvfp4_global_scale(
+            inputs["hidden_bf16"],
+            per_token_activation=True,
+            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        )
+        hfp, hsf, hidden_per_token_scale = nvfp4_quantize(
+            inputs["hidden_bf16"],
+            hidden_global_scale,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+    else:
+        hfp, hsf = fp4_quantize(inputs["hidden_bf16"], hg, sv, False, True)
+        hidden_per_token_scale = None
     hfp = hfp.view(torch.uint8).reshape(n, CFG.hidden_size // 2)
     hsc = (
         hsf.view(torch.float8_e4m3fn)
@@ -610,6 +654,7 @@ def bench_trtllm(
             local_num_experts=num_local_experts,
             routed_scaling_factor=CFG.routed_scaling_factor,
             routing_method_type=RoutingMethodType.DeepSeekV3,
+            per_token_scale=hidden_per_token_scale,
             do_finalize=True,
         )
 
@@ -668,6 +713,7 @@ def run_benchmark(
     use_cupti=True,
     use_wrapper=True,
     routing_bias_scale=0.01,
+    use_per_token_activation=False,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -696,6 +742,8 @@ def run_benchmark(
         use_cupti: Whether to use CUPTI for accurate GPU timing
         use_wrapper: Whether to use CuteDslMoEWrapper API (recommended)
         routing_bias_scale: Scale for random routing bias generation
+        use_per_token_activation: Whether supported FP4 MoE backends should use
+            per-token NVFP4 activation scaling.
 
     Returns:
         List of BenchResult objects
@@ -722,6 +770,7 @@ def run_benchmark(
             use_wrapper=use_wrapper,
             routing_bias_scale=routing_bias_scale,
             do_autotune=do_autotune,
+            use_per_token_activation=use_per_token_activation,
         )
         results.extend(row)
         rows_and_histograms.append((row, histogram_record))
@@ -733,6 +782,7 @@ def run_benchmark(
             use_cuda_graph,
             use_cupti,
             routing_bias_scale,
+            use_per_token_activation=use_per_token_activation,
         )
         for row, histogram_record in rows_and_histograms:
             _print_row(row, histogram_record)
@@ -752,6 +802,7 @@ def _benchmark_single(
     use_wrapper=True,
     routing_bias_scale=0.01,
     do_autotune=True,
+    use_per_token_activation=False,
 ):
     """Benchmark all backends for a single token count.
 
@@ -762,30 +813,21 @@ def _benchmark_single(
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
-    # Run all three backends
-    lat = {
-        "CuteDSL": bench_cute_dsl(
-            inputs,
-            warmup,
-            iters,
-            num_local,
-            local_offset,
-            use_cuda_graph,
-            use_cupti,
-            use_wrapper=use_wrapper,
-            do_autotune=do_autotune,
-        ),
-        "CUTLASS": bench_cutlass(
-            inputs,
-            warmup,
-            iters,
-            num_local,
-            local_offset,
-            use_cuda_graph,
-            use_cupti,
-            do_autotune=do_autotune,
-        ),
-        "TRTLLM": bench_trtllm(
+    lat = {}
+    lat["CuteDSL"] = bench_cute_dsl(
+        inputs,
+        warmup,
+        iters,
+        num_local,
+        local_offset,
+        use_cuda_graph,
+        use_cupti,
+        use_wrapper=use_wrapper,
+        do_autotune=do_autotune,
+        use_per_token_activation=use_per_token_activation,
+    )
+    if not use_per_token_activation:
+        lat["CUTLASS"] = bench_cutlass(
             inputs,
             warmup,
             iters,
@@ -794,8 +836,18 @@ def _benchmark_single(
             use_cuda_graph,
             use_cupti,
             do_autotune=do_autotune,
-        ),
-    }
+        )
+    lat["TRTLLM"] = bench_trtllm(
+        inputs,
+        warmup,
+        iters,
+        num_local,
+        local_offset,
+        use_cuda_graph,
+        use_cupti,
+        do_autotune=do_autotune,
+        use_per_token_activation=use_per_token_activation,
+    )
 
     # Build results
     results = []
@@ -817,10 +869,16 @@ def _print_header(
     use_cuda_graph,
     use_cupti,
     routing_bias_scale,
+    use_per_token_activation=False,
 ):
     """Print benchmark header."""
     print("\n" + "=" * 120)
-    print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})")
+    if use_per_token_activation:
+        print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs TRTLLM (EP={ep_config})")
+    else:
+        print(
+            f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})"
+        )
     print("=" * 120)
     print(
         f"Model: hidden={CFG.hidden_size}, intermediate={CFG.intermediate_size}, "
@@ -836,27 +894,49 @@ def _print_header(
         f"Routing bias scale: {routing_bias_scale} "
         f"(larger values tend to create expert imbalance)"
     )
+    if use_per_token_activation:
+        print("CUTLASS omitted: it does not consume the per-token activation scale.")
     print("-" * 120)
-    print(
-        f"{'Tokens':>6} | "
-        f"{'CuteDSL':^15} | "
-        f"{'CUTLASS':^15} | "
-        f"{'TRTLLM':^15} | "
-        f"{'Speedup (CuteDSL/X)':^18} | "
-        f"{'Winner':^8} | "
-        f"{'Active':^7} | "
-        f"{'Stats':^14}"
-    )
-    print(
-        f"{'':>6} | "
-        f"{'ms':>7} {'TFLOPS':>7} | "
-        f"{'ms':>7} {'TFLOPS':>7} | "
-        f"{'ms':>7} {'TFLOPS':>7} | "
-        f"{'CUTLASS':>9} {'TRTLLM':>9} | "
-        f"{'':^8} | "
-        f"{'experts':^7} | "
-        f"{'min/max/median':^14}"
-    )
+    if use_per_token_activation:
+        print(
+            f"{'Tokens':>6} | "
+            f"{'CuteDSL':^15} | "
+            f"{'TRTLLM':^15} | "
+            f"{'Speedup':^9} | "
+            f"{'Winner':^8} | "
+            f"{'Active':^7} | "
+            f"{'Stats':^14}"
+        )
+        print(
+            f"{'':>6} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'TRTLLM':>9} | "
+            f"{'':^8} | "
+            f"{'experts':^7} | "
+            f"{'min/max/median':^14}"
+        )
+    else:
+        print(
+            f"{'Tokens':>6} | "
+            f"{'CuteDSL':^15} | "
+            f"{'CUTLASS':^15} | "
+            f"{'TRTLLM':^15} | "
+            f"{'Speedup (CuteDSL/X)':^18} | "
+            f"{'Winner':^8} | "
+            f"{'Active':^7} | "
+            f"{'Stats':^14}"
+        )
+        print(
+            f"{'':>6} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'CUTLASS':>9} {'TRTLLM':>9} | "
+            f"{'':^8} | "
+            f"{'experts':^7} | "
+            f"{'min/max/median':^14}"
+        )
     print("-" * 120)
 
 
@@ -864,10 +944,10 @@ def _print_row(results, histogram_record):
     """Print a single row of benchmark results."""
     # Extract values by backend
     r = {r.backend: r for r in results}
-    cute, cutlass, trtllm = r["CuteDSL"], r["CUTLASS"], r["TRTLLM"]
+    cute, trtllm = r["CuteDSL"], r["TRTLLM"]
+    cutlass = r.get("CUTLASS")
 
     # Calculate speedups (> 1.0 means CuteDSL is faster)
-    speedup_cutlass = cutlass.latency_ms / cute.latency_ms
     speedup_trtllm = trtllm.latency_ms / cute.latency_ms
 
     # Find winner
@@ -879,16 +959,28 @@ def _print_row(results, histogram_record):
         f"{histogram_record['max_count']:>3}/"
         f"{histogram_record['median_count']:>7.2f}"
     )
-    print(
-        f"{cute.tokens:>6} | "
-        f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
-        f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} | "
-        f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
-        f"{speedup_cutlass:>8.2f}x {speedup_trtllm:>8.2f}x | "
-        f"{winner:^8} | "
-        f"{active_experts:>7} | "
-        f"{stats:>14}"
-    )
+    if cutlass is None:
+        print(
+            f"{cute.tokens:>6} | "
+            f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
+            f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
+            f"{speedup_trtllm:>8.2f}x | "
+            f"{winner:^8} | "
+            f"{active_experts:>7} | "
+            f"{stats:>14}"
+        )
+    else:
+        speedup_cutlass = cutlass.latency_ms / cute.latency_ms
+        print(
+            f"{cute.tokens:>6} | "
+            f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
+            f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} | "
+            f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
+            f"{speedup_cutlass:>8.2f}x {speedup_trtllm:>8.2f}x | "
+            f"{winner:^8} | "
+            f"{active_experts:>7} | "
+            f"{stats:>14}"
+        )
 
 
 def _print_footer(ep_config, num_local):
@@ -981,6 +1073,11 @@ def main():
         help="Use functional API instead of CuteDslMoEWrapper for CuteDSL benchmark",
     )
     parser.add_argument(
+        "--use-per-token-activation",
+        action="store_true",
+        help="Use per-token NVFP4 activation scaling for supported FP4 MoE backends.",
+    )
+    parser.add_argument(
         "--routing-bias-scale",
         type=float,
         default=0.01,
@@ -1003,6 +1100,7 @@ def main():
     print("\nDeepSeek-V3 MoE Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
+    print(f"Per-token activation: {args.use_per_token_activation}")
 
     run_benchmark(
         token_counts=tokens,
@@ -1015,6 +1113,7 @@ def main():
         use_cupti=not args.no_cupti,
         use_wrapper=not args.functional_api,
         routing_bias_scale=args.routing_bias_scale,
+        use_per_token_activation=args.use_per_token_activation,
     )
 
     return 0

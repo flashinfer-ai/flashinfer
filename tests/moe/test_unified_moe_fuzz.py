@@ -188,6 +188,7 @@ from flashinfer.fused_moe.api import (
     QuantConfig,
     QuantVariant,
     RoutingConfig,
+    TrtllmBf16Config,
     TrtllmFp4Config,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
@@ -226,6 +227,7 @@ pytestmark = pytest.mark.skipif(
 _DETERMINISTIC = {
     "trtllm_fp4_routed": True,  # bitwise-stable across reruns in calibration
     "cute_dsl_nvfp4": False,  # atomic scatter-add finalize -> non-bit-exact by design
+    "trtllm_bf16_routed": True,  # same trtllm-gen finalize path as fp4_routed; bitwise-stable in calibration
 }
 
 # Known-bug ledger: (backend_key, predicate(cfg)) -> reason. A matching (backend, config) is run but
@@ -280,7 +282,7 @@ class DTypeHandler:
     snap: Callable  # bf16 tensor -> exactly-representable fixed point for this dtype
     make_act_pack: Callable  # (x, selected_experts, final_scales) -> MoEActivationPack (pre-routed)
     make_act_pack_logits: (
-        Callable  # (x, routing_logits, routing_bias) -> pack (in-kernel routing)
+        Callable | None  # (x, routing_logits, routing_bias) -> pack (in-kernel routing)
     )
     reference: Callable  # (x, w1, w2, selected_experts, final_scales, I) -> fp32 [T,H] authority
     poison: Callable  # in-place fill a kernel-owned output buffer with garbage + (NaN/Inf if repr.)
@@ -289,7 +291,7 @@ class DTypeHandler:
     rtol: float
 
 
-def _nvfp4_poison(buf, gen):
+def _poison_bf16_out(buf, gen):
     """Fill a bf16 output buffer with large garbage + scattered NaN/±Inf, DETERMINISTICALLY (from a
     per-config seeded generator, so a failure repros bit-for-bit). If a kernel reads or scatter-adds
     into an uninitialized output instead of fully writing it, the poison leaks and is caught by
@@ -358,6 +360,47 @@ def _nvfp4_reference(
     return out
 
 
+def _bf16_snap(t: torch.Tensor) -> torch.Tensor:
+    # bf16 IS the storage grid: the cast is the fixed point (input quant lossless).
+    return t.to(torch.bfloat16)
+
+
+def _bf16_act_pack(x, selected_experts, final_scales):
+    # Raw bf16 activations; the bf16 runner reads hidden_states_q directly and
+    # ignores hidden_states_scale.
+    return MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
+    )
+
+
+def _bf16_reference(
+    x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
+):
+    """Dense bf16 MoE authority: same SwiGLU convention as ``_nvfp4_reference``
+    but no fp4 requant -- the only intermediate quantization is the bf16 rounding
+    of the gemm1 and gemm2 outputs, mirrored below.  Routing weights are cast through bf16
+    to match the packed-id truncation in pack_inputs, so the tolerance measures
+    kernel error, not oracle mismatch."""
+    final_scales = final_scales.to(torch.bfloat16).float()
+    x32, half = x.float(), intermediate_size
+    out = torch.zeros_like(x32)
+    for local_e in range(w1.shape[0]):
+        mask = selected_experts == local_e + expert_offset
+        if not mask.any():
+            continue
+        tok, nth = torch.where(mask)
+        gate, up = w1[local_e][half:, :].float(), w1[local_e][:half, :].float()
+        inter = F.silu(x32[tok] @ gate.t()) * (x32[tok] @ up.t())
+        inter = inter.to(torch.bfloat16).float()  # gemm1 output is stored bf16
+        expert_out = (inter @ w2[local_e].float().t()).to(torch.bfloat16).float()
+        out[tok] += final_scales[tok, nth, None] * expert_out
+    return out
+
+
 _DTYPE = {
     QuantVariant.NVFP4: DTypeHandler(
         variant=QuantVariant.NVFP4,
@@ -366,13 +409,32 @@ _DTYPE = {
         make_act_pack=_nvfp4_act_pack,
         make_act_pack_logits=_nvfp4_act_pack_logits,
         reference=_nvfp4_reference,
-        poison=_nvfp4_poison,
+        poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
         atol_frac=0.15,  # calibrated: obs ratio ≤0.077 (fp4 intermediate-requant floor)
         rtol=0.1,
     ),
-    # FP8 / MXFP4 / MXINT4 / BF16 add one entry each as their runners are wired upstream.
+    QuantVariant.BF16: DTypeHandler(
+        variant=QuantVariant.BF16,
+        candidate_configs=(TrtllmBf16Config,),
+        snap=_bf16_snap,
+        make_act_pack=_bf16_act_pack,
+        make_act_pack_logits=None,
+        reference=_bf16_reference,
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=0.05,  # initial; calibrate on SM100 (bf16 rounding floor)
+        rtol=0.05,
+    ),
+    # FP8 / MXFP4 / MXINT4 add one entry each as their runners are wired upstream.
 }
+
+# Cfg.variant string <-> handler lookup (labels stay lowercase enum names).
+_VARIANT_IDS = tuple(v.name.lower() for v in _DTYPE)
+
+
+def _handler_for(cfg):
+    return _DTYPE[QuantVariant[cfg.variant.upper()]]
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +616,9 @@ def _gen(seed):
         intermediate=i,
         num_experts=ne,
         top_k=top_k,
-        variant="nvfp4",  # only wired variant today; expands with _DTYPE
+        # BF16 is pre-routed-only today; FromLogits currently requires the
+        # TRTLLM FP4 runner.
+        variant="nvfp4" if fromlogits else rng.choice(_VARIANT_IDS),
         route=rng.choice(_ROUTE),
         seed=seed,
         local_experts=local,
@@ -641,6 +705,12 @@ _CURATED = [
         topk_group=2,
         routed_scaling=1.0,
     ),  # DeepSeekV3 mid-size (top_k 8 < 2*128/4=64), non-pow2 intermediate
+    Cfg(
+        256, 1024, 512, 256, 8, "bf16", "uniform", 900_009
+    ),  # DeepSeek-ish shape on the bf16 path
+    Cfg(
+        2048, 1024, 1024, 128, 6, "bf16", "imbalanced", 900_010
+    ),  # bf16 mid size + empty-expert load
 ]
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _curated_by_seed = {c.seed: c for c in _CURATED}
@@ -887,7 +957,7 @@ def test_unified_moe_fuzz(cfg):
     sm = get_compute_capability(torch.device("cuda:0"))
     sm = sm[0] * 10 + sm[1]
 
-    handler = _DTYPE[QuantVariant.NVFP4]
+    handler = _handler_for(cfg)
     dev = torch.device("cuda")
     # Backend *config classes* whose runner is registered in the live MoELayer registry AND valid
     # on this arch. A newly-wired backend lands here automatically.
@@ -917,6 +987,7 @@ def test_unified_moe_fuzz(cfg):
     # SAME bf16 inputs (this rank's LOCAL shard) via the API's uniform prepare_weights. In-kernel
     # routing hands the kernel raw logits (+ bias); pre-routed hands it the host selection.
     if cfg.is_fromlogits:
+        assert handler.make_act_pack_logits is not None
         act_pack = handler.make_act_pack_logits(x, logits, routing_bias)
     else:
         act_pack = handler.make_act_pack(x, selected_experts, final_scales)
@@ -943,7 +1014,7 @@ def test_unified_moe_fuzz(cfg):
             topk_group=cfg.topk_group or None,
             routed_scaling_factor=cfg.routed_scaling or None,
         ),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(variant=handler.variant),
         experts=ExpertConfig(
             intermediate_size=cfg.intermediate,
             local_num_experts=cfg.n_local,
@@ -971,12 +1042,25 @@ def test_unified_moe_fuzz(cfg):
         # pack_inputs; cute_dsl idx 11, trtllm the `output=`), located by dtype+shape: clean=zeros,
         # poison=seeded garbage+NaN/Inf. Both are bit-reproducible from cfg.seed, so any failure --
         # including a partial-write that depends on the buffer -- reproduces exactly.
+        act_ptrs = {
+            t.data_ptr()
+            for t in (
+                act_pack.hidden_states_q,
+                act_pack.hidden_states_scale,
+                act_pack.topk_ids,
+                act_pack.topk_weights,
+                act_pack.routing_logits,
+                act_pack.routing_bias,
+            )
+            if torch.is_tensor(t)
+        }
         bufs = [
             t
             for t in inputs
             if torch.is_tensor(t)
             and t.dtype == handler.out_dtype
             and tuple(t.shape) == out_shape
+            and t.data_ptr() not in act_ptrs
         ]
         assert bufs, "could not locate the output buffer in pack_inputs"
         for b in bufs:
@@ -1120,15 +1204,16 @@ _CACHE_TOKEN_SEQ = [
 ]  # buckets + boundaries + cache-hit re-runs
 
 
+@pytest.mark.parametrize("variant", list(_DTYPE), ids=[v.name.lower() for v in _DTYPE])
 @pytest.mark.parametrize(
     "base", _CACHE_BASES, ids=[f"e{e}h{h}i{i}" for e, h, i in _CACHE_BASES]
 )
-def test_autotune_cache_coherence(base):
+def test_autotune_cache_coherence(base, variant):
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
     sm = get_compute_capability(torch.device("cuda:0"))
     sm = sm[0] * 10 + sm[1]
-    handler = _DTYPE[QuantVariant.NVFP4]
+    handler = _DTYPE[variant]
     dev = torch.device("cuda")
     wired = [
         B
@@ -1174,7 +1259,7 @@ def test_autotune_cache_coherence(base):
     layer = MoELayer(
         MoEConfig(
             routing=RoutingConfig(num_experts=E, top_k=top_k),
-            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            quant=QuantConfig(variant=variant),
             experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
             activation=ActivationConfig(),
             backend=BackendOptions(candidates=tuple(B() for B in wired)),

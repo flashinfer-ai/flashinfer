@@ -42,6 +42,7 @@ import torch
 from cutlass import Float32, Int32, Uint8
 
 from ...api_logging import flashinfer_api
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ...cute_dsl.fp4_common import (
     block_reduce,
     fdiv_rn,
@@ -1327,6 +1328,39 @@ class NVFP4QuantizeTMAKernel:
 # =============================================================================
 
 
+def _kernel_source_files() -> Tuple[str, ...]:
+    """Source files whose content invalidates the on-disk kernel cache."""
+    from ...cute_dsl import fp4_common
+    from .. import quantization_cute_dsl_utils
+
+    return (__file__, fp4_common.__file__, quantization_cute_dsl_utils.__file__)
+
+
+_CUTE_DSL_MODULE = "nvfp4_quantize"
+
+
+def _nvfp4_kernel_name(
+    variant: str,
+    dtype_key: str,
+    K: int,
+    sf_layout: int,
+    enable_pdl: bool,
+    disable_fp4_quant_fast_math: bool,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
+) -> str:
+    """Specialization name within the nvfp4_quantize module, encoding every
+    parameter that affects codegen.
+    """
+    name = f"{variant}_{dtype_key}_k{K}_sf{sf_layout}_pdl{int(enable_pdl)}"
+    if disable_fp4_quant_fast_math:
+        name += "_nofastmath"
+    if nvfp4_4over6_config is not None:
+        cfg = nvfp4_4over6_config
+        err_mode = getattr(cfg.err_mode, "name", cfg.err_mode)
+        name += f"_4over6_{cfg.e4m3_max}_{err_mode}_{int(cfg.err_use_fast_math)}"
+    return name
+
+
 @functools.cache
 def _get_compiled_kernel_nvfp4(
     dtype_key: str,
@@ -1384,17 +1418,30 @@ def _get_compiled_kernel_nvfp4(
             nvfp4_4over6_config,
         )
 
-        compiled_kernel = cute.compile(
-            linear_obj,
-            input_fake,
-            output_fake,
-            scales_fake,
-            Int32(1),  # Dummy M
-            Int32(1),  # Dummy total_sf_blocks
-            Int32(1),  # Dummy num_blocks
-            global_scale_fake,
-            stream_fake,
-            options="--enable-tvm-ffi",
+        compiled_kernel = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _nvfp4_kernel_name(
+                "linear",
+                dtype_key,
+                K,
+                sf_layout,
+                enable_pdl,
+                disable_fp4_quant_fast_math,
+                nvfp4_4over6_config,
+            ),
+            lambda: cute.compile(
+                linear_obj,
+                input_fake,
+                output_fake,
+                scales_fake,
+                Int32(1),  # Dummy M
+                Int32(1),  # Dummy total_sf_blocks
+                Int32(1),  # Dummy num_blocks
+                global_scale_fake,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            ),
+            extra_key_files=_kernel_source_files(),
         )
 
         return compiled_kernel, linear_obj.SF_BLOCKS_PER_TB
@@ -1408,17 +1455,30 @@ def _get_compiled_kernel_nvfp4(
             nvfp4_4over6_config=nvfp4_4over6_config,
         )
 
-        compiled_kernel = cute.compile(
-            swizzled_obj,
-            input_fake,
-            output_fake,
-            scales_fake,
-            Int32(1),  # Dummy M
-            Int32(128),  # Dummy padded_M
-            Int32(1),  # Dummy num_blocks
-            global_scale_fake,
-            stream_fake,
-            options="--enable-tvm-ffi",
+        compiled_kernel = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _nvfp4_kernel_name(
+                "swizzled",
+                dtype_key,
+                K,
+                sf_layout,
+                enable_pdl,
+                disable_fp4_quant_fast_math,
+                nvfp4_4over6_config,
+            ),
+            lambda: cute.compile(
+                swizzled_obj,
+                input_fake,
+                output_fake,
+                scales_fake,
+                Int32(1),  # Dummy M
+                Int32(128),  # Dummy padded_M
+                Int32(1),  # Dummy num_blocks
+                global_scale_fake,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            ),
+            extra_key_files=_kernel_source_files(),
         )
 
         return compiled_kernel, swizzled_obj.rows_per_block
@@ -1468,16 +1528,29 @@ def _get_compiled_kernel_nvfp4_per_token(
         nvfp4_4over6_config=nvfp4_4over6_config,
     )
 
-    return cute.compile(
-        kernel_obj,
-        input_fake,
-        output_fake,
-        scales_fake,
-        per_token_scale_fake,
-        Int32(1),
-        global_scale_inv_fake,
-        stream_fake,
-        options="--enable-tvm-ffi",
+    return build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _nvfp4_kernel_name(
+            "per_token",
+            dtype_key,
+            K,
+            sf_layout,
+            enable_pdl,
+            disable_fp4_quant_fast_math,
+            nvfp4_4over6_config,
+        ),
+        lambda: cute.compile(
+            kernel_obj,
+            input_fake,
+            output_fake,
+            scales_fake,
+            per_token_scale_fake,
+            Int32(1),
+            global_scale_inv_fake,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        ),
+        extra_key_files=_kernel_source_files(),
     )
 
 
@@ -1546,17 +1619,29 @@ def _get_compiled_kernel_nvfp4_tma(
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    compiled_kernel = cute.compile(
-        kernel_obj,
-        input_fake,
-        output_fake,
-        scales_fake,
-        Int32(1),  # Dummy M
-        Int32(1024),  # Dummy padded_M
-        Int32(1),  # Dummy num_blocks
-        global_scale_fake,
-        stream_fake,
-        options="--enable-tvm-ffi",
+    compiled_kernel = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _nvfp4_kernel_name(
+            "tma",
+            dtype_key,
+            K,
+            sf_layout,
+            enable_pdl,
+            disable_fp4_quant_fast_math,
+        ),
+        lambda: cute.compile(
+            kernel_obj,
+            input_fake,
+            output_fake,
+            scales_fake,
+            Int32(1),  # Dummy M
+            Int32(1024),  # Dummy padded_M
+            Int32(1),  # Dummy num_blocks
+            global_scale_fake,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        ),
+        extra_key_files=_kernel_source_files(),
     )
 
     return compiled_kernel, kernel_obj.rows_per_block

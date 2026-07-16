@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+from collections import defaultdict
 from dataclasses import replace
 from enum import Enum
 from types import SimpleNamespace
@@ -50,7 +51,12 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from .kernels.utils import _select_sm100_mm_fp4_cute_dsl_tactic
+from .kernels.utils import (
+    _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
+    _SM100_MMA_TILER_MN_CANDIDATES,
+    _score_sm100_mm_fp4_tactic,
+    _select_sm100_mm_fp4_cute_dsl_tactic,
+)
 from ..utils import (
     get_device_sm_count,
     get_native_fp4_dtype,
@@ -340,6 +346,8 @@ def _cudnn_mm_bf16_requirement(
     ] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
+    if not _cudnn_bf16_gemm_usable_or_skip(a, out_dtype, backend):
+        return False
     return _cudnn_available_or_raise_for_backend(backend)
 
 
@@ -685,6 +693,8 @@ def _cudnn_bmm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
+    if not _cudnn_bf16_gemm_usable_or_skip(A, out_dtype, backend):
+        return False
     return _cudnn_available_or_raise_for_backend(backend)
 
 
@@ -2258,6 +2268,33 @@ def _cudnn_available_or_raise_for_backend(backend):
     if backend == "cudnn":
         _check_cudnn_availability()
     return False
+
+
+def _cudnn_bf16_gemm_usable_or_skip(
+    a: torch.Tensor, out_dtype: torch.dtype, backend: str
+) -> bool:
+    """Precise ban for the cuDNN 9.23.0.x bf16-GEMM bug. cuDNN 9.23.0 (backend_version 92300)
+    miscomputes bf16 GEMM/BMM with **fp16 output on SM90/Hopper** for non-power-of-2 M: the split-k
+    partial-reduce kernel assumes row-major output, but Hopper swaps A<->B so the output is
+    column-major -> wrong reduce dims -> garbage (ratio ~1). bf16 OUTPUT, SM80/89/100, and the
+    non-bf16 dtype paths are all UNAFFECTED, and it's fixed in 9.23.1 (92301). So disable exactly
+    {SM90, fp16-out, 9.23.0.x}: auto falls back to cutlass/cublas, explicit cudnn raises a clear,
+    skippable error. (Envelope deliberately drops the non-pow2-M condition -- the actual trigger --
+    for robustness against the split-k tile heuristic; the over-restriction is only pow2-M
+    bf16->fp16 on SM90/9.23.0, which simply falls back.)"""
+    if (
+        CUDNN_AVAILABLE
+        and out_dtype == torch.float16
+        and cudnn.backend_version() == 92300
+        and get_compute_capability(a.device)[0] == 9
+    ):
+        if backend == "cudnn":
+            raise RuntimeError(
+                "cuDNN 9.23.0 miscomputes bf16->fp16 GEMM/BMM on SM90/Hopper (non-power-of-2 M); "
+                "not supported. Use bf16 output, another backend, or upgrade to cuDNN >= 9.23.1."
+            )
+        return False
+    return True
 
 
 def _is_cublas_fp4_available_in_cudnn():
@@ -4486,34 +4523,11 @@ def _cudnn_mm_mxfp8_requirement(
 
 
 # Shared helpers for CuTe DSL block-scaled GEMM runners (mxfp8 & mxfp4/nvfp4)
-_SM100_MMA_TILER_MN_CANDIDATES = [
-    (128, 8),
-    (128, 16),
-    (128, 32),
-    (128, 64),
-    (256, 64),
-    (128, 128),
-    (256, 128),
-    (128, 192),
-    (256, 192),
-    (128, 256),
-    (256, 256),
-]
-
-_SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
-    (1, 1),
-    (1, 2),
-    (1, 4),
-    (2, 1),
-    (2, 2),
-    (2, 4),
-    (4, 1),
-    (4, 2),
-    (4, 4),
-]
-
 _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
+
+# Max distinct configs the autotuner profiles mm_fp4(backend='cute-dsl')
+_MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS = 32
 
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
@@ -5917,7 +5931,29 @@ def _cute_dsl_gemm_fp4_runner(
                                     )
                                 )
 
-            return valid_tactics
+            # Rank configs and autotune the top-N instead of the entire O(100).
+            # Current heuristic cannot distinguish use_prefetch, so autotuner profiles both.
+            sm_count = get_device_sm_count(a.device)
+            config_tactics = defaultdict(list)
+            for t in valid_tactics:
+                # group by everything except use_prefetch (t[3])
+                tile, cluster, swap_ab, _, kernel_type, tma_store = t
+                config_key = (tile, cluster, swap_ab, kernel_type, tma_store)
+                config_tactics[config_key].append(t)
+            ranked_configs = sorted(
+                config_tactics.values(),
+                key=lambda ts: _score_sm100_mm_fp4_tactic(
+                    m, n, real_k, sm_count, ts[0][0], ts[0][1], ts[0][2]
+                ),
+                reverse=True,
+            )
+            return [
+                t
+                for ts in ranked_configs[
+                    : _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS // 2
+                ]  # // 2 for prefetch and non-prefetch
+                for t in ts
+            ]
 
         def forward(
             self,
@@ -5940,7 +5976,7 @@ def _cute_dsl_gemm_fp4_runner(
                 # Use analytical heuristic to pick the best tactic based on
                 # tile and wave quantization efficiency.
                 tactic = _select_sm100_mm_fp4_cute_dsl_tactic(
-                    m, n, real_k, get_device_sm_count(a.device)
+                    m, n, real_k, get_device_sm_count(a.device), sf_vec_size
                 )
 
             (
@@ -8942,6 +8978,18 @@ def _check_bmm_mxfp8_problem_size(
     if A.shape[2] != B.shape[1]:
         raise ValueError(
             f"K dimension (last dim of A) mismatch in bmm_mxfp8. got {A.shape=}, {B.shape=}"
+        )
+
+    # mxfp8 GEMM needs n,k >= 128 (smaller dims can produce NaN/Inf garbage). mm_mxfp8 enforces this
+    # in its common check (_check_mm_mxfp8_problem_size) but bmm_mxfp8 historically did not, so the
+    # cuDNN bmm path SILENTLY returned garbage for 32<=n<128 instead of rejecting. Mirror the guard.
+    # (B is [b, k, n] here -> n = B.shape[2], k = A.shape[2].)
+    min_n = 128
+    min_k = 128
+    if B.shape[2] < min_n or A.shape[2] < min_k:
+        raise ValueError(
+            f"MXFP8 requires n >= {min_n} and k >= {min_k}. "
+            f"got b={A.shape[0]}, m={A.shape[1]}, n={B.shape[2]}, k={A.shape[2]}."
         )
 
     _validate_mxfp8_output_dtype(dtype)

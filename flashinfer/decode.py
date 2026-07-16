@@ -71,13 +71,13 @@ from .utils import (
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
+    _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
     get_device_sm_count,
-    get_trtllm_gen_multi_ctas_kv_counter_bytes,
     is_float8,
     register_custom_op,
     register_fake_op,
@@ -3394,27 +3394,13 @@ def trtllm_batch_decode_with_kv_cache(
         _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
 
         num_qo_heads = query.size(1)
-        required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
-            batch_size, num_qo_heads, sm_count
+        multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+            multi_ctas_kv_counter_buffer,
+            batch_size,
+            num_qo_heads,
+            sm_count,
+            query.device,
         )
-        if multi_ctas_kv_counter_buffer is None:
-            multi_ctas_kv_counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
-                batch_size, num_qo_heads, sm_count, query.device
-            )
-        elif multi_ctas_kv_counter_buffer.device != query.device:
-            raise ValueError(
-                "multi_ctas_kv_counter_buffer must be on the same device as query"
-            )
-        else:
-            counter_buffer_bytes = (
-                multi_ctas_kv_counter_buffer.numel()
-                * multi_ctas_kv_counter_buffer.element_size()
-            )
-            if counter_buffer_bytes < required_counter_bytes:
-                raise ValueError(
-                    "multi_ctas_kv_counter_buffer is too small: got "
-                    f"{counter_buffer_bytes} bytes, need {required_counter_bytes} bytes"
-                )
         lse_shape = (query.size(0), num_qo_heads)
         if lse is not None:
             check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
