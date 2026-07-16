@@ -1229,34 +1229,33 @@ class AutoTuner:
             synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
-            for r_id, r in enumerate(runners):
-                extras = r.get_cache_key_extras(inputs) if inputs is not None else ()
-                cache_key = AutoTuner._get_cache_key(
-                    custom_op, r, input_shapes, tuning_config, extras
+            runner_keys = [
+                (
+                    r_id,
+                    AutoTuner._get_cache_key(
+                        custom_op,
+                        r,
+                        input_shapes,
+                        tuning_config,
+                        r.get_cache_key_extras(inputs) if inputs is not None else (),
+                    ),
                 )
-                # 1. In-memory cache (from live tuning)
+                for r_id, r in enumerate(runners)
+            ]
+
+            # 1. In-memory cache (from live tuning)
+            for r_id, cache_key in runner_keys:
                 if cache_key in self.profiling_cache:
                     tactic, stored_profile = self.profiling_cache[cache_key]
                     return True, r_id, tactic, stored_profile
 
-                # Build the hash-free file key used by both user configs and bundled configs.
-                # Include extras (index 4) so that runner specific parameters
-                # are not lost on disk.
+            # 2. User-loaded configs (from load_configs or autotune(cache=...))
+            for r_id, cache_key in runner_keys:
                 file_key = cache_key.file_key
-
-                # 2. User-loaded configs (from load_configs or autotune(cache=...))
-                #    Always consulted, even during tuning mode — loaded configs take priority
-                #    so that already-tuned shapes are never re-profiled.
                 if file_key in self._file_configs:
                     runner_name, tactic = self._file_configs[file_key]
-                    runner_id = next(
-                        (
-                            i
-                            for i, runner in enumerate(runners)
-                            if runner.__class__.__name__ == runner_name
-                        ),
-                        0,  # fallback to first runner if name not found
-                    )
+                    if runner_name != runners[r_id].__class__.__name__:
+                        continue
                     log_key = (custom_op, runner_name)
                     if log_key not in self._logged_file_hits:
                         self._logged_file_hits.add(log_key)
@@ -1264,13 +1263,14 @@ class AutoTuner:
                             f"[Autotuner]: Config cache hit for {custom_op} "
                             f"(runner={runner_name}, source=config file)"
                         )
-                    return True, runner_id, tactic, None
+                    return True, r_id, tactic, None
 
-                # 3. Bundled package configs (legacy .py files)
-                if (
-                    os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
-                    and not self.is_tuning_mode
-                ):
+            # 3. Bundled package configs (legacy .py files)
+            if (
+                os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+                and not self.is_tuning_mode
+            ):
+                for r_id, cache_key in runner_keys:
                     is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
                     if is_hit:
                         return True, r_id, file_tactic, None
