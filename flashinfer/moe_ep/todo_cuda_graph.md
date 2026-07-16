@@ -12,7 +12,12 @@ capture post-warmup, 3x replay bit-exact vs eager, replay over mutated input
 buffers, and loud failure when capturing without warmup). Remaining
 follow-ups: the 2-rank lockstep-replay test (item 5 below), the 2-rank
 skewed-rank staging stress test (break-risk item 2), and vLLM-side adoption
-(shared-workspace warmup + dropping VLLM_ENFORCE_EAGER).
+(dropping VLLM_ENFORCE_EAGER). Update 2026-07-16 (later): the shared
+workspace is now UPSTREAM — `core/kernel/workspace_pool.py` pools symm
+buffers across same-key layers with refcounted destroy, so the vLLM
+wrapper's `_SHARED_WORKSPACE` dict and per-layer `_ensure_workspace`
+override are obsolete; `layer.warmup()` on each layer is cheap after the
+first (shared buffer + shared compiled frontend).
 
 Original analysis (2026-07-14) below.
 

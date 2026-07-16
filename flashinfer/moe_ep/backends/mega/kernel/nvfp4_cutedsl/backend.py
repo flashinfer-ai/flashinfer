@@ -242,6 +242,34 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
         return output
 
-    def destroy(self, workspace: Any) -> None:
-        if workspace is not None:
-            workspace.destroy()
+    def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        k = self._kernel_config
+        if k.knobs == "auto":
+            # Autotune retunes (and recompiles) the workspace's shared
+            # frontend at first compute; give each session its own buffer.
+            return None
+        import torch
+
+        from .....core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
+
+        fp = fleet_params
+        return (
+            "nvfp4_cutedsl",
+            torch.cuda.current_device(),
+            self.ep_rank,
+            self.ep_world_size,
+            id(self._ep_comm_group),
+            fp.num_experts,
+            fp.max_tokens_per_rank,
+            k.top_k,
+            fp.token_hidden_size,
+            2 * k.intermediate_size,
+            _resolve_gate_up_clamp(k),
+            k.apply_topk_in_fc1,
+            k.in_kernel_fc2_reduce,
+            k.combine_dtype,
+            epilogue_pool_key(k.fc1_alpha),
+            epilogue_pool_key(k.fc2_alpha),
+            epilogue_pool_key(k.fc1_norm_const),
+            knobs_pool_key(k.knobs),
+        )
