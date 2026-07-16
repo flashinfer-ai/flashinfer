@@ -63,7 +63,9 @@ class Test_FlashInfer_MaskedBMM:
         return torch.bmm(a, b)
 
     @staticmethod
-    def prepare_data(num_groups, max_m, expected_m_per_group, n, k, trans_a, trans_b, dtype):
+    def prepare_data(
+        num_groups, max_m, expected_m_per_group, n, k, trans_a, trans_b, dtype
+    ):
         device = torch.device("cuda")
         q = num_groups
         m = max_m
@@ -92,10 +94,10 @@ class Test_FlashInfer_MaskedBMM:
         # Set all the elements beyond the m_mask to 0
         if trans_a:
             for i in range(num_groups):
-                a[i, :, m_mask[i]:] = 0
+                a[i, :, m_mask[i] :] = 0
         else:
             for i in range(num_groups):
-                a[i, m_mask[i]:, :] = 0
+                a[i, m_mask[i] :, :] = 0
 
         return a, b, a_impl, b_impl, m_mask
 
@@ -109,7 +111,9 @@ class Test_FlashInfer_MaskedBMM:
                 case["n"],
                 case["k"],
             )
-            for case in list(enumerate_m_grouped_masked())[:2]  # Use smaller set for correctness
+            for case in list(enumerate_m_grouped_masked())[
+                :2
+            ]  # Use smaller set for correctness
         ],
     )
     @pytest.mark.parametrize("dtype", [torch.float16])
@@ -146,5 +150,5 @@ class Test_FlashInfer_MaskedBMM:
         c = masked_bmm(a_impl, b_impl, m_mask, trans_a, trans_b, backend=backend)
 
         for i in range(num_groups):
-            c[i, m_mask[i]:, :] = 0
+            c[i, m_mask[i] :, :] = 0
         torch.testing.assert_close(ref_c, c, atol=1e-2, rtol=1e-2)

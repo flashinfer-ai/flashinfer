@@ -984,9 +984,7 @@ class BlockSparseAttentionWrapper:
             num_block_rows = indptr.numel() - 1
 
             # KV as page_size==C paged cache: [N, H_kv, D] -> [N // C, C, H_kv, D].
-            k_cache = k.reshape(
-                self._N // C, C, self._num_kv_heads, self._head_dim
-            )
+            k_cache = k.reshape(self._N // C, C, self._num_kv_heads, self._head_dim)
             v_cache = v.reshape(self._N // C, C, self._num_kv_heads, v.shape[-1])
 
             nnz_per_row = (indptr[1:] - indptr[:-1]).to(torch.int32)

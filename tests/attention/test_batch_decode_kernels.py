@@ -123,7 +123,9 @@ def test_batch_decode_with_paged_kv_cache(
         if kv_layout != "NHD":
             pytest.skip("cuTile decode requires kv_layout='NHD'.")
         if pos_encoding_mode != "NONE":
-            pytest.skip("cuTile decode does not apply RoPE (pos_encoding_mode must be NONE).")
+            pytest.skip(
+                "cuTile decode does not apply RoPE (pos_encoding_mode must be NONE)."
+            )
         if kv_dtype == torch.float8_e4m3fn:
             pytest.skip("cuTile decode fp8 KV not covered yet.")
         if head_dim > 256:

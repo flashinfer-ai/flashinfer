@@ -12,7 +12,7 @@ from ....cutile.cutile_common import cached_replace_hints
 
 import os
 
-_AUTOTUNE_DISABLED = os.getenv('FLASHINFER_CUTILE_AUTOTUNE_DISABLED', '0') == '1'
+_AUTOTUNE_DISABLED = os.getenv("FLASHINFER_CUTILE_AUTOTUNE_DISABLED", "0") == "1"
 
 # Module-level tune cache: (Q, M, N, K, transpose_a_int, transpose_b_int, dtype, device) -> (best_cfg, tuned_kernel)
 _masked_bmm_tune_cache: dict = {}
@@ -179,7 +179,12 @@ def _masked_bmm_autotune_configs():
                     # Focus on occupancy tuning: 1-4 for compute-bound GEMM
                     for occupancy in [1, 2, 4]:
                         yield SimpleNamespace(
-                            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=num_ctas, occupancy=occupancy
+                            BLOCK_M=BM,
+                            BLOCK_N=BN,
+                            BLOCK_K=BK,
+                            GROUP_SIZE_M=8,
+                            num_ctas=num_ctas,
+                            occupancy=occupancy,
                         )
     elif gpu_capability in [(12, 0), (12, 1)]:
         # RTX 5090 (sm120/sm121)
@@ -193,7 +198,12 @@ def _masked_bmm_autotune_configs():
                 for num_ctas in [1, 2, 4]:
                     for occupancy in [1, 2, 4]:
                         yield SimpleNamespace(
-                            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=num_ctas, occupancy=occupancy
+                            BLOCK_M=BM,
+                            BLOCK_N=BN,
+                            BLOCK_K=BK,
+                            GROUP_SIZE_M=8,
+                            num_ctas=num_ctas,
+                            occupancy=occupancy,
                         )
     elif gpu_capability == (9, 0):
         # H100 (sm_90) - supports higher num_ctas values
@@ -208,7 +218,12 @@ def _masked_bmm_autotune_configs():
                 for num_ctas in [1, 2, 4, 8]:
                     for occupancy in [1, 2, 4, 8]:
                         yield SimpleNamespace(
-                            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=num_ctas, occupancy=occupancy
+                            BLOCK_M=BM,
+                            BLOCK_N=BN,
+                            BLOCK_K=BK,
+                            GROUP_SIZE_M=8,
+                            num_ctas=num_ctas,
+                            occupancy=occupancy,
                         )
     else:
         # Default configurations
@@ -220,7 +235,12 @@ def _masked_bmm_autotune_configs():
                 for num_ctas in [1, 2]:
                     for occupancy in [1, 2, 4]:
                         yield SimpleNamespace(
-                            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=num_ctas, occupancy=occupancy
+                            BLOCK_M=BM,
+                            BLOCK_N=BN,
+                            BLOCK_K=BK,
+                            GROUP_SIZE_M=8,
+                            num_ctas=num_ctas,
+                            occupancy=occupancy,
                         )
 
 
@@ -375,13 +395,26 @@ def masked_bmm(
     assert a.is_contiguous(), "A matrix must be contiguous"
     assert b.is_contiguous(), "B matrix must be contiguous"
     assert masked_m.is_contiguous(), "Masked matrix must be contiguous"
-    assert masked_m.shape.numel() == Q, "Masked matrix must have the same shape as the number of batches"
+    assert masked_m.shape.numel() == Q, (
+        "Masked matrix must have the same shape as the number of batches"
+    )
     c = torch.empty((Q, M, N), device=a.device, dtype=a.dtype)
 
     enable_autotune = not _AUTOTUNE_DISABLED
 
     if enable_autotune:
-        _masked_bmm_autotune(torch.cuda.current_stream(), a, b, c, masked_m, Q, M, N, transpose_a, transpose_b)
+        _masked_bmm_autotune(
+            torch.cuda.current_stream(),
+            a,
+            b,
+            c,
+            masked_m,
+            Q,
+            M,
+            N,
+            transpose_a,
+            transpose_b,
+        )
     else:
         default_configs = _get_default_kernel_configs()
         kernel_configs = {**default_configs, **(kwargs.get("kernel_configs") or {})}

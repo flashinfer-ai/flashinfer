@@ -136,13 +136,17 @@ def test_block_sparse_attention(
         if head_dim not in (64, 96, 128):
             pytest.skip("vsa_blackwell requires head_dim in {64, 96, 128}")
         if mask_inside_block:
-            pytest.skip("vsa_blackwell does not support per-element block masks (mask_inside_block=True)")
+            pytest.skip(
+                "vsa_blackwell does not support per-element block masks (mask_inside_block=True)"
+            )
 
     if backend == "cutile":
         # cuTile block-sparse maps each block-row onto a paged prefill batch with
         # page_size == C; it expresses sparsity at block granularity only.
         if mask_inside_block:
-            pytest.skip("cuTile block-sparse does not support per-element intra-block masks.")
+            pytest.skip(
+                "cuTile block-sparse does not support per-element intra-block masks."
+            )
         if M % R != 0 or N % C != 0:
             pytest.skip("cuTile block-sparse requires M % R == 0 and N % C == 0.")
         if C < 16:

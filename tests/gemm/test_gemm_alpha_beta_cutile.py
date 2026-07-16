@@ -14,12 +14,16 @@ from flashinfer.utils import get_compute_capability
 
 class Test_FlashInfer_Matmul_Alpha_Beta:
     @staticmethod
-    def reference(a, b, c, trans_a=False, trans_b=True, alpha=1.0, beta=0.0, dtype=torch.bfloat16):
+    def reference(
+        a, b, c, trans_a=False, trans_b=True, alpha=1.0, beta=0.0, dtype=torch.bfloat16
+    ):
         if trans_a:
             a = a.t()
         if trans_b:
             b = b.t()
-        return torch.addmm(c, a.to(dtype), b.to(dtype), beta=beta, alpha=alpha, out=c).to(dtype)
+        return torch.addmm(
+            c, a.to(dtype), b.to(dtype), beta=beta, alpha=alpha, out=c
+        ).to(dtype)
 
     @staticmethod
     def prepare_data(m, n, k, trans_a, trans_b, dtype):
@@ -44,12 +48,18 @@ class Test_FlashInfer_Matmul_Alpha_Beta:
     @pytest.mark.parametrize("m, n, k", [(4096, 4096, 4096), (8192, 8192, 8192)])
     @pytest.mark.parametrize(
         "dtype, out_dtype",
-        [(torch.float16, torch.float16), (torch.bfloat16, torch.bfloat16), (torch.float8_e4m3fn, torch.bfloat16)],
+        [
+            (torch.float16, torch.float16),
+            (torch.bfloat16, torch.bfloat16),
+            (torch.float8_e4m3fn, torch.bfloat16),
+        ],
     )
     @pytest.mark.parametrize("trans_a, trans_b", [(False, True)])
     @pytest.mark.parametrize("alpha, beta", [(1.0, 0.0), (1.5, 2.0)])
     @pytest.mark.parametrize("backend", ["cutile"])
-    def test_op(self, m, n, k, dtype, out_dtype, trans_a, trans_b, alpha, beta, backend):
+    def test_op(
+        self, m, n, k, dtype, out_dtype, trans_a, trans_b, alpha, beta, backend
+    ):
         if backend == "cutile" and not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
         cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
@@ -64,6 +74,8 @@ class Test_FlashInfer_Matmul_Alpha_Beta:
         c = torch.rand((m, n), device=a.device, dtype=out_dtype)
         ref_c = c.clone()
 
-        result = gemm_alpha_beta(a, b, c, trans_a, trans_b, alpha, beta, backend=backend)
+        result = gemm_alpha_beta(
+            a, b, c, trans_a, trans_b, alpha, beta, backend=backend
+        )
         ref = self.reference(a, b, ref_c, trans_a, trans_b, alpha, beta, out_dtype)
         torch.testing.assert_close(result, ref, atol=1e-2, rtol=1e-2)

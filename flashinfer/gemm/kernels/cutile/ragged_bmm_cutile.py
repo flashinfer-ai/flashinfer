@@ -12,7 +12,7 @@ from ....cutile.cutile_common import cached_replace_hints
 
 import os
 
-_AUTOTUNE_DISABLED = os.getenv('FLASHINFER_CUTILE_AUTOTUNE_DISABLED', '0') == '1'
+_AUTOTUNE_DISABLED = os.getenv("FLASHINFER_CUTILE_AUTOTUNE_DISABLED", "0") == "1"
 
 # Module-level tune caches for standard and swap_ab ragged BMM
 _ragged_bmm_standard_tune_cache: dict = {}
@@ -318,7 +318,12 @@ def _ragged_bmm_autotune_configs_standard():
             for BK in [64]:
                 for occupancy in [1, 2, 4]:
                     yield SimpleNamespace(
-                        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=1, occupancy=occupancy
+                        BLOCK_M=BM,
+                        BLOCK_N=BN,
+                        BLOCK_K=BK,
+                        GROUP_SIZE_M=8,
+                        num_ctas=1,
+                        occupancy=occupancy,
                     )
     elif gpu_capability in [(12, 0), (12, 1)]:
         # RTX 5090 (sm120/sm121) - expanded configs
@@ -330,7 +335,12 @@ def _ragged_bmm_autotune_configs_standard():
             for BK in [64]:
                 for occupancy in [1, 2, 4]:
                     yield SimpleNamespace(
-                        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=1, occupancy=occupancy
+                        BLOCK_M=BM,
+                        BLOCK_N=BN,
+                        BLOCK_K=BK,
+                        GROUP_SIZE_M=8,
+                        num_ctas=1,
+                        occupancy=occupancy,
                     )
     elif gpu_capability == (9, 0):
         # H100 (sm_90) - expanded configs
@@ -342,7 +352,12 @@ def _ragged_bmm_autotune_configs_standard():
             for BK in [64]:
                 for occupancy in [1, 2, 4, 8]:
                     yield SimpleNamespace(
-                        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=1, occupancy=occupancy
+                        BLOCK_M=BM,
+                        BLOCK_N=BN,
+                        BLOCK_K=BK,
+                        GROUP_SIZE_M=8,
+                        num_ctas=1,
+                        occupancy=occupancy,
                     )
     else:
         # Default configurations - expanded
@@ -353,7 +368,12 @@ def _ragged_bmm_autotune_configs_standard():
             for BK in [64]:
                 for occupancy in [1, 2, 4]:
                     yield SimpleNamespace(
-                        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=1, occupancy=occupancy
+                        BLOCK_M=BM,
+                        BLOCK_N=BN,
+                        BLOCK_K=BK,
+                        GROUP_SIZE_M=8,
+                        num_ctas=1,
+                        occupancy=occupancy,
                     )
 
 
@@ -374,7 +394,12 @@ def _ragged_bmm_autotune_configs_swap_ab():
             for BK in [64]:
                 for occupancy in [1, 2, 4]:
                     yield SimpleNamespace(
-                        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=1, occupancy=occupancy
+                        BLOCK_M=BM,
+                        BLOCK_N=BN,
+                        BLOCK_K=BK,
+                        GROUP_SIZE_M=8,
+                        num_ctas=1,
+                        occupancy=occupancy,
                     )
     elif gpu_capability in [(12, 0), (12, 1)]:
         # RTX 5090 (sm120/sm121)
@@ -386,7 +411,12 @@ def _ragged_bmm_autotune_configs_swap_ab():
             for BK in [64]:
                 for occupancy in [1, 2, 4]:
                     yield SimpleNamespace(
-                        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=1, occupancy=occupancy
+                        BLOCK_M=BM,
+                        BLOCK_N=BN,
+                        BLOCK_K=BK,
+                        GROUP_SIZE_M=8,
+                        num_ctas=1,
+                        occupancy=occupancy,
                     )
     elif gpu_capability == (9, 0):
         # H100 (sm_90)
@@ -398,7 +428,12 @@ def _ragged_bmm_autotune_configs_swap_ab():
             for BK in [64]:
                 for occupancy in [1, 2, 4, 8]:
                     yield SimpleNamespace(
-                        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=1, occupancy=occupancy
+                        BLOCK_M=BM,
+                        BLOCK_N=BN,
+                        BLOCK_K=BK,
+                        GROUP_SIZE_M=8,
+                        num_ctas=1,
+                        occupancy=occupancy,
                     )
     else:
         # Default configurations
@@ -409,7 +444,12 @@ def _ragged_bmm_autotune_configs_swap_ab():
             for BK in [64]:
                 for occupancy in [1, 2, 4]:
                     yield SimpleNamespace(
-                        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=8, num_ctas=1, occupancy=occupancy
+                        BLOCK_M=BM,
+                        BLOCK_N=BN,
+                        BLOCK_K=BK,
+                        GROUP_SIZE_M=8,
+                        num_ctas=1,
+                        occupancy=occupancy,
                     )
 
 
@@ -463,7 +503,18 @@ def _get_default_kernel_configs():
 
 
 def _ragged_bmm_autotune_standard(
-    stream, a, b, c, m_indptr, Q, max_m, max_m_device, N, total_m, transpose_a, transpose_b
+    stream,
+    a,
+    b,
+    c,
+    m_indptr,
+    Q,
+    max_m,
+    max_m_device,
+    N,
+    total_m,
+    transpose_a,
+    transpose_b,
 ):
     """
     Autotuned launch for standard ragged BMM kernel.
@@ -509,7 +560,16 @@ def _ragged_bmm_autotune_standard(
     def hints_fn(cfg):
         return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
-    cache_key = (Q, max_m, N, total_m, transpose_a_int, transpose_b_int, a.dtype, str(a.device))
+    cache_key = (
+        Q,
+        max_m,
+        N,
+        total_m,
+        transpose_a_int,
+        transpose_b_int,
+        a.dtype,
+        str(a.device),
+    )
     if cache_key not in _ragged_bmm_standard_tune_cache:
         result = exhaustive_search(
             list(_ragged_bmm_autotune_configs_standard()),
@@ -529,7 +589,18 @@ def _ragged_bmm_autotune_standard(
 
 
 def _ragged_bmm_autotune_swap_ab(
-    stream, a, b, c, m_indptr, Q, max_m, max_m_device, N, total_m, transpose_a, transpose_b
+    stream,
+    a,
+    b,
+    c,
+    m_indptr,
+    Q,
+    max_m,
+    max_m_device,
+    N,
+    total_m,
+    transpose_a,
+    transpose_b,
 ):
     """
     Autotuned launch for swap_ab ragged BMM kernel.
@@ -575,7 +646,16 @@ def _ragged_bmm_autotune_swap_ab(
     def hints_fn(cfg):
         return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
-    swap_cache_key = (Q, max_m, N, total_m, transpose_a_int, transpose_b_int, a.dtype, str(a.device))
+    swap_cache_key = (
+        Q,
+        max_m,
+        N,
+        total_m,
+        transpose_a_int,
+        transpose_b_int,
+        a.dtype,
+        str(a.device),
+    )
     if swap_cache_key not in _ragged_bmm_swap_ab_tune_cache:
         result = exhaustive_search(
             list(_ragged_bmm_autotune_configs_swap_ab()),
@@ -736,9 +816,7 @@ def ragged_bmm(
             hints["num_ctas"] = num_ctas
         if occupancy is not None:
             hints["occupancy"] = occupancy
-        kernel = (
-            cached_replace_hints(kernel_fn, **hints) if hints else kernel_fn
-        )
+        kernel = cached_replace_hints(kernel_fn, **hints) if hints else kernel_fn
 
         ct.launch(
             torch.cuda.current_stream(),

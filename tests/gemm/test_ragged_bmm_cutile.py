@@ -40,7 +40,7 @@ def create_ragged_m_segments(num_groups, m, dtype, align_to=None):
     alignment = align_to if align_to is not None else num_items
 
     # Generate random segment sizes
-    for i in range(num_groups - 1):
+    for _ in range(num_groups - 1):
         size = int(m * random.uniform(0.5, 1.5))
         size = (size // alignment) * alignment
         if size < alignment:
@@ -140,15 +140,22 @@ class Test_FlashInfer_RaggedBMM:
         else:
             b_shape = (num_groups, k, n)
 
-        a = torch.rand(a_shape, device=device, dtype=torch.float16, requires_grad=False).to(dtype)
-        b = torch.rand(b_shape, device=device, dtype=torch.float16, requires_grad=False).to(dtype)
+        a = torch.rand(
+            a_shape, device=device, dtype=torch.float16, requires_grad=False
+        ).to(dtype)
+        b = torch.rand(
+            b_shape, device=device, dtype=torch.float16, requires_grad=False
+        ).to(dtype)
 
         return a, b, max_m, segment_offsets
 
     @pytest.mark.parametrize("trans_a", [False])
     @pytest.mark.parametrize("trans_b", [False, True])
     @pytest.mark.parametrize("dtype", [torch.bfloat16])
-    @pytest.mark.parametrize("num_groups, m, n, k", [(4, 256, 256, 256), (2, 128, 128, 128), (4, 512, 512, 512)])
+    @pytest.mark.parametrize(
+        "num_groups, m, n, k",
+        [(4, 256, 256, 256), (2, 128, 128, 128), (4, 512, 512, 512)],
+    )
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op_shapes(self, trans_a, trans_b, dtype, num_groups, m, n, k, backend):
         if trans_a or not trans_b:
@@ -158,7 +165,9 @@ class Test_FlashInfer_RaggedBMM:
         torch.manual_seed(0)
         random.seed(0)
         out_dtype = dtype
-        a, b, max_m, segment_offsets = self.prepare_data(num_groups, m, n, k, trans_a, trans_b, dtype)
+        a, b, max_m, segment_offsets = self.prepare_data(
+            num_groups, m, n, k, trans_a, trans_b, dtype
+        )
 
         result = ragged_bmm(
             a,
@@ -185,7 +194,9 @@ class Test_FlashInfer_RaggedBMM:
         trans_a = False
         trans_b = True
         out_dtype = dtype
-        a, b, max_m, segment_offsets = self.prepare_data(num_groups, m, n, k, trans_a, trans_b, dtype)
+        a, b, max_m, segment_offsets = self.prepare_data(
+            num_groups, m, n, k, trans_a, trans_b, dtype
+        )
 
         result = ragged_bmm(
             a,
@@ -214,7 +225,9 @@ class Test_FlashInfer_RaggedBMM:
         trans_a = False
         trans_b = True
         out_dtype = torch.bfloat16
-        a, b, max_m, segment_offsets = self.prepare_data(num_groups, m, n, k, trans_a, trans_b, dtype)
+        a, b, max_m, segment_offsets = self.prepare_data(
+            num_groups, m, n, k, trans_a, trans_b, dtype
+        )
 
         result = ragged_bmm(
             a,
@@ -243,7 +256,9 @@ class Test_FlashInfer_RaggedBMM:
         torch.manual_seed(0)
         random.seed(0)
         out_dtype = dtype
-        a, b, max_m, segment_offsets = self.prepare_data(num_groups, m, n, k, trans_a, trans_b, dtype)
+        a, b, max_m, segment_offsets = self.prepare_data(
+            num_groups, m, n, k, trans_a, trans_b, dtype
+        )
 
         result = ragged_bmm(
             a,

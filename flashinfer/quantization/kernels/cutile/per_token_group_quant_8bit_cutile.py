@@ -11,11 +11,12 @@
 
 from typing import Optional
 from typing import Tuple
+from typing import TypeAlias
 
 import cuda.tile as ct
 import torch
 
-ConstInt = ct.Constant[int]
+ConstInt: TypeAlias = ct.Constant[int]
 
 
 def _next_power_of_2(n):
@@ -188,7 +189,9 @@ def per_token_group_quant_8bit_cutile(
     )
     assert x.is_contiguous(), "`x` must be contiguous"
     if scale_tma_aligned or scale_ue8m0:
-        assert column_major_scales, "scale_tma_aligned or scale_ue8m0 requires column_major_scales=True"
+        assert column_major_scales, (
+            "scale_tma_aligned or scale_ue8m0 requires column_major_scales=True"
+        )
 
     if dst_dtype == torch.int8:
         info = torch.iinfo(dst_dtype)
@@ -218,7 +221,9 @@ def per_token_group_quant_8bit_cutile(
             x_s_col_stride = aligned_size
         else:
             shape = (num_groups,) + x.shape[:-1]
-            x_s_raw = torch.zeros(shape, device=x.device, dtype=torch.float32).permute(-1, -2)
+            x_s_raw = torch.zeros(shape, device=x.device, dtype=torch.float32).permute(
+                -1, -2
+            )
             x_s_col_stride = x_s_raw.stride(1)
         x_s = x_s_raw
     else:
@@ -241,7 +246,12 @@ def per_token_group_quant_8bit_cutile(
         x_s_for_kernel = (
             x_s_raw.view(-1)
             if x_s_raw.is_contiguous()
-            else torch.as_strided(x_s_raw, (x_s_raw.numel(),), (1,), storage_offset=x_s_raw.storage_offset())
+            else torch.as_strided(
+                x_s_raw,
+                (x_s_raw.numel(),),
+                (1,),
+                storage_offset=x_s_raw.storage_offset(),
+            )
         )
 
         ct.launch(

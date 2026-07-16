@@ -418,7 +418,16 @@ def gemm_alpha_beta(
             return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
         stream = torch.cuda.current_stream()
-        cache_key = (M, N, K, transpose_a_int, transpose_b_int, a.dtype, num_sms, str(a.device))
+        cache_key = (
+            M,
+            N,
+            K,
+            transpose_a_int,
+            transpose_b_int,
+            a.dtype,
+            num_sms,
+            str(a.device),
+        )
         if cache_key not in _gemm_alpha_beta_tune_cache:
             result = exhaustive_search(
                 list(_gemm_alpha_beta_autotune_configs()),
@@ -451,7 +460,9 @@ def gemm_alpha_beta(
         occupancy = kernel_configs.get("occupancy", 1)
         epilogue_subtile = kernel_configs.get("EPILOGUE_SUBTILE", 0)
 
-        num_programs = _compute_grid_and_programs(M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy)[3]
+        num_programs = _compute_grid_and_programs(
+            M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy
+        )[3]
 
         # 1D grid for persistent scheduling
         grid = (num_programs, 1, 1)

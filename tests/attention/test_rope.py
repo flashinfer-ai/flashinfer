@@ -418,7 +418,9 @@ def test_generalized_rope_quantize(
         if quant_dtype != torch.float8_e4m3fn:
             pytest.skip("cuTile rope_quantize backend supports float8_e4m3fn only.")
         if enable_pdl:
-            pytest.skip("cuTile rope_quantize backend ignores PDL; covered with enable_pdl=False.")
+            pytest.skip(
+                "cuTile rope_quantize backend ignores PDL; covered with enable_pdl=False."
+            )
     device = "cuda:0"
     # Fixed seed for reproducibility across tests
     torch.manual_seed(0)

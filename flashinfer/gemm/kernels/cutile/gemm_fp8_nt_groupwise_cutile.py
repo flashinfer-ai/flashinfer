@@ -374,9 +374,7 @@ def _w8a8_autotune_and_launch(
     ``use_tma`` is part of the cache key so tuned results never cross over.
     """
     kernel = (
-        _w8a8_block_fp8_matmul_kernel_tma
-        if use_tma
-        else _w8a8_block_fp8_matmul_kernel
+        _w8a8_block_fp8_matmul_kernel_tma if use_tma else _w8a8_block_fp8_matmul_kernel
     )
 
     def build_args(cfg):
@@ -592,7 +590,9 @@ def _w8a8_group_fp8_matmul_kernel(
     m_indptr,  # (Q + 1,) int32 row-segment boundaries (prefix sums)
     # Dimensions
     Q: ct.Constant[int],
-    TOTAL_M: ct.Constant[int],  # A/C row count == C.shape[0]; also the OOB store sentinel
+    TOTAL_M: ct.Constant[
+        int
+    ],  # A/C row count == C.shape[0]; also the OOB store sentinel
     max_m_device,  # (1,) int32 device tensor: max over groups of (m_indptr[i+1]-m_indptr[i])
     N: ct.Constant[int],
     K: ct.Constant[int],
@@ -703,10 +703,18 @@ def _w8a8_group_fp8_matmul_kernel(
 
                 # As: (total_m, K_groups) -> (BLOCK_M,); Bs: scalar for (group, n-tile, k-tile)
                 a_s = ct.gather(
-                    As, (offs_am, k_tile), check_bounds=True, padding_value=0.0, latency=4
+                    As,
+                    (offs_am, k_tile),
+                    check_bounds=True,
+                    padding_value=0.0,
+                    latency=4,
                 )
                 b_s = ct.gather(
-                    Bs, (bs_row, k_tile), check_bounds=True, padding_value=0.0, latency=4
+                    Bs,
+                    (bs_row, k_tile),
+                    check_bounds=True,
+                    padding_value=0.0,
+                    latency=4,
                 )
                 ab_s = a_s[:, None] * b_s
 
@@ -732,9 +740,7 @@ def _w8a8_group_fp8_matmul_kernel(
 
             # Drop tail rows that spilled past this group (route to OOB row TOTAL_M).
             offs_cm = ct.where(row_valid, offs_am, TOTAL_M)
-            ct.scatter(
-                C, (offs_cm[:, None], offs_bn[None, :]), c, check_bounds=True
-            )
+            ct.scatter(C, (offs_cm[:, None], offs_bn[None, :]), c, check_bounds=True)
 
 
 def _group_gemm_default_config(total_m, num_groups):

@@ -553,6 +553,4 @@ def per_token_group_quant_8bit(
             scale_ue8m0=scale_ue8m0,
         )
 
-    raise ValueError(
-        f"Unsupported backend for per_token_group_quant_8bit: {backend!r}"
-    )
+    raise ValueError(f"Unsupported backend for per_token_group_quant_8bit: {backend!r}")

@@ -29,7 +29,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         num_items = alignment * ELEM_PER_BYTE_A
 
         # Generate random segment sizes
-        for i in range(num_groups - 1):
+        for _ in range(num_groups - 1):
             # Random size between 0.5x and 1.5x expected size
             size = int(m * random.uniform(0.5, 1.5))
             size = (size // num_items) * num_items
@@ -63,7 +63,6 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         """
         # Ensure m is a multiple of block_m
         aligned_m = ((m + block_m - 1) // block_m) * block_m
-        total_m = num_groups * aligned_m
 
         # Create even segment offsets (all segments same size)
         segment_offsets = torch.zeros(num_groups + 1, dtype=torch.int32, device="cuda")
@@ -120,7 +119,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         total_m, K = a.shape
         Q, N, K_b = b.shape
 
-        assert K == K_b, f"K dimensions must match: {K} != {K_b}"
+        assert K_b == K, f"K dimensions must match: {K} != {K_b}"
 
         # Initialize output tensor
         c = torch.zeros((total_m, N), device=a.device, dtype=out_dtype)
@@ -134,22 +133,32 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
 
             # Extract segment from flattened matrix a
             a_segment = a[start_offset:end_offset, :]  # Shape: [segment_size, K]
-            a_scale_segment = a_scale[start_offset:end_offset, :]  # Shape: [segment_size, k_tiles]
+            a_scale_segment = a_scale[
+                start_offset:end_offset, :
+            ]  # Shape: [segment_size, k_tiles]
 
             b_segment = b[q, :, :]  # Shape: [N, K]
             b_scale_segment = b_scale[q, :, :]  # Shape: [n_tiles, k_tiles]
 
             # Expand block-level scales to match data dimensions
             # a_scale: [segment_size, k_tiles] -> [segment_size, K]
-            a_scale_expanded = torch.repeat_interleave(a_scale_segment, block_k, dim=1)[:, :K]
+            a_scale_expanded = torch.repeat_interleave(a_scale_segment, block_k, dim=1)[
+                :, :K
+            ]
 
             # b_scale: [n_tiles, k_tiles] -> [N, K]
-            b_scale_expanded = torch.repeat_interleave(b_scale_segment, block_n, dim=0)[:N, :]
-            b_scale_expanded = torch.repeat_interleave(b_scale_expanded, block_k, dim=1)[:, :K]
+            b_scale_expanded = torch.repeat_interleave(b_scale_segment, block_n, dim=0)[
+                :N, :
+            ]
+            b_scale_expanded = torch.repeat_interleave(
+                b_scale_expanded, block_k, dim=1
+            )[:, :K]
 
             # Compute matrix multiplication for this segment
             # (a * a_scale) @ (b * b_scale).T
-            c_segment = torch.mm(a_segment * a_scale_expanded, (b_segment * b_scale_expanded).t()).to(out_dtype)
+            c_segment = torch.mm(
+                a_segment * a_scale_expanded, (b_segment * b_scale_expanded).t()
+            ).to(out_dtype)
 
             # Store the result in the output tensor
             c[start_offset:end_offset, :] = c_segment
@@ -168,7 +177,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         use_aligned_segments=False,
     ):
         Q = num_groups
-        assert trans_a == False and trans_b == True, "Only NT layout is supported"
+        assert not trans_a and trans_b, "Only NT layout is supported"
         device = torch.device("cuda")
         factor_for_scale = 1e-2
         block_n = 128
@@ -178,40 +187,62 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
 
         if use_aligned_segments:
             # CuTile requires segment offsets aligned to BLOCK_M (128)
-            max_m, segment_offsets, aligned_m = Test_FlashInfer_RaggedBlockScaledBMM.create_aligned_m_segments(
-                num_groups=num_groups,
-                m=M,
-                block_m=128,  # BLOCK_M for CuTile
+            max_m, segment_offsets, aligned_m = (
+                Test_FlashInfer_RaggedBlockScaledBMM.create_aligned_m_segments(
+                    num_groups=num_groups,
+                    m=M,
+                    block_m=128,  # BLOCK_M for CuTile
+                )
             )
             total_m = segment_offsets[-1].item()
-            actual_m = aligned_m
         else:
             # Supports non-aligned segments
-            max_m, segment_offsets = Test_FlashInfer_RaggedBlockScaledBMM.create_ragged_m_segments(
-                num_groups=num_groups,
-                m=M,
-                ELEM_PER_BYTE_A=1,
-                alignment=16,
+            max_m, segment_offsets = (
+                Test_FlashInfer_RaggedBlockScaledBMM.create_ragged_m_segments(
+                    num_groups=num_groups,
+                    m=M,
+                    ELEM_PER_BYTE_A=1,
+                    alignment=16,
+                )
             )
             total_m = segment_offsets[-1].item()
-            actual_m = M
             assert total_m == num_groups * M
 
         A_fp32 = (
-            (torch.rand(total_m, K, dtype=torch.float32, device=device).normal_(mean=0.0, std=0.3) - 0.5) * 2 * fp8_max
+            (
+                torch.rand(total_m, K, dtype=torch.float32, device=device).normal_(
+                    mean=0.0, std=0.3
+                )
+                - 0.5
+            )
+            * 2
+            * fp8_max
         )
         A_fp8 = A_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
         B_fp32 = (
-            (torch.rand(Q, N, K, dtype=torch.float32, device=device).normal_(mean=0.0, std=0.3) - 0.5) * 2 * fp8_max
+            (
+                torch.rand(Q, N, K, dtype=torch.float32, device=device).normal_(
+                    mean=0.0, std=0.3
+                )
+                - 0.5
+            )
+            * 2
+            * fp8_max
         )
         B_fp8 = B_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
         n_tiles = (N + block_n - 1) // block_n
         k_tiles = (K + block_k - 1) // block_k
 
-        As = torch.rand(total_m, k_tiles, dtype=torch.float32, device=device) * factor_for_scale
-        Bs = torch.rand(Q, n_tiles, k_tiles, dtype=torch.float32, device=device) * factor_for_scale
+        As = (
+            torch.rand(total_m, k_tiles, dtype=torch.float32, device=device)
+            * factor_for_scale
+        )
+        Bs = (
+            torch.rand(Q, n_tiles, k_tiles, dtype=torch.float32, device=device)
+            * factor_for_scale
+        )
 
         ref_c = Test_FlashInfer_RaggedBlockScaledBMM.reference(
             A_fp8,
@@ -231,7 +262,9 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
     @pytest.mark.parametrize("num_groups", [4])
     @pytest.mark.parametrize("m", [128, 512])
     @pytest.mark.parametrize("n, k", [(2048, 2048)])
-    @pytest.mark.parametrize("dtype, out_dtype", [(torch.float8_e4m3fn, torch.bfloat16)])
+    @pytest.mark.parametrize(
+        "dtype, out_dtype", [(torch.float8_e4m3fn, torch.bfloat16)]
+    )
     @pytest.mark.parametrize("trans_a, trans_b", [(False, True)])
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op(self, num_groups, m, n, k, dtype, out_dtype, trans_a, trans_b, backend):

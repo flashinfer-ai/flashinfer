@@ -1040,9 +1040,7 @@ def gemm_alpha_beta(
             gemm_alpha_beta as _gemm_alpha_beta_cutile,
         )
 
-        return _gemm_alpha_beta_cutile(
-            a, b, c, trans_a, trans_b, alpha, beta, num_sms
-        )
+        return _gemm_alpha_beta_cutile(a, b, c, trans_a, trans_b, alpha, beta, num_sms)
 
     raise ValueError(f"Unsupported backend for gemm_alpha_beta: {backend!r}")
 
@@ -1223,9 +1221,7 @@ def ragged_block_scaled_bmm(
             segment_alignment=segment_alignment,
         )
 
-    raise ValueError(
-        f"Unsupported backend for ragged_block_scaled_bmm: {backend!r}"
-    )
+    raise ValueError(f"Unsupported backend for ragged_block_scaled_bmm: {backend!r}")
 
 
 @functools.cache

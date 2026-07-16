@@ -17,6 +17,7 @@ import os
 from types import SimpleNamespace
 from typing import Optional
 from typing import Tuple
+from typing import TypeAlias
 
 import cuda.tile as ct
 import torch
@@ -24,7 +25,7 @@ from cuda.tile.tune import exhaustive_search
 
 from ....cutile.cutile_common import cached_replace_hints
 
-ConstInt = ct.Constant[int]
+ConstInt: TypeAlias = ct.Constant[int]
 PAD_ZERO = ct.PaddingMode.ZERO
 
 # Set FLASHINFER_CUTILE_AUTOTUNE_DISABLED=1 to skip exhaustive search (faster but suboptimal)
@@ -92,7 +93,11 @@ def _cutile_autotune_rope_quantize_fp8(
         result = exhaustive_search(
             list(_rope_quantize_fp8_cutile_configs(num_tokens)),
             stream,
-            lambda cfg: (math.ceil(num_tokens / cfg.TOKENS_PER_BLOCK), total_blocks_y, 1),
+            lambda cfg: (
+                math.ceil(num_tokens / cfg.TOKENS_PER_BLOCK),
+                total_blocks_y,
+                1,
+            ),
             _rope_quantize_fp8_kernel,
             lambda cfg: (
                 q_rope,
@@ -150,7 +155,9 @@ def _cutile_autotune_rope_quantize_fp8(
 
 
 def _load_rope_factors(pos_ids, cos_sin_cache, token_block, TOKENS_PER_BLOCK, HALF_DIM):
-    pos_tile = ct.load(pos_ids, index=token_block, shape=TOKENS_PER_BLOCK, padding_mode=PAD_ZERO)
+    pos_tile = ct.load(
+        pos_ids, index=token_block, shape=TOKENS_PER_BLOCK, padding_mode=PAD_ZERO
+    )
     pos_rows = ct.reshape(pos_tile, (TOKENS_PER_BLOCK, 1))
     half_cols = ct.reshape(ct.arange(HALF_DIM, dtype=ct.int32), (1, HALF_DIM))
     cos = ct.gather(cos_sin_cache, (pos_rows, half_cols), check_bounds=False)
@@ -158,7 +165,9 @@ def _load_rope_factors(pos_ids, cos_sin_cache, token_block, TOKENS_PER_BLOCK, HA
     return cos, sin
 
 
-def _apply_rope_interleave_batched(x_tile, cos, sin, out_dtype, quant_scale, TOKENS_PER_BLOCK, HALF_DIM):
+def _apply_rope_interleave_batched(
+    x_tile, cos, sin, out_dtype, quant_scale, TOKENS_PER_BLOCK, HALF_DIM
+):
     x_3d = ct.reshape(ct.astype(x_tile, ct.float32), (TOKENS_PER_BLOCK, HALF_DIM, 2))
     x_even = ct.reshape(
         ct.extract(x_3d, index=(0, 0, 0), shape=(TOKENS_PER_BLOCK, HALF_DIM, 1)),
@@ -217,7 +226,9 @@ def _rope_quantize_fp8_kernel(
     k_nope_end = k_rope_end + NUM_KV_HEADS * no_rope_chunks
 
     if pid_y < q_rope_end:
-        cos, sin = _load_rope_factors(pos_ids, cos_sin_cache, pid_x, TOKENS_PER_BLOCK, HALF_DIM)
+        cos, sin = _load_rope_factors(
+            pos_ids, cos_sin_cache, pid_x, TOKENS_PER_BLOCK, HALF_DIM
+        )
         head_idx = pid_y
         q_tile = ct.load(
             q_rope,
@@ -234,9 +245,15 @@ def _rope_quantize_fp8_kernel(
             TOKENS_PER_BLOCK,
             HALF_DIM,
         )
-        ct.store(q_rope_out, index=(pid_x, head_idx, 0), tile=ct.reshape(q_rot, (TOKENS_PER_BLOCK, 1, ROPE_DIM)))
+        ct.store(
+            q_rope_out,
+            index=(pid_x, head_idx, 0),
+            tile=ct.reshape(q_rot, (TOKENS_PER_BLOCK, 1, ROPE_DIM)),
+        )
     elif pid_y < k_rope_end:
-        cos, sin = _load_rope_factors(pos_ids, cos_sin_cache, pid_x, TOKENS_PER_BLOCK, HALF_DIM)
+        cos, sin = _load_rope_factors(
+            pos_ids, cos_sin_cache, pid_x, TOKENS_PER_BLOCK, HALF_DIM
+        )
         k_tile = ct.load(
             k_rope,
             index=(pid_x, 0),
@@ -252,7 +269,11 @@ def _rope_quantize_fp8_kernel(
             TOKENS_PER_BLOCK,
             HALF_DIM,
         )
-        ct.store(k_rope_out, index=(pid_x, 0), tile=ct.reshape(k_rot, (TOKENS_PER_BLOCK, ROPE_DIM)))
+        ct.store(
+            k_rope_out,
+            index=(pid_x, 0),
+            tile=ct.reshape(k_rot, (TOKENS_PER_BLOCK, ROPE_DIM)),
+        )
     elif pid_y < k_nope_end:
         chunk_idx = pid_y - k_rope_end
         k_tile = ct.load(
@@ -262,7 +283,9 @@ def _rope_quantize_fp8_kernel(
             padding_mode=PAD_ZERO,
         )
         ct.store(
-            k_nope_out, index=(pid_x, chunk_idx), tile=_quantize_batched_tile(k_tile, k_nope_out.dtype, quant_scale_kv)
+            k_nope_out,
+            index=(pid_x, chunk_idx),
+            tile=_quantize_batched_tile(k_tile, k_nope_out.dtype, quant_scale_kv),
         )
     else:
         task_idx = pid_y - k_nope_end
@@ -335,12 +358,16 @@ def rope_quantize_fp8_cutile(
     num_kv_heads = 1 if is_mla else k_rope.shape[1]
 
     if q_nope is None:
-        q_nope = torch.empty(nnz, num_qo_heads, 0, dtype=q_rope.dtype, device=q_rope.device)
+        q_nope = torch.empty(
+            nnz, num_qo_heads, 0, dtype=q_rope.dtype, device=q_rope.device
+        )
     if k_nope is None:
         if is_mla:
             k_nope = torch.empty(nnz, 0, dtype=k_rope.dtype, device=k_rope.device)
         else:
-            k_nope = torch.empty(nnz, num_kv_heads, 0, dtype=k_rope.dtype, device=k_rope.device)
+            k_nope = torch.empty(
+                nnz, num_kv_heads, 0, dtype=k_rope.dtype, device=k_rope.device
+            )
 
     if quantize_dtype is None:
         for out in (q_rope_out, k_rope_out, q_nope_out, k_nope_out):
@@ -351,10 +378,26 @@ def rope_quantize_fp8_cutile(
             quantize_dtype = torch.float8_e4m3fn
 
     # Pre-zero output buffers to avoid NaN from beta=0 epilogue (PR #3426 pattern)
-    q_rope_out = q_rope_out if q_rope_out is not None else torch.zeros_like(q_rope, dtype=quantize_dtype)
-    k_rope_out = k_rope_out if k_rope_out is not None else torch.zeros_like(k_rope, dtype=quantize_dtype)
-    q_nope_out = q_nope_out if q_nope_out is not None else torch.zeros_like(q_nope, dtype=quantize_dtype)
-    k_nope_out = k_nope_out if k_nope_out is not None else torch.zeros_like(k_nope, dtype=quantize_dtype)
+    q_rope_out = (
+        q_rope_out
+        if q_rope_out is not None
+        else torch.zeros_like(q_rope, dtype=quantize_dtype)
+    )
+    k_rope_out = (
+        k_rope_out
+        if k_rope_out is not None
+        else torch.zeros_like(k_rope, dtype=quantize_dtype)
+    )
+    q_nope_out = (
+        q_nope_out
+        if q_nope_out is not None
+        else torch.zeros_like(q_nope, dtype=quantize_dtype)
+    )
+    k_nope_out = (
+        k_nope_out
+        if k_nope_out is not None
+        else torch.zeros_like(k_nope, dtype=quantize_dtype)
+    )
 
     num_tokens = q_rope.shape[0]
     rope_dim = q_rope.shape[2]
@@ -362,7 +405,12 @@ def rope_quantize_fp8_cutile(
     no_rope_dim = q_nope.shape[2] if q_nope is not None else 0
 
     no_rope_chunks = (no_rope_dim + rope_dim - 1) // rope_dim
-    total_blocks_y = num_qo_heads + num_kv_heads + num_kv_heads * no_rope_chunks + num_qo_heads * no_rope_chunks
+    total_blocks_y = (
+        num_qo_heads
+        + num_kv_heads
+        + num_kv_heads * no_rope_chunks
+        + num_qo_heads * no_rope_chunks
+    )
 
     if is_neox:
         raise ValueError(

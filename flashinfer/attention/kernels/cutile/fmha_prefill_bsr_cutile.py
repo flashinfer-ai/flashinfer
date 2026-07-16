@@ -12,6 +12,7 @@
 import math
 from types import SimpleNamespace
 from typing import Optional
+from typing import TypeAlias
 
 import cuda.tile as ct
 import torch
@@ -26,9 +27,9 @@ _prefill_ragged_tune_cache: dict = {}
 
 INV_LOG_2 = 1.0 / math.log(2)
 
-ConstInt = ct.Constant[int]
-ConstBool = ct.Constant[bool]
-ConstFloat = ct.Constant[float]
+ConstInt: TypeAlias = ct.Constant[int]
+ConstBool: TypeAlias = ct.Constant[bool]
+ConstFloat: TypeAlias = ct.Constant[float]
 
 # Max pages one BLOCK_N may span. _load_page_prefill unrolls a per-page TMA load
 # for NUM_PAGES in {1,2,4,8}; capping BLOCK_N // page_size at 8 keeps configs
@@ -67,7 +68,7 @@ def _get_prefill_autotune_configs(page_size=None):
             # softmax (verified: 94% mismatch). LOAD_BLOCK_N = min(BLOCK_N,
             # page_size), so NUM_PAGES = BLOCK_N // page_size here; cap it at
             # _MAX_LOAD_PAGES to stay within the loader's {1,2,4,8} range.
-            if cfg.BLOCK_N > page_size and cfg.BLOCK_N % page_size != 0:
+            if page_size < cfg.BLOCK_N and cfg.BLOCK_N % page_size != 0:
                 continue
             if cfg.BLOCK_N // page_size > _MAX_LOAD_PAGES:
                 continue
@@ -96,7 +97,9 @@ def _load_page_prefill(
     """
     PAD_ZERO = ct.PaddingMode.ZERO
     if NUM_PAGES == 1:
-        page_id = ct.gather(block_tables, (page_table_offset + page,), padding_value=0).item()
+        page_id = ct.gather(
+            block_tables, (page_table_offset + page,), padding_value=0
+        ).item()
         data = ct.reshape(
             ct.load(
                 cache,
@@ -110,7 +113,9 @@ def _load_page_prefill(
             (LOAD_BLOCK_N, BLOCK_D),
         )
     elif NUM_PAGES == 2:
-        pg0 = ct.gather(block_tables, (page_table_offset + page,), padding_value=0).item()
+        pg0 = ct.gather(
+            block_tables, (page_table_offset + page,), padding_value=0
+        ).item()
         d0 = ct.reshape(
             ct.load(
                 cache,
@@ -123,7 +128,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg1 = ct.gather(block_tables, (page_table_offset + page + 1,), padding_value=0).item()
+        pg1 = ct.gather(
+            block_tables, (page_table_offset + page + 1,), padding_value=0
+        ).item()
         d1 = ct.reshape(
             ct.load(
                 cache,
@@ -138,7 +145,9 @@ def _load_page_prefill(
         )
         data = ct.cat((d0, d1), 0)
     elif NUM_PAGES == 4:
-        pg0 = ct.gather(block_tables, (page_table_offset + page,), padding_value=0).item()
+        pg0 = ct.gather(
+            block_tables, (page_table_offset + page,), padding_value=0
+        ).item()
         d0 = ct.reshape(
             ct.load(
                 cache,
@@ -151,7 +160,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg1 = ct.gather(block_tables, (page_table_offset + page + 1,), padding_value=0).item()
+        pg1 = ct.gather(
+            block_tables, (page_table_offset + page + 1,), padding_value=0
+        ).item()
         d1 = ct.reshape(
             ct.load(
                 cache,
@@ -164,7 +175,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg2 = ct.gather(block_tables, (page_table_offset + page + 2,), padding_value=0).item()
+        pg2 = ct.gather(
+            block_tables, (page_table_offset + page + 2,), padding_value=0
+        ).item()
         d2 = ct.reshape(
             ct.load(
                 cache,
@@ -177,7 +190,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg3 = ct.gather(block_tables, (page_table_offset + page + 3,), padding_value=0).item()
+        pg3 = ct.gather(
+            block_tables, (page_table_offset + page + 3,), padding_value=0
+        ).item()
         d3 = ct.reshape(
             ct.load(
                 cache,
@@ -192,7 +207,9 @@ def _load_page_prefill(
         )
         data = ct.cat((ct.cat((d0, d1), 0), ct.cat((d2, d3), 0)), 0)
     elif NUM_PAGES == 8:
-        pg0 = ct.gather(block_tables, (page_table_offset + page,), padding_value=0).item()
+        pg0 = ct.gather(
+            block_tables, (page_table_offset + page,), padding_value=0
+        ).item()
         d0 = ct.reshape(
             ct.load(
                 cache,
@@ -205,7 +222,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg1 = ct.gather(block_tables, (page_table_offset + page + 1,), padding_value=0).item()
+        pg1 = ct.gather(
+            block_tables, (page_table_offset + page + 1,), padding_value=0
+        ).item()
         d1 = ct.reshape(
             ct.load(
                 cache,
@@ -218,7 +237,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg2 = ct.gather(block_tables, (page_table_offset + page + 2,), padding_value=0).item()
+        pg2 = ct.gather(
+            block_tables, (page_table_offset + page + 2,), padding_value=0
+        ).item()
         d2 = ct.reshape(
             ct.load(
                 cache,
@@ -231,7 +252,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg3 = ct.gather(block_tables, (page_table_offset + page + 3,), padding_value=0).item()
+        pg3 = ct.gather(
+            block_tables, (page_table_offset + page + 3,), padding_value=0
+        ).item()
         d3 = ct.reshape(
             ct.load(
                 cache,
@@ -244,7 +267,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg4 = ct.gather(block_tables, (page_table_offset + page + 4,), padding_value=0).item()
+        pg4 = ct.gather(
+            block_tables, (page_table_offset + page + 4,), padding_value=0
+        ).item()
         d4 = ct.reshape(
             ct.load(
                 cache,
@@ -257,7 +282,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg5 = ct.gather(block_tables, (page_table_offset + page + 5,), padding_value=0).item()
+        pg5 = ct.gather(
+            block_tables, (page_table_offset + page + 5,), padding_value=0
+        ).item()
         d5 = ct.reshape(
             ct.load(
                 cache,
@@ -270,7 +297,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg6 = ct.gather(block_tables, (page_table_offset + page + 6,), padding_value=0).item()
+        pg6 = ct.gather(
+            block_tables, (page_table_offset + page + 6,), padding_value=0
+        ).item()
         d6 = ct.reshape(
             ct.load(
                 cache,
@@ -283,7 +312,9 @@ def _load_page_prefill(
             ),
             (LOAD_BLOCK_N, BLOCK_D),
         )
-        pg7 = ct.gather(block_tables, (page_table_offset + page + 7,), padding_value=0).item()
+        pg7 = ct.gather(
+            block_tables, (page_table_offset + page + 7,), padding_value=0
+        ).item()
         d7 = ct.reshape(
             ct.load(
                 cache,
@@ -386,7 +417,9 @@ def _prefill_attention_paged_body(
     page_table_offset = batch_id * stride_block_table
 
     q_seq = query.slice(axis=0, start=seq_start_index, stop=seq_start_index + seq_len_q)
-    o_seq = output.slice(axis=0, start=seq_start_index, stop=seq_start_index + seq_len_q)
+    o_seq = output.slice(
+        axis=0, start=seq_start_index, stop=seq_start_index + seq_len_q
+    )
 
     q_tile = ct.load(
         q_seq,
@@ -480,7 +513,9 @@ def _prefill_attention_paged_body(
         # multiple of BLOCK_N (the single-page case), so single-page results are bit-identical.
         offs_n = curr_n + offs_n_base
         boundary_mask = ct.reshape((offs_n < off_band_hi), (1, BLOCK_N))
-        qk = ct.where(boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32))
+        qk = ct.where(
+            boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
+        )
 
         # Online softmax with flush_to_zero for IR parity with Triton
         qk_max = ct.max(qk, axis=1, keepdims=False)
@@ -546,19 +581,27 @@ def _prefill_attention_paged_body(
                 qk = ct.mma(q_pe, ct.transpose(k_pe), acc=qk)
 
             offs_n = curr_n + offs_n_base
-            causal_mask = ct.reshape(offs_m, (BLOCK_M, 1)) >= ct.reshape(offs_n, (1, BLOCK_N))
-            qk = ct.where(causal_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32))
+            causal_mask = ct.reshape(offs_m, (BLOCK_M, 1)) >= ct.reshape(
+                offs_n, (1, BLOCK_N)
+            )
+            qk = ct.where(
+                causal_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
+            )
 
             # Boundary mask: when seq_len_kv < start_m + BLOCK_M, on_band_hi is
             # clamped to seq_len_kv and the causal mask alone (offs_m >= offs_n)
             # does not exclude past-seq_len_kv positions that a multi-page BLOCK_N
             # can pull in. No-op when seq_len_kv is a multiple of BLOCK_N.
             boundary_mask = ct.reshape((offs_n < seq_len_kv), (1, BLOCK_N))
-            qk = ct.where(boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32))
+            qk = ct.where(
+                boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
+            )
 
             qk_max = ct.max(qk, axis=1, keepdims=False)
             m_ij = ct.maximum(m_i, (qk_max * qk_scale))
-            p = ct.exp2(qk * qk_scale - ct.reshape(m_ij, (BLOCK_M, 1)), flush_to_zero=True)
+            p = ct.exp2(
+                qk * qk_scale - ct.reshape(m_ij, (BLOCK_M, 1)), flush_to_zero=True
+            )
 
             alpha = ct.exp2((m_i - m_ij), flush_to_zero=True)
             l_i = l_i * alpha + ct.sum(p, axis=1, keepdims=False)
@@ -604,7 +647,9 @@ def _prefill_attention_paged_body(
     token_indices = seq_start_index + start_m + offs_m_store
     head_indices = ct.full((BLOCK_M,), head_id, dtype=ct.int32)
     lse_mask = offs_m_store + start_m < seq_len_q
-    token_indices_masked = ct.where(lse_mask, token_indices, ct.full((BLOCK_M,), -1, dtype=ct.int32))
+    token_indices_masked = ct.where(
+        lse_mask, token_indices, ct.full((BLOCK_M,), -1, dtype=ct.int32)
+    )
     lse_indices = (token_indices_masked, head_indices)
     ct.scatter(lse_output, lse_indices, lse_scaled)
 
@@ -711,7 +756,11 @@ def _prefill_attention_paged_lpt_kernel(
     head_id = bidhb_actual % NUM_HEADS
     seq_block_id = NUM_BLOCKS - 1 - block
 
-    if tile_idx >= NUM_BLOCKS * NUM_HEADS * NUM_BATCH or batch_id >= NUM_BATCH or head_id >= NUM_HEADS:
+    if (
+        tile_idx >= NUM_BLOCKS * NUM_HEADS * NUM_BATCH
+        or batch_id >= NUM_BATCH
+        or head_id >= NUM_HEADS
+    ):
         return
 
     _prefill_attention_paged_body(
@@ -786,9 +835,15 @@ def _prefill_attention_ragged_body(
     # Create sliced views for ragged tensors - enables TMA with block indices
     # Slice along axis 0 to offset base pointer by seq_start_index
     q_seq = query.slice(axis=0, start=seq_start_index, stop=seq_start_index + seq_len_q)
-    k_seq = key_cache.slice(axis=0, start=seq_start_index, stop=seq_start_index + seq_len_kv)
-    v_seq = value_cache.slice(axis=0, start=seq_start_index, stop=seq_start_index + seq_len_kv)
-    o_seq = output.slice(axis=0, start=seq_start_index, stop=seq_start_index + seq_len_q)
+    k_seq = key_cache.slice(
+        axis=0, start=seq_start_index, stop=seq_start_index + seq_len_kv
+    )
+    v_seq = value_cache.slice(
+        axis=0, start=seq_start_index, stop=seq_start_index + seq_len_kv
+    )
+    o_seq = output.slice(
+        axis=0, start=seq_start_index, stop=seq_start_index + seq_len_q
+    )
 
     # Load Q tile using TMA - use seq_block_id as block index
     # q_seq shape: [seq_len_q, num_heads, head_dim_qk + head_dim_rope]
@@ -927,12 +982,18 @@ def _prefill_attention_ragged_body(
                 qk = ct.mma(q_pe, ct.transpose(k_pe), acc=qk)
 
             offs_n = curr_n + offs_n_base
-            causal_mask = ct.reshape(offs_m, (BLOCK_M, 1)) >= ct.reshape(offs_n, (1, BLOCK_N))
-            qk = ct.where(causal_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32))
+            causal_mask = ct.reshape(offs_m, (BLOCK_M, 1)) >= ct.reshape(
+                offs_n, (1, BLOCK_N)
+            )
+            qk = ct.where(
+                causal_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
+            )
 
             qk_max = ct.max(qk, axis=1, keepdims=False)
             m_ij = ct.maximum(m_i, (qk_max * qk_scale))
-            p = ct.exp2(qk * qk_scale - ct.reshape(m_ij, (BLOCK_M, 1)), flush_to_zero=True)
+            p = ct.exp2(
+                qk * qk_scale - ct.reshape(m_ij, (BLOCK_M, 1)), flush_to_zero=True
+            )
 
             alpha = ct.exp2((m_i - m_ij), flush_to_zero=True)
             l_i = l_i * alpha + ct.sum(p, axis=1, keepdims=False)
@@ -972,7 +1033,9 @@ def _prefill_attention_ragged_body(
     token_indices = seq_start_index + start_m + offs_m_store
     head_indices = ct.full((BLOCK_M,), head_id, dtype=ct.int32)
     lse_mask = offs_m_store + start_m < seq_len_q
-    token_indices_masked = ct.where(lse_mask, token_indices, ct.full((BLOCK_M,), -1, dtype=ct.int32))
+    token_indices_masked = ct.where(
+        lse_mask, token_indices, ct.full((BLOCK_M,), -1, dtype=ct.int32)
+    )
     lse_indices = (token_indices_masked, head_indices)
     ct.scatter(lse_output, lse_indices, lse_scaled)
 
@@ -1073,7 +1136,11 @@ def _prefill_attention_ragged_lpt_kernel(
     head_id = bidhb_actual % NUM_HEADS
     seq_block_id = NUM_BLOCKS - 1 - block  # LPT: reverse order
 
-    if tile_idx >= NUM_BLOCKS * NUM_HEADS * NUM_BATCH or batch_id >= NUM_BATCH or head_id >= NUM_HEADS:
+    if (
+        tile_idx >= NUM_BLOCKS * NUM_HEADS * NUM_BATCH
+        or batch_id >= NUM_BATCH
+        or head_id >= NUM_HEADS
+    ):
         return
 
     _prefill_attention_ragged_body(
@@ -1141,7 +1208,9 @@ def prefill_attention_kv_paged_cutile(
         else outputs
     )
     out_lse = (
-        torch.zeros([q.shape[0], num_qo_heads], dtype=torch.float32, device=q.device) if out_lse is None else out_lse
+        torch.zeros([q.shape[0], num_qo_heads], dtype=torch.float32, device=q.device)
+        if out_lse is None
+        else out_lse
     )
 
     # Flatten tensors for kernel
@@ -1184,7 +1253,14 @@ def prefill_attention_kv_paged_cutile(
             result = exhaustive_search(
                 list(_get_prefill_autotune_configs(page_size)),
                 paged_lpt_stream,
-                lambda cfg: ((max_seq_len + cfg.BLOCK_M - 1) // cfg.BLOCK_M * num_qo_heads * num_batch, 1, 1),
+                lambda cfg: (
+                    (max_seq_len + cfg.BLOCK_M - 1)
+                    // cfg.BLOCK_M
+                    * num_qo_heads
+                    * num_batch,
+                    1,
+                    1,
+                ),
                 _prefill_attention_paged_lpt_kernel,
                 lambda cfg: (
                     q,
@@ -1220,12 +1296,21 @@ def prefill_attention_kv_paged_cutile(
             best_cfg = result.best.config
             _prefill_paged_lpt_tune_cache[paged_lpt_cache_key] = (
                 best_cfg,
-                _prefill_attention_paged_lpt_kernel.replace_hints(occupancy=best_cfg.occupancy),
+                _prefill_attention_paged_lpt_kernel.replace_hints(
+                    occupancy=best_cfg.occupancy
+                ),
             )
         best_cfg, tuned_kernel = _prefill_paged_lpt_tune_cache[paged_lpt_cache_key]
         ct.launch(
             paged_lpt_stream,
-            ((max_seq_len + best_cfg.BLOCK_M - 1) // best_cfg.BLOCK_M * num_qo_heads * num_batch, 1, 1),
+            (
+                (max_seq_len + best_cfg.BLOCK_M - 1)
+                // best_cfg.BLOCK_M
+                * num_qo_heads
+                * num_batch,
+                1,
+                1,
+            ),
             tuned_kernel,
             (
                 q,
@@ -1278,7 +1363,11 @@ def prefill_attention_kv_paged_cutile(
             result = exhaustive_search(
                 list(_get_prefill_autotune_configs(page_size)),
                 paged_stream,
-                lambda cfg: (num_batch, num_qo_heads, (max_seq_len + cfg.BLOCK_M - 1) // cfg.BLOCK_M),
+                lambda cfg: (
+                    num_batch,
+                    num_qo_heads,
+                    (max_seq_len + cfg.BLOCK_M - 1) // cfg.BLOCK_M,
+                ),
                 _prefill_attention_paged_kernel,
                 lambda cfg: (
                     q,
@@ -1308,12 +1397,18 @@ def prefill_attention_kv_paged_cutile(
             best_cfg = result.best.config
             _prefill_paged_tune_cache[paged_cache_key] = (
                 best_cfg,
-                _prefill_attention_paged_kernel.replace_hints(occupancy=best_cfg.occupancy),
+                _prefill_attention_paged_kernel.replace_hints(
+                    occupancy=best_cfg.occupancy
+                ),
             )
         best_cfg, tuned_kernel = _prefill_paged_tune_cache[paged_cache_key]
         ct.launch(
             paged_stream,
-            (num_batch, num_qo_heads, (max_seq_len + best_cfg.BLOCK_M - 1) // best_cfg.BLOCK_M),
+            (
+                num_batch,
+                num_qo_heads,
+                (max_seq_len + best_cfg.BLOCK_M - 1) // best_cfg.BLOCK_M,
+            ),
             tuned_kernel,
             (
                 q,
@@ -1382,7 +1477,9 @@ def prefill_attention_kv_ragged_cutile(
         else outputs
     )
     out_lse = (
-        torch.zeros([q.shape[0], num_qo_heads], dtype=torch.float32, device=q.device) if out_lse is None else out_lse
+        torch.zeros([q.shape[0], num_qo_heads], dtype=torch.float32, device=q.device)
+        if out_lse is None
+        else out_lse
     )
 
     # Flatten tensors for kernel
@@ -1421,7 +1518,14 @@ def prefill_attention_kv_ragged_cutile(
             result = exhaustive_search(
                 list(_get_prefill_autotune_configs(None)),
                 ragged_lpt_stream,
-                lambda cfg: ((max_seq_len + cfg.BLOCK_M - 1) // cfg.BLOCK_M * num_qo_heads * num_batch, 1, 1),
+                lambda cfg: (
+                    (max_seq_len + cfg.BLOCK_M - 1)
+                    // cfg.BLOCK_M
+                    * num_qo_heads
+                    * num_batch,
+                    1,
+                    1,
+                ),
                 _prefill_attention_ragged_lpt_kernel,
                 lambda cfg: (
                     q,
@@ -1453,12 +1557,21 @@ def prefill_attention_kv_ragged_cutile(
             best_cfg = result.best.config
             _prefill_ragged_lpt_tune_cache[ragged_lpt_cache_key] = (
                 best_cfg,
-                _prefill_attention_ragged_lpt_kernel.replace_hints(occupancy=best_cfg.occupancy),
+                _prefill_attention_ragged_lpt_kernel.replace_hints(
+                    occupancy=best_cfg.occupancy
+                ),
             )
         best_cfg, tuned_kernel = _prefill_ragged_lpt_tune_cache[ragged_lpt_cache_key]
         ct.launch(
             ragged_lpt_stream,
-            ((max_seq_len + best_cfg.BLOCK_M - 1) // best_cfg.BLOCK_M * num_qo_heads * num_batch, 1, 1),
+            (
+                (max_seq_len + best_cfg.BLOCK_M - 1)
+                // best_cfg.BLOCK_M
+                * num_qo_heads
+                * num_batch,
+                1,
+                1,
+            ),
             tuned_kernel,
             (
                 q,
@@ -1493,7 +1606,11 @@ def prefill_attention_kv_ragged_cutile(
             result = exhaustive_search(
                 list(_get_prefill_autotune_configs(None)),
                 ragged_stream,
-                lambda cfg: ((max_seq_len + cfg.BLOCK_M - 1) // cfg.BLOCK_M, num_batch, num_qo_heads),
+                lambda cfg: (
+                    (max_seq_len + cfg.BLOCK_M - 1) // cfg.BLOCK_M,
+                    num_batch,
+                    num_qo_heads,
+                ),
                 _prefill_attention_ragged_kernel,
                 lambda cfg: (
                     q,
@@ -1519,12 +1636,18 @@ def prefill_attention_kv_ragged_cutile(
             best_cfg = result.best.config
             _prefill_ragged_tune_cache[ragged_cache_key] = (
                 best_cfg,
-                _prefill_attention_ragged_kernel.replace_hints(occupancy=best_cfg.occupancy),
+                _prefill_attention_ragged_kernel.replace_hints(
+                    occupancy=best_cfg.occupancy
+                ),
             )
         best_cfg, tuned_kernel = _prefill_ragged_tune_cache[ragged_cache_key]
         ct.launch(
             ragged_stream,
-            ((max_seq_len + best_cfg.BLOCK_M - 1) // best_cfg.BLOCK_M, num_batch, num_qo_heads),
+            (
+                (max_seq_len + best_cfg.BLOCK_M - 1) // best_cfg.BLOCK_M,
+                num_batch,
+                num_qo_heads,
+            ),
             tuned_kernel,
             (
                 q,

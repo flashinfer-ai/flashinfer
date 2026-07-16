@@ -165,7 +165,9 @@ def _ragged_block_scaled_bmm_kernel(
                     b_scale_val = ct.reshape(b_scale_block, (1, 1))
 
                     # Combined scale: a_scale [BLOCK_M, 1] * b_scale [1, 1] = [BLOCK_M, 1]
-                    scale_combined = a_scale_block * ct.broadcast_to(b_scale_val, (BLOCK_M, 1))
+                    scale_combined = a_scale_block * ct.broadcast_to(
+                        b_scale_val, (BLOCK_M, 1)
+                    )
                     scale_ab = ct.broadcast_to(scale_combined, (BLOCK_M, BLOCK_N))
                 else:
                     # Only b_scale
@@ -302,7 +304,9 @@ def _ragged_block_scaled_bmm_swap_ab_kernel(
                         padding_mode=ct.PaddingMode.ZERO,
                     )
                     b_scale_val = ct.reshape(b_scale_block, (1, 1))
-                    scale_combined = a_scale_block * ct.broadcast_to(b_scale_val, (BLOCK_M, 1))
+                    scale_combined = a_scale_block * ct.broadcast_to(
+                        b_scale_val, (BLOCK_M, 1)
+                    )
                     scale_ab = ct.broadcast_to(scale_combined, (BLOCK_M, BLOCK_N))
                 else:
                     b_scale_block = ct.load(
@@ -323,7 +327,9 @@ def _ragged_block_scaled_bmm_swap_ab_kernel(
             ct.store(c, index=(m_tile_start + pid_m, pid_n), tile=c_block)
 
 
-def _ragged_block_scaled_bmm_autotune_configs(segment_alignment=_DEFAULT_SEGMENT_ALIGNMENT):
+def _ragged_block_scaled_bmm_autotune_configs(
+    segment_alignment=_DEFAULT_SEGMENT_ALIGNMENT,
+):
     """
     Iterator of autotune configurations for ragged_block_scaled_bmm kernel.
 
@@ -387,17 +393,31 @@ def _ragged_block_scaled_bmm_autotune_configs_unfiltered():
             (128, 2, 2),  # for small M
         ]:
             yield SimpleNamespace(
-                BLOCK_M=BM, BLOCK_N=128, BLOCK_K=128, GROUP_SIZE_M=8, swap_ab=False, num_ctas=nc, occupancy=occ
+                BLOCK_M=BM,
+                BLOCK_N=128,
+                BLOCK_K=128,
+                GROUP_SIZE_M=8,
+                swap_ab=False,
+                num_ctas=nc,
+                occupancy=occ,
             )
         # Swapped configs (for small M)
         for GM in [2, 4]:
             for BM in [16, 32, 64]:
                 yield SimpleNamespace(
-                    BLOCK_M=BM, BLOCK_N=256, BLOCK_K=128, GROUP_SIZE_M=GM, swap_ab=True, num_ctas=1, occupancy=1
+                    BLOCK_M=BM,
+                    BLOCK_N=256,
+                    BLOCK_K=128,
+                    GROUP_SIZE_M=GM,
+                    swap_ab=True,
+                    num_ctas=1,
+                    occupancy=1,
                 )
 
 
-def _get_default_kernel_configs(total_m, Q, VEC_SIZE, segment_alignment=_DEFAULT_SEGMENT_ALIGNMENT):
+def _get_default_kernel_configs(
+    total_m, Q, VEC_SIZE, segment_alignment=_DEFAULT_SEGMENT_ALIGNMENT
+):
     """
     Get GPU-specific default kernel configs for non-autotune path.
 
@@ -490,10 +510,12 @@ def ragged_block_scaled_bmm(
     allocated and returned. Passing `out` lets callers avoid an extra copy.
     """
     # Validate inputs
-    assert transpose_a == False and transpose_b == True, "Only NT layout is supported"
+    assert not transpose_a and transpose_b, "Only NT layout is supported"
     assert a.is_contiguous(), "A matrix must be contiguous"
     assert b.is_contiguous(), "B matrix must be contiguous"
-    assert a_scale is None or a_scale.is_contiguous(), "A scale matrix must be contiguous"
+    assert a_scale is None or a_scale.is_contiguous(), (
+        "A scale matrix must be contiguous"
+    )
     assert b_scale.is_contiguous(), "B scale matrix must be contiguous"
     assert m_indptr.is_contiguous(), "m_indptr must be contiguous"
 
@@ -541,7 +563,9 @@ def ragged_block_scaled_bmm(
         max_m_device = torch.tensor([max_m], dtype=torch.int32, device=a.device)
 
     # Get kernel configs
-    default_configs = _get_default_kernel_configs(total_m, Q, VEC_SIZE, segment_alignment)
+    default_configs = _get_default_kernel_configs(
+        total_m, Q, VEC_SIZE, segment_alignment
+    )
     kernel_configs = {**default_configs, **(kwargs.get("kernel_configs") or {})}
 
     BLOCK_M = kernel_configs.get("BLOCK_M")
@@ -578,7 +602,11 @@ def ragged_block_scaled_bmm(
     else:
         a_scale = a_scale
 
-    kernel_fn = _ragged_block_scaled_bmm_swap_ab_kernel if swap_ab else _ragged_block_scaled_bmm_kernel
+    kernel_fn = (
+        _ragged_block_scaled_bmm_swap_ab_kernel
+        if swap_ab
+        else _ragged_block_scaled_bmm_kernel
+    )
 
     hints = {}
     if num_ctas is not None:

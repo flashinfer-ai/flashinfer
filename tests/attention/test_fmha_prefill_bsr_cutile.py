@@ -48,7 +48,10 @@ prefill_attention_kv_ragged_cutile = _prefill_mod.prefill_attention_kv_ragged_cu
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_paged_kvcache(batch_seq_lens_kv, page_size, num_kv_heads, head_dim, dtype, device):
+
+def _make_paged_kvcache(
+    batch_seq_lens_kv, page_size, num_kv_heads, head_dim, dtype, device
+):
     """
     Allocate paged KV cache and build block_tables.
     Returns (k_cache, v_cache, block_tables).
@@ -59,11 +62,17 @@ def _make_paged_kvcache(batch_seq_lens_kv, page_size, num_kv_heads, head_dim, dt
     max_pages_per_seq = max(pages_per_seq)
     total_pages = sum(pages_per_seq)
 
-    k_cache = torch.randn(total_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device)
-    v_cache = torch.randn(total_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device)
+    k_cache = torch.randn(
+        total_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+    )
+    v_cache = torch.randn(
+        total_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+    )
 
     # block_tables: [batch, max_pages_per_seq], unused slots set to 0
-    block_tables = torch.zeros(len(batch_seq_lens_kv), max_pages_per_seq, dtype=torch.int32, device=device)
+    block_tables = torch.zeros(
+        len(batch_seq_lens_kv), max_pages_per_seq, dtype=torch.int32, device=device
+    )
     page_idx = 0
     for b, n_pages in enumerate(pages_per_seq):
         for p in range(n_pages):
@@ -84,6 +93,7 @@ def _make_seq_offsets(seq_lens):
 # ---------------------------------------------------------------------------
 # Test 1: Paged prefill smoke test (causal, GQA)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("use_lpt", [True, False])
 def test_prefill_paged_smoke(use_lpt):
@@ -112,7 +122,9 @@ def test_prefill_paged_smoke(use_lpt):
     )
 
     actual_seq_lens_q = torch.tensor(batch_seq_lens_q, dtype=torch.int32, device=device)
-    actual_seq_lens_kv = torch.tensor(batch_seq_lens_kv, dtype=torch.int32, device=device)
+    actual_seq_lens_kv = torch.tensor(
+        batch_seq_lens_kv, dtype=torch.int32, device=device
+    )
     actual_seq_offset = torch.tensor(
         _make_seq_offsets(batch_seq_lens_q), dtype=torch.int32, device=device
     )
@@ -133,8 +145,12 @@ def test_prefill_paged_smoke(use_lpt):
         use_lpt_scheduler=use_lpt,
     )
 
-    assert out.shape == (total_q, num_qo_heads, head_dim), f"output shape mismatch: {out.shape}"
-    assert out_lse.shape == (total_q, num_qo_heads), f"lse shape mismatch: {out_lse.shape}"
+    assert out.shape == (total_q, num_qo_heads, head_dim), (
+        f"output shape mismatch: {out.shape}"
+    )
+    assert out_lse.shape == (total_q, num_qo_heads), (
+        f"lse shape mismatch: {out_lse.shape}"
+    )
     assert not torch.isnan(out).any(), "output contains NaN"
     assert not torch.isinf(out).any(), "output contains Inf"
     assert not torch.isnan(out_lse).any(), "lse contains NaN"
@@ -143,6 +159,7 @@ def test_prefill_paged_smoke(use_lpt):
 # ---------------------------------------------------------------------------
 # Test 2: Paged prefill non-causal
 # ---------------------------------------------------------------------------
+
 
 def test_prefill_paged_noncausal():
     """Non-causal paged prefill: output should differ from causal."""
@@ -165,16 +182,32 @@ def test_prefill_paged_noncausal():
     actual_seq_offset = torch.tensor([0], dtype=torch.int32, device=device)
 
     out_causal, _ = prefill_attention_kv_paged_cutile(
-        q, k_cache, v_cache,
-        actual_seq_lens_q, actual_seq_lens_kv, actual_seq_offset,
-        block_tables, k_scale=1.0, v_scale=1.0,
-        num_batch=num_batch, max_seq_len=seq_len, is_causal=True,
+        q,
+        k_cache,
+        v_cache,
+        actual_seq_lens_q,
+        actual_seq_lens_kv,
+        actual_seq_offset,
+        block_tables,
+        k_scale=1.0,
+        v_scale=1.0,
+        num_batch=num_batch,
+        max_seq_len=seq_len,
+        is_causal=True,
     )
     out_noncausal, _ = prefill_attention_kv_paged_cutile(
-        q, k_cache, v_cache,
-        actual_seq_lens_q, actual_seq_lens_kv, actual_seq_offset,
-        block_tables, k_scale=1.0, v_scale=1.0,
-        num_batch=num_batch, max_seq_len=seq_len, is_causal=False,
+        q,
+        k_cache,
+        v_cache,
+        actual_seq_lens_q,
+        actual_seq_lens_kv,
+        actual_seq_offset,
+        block_tables,
+        k_scale=1.0,
+        v_scale=1.0,
+        num_batch=num_batch,
+        max_seq_len=seq_len,
+        is_causal=False,
     )
 
     assert out_noncausal.shape == (seq_len, num_qo_heads, head_dim)
@@ -188,6 +221,7 @@ def test_prefill_paged_noncausal():
 # ---------------------------------------------------------------------------
 # Test 3: Ragged prefill smoke test
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("use_lpt", [True, False])
 def test_prefill_ragged_smoke(use_lpt):
@@ -214,7 +248,9 @@ def test_prefill_ragged_smoke(use_lpt):
     v_cache = torch.randn(total_kv, num_kv_heads, head_dim, dtype=dtype, device=device)
 
     actual_seq_lens_q = torch.tensor(batch_seq_lens_q, dtype=torch.int32, device=device)
-    actual_seq_lens_kv = torch.tensor(batch_seq_lens_kv, dtype=torch.int32, device=device)
+    actual_seq_lens_kv = torch.tensor(
+        batch_seq_lens_kv, dtype=torch.int32, device=device
+    )
     actual_seq_offset = torch.tensor(
         _make_seq_offsets(batch_seq_lens_q), dtype=torch.int32, device=device
     )
@@ -237,8 +273,12 @@ def test_prefill_ragged_smoke(use_lpt):
         use_lpt_scheduler=use_lpt,
     )
 
-    assert out.shape == (total_q, num_qo_heads, head_dim), f"output shape mismatch: {out.shape}"
-    assert out_lse.shape == (total_q, num_qo_heads), f"lse shape mismatch: {out_lse.shape}"
+    assert out.shape == (total_q, num_qo_heads, head_dim), (
+        f"output shape mismatch: {out.shape}"
+    )
+    assert out_lse.shape == (total_q, num_qo_heads), (
+        f"lse shape mismatch: {out_lse.shape}"
+    )
     assert not torch.isnan(out).any(), "output contains NaN"
     assert not torch.isinf(out).any(), "output contains Inf"
 
@@ -246,6 +286,7 @@ def test_prefill_ragged_smoke(use_lpt):
 # ---------------------------------------------------------------------------
 # Test 4: Ragged prefill GQA
 # ---------------------------------------------------------------------------
+
 
 def test_prefill_ragged_gqa():
     """Ragged prefill with GQA (8 qo heads, 2 kv heads)."""
@@ -267,10 +308,18 @@ def test_prefill_ragged_gqa():
     block_tables = torch.zeros(num_batch, 1, dtype=torch.int32, device=device)
 
     out, out_lse = prefill_attention_kv_ragged_cutile(
-        q, k_cache, v_cache,
-        actual_seq_lens_q, actual_seq_lens_kv, actual_seq_offset,
-        block_tables, k_scale=1.0, v_scale=1.0,
-        num_batch=num_batch, max_seq_len=seq_len, is_causal=True,
+        q,
+        k_cache,
+        v_cache,
+        actual_seq_lens_q,
+        actual_seq_lens_kv,
+        actual_seq_offset,
+        block_tables,
+        k_scale=1.0,
+        v_scale=1.0,
+        num_batch=num_batch,
+        max_seq_len=seq_len,
+        is_causal=True,
     )
 
     assert out.shape == (seq_len, num_qo_heads, head_dim)
@@ -281,6 +330,7 @@ def test_prefill_ragged_gqa():
 # ---------------------------------------------------------------------------
 # Test 5: Paged vs ragged correctness
 # ---------------------------------------------------------------------------
+
 
 def test_prefill_paged_vs_ragged_correctness():
     """
@@ -308,7 +358,9 @@ def test_prefill_paged_vs_ragged_correctness():
     num_pages = seq_len // page_size  # = 2
     k_cache = k_flat.reshape(num_pages, page_size, num_kv_heads, head_dim).clone()
     v_cache = v_flat.reshape(num_pages, page_size, num_kv_heads, head_dim).clone()
-    block_tables_paged = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
+    block_tables_paged = torch.arange(
+        num_pages, dtype=torch.int32, device=device
+    ).unsqueeze(0)
 
     actual_seq_lens_q = torch.tensor([seq_len], dtype=torch.int32, device=device)
     actual_seq_lens_kv = torch.tensor([seq_len], dtype=torch.int32, device=device)
@@ -316,16 +368,32 @@ def test_prefill_paged_vs_ragged_correctness():
     block_tables_ragged = torch.zeros(num_batch, 1, dtype=torch.int32, device=device)
 
     out_paged, _ = prefill_attention_kv_paged_cutile(
-        q, k_cache, v_cache,
-        actual_seq_lens_q, actual_seq_lens_kv, actual_seq_offset,
-        block_tables_paged, k_scale=1.0, v_scale=1.0,
-        num_batch=num_batch, max_seq_len=seq_len, is_causal=True,
+        q,
+        k_cache,
+        v_cache,
+        actual_seq_lens_q,
+        actual_seq_lens_kv,
+        actual_seq_offset,
+        block_tables_paged,
+        k_scale=1.0,
+        v_scale=1.0,
+        num_batch=num_batch,
+        max_seq_len=seq_len,
+        is_causal=True,
     )
     out_ragged, _ = prefill_attention_kv_ragged_cutile(
-        q, k_flat, v_flat,
-        actual_seq_lens_q, actual_seq_lens_kv, actual_seq_offset,
-        block_tables_ragged, k_scale=1.0, v_scale=1.0,
-        num_batch=num_batch, max_seq_len=seq_len, is_causal=True,
+        q,
+        k_flat,
+        v_flat,
+        actual_seq_lens_q,
+        actual_seq_lens_kv,
+        actual_seq_offset,
+        block_tables_ragged,
+        k_scale=1.0,
+        v_scale=1.0,
+        num_batch=num_batch,
+        max_seq_len=seq_len,
+        is_causal=True,
     )
 
     assert out_paged.shape == out_ragged.shape
@@ -334,6 +402,4 @@ def test_prefill_paged_vs_ragged_correctness():
 
     # Same computation, different cache layout → should match within bf16 tolerance
     max_diff = (out_paged.float() - out_ragged.float()).abs().max().item()
-    assert max_diff < 0.05, (
-        f"paged vs ragged prefill diverged: max_diff={max_diff:.4f}"
-    )
+    assert max_diff < 0.05, f"paged vs ragged prefill diverged: max_diff={max_diff:.4f}"
