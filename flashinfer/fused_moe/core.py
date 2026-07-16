@@ -4347,12 +4347,17 @@ def trtllm_fp4_block_scale_routed_moe(
         Optional in-place ``[seq_len, hidden_size]`` output tensor.
     tune_max_num_tokens : int
         Maximum number of tokens for autotuning (default ``8192``).
+    gemm1_lora_delta : Optional[torch.Tensor]
+        Optional MoE LoRA delta of shape
+        ``[num_tokens, top_k, 2 * intermediate_size]``, ``bfloat16``.  When
+        set it is added to FC1 before the fused gated activation and the
+        post-activation FC1 output is appended to the return list.
 
     Returns
     -------
-    List[torch.Tensor]
-        ``[output]`` when ``do_finalize`` is ``True``, otherwise
-        ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
+    torch.Tensor or List[torch.Tensor]
+        Return shape depends on ``do_finalize`` and ``gemm1_lora_delta``;
+        see :func:`trtllm_bf16_routed_moe` for the table.
     """
     # Determine routing mode based on input format
     if isinstance(topk_ids, tuple):
