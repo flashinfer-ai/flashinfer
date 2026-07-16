@@ -786,7 +786,9 @@ class _B12xRunner(MoERunner):
         from .utils import get_b12x_activation_name
 
         self.config = config
-        self.device = device
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.activation = get_b12x_activation_name(config.activation.type)
         self.tuning_config = TuningConfig()
         self._prepared_weights: dict[str, torch.Tensor] | None = None
