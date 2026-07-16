@@ -2675,14 +2675,17 @@ def get_trtllm_moe_sm100_module():
             norm_topk_prob,
             routing_replay_out,
         )
-        if do_finalize:
-            return [output]
-        else:
-            return [
-                torch.from_dlpack(intermediate_output[0]),
-                topk_weights,
-                torch.from_dlpack(intermediate_output[2]),
-            ]
+        result = _unpack_trtllm_moe_output(
+            intermediate_output, output, do_finalize, gemm1_lora_delta
+        )
+        if (
+            not do_finalize
+            and routing_logits is None
+            and topk_weights is not None
+            and topk_weights.numel() > 0
+        ):
+            result[1] = topk_weights
+        return result
 
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
     def _fake_trtllm_fp4_block_scale_moe(
@@ -4375,7 +4378,10 @@ def trtllm_fp4_block_scale_routed_moe(
         else:
             # Packed format: high 16 bits = expert_id, low 16 bits = packed weight.
             expert_idx = (topk_ids_tensor.to(torch.int32) >> 16).to(torch.int64)
-        inv_dequant_ab = (1.0 / output1_scale_gate_scalar.to(torch.float32))[expert_idx]
+        # topk_ids carry GLOBAL expert ids, but output1_scale_gate_scalar is
+        # [local_num_experts]. Convert to the local row (global - offset).
+        local_idx = (expert_idx - local_expert_offset).clamp(0, local_num_experts - 1)
+        inv_dequant_ab = (1.0 / output1_scale_gate_scalar.to(torch.float32))[local_idx]
         gemm1_lora_delta = (
             gemm1_lora_delta.to(torch.float32) * inv_dequant_ab[..., None]
         ).to(gemm1_lora_delta.dtype)
