@@ -1154,6 +1154,13 @@ struct GemmProfilerBackend {
            (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
   }
 
+  // Native NVFP4: FP4 activations x FP4 weights. Shared by workspace
+  // allocation and consumption so the two never disagree (issue #4003).
+  bool isNativeWfp4Afp4Family() const {
+    return (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
+           (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
+  }
+
   bool isSm90Wfp4Afp8Family() const {
     return mSM == 90 && mDType == nvinfer1::DataType::kFP8 &&
            mWType == nvinfer1::DataType::kUINT8 &&
