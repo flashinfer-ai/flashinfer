@@ -298,6 +298,34 @@ class TrtllmBf16Config:
     def supported(cls, arch: int) -> bool:
         return arch >= 100
 
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build the ``trtllm_bf16_routed`` weight view from canonical bf16 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("trtllm_bf16_routed", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_bf16_weights`.
+        """
+        from .prepare import prepare_trtllm_bf16_weights
+
+        return prepare_trtllm_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+            permute_cache=permute_cache,
+        )
+
     def __repr__(self) -> str:
         return "TrtllmBf16Config()"
 
@@ -499,10 +527,12 @@ class MoEConfig:
 
 @dataclass
 class MoEActivationPack:
-    """Per-call transient data — pre-quantized NVFP4 activations + pre-routed indices."""
+    """Per-call transient data — activations (backend-native encoding) + pre-routed indices."""
 
-    hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4)
-    hidden_states_scale: Tensor  # [M, H//16] float8_e4m3fn
+    hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4) or [M, H] bf16 (BF16 path)
+    hidden_states_scale: Optional[
+        Tensor
+    ]  # [M, H//16] float8_e4m3fn block scales; None for BF16
     selected_experts: Tensor  # [M, top_k] int32
     final_scales: Tensor  # [M, top_k] float32
 

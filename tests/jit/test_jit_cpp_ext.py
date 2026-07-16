@@ -133,7 +133,7 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
     writes = []
     monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
 
-    spec = core.JitSpec(
+    spec = core.JitSpecNvcc(
         name="test_module",
         sources=[],
         extra_cflags=None,
