@@ -668,8 +668,17 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     o_indptr.push_back(o_indptr.back() + qo_len * num_chunks_kv);
   }
 
-  const size_t padded_batch_size =
-      enable_cuda_graph ? std::max(max_batch_size_if_split, total_num_tiles_q) : new_batch_size;
+  // A positive uniform_q_len is a graph invariant supplied by tensor-core decode. With split-KV
+  // disabled, every q tile produces exactly one scheduler entry, so new_batch_size is both
+  // graph-stable and fully initialized.
+  const bool exact_no_split_graph = enable_cuda_graph && disable_split_kv && uniform_q_len > 0;
+  size_t padded_batch_size;
+  if (exact_no_split_graph) {
+    padded_batch_size = new_batch_size;
+  } else {
+    padded_batch_size =
+        enable_cuda_graph ? std::max(max_batch_size_if_split, total_num_tiles_q) : new_batch_size;
+  }
   FLASHINFER_CHECK(new_batch_size <= padded_batch_size,
                    "new batch size should not exceed padded batch size. If you are using fixed "
                    "split size, please consider disabling cuda graph.");
