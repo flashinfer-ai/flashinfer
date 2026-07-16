@@ -1,6 +1,20 @@
 # TODO: CUDA graph compatibility for the mega_moe path (cutedsl backends)
 
-Status: analysis only, nothing implemented yet (2026-07-14).
+Status: IMPLEMENTED for single-rank (2026-07-16). Blocker 1 was already
+resolved by the earlier `sync=False` default on the public entry points
+(commit 68a29e6a); this change added the rest of the restoration plan:
+capture guards (`ensure_not_capturing` in `shim/comm.py`, wired into
+`_ensure_mega_compiled` / `set_gate_up_clamp` / `apply_knobs` /
+`_release_workspace` / `autotune_knobs` / the layer's `_ensure_workspace`),
+the `MoEEpMegaLayer.warmup()` contract, and capture-safe `sync` gating.
+Verified on GB200 by `tests/moe_ep/test_mega_cuda_graph.py` (nvfp4 + mxfp8:
+capture post-warmup, 3x replay bit-exact vs eager, replay over mutated input
+buffers, and loud failure when capturing without warmup). Remaining
+follow-ups: the 2-rank lockstep-replay test (item 5 below), the 2-rank
+skewed-rank staging stress test (break-risk item 2), and vLLM-side adoption
+(shared-workspace warmup + dropping VLLM_ENFORCE_EAGER).
+
+Original analysis (2026-07-14) below.
 
 Update 2026-07-16: priority raised by the vLLM 0.25.1 e2e integration
 (`$LUSTRE_ROOT/moe_ep_benchmark/vllm_e2e/RUNS.md`) — every run there needed

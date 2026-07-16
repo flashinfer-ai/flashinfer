@@ -37,6 +37,12 @@ class MoEEpMegaLayer(nn.Module):
     GB at large-model geometry) across every MoE layer and OOM at model load.
     When ``backend.transformed_weights`` is supplied, the source pack is never
     stored at all.
+
+    CUDA graphs: call :meth:`warmup` on ALL EP ranks first, then capture
+    ``forward``. Under capture the output tensor returned at capture time is
+    the one the graph writes on every replay — consume that same tensor
+    across replays (standard graph practice). Lazy compile/alloc/autotune
+    paths raise if they would fire mid-capture instead of corrupting it.
     """
 
     def __init__(
@@ -98,10 +104,65 @@ class MoEEpMegaLayer(nn.Module):
 
     def _ensure_workspace(self) -> Any:
         if self._workspace is None:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise MoEEpConfigError(
+                    "mega workspace allocation (symmetric heap) cannot run "
+                    "during CUDA graph capture; call warmup() on all EP ranks "
+                    "before capturing"
+                )
             self._workspace = self._kernel.prepare_workspace(
                 self._bootstrap, self._fleet_params
             )
         return self._workspace
+
+    def warmup(self, t: Optional["MoEEpTensors"] = None) -> None:
+        """Run one full eager forward so ``forward`` becomes graph-capturable.
+
+        Forces every lazy host-side step — workspace allocation (symmetric
+        heap), ``cute.compile``, the ``knobs="auto"`` autotune sweep, and one
+        real kernel launch (module load) — then synchronizes the device.
+
+        COLLECTIVE: call on ALL EP ranks together before any rank starts
+        capturing (the kernel has cross-rank device-side barriers, and the
+        lazy steps include collective symmetric-heap allocation).
+
+        ``t`` defaults to a max-shape dummy batch. Pass a real batch when
+        ``quantize_input=False`` — pre-quantized activations and scales
+        cannot be fabricated here.
+        """
+        if t is None:
+            if not self._mega_config.quantize_input:
+                raise MoEEpConfigError(
+                    "warmup() cannot build a dummy pre-quantized batch; pass "
+                    "MoEEpTensors explicitly when quantize_input=False"
+                )
+            from ..tensors import MoEEpTensors
+
+            fp = self._fleet_params
+            device = torch.device("cuda", torch.cuda.current_device())
+            top_k = self._megakernel_config.top_k
+            num_tokens = fp.max_tokens_per_rank
+            t = MoEEpTensors(
+                hidden_states=torch.zeros(
+                    num_tokens,
+                    fp.token_hidden_size,
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                # Distinct in-range experts per row (top_k <= num_experts is
+                # validated at init), spread across all experts.
+                topk_ids=(
+                    torch.arange(num_tokens * top_k, device=device) % fp.num_experts
+                ).view(num_tokens, top_k),
+                topk_weights=torch.full(
+                    (num_tokens, top_k),
+                    1.0 / top_k,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+        self.forward(t)
+        torch.cuda.synchronize()
 
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
         if not self._mega_config.quantize_input:
