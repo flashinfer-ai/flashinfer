@@ -21,7 +21,7 @@ This module provides a TunableRunner implementation for the CuteDSL NVFP4 MoE
 kernels, enabling automatic performance tuning across different GEMM tactics.
 
 Tactic format follows TRT-LLM's style:
-- GEMM1 (Gather + SwiGLU): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+- GEMM1 (Gather + FC1 activation): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 - GEMM2 (Finalize): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
@@ -31,7 +31,7 @@ Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 
 import itertools
 import logging
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -52,13 +52,16 @@ from ..utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from ._inputs_helper import CuteDslMoEInputsHelper
-from .moe_utils import normalize_cute_dsl_moe_activation_type
+from .moe_utils import (
+    normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# GEMM1 Tactics (Gather + SwiGLU Fusion)
+# GEMM1 Tactics (Gather + FC1 Activation Fusion)
 # =============================================================================
 # Reference: TRT-LLM cute_dsl_custom_ops.py line 1867-1897
 # Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner.get_valid_tactics
@@ -265,6 +268,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         output_dtype: Output data type (default: torch.bfloat16).
         use_per_token_activation: Whether inputs include per-token row scales
             for GEMM1.
+        situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
+        situ_linear_beta: Optional SiTU tanh clamp for the up branch.
     """
 
     def __init__(
@@ -281,9 +286,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         use_per_token_activation: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -297,6 +305,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.use_per_token_activation = use_per_token_activation
 
         # Helper that builds a deterministic balanced approx-max-load
@@ -402,6 +412,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
+                self.situ_beta,
+                self.situ_linear_beta,
                 self.use_per_token_activation,
             )
         )
@@ -412,6 +424,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             self.swiglu_alpha,
             self.swiglu_beta,
             self.swiglu_limit,
+            self.situ_beta,
+            self.situ_linear_beta,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -632,6 +646,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
             **kwargs,
         )
 

@@ -2072,13 +2072,26 @@ def _moe_bf16_run_experts(
     gemm1_beta=None,
     gemm1_clamp_limit=None,
     activation_type=ActivationType.Swiglu.value,
+    situ_beta=None,
+    situ_linear_beta=None,
 ):
-    """Un-quantized (bf16) MoE expert computation (SwiGLU/OAI or ReLU^2)."""
+    """Un-quantized (bf16) MoE expert computation."""
     activation_type = normalize_activation_type(activation_type)
-    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
+    if situ_beta is not None or situ_linear_beta is not None:
+        from ...fused_moe.cute_dsl.moe_utils import (
+            validate_cute_dsl_moe_situ_config,
+        )
+
+        validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
+    if activation_type not in (
+        ActivationType.Swiglu,
+        ActivationType.GegluTanh,
+        ActivationType.Relu2,
+    ):
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; "
-            f"expected {ActivationType.Swiglu!r} or {ActivationType.Relu2!r}"
+            f"expected {ActivationType.Swiglu!r}, "
+            f"{ActivationType.GegluTanh!r}, or {ActivationType.Relu2!r}"
         )
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
@@ -2103,14 +2116,25 @@ def _moe_bf16_run_experts(
             act = torch.relu(G1) ** 2
         else:
             X1, X2 = G1[:, :I], G1[:, I:]
-            limit = _moe_expert_param(
-                gemm1_clamp_limit, le, DEFAULT_SWIGLU_LIMIT, X1.device
-            )
-            alpha = _moe_expert_param(gemm1_alpha, le, DEFAULT_SWIGLU_ALPHA, X2.device)
-            beta = _moe_expert_param(gemm1_beta, le, DEFAULT_SWIGLU_BETA, X1.device)
-            up = torch.clamp(X1, min=-limit, max=limit)
-            gate = torch.clamp(X2, max=limit)
-            act = gate * torch.sigmoid(alpha * gate) * (up + beta)
+            if situ_beta is not None:
+                gate = situ_beta * torch.tanh(X2 / situ_beta) * torch.sigmoid(X2)
+                up = X1
+                if situ_linear_beta is not None:
+                    up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+                act = gate * up
+            elif activation_type == ActivationType.GegluTanh:
+                act = torch.nn.functional.gelu(X2, approximate="tanh") * X1
+            else:
+                limit = _moe_expert_param(
+                    gemm1_clamp_limit, le, DEFAULT_SWIGLU_LIMIT, X1.device
+                )
+                alpha = _moe_expert_param(
+                    gemm1_alpha, le, DEFAULT_SWIGLU_ALPHA, X2.device
+                )
+                beta = _moe_expert_param(gemm1_beta, le, DEFAULT_SWIGLU_BETA, X1.device)
+                up = torch.clamp(X1, min=-limit, max=limit)
+                gate = torch.clamp(X2, max=limit)
+                act = gate * torch.sigmoid(alpha * gate) * (up + beta)
         expert_out = act.matmul(W2[le].t())
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
@@ -3111,7 +3135,9 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             optional=True,
             description=(
                 "GEMM1 activation type: ActivationType.Swiglu for gated "
-                "SwiGLU/OAI or ActivationType.Relu2 for non-gated ReLU^2. "
+                "SwiGLU/OAI/SiTU, ActivationType.GegluTanh for "
+                "tanh-approximate GeGLU, or ActivationType.Relu2 for "
+                "non-gated ReLU^2. "
                 "Determines gemm1_out_size."
             ),
         ),
@@ -3129,6 +3155,16 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             "float32",
             optional=True,
             description="SwiGLU clamp limit.",
+        ),
+        "situ_beta": Scalar(
+            "float32",
+            optional=True,
+            description="SiTU gate tanh-clamp beta; enables SiTU when set.",
+        ),
+        "situ_linear_beta": Scalar(
+            "float32",
+            optional=True,
+            description="Optional SiTU up-branch tanh-clamp beta.",
         ),
     },
     outputs={
@@ -3172,6 +3208,16 @@ _cute_dsl_wrapper_inputs["swiglu_beta"] = Scalar(
     description="Set at wrapper __init__, not passed to run().",
 )
 _cute_dsl_wrapper_inputs["swiglu_limit"] = Scalar(
+    "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["situ_beta"] = Scalar(
+    "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["situ_linear_beta"] = Scalar(
     "float32",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
@@ -3361,6 +3407,8 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
     swiglu_beta=DEFAULT_SWIGLU_BETA,
     swiglu_limit=DEFAULT_SWIGLU_LIMIT,
+    situ_beta=None,
+    situ_linear_beta=None,
     per_token_scale=None,
     **_unused,
 ):
@@ -3388,6 +3436,8 @@ def _cute_dsl_fused_moe_nvfp4_reference(
         gemm1_alpha=swiglu_alpha,
         gemm1_beta=swiglu_beta,
         gemm1_clamp_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
