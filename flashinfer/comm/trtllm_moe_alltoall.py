@@ -587,11 +587,12 @@ def moe_a2a_combine(
     output_scales: Optional[torch.Tensor] = None,
     output_scalar_scale: float = 1.0,
     sf_layout: SfLayout = SfLayout.layout_linear,
+    output: Optional[torch.Tensor] = None,
+    *,
     use_low_precision: bool = False,
     enable_pdl: Optional[bool] = None,
     enable_rank_mask: bool = False,
     active_rank_mask: Optional[torch.Tensor] = None,
-    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Combine per-expert outputs back to the originating ranks.
 
@@ -638,6 +639,10 @@ def moe_a2a_combine(
         paths.
     sf_layout : SfLayout
         Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
+    output : Optional[torch.Tensor]
+        Caller-provided contiguous output tensor. Its shape and dtype must
+        match the requested combine output, and it must be on the same device
+        as ``payload``.
     use_low_precision : bool
         If ``True``, quantize the recv-buffer payload to FP8 (e4m3) before
         accumulating; the combine upcasts to a bf16 output.
@@ -654,10 +659,6 @@ def moe_a2a_combine(
         :func:`moe_a2a_active_rank_mask`).  Should match the mask passed to the
         corresponding :func:`moe_a2a_dispatch` call (or be omitted from both).  Requires
         ``enable_rank_mask=True``.
-    output : Optional[torch.Tensor]
-        Caller-provided contiguous output tensor. Its shape and dtype must
-        match the requested combine output, and it must be on the same device
-        as ``payload``.
 
     Returns
     -------
@@ -1245,9 +1246,10 @@ class MoeAlltoAll:
         output_scales: Optional[torch.Tensor] = None,
         output_scalar_scale: float = 1.0,
         sf_layout: SfLayout = SfLayout.layout_linear,
+        output: Optional[torch.Tensor] = None,
+        *,
         use_low_precision: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
-        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the MoE all-to-all combine phase.
 
@@ -1274,6 +1276,10 @@ class MoeAlltoAll:
             paths.
         sf_layout : SfLayout
             Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
+        output : Optional[torch.Tensor]
+            Caller-provided contiguous output tensor. Its shape and dtype must
+            match the requested combine output, and it must be on the same
+            device as ``payload``.
         use_low_precision : bool
             If ``True``, quantize the recv-buffer payload to FP8 (e4m3) before
             accumulating; the combine upcasts to a bf16 output.
@@ -1281,10 +1287,6 @@ class MoeAlltoAll:
             CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]``. Should match the
             mask passed to the preceding :meth:`dispatch` call (or be omitted from both).
             Requires the instance to have been constructed with ``enable_rank_mask=True``.
-        output : Optional[torch.Tensor]
-            Caller-provided contiguous output tensor. Its shape and dtype must
-            match the requested combine output, and it must be on the same
-            device as ``payload``.
 
         Returns
         -------
@@ -1320,7 +1322,7 @@ class MoeAlltoAll:
             output_scales,
             output_scalar_scale,
             sf_layout,
-            use_low_precision,
+            use_low_precision=use_low_precision,
             enable_rank_mask=self.enable_rank_mask,
             active_rank_mask=active_rank_mask,
             output=output,
