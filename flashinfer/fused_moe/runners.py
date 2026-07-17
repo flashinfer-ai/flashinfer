@@ -36,9 +36,6 @@ from .api import (
     QuantVariant,
     RoutingInputMode,
 )
-from ..cute_dsl import is_cute_dsl_available
-from ..jit.cpp_ext import get_cuda_version
-from ..utils import get_compute_capability
 
 
 def _validate_pack_devices(act: MoEActivationPack, runner: str) -> None:
@@ -752,6 +749,10 @@ class _B12xRunner(MoERunner):
 
     def check_support(self) -> None:
         super().check_support()
+
+        from ..cute_dsl import is_cute_dsl_available
+        from ..jit.cpp_ext import get_cuda_version
+        from ..utils import get_compute_capability
 
         if get_cuda_version().major < 13:
             raise ValueError("b12x unified MoE requires CUDA 13 or later.")

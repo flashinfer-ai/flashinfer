@@ -94,15 +94,15 @@ class TestB12xUnifiedValidation:
         monkeypatch, *, cuda_major=13, cute_dsl_available=True, capability=(12, 0)
     ):
         monkeypatch.setattr(
-            "flashinfer.fused_moe.runners.get_cuda_version",
+            "flashinfer.jit.cpp_ext.get_cuda_version",
             lambda: SimpleNamespace(major=cuda_major),
         )
         monkeypatch.setattr(
-            "flashinfer.fused_moe.runners.is_cute_dsl_available",
+            "flashinfer.cute_dsl.is_cute_dsl_available",
             lambda: cute_dsl_available,
         )
         monkeypatch.setattr(
-            "flashinfer.fused_moe.runners.get_compute_capability",
+            "flashinfer.utils.get_compute_capability",
             lambda _: capability,
         )
 
@@ -166,24 +166,16 @@ class TestB12xUnifiedValidation:
         self._mock_environment(monkeypatch)
         assert self._runner(config, runner_type).check_support() is None
 
-    @pytest.mark.parametrize(
-        "runner_type,backend,variant",
-        (
-            (B12xNvfp4Runner, B12xNvfp4Config(), QuantVariant.NVFP4),
-            (B12xW4A16Runner, B12xW4A16Config(), QuantVariant.W4A16),
-        ),
-    )
-    def test_b12x_support_does_not_gate_activation(
-        self, monkeypatch, runner_type, backend, variant
-    ):
+    def test_b12x_w4a16_rejects_geglu_tanh(self, monkeypatch):
         config = self._config(
-            backend,
-            variant,
+            B12xW4A16Config(),
+            QuantVariant.W4A16,
             activation=ActivationConfig(ActivationType.GegluTanh),
         )
         self._mock_environment(monkeypatch)
-        runner = self._runner(config, runner_type)
-        assert runner.check_support() is None
+        runner = self._runner(config, B12xW4A16Runner)
+        with pytest.raises(NotImplementedError, match="Swiglu or Relu2"):
+            runner.check_support()
 
     @pytest.mark.parametrize(
         "environment,error,match",
