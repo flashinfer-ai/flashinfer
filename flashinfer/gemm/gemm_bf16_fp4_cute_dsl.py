@@ -92,6 +92,23 @@ def _get_split_k_dummy(device: torch.device) -> torch.Tensor:
     return t
 
 
+# Per-N-tile arrival counters for the N-sweep fused reduce.  Zeroed once at
+# allocation; the kernel resets each counter after use, so the buffer never
+# needs a host-side memset again.  Keyed per stream because two concurrent
+# launches must not share counters (256 slots covers the n_tiles <= 256
+# tactic gate).
+_TILE_CTR_CACHE: dict = {}
+
+
+def _get_tile_counter(device: torch.device) -> torch.Tensor:
+    key = (device.type, device.index, torch.cuda.current_stream(device).cuda_stream)
+    t = _TILE_CTR_CACHE.get(key)
+    if t is None:
+        t = torch.zeros(256, device=device, dtype=torch.int32)
+        _TILE_CTR_CACHE[key] = t
+    return t
+
+
 def _get_cute_dsl_bf16_fp4_gemm(
     tile_shape_mnk: Tuple[int, int, int],
     a_dtype: torch.dtype,
@@ -171,6 +188,10 @@ def _get_cute_dsl_bf16_fp4_gemm(
     partial_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (sym_partial,), assumed_align=16
     )
+    sym_tile_ctr = cute.sym_int()
+    tile_ctr_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (sym_tile_ctr,), assumed_align=16
+    )
     alpha_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (1,), assumed_align=4
     )
@@ -198,6 +219,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
         b_sf_fake,
         c_fake,
         partial_fake,
+        tile_ctr_fake,
         alpha_fake,
         1,  # l (batch)
         max_active_clusters,
@@ -374,7 +396,12 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     if tile_k == 128 and n // 64 <= 256:
         k_tiles = k // tile_k
         for stripe in (4, 8, 16):
-            add(base_tile_m, base_atom, 1, 1, nsweep=min(stripe, k_tiles))
+            stripe_eff = min(stripe, k_tiles)
+            # Many stripes multiply the partials traffic and the fused
+            # reduce's per-tile work for no fill benefit; large-K shapes
+            # should use a larger stripe instead.
+            if -(-k_tiles // stripe_eff) <= 8:
+                add(base_tile_m, base_atom, 1, 1, nsweep=stripe_eff)
 
     # tile_N=128 halves the (m,n)-tile count but needs large wave count.
     if tile_k == 128 and n >= 12288 and n % 128 == 0:
@@ -439,14 +466,15 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             _, b, _, _, _, _, block_size = inputs
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
-            # N-sweep kernels handle a single M-tile.  Runtime M never
-            # exceeds the tuned bucket (bucket mapping rounds up), so
-            # filtering on the profile M here is sufficient.
+            # N-sweep is offered only to the small-M decode buckets it was
+            # built for: its fused reduce runs on one CTA per N-tile, which
+            # costs more than split-K from m ~ 8 up (and the kernel handles
+            # a single M-tile at most).  Runtime M never exceeds the tuned
+            # bucket (bucket mapping rounds up), so filtering on the
+            # profile M here is sufficient.
             m_opt = int(profile.get_opt_shapes()[0][0])
             configs = _bf16_fp4_cute_dsl_tactic_configs(n, k)
-            return [
-                i for i, cfg in enumerate(configs) if cfg[6] == 0 or m_opt <= cfg[0][0]
-            ]
+            return [i for i, cfg in enumerate(configs) if cfg[6] == 0 or m_opt <= 4]
 
         def forward(
             self,
@@ -518,10 +546,13 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 )
             else:
                 partial = _get_split_k_dummy(a.device)
-            compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)
-            if use_partial:
+            tile_ctr = _get_tile_counter(a.device)
+            compiled(a, b, b_sf_u8, out, partial, tile_ctr, alpha_for_launch)
+            if k_splits > 1:
                 # Fixed-order sum keeps split-K deterministic run-to-run
-                # (atomic accumulation is not).
+                # (atomic accumulation is not).  N-sweep needs no host
+                # reduce: the kernel's last stripe CTA per N-tile sums the
+                # partials in stripe order and writes C itself.
                 out.copy_(partial.view(partial_splits, m, n).sum(dim=0))
             return out
 
