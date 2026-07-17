@@ -17,8 +17,6 @@ autodoc_mock_imports = [
     "triton",
     "flashinfer._build_meta",
     "cuda",
-    # Optional VSA CuTe-DSL dependency; API documentation needs signatures
-    # but must not require the package from its separate source repository.
     "quack",
     "numpy",
     "einops",
