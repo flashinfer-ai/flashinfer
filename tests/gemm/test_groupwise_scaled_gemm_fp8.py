@@ -201,6 +201,7 @@ def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode):
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("backend", ["trtllm", "cutile"])
 @pytest.mark.parametrize("m", [4, 128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
@@ -214,6 +215,7 @@ def test_fp8_groupwise_group_gemm(
     group_size,
     scale_major_mode,
     out_dtype,
+    backend,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if group_size > 1 and compute_capability[0] in [
@@ -226,6 +228,21 @@ def test_fp8_groupwise_group_gemm(
         pytest.skip(
             "group_gemm_fp8_nt_groupwise is only supported on SM100/103, and SM120/121 GPUs."
         )
+    if backend == "cutile":
+        # cuTile group GEMM backend (added in #3426); mirror the capability
+        # guards used by test_fp8_groupwise_gemm's cuTile branch.
+        if compute_capability[0] not in [10, 11, 12]:
+            pytest.skip(
+                "group_gemm_fp8_nt_groupwise cuTile backend requires SM100+ GPUs."
+            )
+        if scale_major_mode != "K":
+            pytest.skip(
+                "group_gemm_fp8_nt_groupwise cuTile backend supports scale_major_mode='K' only."
+            )
+        if not is_cuda_tile_available():
+            pytest.skip(
+                "cuda-tile / tileiras compiler not available in this environment."
+            )
     torch.random.manual_seed(0)
     tile_size = 128
 
@@ -259,6 +276,7 @@ def test_fp8_groupwise_group_gemm(
         m_indptr,
         scale_major_mode=scale_major_mode,
         out_dtype=out_dtype,
+        backend=backend,
     )
     ref_c = (
         einsum(
