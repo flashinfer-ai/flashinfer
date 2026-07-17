@@ -852,7 +852,7 @@ class _B12xRunner(MoERunner):
             )
 
         hidden_states = act.hidden_states_q
-        if hidden_states.dtype is not torch.bfloat16:
+        if hidden_states.dtype != torch.bfloat16:
             raise TypeError(
                 f"{self.backend_key} requires BF16 hidden_states, "
                 f"got {hidden_states.dtype}."
