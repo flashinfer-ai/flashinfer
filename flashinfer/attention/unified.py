@@ -325,6 +325,11 @@ def resolve_paged_prefill(
     if cc_major is None:
         dev = device if device is not None else torch.device("cuda")
         cc_major = torch.cuda.get_device_properties(dev).major
+    if num_qo_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError(
+            f"num_qo_heads ({num_qo_heads}) and num_kv_heads ({num_kv_heads}) "
+            "must be positive integers"
+        )
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError(
             f"num_qo_heads ({num_qo_heads}) must be divisible by "
@@ -941,21 +946,33 @@ class _CudnnAdapter:
 
     def plan(self, m: dict, d: _Derived) -> None:
         self._m, self._d = m, d
+        # The LSE-gather indices and the native stats buffer are static per
+        # plan (qo_indptr and batch size are fixed here) — precompute them so
+        # run() stays a single indexed lookup + multiply on the hot path.
+        self._native_lse = None
+        self._batch_ids = None
+        self._pos = None
+        if m["return_lse"]:
+            dev = m["qo_indptr"].device
+            total = int(m["qo_indptr_cpu"][-1])
+            token = torch.arange(total, device=dev, dtype=torch.int64)
+            bounds = m["qo_indptr"][1:].to(torch.int64)
+            self._batch_ids = torch.searchsorted(bounds, token, right=True)
+            self._pos = token - m["qo_indptr"].to(torch.int64)[self._batch_ids]
+            self._native_lse = torch.empty(
+                m["batch_size"],
+                m["max_q_len"],
+                m["num_qo_heads"],
+                device=dev,
+                dtype=torch.float32,
+            )
 
     def run(self, q, k_cache, v_cache, *, out=None, lse=None):
         from ..cudnn import cudnn_batch_prefill_with_kv_cache
 
         m, d = self._m, self._d
         b = m["batch_size"]
-        native_lse = None
-        if m["return_lse"]:
-            native_lse = torch.empty(
-                b,
-                m["max_q_len"],
-                m["num_qo_heads"],
-                device=q.device,
-                dtype=torch.float32,
-            )
+        native_lse = self._native_lse
         out_t, lse_t = cudnn_batch_prefill_with_kv_cache(
             q,
             k_cache,
@@ -976,15 +993,9 @@ class _CudnnAdapter:
         )
         if not m["return_lse"]:
             return out_t, None
-        # padded (b, max_q, h) natural-log -> packed (tokens, h) base-2.
-        # token->batch mapping via searchsorted (static shapes, zero sync;
-        # repeat_interleave with device lens would sync on the output size).
-        total = q.shape[0]
-        token = torch.arange(total, device=q.device, dtype=torch.int64)
-        bounds = m["qo_indptr"][1:].to(torch.int64)
-        batch_ids = torch.searchsorted(bounds, token, right=True)
-        pos = token - m["qo_indptr"].to(torch.int64)[batch_ids]
-        packed = lse_t[batch_ids, pos, :] * _LOG2E
+        # padded (b, max_q, h) natural-log -> packed (tokens, h) base-2,
+        # using the plan-time precomputed gather indices (zero sync).
+        packed = lse_t[self._batch_ids, self._pos, :] * _LOG2E
         if lse is not None:
             lse.copy_(packed)
             packed = lse
