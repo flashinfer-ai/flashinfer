@@ -12,13 +12,6 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
-Compile, disk-cache, and parallel-precompile helpers for the CuTe-DSL
-block-scaled GEMM backend of mm_fp4.
-
-Kept import-light on purpose: this module (not the much larger and more
-frequently edited gemm_base.py) participates in the on-disk kernel cache
-key, and parallel precompile workers import it in fresh subprocesses.
 """
 
 import logging
@@ -124,10 +117,31 @@ def _compile_block_scaled_gemm(
 
 
 def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
-    """On-disk kernel name for compiled kernel."""
-    return "_".join(
-        [str(part) for part in cache_key]
-        + [f"b{batch_size}", f"mac{max_active_clusters}"]
+    """On-disk kernel name encoding every mm_fp4 codegen parameter.
+
+    Must be symbol-safe as produced (see tests/jit/test_cute_dsl_cache.py):
+    JitSpecCuteDsl sanitizes names, and two names differing only in
+    sanitized-away characters would collide on one artifact.
+    """
+    (
+        sf_vec_size,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        swap_ab,
+        use_prefetch,
+        kernel_type,
+        use_tma_store,
+        enable_pdl,
+        out_dtype,
+    ) = cache_key
+    tma = "x" if use_tma_store is None else int(use_tma_store)
+    dtype = str(out_dtype).removeprefix("torch.")
+    return (
+        f"sf{sf_vec_size}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+        f"_c{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
+        f"_swap{int(swap_ab)}_pf{int(use_prefetch)}_{kernel_type}"
+        f"_tma{tma}_pdl{int(enable_pdl)}_{dtype}"
+        f"_b{batch_size}_mac{max_active_clusters}"
     )
 
 
