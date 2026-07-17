@@ -94,15 +94,16 @@ class TestB12xUnifiedValidation:
         monkeypatch, *, cuda_major=13, cute_dsl_available=True, capability=(12, 0)
     ):
         monkeypatch.setattr(
-            "flashinfer.jit.cpp_ext.get_cuda_version",
+            "flashinfer.fused_moe.runners.get_cuda_version",
             lambda: SimpleNamespace(major=cuda_major),
         )
         monkeypatch.setattr(
-            "flashinfer.cute_dsl.is_cute_dsl_available",
+            "flashinfer.fused_moe.runners.is_cute_dsl_available",
             lambda: cute_dsl_available,
         )
         monkeypatch.setattr(
-            "flashinfer.utils.get_compute_capability", lambda _: capability
+            "flashinfer.fused_moe.runners.get_compute_capability",
+            lambda _: capability,
         )
 
     def _config(
@@ -128,6 +129,21 @@ class TestB12xUnifiedValidation:
         assert runner_type.supported_routing_modes == (
             RoutingInputMode.PackedPrecomputed,
         )
+
+    @pytest.mark.parametrize(
+        "runner_type,expected",
+        ((B12xNvfp4Runner, "nvfp4"), (B12xW4A16Runner, "w4a16")),
+    )
+    def test_b12x_quant_mode_name(self, runner_type, expected):
+        runner = object.__new__(runner_type)
+        assert runner._get_quant_mode_name() == expected
+
+    @pytest.mark.parametrize("variants", ((), (QuantVariant.NVFP4, QuantVariant.W4A16)))
+    def test_b12x_quant_mode_requires_one_variant(self, variants):
+        runner = object.__new__(B12xNvfp4Runner)
+        runner.supported_quant_variants = variants
+        with pytest.raises(ValueError, match="exactly one"):
+            runner._get_quant_mode_name()
 
     @pytest.mark.parametrize(
         "runner_type,backend,variant",

@@ -36,6 +36,9 @@ from .api import (
     QuantVariant,
     RoutingInputMode,
 )
+from ..cute_dsl import is_cute_dsl_available
+from ..jit.cpp_ext import get_cuda_version
+from ..utils import get_compute_capability
 
 
 def _validate_pack_devices(act: MoEActivationPack, runner: str) -> None:
@@ -745,21 +748,10 @@ class _B12xRunner(MoERunner):
     """Shared unified adapter over ``B12xMoEWrapper``."""
 
     backend_key: ClassVar[str] = ""
-    quant_mode: ClassVar[str] = ""
-    required_weight_keys: ClassVar[tuple[str, ...]] = (
-        "w1_weight",
-        "w1_weight_sf",
-        "w1_alpha",
-        "w2_weight",
-        "w2_weight_sf",
-        "w2_alpha",
-    )
+    required_weight_keys: ClassVar[tuple[str, ...]] = ()
 
     def check_support(self) -> None:
         super().check_support()
-        from ..cute_dsl import is_cute_dsl_available
-        from ..jit.cpp_ext import get_cuda_version
-        from ..utils import get_compute_capability
 
         if get_cuda_version().major < 13:
             raise ValueError("b12x unified MoE requires CUDA 13 or later.")
@@ -797,6 +789,18 @@ class _B12xRunner(MoERunner):
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         return [-1]
 
+    def _get_quant_mode_name(self) -> str:
+        if len(self.supported_quant_variants) != 1:
+            raise ValueError(
+                f"{type(self).__name__} must support exactly one quant variant."
+            )
+        quant_variant = self.supported_quant_variants[0]
+        if quant_variant is QuantVariant.NVFP4:
+            return "nvfp4"
+        if quant_variant is QuantVariant.W4A16:
+            return "w4a16"
+        raise ValueError(f"Unsupported b12x quant variant: {quant_variant!r}.")
+
     def _validate_prepared_weights(
         self, prepared_weights: dict[str, torch.Tensor]
     ) -> None:
@@ -831,7 +835,7 @@ class _B12xRunner(MoERunner):
             max_num_tokens=max(1, num_tokens),
             device=self.device,
             activation=self.activation,
-            quant_mode=self.quant_mode,
+            quant_mode=self._get_quant_mode_name(),
             source_format="modelopt",
         )
 
@@ -931,7 +935,6 @@ class B12xNvfp4Runner(_B12xRunner):
     """Unified SM120/SM121 adapter for b12x NVFP4/W4A4 MoE."""
 
     backend_key = "b12x_nvfp4"
-    quant_mode = "nvfp4"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.NVFP4,)
     required_weight_keys = (
@@ -949,6 +952,13 @@ class B12xW4A16Runner(_B12xRunner):
     """Unified SM120/SM121 adapter for b12x W4A16 MoE."""
 
     backend_key = "b12x_w4a16"
-    quant_mode = "w4a16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.W4A16,)
+    required_weight_keys = (
+        "w1_weight",
+        "w1_weight_sf",
+        "w1_alpha",
+        "w2_weight",
+        "w2_weight_sf",
+        "w2_alpha",
+    )
