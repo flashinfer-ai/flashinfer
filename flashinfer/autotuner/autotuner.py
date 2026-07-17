@@ -1229,22 +1229,20 @@ class AutoTuner:
             synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
-            runner_keys = [
-                (
-                    r_id,
-                    AutoTuner._get_cache_key(
-                        custom_op,
-                        r,
-                        input_shapes,
-                        tuning_config,
-                        r.get_cache_key_extras(inputs) if inputs is not None else (),
-                    ),
+            # 1. In-memory cache (from live tuning). Keys are built lazily so
+            #    the common warm path (hit here) pays for exactly one key per
+            #    runner visited; a full miss leaves runner_keys complete for
+            #    the passes below.
+            runner_keys: list[tuple[int, ProfilingCacheKey]] = []
+            for r_id, r in enumerate(runners):
+                cache_key = AutoTuner._get_cache_key(
+                    custom_op,
+                    r,
+                    input_shapes,
+                    tuning_config,
+                    r.get_cache_key_extras(inputs) if inputs is not None else (),
                 )
-                for r_id, r in enumerate(runners)
-            ]
-
-            # 1. In-memory cache (from live tuning)
-            for r_id, cache_key in runner_keys:
+                runner_keys.append((r_id, cache_key))
                 if cache_key in self.profiling_cache:
                     tactic, stored_profile = self.profiling_cache[cache_key]
                     return True, r_id, tactic, stored_profile

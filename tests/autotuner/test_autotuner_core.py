@@ -264,6 +264,37 @@ def test_search_cache_hit_resolves_runner_id_against_current_list():
     assert tactic == tuple_tactic
 
 
+def test_search_cache_in_memory_beats_file_config_across_runners():
+    """An in-memory tuning result must win over a file config that matches an
+    earlier-listed runner: sources are searched in priority order across all
+    runners, not per-runner."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    a = DummyRunner()
+    b = OtherDummyRunner()
+    shapes = (torch.Size([8, 16]),)
+
+    # File config matches runner `a` (position 0); fresher in-memory result
+    # matches runner `b` (position 1).
+    key_a = AutoTuner._get_cache_key("dummy", a, shapes, config)
+    tuner._file_configs[key_a.file_key] = ("DummyRunner", 3)
+    key_b = AutoTuner._get_cache_key("dummy", b, shapes, config)
+    tuner.profiling_cache[key_b] = (5, None)
+
+    hit = tuner.search_cache("dummy", [a, b], shapes, config)
+    assert hit == (True, 1, 5, None)
+
+    # Without the in-memory entry, the file config is used and resolves to
+    # `a`'s position in the current list.
+    tuner.profiling_cache.clear()
+    hit = tuner.search_cache("dummy", [a, b], shapes, config)
+    assert hit == (True, 0, 3, None)
+
+
 def test_search_cache_preserving_leading_dims_hits_while_flattened_misses(monkeypatch):
     """Shape-preserving reshape keeps cache-hit behavior; full flatten can change bucket/key."""
     tuner = reset_autotuner()
