@@ -921,6 +921,17 @@ def _prefill_attention_ragged_body(
             k_pe = ct.reshape(k_pe_tile, (BLOCK_N, BLOCK_R))
             qk = ct.mma(q_pe, ct.transpose(k_pe), acc=qk)
 
+        # Mask KV columns past the valid range. The final BLOCK_N tile is
+        # PAD_ZERO-loaded, so padded columns have qk == 0 and would otherwise add
+        # exp2(-m_ij) mass to the softmax denominator (their V rows are zero, so
+        # only the denominator is corrupted). No-op when off_band_hi is a multiple
+        # of BLOCK_N.
+        offs_n = curr_n + offs_n_base
+        boundary_mask = ct.reshape((offs_n < off_band_hi), (1, BLOCK_N))
+        qk = ct.where(
+            boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
+        )
+
         qk_max = ct.max(qk, axis=1, keepdims=False)
         m_ij = ct.maximum(m_i, (qk_max * qk_scale))
         p = ct.exp2(qk * qk_scale - ct.reshape(m_ij, (BLOCK_M, 1)), flush_to_zero=True)
@@ -1190,6 +1201,13 @@ def prefill_attention_kv_paged_cutile(
     head_dim_qk = q.shape[-1]
     head_dim_vo = v_cache.shape[-1]
 
+    if num_qo_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_qo_heads ({num_qo_heads}) must be divisible by num_kv_heads "
+            f"({num_kv_heads}); a non-integral GQA ratio floor-divides and maps "
+            "trailing query heads to out-of-range KV heads."
+        )
+
     BLOCK_R = head_dim_qk - head_dim_vo
     QUERY_GROUP_SIZE = num_qo_heads // num_kv_heads
 
@@ -1458,6 +1476,13 @@ def prefill_attention_kv_ragged_cutile(
     num_qo_heads = q.shape[1]
     head_dim_qk = q.shape[-1]
     head_dim_vo = v_cache.shape[-1]
+
+    if num_qo_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_qo_heads ({num_qo_heads}) must be divisible by num_kv_heads "
+            f"({num_kv_heads}); a non-integral GQA ratio floor-divides and maps "
+            "trailing query heads to out-of-range KV heads."
+        )
 
     BLOCK_R = head_dim_qk - head_dim_vo
     QUERY_GROUP_SIZE = num_qo_heads // num_kv_heads
