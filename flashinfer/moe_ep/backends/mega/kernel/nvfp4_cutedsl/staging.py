@@ -37,6 +37,7 @@ def stage_mega_moe_inputs(
         Nvfp4BlockSize,
         ceil_div,
         fused_quant_stage,
+        fused_quant_stage_supported,
         nvfp4_quantize_per_block_16,
         round_up,
     )
@@ -49,7 +50,7 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    if _use_fused_stage():
+    if _use_fused_stage() and fused_quant_stage_supported(hidden_states):
         fused_quant_stage(
             hidden_states,
             topk_ids,

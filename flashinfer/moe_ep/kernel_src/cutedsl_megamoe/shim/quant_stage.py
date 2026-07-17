@@ -50,6 +50,16 @@ def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
     return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
 
+def fused_quant_stage_supported(hidden_states: torch.Tensor) -> bool:
+    """True when the fused kernel can take this activation tensor.
+
+    The DSL launcher requires 16-byte-aligned data pointers; torch allocations
+    satisfy this, but sliced/offset views may not — callers fall back to their
+    torch staging path in that case.
+    """
+    return hidden_states.data_ptr() % 16 == 0
+
+
 def fused_quant_stage(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,

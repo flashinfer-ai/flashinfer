@@ -44,6 +44,7 @@ def stage_mega_moe_inputs(
         Mxfp8BlockSize,
         ceil_div,
         fused_quant_stage,
+        fused_quant_stage_supported,
         mxfp8_quantize_per_block_32,
         round_up,
     )
@@ -56,7 +57,7 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    if _use_fused_stage():
+    if _use_fused_stage() and fused_quant_stage_supported(hidden_states):
         fused_quant_stage(
             hidden_states,
             topk_ids,

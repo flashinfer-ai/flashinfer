@@ -160,3 +160,46 @@ def test_fused_stage_launch_cache_tracks_new_data_and_token_count(monkeypatch):
             f"x mismatch at seed={seed} tokens={num_tokens}"
         )
         assert torch.equal(ref[2], buffers[2])
+
+
+@pytest.mark.arch_blackwell
+def test_fused_stage_bit_matches_deep_gemm_torch_stage(monkeypatch):
+    """dg staging: fused DataPreprocess(mxfp8_e4m3) == per_token_cast_to_fp8.
+
+    deep_gemm's packed-ue8m0 recipe is byte-identical to the cutedsl mxfp8
+    recipe (scales are the same e8m0 bytes packed 4-per-int32), so the fused
+    path must reproduce the torch path bit-exactly through the byte views.
+    """
+    import torch
+
+    _require_blackwell()
+    pytest.importorskip("deep_gemm")
+
+    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.staging import (
+        stage_mega_moe_inputs,
+    )
+
+    hidden, topk, num_experts, num_tokens = 2048, 4, 16, 48
+    batch = _make_batch(num_tokens, hidden, topk, num_experts, seed=23)
+    hidden_states, topk_ids, topk_weights = batch
+
+    def _dg_buffers():
+        # deep_gemm layout: sliced-to-n views, scales packed 4-per-int32.
+        x = torch.zeros(num_tokens, hidden, dtype=torch.float8_e4m3fn, device="cuda")
+        sf = torch.zeros(num_tokens, hidden // 128, dtype=torch.int32, device="cuda")
+        idx = torch.full((num_tokens, topk), 7, dtype=torch.int64, device="cuda")
+        w = torch.zeros(num_tokens, topk, dtype=torch.float32, device="cuda")
+        return x, sf, idx, w
+
+    ref = _dg_buffers()
+    got = _dg_buffers()
+    monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "0")
+    stage_mega_moe_inputs(hidden_states, topk_weights, topk_ids, *ref)
+    monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1")
+    stage_mega_moe_inputs(hidden_states, topk_weights, topk_ids, *got)
+    torch.cuda.synchronize()
+
+    assert torch.equal(ref[0].view(torch.uint8), got[0].view(torch.uint8)), "x"
+    assert torch.equal(ref[1].view(torch.uint8), got[1].view(torch.uint8)), "x_sf"
+    assert torch.equal(ref[2], got[2]), "topk_idx"
+    assert torch.equal(ref[3], got[3]), "topk_weights"
