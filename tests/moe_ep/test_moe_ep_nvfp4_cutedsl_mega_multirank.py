@@ -5,7 +5,7 @@ Launched via torchrun:
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels``.
+``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -23,7 +23,10 @@ import os
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels")
+# This test verifies the mega path only through the cutedsl_megamoe shim public
+# API (``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``); it never imports the
+# src/ kernel packages directly, so a new src/ drop can't silently break it.
+pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -69,7 +72,7 @@ def _make_inputs(
 def _make_epilogue_params(rank: int, num_local_experts: int):
     import torch
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         make_dummy_epilogue_params,
     )
 
@@ -151,11 +154,11 @@ def _make_packed_weights(
     return w13, w2, w13_scale, w2_scale
 
 
-def _mega_problem(rank: int, world_size: int):
+def _mega_problem(
+    rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64
+):
     hidden = 2048
     intermediate = 1024
-    num_tokens = 64
-    max_tokens = 64
     num_experts = 8
     topk = 4
     gate_up_clamp = 10.0
@@ -202,12 +205,14 @@ def _mega_problem(rank: int, world_size: int):
     )
 
 
-def _reference_nvfp4_mega_moe_staged(problem: dict, *, destroy_buffer: bool = True):
+def _reference_nvfp4_mega_moe_staged(
+    problem: dict, *, destroy_buffer: bool = True, combine_dtype: str = "bf16"
+):
     """Reference with bf16 activations staged inside the symm buffer."""
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -230,6 +235,7 @@ def _reference_nvfp4_mega_moe_staged(problem: dict, *, destroy_buffer: bool = Tr
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
+        combine_dtype=combine_dtype,
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
         fc1_norm_const=problem["fc1_norm_const"],
@@ -276,7 +282,7 @@ def _reference_nvfp4_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -330,7 +336,35 @@ def _reference_nvfp4_mega_moe_prestaged(
     return y
 
 
-def _megakernel_config(problem: dict, *, epilogue_via_config: bool):
+def _assert_ikr_close(y, y_ref, *, topk):
+    """Scale-aware compare for the in-flight (REDG) top-k reduce.
+
+    The ikr path accumulates the K per-topk bf16 terms in nondeterministic
+    order; the explicit-reduce reference accumulates the same terms in fp32.
+    Where large terms nearly cancel, the achievable agreement is bounded by
+    the bf16 round-off of the largest TERM, not of the final value, so a flat
+    atol/rtol band misfires (this is why the kernel repo validates ikr with a
+    K!-ordering bitwise check).  Bound the error per row by the row magnitude
+    scale instead: K terms x bf16 eps (2^-8) x safety 8.  Measured need at
+    this geometry: <= 0.67x the unscaled band; a missing per-launch output
+    zero (the 2x-accumulation bug) overshoots by ~64x, so the guard stays
+    sharp.
+    """
+    import torch
+
+    a = y.float()
+    b = y_ref.float()
+    diff = (a - b).abs()
+    row_scale = torch.maximum(a.abs(), b.abs()).amax(dim=1, keepdim=True)
+    tol = 5e-2 + (topk * 2.0**-8 * 8.0) * row_scale
+    worst = (diff - tol).max().item()
+    assert worst <= 0.0, (
+        f"ikr output outside the bf16 K-term accumulation band "
+        f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
+    )
+
+
+def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_extra):
     from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
 
     kwargs = dict(
@@ -345,10 +379,20 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool):
             fc2_alpha=problem["fc2_alpha"],
             fc1_norm_const=problem["fc1_norm_const"],
         )
+    kwargs.update(config_extra)
     return Nvfp4CutedslMegaMoeConfig(**kwargs)
 
 
-def _run_mega_layer(rank, world_size, *, quantize_input: bool):
+def _run_mega_layer(
+    rank,
+    world_size,
+    *,
+    quantize_input: bool,
+    num_tokens: int = 64,
+    max_tokens: int = 64,
+    in_kernel_fc2_reduce: bool = False,
+    combine_dtype: str = "bf16",
+):
     import torch
     import torch.distributed as dist
 
@@ -372,9 +416,15 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
 
-    problem = _mega_problem(rank, world_size)
+    problem = _mega_problem(
+        rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
+    )
+    config_extra = dict(
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        combine_dtype=combine_dtype,
+    )
     kernel = create_mega_kernel(
-        _megakernel_config(problem, epilogue_via_config=quantize_input)
+        _megakernel_config(problem, epilogue_via_config=quantize_input, **config_extra)
     )
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
@@ -386,7 +436,7 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
                 get_symm_buffer_for_mega_moe,
             )
 
@@ -428,7 +478,7 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
             weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
             backend=MegaConfig(
                 megakernel=_megakernel_config(
-                    problem, epilogue_via_config=quantize_input
+                    problem, epilogue_via_config=quantize_input, **config_extra
                 ),
                 quantize_input=quantize_input,
                 preprocess_weights=True,
@@ -450,12 +500,19 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
             scales=t_scales,
             **tensor_kwargs,
         )
-        y_layer = mega.forward(t)
+        y_layer = mega.forward(t).clone()
+        # Repeated forward on the same session: with no per-launch host reset
+        # (run() default reset_counters=False) the second launch relies on the
+        # kernel's tail cleanup of its workspace counters/flags -- this is the
+        # regression guard for that contract.
+        y_layer2 = mega.forward(t)
         torch.cuda.synchronize()
         dist.barrier()
 
         if quantize_input:
-            y_ref = _reference_nvfp4_mega_moe_staged(problem, destroy_buffer=True)
+            y_ref = _reference_nvfp4_mega_moe_staged(
+                problem, destroy_buffer=True, combine_dtype=combine_dtype
+            )
         else:
             y_ref = _reference_nvfp4_mega_moe_prestaged(
                 problem, t_hidden, t_scales, destroy_buffer=True
@@ -465,7 +522,37 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
         assert y_layer.shape == (problem["num_tokens"], problem["hidden"])
         assert y_layer.dtype == torch.bfloat16
         assert torch.isfinite(y_layer).all()
-        torch.testing.assert_close(y_layer, y_ref, atol=0.0, rtol=0.0)
+        if in_kernel_fc2_reduce:
+            # Tolerance verdict vs the explicit-reduce (plain-sum) reference;
+            # see _assert_ikr_close.  The repeated forward doubles as the
+            # regression guard for the per-launch output_activation.zero_()
+            # (accumulate-from-zero contract): without it y_layer2 would be
+            # ~2x the reference and fail loudly.
+            _assert_ikr_close(y_layer, y_ref, topk=problem["topk"])
+            _assert_ikr_close(y_layer2, y_ref, topk=problem["topk"])
+        else:
+            torch.testing.assert_close(y_layer, y_ref, atol=0.0, rtol=0.0)
+            torch.testing.assert_close(y_layer2, y_ref, atol=0.0, rtol=0.0)
+
+        if combine_dtype != "bf16":
+            # Numerics sanity vs the exact bf16 combine wire: the quantized
+            # wire lossily encodes the per-topk fc2 outputs, so bound the
+            # whole-tensor relative L2 error rather than per-element compare.
+            # The strong plumbing check is the bit-exact compare above
+            # (layer vs direct-shim reference on the same wire format).
+            y_ref_bf16 = _reference_nvfp4_mega_moe_staged(
+                problem, destroy_buffer=True, combine_dtype="bf16"
+            )
+            dist.barrier()
+            rel_l2 = (
+                (y_layer.float() - y_ref_bf16.float()).norm()
+                / y_ref_bf16.float().norm().clamp_min(1e-6)
+            ).item()
+            band = 0.25 if combine_dtype == "nvfp4" else 0.10
+            assert rel_l2 < band, (
+                f"quantized combine ({combine_dtype}) rel-L2 {rel_l2:.4f} "
+                f"vs bf16 combine exceeds {band}"
+            )
         mega.destroy()
         return rank
     finally:
@@ -502,6 +589,106 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
     print(f"rank {rank}: nvfp4_cutedsl mega layer (prestaged inputs) matches reference")
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_nvfp4_cutedsl_mega_layer_large_tokens_matches_reference():
+    """Large-token (>=2048) path: exercises the tuner's LARGE profile.
+
+    With num_max_tokens >= 2048 the token-count heuristic selects the
+    throughput tile (mma_tiler (256,256,256), token_back reuse_dispatch_warps).
+    This confirms that profile compiles + runs and that the layer path stays
+    bit-exact with the direct-kernel reference (both use the same profile).
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank, world_size, quantize_input=True, num_tokens=2048, max_tokens=2048
+    )
+    print(f"rank {rank}: nvfp4_cutedsl mega layer (large tokens) matches reference")
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("num_tokens", [512, 1024])
+def test_moe_ep_nvfp4_cutedsl_mega_layer_mid_tokens_matches_reference(num_tokens):
+    """Mid-token paths: exercise the tuner's MID / MID-LARGE profiles.
+
+    512 selects the mid tactic (mma_tiler (256,128,256), flag_batch 4,
+    token_back reuse_dispatch_warps); 1024 selects the mid-large tactic
+    (mma_tiler (256,256,256), flag_batch 4, token_back standalone_warps) --
+    the 2026-07-14 autotune winners at those sizes.  Confirms each profile
+    compiles + runs and the layer path stays bit-exact with the direct-kernel
+    reference.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        num_tokens=num_tokens,
+        max_tokens=num_tokens,
+    )
+    print(
+        f"rank {rank}: nvfp4_cutedsl mega layer (mid tokens={num_tokens}) "
+        "matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_nvfp4_cutedsl_mega_layer_in_kernel_fc2_reduce():
+    """In-flight top-k combine (``in_kernel_fc2_reduce=True``).
+
+    The REDG atomic-add collapses the combine as peer data arrives, so the
+    output matches the plain-sum reference only up to accumulation order
+    (tolerance verdict, not bit-exact).  The second forward inside
+    ``_run_mega_layer`` guards the accumulate-from-zero contract: the frontend
+    must zero ``output_activation`` before every launch or the repeat would
+    come back ~2x.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank, world_size, quantize_input=True, in_kernel_fc2_reduce=True
+    )
+    print(
+        f"rank {rank}: nvfp4_cutedsl mega layer (in_kernel_fc2_reduce) "
+        "matches reference within tolerance"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("combine_dtype", ["nvfp4", "mxfp8"])
+def test_moe_ep_nvfp4_cutedsl_mega_layer_quantized_combine(combine_dtype):
+    """Quantized cross-rank combine wire (``combine_dtype`` != bf16).
+
+    ``nvfp4`` (16e2m1xbf16) shrinks the NVLink combine traffic 4x, ``mxfp8``
+    (32e4m3xe8m0) 2x.  The layer output must be bit-exact with the direct-shim
+    reference on the same wire format (deterministic explicit-reduce path) and
+    within a loose relative-L2 band of the exact bf16-combine reference
+    (wire quantization is a numerics tradeoff).
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank, world_size, quantize_input=True, combine_dtype=combine_dtype
+    )
+    print(
+        f"rank {rank}: nvfp4_cutedsl mega layer (combine_dtype={combine_dtype}) "
+        "matches reference"
+    )
 
 
 @pytest.mark.arch_blackwell
@@ -612,3 +799,97 @@ def test_nvfp4_cutedsl_mega_kernel_is_registered():
         Nvfp4CutedslMegaMoeConfig(intermediate_size=128, top_k=2)
     )
     assert kernel.kernel_name() == "nvfp4_cutedsl"
+
+
+def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
+    """The TRT-LLM-import knobs are plumbed through the FI backend config."""
+    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    cfg = Nvfp4CutedslMegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        in_kernel_fc2_reduce=True,
+    )
+    assert cfg.combine_dtype == "bf16"
+    assert create_mega_kernel(cfg).kernel_name() == "nvfp4_cutedsl"
+
+    cfg_q = Nvfp4CutedslMegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        combine_dtype="nvfp4",
+    )
+    assert create_mega_kernel(cfg_q).kernel_name() == "nvfp4_cutedsl"
+
+
+def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import MegaMoENvfp4Config
+
+    base = dict(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=64,
+        num_topk=2,
+        num_total_experts=8,
+        hidden=256,
+        intermediate=256,
+    )
+    # ikr requires a bf16 combine wire.
+    with pytest.raises(ValueError, match="in_kernel_fc2_reduce"):
+        MegaMoENvfp4Config(
+            **base,
+            in_kernel_fc2_reduce=True,
+            combine_dtype="nvfp4",
+            token_back_mode="reuse_dispatch_warps",
+        )
+    # ikr requires the topk score folded before fc2.
+    with pytest.raises(ValueError, match="apply_topk_in_fc1"):
+        MegaMoENvfp4Config(**base, in_kernel_fc2_reduce=True, apply_topk_in_fc1=False)
+    # quantized combine wires are only wired for dispatch-warp token-back.
+    with pytest.raises(ValueError, match="reuse_dispatch_warps"):
+        MegaMoENvfp4Config(**base, combine_dtype="mxfp8")
+
+
+def test_tuner_is_valid_quantized_combine_rules():
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import tuner
+
+    # quantized combine excludes the in-kernel REDG reduce ...
+    assert not tuner.is_valid(
+        {
+            "in_kernel_fc2_reduce": True,
+            "token_back_mode": "reuse_dispatch_warps",
+        },
+        combine_format="16e2m1xbf16",
+    )
+    # ... and any non-dispatch-warp token-back.
+    assert not tuner.is_valid(
+        {"token_back_mode": "epi_warps"}, combine_format="16e2m1xbf16"
+    )
+    assert tuner.is_valid(
+        {"token_back_mode": "reuse_dispatch_warps"}, combine_format="32e4m3xe8m0"
+    )
+    # bf16 combine composes ikr with every token-back mode.
+    for mode in ("epi_warps", "standalone_warps", "reuse_dispatch_warps"):
+        assert tuner.is_valid({"in_kernel_fc2_reduce": True, "token_back_mode": mode})
+
+
+def test_autotune_nvfp4_candidates_cover_ikr():
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.autotune import (
+        nvfp4_candidates,
+    )
+
+    cands = nvfp4_candidates()
+    assert any(k["in_kernel_fc2_reduce"] for k in cands)
+    assert any(not k["in_kernel_fc2_reduce"] for k in cands)
+
+    # A quantized wire prunes to the valid subset: no ikr, dispatch-warp
+    # token-back only.
+    qcands = nvfp4_candidates(combine_format="16e2m1xbf16")
+    assert qcands
+    assert all(
+        not k["in_kernel_fc2_reduce"] and k["token_back_mode"] == "reuse_dispatch_warps"
+        for k in qcands
+    )
+
+    pinned = nvfp4_candidates(allow_in_kernel_fc2_reduce=False)
+    assert pinned and all(not k["in_kernel_fc2_reduce"] for k in pinned)

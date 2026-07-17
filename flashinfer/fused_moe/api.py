@@ -30,9 +30,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import ClassVar, Dict, Optional, Tuple, Union
 
+import torch
 from torch import Tensor
 
-from ..tllm_enums import ActivationType, RoutingMethodType
+from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -527,14 +528,100 @@ class MoEConfig:
 
 @dataclass
 class MoEActivationPack:
-    """Per-call transient data — activations (backend-native encoding) + pre-routed indices."""
+    """Per-call transient data — pre-quantized NVFP4 activations plus routing inputs.
 
-    hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4) or [M, H] bf16 (BF16 path)
+    ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
+
+    * ``PackedPrecomputed`` (default) — **pre-routed**: the caller computes expert
+      selection on the host and passes ``topk_ids`` + ``topk_weights``.
+      (``UnpackedPrecomputed`` exists at the kernel enum level but is not currently
+      supported by the unified runners.)
+    * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
+      methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
+      itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
+      runner allocates internal kernel-filled buffers, and the routing result is not surfaced
+      back through the pack (routing replay is a separate, future capability).  Currently only
+      the TRTLLM FP4 runner supports this mode; ``MoELayer`` dispatches a logits pack only to
+      capable backends (see each runner's ``supported_routing_modes``).
+
+    ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
+    keep the field positions of the former ``selected_experts`` / ``final_scales``, so
+    positional construction of pre-routed packs is unchanged.  The in-kernel routing fields
+    are keyword-only.
+    """
+
+    hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4) or [M, H] bf16
     hidden_states_scale: Optional[
         Tensor
     ]  # [M, H//16] float8_e4m3fn block scales; None for BF16
-    selected_experts: Tensor  # [M, top_k] int32
-    final_scales: Tensor  # [M, top_k] float32
+    # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
+    topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
+    topk_weights: Optional[Tensor] = None  # [M, top_k] float32 (routing weights)
+    # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
+    # call site fails loudly instead of silently binding a tensor to the mode.
+    routing_input_mode: RoutingInputMode = field(
+        default=RoutingInputMode.PackedPrecomputed, kw_only=True
+    )
+    routing_logits: Optional[Tensor] = field(
+        default=None, kw_only=True
+    )  # [M, num_experts] float32 or bfloat16
+    routing_bias: Optional[Tensor] = field(
+        default=None, kw_only=True
+    )  # [num_experts] bfloat16 or float32 (independent of logits dtype)
+
+    def __post_init__(self) -> None:
+        """Fail fast on mode/field mismatches at construction time.
+
+        Raises (not asserts) so the checks survive ``python -O``; catching the
+        mismatch here names the offending field instead of a later failure deep
+        in ``pack_inputs`` or a C++ ICHECK.
+        """
+        mode = self.routing_input_mode
+        if mode == RoutingInputMode.FromLogits:
+            if self.routing_logits is None:
+                raise ValueError(
+                    "routing_input_mode=FromLogits requires routing_logits."
+                )
+            if self.topk_ids is not None or self.topk_weights is not None:
+                raise ValueError(
+                    "FromLogits computes topk_ids/topk_weights in-kernel; "
+                    "leave them None."
+                )
+        elif mode == RoutingInputMode.PackedPrecomputed:
+            if self.topk_ids is None or self.topk_weights is None:
+                raise ValueError(
+                    "routing_input_mode=PackedPrecomputed requires "
+                    "topk_ids + topk_weights."
+                )
+            if self.routing_logits is not None or self.routing_bias is not None:
+                raise ValueError(
+                    "routing_logits/routing_bias are only consumed by "
+                    "in-kernel (FromLogits) routing."
+                )
+            if self.topk_ids.dtype != torch.int32:
+                raise TypeError(
+                    f"topk_ids must be torch.int32 (got {self.topk_ids.dtype}); "
+                    "torch.topk returns int64 — cast before constructing the pack."
+                )
+        # UnpackedPrecomputed: no unified runner supports it; runners raise
+        # NotImplementedError, so no field contract is enforced here.
+
+        # All routing tensors must live with the activations; a stray CPU
+        # tensor otherwise surfaces as a cryptic launch/ICHECK failure.
+        dev = self.hidden_states_q.device
+        for name in (
+            "hidden_states_scale",
+            "topk_ids",
+            "topk_weights",
+            "routing_logits",
+            "routing_bias",
+        ):
+            t = getattr(self, name)
+            if t is not None and t.device != dev:
+                raise ValueError(
+                    f"{name} is on {t.device} but hidden_states_q is on {dev}; "
+                    "all pack tensors must be on the same device."
+                )
 
     @property
     def num_tokens(self) -> int:
