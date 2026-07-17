@@ -17,3 +17,15 @@ cuTile GEMM kernel implementations (internal).
 Import :func:`flashinfer.gemm.is_cuda_tile_available` for the public availability check.
 Import from ``flashinfer.gemm`` for the public kernel APIs.
 """
+
+from .gemm_alpha_beta_cutile import gemm_alpha_beta
+from .masked_bmm_cutile import masked_bmm
+from .ragged_block_scaled_bmm_cutile import ragged_block_scaled_bmm
+from .ragged_bmm_cutile import ragged_bmm
+
+__all__ = [
+    "gemm_alpha_beta",
+    "masked_bmm",
+    "ragged_block_scaled_bmm",
+    "ragged_bmm",
+]
