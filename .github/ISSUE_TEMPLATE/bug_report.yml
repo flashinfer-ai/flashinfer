@@ -1,7 +1,17 @@
 name: 🐛 Bug Report
-description: Report a correctness, crash, or performance bug in FlashInfer
+description: >
+  Report something broken, wrong, or slower than it used to be — correctness
+  issues, crashes, build/install failures, or performance regressions. For new
+  capabilities or speedups, use 🚀 Kernel / Feature Request instead.
 labels: ["bug"]
 body:
+  - type: checkboxes
+    id: presubmit
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have searched existing issues and did not find a solution or an existing report.
+          required: true
   - type: textarea
     id: environment
     attributes:
@@ -38,10 +48,12 @@ body:
     attributes:
       label: Minimal reproduction
       description: >
-        Smallest self-contained script or command that reproduces the issue.
-        Include exact shapes/dtypes and the backend selected (fa2/fa3/cudnn/
-        trtllm/cutlass/...). If the failure involves JIT compilation, re-run
-        with `FLASHINFER_JIT_VERBOSE=1` and attach the log.
+        Smallest self-contained script that reproduces the issue — a short
+        standalone Python script is far more actionable than a full
+        `vllm serve ...` invocation. Include exact shapes/dtypes and the
+        backend selected (fa2/fa3/cudnn/trtllm/cutlass/...). If the failure
+        involves JIT compilation, re-run with `FLASHINFER_JIT_VERBOSE=1` and
+        attach the log.
       render: python
     validations:
       required: true
