@@ -1984,22 +1984,22 @@ _RESTAGE = True
 # (T=4 and T=8, BS=1..256): max|d| <= 9.77e-04 vs branch kernel and vs the torch
 # reference, full wy_output_only pytest green with native forced, and 2-6%
 # faster kernel time at BS>=8 plus 2 fewer host staging copies per call.
-# Set SGLANG_GDN_WY_NATIVE_T=0 to restore full staging.
+# Set FLASHINFER_GDN_WY_NATIVE_T=0 to restore full staging.
 import os as _os
 
-_NATIVE_T = _os.environ.get("SGLANG_GDN_WY_NATIVE_T", "1") != "0"
+_NATIVE_T = _os.environ.get("FLASHINFER_GDN_WY_NATIVE_T", "1") != "0"
 # (strided-qkv) read q/k/v directly from the fused conv-output column slices (token
 # stride = conv_dim) instead of .contiguous()-materializing them. Removes the 3 big
 # q/k/v copies from the verify region. Only valid on the native path (T in {4,8}).
-_STRIDED_QKV = _os.environ.get("SGLANG_GDN_WY_STRIDED_QKV", "0") != "0"
+_STRIDED_QKV = _os.environ.get("FLASHINFER_GDN_WY_STRIDED_QKV", "0") != "0"
 # (native-a/b) read a/b directly from the real [B, n_valid, HV] tensors instead of staging
 # them into T_KERNEL-row zero-padded buffers (removes the 2 a/b staging copies). Bit-exact on
 # the compact [B,T] output: gamma is a causal prefix-sum, so the unloaded tail rows (which get
 # log_alpha=0 instead of the staged-zero value) cannot affect rows 0..n_valid-1, and the tail
 # output is discarded. Native path only (T in {4,8}).
-# ON by default alongside _NATIVE_T (same validation); SGLANG_GDN_WY_NATIVE_AB=0
+# ON by default alongside _NATIVE_T (same validation); FLASHINFER_GDN_WY_NATIVE_AB=0
 # restores a/b staging.
-_NATIVE_AB = _os.environ.get("SGLANG_GDN_WY_NATIVE_AB", "1") != "0"
+_NATIVE_AB = _os.environ.get("FLASHINFER_GDN_WY_NATIVE_AB", "1") != "0"
 # Cache the bf16 cast of the per-layer CONSTANT weights A_log/dt_bias, keyed by
 # storage identity (data_ptr, shape). They are persistent tensors passed every verify
 # call; caching turns the per-call `.to(bf16)` into a one-time (warm-up) cast that does
@@ -2133,7 +2133,7 @@ def gated_delta_rule_mtp(
     dt_bias = _cached_bf16(dt_bias)
     h0 = initial_state_source.contiguous()
     # n_valid = token rows actually present in the q/k tensors handed to the kernel.
-    # Native-short-T (SGLANG_GDN_WY_NATIVE_T): pass q/k as the real [B,T,...] tensors
+    # Native-short-T (FLASHINFER_GDN_WY_NATIVE_T): pass q/k as the real [B,T,...] tensors
     # (n_valid=T); the kernel loads only those rows and zeros its sK/sQ smem tail,
     # skipping the two big q/k gmem->gmem staging copies. Otherwise q/k are staged
     # into a T_KERNEL-row zero-padded buffer (n_valid=T_KERNEL = original behavior).
