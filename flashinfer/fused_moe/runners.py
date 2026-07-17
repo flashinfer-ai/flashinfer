@@ -892,9 +892,8 @@ class _B12xRunner(MoERunner):
             self.config.routing.top_k,
             type(self).__name__,
         )
-        if act.topk_weights.dtype is not torch.float32:
+        if act.topk_weights.dtype != torch.float32:
             raise TypeError("b12x topk_weights must use torch.float32.")
-
         self._prepared_weights = v
         self._ensure_inner(hidden_states.shape[1], hidden_states.shape[0])
         return [hidden_states, act.topk_ids, act.topk_weights]
