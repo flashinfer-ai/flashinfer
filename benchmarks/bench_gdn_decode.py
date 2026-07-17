@@ -1826,9 +1826,12 @@ def run_gdn_decode_bf16_wy_output_only_benchmark(args, dtype, use_qk_l2norm):
 
     Both kernels share the same bf16 (pool, HV, V, K) state and inputs and are
     timed output-only (disable_state_update=True, disable_output=False,
-    recovery_steps=0) via cuda-graph replay = true kernel GPU time (the
-    production decode pattern; excludes per-call Python wrapper overhead), with a
-    cold-L2 cuda-event fallback if a config can't be captured.
+    recovery_steps=0) via CUPTI per-kernel GPU time with cold L2 (flushed before
+    every iteration) — the same methodology as every other version in this file,
+    so the numbers are directly comparable across tables. Kernel-only timing
+    also excludes v18's per-call Python wrapper overhead at small batch (the
+    reason an earlier revision used cuda-graph replay, which however measured
+    warm-L2 and was not comparable with the other versions).
 
     v18 is a fixed T=16-tile kernel, so for T<16 it stages inputs into persistent
     T=16 buffers. v18 is timed KERNEL-ONLY (the eager correctness call pre-stages
@@ -1945,16 +1948,22 @@ def run_gdn_decode_bf16_wy_output_only_benchmark(args, dtype, use_qk_l2norm):
                 # output=None exercises each kernel's natural allocation path;
                 # v18 then returns a zero-copy [:, :T] view (its optimized path),
                 # and the T<16 inputs go through v18's persistent staging buffers.
-                def _time(fn, graph):
+                def _time(fn):
+                    # CUPTI per-kernel GPU time + cold L2 (flushed before every
+                    # iteration) — the same methodology as every other version
+                    # in this file. Kernel-only, so v18's per-call Python
+                    # wrapper cost cannot pollute small-B rows (which is what
+                    # the previous cuda-graph-replay timing was working around,
+                    # at the cost of warm-L2 numbers not comparable with the
+                    # other versions' tables).
                     return (
                         np.median(
                             bench_gpu_time(
                                 lambda: fn(initial_state_source=state, **common),
-                                dry_run_iters=(5 if graph else args.warmup),
+                                dry_run_iters=args.warmup,
                                 repeat_iters=args.iters,
-                                use_cuda_graph=graph,
-                                enable_cupti=False,
-                                cold_l2_cache=(not graph),
+                                enable_cupti=True,
+                                cold_l2_cache=True,
                             )
                         )
                         * 1000
@@ -1978,13 +1987,6 @@ def run_gdn_decode_bf16_wy_output_only_benchmark(args, dtype, use_qk_l2norm):
                     else float("nan")
                 )
 
-                # Prefer cuda-graph replay = true kernel GPU time (the production
-                # decode pattern; excludes the per-call Python wrapper overhead
-                # — 10x from_dlpack, contiguous, alloc, cache lookup — that
-                # otherwise dominates v18 at small batch). Fall back to cold-L2
-                # event timing for BOTH kernels if either can't be captured
-                # (v18's T<16 pad path allocates during capture), so the row's
-                # speedup stays apples-to-apples. 'mode' tags which was used.
                 # Time v18 KERNEL-ONLY: the eager calls above already staged the
                 # inputs into v18's persistent T=16 buffers, so skip the per-call
                 # restage copy (the fixed-buffer serving pattern, and exactly how
@@ -1992,33 +1994,17 @@ def run_gdn_decode_bf16_wy_output_only_benchmark(args, dtype, use_qk_l2norm):
                 # this flag and is timed its natural way (native T, no padding).
                 _v18mod._RESTAGE = False
                 t_br = t_v18 = None
-                mode = "graph"
-                if o_br is not None and o_v18 is not None:
+                mode = "cupti"
+                if o_br is not None:
                     try:
-                        t_br = _time(_branch_mtp, True)
-                        t_v18 = _time(_v18_mtp, True)
+                        t_br = _time(_branch_mtp)
                     except Exception:
-                        mode = "event"
-                        try:
-                            t_br = _time(_branch_mtp, False)
-                        except Exception:
-                            t_br = None
-                        try:
-                            t_v18 = _time(_v18_mtp, False)
-                        except Exception:
-                            t_v18 = None
-                else:
-                    mode = "event"
-                    if o_br is not None:
-                        try:
-                            t_br = _time(_branch_mtp, False)
-                        except Exception:
-                            t_br = None
-                    if o_v18 is not None:
-                        try:
-                            t_v18 = _time(_v18_mtp, False)
-                        except Exception:
-                            t_v18 = None
+                        t_br = None
+                if o_v18 is not None:
+                    try:
+                        t_v18 = _time(_v18_mtp)
+                    except Exception:
+                        t_v18 = None
 
                 spd = (t_br / t_v18) if (t_br and t_v18) else float("nan")
                 br_s = f"{t_br:>12.2f}" if t_br is not None else f"{'ERR':>12}"
