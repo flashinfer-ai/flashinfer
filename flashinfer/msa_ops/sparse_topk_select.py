@@ -105,8 +105,6 @@ def _get_compiled_topk_chunked(topk: int, tiled: bool):
     row-per-CTA one."""
     from .cute_dsl.topk_select_chunked_sm12x import TopKSelectChunkedSm12x
 
-    # Tensors: max_score, candidate keys, candidate indices, out. Scalars: nvp,
-    # force_begin/end, num_chunks, chunk_len, total_q, heads.
     return _compile_topk(TopKSelectChunkedSm12x(topk=topk, tiled=tiled), 4, 7)
 
 
@@ -278,13 +276,9 @@ def msa_topk_select(
         _MIN_CHUNKS,
     )
 
-    # The chunked path serves every grid with enough middle blocks to
-    # amortize its second launch (why it wins on both small and full grids is
-    # explained in topk_select_chunked_sm12x); ``tiled`` swaps in the
-    # coalesced q-tile partial kernel once the grid fills the GPU without
-    # row-per-CTA fan-out. Per-token extents stay on the single-kernel paths:
-    # the chunk geometry is host-derived from the scalar count. Everything
-    # here is shape-constant, so the choice is CUDA-graph safe.
+    # topk_select_chunked_sm12x explains why chunked wins on both small and
+    # full grids; per-token extents stay on the single-kernel paths.
+    # Everything here is shape-constant, so CUDA-graph safe.
     if not per_token_nvp:
         rows = total_qo_len * num_qo_heads
         n_mid = nvp_scalar - force_begin_blocks - force_end_blocks

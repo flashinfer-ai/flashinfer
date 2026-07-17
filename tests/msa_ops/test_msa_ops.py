@@ -883,10 +883,9 @@ def test_sparse_decode_nvfp4_scale_size_guard():
 # ---------------------------------------------------------------------------
 
 
-# nvp = P - 56 lands each case on a different dispatch: P=88 count-rank with
-# a tiny middle region, P=128 with S=2400 the q-tiled chunked kernel (queries
-# past the tiled boundary, with a ragged 32-query tail), P=256 chunked on a
-# small grid (row-per-CTA), P=2560 radix (past the chunked block coverage).
+# nvp = P - 56 lands each case on a different dispatch: P=88 count-rank,
+# P=128 with S=2400 q-tiled chunked (S covers the ragged 32-query tail),
+# P=256 row-per-CTA chunked, P=2560 radix.
 @pytest.mark.parametrize("P,S", [(88, 64), (128, 2400), (256, 64), (2560, 64)])
 def test_msa_topk_select_forced_and_clamped(P, S):
     """Forced begin/end blocks are always selected within the topk budget;
