@@ -114,10 +114,16 @@ def _splitk_reduce_kernel(
     weights_sum = ct.sum(weights)
     weights = weights / weights_sum
 
+    # attn_splitk_out has NUM_KV_SPLITS (<= POW2) splits on axis 0; only lse is
+    # padded to POW2 by the caller. Zero-fill the out-of-range split rows here so
+    # a non-power-of-two NUM_KV_SPLITS cannot read past the buffer. Those rows
+    # carry weight 0 (their lse is padded to -inf), so the zeros do not affect
+    # the weighted reduction below.
     out_all = ct.load(
         attn_splitk_out,
         (0, batch_id, head_id, 0),
         shape=(NUM_KV_SPLITS_POW2, 1, 1, BLOCK_D),
+        padding_mode=ct.PaddingMode.ZERO,
     )
     out_all = ct.reshape(out_all, (NUM_KV_SPLITS_POW2, BLOCK_D))
     out_all = ct.astype(out_all, ct.float32)
