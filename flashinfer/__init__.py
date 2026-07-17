@@ -68,7 +68,6 @@ from .quantization.fp4_quantization import (
     mxfp4_dequantize,
     mxfp4_quantize,
     nvfp4_quantize,
-    nvfp4_scale_only_quantize,
     nvfp4_quantize_paged_kv_cache,
     nvfp4_batched_quantize,
     shuffle_matrix_a,

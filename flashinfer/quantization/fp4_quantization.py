@@ -545,67 +545,6 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
 
     @register_custom_op(
-        "flashinfer::nvfp4_scale_only_quant_and_per_token_scale_sm100",
-        mutates_args=(""),
-    )
-    def nvfp4_scale_only_quant_and_per_token_scale_sm100(
-        scale_input: torch.Tensor,
-        scale_inv: float,
-        expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
-        sf_layout: int = SfLayout.layout_linear.value,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # scale_input holds one fp32 per-block amax per SF_VEC_SIZE (16) group: shape [m, k // 16].
-        m, num_sf = scale_input.shape
-        out_scale_cols = (
-            round_up(num_sf, 4) if sf_layout != SfLayout.layout_linear.value else num_sf
-        )
-        out_scale_rows = (
-            round_up(
-                m,
-                128 if sf_layout == SfLayout.layout_128x4.value else 8,
-            )
-            if sf_layout != SfLayout.layout_linear.value
-            else m
-        )
-        output_scale = scale_input.new_zeros(
-            (out_scale_rows, out_scale_cols), dtype=torch.uint8
-        )
-        output_per_token_scale = scale_input.new_empty((m,), dtype=torch.float32)
-        module.scale_only_quant_and_per_token_scale(
-            scale_input,
-            scale_inv,
-            output_scale,
-            output_per_token_scale,
-            expanded_idx_to_permuted_idx,
-            sf_layout,
-        )
-        return output_scale, output_per_token_scale
-
-    @register_fake_op("flashinfer::nvfp4_scale_only_quant_and_per_token_scale_sm100")
-    def _fake_nvfp4_scale_only_quant_and_per_token_scale_sm100(
-        scale_input: torch.Tensor,
-        scale_inv: float,
-        expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
-        sf_layout: int = SfLayout.layout_linear.value,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        m, num_sf = scale_input.shape
-        out_scale_cols = (
-            round_up(num_sf, 4) if sf_layout != SfLayout.layout_linear.value else num_sf
-        )
-        out_scale_rows = (
-            round_up(
-                m,
-                128 if sf_layout == SfLayout.layout_128x4.value else 8,
-            )
-            if sf_layout != SfLayout.layout_linear.value
-            else m
-        )
-        return (
-            scale_input.new_empty((out_scale_rows, out_scale_cols), dtype=torch.uint8),
-            scale_input.new_empty((m,), dtype=torch.float32),
-        )
-
-    @register_custom_op(
         "flashinfer::silu_and_mul_scaled_nvfp4_experts_quantize_sm100",
         mutates_args=("",),
     )
@@ -854,7 +793,6 @@ def get_fp4_quantization_module(backend: str = "100"):
         mxfp4_dequantize_host=mxfp4_dequantize_host,
         fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
         nvfp4_quant_and_per_token_scale_sm100=nvfp4_quant_and_per_token_scale_sm100,
-        nvfp4_scale_only_quant_and_per_token_scale_sm100=nvfp4_scale_only_quant_and_per_token_scale_sm100,
         silu_and_mul_scaled_nvfp4_experts_quantize_sm100=silu_and_mul_scaled_nvfp4_experts_quantize_sm100,
         scaled_fp4_grouped_quant_sm100=scaled_fp4_grouped_quant_sm100,
     )
@@ -1499,64 +1437,6 @@ def nvfp4_quantize(
     if per_token_activation:
         return a_fp4, a_sf, per_token_scale
     return a_fp4, a_sf
-
-
-def nvfp4_scale_only_quantize(
-    block_amax: torch.Tensor,
-    global_scale_inv,
-    sfLayout: SfLayout = SfLayout.layout_128x4,
-    expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Produce NVFP4 per-token block scales from precomputed per-block amaxes.
-
-    This is the "scale only" companion to :func:`nvfp4_quantize` with
-    ``per_token_activation=True``: the raw activations are not needed because the
-    per-block amaxes are provided directly.  The kernel finds the row-wise amax
-    over the block amaxes, emits the per-token FP32 scale, and quantizes each
-    block scale to E4M3.  No quantized weights are produced.
-
-    Parameters
-    ----------
-    block_amax : torch.Tensor
-        Per-block amaxes of shape ``[M, K // 16]`` with dtype ``float32`` (one
-        value per NVFP4 scale-factor block of 16 elements, linear layout).
-    global_scale_inv : float or torch.Tensor
-        Inverse base scale multiplier (typically ``1 / (448 * 6)``), matching the
-        ``a_global_sf`` argument of :func:`nvfp4_quantize` in per-token mode.
-    sfLayout : SfLayout
-        Scale-factor output layout.  Defaults to ``SfLayout.layout_128x4``.
-    expanded_idx_to_permuted_idx : torch.Tensor, optional
-        Optional row-remapping buffer (int32) for MoE per-token quantization.
-
-    Returns
-    -------
-    Tuple[torch.Tensor, torch.Tensor]
-        ``(sf, per_token_scale)`` where ``sf`` holds the E4M3 block scales laid
-        out per ``sfLayout`` (dtype ``uint8``) and ``per_token_scale`` is the
-        per-token FP32 scale of shape ``[M]``.
-    """
-    scale_inv = (
-        float(global_scale_inv.item())
-        if isinstance(global_scale_inv, torch.Tensor)
-        else float(global_scale_inv)
-    )
-    block_amax_cuda = block_amax.cuda().to(torch.float32).contiguous()
-    expanded_idx_to_permuted_idx_cuda = (
-        expanded_idx_to_permuted_idx.cuda()
-        if expanded_idx_to_permuted_idx is not None
-        else None
-    )
-    major, minor = get_compute_capability(block_amax_cuda.device)
-    device_arch = f"{major * 10 + minor}"
-    sf, per_token_scale = get_fp4_quantization_module(
-        device_arch
-    ).nvfp4_scale_only_quant_and_per_token_scale_sm100(
-        block_amax_cuda,
-        scale_inv,
-        expanded_idx_to_permuted_idx_cuda,
-        sfLayout.value,
-    )
-    return sf, per_token_scale
 
 
 @flashinfer_api(trace=mxfp4_quantize_trace)
