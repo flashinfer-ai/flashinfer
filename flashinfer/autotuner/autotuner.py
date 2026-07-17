@@ -25,7 +25,11 @@ from typing import (
 import torch
 
 from flashinfer.tllm_utils import delay_kernel
-from flashinfer.utils import next_positive_power_of_2
+from flashinfer.utils import (
+    next_positive_power_of_2,
+    is_confidential_compute,
+    get_globaltimer_kernel,
+)
 
 from flashinfer.jit.core import logger
 from flashinfer.version import __version__ as _flashinfer_version
@@ -488,7 +492,7 @@ class TunableRunner(ABC):
     @abstractmethod
     def get_valid_tactics(
         self, inputs: list[torch.Tensor], profile: OptimizationProfile
-    ) -> list[int]:
+    ) -> list[Any]:
         """One tactic corresponding to one cuda kernel normally, but how to interpret the meaning
         of tactic is pure internal details of the runner.
 
@@ -528,7 +532,7 @@ class TunableRunner(ABC):
     def forward(
         self,
         inputs: list[torch.Tensor],
-        tactic: int = -1,
+        tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs,  # all others are keyword args only
     ) -> Any:
@@ -1073,6 +1077,35 @@ class AutoTuner:
             TuningConfig, dict[tuple[tuple[int, ...] | None, bool], TuningConfig]
         ] = weakref.WeakKeyDictionary()
 
+        # Timing backend: globaltimer kernel vs cuda events.
+        # FLASHINFER_AUTOTUNE_TIMER env var overrides auto-detection:
+        #   "globaltimer" -> force globaltimer
+        #   "cuda_event"  -> force cuda events
+        #   unset/default -> auto-detect via is_confidential_compute()
+        timer_env = os.getenv("FLASHINFER_AUTOTUNE_TIMER", "").lower()
+        if timer_env == "globaltimer":
+            self._use_global_timer = True
+        elif timer_env == "cuda_event":
+            self._use_global_timer = False
+        else:
+            self._use_global_timer = is_confidential_compute()
+
+        if self._use_global_timer:
+            self._record_global_timer = get_globaltimer_kernel()
+            if self._record_global_timer is None:
+                # Fallback to cudaEvent if the globaltimer kernel build failed.
+                self._use_global_timer = False
+                if timer_env != "cuda_event":
+                    logger.warning(
+                        "[Autotuner] globaltimer kernel unavailable; falling back "
+                        "to cudaEvent timing. Under Confidential Computing this "
+                        "timing may be unreliable and can degrade tactic selection."
+                    )
+        else:
+            self._record_global_timer = None
+
+        logger.debug(f"[Autotuner] use_global_timer: {self._use_global_timer}")
+
     def _get_override_stack(self) -> OverrideStack:
         """Return the per-thread override stack, creating it on first access."""
         local = self._override_local
@@ -1314,7 +1347,7 @@ class AutoTuner:
         tuning_config: TuningConfig,
         inputs: list[torch.Tensor],
         **kwargs,
-    ) -> tuple[TunableRunner, int]:
+    ) -> tuple[TunableRunner, Any]:
         """Choose the best runner and tactic combination through performance profiling.
 
         Args:
@@ -1325,9 +1358,9 @@ class AutoTuner:
             **kwargs: Arbitrary keyword arguments, will be passed to get_valid_tactics and forward method of each runner
 
         Returns:
-            Tuple[TunableRunner, int]: A tuple containing:
+            Tuple[TunableRunner, Any]: A tuple containing:
                 - The selected runner implementation
-                - The best tactic ID for that runner (-1 if using fallback)
+                - The best tactic for that runner (-1 if using fallback)
 
         Note:
             The method profiles different implementations and tactics to find the
@@ -1683,9 +1716,34 @@ class AutoTuner:
         avg_time = float("inf")
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int) -> float:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
             graph = torch.cuda.CUDAGraph()
+
+            if self._use_global_timer:
+                start_ts = torch.empty(1, dtype=torch.int64, device="cuda")
+                end_ts = torch.empty(1, dtype=torch.int64, device="cuda")
+
+                def record_start():
+                    self._record_global_timer(start_ts)
+
+                def record_end():
+                    self._record_global_timer(end_ts)
+
+                def elapsed_time():
+                    # GPU %globaltimer counts in ns; convert to ms to match the
+                    # units of Torch.cuda.Event.elapsed_time()
+                    return (end_ts.item() - start_ts.item()) / 1e6
+            else:
+                start_evt = torch.cuda.Event(enable_timing=True)
+                end_evt = torch.cuda.Event(enable_timing=True)
+
+                def record_start():
+                    start_evt.record()
+
+                def record_end():
+                    end_evt.record()
+
+                def elapsed_time():
+                    return start_evt.elapsed_time(end_evt)
 
             def _run_kernels():
                 for r in range(repeat):
@@ -1710,17 +1768,17 @@ class AutoTuner:
                 )
                 delay_kernel(delay_kernel_time_usec)
 
-                start.record()
+                record_start()
 
                 if tuning_config.use_cuda_graph:
                     graph.replay()
                 else:
                     _run_kernels()
 
-                end.record()
+                record_end()
                 stream.synchronize()
 
-                return start.elapsed_time(end) / repeat
+                return elapsed_time() / repeat
 
         # Run the timing under ``_profile_measurement_scope`` (so runners
         # can consult ``is_in_profile_measurement()``), then — if a
@@ -2168,13 +2226,31 @@ class AutoTuner:
                 )
                 return False
 
+        skipped_legacy_cudnn_tactics = 0
         with self._lock:
             for key, value in configs.items():
                 runner_name = value[0]
                 tactic = _json_to_tactic(value[1])
+                if (
+                    runner_name.startswith("Cudnn")
+                    and isinstance(tactic, int)
+                    and tactic >= 0
+                ):
+                    skipped_legacy_cudnn_tactics += 1
+                    continue
                 self._file_configs[key] = (runner_name, tactic)
 
-        logger.info(f"[Autotuner]: Loaded {len(configs)} configs from {path}")
+        if skipped_legacy_cudnn_tactics:
+            logger.warning(
+                f"[Autotuner]: Skipped {skipped_legacy_cudnn_tactics} legacy "
+                "cuDNN config(s) using integer plan-index tactics. They will "
+                "be re-tuned when autotuning is enabled."
+            )
+
+        logger.info(
+            f"[Autotuner]: Loaded {len(configs) - skipped_legacy_cudnn_tactics} "
+            f"configs from {path}"
+        )
         return True
 
     def _prepare_input_tensors_with_batches(

@@ -7,15 +7,10 @@ import torch
 from .....core.validation.common import MoEEpConfigError
 
 
-def _require_cutedsl_paths() -> None:
-    from ..cutedsl_backend_kernels import bootstrap_paths
-
-    bootstrap_paths()
-
-
 def _mxfp8_data_dtype(kind: str) -> torch.dtype:
-    _require_cutedsl_paths()
-    from common.host_utils import kind_data_dtype
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
+    # package import also bootstraps sys.path for the kernel packages.
+    from .....kernel_src.cutedsl_megamoe import kind_data_dtype
 
     return kind_data_dtype(kind)
 
@@ -32,10 +27,13 @@ def stage_mega_moe_inputs(
     kind: str = "mxfp8_e4m3",
 ) -> None:
     """bf16 ``hidden_states`` → MXFP8 activation + E8M0 block scales."""
-    _require_cutedsl_paths()
-    from common.host_utils import mxfp8_quantize_per_block_32
-    from common.megamoe_constants import Mxfp8BlockSize
-    from moe_nvfp4_swapab.runner_common import ceil_div, round_up
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import (
+        Mxfp8BlockSize,
+        ceil_div,
+        mxfp8_quantize_per_block_32,
+        round_up,
+    )
 
     num_tokens, hidden = hidden_states.shape
     if num_tokens == 0:
@@ -93,9 +91,12 @@ def validate_mxfp8_forward_inputs(
         )
         return
 
-    _require_cutedsl_paths()
-    from common.megamoe_constants import Mxfp8BlockSize
-    from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype, ceil_div
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import (
+        Mxfp8BlockSize,
+        Mxfp8ScaleDtype,
+        ceil_div,
+    )
 
     num_tokens = hidden_states.shape[0]
     hidden = fleet_params.token_hidden_size

@@ -12,19 +12,58 @@ if TYPE_CHECKING:
     from ......fused_moe.api import MoEConfig, MoEWeightPack as FusedMoEWeightPack
 
 
-def _block_major_k(w: torch.Tensor) -> torch.Tensor:
-    """BlockMajorK shuffle for the trtllm bf16 routed runner (per-expert)."""
-    from flashinfer import shuffle_matrix_a
-    from flashinfer.fused_moe.core import convert_to_block_layout
+# Shape-keyed permute-index cache shared across experts/layers (mirrors
+# flashinfer.fused_moe.prepare._TRTLLM_PERMUTE_CACHE for the fp4 path).
+_TRTLLM_BF16_PERMUTE_CACHE: dict = {}
 
-    epilogue_tile_m = 64
+
+def _block_major_k_weights(
+    w13: torch.Tensor, w2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shuffled BlockMajorK weights for the trtllm bf16 routed runner.
+
+    Mirrors the upstream trtllm-gen bf16 prep (tests/moe
+    ``trtllm_gen_fused_moe_utils``): gemm1 takes the gated-act w3/w1 row
+    reorder + MMA shuffle (``is_gated_act_gemm=True``), gemm2 the plain w2
+    shuffle, both with the kernel-internal ``epilogue_tile_m=128``, then
+    BlockMajorK conversion.  The previous plain ``shuffle_matrix_a`` with
+    tile 64 skipped the gated-act reorder and fed the kernel misordered
+    gate/up rows — undetected by EP-vs-kernel tests because both sides
+    shared this prep; caught by the torch-oracle tests.
+    """
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        convert_to_block_layout,
+        get_w2_permute_indices_with_cache,
+    )
+
+    epilogue_tile_m = 128
     block_k = 128
-    shuffled = []
-    for i in range(w.shape[0]):
-        s = shuffle_matrix_a(w[i].view(torch.uint8), epilogue_tile_m)
-        s = convert_to_block_layout(s, block_k)
-        shuffled.append(s)
-    return torch.stack(shuffled).view(torch.bfloat16)
+    device = w13.device
+
+    g1, g2 = [], []
+    for i in range(w13.shape[0]):
+        p = _maybe_get_cached_w3_w1_permute_indices(
+            _TRTLLM_BF16_PERMUTE_CACHE,
+            w13[i].view(torch.uint8),
+            epilogue_tile_m,
+            is_gated_act_gemm=True,
+        )
+        s = w13[i].view(torch.uint8)[p.to(device)].contiguous()
+        g1.append(convert_to_block_layout(s, block_k))
+
+        p = get_w2_permute_indices_with_cache(
+            _TRTLLM_BF16_PERMUTE_CACHE,
+            w2[i].view(torch.uint8),
+            epilogue_tile_m,
+        )
+        s = w2[i].view(torch.uint8)[p.to(device)].contiguous()
+        g2.append(convert_to_block_layout(s, block_k))
+
+    return (
+        torch.stack(g1).view(torch.bfloat16),
+        torch.stack(g2).view(torch.bfloat16),
+    )
 
 
 def materialize_fused_moe_weights(
@@ -51,11 +90,12 @@ def materialize_fused_moe_weights(
 
     for backend_cfg in moe_config.backend:
         if variant == QuantVariant.BF16 and isinstance(backend_cfg, TrtllmBf16Config):
+            g1, g2 = _block_major_k_weights(weights.w13, weights.w2)
             pack.prepare_for(
                 "trtllm_bf16_routed",
                 {
-                    "gemm1_weights": _block_major_k(weights.w13),
-                    "gemm2_weights": _block_major_k(weights.w2),
+                    "gemm1_weights": g1,
+                    "gemm2_weights": g2,
                 },
             )
             return pack

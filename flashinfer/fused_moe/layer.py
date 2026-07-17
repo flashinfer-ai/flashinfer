@@ -71,6 +71,13 @@ _RUNNER_QUANTS: Dict[type, Tuple[QuantVariant, ...]] = {
 class MoELayer:
     """Stateful MoE layer with cross-backend autotune.
 
+    Not thread-safe: the layer and its runners follow the autotuner's
+    sequential ``pack_inputs -> forward`` contract and stash per-call launch
+    state on the runner (``_static_kwargs``) between the two steps, so
+    concurrent calls on one instance can interleave that state. Use one
+    ``MoELayer`` per thread/stream; a stateless calling convention is a
+    tracked follow-up.
+
     Example
     -------
     >>> layer = MoELayer(config)
@@ -109,10 +116,13 @@ class MoELayer:
                 f"arch sm{arch}. The MVP supports only NVFP4 via [{mvp}]."
             )
 
-        # Cross-backend winner cache, keyed by the num_tokens tuning bucket.
-        # See the MoELayer reuse contract (CR4): the fastest backend can differ
-        # across token-count buckets, so each bucket caches its own winner.
-        self._winners: Dict[int, Tuple[_RunnerT, Any]] = {}
+        # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
+        # routing input mode).  See the MoELayer reuse contract (CR4): the
+        # fastest backend can differ across token-count buckets, so each bucket
+        # caches its own winner; the mode qualifier keeps a winner tuned for
+        # one routing input style (e.g. pre-routed → CuteDSL) from being
+        # dispatched a pack it cannot execute (FromLogits).
+        self._winners: Dict[Tuple[int, Any], Tuple[_RunnerT, Any]] = {}
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
@@ -156,11 +166,25 @@ class MoELayer:
                 f"Reconstruct MoELayer with a larger ceiling."
             )
 
+        # Only runners that can execute this pack's routing input mode compete.
+        # Not every backend has an in-kernel router (CuteDSL is pre-routed-only),
+        # so a FromLogits pack must never reach an incapable runner — neither
+        # here nor via a winner cached under the other mode, hence the
+        # mode-qualified cache key below.
+        mode = act_pack.routing_input_mode
+        runners = [r for r in self.runners if mode in r.supported_routing_modes]
+        if not runners:
+            raise NotImplementedError(
+                f"MoELayer: none of the usable backends "
+                f"{[r.backend_key for r in self.runners]} support "
+                f"routing_input_mode={mode!r}."
+            )
+
         bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
-        winner = self._winners.get(bucket)
+        winner = self._winners.get((bucket, mode))
         if winner is None:
-            winner = self._select_winner(act_pack, weight_pack)
-            self._winners[bucket] = winner
+            winner = self._select_winner(act_pack, weight_pack, runners)
+            self._winners[(bucket, mode)] = winner
         runner, tactic = winner
         self._last_winner_backend = runner.backend_key
 
@@ -171,6 +195,7 @@ class MoELayer:
         self,
         act_pack: MoEActivationPack,
         weight_pack: MoEWeightPack,
+        runners: List[_RunnerT],
     ) -> Tuple[_RunnerT, Any]:
         """Run per-runner autotune, then measure each winner-tactic and
         pick cross-backend winner."""
@@ -184,7 +209,7 @@ class MoELayer:
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
 
-        for runner in self.runners:
+        for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
             # Per-runner tactic selection via autotuner
             _, tactic = self.tuner.choose_one(
@@ -211,7 +236,7 @@ class MoELayer:
                 best_runner = runner
                 best_tactic = tactic
 
-        assert best_runner is not None  # self.runners is non-empty
+        assert best_runner is not None  # runners is non-empty (checked by caller)
         return best_runner, best_tactic
 
     # ---- Introspection helpers ---------------------------------------------

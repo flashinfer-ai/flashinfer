@@ -111,7 +111,7 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
     if _mega_no_dist() or _nvshmem_initialized():
         return False
 
-    from ...backends.mega.kernel.cutedsl_backend_kernels import bootstrap_paths
+    from ...kernel_src.cutedsl_megamoe import bootstrap_paths
 
     bootstrap_paths()
     import numpy as np

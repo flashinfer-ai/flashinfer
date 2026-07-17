@@ -16,6 +16,18 @@ Types and Enums
     RoutingMethodType
     WeightLayout
 
+Shared activation helpers live in :mod:`flashinfer.tllm_enums` and are used by
+both the TRT-LLM and CuteDSL MoE paths.
+
+.. currentmodule:: flashinfer.tllm_enums
+
+.. autosummary::
+    :toctree: ../generated
+
+    is_gated_activation
+
+.. currentmodule:: flashinfer.fused_moe
+
 Utility Functions
 -----------------
 
@@ -45,6 +57,8 @@ top of a Mixture-of-Experts layer (shrink + expand).
     bgmv_moe
     bgmv_moe_shrink
     bgmv_moe_expand
+    bgmv_moe_gemm1_lora_delta
+    bgmv_moe_gemm2_lora_delta
 
 CUTLASS Fused MoE
 -----------------

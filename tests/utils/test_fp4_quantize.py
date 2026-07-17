@@ -1271,12 +1271,17 @@ def test_nvfp4_quantize_tma_backend_parity(
     shape: tuple[int, int],
     sf_layout: SfLayout,
     device: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test that TMA-based CuTe-DSL kernel matches the CUDA backend for large problems."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
+
+    # TMA is disabled by default (flashinfer#3905); force it on so this test
+    # still exercises the CuTe-DSL TMA kernel.
+    monkeypatch.setenv("FLASHINFER_NVFP4_QUANTIZE_USE_TMA", "1")
 
     torch.set_default_device(device)
     torch.manual_seed(42)
