@@ -89,10 +89,79 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "on --max-tokens, so write decode-tuned winners to a separate cache "
         "file (FLASHINFER_MOE_EP_KNOB_CACHE).",
     )
+    parser.add_argument(
+        "--skew",
+        type=float,
+        default=None,
+        help="target per-launch expert-load skew (max-load/mean-load) for the "
+        "tuning routing, e.g. 18 for the DSV4-measured mean. Default keeps "
+        "the near-uniform random routing — which CANNOT discriminate "
+        "skew-sensitive knobs (load_balance_mode, scheduling); pass the "
+        "measured production ratio (FI_MOE_EP_LOAD_STATS cold run).",
+    )
+    parser.add_argument(
+        "--sweep",
+        choices=("default", "schedule"),
+        default="default",
+        help="'default' sweeps tile/flag_batch/token-back(/ikr); 'schedule' "
+        "pins those from --base-knobs (or the current cache winner) and "
+        "sweeps load_balance_mode x group_hint — the skew-sensitive axes.",
+    )
+    parser.add_argument(
+        "--base-knobs",
+        type=str,
+        default=None,
+        help="JSON knob dict used as the base for --sweep schedule "
+        "(default: resolve the current cache/heuristic winner for this key)",
+    )
     parser.add_argument("--warmup-iters", type=int, default=3)
     parser.add_argument("--timed-iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args(argv)
+
+
+def _restage_skewed_routing(
+    symm_buffer,
+    num_tokens: int,
+    topk: int,
+    num_experts: int,
+    target_ratio: float,
+    seed: int,
+) -> None:
+    """Overwrite the staged routing with a skewed expert distribution.
+
+    Expert popularity follows a power law tuned (bisection on the exponent)
+    so the realized per-launch max/mean load ratio approximates
+    ``target_ratio`` — matching cold-run production stats instead of the
+    near-uniform default that hides skew-sensitive knob behavior.
+    """
+    import torch
+
+    g = torch.Generator(device="cuda").manual_seed(seed)
+
+    def realized(alpha: float) -> tuple:
+        w = torch.arange(1, num_experts + 1, device="cuda", dtype=torch.float32)
+        w = w.pow(-alpha)
+        w = w[torch.randperm(num_experts, generator=g, device="cuda")]
+        ids = torch.multinomial(
+            w.expand(num_tokens, -1), topk, replacement=False, generator=g
+        )
+        counts = torch.bincount(ids.flatten(), minlength=num_experts).float()
+        return float(counts.max() / counts.mean().clamp(min=1e-9)), ids
+
+    lo, hi = 0.0, 3.0
+    ids = None
+    for _ in range(12):
+        mid = (lo + hi) / 2
+        ratio, ids = realized(mid)
+        if ratio < target_ratio:
+            lo = mid
+        else:
+            hi = mid
+    assert ids is not None
+    symm_buffer.topk_idx[:num_tokens].copy_(ids.to(torch.int64))
+    symm_buffer.topk_idx[num_tokens:].fill_(-1)
+    symm_buffer.topk_weights[:num_tokens].fill_(1.0 / topk)
 
 
 def _tune_one(
@@ -157,6 +226,44 @@ def _tune_one(
                 in_kernel_fc2_reduce=args.allow_nondeterministic,
             )
             tune = autotune_mxfp8_mega_moe
+
+        if args.sweep == "schedule":
+            import json as _json
+
+            from .kernel_src.cutedsl_megamoe import resolve_knobs
+
+            if args.base_knobs:
+                base = _json.loads(args.base_knobs)
+                base = {
+                    k: tuple(v) if isinstance(v, list) else v for k, v in base.items()
+                }
+            else:
+                base, src = resolve_knobs(
+                    dtype=args.dtype,
+                    world_size=world_size,
+                    hidden=args.hidden,
+                    intermediate=(2 if is_nvfp4 else 1) * args.intermediate,
+                    num_experts=args.num_experts,
+                    topk=args.topk,
+                    max_tokens=max_tokens,
+                )
+                if rank == 0:
+                    print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
+            candidates = [
+                {**base, "load_balance_mode": lb, "group_hint": gh}
+                for lb in ("atomic_counter", "static")
+                for gh in (None, 128, 256, 512)
+            ]
+
+        if args.skew is not None:
+            _restage_skewed_routing(
+                symm_buffer,
+                live_tokens,
+                args.topk,
+                args.num_experts,
+                args.skew,
+                args.seed + rank,
+            )
 
         if args.max_candidates is not None:
             candidates = candidates[: args.max_candidates]
