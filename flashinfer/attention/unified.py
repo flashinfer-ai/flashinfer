@@ -25,27 +25,48 @@ Design rules enforced here (each traces to a documented failure mode):
     (``tests/attention/test_unified_prefill_fuzzer.py``) enforces exactly this
     property with randomized valid and corrupted inputs.
 4.  Two-level selection.  ``resolve_paged_prefill()`` is a static, tensor-free
-    query usable at engine init (before pool allocation / graph capture); the
-    plan-time choice may only pick within the resolved candidate set.
-5.  One output contract.  LSE is always base-2, shape ``(total_q_tokens,
-    num_qo_heads)``, fp32 — adapters normalize native formats (cuDNN returns
-    natural-log padded ``(b, max_q, h)`` stats; the fold lives in its adapter,
-    not in callers).
+    query usable at engine init (before pool allocation / graph capture);
+    passing the returned ``Resolution`` to ``plan(backend=...)`` pins the
+    candidate set — plan() verifies the config matches and may only choose
+    within it.
+5.  One output contract.  LSE is always base-2 (multiply by ``ln(2)`` to get
+    natural log), shape ``(total_q_tokens, num_qo_heads)``, fp32 — adapters
+    normalize native formats (cuDNN returns natural-log padded ``(b, max_q,
+    h)`` stats; the fold lives in its adapter, not in callers).
+
+Capability honesty rule: ``CAPABILITIES`` declares ONLY what the conformance
+matrix and fuzzer actually exercise on hardware.  Production entries are
+wider (fa2 head_dim 64/256, trtllm large pages with GQA, NHD layouts, ...);
+here an admitted config is a machine-checked config, so under-claiming is the
+only honest default.
 
 Prototype simplifications (documented, not hidden):
-- ``kv_layout="HND"`` only (pages, H, page_size, D).  NHD is a capability
-  axis in the proposal; wiring it is mechanical.
+- ``kv_layout="HND"`` only (pages, H, page_size, D).  plan(kv_layout=...)
+  exists and rejects anything else loudly; NHD wiring is mechanical.
 - dtypes: fp16/bf16 only.  fp8/nvfp4 are capability axes, out of scope here.
+- ``window_left`` / sliding window is not plumbed (all three backends can do
+  it; it is a capability axis in the proposal).
+- page_size >= 8 required: page_size=1 token-CSR serving (sglang default) is
+  CSR-canonical per proposal §3.1 and needs the CSR input form, which this
+  prototype does not carry.
 - Heuristic order is a static per-arch placeholder, to be seeded from the
   benchmark suite (proposal §5.2).  Autotune hook (§5.4) is not wired.
 - Each adapter allocates its own workspace lazily (production: share).
+- Trusted inputs (documented, not validated): host mirrors must match the
+  device tensors; ``block_tables`` VALUES (page ids) must be in-pool —
+  checking them costs a device-side pass the hot path cannot pay; a debug
+  mode (FLASHINFER_VALIDATE_INPUTS-style) is the production answer.
+- Stricter than proposal §3.1 in one spot: plan() validates values for every
+  backend, so without mirrors even trtllm/cuDNN plans pay the one documented
+  D2H (the proposal lets maxes-only suffice there).  Reject-or-correct is
+  unconditional in exchange.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -70,8 +91,8 @@ class BackendCapability:
 
     This is the queryable capability matrix from proposal §5.1 — the thing
     that replaces consumer-side support tables (vLLM's scattered gates,
-    sglang's whitelists).  ``availability_probe`` returns None when the
-    backend is usable in this process, else a human-readable reason.
+    sglang's whitelists).  Entries follow the capability-honesty rule from
+    the module docstring: declared == machine-checked by the test suites.
     """
 
     name: str
@@ -79,7 +100,7 @@ class BackendCapability:
     cc_majors: frozenset
     q_dtypes: frozenset
     head_dims: frozenset  # of (head_dim_qk, head_dim_vo) pairs
-    page_sizes: Optional[frozenset]  # None = any
+    page_sizes: Optional[frozenset]  # None = any >= the global floor
     kv_layouts: frozenset
     supports_lse: bool
     supports_noncausal: bool
@@ -145,16 +166,19 @@ def _probe_trtllm() -> Optional[str]:
 
 
 _F16 = frozenset({torch.float16, torch.bfloat16})
-_D128 = frozenset({(128, 128)})
 
+# Per the capability-honesty rule: these sets mirror exactly what
+# tests/attention/test_unified_prefill_{prototype,fuzzer}.py exercise.
+# Production sets are wider (fa2 64/256 head dims, trtllm pages up to 1024
+# with GQA per tests/attention/test_trtllm_gen_attention_prefill.py, NHD...).
 CAPABILITIES: Dict[str, BackendCapability] = {
     "fa2": BackendCapability(
         name="fa2",
-        cc_majors=frozenset({8, 9, 10, 12}),
+        cc_majors=frozenset({8, 9, 10, 11, 12}),
         q_dtypes=_F16,
-        head_dims=frozenset({(64, 64), (128, 128), (256, 256)}),
+        head_dims=frozenset({(128, 128)}),
         page_sizes=None,
-        kv_layouts=frozenset({"HND", "NHD"}),
+        kv_layouts=frozenset({"HND"}),
         supports_lse=True,
         supports_noncausal=True,
         requires_contiguous_q=False,
@@ -163,22 +187,22 @@ CAPABILITIES: Dict[str, BackendCapability] = {
         name="fa3",
         cc_majors=frozenset({9}),
         q_dtypes=_F16,
-        head_dims=frozenset({(64, 64), (128, 128), (256, 256), (192, 128)}),
+        head_dims=frozenset({(128, 128)}),
         page_sizes=None,
-        kv_layouts=frozenset({"HND", "NHD"}),
+        kv_layouts=frozenset({"HND"}),
         supports_lse=True,
         supports_noncausal=True,
         requires_contiguous_q=False,
     ),
     "cudnn": BackendCapability(
         name="cudnn",
-        cc_majors=frozenset({8, 9, 10, 12}),
+        cc_majors=frozenset({8, 9, 10, 11, 12}),
         q_dtypes=_F16,
         head_dims=frozenset({(128, 128), (192, 128)}),
         page_sizes=None,
         kv_layouts=frozenset({"HND"}),
         supports_lse=True,
-        supports_noncausal=False,  # cuDNN SDPA graph path here is causal-only
+        supports_noncausal=True,  # bottom_right mask off + padding mask: verified H100
         requires_contiguous_q=True,  # token-unit offsets assume packed THD
         lse_native="ln_padded_bsh",
     ),
@@ -186,10 +210,13 @@ CAPABILITIES: Dict[str, BackendCapability] = {
         name="trtllm-gen",
         cc_majors=frozenset({10}),
         q_dtypes=_F16,
-        head_dims=_D128,
+        head_dims=frozenset({(128, 128)}),
+        # 128+ pages are supported by the kernel with GQA (repo tests cover
+        # up to 1024) — kept out until this suite exercises them.
         page_sizes=frozenset({16, 32, 64}),
         kv_layouts=frozenset({"HND"}),
         supports_lse=True,
+        # vLLM routes non-causal away from trtllm; unverified here, so False.
         supports_noncausal=False,
         requires_contiguous_q=True,  # TMA: last dim stride 1; keep strict here
     ),
@@ -208,8 +235,13 @@ _HEURISTIC_ORDER = {
     10: ("trtllm-gen", "cudnn", "fa2"),
     9: ("fa3", "fa2", "cudnn"),
     8: ("fa2", "cudnn"),
+    11: ("fa2", "cudnn"),
     12: ("fa2", "cudnn"),
 }
+
+# page_size=1 token-CSR serving is CSR-canonical (proposal §3.1); the dense
+# block_tables form this prototype carries would blow up to (b, max_context).
+_MIN_PAGE_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -219,12 +251,17 @@ class Resolution:
     ``backends`` is the pinned, ordered candidate set: every member is
     runnable for the declared configuration and observationally identical at
     the contract level (same dtypes, same LSE availability), so a later
-    plan-time choice within this set cannot surprise the engine.
+    plan-time choice within this set cannot surprise the engine.  Pass the
+    whole Resolution to ``plan(backend=...)`` to enforce the pinning:
+    plan() verifies its arguments match ``config`` and chooses only within
+    ``backends``.
     """
 
     backends: Tuple[str, ...]
     excluded: Dict[str, str] = field(default_factory=dict)
     kv_layout: str = "HND"
+    # the resolve-time observational config, used by plan() to detect drift
+    config: Tuple = ()
 
     @property
     def chosen(self) -> str:
@@ -235,6 +272,30 @@ class Resolution:
         for name, reason in self.excluded.items():
             lines.append(f"excluded {name}: {reason}")
         return "\n".join(lines)
+
+
+def _resolve_config_key(
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    q_dtype,
+    page_size,
+    kv_layout,
+    causal,
+    need_lse,
+) -> Tuple:
+    return (
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo,
+        str(q_dtype),
+        page_size,
+        kv_layout,
+        causal,
+        need_lse,
+    )
 
 
 def resolve_paged_prefill(
@@ -268,6 +329,14 @@ def resolve_paged_prefill(
         raise ValueError(
             f"num_qo_heads ({num_qo_heads}) must be divisible by "
             f"num_kv_heads ({num_kv_heads}) for GQA/MQA"
+        )
+    if page_size < _MIN_PAGE_SIZE:
+        raise ValueError(
+            f"page_size {page_size} < {_MIN_PAGE_SIZE}: token-granular paging "
+            "(page_size=1) is CSR-canonical and needs the CSR input form, "
+            "which this prototype does not carry — use "
+            "BatchPrefillWithPagedKVCacheWrapper directly, or page_size >= "
+            f"{_MIN_PAGE_SIZE}"
         )
 
     order = _HEURISTIC_ORDER.get(cc_major, ())
@@ -306,7 +375,20 @@ def resolve_paged_prefill(
         detail = "; ".join(f"{k}: {v}" for k, v in excluded.items())
         raise ValueError(f"no runnable backend for this configuration ({detail})")
     return Resolution(
-        backends=tuple(candidates), excluded=excluded, kv_layout=kv_layout
+        backends=tuple(candidates),
+        excluded=excluded,
+        kv_layout=kv_layout,
+        config=_resolve_config_key(
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            head_dim_vo,
+            q_dtype,
+            page_size,
+            kv_layout,
+            causal,
+            need_lse,
+        ),
     )
 
 
@@ -328,32 +410,21 @@ class UnifiedPagedPrefill:
         res = resolve_paged_prefill(cc_major=9, num_qo_heads=8, num_kv_heads=2,
                                     head_dim_qk=128, q_dtype=torch.bfloat16,
                                     page_size=16, need_lse=True)
+        # ... engine allocates its KV pool in res.kv_layout, sets dtypes ...
         attn = UnifiedPagedPrefill(device)
         attn.plan(qo_indptr=..., kv_seq_lens=..., block_tables=...,
                   page_size=16, max_q_len=..., max_kv_len=...,
                   num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
                   q_dtype=torch.bfloat16, causal=True, return_lse=True,
-                  backend=res.chosen)
+                  backend=res)          # pinned candidate set (or a string)
         out, lse = attn.run(q, (k_cache, v_cache))
-
-    Canonical metadata (all CUDA int32, proposal §3.1):
-
-    - ``qo_indptr``:   ``(b+1,)`` token-unit prefix sums of query lengths
-    - ``kv_seq_lens``: ``(b,)``  per-request valid KV lengths (masking truth)
-    - ``block_tables``: ``(b, max_pages_per_seq)`` dense page table
-    - ``page_size, max_q_len, max_kv_len``: host ints (REQUIRED — no hidden
-      device→host sync for maxes, ever)
-    - optional ``qo_indptr_cpu / kv_seq_lens_cpu`` host mirrors: with them,
-      plan() is fully zero-sync (validation + fa2/fa3 scheduling read the
-      mirrors — engines already own these on CPU); without them plan()
-      performs ONE documented D2H here.  There is no hidden sync and no
-      unvalidated path: value-level validation always runs.
     """
 
     def __init__(self, device: Optional[torch.device] = None):
-        self.device = (
-            torch.device(device) if device is not None else torch.device("cuda")
-        )
+        dev = torch.device(device) if device is not None else torch.device("cuda")
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        self.device = dev
         self._adapters: Dict[str, Any] = {}
         self._planned = False
 
@@ -374,15 +445,41 @@ class UnifiedPagedPrefill:
         head_dim_vo: Optional[int] = None,
         q_dtype: torch.dtype,
         kv_dtype: Optional[torch.dtype] = None,
+        kv_layout: str = "HND",
         causal: bool = True,
         sm_scale: Optional[float] = None,
         return_lse: bool = False,
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_seq_lens_cpu: Optional[torch.Tensor] = None,
-        backend: str = "auto",
+        backend: Union[str, Resolution] = "auto",
     ) -> "UnifiedPagedPrefill":
+        """Plan one batch with the canonical paged-prefill metadata.
+
+        Canonical metadata (all CUDA int32 on this wrapper's device):
+
+        - ``qo_indptr``: ``(b+1,)`` token-unit prefix sums of query lengths
+          (``qo_indptr[0] == 0``; build with ``cumsum(..., dtype=torch.int32)``)
+        - ``kv_seq_lens``: ``(b,)`` per-request valid KV lengths >= 1
+          (masking truth; causal requires ``q_len_i <= kv_len_i``)
+        - ``block_tables``: ``(b, max_pages_per_seq)`` dense page table
+        - ``page_size, max_q_len, max_kv_len``: host ints, REQUIRED
+        - ``qo_indptr_cpu`` / ``kv_seq_lens_cpu``: optional host mirrors —
+          with them plan() is zero-sync (validation and fa2/fa3 scheduling
+          read the mirrors the engine already owns); without them plan()
+          performs ONE documented D2H here.  Value-level validation always
+          runs; there is no unvalidated path.
+        - ``backend``: a backend name, ``"auto"``, or a ``Resolution`` from
+          :func:`resolve_paged_prefill` — the latter pins the candidate set
+          decided at engine init (plan() verifies the config matches).
+        """
         head_dim_vo = head_dim_vo if head_dim_vo is not None else head_dim_qk
         kv_dtype = kv_dtype if kv_dtype is not None else q_dtype
+        _expect(
+            kv_layout == "HND",
+            f"kv_layout {kv_layout!r} is not wired in this prototype — only "
+            '"HND" (pages, num_kv_heads, page_size, head_dim); permute NHD '
+            "caches with .permute(0, 2, 1, 3).contiguous()",
+        )
 
         self._validate_structure(
             qo_indptr, kv_seq_lens, block_tables, page_size, max_q_len, max_kv_len
@@ -404,21 +501,45 @@ class UnifiedPagedPrefill:
             max_kv_len,
             qo_indptr_cpu,
             kv_seq_lens_cpu,
+            causal,
         )
 
-        resolution = resolve_paged_prefill(
-            device=self.device,
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            q_dtype=q_dtype,
-            page_size=page_size,
-            causal=causal,
-            need_lse=return_lse,
-            backend=backend,
-        )
-        # Plan-time choice within the resolved set (level 2).  The prototype
+        if isinstance(backend, Resolution):
+            # Level-1 pinning (proposal §5.3): verify the plan config matches
+            # what the engine resolved at init, then choose within the set.
+            want = _resolve_config_key(
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo,
+                q_dtype,
+                page_size,
+                kv_layout,
+                causal,
+                return_lse,
+            )
+            _expect(
+                backend.config == want,
+                "plan() arguments do not match the pinned Resolution "
+                f"(resolved {backend.config}, got {want}) — re-run "
+                "resolve_paged_prefill() with the new configuration",
+            )
+            resolution = backend
+        else:
+            resolution = resolve_paged_prefill(
+                device=self.device,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                q_dtype=q_dtype,
+                page_size=page_size,
+                kv_layout=kv_layout,
+                causal=causal,
+                need_lse=return_lse,
+                backend=backend,
+            )
+        # Plan-time choice within the pinned set (level 2).  The prototype
         # takes the heuristic head; the autotune hook (proposal §5.4) would
         # consult its cache here, keyed on bucketed (total_q_tokens, max_kv_len).
         self._resolution = resolution
@@ -470,7 +591,11 @@ class UnifiedPagedPrefill:
                 t.is_cuda and t.device == self.device,
                 f"{name} must be on CUDA device {self.device}, got {t.device}",
             )
-            _expect(t.dtype == torch.int32, f"{name} must be int32, got {t.dtype}")
+            _expect(
+                t.dtype == torch.int32,
+                f"{name} must be int32, got {t.dtype} — torch cumsum/arange "
+                "default to int64; build with dtype=torch.int32 or .int()",
+            )
             _expect(
                 t.dim() == dim, f"{name} must be {dim}-D, got shape {tuple(t.shape)}"
             )
@@ -489,8 +614,10 @@ class UnifiedPagedPrefill:
             f"batch_size={b}, got {tuple(block_tables.shape)}",
         )
         _expect(
-            isinstance(page_size, int) and page_size >= 1,
-            f"page_size must be a positive host int, got {page_size!r}",
+            isinstance(page_size, int) and page_size >= _MIN_PAGE_SIZE,
+            f"page_size must be a host int >= {_MIN_PAGE_SIZE}, got "
+            f"{page_size!r} (page_size=1 token-CSR is outside this prototype; "
+            "see module docstring)",
         )
         for nm, v in (("max_q_len", max_q_len), ("max_kv_len", max_kv_len)):
             _expect(
@@ -515,6 +642,7 @@ class UnifiedPagedPrefill:
         max_kv_len,
         qo_indptr_cpu,
         kv_seq_lens_cpu,
+        causal,
     ) -> None:
         """Value-level validation against host mirrors. Always runs.
 
@@ -534,7 +662,14 @@ class UnifiedPagedPrefill:
             "kv_seq_lens_cpu must be a CPU mirror with the same shape as kv_seq_lens",
         )
         d = qo_indptr_cpu.diff()
-        _expect(bool((d >= 0).all()), "qo_indptr must be non-decreasing")
+        if not bool((d > 0).all()):
+            bad = int((d <= 0).nonzero()[0])
+            raise ValueError(
+                f"qo_indptr must be strictly increasing (q_len >= 1); entry "
+                f"{bad}->{bad + 1} is {int(qo_indptr_cpu[bad])}->"
+                f"{int(qo_indptr_cpu[bad + 1])} — zero-length requests are "
+                "outside the v1 envelope; filter them before plan()"
+            )
         _expect(int(qo_indptr_cpu[0]) == 0, "qo_indptr[0] must be 0")
         _expect(
             int(d.max()) <= max_q_len,
@@ -542,47 +677,88 @@ class UnifiedPagedPrefill:
             f"query ({int(d.max())}) — this would silently corrupt scheduling "
             "or graph shapes downstream",
         )
-        _expect(bool((kv_seq_lens_cpu >= 0).all()), "kv_seq_lens must be >= 0")
+        if not bool((kv_seq_lens_cpu >= 1).all()):
+            bad = int((kv_seq_lens_cpu < 1).nonzero()[0])
+            raise ValueError(
+                f"kv_seq_lens must be >= 1 (request {bad} has "
+                f"{int(kv_seq_lens_cpu[bad])}) — zero-length KV rows are "
+                "outside the v1 envelope; filter empty requests before plan()"
+            )
+        if causal and not bool((d <= kv_seq_lens_cpu).all()):
+            bad = int((d > kv_seq_lens_cpu).nonzero()[0])
+            raise ValueError(
+                f"causal masking requires q_len_i <= kv_len_i for every "
+                f"request; request {bad} has q_len {int(d[bad])} > kv_len "
+                f"{int(kv_seq_lens_cpu[bad])} (fully-masked rows have "
+                "backend-divergent LSE semantics and are outside the v1 "
+                "envelope)"
+            )
         _expect(
             int(kv_seq_lens_cpu.max()) <= max_kv_len,
             f"max_kv_len ({max_kv_len}) is smaller than the actual longest "
             f"KV ({int(kv_seq_lens_cpu.max())})",
         )
         capacity = block_tables.shape[1] * page_size
-        _expect(
-            int(kv_seq_lens_cpu.max()) <= capacity,
-            f"kv_seq_lens exceed block_tables capacity ({capacity} tokens)",
-        )
+        if not bool((kv_seq_lens_cpu <= capacity).all()):
+            bad = int((kv_seq_lens_cpu > capacity).nonzero()[0])
+            raise ValueError(
+                f"kv_seq_lens[{bad}] = {int(kv_seq_lens_cpu[bad])} exceeds "
+                f"block_tables capacity ({block_tables.shape[1]} pages x "
+                f"page_size {page_size} = {capacity}) — widen block_tables or "
+                "fix the length"
+            )
 
     # ------------------------------ run -------------------------------
 
     def run(
         self,
         q: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        kv_cache: Sequence[torch.Tensor],
         *,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        _expect(self._planned, "run() called before plan()")
+        """Run the planned batch.
+
+        - ``q``: packed ``(total_q_tokens, num_qo_heads, head_dim_qk)``,
+          dtype as planned.
+        - ``kv_cache``: ``(k_cache, v_cache)`` pair, each paged HND
+          ``(pages, num_kv_heads, page_size, head_dim)``.
+        - ``out``: optional preallocated output, contiguous
+          ``(total_q_tokens, num_qo_heads, head_dim_vo)``, dtype == q dtype.
+        - ``lse``: optional preallocated LSE buffer, contiguous fp32
+          ``(total_q_tokens, num_qo_heads)``; requires ``return_lse=True``.
+
+        Returns ``(out, lse)``; ``lse`` is **base-2** (multiply by ``ln(2)``
+        for natural log), packed ``(total_q_tokens, num_qo_heads)``, fp32 —
+        identical for every backend.
+        """
+        _expect(self._planned, "run() called before plan() — call plan() first")
         m = self._meta
         _expect(
-            isinstance(kv_cache, tuple) and len(kv_cache) == 2,
-            "kv_cache must be a (k_cache, v_cache) tuple of paged tensors "
+            isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2,
+            "kv_cache must be a (k_cache, v_cache) pair of paged tensors "
             "(pages, num_kv_heads, page_size, head_dim) [HND]",
         )
         k_cache, v_cache = kv_cache
-        for name, t, d in (
+        for name, t, dim_ in (
             ("k_cache", k_cache, m["head_dim_qk"]),
             ("v_cache", v_cache, m["head_dim_vo"]),
         ):
             _expect(t.dim() == 4, f"{name} must be 4-D paged (pages, H, page_size, D)")
+            nhd_hint = (
+                " — this looks like an NHD-layout cache; this API takes HND "
+                "(pages, H, page_size, D): permute(0, 2, 1, 3).contiguous()"
+                if t.shape[1] == m["page_size"] and t.shape[2] == m["num_kv_heads"]
+                else ""
+            )
             _expect(
                 t.shape[1] == m["num_kv_heads"]
                 and t.shape[2] == m["page_size"]
-                and t.shape[3] == d,
+                and t.shape[3] == dim_,
                 f"{name} shape {tuple(t.shape)} does not match plan "
-                f"(H={m['num_kv_heads']}, page_size={m['page_size']}, D={d})",
+                f"(H={m['num_kv_heads']}, page_size={m['page_size']}, D={dim_})"
+                f"{nhd_hint}",
             )
             _expect(
                 t.dtype == m["kv_dtype"],
@@ -597,12 +773,11 @@ class UnifiedPagedPrefill:
             f"(H={m['num_qo_heads']}, D={m['head_dim_qk']})",
         )
         _expect(q.dtype == m["q_dtype"], f"q dtype {q.dtype} != planned {m['q_dtype']}")
-        if m["qo_indptr_cpu"] is not None:
-            total = int(m["qo_indptr_cpu"][-1])
-            _expect(
-                q.shape[0] == total,
-                f"q has {q.shape[0]} tokens but qo_indptr sums to {total}",
-            )
+        total = int(m["qo_indptr_cpu"][-1])
+        _expect(
+            q.shape[0] == total,
+            f"q has {q.shape[0]} tokens but qo_indptr sums to {total}",
+        )
         cap = CAPABILITIES[self._backend]
         if cap.requires_contiguous_q and not q.is_contiguous():
             raise ValueError(
@@ -616,10 +791,31 @@ class UnifiedPagedPrefill:
                 and out.is_contiguous(),
                 "out must be contiguous (total_q_tokens, num_qo_heads, head_dim_vo)",
             )
+            _expect(
+                out.dtype == m["q_dtype"] and out.device == q.device,
+                f"out must match q dtype/device ({m['q_dtype']}, {q.device}), "
+                f"got ({out.dtype}, {out.device}) — allocate with "
+                "torch.empty(..., dtype=q.dtype, device=q.device)",
+            )
+        if lse is not None:
+            _expect(
+                m["return_lse"],
+                "lse= buffer passed but the plan has return_lse=False — "
+                "plan(return_lse=True) or drop the lse= argument",
+            )
+            _expect(
+                tuple(lse.shape) == (q.shape[0], m["num_qo_heads"])
+                and lse.dtype == torch.float32
+                and lse.is_contiguous()
+                and lse.device == q.device,
+                "lse must be contiguous fp32 (total_q_tokens, num_qo_heads) "
+                f"on {q.device} — the LSE contract is base-2 packed fp32 for "
+                "every backend",
+            )
         return self._adapter.run(q, k_cache, v_cache, out=out, lse=lse)
 
     def explain(self) -> str:
-        _expect(self._planned, "explain() called before plan()")
+        _expect(self._planned, "explain() called before plan() — call plan() first")
         return f"chosen: {self._backend}\n{self._resolution.explain()}"
 
 
@@ -633,30 +829,40 @@ class _Derived:
     q_seq_lens: torch.Tensor  # (b,)  device — diff(qo_indptr)
     cum_kv_seq_lens: torch.Tensor  # (b+1,) device — for trtllm / cuDNN cu_seq_len_kv
     kv_page_indptr: torch.Tensor  # (b+1,) device CSR page-unit indptr
-    kv_page_indices: torch.Tensor  # (total_pages,) device flat page ids
-    kv_last_page_len: torch.Tensor  # (b,) device
+    kv_page_indices: torch.Tensor  # (b*width,) device flat page ids (CSR-compacted
+    # prefix up to kv_page_indptr[-1]; tail is untouched scratch never read by
+    # kernels, which bound reads by the indptr)
 
 
 def _derive(qo_indptr, kv_seq_lens, block_tables, page_size) -> _Derived:
     """Canonical → derived forms.  Pure device ops, zero sync.
 
     In production this is one fused kernel (proposal §3.2); torch ops keep the
-    prototype readable.  The CSR indices buffer is capacity-bounded by the
-    block-table width, so sizing needs no sync either.
+    prototype readable.  All output shapes are static functions of the input
+    shapes — in particular the CSR indices buffer is capacity-allocated at
+    ``b * width`` and filled by scatter (a boolean masked-select would sync
+    to size its result; scatter does not).
     """
-    zero = torch.zeros(1, dtype=torch.int32, device=kv_seq_lens.device)
+    dev = kv_seq_lens.device
+    zero = torch.zeros(1, dtype=torch.int32, device=dev)
     q_seq_lens = qo_indptr.diff()
     cum_kv = torch.cat([zero, torch.cumsum(kv_seq_lens, 0, dtype=torch.int32)])
     pages = (kv_seq_lens + page_size - 1) // page_size  # (b,)
     kv_page_indptr = torch.cat([zero, torch.cumsum(pages, 0, dtype=torch.int32)])
-    width = block_tables.shape[1]
-    col = torch.arange(width, device=block_tables.device, dtype=torch.int32)
-    mask = col.unsqueeze(0) < pages.unsqueeze(1)  # (b, width), row-major keeps order
-    kv_page_indices = block_tables[mask].to(torch.int32)
-    kv_last_page_len = (kv_seq_lens - 1) % page_size + 1
-    return _Derived(
-        q_seq_lens, cum_kv, kv_page_indptr, kv_page_indices, kv_last_page_len
+    b, width = block_tables.shape
+    capacity = b * width
+    col = torch.arange(width, device=dev, dtype=torch.int32)
+    valid = col.unsqueeze(0) < pages.unsqueeze(1)  # (b, width)
+    # compact destination of each (row, col) lane; invalid lanes all target a
+    # dummy tail slot (duplicate scatter writes there are benign — never read)
+    dst = kv_page_indptr[:-1].unsqueeze(1).to(torch.int64) + col.unsqueeze(0).to(
+        torch.int64
     )
+    dst = torch.where(valid, dst, torch.full_like(dst, capacity))
+    buf = torch.empty(capacity + 1, dtype=torch.int32, device=dev)
+    buf.scatter_(0, dst.reshape(-1), block_tables.reshape(-1))
+    kv_page_indices = buf[:capacity]
+    return _Derived(q_seq_lens, cum_kv, kv_page_indptr, kv_page_indices)
 
 
 # --------------------------------------------------------------------------
@@ -668,9 +874,8 @@ def _derive(qo_indptr, kv_seq_lens, block_tables, page_size) -> _Derived:
 class _FaAdapter:
     """fa2/fa3 via the existing BatchPrefillWithPagedKVCacheWrapper.
 
-    Dialect: CSR page metadata + host arrays for the split-KV scheduler.
-    With mirrors: zero-sync plan (host CSR computed from the mirrors).
-    Without: one documented D2H of (qo_indptr, kv_seq_lens).
+    Dialect: CSR page metadata + host arrays for the split-KV scheduler
+    (computed from the mirrors the contract layer guarantees — zero-sync).
     """
 
     def __init__(self, device, backend: str = "fa2"):
@@ -685,13 +890,8 @@ class _FaAdapter:
         )
 
     def plan(self, m: dict, d: _Derived) -> None:
-        if m["qo_indptr_cpu"] is not None and m["kv_seq_lens_cpu"] is not None:
-            qo_host = m["qo_indptr_cpu"].to(torch.int32)
-            kv_lens_host = m["kv_seq_lens_cpu"].to(torch.int32)
-        else:
-            # Documented sync (proposal §3.1): fa2/fa3 scheduling needs values.
-            qo_host = m["qo_indptr"].cpu()
-            kv_lens_host = m["kv_seq_lens"].cpu()
+        qo_host = m["qo_indptr_cpu"].to(torch.int32)
+        kv_lens_host = m["kv_seq_lens_cpu"].to(torch.int32)
         page = m["page_size"]
         pages_host = (kv_lens_host + page - 1) // page
         kv_indptr_host = torch.cat(
@@ -776,14 +976,14 @@ class _CudnnAdapter:
         )
         if not m["return_lse"]:
             return out_t, None
-        # padded (b, max_q, h) natural-log -> packed (tokens, h) base-2
+        # padded (b, max_q, h) natural-log -> packed (tokens, h) base-2.
+        # token->batch mapping via searchsorted (static shapes, zero sync;
+        # repeat_interleave with device lens would sync on the output size).
         total = q.shape[0]
-        batch_ids = torch.repeat_interleave(
-            torch.arange(b, device=q.device), d.q_seq_lens.to(torch.int64)
-        )
-        pos = torch.arange(total, device=q.device) - m["qo_indptr"][batch_ids].to(
-            torch.int64
-        )
+        token = torch.arange(total, device=q.device, dtype=torch.int64)
+        bounds = m["qo_indptr"][1:].to(torch.int64)
+        batch_ids = torch.searchsorted(bounds, token, right=True)
+        pos = token - m["qo_indptr"].to(torch.int64)[batch_ids]
         packed = lse_t[batch_ids, pos, :] * _LOG2E
         if lse is not None:
             lse.copy_(packed)
