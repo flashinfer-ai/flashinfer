@@ -961,3 +961,13 @@ class B12xW4A16Runner(_B12xRunner):
         "w2_weight_sf",
         "w2_alpha",
     )
+
+    def check_support(self) -> None:
+        super().check_support()
+        if self.config.activation.type not in (
+            ActivationType.Swiglu,
+            ActivationType.Relu2,
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu or Relu2 activation."
+            )
