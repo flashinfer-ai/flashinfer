@@ -1106,43 +1106,49 @@ def _gqa_decode_autotune_base(
         str(q.device),
     )
     if cache_key not in _decode_kv_paged_tune_cache:
-        result = exhaustive_search(
-            list(configs),
-            stream,
-            lambda cfg: (
-                num_batch,
-                num_kv_heads * max(QUERY_GROUP_SIZE // cfg.BLOCK_H, 1),
-                NUM_KV_SPLITS,
-            ),
-            _decode_attention_kv_paged_kernel,
-            lambda cfg: (
-                q,
-                k_cache,
-                v_cache,
-                actual_seq_lens_flat,
-                block_tables_flat,
-                Att_Out,
-                LSE_Out_arg,
-                k_scale,
-                v_scale,
-                num_kv_heads,
-                page_size,
-                cfg.BLOCK_H,
-                cfg.BLOCK_N,
-                head_dim_qk,
-                QUERY_GROUP_SIZE,
-                NUM_KV_SPLITS,
-                kv_len_per_split,
-                HAS_LSE_OUT,
-                stride_block_table,
-                max(QUERY_GROUP_SIZE // cfg.BLOCK_H, 1),
-                TRANS_QK,
-                min(cfg.BLOCK_N, page_size),
-                max(cfg.BLOCK_N // page_size, 1),
-            ),
-            lambda cfg: {"occupancy": cfg.occupancy},
-        )
-        best_cfg = result.best.config
+        if _AUTOTUNE_DISABLED:
+            # Respect FLASHINFER_CUTILE_AUTOTUNE_DISABLED: skip the exhaustive
+            # search and take the first (deterministic) config. configs is never
+            # empty -- _get_gqa_decode_autotune_configs always appends a fallback.
+            best_cfg = configs[0]
+        else:
+            result = exhaustive_search(
+                list(configs),
+                stream,
+                lambda cfg: (
+                    num_batch,
+                    num_kv_heads * max(QUERY_GROUP_SIZE // cfg.BLOCK_H, 1),
+                    NUM_KV_SPLITS,
+                ),
+                _decode_attention_kv_paged_kernel,
+                lambda cfg: (
+                    q,
+                    k_cache,
+                    v_cache,
+                    actual_seq_lens_flat,
+                    block_tables_flat,
+                    Att_Out,
+                    LSE_Out_arg,
+                    k_scale,
+                    v_scale,
+                    num_kv_heads,
+                    page_size,
+                    cfg.BLOCK_H,
+                    cfg.BLOCK_N,
+                    head_dim_qk,
+                    QUERY_GROUP_SIZE,
+                    NUM_KV_SPLITS,
+                    kv_len_per_split,
+                    HAS_LSE_OUT,
+                    stride_block_table,
+                    max(QUERY_GROUP_SIZE // cfg.BLOCK_H, 1),
+                    TRANS_QK,
+                    min(cfg.BLOCK_N, page_size),
+                    max(cfg.BLOCK_N // page_size, 1),
+                ),
+                lambda cfg: {"occupancy": cfg.occupancy},
+            )
+            best_cfg = result.best.config
         _decode_kv_paged_tune_cache[cache_key] = (
             best_cfg,
             _decode_attention_kv_paged_kernel.replace_hints(
@@ -1633,10 +1639,11 @@ def decode_mla_kv_paged_cutile(
     else:
         estimated_seq_len = max_seq_len
 
-    if (
-        force_split_kv
-        and estimated_seq_len >= 1024
-        or not force_persistent
+    # force_split_kv must enter the split path unconditionally (matching the two
+    # paged-decode sites above); the degenerate NUM_KV_SPLITS==1 case below still
+    # resolves should_use_split_kv=False, so no >=1024 length gate is needed.
+    if force_split_kv or (
+        not force_persistent
         and estimated_seq_len > 256
         and num_batch * num_head_blocks < NUM_SMS
     ):

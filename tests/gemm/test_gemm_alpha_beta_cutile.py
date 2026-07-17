@@ -79,3 +79,30 @@ class Test_FlashInfer_Matmul_Alpha_Beta:
         )
         ref = self.reference(a, b, ref_c, trans_a, trans_b, alpha, beta, out_dtype)
         torch.testing.assert_close(result, ref, atol=1e-2, rtol=1e-2)
+
+    @pytest.mark.parametrize("m, n, k", [(256, 256, 256), (512, 128, 320)])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("backend", ["cutile"])
+    def test_beta_zero_ignores_nan_c(self, m, n, k, dtype, backend):
+        """beta==0 must not read C: an uninitialized/NaN C must not poison the
+        output (guards against ``0 * NaN`` in the epilogue)."""
+        if backend == "cutile" and not is_cuda_tile_available():
+            pytest.skip("cuda.tile not available")
+        cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
+        if not gemm_alpha_beta.is_backend_supported(backend, cc_num):
+            pytest.skip(
+                f"gemm_alpha_beta {backend} backend not supported on compute capability {cc_num}."
+            )
+
+        torch.manual_seed(0)
+        random.seed(0)
+        a, b = self.prepare_data(m, n, k, False, True, dtype)
+        # C is deliberately full of NaNs; with beta==0 it must be ignored.
+        c = torch.full((m, n), float("nan"), device=a.device, dtype=dtype)
+
+        result = gemm_alpha_beta(
+            a, b, c, False, True, alpha=1.5, beta=0.0, backend=backend
+        )
+        assert not torch.isnan(result).any(), "beta==0 leaked NaN from C into output"
+        ref = (1.5 * (a.to(dtype) @ b.t().to(dtype))).to(dtype)
+        torch.testing.assert_close(result, ref, atol=1e-2, rtol=1e-2)

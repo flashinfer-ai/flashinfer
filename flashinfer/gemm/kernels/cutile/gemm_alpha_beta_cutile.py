@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: MIT
 
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import cuda.tile as ct
@@ -11,7 +12,10 @@ from cuda.tile.tune import exhaustive_search
 from ....cutile.cutile_common import cached_replace_hints
 
 # Module-level tune cache: (M, N, K, transpose_a_int, transpose_b_int, dtype, num_sms, device) -> (best_cfg, tuned_kernel)
-_gemm_alpha_beta_tune_cache: dict = {}
+# Bounded LRU so a long-running process cycling through many shapes cannot grow it
+# without limit (each entry pins a compiled kernel via replace_hints).
+_gemm_alpha_beta_tune_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+_GEMM_ALPHA_BETA_TUNE_CACHE_MAX = 256
 
 
 @ct.kernel
@@ -28,6 +32,7 @@ def _gemm_alpha_beta_kernel(
     BLOCK_K: ct.Constant[int],
     GROUP_SIZE_M: ct.Constant[int],
     EPILOGUE_SUBTILE: ct.Constant[int],
+    HAS_BETA: ct.Constant[int],  # 0 => skip the C load entirely (beta == 0)
 ):
     """
     cuTile kernel for GEMM with alpha/beta scaling: C = alpha * A @ B + beta * C
@@ -123,15 +128,20 @@ def _gemm_alpha_beta_kernel(
             acc0 = ct.extract(acc, index=(0, 0), shape=(BLOCK_M, BLOCK_N // 2))
             acc1 = ct.extract(acc, index=(0, 1), shape=(BLOCK_M, BLOCK_N // 2))
 
-            c_load0 = ct.load(
-                c,
-                index=(pid_m, pid_n * 2),
-                shape=(BLOCK_M, BLOCK_N // 2),
-                order=(0, 1),
-                padding_mode=zero_pad,
-            )
-            c_load0_f32 = ct.astype(c_load0, ct.float32)
-            result0 = alpha * acc0 + beta * c_load0_f32
+            # When beta == 0 the API contract is that C is write-only: skip the
+            # load so uninitialized/NaN C cannot poison the result via 0 * NaN.
+            if HAS_BETA == 1:
+                c_load0 = ct.load(
+                    c,
+                    index=(pid_m, pid_n * 2),
+                    shape=(BLOCK_M, BLOCK_N // 2),
+                    order=(0, 1),
+                    padding_mode=zero_pad,
+                )
+                c_load0_f32 = ct.astype(c_load0, ct.float32)
+                result0 = alpha * acc0 + beta * c_load0_f32
+            else:
+                result0 = alpha * acc0
             c_block0 = ct.astype(result0, c.dtype)
             ct.store(
                 c,
@@ -140,15 +150,18 @@ def _gemm_alpha_beta_kernel(
                 order=(0, 1),
             )
 
-            c_load1 = ct.load(
-                c,
-                index=(pid_m, pid_n * 2 + 1),
-                shape=(BLOCK_M, BLOCK_N // 2),
-                order=(0, 1),
-                padding_mode=zero_pad,
-            )
-            c_load1_f32 = ct.astype(c_load1, ct.float32)
-            result1 = alpha * acc1 + beta * c_load1_f32
+            if HAS_BETA == 1:
+                c_load1 = ct.load(
+                    c,
+                    index=(pid_m, pid_n * 2 + 1),
+                    shape=(BLOCK_M, BLOCK_N // 2),
+                    order=(0, 1),
+                    padding_mode=zero_pad,
+                )
+                c_load1_f32 = ct.astype(c_load1, ct.float32)
+                result1 = alpha * acc1 + beta * c_load1_f32
+            else:
+                result1 = alpha * acc1
             c_block1 = ct.astype(result1, c.dtype)
             ct.store(
                 c,
@@ -157,16 +170,18 @@ def _gemm_alpha_beta_kernel(
                 order=(0, 1),
             )
         else:
-            c_load = ct.load(
-                c,
-                index=(pid_m, pid_n),
-                shape=(BLOCK_M, BLOCK_N),
-                order=(0, 1),
-                padding_mode=zero_pad,
-            )
-
-            c_load_f32 = ct.astype(c_load, ct.float32)
-            result = alpha * acc + beta * c_load_f32
+            if HAS_BETA == 1:
+                c_load = ct.load(
+                    c,
+                    index=(pid_m, pid_n),
+                    shape=(BLOCK_M, BLOCK_N),
+                    order=(0, 1),
+                    padding_mode=zero_pad,
+                )
+                c_load_f32 = ct.astype(c_load, ct.float32)
+                result = alpha * acc + beta * c_load_f32
+            else:
+                result = alpha * acc
 
             c_block = ct.astype(result, c.dtype)
 
@@ -369,9 +384,23 @@ def gemm_alpha_beta(
     if not c.is_contiguous():
         raise ValueError("C matrix must be contiguous")
 
+    # Reject aliasing: the kernel reads A/B and writes C in place, so any storage
+    # overlap among them corrupts the result (a persistent tile may store into C
+    # before another program has loaded the aliased A/B input).
+    def _overlaps(x, y):
+        return x.device.type == "cuda" and y.device.type == "cuda" and (
+            x.untyped_storage().data_ptr() == y.untyped_storage().data_ptr()
+        )
+
+    if _overlaps(a, c) or _overlaps(b, c) or _overlaps(a, b):
+        raise ValueError("a, b, and c must not share storage (in-place write to C)")
+
     # Convert boolean to int for ct.Constant
     transpose_a_int = 1 if trans_a else 0
     transpose_b_int = 1 if trans_b else 0
+    # beta == 0 => C is write-only; the kernel skips the C load (avoids 0 * NaN
+    # poisoning the output when the caller passes an uninitialized C).
+    has_beta_int = 0 if float(beta) == 0.0 else 1
 
     # Check if autotune is requested
     use_autotune = kwargs.get("use_autotune", True)
@@ -403,6 +432,7 @@ def gemm_alpha_beta(
                 cfg.BLOCK_K,
                 cfg.GROUP_SIZE_M,
                 cfg.EPILOGUE_SUBTILE,
+                has_beta_int,
             )
 
         def launch_args_fn(cfg):
@@ -419,6 +449,7 @@ def gemm_alpha_beta(
                 cfg.BLOCK_K,
                 cfg.GROUP_SIZE_M,
                 cfg.EPILOGUE_SUBTILE,
+                has_beta_int,
             )
 
         def hints_fn(cfg):
@@ -431,11 +462,13 @@ def gemm_alpha_beta(
             K,
             transpose_a_int,
             transpose_b_int,
+            has_beta_int,  # the beta==0 epilogue can autotune to a different config
             a.dtype,
             num_sms,
             str(a.device),
         )
-        if cache_key not in _gemm_alpha_beta_tune_cache:
+        cached = _gemm_alpha_beta_tune_cache.get(cache_key)
+        if cached is None:
             result = exhaustive_search(
                 list(_gemm_alpha_beta_autotune_configs()),
                 stream,
@@ -445,11 +478,16 @@ def gemm_alpha_beta(
                 hints_fn,
             )
             best_cfg = result.best.config
-            _gemm_alpha_beta_tune_cache[cache_key] = (
+            cached = (
                 best_cfg,
                 _gemm_alpha_beta_kernel.replace_hints(**hints_fn(best_cfg)),
             )
-        best_cfg, tuned_kernel = _gemm_alpha_beta_tune_cache[cache_key]
+            _gemm_alpha_beta_tune_cache[cache_key] = cached
+            if len(_gemm_alpha_beta_tune_cache) > _GEMM_ALPHA_BETA_TUNE_CACHE_MAX:
+                _gemm_alpha_beta_tune_cache.popitem(last=False)
+        else:
+            _gemm_alpha_beta_tune_cache.move_to_end(cache_key)
+        best_cfg, tuned_kernel = cached
         ct.launch(stream, grid_fn(best_cfg), tuned_kernel, launch_args_fn(best_cfg))
 
         return c
@@ -502,6 +540,7 @@ def gemm_alpha_beta(
                 BLOCK_K,
                 GROUP_SIZE_M,
                 epilogue_subtile,
+                has_beta_int,
             ),
         )
 
