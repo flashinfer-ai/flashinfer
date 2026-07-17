@@ -26,11 +26,9 @@ Usage:
 
 import math
 import torch
-from pathlib import Path
 from typing import Optional, Union, Tuple
 
-from ..jit import env as jit_env
-from ..jit.attention import gen_customize_single_prefill_module
+from ..jit.attention import gen_customize_block_extend_single_prefill_module
 from ..prefill import single_prefill_with_kv_cache_with_jit_module
 from ..utils import MaskMode, is_sm90a_supported
 from ..api_logging import flashinfer_api
@@ -75,19 +73,6 @@ struct BlockExtendAttentionV2WithOffset : AttentionVariantBase {
 };
 """
 
-def _get_aot_path(uri: str) -> Path:
-    """Get AOT precompiled path (unified interface)"""
-    return jit_env.FLASHINFER_AOT_DIR / uri / f"{uri}.so"
-
-
-def _check_aot_available(uri: str) -> bool:
-    """Check if AOT kernel is available (unified interface)"""
-    import os
-    if os.environ.get("FLASHINFER_FORCE_JIT", "0") == "1":
-        return False
-    return _get_aot_path(uri).exists()
-
-
 def _get_dtype_str(dtype: torch.dtype) -> str:
     """Get dtype string representation (unified interface)"""
     _dtype_map = {
@@ -119,8 +104,6 @@ def _get_module_uri_with_offset(head_dim: int, dtype: torch.dtype, backend: str)
         )
     return f"block_expanding_{backend}_with_offset_v2_hdim{head_dim}_{_get_dtype_str(dtype)}"
 
-
-_MODULE_CACHE_WITH_OFFSET = {}
 
 # V3 FA3 Variant Definition: Block Expanding Attention for Hopper (SM90) architecture
 
@@ -165,62 +148,47 @@ def get_block_extend_module_with_offset(
     device: Optional[torch.device] = None,
 ):
     """
-    Get Block Extend Attention module with q_offset/kv_offset support
-    
+    Get Block Extend Attention module with q_offset/kv_offset support.
+
+    This is a thin builder over the existing single-prefill JIT path: it constructs
+    a ``JitSpec`` for the block-extend variant (fixed ``mask_mode=kBlockExpanding``)
+    and lets ``JitSpec.build_and_load()`` handle the AOT-vs-JIT dispatch with its
+    file-lock guard — the same path every other single-prefill call uses. There is
+    deliberately NO separate module cache and no hand-rolled AOT/JIT branch here
+    (see reviewers' API-convergence note, docs/block-extend-design-response.md §2).
+
     Args:
-        head_dim: Head dimension
-        dtype: Data type
-        backend: "fa2" or "fa3"
-        device: Target CUDA device (default: current CUDA device)
-    
+        head_dim: Head dimension (closed dLLM product: {64, 128}).
+        dtype: Data type (closed dLLM product: {fp16, bf16}).
+        backend: "fa2" or "fa3".
+        device: Target CUDA device (default: current CUDA device).
+
     Returns:
-        Compiled module
-    
+        Compiled module.
+
     Raises:
-        RuntimeError: If backend="fa3" but GPU doesn't support SM90
+        RuntimeError: If backend="fa3" but GPU doesn't support SM90.
     """
-    import os
-    import tvm_ffi
-    
     if device is None:
         device = torch.device("cuda")
-    
+
     # FA3 requires SM90 support
     if backend == "fa3" and not is_sm90a_supported(device):
         raise RuntimeError(
             "FA3 backend requires SM90 (Hopper) architecture. "
             "Use backend='fa2' for older architectures."
         )
-    
-    cache_key = (head_dim, dtype, backend, device)
-    if cache_key in _MODULE_CACHE_WITH_OFFSET:
-        return _MODULE_CACHE_WITH_OFFSET[cache_key]
-    
+
     uri = _get_module_uri_with_offset(head_dim, dtype, backend)
-    
-    # AOT mode
-    if _check_aot_available(uri):
-        aot_path = _get_aot_path(uri)
-        module = tvm_ffi.load_module(str(aot_path))
-        _MODULE_CACHE_WITH_OFFSET[cache_key] = module
-        return module
-    
-    # AOT not available, check if JIT is disabled
-    if os.environ.get("FLASHINFER_DISABLE_JIT", "0") == "1":
-        raise RuntimeError(
-            f"JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
-            f"but the required AOT module is not found at: {_get_aot_path(uri)}."
-        )
-    
-    # JIT mode
+
     if backend == "fa3":
         variant_name = "BlockExtendAttentionV3WithOffset"
         variant_decl = BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL
     else:
         variant_name = "BlockExtendAttentionV2WithOffset"
         variant_decl = BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL
-    
-    spec = gen_customize_single_prefill_module(
+
+    spec = gen_customize_block_extend_single_prefill_module(
         backend=backend,
         uri=uri,
         dtype_q=dtype,
@@ -234,12 +202,9 @@ def get_block_extend_module_with_offset(
         additional_scalar_dtypes=["double", "int64_t", "int64_t", "int64_t"],
         variant_name=variant_name,
         variant_decl=variant_decl,
-        mask_modes=[4],  # kBlockExpanding = 4
     )
-    module = spec.build_and_load()
-    
-    _MODULE_CACHE_WITH_OFFSET[cache_key] = module
-    return module
+    # JitSpec.build_and_load() does the AOT-vs-JIT dispatch (with file-lock) for us.
+    return spec.build_and_load()
 
 @flashinfer_api
 def block_extend_attention_with_offset(

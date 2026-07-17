@@ -367,8 +367,11 @@ zero infra cost.
 
 ### Done & in the working tree
 
-Committed locally on `feature/block-extend` as `957fca92` (not pushed). User
-chose: converge the API + keep a thin shim (§2.2.3), commit locally only.
+Two local commits on `feature/block-extend` (not pushed):
+
+- `cc6a23f3` — §3 correctness + §1.2 steps 1–2 (closed product, batch `mask_modes` fix).
+- *(this commit, to be amended/added)* — §1.2 step 3 single-path dedicated gen
+  function + §2.2.2 single-path convergence (drop own cache + hand-rolled AOT/JIT).
 
 | Section | Change | File(s) |
 |---|---|---|
@@ -377,31 +380,44 @@ chose: converge the API + keep a thin shim (§2.2.3), commit locally only.
 | §3.2 | `idtype` embedded in batch dLLM URI (`idx{i32\|i64}`), validated, threaded through `select_best_backend[_paged]` and both `_create_inner_wrapper`; single-path URI unchanged (no idtype axis) | `flashinfer/dllm/batch_block_extend.py` |
 | §1.2 step 1 | Batch dLLM `mask_modes` fixed to `[MaskMode.BLOCK_EXPANDING.value]` at both call sites | `flashinfer/dllm/batch_block_extend.py` |
 | §1.2 step 2 / §3.3 | Closed product enforced: dtype `{fp16,bf16}`, idtype `{int32,int64}`, head_dim `{64,128}` (gated in URI builders); backend stays `auto/fa2/fa3`. fp8 confirmed already rejected (not coerced). | `flashinfer/dllm/batch_block_extend.py`, `flashinfer/dllm/block_extend.py` |
+| §1.2 step 3 (single) | Dedicated `gen_customize_block_extend_single_prefill_module` — compiles only `kBlockExpanding`, validates closed product, exported from `flashinfer.jit.attention`. Single-path now routes through it instead of the shared `gen_customize_single_prefill_module` with `mask_modes=`. | `flashinfer/jit/attention/modules.py`, `flashinfer/jit/attention/__init__.py`, `flashinfer/dllm/block_extend.py` |
+| §2.2.2 (single) | Deleted `_MODULE_CACHE_WITH_OFFSET`, the `_get_aot_path`/`_check_aot_available` helpers, the hand-rolled AOT-vs-JIT branch, and the `tvm_ffi`/`jit_env`/`Path` imports. Single-path module build now delegates to `JitSpec.build_and_load()` (with its file-lock) like every other single-prefill call. | `flashinfer/dllm/block_extend.py` |
 
-Diff stat: 4 files, +259/-20. Python files pass `ast.parse`; the kernel `.cuh`
-change mirrors an existing in-tree primitive.
+Python files pass `ast.parse`; the kernel `.cuh` change mirrors an existing
+in-tree primitive. **No GPU verification done — none possible from this host
+(can't compile/import flashinfer or build CUDA here).**
 
-### Not yet done (remaining tasks, ordered by reviewer priority)
+### Not yet done (remaining tasks)
 
 - **§3 (none remaining)** — all three reviewer-flagged correctness items are
   addressed. The TMA-hang fix is **GPU-verifiable only on SM90** (`test_zero_visible_kv_no_hang`
   will hang on a faulty kernel); needs the H100 CI lane to confirm green.
-- **Task #6 (§1.2 step 3)** — standalone dedicated dLLM gen function; remove
-  `mask_modes` from the shared `gen_customize_*` and from
-  `prefill.py:191`. Low-risk now that steps 1–2 are done; suitable as a
-  follow-up commit.
+- **Task #6 batch half (§1.2 step 3, batch)** — a dedicated
+  `gen_customize_block_extend_batch_prefill_module` already exists and is
+  exported, but the batch *front-end* (`BatchBlockExtend{Ragged,Paged}OffsetWrapper`)
+  still threads `mask_modes` through `jit_kwargs` into the shared
+  `get_customize_batch_prefill_module`. Routing the batch front-end through the
+  dedicated gen needs a dispatch knob on the shared `BatchPrefill…Wrapper.__init__`,
+  which overlaps task #7 — see below.
 - **Task #7 (§2.2.1)** — fold `BatchBlockExtend{Ragged,Paged}OffsetWrapper`
-  into a `block_diffusion=` option on the existing `BatchPrefill…Wrapper.plan`.
-  Larger, user-visible API change.
-- **Task #8 (§2.2.2)** — route `block_extend_attention_with_offset` through
-  `single_prefill_with_kv_cache`; delete `_MODULE_CACHE_WITH_OFFSET` and the
-  hand-rolled AOT/JIT branch.
+  into a `block_diffusion=` plan option on the existing `BatchPrefill…Wrapper`.
+  **Deferred:** this threads the variant `jit_args` build and the offset tensors
+  / `dllm_block_size` through the hottest `BatchPrefill` runtime dispatch path
+  (`prefill.py:1657` and `:2788`), and **cannot be GPU-verified from this host**.
+  Doing it blind on production attention code is the one change I will not make
+  without verification; it must land in a GPU-equipped session / the dLLM CI lane.
+- **Task #8 (§2.2.2) batch** — n/a standalone; folded into #7 above.
 - **Task #9 (§2.3)** — drop the dedicated `gpu-tests-dllm-*` CI lanes; fold the
-  test into the existing prefill test suite.
+  test into the existing prefill test suite. Low-risk mechanical change;
+  intentionally grouped with the #7 convergence so the CI lane goes away at the
+  same moment the dedicated API surface does.
 
-### Decision needed before tasks #7–#9
+### Remaining risk / verification
 
-Tasks #7–#9 delete/replace user-visible APIs (`flashinfer/dllm/` exports) and
-a CI lane. Whether to push those as part of this PR vs. keep the thin shim
-(§2.2.3) is the §4 open question and is the reviewer's call — flagged to the
-user before executing.
+- The two local commits are `ast.parse`-clean but **unverified on GPU**. Before
+  the §2 convergence lands, the existing tests (including the new
+  `test_zero_visible_kv_no_hang`) must run on the H100/dLLM CI lane to confirm:
+  (a) the TMA-hang fix is actually exercised and green, (b) the idtype-in-URI
+  change recompiles cleanly (first-call JIT after the URI schema change,
+  discarding any stale cached dLLM module), (c) the dedicated single-path gen
+  produces byte-identical output to the previous shared-`mask_modes` path.

@@ -34,6 +34,7 @@ from ..utils import (
     dtype_map_kv,
     filename_safe_dtype_map,
     mask_mode_literal,
+    MaskMode,
     pos_encoding_mode_literal,
     write_if_different,
 )
@@ -1460,6 +1461,114 @@ def gen_customize_single_prefill_module(
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")
+
+
+# -----------------------------------------------------------------------------
+# dLLM block-diffusion ("block-expanding") dedicated front-ends.
+#
+# These are thin, deliberately-narrow wrappers over the shared
+# ``gen_customize_single/batch_prefill_module`` that compile ONLY
+# ``MaskMode::kBlockExpanding`` over the small closed product dLLM actually needs
+# (fp16/bf16 x head_dim 64/128 x ragged+paged x fa2/fa3). They are the standalone
+# entry points the reviewers asked for ("move the dispatch into a standalone
+# config/variant class") so the new mask mode is NOT a value multiplied into the
+# big shared prefill cartesian product. The shared ``gen_customize_*`` keeps its
+# default mask list ``[0,1,2,3]`` — no existing prefill URI compiles mode 4.
+# See docs/block-extend-design-response.md §1.
+# -----------------------------------------------------------------------------
+
+_BLOCK_EXTEND_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+_BLOCK_EXTEND_SUPPORTED_HEAD_DIMS = {64, 128}
+
+
+def _check_block_extend_axes(dtype_q: torch.dtype, head_dim_qk: int, head_dim_vo: int) -> None:
+    if dtype_q not in _BLOCK_EXTEND_SUPPORTED_DTYPES:
+        raise ValueError(
+            f"Block-extend (dLLM) only supports {_BLOCK_EXTEND_SUPPORTED_DTYPES}, got {dtype_q}."
+        )
+    if head_dim_qk not in _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS or head_dim_vo not in _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS:
+        raise ValueError(
+            f"Block-extend (dLLM) only supports head_dim in "
+            f"{sorted(_BLOCK_EXTEND_SUPPORTED_HEAD_DIMS)}, got "
+            f"head_dim_qk={head_dim_qk}, head_dim_vo={head_dim_vo}."
+        )
+
+
+def gen_customize_block_extend_single_prefill_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+) -> "JitSpec":
+    """Dedicated single-prefill front-end for dLLM block-diffusion attention.
+
+    Compiles only ``MaskMode::kBlockExpanding`` over the closed dLLM product.
+    Behaviorally delegates to :func:`gen_customize_single_prefill_module` with
+    ``mask_modes`` fixed to ``[kBlockExpanding]`` and the closed product enforced
+    up front — a separate small entry point, not a value multiplied into the big
+    shared prefill cartesian product.
+    """
+    _check_block_extend_axes(dtype_q, head_dim_qk, head_dim_vo)
+    return gen_customize_single_prefill_module(
+        backend, uri, dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo,
+        additional_tensor_names, additional_tensor_dtypes,
+        additional_scalar_names, additional_scalar_dtypes,
+        variant_name, variant_decl, pos_encoding_mode,
+        use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
+        mask_modes=[MaskMode.kBlockExpanding.value],
+    )
+
+
+def gen_customize_block_extend_batch_prefill_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+) -> "JitSpec":
+    """Dedicated batch-prefill front-end for dLLM block-diffusion attention.
+
+    Compiles only ``MaskMode::kBlockExpanding`` over the closed dLLM product.
+    Behaviorally delegates to :func:`gen_customize_batch_prefill_module` with
+    ``mask_modes`` fixed to ``[kBlockExpanding]`` and the closed product enforced.
+    """
+    _check_block_extend_axes(dtype_q, head_dim_qk, head_dim_vo)
+    return gen_customize_batch_prefill_module(
+        backend, uri, dtype_q, dtype_kv, dtype_o, idtype, head_dim_qk, head_dim_vo,
+        additional_tensor_names, additional_tensor_dtypes,
+        additional_scalar_names, additional_scalar_dtypes,
+        variant_name, variant_decl, pos_encoding_mode,
+        use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
+        mask_modes=[MaskMode.kBlockExpanding.value],
+    )
 
 
 def gen_customize_batch_decode_module(
