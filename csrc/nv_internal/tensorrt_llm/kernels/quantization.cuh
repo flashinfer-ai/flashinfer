@@ -964,10 +964,10 @@ __global__ void nvfp4QuantAndPerTokenScaleFP32Kernel(
   }
 }
 
-// This kernel only quantizes fp32 scales to e4m3 and finds the row-wise amax.
-// The per-block amaxes are read directly from `scaleInput` (one fp32 value per SF_VEC_SIZE block,
-// linear layout). The row-wise amax is the max over the block amaxes. The input layout is linear,
-// the output layout is linear, 128x4, or 8x4.
+// This kernel quantizes fp32 NVFP4 dequant scales to e4m3 and finds the row-wise amax.
+// `scaleInput` contains one fp32 dequant scale (block amax / E2M1 max) per SF_VEC_SIZE block in
+// linear layout. Reconstruct the block amax before deriving the per-token scale. The output layout
+// is linear, 128x4, or 8x4.
 template <uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT_OUT, bool CACHE_SCALE_IN_SMEM = true>
 __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
     // input
@@ -977,6 +977,7 @@ __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
     // output
     uint8_t* scaleOutput, float* perTokenScaleOutput) {
   static constexpr int SF_VEC_SIZE = 16;
+  static constexpr float E2M1_MAX_VALUE = 6.f;
   int rowIdx = blockIdx.x;
   if (rowIdx >= m) return;
   if (expandedIdxToPermutedIdx != nullptr) {
@@ -989,11 +990,11 @@ __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
 
   extern __shared__ float scaleSmem[];
 
-  // find the row-wise amax from the per-block fp32 scales
+  // Find the row-wise amax from the per-block fp32 dequant scales.
   float globalAmax = 0.f;
   for (uint32_t vecIdx = threadIdx.x; vecIdx < num_sf_vecs_per_row; vecIdx += blockDim.x) {
     int64_t sfInOffset = static_cast<int64_t>(rowIdx) * num_sf_vecs_per_row + vecIdx;
-    float localAmax = scaleInput[sfInOffset];
+    float localAmax = scaleInput[sfInOffset] * E2M1_MAX_VALUE;
     if constexpr (CACHE_SCALE_IN_SMEM) {
       scaleSmem[vecIdx] = localAmax;
     }
@@ -1018,9 +1019,10 @@ __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
       localAmax = scaleSmem[vecIdx];
     } else {
       int64_t sfInOffset = static_cast<int64_t>(rowIdx) * num_sf_vecs_per_row + vecIdx;
-      localAmax = scaleInput[sfInOffset];
+      localAmax = scaleInput[sfInOffset] * E2M1_MAX_VALUE;
     }
-    float localScale = localAmax == 0.f ? 0.f : 6.f * reciprocal_approximate_ftz(localAmax);
+    float localScale =
+        localAmax == 0.f ? 0.f : E2M1_MAX_VALUE * reciprocal_approximate_ftz(localAmax);
     float fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
     uint8_t fp8Scale = __nv_fp8_e4m3(fp32Scale).__x;
     int64_t sfOffset;
