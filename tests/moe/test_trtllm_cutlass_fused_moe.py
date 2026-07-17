@@ -3523,5 +3523,217 @@ def test_moe_w4a8_hopper_autotune():
     _run_w4a8_moe_hopper(4, 512, 2, 2, 512, dtype=torch.bfloat16, use_autotune=True)
 
 
+# ---------------------------------------------------------------------------
+# Workspace buffer tests (issue #3364, Option A)
+# ---------------------------------------------------------------------------
+_WS_SM100_SKIP = pytest.mark.skipif(
+    not is_sm100a_supported(torch.device("cuda")),
+    reason="workspace_buffer tests require SM100",
+)
+
+_WS_CFG = dict(
+    hidden_size=256,
+    inter_size=512,
+    num_experts=8,
+    top_k=2,
+    dtype=torch.bfloat16,
+)
+
+
+def _make_ws_inputs(num_tokens, cfg=_WS_CFG):
+    E, K, H = cfg["num_experts"], cfg["top_k"], cfg["hidden_size"]
+    I = cfg["inter_size"]
+    dtype = cfg["dtype"]
+    x = torch.randn(num_tokens, H, dtype=dtype, device="cuda")
+    topk_ids = torch.stack(
+        [torch.randperm(E, device="cuda")[:K] for _ in range(num_tokens)]
+    ).to(torch.int32)
+    topk_w = torch.softmax(torch.randn(num_tokens, K, device="cuda"), dim=1)
+    w1 = torch.randn(E, 2 * I, H, dtype=dtype, device="cuda") * 0.01
+    w2 = torch.randn(E, H, I, dtype=dtype, device="cuda") * 0.01
+    return x, topk_ids, topk_w, w1, w2
+
+
+def _call_ws(x, topk_ids, topk_w, w1, w2, workspace_buffer=None):
+    from flashinfer.fused_moe.core import cutlass_fused_moe
+
+    return cutlass_fused_moe(
+        x,
+        topk_ids,
+        topk_w,
+        w1,
+        w2,
+        output_dtype=x.dtype,
+        quant_scales=[],
+        use_fused_finalize=False,
+        tune_max_num_tokens=max(x.shape[0], 256),
+        workspace_buffer=workspace_buffer,
+    )
+
+
+def _ws_size(num_tokens, cfg=_WS_CFG):
+    from flashinfer.fused_moe.core import cutlass_fused_moe_workspace_size
+
+    return cutlass_fused_moe_workspace_size(
+        num_tokens,
+        cfg["hidden_size"],
+        cfg["inter_size"],
+        cfg["num_experts"],
+        cfg["top_k"],
+        x_dtype=cfg["dtype"],
+        weight_dtype=cfg["dtype"],
+        use_fused_finalize=False,
+    )
+
+
+@_WS_SM100_SKIP
+def test_workspace_size_positive_and_monotonic():
+    sizes = [_ws_size(n) for n in [256, 1024, 4096, 8192]]
+    assert all(s > 0 for s in sizes)
+    assert all(sizes[i] <= sizes[i + 1] for i in range(len(sizes) - 1))
+
+
+@_WS_SM100_SKIP
+def test_workspace_buffered_matches_unbuffered():
+    inputs = _make_ws_inputs(256)
+    out_unbuf = _call_ws(*inputs)[0]
+    ws = torch.empty(_ws_size(256), dtype=torch.uint8, device="cuda")
+    out_buf = _call_ws(*inputs, workspace_buffer=ws)[0]
+    torch.testing.assert_close(out_unbuf, out_buf, rtol=0, atol=0)
+
+
+@_WS_SM100_SKIP
+def test_workspace_exact_size_accepted():
+    inputs = _make_ws_inputs(256)
+    ws = torch.empty(_ws_size(256), dtype=torch.uint8, device="cuda")
+    _call_ws(*inputs, workspace_buffer=ws)  # must not raise
+
+
+@_WS_SM100_SKIP
+def test_workspace_undersized_rejected():
+    inputs = _make_ws_inputs(256)
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    with pytest.raises(RuntimeError, match="workspace_buffer too small"):
+        _call_ws(*inputs, workspace_buffer=ws)
+
+
+@_WS_SM100_SKIP
+def test_workspace_wrong_dtype_rejected():
+    inputs = _make_ws_inputs(256)
+    ws = torch.empty(_ws_size(256), dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError, match="dtype must be int8 or uint8"):
+        _call_ws(*inputs, workspace_buffer=ws)
+
+
+@_WS_SM100_SKIP
+def test_workspace_cpu_tensor_rejected():
+    inputs = _make_ws_inputs(256)
+    ws = torch.empty(_ws_size(256), dtype=torch.uint8, device="cpu")
+    with pytest.raises(RuntimeError, match="CUDA tensor"):
+        _call_ws(*inputs, workspace_buffer=ws)
+
+
+@_WS_SM100_SKIP
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="workspace device-guard test requires two CUDA devices",
+)
+def test_workspace_device_tracks_input_not_current_device():
+    with torch.cuda.device(1):
+        inputs = _make_ws_inputs(64)
+        n = _ws_size(64)
+        ws = torch.empty(n, dtype=torch.uint8, device="cuda:1")
+
+    with torch.cuda.device(0):
+        _call_ws(*inputs, workspace_buffer=ws)
+        torch.cuda.synchronize(1)
+        assert torch.cuda.current_device() == 0
+
+        wrong_device_ws = torch.empty(n, dtype=torch.uint8, device="cuda:0")
+        with pytest.raises(RuntimeError, match="does not match input device"):
+            _call_ws(*inputs, workspace_buffer=wrong_device_ws)
+
+
+@_WS_SM100_SKIP
+def test_workspace_wrong_ndim_rejected():
+    inputs = _make_ws_inputs(256)
+    n = _ws_size(256)
+    ws = torch.empty(n // 2, 2, dtype=torch.uint8, device="cuda")
+    with pytest.raises(RuntimeError, match="1-D"):
+        _call_ws(*inputs, workspace_buffer=ws)
+
+
+@_WS_SM100_SKIP
+def test_workspace_noncontiguous_rejected():
+    inputs = _make_ws_inputs(64)
+    n = _ws_size(64)
+    # stride-2 slice: 1-D but non-contiguous
+    ws = torch.empty(n * 2, dtype=torch.uint8, device="cuda")[::2]
+    assert not ws.is_contiguous()
+    with pytest.raises(RuntimeError, match="contiguous"):
+        _call_ws(*inputs, workspace_buffer=ws)
+
+
+@_WS_SM100_SKIP
+def test_workspace_size_rejects_nonpositive_dims():
+    from flashinfer.fused_moe.core import cutlass_fused_moe_workspace_size
+
+    base = dict(
+        hidden_size=256, inter_size=512, num_experts=8, top_k=2,
+        x_dtype=torch.bfloat16, weight_dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="max_num_tokens"):
+        cutlass_fused_moe_workspace_size(0, **base)
+    with pytest.raises(ValueError, match="max_num_tokens"):
+        cutlass_fused_moe_workspace_size(-1, **base)
+    with pytest.raises(ValueError, match="hidden_size"):
+        cutlass_fused_moe_workspace_size(64, **{**base, "hidden_size": -1})
+    with pytest.raises(ValueError, match="top_k"):
+        cutlass_fused_moe_workspace_size(64, **{**base, "top_k": 0})
+
+
+@_WS_SM100_SKIP
+def test_workspace_no_alloc_during_buffered_call():
+    inputs = _make_ws_inputs(512)
+    ws = torch.empty(_ws_size(512), dtype=torch.uint8, device="cuda")
+    # warm tactic cache
+    _call_ws(*inputs)
+    torch.cuda.empty_cache()
+
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    _call_ws(*inputs, workspace_buffer=ws)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+
+    # only the output tensor (~H * num_tokens * 2 bytes) should appear
+    max_expected = 512 * _WS_CFG["hidden_size"] * 2 * 4  # 4× slack
+    assert peak - before <= max_expected, (
+        f"workspace_peak={peak - before} exceeds output-only budget {max_expected}"
+    )
+
+
+@_WS_SM100_SKIP
+def test_workspace_cuda_graph_capture_replay():
+    num_tokens = 128
+    inputs = _make_ws_inputs(num_tokens)
+    ws = torch.empty(_ws_size(num_tokens), dtype=torch.uint8, device="cuda")
+
+    # warm up outside the graph
+    for _ in range(3):
+        _call_ws(*inputs, workspace_buffer=ws)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = _call_ws(*inputs, workspace_buffer=ws)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    out_eager = _call_ws(*inputs, workspace_buffer=ws)
+    out_t = out[0] if isinstance(out, (list, tuple)) else out
+    out_e = out_eager[0] if isinstance(out_eager, (list, tuple)) else out_eager
+    torch.testing.assert_close(out_t, out_e, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
