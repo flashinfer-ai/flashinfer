@@ -1433,6 +1433,11 @@ def rope_quantize_fp8(
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         Quantized tensors: (q_rope_out, k_rope_out, q_nope_out, k_nope_out).
     """
+    if backend not in ("cuda", "cutile"):
+        raise ValueError(
+            f"Unsupported backend for rope_quantize_fp8: {backend!r}; "
+            "expected 'cuda' or 'cutile'."
+        )
     if backend == "cutile":
         if is_neox:
             # The cuTile kernel implements only the interleaved (GPT-J) rotary

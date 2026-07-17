@@ -369,6 +369,12 @@ def rope_quantize_fp8_cutile(
         else:
             quantize_dtype = torch.float8_e4m3fn
 
+    if quantize_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(
+            "quantize_dtype must be float8_e4m3fn or float8_e5m2; "
+            f"got {quantize_dtype}"
+        )
+
     # Pre-zero output buffers to avoid NaN from beta=0 epilogue (PR #3426 pattern)
     q_rope_out = (
         q_rope_out
