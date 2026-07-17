@@ -36,18 +36,7 @@ _TORCH_TO_CUTLASS_DTYPE_ATTR = {
 
 
 def _blockscaled_gemm_cache_key_files() -> tuple:
-    """Source files whose content invalidates the on-disk mm_fp4 kernels.
-
-    Must be identical for every kernel of the module: the per-module
-    ``meta.json`` records one source hash, so per-kernel variation would
-    make sibling kernels wipe each other's artifacts.  This module (rather
-    than the much larger, frequently edited gemm_base.py) is in the list
-    because it constructs the ``cute.compile`` arguments.
-
-    If the runner ever compiles other kernel classes into this cache
-    module (e.g. re-enabling the SM103 kernel), their source files must
-    be added here, or stale artifacts would survive kernel edits.
-    """
+    """Source files whose content invalidates the on-disk mm_fp4 kernels."""
     from .kernels import (
         dense_blockscaled_gemm_sm100,
         dense_blockscaled_gemm_sm100_common,
@@ -81,13 +70,6 @@ def _compile_block_scaled_gemm(
 
     ``make_gemm_kernel`` is a zero-arg callable that returns a kernel instance
     (Sm100 or Sm103).  It is only invoked on a cache miss.
-
-    When ``cache_module_name`` is given, compiled kernels also persist to the
-    on-disk CuTe-DSL cache (see ``flashinfer/jit/cute_dsl_core.py``) and are
-    reloaded from it in new processes; ``cache_key`` must therefore encode
-    every codegen-affecting parameter.  ``max_active_clusters`` is baked into
-    the persistent scheduler and is appended to the on-disk name, since the
-    compile arch alone does not distinguish GPUs with different SM counts.
 
     TVM-FFI compilation pattern:
       - A, B, C, alpha: make_fake_compact_tensor -> torch tensors
@@ -142,8 +124,7 @@ def _compile_block_scaled_gemm(
 
 
 def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
-    """On-disk kernel name; shared by the in-process compile path and the
-    parallel precompilation workers, which must agree byte-for-byte."""
+    """On-disk kernel name for compiled kernel."""
     return "_".join(
         [str(part) for part in cache_key]
         + [f"b{batch_size}", f"mac{max_active_clusters}"]
@@ -163,7 +144,7 @@ def _make_blockscaled_gemm_compile_fn(
     batch_size,
     max_active_clusters,
 ):
-    """Zero-arg closure performing the ``cute.compile`` call for *gemm*."""
+    """Build a zero-arg closure that runs ``cute.compile`` for gemm."""
     import cutlass
     import cutlass.cute as cute
 
@@ -294,9 +275,7 @@ def _mm_fp4_precompile_worker(payload):
         return (kernel_name, f"{type(e).__name__}: {e}")
 
 
-# Host-RAM budget per precompile worker.  Measured peak RSS per worker is
-# ~0.8 GB (torch/cutlass import baseline + one cute.compile); 1 GB adds
-# headroom.  cute.compile itself uses zero GPU memory.
+# Empirically measured host-RAM budget (RSS) per precompile worker -- 1 GiB
 _MM_FP4_PRECOMPILE_WORKER_RAM_BYTES = 1 << 30
 
 
@@ -313,13 +292,10 @@ def _available_host_memory_bytes() -> Optional[int]:
 
 
 def _get_mm_fp4_cute_dsl_compile_workers() -> int:
-    """Number of subprocesses used to precompile mm_fp4 cute-dsl tactics
-    during autotuning.
+    """How many subprocesses to use for precompiling mm_fp4 cute-dsl tactics.
 
-    Override with FLASHINFER_MM_FP4_CUTE_DSL_COMPILE_WORKERS; <= 1 disables
-    parallel precompilation (tactics compile serially on first use, as
-    before).  The requested count is additionally capped by available host
-    memory to avoid host-side OOM when many processes tune concurrently.
+    Starts from FLASHINFER_MM_FP4_CUTE_DSL_COMPILE_WORKERS (default 4), then
+    lowers it to what host RAM can hold using 1 GiB per spawned worker as a safety measure.
     """
     workers = int(os.environ.get("FLASHINFER_MM_FP4_CUTE_DSL_COMPILE_WORKERS", "4"))
     if workers <= 1:
@@ -337,11 +313,10 @@ def _get_mm_fp4_cute_dsl_compile_workers() -> int:
     return workers
 
 
-def run_mm_fp4_precompile_pool(payloads) -> None:
+def _run_mm_fp4_precompile_pool(payloads) -> None:
     """Compile mm_fp4 tactics into the on-disk cache with a subprocess pool.
 
-    Each payload is handled by ``_mm_fp4_precompile_worker``; failures are
-    logged and skipped (those tactics compile in-process on first use).
+    Each subprocess runs _mm_fp4_precompile_worker.
     """
     from multiprocessing import get_context
 
@@ -357,3 +332,87 @@ def run_mm_fp4_precompile_pool(payloads) -> None:
             logger.debug(
                 f"[mm_fp4 cute-dsl] precompile failed for {kernel_name}: {err}"
             )
+
+
+def _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype):
+    """In-memory kernel-cache key for one mm_fp4 tactic tuple.
+
+    Shared by the runner's forward path and the precompile path, which
+    must agree byte-for-byte: the on-disk kernel name derives from it.
+    """
+    return (sf_vec_size, *tactic, enable_pdl, out_dtype)
+
+
+def precompile_mm_fp4_tactics(
+    tactics, m, n, real_k, use_nvfp4, enable_pdl, out_dtype, kernel_cache
+) -> None:
+    """Batch-compile not-yet-cached mm_fp4 tactics into the on-disk
+    CuTe-DSL cache with a pool of subprocesses.
+
+    Called by autotuner's do_preparation, before the per-tactic profiling loop.
+    Failures are non-fatal: any tactic missing from kernel_cache and
+    the disk cache compiles in-process on first use.
+    """
+    from ..jit.cute_dsl_core import (
+        JitSpecCuteDsl,
+        _hash_source_files,
+        cute_dsl_cache_disabled,
+    )
+
+    if cute_dsl_cache_disabled():
+        return  # workers hand kernels to the parent via the disk cache
+    if _get_mm_fp4_cute_dsl_compile_workers() <= 1:
+        return
+
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    sf_vec_size = 16 if use_nvfp4 else 32
+    key_files = _blockscaled_gemm_cache_key_files()
+    source_sha256 = _hash_source_files(tuple(key_files))
+
+    max_clusters_cache: dict = {}
+    payloads = []
+    for tactic in tactics:
+        (
+            mma_tiler_mn,
+            cluster_shape_mn,
+            swap_ab,
+            _use_prefetch,
+            kernel_type,
+            _use_tma_store,
+        ) = tactic
+        if kernel_type != "sm100":
+            continue
+        cache_key = _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype)
+        if cache_key in kernel_cache:
+            continue
+
+        cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+        if cluster_size not in max_clusters_cache:
+            max_clusters_cache[cluster_size] = get_max_active_clusters(cluster_size)
+        mac = max_clusters_cache[cluster_size]
+        kernel_name = _blockscaled_kernel_disk_name(cache_key, 1, mac)
+        spec = JitSpecCuteDsl("mm_fp4", kernel_name, lambda: None, source_sha256)
+        if spec.is_compiled:
+            continue  # already on disk; forward will JITLink it
+
+        kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
+        payloads.append(
+            {
+                "cache_key": cache_key,
+                "kernel_name": kernel_name,
+                "max_active_clusters": mac,
+                "sf_m": (kernel_m + 127) // 128,
+                "sf_n": (kernel_n + 127) // 128,
+                "sf_k": (real_k // sf_vec_size + 3) // 4,
+                "batch_size": 1,
+                "key_files": key_files,
+            }
+        )
+
+    # A single missing tactic compiles faster in-process than the
+    # spawn + import cost of a one-worker pool.
+    if len(payloads) < 2:
+        return
+
+    _run_mm_fp4_precompile_pool(payloads)

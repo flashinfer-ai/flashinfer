@@ -187,12 +187,11 @@ class JitSpecCuteDsl(JitSpec):
     def compile_and_persist(self) -> None:
         """Compile outside the module lock; commit the artifact under it.
 
-        ``build_and_load()`` holds the module lock for the whole build, which
-        would serialize a pool of parallel precompilation workers building
-        distinct kernels of one module.  This variant runs ``compile_fn``
-        unlocked and takes the lock only for the stale-module wipe and the
-        artifact export (~ms).  Concurrent duplicate builds of the *same*
-        kernel waste work but stay correct: exports are atomic replaces.
+        ``build_and_load()`` holds the module lock for the whole build.
+        This variant runs ``compile_fn`` unlocked and takes the lock only
+        for the stale-module wipe and the artifact export (~ms).
+
+        Meant for parallel precompilation workers.
         """
         from filelock import FileLock
 

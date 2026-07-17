@@ -55,11 +55,9 @@ from ..fused_moe.utils import (
 )
 from .gemm_mm_fp4_cute_dsl import (
     _TORCH_TO_CUTLASS_DTYPE_ATTR,
-    _blockscaled_gemm_cache_key_files,
-    _blockscaled_kernel_disk_name,
     _compile_block_scaled_gemm,
-    _get_mm_fp4_cute_dsl_compile_workers,
-    run_mm_fp4_precompile_pool,
+    _mm_fp4_cache_key,
+    precompile_mm_fp4_tactics,
 )
 from .kernels.utils import (
     _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
@@ -5957,102 +5955,6 @@ def _cute_dsl_gemm_fp4_runner(
                 for t in ts
             ]
 
-        def _precompile_tactics(self, inputs) -> None:
-            """Batch-compile all not-yet-cached valid tactics into the
-            on-disk CuTe-DSL cache with a pool of subprocesses.
-
-            Called from the autotuner's do_preparation hook, before the
-            per-tactic profiling loop.  Without this, each new tactic pays
-            a full serial cute.compile (~2-3 s) inside the profiling loop.
-            The profiling loop then hits the freshly persisted artifacts
-            (~10 ms JITLink loads).  Failures are non-fatal: any tactic
-            missing from the cache compiles in-process on first use.
-            """
-            from ..jit.cute_dsl_core import (
-                JitSpecCuteDsl,
-                _hash_source_files,
-                cute_dsl_cache_disabled,
-            )
-
-            if cute_dsl_cache_disabled():
-                return  # workers hand kernels to the parent via the disk cache
-            num_workers = _get_mm_fp4_cute_dsl_compile_workers()
-            if num_workers <= 1:
-                return
-
-            from flashinfer.cute_dsl.utils import get_max_active_clusters
-
-            (a, b, *_rest) = inputs
-            m = a.shape[0]
-            k_packed = a.shape[1]
-            n = b.shape[1]
-            real_k = k_packed * 2
-
-            sf_vec_size = 16 if use_nvfp4 else 32
-            key_files = _blockscaled_gemm_cache_key_files()
-            source_sha256 = _hash_source_files(tuple(key_files))
-
-            max_clusters_cache: dict = {}
-            payloads = []
-            for tactic in self.get_valid_tactics(inputs, None):
-                (
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    swap_ab,
-                    use_prefetch,
-                    kernel_type,
-                    use_tma_store,
-                ) = tactic
-                if kernel_type != "sm100":
-                    continue
-                cache_key = (
-                    sf_vec_size,
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    swap_ab,
-                    use_prefetch,
-                    kernel_type,
-                    use_tma_store,
-                    enable_pdl,
-                    out_dtype,
-                )
-                if cache_key in _CUTE_DSL_MM_FP4_KERNEL_CACHE:
-                    continue
-
-                cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
-                if cluster_size not in max_clusters_cache:
-                    max_clusters_cache[cluster_size] = get_max_active_clusters(
-                        cluster_size
-                    )
-                mac = max_clusters_cache[cluster_size]
-                kernel_name = _blockscaled_kernel_disk_name(cache_key, 1, mac)
-                spec = JitSpecCuteDsl(
-                    "mm_fp4", kernel_name, lambda: None, source_sha256
-                )
-                if spec.is_compiled:
-                    continue  # already on disk; forward will JITLink it
-
-                kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
-                payloads.append(
-                    {
-                        "cache_key": cache_key,
-                        "kernel_name": kernel_name,
-                        "max_active_clusters": mac,
-                        "sf_m": (kernel_m + 127) // 128,
-                        "sf_n": (kernel_n + 127) // 128,
-                        "sf_k": (real_k // sf_vec_size + 3) // 4,
-                        "batch_size": 1,
-                        "key_files": key_files,
-                    }
-                )
-
-            # A single missing tactic compiles faster in-process than the
-            # spawn + import cost of a one-worker pool.
-            if len(payloads) < 2:
-                return
-
-            run_mm_fp4_precompile_pool(payloads)
-
         def forward(
             self,
             inputs: List[torch.Tensor],
@@ -6060,16 +5962,6 @@ def _cute_dsl_gemm_fp4_runner(
             do_preparation: bool = False,
             **kwargs,
         ):
-            if do_preparation:
-                try:
-                    self._precompile_tactics(inputs)
-                except Exception as e:  # noqa: BLE001 -- perf optimization only
-                    logger.warning(
-                        f"[mm_fp4 cute-dsl] tactic precompilation failed "
-                        f"({type(e).__name__}: {e}); tactics will compile "
-                        f"serially during profiling."
-                    )
-
             (a, b, a_descale, b_descale, alpha_tensor, _, out, _, _, _) = inputs
             m = a.shape[0]
             k_packed = a.shape[1]
@@ -6079,6 +5971,25 @@ def _cute_dsl_gemm_fp4_runner(
             sf_vec_size = 16 if use_nvfp4 else 32
             sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
             batch_size = 1
+
+            if do_preparation:
+                try:
+                    precompile_mm_fp4_tactics(
+                        self.get_valid_tactics(inputs, None),
+                        m,
+                        n,
+                        real_k,
+                        use_nvfp4,
+                        enable_pdl,
+                        out_dtype,
+                        _CUTE_DSL_MM_FP4_KERNEL_CACHE,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[mm_fp4 cute-dsl] tactic precompilation failed "
+                        f"({type(e).__name__}: {e}); tactics will compile "
+                        f"serially during profiling."
+                    )
 
             if tactic is None or tactic == -1:
                 # Use analytical heuristic to pick the best tactic based on
@@ -6114,17 +6025,7 @@ def _cute_dsl_gemm_fp4_runner(
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            cache_key = (
-                sf_vec_size,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                swap_ab,
-                use_prefetch,
-                kernel_type,
-                use_tma_store,
-                enable_pdl,
-                out_dtype,
-            )
+            cache_key = _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype)
 
             if kernel_type == "sm103" and Sm103Kernel is not None:
                 make_kernel = lambda: Sm103Kernel(
