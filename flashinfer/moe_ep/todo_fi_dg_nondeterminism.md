@@ -1,9 +1,33 @@
 # TODO: fi_dg (deep_gemm_mega) run-to-run nondeterminism
 
-Status: analysis only, nothing implemented yet (2026-07-16). Found during the
-2026-07-15 vLLM 0.25.1 e2e integration (DeepSeek-V4-Flash, 4x GB200, TP4+EP4,
-eager). Full run log: `$LUSTRE_ROOT/moe_ep_benchmark/vllm_e2e/RUNS.md`
-(runs 3/4/11) and `FINDINGS.md` there.
+Status: LAYER-LEVEL EXONERATED (2026-07-16 pm) — engine-side lead open.
+`tests/moe_ep/test_moe_ep_deep_gemm_skew_determinism.py` (4x GB200) proves
+the fi_dg layer bit-deterministic under (a) back-to-back repeats, (b) gross
+~100 ms per-iteration-rotating rank skew (kills the arrival-order-combine
+hypothesis — the deep_gemm combine is order-fixed), and (c) identical input
+bytes at shifted base addresses/alignments (16B/8B/128B/256B — staged fp8 +
+scales + outputs all bit-equal, killing the allocator-address hypothesis).
+Code inspection additionally equalized fi-vs-native on is_padding handling,
+capacity-tail semantics (dg derives n from y.shape[0]), workspace
+provenance, and output-buffer freshness.
+
+NEW LEADING HYPOTHESIS: the divergence is not in the MoE path at all —
+vLLM batch-formation timing. The fi path's heavier/more variable host loop
+can straddle scheduler boundaries so chunked-prefill/batch composition
+differs across runs; different batch shapes change attention/GEMM reduction
+splits (deterministic per shape, shape-dependent rounding) → small logit
+deltas → greedy token flips on near-ties. Matches the symptom (some prompts
+exact, others small-|dlp|). NEXT EXPERIMENT: log per-step scheduled-token
+shapes across two identical fi_dg runs (wrapper sees num_tokens at layer 0;
+one line per engine step) and diff — identical schedules would falsify this
+and reopen the state hunt; differing schedules confirm and reclassify the
+issue as engine-timing sensitivity (not an fi correctness bug), with the
+per-step shape log as the standard control for future determinism claims.
+
+Original analysis (2026-07-16 am) below. Found during the 2026-07-15 vLLM
+0.25.1 e2e integration (DeepSeek-V4-Flash, 4x GB200, TP4+EP4, eager). Full
+run log: `$LUSTRE_ROOT/moe_ep_benchmark/vllm_e2e/RUNS.md` (runs 3/4/11) and
+`FINDINGS.md` there.
 
 ## Symptom
 
