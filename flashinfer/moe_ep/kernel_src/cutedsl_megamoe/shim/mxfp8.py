@@ -865,6 +865,17 @@ def get_symm_buffer_for_mxfp8_mega_moe(
             max_tokens=num_max_tokens,
         )
     cfg = with_knobs(cfg, knobs)
+    if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
+        # Caller-owned correctness choice; see the NVFP4 factory. The MXFP8
+        # kernel rejects ikr together with dispatch-warp token-back, so the
+        # restored ikr also forces epi-warps token-back.
+        cfg = dataclasses.replace(
+            cfg,
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            token_back_by_dispatch=(
+                False if in_kernel_fc2_reduce else cfg.token_back_by_dispatch
+            ),
+        )
     frontend = MegaMoEMxfp8Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
@@ -919,7 +930,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
 
 
 def mxfp8_mega_moe(
-    y: torch.Tensor,
+    y: Optional[torch.Tensor],
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoEMxfp8SymmBuffer,
@@ -929,7 +940,7 @@ def mxfp8_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
     sync: bool = False,
-) -> None:
+) -> Optional[torch.Tensor]:
     """Launch the fused CuTeDSL MXFP8 MegaMoE kernel (dispatch + fc1 + fc2 + combine).
 
     Caller must stage ``symm_buffer.x`` / routing slices before calling.
@@ -966,13 +977,14 @@ def mxfp8_mega_moe(
             f"num_tokens must be in [0, {symm_buffer.num_max_tokens}], got {n}."
         )
     if n == 0 and symm_buffer._frontend.config.in_kernel_fc2_reduce:
-        return
-    if y.shape != (n, symm_buffer.hidden):
-        raise ValueError(
-            f"y must be ({n}, {symm_buffer.hidden}), got {tuple(y.shape)}."
-        )
-    if y.dtype != torch.bfloat16:
-        raise ValueError(f"y must be bfloat16, got {y.dtype}.")
+        return symm_buffer.output_activation[:0] if y is None else None
+    if y is not None:
+        if y.shape != (n, symm_buffer.hidden):
+            raise ValueError(
+                f"y must be ({n}, {symm_buffer.hidden}), got {tuple(y.shape)}."
+            )
+        if y.dtype != torch.bfloat16:
+            raise ValueError(f"y must be bfloat16, got {y.dtype}.")
 
     fc1_weight, fc1_weight_sf = transformed_l1
     fc2_weight, fc2_weight_sf = transformed_l2
@@ -1001,10 +1013,17 @@ def mxfp8_mega_moe(
     # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
     # live [:n] rows out -- matches the reference driver, which does not slice.
     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
-    if out is not None:
-        y.copy_(out[:n])
+    if y is None:
+        # Zero-copy: the caller consumes the workspace view under stream
+        # ordering (valid until the next launch on this session's buffers).
+        result = out[:n] if out is not None else symm_buffer.output_activation[:0]
+    else:
+        result = None
+        if out is not None:
+            y.copy_(out[:n])
     if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
+    return result
 
 
 def mxfp8_mega_launch_thunk(

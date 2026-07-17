@@ -205,3 +205,28 @@ def test_mega_layer_capture_without_warmup_raises(monkeypatch):
             layer.forward(t)
     finally:
         layer.destroy()
+
+
+@pytest.mark.arch_blackwell
+def test_mega_compute_output_none_returns_workspace_view(monkeypatch):
+    """compute(output=None) is a zero-copy view, bit-equal to the copy path."""
+    import torch
+
+    _require_blackwell()
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    layer, problem = _single_rank_layer("nvfp4")
+    try:
+        layer.warmup()
+        t = _random_batch(problem, seed=42)
+        y_copy = layer.forward(t).clone()
+        torch.cuda.synchronize()
+
+        kernel, ws, transformed = layer._kernel, layer._workspace, layer._transformed
+        kernel.stage_inputs(t, ws, quantize_input=True)
+        view = kernel.compute(ws, transformed, output=None)
+        torch.cuda.synchronize()
+        assert view.data_ptr() == ws.output_activation.data_ptr()
+        assert torch.equal(view, y_copy)
+    finally:
+        layer.destroy()

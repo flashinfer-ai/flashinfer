@@ -1085,6 +1085,12 @@ def get_symm_buffer_for_mega_moe(
         ),
     )
     cfg = with_knobs(cfg, resolved_knobs)
+    if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
+        # in_kernel_fc2_reduce is a caller-owned CORRECTNESS choice (it makes
+        # the combine accumulation order nondeterministic); cached/heuristic
+        # perf knobs must not flip it. Explicit knobs dicts already bypassed
+        # resolution above and keep full control.
+        cfg = dataclasses.replace(cfg, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
     frontend = MegaMoENvfp4Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
@@ -1154,7 +1160,7 @@ def get_symm_buffer_for_mega_moe(
 
 
 def nvfp4_mega_moe(
-    y: torch.Tensor,
+    y: Optional[torch.Tensor],
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoESymmBuffer,
@@ -1164,7 +1170,7 @@ def nvfp4_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
     sync: bool = False,
-) -> None:
+) -> Optional[torch.Tensor]:
     """Launch the fused CuTeDSL NVFP4 MegaMoE kernel (dispatch + fc1 + fc2 + combine).
 
     Caller must stage ``symm_buffer.x`` / routing slices before calling.
@@ -1202,13 +1208,14 @@ def nvfp4_mega_moe(
             f"num_tokens must be in [0, {symm_buffer.num_max_tokens}], got {n}."
         )
     if n == 0 and symm_buffer._frontend.config.fc2_reduces_topk:
-        return
-    if y.shape != (n, symm_buffer.hidden):
-        raise ValueError(
-            f"y must be ({n}, {symm_buffer.hidden}), got {tuple(y.shape)}."
-        )
-    if y.dtype != torch.bfloat16:
-        raise ValueError(f"y must be bfloat16, got {y.dtype}.")
+        return symm_buffer.output_activation[:0] if y is None else None
+    if y is not None:
+        if y.shape != (n, symm_buffer.hidden):
+            raise ValueError(
+                f"y must be ({n}, {symm_buffer.hidden}), got {tuple(y.shape)}."
+            )
+        if y.dtype != torch.bfloat16:
+            raise ValueError(f"y must be bfloat16, got {y.dtype}.")
 
     fc1_weight, fc1_weight_sf = transformed_l1
     fc2_weight, fc2_weight_sf = transformed_l2
@@ -1240,10 +1247,17 @@ def nvfp4_mega_moe(
     # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
     # live [:n] rows out -- matches the reference driver, which does not slice.
     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
-    if out is not None:
-        y.copy_(out[:n])
+    if y is None:
+        # Zero-copy: the caller consumes the workspace view under stream
+        # ordering (valid until the next launch on this session's buffers).
+        result = out[:n] if out is not None else symm_buffer.output_activation[:0]
+    else:
+        result = None
+        if out is not None:
+            y.copy_(out[:n])
     if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
+    return result
 
 
 def nvfp4_mega_launch_thunk(

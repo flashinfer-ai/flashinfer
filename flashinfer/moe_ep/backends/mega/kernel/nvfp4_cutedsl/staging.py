@@ -38,6 +38,7 @@ def stage_mega_moe_inputs(
         ceil_div,
         fused_quant_stage,
         fused_quant_stage_supported,
+        note_staged_tokens,
         nvfp4_quantize_per_block_16,
         round_up,
     )
@@ -84,6 +85,7 @@ def stage_mega_moe_inputs(
     capacity = x_nvfp4.shape[0]
     if num_tokens < capacity:
         topk_idx_out[num_tokens:capacity].fill_(-1)
+    note_staged_tokens(topk_idx_out, num_tokens)
 
 
 def validate_nvfp4_forward_inputs(

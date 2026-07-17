@@ -53,8 +53,13 @@ def _make_buffers(quant_type: str, capacity: int, hidden: int, topk: int):
             .view(torch.float8_e8m0fnu)
             .reshape(capacity, hidden // 32)
         )
-    # Dirty the routing tail so the capacity re-mask is actually exercised.
+    # Dirty the routing tail so the capacity re-mask is actually exercised;
+    # reset the tail-fill memo for this (possibly reused) address so the
+    # fused path treats the dirty buffer as fully live.
     topk_idx = torch.full((capacity, topk), 7, dtype=torch.int64, device="cuda")
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import note_staged_tokens
+
+    note_staged_tokens(topk_idx, capacity)
     topk_weights = torch.zeros(capacity, topk, dtype=torch.float32, device="cuda")
     return x, sf, topk_idx, topk_weights
 
@@ -203,3 +208,51 @@ def test_fused_stage_bit_matches_deep_gemm_torch_stage(monkeypatch):
     assert torch.equal(ref[1].view(torch.uint8), got[1].view(torch.uint8)), "x_sf"
     assert torch.equal(ref[2], got[2]), "topk_idx"
     assert torch.equal(ref[3], got[3]), "topk_weights"
+
+
+@pytest.mark.arch_blackwell
+def test_fused_stage_tail_memo_shrinking_batches(monkeypatch):
+    """Tail re-mask memo: shrink/grow sequences must keep [n:] masked."""
+    import torch
+
+    _require_blackwell()
+
+    hidden, topk, num_experts, capacity = 2048, 4, 16, 64
+    buffers = _make_buffers("nvfp4", capacity, hidden, topk)
+    for seed, num_tokens in ((1, 64), (2, 32), (3, 48), (4, 16), (5, 16)):
+        batch = _make_batch(num_tokens, hidden, topk, num_experts, seed=seed)
+        _stage("nvfp4", monkeypatch, True, batch, buffers, 1.0)
+        torch.cuda.synchronize()
+        assert (buffers[2][num_tokens:] == -1).all(), (
+            f"tail not masked after n={num_tokens}"
+        )
+        assert (buffers[2][:num_tokens] >= 0).all()
+
+    # Mixed fused/torch sequence: the torch fallback must update the memo so
+    # a later fused shrink cannot skip a needed fill.
+    _stage(
+        "nvfp4",
+        monkeypatch,
+        True,
+        _make_batch(16, hidden, topk, num_experts, seed=6),
+        buffers,
+        1.0,
+    )
+    _stage(
+        "nvfp4",
+        monkeypatch,
+        False,
+        _make_batch(64, hidden, topk, num_experts, seed=7),
+        buffers,
+        1.0,
+    )
+    _stage(
+        "nvfp4",
+        monkeypatch,
+        True,
+        _make_batch(32, hidden, topk, num_experts, seed=8),
+        buffers,
+        1.0,
+    )
+    torch.cuda.synchronize()
+    assert (buffers[2][32:] == -1).all(), "fused-after-torch shrink left live tail"

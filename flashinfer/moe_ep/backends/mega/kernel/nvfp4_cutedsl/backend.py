@@ -195,6 +195,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             capacity = workspace.x.shape[0]
             if num_tokens < capacity:
                 workspace.topk_idx[num_tokens:capacity].fill_(-1)
+            from .....kernel_src.cutedsl_megamoe import note_staged_tokens
+
+            note_staged_tokens(workspace.topk_idx, num_tokens)
 
         if t.fc1_alpha is not None:
             workspace.fc1_alpha.copy_(t.fc1_alpha)
@@ -208,9 +211,25 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
         *,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from .....kernel_src.cutedsl_megamoe import nvfp4_mega_moe
+        from .....kernel_src.cutedsl_megamoe import nvfp4_mega_moe, staged_tokens
+
+        if output is not None:
+            num_tokens = output.shape[0]
+        else:
+            if self._autotune_pending:
+                raise ValueError(
+                    "compute(output=None) is incompatible with knobs='auto' "
+                    "(the autotune sweep needs a caller output buffer)"
+                )
+            staged = staged_tokens(workspace.topk_idx)
+            if staged is None:
+                raise ValueError(
+                    "compute(output=None) requires stage_inputs() to have "
+                    "staged this workspace first"
+                )
+            num_tokens = staged
 
         kcfg = self._kernel_config
         if self._autotune_pending:
@@ -223,24 +242,27 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 transformed_weights[0],
                 transformed_weights[1],
                 workspace,
-                num_tokens=output.shape[0],
+                num_tokens=num_tokens,
                 gate_up_clamp=_resolve_gate_up_clamp(kcfg),
                 activation_clamp=kcfg.activation_clamp,
             )
             # Cleared only on success: if the collective tune raises, a retried
             # compute() re-attempts it (all ranks fail together, so lockstep holds).
             self._autotune_pending = False
-        nvfp4_mega_moe(
+        view = nvfp4_mega_moe(
             output,
             transformed_weights[0],
             transformed_weights[1],
             workspace,
-            num_tokens=output.shape[0],
+            num_tokens=num_tokens,
             gate_up_clamp=_resolve_gate_up_clamp(kcfg),
             activation_clamp=kcfg.activation_clamp,
             fast_math=kcfg.fast_math,
         )
-        return output
+        # output=None -> zero-copy: the kernel's reduced result stays in the
+        # workspace and the caller consumes the [:n] view under stream
+        # ordering (valid until the next launch on this session's buffers).
+        return output if output is not None else view
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         k = self._kernel_config
