@@ -9,7 +9,7 @@
 > tests cover ikr (tolerance + repeat-launch zero guard) and both quantized
 > wires (bit-exact vs same-wire reference + rel-L2 band vs bf16).
 > Remaining: 2b streaming weight reload (on demand), 2d CUDA-graph capture
-> (`todo_cuda_graph.md`).
+> (landed; see `tests/moe_ep/test_mega_cuda_graph*.py`).
 
 Source: TRT-LLM PR #16190 (`MEGAMOE_CUTEDSL` backend for DeepSeek-V4 DEP
 serving, Blackwell) — same kernel drop we vendor.  The TRT-LLM team reports
@@ -75,7 +75,7 @@ c. **Workspace/fence lifecycle keyed on symmetric-buffer identity** — we
    already have the equivalent (launch-kwargs cache keyed on buffer
    pointers; no-reset default relying on kernel tail cleanup).
 d. **CUDA-graph capture-safe integration** — pairs with our
-   `todo_cuda_graph.md`; the launch thunk (single prebuilt kernel launch,
+   the landed CUDA-graph support; the launch thunk (single prebuilt kernel launch,
    stable pointers) is the graphable unit; ikr adds a graphable
    `output.zero_()` node before it.
 

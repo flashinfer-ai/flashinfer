@@ -101,7 +101,8 @@ principle. To validate that:
 
 ## Related
 
-- `todo_cuda_graph.md` — CUDA-graph restoration; interacts here: symmetric
+- CUDA-graph support (landed: warmup contract + capture guards; see
+  `tests/moe_ep/test_mega_cuda_graph*.py`); interacts here: symmetric
   heap allocation and peer-pointer computation are host collectives that
   must stay pre-capture regardless of node count, and multi-node replay
   needs all ranks (across nodes) replaying in lockstep.

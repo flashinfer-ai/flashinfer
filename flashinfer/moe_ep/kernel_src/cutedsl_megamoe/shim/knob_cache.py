@@ -4,7 +4,7 @@
 
 The online ``knobs="auto"`` sweep is unusable inside a serving engine (~24
 ``cute.compile``\\ s + collective barriers at first compute — see
-``flashinfer/moe_ep/todo_vllm_knob_heuristic.md``).  This module makes tuning
+the 2026-07-16 vLLM e2e runs).  This module makes tuning
 a write-once/offline step: winners land in a small JSON file keyed by
 (device, dtype, world_size, geometry, combine wire, token-bucket), and
 ``get_symm_buffer_for_*`` resolves ``knobs=None`` through :func:`lookup_knobs`

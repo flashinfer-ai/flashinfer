@@ -503,6 +503,7 @@ Each `run_sweep.sh` invocation writes its own timestamped CSV under
 
 ## Next levers
 
-CUDA-graph capture of the launch thunk (`../todo_cuda_graph.md`; with ikr
+CUDA-graph capture of the launch thunk (landed — `MoEEpMegaLayer.warmup()`
++ capture guards, `tests/moe_ep/test_mega_cuda_graph*.py`; with ikr
 the thunk is zero+launch, both graphable), streaming weight reload
 (on demand — see `../todo_trtllm_import.md`).

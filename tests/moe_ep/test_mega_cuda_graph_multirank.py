@@ -1,7 +1,6 @@
 """2-rank lockstep CUDA-graph capture/replay for the nvfp4 mega layer.
 
-Multirank completion of ``test_mega_cuda_graph.py`` (todo_cuda_graph.md
-item 5): the mega kernel has cross-rank device-side barriers, so ranks must
+Multirank completion of ``test_mega_cuda_graph.py``: the mega kernel has cross-rank device-side barriers, so ranks must
 replay together — this test warms up collectively, captures each rank's
 ``layer.forward`` (capture records without executing, so no cross-rank
 dependency during capture), then replays in lockstep and compares against
