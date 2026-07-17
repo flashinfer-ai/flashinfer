@@ -39,10 +39,10 @@ _MIN_CHUNKS = 2
 # Dispatch floor: under this many middle blocks the second launch never pays
 # for itself.
 _MIN_BLOCKS = 32
-# Partial-kernel boundary: at or below this many rows the grid needs
+# Partial-kernel boundary: at or below this many queries the grid needs
 # row-per-CTA fan-out to fill the GPU; above it the q-tiled partial takes
 # over for coalesced score reads.
-_MAX_CHUNKED_ROWS = 2048
+_TILED_MIN_QUERIES = 2048
 # Candidate-scratch ceiling (rows * num_chunks * topk * 8 bytes per call).
 # Sized to cover the benchmarked range (32k-token prefill needs ~67MB) with
 # margin; larger grids keep the allocation-free single-kernel paths so a

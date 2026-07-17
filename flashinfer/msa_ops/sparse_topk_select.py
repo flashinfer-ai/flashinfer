@@ -199,7 +199,7 @@ def msa_topk_select(
     from .cute_dsl.topk_select_chunked_sm12x import (
         _CHUNK_BLOCKS,
         _MAX_CHUNK_BLOCKS,
-        _MAX_CHUNKED_ROWS,
+        _TILED_MIN_QUERIES,
         _MAX_CHUNKED_SCRATCH_BYTES,
         _MAX_CHUNKS,
         _MIN_BLOCKS,
@@ -221,13 +221,15 @@ def msa_topk_select(
     # Keyed on queries, not rows: the tiled kernel's lanes parallelize over
     # queries only, so a head-heavy grid with few queries would run it with
     # mostly idle lanes even though rows is large.
-    tiled = total_qo_len > _MAX_CHUNKED_ROWS
+    tiled = total_qo_len > _TILED_MIN_QUERIES
     if chunked:
         num_chunks = max(_MIN_CHUNKS, min(_MAX_CHUNKS, -(-n_mid // _CHUNK_BLOCKS)))
         if rows * num_chunks * topk * 8 > _MAX_CHUNKED_SCRATCH_BYTES:
             chunked = False
     if chunked:
         chunk_len = -(-n_mid // num_chunks)
+        # The partial kernels' SMEM staging has no in-kernel clamp.
+        assert chunk_len <= _MAX_CHUNK_BLOCKS
         # One allocation for both candidate buffers keeps this hot path at a
         # single allocator call.
         cand = torch.empty(
