@@ -1,5 +1,18 @@
 # TODO: fi_dg (deep_gemm_mega) run-to-run nondeterminism
 
+UPDATE 2026-07-17: THE PREMISE IS FALSIFIED. Rerunning the smoke pairs on a
+fresh node (shape-determinism experiment, `vllm_e2e/results/shape_det_*`):
+**fi_dg was 8/8 self-exact and NATIVE diverged 3/8** — the exact mirror of
+the 07-15 result (native 8/8, fi_dg 2/8; each conclusion rested on a single
+rerun pair). Run-to-run nondeterminism is an engine/environment-level
+property that comes and goes (node, timing, allocator, NCCL state), NOT an
+fi-path defect — fully consistent with the layer-level exoneration below.
+Reclassified: not an fi moe_ep bug; any future determinism claim needs N
+rerun pairs per backend plus the per-step batch-shape log
+(`FI_MOE_EP_SHAPE_LOG`, wired in `vllm_e2e/patch_0251`) as a control.
+Mechanism confirmation for the engine-level divergence (batch-shape
+schedule diff on a diverging pair) tracked in the vLLM bench repo.
+
 Status: LAYER-LEVEL EXONERATED (2026-07-16 pm) — engine-side lead open.
 `tests/moe_ep/test_moe_ep_deep_gemm_skew_determinism.py` (4x GB200) proves
 the fi_dg layer bit-deterministic under (a) back-to-back repeats, (b) gross
