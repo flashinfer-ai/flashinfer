@@ -1,7 +1,8 @@
 """fi_dg determinism probe: repeated forwards under deliberate rank skew.
 
 Discriminates the two live hypotheses for the vLLM e2e fi_dg run-to-run
-nondeterminism (``todo_fi_dg_nondeterminism.md``): staged bytes and kernel
+nondeterminism (root-caused 2026-07-17 to vLLM batch-formation timing —
+engine-level and backend-independent): staged bytes and kernel
 args are proven identical, so divergence must enter either through
 
   (a) cross-rank arrival order — the deep_gemm mega kernel's combine being

@@ -3,8 +3,9 @@
 CPU tests cover the cache file semantics (round trip, bucket selection,
 fallback, corruption tolerance, disable switch); the GPU test verifies
 ``get_symm_buffer_for_mega_moe(knobs=None)`` actually picks a cached entry up
-into the compiled config. See ``todo_vllm_knob_heuristic.md`` for why the hot
-path must be a lookup.
+into the compiled config. The hot path must be a pure lookup: knobs="auto"
+is a collective multi-minute compile+timing sweep, unusable in a serving
+engine.
 """
 
 from __future__ import annotations

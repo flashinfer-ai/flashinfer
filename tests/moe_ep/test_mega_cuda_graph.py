@@ -1,6 +1,6 @@
 """CUDA graph capture/replay for the cutedsl mega paths (single rank).
 
-Contract under test (see ``flashinfer/moe_ep/todo_cuda_graph.md``):
+Contract under test:
 
 1. ``MoEEpMegaLayer.warmup()`` forces every lazy host-side step (workspace
    alloc, ``cute.compile``, one real launch) eagerly.
