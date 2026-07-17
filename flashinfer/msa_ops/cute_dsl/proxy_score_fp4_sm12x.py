@@ -656,8 +656,7 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
         # gather/epilogue, so each factorization compiles to its own kernel.
         self._QHEAD_PER_KV = qhead_per_kv
         self._PACK_Q_LEN = pack_q_len
-        # True: right-aligned decode; the causal offset (seqlen_k - seqlen_q)
-        # is computed in-kernel instead of read from mQOffset.
+        # True: right-aligned decode; the causal offset is computed in-kernel.
         self._qoff_default = qoff_default
 
     @cute.jit
