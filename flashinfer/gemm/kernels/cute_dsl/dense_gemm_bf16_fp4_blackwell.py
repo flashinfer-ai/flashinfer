@@ -44,12 +44,15 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Float32, Int32, Uint32
 
 from ....cute_dsl.fp4_common import (
+    atomic_add_global_i32,
     cvt_s0e5m3_to_f16x2_broadcast,
     f16x2_to_f32x2,
     fp4_decode_4bytes,
+    get_ptr_as_int64,
     get_smem_ptr_as_int32,
     half2_mul,
     ld_shared_v2_u32,
+    threadfence,
 )
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
@@ -385,6 +388,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         b_sf: cute.Tensor,
         c: cute.Tensor,
         partial: cute.Tensor,
+        tile_ctr: cute.Tensor,
         alpha: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
@@ -482,6 +486,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                     ],
                     self.buffer_align_bytes,
                 ]
+                # Broadcasts the "this CTA drew the last reduce ticket"
+                # decision from thread 0 to all MMA threads.
+                reduce_flag: cute.struct.MemRange[cutlass.Int32, 1]
 
             self.shared_storage: type = SharedStorageNSweep
 
@@ -494,6 +501,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                 tma_tensor_b_sf,
                 c,
                 partial,
+                tile_ctr,
                 alpha,
                 self.tiled_mma,
                 self.a_smem_layout_staged,
@@ -1294,6 +1302,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         mC_mnl: cute.Tensor,
         # (n_sweep_stripes * m, n) fp32 partials workspace.
         mPartial: cute.Tensor,
+        # (>= n_tiles,) int32 arrival counters, one per N-tile; zeroed at
+        # allocation and self-resetting (the reducing CTA writes 0 back).
+        mTileCtr: cute.Tensor,
         mAlpha: cute.Tensor,
         tiled_mma: cute.TiledMma,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1366,6 +1377,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
         )
+        sReduceFlag = storage.reduce_flag.get_tensor(cute.make_layout(1))
 
         gA_mkl = cute.local_tile(
             mA_mkl,
@@ -1526,6 +1538,14 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             half_n = epi_tile_n // 2
             pairs = epi_tile_m * half_n
             num_mma_threads = self.num_mma_warps * self.num_threads_per_warp
+            # Flat row-major view of C for the fused-reduce scalar stores.
+            mC_flat = cute.make_tensor(
+                mC_mnl.iterator, cute.make_layout(m_actual * n_actual)
+            )
+            # Ticket in flight from the previous N-tile (see the fused
+            # reduce below); -1 = none yet.
+            pending_nt = Int32(-1)
+            pending_ticket = Int32(0)
 
             for i_nt in cutlass.range(0, my_n_cnt, 1, unroll=1):
                 nt = Int32(bidx) + Int32(i_nt) * gx
@@ -1701,6 +1721,53 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                             # before a later iteration rewrites it.
                             self.epilog_sync_barrier.arrive_and_wait()
                             kept_count = kept_count + 1
+
+                # Fused cross-stripe reduce, part 1: take this N-tile's
+                # arrival ticket.  The prior arrive_and_wait already
+                # ordered every thread's partial stores before this point,
+                # so only thread 0 needs the gpu-scope release fence.  The
+                # ticket is evaluated one N-tile LATER (part 2 below):
+                # reading the atomic's result immediately would stall all
+                # MMA warps on its round trip once per N-tile, which is
+                # what made the first inline version slower than the
+                # separate reduce kernels it replaced.
+                new_ticket = Int32(0)
+                if tidx == 0:
+                    threadfence()
+                    new_ticket = atomic_add_global_i32(
+                        get_ptr_as_int64(mTileCtr, nt), Int32(1)
+                    )
+                # Part 2: resolve the PREVIOUS tile's ticket (its atomic
+                # has had a whole mainloop to complete).
+                if pending_nt >= Int32(0):
+                    self._nsweep_resolve_ticket(
+                        mPartial,
+                        mTileCtr,
+                        mC_flat,
+                        sReduceFlag,
+                        pending_nt,
+                        pending_ticket,
+                        tidx,
+                        m_actual,
+                        n_actual,
+                    )
+                pending_nt = nt
+                pending_ticket = new_ticket
+
+            # Drain the last tile's ticket (the one place the atomic's
+            # latency is actually paid, once per CTA).
+            if pending_nt >= Int32(0):
+                self._nsweep_resolve_ticket(
+                    mPartial,
+                    mTileCtr,
+                    mC_flat,
+                    sReduceFlag,
+                    pending_nt,
+                    pending_ticket,
+                    tidx,
+                    m_actual,
+                    n_actual,
+                )
         elif warp_idx == self.num_mma_warps:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
 
@@ -1765,6 +1832,61 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             # intentionally never released by the consumers.
         cute.arch.griddepcontrol_launch_dependents()
         return
+
+    @cute.jit
+    def _nsweep_resolve_ticket(
+        self,
+        mPartial: cute.Tensor,
+        mTileCtr: cute.Tensor,
+        mC_flat: cute.Tensor,
+        sReduceFlag: cute.Tensor,
+        pending_nt: Int32,
+        pending_ticket: Int32,
+        tidx: Int32,
+        m_actual: Int32,
+        n_actual: Int32,
+    ):
+        """Fused cross-stripe reduce for one N-tile whose ticket resolved.
+
+        The CTA that drew the last arrival ticket sums the tile's fp32
+        partials in stripe order — deterministic no matter which CTA it
+        is — and writes bf16 C directly, replacing the separate reduce
+        kernels whose fixed launch cost ate the resident-A gain.
+        """
+        tile_n = Int32(self.tile_shape_mnk[1])
+        num_mma_threads = self.num_mma_warps * self.num_threads_per_warp
+        if tidx == 0:
+            if pending_ticket == Int32(self.n_sweep_stripes) - Int32(1):
+                sReduceFlag[0] = Int32(1)
+                # Reset so the next launch reuses the counter without a
+                # host-side memset.
+                mTileCtr[pending_nt] = Int32(0)
+            else:
+                sReduceFlag[0] = Int32(0)
+        self.epilog_sync_barrier.arrive_and_wait()
+        if sReduceFlag[0] != 0:
+            # Make the other stripes' partial stores visible.
+            threadfence()
+            # One column per thread keeps every thread busy at the small M
+            # this mode targets (a 4-wide variant won m >= 8 but cost ~3us
+            # at m = 1, the case that matters; carrying both bodies behind
+            # a runtime branch measured worse than either).
+            col0 = pending_nt * tile_n
+            total = m_actual * tile_n
+            iters = (total + Int32(num_mma_threads) - Int32(1)) // Int32(
+                num_mma_threads
+            )
+            for it in cutlass.range(0, iters, 1, unroll=2):
+                idx = it * Int32(num_mma_threads) + tidx
+                if idx < total:
+                    row = idx // tile_n
+                    col = col0 + idx % tile_n
+                    acc_sum = Float32(0.0)
+                    for s in cutlass.range_constexpr(self.n_sweep_stripes):
+                        acc_sum = acc_sum + Float32(
+                            mPartial[(Int32(s) * m_actual + row) * n_actual + col]
+                        )
+                    mC_flat[row * n_actual + col] = acc_sum.to(self.c_dtype)
 
     @staticmethod
     def _compute_stages(
@@ -2145,6 +2267,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         mB_sf: cute.Tensor,
         mC: cute.Tensor,
         mPartial: cute.Tensor,
+        mTileCtr: cute.Tensor,
         mAlpha: cute.Tensor,
         l: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -2160,6 +2283,10 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             mPartial:  (k_splits * m * n,) fp32 split-K partials, or
                        (n_sweep_stripes * m * n,) in n_sweep mode; (1,)
                        dummy otherwise.
+            mTileCtr:  (>= n_tiles,) int32 per-N-tile arrival counters for
+                       the n_sweep fused reduce; must be zeroed at
+                       allocation (self-resetting after that).  Unused
+                       dummy outside n_sweep mode.
             mAlpha:    (1,) fp32 global scale.
             l: batch dimension (Constexpr); typically 1.
             max_active_clusters: Constexpr from get_max_active_clusters(1).
@@ -2199,6 +2326,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             b_sf_tensor,
             c_tensor,
             mPartial,
+            mTileCtr,
             mAlpha,
             max_active_clusters,
             current_stream,
