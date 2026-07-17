@@ -45,6 +45,7 @@ def stage_mega_moe_inputs(
         ceil_div,
         fused_quant_stage,
         fused_quant_stage_supported,
+        note_staged_tokens,
         mxfp8_quantize_per_block_32,
         round_up,
     )
@@ -91,6 +92,7 @@ def stage_mega_moe_inputs(
     capacity = x_fp8.shape[0]
     if num_tokens < capacity:
         topk_idx_out[num_tokens:capacity].fill_(-1)
+    note_staged_tokens(topk_idx_out, num_tokens)
 
 
 def validate_mxfp8_forward_inputs(
