@@ -184,6 +184,37 @@ class JitSpecCuteDsl(JitSpec):
                 f"{self.object_path}: {e}. The kernel will be recompiled next run."
             )
 
+    def compile_and_persist(self) -> None:
+        """Compile outside the module lock; commit the artifact under it.
+
+        ``build_and_load()`` holds the module lock for the whole build, which
+        would serialize a pool of parallel precompilation workers building
+        distinct kernels of one module.  This variant runs ``compile_fn``
+        unlocked and takes the lock only for the stale-module wipe and the
+        artifact export (~ms).  Concurrent duplicate builds of the *same*
+        kernel waste work but stay correct: exports are atomic replaces.
+        """
+        from filelock import FileLock
+
+        self._compiled_kernel = self.compile_fn()
+        with FileLock(self.lock_path, thread_local=False):
+            if (
+                self.module_dir.exists()
+                and _read_meta(self.meta_path) != self.expected_meta
+            ):
+                logger.info(
+                    f"Invalidating stale CuTe-DSL module {self.module_dir_name}"
+                )
+                shutil.rmtree(self.module_dir, ignore_errors=True)
+            try:
+                self._export()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to persist CuTe-DSL kernel {self.name} to "
+                    f"{self.object_path}: {e}. The kernel will be recompiled "
+                    f"next run."
+                )
+
     def load(self) -> Any:
         """The kernel compiled by build(), or the on-disk artifact."""
         if self._compiled_kernel is not None:
