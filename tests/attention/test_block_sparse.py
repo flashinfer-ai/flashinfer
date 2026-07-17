@@ -16,15 +16,23 @@ limitations under the License.
 
 import numpy as np
 import pytest
-import scipy as sp
 import torch
+
+try:
+    import scipy as sp
+
+    HAVE_SCIPY = True
+except ImportError:
+    sp = None
+    HAVE_SCIPY = False
+
 from tests.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,
 )
 
 import flashinfer
-from flashinfer.utils import has_flashinfer_jit_cache
+from flashinfer.utils import has_flashinfer_jit_cache, is_sm100a_supported
 
 
 @pytest.fixture(
@@ -65,11 +73,14 @@ def bsr_attention_ref(
 ):
     M = q.shape[0]
     N = k.shape[0]
-    bsr = sp.sparse.bsr_matrix(
-        (mask_data.cpu().numpy(), indices.cpu().numpy(), indptr.cpu().numpy()),
-        shape=(M, N),
-    )
-    dense_mask = torch.tensor(bsr.toarray(), dtype=bool, device=q.device)
+    if HAVE_SCIPY:
+        bsr = sp.sparse.bsr_matrix(
+            (mask_data.cpu().numpy(), indices.cpu().numpy(), indptr.cpu().numpy()),
+            shape=(M, N),
+        )
+        dense_mask = torch.tensor(bsr.toarray(), dtype=bool, device=q.device)
+    else:
+        dense_mask = _bsr_to_dense_torch(indptr, indices, mask_data, M, N).to(q.device)
     o = flashinfer.prefill.single_prefill_with_kv_cache(q, k, v, custom_mask=dense_mask)
     return o
 
@@ -80,8 +91,29 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
 
 
-@pytest.mark.parametrize("R", [1, 4, 16])
-@pytest.mark.parametrize("C", [1, 4, 16])
+def _bsr_to_dense_torch(
+    indptr: "torch.Tensor",
+    indices: "torch.Tensor",
+    mask_data: "torch.Tensor",
+    M: int,
+    N: int,
+) -> "torch.Tensor":
+    """Convert BSR format to dense boolean mask without scipy."""
+    R = mask_data.shape[1]
+    C = mask_data.shape[2]
+    device = mask_data.device
+    dense = torch.zeros(M, N, dtype=torch.bool, device=device)
+    n_block_rows = indptr.numel() - 1
+    for br in range(n_block_rows):
+        for ki in range(indptr[br].item(), indptr[br + 1].item()):
+            bc = indices[ki].item()
+            dense[br * R : (br + 1) * R, bc * C : (bc + 1) * C] = mask_data[ki]
+    return dense
+
+
+@pytest.mark.parametrize("backend", ["auto", "vsa_blackwell", "cutile"])
+@pytest.mark.parametrize("R", [1, 4, 16, 128])
+@pytest.mark.parametrize("C", [1, 4, 16, 128])
 @pytest.mark.parametrize("M", [64, 128, 256])
 @pytest.mark.parametrize("N", [64, 128, 256])
 @pytest.mark.parametrize("num_qo_heads", [1, 4, 16])
@@ -89,20 +121,63 @@ def set_seed(seed: int = 42):
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("mask_inside_block", [True, False])
 def test_block_sparse_attention(
-    R, C, M, N, num_qo_heads, num_kv_heads, head_dim, mask_inside_block
+    backend, R, C, M, N, num_qo_heads, num_kv_heads, head_dim, mask_inside_block
 ):
     if num_qo_heads % num_kv_heads != 0:
         pytest.skip("num_qo_heads must be divisible by num_kv_heads")
+
+    if backend == "vsa_blackwell":
+        if not is_sm100a_supported(torch.device(0)):
+            pytest.skip("vsa_blackwell requires sm100a (Blackwell GPU)")
+        if R != 128 or C != 128:
+            pytest.skip("vsa_blackwell requires R == C == 128")
+        if M % 128 != 0 or N % 128 != 0:
+            pytest.skip("vsa_blackwell requires M and N divisible by 128")
+        if head_dim not in (64, 96, 128):
+            pytest.skip("vsa_blackwell requires head_dim in {64, 96, 128}")
+        if mask_inside_block:
+            pytest.skip(
+                "vsa_blackwell does not support per-element block masks (mask_inside_block=True)"
+            )
+
+    if backend == "cutile":
+        # cuTile block-sparse maps each block-row onto a paged prefill batch with
+        # page_size == C; it expresses sparsity at block granularity only.
+        if mask_inside_block:
+            pytest.skip(
+                "cuTile block-sparse does not support per-element intra-block masks."
+            )
+        if M % R != 0 or N % C != 0:
+            pytest.skip("cuTile block-sparse requires M % R == 0 and N % C == 0.")
+        if C < 16:
+            # The BSR column-block size C maps to the paged-KV page_size; the
+            # prefill autotune (_get_prefill_autotune_configs) only yields configs
+            # with BLOCK_N <= page_size, and the smallest BLOCK_N is 16, so C < 16
+            # leaves an empty search space.
+            pytest.skip("cuTile block-sparse requires C >= 16 (min prefill BLOCK_N).")
 
     set_seed(33)
     rng = np.random.default_rng()
 
     MB = M // R
     NB = N // C
-    S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
-    indptr = torch.from_numpy(S.indptr).to(0)
-    indices = torch.from_numpy(S.indices).to(0)
-    nnz = S.nnz
+    if HAVE_SCIPY:
+        S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
+        indptr = torch.from_numpy(S.indptr).to(0)
+        indices = torch.from_numpy(S.indices).to(0)
+        nnz = S.nnz
+    else:
+        # Generate random sparse CSR pattern without scipy
+        sp_mask = torch.rand(MB, NB) < 0.25
+        indptr_list = [0]
+        indices_list = []
+        for br in range(MB):
+            cols = sp_mask[br].nonzero(as_tuple=True)[0].tolist()
+            indices_list.extend(cols)
+            indptr_list.append(len(indices_list))
+        indptr = torch.tensor(indptr_list, dtype=torch.int32, device=0)
+        indices = torch.tensor(indices_list, dtype=torch.int32, device=0)
+        nnz = len(indices_list)
     if mask_inside_block:
         data_mask = (torch.rand((nnz, R, C)) > 0.5).to(0)
     else:
@@ -114,7 +189,7 @@ def test_block_sparse_attention(
     o_ref = bsr_attention_ref(q, k, v, indptr, indices, data_mask)
     workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=0)
     sparse_attention_wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(
-        workspace_buffer
+        workspace_buffer, backend=backend
     )
 
     sparse_attention_wrapper.plan(
