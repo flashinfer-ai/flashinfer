@@ -384,16 +384,17 @@ def gemm_alpha_beta(
     if not c.is_contiguous():
         raise ValueError("C matrix must be contiguous")
 
-    # Reject aliasing: the kernel reads A/B and writes C in place, so any storage
-    # overlap among them corrupts the result (a persistent tile may store into C
-    # before another program has loaded the aliased A/B input).
+    # Reject aliasing with the output: the kernel writes C in place, so a
+    # persistent tile may store into C before another program has loaded an
+    # aliased A/B input. A/B sharing storage with each other is read-only and
+    # safe (e.g. a Gram matrix A @ A.T), so it is allowed.
     def _overlaps(x, y):
         return x.device.type == "cuda" and y.device.type == "cuda" and (
             x.untyped_storage().data_ptr() == y.untyped_storage().data_ptr()
         )
 
-    if _overlaps(a, c) or _overlaps(b, c) or _overlaps(a, b):
-        raise ValueError("a, b, and c must not share storage (in-place write to C)")
+    if _overlaps(a, c) or _overlaps(b, c):
+        raise ValueError("c must not share storage with a or b (in-place write to C)")
 
     # Convert boolean to int for ct.Constant
     transpose_a_int = 1 if trans_a else 0
@@ -455,7 +456,7 @@ def gemm_alpha_beta(
         def hints_fn(cfg):
             return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
-        stream = torch.cuda.current_stream()
+        stream = torch.cuda.current_stream(a.device)
         cache_key = (
             M,
             N,
@@ -524,7 +525,7 @@ def gemm_alpha_beta(
         )
 
         ct.launch(
-            torch.cuda.current_stream(),
+            torch.cuda.current_stream(a.device),
             grid,
             kernel,
             (

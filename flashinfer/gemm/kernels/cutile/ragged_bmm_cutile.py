@@ -550,7 +550,11 @@ def _ragged_bmm_autotune_standard(
     def grid_fn(cfg):
         BM = cfg.BLOCK_M
         BN = cfg.BLOCK_N
-        num_pid_m = ct.cdiv(max_m, BM)
+        # Size the grid from total_m (the true row-count upper bound), not the
+        # host max_m hint: a stale/zero max_m would yield 0 tiles -> empty grid
+        # -> unwritten output. The kernel still reads its per-tile bound from
+        # max_m_device.
+        num_pid_m = ct.cdiv(total_m, BM)
         num_pid_n = ct.cdiv(N, BN)
         tiles_per_batch = num_pid_m * num_pid_n
         total_tiles = tiles_per_batch * Q
@@ -636,7 +640,11 @@ def _ragged_bmm_autotune_swap_ab(
     def grid_fn(cfg):
         BM = cfg.BLOCK_M
         BN = cfg.BLOCK_N
-        num_pid_m = ct.cdiv(max_m, BM)
+        # Size the grid from total_m (the true row-count upper bound), not the
+        # host max_m hint: a stale/zero max_m would yield 0 tiles -> empty grid
+        # -> unwritten output. The kernel still reads its per-tile bound from
+        # max_m_device.
+        num_pid_m = ct.cdiv(total_m, BM)
         num_pid_n = ct.cdiv(N, BN)
         tiles_per_batch = num_pid_m * num_pid_n
         total_tiles = tiles_per_batch * Q
@@ -752,7 +760,7 @@ def ragged_bmm(
     if enable_autotune:
         if use_swap_ab:
             _ragged_bmm_autotune_swap_ab(
-                torch.cuda.current_stream(),
+                torch.cuda.current_stream(a.device),
                 a,
                 b,
                 c,
@@ -767,7 +775,7 @@ def ragged_bmm(
             )
         else:
             _ragged_bmm_autotune_standard(
-                torch.cuda.current_stream(),
+                torch.cuda.current_stream(a.device),
                 a,
                 b,
                 c,
@@ -794,8 +802,9 @@ def ragged_bmm(
         occupancy = kernel_configs.get("occupancy", 2)
 
         # Calculate grid size for persistent scheduling
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-        num_pid_m = ct.cdiv(max_m, BLOCK_M)
+        NUM_SMS = torch.cuda.get_device_properties(a.device).multi_processor_count
+        # See grid_fn note: size from total_m, not the host max_m hint.
+        num_pid_m = ct.cdiv(total_m, BLOCK_M)
         num_pid_n = ct.cdiv(N, BLOCK_N)
         tiles_per_batch = num_pid_m * num_pid_n
         total_tiles = tiles_per_batch * Q
@@ -819,7 +828,7 @@ def ragged_bmm(
         kernel = cached_replace_hints(kernel_fn, **hints) if hints else kernel_fn
 
         ct.launch(
-            torch.cuda.current_stream(),
+            torch.cuda.current_stream(a.device),
             grid,
             kernel,
             (

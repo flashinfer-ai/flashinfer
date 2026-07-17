@@ -315,4 +315,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
             backend=backend,
         )
 
-        torch.testing.assert_close(ref_c, c, atol=1.0, rtol=1.0)
+        # FP8 block-scaled GEMM: rtol=1.0 accepted 100%-off (or all-zero) output.
+        # 2e-2 is comfortable headroom for e4m3 block-scale rounding while still
+        # rejecting a mis-scaled tile (e.g. a wrong b_scale broadcast).
+        torch.testing.assert_close(ref_c, c, atol=1.0, rtol=2e-2)

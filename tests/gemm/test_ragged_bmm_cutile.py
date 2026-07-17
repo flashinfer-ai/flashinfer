@@ -229,7 +229,7 @@ class Test_FlashInfer_RaggedBMM:
             num_groups, m, n, k, trans_a, trans_b, dtype
         )
 
-        result = ragged_bmm(
+        call = lambda: ragged_bmm(
             a,
             b,
             segment_offsets,
@@ -240,6 +240,15 @@ class Test_FlashInfer_RaggedBMM:
             out_dtype=out_dtype,
             backend=backend,
         )
+
+        # ragged_bmm supports float16 / bfloat16 inputs only; anything else must
+        # be rejected with a clear error rather than silently miscomputing.
+        if dtype not in (torch.float16, torch.bfloat16):
+            with pytest.raises(ValueError):
+                call()
+            return
+
+        result = call()
         ref = self.reference(a, b, segment_offsets, trans_a, trans_b, out_dtype)
         torch.testing.assert_close(result, ref, atol=1e-2, rtol=1e-2)
 
