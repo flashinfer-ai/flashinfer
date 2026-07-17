@@ -185,8 +185,9 @@ class MegaKernelBackend(ABC):
         workspace: Any,
         *,
         quantize_input: bool,
+        output: "torch.Tensor | None" = None,
     ) -> None:
-        """Copy or quantize activations into workspace buffers."""
+        """Stage inputs and optionally bind a caller-provided output tensor."""
 
     @abstractmethod
     def compute(

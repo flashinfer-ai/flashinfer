@@ -145,7 +145,9 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         *,
         quantize_input: bool,
+        output: torch.Tensor | None = None,
     ) -> None:
+        del output
         num_tokens = t.hidden_states.shape[0]
         if quantize_input:
             stage_mega_moe_inputs(

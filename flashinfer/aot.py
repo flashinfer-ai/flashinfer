@@ -535,6 +535,19 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
+            from .moe_ep.kernel_src.sm90_push_megamoe import (
+                gen_sm90_push_a2a_module,
+                gen_sm90_push_fp8_moe_gemm_module,
+            )
+
+            jit_specs.append(gen_sm90_push_a2a_module())
+            if get_cuda_version() >= Version("12.8"):
+                jit_specs.append(gen_sm90_push_fp8_moe_gemm_module())
+            else:
+                print(
+                    "Skipping SM90 push FP8 MoE GEMM AOT module: "
+                    "CUDA Toolkit 12.8 or newer is required."
+                )
             jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
             # MonoMoe kernel: single-kernel block-FP8 top-K MoE,

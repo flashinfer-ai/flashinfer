@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Run moe_ep tests (unit + multirank + smoke + mega).
+# Run moe_ep tests (unit + multirank + sm90_push + smoke + mega).
 #
 # Usage (from repo root):
 #   bash tests/moe_ep/run_tests.sh
 #   bash tests/moe_ep/run_tests.sh unit          # host-only pytest
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
+#   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper push FP8
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_nvfp4  # 4-GPU NVFP4 split-path numerics
@@ -35,6 +36,7 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 PY="${PYTHON:-python}"
 TORCHRUN="${TORCHRUN:-torchrun}"
 NPROC_MULTIRANK="${NPROC_MULTIRANK:-4}"
+NPROC_SM90_PUSH="${NPROC_SM90_PUSH:-2}"
 NPROC_SMOKE="${NPROC_SMOKE:-4}"
 # NOTE: no --confcutdir. The moe_ep pytest hooks (--backend option, nvep/gpu_*/
 # arch_blackwell markers, env/GPU/arch auto-skips) live in the root
@@ -81,7 +83,9 @@ run_section() {
 }
 
 run_unit() {
-  "${PY}" -m pytest tests/moe_ep/ -v \
+  "${PY}" -m pytest tests/moe_ep/ \
+    tests/gemm/test_sm90_moe_gemm.py \
+    tests/gemm/test_sm90_moe_gemm_contract.py -v \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     --ignore=tests/moe_ep/test_moe_ep_layer_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
@@ -97,8 +101,15 @@ run_unit() {
     -k "not multirank_roundtrip"
 }
 
+run_sm90_push() {
+  "${TORCHRUN}" --nproc_per_node="${NPROC_SM90_PUSH}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_push_fp8_kernel.py \
+    tests/moe_ep/test_sm90_push_fp8_backend.py -v
+}
+
 run_multirank() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   local rc=0
 
@@ -111,6 +122,8 @@ run_multirank() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_split_kernels.py -v \
     -m "nvep and gpu_4" --backend=nccl_ep || rc=1
+
+  run_sm90_push || rc=1
 
   if have_nixl_ep; then
     "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
@@ -264,6 +277,7 @@ case "${1:-all}" in
   unit) run_section "unit + mock (no multirank)" run_unit; print_summary ;;
   oracle) run_section "torch-oracle correctness (1 GPU)" run_oracle; print_summary ;;
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
+  sm90_push) run_section "SM90 push FP8 (2 GPU)" run_sm90_push; print_summary ;;
   split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16; print_summary ;;
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
@@ -271,7 +285,7 @@ case "${1:-all}" in
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|multirank|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|smoke|all]" >&2
+    echo "Usage: $0 [unit|oracle|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|smoke|all]" >&2
     exit 1
     ;;
 esac
