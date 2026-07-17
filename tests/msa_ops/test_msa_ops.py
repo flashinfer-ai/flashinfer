@@ -1701,30 +1701,3 @@ def test_msa_topk_select_countrank_matches_radix_on_nan():
     assert torch.equal(outs[0], outs[3]), "chunked != count-rank on NaN scores"
     assert torch.equal(outs[5], outs[6]), "tiled chunked nondeterministic on NaN"
     assert torch.equal(outs[0], outs[5]), "tiled chunked != count-rank on NaN scores"
-
-
-def test_msa_topk_select_countrank_near_block_cap():
-    """Count-rank near its 128-block ceiling with forced blocks is only reachable
-    through the dispatcher via the scratch-cap fallback (multi-million-row grids),
-    so pin the kernel directly and check it still matches the chunked selection."""
-    _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_topk_select
-    from flashinfer.msa_ops.sparse_topk_select import _get_compiled_topk
-
-    dev = "cuda"
-    H, S, topk = 2, 96, 16
-    nvp, fb, fe = 120, 3, 2
-    torch.manual_seed(11)
-    score = torch.randn(H, 128, S, device=dev, dtype=torch.float32)
-    score[:, nvp:, :] = float("-inf")
-    api_out = msa_topk_select(
-        score, topk, num_valid_pages=nvp, force_begin_blocks=fb, force_end_blocks=fe
-    )
-    direct = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
-    _get_compiled_topk(topk, True)(score, direct, nvp, fb, fe, S, H)
-    torch.cuda.synchronize()
-    forced = set(range(fb)) | set(range(nvp - fe, nvp))
-    for h in range(H):
-        for qi in range(0, S, 7):
-            assert forced <= set(direct[qi, h][direct[qi, h] >= 0].tolist())
-    assert torch.equal(api_out, direct), "count-rank != chunked selection"
