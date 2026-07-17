@@ -156,7 +156,8 @@ struct DMA {
         int& bidh, int& q_step_offset, bool reverse = false) {
       // Avoid looping over cu_q_seqlens when seqlens are uniform (computed on host).
       if (params.is_uniform_q) {
-        int const q_tiles_per_head = compute_dynamic_q_tiles_per_head(params.cu_q_seqlens[1]);
+        int const q_tiles_per_head =
+            compute_dynamic_q_tiles_per_head(params.cu_q_seqlens[1] - params.cu_q_seqlens[0]);
         if (reverse && params.use_head_first_scheduling) {
           // Globally reverse-Q: the heaviest (largest-q) tile of every batch/head is
           // emitted before any lighter one (best tail schedule), matching the static
