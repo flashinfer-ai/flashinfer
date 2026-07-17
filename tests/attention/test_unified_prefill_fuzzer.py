@@ -26,10 +26,15 @@ Mechanics:
 
 Trials per backend via FI_UNIFIED_FUZZ_TRIALS (default 30).
 
-Known gaps (documented caller contract, not fuzzed):
+Known gaps (documented caller contract; the corresponding mutations are
+marked xfail rather than dropped, so the gap stays visible in reports):
 - host mirrors are trusted to match the device tensors (engines own both
   copies; validating equality would cost the sync the API removes);
-- zero-length sequences are out of the prototype's envelope.
+- block_tables VALUES (page ids) are trusted to be in-pool — a negative or
+  stale id returns finite plausible garbage on every backend; the production
+  answer is an opt-in debug validation pass (FLASHINFER_VALIDATE_INPUTS).
+Zero-length sequences and causal q_len>kv_len are REJECTED by validation
+(fully-masked rows have backend-divergent LSE semantics).
 """
 
 import os
@@ -191,6 +196,34 @@ def m_page_size_mismatch(p):
     return p
 
 
+def m_out_wrong_dtype(p):
+    p = _clone(p)
+    total, h, _ = p["q"].shape
+    p["_out_override"] = torch.zeros(
+        total, h, p["head_dim_vo"], dtype=torch.float32, device=p["q"].device
+    )
+    return p
+
+
+def m_lse_wrong_dtype(p):
+    p = _clone(p)
+    total, h, _ = p["q"].shape
+    p["_lse_override"] = torch.zeros(
+        total, h, dtype=torch.float16, device=p["q"].device
+    )
+    return p
+
+
+def m_block_tables_negative(p):
+    # KNOWN GAP: page-id values are a documented trusted input; this mutation
+    # is expected to FAIL the property today and is marked xfail in the test.
+    p = _clone(p)
+    bt = p["block_tables"].clone()
+    bt[0, 0] = -1
+    p["block_tables"] = bt
+    return p
+
+
 def m_q_noncontig(p):
     # fused-QKV-style slice: valid semantics, strided storage.  Backends
     # that can address it must be correct; token-offset backends must
@@ -217,7 +250,13 @@ MUTATIONS = [
     ("block_tables_1d", False, m_block_tables_1d),
     ("page_size_mismatch", False, m_page_size_mismatch),
     ("q_noncontig", True, m_q_noncontig),
+    ("out_wrong_dtype", False, m_out_wrong_dtype),
+    ("lse_wrong_dtype", False, m_lse_wrong_dtype),
+    ("block_tables_negative", False, m_block_tables_negative),
 ]
+
+# documented trusted inputs: expected to fail reject-or-correct today
+KNOWN_GAP_MUTATIONS = {"block_tables_negative"}
 
 
 def _run_and_check(p, backend, causal, repro):
@@ -281,6 +320,11 @@ def test_fuzz_reject_or_correct(backend, mutation):
     """Corrupted inputs: clean raise, or (when semantics remain defined)
     a correct result.  Silent wrong numbers fail, always."""
     name, comparable, mutate = next(m for m in MUTATIONS if m[0] == mutation)
+    if name in KNOWN_GAP_MUTATIONS:
+        pytest.xfail(
+            "documented trusted input (see module docstring Known gaps): "
+            "value-level block-table validation needs a device-side pass"
+        )
     checked = 0
     for trial in range(max(3, TRIALS // 5)):
         seed = 20_000 + trial

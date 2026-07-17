@@ -10,6 +10,8 @@ One backend-parametrized test, one reference oracle, one output contract:
 This file doubles as executable documentation of the API (proposal P0).
 """
 
+import zlib
+
 import pytest
 import torch
 
@@ -99,7 +101,9 @@ def make_problem(
     )
 
 
-def run_unified(p, backend, *, causal=True, return_lse=True, with_mirrors=True):
+def run_unified(
+    p, backend, *, causal=True, return_lse=True, with_mirrors=True, sm_scale=None
+):
     attn = UnifiedPagedPrefill(torch.device(p["device"]))
     attn.plan(
         qo_indptr=p["qo_indptr"],
@@ -117,9 +121,15 @@ def run_unified(p, backend, *, causal=True, return_lse=True, with_mirrors=True):
         return_lse=return_lse,
         qo_indptr_cpu=p["qo_indptr_cpu"] if with_mirrors else None,
         kv_seq_lens_cpu=p["kv_seq_lens_cpu"] if with_mirrors else None,
+        sm_scale=sm_scale,
         backend=backend,
     )
-    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    out, lse = attn.run(
+        p["q"],
+        (p["k_cache"], p["v_cache"]),
+        out=p.get("_out_override"),
+        lse=p.get("_lse_override"),
+    )
     return attn, out, lse
 
 
@@ -175,7 +185,9 @@ def test_unified_prefill_conformance(
     backend, batch_size, max_q, max_kv, heads, page_size
 ):
     p = make_problem(
-        seed=hash((backend, batch_size, max_q, max_kv, heads, page_size)) % (2**31),
+        seed=zlib.crc32(
+            repr((backend, batch_size, max_q, max_kv, heads, page_size)).encode()
+        ),
         batch_size=batch_size,
         max_q=max_q,
         max_kv=max_kv,
@@ -280,3 +292,193 @@ def test_resolve_is_static_and_explains():
             q_dtype=torch.bfloat16,
             page_size=16,
         )
+
+
+@pytest.mark.parametrize("backend", ["cudnn", "fa2"])
+def test_unified_prefill_headdim_192_128(backend):
+    """(192,128) head dims — capability-honesty: declared rows are tested."""
+    if backend == "fa2":
+        pytest.skip("fa2 (192,128) not declared in the prototype capability set")
+    p = make_problem(
+        seed=17,
+        batch_size=3,
+        max_q=32,
+        max_kv=256,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    check(p, backend)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn"])
+def test_unified_prefill_noncausal(backend):
+    p = make_problem(
+        seed=11,
+        batch_size=4,
+        max_q=32,
+        max_kv=128,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    check(p, backend, causal=False)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_unified_prefill_sm_scale_replan(backend):
+    """Two plans with identical shapes but different sm_scale must each be
+    correct.  Regression for the cuDNN graph-cache stale-scale replay (the
+    cache key omitted attn_scale; found by this prototype's fuzzer, fixed in
+    flashinfer/cudnn/prefill.py)."""
+    p = make_problem(
+        seed=19,
+        batch_size=4,
+        max_q=32,
+        max_kv=256,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    _resolve_or_skip(p, backend)
+    for scale_mult in (1.0, 3.0):
+        sm_scale = scale_mult / (128**0.5)
+        _, out, lse = run_unified(p, backend, sm_scale=sm_scale)
+        ref_out, ref_lse = reference_paged_prefill(
+            p["q"],
+            p["k_cache"],
+            p["v_cache"],
+            p["qo_indptr_cpu"],
+            p["kv_seq_lens_cpu"],
+            p["block_tables"],
+            p["page_size"],
+            True,
+            sm_scale=sm_scale,
+        )
+        torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+        torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+def test_resolution_pinning():
+    """plan(backend=Resolution) enforces the init-time pinned config."""
+    p = make_problem(
+        seed=23,
+        batch_size=2,
+        max_q=16,
+        max_kv=64,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    res = _resolve_or_skip(p, "auto")
+    attn = UnifiedPagedPrefill(torch.device(p["device"]))
+    attn.plan(
+        qo_indptr=p["qo_indptr"],
+        kv_seq_lens=p["kv_seq_lens"],
+        block_tables=p["block_tables"],
+        page_size=p["page_size"],
+        max_q_len=p["max_q_len"],
+        max_kv_len=p["max_kv_len"],
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        causal=True,
+        return_lse=True,
+        qo_indptr_cpu=p["qo_indptr_cpu"],
+        kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
+        backend=res,
+    )
+    assert attn._backend in res.backends
+    # drifted config (different heads) must be rejected, not silently re-resolved
+    with pytest.raises(ValueError, match="pinned Resolution"):
+        attn.plan(
+            qo_indptr=p["qo_indptr"],
+            kv_seq_lens=p["kv_seq_lens"],
+            block_tables=p["block_tables"],
+            page_size=p["page_size"],
+            max_q_len=p["max_q_len"],
+            max_kv_len=p["max_kv_len"],
+            num_qo_heads=p["num_qo_heads"],
+            num_kv_heads=p["num_qo_heads"],  # MHA instead of GQA
+            head_dim_qk=p["head_dim_qk"],
+            q_dtype=p["dtype"],
+            causal=True,
+            return_lse=True,
+            backend=res,
+        )
+
+
+def test_envelope_rejections():
+    """Zero-length KV rows and causal q_len>kv_len are outside the v1
+    envelope and must be rejected loudly (backends disagree on the LSE of
+    fully-masked rows: fa2 finite sentinel vs cudnn -inf)."""
+    p = make_problem(
+        seed=29,
+        batch_size=3,
+        max_q=8,
+        max_kv=64,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    kv0 = p["kv_seq_lens_cpu"].clone()
+    kv0[1] = 0
+    with pytest.raises(ValueError, match="outside the v1 envelope"):
+        run_unified(
+            {**p, "kv_seq_lens_cpu": kv0, "kv_seq_lens": kv0.to(p["device"])}, "fa2"
+        )
+    # causal q>kv: force q_len 8 > kv_len 4 on request 0
+    kvq = p["kv_seq_lens_cpu"].clone()
+    q_lens = p["qo_indptr_cpu"].diff()
+    kvq[0] = max(1, int(q_lens[0]) - 1)
+    with pytest.raises(ValueError, match="q_len_i <= kv_len_i"):
+        run_unified(
+            {**p, "kv_seq_lens_cpu": kvq, "kv_seq_lens": kvq.to(p["device"])}, "fa2"
+        )
+
+
+def test_derive_is_sync_free():
+    """The derivation layer must not synchronize (proposal P1 acceptance:
+    with mirrors, plan() is zero-D2H).  Guards against masked-select /
+    repeat_interleave style data-dependent-size ops sneaking back in."""
+    from flashinfer.attention.unified import _derive
+
+    p = make_problem(
+        seed=31,
+        batch_size=6,
+        max_q=16,
+        max_kv=256,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        d = _derive(p["qo_indptr"], p["kv_seq_lens"], p["block_tables"], p["page_size"])
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    # correctness of the scatter-compaction vs a host-side reference
+    pages = (p["kv_seq_lens_cpu"] + p["page_size"] - 1) // p["page_size"]
+    expected = torch.cat(
+        [
+            p["block_tables"].cpu()[i, : int(pages[i])]
+            for i in range(p["kv_seq_lens_cpu"].shape[0])
+        ]
+    )
+    total_pages = int(pages.sum())
+    assert torch.equal(d.kv_page_indices.cpu()[:total_pages], expected)
