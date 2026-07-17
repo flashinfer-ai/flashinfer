@@ -800,7 +800,7 @@ def prepare_b12x_nvfp4_weights(
     device = torch.device(device)
     w1_bf16 = w1_bf16.to(device)
     w2_bf16 = w2_bf16.to(device)
-    if w1_bf16.dtype is not torch.bfloat16 or w2_bf16.dtype is not torch.bfloat16:
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
         raise TypeError("b12x canonical weights must use torch.bfloat16.")
 
     is_gated = is_gated_activation(activation)
