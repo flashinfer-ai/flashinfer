@@ -341,10 +341,28 @@ def _render_init_source(fn: Callable) -> str:
 
 
 def _render_reference_source(fn: Callable) -> str:
-    """Return reference source with imports needed for standalone exec()."""
+    """Return reference source with imports needed for standalone exec().
+
+    Module-level helper functions the reference calls must be listed in a
+    ``_trace_reference_dependencies`` attribute on *fn* (mirroring
+    ``_trace_init_dependencies`` for init functions); their sources are
+    inlined ahead of the reference so the rendered string is runnable
+    standalone.
+    """
     import inspect  # noqa: PLC0415
 
-    return _REFERENCE_PREAMBLE + inspect.getsource(fn)
+    parts = [_REFERENCE_PREAMBLE]
+    dependencies = tuple(getattr(fn, "_trace_reference_dependencies", ()))
+    if dependencies:
+        parts.append("# ----- reference dependencies -----\n")
+        for dep in dependencies:
+            dep_src = inspect.getsource(dep)
+            parts.append(dep_src)
+            if not dep_src.endswith("\n"):
+                parts.append("\n")
+            parts.append("\n")
+    parts.append(inspect.getsource(fn))
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------

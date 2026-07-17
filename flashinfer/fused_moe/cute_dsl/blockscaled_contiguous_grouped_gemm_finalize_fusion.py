@@ -179,6 +179,7 @@ def _get_compiled_finalize_kernel(
     permuted_idx_ptr,
     num_tiles_ptr,
     token_scales_ptr,
+    a_per_token_scale_ptr,
     max_active_clusters: int,
     stream,
     # Tactic parameters (compile-time - IN cache key)
@@ -188,6 +189,7 @@ def _get_compiled_finalize_kernel(
     cluster_shape_mn: Tuple[int, int],
     raster_along_m: bool,
     enable_pdl: bool = True,
+    use_a_per_token_scale: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -208,6 +210,7 @@ def _get_compiled_finalize_kernel(
         cluster_shape_mn,
         raster_along_m,
         enable_pdl,
+        use_a_per_token_scale,
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -218,6 +221,7 @@ def _get_compiled_finalize_kernel(
             cluster_shape_mn=cluster_shape_mn,
             raster_along_m=raster_along_m,
             enable_pdl=enable_pdl,
+            use_a_per_token_scale=use_a_per_token_scale,
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -225,7 +229,8 @@ def _get_compiled_finalize_kernel(
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
         #  permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
-        #  token_final_scales_ptr, m, n, k, l, num_tokens, top_k,
+        #  token_final_scales_ptr, a_per_token_scale_ptr,
+        #  m, n, k, l, num_tokens, top_k,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
         compiled_gemm = cute.compile(
             gemm.wrapper,
@@ -240,6 +245,7 @@ def _get_compiled_finalize_kernel(
             permuted_idx_ptr,
             num_tiles_ptr,
             token_scales_ptr,
+            a_per_token_scale_ptr,
             permuted_m,
             n,
             k,
@@ -270,6 +276,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     token_final_scales: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     *,
+    a_per_token_scale: Optional[torch.Tensor] = None,
     ab_dtype: str = "float4_e2m1fn",
     sf_dtype: str = "float8_e4m3fn",
     out_dtype: str = "bfloat16",
@@ -310,6 +317,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
              If `out` is None, this function allocates a zero-initialized
              output tensor. Passing a non-zeroed `out` buffer will silently
              produce incorrect results.
+        a_per_token_scale: Optional per-row operand-A scale, shape (permuted_m,).
+             Used when GEMM1 output is quantized by a standalone per-token
+             NVFP4 quantizer instead of the fused GEMM1 epilogue.
         ab_dtype: Data type for A and B matrices. Default: "float4_e2m1fn"
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         out_dtype: Data type for output matrix. Default: "bfloat16"
@@ -379,6 +389,20 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
 
     seq_len = token_final_scales.shape[0]
     topk = token_final_scales.shape[1]
+
+    use_a_per_token_scale = a_per_token_scale is not None
+    if use_a_per_token_scale:
+        if a_per_token_scale.device.type != "cuda":
+            raise ValueError("a_per_token_scale must be on CUDA device")
+        if a_per_token_scale.dtype != torch.float32:
+            raise ValueError("a_per_token_scale must have dtype torch.float32")
+        if not a_per_token_scale.is_contiguous():
+            raise ValueError("a_per_token_scale must be contiguous")
+        if a_per_token_scale.shape != (permuted_m,):
+            raise ValueError(
+                f"a_per_token_scale must have shape ({permuted_m},), "
+                f"got {tuple(a_per_token_scale.shape)}"
+            )
 
     # Check compute capability
     major, minor = get_compute_capability(a.device)
@@ -485,6 +509,14 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
+    if use_a_per_token_scale:
+        a_per_token_scale_ptr = make_ptr(
+            cutlass.Float32,
+            a_per_token_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+        )
+    else:
+        a_per_token_scale_ptr = None
 
     # Get CUDA stream
     torch_stream = torch.cuda.current_stream()
@@ -511,6 +543,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         permuted_idx_ptr=permuted_idx_ptr,
         num_tiles_ptr=num_tiles_ptr,
         token_scales_ptr=token_scales_ptr,
+        a_per_token_scale_ptr=a_per_token_scale_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
         # Tactic parameters (compile-time, cached)
@@ -520,13 +553,14 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         cluster_shape_mn=cluster_shape_mn,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
+        use_a_per_token_scale=use_a_per_token_scale,
     )
 
     # Execute kernel with runtime parameters
     # Order must match wrapper signature:
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr, tile_idx_ptr,
     #  mn_limit_ptr, permuted_idx_ptr, num_tiles_ptr, token_scales_ptr,
-    #  m, n, k, l, num_tokens, top_k, stream)
+    #  a_per_token_scale_ptr, m, n, k, l, num_tokens, top_k, stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
@@ -539,6 +573,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         permuted_idx_ptr,
         num_tiles_ptr,
         token_scales_ptr,
+        a_per_token_scale_ptr,
         permuted_m,
         n,
         k,

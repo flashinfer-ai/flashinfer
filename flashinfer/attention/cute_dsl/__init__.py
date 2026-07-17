@@ -25,11 +25,13 @@ if is_cute_dsl_available():
         get_cute_dsl_fmha_kernel,
         cute_dsl_fmha_ragged_prefill,
     )
+    from .fmha_blockscaled import cute_dsl_fmha_blockscaled_prefill
 
     __all__ = [
         "is_cute_dsl_available",
         "get_cute_dsl_fmha_kernel",
         "cute_dsl_fmha_ragged_prefill",
+        "cute_dsl_fmha_blockscaled_prefill",
     ]
 else:
     __all__ = [

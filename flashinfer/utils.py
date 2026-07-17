@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
+import logging
 import functools
 import math
 from enum import Enum
+from functools import lru_cache
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
@@ -27,6 +30,8 @@ from torch.torch_version import __version__ as torch_version
 import inspect
 
 from .jit.spdlog import gen_spdlog_module
+
+logger = logging.getLogger(__name__)
 
 
 class PosEncodingMode(Enum):
@@ -653,6 +658,9 @@ def determine_mla_backend(device: torch.device) -> str:
 def _check_block_tables_shape(
     block_tables: torch.Tensor,
     uses_shared_paged_kv_idx: bool,
+    block_sparse: bool = False,
+    num_kv_heads: Optional[int] = None,
+    batch_size: Optional[int] = None,
 ) -> None:
     """Validate ``block_tables`` rank against the paged KV index layout.
 
@@ -660,7 +668,35 @@ def _check_block_tables_shape(
     ``[batch_size, max_num_pages_per_seq]``.  Separate layout expects a 3-D
     tensor ``[batch_size, 2, max_num_pages_per_seq]`` where dim1 distinguishes
     K (0) and V (1) page indices.
+
+    Block-sparse attention (``block_sparse=True``) uses per-KV-head page
+    tables and expects a 3-D tensor ``[num_kv_heads, batch_size,
+    max_num_pages_per_seq]`` with the shared layout; the selected sparse
+    pages must be packed densely at the front of each row.
     """
+    if block_sparse:
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "block-sparse attention currently requires the shared paged-KV "
+                "index layout (uses_shared_paged_kv_idx=True)"
+            )
+        if block_tables.ndim != 3:
+            raise ValueError(
+                f"block_tables must be 3D [num_kv_heads, batch_size, "
+                f"max_num_pages_per_seq] for block-sparse attention, "
+                f"got ndim={block_tables.ndim}"
+            )
+        if num_kv_heads is not None and block_tables.shape[0] != num_kv_heads:
+            raise ValueError(
+                f"block_tables must have shape[0]==num_kv_heads ({num_kv_heads}) "
+                f"for block-sparse attention, got shape={block_tables.shape}"
+            )
+        if batch_size is not None and block_tables.shape[1] != batch_size:
+            raise ValueError(
+                f"block_tables must have shape[1]==batch_size ({batch_size}) "
+                f"for block-sparse attention, got shape={block_tables.shape}"
+            )
+        return
     expected_ndim = 2 if uses_shared_paged_kv_idx else 3
     if block_tables.ndim != expected_ndim:
         layout = "shared" if uses_shared_paged_kv_idx else "separate"
@@ -795,6 +831,37 @@ def _get_trtllm_gen_multi_ctas_kv_counter_buffer(
         batch_size, num_qo_heads, sm_count
     )
     return torch.zeros(counter_bytes, dtype=torch.uint8, device=device)
+
+
+def _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+    counter_buffer: Optional[torch.Tensor],
+    batch_size: int,
+    num_qo_heads: int,
+    sm_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate or validate a trtllm-gen multi-CTA KV counter buffer."""
+    required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    if counter_buffer is None:
+        return _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+            batch_size, num_qo_heads, sm_count, device
+        )
+    if counter_buffer.device != device:
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer must be on the same device as query"
+        )
+    if not counter_buffer.is_contiguous():
+        raise ValueError("multi_ctas_kv_counter_buffer must be contiguous")
+    _check_workspace_buffer_alignment(counter_buffer, "multi_ctas_kv_counter_buffer")
+    counter_buffer_bytes = counter_buffer.numel() * counter_buffer.element_size()
+    if counter_buffer_bytes < required_counter_bytes:
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer is too small: got "
+            f"{counter_buffer_bytes} bytes, need {required_counter_bytes} bytes"
+        )
+    return counter_buffer
 
 
 class FP4Tensor:
@@ -1367,3 +1434,69 @@ def prepare_jit_additional_args(
             result.append(None)
     result.extend(user_args_list)
     return result
+
+
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Detected once via NVML and cached.
+    Overridable with ``FLASHINFER_CONFIDENTIAL_COMPUTE=1/0``.
+    """
+    forced = os.environ.get("FLASHINFER_CONFIDENTIAL_COMPUTE")
+    if forced is not None:
+        if forced not in ("0", "1"):
+            raise ValueError(
+                f"FLASHINFER_CONFIDENTIAL_COMPUTE must be '0' or '1', got {forced!r}"
+            )
+        return forced == "1"
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            state = pynvml.nvmlSystemGetConfComputeState()
+            # ccFeature != 0 means CC is enabled (ON or devtools).
+            return int(getattr(state, "ccFeature", 0)) != 0
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.debug("[Flashinfer]: Confidential-compute detection failed: %r", e)
+        return False
+
+
+@lru_cache(maxsize=1)
+def get_globaltimer_kernel():
+    """Lazily JIT-build the %globaltimer kernel."""
+
+    _GLOBALTIMER_KERNEL_CU = r"""
+    #include <torch/extension.h>
+    #include <ATen/cuda/CUDAContext.h>
+    __global__ void _get_globaltimer_timestamp(uint64_t* timestamp) {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(*timestamp));
+    }
+    void get_globaltimer_timestamp(torch::Tensor timestamp) {
+        _get_globaltimer_timestamp<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<uint64_t*>(timestamp.data_ptr<int64_t>()));
+    }
+    """
+
+    try:
+        from torch.utils.cpp_extension import load_inline
+
+        mod = load_inline(
+            name="flashinfer_globaltimer",
+            cpp_sources="void get_globaltimer_timestamp(torch::Tensor);",
+            cuda_sources=_GLOBALTIMER_KERNEL_CU,
+            functions=["get_globaltimer_timestamp"],
+            verbose=False,
+        )
+        return mod.get_globaltimer_timestamp
+    except Exception as e:
+        logger.warning(
+            f"[Flashinfer]: %globaltimer stamp kernel build failed ({e}); "
+            f"falling back to cudaEvent timing."
+        )
+    return None
