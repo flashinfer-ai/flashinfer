@@ -2062,8 +2062,8 @@ nvfp4_quantize_smooth_trace = TraceTemplate(
     axes={
         "M": Var(),
         "N": Const(),
-        "N_half": Const(description="N / 2 (two e2m1 values per byte)."),
-        "SF": Const(description="128x4-swizzled scale buffer size."),
+        "N_half": Var(description="N / 2 (two e2m1 values per byte)."),
+        "SF": Var(description="128x4-swizzled scale buffer size derived from M and N."),
     },
     inputs={
         "x": Tensor(["M", "N"], param="x", description="Input activation, bf16."),
@@ -2082,6 +2082,10 @@ nvfp4_quantize_smooth_trace = TraceTemplate(
         "xq": Tensor(["M", "N_half"], dtype="uint8"),
         "sf": Tensor(["SF"], dtype="uint8"),
     },
+    constraints=[
+        "N_half == N // 2",
+        "SF == ((M + 127) // 128) * 128 * ((N // 16 + 3) // 4) * 4",
+    ],
     tags=["quantization:fp4"],
     init=_nvfp4_quantize_smooth_init,
 )
