@@ -247,13 +247,15 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     def _initialize_protocol(self) -> None:
         self.handle.lamport_initialize(self.rank, torch.float32)
         num_bytes_to_clear = [0] * 4
-        self.buffer_flags.copy_(
-            torch.tensor(
-                [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
-                dtype=torch.uint32,
-                device=self.buffer_flags.device,
+        # The workspace may be created under inference mode and restored outside it.
+        with torch.inference_mode():
+            self.buffer_flags.copy_(
+                torch.tensor(
+                    [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+                    dtype=torch.uint32,
+                    device=self.buffer_flags.device,
+                )
             )
-        )
         torch.cuda.synchronize()
 
     @flashinfer_api
