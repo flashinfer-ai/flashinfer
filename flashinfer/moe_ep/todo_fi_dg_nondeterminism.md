@@ -10,8 +10,17 @@ fi-path defect — fully consistent with the layer-level exoneration below.
 Reclassified: not an fi moe_ep bug; any future determinism claim needs N
 rerun pairs per backend plus the per-step batch-shape log
 (`FI_MOE_EP_SHAPE_LOG`, wired in `vllm_e2e/patch_0251`) as a control.
-Mechanism confirmation for the engine-level divergence (batch-shape
-schedule diff on a diverging pair) tracked in the vLLM bench repo.
+MECHANISM CONFIRMED (same day, round 2 with line-buffered logs): on a
+diverging native pair (3/8 exact), the per-MoE-call batch-shape schedules
+differ between the two runs on ALL ranks — first divergence at call 215 =
+engine step 5 (43 layers/step), where run A scheduled a 1-token batch and
+run B an 8-token batch. The vLLM scheduler composes different batches
+across identical runs (async request-joining timing); different shapes →
+shape-dependent kernel splits/rounding → ULP logit deltas → greedy token
+flips. CLOSED as an fi issue. Artifacts:
+`vllm_e2e/results/shape_det2_*`; log hook stays env-gated
+(`FI_MOE_EP_SHAPE_LOG`) in `vllm_e2e/patch_0251` as the standard
+determinism control.
 
 Status: LAYER-LEVEL EXONERATED (2026-07-16 pm) — engine-side lead open.
 `tests/moe_ep/test_moe_ep_deep_gemm_skew_determinism.py` (4x GB200) proves
