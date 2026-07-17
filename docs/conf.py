@@ -17,6 +17,9 @@ autodoc_mock_imports = [
     "triton",
     "flashinfer._build_meta",
     "cuda",
+    # CuTe-DSL imports its CUDA/CUTLASS stack eagerly, but API docs only need
+    # the public function signatures.
+    "cutlass",
     "numpy",
     "einops",
     "mpi4py",
