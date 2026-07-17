@@ -56,13 +56,13 @@ body:
       description: Select every confirmed target.
       multiple: true
       options:
-        - SM80 / SM86 - Ampere (A100, A30, RTX 30)
-        - SM89 - Ada (L4, L40S, RTX 40)
-        - SM90 - Hopper (H100, H200, or H20)
-        - SM100 - Blackwell datacenter (B200 or GB200)
-        - SM103 - Blackwell Ultra datacenter (B300 or GB300)
-        - SM120 - RTX PRO 6000 Blackwell or GeForce Blackwell
-        - SM121 - GB10 or DGX Spark
+        - SM80 / SM86 (A100, A30, RTX 30-series)
+        - SM89 (L4, L40S, RTX 40-series)
+        - SM90 (H100, H200, H20)
+        - SM100 (B200, GB200)
+        - SM103 (B300, GB300)
+        - SM120 (RTX PRO 6000, RTX 50-series)
+        - SM121 (GB10 — DGX Spark, RTX Spark)
         - Future architecture
         - Hardware-independent
         - Other or unknown
