@@ -10,9 +10,11 @@ from types import SimpleNamespace
 from typing import Optional
 import torch
 from flashinfer.utils import (
+    backend_requirement,
+    get_compute_capability,
+    is_sm103_tinygemm_unsafe_shape,
     register_custom_op,
     supported_compute_capability,
-    backend_requirement,
 )
 
 
@@ -310,6 +312,7 @@ def mm_M1_16_K6144_N256(
 
 @supported_compute_capability([90, 100, 103, 110, 120, 121])
 def _tinygemm_bf16_shape_checks(input, weight, out, bias, use_pdl):
+    """Validate public TinyGEMM tensor layout, dtype, and SM103 safety."""
     if input.dim() != 2:
         raise ValueError("input must be a 2D tensor")
     if weight.dim() != 2:
@@ -337,6 +340,13 @@ def _tinygemm_bf16_shape_checks(input, weight, out, bias, use_pdl):
             f"out.shape[1] ({out.shape[1]}) must equal weight.shape[0] ({weight.shape[0]})"
         )
     output_features = weight.shape[0]
+    if is_sm103_tinygemm_unsafe_shape(
+        get_compute_capability(input.device), output_features, weight.shape[1]
+    ):
+        raise ValueError(
+            "The TinyGEMM backend is disabled for this large BF16 projection on SM103 "
+            "to avoid a known kernel hang; see flashinfer-ai/flashinfer#3848."
+        )
 
     if output_features % 16 != 0:
         raise ValueError(

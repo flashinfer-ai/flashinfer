@@ -60,13 +60,14 @@ from .kernels.utils import (
     _select_sm100_mm_fp4_cute_dsl_tactic,
 )
 from ..utils import (
+    LibraryError,
+    backend_requirement,
     get_device_sm_count,
     get_native_fp4_dtype,
     is_sm100a_supported,
     is_sm100f_supported,
+    is_sm103_tinygemm_unsafe,
     is_sm12x_supported,
-    LibraryError,
-    backend_requirement,
     supported_compute_capability,
 )
 from ..jit.gemm import gen_gemm_sm90_module
@@ -118,29 +119,6 @@ from ..utils import (
 )
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
-_SM103_TINYGEMM_MAX_PROJECTION_ELEMENTS = 32 * 1024 * 1024
-
-
-def _is_sm103_tinygemm_unsafe_shape(
-    compute_capability: Tuple[int, int], n: int, k: int
-) -> bool:
-    """Return whether TinyGEMM is unsafe for an SM103 projection shape.
-
-    TinyGEMM can hang indefinitely on B300A/SM103 for large BF16 projection
-    shapes. Keep the workaround scoped to the affected architecture and
-    disable it only once the N*K projection size reaches the smallest
-    reported failure threshold. See flashinfer-ai/flashinfer#3848.
-    """
-    return (
-        compute_capability == (10, 3)
-        and n * k >= _SM103_TINYGEMM_MAX_PROJECTION_ELEMENTS
-    )
-
-
-def _is_sm103_tinygemm_unsafe(a: torch.Tensor, b: torch.Tensor) -> bool:
-    return _is_sm103_tinygemm_unsafe_shape(
-        get_compute_capability(a.device), b.shape[1], a.shape[1]
-    )
 
 
 # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
@@ -448,6 +426,7 @@ def _tinygemm_mm_bf16_requirement(
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "tinygemm", "auto"] = "cudnn",
 ):
+    """Validate BF16 TinyGEMM layout, dtype, and SM103 safety requirements."""
     if out_dtype != torch.bfloat16:
         raise ValueError("The TinyGEMM backend only supports bfloat16 output.")
     if a.dim() != 2:
@@ -469,7 +448,7 @@ def _tinygemm_mm_bf16_requirement(
         raise ValueError("The TinyGEMM backend requires a contiguous output tensor.")
     if bias is not None and not bias.is_contiguous():
         raise ValueError("The TinyGEMM backend requires a contiguous bias tensor.")
-    if _is_sm103_tinygemm_unsafe(a, b):
+    if is_sm103_tinygemm_unsafe(a, b):
         raise ValueError(
             "The TinyGEMM backend is disabled for this large BF16 projection on SM103 "
             "to avoid a known kernel hang; see flashinfer-ai/flashinfer#3848."
@@ -531,6 +510,7 @@ def _heuristic_func_mm_bf16(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
 ):
+    """Order valid BF16 GEMM backends for automatic selection."""
     heuristic_backends = []
     if bias is not None or pdl:
         # CUTLASS and cuBLASLt doesn't support bias/pdl, only TGV and cuDNN do
@@ -548,11 +528,7 @@ def _heuristic_func_mm_bf16(
         if "cublaslt" in suitable_backends:
             heuristic_backends.append("cublaslt")
 
-    if (
-        "tinygemm" in suitable_backends
-        and out_dtype == torch.bfloat16
-        and not _is_sm103_tinygemm_unsafe(a, b)
-    ):
+    if "tinygemm" in suitable_backends and out_dtype == torch.bfloat16:
         heuristic_backends.append("tinygemm")
 
     return heuristic_backends

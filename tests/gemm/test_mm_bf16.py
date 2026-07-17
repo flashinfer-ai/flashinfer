@@ -4,8 +4,11 @@ import torch.nn.functional as F
 
 from flashinfer import autotune, mm_bf16
 from flashinfer.gemm import is_cuda_tile_available
-from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE, _is_sm103_tinygemm_unsafe_shape
-from flashinfer.utils import get_compute_capability
+from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm103_tinygemm_unsafe_shape,
+)
 
 
 @pytest.mark.parametrize("m", [1, 8, 16, 32, 64])
@@ -113,13 +116,15 @@ def test_mm_bf16(
 def test_sm103_tinygemm_large_projection_guard(
     compute_capability: tuple[int, int], n: int, k: int, expected: bool
 ):
-    assert _is_sm103_tinygemm_unsafe_shape(compute_capability, n, k) is expected
+    """Cover reported SM103 hangs and unaffected architectures."""
+    assert is_sm103_tinygemm_unsafe_shape(compute_capability, n, k) is expected
 
 
 def test_sm103_tinygemm_guard_boundary():
+    """Verify the guard changes behavior exactly at its projection threshold."""
     threshold = 32 * 1024 * 1024
-    assert _is_sm103_tinygemm_unsafe_shape((10, 3), threshold // 5120, 5120) is False
-    assert _is_sm103_tinygemm_unsafe_shape((10, 3), threshold // 5120 + 1, 5120) is True
+    assert is_sm103_tinygemm_unsafe_shape((10, 3), threshold // 5120, 5120) is False
+    assert is_sm103_tinygemm_unsafe_shape((10, 3), threshold // 5120 + 1, 5120) is True
 
 
 def test_mm_bf16_cutile_rejects_bias_and_pdl():
