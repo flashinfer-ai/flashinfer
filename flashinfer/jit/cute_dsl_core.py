@@ -207,7 +207,7 @@ class JitSpecCuteDsl(JitSpec):
                 shutil.rmtree(self.module_dir, ignore_errors=True)
             try:
                 self._export()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 -- persistence is best-effort
                 logger.warning(
                     f"Failed to persist CuTe-DSL kernel {self.name} to "
                     f"{self.object_path}: {e}. The kernel will be recompiled "

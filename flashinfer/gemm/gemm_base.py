@@ -56,6 +56,7 @@ from ..fused_moe.utils import (
 from .gemm_mm_fp4_cute_dsl import (
     _TORCH_TO_CUTLASS_DTYPE_ATTR,
     _compile_block_scaled_gemm,
+    _device_index,
     _mm_fp4_cache_key,
     precompile_mm_fp4_tactics,
 )
@@ -5983,8 +5984,9 @@ def _cute_dsl_gemm_fp4_runner(
                         enable_pdl,
                         out_dtype,
                         _CUTE_DSL_MM_FP4_KERNEL_CACHE,
+                        a.device,
                     )
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 -- serial fallback is intentional
                     logger.warning(
                         f"[mm_fp4 cute-dsl] tactic precompilation failed "
                         f"({type(e).__name__}: {e}); tactics will compile "
@@ -6059,6 +6061,7 @@ def _cute_dsl_gemm_fp4_runner(
                 sf_k=sf_k,
                 batch_size=batch_size,
                 cache_module_name="mm_fp4",
+                device_index=_device_index(a.device),
             )
 
             alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)

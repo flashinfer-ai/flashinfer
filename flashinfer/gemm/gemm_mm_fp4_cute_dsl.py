@@ -28,6 +28,11 @@ _TORCH_TO_CUTLASS_DTYPE_ATTR = {
 }
 
 
+def _device_index(device) -> int:
+    """Get the CUDA device index for a torch.device."""
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
 def _blockscaled_gemm_cache_key_files() -> tuple:
     """Source files whose content invalidates the on-disk mm_fp4 kernels."""
     from .kernels import (
@@ -58,6 +63,7 @@ def _compile_block_scaled_gemm(
     batch_size,
     cluster_shape_k=1,
     cache_module_name=None,
+    device_index=None,
 ):
     """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
 
@@ -75,8 +81,11 @@ def _compile_block_scaled_gemm(
     stored as uint8 in torch (2 FP4 values per byte); the kernel wrapper
     recasts from Uint8 to Float4E2M1FN internally.
     """
-    if cache_key in cache:
-        return cache[cache_key]
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    mem_key = (device_index, cache_key)
+    if mem_key in cache:
+        return cache[mem_key]
 
     from flashinfer.cute_dsl.utils import get_max_active_clusters
 
@@ -112,7 +121,7 @@ def _compile_block_scaled_gemm(
         )
 
     result = (compiled_gemm, max_active_clusters)
-    cache[cache_key] = result
+    cache[mem_key] = result
     return result
 
 
@@ -235,6 +244,9 @@ def _mm_fp4_precompile_worker(payload):
     """
     kernel_name = payload["kernel_name"]
     try:
+        # Set the current GPU in this subprocess
+        torch.cuda.set_device(payload["device_index"])
+
         import cutlass
 
         from ..jit.cute_dsl_core import JitSpecCuteDsl, _hash_source_files
@@ -293,16 +305,52 @@ def _mm_fp4_precompile_worker(payload):
 _MM_FP4_PRECOMPILE_WORKER_RAM_BYTES = 1 << 30
 
 
+def _cgroup_available_memory_bytes() -> Optional[int]:
+    """Headroom under the current cgroup memory limit, or None if
+    unlimited/unreadable.
+
+    Inside containers /proc/meminfo reports *host* memory, so the cgroup
+    limit is what actually prevents an OOM kill.
+    cgroup's memory.current is profiled here to estimate the headroom.
+    """
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            limit = f.read().strip()
+        if limit != "max":
+            with open("/sys/fs/cgroup/memory.current") as f:
+                current = int(f.read())
+            return max(0, int(limit) - current)
+    except (OSError, ValueError):
+        pass
+    # cgroup v1
+    try:
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
+            limit_v1 = int(f.read())
+        if limit_v1 < 1 << 60:  # values near 2**63 mean "unlimited"
+            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f:
+                usage = int(f.read())
+            return max(0, limit_v1 - usage)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def _available_host_memory_bytes() -> Optional[int]:
-    """Return MemAvailable from /proc/meminfo, or None if unreadable."""
+    """Best-effort available memory: the tighter of host MemAvailable and
+    the cgroup limit headroom, or None if neither is readable."""
+    candidates = []
     try:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
+                    candidates.append(int(line.split()[1]) * 1024)
+                    break
     except OSError:
         pass
-    return None
+    cgroup = _cgroup_available_memory_bytes()
+    if cgroup is not None:
+        candidates.append(cgroup)
+    return min(candidates) if candidates else None
 
 
 def _get_mm_fp4_cute_dsl_compile_workers() -> int:
@@ -358,7 +406,7 @@ def _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype):
 
 
 def precompile_mm_fp4_tactics(
-    tactics, m, n, real_k, use_nvfp4, enable_pdl, out_dtype, kernel_cache
+    tactics, m, n, real_k, use_nvfp4, enable_pdl, out_dtype, kernel_cache, device
 ) -> None:
     """Batch-compile not-yet-cached mm_fp4 tactics into the on-disk
     CuTe-DSL cache with a pool of subprocesses.
@@ -381,6 +429,7 @@ def precompile_mm_fp4_tactics(
     from flashinfer.cute_dsl.utils import get_max_active_clusters
 
     sf_vec_size = 16 if use_nvfp4 else 32
+    device_index = _device_index(device)
     key_files = _blockscaled_gemm_cache_key_files()
     source_sha256 = _hash_source_files(tuple(key_files))
 
@@ -398,7 +447,7 @@ def precompile_mm_fp4_tactics(
         if kernel_type != "sm100":
             continue
         cache_key = _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype)
-        if cache_key in kernel_cache:
+        if (device_index, cache_key) in kernel_cache:
             continue
 
         cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
@@ -421,6 +470,7 @@ def precompile_mm_fp4_tactics(
                 "sf_k": (real_k // sf_vec_size + 3) // 4,
                 "batch_size": 1,
                 "key_files": key_files,
+                "device_index": device_index,
             }
         )
 
