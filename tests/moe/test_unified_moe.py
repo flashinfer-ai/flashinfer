@@ -609,6 +609,235 @@ class TestMoELayerMVPValidation:
             MoELayer(cfg)
 
 
+# ---------------------------------------------------------------------------
+# MoEActivationPack construction + runner-boundary validation (CPU-only)
+# ---------------------------------------------------------------------------
+# The runner helpers are tested DIRECTLY (private imports) on purpose: the
+# public path (pack_inputs) needs a JIT'd runner + GPU, which would push these
+# regressions out of the always-on CPU tier.
+
+
+def _pack_tensors(num_tokens=4, top_k=2, hidden_packed=8, num_experts=16):
+    x = torch.zeros(num_tokens, hidden_packed, dtype=torch.uint8)
+    sf = torch.zeros(num_tokens, 1, dtype=torch.uint8)
+    ids = torch.zeros(num_tokens, top_k, dtype=torch.int32)
+    w = torch.ones(num_tokens, top_k)
+    logits = torch.zeros(num_tokens, num_experts, dtype=torch.float32)
+    return x, sf, ids, w, logits
+
+
+class TestActivationPackValidation:
+    """``MoEActivationPack.__post_init__`` contract (raises, survives -O)."""
+
+    def test_valid_prerouted_and_positional_compat(self):
+        x, sf, ids, w, _ = _pack_tensors()
+        pack = MoEActivationPack(x, sf, ids, w)  # positional, pre-rename order
+        assert pack.topk_ids is ids and pack.topk_weights is w
+
+    def test_routing_fields_are_keyword_only(self):
+        x, sf, ids, w, _ = _pack_tensors()
+        with pytest.raises(TypeError):
+            MoEActivationPack(x, sf, ids, w, torch.zeros(4, 16))
+
+    def test_valid_fromlogits_mixed_dtypes(self):
+        from flashinfer.fused_moe.core import RoutingInputMode
+
+        x, sf, _, _, logits = _pack_tensors()
+        # fp32 logits + bf16 bias is the standard DeepSeek-V3 shape; dtypes
+        # are independent (test_routing_dtype_flexibility).
+        pack = MoEActivationPack(
+            x,
+            sf,
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=logits,
+            routing_bias=torch.zeros(16, dtype=torch.bfloat16),
+        )
+        assert pack.topk_ids is None
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            dict(topk_ids=None),  # missing ids in pre-routed
+            dict(topk_weights=None),  # missing weights in pre-routed
+            dict(routing_logits="LOGITS"),  # logits smuggled into pre-routed
+            dict(routing_bias="BIAS"),  # bias smuggled into pre-routed
+        ],
+    )
+    def test_prerouted_field_mismatch_raises(self, kwargs):
+        x, sf, ids, w, logits = _pack_tensors()
+        fields = dict(topk_ids=ids, topk_weights=w)
+        for k, v in kwargs.items():
+            fields[k] = (
+                logits
+                if v == "LOGITS"
+                else torch.zeros(16, dtype=torch.bfloat16)
+                if v == "BIAS"
+                else v
+            )
+        with pytest.raises(ValueError):
+            MoEActivationPack(x, sf, **fields)
+
+    def test_fromlogits_field_mismatch_raises(self):
+        from flashinfer.fused_moe.core import RoutingInputMode
+
+        x, sf, ids, w, logits = _pack_tensors()
+        with pytest.raises(ValueError):  # missing logits
+            MoEActivationPack(x, sf, routing_input_mode=RoutingInputMode.FromLogits)
+        with pytest.raises(ValueError):  # topk fields must stay None
+            MoEActivationPack(
+                x,
+                sf,
+                ids,
+                w,
+                routing_input_mode=RoutingInputMode.FromLogits,
+                routing_logits=logits,
+            )
+
+    def test_int64_topk_ids_rejected(self):
+        # torch.topk returns int64; the launcher casts data_ptr without a
+        # dtype ICHECK, so int64 reaching it is read as int32 bytes (silent
+        # garbage routing) -- must fail loudly at construction.
+        x, sf, ids, w, _ = _pack_tensors()
+        with pytest.raises(TypeError, match="int32"):
+            MoEActivationPack(x, sf, ids.long(), w)
+
+    @pytest.mark.parametrize(
+        "field_name", ["topk_ids", "topk_weights", "hidden_states_scale"]
+    )
+    def test_device_mismatch_rejected(self, field_name):
+        # meta-device tensors give a second device without needing a GPU.
+        x, sf, ids, w, _ = _pack_tensors()
+        fields = dict(hidden_states_scale=sf, topk_ids=ids, topk_weights=w)
+        t = fields[field_name]
+        fields[field_name] = torch.zeros(t.shape, dtype=t.dtype, device="meta")
+        with pytest.raises(ValueError, match="device"):
+            MoEActivationPack(x, **fields)
+
+
+class TestRunnerBoundaryValidation:
+    """The shared ``_validate_*`` helpers, called directly (CPU, no JIT).
+
+    They duplicate ``__post_init__`` BY DESIGN: the pack is mutable, so the
+    launch boundary is the authoritative validation layer. The mutation tests
+    below pin exactly the bypass that motivates the duplication -- do not
+    "deduplicate" these checks against ``__post_init__``.
+    """
+
+    def test_prerouted_valid_passes(self):
+        from flashinfer.fused_moe.runners import _validate_prerouted_inputs
+
+        x, sf, ids, w, _ = _pack_tensors()
+        _validate_prerouted_inputs(MoEActivationPack(x, sf, ids, w), 4, 2, "T")
+
+    def test_prerouted_column_mismatch_raises(self):
+        from flashinfer.fused_moe.runners import _validate_prerouted_inputs
+
+        x, sf, _, _, _ = _pack_tensors()
+        ids3 = torch.zeros(4, 3, dtype=torch.int32)
+        w3 = torch.ones(4, 3)
+        pack = MoEActivationPack(x, sf, ids3, w3)
+        # config top_k=2 but the pack carries 3 columns: mis-packs against the
+        # kernel's top_k-sized buffers.
+        with pytest.raises(ValueError, match="top_k"):
+            _validate_prerouted_inputs(pack, 4, 2, "T")
+
+    def test_mutation_to_int64_caught_at_runner_boundary(self):
+        from flashinfer.fused_moe.runners import _validate_prerouted_inputs
+
+        x, sf, ids, w, _ = _pack_tensors()
+        pack = MoEActivationPack(x, sf, ids, w)  # valid at construction
+        pack.topk_ids = pack.topk_ids.long()  # bypasses __post_init__
+        with pytest.raises(TypeError, match="int32"):
+            _validate_prerouted_inputs(pack, 4, 2, "T")
+
+    def test_mutation_smuggling_logits_caught_at_runner_boundary(self):
+        from flashinfer.fused_moe.runners import _validate_prerouted_inputs
+
+        x, sf, ids, w, logits = _pack_tensors()
+        pack = MoEActivationPack(x, sf, ids, w)
+        pack.routing_logits = logits  # bypasses __post_init__
+        with pytest.raises(ValueError, match="FromLogits"):
+            _validate_prerouted_inputs(pack, 4, 2, "T")
+
+    def test_prerouted_device_mutation_caught_at_runner_boundary(self):
+        from flashinfer.fused_moe.runners import _validate_prerouted_inputs
+
+        x, sf, ids, w, _ = _pack_tensors()
+        pack = MoEActivationPack(x, sf, ids, w)
+        pack.topk_ids = torch.zeros(
+            pack.topk_ids.shape, dtype=torch.int32, device="meta"
+        )
+        with pytest.raises(ValueError, match="device"):
+            _validate_prerouted_inputs(pack, 4, 2, "T")
+
+    def _logits_pack(self, logits, bias=None):
+        from flashinfer.fused_moe.core import RoutingInputMode
+
+        x, sf, _, _, _ = _pack_tensors()
+        return MoEActivationPack(
+            x,
+            sf,
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=logits,
+            routing_bias=bias,
+        )
+
+    def test_logits_valid_passes_including_mixed_dtypes(self):
+        from flashinfer.fused_moe.runners import _validate_logits_inputs
+
+        pack = self._logits_pack(
+            torch.zeros(4, 16, dtype=torch.float32),
+            bias=torch.zeros(16, dtype=torch.bfloat16),
+        )
+        _validate_logits_inputs(pack, 4, 16, "T")
+
+    def test_logits_shape_mismatch_raises(self):
+        from flashinfer.fused_moe.runners import _validate_logits_inputs
+
+        pack = self._logits_pack(torch.zeros(4, 9))
+        with pytest.raises(ValueError, match="num_experts"):
+            _validate_logits_inputs(pack, 4, 16, "T")
+
+    @pytest.mark.parametrize("bad_dtype", [torch.float16, torch.float64])
+    def test_logits_dtype_rejected(self, bad_dtype):
+        from flashinfer.fused_moe.runners import _validate_logits_inputs
+
+        pack = self._logits_pack(torch.zeros(4, 16, dtype=torch.float32))
+        pack.routing_logits = pack.routing_logits.to(bad_dtype)  # mutation
+        with pytest.raises(TypeError, match="float32 or bfloat16"):
+            _validate_logits_inputs(pack, 4, 16, "T")
+
+    def test_bias_dtype_rejected(self):
+        # The launcher maps bf16->Bfloat16 and anything-else->Fp32 with no
+        # ICHECK: an fp16 bias would be silently reinterpreted as fp32 bits.
+        from flashinfer.fused_moe.runners import _validate_logits_inputs
+
+        pack = self._logits_pack(torch.zeros(4, 16, dtype=torch.float32))
+        pack.routing_bias = torch.zeros(16, dtype=torch.float16)  # mutation
+        with pytest.raises(TypeError, match="bfloat16 or float32"):
+            _validate_logits_inputs(pack, 4, 16, "T")
+
+    def test_bias_shape_rejected(self):
+        from flashinfer.fused_moe.runners import _validate_logits_inputs
+
+        pack = self._logits_pack(
+            torch.zeros(4, 16, dtype=torch.float32),
+            bias=torch.zeros(15, dtype=torch.bfloat16),
+        )
+        with pytest.raises(ValueError, match="num_experts"):
+            _validate_logits_inputs(pack, 4, 16, "T")
+
+    def test_logits_device_mutation_caught_at_runner_boundary(self):
+        from flashinfer.fused_moe.runners import _validate_logits_inputs
+
+        pack = self._logits_pack(torch.zeros(4, 16, dtype=torch.float32))
+        pack.routing_logits = torch.zeros(
+            pack.routing_logits.shape, dtype=torch.float32, device="meta"
+        )
+        with pytest.raises(ValueError, match="device"):
+            _validate_logits_inputs(pack, 4, 16, "T")
+
+
 sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
     reason="Unified NVFP4 MoE requires SM100 family (Blackwell SM100/SM103)",
@@ -656,8 +885,8 @@ def _make_packs_and_config(
     act_pack = MoEActivationPack(
         hidden_states_q=tensors["x"],
         hidden_states_scale=tensors["x_sf"].squeeze(-1),
-        selected_experts=tensors["token_selected_experts"],
-        final_scales=tensors["token_final_scales"],
+        topk_ids=tensors["token_selected_experts"],
+        topk_weights=tensors["token_final_scales"],
     )
 
     weight_pack = MoEWeightPack()
@@ -712,8 +941,8 @@ def _compute_ref(act_pack, tensors, shape):
         gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
         gemm1_alpha=tensors["w1_alpha"],
         gemm2_alpha=tensors["w2_alpha"],
-        token_selected_experts=act_pack.selected_experts,
-        token_final_scales=act_pack.final_scales,
+        token_selected_experts=act_pack.topk_ids,
+        token_final_scales=act_pack.topk_weights,
         num_tokens=act_pack.num_tokens,
         num_experts=shape["num_experts"],
         top_k=shape["top_k"],
@@ -874,8 +1103,8 @@ def _make_bf16_packs_and_config(
     act_pack = MoEActivationPack(
         hidden_states_q=x,  # raw bf16 on this path
         hidden_states_scale=None,  # unused by trtllm_bf16_routed
-        selected_experts=selected_experts,
-        final_scales=final_scales,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
     )
 
     weight_pack = MoEWeightPack()
@@ -957,8 +1186,8 @@ def _bf16_ref(act_pack, tensors, expert_offset=0):
         tensors["x"],
         tensors["w1"],
         tensors["w2"],
-        act_pack.selected_experts,
-        act_pack.final_scales,
+        act_pack.topk_ids,
+        act_pack.topk_weights,
         tensors["w2"].shape[-1],  # intermediate_size, derived not hardcoded
         expert_offset=expert_offset,
     )
@@ -1187,8 +1416,8 @@ class TestTrtllmRoutedPackingContract:
         act_pack = MoEActivationPack(
             hidden_states_q=hidden_q,
             hidden_states_scale=hidden_scale,
-            selected_experts=selected_experts,
-            final_scales=final_scales,
+            topk_ids=selected_experts,
+            topk_weights=final_scales,
         )
 
         # pack_inputs only threads weights into static kwargs; dummies suffice
@@ -1279,8 +1508,8 @@ class TestTrtllmEPOffset:
             act_pack = MoEActivationPack(
                 hidden_states_q=tensors["x"],
                 hidden_states_scale=tensors["x_sf"].squeeze(-1),
-                selected_experts=tensors["token_selected_experts"] + offset,
-                final_scales=tensors["token_final_scales"],
+                topk_ids=tensors["token_selected_experts"] + offset,
+                topk_weights=tensors["token_final_scales"],
             )
             runner = TrtllmFp4RoutedRunner(config, device=device)
             inputs = runner.pack_inputs(act_pack, weight_pack)
@@ -1301,6 +1530,80 @@ class TestTrtllmEPOffset:
 
 
 # ---------------------------------------------------------------------------
+# 4. FromLogits packing contract (gh #3595)
+# ---------------------------------------------------------------------------
+
+
+@sm100_required
+class TestTrtllmFromLogitsPackingContract:
+    """FromLogits buffer allocation must follow the kernel's output contract.
+
+    The fp4 routing kernel writes bf16 expert weights regardless of the logits
+    dtype; allocating ``expert_weights`` with ``routing_logits.dtype`` (fp32
+    DeepSeekV3 logits) mislabels the kernel-filled buffer, so an unfinalized
+    read interprets bf16 bits as fp32 garbage (gh #3595 — same bug previously
+    fixed in the canonical ``trtllm_fp4_block_scale_moe`` wrapper).  Packing
+    inspection only; no kernel launch.
+    """
+
+    @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+    def test_expert_weights_buffer_is_bf16(self, logits_dtype):
+        from flashinfer.fused_moe.core import MoeRunnerInputs, RoutingInputMode
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_experts, top_k, num_tokens, hidden_size = 128, 4, 16, 256
+
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            experts=ExpertConfig(intermediate_size=512),
+        )
+        runner = TrtllmFp4RoutedRunner(config, device=device)
+
+        routing_logits = torch.randn(
+            num_tokens, num_experts, dtype=logits_dtype, device=device
+        )
+        act_pack = MoEActivationPack(
+            hidden_states_q=torch.zeros(
+                num_tokens, hidden_size // 2, dtype=torch.uint8, device=device
+            ),
+            hidden_states_scale=torch.zeros(
+                num_tokens, hidden_size // 16, dtype=torch.uint8, device=device
+            ).view(torch.float8_e4m3fn),
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=routing_logits,
+        )
+        weight_pack = MoEWeightPack()
+        weight_pack.prepare_for(
+            "trtllm_fp4_routed",
+            {
+                "gemm1_weights": torch.empty(0, device=device),
+                "gemm1_weights_scale": torch.empty(0, device=device),
+                "gemm1_alpha": torch.empty(0, device=device),
+                "gemm2_weights": torch.empty(0, device=device),
+                "gemm2_weights_scale": torch.empty(0, device=device),
+            },
+        )
+
+        moe_inputs = MoeRunnerInputs.from_list(
+            runner.pack_inputs(act_pack, weight_pack)
+        )
+
+        # Kernel-filled OUTPUT buffers: bf16 weights (gh #3595), int32 ids.
+        assert moe_inputs.expert_weights.dtype == torch.bfloat16, (
+            f"logits_dtype={logits_dtype}: expert_weights buffer is "
+            f"{moe_inputs.expert_weights.dtype}, but the fp4 routing kernel "
+            f"writes bf16 — an unfinalized read would mislabel the data"
+        )
+        assert moe_inputs.expert_weights.shape == (num_tokens, top_k)
+        assert moe_inputs.topk_ids.dtype == torch.int32
+        # Logits thread through unchanged; mode reaches the kernel kwargs.
+        assert moe_inputs.routing_logits is routing_logits
+        assert (
+            runner._static_kwargs["routing_input_mode"] == RoutingInputMode.FromLogits
+        )
+
+
 # 6. prepare_trtllm_bf16_weights input contract
 # ---------------------------------------------------------------------------
 # Validation fires before any CUDA work, so the negative tests are CPU-only.

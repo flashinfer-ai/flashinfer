@@ -96,8 +96,8 @@ def _kernel_full_moe_reference(x, w1_full, w2_full, topk_ids, topk_weights):
     act = MoEActivationPack(
         hidden_states_q=x_q,
         hidden_states_scale=x_sf,
-        selected_experts=topk_ids.to(torch.int32),
-        final_scales=topk_weights.to(torch.float32),
+        topk_ids=topk_ids.to(torch.int32),
+        topk_weights=topk_weights.to(torch.float32),
     )
     return MoELayer(cfg)(act, wp)
 

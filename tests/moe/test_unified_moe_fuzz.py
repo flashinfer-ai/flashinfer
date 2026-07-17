@@ -63,7 +63,19 @@ reused for a different shape is caught (the #2933-adjacent class).
 deviating backend is caught by #2 directly, and #2 also names which backend -- so a cross-backend
 comparison adds no pass/fail power, only redundancy. See the design discussion.)
 
-Coverage today: NVFP4 (CuteDSL + TRTLLM-FP4-routed) on SM100 -- the only wired MVP runners.
+Routing coverage (both modes, axes ``routing_method`` x ``routing_input_mode`` x ``logits_dtype``):
+  * **pre-routed** (RoutingInputMode.PackedPrecomputed): the host computes the top-k per method and
+    feeds packed indices -- the original path.
+  * **in-kernel** (RoutingInputMode.FromLogits): the kernel routes from raw logits per
+    RoutingConfig.method -- reaches the bug cluster the pre-routed harness structurally can't:
+    DeepSeekV3 group-topk + bias (#2575), all-negative logits (#2822), fp32 router logits (#2796),
+    bias-method weight leakage (#2485/#2907). The SAME ``_route`` oracle (ported verbatim from the
+    kernel-validated references in ``tests/moe/test_trtllm_gen_fused_moe.py``) is the authority for
+    both modes, so a kernel that routes wrong is caught by check #2. In-kernel routing is single-GPU
+    (non-EP) here; EP + in-kernel routing semantics are a separate validation.
+
+Coverage today: NVFP4 (CuteDSL pre-routed + TRTLLM-FP4 pre-routed/in-kernel) on SM100 -- the only
+wired MVP runners (CuteDSL is pre-routed-only; FromLogits restricts to the trtllm backend).
 
 OPT-IN: this suite is gated behind FLASHINFER_UMOE_FUZZ (see the pytestmark below) and is
 SKIPPED unless that env var is set -- waived in CI pending root-cause of a
@@ -73,7 +85,16 @@ whole-process device-side-assert abort that would block B200 CI. Run it explicit
 NOTE: `pytest --forked` does NOT work here (CUDA inits at collection ->
 "Cannot re-initialize CUDA in forked subprocess"); for crash-isolated enumeration run each
 test id in its own process instead (see var/03-ssh-docker-workflow.md).
-Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 80), FLASHINFER_UMOE_FUZZ_SEED (default 0).
+Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 80), FLASHINFER_UMOE_FUZZ_SEED (default 0),
+     FLASHINFER_UMOE_FUZZ_ONLY_SEED (comma-separated seeds -> run ONLY those configs; the
+     perfect-repro hook printed on every test).
+
+Determinism / repro / diagnostics: every config is fully derived from its seed -- shapes
+(random.Random(seed)), input tensors + output-buffer init (per-config torch.Generator), and the
+global RNG (torch.manual_seed(seed)) -- so a failing test reproduces bit-for-bit from the REPRO
+command it prints. Each test prints its full config + repro command (visible with `-s`, or on
+failure); on a numeric mismatch it dumps output-vs-oracle stats + the worst <=30 elements, so the
+CI log alone tells you whether the output is all-zero / all-NaN / Inf without having to rerun.
 
 ------------------------------------------------------------------------------------------------
 EXTENDING (cheap, by design):
@@ -151,7 +172,12 @@ import torch.nn.functional as F
 
 from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import fp4_quantize
-from flashinfer.fused_moe import MoEActivationPack, MoELayer, MoEWeightPack
+from flashinfer.fused_moe import (
+    MoEActivationPack,
+    MoELayer,
+    MoEWeightPack,
+    RoutingInputMode,
+)
 from flashinfer.fused_moe.api import (
     ActivationConfig,
     BackendOptions,
@@ -167,10 +193,15 @@ from flashinfer.fused_moe.api import (
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
+from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
 NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "80"))
 BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
+# Perfect-repro hook: if set (comma-separated seeds), the suite runs ONLY those configs. A curated
+# seed maps to its hand-written Cfg; any other seed is regenerated via the deterministic _gen(seed),
+# so a single seed reproduces exactly one config. The repro command printed on every test uses this.
+_ONLY_SEEDS = os.environ.get("FLASHINFER_UMOE_FUZZ_ONLY_SEED", "")
 
 # --- CI-safety gate: OPT-IN ----------------------------------------------------------------
 # Waived in CI pending root-cause of a whole-process abort. Running the SM100 fuzzer
@@ -249,7 +280,10 @@ class DTypeHandler:
         tuple  # all plausible backend config classes; unwired ones auto-skip
     )
     snap: Callable  # bf16 tensor -> exactly-representable fixed point for this dtype
-    make_act_pack: Callable  # (x, selected_experts, final_scales) -> MoEActivationPack
+    make_act_pack: Callable  # (x, selected_experts, final_scales) -> MoEActivationPack (pre-routed)
+    make_act_pack_logits: (
+        Callable | None  # (x, routing_logits, routing_bias) -> pack (in-kernel routing)
+    )
     reference: Callable  # (x, w1, w2, selected_experts, final_scales, I) -> fp32 [T,H] authority
     poison: Callable  # in-place fill a kernel-owned output buffer with garbage + (NaN/Inf if repr.)
     out_dtype: torch.dtype  # output buffer dtype (used to locate it in the inputs list)
@@ -257,13 +291,13 @@ class DTypeHandler:
     rtol: float
 
 
-def _poison_bf16_out(buf):
-    """Fill a bf16 output buffer with large garbage + scattered NaN/±Inf. If a kernel reads or
-    scatter-adds into an uninitialized output instead of fully writing it, the poison leaks and
-    is caught by no-NaN / numeric. This is the torch->JAX buffer-hygiene guard: torch's caching
-    allocator usually hands back clean memory (masking the bug), JAX/XLA donates dirty buffers
-    (the GH-6158764 class)."""
-    g = torch.randn_like(buf) * 1e4
+def _poison_bf16_out(buf, gen):
+    """Fill a bf16 output buffer with large garbage + scattered NaN/±Inf, DETERMINISTICALLY (from a
+    per-config seeded generator, so a failure repros bit-for-bit). If a kernel reads or scatter-adds
+    into an uninitialized output instead of fully writing it, the poison leaks and is caught by
+    no-NaN / numeric. This is the torch->JAX buffer-hygiene guard: torch's caching allocator usually
+    hands back clean memory (masking the bug), JAX/XLA donates dirty buffers (the GH-6158764 class)."""
+    g = torch.randn(buf.shape, generator=gen, device=buf.device, dtype=buf.dtype) * 1e4
     flat = g.view(-1)
     flat[0::4], flat[1::4], flat[2::4] = float("nan"), float("inf"), float("-inf")
     buf.copy_(g)
@@ -278,8 +312,26 @@ def _nvfp4_act_pack(x, selected_experts, final_scales):
     return MoEActivationPack(
         hidden_states_q=packed,
         hidden_states_scale=scale.squeeze(-1) if scale.dim() > 2 else scale,
-        selected_experts=selected_experts,
-        final_scales=final_scales,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
+    )
+
+
+def _nvfp4_act_pack_logits(x, routing_logits, routing_bias):
+    """In-kernel-routing pack: same nvfp4 activation quant as ``_nvfp4_act_pack`` but carrying raw
+    ``routing_logits`` (and optional ``routing_bias``) instead of pre-routed indices, so the kernel
+    computes the top-k selection itself (RoutingInputMode.FromLogits)."""
+    one = torch.tensor([1.0], device=x.device)
+    packed, scale = fp4_quantize(
+        x, global_scale=one, sf_vec_size=16, is_sf_swizzled_layout=False
+    )
+    return MoEActivationPack(
+        hidden_states_q=packed,
+        hidden_states_scale=scale.squeeze(-1) if scale.dim() > 2 else scale,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
     )
 
 
@@ -319,8 +371,9 @@ def _bf16_act_pack(x, selected_experts, final_scales):
     return MoEActivationPack(
         hidden_states_q=x,
         hidden_states_scale=None,
-        selected_experts=selected_experts,
-        final_scales=final_scales,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
     )
 
 
@@ -354,6 +407,7 @@ _DTYPE = {
         candidate_configs=(CuteDslConfig, TrtllmFp4Config),
         snap=_snap_to_nvfp4,
         make_act_pack=_nvfp4_act_pack,
+        make_act_pack_logits=_nvfp4_act_pack_logits,
         reference=_nvfp4_reference,
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
@@ -365,6 +419,7 @@ _DTYPE = {
         candidate_configs=(TrtllmBf16Config,),
         snap=_bf16_snap,
         make_act_pack=_bf16_act_pack,
+        make_act_pack_logits=None,
         reference=_bf16_reference,
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
@@ -413,7 +468,42 @@ _TOPK = [1, 2, 4, 6, 8]  # 6 non-pow2
 # num_tokens is runtime batch*seqlen -- arbitrary. Sweep odd + tile/autotune-bucket boundaries
 # (the #3168 16384-bucket / 4095-4097 tile-remainder class), not just clean powers of two.
 _TOKENS = [1, 2, 3, 7, 17, 64, 127, 129, 256, 1024, 2048, 4095, 4096, 4097]
-_ROUTE = ["uniform", "uniform", "hot1", "imbalanced"]
+# Routing-logits *distribution* skew (orthogonal to the routing METHOD below). "all_negative"
+# (#2822 all-negative-logit mis-selection) and "all_to_one" only bite the in-kernel router; the
+# pre-routed host topk handles them trivially, but exercising both modes is free coverage.
+_ROUTE = ["uniform", "uniform", "hot1", "imbalanced", "all_negative", "all_to_one"]
+
+# Routing METHOD axis (RoutingMethodType). Pre-routed mode computes the host weights per method
+# (the kernel then ignores the method, using the packed weights directly); in-kernel mode hands the
+# kernel raw logits and it routes per this method -- so the SAME _route() oracle validates both.
+# Covers the in-kernel-routing bug cluster the pre-routed harness structurally can't reach:
+# DeepSeekV3 group routing + bias (#2575), bias methods (#2485/#2907), fp32 logits (#2796).
+_ROUTING_METHODS = [
+    RoutingMethodType.RenormalizeNaive,  # == the harness's original host routing
+    RoutingMethodType.Default,
+    RoutingMethodType.Renormalize,
+    RoutingMethodType.TopK,
+    RoutingMethodType.Sigmoid,
+    RoutingMethodType.SigmoidRenorm,
+    RoutingMethodType.DeepSeekV3,  # sigmoid+bias -> group-topk -> top_k (#2575 lives here)
+    RoutingMethodType.MiniMax2,  # sigmoid+bias -> top_k -> scaled sum-norm
+    RoutingMethodType.Llama4,  # top1 -> sigmoid (top_k forced to 1)
+]
+# Routing logits dtype axis: fp32 router logits are the #2796 class; bf16 is the common case.
+_LOGITS_DTYPE = {"bf16": torch.bfloat16, "fp32": torch.float32}
+
+# Backend config classes whose runner can do in-kernel routing (RoutingInputMode.FromLogits),
+# derived from the runners' own capability declaration so this can't drift from the layer's
+# dispatch filtering. CuteDSL is pre-routed-only, so a fromlogits config restricts to these.
+_FROMLOGITS_BACKENDS = {
+    cfg_cls
+    for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
+    if RoutingInputMode.FromLogits in runner_cls.supported_routing_modes
+}
+
+# Methods whose routing uses an additive bias (selection only -- weights stay unbiased). DeepSeekV3
+# REQUIRES a bias; MiniMax2's is optional but we always supply one to exercise the bias path.
+_BIAS_METHODS = {RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2}
 
 # Per-test weight footprint cap so one fuzz config never hogs the GPU (parallel-CI-friendly) and the
 # CPU exact-grid snap stays sub-few-seconds. ~500M bf16 weight elems ≈ 1 GB. The cap naturally pairs
@@ -438,6 +528,16 @@ class Cfg:
     seed: int
     local_experts: int = 0  # this rank's shard; 0 -> non-EP (== num_experts)
     expert_offset: int = 0  # global id of this shard's first expert (EP)
+    # Routing axes (defaults keep the original pre-routed RenormalizeNaive behavior so the
+    # positional _CURATED literals below are unaffected).
+    routing_method: RoutingMethodType = RoutingMethodType.RenormalizeNaive
+    routing_input_mode: str = (
+        "prerouted"  # "prerouted" (PackedPrecomputed) | "fromlogits"
+    )
+    logits_dtype: str = "bf16"  # "bf16" | "fp32" (#2796 fp32-router-logits class)
+    n_group: int = 0  # DeepSeekV3 group count (0 -> None)
+    topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
+    routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
 
     @property
     def n_local(self):  # experts actually held + computed on this rank
@@ -448,41 +548,89 @@ class Cfg:
         return self.expert_offset > 0 or self.n_local != self.num_experts
 
     @property
+    def is_fromlogits(self):
+        return self.routing_input_mode == "fromlogits"
+
+    @property
     def label(self):
         ep = f"L{self.n_local}o{self.expert_offset}_" if self.is_ep else ""
+        mode = "FL_" if self.is_fromlogits else ""
+        ld = "fp32_" if self.logits_dtype == "fp32" else ""
+        grp = f"g{self.n_group}x{self.topk_group}_" if self.n_group else ""
         return (
-            f"{self.variant}_{self.route}_e{self.num_experts}_{ep}k{self.top_k}_"
+            f"{self.variant}_{mode}{self.routing_method.name}_{ld}{self.route}_"
+            f"e{self.num_experts}_{ep}{grp}k{self.top_k}_"
             f"t{self.num_tokens}_h{self.hidden}_i{self.intermediate}_s{self.seed}"
         )
 
 
 def _gen(seed):
     rng = random.Random(seed)
-    # Resample shape until the LOCAL-shard weights fit the budget (modest per-test GPU footprint).
+    method = rng.choice(_ROUTING_METHODS)
+    # In-kernel routing ~half the time. FromLogits is single-shard only here: EP + in-kernel
+    # routing semantics (does the kernel route over global logits then filter to local?) are a
+    # separate validation, and EP collectives are out of scope for this single-GPU harness.
+    # DeepSeekV3 group routing scores over the full expert set, so keep it non-EP too.
+    fromlogits = rng.random() < 0.5
+    force_non_ep = fromlogits or method == RoutingMethodType.DeepSeekV3
+    # Resample shape until the weights of the FINAL config fit the budget (modest per-test
+    # GPU footprint). Routing mode is chosen BEFORE this loop on purpose: non-EP-forced
+    # configs (FromLogits / DeepSeekV3) hold the FULL expert set, so budgeting a sharded
+    # `local` and flipping to non-EP afterwards would admit up to shards x the budget.
     for _ in range(64):
         ne, h, i = rng.choice(_EXPERTS), rng.choice(_HIDDEN), rng.choice(_INTERMED)
         # ~30%: expert-parallel shard -- split the global experts and pick a shard (offset>0). This
         # is how large MoE actually runs (no rank holds all experts) and exercises the offset path.
         local, offset = ne, 0
-        shards = rng.choice([2, 4])
-        if rng.random() < 0.3 and ne >= 16 and ne % shards == 0:
-            local = ne // shards
-            offset = local * rng.randrange(shards)
+        if not force_non_ep:
+            shards = rng.choice([2, 4])
+            if rng.random() < 0.3 and ne >= 16 and ne % shards == 0:
+                local = ne // shards
+                offset = local * rng.randrange(shards)
         if _weight_elems(local, h, i) <= _WEIGHT_ELEM_BUDGET:
             break
+
+    # Method-specific top_k + group params.
+    n_group = topk_group = 0
+    routed_scaling = 0.0
+    if method == RoutingMethodType.Llama4:
+        top_k = 1  # the reference (and the kernel) only define Llama4 for top1
+    elif method == RoutingMethodType.DeepSeekV3:
+        # n_group divides ne with ne>n_group (=> >=2 experts/group for the top-2 group score);
+        # topk_group<=min(4,n_group); top_k < topk_group*ne/n_group (experts reachable after the
+        # group mask) and <= local. ne is always %4==0 (every _EXPERTS entry is).
+        n_group = rng.choice([g for g in (1, 2, 4, 8) if g < ne and ne % g == 0])
+        topk_group = rng.randint(1, min(4, n_group))
+        reachable = topk_group * ne // n_group
+        valid_k = [t for t in _TOPK if t < reachable and t <= local]
+        top_k = rng.choice(valid_k) if valid_k else 1
+        routed_scaling = rng.choice([1.0, 2.5])
+    else:
+        top_k = rng.choice(
+            [t for t in _TOPK if t <= local]
+        )  # route within the local shard
+
     return Cfg(
         num_tokens=rng.choice(_TOKENS),
         hidden=h,
         intermediate=i,
         num_experts=ne,
-        top_k=rng.choice(
-            [t for t in _TOPK if t <= local]
-        ),  # route within the local shard
-        variant=rng.choice(_VARIANT_IDS),
+        top_k=top_k,
+        # BF16 is pre-routed-only today; FromLogits currently requires the
+        # TRTLLM FP4 runner.
+        variant="nvfp4" if fromlogits else rng.choice(_VARIANT_IDS),
         route=rng.choice(_ROUTE),
         seed=seed,
         local_experts=local,
         expert_offset=offset,
+        routing_method=method,
+        routing_input_mode="fromlogits" if fromlogits else "prerouted",
+        logits_dtype="fp32"
+        if rng.random() < 0.25
+        else "bf16",  # #2796 fp32-logits axis
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling=routed_scaling,
     )
 
 
@@ -501,21 +649,158 @@ _CURATED = [
     Cfg(
         512, 512, 512, 512, 4, "nvfp4", "hot1", 900_004
     ),  # max expert count (small H/I)
+    # In-kernel routing (FromLogits) headline cases the pre-routed harness can't reach:
     Cfg(
-        256, 1024, 512, 256, 8, "bf16", "uniform", 900_005
+        256,
+        1024,
+        512,
+        256,
+        8,
+        "nvfp4",
+        "uniform",
+        900_005,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        routing_input_mode="fromlogits",
+        n_group=8,
+        topk_group=4,
+        routed_scaling=2.5,
+    ),  # #2575 DeepSeekV3 group routing at large expert count (top_k 8 < 4*256/8=128)
+    Cfg(
+        512,
+        1024,
+        512,
+        64,
+        6,
+        "nvfp4",
+        "uniform",
+        900_006,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+        logits_dtype="fp32",
+    ),  # #2796 fp32 router logits, in-kernel softmax->topk
+    Cfg(
+        256,
+        512,
+        512,
+        128,
+        4,
+        "nvfp4",
+        "all_negative",
+        900_007,
+        routing_method=RoutingMethodType.Renormalize,
+        routing_input_mode="fromlogits",
+    ),  # #2822 all-negative logits, in-kernel topk->softmax
+    Cfg(
+        1024,
+        1024,
+        768,
+        128,
+        8,
+        "nvfp4",
+        "uniform",
+        900_008,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        routing_input_mode="fromlogits",
+        n_group=4,
+        topk_group=2,
+        routed_scaling=1.0,
+    ),  # DeepSeekV3 mid-size (top_k 8 < 2*128/4=64), non-pow2 intermediate
+    Cfg(
+        256, 1024, 512, 256, 8, "bf16", "uniform", 900_009
     ),  # DeepSeek-ish shape on the bf16 path
     Cfg(
-        2048, 1024, 1024, 128, 6, "bf16", "imbalanced", 900_006
+        2048, 1024, 1024, 128, 6, "bf16", "imbalanced", 900_010
     ),  # bf16 mid size + empty-expert load
 ]
-_CONFIGS = _CURATED + [_gen(BASE_SEED + i) for i in range(NUM_TESTS)]
+if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
+    _curated_by_seed = {c.seed: c for c in _CURATED}
+    _CONFIGS = [
+        _curated_by_seed.get(s) or _gen(s)
+        for s in (int(t) for t in _ONLY_SEEDS.split(",") if t.strip())
+    ]
+else:
+    _CONFIGS = _CURATED + [_gen(BASE_SEED + i) for i in range(NUM_TESTS)]
+
+
+def _route(
+    logits, method, top_k, *, bias=None, n_group=0, topk_group=0, routed_scaling=None
+):
+    """Host routing reference: logits[T,E] -> (selected[T,k] int64, weights[T,k] float32).
+
+    Mirrors the per-method math in ``tests/moe/test_trtllm_gen_fused_moe.py``
+    (``routing_reference_*`` / ``noaux_tc_ref``), which is validated against the SAME
+    trtllm-gen kernel the unified FromLogits path drives -- so the in-kernel router
+    agrees with this oracle by transitivity.  Selection/weight alignment is by column
+    (``selected[t,j]`` <-> ``weights[t,j]``); column ORDER is irrelevant downstream
+    (the reference sums over the top-k and matches experts by id, not position).
+    """
+    M = RoutingMethodType
+    lf = logits.float()
+    if (
+        method == M.Default
+    ):  # softmax -> top_k (NOT renormalized; norm_topk_prob is a no-op here)
+        w, sel = torch.topk(F.softmax(lf, dim=-1), top_k, dim=-1)
+    elif method in (M.Renormalize, M.RenormalizeNaive):
+        # top_k(raw) -> softmax over selected. The kernel aliases RenormalizeNaive to this
+        # (Softmax->TopK->SumNorm is algebraically identical to TopK->Softmax).
+        raw, sel = torch.topk(lf, top_k, dim=-1)
+        w = F.softmax(raw, dim=-1)
+    elif (
+        method == M.TopK
+    ):  # top_k of raw logits, raw logit values as weights (no normalization)
+        w, sel = torch.topk(lf, top_k, dim=-1)
+    elif method == M.Sigmoid:  # sigmoid -> top_k (no renorm)
+        w, sel = torch.topk(torch.sigmoid(lf), top_k, dim=-1)
+    elif (
+        method == M.SigmoidRenorm
+    ):  # sigmoid -> top_k -> renorm (divide by sum of selected)
+        w, sel = torch.topk(torch.sigmoid(lf), top_k, dim=-1)
+        w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
+    elif method == M.Llama4:  # top1 -> sigmoid weight (top_k forced to 1 by config gen)
+        w, sel = torch.topk(torch.sigmoid(lf), top_k, dim=-1)
+    elif method in (M.DeepSeekV3, M.MiniMax2):
+        # Sigmoid + bias drives SELECTION; the final weights use the UNBIASED sigmoid scores
+        # (the classic "bias leaks into weights" bug). DeepSeekV3 adds a group-topk pre-mask.
+        scores = torch.sigmoid(lf)
+        sel_scores = scores + bias.float() if bias is not None else scores.clone()
+        if method == M.DeepSeekV3 and n_group > 1:
+            E = sel_scores.shape[-1]
+            grp = sel_scores.view(*sel_scores.shape[:-1], n_group, E // n_group)
+            group_scores = torch.topk(grp, k=2, dim=-1).values.sum(
+                dim=-1
+            )  # top-2 sum per group
+            _, gidx = torch.topk(group_scores, k=topk_group, dim=-1)
+            gmask = torch.zeros_like(group_scores).scatter_(-1, gidx, 1.0)
+            smask = (
+                gmask.unsqueeze(-1)
+                .expand(*sel_scores.shape[:-1], n_group, E // n_group)
+                .reshape(sel_scores.shape)
+            )
+            sel_scores = (
+                sel_scores * smask
+            )  # zero out experts outside the selected groups
+        _, sel = torch.topk(sel_scores, top_k, dim=-1)
+        w = torch.gather(scores, -1, sel)  # UNBIASED sigmoid weights
+        w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
+        if routed_scaling is not None:
+            w = w * routed_scaling
+    else:
+        raise NotImplementedError(
+            f"routing method {method!r} not supported by the fuzzer oracle"
+        )
+    return sel.to(torch.int64), w.float()
 
 
 def _master(cfg, handler):
     """Sparse, exactly-representable bf16 inputs + host routing. Sparsity keeps the gemm reductions
     short so a structural bug isn't averaged away; exact-grid snapping makes input quant lossless.
     Weights cover only this rank's LOCAL shard (E_local); routing selects within the shard's GLOBAL
-    id range [offset, offset+E_local) (the EP contract -- non-EP is offset=0, E_local=num_experts)."""
+    id range [offset, offset+E_local) (the EP contract -- non-EP is offset=0, E_local=num_experts).
+
+    Routing is computed per ``cfg.routing_method`` via ``_route`` (the kernel-matching oracle). The
+    raw ``logits`` (+ ``routing_bias``) are returned so the in-kernel (FromLogits) path can feed them
+    to the kernel, while the host-computed ``selected_experts`` / ``final_scales`` remain the
+    authoritative reference for BOTH modes (the kernel must reproduce them)."""
     g = torch.Generator(device="cuda").manual_seed(cfg.seed)
     E_local, H, I, T = cfg.n_local, cfg.hidden, cfg.intermediate, cfg.num_tokens
 
@@ -527,17 +812,34 @@ def _master(cfg, handler):
     x, w1, w2 = sparse(T, H), sparse(E_local, 2 * I, H), sparse(E_local, H, I)
 
     logits = torch.randn(T, E_local, device="cuda", generator=g)  # over the local shard
-    if cfg.route == "hot1":  # pile every token onto one expert
+    if cfg.route in ("hot1", "all_to_one"):  # pile every token onto one expert
         logits[:, 0] += 50.0
     elif cfg.route == "imbalanced":  # rank-skew -> some experts get zero tokens
         logits += torch.linspace(8.0, -8.0, E_local, device="cuda")
-    weights = F.softmax(logits, dim=1, dtype=torch.float32)
-    weights, local_sel = torch.topk(weights, cfg.top_k, dim=-1)
-    final_scales = (weights / weights.sum(dim=-1, keepdim=True)).float()
+    elif (
+        cfg.route == "all_negative"
+    ):  # #2822: no positive anchor for the in-kernel router
+        logits = -logits.abs() - 1.0
+    logits = logits.to(_LOGITS_DTYPE[cfg.logits_dtype])
+
+    # Bias for bias-aware methods (affects SELECTION only); dtype follows logits here for simplicity (the kernel accepts bf16 or fp32 independently of logits dtype).
+    routing_bias = None
+    if cfg.routing_method in _BIAS_METHODS:
+        routing_bias = torch.randn(E_local, device="cuda", generator=g).to(logits.dtype)
+
+    local_sel, final_scales = _route(
+        logits,
+        cfg.routing_method,
+        cfg.top_k,
+        bias=routing_bias,
+        n_group=cfg.n_group,
+        topk_group=cfg.topk_group,
+        routed_scaling=cfg.routed_scaling or None,
+    )
     selected_experts = (local_sel + cfg.expert_offset).to(
         torch.int32
     )  # local -> global ids
-    return x, w1, w2, selected_experts, final_scales
+    return x, w1, w2, selected_experts, final_scales, logits, routing_bias
 
 
 _SKIP_SUBSTR = (
@@ -560,17 +862,98 @@ def _is_unsupported(e):
     return isinstance(e, NotImplementedError) or any(s in msg for s in _SKIP_SUBSTR)
 
 
+# ---------------------------------------------------------------------------
+# Diagnostics: every test prints its full config + a perfect-repro command; on a mismatch we dump
+# output-vs-oracle stats + the worst <=30 elements, so the CI log alone tells you whether the output
+# is all-zero / all-NaN / Inf without having to rerun. (Mirrors tests/gemm/test_unified_gemm_fuzz.py.)
+# ---------------------------------------------------------------------------
+def _describe(cfg: Cfg) -> str:
+    return (
+        f"CONFIG {cfg.label}\n"
+        f"  variant={cfg.variant} routing={cfg.routing_input_mode} "
+        f"method={cfg.routing_method.name} logits_dtype={cfg.logits_dtype} route={cfg.route}\n"
+        f"  shape: tokens={cfg.num_tokens} hidden={cfg.hidden} intermediate={cfg.intermediate}  "
+        f"experts={cfg.num_experts} top_k={cfg.top_k}\n"
+        f"  EP: n_local={cfg.n_local} expert_offset={cfg.expert_offset} (is_ep={cfg.is_ep})  "
+        f"group: n_group={cfg.n_group} topk_group={cfg.topk_group} "
+        f"routed_scaling={cfg.routed_scaling}  seed={cfg.seed}"
+    )
+
+
+def _env_prefix() -> str:
+    """Shell-safe env prefix for repro commands: include only variables that are
+    actually set (an unset variable is not needed to reproduce), quoting values so
+    the printed command is directly executable."""
+    import shlex
+
+    parts = [
+        f"{var}={shlex.quote(os.environ[var])}"
+        for var in ("CUDA_HOME", "CUDA_VISIBLE_DEVICES")
+        if var in os.environ
+    ]
+    return " ".join(parts) + " " if parts else ""
+
+
+def _repro(cfg: Cfg) -> str:
+    return (
+        f"REPRO: {_env_prefix()}FLASHINFER_UMOE_FUZZ=1 "
+        f"FLASHINFER_UMOE_FUZZ_ONLY_SEED={cfg.seed} "
+        f"pytest -s tests/moe/test_unified_moe_fuzz.py::test_unified_moe_fuzz"
+    )
+
+
+def _stats(t: torch.Tensor) -> str:
+    tf = t.float()
+    n = tf.numel()
+    return (
+        f"shape={tuple(t.shape)} dtype={t.dtype} nan={int(torch.isnan(tf).sum())} "
+        f"inf={int(torch.isinf(tf).sum())} zero={int((tf == 0).sum())}/{n} "
+        f"max|.|={tf.abs().nan_to_num().max().item():.4g}"
+    )
+
+
+def _dump(out: torch.Tensor, ref: torch.Tensor, k: int = 30) -> str:
+    of, rf = out.float().reshape(-1), ref.float().reshape(-1)
+    diff = (of - rf).abs()
+    # rank by |diff|, treating non-finite diffs as worst so NaN/Inf elems surface first.
+    diffn = torch.where(torch.isfinite(diff), diff, torch.full_like(diff, float("inf")))
+    idx = torch.topk(diffn, min(k, diffn.numel())).indices.tolist()
+    lines = [
+        f"  output: {_stats(out)}",
+        f"  oracle: {_stats(ref)}",
+        f"  worst {len(idx)} elems  [flat_idx]  output  vs  oracle:",
+    ]
+    lines += [f"    [{i}] {of[i].item():.6g}  vs  {rf[i].item():.6g}" for i in idx]
+    return "\n".join(lines)
+
+
+def _fail(cfg: Cfg, tag: str, why: str, out=None, ref=None):
+    parts = [f"{tag}: {why}", _describe(cfg)]
+    if out is not None and ref is not None:
+        parts.append(_dump(out, ref))
+    parts.append(_repro(cfg))
+    pytest.fail("\n".join(parts))
+
+
 @pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
 def test_unified_moe_fuzz(cfg):
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
-    # Full per-config determinism so any failure reproduces from the seed in the test id alone.
-    # Shapes (random.Random(seed)) and the input tensors (a per-config torch.Generator) are already
-    # seeded; this also pins the two GLOBAL-RNG draws -- the poison garbage and the device probe --
-    # so the entire run is bitwise-reproducible from `cfg.seed`. (Autotune winner selection is
-    # timing-based and may vary run-to-run, but every tactic is validated, so a correctness failure
-    # still reproduces via the tactic sweep regardless of which winner the tuner picks.)
+    # Full per-config determinism so any failure reproduces from the seed alone. Shapes
+    # (random.Random(seed)) and input tensors (a per-config torch.Generator) are already seeded;
+    # this pins the global RNG (the device probe), and the output buffer is initialized from the
+    # dedicated `poison_gen` below -- so the entire run is bitwise-reproducible from `cfg.seed`.
+    # (Autotune winner selection is timing-based and may vary run-to-run, but every tactic is
+    # validated, so a correctness failure still reproduces via the tactic sweep regardless of which
+    # winner the tuner picks.)
     torch.manual_seed(cfg.seed)
+    # Dedicated generator for output-buffer init, decoupled from the input generator's stream so the
+    # poison/zero fill is deterministic regardless of how many runners/calls a config drives.
+    poison_gen = torch.Generator(device="cuda").manual_seed(cfg.seed + 1_000_003)
+    # Every test prints its full config + the exact repro command (captured by pytest; shown on
+    # failure, or always with `-s`) so a CI log is self-explanatory without a rerun.
+    print("\n" + _describe(cfg))
+    print(_repro(cfg))
     sm = get_compute_capability(torch.device("cuda:0"))
     sm = sm[0] * 10 + sm[1]
 
@@ -583,10 +966,17 @@ def test_unified_moe_fuzz(cfg):
         for BackendCfg in handler.candidate_configs
         if BackendCfg in _BACKEND_RUNNERS and BackendCfg.supported(sm)
     ]
+    if cfg.is_fromlogits:
+        # In-kernel routing restricts to FromLogits-capable backends (CuteDSL is pre-routed-only,
+        # so it cannot serve a logits-only pack and would compare apples to oranges).
+        wired_backends = [B for B in wired_backends if B in _FROMLOGITS_BACKENDS]
     if not wired_backends:
-        pytest.skip(f"no wired backend for {cfg.variant} on SM{sm}")
+        mode = "in-kernel-routing " if cfg.is_fromlogits else ""
+        pytest.skip(f"no wired {mode}backend for {cfg.variant} on SM{sm}")
 
-    x, w1, w2, selected_experts, final_scales = _master(cfg, handler)
+    x, w1, w2, selected_experts, final_scales, logits, routing_bias = _master(
+        cfg, handler
+    )
     ref = handler.reference(
         x, w1, w2, selected_experts, final_scales, cfg.intermediate, cfg.expert_offset
     )
@@ -594,8 +984,13 @@ def test_unified_moe_fuzz(cfg):
     rtol = handler.rtol
 
     # One activation pack + one weight pack with each backend's native view, all built from the
-    # SAME bf16 inputs (this rank's LOCAL shard) via the API's uniform prepare_weights.
-    act_pack = handler.make_act_pack(x, selected_experts, final_scales)
+    # SAME bf16 inputs (this rank's LOCAL shard) via the API's uniform prepare_weights. In-kernel
+    # routing hands the kernel raw logits (+ bias); pre-routed hands it the host selection.
+    if cfg.is_fromlogits:
+        assert handler.make_act_pack_logits is not None
+        act_pack = handler.make_act_pack_logits(x, logits, routing_bias)
+    else:
+        act_pack = handler.make_act_pack(x, selected_experts, final_scales)
     weight_pack = MoEWeightPack()
     for BackendCfg in wired_backends:
         weight_pack.prepare_for(
@@ -611,7 +1006,14 @@ def test_unified_moe_fuzz(cfg):
         )
 
     config = MoEConfig(
-        routing=RoutingConfig(num_experts=cfg.num_experts, top_k=cfg.top_k),
+        routing=RoutingConfig(
+            num_experts=cfg.num_experts,
+            top_k=cfg.top_k,
+            method=cfg.routing_method,
+            n_group=cfg.n_group or None,
+            topk_group=cfg.topk_group or None,
+            routed_scaling_factor=cfg.routed_scaling or None,
+        ),
         quant=QuantConfig(variant=handler.variant),
         experts=ExpertConfig(
             intermediate_size=cfg.intermediate,
@@ -636,48 +1038,62 @@ def test_unified_moe_fuzz(cfg):
 
     def run(runner, poison=False):
         inputs = runner.pack_inputs(act_pack, weight_pack)
-        if poison:
-            # The output buffer is a kernel-owned `new_empty` tensor inside the inputs list
-            # (cute_dsl idx 11, trtllm the `output=`); locate it by dtype+shape and poison it.
-            act_ptrs = {
-                t.data_ptr()
-                for t in (
-                    act_pack.hidden_states_q,
-                    act_pack.hidden_states_scale,
-                    act_pack.selected_experts,
-                    act_pack.final_scales,
-                )
-                if torch.is_tensor(t)
-            }
-            bufs = [
-                t
-                for t in inputs
-                if torch.is_tensor(t)
-                and t.dtype == handler.out_dtype
-                and tuple(t.shape) == out_shape
-                and t.data_ptr()
-                not in act_ptrs  # bf16 hidden_states aliases dtype+shape
-            ]
-            assert bufs, "could not locate the output buffer in pack_inputs to poison"
-            for b in bufs:
-                handler.poison(b)
+        # Deterministically initialize the kernel-owned output buffer (a `new_empty` in the runner's
+        # pack_inputs; cute_dsl idx 11, trtllm the `output=`), located by dtype+shape: clean=zeros,
+        # poison=seeded garbage+NaN/Inf. Both are bit-reproducible from cfg.seed, so any failure --
+        # including a partial-write that depends on the buffer -- reproduces exactly.
+        act_ptrs = {
+            t.data_ptr()
+            for t in (
+                act_pack.hidden_states_q,
+                act_pack.hidden_states_scale,
+                act_pack.topk_ids,
+                act_pack.topk_weights,
+                act_pack.routing_logits,
+                act_pack.routing_bias,
+            )
+            if torch.is_tensor(t)
+        }
+        bufs = [
+            t
+            for t in inputs
+            if torch.is_tensor(t)
+            and t.dtype == handler.out_dtype
+            and tuple(t.shape) == out_shape
+            and t.data_ptr() not in act_ptrs
+        ]
+        assert bufs, "could not locate the output buffer in pack_inputs"
+        for b in bufs:
+            handler.poison(b, poison_gen) if poison else b.zero_()
         out = runner.forward(inputs, tactic=-1)
         out = (out[0] if isinstance(out, (list, tuple)) else out).float()
         torch.cuda.synchronize()
         return out
 
     def assert_correct(out, tag):
-        # no NaN/Inf where the reference is finite.
+        # (1) no NaN/Inf where the reference is finite.
         n_bad = int(((~torch.isfinite(out)) & torch.isfinite(ref)).sum().item())
-        assert n_bad == 0, f"{tag}: {n_bad} non-finite outputs vs finite reference"
-        # numeric vs the canonical quant-aware reference (the authority), magnitude-scaled.
+        if n_bad != 0:
+            _fail(
+                cfg,
+                tag,
+                f"{n_bad}/{out.numel()} non-finite outputs where oracle is finite "
+                f"(#2569/#3103-class)",
+                out,
+                ref,
+            )
+        # (2) numeric vs the canonical quant-aware reference (the authority), magnitude-scaled.
         abs_diff = (out - ref).abs()
         over_tol = abs_diff > (atol + rtol * ref.abs())
         if over_tol.any():
-            pytest.fail(
-                f"{tag}: {int(over_tol.sum())}/{out.numel()} elems exceed "
-                f"(rtol={rtol} atol={atol:.3g}); max|diff|={abs_diff.max().item():.4g}, "
-                f"‖ref‖∞={ref.abs().max().item():.4g}"
+            _fail(
+                cfg,
+                tag,
+                f"{int(over_tol.sum())}/{out.numel()} elems exceed tol "
+                f"(rtol={rtol} atol={atol:.3g}; max|diff|={abs_diff.max().item():.4g}, "
+                f"‖ref‖∞={ref.abs().max().item():.4g})",
+                out,
+                ref,
             )
 
     def check_backend(runner, out, tag):
@@ -686,11 +1102,15 @@ def test_unified_moe_fuzz(cfg):
         # (3) determinism per the backend's contract: deterministic backends must reproduce
         # bitwise; non-deterministic ones (atomic-scatter finalize) are exempt.
         if _DETERMINISTIC.get(runner.backend_key, False):
-            if not torch.equal(out, run(runner)):
-                drift = (out - run(runner)).abs().max().item()
-                pytest.fail(
-                    f"{tag}: declared DETERMINISTIC but not bitwise-reproducible "
-                    f"(max abs diff {drift:.3e})"
+            out2 = run(runner)
+            if not torch.equal(out, out2):
+                _fail(
+                    cfg,
+                    tag,
+                    "declared DETERMINISTIC but not bitwise-reproducible across identical runs "
+                    "(#2514-class); 'output' = first run, 'oracle' = second run",
+                    out,
+                    out2,
                 )
         # (4) output-buffer poison: the kernel owns its (uninitialized `new_empty`) output, so the
         # result must NOT depend on it being clean. torch's allocator usually hands back zeros and
@@ -805,6 +1225,14 @@ def test_autotune_cache_coherence(base, variant):
 
     E, H, I = base
     top_k = 4
+    _repro_cmd = (
+        f"REPRO: {_env_prefix()}FLASHINFER_UMOE_FUZZ=1 "
+        f"pytest -s tests/moe/test_unified_moe_fuzz.py::test_autotune_cache_coherence -k e{E}h{H}i{I}"
+    )
+    print(
+        f"\nCACHE-COHERENCE base=e{E}h{H}i{I} top_k={top_k} token_seq={_CACHE_TOKEN_SEQ}"
+    )
+    print(_repro_cmd)
     g = torch.Generator(device="cuda").manual_seed(12345)
 
     def sparse(*shape):
@@ -855,10 +1283,13 @@ def test_autotune_cache_coherence(base, variant):
             torch.cuda.synchronize()
             tag = f"cache-seq T={num_tokens} (winner={layer.winner_backend}) {base}"
             n_bad = int(((~torch.isfinite(out)) & torch.isfinite(ref)).sum().item())
-            assert n_bad == 0, f"{tag}: {n_bad} non-finite outputs"
             atol = handler.atol_frac * ref.abs().max().item() + 1e-3
             over = (out - ref).abs() > (atol + handler.rtol * ref.abs())
-            assert not over.any(), (
-                f"{tag}: {int(over.sum())} elems exceed tol "
-                f"(max|diff|={(out - ref).abs().max().item():.4g}) -- stale/mis-keyed cached winner?"
-            )
+            if n_bad != 0 or over.any():
+                why = (
+                    f"{n_bad} non-finite outputs"
+                    if n_bad
+                    else f"{int(over.sum())} elems exceed tol "
+                    f"(max|diff|={(out - ref).abs().max().item():.4g}) -- stale/mis-keyed cached winner?"
+                )
+                pytest.fail(f"{tag}: {why}\n{_dump(out, ref)}\n{_repro_cmd}")
