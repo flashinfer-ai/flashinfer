@@ -37,6 +37,48 @@ static constexpr float kFP8E4M3Max = 448.0f;
 // produce a zero scale.
 static constexpr float kFP8E4M3MinSubnormal = 1.0f / 512.0f;
 static constexpr float kDynamicFP8MinScale = kFP8E4M3MinSubnormal / kFP8E4M3Max;
+static constexpr float kUE8M0MinScaleInput = 1e-10f;
+
+__device__ __forceinline__ float compute_ue8m0_scale(float group_absmax) {
+  float scale = fmaxf(group_absmax / kFP8E4M3Max, kUE8M0MinScaleInput);
+  unsigned int scale_bits = __float_as_uint(scale);
+  if (scale_bits & 0x7fffff) {
+    scale_bits = (scale_bits + 0x800000) & 0x7f800000;
+  }
+  return __uint_as_float(scale_bits);
+}
+
+__device__ __forceinline__ void write_packed_ue8m0_scale(void* scale_out, int token_id,
+                                                         int token_num, int hidden_dim,
+                                                         int group_size, int tma_aligned_mn,
+                                                         int group_idx_in_row, float group_absmax) {
+  float scale = compute_ue8m0_scale(group_absmax);
+  int groups_per_row = hidden_dim / group_size;
+  int k_num_packed = (groups_per_row + 3) / 4;
+  int pack_idx = group_idx_in_row / 4;
+  int pos = group_idx_in_row % 4;
+  int elem_idx = pack_idx * tma_aligned_mn + token_id;
+
+  unsigned int bits = __float_as_uint(scale);
+  reinterpret_cast<uint8_t*>(scale_out)[elem_idx * 4 + pos] =
+      static_cast<uint8_t>((bits >> 23u) & 0xffu);
+
+  if (group_idx_in_row == groups_per_row - 1) {
+    for (int p = pos + 1; p < 4; p++) {
+      reinterpret_cast<uint8_t*>(scale_out)[elem_idx * 4 + p] = 0;
+    }
+  }
+
+  // The final packed column only allocates token_num rows. Earlier columns
+  // include the TMA-aligned token padding and must be initialized explicitly.
+  if (token_id == token_num - 1 && group_idx_in_row == 0) {
+    for (int pad_t = token_num; pad_t < tma_aligned_mn; pad_t++) {
+      for (int pk = 0; pk < k_num_packed - 1; pk++) {
+        reinterpret_cast<uint32_t*>(scale_out)[pk * tma_aligned_mn + pad_t] = 0;
+      }
+    }
+  }
+}
 
 }  // namespace details
 
@@ -1124,7 +1166,6 @@ class FusedOp {
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
     } else if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
       // Per-token-group FP8 quantization with UE8M0 packed scales.
-      constexpr float FP8_E4M3_MAX = 448.0f;
       int group_size = m_params.block_quant_group_size;
       int groups_in_block = blockDim.x * VEC_SIZE / group_size;
       int block_elem_start = threadIdx.x * VEC_SIZE;
@@ -1178,23 +1219,13 @@ class FusedOp {
         }
       }
 
-      // compute UE8M0 scale and quantize to FP8
-      auto compute_ue8m0_scale = [](float group_absmax) -> float {
-        float y_s = fmaxf(group_absmax / FP8_E4M3_MAX, 1e-10f);
-        unsigned int y_s_bits = __float_as_uint(y_s);
-        if (y_s_bits & 0x7fffff) {
-          y_s_bits = (y_s_bits + 0x800000) & 0x7f800000;
-        }
-        return __uint_as_float(y_s_bits);
-      };
-
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
-        float y_s = compute_ue8m0_scale(elem_group_absmax[i]);
+        float y_s = details::compute_ue8m0_scale(elem_group_absmax[i]);
         float q = static_cast<float>(reinterpret_cast<T*>(&val)[i]) / y_s;
-        q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+        q = fminf(fmaxf(q, -details::kFP8E4M3Max), details::kFP8E4M3Max);
         reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(q);
       }
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
@@ -1203,47 +1234,15 @@ class FusedOp {
       // For warp-shuffle path: one thread per group (first thread in each group).
       // For smem path: one thread per group in the block (threadIdx.x < groups_in_block).
       int block_first_elem = (m_access_id_in_token - threadIdx.x) * VEC_SIZE;
-      auto write_group_scale = [&](int group_idx_in_row, float group_absmax) {
-        float y_s = compute_ue8m0_scale(group_absmax);
-        int groups_per_row = m_params.hidden_dim / group_size;
-        int k_num_packed = (groups_per_row + 3) / 4;
-        int token_num = m_params.size / m_params.hidden_dim;
-        int pack_idx = group_idx_in_row / 4;
-        int pos = group_idx_in_row % 4;
-        int elem_idx = pack_idx * m_params.tma_aligned_mn + token_id;
-
-        // Write valid exponent
-        unsigned int bits = __float_as_uint(y_s);
-        uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
-        reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + pos] = exponent;
-
-        // K-padding: last valid group zeros trailing bytes in its pack
-        if (group_idx_in_row == groups_per_row - 1) {
-          for (int p = pos + 1; p < 4; p++) {
-            reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + p] = 0;
-          }
-        }
-
-        // MN-padding: on last valid token, first group zeros all packs
-        // for padding tokens (token_num .. tma_aligned_mn - 1).
-        // Skip the last packed column (pk = k_num_packed - 1) because
-        // scale_out storage is (token_num + (k_num_packed-1)*tma_aligned_mn)
-        // elements — the last column only has token_num rows allocated.
-        if (token_id == token_num - 1 && group_idx_in_row == 0) {
-          for (int pad_t = token_num; pad_t < m_params.tma_aligned_mn; pad_t++) {
-            for (int pk = 0; pk < k_num_packed - 1; pk++) {
-              int pad_elem = pk * m_params.tma_aligned_mn + pad_t;
-              reinterpret_cast<uint32_t*>(m_params.scale_out)[pad_elem] = 0;
-            }
-          }
-        }
-      };
+      int token_num = m_params.size / m_params.hidden_dim;
 
       if (use_warp_shuffle) {
         int lane_in_group = m_access_id_in_token % group_size_in_vecs;
         if (lane_in_group == 0) {
           int group_idx_in_row = m_access_id_in_token / group_size_in_vecs;
-          write_group_scale(group_idx_in_row, elem_group_absmax[0]);
+          details::write_packed_ue8m0_scale(
+              m_params.scale_out, token_id, token_num, m_params.hidden_dim, group_size,
+              m_params.tma_aligned_mn, group_idx_in_row, elem_group_absmax[0]);
         }
       } else {
         // Loop: groups_in_block may exceed blockDim.x when group_size < VEC_SIZE
@@ -1251,7 +1250,9 @@ class FusedOp {
              local_group += blockDim.x) {
           float group_absmax = __uint_as_float(smem_group_absmax[local_group]);
           int group_idx_in_row = block_first_elem / group_size + local_group;
-          write_group_scale(group_idx_in_row, group_absmax);
+          details::write_packed_ue8m0_scale(
+              m_params.scale_out, token_id, token_num, m_params.hidden_dim, group_size,
+              m_params.tma_aligned_mn, group_idx_in_row, group_absmax);
         }
       }
     } else if constexpr (GetQuantType<Pattern> == QuantType::kDynamicFP8) {
