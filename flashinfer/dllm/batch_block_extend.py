@@ -283,6 +283,58 @@ struct BatchBlockExtendOffsetAttentionFA3 : AttentionVariantBase {
 """
 
 
+def build_block_diffusion_jit_args(
+    head_dim: int,
+    dtype: torch.dtype,
+    idtype: torch.dtype,
+    backend: str,
+    layout: str,
+) -> Tuple[List[Any], Dict[str, Any]]:
+    """Build the (jit_args, jit_kwargs) for a block-diffusion (block-extend) batch
+    prefill variant, suitable for passing to the existing
+    ``BatchPrefillWithRaggedKVCacheWrapper`` / ``BatchPrefillWithPagedKVCacheWrapper``
+    via ``jit_args=``/``jit_kwargs=``.
+
+    This is the single source of truth for the dLLM variant wiring (variant decl,
+    offset tensor slots, sm_scale/dllm_block_size scalar slots, mask_mode fixed to
+    kBlockExpanding). Both the dedicated ``flashinfer.dllm`` convenience wrappers
+    and the named ``block_diffusion=`` option on the existing wrappers call it, so
+    the mask option is exposed on the existing prefill APIs (reviewers' design #2)
+    rather than as a new API family. See docs/block-extend-design-response.md §2.
+    """
+    if layout not in ("ragged", "paged"):
+        raise ValueError(f"layout must be 'ragged' or 'paged', got {layout!r}")
+    if backend == "fa3":
+        suffix = f"_{layout}_offset_fa3"
+        variant_name = "BatchBlockExtendOffsetAttentionFA3"
+        variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL_FA3
+    elif backend == "fa2":
+        suffix = f"_{layout}_offset"
+        variant_name = "BatchBlockExtendOffsetAttention"
+        variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL
+    else:
+        raise ValueError(f"backend must be 'fa2' or 'fa3', got {backend!r}")
+
+    uri = _get_batch_be_module_uri(head_dim, dtype, idtype) + suffix
+
+    jit_args = [
+        uri, dtype, dtype, dtype, idtype, head_dim, head_dim,
+        ["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
+        [dtype_map_for_idtype(idtype), dtype_map_for_idtype(idtype)],
+        ["sm_scale", "dllm_block_size"], ["double", "int64_t"],
+        variant_name, variant_decl,
+    ]
+    jit_kwargs = {
+        "pos_encoding_mode": 0, "use_sliding_window": False,
+        "use_logits_soft_cap": False, "use_fp16_qk_reduction": False,
+        # Dedicated dLLM URIs compile ONLY mask_mode=kBlockExpanding (=4). The
+        # delegation switch in get_customize_batch_prefill_module routes this
+        # through gen_customize_block_extend_batch_prefill_module.
+        "mask_modes": [MaskMode.BLOCK_EXPANDING.value],
+    }
+    return jit_args, jit_kwargs
+
+
 class BatchBlockExtendPagedOffsetWrapper:
     """Batch Block Extend Paged Attention with Offset Support"""
     
@@ -330,33 +382,9 @@ class BatchBlockExtendPagedOffsetWrapper:
         effective_backend = select_best_backend_paged(head_dim, dtype, self._preferred_backend, self._device, idtype)
         self._backend = effective_backend
 
-        if self._backend == "fa3":
-            uri = _get_batch_be_module_uri(head_dim, dtype, idtype) + "_paged_offset_fa3"
-            variant_name = "BatchBlockExtendOffsetAttentionFA3"
-            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL_FA3
-        else:
-            uri = _get_batch_be_module_uri(head_dim, dtype, idtype) + "_paged_offset"
-            variant_name = "BatchBlockExtendOffsetAttention"
-            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL
-        
-        jit_args = [
-            uri, dtype, dtype, dtype, idtype, head_dim, head_dim,
-            ["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
-            [dtype_map_for_idtype(idtype), dtype_map_for_idtype(idtype)],
-            ["sm_scale", "dllm_block_size"], ["double", "int64_t"],
-            variant_name, variant_decl,
-        ]
-        jit_kwargs = {
-            "pos_encoding_mode": 0, "use_sliding_window": False,
-            "use_logits_soft_cap": False, "use_fp16_qk_reduction": False,
-            # Block-extend (dLLM) URIs compile ONLY mask_mode=kBlockExpanding (=4).
-            # The other modes (null/causal/custom/multi-item-scoring) are irrelevant
-            # for this dedicated front-end and must not be enumerated into its source
-            # set — that would inflate the dedicated URI's JIT cache and risk the
-            # dispatcher selecting a non-block-extend kernel behind this entry point.
-            # See docs/block-extend-design-response.md §1.
-            "mask_modes": [MaskMode.BLOCK_EXPANDING.value],
-        }
+        jit_args, jit_kwargs = build_block_diffusion_jit_args(
+            head_dim, dtype, idtype, self._backend, layout="paged"
+        )
 
         self._inner_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             self._float_workspace_buffer, kv_layout=self._kv_layout,
@@ -474,29 +502,9 @@ class BatchBlockExtendRaggedOffsetWrapper:
         effective_backend = select_best_backend(head_dim, dtype, self._preferred_backend, self._device, idtype)
         self._backend = effective_backend
 
-        if self._backend == "fa3":
-            uri = _get_batch_be_module_uri(head_dim, dtype, idtype) + "_ragged_offset_fa3"
-            variant_name = "BatchBlockExtendOffsetAttentionFA3"
-            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL_FA3
-        else:
-            uri = _get_batch_be_module_uri(head_dim, dtype, idtype) + "_ragged_offset"
-            variant_name = "BatchBlockExtendOffsetAttention"
-            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL
-        
-        jit_args = [
-            uri, dtype, dtype, dtype, idtype, head_dim, head_dim,
-            ["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
-            [dtype_map_for_idtype(idtype), dtype_map_for_idtype(idtype)],
-            ["sm_scale", "dllm_block_size"], ["double", "int64_t"],
-            variant_name, variant_decl,
-        ]
-        jit_kwargs = {
-            "pos_encoding_mode": 0, "use_sliding_window": False,
-            "use_logits_soft_cap": False, "use_fp16_qk_reduction": False,
-            # Block-extend (dLLM) URIs compile ONLY mask_mode=kBlockExpanding (=4).
-            # See docs/block-extend-design-response.md §1 for rationale.
-            "mask_modes": [MaskMode.BLOCK_EXPANDING.value],
-        }
+        jit_args, jit_kwargs = build_block_diffusion_jit_args(
+            head_dim, dtype, idtype, self._backend, layout="ragged"
+        )
 
         self._inner_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
             self._float_workspace_buffer, kv_layout=self._kv_layout,

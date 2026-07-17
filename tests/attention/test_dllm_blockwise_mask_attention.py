@@ -783,6 +783,96 @@ def test_zero_visible_kv_no_hang(
     assert all_pass, "zero-visible-KV regression failed (see diffs above; a hang here on FA3 is the bug)"
 
 
+def test_block_diffusion_named_option(
+    verbose: bool = True,
+):
+    """Exercise the reviewers' preferred shape: a ``block_diffusion=`` mask option
+    on the existing ``BatchPrefillWith{Ragged,Paged}KVCacheWrapper`` (rather than
+    the dedicated ``flashinfer.dllm`` API family). Cross-checks that the named
+    option matches both the FA2 reference and the dedicated ``BatchBlockExtend*``
+    shim, which must be equivalent since both drive the same underlying variant.
+    """
+    device = torch.device("cuda:0")
+    available_backends = get_available_backends(device)
+    dtype = torch.float16
+    num_heads = 32
+    num_kv_heads = 8
+    head_dim = 128
+    B = 32
+    qo_len = 64
+    kv_len = 128
+    q_offset = 0
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    tol = 1e-2
+
+    q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+    ref = compute_block_extend_reference(q, k, v, B, q_offset=q_offset, sm_scale=sm_scale)
+
+    qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
+    q_offsets = torch.tensor([q_offset], dtype=torch.int32, device=device)
+    kv_offsets = torch.zeros(1, dtype=torch.int32, device=device)
+
+    results = {}
+
+    # --- Ragged: existing wrapper with block_diffusion=True ---
+    for backend in available_backends:
+        ws = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+            ws, kv_layout="NHD", backend=backend,
+            block_diffusion=True, dllm_block_size=B,
+        )
+        wrapper.plan(
+            qo_indptr=qo_indptr, kv_indptr=kv_indptr,
+            num_qo_heads=num_heads, num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim, q_data_type=dtype, sm_scale=sm_scale,
+            q_offsets=q_offsets, kv_offsets=kv_offsets,
+        )
+        out = wrapper.run(q, k, v)
+        diff = (out.to(torch.float32) - ref.to(torch.float32)).abs().max().item()
+        results[f"ragged_named_{backend}"] = diff
+        del wrapper
+        torch.cuda.empty_cache()
+
+    # --- Paged: existing wrapper with block_diffusion=True ---
+    page_size = 16
+    num_pages = (kv_len + page_size - 1) // page_size
+    kv_data = torch.randn(num_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=device)
+    paged_kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    paged_kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    last_page_len = kv_len - (num_pages - 1) * page_size if kv_len % page_size != 0 else page_size
+    paged_kv_last_page_len = torch.tensor([last_page_len], dtype=torch.int32, device=device)
+
+    for backend in available_backends:
+        ws = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            ws, kv_layout="NHD", backend=backend,
+            block_diffusion=True, dllm_block_size=B,
+        )
+        wrapper.plan(
+            qo_indptr=qo_indptr, paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices, paged_kv_last_page_len=paged_kv_last_page_len,
+            num_qo_heads=num_heads, num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim, page_size=page_size,
+            q_data_type=dtype, sm_scale=sm_scale,
+            q_offsets=q_offsets, kv_offsets=kv_offsets,
+        )
+        out = wrapper.run(q, kv_data)
+        diff = (out.to(torch.float32) - ref.to(torch.float32)).abs().max().item()
+        results[f"paged_named_{backend}"] = diff
+        del wrapper
+        torch.cuda.empty_cache()
+
+    all_pass = all(d < tol for d in results.values())
+    if verbose:
+        for k_, d in results.items():
+            print(f"  {k_}: max_diff={d:.6f} [{'PASS' if d < tol else 'FAIL'}]")
+        print(f"  block_diffusion named-option overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
+    assert all_pass, f"block_diffusion named-option failed: {results}"
+
+
 def test_sglang_vs_block_extend_cascade(
     verbose: bool = True,
 ):

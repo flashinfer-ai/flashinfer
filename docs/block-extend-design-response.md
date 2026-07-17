@@ -382,42 +382,38 @@ Two local commits on `feature/block-extend` (not pushed):
 | §1.2 step 2 / §3.3 | Closed product enforced: dtype `{fp16,bf16}`, idtype `{int32,int64}`, head_dim `{64,128}` (gated in URI builders); backend stays `auto/fa2/fa3`. fp8 confirmed already rejected (not coerced). | `flashinfer/dllm/batch_block_extend.py`, `flashinfer/dllm/block_extend.py` |
 | §1.2 step 3 (single) | Dedicated `gen_customize_block_extend_single_prefill_module` — compiles only `kBlockExpanding`, validates closed product, exported from `flashinfer.jit.attention`. Single-path now routes through it instead of the shared `gen_customize_single_prefill_module` with `mask_modes=`. | `flashinfer/jit/attention/modules.py`, `flashinfer/jit/attention/__init__.py`, `flashinfer/dllm/block_extend.py` |
 | §2.2.2 (single) | Deleted `_MODULE_CACHE_WITH_OFFSET`, the `_get_aot_path`/`_check_aot_available` helpers, the hand-rolled AOT-vs-JIT branch, and the `tvm_ffi`/`jit_env`/`Path` imports. Single-path module build now delegates to `JitSpec.build_and_load()` (with its file-lock) like every other single-prefill call. | `flashinfer/dllm/block_extend.py` |
+| §1.2 step 3 (batch) | Delegation switch in `get_customize_batch_prefill_module`: when `mask_modes==[kBlockExpanding]`, route to `gen_customize_block_extend_batch_prefill_module` (dedicated gen, fixed mode 4, closed product). Shared default stays `[0,1,2,3]`. Exported dedicated gens from `flashinfer.jit`. | `flashinfer/prefill.py`, `flashinfer/jit/__init__.py` |
+| §2.2.1 (batch) | Named `block_diffusion=` mask option on BOTH `BatchPrefillWithPagedKVCacheWrapper` and `BatchPrefillWithRaggedKVCacheWrapper` (`__init__(block_diffusion=, dllm_block_size=)`, `plan(q_offsets=, kv_offsets=)` with auto-flip to `kBlockExpanding`, `run` injects offsets+`sm_scale`+`dllm_block_size` from `self`). This is the reviewers' preferred shape — a mask option on the existing prefill API, not a new API family. All edits guarded by `self._block_diffusion` (default False → normal users untouched). | `flashinfer/prefill.py` |
+| §2 shim | `flashinfer/dllm/batch_block_extend.py` factored to a shared `build_block_diffusion_jit_args` helper; the two `BatchBlockExtend*OffsetWrapper` classes are now thin shims over the existing wrappers (no own cache / no own AOT path — those were already gone; now also share the variant wiring). | `flashinfer/dllm/batch_block_extend.py` |
+| §2 test | `test_block_diffusion_named_option` exercises `block_diffusion=True` on both existing wrappers and cross-checks vs the FA2 reference. | `tests/attention/test_dllm_blockwise_mask_attention.py` |
 
 Python files pass `ast.parse`; the kernel `.cuh` change mirrors an existing
 in-tree primitive. **No GPU verification done — none possible from this host
-(can't compile/import flashinfer or build CUDA here).**
+(can't compile/import flashinfer or build CUDA here). User will verify on a
+GPU server.**
 
 ### Not yet done (remaining tasks)
 
 - **§3 (none remaining)** — all three reviewer-flagged correctness items are
   addressed. The TMA-hang fix is **GPU-verifiable only on SM90** (`test_zero_visible_kv_no_hang`
   will hang on a faulty kernel); needs the H100 CI lane to confirm green.
-- **Task #6 batch half (§1.2 step 3, batch)** — a dedicated
-  `gen_customize_block_extend_batch_prefill_module` already exists and is
-  exported, but the batch *front-end* (`BatchBlockExtend{Ragged,Paged}OffsetWrapper`)
-  still threads `mask_modes` through `jit_kwargs` into the shared
-  `get_customize_batch_prefill_module`. Routing the batch front-end through the
-  dedicated gen needs a dispatch knob on the shared `BatchPrefill…Wrapper.__init__`,
-  which overlaps task #7 — see below.
-- **Task #7 (§2.2.1)** — fold `BatchBlockExtend{Ragged,Paged}OffsetWrapper`
-  into a `block_diffusion=` plan option on the existing `BatchPrefill…Wrapper`.
-  **Deferred:** this threads the variant `jit_args` build and the offset tensors
-  / `dllm_block_size` through the hottest `BatchPrefill` runtime dispatch path
-  (`prefill.py:1657` and `:2788`), and **cannot be GPU-verified from this host**.
-  Doing it blind on production attention code is the one change I will not make
-  without verification; it must land in a GPU-equipped session / the dLLM CI lane.
-- **Task #8 (§2.2.2) batch** — n/a standalone; folded into #7 above.
-- **Task #9 (§2.3)** — drop the dedicated `gpu-tests-dllm-*` CI lanes; fold the
-  test into the existing prefill test suite. Low-risk mechanical change;
-  intentionally grouped with the #7 convergence so the CI lane goes away at the
-  same moment the dedicated API surface does.
+- **Task #9 (§2.3 CI consolidation)** — the dedicated `gpu-tests-dllm-a10g/h100`
+  CI lanes are KEPT for now (they run the dLLM test suite that covers the blind
+  block-diffusion code; useful for the user's GPU verification). Full lane
+  deletion + folding the test into the standard prefill test part is deferred —
+  it needs multi-spot YAML `needs`-graph surgery that can't be CI-verified from
+  this host and is best done with the maintainers' test-suite wiring knowledge.
 
 ### Remaining risk / verification
 
-- The two local commits are `ast.parse`-clean but **unverified on GPU**. Before
-  the §2 convergence lands, the existing tests (including the new
-  `test_zero_visible_kv_no_hang`) must run on the H100/dLLM CI lane to confirm:
-  (a) the TMA-hang fix is actually exercised and green, (b) the idtype-in-URI
+- The local commits are `ast.parse`-clean but **unverified on GPU**. Before
+  merge, the existing tests (including the new `test_zero_visible_kv_no_hang`
+  and `test_block_diffusion_named_option`) must run on the H100/dLLM CI lane to
+  confirm: (a) the TMA-hang fix is exercised and green, (b) the idtype-in-URI
   change recompiles cleanly (first-call JIT after the URI schema change,
   discarding any stale cached dLLM module), (c) the dedicated single-path gen
-  produces byte-identical output to the previous shared-`mask_modes` path.
+  and the `block_diffusion=` named option produce output identical to the
+  dedicated shim path, (d) the `block_diffusion=` run-arg injection (offsets +
+  `sm_scale` + `dllm_block_size`) matches the variant kernel's expected arg
+  order — this is the one piece of blind hot-path wiring that most needs a GPU
+  run to confirm.
