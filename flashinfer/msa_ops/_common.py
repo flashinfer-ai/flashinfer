@@ -69,16 +69,81 @@ def _cutlass_dtype(torch_dtype: torch.dtype):
     }[torch_dtype]
 
 
-def _fake(dtype, shape, align=16):
-    """Make a fake compact row-major tensor for ``cute.compile``.
+def _fake(dtype, shape, align=16, stride_order=None):
+    """Make a fake compact tensor for ``cute.compile`` (row-major by default).
 
     Compiling against symbolic shapes (``cute.sym_int()``) yields one kernel
     that accepts torch tensors of any matching-rank shape at runtime."""
     import cutlass.cute as cute
 
+    if stride_order is None:
+        stride_order = tuple(reversed(range(len(shape))))
     return cute.runtime.make_fake_compact_tensor(
         dtype,
         shape,
-        stride_order=tuple(reversed(range(len(shape)))),
+        stride_order=stride_order,
         assumed_align=align,
     )
+
+
+def _resolve_packed_kv(k, v, head_dim, *, paged, kv_nvfp4):
+    """Shared wrapper plumbing: detect packed K/V split views (paged,
+    non-NVFP4 only) via :func:`_packed_kv_view`, enforcing contiguity for
+    every other input."""
+    packed = None if kv_nvfp4 or not paged else _packed_kv_view(k, v, head_dim)
+    if packed is None and not (k.is_contiguous() and v.is_contiguous()):
+        raise ValueError("k/v must be contiguous")
+    return packed
+
+
+def _packed_kv_view(k, v, head_dim):
+    """Recover the packed cache behind K/V views split from a paged KV cache
+    that stores K and V in one ``2 * head_dim`` content dim per token.
+
+    Returns ``None`` when both tensors are plain contiguous, else ``(packed,
+    stride_order)``: the storage re-viewed as a 5-D cache with K at plane 0
+    and V at plane 1 of dim 3, plus its dim ranks for ``cute.compile``. The
+    view must be compact, meaning its strides telescope in some dim order (a
+    permuted-contiguous NHD cache qualifies); any other layout raises."""
+    if k.is_contiguous() and v.is_contiguous():
+        return None
+    if (
+        k.ndim != 4
+        or k.stride() != v.stride()
+        or k.stride(-1) != 1
+        or v.data_ptr() - k.data_ptr() != head_dim * k.element_size()
+    ):
+        raise ValueError(
+            "k/v must be contiguous, or K/V views split from a paged KV cache "
+            "that packs K and V in one 2*head_dim content dim per token"
+        )
+    num_pages, num_kv_heads, page, _ = k.shape
+    packed = k.as_strided(
+        (num_pages, num_kv_heads, page, 2, head_dim),
+        (k.stride(0), k.stride(1), k.stride(2), head_dim, 1),
+    )
+    # Sized strides must telescope: the kernel derives addresses from the
+    # compact layout. Size-1 dims carry arbitrary strides, so they rank
+    # outermost (inner they would break the kernel's static alignment proof)
+    # and get rebuilt strides.
+    ones = [i for i in range(5) if packed.shape[i] == 1]
+    sized = sorted(
+        (i for i in range(5) if packed.shape[i] > 1), key=lambda i: packed.stride(i)
+    )
+    strides = [0] * 5
+    expected = 1
+    for i in sized:
+        if packed.stride(i) != expected:
+            raise ValueError(
+                "packed K/V views must cover a compact KV cache, got strides "
+                f"{tuple(packed.stride())} for shape {tuple(packed.shape)}"
+            )
+        strides[i] = expected
+        expected *= packed.shape[i]
+    for i in ones:
+        strides[i] = expected
+    packed = k.as_strided(packed.shape, strides)
+    rank = [0] * 5
+    for pos, dim in enumerate(sized + ones):
+        rank[dim] = pos
+    return packed, tuple(rank)

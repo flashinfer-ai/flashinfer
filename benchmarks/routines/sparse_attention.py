@@ -47,6 +47,11 @@ _ROUTINE_BACKENDS = {
 
 def run_sparse_attention_test(args):
     """Route an MSA routine to its test function."""
+    if args.kv_layout != "flat" and args.routine not in (
+        "MSASparseAttention",
+        "MSASparseDecode",
+    ):
+        raise ValueError(f"--kv_layout {args.kv_layout} unsupported for {args.routine}")
     if args.routine == "MSAProxyScore":
         return testMSAProxyScore(args)
     elif args.routine == "MSASparseAttention":
@@ -105,6 +110,17 @@ def parse_sparse_attention_args(line, parser):
         default="bfloat16",
         help="KV dtype: bfloat16/float16/fp8_e4m3/nvfp4 (prefill/decode/pipeline).",
     )
+    parser.add_argument(
+        "--kv_layout",
+        type=str,
+        default="flat",
+        choices=["flat", "paged", "packed"],
+        help=(
+            "KV storage for prefill/decode: flat varlen, a paged cache, or "
+            "K/V views split from a paged cache that packs K|V per token "
+            "(vLLM's layout). paged/packed exclude nvfp4."
+        ),
+    )
     args = parser.parse_args(line)
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -145,6 +161,27 @@ def _rand_q2k(batch_size, s_qo, s_kv, num_kv_heads, topk, device):
             sel = torch.randperm(nb, device=device)[:nsel].sort().values
             idx[h, qi, :nsel] = sel.to(torch.int32)
     return idx
+
+
+def _paged_kv(bs, s_kv, num_kv_heads, q_dtype, kv_dtype, device, packed):
+    """Paged K/V (contiguous, or views split from a packed K|V cache) plus the
+    paged-call kwargs."""
+    if kv_dtype not in (torch.bfloat16, torch.float16, torch.float8_e4m3fn):
+        raise ValueError("--kv_layout paged/packed excludes nvfp4")
+    pages_per_req = -(-s_kv // BLK_KV)
+    num_pages = bs * pages_per_req
+    cache = (
+        torch.randn(num_pages, num_kv_heads, BLK_KV, 256, device=device, dtype=q_dtype)
+        / 3
+    ).to(kv_dtype)
+    k, v = cache.split(128, dim=-1)
+    if not packed:
+        k, v = k.contiguous(), v.contiguous()
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(
+        bs, pages_per_req
+    )
+    seqused_k = torch.full((bs,), s_kv, dtype=torch.int32, device=device)
+    return k, v, dict(page_table=page_table, seqused_k=seqused_k)
 
 
 def _maybe_quantize_kv(k, v, kv_dtype):
@@ -361,7 +398,12 @@ def testMSASparseAttention(args):
     v = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
     cu_q, cu_k = _cu_seqlens(bs, s_qo, device), _cu_seqlens(bs, s_kv, device)
     q2k = _rand_q2k(bs, s_qo, s_kv, Hkv, args.topk, device)
-    k_in, v_in, extra = _maybe_quantize_kv(k, v, kv_dtype)
+    if args.kv_layout != "flat":
+        k_in, v_in, extra = _paged_kv(
+            bs, s_kv, Hkv, q_dtype, kv_dtype, device, args.kv_layout == "packed"
+        )
+    else:
+        k_in, v_in, extra = _maybe_quantize_kv(k, v, kv_dtype)
     scale = 1.0 / math.sqrt(128)
 
     def run(_b):
@@ -418,7 +460,13 @@ def testMSASparseDecode(args):
     v = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
     cu_k = _cu_seqlens(bs, s_kv, device)
     q2k = _rand_q2k(bs, 1, s_kv, Hkv, args.topk, device)
-    k_in, v_in, extra = _maybe_quantize_kv(k, v, kv_dtype)
+    if args.kv_layout != "flat":
+        k_in, v_in, extra = _paged_kv(
+            bs, s_kv, Hkv, q_dtype, kv_dtype, device, args.kv_layout == "packed"
+        )
+    else:
+        k_in, v_in, extra = _maybe_quantize_kv(k, v, kv_dtype)
+        extra = dict(cu_seqlens_k=cu_k, **extra)
     scale = 1.0 / math.sqrt(128)
 
     def run(_b):
@@ -427,7 +475,6 @@ def testMSASparseDecode(args):
             k_in,
             v_in,
             q2k,
-            cu_seqlens_k=cu_k,
             seqlen_q=1,
             causal=args.causal,
             softmax_scale=scale,
