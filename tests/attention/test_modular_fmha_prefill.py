@@ -1115,8 +1115,14 @@ def test_attention_prefill_sliding_window_varlen(
     for i in range(len(indptr) - 1):
         lo, hi = indptr[i], indptr[i + 1]
         o_ref[lo:hi] = attention_band_mask_ref(
-            1, q[lo:hi], k[lo:hi], v[lo:hi], SM_SCALE, causal,
-            window_left, window_right,
+            1,
+            q[lo:hi],
+            k[lo:hi],
+            v[lo:hi],
+            SM_SCALE,
+            causal,
+            window_left,
+            window_right,
         )
 
     torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
