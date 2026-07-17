@@ -38,11 +38,13 @@ from .api import (
     QuantVariant,
     TrtllmBf16Config,
     TrtllmFp4Config,
+    TrtllmFp8BlockConfig,
 )
 from .runners import (
     CuteDslNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
+    TrtllmFp8BlockRunner,
 )
 from .utils import map_to_hybrid_bucket
 
@@ -50,13 +52,19 @@ from .utils import map_to_hybrid_bucket
 # Union of the concrete runners the layer dispatches to.  All share
 # backend_key / tuning_config / pack_inputs as attributes or class members;
 # typing the list with this Union gives mypy the visibility it needs.
-_RunnerT = Union[CuteDslNvfp4Runner, TrtllmFp4RoutedRunner, TrtllmBf16RoutedRunner]
+_RunnerT = Union[
+    CuteDslNvfp4Runner,
+    TrtllmFp4RoutedRunner,
+    TrtllmBf16RoutedRunner,
+    TrtllmFp8BlockRunner,
+]
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
+    TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
 }
 
 # Quant variants each runner can execute.  Used by _validate_mvp_scope to accept
@@ -65,6 +73,7 @@ _RUNNER_QUANTS: Dict[type, Tuple[QuantVariant, ...]] = {
     CuteDslConfig: (QuantVariant.NVFP4,),
     TrtllmFp4Config: (QuantVariant.NVFP4,),
     TrtllmBf16Config: (QuantVariant.BF16,),
+    TrtllmFp8BlockConfig: (QuantVariant.DeepSeekFp8, QuantVariant.MxFp8),
 }
 
 
@@ -113,7 +122,7 @@ class MoELayer:
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
-                f"arch sm{arch}. The MVP supports only NVFP4 via [{mvp}]."
+                f"arch sm{arch}. Registered unified runners: [{mvp}]."
             )
 
         # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
@@ -133,8 +142,8 @@ class MoELayer:
         Surfacing this at construction time turns a deep C++ crash or silent
         backend skip into a clear, actionable Python error.  NVFP4 (CuteDSL /
         TRTLLM-FP4) and BF16 (TRTLLM-BF16, the EP grouped-GEMM path) are
-        supported; FP8 / MXFP4 / MxInt4 remain post-MVP.  Only the Swiglu
-        activation is supported.
+        supported, as are DeepSeek FP8 / MXFP8 through TRTLLM block-scale.
+        MXFP4 / MxInt4 remain post-MVP. Only the Swiglu activation is supported.
         """
         variant = config.quant.variant
         supported = {
@@ -145,7 +154,7 @@ class MoELayer:
                 f"MoELayer: QuantVariant.{variant.name} is not executable by any "
                 f"configured backend (supported here: "
                 f"{sorted(q.name for q in supported) or 'none'}). "
-                "FP8 / MXFP4 / MxInt4 paths are tracked as post-MVP follow-ups."
+                "MXFP4 / MxInt4 paths are tracked as post-MVP follow-ups."
             )
         act = config.activation.type
         if act is not ActivationType.Swiglu:

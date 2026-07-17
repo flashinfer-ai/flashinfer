@@ -255,11 +255,10 @@ class TestBackendOptions:
         opts = BackendOptions(
             candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
         )
-        # sm80: BF16 requires 100+, FP8Block requires 80+, Cutlass is universal
+        # TRTLLM-gen BF16 and block-FP8 require SM100+; Cutlass is universal.
         valid = opts.valid_for(80)
-        assert len(valid) == 2
-        assert isinstance(valid[0], TrtllmFp8BlockConfig)
-        assert isinstance(valid[1], CutlassConfig)
+        assert len(valid) == 1
+        assert isinstance(valid[0], CutlassConfig)
 
     def test_valid_for_blackwell(self):
         opts = BackendOptions(
@@ -586,15 +585,24 @@ class TestMoELayerMVPValidation:
 
     @pytest.mark.parametrize(
         "variant",
-        # NVFP4 (CuteDSL/TRTLLM-FP4) and BF16 (TRTLLM-BF16, the EP grouped-GEMM
-        # path) are both MVP-supported now; everything else is still rejected.
-        [v for v in QuantVariant if v not in (QuantVariant.NVFP4, QuantVariant.BF16)],
+        # NVFP4, BF16, DeepSeek FP8, and MXFP8 have unified runners.
+        [
+            v
+            for v in QuantVariant
+            if v
+            not in (
+                QuantVariant.NVFP4,
+                QuantVariant.BF16,
+                QuantVariant.DeepSeekFp8,
+                QuantVariant.MxFp8,
+            )
+        ],
     )
     def test_non_nvfp4_quant_rejected(self, variant):
         from flashinfer.fused_moe import MoELayer
 
         cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
-        with pytest.raises(NotImplementedError, match="NVFP4"):
+        with pytest.raises(NotImplementedError, match="not executable"):
             MoELayer(cfg)
 
     @pytest.mark.parametrize(

@@ -273,7 +273,45 @@ class TrtllmFp8BlockConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 80
+        # This adapter delegates to get_trtllm_moe_sm100_module(), whose
+        # trtllm-gen kernels require Blackwell SM100+.
+        return arch >= 100
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        variant: QuantVariant,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Build the ``trtllm_fp8_block`` weight view from canonical BF16.
+
+        ``variant`` must be :attr:`QuantVariant.DeepSeekFp8` or
+        :attr:`QuantVariant.MxFp8`; their scale formats are intentionally
+        prepared by separate paths.
+        """
+        from .prepare import prepare_trtllm_fp8_block_weights
+
+        return prepare_trtllm_fp8_block_weights(
+            w1_bf16,
+            w2_bf16,
+            variant=variant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, variant: QuantVariant):
+        """Quantize BF16 activations for the selected block-FP8 convention."""
+        from .prepare import prepare_trtllm_fp8_block_activations
+
+        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, variant=variant)
 
     def __repr__(self) -> str:
         return "TrtllmFp8BlockConfig()"
