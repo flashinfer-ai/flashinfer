@@ -18,6 +18,7 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
+from ..utils import _get_cache_buf, get_device_sm_count
 from .gemm_base import _check_cute_dsl_availability
 from .gemm_bf16_fp4 import _unswizzle_sf_128x4
 
@@ -78,18 +79,6 @@ def _select_bf16_fp4_tile_shape(
 
 
 _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE: dict = {}
-
-# Placeholder for the kernel's split-K partials argument when k_splits == 1.
-_SPLIT_K_DUMMY_CACHE: dict = {}
-
-
-def _get_split_k_dummy(device: torch.device) -> torch.Tensor:
-    key = (device.type, device.index)
-    t = _SPLIT_K_DUMMY_CACHE.get(key)
-    if t is None:
-        t = torch.empty(4, device=device, dtype=torch.float32)
-        _SPLIT_K_DUMMY_CACHE[key] = t
-    return t
 
 
 def _get_cute_dsl_bf16_fp4_gemm(
@@ -347,9 +336,7 @@ def _bf16_fp4_cute_dsl_tactic_configs(
         add(tile_m, atom, 1, 1)
 
     # Split-K variants: small-N decode shapes launch too few CTAs to fill
-    # the GPU; splitting the K loop across CTAs restores parallelism.  Only
-    # worth trying when the plain grid is small, and each split must own at
-    # least one K-tile.
+    # the GPU; splitting the K loop across CTAs restores parallelism.
     if n // 64 <= 256:
         k_tiles = k // tile_k
         for splits in (2, 4, 8):
@@ -420,19 +407,14 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
             m_opt = int(profile.get_opt_shapes()[0][0])
-            sm_count = torch.cuda.get_device_properties(a.device).multi_processor_count
+            sm_count = get_device_sm_count(a.device)
             configs = _bf16_fp4_cute_dsl_tactic_configs(n, k)
 
             def split_reduces_makespan(cfg) -> bool:
-                # Splitting K trades extra partials traffic for fill, so
-                # it only pays when it shortens the last wave by enough to
-                # cover that traffic.  Without this guard the tuner's
-                # cache-warm timing loop picks split-K on nearly-full
-                # grids, where cold-cache it just adds the partials round
-                # trip (measured -9% on GB202 10304x2688 at 0.86 waves).
-                # The 25% bar separates the measured outcomes: every
-                # validated winner shortens the makespan by >= 25%, and
-                # the marginal 12.5% case still lost by 12%.
+                # Splitting K must shorten the grid's last wave by enough
+                # (25%) to cover its partials traffic.  The autotuner
+                # cannot police this itself: its warm-cache timing loop
+                # hides the partials cost.
                 splits = cfg[5]
                 if splits == 1:
                     return True
@@ -480,14 +462,22 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 k_splits=k_splits,
             )
             if k_splits > 1:
-                # The compiled module launches its own reduce kernel after
-                # the GEMM (fixed-order fp32 sum -> deterministic), so no
-                # torch ops follow the call.
-                partial = torch.empty(
-                    k_splits * m * n, device=a.device, dtype=torch.float32
-                )
+                if k_splits > k // tile_shape_mnk[2]:
+                    raise ValueError(
+                        f"k_splits={k_splits} exceeds the K-tile count for "
+                        f"k={k}, tile_k={tile_shape_mnk[2]}"
+                    )
+                # The module's own reduce kernel sums the partials after
+                # the GEMM, so no torch ops follow the call.
+                partial = _get_cache_buf(
+                    "mm_bf16_fp4_split_k_partial",
+                    k_splits * m * n * 4,
+                    a.device,
+                ).view(torch.float32)
             else:
-                partial = _get_split_k_dummy(a.device)
+                partial = _get_cache_buf(
+                    "mm_bf16_fp4_split_k_partial_dummy", 16, a.device
+                ).view(torch.float32)
             compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)
             return out
 
