@@ -861,7 +861,17 @@ def group_gemm_fp8_nt_groupwise_cutile(
     # device-side max_m_device for its loop bound; ``max_m=total_m`` is a safe host
     # grid overestimate capped at NUM_SMS). This cannot be auto-detected without a
     # host sync that would break capture, so it is a caller contract.
-    if segment_alignment >= 128 and segment_alignment % 128 == 0:
+    # ``ragged_block_scaled_bmm`` indexes b_scale on the N axis as
+    # ``n_offset // BLOCK_K`` and its configs fix BLOCK_K=128, so it is correct
+    # only when the N and K scale granularities match (block_n == block_k) and K
+    # tiles evenly by block_k. Otherwise fall through to the gather kernel, which
+    # handles arbitrary (block_n, block_k).
+    if (
+        segment_alignment >= 128
+        and segment_alignment % 128 == 0
+        and block_n == block_k
+        and K % block_k == 0
+    ):
         from .ragged_block_scaled_bmm_cutile import ragged_block_scaled_bmm
 
         # Pass ``out`` so the kernel stores into it directly (no extra copy).
