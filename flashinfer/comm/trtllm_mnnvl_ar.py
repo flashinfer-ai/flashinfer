@@ -247,13 +247,15 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     def _initialize_protocol(self) -> None:
         self.handle.lamport_initialize(self.rank, torch.float32)
         num_bytes_to_clear = [0] * 4
-        self.buffer_flags.copy_(
-            torch.tensor(
-                [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
-                dtype=torch.uint32,
-                device=self.buffer_flags.device,
+        # The workspace may be created under inference mode and restored outside it.
+        with torch.inference_mode():
+            self.buffer_flags.copy_(
+                torch.tensor(
+                    [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+                    dtype=torch.uint32,
+                    device=self.buffer_flags.device,
+                )
             )
-        )
         torch.cuda.synchronize()
 
     @flashinfer_api
@@ -273,7 +275,15 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
 
     @flashinfer_api
     def checkpoint_restore(self, comm_backend: CommBackend) -> None:
-        """Restore physical backing; repeated successful calls are no-ops."""
+        """Restore physical backing; repeated successful calls are no-ops.
+
+        Parameters
+        ----------
+        comm_backend : CommBackend
+            Communication backend used to recreate and exchange MNNVL memory
+            handles. It must have the same rank and world size as the original
+            allocation.
+        """
         memory = getattr(self.handle, "mcast_device_memory", None)
         if not isinstance(memory, SymmDeviceMemory):
             raise NotImplementedError(

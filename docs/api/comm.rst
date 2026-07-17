@@ -89,8 +89,6 @@ Unified AllReduce Fusion API
     allreduce_fusion
     create_allreduce_fusion_workspace
     AllReduceFusionWorkspace
-    TRTLLMAllReduceFusionWorkspace
-    MNNVLAllReduceFusionWorkspace
 
 All-reduce workspaces backed by ``SymmDeviceMemory`` preserve their CUDA
 virtual addresses across process checkpoint/restore.  After quiescing all
@@ -109,13 +107,17 @@ exception occurs after detach or reattach begins, do not retry or reuse the
 workspace; restart the affected rank.  Workspaces backed by torch symmetric
 memory do not support this lifecycle.
 
-.. autosummary::
-    :toctree: ../generated
+.. autoclass:: TRTLLMAllReduceFusionWorkspace
+    :members:
+    :show-inheritance:
 
-    TRTLLMAllReduceFusionWorkspace.checkpoint_prepare
-    TRTLLMAllReduceFusionWorkspace.checkpoint_restore
-    MNNVLAllReduceFusionWorkspace.checkpoint_prepare
-    MNNVLAllReduceFusionWorkspace.checkpoint_restore
+    .. automethod:: __init__
+
+.. autoclass:: MNNVLAllReduceFusionWorkspace
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
 
 vLLM AllReduce
 --------------

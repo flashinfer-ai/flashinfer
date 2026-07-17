@@ -179,6 +179,13 @@ def make_bucket_mapper(
 
 _METADATA_KEY = "_metadata"
 
+# Metadata values a writer records when it cannot determine a field.
+# ("None" covers files written by versions that stringified a null version
+# report.)  A cache carrying these values is ignored on load, but — unlike a
+# genuine environment mismatch — may be overwritten on save, so a poisoned
+# file heals on the next tuned run instead of forcing a re-tune forever.
+_INDETERMINATE_META_VALUES = (None, "unknown", "None")
+
 
 def _get_cublas_version() -> str:
     """Return the cuBLAS version as ``major.minor.patch``.
@@ -261,6 +268,32 @@ def _get_cublas_version() -> str:
     return "unknown"
 
 
+def _get_cudnn_backend_version() -> str:
+    """Return the cuDNN backend version as a string, or ``"unknown"``.
+
+    ``torch.backends.cudnn.version()`` returns ``None`` (or raises) when
+    torch has not loaded cuDNN in this process — e.g. before torch's lazy
+    cuDNN initialization, or in a CPU-only context.  Fall back to the
+    cudnn-frontend's ``backend_version()``, which queries libcudnn directly
+    without torch's lazy init (the same gate ``gemm_base`` uses).
+    """
+    try:
+        version = torch.backends.cudnn.version()
+        if version:
+            return str(version)
+    except Exception:
+        pass
+    try:
+        import cudnn as _cudnn_frontend
+
+        version = _cudnn_frontend.backend_version()
+        if version:
+            return str(version)
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _collect_metadata() -> dict[str, str]:
     """Collect environment metadata that can affect tactic-to-kernel mappings.
 
@@ -288,10 +321,7 @@ def _collect_metadata() -> dict[str, str]:
     meta["flashinfer_version"] = _flashinfer_version
     meta["cuda_version"] = getattr(torch.version, "cuda", None) or "unknown"
     meta["cublas_version"] = _get_cublas_version()
-    try:
-        meta["cudnn_version"] = str(torch.backends.cudnn.version())
-    except Exception:
-        meta["cudnn_version"] = "unknown"
+    meta["cudnn_version"] = _get_cudnn_backend_version()
     try:
         # cudnn-frontend is an optional dependency; failing to import is
         # not fatal -- we just record "unknown" and let the metadata
@@ -308,6 +338,45 @@ def _collect_metadata() -> dict[str, str]:
     except Exception:
         meta["gpu"] = "unknown"
     return meta
+
+
+def _classify_metadata_mismatches(
+    saved_meta: dict[str, Any], current_meta: dict[str, str]
+) -> tuple[dict[str, tuple[Any, str]], dict[str, tuple[Any, str]]]:
+    """Split saved-vs-current metadata mismatches by severity.
+
+    Returns ``(hard, soft)``, each mapping ``key -> (saved, current)``:
+
+      * ``hard`` — the writer recorded a definite value that differs from
+        the current environment: a genuine environment conflict.  Neither
+        reading the file's configs nor overwriting the file is safe.
+      * ``soft`` — the writer recorded an indeterminate value (or the key
+        is missing, for files from older flashinfer versions): the configs
+        cannot be trusted, but replacing the file with freshly tuned
+        configs and the current environment's metadata is safe.
+
+    A saved value of ``"*"`` is a wildcard and never mismatches.  Keys in
+    ``saved_meta`` that ``current_meta`` does not track are ignored.  A
+    corrupt (non-dict) ``saved_meta`` is treated as all-keys-missing: the
+    file is unattributable, i.e. every mismatch is soft.
+    """
+    if not isinstance(saved_meta, dict):
+        saved_meta = {}
+    hard: dict[str, tuple[Any, str]] = {}
+    soft: dict[str, tuple[Any, str]] = {}
+    for key, current in current_meta.items():
+        saved = saved_meta.get(key)
+        if saved in (current, "*"):
+            continue
+        target = soft if saved in _INDETERMINATE_META_VALUES else hard
+        target[key] = (saved, current)
+    return hard, soft
+
+
+def _format_meta_mismatches(mismatches: dict[str, tuple[Any, str]]) -> str:
+    return ", ".join(
+        f"{k}: saved={old} vs current={new}" for k, (old, new) in mismatches.items()
+    )
 
 
 def get_config_path(is_module: bool):
@@ -712,17 +781,16 @@ def autotune(
             "pass None (or omit) to inherit the current buckets"
         )
 
-    # Load configs from cache file on entry (if it exists).
-    # cache_valid is False when the file exists but has a metadata mismatch;
-    # in that case we skip saving on exit to avoid overwriting configs from
-    # a different environment.
-    cache_valid = True
+    # Load configs from cache file on entry (if it exists).  A file with
+    # mismatched metadata is ignored here; whether it may be overwritten on
+    # exit is decided by save_configs at save time (it re-reads the file,
+    # so a heal or replacement by another process is re-evaluated).
     if cache is not None:
         with tuner._lock:
             tuner._file_configs.clear()
             tuner._logged_file_hits.clear()
         if os.path.isfile(cache):
-            cache_valid = tuner.load_configs(cache)
+            tuner.load_configs(cache)
 
     # Push skip_ops onto per-thread stack.  Each entry is the cumulative
     # union so that _effective_skip_ops is an O(1) read from the top.
@@ -783,10 +851,12 @@ def autotune(
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
 
-        # Save configs on exit when tuning with a cache path,
-        # but only if new profiling results were added this session
-        # and the cache file was valid (no environment mismatch).
-        if cache is not None and cache_valid and tune_mode and tuner._dirty:
+        # Save configs on exit when tuning with a cache path, but only if
+        # new profiling results were added this session.  save_configs
+        # itself refuses to overwrite a file that belongs to a genuinely
+        # different environment, and replaces one whose recorded
+        # environment is indeterminate.
+        if cache is not None and tune_mode and tuner._dirty:
             tuner.save_configs(cache)
 
 
@@ -1052,6 +1122,10 @@ class AutoTuner:
         self._file_configs: dict[str, tuple[str, Any]] = {}
         # Track which file config keys have been logged (to avoid per-call spam)
         self._logged_file_hits: set[tuple[str, str]] = set()
+        # Cache-metadata mismatch severities ("hard"/"soft") already logged at
+        # WARNING; repeats for further cache files are logged at DEBUG (a
+        # deployment can touch dozens of cache files per process).
+        self._warned_cache_mismatch: set[str] = set()
         # Track which (custom_op, profile-shape signature) pairs have already
         # produced an out-of-range cache-miss warning, so we warn at most
         # once per unique missing shape.
@@ -2049,6 +2123,21 @@ class AutoTuner:
         results taking priority for overlapping keys). This ensures the saved
         file is always a complete, self-contained config.
 
+        If a file already exists at ``path``, its ``_metadata`` decides how
+        the save proceeds:
+
+            * matches the current environment (or the file predates
+              metadata) — on-disk entries are merged with this process's
+              entries and the original "created by" record is preserved;
+            * indeterminate (``"unknown"`` values, or keys missing from
+              files written by older flashinfer versions) — the on-disk
+              entries were tuned in an environment the writer could not
+              identify, so the file is **replaced** with this process's
+              configs stamped with the current metadata (healing the file);
+            * definite conflict — the file belongs to a different
+              environment sharing this path; the save is skipped with a
+              warning so that environment's configs survive.
+
         Note:
             This is called automatically on exit from
             ``with autotune(True, cache=path):``. Direct calls are only needed
@@ -2094,16 +2183,51 @@ class AutoTuner:
 
         # Re-read the file from disk and merge to reduce lost updates when
         # multiple processes save to the same path.  Entries from this
-        # process take priority over on-disk entries.
+        # process take priority over on-disk entries.  The decision is made
+        # here, at save time, so that a file healed or replaced by another
+        # process since our load_configs() call is re-evaluated against its
+        # current on-disk metadata.
         abs_path = os.path.abspath(path)
         original_metadata = None
         try:
             with open(abs_path, "r") as f:
                 disk_configs = json.load(f)
-            # Preserve the original _metadata from disk (the "created by" record).
-            original_metadata = disk_configs.pop(_METADATA_KEY, None)
-            disk_configs.update(configs)
-            configs = disk_configs
+            if not isinstance(disk_configs, dict):
+                disk_configs = {}
+            disk_meta = disk_configs.pop(_METADATA_KEY, None)
+            hard, soft = (
+                _classify_metadata_mismatches(disk_meta, current_meta)
+                if disk_meta is not None
+                else ({}, {})
+            )
+            if hard:
+                # Genuine environment conflict: leave the other
+                # environment's file untouched (mirrors load_configs).
+                message = (
+                    f"[Autotuner]: Not saving configs to {path}: the file "
+                    f"was created in a different environment "
+                    f"({_format_meta_mismatches(hard)}). Use a different "
+                    f"cache path for the current environment, or delete "
+                    f"the file to re-prime it."
+                )
+                with self._lock:
+                    if "hard" in self._warned_cache_mismatch:
+                        logger.debug(message)
+                    else:
+                        self._warned_cache_mismatch.add("hard")
+                        logger.warning(message)
+                return
+            if not soft:
+                # Same environment: merge on-disk entries and preserve the
+                # original "created by" record.
+                disk_configs.update(configs)
+                configs = disk_configs
+                original_metadata = disk_meta
+            # else: the on-disk entries were tuned in an environment the
+            # writer could not identify ("unknown") — drop them and replace
+            # the file, stamping the current metadata.  This heals caches
+            # poisoned by e.g. cudnn_version="unknown", which would
+            # otherwise be ignored by every future load_configs() forever.
         except (FileNotFoundError, json.JSONDecodeError):
             pass  # file doesn't exist yet or is being replaced -- proceed with what we have
 
@@ -2165,10 +2289,21 @@ class AutoTuner:
               ``policy=ALL`` plan_index ordering independent of backend)
             * ``gpu`` (different SM may expose different engines)
 
-        Caches saved by older flashinfer versions that predate the
-        ``cudnn_frontend_version`` metadata field will fail this check
-        (since saved metadata does not contain the field) and need to
-        be regenerated.  See :func:`_collect_metadata` for the exact list.
+        A skipped cache is handled in one of two ways by the next
+        :meth:`save_configs` on the same path:
+
+            * the saved metadata records a **definite** conflicting value —
+              a genuine environment conflict; the file is never
+              overwritten.  Use a different cache path, or delete the file
+              to re-prime it for this environment.
+            * the saved metadata is **indeterminate** — ``"unknown"``
+              values (the writer could not detect e.g. its cuDNN version),
+              or keys missing entirely from files written by older
+              flashinfer versions.  The file is replaced with freshly
+              tuned configs and the current environment's metadata, so the
+              cache heals instead of being re-tuned forever.
+
+        See :func:`_collect_metadata` for the exact field list.
 
         Note:
             This is called automatically on entry to
@@ -2206,24 +2341,35 @@ class AutoTuner:
         # entirely to avoid silently using invalid or suboptimal tactics.
         if saved_meta is not None:
             current_meta = _collect_metadata()
-            mismatches = {
-                k: (saved_meta.get(k), current_meta.get(k))
-                for k in current_meta
-                if saved_meta.get(k) not in (current_meta.get(k), "*")
-            }
-            if mismatches:
-                details = ", ".join(
-                    f"{k}: saved={old} vs current={new}"
-                    for k, (old, new) in mismatches.items()
+            hard, soft = _classify_metadata_mismatches(saved_meta, current_meta)
+            if hard or soft:
+                if hard:
+                    severity = "hard"
+                    consequence = (
+                        "Results will not be saved to this file to avoid "
+                        "overwriting configs from a different environment. "
+                        "Use a different cache path for the current "
+                        "environment, or delete the file to re-prime it."
+                    )
+                else:
+                    severity = "soft"
+                    consequence = (
+                        "The file's recorded environment is indeterminate, "
+                        "so the next save will replace it with freshly "
+                        "tuned configs for the current environment."
+                    )
+                message = (
+                    f"[Autotuner]: Cache file {path} was created in a "
+                    f"different environment "
+                    f"({_format_meta_mismatches({**hard, **soft})}). "
+                    f"Ignoring cached configs. {consequence}"
                 )
-                logger.warning(
-                    f"[Autotuner]: Cache file {path} was created in a different "
-                    f"environment ({details}). Ignoring cached configs. "
-                    f"Results will not be saved to this file to avoid "
-                    f"overwriting configs from a different environment. "
-                    f"Use a different cache path to save configs for the "
-                    f"current environment."
-                )
+                with self._lock:
+                    if severity in self._warned_cache_mismatch:
+                        logger.debug(message)
+                    else:
+                        self._warned_cache_mismatch.add(severity)
+                        logger.warning(message)
                 return False
 
         skipped_legacy_cudnn_tactics = 0

@@ -34,6 +34,10 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
 
+constexpr int kEp4Size = 4;
+constexpr int kCompactDispatchMaxPayloadBytes = 1024;
+constexpr int kCompactDispatchBlockSize = 128;
+
 #ifndef DISABLE_TIMEOUT
 #define DISABLE_TIMEOUT 0
 #endif
@@ -370,13 +374,10 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token
 
 // ============================================================================
 // Generic Dispatch Kernel Implementation
-// One warp per token design:
-// - Each CTA has 256 threads = 8 warps
-// - Each warp independently processes one token and all its payloads
-// - Better GPU utilization and reduced synchronization overhead
+// One CTA processes one token and all its payloads.
 // ============================================================================
 
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool COMPACT_EP4>
 __global__ void moeA2ADispatchKernel(
     int32_t const* token_selected_experts,  // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
@@ -384,6 +385,7 @@ __global__ void moeA2ADispatchKernel(
     int max_tokens_per_rank,                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts,
     bool enable_pdl) {
+  static_assert(!COMPACT_EP4 || TOP_K > kEp4Size);
   int thread_idx = threadIdx.x;
   int local_token_idx = blockIdx.x;
 
@@ -406,75 +408,96 @@ __global__ void moeA2ADispatchKernel(
     // Prepare per-policy shared-memory tiles for this token
     extern __shared__ int smem[];
     int* smem_topk_target_ranks = smem;
-    int* smem_topk_send_indices = smem + TOP_K;
+    int* smem_topk_send_indices = nullptr;
+    int* smem_compact_send_indices = smem;
+    if constexpr (!COMPACT_EP4) {
+      smem_topk_send_indices = smem + TOP_K;
+    }
 
-    uint64_t already_copied[kRankMaskWords] = {};
     // Precompute the ceil/floor partition parameters once per thread, outside the
     // per-token TOP_K loop.  The fast path (remainder == 0) then collapses to a single
     // integer divide per call, matching the pre-PR uniform-partition cost exactly.
     int const ep_base = num_experts / ep_size;
     int const ep_remainder = num_experts - ep_base * ep_size;  // == num_experts % ep_size
-    for (int k = 0; k < TOP_K; k++) {
-      int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-      // Use contiguous ceil/floor partitioning (supports non-divisible num_experts % ep_size).
-      int target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
 
-      // Skip duplicates AND dead ranks: both produce the same -1 sentinel that combine checks
-      // via topk_send_indices[k] < 0. A token whose only target is dead is dropped from this
-      // collective; higher-layer logic (e.g. EPLB redistribution) is responsible for re-routing
-      // such tokens on subsequent iterations. When ENABLE_RANK_MASK is false, the dead-rank check
-      // is compiled out entirely (no active_rank_mask load/branch on this per-token hot path).
-      int const mask_word = target_rank >> 6;
-      uint64_t const mask_bit = 1ULL << (target_rank & 63);
-      bool const target_already_copied = already_copied[mask_word] & mask_bit;
-      bool skip_target = target_already_copied;
-      if constexpr (ENABLE_RANK_MASK) {
-        skip_target = skip_target || !is_rank_active(ptrs.active_rank_mask, target_rank);
-      }
-      if (skip_target) {
-        if (thread_idx == 0) {
-          ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = -1;
-          ptrs.topk_send_indices[local_token_idx * TOP_K + k] = -1;
-          // Mirror to shared memory immediately
-          smem_topk_target_ranks[k] = -1;
-          smem_topk_send_indices[k] = -1;
+    if (thread_idx < warpSize) {
+      int lane_id = thread_idx;
+      if constexpr (COMPACT_EP4) {
+        if (lane_id < kEp4Size) {
+          smem_compact_send_indices[lane_id] = -1;
         }
-        continue;
+        __syncwarp();
       }
 
-      // Only one thread per warp should increment the counter
-      int dst_token_idx;
-      if (thread_idx == 0) {
-        dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
+      unsigned topk_mask = __ballot_sync(0xffffffff, lane_id < TOP_K);
+      if (lane_id < TOP_K) {
+        int k = lane_id;
+        int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
+        // Use contiguous ceil/floor partitioning (supports non-divisible num_experts % ep_size).
+        int target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
+
+        // Elect the first top-k lane for each destination rank; duplicate targets within a
+        // token collapse to a single send (replaces the old serial already_copied bitmask).
+        unsigned matching_lanes = __match_any_sync(topk_mask, target_rank);
+        bool is_first = lane_id == __ffs(matching_lanes) - 1;
+
+        // Dead ranks (ENABLE_RANK_MASK) are dropped the same way as duplicates: no send is
+        // issued and topk_send_indices[k] stays < 0, so combine's existing skip check on that
+        // sentinel handles both cases uniformly. When ENABLE_RANK_MASK is false, the dead-rank
+        // check is compiled out entirely (no active_rank_mask load/branch on this hot path).
+        bool is_valid = is_first;
+        if constexpr (ENABLE_RANK_MASK) {
+          is_valid = is_valid && is_rank_active(ptrs.active_rank_mask, target_rank);
+        }
+
+        int dst_token_idx = -1;
+        if (is_valid) {
+          dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
+          if constexpr (COMPACT_EP4) {
+            smem_compact_send_indices[target_rank] = dst_token_idx;
+          }
+        } else {
+          target_rank = -1;
+        }
 
         ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
         ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
-        // Mirror to shared memory immediately
-        smem_topk_target_ranks[k] = target_rank;
-        smem_topk_send_indices[k] = dst_token_idx;
+        if constexpr (!COMPACT_EP4) {
+          smem_topk_target_ranks[k] = target_rank;
+          smem_topk_send_indices[k] = dst_token_idx;
+        }
       }
-      already_copied[mask_word] |= mask_bit;
     }
     // Sync before dispatching data
     __syncthreads();
 
-    // Read staged routing once into registers per thread
-    int topk_target_ranks[TOP_K];
-    int topk_send_indices[TOP_K];
+    // EP4 has at most four unique destinations, regardless of TOP_K. The compact
+    // specialization avoids expanding those destinations back to TOP_K entries.
+    constexpr int NUM_DESTINATIONS = COMPACT_EP4 ? kEp4Size : TOP_K;
+    int target_ranks[NUM_DESTINATIONS];
+    int send_indices[NUM_DESTINATIONS];
+    if constexpr (COMPACT_EP4) {
 #pragma unroll
-    for (int k = 0; k < TOP_K; ++k) {
-      topk_target_ranks[k] = smem_topk_target_ranks[k];
-      topk_send_indices[k] = smem_topk_send_indices[k];
+      for (int target_rank = 0; target_rank < NUM_DESTINATIONS; ++target_rank) {
+        target_ranks[target_rank] = target_rank;
+        send_indices[target_rank] = smem_compact_send_indices[target_rank];
+      }
+    } else {
+#pragma unroll
+      for (int k = 0; k < TOP_K; ++k) {
+        target_ranks[k] = smem_topk_target_ranks[k];
+        send_indices[k] = smem_topk_send_indices[k];
+      }
     }
 
-    // Perform a single source load and TOP_K fanout per payload
+    // Perform a single source load and fan out to each unique destination.
     for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
       uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
       int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
       uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
 
-      vectorized_dispatch<TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                 payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+      vectorized_dispatch<NUM_DESTINATIONS>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                                            payload_idx, ptrs, target_ranks, send_indices);
     }
 
     __syncthreads();
@@ -651,26 +674,56 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
     kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
   }
 
-  int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
-  // Configure kernel launch: one block per token.
+  int block_size = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
+
+  bool const use_compact_ep4 = params.ep_size == kEp4Size && params.top_k > kEp4Size;
+
+  int max_payload_bytes_per_token = 0;
+  for (int i = 0; i < params.num_payloads; ++i) {
+    if (kernel_ptrs.payload_bytes_per_token[i] > max_payload_bytes_per_token) {
+      max_payload_bytes_per_token = kernel_ptrs.payload_bytes_per_token[i];
+    }
+  }
+  // Small payloads do not have enough 16-byte vectors to use larger CTAs. A GB200
+  // sweep found 128 threads faster than both 64 and 256 at prefill token counts.
+  if (use_compact_ep4 && max_payload_bytes_per_token <= kCompactDispatchMaxPayloadBytes &&
+      block_size > kCompactDispatchBlockSize) {
+    block_size = kCompactDispatchBlockSize;
+  }
+
+  // Configure kernel launch: one block per token
   int grid_size = params.local_num_tokens;
   // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
   // synchronization.
   if (grid_size == 0) {
     grid_size = 1;
   }
-  int shared_bytes = 2 * params.top_k * (int)sizeof(int);
   SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
     SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
-      SWITCH_TOP_K(params.top_k, TOP_K, {
-        auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK>;
-        launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
-                                 kBlockSize, shared_bytes, params.stream,
-                                 params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                                 params.max_tokens_per_rank, params.local_num_tokens,
-                                 params.ep_rank, params.ep_size, params.num_experts,
-                                 params.eplb_stats_num_experts, params.enable_pdl);
-      });
+      if (use_compact_ep4) {
+        int shared_bytes = kEp4Size * (int)sizeof(int);
+        SWITCH_TOP_K(
+            params.top_k, TOP_K, if constexpr (TOP_K > kEp4Size) {
+              auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, true>;
+              launchWithPdlWhenEnabled(
+                  "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
+                  shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+                  params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
+                  params.ep_rank, params.ep_size, params.num_experts,
+                  params.eplb_stats_num_experts, params.enable_pdl);
+            })
+      } else {
+        int shared_bytes = 2 * params.top_k * (int)sizeof(int);
+        SWITCH_TOP_K(params.top_k, TOP_K, {
+          auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, false>;
+          launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
+                                   block_size, shared_bytes, params.stream,
+                                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                                   params.max_tokens_per_rank, params.local_num_tokens,
+                                   params.ep_rank, params.ep_size, params.num_experts,
+                                   params.eplb_stats_num_experts, params.enable_pdl);
+        });
+      }
     });
   })
 }
