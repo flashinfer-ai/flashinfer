@@ -708,7 +708,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.mUseDeepSeekFp8 = true;
   activationData.inPtr = workspace.gemm1_output;
   activationData.outPtr = workspace.activation_output;
-  activationData.inDqSfsPtr = workspace.gemm1_output_scale;
+  activationData.inDqSfsPtr = static_cast<float*>(workspace.gemm1_output_scale);
   activationData.outDqSfsPtr = workspace.activation_output_scale;
   activationData.innerDim =
       args.intermediate_size * (isGatedActivation(args.activation_type) ? 2 : 1);
@@ -865,7 +865,8 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
       FLASHINFER_CHECK(workspace.gemm1_output_scale != nullptr);
       invokeScaleOnlyQuantAndPerTokenScale(
           args.num_tokens * totalExpertsPerToken, args.intermediate_size,
-          workspace.gemm1_output_scale, globalScaleInv, workspace.expanded_idx_to_permuted_idx,
+          static_cast<float const*>(workspace.gemm1_output_scale), globalScaleInv,
+          workspace.expanded_idx_to_permuted_idx,
           reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
           reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
     } else {

@@ -1020,7 +1020,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
-    workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
+    workspace.gemm1_output_scale = gemm1_output_scale.data_ptr();
     workspace.activation_output = nullptr;
     workspace.activation_output_scale = nullptr;
     workspace.gemm2_output = gemm2_output.data_ptr();
@@ -1385,7 +1385,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
-    workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
+    workspace.gemm1_output_scale = gemm1_output_scale.data_ptr();
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
       workspace.activation_output = activation_output.data_ptr();
       workspace.activation_output_scale = static_cast<float*>(activation_output_scale.data_ptr());
@@ -1974,9 +1974,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     // Setup workspace pointers
     workspace.hidden_states_scale_linear = nullptr;  // FP4 doesn't use linear scale
     workspace.gemm1_output = gemm1_output.data_ptr();
-    workspace.gemm1_output_scale = gemm1_output_scale.has_value()
-                                       ? static_cast<float*>(gemm1_output_scale.value().data_ptr())
-                                       : nullptr;
+    workspace.gemm1_output_scale =
+        gemm1_output_scale.has_value() ? gemm1_output_scale.value().data_ptr() : nullptr;
     if (per_token_scales.has_value()) {
       workspace.token_scales = per_token_scales.value().data_ptr();
       workspace.activation_output = activation_output.data_ptr();

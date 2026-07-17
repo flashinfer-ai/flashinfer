@@ -390,7 +390,7 @@ struct MoEWorkspace {
   // Gemm1 intermediate outputs:
   int32_t ProjUpTileN{0};
   void* gemm1_output = nullptr;
-  float* gemm1_output_scale = nullptr;
+  void* gemm1_output_scale = nullptr;
 
   // Activation intermediate outputs:
   void* activation_output = nullptr;
