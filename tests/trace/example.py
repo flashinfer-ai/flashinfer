@@ -65,6 +65,7 @@ rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
+silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -232,6 +233,7 @@ from flashinfer.quantization.fp4_quantization import (
     nvfp4_kv_dequantize_paged,
     mxfp4_quantize,
     nvfp4_quantize,
+    silu_and_mul_nvfp4_quantize,
 )
 from flashinfer.quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
@@ -250,6 +252,13 @@ with contextlib.suppress(Exception):
     mxfp4_quantize(quant_input_bf16)
 with contextlib.suppress(Exception):
     mxfp8_quantize(quant_input_bf16)
+# Match silu_and_mul_h16384 with a gated [M, 2K] input and packed [M, K/2] output.
+with contextlib.suppress(Exception):
+    silu_and_mul_nvfp4_quantize(
+        torch.randn(quant_M, 2 * 8192, dtype=torch.bfloat16, device=device),
+        quant_global_sf,
+        sf_vec_size=16,
+    )
 
 # Paged NVFP4 KV dequantization helper: NHD and HND cache layouts.
 with contextlib.suppress(Exception):
