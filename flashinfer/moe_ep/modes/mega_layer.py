@@ -43,6 +43,9 @@ class MoEEpMegaLayer(nn.Module):
     the one the graph writes on every replay — consume that same tensor
     across replays (standard graph practice). Lazy compile/alloc/autotune
     paths raise if they would fire mid-capture instead of corrupting it.
+
+    Call :meth:`destroy` before process-group or peer teardown. ``__del__`` is a
+    best-effort fallback and provides no deterministic teardown guarantee.
     """
 
     def __init__(
@@ -198,17 +201,17 @@ class MoEEpMegaLayer(nn.Module):
 
         workspace = self._ensure_workspace()
 
-        self._kernel.stage_inputs(
-            t,
-            workspace,
-            quantize_input=quantize_input,
-        )
-
         y = torch.empty(
             t.num_tokens,
             self._fleet_params.token_hidden_size,
             dtype=torch.bfloat16,
             device=t.hidden_states.device,
+        )
+        self._kernel.stage_inputs(
+            t,
+            workspace,
+            quantize_input=quantize_input,
+            output=y,
         )
         return self._kernel.compute(
             workspace,

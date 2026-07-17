@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import tempfile
 import types
 from pathlib import Path
 from typing import Any, Dict, Set
@@ -28,6 +30,25 @@ from flashinfer.jit import MissingJITCacheError
 # Global tracking for JIT cache coverage
 # Store tuples of (test_name, module_name, spec_info)
 _MISSING_JIT_CACHE_MODULES: Set[tuple] = set()
+
+
+@pytest.fixture(scope="session")
+def isolated_deep_gemm_cache():
+    """Provide one session cache when the caller did not configure DeepGEMM."""
+    configured_cache = os.environ.get("TRTLLM_DG_CACHE_DIR")
+    if configured_cache is not None:
+        yield configured_cache
+        return
+
+    cache_dir = tempfile.mkdtemp(prefix="flashinfer-deep-gemm-test-")
+    os.environ["TRTLLM_DG_CACHE_DIR"] = cache_dir
+    try:
+        yield cache_dir
+    finally:
+        if os.environ.get("TRTLLM_DG_CACHE_DIR") == cache_dir:
+            os.environ.pop("TRTLLM_DG_CACHE_DIR")
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
 
 # File path for aggregating JIT cache info across multiple pytest runs
 _JIT_CACHE_REPORT_FILE = os.environ.get("FLASHINFER_JIT_CACHE_REPORT_FILE", None)
