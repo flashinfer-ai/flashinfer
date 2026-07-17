@@ -52,6 +52,12 @@ def _per_token_group_quant_8bit_kernel(
     y = ct.gather(y_input, (y_indices,), check_bounds=True, padding_value=0.0)
     y = ct.astype(y, ct.float32)
 
+    # Zero the padded lanes (BLOCK = next_pow2(group_size) > group_size when
+    # group_size is not a power of two). Those lanes gather in-bounds data from
+    # the *next* group (gather's padding_value only fires on true OOB), so
+    # without this they would corrupt the absmax reduction below.
+    y = ct.where(mask, y, 0.0)
+
     # Compute absmax
     abs_y = ct.abs(y)
     _absmax = ct.max(abs_y, axis=0)
@@ -117,6 +123,12 @@ def _per_token_group_quant_8bit_colmajor_kernel(
     y = ct.gather(y_input, (y_indices,), check_bounds=True, padding_value=0.0)
     y = ct.astype(y, ct.float32)
 
+    # Zero the padded lanes (BLOCK = next_pow2(group_size) > group_size when
+    # group_size is not a power of two). Those lanes gather in-bounds data from
+    # the *next* group (gather's padding_value only fires on true OOB), so
+    # without this they would corrupt the absmax reduction below.
+    y = ct.where(mask, y, 0.0)
+
     # Compute absmax
     abs_y = ct.abs(y)
     _absmax = ct.max(abs_y, axis=0)
@@ -178,6 +190,11 @@ def per_token_group_quant_8bit_cutile(
     """
     if dst_dtype is None:
         dst_dtype = torch.float8_e4m3fn
+    if dst_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8):
+        raise ValueError(
+            "dst_dtype must be float8_e4m3fn, float8_e5m2, or int8; "
+            f"got {dst_dtype}"
+        )
     assert x.shape[-1] % group_size == 0, (
         f"the last dimension of `x` {x.shape[-1]} must be divisible by `group_size` {group_size}"
     )
@@ -202,6 +219,11 @@ def per_token_group_quant_8bit_cutile(
     N = group_size
 
     if column_major_scales:
+        if x.dim() != 2:
+            raise ValueError(
+                "column_major_scales is only supported for 2D inputs; "
+                f"got a {x.dim()}D input"
+            )
         num_groups = x.shape[-1] // group_size
         num_tokens = x.shape[-2] if x.dim() >= 2 else x.shape[0]
         if scale_tma_aligned:

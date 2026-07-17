@@ -7,6 +7,7 @@ import torch
 
 from flashinfer.cutile.cutile_common import is_cuda_tile_available
 from flashinfer.quantization import per_token_group_quant_8bit
+from flashinfer.utils import get_compute_capability
 
 if not is_cuda_tile_available():
     pytest.skip("cuda.tile not available", allow_module_level=True)
@@ -14,9 +15,9 @@ if not is_cuda_tile_available():
 
 @pytest.fixture(autouse=True)
 def require_sm90():
-    cc = torch.cuda.get_device_capability()
-    if cc[0] * 10 + cc[1] < 90:
-        pytest.skip(f"requires sm90+, got sm{cc[0] * 10 + cc[1]}")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if major * 10 + minor < 90:
+        pytest.skip(f"requires sm90+, got sm{major * 10 + minor}")
 
 
 def _ref_quant(x, group_size, dst_dtype):
@@ -98,6 +99,9 @@ def test_column_major_scales(num_tokens, hidden_dim, group_size, dst_dtype, back
         f"expected ({num_tokens},{n_groups}) got {x_s.shape}"
     )
     assert not x_s.isnan().any()
+    # Column-major (Fortran order): the token dim is the contiguous one, so its
+    # stride is 1 — this is what makes the scales TMA-loadable per group.
+    assert x_s.stride(0) == 1, f"expected column-major scales, got strides {x_s.stride()}"
 
 
 @pytest.mark.parametrize(
@@ -106,8 +110,8 @@ def test_column_major_scales(num_tokens, hidden_dim, group_size, dst_dtype, back
 @pytest.mark.parametrize("backend", ["cutile"])
 def test_scale_ue8m0(num_tokens, hidden_dim, group_size, backend):
     """UE8M0 scale format (Blackwell only)."""
-    cc = torch.cuda.get_device_capability()
-    if cc[0] < 10:
+    major, _ = get_compute_capability(torch.device("cuda"))
+    if major < 10:
         pytest.skip("scale_ue8m0 requires sm100+ (Blackwell)")
     torch.manual_seed(99)
     x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
@@ -121,3 +125,32 @@ def test_scale_ue8m0(num_tokens, hidden_dim, group_size, backend):
     )
     assert x_q.shape == x.shape
     assert not x_s.isnan().any()
+    # UE8M0 = 8-bit exponent, no mantissa, so every nonzero scale is an exact
+    # power of two. frexp of 2**k is (0.5, k+1), i.e. mantissa == 0.5.
+    nz = x_s[x_s != 0]
+    mant, _ = torch.frexp(nz)
+    assert torch.all(mant == 0.5), "UE8M0 scales must be exact powers of two"
+
+
+@pytest.mark.parametrize("num_tokens", [128, 257])
+@pytest.mark.parametrize("group_size", [96, 48])
+@pytest.mark.parametrize("dst_dtype", [torch.int8, torch.float8_e4m3fn])
+def test_non_pow2_group_size(num_tokens, group_size, dst_dtype):
+    """Regression: non-power-of-2 group_size. BLOCK = next_pow2(group_size) >
+    group_size, so the padded lanes gather in-bounds data from the next group;
+    without masking them out they corrupt the per-group absmax → wrong scales."""
+    torch.manual_seed(123)
+    hidden_dim = group_size * 12
+    x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
+
+    x_q, x_s = per_token_group_quant_8bit(
+        x,
+        group_size=group_size,
+        dst_dtype=dst_dtype,
+        column_major_scales=False,
+        backend="cutile",
+    )
+    ref_q, ref_s = _ref_quant(x, group_size, dst_dtype)
+
+    assert x_s.shape == (num_tokens, hidden_dim // group_size)
+    torch.testing.assert_close(x_s.float(), ref_s.float(), rtol=1e-3, atol=1e-3)
