@@ -104,11 +104,19 @@ def _get_dtype_str(dtype: torch.dtype) -> str:
 
 def _get_module_uri_with_offset(head_dim: int, dtype: torch.dtype, backend: str) -> str:
     """Generate unique identifier for with offset module
-    
+
     v2: 4 scalar params (sm_scale, dllm_block_size, q_block_expanding_offset,
                          kv_block_expanding_offset)
     Old version (without _v2 suffix) only has 3 scalars, will automatically match new URI when recompilation is needed.
     """
+    # dLLM closed product: restrict head_dim to what dLLM actually needs, matching the
+    # batch front-end. See docs/block-extend-design-response.md §1.
+    _supported_head_dims = {64, 128}
+    if head_dim not in _supported_head_dims:
+        raise ValueError(
+            f"Unsupported head_dim {head_dim} for Block Extend Attention. "
+            f"Supported (dLLM closed product): {sorted(_supported_head_dims)}."
+        )
     return f"block_expanding_{backend}_with_offset_v2_hdim{head_dim}_{_get_dtype_str(dtype)}"
 
 

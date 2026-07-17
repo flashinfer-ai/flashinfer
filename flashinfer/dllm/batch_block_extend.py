@@ -80,11 +80,11 @@ def check_kernel_availability(uri: str) -> tuple:
     return aot_available, jit_available, aot_path
 
 
-def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None) -> str:
+def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None, idtype: torch.dtype = torch.int32) -> str:
     """Select backend based on kernel availability and compute capability"""
     from ..utils import is_sm90a_supported
-    
-    base_uri = _get_batch_be_module_uri(head_dim, dtype)
+
+    base_uri = _get_batch_be_module_uri(head_dim, dtype, idtype)
     fa2_uri = base_uri + "_ragged_offset"
     fa3_uri = base_uri + "_ragged_offset_fa3"
     
@@ -135,11 +135,11 @@ def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: st
     raise ValueError(f"Unknown backend: {preferred_backend}")
 
 
-def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None) -> str:
+def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None, idtype: torch.dtype = torch.int32) -> str:
     """Select backend based on Paged kernel availability and compute capability"""
     from ..utils import is_sm90a_supported
 
-    base_uri = _get_batch_be_module_uri(head_dim, dtype)
+    base_uri = _get_batch_be_module_uri(head_dim, dtype, idtype)
     fa2_uri = base_uri + "_paged_offset"
     fa3_uri = base_uri + "_paged_offset_fa3"
 
@@ -189,14 +189,36 @@ def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backe
     raise ValueError(f"Unknown backend: {preferred_backend}")
 
 
-def _get_batch_be_module_uri(head_dim: int, dtype: torch.dtype) -> str:
+def _get_batch_be_module_uri(head_dim: int, dtype: torch.dtype, idtype: torch.dtype) -> str:
+    # The dLLM block-extend URIs are intentionally a CLOSED small cartesian product
+    # (the dedicated front-end's own product), not a value multiplied into the big
+    # shared prefill product. Restrict each axis to what dLLM actually needs so the
+    # dedicated variants cannot silently generalize. See
+    # docs/block-extend-design-response.md §1.
+    _SUPPORTED_HEAD_DIMS = {64, 128}
+    if head_dim not in _SUPPORTED_HEAD_DIMS:
+        raise ValueError(
+            f"Unsupported head_dim {head_dim} for Block Extend Attention. "
+            f"Supported (dLLM closed product): {sorted(_SUPPORTED_HEAD_DIMS)}."
+        )
     _dtype_map = {torch.float16: "fp16", torch.bfloat16: "bf16"}
     if dtype not in _dtype_map:
         raise ValueError(
             f"Unsupported dtype {dtype} for Block Extend Attention. "
             f"Supported: {list(_dtype_map.keys())}"
         )
-    return f"batch_prefill_block_expanding_hd{head_dim}_{_dtype_map[dtype]}"
+    _idtype_map = {torch.int32: "i32", torch.int64: "i64"}
+    if idtype not in _idtype_map:
+        raise ValueError(
+            f"Unsupported idtype {idtype} for Block Extend Attention. "
+            f"Supported: {list(_idtype_map.keys())}"
+        )
+    # idtype is embedded in the URI to match the standard batch-prefill URI scheme
+    # (``dtype_idx_{...}``), preventing JIT-cache aliasing between int32 and int64
+    # index builds of the same (head_dim, dtype) — a build for one idtype would
+    # otherwise overwrite the generated source directory of the other.
+    # See docs/block-extend-design-response.md §3.2.
+    return f"batch_prefill_block_expanding_hd{head_dim}_{_dtype_map[dtype]}_idx{_idtype_map[idtype]}"
 
 
 def _get_batch_be_aot_path(uri: str) -> Path:
@@ -305,15 +327,15 @@ class BatchBlockExtendPagedOffsetWrapper:
         self._kv_offsets: Optional[torch.Tensor] = None
     
     def _create_inner_wrapper(self, dtype: torch.dtype, head_dim: int, idtype: torch.dtype = torch.int32) -> None:
-        effective_backend = select_best_backend_paged(head_dim, dtype, self._preferred_backend, self._device)
+        effective_backend = select_best_backend_paged(head_dim, dtype, self._preferred_backend, self._device, idtype)
         self._backend = effective_backend
-        
+
         if self._backend == "fa3":
-            uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_offset_fa3"
+            uri = _get_batch_be_module_uri(head_dim, dtype, idtype) + "_paged_offset_fa3"
             variant_name = "BatchBlockExtendOffsetAttentionFA3"
             variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL_FA3
         else:
-            uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_offset"
+            uri = _get_batch_be_module_uri(head_dim, dtype, idtype) + "_paged_offset"
             variant_name = "BatchBlockExtendOffsetAttention"
             variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL
         
@@ -327,9 +349,15 @@ class BatchBlockExtendPagedOffsetWrapper:
         jit_kwargs = {
             "pos_encoding_mode": 0, "use_sliding_window": False,
             "use_logits_soft_cap": False, "use_fp16_qk_reduction": False,
-            "mask_modes": [0, 1, 2, 3, 4],
+            # Block-extend (dLLM) URIs compile ONLY mask_mode=kBlockExpanding (=4).
+            # The other modes (null/causal/custom/multi-item-scoring) are irrelevant
+            # for this dedicated front-end and must not be enumerated into its source
+            # set — that would inflate the dedicated URI's JIT cache and risk the
+            # dispatcher selecting a non-block-extend kernel behind this entry point.
+            # See docs/block-extend-design-response.md §1.
+            "mask_modes": [MaskMode.BLOCK_EXPANDING.value],
         }
-        
+
         self._inner_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             self._float_workspace_buffer, kv_layout=self._kv_layout,
             use_cuda_graph=self._use_cuda_graph, qo_indptr_buf=self._qo_indptr_buf,
@@ -443,15 +471,15 @@ class BatchBlockExtendRaggedOffsetWrapper:
         self._kv_offsets: Optional[torch.Tensor] = None
     
     def _create_inner_wrapper(self, dtype: torch.dtype, head_dim: int, idtype: torch.dtype = torch.int32) -> None:
-        effective_backend = select_best_backend(head_dim, dtype, self._preferred_backend, self._device)
+        effective_backend = select_best_backend(head_dim, dtype, self._preferred_backend, self._device, idtype)
         self._backend = effective_backend
-        
+
         if self._backend == "fa3":
-            uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_offset_fa3"
+            uri = _get_batch_be_module_uri(head_dim, dtype, idtype) + "_ragged_offset_fa3"
             variant_name = "BatchBlockExtendOffsetAttentionFA3"
             variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL_FA3
         else:
-            uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_offset"
+            uri = _get_batch_be_module_uri(head_dim, dtype, idtype) + "_ragged_offset"
             variant_name = "BatchBlockExtendOffsetAttention"
             variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL
         
@@ -465,9 +493,11 @@ class BatchBlockExtendRaggedOffsetWrapper:
         jit_kwargs = {
             "pos_encoding_mode": 0, "use_sliding_window": False,
             "use_logits_soft_cap": False, "use_fp16_qk_reduction": False,
-            "mask_modes": [0, 1, 2, 3, 4],
+            # Block-extend (dLLM) URIs compile ONLY mask_mode=kBlockExpanding (=4).
+            # See docs/block-extend-design-response.md §1 for rationale.
+            "mask_modes": [MaskMode.BLOCK_EXPANDING.value],
         }
-        
+
         self._inner_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
             self._float_workspace_buffer, kv_layout=self._kv_layout,
             use_cuda_graph=self._use_cuda_graph, qo_indptr_buf=self._qo_indptr_buf,

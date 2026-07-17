@@ -601,6 +601,188 @@ def test_cascade_precision_alignment(
     return {"results": results, "overall_pass": overall_pass}
 
 
+def compute_block_extend_offset_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dllm_block_size: int,
+    q_offset: int = 0,
+    kv_offset: int = 0,
+    sm_scale: float = None,
+) -> torch.Tensor:
+    """Reference implementation with explicit kv_offset (cascade "current chunk" shape).
+
+    mask[q, k] = ((q_offset + q_idx) // B) >= ((kv_offset + k_idx) // B)
+
+    Used by the zero-visible-KV regression test (test_zero_visible_kv_no_hang), which
+    needs a non-zero ``kv_offset`` to drive ``kv_valid_end <= 0`` on the first Q tile.
+    The standard ``compute_block_extend_reference`` assumes kv_offset=0 and so can
+    never construct that case.
+    """
+    qo_len = q.shape[0]
+    kv_len = k.shape[0]
+    if sm_scale is None:
+        head_dim = q.shape[-1]
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+    q_pos = torch.arange(qo_len, device=q.device) + q_offset
+    k_pos = torch.arange(kv_len, device=k.device) + kv_offset
+    q_block = q_pos.unsqueeze(1) // dllm_block_size
+    k_block = k_pos.unsqueeze(0) // dllm_block_size
+    mask_2d = (q_block >= k_block).to(torch.uint8)
+
+    return single_prefill_with_kv_cache(
+        q, k, v, custom_mask=mask_2d, sm_scale=sm_scale, backend="fa2"
+    )
+
+
+def test_zero_visible_kv_no_hang(
+    verbose: bool = True,
+):
+    """Regression test for the zero-visible-KV TMA-hang on the Hopper (FA3) mainloop.
+
+    The block-expanding mask can make an entire CTA's first tile have zero visible
+    KV (``kv_valid_end <= 0``) when ``kv_offset`` places all KV above Q's block — the
+    cascade "current chunk" shape where the prefix occupies the low KV range. On FA3
+    the consumer then takes the ``store_zero`` fast-path and skips the ``barrier_O``
+    arrive that the producer of the *next* (non-zero) tile waits on in
+    ``mainloop.cuh`` (``shared_storage.barrier_O.wait((work_idx+1)%2)``), deadlocking
+    if a non-zero tile follows. FA2 has no persistent TMA pipeline and is immune.
+
+    This test builds batched configs where at least one request's first Q-tile is
+    zero-visible while a later request (or later tile) is non-zero, so a faulty
+    kernel hangs on an H100. We assert it completes and that FA3 matches FA2 (which
+    writes the correct all-zero rows for fully-masked Q) — crossing the fix's
+    invariants instead of relying on a hang-only oracle.
+    """
+    device = torch.device("cuda:0")
+    available_backends = get_available_backends(device)
+    dtype = torch.float16
+    num_heads = 32
+    num_kv_heads = 8
+    head_dim = 128
+    tol = 1e-2
+
+    # B=32, head_dim=128 → FA3 CTA_Q=128, CTA_KV=96 (per prefill_sm90.cuh dispatch).
+    # Mix a zero-visible request (kv_offset high above q block) with a normal one so
+    # the zero-tile is NOT the last tile in the persistent batch stream — the exact
+    # shape that triggers the cross-tile barrier_O deadlock.
+    B = 32
+    configs = [
+        # (qo_len, kv_len, q_offset, kv_offset, expect_all_zero)
+        {"name": "single_all_invisible", "qo_len": 128, "kv_len": 128, "q_offset": 0, "kv_offset": 256},
+        {"name": "single_partial", "qo_len": 128, "kv_len": 128, "q_offset": 0, "kv_offset": 96},
+        {"name": "single_fully_visible_baseline", "qo_len": 128, "kv_len": 128, "q_offset": 0, "kv_offset": 0},
+    ]
+
+    results = []
+
+    # ---- Part A: single-request path through block_extend_attention_with_offset ----
+    for cfg in configs:
+        qo_len = cfg["qo_len"]
+        kv_len = cfg["kv_len"]
+        q_offset = cfg["q_offset"]
+        kv_offset = cfg["kv_offset"]
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        ref = compute_block_extend_offset_reference(
+            q, k, v, B, q_offset=q_offset, kv_offset=kv_offset, sm_scale=sm_scale
+        )
+
+        row = {"config": cfg["name"], **cfg}
+        for backend in available_backends:
+            # If the deadlock is present, this call hangs on FA3 (H100).
+            out = block_extend_attention_with_offset(
+                q, k, v, dllm_block_size=B,
+                q_offset=q_offset, kv_offset=kv_offset,
+                sm_scale=sm_scale, return_lse=False, backend=backend,
+            )
+            diff = (out.to(torch.float32) - ref.to(torch.float32)).abs().max().item()
+            row[f"{backend}_max_diff"] = diff
+            row[f"{backend}_pass"] = diff < tol
+        results.append(row)
+        if verbose:
+            fa2_s = "PASS" if row["fa2_pass"] else "FAIL"
+            line = f"  [single {cfg['name']:28s}] qo={qo_len} kv={kv_len} q_off={q_offset} kv_off={kv_offset}"
+            line += f"  FA2:{fa2_s}({row['fa2_max_diff']:.6f})"
+            if "fa3" in available_backends:
+                fa3_s = "PASS" if row["fa3_pass"] else "FAIL"
+                line += f"  FA3:{fa3_s}({row['fa3_max_diff']:.6f})"
+            print(line)
+        torch.cuda.empty_cache()
+
+    # ---- Part B: batched ragged path — zero-visible request THEN a normal request ----
+    # Reverse order keeps the zero-tile from being last-in-stream across the batch.
+    normal_req = {"qo_len": 128, "kv_len": 128, "q_offset": 0, "kv_offset": 0}
+    zero_req = {"qo_len": 128, "kv_len": 128, "q_offset": 0, "kv_offset": 256}
+
+    nnz_q = zero_req["qo_len"] + normal_req["qo_len"]
+    nnz_kv = zero_req["kv_len"] + normal_req["kv_len"]
+    q_batch = torch.randn(nnz_q, num_heads, head_dim, dtype=dtype, device=device)
+    k_batch = torch.randn(nnz_kv, num_kv_heads, head_dim, dtype=dtype, device=device)
+    v_batch = torch.randn(nnz_kv, num_kv_heads, head_dim, dtype=dtype, device=device)
+    qo_indptr = torch.tensor([0, zero_req["qo_len"], nnz_q], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, zero_req["kv_len"], nnz_kv], dtype=torch.int32, device=device)
+    q_offsets = torch.tensor([zero_req["q_offset"], normal_req["q_offset"]], dtype=torch.int32, device=device)
+    kv_offsets = torch.tensor([zero_req["kv_offset"], normal_req["kv_offset"]], dtype=torch.int32, device=device)
+
+    refs = [
+        compute_block_extend_offset_reference(
+            q_batch[:zero_req["qo_len"]], k_batch[:zero_req["kv_len"]],
+            v_batch[:zero_req["kv_len"]], B,
+            q_offset=zero_req["q_offset"], kv_offset=zero_req["kv_offset"],
+            sm_scale=1.0 / math.sqrt(head_dim),
+        ),
+        compute_block_extend_offset_reference(
+            q_batch[zero_req["qo_len"]:], k_batch[zero_req["kv_len"]:],
+            v_batch[zero_req["kv_len"]:], B,
+            q_offset=normal_req["q_offset"], kv_offset=normal_req["kv_offset"],
+            sm_scale=1.0 / math.sqrt(head_dim),
+        ),
+    ]
+    ref_batch = torch.cat(refs, dim=0)
+
+    batch_row = {"config": "batch_zero_then_normal"}
+    for backend in available_backends:
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        wrapper = BatchBlockExtendRaggedOffsetWrapper(
+            workspace, kv_layout="NHD", dllm_block_size=B, backend=backend
+        )
+        wrapper.plan(
+            qo_indptr=qo_indptr, kv_indptr=kv_indptr,
+            num_qo_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+            q_data_type=dtype, sm_scale=1.0 / math.sqrt(head_dim),
+            q_offsets=q_offsets, kv_offsets=kv_offsets,
+        )
+        out = wrapper.run(q_batch, k_batch, v_batch)
+        diff = (out.to(torch.float32) - ref_batch.to(torch.float32)).abs().max().item()
+        batch_row[f"{backend}_max_diff"] = diff
+        batch_row[f"{backend}_pass"] = diff < tol
+        del wrapper
+        torch.cuda.empty_cache()
+
+    if verbose:
+        fa2_s = "PASS" if batch_row["fa2_pass"] else "FAIL"
+        line = f"  [batch  zero_then_normal]  FA2:{fa2_s}({batch_row['fa2_max_diff']:.6f})"
+        if "fa3" in available_backends:
+            fa3_s = "PASS" if batch_row["fa3_pass"] else "FAIL"
+            line += f"  FA3:{fa3_s}({batch_row['fa3_max_diff']:.6f})"
+        print(line)
+
+    all_pass = all(
+        r[f"{b}_pass"]
+        for r in results + [batch_row]
+        for b in available_backends
+        if f"{b}_pass" in r
+    )
+    if verbose:
+        print(f"\n  Zero-visible-KV overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
+    assert all_pass, "zero-visible-KV regression failed (see diffs above; a hang here on FA3 is the bug)"
+
+
 def test_sglang_vs_block_extend_cascade(
     verbose: bool = True,
 ):
