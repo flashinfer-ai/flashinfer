@@ -118,6 +118,30 @@ from ..utils import (
 )
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
+_SM103_TINYGEMM_MAX_PROJECTION_ELEMENTS = 32 * 1024 * 1024
+
+
+def _is_sm103_tinygemm_unsafe_shape(
+    compute_capability: Tuple[int, int], n: int, k: int
+) -> bool:
+    """Return whether TinyGEMM is unsafe for an SM103 projection shape.
+
+    TinyGEMM can hang indefinitely on B300A/SM103 for large BF16 projection
+    shapes. Keep the workaround scoped to the affected architecture and
+    disable it only once the N*K projection size reaches the smallest
+    reported failure threshold. See flashinfer-ai/flashinfer#3848.
+    """
+    return (
+        compute_capability == (10, 3)
+        and n * k >= _SM103_TINYGEMM_MAX_PROJECTION_ELEMENTS
+    )
+
+
+def _is_sm103_tinygemm_unsafe(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return _is_sm103_tinygemm_unsafe_shape(
+        get_compute_capability(a.device), b.shape[1], a.shape[1]
+    )
+
 
 # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
@@ -445,6 +469,11 @@ def _tinygemm_mm_bf16_requirement(
         raise ValueError("The TinyGEMM backend requires a contiguous output tensor.")
     if bias is not None and not bias.is_contiguous():
         raise ValueError("The TinyGEMM backend requires a contiguous bias tensor.")
+    if _is_sm103_tinygemm_unsafe(a, b):
+        raise ValueError(
+            "The TinyGEMM backend is disabled for this large BF16 projection on SM103 "
+            "to avoid a known kernel hang; see flashinfer-ai/flashinfer#3848."
+        )
     return True
 
 
@@ -519,7 +548,11 @@ def _heuristic_func_mm_bf16(
         if "cublaslt" in suitable_backends:
             heuristic_backends.append("cublaslt")
 
-    if "tinygemm" in suitable_backends and out_dtype == torch.bfloat16:
+    if (
+        "tinygemm" in suitable_backends
+        and out_dtype == torch.bfloat16
+        and not _is_sm103_tinygemm_unsafe(a, b)
+    ):
         heuristic_backends.append("tinygemm")
 
     return heuristic_backends
