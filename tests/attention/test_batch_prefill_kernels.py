@@ -1843,6 +1843,142 @@ def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256(kv_dtype):
         torch.testing.assert_close(o_i, o_ref_i, rtol=2e-3, atol=2e-3)
 
 
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("qo_len", [17, 65])
+def test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides(kv_layout, qo_len):
+    """Execute the shared-KV-smem on-the-fly producer's V routing with
+    genuinely unequal K/V stride families.
+
+    ``page_produce_kv_on_the_fly`` runs only under
+    ``KernelTraits::USE_KV_SHARED_SMEM`` (USE_VO_SPLIT, not FP4,
+    HEAD_DIM_QK == HEAD_DIM_VO, 2-byte KV or CTA_TILE_Q > 16), which the
+    asymmetric NVFP4 test cannot reach. At (qk, vo) = (512, 512) with fp16 KV
+    it holds for both CTA tiles the planner can pick (static reasoning from
+    prefill.cuh): head_dim >= 512 gives CTA_TILE_Q=16 for
+    avg_packed_qo_len <= 32 (NUM_WARPS_KV=4; NUM_MMA_D_VO=32 % 4 == 0) and
+    CTA_TILE_Q=32 above (kLargeHeadWarpSplit: NUM_WARPS_KV=2; 32 % 2 == 0), so
+    USE_VO_SPLIT -- and with fp16's HEAD_DIM_QK == HEAD_DIM_VO,
+    USE_KV_SHARED_SMEM -- is true either way. The qo_len parametrization
+    covers both tiles.
+
+    K and V pools are views of differently padded parent tensors (identical
+    logical shapes, unequal stride families -- the decode negative test's
+    construction), so ``get_paged_kv_offset_for_logical_row<produce_v=true>``
+    must route V rows through the V strides: addressing V with K's stride
+    family (the routing bug this pins) reads V rows at wrong offsets and
+    fails the exact float32 reference check. SM80+, so it runs on the
+    standard CI runners.
+    """
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+
+    torch.manual_seed(42)
+    batch_size = 2
+    kv_len = 97
+    page_size = 16
+    num_kv_heads = 2
+    num_qo_heads = 2  # group_size 1: avg_packed_qo_len == qo_len
+    causal = True
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    q_indptr_cpu = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr_cpu = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32) * num_pages_per_seq
+    )
+    kv_indices_cpu = torch.arange(0, total_num_pages, dtype=torch.int32)
+    kv_last_page_len_cpu = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    )
+
+    def padded_pool(num_padding_heads):
+        """A [pages, ..., num_kv_heads, ...] view of a parent padded along the
+        heads dim: logical shape identical across pools, strides governed by
+        the parent's padding. The parent is fully random so misaddressed reads
+        yield wrong values rather than zeros."""
+        if kv_layout == "NHD":
+            parent = torch.randn(
+                total_num_pages,
+                page_size,
+                num_kv_heads + num_padding_heads,
+                head_dim,
+                device="cuda:0",
+                dtype=torch.float16,
+            )
+            return parent[:, :, :num_kv_heads, :]
+        parent = torch.randn(
+            total_num_pages,
+            num_kv_heads + num_padding_heads,
+            page_size,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float16,
+        )
+        return parent[:, :num_kv_heads, :, :]
+
+    k = padded_pool(1)
+    v = padded_pool(3)
+    assert k.shape == v.shape
+    assert not k.is_contiguous() and not v.is_contiguous()
+    # The point of the test: genuinely different stride families.
+    assert k.stride() != v.stride()
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, backend="fa2"
+    )
+    wrapper.plan(
+        q_indptr_cpu.to("cuda:0"),
+        kv_indptr_cpu.to("cuda:0"),
+        kv_indices_cpu.to("cuda:0"),
+        kv_last_page_len_cpu.to("cuda:0"),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+        pos_encoding_mode="NONE",
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    o = wrapper.run(q, (k, v))
+    assert o.shape == (batch_size * qo_len, num_qo_heads, head_dim)
+
+    # Exact float32 reference on the logical (view) K/V values.
+    sm_scale = head_dim**-0.5
+    perm = (0, 1, 2, 3) if kv_layout == "NHD" else (0, 2, 1, 3)
+    for i in range(batch_size):
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()
+        ki = (
+            k[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
+            .permute(*perm)
+            .reshape(-1, num_kv_heads, head_dim)[:kv_len]
+            .float()
+        )
+        vi = (
+            v[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
+            .permute(*perm)
+            .reshape(-1, num_kv_heads, head_dim)[:kv_len]
+            .float()
+        )
+        logits = torch.einsum("qhd,khd->hqk", qi, ki) * sm_scale
+        if causal:
+            qpos = torch.arange(qo_len, device="cuda:0").unsqueeze(1)
+            kpos = torch.arange(kv_len, device="cuda:0").unsqueeze(0)
+            allowed = kpos <= qpos + (kv_len - qo_len)
+            logits = logits.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+        o_ref_i = torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), vi)
+        o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()
+        torch.testing.assert_close(o_i, o_ref_i, rtol=2e-3, atol=2e-3)
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("kv_len", [128, 256])
 @pytest.mark.parametrize("qo_len", [64, 128])
