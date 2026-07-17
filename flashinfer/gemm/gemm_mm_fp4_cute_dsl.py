@@ -38,12 +38,14 @@ def _blockscaled_gemm_cache_key_files() -> tuple:
     from .kernels import (
         dense_blockscaled_gemm_sm100,
         dense_blockscaled_gemm_sm100_common,
+        dense_blockscaled_gemm_sm103,
     )
 
     return (
         __file__,
         dense_blockscaled_gemm_sm100.__file__,
         dense_blockscaled_gemm_sm100_common.__file__,
+        dense_blockscaled_gemm_sm103.__file__,
     )
 
 
