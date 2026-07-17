@@ -212,9 +212,12 @@ def fused_quant_stage(
     if ptr in _GRAPH_CAPTURED_BUFFERS:
         if num_tokens < capacity:
             topk_idx_out[num_tokens:capacity].fill_(-1)
-        _LAST_STAGED_N[ptr] = capacity
     else:
         prev_n = _LAST_STAGED_N.get(ptr, capacity)
         if num_tokens < prev_n:
             topk_idx_out[num_tokens:prev_n].fill_(-1)
-        _LAST_STAGED_N[ptr] = num_tokens
+    # The memo always records the ACTUAL live count of this staging: it also
+    # backs staged_tokens() / compute(output=None) view slicing, which must
+    # see the real n even for captured buffers (each captured graph's view is
+    # fixed at its own capture-time batch size).
+    _LAST_STAGED_N[ptr] = num_tokens
