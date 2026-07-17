@@ -1,14 +1,6 @@
-import sys
 from typing import Any, List
 
 import flashinfer  # noqa: F401
-
-# Importing ``flashinfer`` can transitively load the real CuTe-DSL stack.  The
-# Sphinx mock importer only intercepts future imports, so remove those cached
-# modules before autosummary loads the block-sparse API package.
-for _module_name in tuple(sys.modules):
-    if _module_name == "cutlass" or _module_name.startswith("cutlass."):
-        del sys.modules[_module_name]
 
 # import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
@@ -25,9 +17,9 @@ autodoc_mock_imports = [
     "triton",
     "flashinfer._build_meta",
     "cuda",
-    # CuTe-DSL imports its CUDA/CUTLASS stack eagerly, but API docs only need
-    # the public function signatures.
-    "cutlass",
+    # Optional VSA CuTe-DSL dependency; API documentation needs signatures
+    # but must not require the package from its separate source repository.
+    "quack",
     "numpy",
     "einops",
     "mpi4py",
