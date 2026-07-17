@@ -15,6 +15,7 @@
 
 import contextlib
 import math
+import os
 import warnings
 from enum import Enum
 from typing import Dict, Optional, Tuple
@@ -1146,6 +1147,16 @@ class FlashInferLinear(nn.Module):
         if not self._fp8_nt_prepared:
             self._prepare_fp8_nt_weights()
 
+        # The SM100 cutlass groupwise kernel rejects M > 32 that is not a
+        # multiple of 4 (can_implement fails; measured empirically — m=33/
+        # 4181/9401 fail while 27/36/4184 pass). Real sequence lengths are
+        # arbitrary, so pad M up to the next multiple of 4 and slice the
+        # output back.
+        m_orig = x.shape[0]
+        if m_orig > 32 and m_orig % 4 != 0:
+            pad = 4 - m_orig % 4
+            x = torch.nn.functional.pad(x, (0, 0, 0, pad))
+
         x_fp8, x_scale = self._quantize_activation_fp8_blockwise(x, block_size=128)
         # x_scale is (m, k_blocks) K-major; convert to (k_blocks, m) MN-major.
         x_scale_mn = x_scale.t().contiguous()
@@ -1164,6 +1175,8 @@ class FlashInferLinear(nn.Module):
             out_dtype=torch.bfloat16,
             backend=backend,
         )
+        if out.shape[0] != m_orig:
+            out = out[:m_orig]
 
         if self.bias is not None:
             out = out + self.bias.to(out.dtype)
@@ -1178,30 +1191,40 @@ class FlashInferLinear(nn.Module):
         if not self._fp8_nt_prepared:
             self._prepare_fp8_nt_weights()
 
-        x_fp8, x_scale = self._quantize_activation_fp8_blockwise(x, block_size=128)
-
-        # gemm_fp8_nt_blockscaled: wrapper over groupwise with (128,128,128) granularity
-        # a_scale for blockscaled: MN-major -> (k_blocks, m_blocks)
-        m = x.shape[0]
+        # The (128,128,128)-granularity kernel dequantizes each 128x128
+        # activation tile with a single scale, so the activation must be
+        # ENCODED with that same per-tile scale. (Encoding per token and
+        # handing the kernel the per-tile amax of those scales — the previous
+        # code here — mis-scales every token whose own scale is smaller,
+        # which compounded to cos_sim ~0.49 over a 4-layer backbone.)
+        m, k = x.shape
         block_size = 128
         m_blocks = (m + block_size - 1) // block_size
-        k_blocks = x_scale.shape[1]
-
-        # Reshape per-token scale to per-block scale for 128x128 blocking
-        x_scale_padded = torch.zeros(
+        k_blocks = (k + block_size - 1) // block_size
+        x_padded = torch.zeros(
             m_blocks * block_size,
-            k_blocks,
-            dtype=torch.float32,
+            k_blocks * block_size,
+            dtype=x.dtype,
             device=x.device,
         )
-        x_scale_padded[:m] = x_scale
-        x_scale_block = (
-            x_scale_padded.view(m_blocks, block_size, k_blocks).amax(
-                dim=1
-            )  # (m_blocks, k_blocks)
+        x_padded[:m, :k] = x
+        x_view = x_padded.view(m_blocks, block_size, k_blocks, block_size)
+        tile_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(min=1e-4)
+        tile_scale = tile_amax / 448.0
+        # Keep the M dimension padded to the 128 tile for the kernel call (the
+        # SM100 kernel rejects M > 32 that is not a multiple of 4) and slice
+        # the output back below. K must be sliced back: the weight tensor is
+        # unpadded (N, K).
+        x_fp8 = (
+            (x_view / tile_scale)
+            .to(torch.float8_e4m3fn)
+            .view(m_blocks * block_size, k_blocks * block_size)[:, :k]
+            .contiguous()
         )
         # MN-major: (k_blocks, m_blocks)
-        a_scale_mn = x_scale_block.t().contiguous()
+        a_scale_mn = (
+            tile_scale.view(m_blocks, k_blocks).t().contiguous().to(torch.float32)
+        )
 
         out = gemm_fp8_nt_blockscaled(
             x_fp8,
@@ -1211,6 +1234,8 @@ class FlashInferLinear(nn.Module):
             scale_major_mode="MN",
             out_dtype=torch.bfloat16,
         )
+        if out.shape[0] != m:
+            out = out[:m]
 
         if self.bias is not None:
             out = out + self.bias.to(out.dtype)
@@ -1793,6 +1818,22 @@ class FlashInferFusedMoE(nn.Module):
             elif self._backend == MoEBackend.TRTLLM:
                 self._prepare_trtllm_weights()
         self._prepared = True
+        # Opt-in: drop the BF16 master expert weights once the backend has
+        # built its own quantized / reshuffled copies. Only the torch and
+        # cutlass-BF16 forward paths read the masters, so for every other
+        # backend this halves (FP8) or quarters (FP4) the resident MoE
+        # footprint — required to fit the 80B checkpoint plus quantized
+        # copies on a single ~180GB GPU. Costs: the torch fallback and any
+        # re-preparation stop working for this module.
+        free_masters = os.getenv("FLASHINFER_MOE_FREE_MASTERS", "0") == "1"
+        if free_masters and self._backend not in (
+            MoEBackend.TORCH,
+            MoEBackend.CUTLASS,
+        ):
+            dev = self.w13_weight.device
+            dt = self.w13_weight.dtype
+            self.w13_weight.data = torch.empty(0, device=dev, dtype=dt)
+            self.w2_weight.data = torch.empty(0, device=dev, dtype=dt)
 
     @torch.no_grad()
     def _prepare_fp8_weights(self):
@@ -1847,16 +1888,58 @@ class FlashInferFusedMoE(nn.Module):
         trtllm_fp4_block_scale_routed_moe expects.
         """
         from flashinfer import fp4_quantize
+        from flashinfer.quantization import block_scale_interleave
 
-        def _quant(w: torch.Tensor):
-            # w: (E, N, K) -> packed (E, N, K/2), stacked swizzled scales,
+        # The trtllm-gen FP4 MoE kernels only support shuffled weights
+        # (use_shuffled_weight=True is hard-coded in fused_moe/core.py, and
+        # tests/moe/utils.py marks FP4Moe + unshuffled as incompatible), so
+        # the trtllm path additionally applies the epilogue-tile permute to
+        # the packed weights AND the (linear-layout) block scales, then
+        # interleaves the scales — mirroring
+        # FP4Moe.prepare_static_weights_for_kernel in
+        # tests/moe/trtllm_gen_fused_moe_utils.py. The cutlass path keeps the
+        # plain fp4_quantize output (swizzled scales, no shuffle).
+        trtllm = self._backend == MoEBackend.TRTLLM_FP4
+
+        def _quant(w: torch.Tensor, is_w13: bool):
+            # w: (E, N, K) -> packed (E, N, K/2), stacked block scales,
             # per-expert global *dequant* scales (1 / encode_gs).
             e = w.shape[0]
             packed, block_scales, gs_dequant = [], [], []
             for i in range(e):
                 amax = w[i].abs().amax().to(torch.float32).clamp(min=1e-12)
                 gs = (448.0 * 6.0) / amax
-                q, bs = fp4_quantize(w[i], gs)
+                q, bs = fp4_quantize(w[i], gs, is_sf_swizzled_layout=not trtllm)
+                if trtllm:
+                    bs = bs.view(torch.float8_e4m3fn).reshape(w.shape[1], -1)
+                    if is_w13:
+                        perm_w = _maybe_get_cached_w3_w1_permute_indices(
+                            self._trtllm_permute_cache,
+                            q.view(torch.uint8),
+                            128,  # epilogue_tile_m
+                            is_gated_act_gemm=True,
+                        )
+                        perm_sf = _maybe_get_cached_w3_w1_permute_indices(
+                            self._trtllm_permute_cache,
+                            bs.view(torch.uint8),
+                            128,
+                            num_elts_per_sf=16,
+                            is_gated_act_gemm=True,
+                        )
+                    else:
+                        perm_w = get_w2_permute_indices_with_cache(
+                            self._trtllm_permute_cache, q.view(torch.uint8), 128
+                        )
+                        perm_sf = get_w2_permute_indices_with_cache(
+                            self._trtllm_permute_cache,
+                            bs.view(torch.uint8),
+                            128,
+                            num_elts_per_sf=16,
+                        )
+                    q = q.view(torch.uint8)[perm_w.to(q.device)].contiguous()
+                    bs = block_scale_interleave(
+                        bs.view(torch.uint8)[perm_sf.to(bs.device)].contiguous()
+                    )
                 packed.append(q)
                 block_scales.append(bs)
                 gs_dequant.append(1.0 / gs)
@@ -1867,10 +1950,10 @@ class FlashInferFusedMoE(nn.Module):
             )
 
         self._w13_fp4, self._w13_fp4_bs, self._w13_fp4_gs_dequant = _quant(
-            self.w13_weight.data
+            self.w13_weight.data, is_w13=True
         )
         self._w2_fp4, self._w2_fp4_bs, self._w2_fp4_gs_dequant = _quant(
-            self.w2_weight.data
+            self.w2_weight.data, is_w13=False
         )
 
     @torch.no_grad()
@@ -1997,6 +2080,12 @@ class FlashInferFusedMoE(nn.Module):
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Eager per-expert reference (matches the kernels' SwiGLU convention)."""
+        if self.w13_weight.numel() == 0:
+            raise RuntimeError(
+                "FlashInferFusedMoE master weights were freed after "
+                "prepare_weights() (FLASHINFER_MOE_FREE_MASTERS=1), so the "
+                "torch reference path is unavailable."
+            )
         out = torch.zeros_like(hidden_states)
         for e in range(self.num_experts):
             token_idx, k_idx = (topk_ids == e).nonzero(as_tuple=True)
@@ -2292,8 +2381,14 @@ class FlashInferFusedMoE(nn.Module):
         hs_sf = hs_sf.view(torch.float8_e4m3fn).reshape(num_tokens, -1)
 
         act_dequant = 1.0 / act_gs  # (1,)
+        # Scale convention of FP4Moe.prepare_static_weights_for_kernel with the
+        # intermediate-activation global encode scale c_global_sf fixed to 1
+        # (it cannot be derived offline without calibration):
+        #   output1_scale_scalar = c_gs * w13_dq * act_dq
+        #   output1_scale_gate_scalar = w13_dq * act_dq
+        #   output2_scale_scalar = (1 / c_gs) * w2_dq
         output1_scale = (act_dequant * self._w13_fp4_gs_dequant).contiguous()
-        output2_scale = (act_dequant * self._w2_fp4_gs_dequant).contiguous()
+        output2_scale = self._w2_fp4_gs_dequant.contiguous()
 
         e, _, _ = self._w13_fp4.shape
         w13_bs = self._w13_fp4_bs.view(torch.float8_e4m3fn).reshape(

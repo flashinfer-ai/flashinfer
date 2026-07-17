@@ -104,6 +104,7 @@ command-line flags > environment variables > defaults.
 | `--moe-backend` | `FLASHINFER_MOE_BACKEND` | `cutlass`, `cutlass_fp8`, `cutlass_fp8_blockscale`, `cutlass_w4a16`, `cutlass_nvfp4`, `trtllm`, `trtllm_fp8_blockscale`, `trtllm_fp4`, `torch`, `eager` | `cutlass` | Fused-MoE backend for the routed experts. `cutlass` = BF16 `cutlass_fused_moe` (SM89/SM90/SM100+); `cutlass_fp8` = per-tensor FP8 W8A8 on the same kernel; `cutlass_fp8_blockscale` = DeepSeek-style 128x128 block-scale FP8 W8A8 (SM90 only — the only arch with this kernel; needs CUDA >= 12.8); `cutlass_w4a16` = MXFP4 weight-only, BF16 activation on the Hopper mixed-input GEMM (SM90 only); `cutlass_nvfp4` = NVFP4 W4A4 (SM100/SM103/SM110/SM120/SM121); `trtllm` = `trtllm_bf16_routed_moe` (SM100/SM103 only); `trtllm_fp8_blockscale` / `trtllm_fp4` = trtllm-gen DeepSeek-FP8 / NVFP4 routed MoE (SM100/SM103 only); `torch` = eager loop inside `FlashInferFusedMoE`; `eager` keeps the upstream per-expert HunyuanMoE loop. Unsupported backends fall back to `torch` with a warning. See the [per-architecture matrix in `examples/pytorch/README.md`](../README.md#fused-moe-apis). |
 | `--moe-impl` | `FLASHINFER_MOE_IMPL` | `flashinfer`, `eager` | — | Deprecated alias: `flashinfer` → `--moe-backend cutlass`, `eager` → `--moe-backend eager`. |
 | `--offline-act-quant` | `FLASHINFER_ONLINE_ACT_QUANT=0` | — | online | Use fixed default activation scale instead of computing it from the current tensor (FP8/FP4 backends only). |
+| — | `FLASHINFER_MOE_FREE_MASTERS=1` | — | off | Free the BF16 master expert weights after each `FlashInferFusedMoE.prepare_weights()` (all backends except `torch`/`cutlass`, whose forwards read the masters). Required to fit the 80B checkpoint plus quantized copies on a single ~180GB GPU; afterwards the module's `torch` fallback and re-preparation no longer work. |
 
 ## End-to-end validation (8× H20, SM90)
 
@@ -162,6 +163,56 @@ Takeaways:
   eventually diverge at near-tie tokens (expected for any quantized
   backend under greedy decoding) but stay semantically equivalent and
   factually correct.
+
+## End-to-end validation (1× B200, SM100)
+
+Same recipe on a single B200 (183 GB): `text2img`, 1024×1024, 50 denoising
+steps, `--seed 42`, same prompt, `--vae-use-tiling`, torch 2.11 (nvcr
+pytorch:26.03), transformers 4.57. `FLASHINFER_MOE_FREE_MASTERS=1` is
+required for every quantized/trtllm MoE backend — without it the BF16
+masters plus the quantized copies exceed the single GPU (the whole matrix
+peaks at 171–179 GB with it). GEMM stays `torch` in the MoE rows; the two
+SM90-only backends (`cutlass_fp8_blockscale`, `cutlass_w4a16`) fall back to
+`torch` here and are absent.
+
+| Config | ms/step | Total (50 steps) | Speedup | PSNR vs baseline |
+| :--- | ---: | ---: | ---: | ---: |
+| baseline (`--skip-flashinfer`) | 790.0 | 39.5 s | 1.00× | — |
+| `--moe-backend cutlass` (BF16) | 552.1 | 27.6 s | 1.43× | 23.8 dB |
+| `--moe-backend trtllm` (BF16) | 561.8 | 28.1 s | 1.41× | 20.4 dB |
+| `--moe-backend cutlass_fp8` | 516.4 | 25.8 s | 1.53× | 23.6 dB |
+| `--moe-backend trtllm_fp8_blockscale` | 608.8 | 30.4 s | 1.30× | 24.9 dB |
+| `--moe-backend cutlass_nvfp4` | 488.8 | 24.4 s | 1.62× | 14.3 dB (coherent, composition drift) |
+| `--moe-backend trtllm_fp4` | 440.3 | 22.0 s | **1.79×** | 21.9 dB |
+| `--gemm-backend bf16` + trtllm_fp8_blockscale MoE | 610.3 | 30.5 s | 1.29× | 24.9 dB |
+| `--gemm-backend fp8_groupwise` + trtllm_fp8_blockscale MoE | 654.2 | 32.7 s | 1.21× | **28.3 dB** |
+
+Takeaways:
+
+- `trtllm_fp4` is the fastest end-to-end config (1.79×) and, unlike
+  `cutlass_nvfp4`, keeps the baseline composition (21.9 dB). Both FP4
+  backends measure cos 0.973 against the module's eager `torch` reference
+  at the real MoE shapes (E=64, top-8, hidden 4096, intermediate 3072) —
+  the inherent W4A4 quantization error; the two independent FP4
+  implementations agree to 4 decimal places.
+- `cutlass_fp8` is the best FP8 pick on Blackwell (1.53×, cos 0.9978,
+  1.3 PFLOP/s dense-equiv at 8K tokens). `trtllm_fp8_blockscale` (cos
+  0.9972) trades some speed for the closest image tracking of the
+  MoE-only rows.
+- Adding a FlashInfer GEMM on top of the MoE swap does not pay off at
+  batch 1 on B200: `bf16` matches torch, and `fp8_groupwise`'s per-call
+  activation quantization costs more than the GEMM saves (it does track
+  the baseline image closest at 28.3 dB).
+- Per-backend correctness at the real MoE shapes (cos vs the module's own
+  eager reference): `cutlass` 0.99998, `cutlass_fp8` 0.9978, `trtllm`
+  0.99998, `trtllm_fp8_blockscale` 0.9972, `cutlass_nvfp4` / `trtllm_fp4`
+  0.9731.
+- The `batch_deepgemm_fp8` GEMM backend is unusable for this model's
+  shapes: the published DeepGEMM cubin set has no kernels for them
+  ("cubin not registered"). The `fp8` (mm_fp8 low-latency) backend is
+  numerically loose by design (its unit test asserts only cos > 0.99 per
+  GEMM) and compounds visibly over 32 layers; prefer `fp8_groupwise` /
+  `bmm_fp8` on SM100.
 
 ## Caveats
 
