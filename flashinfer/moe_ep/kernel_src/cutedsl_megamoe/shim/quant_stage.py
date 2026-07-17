@@ -45,6 +45,10 @@ _STAGERS: dict[tuple, _CompiledStager] = {}
 # that buffer (tail-fill memoization; see the fill logic below).
 _LAST_STAGED_N: dict[int, int] = {}
 
+# Buffers that have ever been staged inside a CUDA graph capture: replays
+# bypass host code, so the memo is permanently untrustworthy for them.
+_GRAPH_CAPTURED_BUFFERS: set[int] = set()
+
 
 def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
     import cutlass.torch as cutlass_torch
@@ -189,12 +193,28 @@ def fused_quant_stage(
 
     # Parity with the torch stager: rows beyond this batch must stay masked
     # (-1) so they cannot dispatch as live tokens. The buffer starts fully
-    # masked and staging only overwrites [:n], so a fill is needed ONLY for
-    # the [n, prev_n) rows a previous LARGER batch left routed — memoized per
-    # buffer to skip the launch on same-or-growing batches (in a serving
-    # engine all layers share one buffer, so at most the first layer of a
+    # masked and staging only overwrites [:n], so eagerly a fill is needed
+    # ONLY for the [n, prev_n) rows a previous LARGER batch left routed —
+    # memoized per buffer so same-or-growing batches skip the launch (all
+    # layers share one buffer in an engine, so at most the first layer of a
     # shrinking step pays it).
-    prev_n = _LAST_STAGED_N.get(topk_idx_out.data_ptr(), capacity)
-    if num_tokens < prev_n:
-        topk_idx_out[num_tokens:prev_n].fill_(-1)
-    _LAST_STAGED_N[topk_idx_out.data_ptr()] = num_tokens
+    #
+    # Under CUDA graphs the memo is USELESS AND DANGEROUS: graphs replay
+    # device ops without host logic, and engines capture one graph per batch
+    # size — a small-size graph replayed after a larger one must mask
+    # everything the larger graph staged, and an EAGER call after any replay
+    # cannot trust a host count the replays never updated. So every captured
+    # graph bakes the full conservative fill, and a buffer that has ever been
+    # captured permanently loses the memo optimization (eager fills fully).
+    ptr = topk_idx_out.data_ptr()
+    if torch.cuda.is_current_stream_capturing():
+        _GRAPH_CAPTURED_BUFFERS.add(ptr)
+    if ptr in _GRAPH_CAPTURED_BUFFERS:
+        if num_tokens < capacity:
+            topk_idx_out[num_tokens:capacity].fill_(-1)
+        _LAST_STAGED_N[ptr] = capacity
+    else:
+        prev_n = _LAST_STAGED_N.get(ptr, capacity)
+        if num_tokens < prev_n:
+            topk_idx_out[num_tokens:prev_n].fill_(-1)
+        _LAST_STAGED_N[ptr] = num_tokens
