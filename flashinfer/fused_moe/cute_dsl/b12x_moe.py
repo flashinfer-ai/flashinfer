@@ -585,7 +585,12 @@ class B12xMoEWrapper:
         if self.quant_mode == "nvfp4" and input_global_scale is not None:
             # Fold once and reuse; launch_sm120_moe skips its fold when
             # weight views are given.
-            fold_key = (w1_alpha.data_ptr(), input_global_scale.data_ptr())
+            fold_key = (
+                w1_alpha.data_ptr(),
+                input_global_scale.data_ptr(),
+                w1_alpha._version,
+                input_global_scale._version,
+            )
             if self._folded_w1_alpha is None or self._folded_w1_alpha_key != fold_key:
                 self._folded_w1_alpha = (
                     w1_alpha.to(torch.float32) * input_global_scale.to(torch.float32)

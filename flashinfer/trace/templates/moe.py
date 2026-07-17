@@ -3224,6 +3224,9 @@ b12x_fused_moe_trace = TraceTemplate(
             abbrev="",
             description="2*I (SwiGLU) or I (ReLU2).",
         ),
+        "input_global_scale_size": Var(
+            description="1 (shared scale) or num_local_experts."
+        ),
     },
     inputs={
         "x": Tensor(
@@ -3278,7 +3281,7 @@ b12x_fused_moe_trace = TraceTemplate(
             ),
         ),
         "input_global_scale": Tensor(
-            ["num_local_experts"],
+            ["input_global_scale_size"],
             dtype="float32",
             optional=True,
             description=(

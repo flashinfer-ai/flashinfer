@@ -1924,6 +1924,7 @@ def testB12xFusedMoe(args):
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
         cur_res["fp4_mode"] = quant_mode
+        cur_res["cold_l2_cache"] = cold_l2_cache
         cur_res["activation_type"] = activation_type.name
         res.append(cur_res)
 
