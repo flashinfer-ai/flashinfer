@@ -41,6 +41,10 @@ class _CompiledStager:
 
 _STAGERS: dict[tuple, _CompiledStager] = {}
 
+# topk_idx_out.data_ptr() -> num_tokens staged by the last fused call into
+# that buffer (tail-fill memoization; see the fill logic below).
+_LAST_STAGED_N: dict[int, int] = {}
+
 
 def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
     import cutlass.torch as cutlass_torch
@@ -48,6 +52,22 @@ def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
     cute_tensor = cutlass_torch.from_dlpack(tensor, assumed_align=assumed_align)
     leading_dim = cutlass_torch.get_leading_dim(tensor)
     return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+
+
+def note_staged_tokens(topk_idx_out: torch.Tensor, num_tokens: int) -> None:
+    """Record a non-fused staging into ``topk_idx_out`` (tail-fill memo).
+
+    The torch fallback paths stage live rows and re-mask the full tail; they
+    must update the memo so a later fused call cannot skip a fill over rows
+    the fallback left live. Unknown buffers default to "assume fully live"
+    (prev_n = capacity), which is always safe.
+    """
+    _LAST_STAGED_N[topk_idx_out.data_ptr()] = num_tokens
+
+
+def staged_tokens(topk_idx_out: torch.Tensor) -> Optional[int]:
+    """Live-token count of the last staging into this buffer, if known."""
+    return _LAST_STAGED_N.get(topk_idx_out.data_ptr())
 
 
 def fused_quant_stage_supported(hidden_states: torch.Tensor) -> bool:
@@ -167,7 +187,14 @@ def fused_quant_stage(
 
     stager.compiled(*stager.launch_args, **stager.launch_kwargs)
 
-    # Parity with the torch stager: re-mask the capacity tail so rows beyond
-    # this batch cannot dispatch as live tokens.
-    if num_tokens < capacity:
-        topk_idx_out[num_tokens:capacity].fill_(-1)
+    # Parity with the torch stager: rows beyond this batch must stay masked
+    # (-1) so they cannot dispatch as live tokens. The buffer starts fully
+    # masked and staging only overwrites [:n], so a fill is needed ONLY for
+    # the [n, prev_n) rows a previous LARGER batch left routed — memoized per
+    # buffer to skip the launch on same-or-growing batches (in a serving
+    # engine all layers share one buffer, so at most the first layer of a
+    # shrinking step pays it).
+    prev_n = _LAST_STAGED_N.get(topk_idx_out.data_ptr(), capacity)
+    if num_tokens < prev_n:
+        topk_idx_out[num_tokens:prev_n].fill_(-1)
+    _LAST_STAGED_N[topk_idx_out.data_ptr()] = num_tokens

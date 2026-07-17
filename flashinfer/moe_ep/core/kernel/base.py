@@ -215,8 +215,11 @@ class MegaKernelBackend(ABC):
         workspace: Any,
         transformed_weights: Any,
         *,
-        output: "torch.Tensor",
-    ) -> "torch.Tensor": ...
+        output: "torch.Tensor | None",
+    ) -> "torch.Tensor":
+        """Run the fused kernel. ``output=None`` (cutedsl backends) returns a
+        zero-copy view of the workspace output, valid under stream ordering
+        until the next launch on this session's buffers."""
 
     def destroy(self, workspace: Any) -> None:
         """Release durable workspace resources (pool-aware, refcounted)."""
