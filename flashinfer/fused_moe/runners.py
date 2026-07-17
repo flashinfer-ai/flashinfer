@@ -882,33 +882,18 @@ class _B12xRunner(MoERunner):
                 f"hidden size {hidden_states.shape[1]} does not match prepared "
                 f"weights ({prepared_hidden_size})."
             )
-        if act.selected_experts.dtype is not torch.int32:
-            raise TypeError("b12x selected_experts must use torch.int32.")
-        if act.final_scales.dtype is not torch.float32:
-            raise TypeError("b12x final_scales must use torch.float32.")
-        if (
-            act.selected_experts.device != self.device
-            or act.final_scales.device != self.device
-        ):
-            raise ValueError("b12x routing tensors must be on the runner device.")
-        expected_routing_shape = (
+        _validate_prerouted_inputs(
+            act,
             hidden_states.shape[0],
             self.config.routing.top_k,
+            type(self).__name__,
         )
-        if tuple(act.selected_experts.shape) != expected_routing_shape:
-            raise ValueError(
-                f"expected selected_experts shape {expected_routing_shape}, got "
-                f"{tuple(act.selected_experts.shape)}."
-            )
-        if tuple(act.final_scales.shape) != expected_routing_shape:
-            raise ValueError(
-                f"expected final_scales shape {expected_routing_shape}, got "
-                f"{tuple(act.final_scales.shape)}."
-            )
+        if act.topk_weights.dtype is not torch.float32:
+            raise TypeError("b12x topk_weights must use torch.float32.")
 
         self._prepared_weights = v
         self._ensure_inner(hidden_states.shape[1], hidden_states.shape[0])
-        return [hidden_states, act.selected_experts, act.final_scales]
+        return [hidden_states, act.topk_ids, act.topk_weights]
 
     def forward(
         self,
@@ -947,6 +932,7 @@ class B12xNvfp4Runner(_B12xRunner):
 
     backend_key = "b12x_nvfp4"
     quant_mode = "nvfp4"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.NVFP4,)
     required_weight_keys = (
         "w1_weight",
@@ -964,4 +950,5 @@ class B12xW4A16Runner(_B12xRunner):
 
     backend_key = "b12x_w4a16"
     quant_mode = "w4a16"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.W4A16,)

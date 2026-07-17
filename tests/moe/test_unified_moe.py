@@ -512,7 +512,7 @@ class TestExpressiveness:
             backend=BackendOptions((CutlassConfig(),)),
         )
         # CUTLASS uses modular (pre-routed) dispatch — supplied at call time via
-        # MoEActivationPack (selected_experts/final_scales), not via config
+        # MoEActivationPack (topk_ids/topk_weights), not via config
         assert any(isinstance(c, CutlassConfig) for c in cfg.backend)
 
     def test_cutedsl_nvfp4(self):

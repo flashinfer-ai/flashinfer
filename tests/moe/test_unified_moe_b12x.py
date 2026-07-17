@@ -48,6 +48,7 @@ from flashinfer.fused_moe.api import (
     QuantConfig,
     QuantVariant,
     RoutingConfig,
+    RoutingInputMode,
 )
 from tests.moe.test_b12x_fused_moe import (  # noqa: E402
     check_accuracy as check_b12x_accuracy,
@@ -120,6 +121,12 @@ class TestB12xUnifiedValidation:
             activation=activation,
             backend=BackendOptions((backend,)),
             execution=execution or ExecutionConfig(),
+        )
+
+    @pytest.mark.parametrize("runner_type", (B12xNvfp4Runner, B12xW4A16Runner))
+    def test_b12x_supports_precomputed_routing(self, runner_type):
+        assert runner_type.supported_routing_modes == (
+            RoutingInputMode.PackedPrecomputed,
         )
 
     @pytest.mark.parametrize(
@@ -402,8 +409,8 @@ def _make_b12x_layer_and_packs(
     act_pack = MoEActivationPack(
         hidden_states_q=tensors["x_bf16"],
         hidden_states_scale=torch.empty(0, device="cuda"),
-        selected_experts=tensors["token_selected_experts"],
-        final_scales=tensors["token_final_scales"],
+        topk_ids=tensors["token_selected_experts"],
+        topk_weights=tensors["token_final_scales"],
     )
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for(backend_key, prepared)
