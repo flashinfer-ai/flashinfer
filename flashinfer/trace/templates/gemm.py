@@ -2036,10 +2036,13 @@ def _nvfp4_quantize_smooth_init(
     *,
     M: int,
     N: int = 3072,
+    N_half: int = 0,
+    SF: int = 0,
     device: str = "cuda",
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.nvfp4_quantize_smooth``."""
+    del N_half, SF  # output-only / derived axes
     torch.manual_seed(seed)
     x = torch.randn(M, N, dtype=torch.bfloat16, device=device)
     pqs = torch.rand(N, dtype=torch.bfloat16, device=device) + 0.5
