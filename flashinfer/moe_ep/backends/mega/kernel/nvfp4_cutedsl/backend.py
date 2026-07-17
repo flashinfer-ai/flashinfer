@@ -45,6 +45,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Nvfp4CutedslMegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Nvfp4CutedslMegaMoeConfig = config
+        self._thunk_state: tuple | None = None
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
@@ -213,7 +214,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from .....kernel_src.cutedsl_megamoe import nvfp4_mega_moe, staged_tokens
+        from .....kernel_src.cutedsl_megamoe import staged_tokens
 
         if output is not None:
             num_tokens = output.shape[0]
@@ -249,20 +250,64 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             # Cleared only on success: if the collective tune raises, a retried
             # compute() re-attempts it (all ranks fail together, so lockstep holds).
             self._autotune_pending = False
-        view = nvfp4_mega_moe(
-            output,
-            transformed_weights[0],
-            transformed_weights[1],
-            workspace,
-            num_tokens=num_tokens,
-            gate_up_clamp=_resolve_gate_up_clamp(kcfg),
-            activation_clamp=kcfg.activation_clamp,
-            fast_math=kcfg.fast_math,
+        # Steady-state launch thunk: nvfp4_mega_moe re-validates, re-resolves
+        # the clamp, and rebuilds the 12-field inputs bundle on every call
+        # (~70us of loop-invariant host Python at 43 layers x 4 ranks — the
+        # measured arrival-skew generator; see vllm_e2e RUNS.md run 27/28).
+        # Build once per (workspace, weights, compiled-session, STREAM) and
+        # reuse. The stream is part of the key because the thunk's launch
+        # kwargs bind it at build time — a graph capture runs on a capture
+        # stream and must get its own thunk or the kernel launch escapes the
+        # graph. A knobs/clamp change nulls the frontend's compiled session,
+        # changing the key and forcing a rebuild through the validated path.
+        fe = workspace._frontend
+        clamp = _resolve_gate_up_clamp(kcfg)
+        if clamp is not None:
+            fe.set_gate_up_clamp(clamp)
+        mega = fe._mega
+        stream = torch.cuda.current_stream().cuda_stream
+        key = (
+            id(workspace),
+            id(transformed_weights[0][0]),
+            id(mega.compiled) if mega is not None and mega.compiled else None,
+            stream,
         )
-        # output=None -> zero-copy: the kernel's reduced result stays in the
-        # workspace and the caller consumes the [:n] view under stream
-        # ordering (valid until the next launch on this session's buffers).
-        return output if output is not None else view
+        state = self._thunk_state
+        if state is None or state[0] != key or key[2] is None:
+            from .....kernel_src.cutedsl_megamoe.shim.nvfp4 import (
+                MegaMoENvfp4Inputs,
+            )
+
+            inputs = MegaMoENvfp4Inputs(
+                activation=workspace.x,
+                activation_sf=workspace.x_sf,
+                topk_idx=workspace.topk_idx,
+                topk_weights=workspace.topk_weights,
+                fc1_weight=transformed_weights[0][0],
+                fc1_weight_sf=transformed_weights[0][1],
+                fc2_weight=transformed_weights[1][0],
+                fc2_weight_sf=transformed_weights[1][1],
+                fc1_alpha=workspace.fc1_alpha,
+                fc2_alpha=workspace.fc2_alpha,
+                fc1_norm_const=workspace.fc1_norm_const,
+                output_activation=workspace.output_activation,
+            )
+            # Full validation happens inside make_launch_thunk's
+            # _prepare_launch_inputs (run()'s slow-path validator).
+            thunk = fe.make_launch_thunk(inputs)
+            mega = fe._mega
+            key = (key[0], key[1], id(mega.compiled), stream)
+            state = (key, thunk, workspace.output_activation)
+            self._thunk_state = state
+
+        _, thunk, out_buf = state
+        thunk()
+        if output is not None:
+            output.copy_(out_buf[:num_tokens])
+            return output
+        # Zero-copy: the caller consumes the [:n] view under stream ordering
+        # (valid until the next launch on this session's buffers).
+        return out_buf[:num_tokens]
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         k = self._kernel_config
