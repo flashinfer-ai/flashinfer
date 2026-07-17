@@ -1,6 +1,14 @@
+import sys
 from typing import Any, List
 
 import flashinfer  # noqa: F401
+
+# Importing ``flashinfer`` can transitively load the real CuTe-DSL stack.  The
+# Sphinx mock importer only intercepts future imports, so remove those cached
+# modules before autosummary loads the block-sparse API package.
+for _module_name in tuple(sys.modules):
+    if _module_name == "cutlass" or _module_name.startswith("cutlass."):
+        del sys.modules[_module_name]
 
 # import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
