@@ -1,9 +1,15 @@
+import inspect
+import random
+
 import pytest
 import torch
 import torch.nn.functional as F
-import random
 
 import flashinfer
+from flashinfer.mla._batch_mla._backends import (
+    trtllm_gen_backend as batch_mla_trtllm_gen,
+)
+from flashinfer.mla._batch_mla import _core as batch_mla_core
 from flashinfer.mla import (
     MLALayerDimensions,
     supported_mla_layer_dimensions,
@@ -21,6 +27,163 @@ workspace_size = 128 * 1024 * 1024
 
 # Guard region we zero past the softmax slab so we can detect OOB writes.
 TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
+
+
+def test_trtllm_gen_module_loader_is_backend_owned_and_reexported():
+    assert (
+        batch_mla_core.get_trtllm_gen_fmha_module
+        is batch_mla_trtllm_gen.get_trtllm_gen_fmha_module
+    )
+
+
+def test_functional_trtllm_gen_ignores_legacy_compatibility_knobs(monkeypatch):
+    expected = object()
+    forwarded = []
+
+    def recording_impl(**kwargs):
+        forwarded.append(kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        batch_mla_core,
+        "_run_mla_decode_trtllm_gen_or_cute_dsl_impl",
+        recording_impl,
+    )
+
+    result = batch_mla_core._run_mla_decode_trtllm_gen(
+        query=object(),
+        kv_cache=object(),
+        workspace_buffer=object(),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=object(),
+        seq_lens=object(),
+        max_seq_len=1,
+        backend="trtllm-gen",
+        cute_dsl_impl="monolithic",
+        kv_scale_format="arbitrary_legacy_format",
+    )
+
+    assert result is expected
+    assert forwarded[0]["cute_dsl_impl"] == "auto"
+    assert forwarded[0]["kv_scale_format"] == "auto"
+
+
+def test_functional_runner_and_wrapper_lower_equivalent_dense_launches(monkeypatch):
+    launch_calls = []
+    launcher_signature = inspect.signature(
+        batch_mla_trtllm_gen._TrtllmGenMlaDecodeLauncher.run
+    )
+
+    class FakeModule:
+        trtllm_paged_attention_decode = object()
+
+    class RecordingLauncher:
+        def __init__(self, run_func):
+            assert run_func is FakeModule.trtllm_paged_attention_decode
+
+        def reserve_counter_buffer(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            launch_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        batch_mla_trtllm_gen,
+        "get_trtllm_gen_fmha_module",
+        lambda: FakeModule(),
+    )
+    monkeypatch.setattr(
+        batch_mla_trtllm_gen,
+        "_TrtllmGenMlaDecodeLauncher",
+        RecordingLauncher,
+    )
+    monkeypatch.setattr(
+        batch_mla_trtllm_gen, "device_support_pdl", lambda device: False
+    )
+    monkeypatch.setattr(batch_mla_trtllm_gen, "get_device_sm_count", lambda device: 120)
+
+    runner_type = getattr(batch_mla_trtllm_gen, "TrtllmGenMlaDecodeRunner", None)
+    assert runner_type is not None
+
+    batch_size, q_len, num_heads = 2, 1, 128
+    query_combined = torch.zeros(
+        (batch_size, q_len, num_heads, 576), dtype=torch.bfloat16
+    )
+    kv_combined = torch.zeros((4, 64, 576), dtype=torch.bfloat16)
+    q_nope, q_pe = query_combined[..., :512], query_combined[..., 512:]
+    ckv_cache, kpe_cache = kv_combined[..., :512], kv_combined[..., 512:]
+    workspace = torch.empty(128, dtype=torch.uint8)
+    wrapper_out = torch.empty((batch_size, num_heads, 512), dtype=torch.bfloat16)
+
+    backend = batch_mla_trtllm_gen._BatchMLAPagedAttentionTrtllmGenBackend(workspace)
+    backend.plan(
+        cum_seq_lens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+        block_tables=torch.tensor([[0, 0], [1, 0]], dtype=torch.int32),
+        seq_lens=torch.tensor([64, 64], dtype=torch.int32),
+        max_q_len=1,
+        num_heads=num_heads,
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        page_size=64,
+        causal=False,
+        sm_scale=1.0 / (128 + 64) ** 0.5,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        use_profiler=False,
+        qk_nope_head_dim=128,
+    )
+    assert backend._max_seq_len == 2 * 64
+
+    functional_out = torch.empty(
+        (batch_size, q_len, num_heads, 512), dtype=torch.bfloat16
+    )
+    runner = runner_type(
+        kv_cache=kv_combined.unsqueeze(1),
+        workspace_buffer=workspace,
+        sm_count=120,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        max_seq_len=2 * 64,
+        sparse_mla_top_k=0,
+        bmm1_scale=1.0 / (128 + 64) ** 0.5,
+        bmm2_scale=1.0,
+        sinks=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_pdl=False,
+        is_var_seq=True,
+        uses_shared_paged_kv_idx=True,
+        return_lse=False,
+        lse=None,
+    )
+    runner.forward(
+        [query_combined, backend._block_tables, backend._seq_lens, functional_out]
+    )
+    backend.run(
+        q_nope=q_nope.reshape(batch_size, num_heads, 512),
+        q_pe=q_pe.reshape(batch_size, num_heads, 64),
+        ckv_cache=ckv_cache,
+        kpe_cache=kpe_cache,
+        out=wrapper_out,
+    )
+
+    assert len(launch_calls) == 2
+    functional_launch, wrapper_launch = launch_calls
+    for name, parameter in launcher_signature.parameters.items():
+        if name == "self":
+            continue
+        functional_value = functional_launch.get(name, parameter.default)
+        wrapper_value = wrapper_launch.get(name, parameter.default)
+        if isinstance(functional_value, torch.Tensor):
+            assert functional_value.shape == wrapper_value.shape
+            assert functional_value.dtype == wrapper_value.dtype
+            assert functional_value.device == wrapper_value.device
+            if name != "out":
+                torch.testing.assert_close(functional_value, wrapper_value)
+        else:
+            assert functional_value == wrapper_value
 
 
 def trtllm_gen_workspace_softmax_end_bytes_decode(

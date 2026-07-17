@@ -9,10 +9,15 @@ import torch
 import flashinfer
 from flashinfer import autotune
 from flashinfer.autotuner import AutoTuner
+from flashinfer.mla._batch_mla._backends import (
+    trtllm_gen_backend as batch_mla_trtllm_gen,
+)
+from flashinfer.mla._batch_mla import _core as batch_mla_core
 from flashinfer.utils import (
     get_compute_capability,
     get_device_sm_count,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    next_positive_power_of_2,
 )
 
 
@@ -124,3 +129,171 @@ def test_autotune_dispatcher_runs_with_auto_backend_and_caller_counter():
     assert out.shape == (query.shape[0], 1, _NUM_HEADS, _KV_LORA_RANK)
     assert out.isfinite().all()
     assert torch.count_nonzero(caller_counter_buffer).item() == 0
+
+
+def test_trtllm_runner_cache_key_is_stable_after_backend_local_extraction(
+    monkeypatch,
+):
+    class FakeModule:
+        def trtllm_paged_attention_decode(self, *args):
+            raise AssertionError("cache-key construction must not launch a kernel")
+
+    monkeypatch.setattr(
+        batch_mla_trtllm_gen,
+        "get_trtllm_gen_fmha_module",
+        lambda: FakeModule(),
+    )
+    runner_type = batch_mla_trtllm_gen.TrtllmGenMlaDecodeRunner
+    runner = runner_type(
+        kv_cache=torch.empty((4, 1, 64, 576), dtype=torch.bfloat16),
+        workspace_buffer=torch.empty(16, dtype=torch.uint8),
+        sm_count=120,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        max_seq_len=2048,
+        sparse_mla_top_k=0,
+        bmm1_scale=1.0,
+        bmm2_scale=torch.ones(1),
+        sinks=[torch.empty(2)],
+        skip_softmax_threshold_scale_factor=None,
+        enable_pdl=False,
+        is_var_seq=True,
+        uses_shared_paged_kv_idx=True,
+        return_lse=False,
+        lse=None,
+    )
+    inputs = [
+        torch.empty((2, 1, 128, 576), dtype=torch.float16),
+        torch.zeros((2, 1), dtype=torch.int32),
+        torch.ones(2, dtype=torch.int32),
+        torch.empty((2, 1, 128, 512), dtype=torch.float32),
+    ]
+
+    cache_key_extras = runner.get_cache_key_extras(inputs)
+    assert cache_key_extras[7] == next_positive_power_of_2(runner.max_seq_len)
+    assert cache_key_extras == (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        128,
+        512,
+        64,
+        64,
+        2048,
+        0,
+        True,
+        True,
+        False,
+        "bmm1_float",
+        "bmm2_tensor",
+        (((2,), torch.float32),),
+        None,
+        False,
+    )
+    assert hash(runner) == hash(
+        runner_type(
+            kv_cache=torch.empty((8, 1, 64, 576), dtype=torch.bfloat16),
+            workspace_buffer=torch.empty(32, dtype=torch.uint8),
+            sm_count=120,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            max_seq_len=2048,
+            sparse_mla_top_k=0,
+            bmm1_scale=1.0,
+            bmm2_scale=torch.ones(1),
+            sinks=[torch.empty(2)],
+            skip_softmax_threshold_scale_factor=None,
+            enable_pdl=False,
+            is_var_seq=True,
+            uses_shared_paged_kv_idx=True,
+            return_lse=False,
+            lse=None,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected_candidates"),
+    (("trtllm-gen", ("trtllm-gen",)), ("auto", ("trtllm-gen", "cute-dsl"))),
+)
+def test_explicit_and_auto_candidate_names_and_order_remain_stable(
+    monkeypatch, backend, expected_candidates
+):
+    seen = {}
+
+    class FakeRunner:
+        def __init__(self, name, **kwargs):
+            self.name = name
+
+        def __call__(self, *, inputs, tactic):
+            seen["final_call"] = (self.name, inputs, tactic)
+
+    class FakeAutoTuner:
+        @classmethod
+        def get(cls):
+            return cls()
+
+        def choose_one(self, op_name, runners, tuning_config, inputs):
+            seen["choose"] = (
+                op_name,
+                tuple(runner.name for runner in runners),
+                tuning_config,
+            )
+            return runners[0], -1
+
+    monkeypatch.setattr(
+        batch_mla_core,
+        "TrtllmGenMlaDecodeRunner",
+        lambda **kwargs: FakeRunner("trtllm-gen", **kwargs),
+    )
+    monkeypatch.setattr(
+        batch_mla_core,
+        "CuteDslMlaDecodeRunner",
+        lambda **kwargs: FakeRunner("cute-dsl", **kwargs),
+    )
+    monkeypatch.setattr(batch_mla_core, "AutoTuner", FakeAutoTuner)
+    monkeypatch.setattr(batch_mla_core, "device_support_pdl", lambda device: False)
+    monkeypatch.setattr(batch_mla_core, "get_device_sm_count", lambda device: 120)
+    monkeypatch.setattr(
+        batch_mla_core,
+        "_check_trtllm_gen_mla_shape",
+        lambda query, kv_cache, *args, **kwargs: kv_cache,
+    )
+    monkeypatch.setattr(
+        batch_mla_core,
+        "_cute_dsl_incompatibility_reason",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        batch_mla_core,
+        "_build_mla_decode_tuning_config",
+        lambda **kwargs: seen.setdefault(
+            "tuning_runner_names", tuple(kwargs["runner_names"])
+        ),
+    )
+
+    query = torch.empty((2, 1, 128, 576), dtype=torch.bfloat16)
+    out = torch.empty((2, 1, 128, 512), dtype=torch.bfloat16)
+    result = batch_mla_core._run_mla_decode_trtllm_gen_or_cute_dsl_impl(
+        query=query,
+        kv_cache=torch.empty((4, 1, 64, 576), dtype=torch.bfloat16),
+        workspace_buffer=torch.empty(16, dtype=torch.uint8),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        max_seq_len=64,
+        out=out,
+        backend=backend,
+    )
+
+    assert result is out
+    assert seen["tuning_runner_names"] == expected_candidates
+    assert seen["choose"][:2] == (
+        "trtllm_batch_decode_mla",
+        expected_candidates,
+    )
+    assert seen["final_call"][0] == expected_candidates[0]

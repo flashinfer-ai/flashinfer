@@ -202,6 +202,24 @@ def test_stateful_plan_run_namespace_and_candidate_kwargs():
     assert ck["sm_scale"] == 0.125
 
 
+def test_mla_stateful_adapter_preserves_old_and_new_module_paths():
+    from flashinfer.trace_apply.plan_capture import adapter_for
+
+    legacy = adapter_for("flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run")
+    current = adapter_for(
+        "flashinfer.mla._batch_mla._core.BatchMLAPagedAttentionWrapper.run"
+    )
+
+    assert legacy is current
+    assert current is not None
+    assert current.plan_attr == "plan"
+    assert current.plan_inputs == {
+        "kv_indptr": "kv_indptr",
+        "kv_indices": "kv_indices",
+        "sm_scale": "sm_scale",
+    }
+
+
 def test_output_adapt_value_returning_returns_value():
     tmpl = _live_template(FI_API)
     x = torch.randn(4, 8)
