@@ -404,7 +404,7 @@ def masked_bmm(
 
     if enable_autotune:
         _masked_bmm_autotune(
-            torch.cuda.current_stream(),
+            torch.cuda.current_stream(a.device),
             a,
             b,
             c,
@@ -426,7 +426,7 @@ def masked_bmm(
         num_ctas = kernel_configs.get("num_ctas", 1)
         occupancy = kernel_configs.get("occupancy", 1)
 
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        NUM_SMS = torch.cuda.get_device_properties(a.device).multi_processor_count
         num_pid_m = ct.cdiv(M, BLOCK_M)
         num_pid_n = ct.cdiv(N, BLOCK_N)
         tiles_per_batch = num_pid_m * num_pid_n
@@ -450,7 +450,7 @@ def masked_bmm(
         )
 
         ct.launch(
-            torch.cuda.current_stream(),
+            torch.cuda.current_stream(a.device),
             grid,
             kernel,
             (

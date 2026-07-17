@@ -404,11 +404,16 @@ def _ragged_block_scaled_bmm_autotune_configs_unfiltered():
                 occupancy=occ,
             )
         # Swapped configs (for small M)
+        # BLOCK_N must stay <= the FP8 block-scale N-granularity (128): the kernel
+        # loads a single b_scale entry per (pid_q, offs_bsn, k) and broadcasts it
+        # across the whole BLOCK_N tile, so a BLOCK_N=256 config would apply the
+        # first 128-column group's scale to the second group too (silent numerical
+        # error). This mirrors the sm90 branch's cap above.
         for GM in [2, 4]:
             for BM in [16, 32, 64]:
                 yield SimpleNamespace(
                     BLOCK_M=BM,
-                    BLOCK_N=256,
+                    BLOCK_N=128,
                     BLOCK_K=128,
                     GROUP_SIZE_M=GM,
                     swap_ab=True,
@@ -590,7 +595,7 @@ def ragged_block_scaled_bmm(
     # max_m hint: a stale/zero max_m would make num_programs 0 and leave the
     # output unwritten. The kernel still reads its per-tile bound from
     # max_m_device, so this only affects the launched program count.
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    NUM_SMS = torch.cuda.get_device_properties(a.device).multi_processor_count
     num_pid_m = ct.cdiv(total_m, BLOCK_M)
     num_pid_n = ct.cdiv(N, BLOCK_N)
     tiles_per_batch = num_pid_m * num_pid_n
@@ -620,7 +625,7 @@ def ragged_block_scaled_bmm(
     kernel = cached_replace_hints(kernel_fn, **hints) if hints else kernel_fn
 
     ct.launch(
-        torch.cuda.current_stream(),
+        torch.cuda.current_stream(a.device),
         grid,
         kernel,
         (
