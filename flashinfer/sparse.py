@@ -434,6 +434,90 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
 
+        # ---- cuTile backend (pure cuda.tile Python kernel) ------------------------
+        # No C++ module to JIT: just stash the BSR plan state. run() reconstructs a
+        # dense block table from (indptr/indices) and treats each block-row as one
+        # variable-length prefill "batch" with page_size == C.
+        if self._backend == "cutile":
+            if indptr is None or indices is None:
+                raise ValueError(
+                    "cuTile block-sparse backend requires indptr and indices."
+                )
+            if N % C != 0:
+                raise ValueError(
+                    f"cuTile block-sparse backend requires N % C == 0 (N={N}, C={C})."
+                )
+            if mask is not None or packed_mask is not None:
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not support per-element "
+                    "intra-block masks (mask/packed_mask)."
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not support logits_soft_cap."
+                )
+            if pos_encoding_mode != "NONE":
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not apply position encoding "
+                    "(pos_encoding_mode must be 'NONE')."
+                )
+            if M % R != 0:
+                # run() forces each block-row batch to exactly R query rows; a
+                # non-multiple M would slice past the query buffer -> OOB.
+                raise ValueError(
+                    f"cuTile block-sparse backend requires M % R == 0 (M={M}, R={R})."
+                )
+            if C < 16:
+                # Prefill autotune's minimum BLOCK_N is 16 (32 on SM90); a smaller
+                # C yields an empty search space -> opaque exhaustive_search error.
+                raise ValueError(
+                    "cuTile block-sparse backend requires C >= 16 (the minimum "
+                    f"prefill BLOCK_N); got C={C}."
+                )
+            if causal:
+                # The BSR->paged mapping gathers arbitrary column-blocks, so the
+                # kernel's packed (gathered-block) position mask does NOT equal
+                # global row/column causality. (The standalone prefill kernel
+                # supports causal for contiguous paged/ragged inputs; only this
+                # block-sparse mapping cannot express it correctly.)
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not support causal masking "
+                    "under the block-sparse (gathered-block) mapping."
+                )
+            if num_qo_heads % num_kv_heads != 0:
+                # run() maps each (block-row, kv-head) onto QUERY_GROUP_SIZE =
+                # num_qo_heads // num_kv_heads query heads; a non-multiple would
+                # silently drop the remainder heads.
+                raise ValueError(
+                    "cuTile block-sparse backend requires num_qo_heads % "
+                    f"num_kv_heads == 0 (num_qo_heads={num_qo_heads}, "
+                    f"num_kv_heads={num_kv_heads})."
+                )
+            num_col_blocks = N // C
+            if indices.numel() > 0:
+                # Each index selects a column-block gathered as a page; an
+                # out-of-range value would issue an invalid page load.
+                idx_min = int(indices.min().item())
+                idx_max = int(indices.max().item())
+                if idx_min < 0 or idx_max >= num_col_blocks:
+                    raise ValueError(
+                        "cuTile block-sparse backend requires all indices in "
+                        f"[0, N // C) = [0, {num_col_blocks}); got "
+                        f"[{idx_min}, {idx_max}]."
+                    )
+            self._R = R
+            self._C = C
+            self._M = M
+            self._N = N
+            self._num_qo_heads = num_qo_heads
+            self._num_kv_heads = num_kv_heads
+            self._head_dim = head_dim
+            self._causal = causal
+            self._sm_scale = sm_scale
+            self._sparse_indptr = indptr.to(self.device, non_blocking=non_blocking)
+            self._sparse_indices = indices.to(self.device, non_blocking=non_blocking)
+            return
+
         # ---- VSA Blackwell backend (BSA blk128 kernel) ----------------------------
         if self._backend == "vsa_blackwell":
             cc = get_compute_capability(self.device)
@@ -881,6 +965,72 @@ class BlockSparseAttentionWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+
+        # ---- cuTile backend (pure cuda.tile Python kernel) ------------------------
+        # Map the BSR plan onto a paged prefill: each block-row (R query rows) is one
+        # variable-length batch whose KV pages are the selected column-blocks (width C).
+        if self._backend == "cutile":
+            if return_lse:
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not support return_lse."
+                )
+            from .attention.kernels.cutile.fmha_prefill_bsr_cutile import (  # noqa: PLC0415
+                prefill_attention_kv_paged_cutile,
+            )
+
+            R, C = self._R, self._C
+            indptr = self._sparse_indptr
+            indices = self._sparse_indices
+            num_block_rows = indptr.numel() - 1
+
+            # KV as page_size==C paged cache: [N, H_kv, D] -> [N // C, C, H_kv, D].
+            k_cache = k.reshape(self._N // C, C, self._num_kv_heads, self._head_dim)
+            v_cache = v.reshape(self._N // C, C, self._num_kv_heads, v.shape[-1])
+
+            nnz_per_row = (indptr[1:] - indptr[:-1]).to(torch.int32)
+            actual_seq_lens_q = torch.full(
+                (num_block_rows,), R, dtype=torch.int32, device=q.device
+            )
+            actual_seq_lens_kv = (nnz_per_row * C).to(torch.int32)
+            max_pages = int(nnz_per_row.max().item())
+            block_tables = torch.zeros(
+                (num_block_rows, max_pages), dtype=torch.int32, device=q.device
+            )
+            col = torch.arange(max_pages, device=q.device)
+            valid = col[None, :] < nnz_per_row[:, None]
+            block_tables[valid] = indices.to(torch.int32)
+            actual_seq_offset = torch.nn.functional.pad(
+                actual_seq_lens_q.cumsum(0), (1, 0)
+            ).to(torch.int32)
+
+            # The kernel folds the softmax scale into k_scale (qk_scale =
+            # k_scale * INV_LOG_2), so k_scale must carry the 1/sqrt(head_dim)
+            # softmax scale, matching single_prefill_with_kv_cache's default.
+            sm_scale = self._sm_scale
+            if sm_scale is None:
+                sm_scale = 1.0 / math.sqrt(self._head_dim)
+
+            out, _ = prefill_attention_kv_paged_cutile(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                actual_seq_lens_q=actual_seq_lens_q,
+                actual_seq_lens_kv=actual_seq_lens_kv,
+                actual_seq_offset=actual_seq_offset,
+                block_tables=block_tables,
+                k_scale=sm_scale,
+                v_scale=1.0,
+                num_batch=num_block_rows,
+                # Each block-row is one variable-length batch of exactly R query
+                # rows, so the per-batch max query length is R (not the global M).
+                # Passing R sizes the grid / LPT tile count to exactly ceil(R/
+                # BLOCK_M) tiles instead of ceil(M/BLOCK_M), avoiding the ~M/R x
+                # over-launch of CTAs that would otherwise early-return.
+                max_seq_len=R,
+                is_causal=self._causal,
+                outputs=out,
+            )
+            return out
 
         # ---- VSA Blackwell backend (BSA blk128 kernel) ----------------------------
         if self._backend == "vsa_blackwell":

@@ -1525,6 +1525,70 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"request with kv_len={min_kv_len}: its earlier rows "
                     "would attend to an empty KV range."
                 )
+        if self._backend == "cutile":
+            # Pure cuda.tile Python kernel: no C++ module to JIT. Stash the
+            # per-sequence KV lengths and page size, and materialize the dense
+            # block table now (at plan time) so run() is CUDA-graph-capturable --
+            # reconstructing it in run() would require host .item() syncs.
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise NotImplementedError(
+                    "cuTile decode backend does not support logits_soft_cap."
+                )
+            if window_left >= 0:
+                # The kernel receives no window_left; a sliding window would be
+                # silently ignored and run as full attention.
+                raise NotImplementedError(
+                    "cuTile decode backend does not support sliding window "
+                    f"(window_left={window_left})."
+                )
+            if pos_encoding_mode != "NONE":
+                # The kernel applies no positional encoding; anything other than
+                # "NONE" would be silently dropped.
+                raise NotImplementedError(
+                    "cuTile decode backend does not apply position encoding "
+                    f"(pos_encoding_mode must be 'NONE'); got {pos_encoding_mode!r}."
+                )
+            self._page_size = page_size
+            self._kv_lens_arr_host = kv_lens_arr_host
+            # Device copy of the per-seq KV lengths, staged once at plan time.
+            # run() must not copy it H2D itself: a CPU->CUDA copy from unpinned
+            # host memory is illegal during CUDA graph capture.
+            self._kv_lens_device = kv_lens_arr_host.to(
+                device=self.device, dtype=torch.int32
+            )
+            if self._block_tables is None:
+                # Build a dense [batch, max_pages] block table from the CSR
+                # (indptr/indices) plan state. Done here, once, outside any CUDA
+                # graph capture, so run() pays no per-call host sync (mirrors the
+                # trtllm-gen plan-time reconstruction below).
+                blocks_per_seq = [
+                    (int(seq_len) + page_size - 1) // page_size
+                    for seq_len in kv_lens_arr_host
+                ]
+                max_num_blocks_per_seq = max(blocks_per_seq)
+                self._block_tables = torch.zeros(
+                    (batch_size, max_num_blocks_per_seq),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                block_id = int(indptr_host[0].item())
+                for i in range(batch_size):
+                    num_blocks_needed = blocks_per_seq[i]
+                    self._block_tables[i, :num_blocks_needed] = (
+                        self._paged_kv_indices_buf[
+                            block_id : block_id + num_blocks_needed
+                        ]
+                    )
+                    block_id += num_blocks_needed
+            self._plan_info = None
+            # run() reads these; normally set after the module-build branches below.
+            self._pos_encoding_mode = pos_encoding_mode
+            self._window_left = window_left
+            self._logits_soft_cap = logits_soft_cap
+            self._sm_scale = sm_scale
+            self._rope_scale = rope_scale
+            self._rope_theta = rope_theta
+            return
         if self._backend == "cute-dsl":
             if logits_soft_cap is not None and logits_soft_cap > 0:
                 raise NotImplementedError(
@@ -2022,6 +2086,50 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
+
+        if self._backend == "cutile":
+            if return_lse:
+                raise NotImplementedError(
+                    "cuTile decode backend does not support return_lse."
+                )
+            if sinks is not None:
+                raise NotImplementedError(
+                    "cuTile decode backend does not support attention sinks."
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "cuTile decode backend does not support NVFP4 KV cache."
+                )
+            if self._kv_layout != "NHD":
+                raise NotImplementedError(
+                    "cuTile decode backend requires kv_layout='NHD'."
+                )
+            if q.shape[0] != actual_batch_size:
+                raise NotImplementedError(
+                    "cuTile decode backend requires q_len_per_req == 1 "
+                    f"(got q.shape[0]={q.shape[0]}, batch_size={actual_batch_size})."
+                )
+            from .attention.kernels.cutile.fmha_decode_bsr_cutile import (
+                fmha_decode_bsr_cutile,
+            )
+
+            # Both the block table and the device KV-lengths are materialized at
+            # plan() time (see the cuTile plan branch), so run() does only
+            # device->device ops (no host .item() sync, no CPU->CUDA copy) and is
+            # safe to capture in a CUDA graph.
+            actual_seq_lens = self._kv_lens_device.to(device=q.device)
+            block_tables = self._block_tables.to(device=q.device, dtype=torch.int32)
+
+            return fmha_decode_bsr_cutile(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                actual_seq_lens=actual_seq_lens,
+                block_tables=block_tables,
+                k_scale=sm_scale,
+                v_scale=1.0 if v_scale is None else v_scale,
+                outputs=out,
+            )
 
         if self._backend == "cute-dsl" and out is None:
             out = None  # Let cute-dsl wrapper handle the alloc
