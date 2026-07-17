@@ -102,10 +102,6 @@ def _get_cute_dsl_bf16_fp4_gemm(
     enable_pdl: bool = True,
     tile_swizzle: int = 1,
     k_splits: int = 1,
-    # (stripe_tiles, num_stripes, gx) for the K-striped N-sweep decode
-    # mode; (0, 0, 0) = off.  Baked into the compiled kernel, so it is
-    # part of the cache key.
-    n_sweep: Tuple[int, int, int] = (0, 0, 0),
 ):
     # Normalize to a tuple (callers may pass a list) so the cache key is hashable.
     atom_layout = cast(Tuple[int, int, int], tuple(atom_layout))
@@ -114,7 +110,6 @@ def _get_cute_dsl_bf16_fp4_gemm(
     enable_pdl = bool(enable_pdl)
     tile_swizzle = int(tile_swizzle)
     k_splits = int(k_splits)
-    n_sweep = cast(Tuple[int, int, int], tuple(int(v) for v in n_sweep))
     cache_key = (
         tile_shape_mnk,
         a_dtype,
@@ -125,7 +120,6 @@ def _get_cute_dsl_bf16_fp4_gemm(
         enable_pdl,
         tile_swizzle,
         k_splits,
-        n_sweep,
     )
     cached = _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -185,9 +179,6 @@ def _get_cute_dsl_bf16_fp4_gemm(
         enable_pdl=enable_pdl,
         tile_swizzle=tile_swizzle,
         k_splits=k_splits,
-        n_sweep_stripe_tiles=n_sweep[0],
-        n_sweep_stripes=n_sweep[1],
-        n_sweep_gx=n_sweep[2],
     )
     max_active_clusters = get_max_active_clusters(1)
 
@@ -314,11 +305,11 @@ def _prepare_cute_dsl(
 
 def _bf16_fp4_cute_dsl_tactic_configs(
     n: int, k: int
-) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int, int]]:
+) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int]]:
     """Enumerate cute-DSL tactic configs for a given ``(N, K)``.
 
     Returns a list of ``(tile_shape_mnk, atom_layout, pipeline_depth,
-    use_fp16_mma, tile_swizzle, k_splits, n_sweep_stripe_tiles)`` tuples.
+    use_fp16_mma, tile_swizzle, k_splits)`` tuples.
     """
     tile_k = 128 if k % 128 == 0 else 64
 
@@ -331,11 +322,11 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     tile_m_atoms.append((64, (2, 2, 1)))
 
     configs: List[
-        Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int, int]
+        Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int]
     ] = []
     seen = set()
 
-    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None, swz=1, splits=1, nsweep=0):
+    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None, swz=1, splits=1):
         cfg = (
             (tile_m, tile_n, tile_k if tk is None else tk),
             atom,
@@ -343,9 +334,8 @@ def _bf16_fp4_cute_dsl_tactic_configs(
             fp16,
             swz,
             splits,
-            nsweep,
         )
-        key = (cfg[0], cfg[1], pdepth, fp16, swz, splits, nsweep)
+        key = (cfg[0], cfg[1], pdepth, fp16, swz, splits)
         if key not in seen:
             seen.add(key)
             configs.append(cfg)
@@ -365,21 +355,6 @@ def _bf16_fp4_cute_dsl_tactic_configs(
         for splits in (2, 4, 8):
             if splits <= k_tiles:
                 add(base_tile_m, base_atom, 1, 1, splits=splits)
-
-    # K-striped N-sweep variants (decode, m <= tile_M): each CTA keeps one
-    # K-stripe of A resident in smem and sweeps N-tiles at that K-range, so
-    # the A rows stop being re-fetched by every N-tile CTA (in the default
-    # schedule that re-fetch costs about as much L2 traffic as the weights).
-    # get_valid_tactics hides these when the tuning M exceeds tile_M.
-    if tile_k == 128 and n // 64 <= 256:
-        k_tiles = k // tile_k
-        for stripe in (4, 8, 16):
-            stripe_eff = min(stripe, k_tiles)
-            # Many stripes multiply the partials traffic and the reduce
-            # work for no fill benefit; large-K shapes should use a larger
-            # stripe instead (28 stripes measured 2x slower on GB10).
-            if -(-k_tiles // stripe_eff) <= 8:
-                add(base_tile_m, base_atom, 1, 1, nsweep=stripe_eff)
 
     # tile_N=128 halves the (m,n)-tile count but needs large wave count.
     if tile_k == 128 and n >= 12288 and n % 128 == 0:
@@ -441,17 +416,33 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            _, b, _, _, _, _, block_size = inputs
+            a, b, _, _, _, _, block_size = inputs
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
-            # N-sweep is offered only to the small-M decode buckets it was
-            # built for (the kernel handles a single M-tile, and larger M
-            # is served better by split-K).  Runtime M never exceeds the
-            # tuned bucket (bucket mapping rounds up), so filtering on the
-            # profile M here is sufficient.
             m_opt = int(profile.get_opt_shapes()[0][0])
+            sm_count = torch.cuda.get_device_properties(a.device).multi_processor_count
             configs = _bf16_fp4_cute_dsl_tactic_configs(n, k)
-            return [i for i, cfg in enumerate(configs) if cfg[6] == 0 or m_opt <= 4]
+
+            def split_reduces_makespan(cfg) -> bool:
+                # Splitting K trades extra partials traffic for fill, so
+                # it only pays when it shortens the last wave by enough to
+                # cover that traffic.  Without this guard the tuner's
+                # cache-warm timing loop picks split-K on nearly-full
+                # grids, where cold-cache it just adds the partials round
+                # trip (measured -9% on GB202 10304x2688 at 0.86 waves).
+                # The 25% bar separates the measured outcomes: every
+                # validated winner shortens the makespan by >= 25%, and
+                # the marginal 12.5% case still lost by 12%.
+                splits = cfg[5]
+                if splits == 1:
+                    return True
+                tile_m, tile_n, _ = cfg[0]
+                tiles = (-(-m_opt // tile_m)) * (-(-n // tile_n))
+                base_waves = -(-tiles // sm_count)
+                split_waves = (-(-tiles * splits // sm_count)) / splits
+                return split_waves <= 0.75 * base_waves
+
+            return [i for i, cfg in enumerate(configs) if split_reduces_makespan(cfg)]
 
         def forward(
             self,
@@ -467,8 +458,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             if tactic < 0:
                 # Fallback == pre-autotuner heuristic (M-aware), default knobs.
                 tile_shape_mnk, atom_layout = _select_bf16_fp4_tile_shape(m, n, k)
-                pipeline_depth, use_fp16_mma, tile_swizzle = 1, 1, 1
-                k_splits, stripe_tiles = 1, 0
+                pipeline_depth, use_fp16_mma, tile_swizzle, k_splits = 1, 1, 1, 1
             else:
                 (
                     tile_shape_mnk,
@@ -477,31 +467,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     use_fp16_mma,
                     tile_swizzle,
                     k_splits,
-                    stripe_tiles,
                 ) = _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic]
-            if stripe_tiles > 0:
-                # get_valid_tactics only offers N-sweep tactics when the
-                # tuning M fits one M-tile; reaching here otherwise means a
-                # forced-tactic call with an unsupported M.
-                if m > tile_shape_mnk[0]:
-                    raise ValueError(
-                        f"N-sweep tactic {tactic} requires m <= "
-                        f"{tile_shape_mnk[0]} (got m={m})"
-                    )
-                k_tiles = k // tile_shape_mnk[2]
-                num_stripes = -(-k_tiles // stripe_tiles)
-                n_tiles = n // tile_shape_mnk[1]
-                # One CTA per SM: blockIdx.x lanes share the SMs left over
-                # after the stripe dimension.
-                sm_count = torch.cuda.get_device_properties(
-                    a.device
-                ).multi_processor_count
-                gx = min(n_tiles, max(1, sm_count // num_stripes))
-                n_sweep = (stripe_tiles, num_stripes, gx)
-                partial_splits = num_stripes
-            else:
-                n_sweep = (0, 0, 0)
-                partial_splits = k_splits
             compiled = _get_cute_dsl_bf16_fp4_gemm(
                 tile_shape_mnk,
                 a.dtype,
@@ -512,16 +478,13 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 enable_pdl=enable_pdl,
                 tile_swizzle=tile_swizzle,
                 k_splits=k_splits,
-                n_sweep=n_sweep,
             )
-            # N-sweep always goes through partials (even with one stripe);
-            # split-K only when it actually splits.  The compiled module
-            # launches its own reduce kernel after the GEMM (fixed-order
-            # fp32 sum -> deterministic), so no torch ops follow.
-            use_partial = k_splits > 1 or stripe_tiles > 0
-            if use_partial:
+            if k_splits > 1:
+                # The compiled module launches its own reduce kernel after
+                # the GEMM (fixed-order fp32 sum -> deterministic), so no
+                # torch ops follow the call.
                 partial = torch.empty(
-                    partial_splits * m * n, device=a.device, dtype=torch.float32
+                    k_splits * m * n, device=a.device, dtype=torch.float32
                 )
             else:
                 partial = _get_split_k_dummy(a.device)
