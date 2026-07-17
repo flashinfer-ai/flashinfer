@@ -825,7 +825,8 @@ def test_mxfp8_quantize_extreme_scale_inputs(dtype, is_sf_swizzled_layout, backe
         pytest.skip("CuTe-DSL is not available")
 
     a = torch.zeros((2, 128), dtype=dtype, device="cuda")
-    a[:, 32:64] = float("inf")
+    a[0, 32:64] = float("inf")
+    a[1, 32:64] = -float("inf")
     a[:, 64:96] = 448.0
     a[:, 96:128] = -448.0
 

@@ -208,8 +208,9 @@ def ue8m0_to_inv_scale_fast(ue8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
     """
     Convert UE8M0 to inverse scale using integer bit construction.
 
-    Constructs a float32 with exponent = (254 - ue8m0) and zero mantissa,
-    which is exactly 2^(127 - ue8m0). No SFU dependency.
+    For nonzero ue8m0 in [1, 254], constructs the exact float32
+    representation of 2^(127 - ue8m0). The ue8m0 == 254 case is the
+    subnormal 2^-127 (bits 0x00400000). No SFU dependency.
     Returns 0 for ue8m0 == 0.
     """
     return Float32(
@@ -220,12 +221,14 @@ def ue8m0_to_inv_scale_fast(ue8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
             {
                 .reg .s32 new_exp;
                 .reg .b32 float_bits;
-                .reg .pred p_zero;
+                .reg .pred p_zero, p_subnormal;
 
                 setp.eq.u32 p_zero, $1, 0;
+                setp.eq.u32 p_subnormal, $1, 254;
                 sub.s32 new_exp, 254, $1;
                 max.s32 new_exp, new_exp, 0;
                 shl.b32 float_bits, new_exp, 23;
+                @p_subnormal mov.b32 float_bits, 0x00400000;
                 mov.b32 $0, float_bits;
                 @p_zero mov.b32 $0, 0;
             }
