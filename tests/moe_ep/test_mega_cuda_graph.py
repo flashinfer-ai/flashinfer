@@ -230,3 +230,55 @@ def test_mega_compute_output_none_returns_workspace_view(monkeypatch):
         assert torch.equal(view, y_copy)
     finally:
         layer.destroy()
+
+
+@pytest.mark.arch_blackwell
+def test_mega_layer_multi_size_graphs_and_eager_interleave(monkeypatch):
+    """Engine pattern: one graph per batch size + eager calls, interleaved.
+
+    Regression test for the tail-mask memo bug: a small-size graph replayed
+    after a larger one (or an eager call after replays) must not leave the
+    larger batch's rows live in the shared workspace — stale live rows
+    dispatch garbage work and can change outputs.
+    """
+    import torch
+
+    _require_blackwell()
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    layer, problem = _single_rank_layer("nvfp4")
+    try:
+        layer.warmup()
+        t64 = _random_batch(problem, seed=51, num_tokens=64)
+        t32 = _random_batch(problem, seed=52, num_tokens=32)
+
+        y64_ref = layer.forward(t64).clone()
+        y32_ref = layer.forward(t32).clone()
+        torch.cuda.synchronize()
+
+        g64 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g64):
+            y64_g = layer.forward(t64)
+        g32 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g32):
+            y32_g = layer.forward(t32)
+
+        # Small replay AFTER large replay: the 64-row staging must not leak
+        # into the 32-row step.
+        g64.replay()
+        g32.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(y32_g, y32_ref), "g32 after g64 diverged (stale rows)"
+        g32.replay()
+        g64.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(y64_g, y64_ref)
+
+        # Eager after replays: host-side state must not trust counts the
+        # replays never updated.
+        g64.replay()
+        y32_eager = layer.forward(t32)
+        torch.cuda.synchronize()
+        assert torch.equal(y32_eager, y32_ref), "eager after replay diverged"
+    finally:
+        layer.destroy()

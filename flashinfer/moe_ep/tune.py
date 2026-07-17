@@ -79,6 +79,16 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="truncate the candidate list (smoke testing)",
     )
+    parser.add_argument(
+        "--live-tokens",
+        type=int,
+        default=None,
+        help="live token count to stage and time (default: the bucket size). "
+        "Use a decode-like count (e.g. 256) to tune for decode steps while "
+        "keeping the engine's buffer bucket; the cache entry is still keyed "
+        "on --max-tokens, so write decode-tuned winners to a separate cache "
+        "file (FLASHINFER_MOE_EP_KNOB_CACHE).",
+    )
     parser.add_argument("--warmup-iters", type=int, default=3)
     parser.add_argument("--timed-iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -102,6 +112,9 @@ def _tune_one(
     )
 
     is_nvfp4 = args.dtype == "nvfp4"
+    live_tokens = args.live_tokens if args.live_tokens is not None else max_tokens
+    if live_tokens > max_tokens:
+        raise SystemExit("--live-tokens must be <= --max-tokens")
     symm_buffer: Any = None
     try:
         if is_nvfp4:
@@ -110,7 +123,7 @@ def _tune_one(
                 world_size,
                 args.num_experts,
                 max_tokens,
-                max_tokens,
+                live_tokens,
                 args.topk,
                 args.hidden,
                 2 * args.intermediate,
@@ -132,7 +145,7 @@ def _tune_one(
                 world_size,
                 args.num_experts,
                 max_tokens,
-                max_tokens,
+                live_tokens,
                 args.topk,
                 args.hidden,
                 args.intermediate,
@@ -149,8 +162,8 @@ def _tune_one(
             candidates = candidates[: args.max_candidates]
         if rank == 0:
             print(
-                f"[moe_ep-tune] {args.dtype} max_tokens={max_tokens}: "
-                f"{len(candidates)} candidates",
+                f"[moe_ep-tune] {args.dtype} max_tokens={max_tokens} "
+                f"live_tokens={live_tokens}: {len(candidates)} candidates",
                 flush=True,
             )
 
@@ -159,7 +172,7 @@ def _tune_one(
             l1,
             l2,
             symm_buffer,
-            num_tokens=max_tokens,
+            num_tokens=live_tokens,
             candidates=candidates,
             warmup_iters=args.warmup_iters,
             timed_iters=args.timed_iters,
