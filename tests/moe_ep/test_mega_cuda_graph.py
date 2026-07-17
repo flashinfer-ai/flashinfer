@@ -280,5 +280,15 @@ def test_mega_layer_multi_size_graphs_and_eager_interleave(monkeypatch):
         y32_eager = layer.forward(t32)
         torch.cuda.synchronize()
         assert torch.equal(y32_eager, y32_ref), "eager after replay diverged"
+
+        # Zero-copy view sizing must reflect the ACTUAL staged count even on
+        # capture-touched buffers (regression: memo poisoning made the view
+        # capacity-sized during engine capture warmup).
+        kernel, ws, transformed = layer._kernel, layer._workspace, layer._transformed
+        kernel.stage_inputs(t32, ws, quantize_input=True)
+        view = kernel.compute(ws, transformed, output=None)
+        torch.cuda.synchronize()
+        assert view.shape[0] == t32.hidden_states.shape[0]
+        assert torch.equal(view, y32_ref)
     finally:
         layer.destroy()
