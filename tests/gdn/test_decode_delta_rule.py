@@ -2439,7 +2439,6 @@ def test_gdn_decode_bf16_wy_output_only_mtp_kernel(
     # Swap the module-level kernel symbol that _test_gdn_decode_bf16_state_mtp_kernel
     # looks up at call time. monkeypatch auto-restores after the test. The v18
     # signature is call-compatible (output-only subset), so no partial is needed.
-    import sys
     monkeypatch.setattr(
         sys.modules[__name__],
         "gdn_decode_bf16_state_mtp",

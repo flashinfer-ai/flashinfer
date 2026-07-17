@@ -305,28 +305,6 @@ def _cp_async_wait_group_n(n_const):
     return Int32(r)
 
 
-def _st_global_bf16x2_f32(base_addr_i64, bf16_elem_offset, lo_f32, hi_f32):
-    r = llvm.inline_asm(
-        mlir_T.i32(),
-        [
-            base_addr_i64.ir_value(),
-            bf16_elem_offset.ir_value(),
-            lo_f32.ir_value(),
-            hi_f32.ir_value(),
-        ],
-        "{ .reg .u64 _addr; .reg .b32 _v;"
-        " mad.wide.u32 _addr, $2, 2, $1;"
-        " cvt.rn.bf16x2.f32 _v, $4, $3;"
-        " st.global.b32 [_addr], _v;"
-        " mov.u32 $0, 0; }",
-        "=r,l,r,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return Int32(r)
-
-
 def _sts_bf16x2_f32(smem_addr_i32, lo_f32, hi_f32):
     """v5 (H3): packed FP32 → BF16x2 cast + STS.32 to SMEM.
     Replaces a pair of (LDS f32 + F2FP.BF16 + STS.16) sequences with a
@@ -2241,11 +2219,6 @@ def gated_delta_rule_mtp(
     # ~1-7% faster across BS=16..256 with bit-identical output. mbp=12 (40 regs) gains no
     # further occupancy (SMEM-capped at 7 CTAs) and is slower — do not raise past 8.
     mbp = max(1, min(_needed + 1, 8))
-    # GDN_WY_MBP overrides min_blocks_per_mp (launch bounds) for perf experiments.
-    # mbp is part of cache_key, so each value compiles its own kernel.
-    _mbp_env = _os.environ.get("GDN_WY_MBP")
-    if _mbp_env:
-        mbp = int(_mbp_env)
     # T-aware Phase-2 squaring depth.
     t_disc = 4 if T <= 4 else (8 if T <= 8 else 16)
     # n_valid in the key: native (n_valid<T) vs staged (n_valid=T_KERNEL) compile to
