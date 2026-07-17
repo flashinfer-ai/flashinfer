@@ -27,9 +27,10 @@ example uses):
 - SwiGLU (silu+mul) -> ``flashinfer.silu_and_mul``.
 - ``HunyuanMoE`` -> ``FlashInferHunyuanMoE``: upstream gate (softmax -> top-8
   -> renormalize) + the shared ``FlashInferFusedMoE``, which dispatches to
-  ``flashinfer.fused_moe.cutlass_fused_moe`` (BF16 or per-tensor FP8 W8A8,
-  SM89/SM90/SM100+) or ``flashinfer.fused_moe.trtllm_bf16_routed_moe``
-  (SM100/SM103) over stacked expert weights.
+  ``flashinfer.fused_moe.cutlass_fused_moe`` (BF16 / per-tensor FP8 /
+  SM90 FP8 block-scale / SM90 MXFP4-W4A16 / SM100+ NVFP4) or the
+  trtllm-gen routed MoE entry points (BF16 / DeepSeek-FP8 / NVFP4,
+  SM100/SM103) over stacked expert weights.
 - ``HunyuanImage3SDPAAttention`` -> shared ``FlashInferAttentionDispatcher``
   (single / cudnn / trtllm / torch paths) for mask-less prefill,
   ``flashinfer.decode.single_decode_with_kv_cache`` for decode steps; falls
@@ -111,8 +112,17 @@ class FlashInferBackboneOptions:
     """Knobs for the FlashInfer swap, mirroring the wan example layout."""
 
     gemm_backend: Literal[
-        "torch", "bf16", "fp8", "fp8_sm90", "bmm_fp8", "fp8_groupwise",
-        "fp8_blockscaled", "batch_deepgemm_fp8", "fp4", "bmm_bf16", "mxfp8",
+        "torch",
+        "bf16",
+        "fp8",
+        "fp8_sm90",
+        "bmm_fp8",
+        "fp8_groupwise",
+        "fp8_blockscaled",
+        "batch_deepgemm_fp8",
+        "fp4",
+        "bmm_bf16",
+        "mxfp8",
         "bmm_mxfp8",
     ] = "torch"
     online_act_quant: bool = True
@@ -121,17 +131,30 @@ class FlashInferBackboneOptions:
     # always fall back to SDPA, because FlashInfer's prefill APIs do not take
     # arbitrary boolean masks. Valid bases match the shared wan dispatcher
     # (``torch`` and its legacy alias ``sdpa`` route through SDPA).
-    attention_backend: Literal[
-        "auto", "single", "cudnn", "trtllm", "torch", "sdpa"
-    ] = "auto"
+    attention_backend: Literal["auto", "single", "cudnn", "trtllm", "torch", "sdpa"] = (
+        "auto"
+    )
     # Fused-MoE backend for the routed experts (see
     # ``flashinfer_modules.MoEBackend``): ``cutlass`` (BF16
     # cutlass_fused_moe, SM89/SM90/SM100+), ``cutlass_fp8`` (per-tensor FP8
-    # W8A8), ``trtllm`` (trtllm-gen BF16, SM100/SM103), ``torch`` (eager loop
-    # inside FlashInferFusedMoE), or ``eager`` to keep the upstream
-    # per-expert HunyuanMoE loop entirely.
+    # W8A8), ``cutlass_fp8_blockscale`` (DeepSeek-style 128x128 block-scale
+    # FP8 W8A8, SM90 only), ``cutlass_w4a16`` (MXFP4 weight-only, SM90
+    # only), ``cutlass_nvfp4`` (NVFP4 W4A4, SM100/SM110/SM120/SM121),
+    # ``trtllm`` (trtllm-gen BF16, SM100/SM103), ``trtllm_fp8_blockscale``
+    # (trtllm-gen DeepSeek FP8, SM100/SM103), ``trtllm_fp4`` (trtllm-gen
+    # NVFP4, SM100/SM103), ``torch`` (eager loop inside FlashInferFusedMoE),
+    # or ``eager`` to keep the upstream per-expert HunyuanMoE loop entirely.
     moe_backend: Literal[
-        "cutlass", "cutlass_fp8", "trtllm", "torch", "eager"
+        "cutlass",
+        "cutlass_fp8",
+        "cutlass_fp8_blockscale",
+        "cutlass_w4a16",
+        "cutlass_nvfp4",
+        "trtllm",
+        "trtllm_fp8_blockscale",
+        "trtllm_fp4",
+        "torch",
+        "eager",
     ] = "cutlass"
 
 
@@ -171,9 +194,7 @@ def _resolve_options(**overrides: Any) -> FlashInferBackboneOptions:
     opts = FlashInferBackboneOptions()
     legacy_moe_impl = os.getenv("FLASHINFER_MOE_IMPL")
     if legacy_moe_impl is not None:
-        opts.moe_backend = _LEGACY_MOE_IMPL_MAP.get(
-            legacy_moe_impl, legacy_moe_impl
-        )
+        opts.moe_backend = _LEGACY_MOE_IMPL_MAP.get(legacy_moe_impl, legacy_moe_impl)
     for field, env_name in _FLASHINFER_ENV_OVERRIDES.items():
         raw = os.getenv(env_name)
         if raw is None:
@@ -284,10 +305,13 @@ class _FlashInferHunyuanMLP(nn.Module):
         gate, up = gate_up.chunk(2, dim=-1)
         fused_input = torch.cat([up, gate], dim=-1).contiguous()
         if os.environ.get("FI_DEBUG_MLP"):
-            print(f"[FI_DEBUG_MLP] silu in shape={tuple(fused_input.shape)} "
-                  f"dtype={fused_input.dtype} dev={fused_input.device} "
-                  f"contig={fused_input.is_contiguous()} "
-                  f"cur_dev={torch.cuda.current_device()}", flush=True)
+            print(
+                f"[FI_DEBUG_MLP] silu in shape={tuple(fused_input.shape)} "
+                f"dtype={fused_input.dtype} dev={fused_input.device} "
+                f"contig={fused_input.is_contiguous()} "
+                f"cur_dev={torch.cuda.current_device()}",
+                flush=True,
+            )
         with _device_ctx(fused_input):
             if fused_input.dtype == torch.float32:
                 # ``silu_and_mul`` is BF16/FP16-only.
@@ -431,8 +455,8 @@ class FlashInferHunyuanImage3Attention(nn.Module):
 
     def _attention_decode(
         self,
-        q: torch.Tensor,   # (B, num_heads, 1, head_dim)
-        k: torch.Tensor,   # (B, num_heads, kv_len, head_dim)
+        q: torch.Tensor,  # (B, num_heads, 1, head_dim)
+        k: torch.Tensor,  # (B, num_heads, kv_len, head_dim)
         v: torch.Tensor,
     ) -> torch.Tensor:
         bsz, _, q_len, _ = q.shape
@@ -442,9 +466,8 @@ class FlashInferHunyuanImage3Attention(nn.Module):
             # For bsz>1 fall back to SDPA which handles batched decode
             # without paged KV setup.
             return self._attention_sdpa(q, k, v, attn_mask=None)
-        kv_len = k.shape[2]
-        q_2d = q[0, :, 0, :].contiguous()           # (num_heads, head_dim)
-        k_nhd = k[0].transpose(0, 1).contiguous()   # (kv_len, num_heads, head_dim)
+        q_2d = q[0, :, 0, :].contiguous()  # (num_heads, head_dim)
+        k_nhd = k[0].transpose(0, 1).contiguous()  # (kv_len, num_heads, head_dim)
         v_nhd = v[0].transpose(0, 1).contiguous()
         out = single_decode_with_kv_cache(q_2d, k_nhd, v_nhd)
         # (num_heads, head_dim) -> (1, num_heads, 1, head_dim)
@@ -489,14 +512,21 @@ class FlashInferHunyuanImage3Attention(nn.Module):
 
         qkv = self.qkv_proj(hidden_states)
         qkv = qkv.reshape(
-            bsz, q_len, self.num_key_value_heads,
-            self.num_key_value_groups + 2, self.head_dim,
+            bsz,
+            q_len,
+            self.num_key_value_heads,
+            self.num_key_value_groups + 2,
+            self.head_dim,
         )
         # Same split convention as upstream: [num_kv_groups, 1, 1] along dim=3.
         q, k, v = torch.split(qkv, [self.num_key_value_groups, 1, 1], dim=3)
         q = q.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(
+            1, 2
+        )
+        v = v.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(
+            1, 2
+        )
 
         if self.use_rotary_pos_emb:
             cos, sin = custom_pos_emb
@@ -661,9 +691,7 @@ class FlashInferHunyuanMoE(nn.Module):
         )
         with torch.no_grad():
             for i, expert in enumerate(original_moe.experts):
-                self.fused_moe.w13_weight.data[i].copy_(
-                    expert.gate_and_up_proj.weight
-                )
+                self.fused_moe.w13_weight.data[i].copy_(expert.gate_and_up_proj.weight)
                 self.fused_moe.w2_weight.data[i].copy_(expert.down_proj.weight)
                 # Free the per-expert weights as we go so peak memory stays
                 # one expert above the stacked copy (the upstream flashinfer
@@ -708,8 +736,9 @@ def _replace_rmsnorm(parent: nn.Module, name: str, original: nn.Module) -> None:
     setattr(parent, name, new)
 
 
-def _replace_mlp(parent: nn.Module, name: str, original: nn.Module,
-                 opts: FlashInferBackboneOptions) -> None:
+def _replace_mlp(
+    parent: nn.Module, name: str, original: nn.Module, opts: FlashInferBackboneOptions
+) -> None:
     """Replace a single ``HunyuanMLP`` with the FlashInfer SwiGLU MLP.
 
     The upstream class supports both ``silu`` and ``gelu`` activations, but
@@ -746,8 +775,9 @@ def _replace_mlp(parent: nn.Module, name: str, original: nn.Module,
     setattr(parent, name, new)
 
 
-def _replace_attention(parent: nn.Module, name: str, original: nn.Module,
-                       opts: FlashInferBackboneOptions) -> None:
+def _replace_attention(
+    parent: nn.Module, name: str, original: nn.Module, opts: FlashInferBackboneOptions
+) -> None:
     new = FlashInferHunyuanImage3Attention(original, opts)
     setattr(parent, name, new)
 
@@ -811,9 +841,14 @@ def replace_backbone_with_flashinfer(
             ``trtllm``, ``torch``, or its alias ``sdpa``.
         moe_backend: ``cutlass`` (default; BF16 cutlass_fused_moe,
             SM89/SM90/SM100+), ``cutlass_fp8`` (per-tensor FP8 W8A8),
-            ``trtllm`` (trtllm-gen BF16 routed MoE, SM100/SM103), ``torch``
-            (eager loop inside FlashInferFusedMoE), or ``eager`` (keep the
-            upstream per-expert HunyuanMoE loop).
+            ``cutlass_fp8_blockscale`` (DeepSeek-style 128x128 block-scale
+            FP8 W8A8, SM90 only), ``cutlass_w4a16`` (MXFP4 weight-only,
+            SM90 only), ``cutlass_nvfp4`` (NVFP4 W4A4,
+            SM100/SM110/SM120/SM121), ``trtllm`` (trtllm-gen BF16 routed
+            MoE, SM100/SM103), ``trtllm_fp8_blockscale`` /
+            ``trtllm_fp4`` (trtllm-gen quantized routed MoE, SM100/SM103),
+            ``torch`` (eager loop inside FlashInferFusedMoE), or ``eager``
+            (keep the upstream per-expert HunyuanMoE loop).
         moe_impl: Deprecated alias — ``flashinfer`` maps to
             ``moe_backend='cutlass'``, ``eager`` to ``moe_backend='eager'``.
         prepare_weights: If True, eagerly quantize every swapped
@@ -842,12 +877,16 @@ def replace_backbone_with_flashinfer(
         )
 
     n_layers = len(backbone.layers)
-    logger.info("Replacing %d HunyuanImage3 decoder layers with FlashInfer kernels.", n_layers)
+    logger.info(
+        "Replacing %d HunyuanImage3 decoder layers with FlashInfer kernels.", n_layers
+    )
 
     for layer in backbone.layers:
         # 1. Norms
         _replace_rmsnorm(layer, "input_layernorm", layer.input_layernorm)
-        _replace_rmsnorm(layer, "post_attention_layernorm", layer.post_attention_layernorm)
+        _replace_rmsnorm(
+            layer, "post_attention_layernorm", layer.post_attention_layernorm
+        )
 
         # 2. Attention
         _replace_attention(layer, "self_attn", layer.self_attn, opts)
@@ -894,15 +933,18 @@ if __name__ == "__main__":
         )
     )
     parser.add_argument(
-        "--model", default="tencent/HunyuanImage-3.0-Instruct",
+        "--model",
+        default="tencent/HunyuanImage-3.0-Instruct",
         help="HuggingFace repo id or local path.",
     )
     parser.add_argument(
-        "--dtype", default="bfloat16",
+        "--dtype",
+        default="bfloat16",
         choices=["float16", "bfloat16", "float32"],
     )
     parser.add_argument(
-        "--gemm-backend", default=os.getenv("FLASHINFER_GEMM_BACKEND", "torch"),
+        "--gemm-backend",
+        default=os.getenv("FLASHINFER_GEMM_BACKEND", "torch"),
         choices=_GEMM_BACKENDS,
     )
     parser.add_argument(
@@ -917,7 +959,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--offline-act-quant", action="store_true")
     parser.add_argument(
-        "--skip-prepare-weights", action="store_true",
+        "--skip-prepare-weights",
+        action="store_true",
         help="Skip the eager FlashInferLinear.prepare_weights() pass.",
     )
     args = parser.parse_args()
@@ -925,13 +968,19 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
 
-    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
-             "float32": torch.float32}[args.dtype]
+    dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[args.dtype]
 
     from transformers import AutoModelForCausalLM
+
     print(f"Loading {args.model} (trust_remote_code=True) ...")
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, trust_remote_code=True, torch_dtype=dtype,
+        args.model,
+        trust_remote_code=True,
+        torch_dtype=dtype,
     )
     model = model.eval().cuda()
 

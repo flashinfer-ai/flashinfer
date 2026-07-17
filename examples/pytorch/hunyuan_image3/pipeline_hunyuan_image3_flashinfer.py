@@ -30,18 +30,27 @@ Run examples:
       --image-path /path/to/image.png \\
       --prompts "Describe this image."
 
-Environment variables (same precedence as the wan example):
+Environment variables (same precedence as the wan example; command-line
+flags override them):
 
   FLASHINFER_GEMM_BACKEND       torch | bf16 | fp8 | ...
   FLASHINFER_ATTENTION_BACKEND  auto | single | cudnn | trtllm | sdpa
-  FLASHINFER_MOE_IMPL           flashinfer | eager
+  FLASHINFER_MOE_BACKEND        cutlass | cutlass_fp8 |
+                                cutlass_fp8_blockscale | cutlass_w4a16 |
+                                trtllm | torch | eager
+  FLASHINFER_MOE_IMPL           flashinfer | eager (deprecated alias of
+                                FLASHINFER_MOE_BACKEND)
   FLASHINFER_ONLINE_ACT_QUANT   1/0
+
+Note: the checkpoint's remote code requires transformers 4.x (upstream
+tests 4.56) and a local model directory whose name contains no dots, e.g.
+``hf download tencent/HunyuanImage-3.0-Instruct --local-dir
+./HunyuanImage-3-Instruct``.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -54,6 +63,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from modeling_hunyuan_image3_flashinfer import (  # noqa: E402
+    _MOE_BACKENDS,
     replace_backbone_with_flashinfer,
 )
 
@@ -80,16 +90,20 @@ def parse_args() -> argparse.Namespace:
         description="HunyuanImage-3.0 FlashInfer end-to-end driver."
     )
     p.add_argument(
-        "--model", default="tencent/HunyuanImage-3.0-Instruct",
+        "--model",
+        default="tencent/HunyuanImage-3.0-Instruct",
         help="HuggingFace repo id or local path.",
     )
     p.add_argument(
-        "--modality", default="text2img",
+        "--modality",
+        default="text2img",
         choices=list(_MODALITY_TASK_MAP),
     )
     p.add_argument("--prompts", nargs="+", default=None)
     p.add_argument(
-        "--image-path", type=str, default=None,
+        "--image-path",
+        type=str,
+        default=None,
         help="Input image path(s) for img2img/img2text, comma-separated for multi-image (max 3).",
     )
     p.add_argument("--output", type=str, default=".")
@@ -99,31 +113,38 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, default=1024)
     p.add_argument("--width", type=int, default=1024)
     p.add_argument(
-        "--bot-task", type=str, default=None,
+        "--bot-task",
+        type=str,
+        default=None,
         choices=["none", "think", "recaption", "think_recaption", "vanilla"],
     )
     p.add_argument(
-        "--sys-type", type=str, default=None,
+        "--sys-type",
+        type=str,
+        default=None,
         help="Override system prompt type (e.g. en_unified, en_vanilla).",
     )
     p.add_argument(
-        "--dtype", default="bfloat16",
+        "--dtype",
+        default="bfloat16",
         choices=["float16", "bfloat16", "float32"],
     )
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument(
-        "--device-map", default=None,
+        "--device-map",
+        default=None,
         help="HF device_map for from_pretrained (e.g. 'auto' to shard the "
-             "168GB model across multiple GPUs). Default: load on CPU then "
-             ".cuda() onto a single GPU.",
+        "168GB model across multiple GPUs). Default: load on CPU then "
+        ".cuda() onto a single GPU.",
     )
     p.add_argument(
-        "--max-memory-per-gpu", default="140GiB",
+        "--max-memory-per-gpu",
+        default="140GiB",
         help="Per-GPU cap passed as from_pretrained(max_memory=...) when "
-             "--device-map is set. 'auto' greedily fills GPU 0 to capacity, "
-             "leaving no room for FlashInfer weight-prep caches / activations; "
-             "a cap (default 140GiB on a 178GiB B200) forces headroom on every "
-             "GPU. Set to 'none' to disable.",
+        "--device-map is set. 'auto' greedily fills GPU 0 to capacity, "
+        "leaving no room for FlashInfer weight-prep caches / activations; "
+        "a cap (default 140GiB on a 178GiB B200) forces headroom on every "
+        "GPU. Set to 'none' to disable.",
     )
 
     # FlashInfer config flags.
@@ -140,24 +161,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--moe-backend",
         default=os.getenv("FLASHINFER_MOE_BACKEND", "cutlass"),
-        choices=["cutlass", "cutlass_fp8", "trtllm", "torch", "eager"],
+        choices=list(_MOE_BACKENDS),
         help="Fused-MoE backend for the routed experts (see "
-             "flashinfer_modules.MoEBackend). 'eager' keeps the upstream "
-             "per-expert loop.",
+        "flashinfer_modules.MoEBackend). 'eager' keeps the upstream "
+        "per-expert loop.",
     )
     p.add_argument(
         "--moe-impl",
         default=None,
         choices=["flashinfer", "eager"],
         help="Deprecated alias for --moe-backend "
-             "(flashinfer -> cutlass, eager -> eager).",
+        "(flashinfer -> cutlass, eager -> eager).",
     )
     p.add_argument(
-        "--offline-act-quant", action="store_true",
+        "--offline-act-quant",
+        action="store_true",
         help="Use fixed default activation quantization scale (FP8/FP4 backends).",
     )
     p.add_argument(
-        "--skip-flashinfer", action="store_true",
+        "--skip-flashinfer",
+        action="store_true",
         help="Load the model but don't swap to FlashInfer (for A/B comparison).",
     )
 
@@ -165,8 +188,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--compile-mode",
         default="none",
-        choices=["none", "default", "reduce-overhead", "max-autotune",
-                 "max-autotune-no-cudagraphs"],
+        choices=[
+            "none",
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ],
         help=(
             "torch.compile mode for the HunyuanImage3Model backbone "
             "(model.model). 'none' disables compilation. 'reduce-overhead' and "
@@ -175,7 +203,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--taylor-cache", action="store_true",
+        "--taylor-cache",
+        action="store_true",
         help=(
             "Enable the upstream Taylor activation cache across timesteps. Off "
             "by default; leave off for torch.compile / CUDA-graph runs (it makes "
@@ -184,16 +213,21 @@ def parse_args() -> argparse.Namespace:
     )
     # Benchmarking: warmup + timed repeats so compile/graph cost is amortized.
     p.add_argument(
-        "--bench", action="store_true",
+        "--bench",
+        action="store_true",
         help="Report end-to-end and per-step latency (GPU-synced) for each run.",
     )
     p.add_argument(
-        "--warmup-runs", type=int, default=0,
+        "--warmup-runs",
+        type=int,
+        default=0,
         help="Throwaway generations before timing (warms torch.compile / JIT / "
-             "CUDA-graph capture). Recommended >=1 when --compile-mode != none.",
+        "CUDA-graph capture). Recommended >=1 when --compile-mode != none.",
     )
     p.add_argument(
-        "--timed-runs", type=int, default=1,
+        "--timed-runs",
+        type=int,
+        default=1,
         help="Number of timed generations to average over when --bench is set.",
     )
 
@@ -219,6 +253,7 @@ def _load_inputs(args: argparse.Namespace) -> tuple[list[str], list]:
         if not args.image_path:
             raise ValueError(f"--image-path is required for {args.modality}.")
         from PIL import Image
+
         image_paths = [p.strip() for p in args.image_path.split(",") if p.strip()]
         if len(image_paths) > 3:
             raise ValueError(
@@ -232,8 +267,13 @@ def _load_inputs(args: argparse.Namespace) -> tuple[list[str], list]:
     return prompts, input_images
 
 
-def _print_config(args: argparse.Namespace, opts, prompts: list[str],
-                  task: str, bot_task: Optional[str]) -> None:
+def _print_config(
+    args: argparse.Namespace,
+    opts,
+    prompts: list[str],
+    task: str,
+    bot_task: Optional[str],
+) -> None:
     if args.verbose < 1:
         return
     print("=" * 60)
@@ -243,7 +283,9 @@ def _print_config(args: argparse.Namespace, opts, prompts: list[str],
     print(f"  dtype: {args.dtype}")
     print(f"  FlashInfer options: {opts}")
     if args.modality in ("text2img", "img2img"):
-        print(f"  Steps: {args.steps}, guidance: {args.guidance_scale}, seed: {args.seed}")
+        print(
+            f"  Steps: {args.steps}, guidance: {args.guidance_scale}, seed: {args.seed}"
+        )
         print(f"  Output size: {args.width}x{args.height}")
     if args.image_path:
         print(f"  Input image: {args.image_path}")
@@ -251,7 +293,9 @@ def _print_config(args: argparse.Namespace, opts, prompts: list[str],
     print("=" * 60)
 
 
-def _resolve_bot_task(args: argparse.Namespace, default_bot_task: Optional[str]) -> Optional[str]:
+def _resolve_bot_task(
+    args: argparse.Namespace, default_bot_task: Optional[str]
+) -> Optional[str]:
     if args.bot_task is None:
         return default_bot_task
     if args.bot_task == "none":
@@ -259,9 +303,30 @@ def _resolve_bot_task(args: argparse.Namespace, default_bot_task: Optional[str])
     return args.bot_task
 
 
+def _check_transformers_version() -> None:
+    """Fail fast on transformers >= 5.
+
+    The checkpoint's remote code targets the transformers 4.x generation and
+    cache APIs (e.g. it calls ``StaticLayer.lazy_initialization(key_states)``
+    with one argument and relies on 4.x ``generate`` internals). On
+    transformers 5.x it crashes deep inside ``generate``; the upstream model
+    card tests with transformers 4.56.
+    """
+    import transformers
+
+    major = int(transformers.__version__.split(".")[0])
+    if major >= 5:
+        raise RuntimeError(
+            f"HunyuanImage-3's remote code requires transformers 4.x "
+            f"(upstream tests 4.56), but {transformers.__version__} is "
+            f"installed. Run: pip install 'transformers==4.56.2'"
+        )
+
+
 def main() -> None:
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
+    _check_transformers_version()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run HunyuanImage-3.")
@@ -269,7 +334,6 @@ def main() -> None:
     dtype = _torch_dtype(args.dtype)
     task, default_bot_task = _MODALITY_TASK_MAP[args.modality]
     bot_task = _resolve_bot_task(args, default_bot_task)
-    mode = _MODALITY_MODE[args.modality]
 
     prompts, input_images = _load_inputs(args)
 
@@ -293,8 +357,10 @@ def main() -> None:
         if mm and mm.lower() != "none":
             n_gpus = torch.cuda.device_count()
             from_kwargs["max_memory"] = {i: mm for i in range(n_gpus)}
-            print(f"[load] device_map={args.device_map} "
-                  f"max_memory={{0..{n_gpus - 1}: {mm}}}")
+            print(
+                f"[load] device_map={args.device_map} "
+                f"max_memory={{0..{n_gpus - 1}: {mm}}}"
+            )
     model = AutoModelForCausalLM.from_pretrained(args.model, **from_kwargs)
     model = model.eval()
     if args.device_map is None:
@@ -315,10 +381,15 @@ def main() -> None:
         model.load_tokenizer(args.model)
     else:
         model._tokenizer = AutoTokenizer.from_pretrained(
-            args.model, trust_remote_code=True)
+            args.model, trust_remote_code=True
+        )
 
     # Optionally enable VAE tiling to keep peak memory down for large images.
-    if args.vae_use_tiling and hasattr(model, "vae") and hasattr(model.vae, "enable_tiling"):
+    if (
+        args.vae_use_tiling
+        and hasattr(model, "vae")
+        and hasattr(model.vae, "enable_tiling")
+    ):
         model.vae.enable_tiling()
 
     # 2. Swap the backbone hot paths to FlashInfer kernels (unless asked not to).
@@ -379,8 +450,10 @@ def _maybe_compile_backbone(model, args: argparse.Namespace) -> None:
     if args.compile_mode == "none":
         return
     if args.taylor_cache:
-        print("[warn] --taylor-cache with --compile-mode may trigger frequent "
-              "recompiles / graph breaks.")
+        print(
+            "[warn] --taylor-cache with --compile-mode may trigger frequent "
+            "recompiles / graph breaks."
+        )
 
     backbone = getattr(model, "model", None)
     if backbone is None:
@@ -390,12 +463,15 @@ def _maybe_compile_backbone(model, args: argparse.Namespace) -> None:
     # A roomy dynamo cache: the first vs. later denoising step and the
     # text-decode path specialize to different guards.
     import torch._dynamo as dynamo
+
     dynamo.config.cache_size_limit = max(dynamo.config.cache_size_limit, 64)
 
     mode = None if args.compile_mode == "default" else args.compile_mode
     uses_cudagraph = args.compile_mode in ("reduce-overhead", "max-autotune")
-    print(f"[compile] torch.compile(model.model, mode={args.compile_mode!r}) "
-          f"(CUDA graphs: {uses_cudagraph})")
+    print(
+        f"[compile] torch.compile(model.model, mode={args.compile_mode!r}) "
+        f"(CUDA graphs: {uses_cudagraph})"
+    )
     compiled = torch.compile(backbone, mode=mode)
 
     if uses_cudagraph:
@@ -471,15 +547,19 @@ def _bench_generate(gen_fn, args: argparse.Namespace, label: str):
         dt = time.perf_counter() - t0
         times.append(dt)
         per_step = dt / max(1, args.steps)
-        print(f"[bench:{label}] run {r + 1}/{args.timed_runs}: "
-              f"{dt:.3f} s total, {per_step * 1e3:.1f} ms/step ({args.steps} steps)")
+        print(
+            f"[bench:{label}] run {r + 1}/{args.timed_runs}: "
+            f"{dt:.3f} s total, {per_step * 1e3:.1f} ms/step ({args.steps} steps)"
+        )
 
     best = min(times)
     mean = sum(times) / len(times)
     peak = torch.cuda.max_memory_allocated() / 1e9
-    print(f"[bench:{label}] SUMMARY best={best:.3f}s mean={mean:.3f}s "
-          f"per_step_best={best / max(1, args.steps) * 1e3:.1f}ms "
-          f"peak_mem={peak:.1f}GB")
+    print(
+        f"[bench:{label}] SUMMARY best={best:.3f}s mean={mean:.3f}s "
+        f"per_step_best={best / max(1, args.steps) * 1e3:.1f}ms "
+        f"peak_mem={peak:.1f}GB"
+    )
     return result
 
 
@@ -542,8 +622,9 @@ def _run_text2img(model, prompts: list[str], args: argparse.Namespace) -> None:
             print(f"  saved: {save_path}")
 
 
-def _run_img2img(model, prompts: list[str], input_images: list,
-                 args: argparse.Namespace) -> None:
+def _run_img2img(
+    model, prompts: list[str], input_images: list, args: argparse.Namespace
+) -> None:
     """Image editing path: same pipeline, but with ``image`` arg."""
     pipeline = model.pipeline
     img_arg = input_images[0] if len(input_images) == 1 else input_images
@@ -563,8 +644,13 @@ def _run_img2img(model, prompts: list[str], input_images: list,
             print(f"  saved: {save_path}")
 
 
-def _run_img2text(model, prompts: list[str], input_images: list,
-                  args: argparse.Namespace, bot_task: Optional[str]) -> None:
+def _run_img2text(
+    model,
+    prompts: list[str],
+    input_images: list,
+    args: argparse.Namespace,
+    bot_task: Optional[str],
+) -> None:
     """Image-conditioned text generation via the model's ``.generate`` path."""
     img_arg = input_images[0] if len(input_images) == 1 else input_images
     for idx, prompt in enumerate(prompts):
@@ -582,12 +668,17 @@ def _run_img2text(model, prompts: list[str], input_images: list,
             verbose=args.verbose,
             decode_text=True,
         )
-        text = out if isinstance(out, str) else (out[0] if isinstance(out, list) else str(out))
+        text = (
+            out
+            if isinstance(out, str)
+            else (out[0] if isinstance(out, list) else str(out))
+        )
         print(f"  output: {text}")
 
 
-def _run_text2text(model, prompts: list[str], args: argparse.Namespace,
-                   bot_task: Optional[str]) -> None:
+def _run_text2text(
+    model, prompts: list[str], args: argparse.Namespace, bot_task: Optional[str]
+) -> None:
     """Pure text-to-text generation via the model's ``.generate`` path."""
     for idx, prompt in enumerate(prompts):
         print(f"\n[{idx + 1}/{len(prompts)}] Generating text for: {prompt!r}")
@@ -603,7 +694,11 @@ def _run_text2text(model, prompts: list[str], args: argparse.Namespace,
             verbose=args.verbose,
             decode_text=True,
         )
-        text = out if isinstance(out, str) else (out[0] if isinstance(out, list) else str(out))
+        text = (
+            out
+            if isinstance(out, str)
+            else (out[0] if isinstance(out, list) else str(out))
+        )
         print(f"  output: {text}")
 
 

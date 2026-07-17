@@ -31,7 +31,11 @@ from flashinfer.fused_moe import (
     WeightLayout,
     convert_to_block_layout,
     cutlass_fused_moe,
+    interleave_moe_scales_for_sm90_mixed_gemm,
+    interleave_moe_weights_for_sm90_mixed_gemm,
     trtllm_bf16_routed_moe,
+    trtllm_fp4_block_scale_routed_moe,
+    trtllm_fp8_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.core import (
     _maybe_get_cached_w3_w1_permute_indices,
@@ -813,8 +817,9 @@ class FlashInferLinear(nn.Module):
         # device_map sharding the activations live on cuda:1/2/3 while the
         # current device may be cuda:0, so raw-pointer kernels would otherwise
         # launch in the wrong context (-> misaligned address / invalid arg).
-        _dev = (torch.cuda.device(x_2d.device) if x_2d.is_cuda
-                else contextlib.nullcontext())
+        _dev = (
+            torch.cuda.device(x_2d.device) if x_2d.is_cuda else contextlib.nullcontext()
+        )
         with _dev:
             out = self._dispatch_backend(x_2d)
 
@@ -996,7 +1001,7 @@ class FlashInferLinear(nn.Module):
         # NVFP4 needs a per-tensor global scale factor. Online: recompute
         # from the current activation's amax (.float()/.nan_to_num() were
         # the culprit in the original wrapper; .abs().amax() is already
-        # cheap, see the wrapper-hot-paths note in wan/BENCHMARK.md).
+        # cheap).
         # Offline: use a fixed default global SF — the same shape as the
         # FP8 offline path, so calibration / overrides can later swap in
         # a real per-layer constant.
@@ -1061,10 +1066,23 @@ class FlashInferLinear(nn.Module):
             self._prepare_fp8_sm90_weights()
 
         x_fp8, input_scale = self._quantize_activation_fp8_blockwise(x, block_size=128)
+        # The TRT-LLM W8A8 kernel reads the activation scales in TRANSPOSED
+        # layout (K // 128, M) with the underlying row stride padded to a
+        # multiple of 4 in M (TMA alignment) — see
+        # tests/gemm/test_fp8_blockscale_gemm.py::test_fp8_blockscale_gemm_w8a8.
+        # Passing the natural (M, K // 128) layout makes the kernel apply
+        # wrong per-group scales (silently ~20% relative error).
+        m = x_fp8.shape[0]
+        k_blocks = input_scale.shape[1]
+        m_padded = (m + 3) // 4 * 4
+        input_scale_t = torch.zeros(
+            k_blocks, m_padded, dtype=torch.float32, device=x_fp8.device
+        )
+        input_scale_t[:, :m] = input_scale.t()
         out = flashinfer.gemm.fp8_blockscale_gemm_sm90(
             x_fp8,
             self._weight_fp8_sm90,
-            input_scale=input_scale,
+            input_scale=input_scale_t[:, :m],
             weight_scale=self._weight_scale_sm90,
             out_dtype=torch.bfloat16,
         )
@@ -1395,9 +1413,31 @@ class MoEBackend(Enum):
     """Fused Mixture-of-Experts backend selection for FlashInferFusedMoE."""
 
     TORCH = "torch"  # Eager per-expert loop (fallback, any GPU)
-    CUTLASS = "cutlass"  # flashinfer.fused_moe.cutlass_fused_moe, BF16 (SM89/SM90/SM100+)
-    CUTLASS_FP8 = "cutlass_fp8"  # cutlass_fused_moe with per-tensor FP8 W8A8 (SM89/SM90/SM100+)
+    CUTLASS = (
+        "cutlass"  # flashinfer.fused_moe.cutlass_fused_moe, BF16 (SM89/SM90/SM100+)
+    )
+    CUTLASS_FP8 = (
+        "cutlass_fp8"  # cutlass_fused_moe with per-tensor FP8 W8A8 (SM89/SM90/SM100+)
+    )
+    # cutlass_fused_moe with DeepSeek-style FP8 128x128 block-scale weights
+    # (use_deepseek_fp8_block_scale=True). The kernel quantizes the BF16
+    # activation internally per-token-group; only SM90 has this kernel
+    # (flashinfer/jit/fused_moe.py enables ENABLE_FP8_BLOCK_SCALE for the
+    # sm90 module alone, and cutlass_fused_moe raises on other archs).
+    CUTLASS_FP8_BLOCKSCALE = "cutlass_fp8_blockscale"
+    # cutlass_fused_moe with MXFP4 weight-only quantization (BF16 activation,
+    # use_w4_group_scaling=True) on the Hopper mixed-input GEMM. SM90 only.
+    CUTLASS_W4A16 = "cutlass_w4a16"
+    # cutlass_fused_moe with NVFP4 W4A4 (per-expert global scales + 16-element
+    # E4M3 block scales, 6-tensor quant_scales). SM100/SM103/SM110/SM120/SM121.
+    CUTLASS_NVFP4 = "cutlass_nvfp4"
     TRTLLM = "trtllm"  # flashinfer.fused_moe.trtllm_bf16_routed_moe (SM100/SM103 only)
+    # trtllm-gen routed MoE with DeepSeek-style FP8 128x128 block-scale
+    # weights + per-token-group-128 activation scales (SM100/SM103 only).
+    TRTLLM_FP8_BLOCKSCALE = "trtllm_fp8_blockscale"
+    # trtllm-gen routed MoE with NVFP4 activations and weights
+    # (SM100/SM103 only).
+    TRTLLM_FP4 = "trtllm_fp4"
 
 
 # Human-readable per-backend SM requirement, used by the fallback warning.
@@ -1405,7 +1445,12 @@ class MoEBackend(Enum):
 _MOE_BACKEND_REQUIREMENT_STR: Dict[str, str] = {
     "cutlass": "SM89/SM90/SM100+",
     "cutlass_fp8": "SM89/SM90/SM100+",
+    "cutlass_fp8_blockscale": "SM90 (Hopper) only, CUDA >= 12.8",
+    "cutlass_w4a16": "SM90 (Hopper) only",
+    "cutlass_nvfp4": "SM100/SM103/SM110/SM120/SM121",
     "trtllm": "SM100/SM103 (Blackwell)",
+    "trtllm_fp8_blockscale": "SM100/SM103 (Blackwell)",
+    "trtllm_fp4": "SM100/SM103 (Blackwell)",
 }
 
 
@@ -1414,9 +1459,12 @@ def _check_moe_backend_support(backend: MoEBackend, device: torch.device) -> boo
 
     The CUTLASS fused-MoE JIT modules are generated per-arch for SM89, SM90,
     SM100, SM103 and SM120 (see flashinfer/jit/fused_moe.py), all with BF16
-    and FP8 kernels enabled. The trtllm-gen MoE cubins only exist for
-    Blackwell (supported_major_versions=[10, 12]; is_trtllm_moe_supported
-    rejects anything below SM100).
+    and FP8 kernels enabled. The DeepSeek FP8 block-scale and W4A16
+    mixed-input kernels are compiled for the SM90 module only, and
+    cutlass_fused_moe additionally requires CUDA >= 12.8 for block-scale.
+    The trtllm-gen MoE cubins only exist for Blackwell
+    (supported_major_versions=[10, 12]; is_trtllm_moe_supported rejects
+    anything below SM100).
     """
     if backend == MoEBackend.TORCH:
         return True
@@ -1426,9 +1474,99 @@ def _check_moe_backend_support(backend: MoEBackend, device: torch.device) -> boo
 
     if backend in (MoEBackend.CUTLASS, MoEBackend.CUTLASS_FP8):
         return sm in (89, 90) or sm >= 100
-    if backend == MoEBackend.TRTLLM:
+    if backend == MoEBackend.CUTLASS_FP8_BLOCKSCALE:
+        cuda_ver = tuple(int(v) for v in (torch.version.cuda or "0.0").split(".")[:2])
+        return sm == 90 and cuda_ver >= (12, 8)
+    if backend == MoEBackend.CUTLASS_W4A16:
+        return sm == 90
+    if backend == MoEBackend.CUTLASS_NVFP4:
+        # Matches the NVFP4 cutlass_fused_moe test gate: SM100/SM103 (major
+        # 10), SM110 (major 11), SM120/SM121 (major 12).
+        return major in (10, 11, 12)
+    if backend in (
+        MoEBackend.TRTLLM,
+        MoEBackend.TRTLLM_FP8_BLOCKSCALE,
+        MoEBackend.TRTLLM_FP4,
+    ):
         return sm in (100, 103)
     return False
+
+
+# E2M1 magnitude table used by both the MXFP4 weight quantizer below and the
+# kernels' own dequant (see _dequant_mxfp4_on_device in
+# tests/moe/test_trtllm_cutlass_fused_moe.py).
+_MXFP4_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _quantize_mxfp4_weight(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a weight tensor to MXFP4 along its last dimension.
+
+    Pure-torch reference quantizer producing the linear (non-swizzled) layout
+    the Hopper W4A16 mixed-input GEMM consumes *before*
+    ``interleave_moe_weights/scales_for_sm90_mixed_gemm``: packed E2M1 nibbles
+    (low nibble = even element) plus one UE8M0 scale byte per 32 consecutive
+    elements. Matches the decode convention of the kernel's test reference
+    (tests/moe/test_trtllm_cutlass_fused_moe.py::_dequant_mxfp4_on_device).
+    Runs once per layer at weight-prep time, so clarity beats speed here.
+
+    Args:
+        w: (..., K) float tensor, K % 32 == 0.
+
+    Returns:
+        (packed, scales): uint8 tensors of shape (..., K/2) and (..., K/32).
+    """
+    orig_shape = w.shape
+    k = orig_shape[-1]
+    assert k % 32 == 0, f"MXFP4 needs K % 32 == 0, got {k}"
+    g = w.float().reshape(-1, 32)
+
+    # UE8M0 block scale: smallest power of two with amax/scale <= 6 (E2M1 max).
+    amax = g.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+    exp = torch.ceil(torch.log2(amax / 6.0)).clamp(min=-127.0, max=127.0)
+    scale = torch.exp2(exp)
+
+    q = g / scale
+    lut = torch.tensor(_MXFP4_MAGNITUDES, device=w.device)
+    # Round-to-nearest E2M1 code via magnitude bucket midpoints.
+    midpoints = (lut[1:] + lut[:-1]) / 2.0
+    code = torch.bucketize(q.abs().clamp(max=6.0), midpoints)
+    code = torch.where(q < 0, code + 8, code)  # sign bit
+
+    code = code.reshape(*orig_shape[:-1], k).to(torch.uint8)
+    packed = code[..., 0::2] | (code[..., 1::2] << 4)
+    scales = (exp + 127.0).reshape(*orig_shape[:-1], k // 32).to(torch.uint8)
+    return packed.contiguous(), scales.contiguous()
+
+
+def _quantize_fp8_128x128_blocks(
+    w: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-expert 128x128 block FP8 quantization (DeepSeek convention).
+
+    Args:
+        w: (E, N, K) float tensor.
+
+    Returns:
+        (w_fp8, scales): float8_e4m3fn (E, N, K) and float32
+        (E, ceil(N/128), ceil(K/128)) dequant scales.
+    """
+    e, n, k = w.shape
+    block = 128
+    n_pad = ((n + block - 1) // block) * block
+    k_pad = ((k + block - 1) // block) * block
+
+    w_padded = torch.zeros(e, n_pad, k_pad, dtype=w.dtype, device=w.device)
+    w_padded[:, :n, :k] = w
+    w_view = w_padded.view(e, n_pad // block, block, k_pad // block, block)
+
+    amax = w_view.abs().float().amax(dim=(2, 4), keepdim=True).clamp(min=1e-4)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    scale = amax / fp8_max
+    w_fp8 = (
+        (w_view / scale).to(torch.float8_e4m3fn).view(e, n_pad, k_pad)[:, :n, :k]
+    ).contiguous()
+    scales = scale.view(e, n_pad // block, k_pad // block).to(torch.float32)
+    return w_fp8, scales.contiguous()
 
 
 class FlashInferFusedMoE(nn.Module):
@@ -1513,16 +1651,45 @@ class FlashInferFusedMoE(nn.Module):
             )
             self._backend = MoEBackend.TORCH
 
-        # The trtllm-gen shuffled/block-major weight layout tiles rows in
-        # chunks of 128 and the K dim in 128-byte blocks; non-multiple shapes
-        # have no matching cubin.
-        if self._backend == MoEBackend.TRTLLM and (
-            hidden_size % 128 != 0 or intermediate_size % 128 != 0
+        # The trtllm-gen kernels tile rows in chunks of 128 (and the DeepSeek
+        # FP8 path additionally derives exact 128-block scale shapes from the
+        # dims); non-multiple shapes have no matching cubin. The NVFP4
+        # cutlass path packs 2 elements/byte with 16-element scale groups.
+        if self._backend in (
+            MoEBackend.TRTLLM,
+            MoEBackend.TRTLLM_FP8_BLOCKSCALE,
+            MoEBackend.TRTLLM_FP4,
+        ) and (hidden_size % 128 != 0 or intermediate_size % 128 != 0):
+            warnings.warn(
+                f"{self._backend.value} MoE backend requires hidden_size and "
+                f"intermediate_size to be multiples of 128, got "
+                f"({hidden_size}, {intermediate_size}); falling back to TORCH.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._backend = MoEBackend.TORCH
+
+        if self._backend == MoEBackend.CUTLASS_NVFP4 and (
+            hidden_size % 16 != 0 or intermediate_size % 16 != 0
         ):
             warnings.warn(
-                f"trtllm MoE backend requires hidden_size and intermediate_size "
-                f"to be multiples of 128, got ({hidden_size}, {intermediate_size}); "
-                "falling back to TORCH.",
+                f"cutlass_nvfp4 MoE backend requires hidden_size and "
+                f"intermediate_size to be multiples of 16, got "
+                f"({hidden_size}, {intermediate_size}); falling back to TORCH.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._backend = MoEBackend.TORCH
+
+        # MXFP4 packs 2 elements per byte and scales 32 elements per group
+        # along the GEMM K dims (hidden for W13, intermediate for W2).
+        if self._backend == MoEBackend.CUTLASS_W4A16 and (
+            hidden_size % 32 != 0 or intermediate_size % 32 != 0
+        ):
+            warnings.warn(
+                f"cutlass_w4a16 MoE backend requires hidden_size and "
+                f"intermediate_size to be multiples of 32, got "
+                f"({hidden_size}, {intermediate_size}); falling back to TORCH.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -1530,26 +1697,49 @@ class FlashInferFusedMoE(nn.Module):
 
         self.w13_weight = nn.Parameter(
             torch.empty(
-                num_experts, 2 * intermediate_size, hidden_size,
-                device=device, dtype=dtype,
+                num_experts,
+                2 * intermediate_size,
+                hidden_size,
+                device=device,
+                dtype=dtype,
             ),
             requires_grad=False,
         )
         self.w2_weight = nn.Parameter(
             torch.empty(
-                num_experts, hidden_size, intermediate_size,
-                device=device, dtype=dtype,
+                num_experts,
+                hidden_size,
+                intermediate_size,
+                device=device,
+                dtype=dtype,
             ),
             requires_grad=False,
         )
 
         # Backend-specific prepared-weight buffers (filled by prepare_weights).
+        # _w13_fp8/_w13_scale (and the _w2 pair) are shared by the per-tensor
+        # FP8 and the FP8 block-scale backends — only one backend is ever
+        # active per module, the scale shape just differs (per-expert scalar
+        # vs (E, n_blocks, k_blocks)).
         self.register_buffer("_w13_fp8", None)
         self.register_buffer("_w13_scale", None)
         self.register_buffer("_w2_fp8", None)
         self.register_buffer("_w2_scale", None)
+        self.register_buffer("_w13_w4", None)
+        self.register_buffer("_w13_w4_scale", None)
+        self.register_buffer("_w2_w4", None)
+        self.register_buffer("_w2_w4_scale", None)
         self.register_buffer("_gemm1_shuffled", None)
         self.register_buffer("_gemm2_shuffled", None)
+        # NVFP4 buffers (cutlass_nvfp4 / trtllm_fp4): packed weights, E4M3
+        # block scales, and per-expert global dequant scales.
+        self.register_buffer("_w13_fp4", None)
+        self.register_buffer("_w13_fp4_bs", None)
+        self.register_buffer("_w13_fp4_gs_dequant", None)
+        self.register_buffer("_w2_fp4", None)
+        self.register_buffer("_w2_fp4_bs", None)
+        self.register_buffer("_w2_fp4_gs_dequant", None)
+        self._nvfp4_act_gs: Optional[torch.Tensor] = None
         # Permute-index cache shared across experts (same shape -> one entry).
         self._trtllm_permute_cache: Dict = {}
         self._offline_act_scale: Optional[torch.Tensor] = None
@@ -1578,10 +1768,30 @@ class FlashInferFusedMoE(nn.Module):
         """
         if self._prepared:
             return
-        if self._backend == MoEBackend.CUTLASS_FP8:
-            self._prepare_fp8_weights()
-        elif self._backend == MoEBackend.TRTLLM:
-            self._prepare_trtllm_weights()
+        # Pin kernel launches to the weights' GPU: under HF device_map
+        # sharding this module's weights live on cuda:k while the current
+        # device is cuda:0, and the raw-pointer prep kernels (e.g. the SM90
+        # W4A16 interleave) would otherwise fault with an illegal memory
+        # access.
+        _dev = (
+            torch.cuda.device(self.w13_weight.device)
+            if self.w13_weight.is_cuda
+            else contextlib.nullcontext()
+        )
+        with _dev:
+            if self._backend == MoEBackend.CUTLASS_FP8:
+                self._prepare_fp8_weights()
+            elif self._backend in (
+                MoEBackend.CUTLASS_FP8_BLOCKSCALE,
+                MoEBackend.TRTLLM_FP8_BLOCKSCALE,
+            ):
+                self._prepare_fp8_blockscale_weights()
+            elif self._backend == MoEBackend.CUTLASS_W4A16:
+                self._prepare_w4a16_weights()
+            elif self._backend in (MoEBackend.CUTLASS_NVFP4, MoEBackend.TRTLLM_FP4):
+                self._prepare_nvfp4_weights()
+            elif self._backend == MoEBackend.TRTLLM:
+                self._prepare_trtllm_weights()
         self._prepared = True
 
     @torch.no_grad()
@@ -1598,7 +1808,8 @@ class FlashInferFusedMoE(nn.Module):
             amax = w.abs().amax(dim=(1, 2)).float().clamp(min=1e-12)
             scale = amax / finfo.max  # dequant scale (multiply after GEMM)
             w_fp8 = (
-                (w / scale.view(-1, 1, 1)).clamp(finfo.min, finfo.max)
+                (w / scale.view(-1, 1, 1))
+                .clamp(finfo.min, finfo.max)
                 .to(torch.float8_e4m3fn)
                 .contiguous()
             )
@@ -1606,6 +1817,82 @@ class FlashInferFusedMoE(nn.Module):
 
         self._w13_fp8, self._w13_scale = _quant(self.w13_weight.data)
         self._w2_fp8, self._w2_scale = _quant(self.w2_weight.data)
+
+    @torch.no_grad()
+    def _prepare_fp8_blockscale_weights(self):
+        """DeepSeek-style 128x128 block FP8 quantization for cutlass_fused_moe.
+
+        The block-scale path takes the *unquantized* BF16 activation and
+        quantizes it internally per token group, so only the weights are
+        prepared here. quant_scales layout is ``[w13_scales, w2_scales]``
+        with shape (E, ceil(N/128), ceil(K/128)) — see
+        tests/moe/test_trtllm_cutlass_fused_moe.py::test_moe_fp8_block_scaling.
+        """
+        self._w13_fp8, self._w13_scale = _quantize_fp8_128x128_blocks(
+            self.w13_weight.data
+        )
+        self._w2_fp8, self._w2_scale = _quantize_fp8_128x128_blocks(self.w2_weight.data)
+
+    @torch.no_grad()
+    def _prepare_nvfp4_weights(self):
+        """NVFP4 quantization shared by cutlass_nvfp4 and trtllm_fp4.
+
+        Per-expert quantization with amax-derived global encode scales
+        ``gs_e = (448 * 6) / amax_e`` (the convention of
+        tests/moe/test_trtllm_cutlass_fused_moe.py::test_moe_nvfp4), packed
+        E2M1 weights plus swizzled 16-element E4M3 block scales from
+        ``fp4_quantize``. Because 2*intermediate_size and hidden_size are
+        multiples of 128 on the trtllm path, the per-expert swizzled scale
+        blocks stack cleanly into the (E, rows, K/16) view that
+        trtllm_fp4_block_scale_routed_moe expects.
+        """
+        from flashinfer import fp4_quantize
+
+        def _quant(w: torch.Tensor):
+            # w: (E, N, K) -> packed (E, N, K/2), stacked swizzled scales,
+            # per-expert global *dequant* scales (1 / encode_gs).
+            e = w.shape[0]
+            packed, block_scales, gs_dequant = [], [], []
+            for i in range(e):
+                amax = w[i].abs().amax().to(torch.float32).clamp(min=1e-12)
+                gs = (448.0 * 6.0) / amax
+                q, bs = fp4_quantize(w[i], gs)
+                packed.append(q)
+                block_scales.append(bs)
+                gs_dequant.append(1.0 / gs)
+            return (
+                torch.stack(packed).contiguous(),
+                torch.stack(block_scales).contiguous(),
+                torch.stack(gs_dequant).to(torch.float32).contiguous(),
+            )
+
+        self._w13_fp4, self._w13_fp4_bs, self._w13_fp4_gs_dequant = _quant(
+            self.w13_weight.data
+        )
+        self._w2_fp4, self._w2_fp4_bs, self._w2_fp4_gs_dequant = _quant(
+            self.w2_weight.data
+        )
+
+    @torch.no_grad()
+    def _prepare_w4a16_weights(self):
+        """MXFP4 weight-only quantization for the Hopper mixed-input GEMM.
+
+        Quantize each weight to packed E2M1 + UE8M0 group-32 scales along K,
+        then apply the SM90 interleave transforms. quant_scales layout is
+        ``[w13_scales_il.view(int32), w2_scales_il.view(int32)]`` with
+        ``use_w4_group_scaling=True`` — see
+        tests/moe/test_trtllm_cutlass_fused_moe.py::_run_w4a16_moe_hopper.
+        """
+        w13_q, w13_sf = _quantize_mxfp4_weight(self.w13_weight.data)
+        w2_q, w2_sf = _quantize_mxfp4_weight(self.w2_weight.data)
+        self._w13_w4 = interleave_moe_weights_for_sm90_mixed_gemm(w13_q, "fp4")
+        self._w2_w4 = interleave_moe_weights_for_sm90_mixed_gemm(w2_q, "fp4")
+        self._w13_w4_scale = interleave_moe_scales_for_sm90_mixed_gemm(w13_sf).view(
+            torch.int32
+        )
+        self._w2_w4_scale = interleave_moe_scales_for_sm90_mixed_gemm(w2_sf).view(
+            torch.int32
+        )
 
     @torch.no_grad()
     def _prepare_trtllm_weights(self):
@@ -1681,8 +1968,26 @@ class FlashInferFusedMoE(nn.Module):
                 return self._forward_cutlass(hidden_states, topk_ids, topk_weights)
             if self._backend == MoEBackend.CUTLASS_FP8:
                 return self._forward_cutlass_fp8(hidden_states, topk_ids, topk_weights)
+            if self._backend == MoEBackend.CUTLASS_FP8_BLOCKSCALE:
+                return self._forward_cutlass_fp8_blockscale(
+                    hidden_states, topk_ids, topk_weights
+                )
+            if self._backend == MoEBackend.CUTLASS_W4A16:
+                return self._forward_cutlass_w4a16(
+                    hidden_states, topk_ids, topk_weights
+                )
+            if self._backend == MoEBackend.CUTLASS_NVFP4:
+                return self._forward_cutlass_nvfp4(
+                    hidden_states, topk_ids, topk_weights
+                )
             if self._backend == MoEBackend.TRTLLM:
                 return self._forward_trtllm(hidden_states, topk_ids, topk_weights)
+            if self._backend == MoEBackend.TRTLLM_FP8_BLOCKSCALE:
+                return self._forward_trtllm_fp8_blockscale(
+                    hidden_states, topk_ids, topk_weights
+                )
+            if self._backend == MoEBackend.TRTLLM_FP4:
+                return self._forward_trtllm_fp4(hidden_states, topk_ids, topk_weights)
             return self._forward_torch(hidden_states, topk_ids, topk_weights)
 
     def _forward_torch(
@@ -1734,9 +2039,7 @@ class FlashInferFusedMoE(nn.Module):
     ) -> torch.Tensor:
         finfo = torch.finfo(torch.float8_e4m3fn)
         if self.online_act_quant:
-            x_scale = (
-                hidden_states.abs().amax().float().clamp(min=1e-12) / finfo.max
-            )
+            x_scale = hidden_states.abs().amax().float().clamp(min=1e-12) / finfo.max
         else:
             # Cache the constant scale so cuda-graph capture doesn't see a
             # fresh CPU->GPU copy on each call (same trick as FlashInferLinear).
@@ -1749,7 +2052,8 @@ class FlashInferFusedMoE(nn.Module):
                 )
             x_scale = self._offline_act_scale
         x_fp8 = (
-            (hidden_states / x_scale).clamp(finfo.min, finfo.max)
+            (hidden_states / x_scale)
+            .clamp(finfo.min, finfo.max)
             .to(torch.float8_e4m3fn)
             .contiguous()
         )
@@ -1787,18 +2091,260 @@ class FlashInferFusedMoE(nn.Module):
         )
         return output
 
+    def _forward_cutlass_fp8_blockscale(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """DeepSeek-style FP8 block-scale W8A8 (SM90 only).
+
+        The kernel consumes the BF16 activation directly and performs the
+        per-token-group activation quantization internally, so
+        ``online_act_quant`` does not apply to this backend.
+        """
+        output = torch.empty_like(hidden_states)
+        cutlass_fused_moe(
+            hidden_states.contiguous(),
+            topk_ids.to(torch.int).contiguous(),
+            topk_weights.to(torch.float).contiguous(),
+            self._w13_fp8,
+            self._w2_fp8,
+            hidden_states.dtype,
+            use_deepseek_fp8_block_scale=True,
+            quant_scales=[self._w13_scale, self._w2_scale],
+            output=output,
+            activation_type=ActivationType.Swiglu,
+        )
+        return output
+
+    def _forward_cutlass_w4a16(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """MXFP4 weight-only, BF16 activation (Hopper mixed-input GEMM)."""
+        output = torch.empty_like(hidden_states)
+        cutlass_fused_moe(
+            hidden_states.contiguous(),
+            topk_ids.to(torch.int).contiguous(),
+            topk_weights.to(torch.float).contiguous(),
+            self._w13_w4,
+            self._w2_w4,
+            hidden_states.dtype,
+            quant_scales=[self._w13_w4_scale, self._w2_w4_scale],
+            use_w4_group_scaling=True,
+            output=output,
+            activation_type=ActivationType.Swiglu,
+        )
+        return output
+
+    def _forward_cutlass_nvfp4(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """NVFP4 W4A4 cutlass_fused_moe (SM100/SM103/SM110/SM120/SM121).
+
+        The BF16 activation goes in unquantized; the kernel quantizes it
+        internally with the global scale in quant_scales[0]/[3] (kept at the
+        test-default 1.0, so ``fc*_global`` reduces to the per-expert weight
+        global dequant scale). 6-tensor quant_scales layout per
+        tests/moe/test_trtllm_cutlass_fused_moe.py::test_moe_nvfp4.
+        """
+        if (
+            self._nvfp4_act_gs is None
+            or self._nvfp4_act_gs.device != hidden_states.device
+        ):
+            self._nvfp4_act_gs = torch.ones(
+                (), device=hidden_states.device, dtype=torch.float32
+            )
+        quant_scales = [
+            self._nvfp4_act_gs,
+            self._w13_fp4_bs.view(torch.int32),
+            self._w13_fp4_gs_dequant,
+            self._nvfp4_act_gs,
+            self._w2_fp4_bs.view(torch.int32),
+            self._w2_fp4_gs_dequant,
+        ]
+        output = torch.empty_like(hidden_states)
+        cutlass_fused_moe(
+            hidden_states.contiguous(),
+            topk_ids.to(torch.int).contiguous(),
+            topk_weights.to(torch.float).contiguous(),
+            self._w13_fp4.view(torch.long),
+            self._w2_fp4.view(torch.long),
+            hidden_states.dtype,
+            quant_scales=quant_scales,
+            input_sf=None,
+            output=output,
+            activation_type=ActivationType.Swiglu,
+        )
+        return output
+
+    @staticmethod
+    def _pack_routed_ids(
+        topk_ids: torch.Tensor, topk_weights: torch.Tensor
+    ) -> torch.Tensor:
+        # Packed routed format: (expert_id << 16) | bf16(weight).view(int16).
+        # Routing weights are softmax outputs (>= 0), so the bf16 sign bit is
+        # clear and the int16 view never sign-extends into the expert id.
+        return (topk_ids.to(torch.int32) << 16) | topk_weights.to(torch.bfloat16).view(
+            torch.int16
+        ).to(torch.int32)
+
+    def _forward_trtllm_fp8_blockscale(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """trtllm-gen routed MoE, DeepSeek-style FP8 block scaling (SM100/103).
+
+        Weights carry 128x128-block dequant scales (same preparation as the
+        SM90 cutlass_fp8_blockscale backend); the activation is quantized
+        here per token-group-128, with the scale tensor transposed to the
+        kernel's ``[hidden_size // 128, num_tokens]`` layout. Layout is plain
+        MajorK (no shuffle) — mirrors
+        tests/moe/test_trtllm_gen_routed_fused_moe.py::test_trtllm_gen_fp8_routed_fused_moe.
+        The per-group activation scales are always computed online (that is
+        the DeepSeek FP8 convention); ``online_act_quant`` is not consulted.
+        """
+        num_tokens, hidden = hidden_states.shape
+        x = hidden_states.contiguous()
+        x_view = x.view(num_tokens, hidden // 128, 128)
+        amax = x_view.abs().amax(dim=2).to(torch.float32).clamp(min=1e-4)
+        x_scale = amax / 448.0  # dequant scale, (T, H/128)
+        x_fp8 = (
+            (x_view / x_scale.unsqueeze(2))
+            .to(torch.float8_e4m3fn)
+            .view(num_tokens, hidden)
+        )
+
+        output = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        trtllm_fp8_block_scale_routed_moe(
+            topk_ids=self._pack_routed_ids(topk_ids, topk_weights),
+            routing_bias=None,
+            hidden_states=x_fp8,
+            hidden_states_scale=x_scale.t().contiguous(),
+            gemm1_weights=self._w13_fp8,
+            gemm1_weights_scale=self._w13_scale,
+            gemm2_weights=self._w2_fp8,
+            gemm2_weights_scale=self._w2_scale,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=self.intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=self.num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.RenormalizeNaive.value,
+            use_shuffled_weight=False,
+            weight_layout=WeightLayout.MajorK.value,
+            output=output,
+        )
+        return output.to(hidden_states.dtype)
+
+    def _forward_trtllm_fp4(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """trtllm-gen routed MoE, NVFP4 activations x NVFP4 weights (SM100/103).
+
+        Mirrors tests/moe/test_trtllm_gen_routed_fused_moe.py's NvFP4xNvFP4
+        branch: linear (non-swizzled) activation scale layout, per-expert
+        ``output*_scale_scalar`` = activation global dequant x weight global
+        dequant. With ``online_act_quant`` the activation encode scale is
+        recomputed from the current amax (matching FlashInferLinear's FP4
+        path); otherwise the fixed NVFP4 default 448*6 is used.
+        """
+        from flashinfer import fp4_quantize
+
+        num_tokens = hidden_states.shape[0]
+        if self.online_act_quant:
+            amax = hidden_states.abs().amax().to(torch.float32).clamp(min=1e-12)
+            act_gs = ((448.0 * 6.0) / amax).reshape(1)
+        else:
+            if (
+                self._nvfp4_act_gs is None
+                or self._nvfp4_act_gs.device != hidden_states.device
+            ):
+                self._nvfp4_act_gs = torch.full(
+                    (1,),
+                    448.0 * 6.0,
+                    device=hidden_states.device,
+                    dtype=torch.float32,
+                )
+            act_gs = self._nvfp4_act_gs
+
+        hs_q, hs_sf = fp4_quantize(
+            hidden_states.contiguous(),
+            act_gs,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
+        )
+        hs_sf = hs_sf.view(torch.float8_e4m3fn).reshape(num_tokens, -1)
+
+        act_dequant = 1.0 / act_gs  # (1,)
+        output1_scale = (act_dequant * self._w13_fp4_gs_dequant).contiguous()
+        output2_scale = (act_dequant * self._w2_fp4_gs_dequant).contiguous()
+
+        e, _, _ = self._w13_fp4.shape
+        w13_bs = self._w13_fp4_bs.view(torch.float8_e4m3fn).reshape(
+            e, 2 * self.intermediate_size, self.hidden_size // 16
+        )
+        w2_bs = self._w2_fp4_bs.view(torch.float8_e4m3fn).reshape(
+            e, self.hidden_size, self.intermediate_size // 16
+        )
+
+        out = trtllm_fp4_block_scale_routed_moe(
+            self._pack_routed_ids(topk_ids, topk_weights),
+            None,  # routing_bias
+            hs_q,
+            hs_sf,
+            self._w13_fp4,
+            w13_bs,
+            None,  # w13_bias
+            None,  # gemm1_alpha
+            None,  # gemm1_beta
+            None,  # gemm1_clamp_limit
+            self._w2_fp4,
+            w2_bs,
+            None,  # w2_bias
+            output1_scale,
+            output1_scale,  # gate scalar — same value for both halves
+            output2_scale,
+            self.num_experts,
+            self.top_k,
+            None,  # n_group
+            None,  # topk_group
+            self.intermediate_size,
+            0,  # local_expert_offset
+            self.num_experts,
+            None,  # routed_scaling_factor
+            RoutingMethodType.RenormalizeNaive.value,
+            True,  # do_finalize
+            None,  # enable_pdl (auto)
+            ActivationType.Swiglu.value,
+            None,  # output
+        )
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        return out.to(hidden_states.dtype)
+
     def _forward_trtllm(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        # Packed routed format: (expert_id << 16) | bf16(weight).view(int16).
-        # Routing weights are softmax outputs (>= 0), so the bf16 sign bit is
-        # clear and the int16 view never sign-extends into the expert id.
-        packed = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
-            torch.bfloat16
-        ).view(torch.int16).to(torch.int32)
+        packed = self._pack_routed_ids(topk_ids, topk_weights)
         out = trtllm_bf16_routed_moe(
             packed,
             hidden_states.contiguous(),
@@ -1872,8 +2418,7 @@ class FlashInferRMSNorm(nn.Module):
             # sharding the activation may live on a different device than the
             # current CUDA context.
             _dev = (
-                torch.cuda.device(x.device) if x.is_cuda
-                else contextlib.nullcontext()
+                torch.cuda.device(x.device) if x.is_cuda else contextlib.nullcontext()
             )
             with _dev:
                 # FlashInfer rmsnorm only supports FP16/BF16, cast if needed
@@ -2404,7 +2949,13 @@ class FlashInferAttentionDispatcher(nn.Module):
             )
         if backend == "trtllm":
             return self._attention_trtllm_batch(
-                query, key, value, batch_size, seq_len_q, seq_len_kv, use_sparse,
+                query,
+                key,
+                value,
+                batch_size,
+                seq_len_q,
+                seq_len_kv,
+                use_sparse,
                 causal,
             )
         if backend == "cudnn":
