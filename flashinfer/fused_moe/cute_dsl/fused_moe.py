@@ -129,7 +129,7 @@ def _get_cuda_graph_resources() -> Dict[str, Any]:
 def _moe_core_impl(
     # Input
     x: torch.Tensor,
-    x_sf: torch.Tensor,
+    x_sf: Optional[torch.Tensor],
     # Routing
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
@@ -138,7 +138,7 @@ def _moe_core_impl(
     w1_weight_sf: torch.Tensor,
     w1_alpha: torch.Tensor,
     # GEMM2 intermediate scale
-    fc2_input_scale: torch.Tensor,
+    fc2_input_scale: Optional[torch.Tensor],
     # GEMM2 weights
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
@@ -183,14 +183,15 @@ def _moe_core_impl(
     4. Routing-weight reduction in deterministic mode
 
     Args:
-        x: Input tensor, NVFP4 quantized.
-        x_sf: Scale factors for x.
+        x: Input tensor, NVFP4 quantized or BF16 when ``x_sf`` is ``None``.
+        x_sf: Scale factors for an NVFP4 input, or ``None`` for BF16 input.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
         w1_weight: GEMM1 weights (gate + up fused).
         w1_weight_sf: Scale factors for w1_weight.
         w1_alpha: Per-expert global scale for GEMM1.
-        fc2_input_scale: Global scale for GEMM2 input quantization.
+        fc2_input_scale: Global scale for GEMM2 input quantization. Ignored
+            when ``x_sf`` is ``None`` because GEMM1 output stays in BF16.
         w2_weight: GEMM2 weights (down projection).
         w2_weight_sf: Scale factors for w2_weight.
         w2_alpha: Per-expert global scale for GEMM2.
@@ -227,6 +228,33 @@ def _moe_core_impl(
         Output tensor [num_tokens, hidden_size].
     """
     activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+
+    if x_sf is None:
+        return _moe_bf16_activation_impl(
+            x=x,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            moe_output=moe_output,
+            per_token_scale=per_token_scale,
+            output_dtype=output_dtype,
+            use_fused_finalize=use_fused_finalize,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+        )
+    if fc2_input_scale is None:
+        raise ValueError("fc2_input_scale is required for NVFP4 activations")
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
@@ -387,6 +415,97 @@ def _moe_core_impl(
         )
 
     return moe_output[:num_tokens]
+
+
+def _moe_bf16_activation_impl(
+    x: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    num_local_experts: int,
+    local_expert_offset: int,
+    moe_output: Optional[torch.Tensor],
+    per_token_scale: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+    use_fused_finalize: bool,
+    activation: ActivationType,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+) -> torch.Tensor:
+    """Run the BF16-activation, online-NVFP4-weight-dequantization path."""
+    if x.dtype != torch.bfloat16:
+        raise TypeError(f"x must be torch.bfloat16 when x_sf is None, got {x.dtype}")
+    if output_dtype != torch.bfloat16:
+        raise ValueError("the BF16 activation path only supports BF16 output")
+    if per_token_scale is not None:
+        raise ValueError("per_token_scale is not supported when x_sf is None")
+    if not use_fused_finalize:
+        raise ValueError("the BF16 activation path requires use_fused_finalize=True")
+    if num_local_experts != num_experts or local_expert_offset != 0:
+        raise ValueError(
+            "the BF16 activation path does not yet support expert parallelism"
+        )
+
+    if activation == ActivationType.Swiglu:
+        if (
+            swiglu_alpha != DEFAULT_SWIGLU_ALPHA
+            or swiglu_beta != DEFAULT_SWIGLU_BETA
+            or swiglu_limit != DEFAULT_SWIGLU_LIMIT
+        ):
+            raise ValueError(
+                "the BF16 activation path only supports standard SwiGLU parameters"
+            )
+        kernel_activation = "silu"
+    elif activation == ActivationType.Relu2:
+        kernel_activation = "relu2"
+    else:
+        raise ValueError(f"unsupported BF16 activation path type {activation!r}")
+
+    num_tokens = int(token_selected_experts.size(0))
+    hidden_size = int(w2_weight.size(1))
+    if tuple(x.shape) != (num_tokens, hidden_size):
+        raise ValueError(
+            "x must have shape "
+            f"{(num_tokens, hidden_size)} when x_sf is None, got {tuple(x.shape)}"
+        )
+    if moe_output is None:
+        moe_output = torch.empty(
+            (num_tokens, hidden_size), dtype=torch.bfloat16, device=x.device
+        )
+    elif tuple(moe_output.shape) != (num_tokens, hidden_size):
+        raise ValueError(
+            f"moe_output must have shape {(num_tokens, hidden_size)}, "
+            f"got {tuple(moe_output.shape)}"
+        )
+
+    from .blackwell_sm12x.moe_dispatch import launch_w4a16_moe
+
+    return launch_w4a16_moe(
+        a=x,
+        topk_ids=token_selected_experts,
+        topk_weights=token_final_scales,
+        w1_weight=w1_weight,
+        w1_weight_sf=w1_weight_sf,
+        w1_alpha=w1_alpha,
+        w2_weight=w2_weight,
+        w2_weight_sf=w2_weight_sf,
+        w2_alpha=w2_alpha,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        scatter_output=moe_output,
+        activation=kernel_activation,
+        w13_is_interleaved=True,
+        apply_global_scale_in_fp32=True,
+    )
 
 
 # =============================================================================
@@ -587,13 +706,13 @@ class CuteDslMoEWrapper:
     def _forward_with_tactic(
         self,
         x: torch.Tensor,
-        x_sf: torch.Tensor,
+        x_sf: Optional[torch.Tensor],
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
         w1_weight: torch.Tensor,
         w1_weight_sf: torch.Tensor,
         w1_alpha: torch.Tensor,
-        fc2_input_scale: torch.Tensor,
+        fc2_input_scale: Optional[torch.Tensor],
         w2_weight: torch.Tensor,
         w2_weight_sf: torch.Tensor,
         w2_alpha: torch.Tensor,
@@ -657,13 +776,13 @@ class CuteDslMoEWrapper:
     def run(
         self,
         x: torch.Tensor,
-        x_sf: torch.Tensor,
+        x_sf: Optional[torch.Tensor],
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
         w1_weight: torch.Tensor,
         w1_weight_sf: torch.Tensor,
         w1_alpha: torch.Tensor,
-        fc2_input_scale: torch.Tensor,
+        fc2_input_scale: Optional[torch.Tensor],
         w2_weight: torch.Tensor,
         w2_weight_sf: torch.Tensor,
         w2_alpha: torch.Tensor,
@@ -680,9 +799,11 @@ class CuteDslMoEWrapper:
         Parameters
         ----------
         x : torch.Tensor
-            NVFP4-quantized input of shape ``[num_tokens, hidden_size // 2]``.
-        x_sf : torch.Tensor
-            Scale factors for ``x``.
+            NVFP4-quantized input of shape ``[num_tokens, hidden_size // 2]``,
+            or BF16 input of shape ``[num_tokens, hidden_size]``.
+        x_sf : Optional[torch.Tensor]
+            Scale factors for an NVFP4 input. Passing ``None`` selects BF16
+            activations with online NVFP4 weight dequantization.
         token_selected_experts : torch.Tensor
             Expert assignments of shape ``[num_tokens, top_k]``.
         token_final_scales : torch.Tensor
@@ -693,8 +814,9 @@ class CuteDslMoEWrapper:
             Scale factors for ``w1_weight``.
         w1_alpha : torch.Tensor
             Per-expert global scale for GEMM1.
-        fc2_input_scale : torch.Tensor
-            Global scale for GEMM2 input quantization.
+        fc2_input_scale : Optional[torch.Tensor]
+            Global scale for GEMM2 input quantization. Ignored when ``x_sf``
+            is ``None`` because GEMM1 output stays in BF16.
         w2_weight : torch.Tensor
             GEMM2 weights (down projection).
         w2_weight_sf : torch.Tensor
@@ -703,7 +825,7 @@ class CuteDslMoEWrapper:
             Per-expert global scale for GEMM2.
         tactic : Optional[Tuple]
             Tactic tuple, or ``None`` for auto-selection via the runtime
-            tuner.
+            tuner. Explicit tactics are not supported for BF16 activations.
         per_token_scale : Optional[torch.Tensor]
             Per-token input row scale for GEMM1. Passing this enables the
             per-token activation path.
@@ -714,14 +836,41 @@ class CuteDslMoEWrapper:
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
         num_tokens = token_selected_experts.size(0)
-        use_per_token_activation = per_token_scale is not None
-        runner = self._per_token_runner if use_per_token_activation else self._runner
 
         moe_output = torch.empty(
             (num_tokens, self.hidden_size),
             dtype=self.output_dtype,
             device=x.device,
         )
+
+        if x_sf is None:
+            if tactic is not None:
+                raise ValueError("tactic is not supported for BF16 activations")
+            return self._forward_with_tactic(
+                x=x,
+                x_sf=None,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                w1_weight=w1_weight,
+                w1_weight_sf=w1_weight_sf,
+                w1_alpha=w1_alpha,
+                fc2_input_scale=fc2_input_scale,
+                w2_weight=w2_weight,
+                w2_weight_sf=w2_weight_sf,
+                w2_alpha=w2_alpha,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                local_expert_offset=self.local_expert_offset,
+                output_dtype=self.output_dtype,
+                use_fused_finalize=self.use_fused_finalize,
+                moe_output=moe_output,
+                per_token_scale=per_token_scale,
+                enable_pdl=self.enable_pdl,
+            )
+
+        use_per_token_activation = per_token_scale is not None
+        runner = self._per_token_runner if use_per_token_activation else self._runner
 
         # Use auto-tuner for tactic selection
         tuner = AutoTuner.get()
@@ -769,13 +918,13 @@ class CuteDslMoEWrapper:
 
 def _cute_dsl_fused_moe_nvfp4_impl(
     x: torch.Tensor,
-    x_sf: torch.Tensor,
+    x_sf: Optional[torch.Tensor],
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
     w1_alpha: torch.Tensor,
-    fc2_input_scale: torch.Tensor,
+    fc2_input_scale: Optional[torch.Tensor],
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
     w2_alpha: torch.Tensor,
@@ -839,13 +988,13 @@ def _cute_dsl_fused_moe_nvfp4_impl(
 @flashinfer_api(trace=cute_dsl_fused_moe_nvfp4_trace)
 def cute_dsl_fused_moe_nvfp4(
     x: torch.Tensor,
-    x_sf: torch.Tensor,
+    x_sf: Optional[torch.Tensor],
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
     w1_alpha: torch.Tensor,
-    fc2_input_scale: torch.Tensor,
+    fc2_input_scale: Optional[torch.Tensor],
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
     w2_alpha: torch.Tensor,
@@ -878,9 +1027,11 @@ def cute_dsl_fused_moe_nvfp4(
     Parameters
     ----------
     x : torch.Tensor
-        NVFP4-quantized input of shape ``[num_tokens, hidden_size // 2]``.
-    x_sf : torch.Tensor
-        Scale factors for ``x``.
+        NVFP4-quantized input of shape ``[num_tokens, hidden_size // 2]``, or
+        BF16 input of shape ``[num_tokens, hidden_size]``.
+    x_sf : Optional[torch.Tensor]
+        Scale factors for an NVFP4 input. Passing ``None`` selects BF16
+        activations with online NVFP4 weight dequantization.
     token_selected_experts : torch.Tensor
         Expert assignments of shape ``[num_tokens, top_k]``.
     token_final_scales : torch.Tensor
@@ -891,8 +1042,9 @@ def cute_dsl_fused_moe_nvfp4(
         Scale factors for ``w1_weight``.
     w1_alpha : torch.Tensor
         Per-expert global scale for GEMM1.
-    fc2_input_scale : torch.Tensor
-        Global scale for GEMM2 input quantization.
+    fc2_input_scale : Optional[torch.Tensor]
+        Global scale for GEMM2 input quantization. Ignored when ``x_sf`` is
+        ``None`` because GEMM1 output stays in BF16.
     w2_weight : torch.Tensor
         GEMM2 weights (down projection).
     w2_weight_sf : torch.Tensor
@@ -949,6 +1101,35 @@ def cute_dsl_fused_moe_nvfp4(
             (num_tokens, hidden_size),
             dtype=output_dtype,
             device=x.device,
+        )
+
+    if x_sf is None:
+        return _cute_dsl_fused_moe_nvfp4_impl(
+            x=x,
+            x_sf=None,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            output_dtype=output_dtype,
+            use_fused_finalize=use_fused_finalize,
+            moe_output=moe_output,
+            per_token_scale=per_token_scale,
+            aux_stream=aux_stream,
+            enable_pdl=enable_pdl,
+            activation_type=activation.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
         )
 
     tuner = AutoTuner.get()

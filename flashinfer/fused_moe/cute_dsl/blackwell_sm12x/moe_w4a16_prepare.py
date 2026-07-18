@@ -9,6 +9,7 @@ import torch
 
 from .moe_w4a16_host import (
     W4A16PackedBuffers,
+    deinterleave_w13,
     make_w4a16_packed_buffers as _make_w4a16_packed_buffers,
     normalize_expert_block_scales,
     reorder_w13_to_gate_up,
@@ -261,6 +262,7 @@ def prepare_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype = torch.bfloat16,
     source_format: str = "modelopt",
+    w13_is_interleaved: bool = False,
 ) -> W4A16PackedWeights:
     source_format = _normalize_source_format(source_format)
     shape = validate_w4a16_packed_inputs(
@@ -288,6 +290,12 @@ def prepare_w4a16_packed_weights(
         cols=hidden_size,
     )
     if is_gated:
+        if w13_is_interleaved:
+            w13, w13_scale = deinterleave_w13(
+                w13,
+                w13_scale,
+                intermediate_size=intermediate_size,
+            )
         w13, w13_scale = reorder_w13_to_gate_up(
             w13,
             w13_scale,

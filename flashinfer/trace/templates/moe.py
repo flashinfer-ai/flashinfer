@@ -3016,9 +3016,9 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
     op_type="moe",
     name_prefix="cute_dsl_fused_moe_nvfp4",
     description=(
-        "CuteDSL NVFP4 fused MoE (SM100/SM103). Accepts NvFP4-packed input + "
-        "scales with precomputed top-k routing (token_selected_experts + "
-        "token_final_scales) and per-expert alpha scales."
+        "CuteDSL NVFP4 fused MoE (SM100/SM103). Accepts NVFP4-packed input "
+        "with scales or BF16 input with online NVFP4 weight dequantization, "
+        "precomputed top-k routing, and per-expert alpha scales."
     ),
     axes={
         "num_tokens": Var(description="Total tokens across the batch."),
@@ -3027,6 +3027,9 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "num_local_experts": Const(abbrev="e"),
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
+        "input_width": Var(
+            description="hidden_size // 2 for NVFP4 input or hidden_size for BF16."
+        ),
         "num_packed_hidden": Var(description="hidden_size // 2 (NvFP4 packed)."),
         "num_packed_intermediate": Var(
             description="intermediate_size // 2 (NvFP4 packed)."
@@ -3047,12 +3050,13 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
     },
     inputs={
         "x": Tensor(
-            ["num_tokens", "num_packed_hidden"],
-            description="NvFP4-packed input (uint8, 2 fp4 per byte).",
+            ["num_tokens", "input_width"],
+            description="NVFP4-packed input or BF16 input when x_sf is omitted.",
         ),
         "x_sf": Tensor(
             ["num_tokens", "num_fp4_hidden_blocks"],
-            description="NvFP4 scale factors for x (float8_e4m3fn).",
+            optional=True,
+            description="NVFP4 scale factors for x; omitted for BF16 input.",
         ),
         "token_selected_experts": Tensor(
             ["num_tokens", "top_k"],
@@ -3080,7 +3084,10 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "fc2_input_scale": Tensor(
             ["one"],
             dtype="float32",
-            description="Global scale for FC2 input quantization.",
+            optional=True,
+            description=(
+                "Global scale for FC2 input quantization; ignored for BF16 input."
+            ),
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
@@ -3369,7 +3376,11 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     weights."""
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
-    hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
+    hs_deq = (
+        x.to(torch.float32)
+        if x_sf is None
+        else _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
+    )
     W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=False)
     W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=False)
     if per_token_scale is not None:

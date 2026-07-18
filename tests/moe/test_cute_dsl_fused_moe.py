@@ -850,6 +850,81 @@ class TestAutotunerBucketConfig:
 
 
 # =============================================================================
+# Test Class: BF16 activations with online NVFP4 weight dequantization
+# =============================================================================
+
+
+@cute_dsl_available
+@sm100_required
+class TestCuteDslMoeBf16Activation:
+    @pytest.mark.parametrize("use_wrapper", [False, True])
+    def test_numerical_accuracy(self, use_wrapper: bool):
+        from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
+
+        num_tokens, hidden_size, intermediate_size = 64, 256, 512
+        num_experts, top_k = 256, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        kwargs = {
+            "x": tensors["x_bf16"],
+            "x_sf": None,
+            "token_selected_experts": tensors["token_selected_experts"],
+            "token_final_scales": tensors["token_final_scales"],
+            "w1_weight": tensors["w1_weight"],
+            "w1_weight_sf": tensors["w1_weight_sf"],
+            "w1_alpha": tensors["w1_alpha"],
+            "fc2_input_scale": None,
+            "w2_weight": tensors["w2_weight"],
+            "w2_weight_sf": tensors["w2_weight_sf"],
+            "w2_alpha": tensors["w2_alpha"],
+        }
+        if use_wrapper:
+            moe = CuteDslMoEWrapper(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=False,
+            )
+            result = moe.run(**kwargs)
+        else:
+            result = cute_dsl_fused_moe_nvfp4(
+                **kwargs,
+                num_experts=num_experts,
+                top_k=top_k,
+            )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"],
+            gemm1_weights=tensors["w1_weight_bf16"],
+            gemm2_weights=tensors["w2_weight_bf16"],
+            gemm1_alpha=tensors["w1_alpha"],
+            gemm2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert result.dtype == torch.bfloat16
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+
+# =============================================================================
 # Test Class: Functional API (cute_dsl_fused_moe_nvfp4)
 # =============================================================================
 

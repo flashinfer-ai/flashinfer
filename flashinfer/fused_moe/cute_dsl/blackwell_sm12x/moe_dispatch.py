@@ -2092,11 +2092,13 @@ def _get_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype,
     source_format: str = "modelopt",
+    w13_is_interleaved: bool = False,
 ) -> W4A16PackedWeights:
     key = (
         activation,
         params_dtype,
         source_format,
+        w13_is_interleaved,
         tuple(w1_weight.shape),
         tuple(w1_weight_sf.shape),
         tuple(w1_alpha.shape),
@@ -2128,6 +2130,7 @@ def _get_w4a16_packed_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format=source_format,
+        w13_is_interleaved=w13_is_interleaved,
     )
     _W4A16_WEIGHT_CACHE[key] = prepared
     _register_cache_eviction(
@@ -2175,7 +2178,7 @@ def _validate_w4a16_workspace(
         )
 
 
-def _launch_sm120_w4a16_moe(
+def launch_w4a16_moe(
     *,
     a: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -2193,6 +2196,8 @@ def _launch_sm120_w4a16_moe(
     fast_math: bool = True,
     activation: str = "silu",
     source_format: str = "modelopt",
+    w13_is_interleaved: bool = False,
+    apply_global_scale_in_fp32: bool = False,
     _workspace=None,
     _prepared_weights=None,
 ) -> torch.Tensor:
@@ -2209,6 +2214,7 @@ def _launch_sm120_w4a16_moe(
             activation=activation,
             params_dtype=a.dtype,
             source_format=source_format,
+            w13_is_interleaved=w13_is_interleaved,
         )
     )
     if int(prepared.num_experts) != int(num_local_experts):
@@ -2256,6 +2262,7 @@ def _launch_sm120_w4a16_moe(
         intermediate_cache13=workspace.intermediate_cache13,
         intermediate_cache2=workspace.intermediate_cache2,
         output=scatter_output,
+        apply_global_scale_in_fp32=apply_global_scale_in_fp32,
         fc1_c_tmp=workspace.fc1_c_tmp,
         fc2_c_tmp=workspace.fc2_c_tmp,
         packed_route_indices=workspace.packed_route_indices,
@@ -2599,7 +2606,7 @@ def launch_sm120_moe(
     routed_rows = num_tokens * top_k
 
     if quant_mode == "w4a16":
-        return _launch_sm120_w4a16_moe(
+        return launch_w4a16_moe(
             a=a,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
