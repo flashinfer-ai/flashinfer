@@ -76,10 +76,7 @@ def get_sampling_module():
         enable_pdl: bool,
     ) -> torch.Tensor:
         if logits.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-            raise TypeError(
-                "softmax logits must be float32, float16, or bfloat16, "
-                f"got {logits.dtype}"
-            )
+            logits = logits.float()
         probs = torch.empty_like(logits, device=logits.device, dtype=torch.float32)
         maybe_temperature_arr = (
             maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
@@ -1869,10 +1866,10 @@ def top_p_renorm_probs(
         If True, use deterministic integer accumulation for reproducible results. Will affect performance.
         Default is False.
     out: Optional[torch.Tensor]
-        Optional destination tensor. It must have the same shape, dtype, device,
-        and layout as ``probs``. Passing ``out=probs`` performs the final AIR
-        renormalization in place and avoids allocating another probability
-        tensor.
+        Optional destination tensor for float32 probabilities. It must have the
+        same shape, dtype, device, and layout as ``probs``. Passing
+        ``out=probs`` performs the final AIR renormalization in place and avoids
+        allocating another probability tensor.
     workspace: Optional[torch.Tensor]
         Optional uint8 workspace. When omitted, a temporary workspace is
         allocated. Reusing a caller-owned workspace avoids repeated allocator

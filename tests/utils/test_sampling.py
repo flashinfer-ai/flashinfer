@@ -76,9 +76,10 @@ def test_softmax(
     assert torch.allclose(probs, probs_ref, atol=1e-5)
 
 
-def test_softmax_bfloat16_input_float32_output():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
+def test_softmax_input_float32_output(dtype):
     torch.manual_seed(42)
-    logits = torch.randn(8, 154880, device="cuda:0", dtype=torch.bfloat16)
+    logits = torch.randn(8, 154880, device="cuda:0", dtype=dtype)
     probs = flashinfer.sampling.softmax(logits)
     probs_ref = torch.softmax(logits, dim=-1, dtype=torch.float32)
 
