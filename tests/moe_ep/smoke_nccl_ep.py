@@ -1,22 +1,29 @@
 """NCCL-EP smoke entry point.
 
 Usage:
-    torchrun --nproc_per_node=8 tests/moe_ep/smoke_nccl_ep.py
+    torchrun --nproc_per_node=4 tests/moe_ep/smoke_nccl_ep.py
 
-Constructs an :class:`MoEEpLayer` with ``backend="nccl_ep"`` and runs one
-dispatch → identity → combine → complete pass. Asserts the output has the
-same shape as the input. With identity inner compute on softmax-normalized
-topk_weights, the output approximates the input within bf16 tolerance.
+Constructs an :class:`MoEEpLayer` with ``backend="nccl_ep"`` (default
+``IdentityConfig`` inner kernel) and runs one dispatch → identity → combine
+pass. Asserts the output has the same shape as the input. With
+softmax-normalized topk_weights, the output approximates the input within
+bf16 tolerance.
 
-Designed for the Phase 4 on-cluster validation step. On the dev box this
-also exits 0 with ``--nproc_per_node=1`` provided the EP backends are
-available (they are by default: nccl4py is a base dependency).
+Requires ``nccl.ep``, which is available by default: it ships in the
+``nccl4py`` wheel, a base dependency of flashinfer-python (a plain
+``pip install -e .`` is enough).
 """
 
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 import sys
+
+# First-use JIT compile of reference kernels (e.g. fused_moe_trtllm_sm100)
+# can exceed torch's 10-min default watchdog while other ranks wait in a
+# collective; a cold cache is not a hang.
+_PG_TIMEOUT = timedelta(minutes=60)
 
 # When launched as `torchrun tests/moe_ep/smoke_nccl_ep.py`, Python inserts
 # this script's directory (tests/moe_ep/) at sys.path[0]. That dir holds the
@@ -33,7 +40,7 @@ def main() -> int:
 
     # Initialize the process group; srun/torchrun sets RANK/WORLD_SIZE.
     backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(backend=backend, timeout=_PG_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if torch.cuda.is_available():
@@ -42,6 +49,7 @@ def main() -> int:
         torch.cuda.set_device(local_rank)
 
     from flashinfer.moe_ep import (
+        dummy_moe_weights,
         BootstrapConfig,
         EpAlgorithm,
         FleetParams,
@@ -86,6 +94,10 @@ def main() -> int:
             dtype_bytes=2,
             algorithm=EpAlgorithm.LOW_LATENCY,
         ),
+        weights=dummy_moe_weights(
+            num_local_experts=num_experts // world_size,
+            hidden=hidden,
+        ),
         backend="nccl_ep",
     )
     t = MoEEpTensors(hidden_states=x, topk_ids=topk_ids, topk_weights=topk_weights)
@@ -96,6 +108,7 @@ def main() -> int:
     y_mean = float(y.float().mean().item())
     print(f"rank {rank}: nccl_ep smoke OK, y.mean={y_mean:.4f}")
 
+    layer.destroy()
     dist.barrier()
     if rank == 0:
         print("SMOKE_RESULT: nccl_ep OK")

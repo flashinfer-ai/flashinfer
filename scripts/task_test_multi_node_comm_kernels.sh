@@ -23,7 +23,7 @@ DISABLE_SANITY_TEST=true
 source "${SCRIPT_DIR}/test_utils.sh"
 
 # Define the specific test files for multi-node comm tests
-TEST_FILES="tests/comm/test_mnnvl_memory.py tests/comm/test_trtllm_mnnvl_allreduce.py tests/comm/test_mnnvl_moe_alltoall.py"
+TEST_FILES="tests/comm/test_mnnvl_memory.py tests/comm/test_trtllm_mnnvl_allreduce.py tests/comm/test_mnnvl_moe_alltoall.py tests/comm/test_trtllm_allreduce_checkpoint.py"
 
 # Main execution
 main() {

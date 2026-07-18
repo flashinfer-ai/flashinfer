@@ -14,6 +14,9 @@ if [ "$SKIP_INSTALL" = "0" ]; then
 fi
 
 # Run each test file separately to isolate CUDA memory issues
+# moe_ep unit subset: host-only + single-GPU (multirank/mega auto-skip via
+# markers; see tests/moe_ep/run_tests.sh and docs/design_docs/moe_ep_runbook.md)
+bash tests/moe_ep/run_tests.sh unit
 pytest -s tests/attention/test_logits_cap.py
 pytest -s tests/attention/test_sliding_window.py
 pytest -s tests/attention/test_tensor_cores_decode.py
