@@ -305,28 +305,6 @@ def _cp_async_wait_group_n(n_const):
     return Int32(r)
 
 
-def _st_global_bf16x2_f32(base_addr_i64, bf16_elem_offset, lo_f32, hi_f32):
-    r = llvm.inline_asm(
-        mlir_T.i32(),
-        [
-            base_addr_i64.ir_value(),
-            bf16_elem_offset.ir_value(),
-            lo_f32.ir_value(),
-            hi_f32.ir_value(),
-        ],
-        "{ .reg .u64 _addr; .reg .b32 _v;"
-        " mad.wide.u32 _addr, $2, 2, $1;"
-        " cvt.rn.bf16x2.f32 _v, $4, $3;"
-        " st.global.b32 [_addr], _v;"
-        " mov.u32 $0, 0; }",
-        "=r,l,r,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return Int32(r)
-
-
 def _sts_bf16x2_f32(smem_addr_i32, lo_f32, hi_f32):
     """v5 (H3): packed FP32 → BF16x2 cast + STS.32 to SMEM.
     Replaces a pair of (LDS f32 + F2FP.BF16 + STS.16) sequences with a
@@ -344,6 +322,49 @@ def _sts_bf16x2_f32(smem_addr_i32, lo_f32, hi_f32):
         " st.shared.b32 [$1], _v;"
         " mov.u32 $0, 0; }",
         "=r,r,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
+def _lds_v4_b32(smem_addr_i32):
+    """LDS.128: 16 B (8 bf16) from SMEM. Address must be 16-B aligned."""
+    r = llvm.inline_asm(
+        llvm.StructType.get_literal(
+            [mlir_T.i32(), mlir_T.i32(), mlir_T.i32(), mlir_T.i32()]
+        ),
+        [smem_addr_i32.ir_value()],
+        "ld.shared.v4.b32 {$0,$1,$2,$3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        Int32(llvm.extractvalue(mlir_T.i32(), r, [0])),
+        Int32(llvm.extractvalue(mlir_T.i32(), r, [1])),
+        Int32(llvm.extractvalue(mlir_T.i32(), r, [2])),
+        Int32(llvm.extractvalue(mlir_T.i32(), r, [3])),
+    )
+
+
+def _st_global_v4_b32(base_addr_i64, bf16_elem_offset, v0, v1, v2, v3):
+    """STG.128: 16 B (8 bf16) to global. Offset in bf16 elements, 16-B aligned."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [
+            base_addr_i64.ir_value(),
+            bf16_elem_offset.ir_value(),
+            v0.ir_value(),
+            v1.ir_value(),
+            v2.ir_value(),
+            v3.ir_value(),
+        ],
+        "{ .reg .u64 _a; mad.wide.u32 _a, $2, 2, $1;"
+        " st.global.v4.b32 [_a], {$3,$4,$5,$6}; mov.u32 $0, 0; }",
+        "=r,l,r,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -1814,6 +1835,10 @@ class GdnDecodeKernel:
         _gOut_base = gOut.iterator.toint()
         _out_base = pid_b * so_b + pid_hv * so_hv
         _v_off_base = Int32(0)  # full V in one tile
+        # Output staging tile [T, V_PADDED] bf16 aliased onto h_buf (16 KiB;
+        # needs 4.25 KiB). sH's last read is the half-1 H GEMM; every warp is
+        # past it once the sync below (before QT@V) has run.
+        _sOutStage_base = sH.iterator.toint()
 
         # 4 V-groups per warp at 8 V-cols each → byte stride = 8*2 = 16 within a warp,
         # warp_id stride in V-cols = 32 → 64 bytes between warps.
@@ -1852,31 +1877,48 @@ class GdnDecodeKernel:
             if h_iter == 3:
                 for j in cutlass.range_constexpr(4):
                     acc.iterator[j] = acc.iterator[j] + wh_acc_3.iterator[j]
+            # SMEM-staged epilogue (NCU B=256 mbp8: the 8 fragment-direct 4-B
+            # STG.32s were the top uncoalesced-global source — 50% of each
+            # 32-B sector wasted, 2.1M of 2.6M excessive L2 sectors). Stage
+            # the [T,128] tile in SMEM (h_buf — sH is dead after the half-1 H
+            # GEMM; the sync at the QT@V wait above orders all warps past it),
+            # then flush with fully-coalesced 16-B STGs below. STS pattern
+            # (word = 68*r + 4*h + lane%4) is bank-conflict-free.
             _out_r0 = lane_id // 4
             _out_c0 = (lane_id & 3) * 2
-            _out_v0 = _v_off_base + h * 8 + _out_c0
-            if const_expr(self._t_input >= 8):
-                _st_global_bf16x2_f32(
-                    _gOut_base,
-                    _out_base + _out_r0 * so_t + _out_v0,
-                    acc.iterator[0],
-                    acc.iterator[1],
-                )
-            else:
-                if _out_r0 < Int32(self._t_input):
-                    _st_global_bf16x2_f32(
-                        _gOut_base,
-                        _out_base + _out_r0 * so_t + _out_v0,
-                        acc.iterator[0],
-                        acc.iterator[1],
-                    )
+            _stg_col = h * 8 + _out_c0
+            _sts_bf16x2_f32(
+                _sOutStage_base + (_out_r0 * V_PADDED + _stg_col) * 2,
+                acc.iterator[0],
+                acc.iterator[1],
+            )
             if const_expr(self._t_input > 8):
-                _st_global_bf16x2_f32(
-                    _gOut_base,
-                    _out_base + (_out_r0 + 8) * so_t + _out_v0,
+                _sts_bf16x2_f32(
+                    _sOutStage_base + ((_out_r0 + 8) * V_PADDED + _stg_col) * 2,
                     acc.iterator[2],
                     acc.iterator[3],
                 )
+
+        # Coalesced flush: consecutive lanes write consecutive 16-B chunks
+        # (16 chunks per 256-B row), so each warp covers 512 B contiguous —
+        # 100% sector utilization. LDS.128 quarter-warps read 32 consecutive
+        # SMEM words (pos*4 spans a full bank period) — conflict-free.
+        sync_threads()
+        for _fl_pass in cutlass.range_constexpr(2 if self._t_input > 8 else 1):
+            _fl_chunk = _fl_pass * 128 + tidx
+            _fl_row = _fl_chunk // 16
+            _fl_pos = _fl_chunk & 15
+            _fl_lds = _sOutStage_base + _fl_row * Int32(V_PADDED * 2) + _fl_pos * 16
+            _fl_off = _out_base + _fl_row * so_t + _v_off_base + _fl_pos * 8
+            # LDS hoisted out of the runtime guard: tuple-unpack inside an
+            # if-region trips a DSL region-type error, and reading staged
+            # garbage rows (>= t_input) is harmless — only the STG is gated.
+            _v0, _v1, _v2, _v3 = _lds_v4_b32(_fl_lds)
+            if const_expr(self._t_input >= 8):
+                _st_global_v4_b32(_gOut_base, _fl_off, _v0, _v1, _v2, _v3)
+            else:
+                if _fl_row < Int32(self._t_input):
+                    _st_global_v4_b32(_gOut_base, _fl_off, _v0, _v1, _v2, _v3)
 
 
 # ============================================================================
@@ -1914,20 +1956,28 @@ _RESTAGE = True
 # real [B,T,...] tensors (no host staging copy) and the kernel loads only those T
 # rows + zeros its sK/sQ smem tail. Removes the two big q/k gmem->gmem staging
 # copies. v/a/b stay staged (v is already minimized by _v_iters=1 at t_input<=8;
-# a/b feed the per-lane gamma path). Off by default (full staging) for safety.
+# a/b feed the per-lane gamma path).
+# ON by default since the _BF16_CACHE stale-cast fix: the earlier "unsafe"
+# accuracy signal traced to that host-side bug, not this path. Validated on B200
+# (T=4 and T=8, BS=1..256): max|d| <= 9.77e-04 vs branch kernel and vs the torch
+# reference, full wy_output_only pytest green with native forced, and 2-6%
+# faster kernel time at BS>=8 plus 2 fewer host staging copies per call.
+# Set FLASHINFER_GDN_WY_NATIVE_T=0 to restore full staging.
 import os as _os
 
-_NATIVE_T = _os.environ.get("SGLANG_GDN_WY_NATIVE_T", "0") != "0"
+_NATIVE_T = _os.environ.get("FLASHINFER_GDN_WY_NATIVE_T", "1") != "0"
 # (strided-qkv) read q/k/v directly from the fused conv-output column slices (token
 # stride = conv_dim) instead of .contiguous()-materializing them. Removes the 3 big
 # q/k/v copies from the verify region. Only valid on the native path (T in {4,8}).
-_STRIDED_QKV = _os.environ.get("SGLANG_GDN_WY_STRIDED_QKV", "0") != "0"
+_STRIDED_QKV = _os.environ.get("FLASHINFER_GDN_WY_STRIDED_QKV", "0") != "0"
 # (native-a/b) read a/b directly from the real [B, n_valid, HV] tensors instead of staging
 # them into T_KERNEL-row zero-padded buffers (removes the 2 a/b staging copies). Bit-exact on
 # the compact [B,T] output: gamma is a causal prefix-sum, so the unloaded tail rows (which get
 # log_alpha=0 instead of the staged-zero value) cannot affect rows 0..n_valid-1, and the tail
 # output is discarded. Native path only (T in {4,8}).
-_NATIVE_AB = _os.environ.get("SGLANG_GDN_WY_NATIVE_AB", "0") != "0"
+# ON by default alongside _NATIVE_T (same validation); FLASHINFER_GDN_WY_NATIVE_AB=0
+# restores a/b staging.
+_NATIVE_AB = _os.environ.get("FLASHINFER_GDN_WY_NATIVE_AB", "1") != "0"
 # Cache the bf16 cast of the per-layer CONSTANT weights A_log/dt_bias, keyed by
 # storage identity (data_ptr, shape). They are persistent tensors passed every verify
 # call; caching turns the per-call `.to(bf16)` into a one-time (warm-up) cast that does
@@ -2061,7 +2111,7 @@ def gated_delta_rule_mtp(
     dt_bias = _cached_bf16(dt_bias)
     h0 = initial_state_source.contiguous()
     # n_valid = token rows actually present in the q/k tensors handed to the kernel.
-    # Native-short-T (SGLANG_GDN_WY_NATIVE_T): pass q/k as the real [B,T,...] tensors
+    # Native-short-T (FLASHINFER_GDN_WY_NATIVE_T): pass q/k as the real [B,T,...] tensors
     # (n_valid=T); the kernel loads only those rows and zeros its sK/sQ smem tail,
     # skipping the two big q/k gmem->gmem staging copies. Otherwise q/k are staged
     # into a T_KERNEL-row zero-padded buffer (n_valid=T_KERNEL = original behavior).
@@ -2160,10 +2210,15 @@ def gated_delta_rule_mtp(
             q, k, v, a, b = qb, kb, vb, ab, bb
 
     _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    # One CTA per (b, hv) — full V tile per CTA. Per-CTA SMEM ~51.5 KB -> <=4 CTAs/SM.
+    # One CTA per (b, hv) — full V tile per CTA. Per-CTA SMEM ~29.8 KB -> <=7 CTAs/SM (ncu, B200).
     _total_ctas = HV * B
     _needed = math.ceil(_total_ctas / _num_sms)
-    mbp = max(1, min(_needed + 1, 4))
+    # Cap raised 4 -> 8 (measured on B200, T=16/HV=64): launch bounds mbp=8 makes the
+    # compiler fit 64 regs/thread (was 73 -> 80 allocated -> 6-CTA register limit),
+    # unlocking the 7-CTA SMEM limit (29.8 KB/CTA): theoretical occupancy 37.5% -> 43.75%,
+    # ~1-7% faster across BS=16..256 with bit-identical output. mbp=12 (40 regs) gains no
+    # further occupancy (SMEM-capped at 7 CTAs) and is slower — do not raise past 8.
+    mbp = max(1, min(_needed + 1, 8))
     # T-aware Phase-2 squaring depth.
     t_disc = 4 if T <= 4 else (8 if T <= 8 else 16)
     # n_valid in the key: native (n_valid<T) vs staged (n_valid=T_KERNEL) compile to
@@ -2174,6 +2229,13 @@ def gated_delta_rule_mtp(
     # pool extent at launch). mbp still varies with B, but only over <=4 buckets.
     # Exception: the strided-qkv opt-in path passes non-compact q/k/v whose
     # descriptors stay fully static, so it keeps B/pool in the key (fallback).
+    # HV/H/V_dim MUST be in the key: they are runtime Int32 kernel args, but the
+    # compiled artifact bakes in the captured tensors' layouts (H0 TMA descriptor,
+    # q/k/v/out head+feature strides — only the batch mode-0 dim is dynamic). A
+    # process mixing HV values (e.g. HV=32 then HV=64) previously reused the first
+    # compile and read H0 with the wrong strides -> ~3e-01 garbage outputs. Found
+    # by the intense correctness sweep; invisible to the tests/benches, which use
+    # one HV per process.
     cache_key: tuple = (
         str(device),
         mbp,
@@ -2181,6 +2243,9 @@ def gated_delta_rule_mtp(
         n_valid,
         _qkv_rs,
         _ab_native_flag,
+        HV,
+        H,
+        V_dim,
     )
     if _qkv_rs > 0:
         cache_key = cache_key + (B, h0.shape[0])
