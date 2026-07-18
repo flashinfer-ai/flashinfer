@@ -1386,7 +1386,6 @@ def _gen_customize_single_prefill_module_impl(
             "additional_func_params": additional_func_params,
             "additional_params_decl": additional_params_decl,
             "additional_params_setter": additional_params_setter,
-            "has_q_block_expanding_offset": "q_block_expanding_offset" in additional_scalar_names,
         }
 
         generated_inc_str = config_templ.render(
