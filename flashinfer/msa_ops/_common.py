@@ -90,10 +90,29 @@ def _resolve_packed_kv(k, v, head_dim, *, paged, kv_nvfp4):
     """Shared wrapper plumbing: detect packed K/V split views (paged,
     non-NVFP4 only) via :func:`_packed_kv_view`, enforcing contiguity for
     every other input."""
-    packed = None if kv_nvfp4 or not paged else _packed_kv_view(k, v, head_dim)
+    packed = None if kv_nvfp4 or not paged else _packed_kv_view_cached(k, v, head_dim)
     if packed is None and not (k.is_contiguous() and v.is_contiguous()):
         raise ValueError("k/v must be contiguous")
     return packed
+
+
+# Cached views pin their storage, hence the small cap.
+_PACKED_VIEW_CACHE: dict = {}
+
+
+def _packed_kv_view_cached(k, v, head_dim):
+    """Memoized :func:`_packed_kv_view`: callers pass the same cache views
+    every step, and the per-call detection cost lands on the decode hot path."""
+    if k.is_contiguous() and v.is_contiguous():
+        return None
+    key = (k.data_ptr(), v.data_ptr(), k.shape, k.stride(), v.stride(), k.dtype)
+    hit = _PACKED_VIEW_CACHE.get(key)
+    if hit is None:
+        if len(_PACKED_VIEW_CACHE) >= 32:
+            _PACKED_VIEW_CACHE.clear()
+        hit = _packed_kv_view(k, v, head_dim)
+        _PACKED_VIEW_CACHE[key] = hit
+    return hit
 
 
 def _packed_kv_view(k, v, head_dim):
