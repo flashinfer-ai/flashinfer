@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
-    Optional,
     TypeAlias,
 )
 
@@ -831,11 +830,11 @@ def is_in_profile_measurement() -> bool:
     return getattr(_profile_measurement_thread_local, "active", False)
 
 
-_tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
+_tune_process_group: "torch.distributed.ProcessGroup | None" = None
 
 
 def set_autotune_process_group(
-    group: Optional["torch.distributed.ProcessGroup"],
+    group: "torch.distributed.ProcessGroup | None",
 ) -> None:
     """All-reduce (mean) per-tactic profile timings across ``group`` so every
     rank's ``argmin`` picks the same tactic.
@@ -868,7 +867,7 @@ def set_autotune_process_group(
     _tune_process_group = group
 
 
-def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
+def get_autotune_process_group() -> "torch.distributed.ProcessGroup | None":
     """Return the process group previously passed to ``set_autotune_process_group``."""
     return _tune_process_group
 
@@ -1807,7 +1806,7 @@ class AutoTuner:
         # unconditionally, and then re-raise so the outer error-handling
         # path in ``choose_one`` still runs (logging, stats, OOM
         # fallback).
-        profile_exc: Optional[BaseException] = None
+        profile_exc: BaseException | None = None
         try:
             with _profile_measurement_scope():
                 # warm up, no timing
