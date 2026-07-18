@@ -667,6 +667,10 @@ def _select_kernel_schedule(
 
     if head_dim == 128 and use_gate and sequence_heads >= 224:
         tile_rows = 16
+    # The measured 64-sequence-head T1 gate path amortizes its front end better
+    # with row-16 despite the smaller grid and higher register allocation.
+    if head_dim == 128 and use_gate and num_tokens == 1 and sequence_heads == 64:
+        tile_rows = 16
 
     reduction_schedule = (
         DOT_REDUCTION_DUAL_ACCUM

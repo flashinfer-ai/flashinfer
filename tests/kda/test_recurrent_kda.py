@@ -1248,6 +1248,15 @@ def test_spec_decode_separate_source_and_beta_logits(D):
         ),
         pytest.param(
             128,
+            4,
+            1,
+            True,
+            16,
+            DUAL_ACCUM_REDUCTION,
+            id="D128-T1-smart-row16",
+        ),
+        pytest.param(
+            128,
             8,
             8,
             True,
