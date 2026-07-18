@@ -873,6 +873,71 @@ def test_block_diffusion_named_option(
     assert all_pass, f"block_diffusion named-option failed: {results}"
 
 
+def test_block_diffusion_single_native_option(
+    verbose: bool = True,
+):
+    """Exercise the native single-prefill block_diffusion option:
+    ``single_prefill_with_kv_cache(..., block_diffusion=True, dllm_block_size=,
+    q_offset=, kv_offset=)`` (reviewers' design #2 "complete convergence" for the
+    single-request path — no flashinfer/dllm API needed). Cross-checks vs the
+    kv_offset-aware reference AND vs the dedicated ``block_extend_attention_with_offset``
+    shim, which must be identical (the shim now delegates to this native path).
+    """
+    device = torch.device("cuda:0")
+    available_backends = get_available_backends(device)
+    dtype = torch.float16
+    num_heads = 32
+    num_kv_heads = 8
+    head_dim = 128
+    B = 32
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    tol = 1e-2
+
+    configs = [
+        # (qo_len, kv_len, q_offset, kv_offset)
+        (64, 128, 0, 0),    # baseline, kv_offset=0 → matches plain block-extend ref
+        (64, 128, 64, 64),  # incremental chunk prefill (q/kv offset == prefix)
+        (128, 128, 0, 256), # cascade current chunk: zero-visible first tile (kv_offset high)
+    ]
+
+    qo_len0, kv_len0, _, _ = configs[0]
+    results = {}
+    for (qo_len, kv_len, q_offset, kv_offset) in configs:
+        q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        ref = compute_block_extend_offset_reference(
+            q, k, v, B, q_offset=q_offset, kv_offset=kv_offset, sm_scale=sm_scale
+        )
+        for backend in available_backends:
+            # Native path: the canonical reviewer-preferred entry point.
+            out_native = single_prefill_with_kv_cache(
+                q, k, v, sm_scale=sm_scale,
+                block_diffusion=True, dllm_block_size=B,
+                q_offset=q_offset, kv_offset=kv_offset,
+                backend=backend, return_lse=False,
+            )
+            # Dedicated shim (now delegates to the native path) — must match.
+            out_shim = block_extend_attention_with_offset(
+                q, k, v, dllm_block_size=B,
+                q_offset=q_offset, kv_offset=kv_offset,
+                sm_scale=sm_scale, return_lse=False, backend=backend,
+            )
+            d_ref = (out_native.to(torch.float32) - ref.to(torch.float32)).abs().max().item()
+            d_shim = (out_native.to(torch.float32) - out_shim.to(torch.float32)).abs().max().item()
+            tag = f"single qo={qo_len} kv={kv_len} qo={q_offset} kvo={kv_offset} {backend}"
+            results[tag + " vs_ref"] = d_ref
+            results[tag + " vs_shim"] = d_shim
+            torch.cuda.empty_cache()
+
+    all_pass = all(d < tol for d in results.values())
+    if verbose:
+        for k_, d in results.items():
+            print(f"  {k_}: max_diff={d:.6f} [{'PASS' if d < tol else 'FAIL'}]")
+        print(f"  block_diffusion single-native overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
+    assert all_pass, f"block_diffusion single-native failed: {results}"
+
+
 def test_sglang_vs_block_extend_cascade(
     verbose: bool = True,
 ):

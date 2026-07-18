@@ -29,8 +29,7 @@ import torch
 from typing import Optional, Union, Tuple
 
 from ..jit.attention import gen_customize_block_extend_single_prefill_module
-from ..prefill import single_prefill_with_kv_cache_with_jit_module
-from ..utils import MaskMode, is_sm90a_supported
+from ..utils import is_sm90a_supported
 from ..api_logging import flashinfer_api
 
 BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL = r"""
@@ -218,66 +217,38 @@ def block_extend_attention_with_offset(
     return_lse: bool = False,
     backend: str = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """
-    Block Extend Attention with Q and KV Offset Support
-    
-    Supports incremental Chunk Prefill and Cascade Current Chunk scenarios.
-    
+    """Block-extend (dLLM block-diffusion) single-request attention.
+
+    Thin convenience wrapper over the native
+    :func:`flashinfer.prefill.single_prefill_with_kv_cache` with
+    ``block_diffusion=True``. The canonical entry point is the native API; this
+    shim is kept for the SGLang-dLLM one-call ergonomics (reviewers' design #2 /
+    "keep shim"). See docs/block-extend-design-response.md §2.2.2.
+
     Args:
         q: Query tensor [qo_len, num_heads, head_dim]
-        k: Key tensor [kv_len, num_heads, head_dim]
-        v: Value tensor [kv_len, num_heads, head_dim]
+        k: Key tensor [kv_len, num_kv_heads, head_dim]
+        v: Value tensor [kv_len, num_kv_heads, head_dim]
         dllm_block_size: DLLM block size (must be power of 2)
         q_offset: Q's global starting position (default 0)
         kv_offset: KV's global starting position (default 0)
         sm_scale: Softmax scale (default 1/sqrt(head_dim))
         return_lse: Whether to return log-sum-exp
         backend: "auto" (auto-select), "fa2" or "fa3"
-    
+
     Returns:
-        Output tensor [qo_len, num_heads, head_dim]
-    
-    Example:
-        >>> # Incremental chunk prefill
-        >>> o = block_extend_attention_with_offset(
-        ...     q, k_cumul, v_cumul,
-        ...     dllm_block_size=32,
-        ...     q_offset=i * chunk_len,
-        ... )
-        >>> 
-        >>> # Cascade Current Chunk
-        >>> o = block_extend_attention_with_offset(
-        ...     q, k_current, v_current,
-        ...     dllm_block_size=256,
-        ...     q_offset=prefix_len,
-        ...     kv_offset=prefix_len,
-        ... )
+        Output tensor [qo_len, num_heads, head_dim] (and lse if return_lse)
     """
-    assert q.dim() == 3 and k.dim() == 3 and v.dim() == 3, \
-        "q, k, v must be 3D tensors [seq_len, num_heads, head_dim]"
-    assert dllm_block_size > 0 and (dllm_block_size & (dllm_block_size - 1)) == 0, \
-        f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
-    
-    head_dim = q.size(-1)
-    dtype = q.dtype
-    
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(head_dim)
-    
-    # backend selection
-    if backend == "auto":
-        backend = "fa3" if is_sm90a_supported(q.device) else "fa2"
-    
-    module = get_block_extend_module_with_offset(head_dim=head_dim, dtype=dtype, backend=backend, device=q.device)
-    
-    return single_prefill_with_kv_cache_with_jit_module(
-        module,
+    from ..prefill import single_prefill_with_kv_cache
+
+    return single_prefill_with_kv_cache(
         q, k, v,
-        sm_scale,
-        dllm_block_size,
-        q_offset,
-        kv_offset,
-        mask_mode=MaskMode.BLOCK_EXPANDING.value,
+        sm_scale=sm_scale,
+        block_diffusion=True,
+        dllm_block_size=dllm_block_size,
+        q_offset=q_offset,
+        kv_offset=kv_offset,
+        backend=backend,
         return_lse=return_lse,
     )
 

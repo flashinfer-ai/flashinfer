@@ -1148,6 +1148,10 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    block_diffusion: bool = False,
+    dllm_block_size: Optional[int] = None,
+    q_offset: int = 0,
+    kv_offset: int = 0,
 ) -> torch.Tensor: ...
 
 
@@ -1176,6 +1180,10 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    block_diffusion: bool = False,
+    dllm_block_size: Optional[int] = None,
+    q_offset: int = 0,
+    kv_offset: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -1204,6 +1212,10 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    block_diffusion: bool = False,
+    dllm_block_size: Optional[int] = None,
+    q_offset: int = 0,
+    kv_offset: int = 0,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
@@ -1348,6 +1360,43 @@ def single_prefill_with_kv_cache(
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
+
+    # block_diffusion: native dLLM block-diffusion ("block-extend") mask option
+    # (reviewers' design #2 — a mask option on the existing single-prefill API,
+    # not a separate flashinfer/dllm API). When set, build the block-extend
+    # variant jit module via the dedicated gen and run through the jit-module
+    # path with mask_mode=kBlockExpanding. See docs/block-extend-design-response.md §2.
+    if block_diffusion:
+        if dllm_block_size is None:
+            raise ValueError("dllm_block_size must be provided when block_diffusion=True")
+        if dllm_block_size <= 0 or (dllm_block_size & (dllm_block_size - 1)) != 0:
+            raise ValueError(
+                f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
+            )
+        if custom_mask is not None or packed_custom_mask is not None:
+            raise ValueError(
+                "custom_mask/packed_custom_mask cannot be combined with block_diffusion=True"
+            )
+        if window_left >= 0:
+            raise ValueError(
+                "sliding window (window_left>=0) cannot be combined with block_diffusion=True"
+            )
+        if backend == "auto":
+            _bd_backend = "fa3" if is_sm90a_supported(q.device) else "fa2"
+        else:
+            _bd_backend = backend
+        from .dllm.block_extend import get_block_extend_module_with_offset
+        module = get_block_extend_module_with_offset(
+            head_dim=q.shape[-1], dtype=q.dtype, backend=_bd_backend, device=q.device,
+        )
+        return single_prefill_with_kv_cache_with_jit_module(
+            module, q, k, v, sm_scale, dllm_block_size, q_offset, kv_offset,
+            kv_layout=kv_layout,
+            mask_mode=MaskMode.BLOCK_EXPANDING.value,
+            window_left=window_left,
+            return_lse=return_lse,
+        )
+
     if custom_mask is not None and packed_custom_mask is None:
         # create packed custom mask from custom mask
         packed_custom_mask = packbits(
