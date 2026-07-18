@@ -24,7 +24,13 @@ from typing import List, Literal, Optional, Sequence, Tuple, Union, cast, overlo
 import torch
 
 from ..api_logging import flashinfer_api
-from ..autotuner import AutoTuner, TunableRunner
+from flashinfer.autotuner import (
+    AutoTuner,
+    TunableRunner,
+    TuningConfig,
+    make_bucket_mapper,
+    DynamicTensorSpec,
+)
 from ..trace.templates.attention import (
     mla_paged_decode_trace,
     trtllm_batch_decode_mla_trace_dispatch,
@@ -2010,7 +2016,7 @@ def _cute_dsl_max_supported_batch(
 
 def _compute_mla_decode_buckets(
     workspace_buffer: torch.Tensor,
-    runner_names: List[str],
+    runner_names: Sequence[str],
     q_len: int,
     num_heads: int,
     kv_lora_rank: int,
@@ -2144,44 +2150,27 @@ def _cute_dsl_incompatibility_reason(
     return None
 
 
-def _build_mla_decode_tuning_config(
-    kv_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    workspace_buffer: torch.Tensor,
-    runner_names: List[str],
-    q_len: int,
-    num_heads: int,
-    kv_lora_rank: int,
-    max_seq_len: int,
-    device: torch.device,
-):
-    """Per-call TuningConfig with bucket-capped batch sweep and closure-based initializers.
+@functools.cache
+def _mla_decode_tuning_config(
+    buckets: tuple[int, ...],
+    num_pages: int,
+    profile_seq_len: int,
+) -> TuningConfig:
+    """One TuningConfig (and one pair of initializer closures) per key.
+
+    Memoized because ``AutoTuner._find_nearest_profile`` lru-caches on
+    ``(shapes, tuning_config)``: a fresh config per dispatcher call shares
+    its hash with all previous ones (``DynamicTensorSpec.__hash__`` skips
+    ``tensor_initializers``) but never compares equal (closures compare by
+    identity), so would result in a leak.
 
     The DynamicTensorSpec sweeps batch dim across all four ``inputs`` tensors
     (query, block_tables, seq_lens, out). ``block_tables`` is initialized via
     ``random_(0, num_pages)`` which wraps mod kv_cache size — safe for autotune
     profiling because MLA decode reads kv_cache and never writes it, so aliased
     page reads give correct timing measurements. ``seq_lens`` is filled
-    homogeneously with ``min(max_seq_len, provisioned_max_seq_len)``.
+    homogeneously with ``profile_seq_len``.
     """
-    from ..autotuner import DynamicTensorSpec, TuningConfig, make_bucket_mapper
-
-    # kv_cache may be 3D [num_pages, page_size, D] or 4D
-    # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
-    # page_size is the second-to-last dim in both layouts.
-    page_size = kv_cache.shape[-2]
-    provisioned_max_seq_len = block_tables.shape[-1] * page_size
-    profile_seq_len = min(max_seq_len, provisioned_max_seq_len)
-    num_pages = kv_cache.shape[0]
-
-    buckets = _compute_mla_decode_buckets(
-        workspace_buffer,
-        runner_names,
-        q_len,
-        num_heads,
-        kv_lora_rank,
-        device,
-    )
 
     def init_block_tables(shapes, dtype, device):
         tensor = torch.empty(shapes, dtype=dtype, device=device)
@@ -2200,12 +2189,50 @@ def _build_mla_decode_tuning_config(
                 dim_idx=(0, 0, 0, 0),
                 gen_tuning_buckets=buckets,
                 map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
-                tensor_initializers=[None, init_block_tables, init_seq_lens, None],
+                tensor_initializers=(None, init_block_tables, init_seq_lens, None),
             ),
         ),
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )
+
+
+def _build_mla_decode_tuning_config(
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    runner_names: Sequence[str],
+    q_len: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    max_seq_len: int,
+    device: torch.device,
+) -> TuningConfig:
+    """Reduce call args to the memoization key of ``_mla_decode_tuning_config``.
+
+    Key stability: num_pages and profile_seq_len are fixed per KV-cache
+    allocation. A caller that varies max_seq_len or block-table width per
+    call gets one cached config per distinct value (bounded, unlike the
+    per-call configs this replaces).
+    """
+    # kv_cache may be 3D [num_pages, page_size, D] or 4D
+    # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
+    # page_size is the second-to-last dim in both layouts.
+    page_size = kv_cache.shape[-2]
+    provisioned_max_seq_len = block_tables.shape[-1] * page_size
+    profile_seq_len = min(max_seq_len, provisioned_max_seq_len)
+    num_pages = kv_cache.shape[0]
+
+    buckets = _compute_mla_decode_buckets(
+        workspace_buffer,
+        runner_names,
+        q_len,
+        num_heads,
+        kv_lora_rank,
+        device,
+    )
+
+    return _mla_decode_tuning_config(buckets, num_pages, profile_seq_len)
 
 
 class TrtllmGenMlaDecodeRunner(TunableRunner):

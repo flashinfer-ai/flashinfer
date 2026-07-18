@@ -1356,12 +1356,23 @@ def testMmFp4(args):
         input_fp4, input_inv_s = flashinfer.mxfp4_quantize(input)
         mat2_fp4, mat2_inv_s = flashinfer.mxfp4_quantize(mat2)
 
-    mat2_fp4_trtllm, mat2_inv_s_trtllm = flashinfer.nvfp4_quantize(
-        mat2,
-        global_sf_mat2,
-        sfLayout=flashinfer.SfLayout.layout_128x4,
-        do_shuffle=True,
-    )
+    # The trtllm backend consumes a shuffled weight/scale layout. Prepare it
+    # only when that backend is requested: the shuffle requires n to be a
+    # multiple of 128, and an unaligned n must not fail the other backends.
+    mat2_fp4_trtllm, mat2_inv_s_trtllm = None, None
+    if "trtllm" in backends:
+        try:
+            mat2_fp4_trtllm, mat2_inv_s_trtllm = flashinfer.nvfp4_quantize(
+                mat2,
+                global_sf_mat2,
+                sfLayout=flashinfer.SfLayout.layout_128x4,
+                do_shuffle=True,
+            )
+        except Exception as e:
+            print(
+                f"[INFO] trtllm backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends.remove("trtllm")
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_fp4.shape = }")
@@ -1419,7 +1430,7 @@ def testMmFp4(args):
 
     if len(backends) == 0:
         print("[ERROR] No backends passed validation. Exiting.")
-        return
+        return res
 
     def run_backend(
         backend,
@@ -1698,7 +1709,7 @@ def testMmBf16Fp4(args):
 
     if len(backends) == 0:
         print("[ERROR] No backends passed validation. Exiting.")
-        return
+        return []
 
     autotune_supported_backends = ["cudnn", "cute-dsl"]
     cache_path = getattr(args, "autotune_cache", None)

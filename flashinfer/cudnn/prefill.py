@@ -163,6 +163,10 @@ def _sdpa_prefill_key_fn(
         bottom_right_causal_mask,
         page_size,
         cu_seq_lens_q is not None,
+        # attn_scale is baked into the built graph as a compile-time constant
+        # (see _build_prefill_graph); omitting it here silently replays a
+        # stale-scale graph for any same-shape call with a different scale.
+        scale,
     )
     return key
 
