@@ -200,38 +200,43 @@ def _fp8_blockscale_2shot_kernel(
     my_data = (my_buf + data_offset).to(tl.pointer_type(tl.float8e4nv))
     my_data = tl.multiple_of(my_data, 16)
 
-    group_ids = tl.arange(0, GROUPS_PER_BLOCK)
-    elem_ids = tl.arange(0, SCALE_GROUP)
+    group_ids = tl.arange(0, GROUPS_PER_BLOCK).to(tl.int64)
+    elem_ids = tl.arange(0, SCALE_GROUP).to(tl.int64)
 
     # Phase 1: quantize BF16 → FP8, write to symmetric memory buffer
-    num_compute_blocks = tl.cdiv(numel, BLOCK_SIZE)
-    blk_id = pid
-    while blk_id < num_compute_blocks:
-        blk_off = blk_id * BLOCK_SIZE
-        first_group = blk_id * GROUPS_PER_BLOCK
+    # Uses same stride pattern as Phase 2 so per-block barrier is sufficient.
+    block_start = pid * stride_per_program
+    while block_start < numel:
+        for local_blk in tl.static_range(world_size):
+            blk_off = (block_start + local_blk * BLOCK_SIZE).to(tl.int64)
+            first_group = blk_off // SCALE_GROUP
 
-        offsets_2d = blk_off + group_ids[:, None] * SCALE_GROUP + elem_ids[None, :]
-        mask_2d = offsets_2d < numel
+            offsets_2d = blk_off + group_ids[:, None] * SCALE_GROUP + elem_ids[None, :]
+            mask_2d = offsets_2d < numel
 
-        x = tl.load(input_ptr + offsets_2d, mask=mask_2d, other=0.0).to(tl.float32)
-        grp_amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-12)
-        grp_inv_scales = grp_amax / FP8_MAX  # stored for Phase 2/3 dequant (multiply)
+            x = tl.load(input_ptr + offsets_2d, mask=mask_2d, other=0.0).to(tl.float32)
+            grp_amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-12)
+            grp_inv_scales = (
+                grp_amax / FP8_MAX
+            )  # stored for Phase 2/3 dequant (multiply)
 
-        scale_mask = (first_group + group_ids) < num_groups_total
-        tl.store(my_scales + first_group + group_ids, grp_inv_scales, mask=scale_mask)
+            scale_mask = (first_group + group_ids) < num_groups_total
+            tl.store(
+                my_scales + first_group + group_ids, grp_inv_scales, mask=scale_mask
+            )
 
-        grp_quant_scales = FP8_MAX / grp_amax
-        x_scaled = tl.clamp(x * grp_quant_scales[:, None], -FP8_MAX, FP8_MAX)
+            grp_quant_scales = FP8_MAX / grp_amax
+            x_scaled = tl.clamp(x * grp_quant_scales[:, None], -FP8_MAX, FP8_MAX)
 
-        offsets_1d = blk_off + tl.arange(0, BLOCK_SIZE)
-        mask_1d = offsets_1d < numel
-        tl.store(
-            my_data + offsets_1d,
-            tl.reshape(x_scaled, [BLOCK_SIZE]).to(tl.float8e4nv),
-            mask=mask_1d,
-        )
+            offsets_1d = blk_off + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+            mask_1d = offsets_1d < numel
+            tl.store(
+                my_data + offsets_1d,
+                tl.reshape(x_scaled, [BLOCK_SIZE]).to(tl.float8e4nv),
+                mask=mask_1d,
+            )
 
-        blk_id += tl.num_programs(0)
+        block_start += tl.num_programs(0) * stride_per_program
 
     # Barrier 1
     symm_mem_sync(
@@ -246,10 +251,10 @@ def _fp8_blockscale_2shot_kernel(
     # Phase 2: each rank reduces its stripe by reading FP8 from all peers
     block_start = pid * stride_per_program
     while block_start < numel:
-        stripe_off = block_start + rank * BLOCK_SIZE
+        stripe_off = (block_start + rank * BLOCK_SIZE).to(tl.int64)
         first_group = stripe_off // SCALE_GROUP
 
-        offsets = stripe_off + tl.arange(0, BLOCK_SIZE)
+        offsets = stripe_off + tl.arange(0, BLOCK_SIZE).to(tl.int64)
         mask = offsets < numel
 
         acc_2d = tl.zeros([GROUPS_PER_BLOCK, SCALE_GROUP], dtype=tl.float32)
@@ -322,10 +327,10 @@ def _fp8_blockscale_2shot_kernel(
         while block_start < numel:
             for r in tl.static_range(world_size):
                 if r != rank:
-                    stripe_off = block_start + r * BLOCK_SIZE
+                    stripe_off = (block_start + r * BLOCK_SIZE).to(tl.int64)
                     first_group = stripe_off // SCALE_GROUP
 
-                    offsets = stripe_off + tl.arange(0, BLOCK_SIZE)
+                    offsets = stripe_off + tl.arange(0, BLOCK_SIZE).to(tl.int64)
                     mask = offsets < numel
 
                     reducer = tl.load(ptrs + r).to(tl.pointer_type(tl.uint8))
@@ -357,10 +362,10 @@ def _fp8_blockscale_2shot_kernel(
         while block_start < numel:
             for r in tl.static_range(world_size):
                 if r != rank:
-                    stripe_off = block_start + r * BLOCK_SIZE
+                    stripe_off = (block_start + r * BLOCK_SIZE).to(tl.int64)
                     first_group = stripe_off // SCALE_GROUP
 
-                    offsets = stripe_off + tl.arange(0, BLOCK_SIZE)
+                    offsets = stripe_off + tl.arange(0, BLOCK_SIZE).to(tl.int64)
                     mask = offsets < numel
 
                     fp8_vals = tl.load(my_data + offsets, mask=mask, other=0.0)
