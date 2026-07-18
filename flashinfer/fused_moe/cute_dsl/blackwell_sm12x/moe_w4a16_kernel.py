@@ -343,7 +343,6 @@ class W4A16GemmKernel:
         max_m_blocks: int,
         element_dtype: str = "bf16",
         epilogue_activation: str | None = None,
-        apply_global_scale_in_fp32: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -379,7 +378,6 @@ class W4A16GemmKernel:
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
         self.epilogue_relu2 = epilogue_activation == "relu2"
-        self.apply_global_scale_in_fp32 = bool(apply_global_scale_in_fp32)
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
         self.uses_m_block_8 = moe_block_size == 8
         self.max_m_blocks = int(max_m_blocks)
@@ -858,9 +856,9 @@ class W4A16GemmKernel:
                 safe_idx = idx
                 if idx >= Int32(self.size_m * self.top_k):
                     safe_idx = Int32(0)
-                topk = topk_weights_flat[safe_idx].to(cutlass.Float32)
-                if cutlass.const_expr(not self.apply_global_scale_in_fp32):
-                    topk = topk * global_scale_f32
+                topk = (
+                    topk_weights_flat[safe_idx].to(cutlass.Float32) * global_scale_f32
+                )
                 packed_topk = self._broadcast_f32_to_elem2(topk)
                 # top-k weights are cached as packed element pairs.
                 topk_word_addr = (
@@ -2431,9 +2429,7 @@ class W4A16GemmKernel:
 
         if tid // Int32(32) < Int32(self.tb_n_warps):
             write_scale = cutlass.Float32(1.0)
-            if cutlass.const_expr(
-                not self.mul_topk_weights or self.apply_global_scale_in_fp32
-            ):
+            if cutlass.const_expr(not self.mul_topk_weights):
                 write_scale = global_scale_f32
             for jj in cutlass.range_constexpr(4):
                 wr = c_sh_wr + Int32(16 * jj)
@@ -2593,9 +2589,7 @@ class W4A16GemmKernel:
 
         if tid // Int32(32) < Int32(self.tb_n_warps):
             write_scale = cutlass.Float32(1.0)
-            if cutlass.const_expr(
-                not self.mul_topk_weights or self.apply_global_scale_in_fp32
-            ):
+            if cutlass.const_expr(not self.mul_topk_weights):
                 write_scale = global_scale_f32
             for mb in cutlass.range_constexpr(self.cta_m_blocks):
                 for jj in cutlass.range_constexpr(4):
@@ -2667,7 +2661,6 @@ class W4A16FusedMoeKernel:
         moe_block_size: int,
         max_m_blocks: int,
         element_dtype: str = "bf16",
-        apply_global_scale_in_fp32: bool = False,
     ):
         is_gated = validate_activation(activation)
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
@@ -2697,7 +2690,6 @@ class W4A16FusedMoeKernel:
             max_m_blocks=max_m_blocks,
             element_dtype=element_dtype,
             epilogue_activation=None if is_gated else "relu2",
-            apply_global_scale_in_fp32=apply_global_scale_in_fp32,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -2711,7 +2703,6 @@ class W4A16FusedMoeKernel:
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
             element_dtype=element_dtype,
-            apply_global_scale_in_fp32=apply_global_scale_in_fp32,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -3269,7 +3260,6 @@ def compile_w4a16_fused_moe(
     moe_block_size: int,
     max_m_blocks: int,
     element_dtype: str = "bf16",
-    apply_global_scale_in_fp32: bool = False,
     sms: int,
     max_shared_mem: int,
 ) -> W4A16FusedMoeCompileResult:
@@ -3337,7 +3327,6 @@ def compile_w4a16_fused_moe(
         activation,
         bool(apply_router_weight_on_input),
         bool(zero_fc2_output),
-        bool(apply_global_scale_in_fp32),
         fc1_tile_n,
         fc1_tile_k,
         fc2_tile_n,
@@ -3461,7 +3450,6 @@ def compile_w4a16_fused_moe(
         moe_block_size=moe_block_size,
         max_m_blocks=max_m_blocks,
         element_dtype=element_dtype,
-        apply_global_scale_in_fp32=apply_global_scale_in_fp32,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -3779,7 +3767,6 @@ def run_w4a16_moe(
     expert_offsets: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
-    apply_global_scale_in_fp32: bool = False,
     fast_math: bool = True,
 ) -> torch.Tensor:
     is_gated = validate_activation(activation)
@@ -3903,7 +3890,6 @@ def run_w4a16_moe(
         moe_block_size=block_size_m,
         max_m_blocks=int(block_expert_ids.numel()),
         element_dtype=element_dtype,
-        apply_global_scale_in_fp32=apply_global_scale_in_fp32,
         sms=sms,
         max_shared_mem=max_shared_mem,
     )

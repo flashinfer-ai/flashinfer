@@ -463,11 +463,8 @@ def _moe_bf16_activation_impl(
             raise ValueError(
                 "the BF16 activation path only supports standard SwiGLU parameters"
             )
-        kernel_activation = "silu"
-    elif activation == ActivationType.Relu2:
-        kernel_activation = "relu2"
     else:
-        raise ValueError(f"unsupported BF16 activation path type {activation!r}")
+        raise ValueError("the BF16 activation path currently requires SwiGLU")
 
     num_tokens = int(token_selected_experts.size(0))
     hidden_size = int(w2_weight.size(1))
@@ -486,25 +483,19 @@ def _moe_bf16_activation_impl(
             f"got {tuple(moe_output.shape)}"
         )
 
-    from .blackwell_sm12x.moe_dispatch import launch_w4a16_moe
+    from .blackwell.moe_w4a16 import launch_w4a16_moe
 
     return launch_w4a16_moe(
-        a=x,
-        topk_ids=token_selected_experts,
-        topk_weights=token_final_scales,
+        x=x,
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
         w1_weight=w1_weight,
         w1_weight_sf=w1_weight_sf,
         w1_alpha=w1_alpha,
         w2_weight=w2_weight,
         w2_weight_sf=w2_weight_sf,
         w2_alpha=w2_alpha,
-        num_experts=num_experts,
-        top_k=top_k,
-        num_local_experts=num_local_experts,
-        scatter_output=moe_output,
-        activation=kernel_activation,
-        w13_is_interleaved=True,
-        apply_global_scale_in_fp32=True,
+        moe_output=moe_output,
     )
 
 

@@ -1663,7 +1663,7 @@ def bfloat2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
         llvm.inline_asm(
             T.i32(),
             [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "mul.rn.bf16x2 $0, $1, $2;",
+            "mul.bf16x2 $0, $1, $2;",
             "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,
