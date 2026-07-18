@@ -78,6 +78,7 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
   TVM_FFI_ICHECK_EQ(v_scale.numel(), value.size(1) * value.size(2));
   TVM_FFI_ICHECK_GT(sm_count, 0);
 
+  ffi::CUDADeviceGuard device_guard(query.device().device_id);
   auto const stream = get_stream(query.device());
   auto const memset_status =
       cudaMemsetAsync(v_scale.data_ptr(), 0, v_scale.numel() * sizeof(float), stream);
