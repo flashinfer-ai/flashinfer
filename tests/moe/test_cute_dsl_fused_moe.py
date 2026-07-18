@@ -861,8 +861,8 @@ class TestCuteDslMoeBf16Activation:
     def test_numerical_accuracy(self, use_wrapper: bool):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
 
-        num_tokens, hidden_size, intermediate_size = 64, 256, 512
-        num_experts, top_k = 256, 2
+        num_tokens, hidden_size, intermediate_size = 129, 256, 512
+        num_experts, top_k = 256, 1
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
@@ -871,6 +871,8 @@ class TestCuteDslMoeBf16Activation:
             num_local_experts=num_experts,
             top_k=top_k,
         )
+        # Exercise one full route tile and one boundary tile for the same expert.
+        tensors["token_selected_experts"].zero_()
 
         kwargs = {
             "x": tensors["x_bf16"],
