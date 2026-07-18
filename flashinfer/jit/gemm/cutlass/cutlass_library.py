@@ -967,6 +967,7 @@ ArchitectureNames = {
     70: "volta",
     75: "turing",
     80: "ampere",
+    87: "ampere",  # Jetson Orin, etc.
     89: "ada",
     90: "hopper",
 }
