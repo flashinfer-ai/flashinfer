@@ -182,6 +182,33 @@ def reorder_w13_to_gate_up(
     )
 
 
+def deinterleave_w13(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    *,
+    intermediate_size: int,
+    group_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Restore contiguous up/gate halves from the SM100 interleaved layout."""
+    if intermediate_size % group_size != 0:
+        raise ValueError(
+            "intermediate_size must be divisible by the W13 interleave group size"
+        )
+    num_experts = int(w13.shape[0])
+    num_groups = int(intermediate_size // group_size)
+
+    def _deinterleave(tensor: torch.Tensor) -> torch.Tensor:
+        trailing_shape = tuple(tensor.shape[2:])
+        return (
+            tensor.reshape(num_experts, num_groups, 2, group_size, *trailing_shape)
+            .transpose(1, 2)
+            .reshape(num_experts, 2 * intermediate_size, *trailing_shape)
+            .contiguous()
+        )
+
+    return _deinterleave(w13), _deinterleave(w13_scale)
+
+
 def select_route_block_size_m(m: int, topk: int, num_experts: int) -> int:
     avg_routes_per_expert = (int(m) * int(topk)) / int(num_experts)
     for routed_size in _W4A16_ALLOWED_ROUTED_SIZES:
@@ -342,6 +369,7 @@ __all__ = [
     "packed_gemm_scratch_elements",
     "max_packed_route_slots",
     "plan_w4a16_buffers",
+    "deinterleave_w13",
     "reorder_w13_to_gate_up",
     "select_route_block_size_m",
     "unswizzle_block_scale",

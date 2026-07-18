@@ -210,6 +210,7 @@ def bench_cute_dsl(
     use_wrapper=False,
     do_autotune=True,
     use_per_token_activation=False,
+    use_bf16_activation=False,
     use_fused_finalize=True,
 ):
     """Benchmark CuteDSL MoE.
@@ -225,6 +226,8 @@ def bench_cute_dsl(
                     both CUDA graphs and CUPTI are disabled).
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
+        use_bf16_activation: Keep activations in BF16 and dequantize NVFP4
+            weights online in both GEMMs.
     """
     import contextlib
 
@@ -248,7 +251,11 @@ def bench_cute_dsl(
     tv = torch.empty(n, CFG.top_k, dtype=torch.float32, device=dev)
     ti = torch.empty(n, CFG.top_k, dtype=torch.int32, device=dev)
 
-    if use_per_token_activation:
+    if use_bf16_activation:
+        xf = inputs["hidden_bf16"]
+        xs = None
+        hidden_per_token_scale = None
+    elif use_per_token_activation:
         hidden_global_scale = make_nvfp4_global_scale(
             inputs["hidden_bf16"],
             per_token_activation=True,
@@ -264,7 +271,10 @@ def bench_cute_dsl(
     else:
         xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
         hidden_per_token_scale = None
-    xs = xs.view(torch.float8_e4m3fn).reshape(n, CFG.hidden_size // sv).unsqueeze(-1)
+    if xs is not None:
+        xs = (
+            xs.view(torch.float8_e4m3fn).reshape(n, CFG.hidden_size // sv).unsqueeze(-1)
+        )
 
     # Expert range for this EP partition
     expert_start = local_expert_offset
@@ -333,7 +343,7 @@ def bench_cute_dsl(
                 w1_weight=w1q,
                 w1_weight_sf=w1s,
                 w1_alpha=alpha,
-                fc2_input_scale=fc2sc,
+                fc2_input_scale=None if use_bf16_activation else fc2sc,
                 w2_weight=w2q,
                 w2_weight_sf=w2s,
                 w2_alpha=alpha,
@@ -362,7 +372,7 @@ def bench_cute_dsl(
                 w1_weight=w1q,
                 w1_weight_sf=w1s,
                 w1_alpha=alpha,
-                fc2_input_scale=fc2sc,
+                fc2_input_scale=None if use_bf16_activation else fc2sc,
                 w2_weight=w2q,
                 w2_weight_sf=w2s,
                 w2_alpha=alpha,
@@ -723,7 +733,9 @@ def run_benchmark(
     use_wrapper=True,
     routing_bias_scale=0.01,
     use_per_token_activation=False,
+    use_bf16_activation=False,
     use_fused_finalize=True,
+    cute_dsl_only=False,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -754,8 +766,11 @@ def run_benchmark(
         routing_bias_scale: Scale for random routing bias generation
         use_per_token_activation: Whether supported FP4 MoE backends should use
             per-token NVFP4 activation scaling.
+        use_bf16_activation: Whether CuTe DSL should keep activations in BF16
+            and dequantize NVFP4 weights online.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
+        cute_dsl_only: Skip CUTLASS and TRTLLM backends.
 
     Returns:
         List of BenchResult objects
@@ -783,7 +798,9 @@ def run_benchmark(
             routing_bias_scale=routing_bias_scale,
             do_autotune=do_autotune,
             use_per_token_activation=use_per_token_activation,
+            use_bf16_activation=use_bf16_activation,
             use_fused_finalize=use_fused_finalize,
+            cute_dsl_only=cute_dsl_only,
         )
         results.extend(row)
         rows_and_histograms.append((row, histogram_record))
@@ -796,11 +813,13 @@ def run_benchmark(
             use_cupti,
             routing_bias_scale,
             use_per_token_activation=use_per_token_activation,
+            use_bf16_activation=use_bf16_activation,
             use_fused_finalize=use_fused_finalize,
+            cute_dsl_only=cute_dsl_only,
         )
         for row, histogram_record in rows_and_histograms:
             _print_row(row, histogram_record)
-        _print_footer(ep_config, num_local)
+        _print_footer(ep_config, num_local, cute_dsl_only=cute_dsl_only)
 
     return results
 
@@ -817,7 +836,9 @@ def _benchmark_single(
     routing_bias_scale=0.01,
     do_autotune=True,
     use_per_token_activation=False,
+    use_bf16_activation=False,
     use_fused_finalize=True,
+    cute_dsl_only=False,
 ):
     """Benchmark all backends for a single token count.
 
@@ -840,9 +861,10 @@ def _benchmark_single(
         use_wrapper=use_wrapper,
         do_autotune=do_autotune,
         use_per_token_activation=use_per_token_activation,
+        use_bf16_activation=use_bf16_activation,
         use_fused_finalize=use_fused_finalize,
     )
-    if not use_per_token_activation:
+    if not cute_dsl_only and not use_per_token_activation:
         lat["CUTLASS"] = bench_cutlass(
             inputs,
             warmup,
@@ -853,17 +875,18 @@ def _benchmark_single(
             use_cupti,
             do_autotune=do_autotune,
         )
-    lat["TRTLLM"] = bench_trtllm(
-        inputs,
-        warmup,
-        iters,
-        num_local,
-        local_offset,
-        use_cuda_graph,
-        use_cupti,
-        do_autotune=do_autotune,
-        use_per_token_activation=use_per_token_activation,
-    )
+    if not cute_dsl_only:
+        lat["TRTLLM"] = bench_trtllm(
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            do_autotune=do_autotune,
+            use_per_token_activation=use_per_token_activation,
+        )
 
     # Build results
     results = []
@@ -886,11 +909,15 @@ def _print_header(
     use_cupti,
     routing_bias_scale,
     use_per_token_activation=False,
+    use_bf16_activation=False,
     use_fused_finalize=True,
+    cute_dsl_only=False,
 ):
     """Print benchmark header."""
     print("\n" + "=" * 120)
-    if use_per_token_activation:
+    if cute_dsl_only:
+        print(f"DeepSeek-V3 MoE Benchmark: CuteDSL (EP={ep_config})")
+    elif use_per_token_activation:
         print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs TRTLLM (EP={ep_config})")
     else:
         print(
@@ -911,13 +938,24 @@ def _print_header(
         f"Routing bias scale: {routing_bias_scale} "
         f"(larger values tend to create expert imbalance)"
     )
+    print(f"CuTe DSL activation: {'BF16' if use_bf16_activation else 'NVFP4'}")
     print(
         "CuteDSL finalize: "
         f"{'atomic fused' if use_fused_finalize else 'deterministic two-stage'}"
     )
-    if use_per_token_activation:
+    if cute_dsl_only:
+        print("CUTLASS and TRTLLM omitted by --cute-dsl-only.")
+    if cute_dsl_only:
+        print(f"{'Tokens':>6} | {'CuteDSL':^15} | {'Active':^7} | {'Stats':^14}")
+        print(
+            f"{'':>6} | {'ms':>7} {'TFLOPS':>7} | "
+            f"{'experts':^7} | {'min/max/median':^14}"
+        )
+    elif use_per_token_activation:
         print("CUTLASS omitted: it does not consume the per-token activation scale.")
     print("-" * 120)
+    if cute_dsl_only:
+        return
     if use_per_token_activation:
         print(
             f"{'Tokens':>6} | "
@@ -965,14 +1003,8 @@ def _print_row(results, histogram_record):
     """Print a single row of benchmark results."""
     # Extract values by backend
     r = {r.backend: r for r in results}
-    cute, trtllm = r["CuteDSL"], r["TRTLLM"]
+    cute = r["CuteDSL"]
     cutlass = r.get("CUTLASS")
-
-    # Calculate speedups (> 1.0 means CuteDSL is faster)
-    speedup_trtllm = trtllm.latency_ms / cute.latency_ms
-
-    # Find winner
-    winner = min(r.values(), key=lambda x: x.latency_ms).backend
 
     active_experts = f"{histogram_record['active_local_experts']:>3}"
     stats = (
@@ -980,6 +1012,18 @@ def _print_row(results, histogram_record):
         f"{histogram_record['max_count']:>3}/"
         f"{histogram_record['median_count']:>7.2f}"
     )
+    if len(r) == 1:
+        print(
+            f"{cute.tokens:>6} | "
+            f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
+            f"{active_experts:>7} | "
+            f"{stats:>14}"
+        )
+        return
+
+    trtllm = r["TRTLLM"]
+    speedup_trtllm = trtllm.latency_ms / cute.latency_ms
+    winner = min(r.values(), key=lambda x: x.latency_ms).backend
     if cutlass is None:
         print(
             f"{cute.tokens:>6} | "
@@ -1004,10 +1048,11 @@ def _print_row(results, histogram_record):
         )
 
 
-def _print_footer(ep_config, num_local):
+def _print_footer(ep_config, num_local, cute_dsl_only=False):
     """Print benchmark footer."""
     print("-" * 120)
-    print("Speedup > 1.0 means CuteDSL is faster than that backend")
+    if not cute_dsl_only:
+        print("Speedup > 1.0 means CuteDSL is faster than that backend")
 
 
 def _collect_expert_histogram(inputs, num_local, local_offset):
@@ -1094,9 +1139,19 @@ def main():
         help="Use functional API instead of CuteDslMoEWrapper for CuteDSL benchmark",
     )
     parser.add_argument(
+        "--cute-dsl-only",
+        action="store_true",
+        help="Benchmark only the CuTe DSL backend.",
+    )
+    parser.add_argument(
         "--use-per-token-activation",
         action="store_true",
         help="Use per-token NVFP4 activation scaling for supported FP4 MoE backends.",
+    )
+    parser.add_argument(
+        "--use-bf16-activation",
+        action="store_true",
+        help="Use BF16 activations with online NVFP4 weight dequantization in CuTe DSL.",
     )
     parser.add_argument(
         "--no-fused-finalize",
@@ -1111,6 +1166,15 @@ def main():
         help="Scale for random routing bias. Larger values tend to create expert imbalance.",
     )
     args = parser.parse_args()
+
+    if args.use_bf16_activation and args.use_per_token_activation:
+        parser.error(
+            "--use-bf16-activation and --use-per-token-activation are mutually exclusive"
+        )
+    if args.use_bf16_activation and args.ep != 1:
+        parser.error("--use-bf16-activation currently requires --ep 1")
+    if args.use_bf16_activation and not args.use_fused_finalize:
+        parser.error("--use-bf16-activation requires fused finalize")
 
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
@@ -1128,6 +1192,7 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Per-token activation: {args.use_per_token_activation}")
+    print(f"BF16 activation: {args.use_bf16_activation}")
     print(
         "CuteDSL finalize: "
         f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
@@ -1145,7 +1210,9 @@ def main():
         use_wrapper=not args.functional_api,
         routing_bias_scale=args.routing_bias_scale,
         use_per_token_activation=args.use_per_token_activation,
+        use_bf16_activation=args.use_bf16_activation,
         use_fused_finalize=args.use_fused_finalize,
+        cute_dsl_only=args.cute_dsl_only,
     )
 
     return 0
