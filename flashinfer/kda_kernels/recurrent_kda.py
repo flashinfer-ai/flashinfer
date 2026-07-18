@@ -40,7 +40,6 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
-from cutlass import utils
 from cutlass._mlir.dialects import arith as mlir_arith
 from cutlass._mlir.dialects import math as mlir_math
 from cutlass._mlir.dialects import nvvm
@@ -694,7 +693,7 @@ def recurrent_kda_decode_kernel(
         A_log_val = cute.exp(gALog[query_head_idx].to(cutlass.Float32), fastmath=True)
         h_K_offset = query_head_idx * HEAD_DIM
 
-    smem = utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
 
     # Allocate SMEM -- 2 ping-pong H buffers (D=128 reuses for chunks 2,3)
     h_sh_a = smem.allocate_tensor(
@@ -1170,7 +1169,7 @@ def recurrent_kda_decode_chunk_major_kernel(
         A_log_val = cute.exp(gALog[query_head_idx].to(cutlass.Float32), fastmath=True)
         h_K_offset = query_head_idx * HEAD_DIM
 
-    smem = utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
     h_sh_a = smem.allocate_tensor(
         cutlass.BFloat16,
         cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
@@ -1417,7 +1416,7 @@ def recurrent_kda_decode_vtile_kernel(
         A_log_val = cute.exp(gALog[query_head_idx].to(cutlass.Float32), fastmath=True)
         h_K_offset = query_head_idx * HEAD_DIM
 
-    smem = utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
 
     # Single SMEM h buffer -- no ping-pong, only one chunk per CTA.
     # Physical row count is always 32 (=LANES_PER_WARP), even at V_TILE_ROWS=16.

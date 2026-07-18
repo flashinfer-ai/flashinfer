@@ -31,7 +31,6 @@ from typing import Any, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -95,9 +94,9 @@ class _Sm100BlockScaledGemmCommon:
         self.b_dtype: Type[cutlass.Numeric] = b_tensor.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa_tensor.element_type
         self.c_dtype: Type[cutlass.Numeric] = c_tensor.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c_tensor)
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -266,7 +265,7 @@ class _Sm100BlockScaledGemmCommon:
         b_major_mode: cute.nvgpu.OperandMajorMode,
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: cutlass.tensor_utils.LayoutEnum,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         smem_capacity: int,
@@ -289,7 +288,7 @@ class _Sm100BlockScaledGemmCommon:
             b_major_mode (cute.nvgpu.OperandMajorMode): Layout of operand B.
             epi_tile (cute.Tile): The epilogue tile shape.
             c_dtype (Type[cutlass.Numeric]): Data type of operand C.
-            c_layout (utils.LayoutEnum): Layout of operand C.
+            c_layout (cutlass.tensor_utils.LayoutEnum): Layout of operand C.
             sf_dtype (Type[cutlass.Numeric]): Data type of the scale factors.
             sf_vec_size (int): Vector size of the scale factors.
             smem_capacity (int): Total available shared memory in bytes.

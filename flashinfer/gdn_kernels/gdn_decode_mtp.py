@@ -280,7 +280,7 @@ def gdn_verify_kernel_mtp(
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
 
     # Allocate shared memory for pre-computed values (broadcast to all warps)
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
     sQ = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
     )
@@ -1704,7 +1704,7 @@ def gdn_verify_kernel_mtp_inline(
 
     # v10: No sQ/sK/sG/sBeta — q/k/g/β are inlined into T-loop (deferred L2 norm)
     # Only allocate sVdata (for use_smem_v) and sOutput (for coalesced writeback)
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
     sVdata = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
     )

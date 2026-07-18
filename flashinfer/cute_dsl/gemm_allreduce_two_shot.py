@@ -349,7 +349,7 @@ class PersistentDenseGemmKernel:
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
         self.all_reduce_sync_bar_id = 3
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(sm_version)
 
         self.num_ranks = 1
         self.rank_id = 0
@@ -512,9 +512,9 @@ class PersistentDenseGemmKernel:
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -713,7 +713,7 @@ class PersistentDenseGemmKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr
@@ -1682,7 +1682,7 @@ class PersistentDenseGemmKernel:
         b_dtype: Type[cutlass.Numeric],
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: cutlass.tensor_utils.LayoutEnum,
         smem_capacity: int,
         occupancy: int,
         use_tma_store: bool,
@@ -1702,7 +1702,7 @@ class PersistentDenseGemmKernel:
         :param c_dtype: Data type of operand C (output).
         :type c_dtype: type[cutlass.Numeric]
         :param c_layout: Layout enum of operand C.
-        :type c_layout: utils.LayoutEnum
+        :type c_layout: cutlass.tensor_utils.LayoutEnum
         :param smem_capacity: Total available shared memory capacity in bytes.
         :type smem_capacity: int
         :param occupancy: Target number of CTAs per SM (occupancy).
@@ -1831,7 +1831,7 @@ class PersistentDenseGemmKernel:
         """
         acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage))
-        num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        num_tmem_alloc_cols = cutlass.memory.get_num_tmem_alloc_cols(tCtAcc_fake)
 
         return num_tmem_alloc_cols
 

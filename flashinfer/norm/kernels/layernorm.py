@@ -143,7 +143,7 @@ class LayerNormKernel:
         num_vec_blocks = self.num_vec_blocks
         copy_bits = self.copy_bits
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         # Two reduction buffers: one for sum, one for variance
         reduction_buffer_sum = smem.allocate_tensor(

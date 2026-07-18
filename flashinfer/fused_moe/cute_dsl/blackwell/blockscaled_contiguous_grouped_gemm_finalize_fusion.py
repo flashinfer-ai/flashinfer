@@ -437,7 +437,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
 
@@ -685,9 +685,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.out_dtype: Type[cutlass.Numeric] = out.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.final_scale_dtype: Type[cutlass.Numeric] = token_final_scales.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.gemm_output_layout = utils.LayoutEnum.ROW_MAJOR
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
+        self.gemm_output_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
 
         self.topK = token_final_scales.shape[1]
         # Check if input data types are compatible with MMA instruction
@@ -1087,7 +1087,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -1156,7 +1156,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],

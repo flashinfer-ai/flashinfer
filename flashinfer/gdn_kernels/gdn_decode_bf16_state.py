@@ -222,7 +222,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
 
     if cutlass.const_expr(T > 1):
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sQ = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
         )
@@ -954,7 +954,7 @@ def gdn_wide_vec_kernel(
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
 
     # ----- SMEM -----
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
     sQ = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
     )
@@ -1996,7 +1996,7 @@ def gdn_wide_vec_kernel_t1(
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
 
     # ----- SMEM -----
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
     sQ = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
     )

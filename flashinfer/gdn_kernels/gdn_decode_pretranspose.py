@@ -86,7 +86,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
     i_h = i_hv // (HV // H)
     i_t = 0
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
 
     # ===================================================================
     # Allocate shared memory (using passed-in layout)
@@ -408,7 +408,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
     r_b = cutlass.Float32(b[i_n, i_t, i_hv])
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
 
     # ===================================================================
     # Allocate shared memory (using passed-in layout)

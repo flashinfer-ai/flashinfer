@@ -39,7 +39,6 @@ import cutlass
 from cutlass import const_expr
 import cutlass.cute as cute
 import cutlass.cute.experimental  # noqa: F401  # side effect: registers cute.experimental.jit
-import cutlass.utils as utils
 from cutlass.cute.arch import sync_threads
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp import MmaF16BF16Op
@@ -862,7 +861,7 @@ class GdnDecodeKernel:
             _v7e_alog_bf16 = gAlog.iterator[pid_hv].to(f32)
             _v7e_dt_bf16 = gDtbias.iterator[pid_hv].to(f32)
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         @cute.struct
         class SS:

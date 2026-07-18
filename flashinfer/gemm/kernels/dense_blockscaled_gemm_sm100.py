@@ -135,7 +135,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -535,7 +535,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr

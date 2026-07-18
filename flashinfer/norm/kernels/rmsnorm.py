@@ -264,7 +264,7 @@ class RMSNormKernel:
             cluster_y = cutlass.const_expr(0)
 
         # ===== Allocate shared memory =====
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         if cutlass.const_expr(self.use_async_copy):
             sX = smem.allocate_tensor(
@@ -543,7 +543,7 @@ class QKRMSNormKernel:
         row_in_bounds = actual_row < M
 
         # ===== Allocate shared memory =====
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         if cutlass.const_expr(self.use_async_copy):
             sX = smem.allocate_tensor(
@@ -823,7 +823,7 @@ class RMSNormQuantKernel:
         inv_scale = rcp_approx_ftz(mS[0])
 
         # ===== Allocate shared memory =====
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         if cutlass.const_expr(self.use_async_copy):
             sX = smem.allocate_tensor(
