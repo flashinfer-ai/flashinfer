@@ -241,7 +241,6 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
-        mask_modes,
     ).build_and_load()
 
 
