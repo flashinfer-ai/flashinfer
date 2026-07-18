@@ -493,6 +493,54 @@ def test_top_p_renorm_probs_out_and_inplace():
     torch.testing.assert_close(actual_inplace, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unaligned_workspace",
+        "partial_out",
+        "workspace_probs",
+        "workspace_out",
+        "workspace_top_p",
+    ],
+)
+def test_top_p_renorm_probs_rejects_invalid_memory(case):
+    probs = torch.randn(2, 32768, device="cuda:0").softmax(dim=-1)
+    top_p = torch.full((2,), 0.95, device="cuda:0")
+    workspace_size = flashinfer.sampling.get_top_p_renorm_probs_workspace_size(
+        *probs.shape
+    )
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=probs.device)
+    out = torch.empty_like(probs)
+
+    if case == "unaligned_workspace":
+        workspace = torch.empty(
+            workspace_size + 1, dtype=torch.uint8, device=probs.device
+        )[1:]
+        match = "workspace must be aligned"
+    elif case == "partial_out":
+        storage = torch.empty(probs.numel() + 1, device=probs.device)
+        probs = storage[:-1].view_as(probs)
+        out = storage[1:].view_as(probs)
+        match = "must either alias exactly or not overlap"
+    else:
+        storage = torch.empty(
+            max(probs.nbytes, workspace_size), dtype=torch.uint8, device=probs.device
+        )
+        workspace = storage[:workspace_size]
+        if case == "workspace_probs":
+            probs = storage[: probs.nbytes].view(torch.float32).view_as(probs)
+        elif case == "workspace_out":
+            out = storage[: out.nbytes].view(torch.float32).view_as(out)
+        else:
+            top_p = storage[: top_p.nbytes].view(torch.float32).view_as(top_p)
+        match = "workspace must not overlap"
+
+    with pytest.raises(ValueError, match=match):
+        flashinfer.sampling.top_p_renorm_probs(
+            probs, top_p, out=out, workspace=workspace
+        )
+
+
 @pytest.mark.parametrize("batch_size", [4, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 def test_top_p_renorm_probs_per_request(batch_size, vocab_size):
