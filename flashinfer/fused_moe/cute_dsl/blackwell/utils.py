@@ -243,6 +243,45 @@ def silu_f32(
     return a * sigmoid_f32(a, fastmath=fastmath)
 
 
+def tanh_f32(
+    a: Union[float, cutlass.Float32], fastmath: bool = False
+) -> Union[float, cutlass.Float32]:
+    """Compute tanh from the existing sigmoid primitive."""
+    return cutlass.Float32(2.0) * sigmoid_f32(
+        cutlass.Float32(2.0) * a, fastmath=fastmath
+    ) - cutlass.Float32(1.0)
+
+
+def situ_f32(
+    a: Union[float, cutlass.Float32],
+    beta: Union[float, cutlass.Float32],
+    fastmath: bool = False,
+) -> Union[float, cutlass.Float32]:
+    """Compute SiTU: beta * tanh(x / beta) * sigmoid(x)."""
+    x = cutlass.Float32(a)
+    beta_f32 = cutlass.Float32(beta)
+    return (
+        beta_f32
+        * tanh_f32(x / beta_f32, fastmath=fastmath)
+        * sigmoid_f32(x, fastmath=fastmath)
+    )
+
+
+def gelu_tanh_f32(
+    a: Union[float, cutlass.Float32], fastmath: bool = False
+) -> Union[float, cutlass.Float32]:
+    """Compute GELU using the tanh approximation."""
+    x = cutlass.Float32(a)
+    inner = cutlass.Float32(0.7978845608028654) * (
+        x + cutlass.Float32(0.044715) * x * x * x
+    )
+    return (
+        cutlass.Float32(0.5)
+        * x
+        * (cutlass.Float32(1.0) + tanh_f32(inner, fastmath=fastmath))
+    )
+
+
 # TODO(zhichenj): try to move these to NVVM wrapper or helper functions
 @dsl_user_op
 def vectorized_atomic_add_bf16x8(
