@@ -71,24 +71,6 @@ struct Params {
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
     return kv_len;
   }
-
-  // SinglePrefill: q_block_expanding_offset support
-  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
-{% if has_q_block_expanding_offset %}
-    return static_cast<uint32_t>(additional_params.q_block_expanding_offset);
-{% else %}
-    return 0;
-{% endif %}
-  }
-
-  // SinglePrefill: kv_block_expanding_offset support (for Cascade Current Chunk)
-  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
-{% if has_kv_block_expanding_offset %}
-    return static_cast<uint32_t>(additional_params.kv_block_expanding_offset);
-{% else %}
-    return 0;
-{% endif %}
-  }
 };
 
 {{ variant_decl }}

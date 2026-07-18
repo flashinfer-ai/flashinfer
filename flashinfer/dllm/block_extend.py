@@ -35,7 +35,7 @@ from ..api_logging import flashinfer_api
 BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL = r"""
 // For incremental Chunk Prefill scenarios:
 //   - Each chunk's Q has global offset q_offset
-//   - Kernel retrieves offset via params.get_q_block_expanding_offset()
+//   - Kernel reads the offset directly from params.q_block_expanding_offset
 //   - position_mask internally calculates: (q_global_block >= k_block)
 
 struct BlockExtendAttentionV2WithOffset : AttentionVariantBase {
@@ -56,7 +56,7 @@ struct BlockExtendAttentionV2WithOffset : AttentionVariantBase {
   }
 
   // CUDA kernel natively supports MaskMode::kBlockExpanding:
-  //   - q_offset retrieved via params.get_q_block_expanding_offset(batch_idx)
+  //   - q_offset read directly from params.q_block_expanding_offset
   //   - position_mask internally handles: (q_global_block >= k_block)
   //
   // Therefore LogitsMask only needs to return true

@@ -1109,8 +1109,8 @@ __device__ __forceinline__ void logits_mask(
         bool position_mask;
         if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
           const uint32_t dllm_block_size = params.dllm_block_size;
-          const uint32_t q_offset = params.get_q_block_expanding_offset(batch_idx);
-          const uint32_t kv_offset = params.get_kv_block_expanding_offset(batch_idx);
+          const uint32_t q_offset = ((params.maybe_q_block_expanding_offset != nullptr) ? params.maybe_q_block_expanding_offset[batch_idx] : 0);
+          const uint32_t kv_offset = ((params.maybe_kv_block_expanding_offset != nullptr) ? params.maybe_kv_block_expanding_offset[batch_idx] : 0);
           const uint32_t q_global = q_offset + q_idx;
           const uint32_t q_block = q_global / dllm_block_size;
           const uint32_t kv_global = kv_offset + kv_idx;
@@ -1829,7 +1829,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
         const uint32_t dllm_block_size = params.dllm_block_size;
         const uint32_t q_tile_end = min(qo_len, ceil_div(((bx + 1) * CTA_TILE_Q), group_size));
-        const uint32_t q_offset = params.get_q_block_expanding_offset(0);  // Single prefill: batch_idx=0
+        const uint32_t q_offset = params.q_block_expanding_offset;  // Single prefill: batch_idx=0
         num_iterations = block_expanding_num_iterations(
             q_tile_end, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset);
       } else if constexpr (MASK_MODE == MaskMode::kCausal) {
@@ -1851,8 +1851,8 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
         const uint32_t dllm_block_size = params.dllm_block_size;
         const uint32_t q_tile_start = ceil_div((bx * CTA_TILE_Q), group_size);
-        const uint32_t q_offset = params.get_q_block_expanding_offset(0);  // Single prefill: batch_idx=0
-        const uint32_t kv_offset = params.get_kv_block_expanding_offset(0);  // Single prefill: batch_idx=0
+        const uint32_t q_offset = params.q_block_expanding_offset;  // Single prefill: batch_idx=0
+        const uint32_t kv_offset = params.kv_block_expanding_offset;  // Single prefill: batch_idx=0
         mask_iteration = block_expanding_mask_iteration(
             q_tile_start, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset, kv_offset);
       } else if constexpr (MASK_MODE == MaskMode::kCausal) {
@@ -2396,7 +2396,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       uint32_t num_iterations;
       if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
         const uint32_t dllm_block_size = params.dllm_block_size;
-        const uint32_t q_offset = params.get_q_block_expanding_offset(request_idx);
+        const uint32_t q_offset = ((params.maybe_q_block_expanding_offset != nullptr) ? params.maybe_q_block_expanding_offset[request_idx] : 0);
         const uint32_t q_tile_end = min(qo_len, ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size));
         num_iterations = block_expanding_num_iterations(
             q_tile_end, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset);
@@ -2419,8 +2419,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       uint32_t mask_iteration;
       if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
         const uint32_t dllm_block_size = params.dllm_block_size;
-        const uint32_t q_offset = params.get_q_block_expanding_offset(request_idx);
-        const uint32_t kv_offset = params.get_kv_block_expanding_offset(request_idx);
+        const uint32_t q_offset = ((params.maybe_q_block_expanding_offset != nullptr) ? params.maybe_q_block_expanding_offset[request_idx] : 0);
+        const uint32_t kv_offset = ((params.maybe_kv_block_expanding_offset != nullptr) ? params.maybe_kv_block_expanding_offset[request_idx] : 0);
         const uint32_t q_tile_start = ceil_div((qo_tile_idx * CTA_TILE_Q), group_size);
         mask_iteration = block_expanding_mask_iteration(
             q_tile_start, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset, kv_offset);
@@ -3179,7 +3179,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
         if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
           const uint32_t dllm_block_size = params.dllm_block_size;
-          const uint32_t q_offset = params.get_q_block_expanding_offset(request_idx);
+          const uint32_t q_offset = ((params.maybe_q_block_expanding_offset != nullptr) ? params.maybe_q_block_expanding_offset[request_idx] : 0);
           const uint32_t q_tile_end = min(qo_len, ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size));
           num_iterations = block_expanding_num_iterations(
               q_tile_end, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset);
@@ -3228,8 +3228,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       uint32_t mask_iteration;
       if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
         const uint32_t dllm_block_size = params.dllm_block_size;
-        const uint32_t q_offset = params.get_q_block_expanding_offset(request_idx);
-        const uint32_t kv_offset = params.get_kv_block_expanding_offset(request_idx);
+        const uint32_t q_offset = ((params.maybe_q_block_expanding_offset != nullptr) ? params.maybe_q_block_expanding_offset[request_idx] : 0);
+        const uint32_t kv_offset = ((params.maybe_kv_block_expanding_offset != nullptr) ? params.maybe_kv_block_expanding_offset[request_idx] : 0);
         const uint32_t q_tile_start = ceil_div((qo_tile_idx * CTA_TILE_Q), group_size);
         mask_iteration = block_expanding_mask_iteration(
             q_tile_start, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset, kv_offset);
