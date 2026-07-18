@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CuTe-DSL backend for the bf16 x fp4 GEMM (weight repack / kernel launch)."""
 
+import functools
 from typing import List, Optional, Tuple, cast
 
 import torch
@@ -365,6 +366,7 @@ _BF16_FP4_CUTE_DSL_TUNING_CONFIG = TuningConfig(
 )
 
 
+@functools.lru_cache(maxsize=1024)
 def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
     """Build a ``CuteDslBf16Fp4Runner`` for the cute-DSL bf16 x fp4 GEMM."""
 
