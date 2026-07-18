@@ -327,6 +327,12 @@ def recurrent_kda_decode_kernel(
         cute.autovec_copy(q_tile, q_bf16)
         cute.autovec_copy(k_tile, k_bf16)
         cute.autovec_copy(gate_tile, gate_bf16)
+        v_loaded = cutlass.Float32(0.0)
+        # D128 row-16 hides V latency behind gate/norm work. Other measured
+        # specializations are faster with the load left next to its consumer.
+        if cutlass.const_expr(HEAD_DIM == 128 and TILE_ROWS == 16):
+            if tidx < TILE_ROWS:
+                v_loaded = v_head[v_offset + tidx].to(cutlass.Float32)
 
         for i in cutlass.range_constexpr(VALUES_PER_THREAD):
             k_idx = tidx * VALUES_PER_THREAD + i
@@ -399,9 +405,9 @@ def recurrent_kda_decode_kernel(
                 gate_src[source_value], offset=source_lane, mask=0xFFFFFFFF
             )
 
-        v_loaded = cutlass.Float32(0.0)
-        if tidx < TILE_ROWS:
-            v_loaded = v_head[v_offset + tidx].to(cutlass.Float32)
+        if cutlass.const_expr(HEAD_DIM != 128 or TILE_ROWS != 16):
+            if tidx < TILE_ROWS:
+                v_loaded = v_head[v_offset + tidx].to(cutlass.Float32)
         for j in cutlass.range_constexpr(TILE_ROWS // V_LANES):
             for i in cutlass.range_constexpr(8):
                 h_reg[j, i] = h_reg[j, i] * gate_reg[i]
