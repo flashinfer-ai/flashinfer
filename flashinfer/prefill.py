@@ -1664,6 +1664,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         jit_kwargs: Optional[Dict[str, Any]] = None,
         block_diffusion: bool = False,
         dllm_block_size: Optional[int] = None,
+        q_offsets_buf: Optional[torch.Tensor] = None,
+        kv_offsets_buf: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -1747,6 +1749,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._q_offsets = None
         self._kv_offsets = None
         self._block_diffusion_backend: Optional[str] = None
+        # cuda-graph offset buffers (parity with the dedicated dLLM shim) and a
+        # rebuild key so plan() rebuilds the variant jit module when head_dim /
+        # dtype / idtype change across plans (correctness — a stale module would
+        # read the wrong shape). See docs/block-extend-design-response.md §2.
+        self._q_offsets_buf = q_offsets_buf
+        self._kv_offsets_buf = kv_offsets_buf
+        self._bd_built_key: Optional[tuple] = None
         if self._block_diffusion:
             if dllm_block_size is None:
                 raise ValueError("dllm_block_size must be provided when block_diffusion=True")
@@ -2179,8 +2188,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # block_diffusion: build the variant jit module lazily at plan() time (the
         # dtype/head_dim/idtype needed to build it are only known now). Routed
         # through the dedicated gen via the mask_modes delegation switch in
-        # get_customize_batch_prefill_module. Only runs for block_diffusion users.
-        if self._block_diffusion and self._jit_module is None:
+        # get_customize_batch_prefill_module. Rebuilds when the shape key changes
+        # across plans (correctness — parity with the dedicated dLLM shim).
+        _bd_key = (head_dim_qk, q_data_type, paged_kv_indptr.dtype)
+        if self._block_diffusion and (
+            self._jit_module is None or self._bd_built_key != _bd_key
+        ):
             from .dllm.batch_block_extend import build_block_diffusion_jit_args
             if self._backend == "auto":
                 self._backend = "fa3" if is_sm90a_supported(self.device) else "fa2"
@@ -2200,6 +2213,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 get_customize_batch_prefill_module(self._backend, *jit_args_bd, **jit_kwargs_bd),
             )
             self._jit_additional_tensor_names = list(jit_args_bd[7])
+            self._bd_built_key = _bd_key
 
         if self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -2313,8 +2327,33 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "(it is fixed to kBlockExpanding)."
                 )
             self._mask_mode = MaskMode.BLOCK_EXPANDING.value
-            self._q_offsets = q_offsets
-            self._kv_offsets = kv_offsets
+            # cuda-graph parity: copy offsets into the pre-allocated buffers so the
+            # captured graph reads stable addresses (mirrors the dedicated dLLM
+            # shim). In non-cuda-graph mode, store the tensors directly.
+            if self._use_cuda_graph:
+                if q_offsets is not None:
+                    if self._q_offsets_buf is None:
+                        raise ValueError(
+                            "q_offsets_buf must be provided in CUDA Graph mode "
+                            "with block_diffusion=True"
+                        )
+                    self._q_offsets_buf[: len(q_offsets)].copy_(q_offsets, non_blocking=True)
+                    self._q_offsets = self._q_offsets_buf[: len(q_offsets)]
+                else:
+                    self._q_offsets = None
+                if kv_offsets is not None:
+                    if self._kv_offsets_buf is None:
+                        raise ValueError(
+                            "kv_offsets_buf must be provided in CUDA Graph mode "
+                            "with block_diffusion=True"
+                        )
+                    self._kv_offsets_buf[: len(kv_offsets)].copy_(kv_offsets, non_blocking=True)
+                    self._kv_offsets = self._kv_offsets_buf[: len(kv_offsets)]
+                else:
+                    self._kv_offsets = None
+            else:
+                self._q_offsets = q_offsets
+                self._kv_offsets = kv_offsets
 
     begin_forward = plan
 
@@ -2889,6 +2928,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         jit_kwargs: Optional[Dict[str, Any]] = None,
         block_diffusion: bool = False,
         dllm_block_size: Optional[int] = None,
+        q_offsets_buf: Optional[torch.Tensor] = None,
+        kv_offsets_buf: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
@@ -2952,6 +2993,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._q_offsets = None
         self._kv_offsets = None
         self._block_diffusion_backend: Optional[str] = None
+        # cuda-graph offset buffers (parity with the dedicated dLLM shim) and a
+        # rebuild key so plan() rebuilds the variant jit module when head_dim /
+        # dtype / idtype change across plans (correctness — a stale module would
+        # read the wrong shape). See docs/block-extend-design-response.md §2.
+        self._q_offsets_buf = q_offsets_buf
+        self._kv_offsets_buf = kv_offsets_buf
+        self._bd_built_key: Optional[tuple] = None
         if self._block_diffusion:
             if dllm_block_size is None:
                 raise ValueError("dllm_block_size must be provided when block_diffusion=True")
@@ -3318,8 +3366,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         # block_diffusion: build the variant jit module lazily at plan() time (the
         # dtype/head_dim/idtype needed to build it are only known now). Routed
         # through the dedicated gen via the mask_modes delegation switch in
-        # get_customize_batch_prefill_module. Only runs for block_diffusion users.
-        if self._block_diffusion and self._jit_module is None:
+        # get_customize_batch_prefill_module. Rebuilds when the shape key changes
+        # across plans (correctness — parity with the dedicated dLLM shim).
+        _bd_key = (head_dim_qk, q_data_type, kv_indptr.dtype)
+        if self._block_diffusion and (
+            self._jit_module is None or self._bd_built_key != _bd_key
+        ):
             from .dllm.batch_block_extend import build_block_diffusion_jit_args
             if self._backend == "auto":
                 self._backend = "fa3" if is_sm90a_supported(self.device) else "fa2"
@@ -3337,6 +3389,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 get_customize_batch_prefill_module(self._backend, *jit_args_bd, **jit_kwargs_bd),
             )
             self._jit_additional_tensor_names = list(jit_args_bd[7])
+            self._bd_built_key = _bd_key
 
         if self._backend == "cute-dsl":
             if custom_mask is not None or packed_custom_mask is not None:
@@ -3476,8 +3529,33 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "(it is fixed to kBlockExpanding)."
                 )
             self._mask_mode = MaskMode.BLOCK_EXPANDING.value
-            self._q_offsets = q_offsets
-            self._kv_offsets = kv_offsets
+            # cuda-graph parity: copy offsets into the pre-allocated buffers so the
+            # captured graph reads stable addresses (mirrors the dedicated dLLM
+            # shim). In non-cuda-graph mode, store the tensors directly.
+            if self._use_cuda_graph:
+                if q_offsets is not None:
+                    if self._q_offsets_buf is None:
+                        raise ValueError(
+                            "q_offsets_buf must be provided in CUDA Graph mode "
+                            "with block_diffusion=True"
+                        )
+                    self._q_offsets_buf[: len(q_offsets)].copy_(q_offsets, non_blocking=True)
+                    self._q_offsets = self._q_offsets_buf[: len(q_offsets)]
+                else:
+                    self._q_offsets = None
+                if kv_offsets is not None:
+                    if self._kv_offsets_buf is None:
+                        raise ValueError(
+                            "kv_offsets_buf must be provided in CUDA Graph mode "
+                            "with block_diffusion=True"
+                        )
+                    self._kv_offsets_buf[: len(kv_offsets)].copy_(kv_offsets, non_blocking=True)
+                    self._kv_offsets = self._kv_offsets_buf[: len(kv_offsets)]
+                else:
+                    self._kv_offsets = None
+            else:
+                self._q_offsets = q_offsets
+                self._kv_offsets = kv_offsets
 
     begin_forward = plan
 
