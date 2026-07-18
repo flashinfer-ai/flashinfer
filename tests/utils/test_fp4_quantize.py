@@ -535,7 +535,8 @@ def test_mxfp4_quantize_layout(sf_layout: SfLayout, device: str) -> None:
         pytest.skip("MXFP4 requires compute capability >= 10 and CUDA >= 12.8")
 
     torch.manual_seed(42)
-    x = torch.randn((128, 128), dtype=torch.bfloat16, device=device)
+    # Exercise row padding (127 -> 128) and SF-column padding (96 / 32 = 3 -> 4).
+    x = torch.randn((127, 96), dtype=torch.bfloat16, device=device)
     quantized, scales = mxfp4_quantize(x, sfLayout=sf_layout)
     dequantized = mxfp4_dequantize(quantized, scales, sfLayout=sf_layout)
     torch.testing.assert_close(

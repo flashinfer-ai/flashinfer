@@ -1520,10 +1520,9 @@ def mxfp4_quantize(
     elif backend == "cuda":
         is_sf_swizzled_layout = sfLayout != SfLayout.layout_linear
         is_sf_8x4_layout = sfLayout == SfLayout.layout_8x4
-        a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
         a_fp4, a_sf = fp4_quantize(
             a.cuda(),
-            a_global_sf.cuda(),
+            global_scale=None,
             sf_vec_size=32,
             sf_use_ue8m0=True,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
