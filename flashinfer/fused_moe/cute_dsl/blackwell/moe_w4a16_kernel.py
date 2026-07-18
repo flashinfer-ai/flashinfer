@@ -1876,6 +1876,9 @@ class Sm100W4A16GroupedGemmKernel:
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
                 tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
+                tma_distance_to_boundary = work_tile.distance_to_boundary
+                if cutlass.const_expr(self.deinterleave_output):
+                    tma_distance_to_boundary = cutlass.Int32(0)
 
                 # Store accumulator to global memory in subtiles
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
@@ -1883,7 +1886,7 @@ class Sm100W4A16GroupedGemmKernel:
                     # Load accumulator from tensor memory buffer to register
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-                    if work_tile.distance_to_boundary >= self.cta_tile_shape_mnk[1]:
+                    if tma_distance_to_boundary >= self.cta_tile_shape_mnk[1]:
                         # Convert to C type
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         acc_vec = cutlass.Float32(alpha_val) * acc_vec
