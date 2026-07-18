@@ -502,10 +502,12 @@ def test_top_p_renorm_probs_out_and_inplace():
         "workspace_probs",
         "workspace_out",
         "workspace_top_p",
+        "top_p_out",
     ],
 )
 def test_top_p_renorm_probs_rejects_invalid_memory(case):
-    probs = torch.randn(2, 32768, device="cuda:0").softmax(dim=-1)
+    vocab_size = 1024 if case == "top_p_out" else 32768
+    probs = torch.randn(2, vocab_size, device="cuda:0").softmax(dim=-1)
     top_p = torch.full((2,), 0.95, device="cuda:0")
     workspace_size = flashinfer.sampling.get_top_p_renorm_probs_workspace_size(
         *probs.shape
@@ -523,6 +525,11 @@ def test_top_p_renorm_probs_rejects_invalid_memory(case):
         probs = storage[:-1].view_as(probs)
         out = storage[1:].view_as(probs)
         match = "must either alias exactly or not overlap"
+    elif case == "top_p_out":
+        storage = torch.empty(probs.numel(), device=probs.device)
+        out = storage.view_as(probs)
+        top_p = storage[: probs.size(0)]
+        match = "renorm_probs must not overlap top_p"
     else:
         storage = torch.empty(
             max(probs.nbytes, workspace_size), dtype=torch.uint8, device=probs.device

@@ -79,6 +79,7 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
   check_no_overlap(workspace, renorm_probs, "workspace", "renorm_probs");
   if (has_top_p_arr) {
     check_no_overlap(workspace, maybe_top_p_arr.value(), "workspace", "top_p");
+    check_no_overlap(renorm_probs, maybe_top_p_arr.value(), "renorm_probs", "top_p");
   }
   if (vocab_size >= sampling::air_top_p::NUM_BUCKETS &&
       reinterpret_cast<std::uintptr_t>(workspace.data_ptr()) %

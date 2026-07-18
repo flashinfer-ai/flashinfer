@@ -1829,16 +1829,6 @@ def get_top_p_renorm_probs_workspace_size(
     )
 
 
-def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
-    if lhs.device != rhs.device:
-        return False
-    lhs_begin = lhs.data_ptr()
-    rhs_begin = rhs.data_ptr()
-    lhs_end = lhs_begin + lhs.numel() * lhs.element_size()
-    rhs_end = rhs_begin + rhs.numel() * rhs.element_size()
-    return lhs_begin < rhs_end and rhs_begin < lhs_end
-
-
 @flashinfer_api(trace=top_p_renorm_probs_trace)
 def top_p_renorm_probs(
     probs: torch.Tensor,
@@ -1934,14 +1924,8 @@ def top_p_renorm_probs(
             "workspace must be a contiguous uint8 tensor on the same device "
             f"with at least {ws_size} elements"
         )
-    if vocab_size >= 2048 and workspace.data_ptr() % 128 != 0:
-        raise ValueError("workspace must be aligned to 128 bytes")
 
     top_p_args = _to_tensor_scalar_tuple(top_p)
-    for name, tensor in (("probs", probs), ("top_p", top_p_args[0])):
-        if tensor is not None and _tensors_overlap(workspace, tensor):
-            raise ValueError(f"workspace must not overlap {name}")
-
     if out is None:
         return get_sampling_module().top_p_renorm_probs(
             probs, *top_p_args, is_deterministic, workspace
@@ -1960,14 +1944,7 @@ def top_p_renorm_probs(
             "layout as probs"
         )
 
-    probs_begin = probs.data_ptr()
-    out_begin = out.data_ptr()
-    if _tensors_overlap(probs, out) and probs_begin != out_begin:
-        raise ValueError("probs and out must either alias exactly or not overlap")
-    if _tensors_overlap(workspace, out):
-        raise ValueError("workspace must not overlap out")
-
-    if out_begin == probs_begin:
+    if out is probs:
         get_sampling_module().top_p_renorm_probs_inplace(
             probs, *top_p_args, is_deterministic, workspace
         )
