@@ -8790,10 +8790,10 @@ def _cudnn_gemm_mxfp8(
     )
 
 
-def _cudnn_gemm_mxfp8_runner():
+def _cudnn_gemm_mxfp8_runner(tuning_config):
     """Build a cuDNN MXFP8 runner with scale layout supplied as tuner input."""
     m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
+        tuning_config, spec_idx=0
     )
 
     class CudnnMxfp8GemmRunner(TunableRunner):
@@ -8900,17 +8900,18 @@ def mxfp8_gemm_sm100(
     scale_reordering,
 ) -> None:
     tuner = AutoTuner.get()
+    tuning_config = _FP8_GEMM_SM100_TUNING_CONFIG
 
     runners = []
     if "cudnn" in runner_names:
-        runners.append(_cudnn_gemm_mxfp8_runner())
+        runners.append(_cudnn_gemm_mxfp8_runner(tuning_config))
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer, scale_reordering]
     runner, tactic = tuner.choose_one(
         "mxfp8_gemm",  # TODO: check if this is correct
         runners,
-        _FP8_GEMM_SM100_TUNING_CONFIG,  # TODO: check if this is correct
+        tuning_config,  # TODO: check if this is correct
         inputs,
     )
 
