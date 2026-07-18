@@ -75,8 +75,12 @@ def get_sampling_module():
         temperature_val: float,
         enable_pdl: bool,
     ) -> torch.Tensor:
-        logits = logits.float()
-        probs = torch.empty_like(logits, device=logits.device)
+        if logits.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            raise TypeError(
+                "softmax logits must be float32, float16, or bfloat16, "
+                f"got {logits.dtype}"
+            )
+        probs = torch.empty_like(logits, device=logits.device, dtype=torch.float32)
         maybe_temperature_arr = (
             maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
         )
@@ -511,6 +515,74 @@ def get_sampling_module():
     ) -> torch.Tensor:
         return torch.empty_like(probs)
 
+    @register_custom_op(
+        "flashinfer::top_p_renorm_probs_out",
+        mutates_args=("renorm_probs", "workspace"),
+    )
+    def top_p_renorm_probs_out(
+        probs: torch.Tensor,
+        renorm_probs: torch.Tensor,
+        maybe_top_p_arr: Optional[torch.Tensor],
+        top_p_val: float,
+        is_deterministic: bool,
+        workspace: torch.Tensor,
+    ) -> None:
+        maybe_top_p_arr = (
+            maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
+        )
+        module.top_p_renorm_probs(
+            probs,
+            renorm_probs,
+            maybe_top_p_arr,
+            top_p_val,
+            is_deterministic,
+            workspace,
+        )
+
+    @register_fake_op("flashinfer::top_p_renorm_probs_out")
+    def _fake_top_p_renorm_probs_out(
+        probs: torch.Tensor,
+        renorm_probs: torch.Tensor,
+        maybe_top_p_arr: Optional[torch.Tensor],
+        top_p_val: float,
+        is_deterministic: bool,
+        workspace: torch.Tensor,
+    ) -> None:
+        pass
+
+    @register_custom_op(
+        "flashinfer::top_p_renorm_probs_inplace",
+        mutates_args=("probs", "workspace"),
+    )
+    def top_p_renorm_probs_inplace(
+        probs: torch.Tensor,
+        maybe_top_p_arr: Optional[torch.Tensor],
+        top_p_val: float,
+        is_deterministic: bool,
+        workspace: torch.Tensor,
+    ) -> None:
+        maybe_top_p_arr = (
+            maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
+        )
+        module.top_p_renorm_probs(
+            probs,
+            probs,
+            maybe_top_p_arr,
+            top_p_val,
+            is_deterministic,
+            workspace,
+        )
+
+    @register_fake_op("flashinfer::top_p_renorm_probs_inplace")
+    def _fake_top_p_renorm_probs_inplace(
+        probs: torch.Tensor,
+        maybe_top_p_arr: Optional[torch.Tensor],
+        top_p_val: float,
+        is_deterministic: bool,
+        workspace: torch.Tensor,
+    ) -> None:
+        pass
+
     # torch library for top_k_renorm_probs
 
     @register_custom_op(
@@ -659,6 +731,8 @@ def get_sampling_module():
         min_p_sampling_from_probs=min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs=top_k_top_p_sampling_from_probs,
         top_p_renorm_probs=top_p_renorm_probs,
+        top_p_renorm_probs_out=top_p_renorm_probs_out,
+        top_p_renorm_probs_inplace=top_p_renorm_probs_inplace,
         top_k_renorm_probs=top_k_renorm_probs,
         top_k_mask_logits=top_k_mask_logits,
         chain_speculative_sampling=chain_speculative_sampling,
@@ -1738,11 +1812,33 @@ def top_k_top_p_sampling_from_probs(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
+def get_top_p_renorm_probs_workspace_size(
+    batch_size: int,
+    vocab_size: int,
+    is_deterministic: bool = False,
+) -> int:
+    """Return the AIR top-p workspace size in bytes."""
+    align256 = lambda x: ((x + 255) // 256) * 256
+    counter_size = 384  # sizeof(Counter<float>) with alignas(128) members
+    # buf_len = alignTo(vocab_size / (ratio * 8), 256), ratio = 4 for float32
+    buf_len = max(align256(vocab_size // 32), 256)
+    hist_entry_size = 8 if is_deterministic else 4  # uint64 vs float
+    return (
+        align256(counter_size * batch_size)
+        + align256(hist_entry_size * 2048 * batch_size)
+        + align256(4 * 2048 * batch_size)
+        + align256(4 * buf_len * batch_size)
+        + align256(4 * buf_len * batch_size)
+    )
+
+
 @flashinfer_api(trace=top_p_renorm_probs_trace)
 def top_p_renorm_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
     is_deterministic: bool = False,
+    out: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-p thresholding.
 
@@ -1762,6 +1858,15 @@ def top_p_renorm_probs(
     is_deterministic: bool
         If True, use deterministic integer accumulation for reproducible results. Will affect performance.
         Default is False.
+    out: Optional[torch.Tensor]
+        Optional destination tensor. It must have the same shape, dtype, device,
+        and layout as ``probs``. Passing ``out=probs`` performs the final AIR
+        renormalization in place and avoids allocating another probability
+        tensor.
+    workspace: Optional[torch.Tensor]
+        Optional uint8 workspace. When omitted, a temporary workspace is
+        allocated. Reusing a caller-owned workspace avoids repeated allocator
+        traffic.
 
     Returns
     -------
@@ -1804,24 +1909,53 @@ def top_p_renorm_probs(
     """
     batch_size = probs.size(0)
     vocab_size = probs.size(1)
-    # Workspace size for AIR Top-P radix algorithm.
     # Must match GetAirTopPRenormWorkspaceSize in air_top_p.cuh.
-    align256 = lambda x: ((x + 255) // 256) * 256
-    counter_size = 384  # sizeof(Counter<float>) with alignas(128) members
-    # buf_len = alignTo(vocab_size / (ratio * 8), 256), ratio = 4 for float32
-    buf_len = max(align256(vocab_size // 32), 256)
-    hist_entry_size = 8 if is_deterministic else 4  # uint64 vs float
-    ws_size = (
-        align256(counter_size * batch_size)  # counters
-        + align256(hist_entry_size * 2048 * batch_size)  # histogram
-        + align256(4 * 2048 * batch_size)  # countHistogram
-        + align256(4 * buf_len * batch_size)  # buf1
-        + align256(4 * buf_len * batch_size)  # buf2
+    ws_size = get_top_p_renorm_probs_workspace_size(
+        batch_size,
+        vocab_size,
+        is_deterministic,
     )
-    workspace = torch.empty(ws_size, dtype=torch.uint8, device=probs.device)
-    return get_sampling_module().top_p_renorm_probs(
-        probs, *_to_tensor_scalar_tuple(top_p), is_deterministic, workspace
-    )
+    if workspace is None:
+        workspace = torch.empty(ws_size, dtype=torch.uint8, device=probs.device)
+    elif (
+        workspace.dtype != torch.uint8
+        or workspace.device != probs.device
+        or workspace.numel() < ws_size
+        or not workspace.is_contiguous()
+    ):
+        raise ValueError(
+            "workspace must be a contiguous uint8 tensor on the same device "
+            f"with at least {ws_size} elements"
+        )
+
+    if out is None:
+        return get_sampling_module().top_p_renorm_probs(
+            probs, *_to_tensor_scalar_tuple(top_p), is_deterministic, workspace
+        )
+
+    if probs.dtype != torch.float32:
+        raise TypeError(f"out= requires float32 probs, got {probs.dtype}")
+    if (
+        out.shape != probs.shape
+        or out.dtype != probs.dtype
+        or out.device != probs.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must have the same shape, dtype, device, and contiguous "
+            "layout as probs"
+        )
+
+    top_p_args = _to_tensor_scalar_tuple(top_p)
+    if out.data_ptr() == probs.data_ptr():
+        get_sampling_module().top_p_renorm_probs_inplace(
+            probs, *top_p_args, is_deterministic, workspace
+        )
+    else:
+        get_sampling_module().top_p_renorm_probs_out(
+            probs, out, *top_p_args, is_deterministic, workspace
+        )
+    return out
 
 
 top_p_renorm_prob = top_p_renorm_probs

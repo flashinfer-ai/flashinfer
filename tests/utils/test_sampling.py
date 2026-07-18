@@ -76,6 +76,16 @@ def test_softmax(
     assert torch.allclose(probs, probs_ref, atol=1e-5)
 
 
+def test_softmax_bfloat16_input_float32_output():
+    torch.manual_seed(42)
+    logits = torch.randn(8, 154880, device="cuda:0", dtype=torch.bfloat16)
+    probs = flashinfer.sampling.softmax(logits)
+    probs_ref = torch.softmax(logits, dim=-1, dtype=torch.float32)
+
+    assert probs.dtype == torch.float32
+    torch.testing.assert_close(probs, probs_ref, rtol=2e-5, atol=1e-7)
+
+
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
@@ -446,6 +456,41 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
         rtol=1e-3,
         atol=1e-3,
     )
+
+
+def test_top_p_renorm_probs_out_and_inplace():
+    torch.manual_seed(42)
+    probs = torch.randn(8, 154880, device="cuda:0").softmax(dim=-1)
+    top_p = torch.full((8,), 0.95, device="cuda:0")
+    expected = flashinfer.sampling.top_p_renorm_probs(
+        probs, top_p, is_deterministic=True
+    )
+    workspace_size = flashinfer.sampling.get_top_p_renorm_probs_workspace_size(
+        *probs.shape, is_deterministic=True
+    )
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=probs.device)
+
+    out = torch.empty_like(probs)
+    actual_out = flashinfer.sampling.top_p_renorm_probs(
+        probs,
+        top_p,
+        is_deterministic=True,
+        out=out,
+        workspace=workspace,
+    )
+    assert actual_out.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(actual_out, expected, rtol=0, atol=0)
+
+    inplace = probs.clone()
+    actual_inplace = flashinfer.sampling.top_p_renorm_probs(
+        inplace,
+        top_p,
+        is_deterministic=True,
+        out=inplace,
+        workspace=workspace,
+    )
+    assert actual_inplace.data_ptr() == inplace.data_ptr()
+    torch.testing.assert_close(actual_inplace, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("batch_size", [4, 99, 989])
