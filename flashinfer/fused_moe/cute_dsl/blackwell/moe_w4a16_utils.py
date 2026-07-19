@@ -171,11 +171,11 @@ def decode_nvfp4_fragment_to_bf16(
     loc=None,
     ip=None,
 ) -> cute.TensorSSA:
-    """Decode one 64-value NVFP4 transform fragment to BF16."""
+    """Decode one NVFP4 transform fragment to BF16."""
     packed_byte_count = cute.size(packed_fragment.shape)
     fragment_size = packed_byte_count * 2
     scale_count = fragment_size // 16
-    assert fragment_size == 64
+    assert fragment_size in (64, 128)
 
     packed_values = [
         vector.extract(
