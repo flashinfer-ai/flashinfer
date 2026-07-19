@@ -32,10 +32,9 @@ _CLUSTER_SHAPE_MN = (2, 1)
 @dataclass
 class _W4A16Workspace:
     moe_sort_buffers: Dict[str, torch.Tensor]
-    gathered_activations: torch.Tensor
+    hidden_workspace: torch.Tensor
     gemm1_output: torch.Tensor
     intermediate: torch.Tensor
-    gemm2_output: torch.Tensor
 
 
 _workspace_cache: Dict[Tuple, _W4A16Workspace] = {}
@@ -54,7 +53,9 @@ def _get_workspace(
     )
     key = (
         x.device,
-        route_slots,
+        int(torch.cuda.current_stream(x.device).cuda_stream),
+        num_tokens,
+        top_k,
         int(x.size(1)),
         int(intermediate_size),
         int(num_experts),
@@ -70,7 +71,8 @@ def _get_workspace(
                 tile_tokens_dim=_ROUTE_TILE,
                 device=x.device,
             ),
-            gathered_activations=torch.empty(
+            # Permuted input is dead before GEMM2 writes its output.
+            hidden_workspace=torch.empty(
                 (route_slots, x.size(1)), dtype=torch.bfloat16, device=x.device
             ),
             gemm1_output=torch.empty(
@@ -82,9 +84,6 @@ def _get_workspace(
                 (route_slots, intermediate_size),
                 dtype=torch.bfloat16,
                 device=x.device,
-            ),
-            gemm2_output=torch.empty(
-                (route_slots, x.size(1)), dtype=torch.bfloat16, device=x.device
             ),
         )
         _workspace_cache[key] = workspace
@@ -284,7 +283,7 @@ def launch_w4a16_moe(
     route_slots = int(permuted_idx_to_expanded_idx.numel())
     moe_permute(
         input=x,
-        permuted_output=workspace.gathered_activations,
+        permuted_output=workspace.hidden_workspace,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         num_non_exiting_tiles=num_non_exiting_tiles,
@@ -296,7 +295,7 @@ def launch_w4a16_moe(
     _run_grouped_gemm(
         w1_weight,
         w1_weight_sf,
-        workspace.gathered_activations,
+        workspace.hidden_workspace,
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
         num_non_exiting_tiles,
@@ -323,13 +322,13 @@ def launch_w4a16_moe(
         tile_idx_to_mn_limit,
         num_non_exiting_tiles,
         w2_alpha,
-        workspace.gemm2_output,
+        workspace.hidden_workspace,
         num_experts,
         False,
         enable_pdl,
     )
     moe_unpermute(
-        permuted_input=workspace.gemm2_output,
+        permuted_input=workspace.hidden_workspace,
         output=moe_output,
         expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
         topk_scales=token_final_scales,
