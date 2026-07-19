@@ -878,7 +878,7 @@ class TestCuteDslMoeBf16Activation:
             num_local_experts=num_experts,
             top_k=top_k,
         )
-        # Give two experts one full route tile and one boundary tile each, and
+        # Give two experts four full route tiles and one boundary tile each, and
         # exercise the route-to-token reduction in fused finalize.
         tensors["token_selected_experts"][:] = torch.arange(
             top_k, device=tensors["token_selected_experts"].device
