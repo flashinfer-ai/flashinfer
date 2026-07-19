@@ -1420,7 +1420,7 @@ class Sm100W4A16GroupedGemmKernel:
                 )
             # Deduce a sub-tile size and tile tensors
             transform_tiler_size = min(
-                cute.size(cute.coalesce(tAsA_input.layout), mode=[0]), 64
+                cute.size(cute.coalesce(tAsA_input.layout), mode=[0]), 128
             )
             transform_tiler = cute.make_layout(transform_tiler_size)
             tArA_load = cute.flat_divide(tArA, transform_tiler)
