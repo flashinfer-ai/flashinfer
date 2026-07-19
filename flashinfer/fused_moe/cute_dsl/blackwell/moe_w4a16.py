@@ -39,7 +39,7 @@ class _W4A16Workspace:
 
 
 _workspace_cache: Dict[Tuple, _W4A16Workspace] = {}
-_kernel_cache: Dict[Tuple[int, bool], object] = {}
+_kernel_cache: Dict[Tuple[int, bool, bool], object] = {}
 
 
 def _get_workspace(
@@ -107,8 +107,9 @@ def _get_compiled_kernel(
     max_active_clusters: int,
     stream,
     deinterleave_output: bool,
+    enable_pdl: bool,
 ):
-    cache_key = (num_experts, deinterleave_output)
+    cache_key = (num_experts, deinterleave_output, enable_pdl)
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
         kernel = Sm100W4A16GroupedGemmKernel(
@@ -121,6 +122,7 @@ def _get_compiled_kernel(
             group_count=num_experts,
             shuffle_a=False,
             deinterleave_output=deinterleave_output,
+            enable_pdl=enable_pdl,
         )
         compiled = cute.compile(
             kernel.wrapper,
@@ -153,6 +155,7 @@ def _run_grouped_gemm(
     output: torch.Tensor,
     num_experts: int,
     deinterleave_output: bool,
+    enable_pdl: bool,
 ) -> None:
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
@@ -223,6 +226,7 @@ def _run_grouped_gemm(
         max_active_clusters,
         stream,
         deinterleave_output,
+        enable_pdl,
     )
     compiled(
         weight_ptr,
@@ -251,6 +255,7 @@ def launch_w4a16_moe(
     w2_weight_sf: torch.Tensor,
     w2_alpha: torch.Tensor,
     moe_output: torch.Tensor,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
     num_experts = int(w1_weight.size(0))
@@ -272,6 +277,7 @@ def launch_w4a16_moe(
         top_k=top_k,
         num_local_experts=num_experts,
         tile_tokens_dim=_ROUTE_TILE,
+        enable_pdl=enable_pdl,
         **workspace.moe_sort_buffers,
     )
     route_slots = int(permuted_idx_to_expanded_idx.numel())
@@ -284,6 +290,7 @@ def launch_w4a16_moe(
         max_num_permuted_tokens=route_slots,
         top_k=top_k,
         tile_size=_ROUTE_TILE,
+        enable_pdl=enable_pdl,
     )
     _run_grouped_gemm(
         w1_weight,
@@ -296,6 +303,7 @@ def launch_w4a16_moe(
         workspace.gemm1_output,
         num_experts,
         True,
+        enable_pdl,
     )
     moe_swiglu(
         input=workspace.gemm1_output,
@@ -304,6 +312,7 @@ def launch_w4a16_moe(
         num_non_exiting_tiles=num_non_exiting_tiles,
         max_num_permuted_tokens=route_slots,
         tile_size=_ROUTE_TILE,
+        enable_pdl=enable_pdl,
     )
     _run_grouped_gemm(
         w2_weight,
@@ -316,6 +325,7 @@ def launch_w4a16_moe(
         workspace.gemm2_output,
         num_experts,
         False,
+        enable_pdl,
     )
     moe_unpermute(
         permuted_input=workspace.gemm2_output,
@@ -324,6 +334,7 @@ def launch_w4a16_moe(
         topk_scales=token_final_scales,
         num_tokens=int(x.size(0)),
         top_k=top_k,
+        enable_pdl=enable_pdl,
     )
     return moe_output
 
