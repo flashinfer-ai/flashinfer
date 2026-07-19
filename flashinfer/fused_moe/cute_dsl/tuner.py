@@ -636,6 +636,237 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         )
 
 
+# W4A16 tuning is intentionally limited to route padding and GEMM1's
+# 1-CTA/2-CTA topology. GEMM2 keeps the 2-CTA topology, avoiding a full
+# pipeline Cartesian product.
+W4A16_MOE_TACTICS: Tuple[Tuple[int, bool, bool], ...] = tuple(
+    (route_tile, gemm1_use_1cta, False)
+    for route_tile in (32, 64, 128)
+    for gemm1_use_1cta in (True, False)
+)
+
+
+class CuteDslFusedMoEW4A16Runner(TunableRunner):
+    """Tunable runner for the BF16-activation, NVFP4-weight MoE pipeline."""
+
+    def __init__(
+        self,
+        forward_impl: Callable,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int = 0,
+        use_fused_finalize: bool = True,
+        output_dtype: torch.dtype = torch.bfloat16,
+        enable_pdl: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    ):
+        activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        self.forward_impl = forward_impl
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.local_expert_offset = local_expert_offset
+        self.use_fused_finalize = use_fused_finalize
+        self.output_dtype = output_dtype
+        self.enable_pdl = enable_pdl
+        self.activation_type = activation_type
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
+
+        self._inputs_helper = CuteDslMoEInputsHelper(
+            num_experts, top_k, num_local_experts, local_expert_offset
+        )
+        self.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0, 2, 3, 11),
+                    dim_idx=(0, 0, 0, 0),
+                    gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                    map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+                    tensor_initializers=[
+                        lambda shapes, dtype, device: torch.randn(
+                            shapes,
+                            dtype=dtype,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
+                        ),
+                        lambda shapes, dtype, device: torch.randint(
+                            0,
+                            max(num_experts, 1),
+                            shapes,
+                            dtype=torch.int32,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
+                        ),
+                        lambda shapes, dtype, device: torch.softmax(
+                            torch.randn(
+                                shapes,
+                                device=device,
+                                generator=torch.Generator(device=device).manual_seed(
+                                    515
+                                ),
+                            ),
+                            dim=-1,
+                        ).to(torch.float32),
+                        lambda shapes, dtype, device: torch.empty(
+                            shapes, dtype=dtype, device=device
+                        ),
+                    ],
+                ),
+            ),
+            inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
+            use_cold_l2_cache=True,
+        )
+
+    def __hash__(self):
+        return hash(
+            (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.use_fused_finalize,
+                self.output_dtype,
+                self.enable_pdl,
+                int(self.activation_type),
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.swiglu_limit,
+            )
+        )
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (
+            self.num_experts,
+            self.top_k,
+            self.num_local_experts,
+            self.local_expert_offset,
+            self.use_fused_finalize,
+            self.output_dtype,
+            self.enable_pdl,
+            int(self.activation_type),
+            self.swiglu_alpha,
+            self.swiglu_beta,
+            self.swiglu_limit,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[Tuple[Any, ...]]:
+        import cutlass
+
+        from .blackwell.moe_w4a16 import get_w4a16_route_tile_candidates
+        from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
+        from .moe_utils import get_max_num_permuted_tokens
+
+        w1_weight = inputs[4]
+        w2_weight = inputs[8]
+        num_tokens = inputs[0].shape[0]
+
+        def can_implement(
+            weight: torch.Tensor,
+            route_slots: int,
+            route_tile: int,
+            use_1cta: bool,
+        ) -> bool:
+            m = weight.shape[1]
+            k = weight.shape[2] * 2
+            return Sm100W4A16GroupedGemmKernel.can_implement(
+                mnkl=(m, route_slots, k, self.num_local_experts),
+                a_dtype=cutlass.Float4E2M1FN,
+                b_dtype=cutlass.BFloat16,
+                c_dtype=cutlass.BFloat16,
+                a_major="k",
+                b_major="k",
+                c_major="m",
+                scale_granularity_m=1,
+                scale_granularity_k=16,
+                mma_tiler=(
+                    128 if use_1cta else 256,
+                    route_tile,
+                    256 if k % 256 == 0 else 128,
+                ),
+                cluster_shape_mn=(2, 1),
+                use_2cta_instrs=not use_1cta,
+            )
+
+        route_tile_candidates = get_w4a16_route_tile_candidates(
+            num_tokens, self.top_k, self.num_local_experts
+        )
+        valid_tactics = []
+        for tactic in W4A16_MOE_TACTICS:
+            route_tile, gemm1_use_1cta, gemm2_use_1cta = tactic
+            if route_tile not in route_tile_candidates:
+                continue
+            route_slots = get_max_num_permuted_tokens(
+                num_tokens,
+                self.top_k,
+                self.num_local_experts,
+                route_tile,
+            )
+            if can_implement(
+                w1_weight, route_slots, route_tile, gemm1_use_1cta
+            ) and can_implement(w2_weight, route_slots, route_tile, gemm2_use_1cta):
+                valid_tactics.append(tactic)
+        return valid_tactics
+
+    def forward(  # type: ignore[override]
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Tuple[int, bool, bool] = None,  # type: ignore[assignment]
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        (
+            x,
+            x_sf,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            fc2_input_scale,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            moe_output,
+        ) = inputs
+        return self.forward_impl(
+            x=x,
+            x_sf=x_sf,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            num_local_experts=self.num_local_experts,
+            local_expert_offset=self.local_expert_offset,
+            output_dtype=self.output_dtype,
+            use_fused_finalize=self.use_fused_finalize,
+            moe_output=moe_output,
+            enable_pdl=self.enable_pdl,
+            activation_type=int(self.activation_type),
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
+            w4a16_tactic=None if tactic is None or tactic == -1 else tactic,
+            **kwargs,
+        )
+
+
 # =============================================================================
 # Utility Functions
 # =============================================================================

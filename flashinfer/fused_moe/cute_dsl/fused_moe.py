@@ -89,6 +89,7 @@ from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
 from .tuner import (
     ALL_MOE_TACTICS,
     CuteDslFusedMoENvfp4Runner,
+    CuteDslFusedMoEW4A16Runner,
 )
 
 # =============================================================================
@@ -154,6 +155,8 @@ def _moe_core_impl(
     gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+    w4a16_tactic: Optional[Tuple[int, bool, bool]] = None,
+    w4a16_workspace_cache: Optional[Dict[Tuple, Any]] = None,
     # Pre-allocated buffers (for CUDA graph)
     moe_sort_buffers: Optional[Dict[str, torch.Tensor]] = None,
     gemm1_out: Optional[torch.Tensor] = None,
@@ -204,6 +207,8 @@ def _moe_core_impl(
         gemm1_cluster_shape_mn: GEMM1 cluster shape.
         gemm2_mma_tiler_mn: GEMM2 MMA tiler shape.
         gemm2_cluster_shape_mn: GEMM2 cluster shape.
+        w4a16_tactic: Route tile and GEMM topology for BF16 activations.
+        w4a16_workspace_cache: Wrapper-owned BF16 activation workspaces.
         moe_sort_buffers: Pre-allocated moe_sort output buffers.
         gemm1_out: Pre-allocated GEMM1 output buffer.
         gemm1_out_scale: Pre-allocated GEMM1 output scale buffer.
@@ -253,6 +258,8 @@ def _moe_core_impl(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            tactic=w4a16_tactic,
+            workspace_cache=w4a16_workspace_cache,
         )
     if fc2_input_scale is None:
         raise ValueError("fc2_input_scale is required for NVFP4 activations")
@@ -441,6 +448,8 @@ def _moe_bf16_activation_impl(
     swiglu_alpha: float,
     swiglu_beta: float,
     swiglu_limit: float,
+    tactic: Optional[Tuple[int, bool, bool]],
+    workspace_cache: Optional[Dict[Tuple, Any]],
 ) -> torch.Tensor:
     """Run the BF16-activation, online-NVFP4-weight-dequantization path."""
     if x.dtype != torch.bfloat16:
@@ -498,6 +507,8 @@ def _moe_bf16_activation_impl(
         moe_output=moe_output,
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
+        tactic=tactic,
+        workspace_cache=workspace_cache,
     )
 
 
@@ -690,6 +701,21 @@ class CuteDslMoEWrapper:
             swiglu_limit=swiglu_limit,
             use_per_token_activation=True,
         )
+        self._w4a16_runner = CuteDslFusedMoEW4A16Runner(
+            forward_impl=_forward_with_tactic_weak,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=self.num_local_experts,
+            local_expert_offset=local_expert_offset,
+            use_fused_finalize=use_fused_finalize,
+            output_dtype=output_dtype,
+            enable_pdl=enable_pdl,
+            activation_type=activation.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+        )
+        self._w4a16_workspace_cache: Dict[Tuple, Any] = {}
 
         if use_cuda_graph:
             self._aux_stream = torch.cuda.Stream(device=self.device)
@@ -718,6 +744,7 @@ class CuteDslMoEWrapper:
         gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
         gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
         gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+        w4a16_tactic: Optional[Tuple[int, bool, bool]] = None,
         output_dtype: torch.dtype = torch.bfloat16,
         use_fused_finalize: bool = True,
         moe_output: Optional[torch.Tensor] = None,
@@ -763,6 +790,8 @@ class CuteDslMoEWrapper:
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            w4a16_tactic=w4a16_tactic,
+            w4a16_workspace_cache=self._w4a16_workspace_cache,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -839,28 +868,29 @@ class CuteDslMoEWrapper:
         if x_sf is None:
             if tactic is not None:
                 raise ValueError("tactic is not supported for BF16 activations")
-            return self._forward_with_tactic(
-                x=x,
-                x_sf=None,
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                w1_weight=w1_weight,
-                w1_weight_sf=w1_weight_sf,
-                w1_alpha=w1_alpha,
-                fc2_input_scale=fc2_input_scale,
-                w2_weight=w2_weight,
-                w2_weight_sf=w2_weight_sf,
-                w2_alpha=w2_alpha,
-                num_experts=self.num_experts,
-                top_k=self.top_k,
-                num_local_experts=self.num_local_experts,
-                local_expert_offset=self.local_expert_offset,
-                output_dtype=self.output_dtype,
-                use_fused_finalize=self.use_fused_finalize,
-                moe_output=moe_output,
-                per_token_scale=per_token_scale,
-                enable_pdl=self.enable_pdl,
+            if per_token_scale is not None:
+                raise ValueError("per_token_scale is not supported when x_sf is None")
+            inputs = [
+                x,
+                None,
+                token_selected_experts,
+                token_final_scales,
+                w1_weight,
+                w1_weight_sf,
+                w1_alpha,
+                fc2_input_scale,
+                w2_weight,
+                w2_weight_sf,
+                w2_alpha,
+                moe_output,
+            ]
+            _, best_tactic = AutoTuner.get().choose_one(
+                f"CuteDslMoEWrapper::run::W4A16::{self.activation_type.name}",
+                [self._w4a16_runner],
+                self._w4a16_runner.tuning_config,
+                inputs,
             )
+            return self._w4a16_runner(inputs, tactic=best_tactic)
 
         use_per_token_activation = per_token_scale is not None
         runner = self._per_token_runner if use_per_token_activation else self._runner
@@ -930,6 +960,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+    w4a16_tactic: Optional[Tuple[int, bool, bool]] = None,
     output_dtype: torch.dtype = torch.bfloat16,
     use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
@@ -963,6 +994,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         gemm1_cluster_shape_mn=gemm1_cluster_shape_mn,
         gemm2_mma_tiler_mn=gemm2_mma_tiler_mn,
         gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
+        w4a16_tactic=w4a16_tactic,
         moe_output=moe_output,
         per_token_scale=per_token_scale,
         aux_stream=aux_stream,
@@ -1097,33 +1129,44 @@ def cute_dsl_fused_moe_nvfp4(
         )
 
     if x_sf is None:
-        return _cute_dsl_fused_moe_nvfp4_impl(
-            x=x,
-            x_sf=None,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            w1_weight=w1_weight,
-            w1_weight_sf=w1_weight_sf,
-            w1_alpha=w1_alpha,
-            fc2_input_scale=fc2_input_scale,
-            w2_weight=w2_weight,
-            w2_weight_sf=w2_weight_sf,
-            w2_alpha=w2_alpha,
+        if per_token_scale is not None:
+            raise ValueError("per_token_scale is not supported when x_sf is None")
+        w4a16_runner = CuteDslFusedMoEW4A16Runner(
+            forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
-            output_dtype=output_dtype,
             use_fused_finalize=use_fused_finalize,
-            moe_output=moe_output,
-            per_token_scale=per_token_scale,
-            aux_stream=aux_stream,
+            output_dtype=output_dtype,
             enable_pdl=enable_pdl,
             activation_type=activation.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
         )
+        inputs = [
+            x,
+            None,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            fc2_input_scale,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            moe_output,
+        ]
+        _, best_tactic = AutoTuner.get().choose_one(
+            f"CuteDslFusedMoE::run_moe_w4a16::{activation.name}",
+            [w4a16_runner],
+            w4a16_runner.tuning_config,
+            inputs,
+            aux_stream=aux_stream,
+        )
+        return w4a16_runner(inputs, tactic=best_tactic, aux_stream=aux_stream)
 
     tuner = AutoTuner.get()
 

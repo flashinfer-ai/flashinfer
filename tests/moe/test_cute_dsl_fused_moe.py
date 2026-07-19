@@ -954,6 +954,92 @@ class TestCuteDslMoeBf16Activation:
             )
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 
+    def test_autotune_cuda_graph(self):
+        from flashinfer import autotune
+        from flashinfer import CuteDslMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 256, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        route_idx = torch.arange(
+            num_tokens * top_k,
+            device=tensors["token_selected_experts"].device,
+            dtype=torch.int32,
+        )
+        tensors["token_selected_experts"].copy_(
+            route_idx.reshape(num_tokens, top_k) % num_experts
+        )
+        kwargs = {
+            "x": tensors["x_bf16"],
+            "x_sf": None,
+            "token_selected_experts": tensors["token_selected_experts"],
+            "token_final_scales": tensors["token_final_scales"],
+            "w1_weight": tensors["w1_weight"],
+            "w1_weight_sf": tensors["w1_weight_sf"],
+            "w1_alpha": tensors["w1_alpha"],
+            "fc2_input_scale": None,
+            "w2_weight": tensors["w2_weight"],
+            "w2_weight_sf": tensors["w2_weight_sf"],
+            "w2_alpha": tensors["w2_alpha"],
+        }
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=True,
+            max_num_tokens=num_tokens,
+            use_fused_finalize=False,
+        )
+
+        # Profile eagerly so graph capture only performs a cache lookup and
+        # launches the already-selected tactic.
+        with autotune(True):
+            eager_output = moe.run(**kwargs)
+        torch.cuda.synchronize()
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"],
+            gemm1_weights=tensors["w1_weight_bf16"],
+            gemm2_weights=tensors["w2_weight_bf16"],
+            gemm1_alpha=tensors["w1_alpha"],
+            gemm2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        passed, percent_within, atol = check_accuracy(eager_output, ref_output)
+        assert passed, (
+            f"Eager accuracy: {percent_within * 100:.2f}% "
+            f"within tolerance (atol={atol:.4f})"
+        )
+
+        for _ in range(3):
+            moe.run(**kwargs)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = moe.run(**kwargs)
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            passed, percent_within, atol = check_accuracy(graph_output, ref_output)
+            assert passed, (
+                f"CUDA graph accuracy: {percent_within * 100:.2f}% "
+                f"within tolerance (atol={atol:.4f})"
+            )
+
 
 # =============================================================================
 # Test Class: Functional API (cute_dsl_fused_moe_nvfp4)
