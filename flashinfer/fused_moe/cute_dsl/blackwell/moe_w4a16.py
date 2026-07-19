@@ -17,7 +17,6 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     get_max_num_permuted_tokens,
     moe_permute,
     moe_sort,
-    moe_swiglu,
     moe_unpermute,
 )
 
@@ -33,7 +32,6 @@ _CLUSTER_SHAPE_MN = (2, 1)
 class _W4A16Workspace:
     moe_sort_buffers: Dict[str, torch.Tensor]
     gathered_activations: torch.Tensor
-    gemm1_output: torch.Tensor
     intermediate: torch.Tensor
     gemm2_output: torch.Tensor
 
@@ -73,11 +71,6 @@ def _get_workspace(
             ),
             gathered_activations=torch.empty(
                 (route_slots, x.size(1)), dtype=torch.bfloat16, device=x.device
-            ),
-            gemm1_output=torch.empty(
-                (route_slots, 2 * intermediate_size),
-                dtype=torch.bfloat16,
-                device=x.device,
             ),
             intermediate=torch.empty(
                 (route_slots, intermediate_size),
@@ -137,21 +130,21 @@ def _get_compiled_kernel(
     k: int,
     max_active_clusters: int,
     stream,
-    deinterleave_output: bool,
+    fuse_swiglu: bool,
 ):
-    cache_key = (num_experts, deinterleave_output)
+    cache_key = (num_experts, fuse_swiglu)
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
         kernel = Sm100W4A16GroupedGemmKernel(
             scale_granularity_m=1,
             scale_granularity_k=16,
             acc_dtype=cutlass.Float32,
-            use_2cta_instrs=True,
-            mma_tiler_mnk=_MMA_TILER_MNK,
+            use_2cta_instrs=not fuse_swiglu,
+            mma_tiler_mnk=(128, 128, 128) if fuse_swiglu else _MMA_TILER_MNK,
             cluster_shape_mn=_CLUSTER_SHAPE_MN,
             group_count=num_experts,
             shuffle_a=False,
-            deinterleave_output=deinterleave_output,
+            fuse_swiglu=fuse_swiglu,
         )
         compiled = cute.compile(
             kernel.wrapper,
@@ -183,7 +176,7 @@ def _run_grouped_gemm(
     alpha: torch.Tensor,
     output: torch.Tensor,
     num_experts: int,
-    deinterleave_output: bool,
+    fuse_swiglu: bool,
 ) -> None:
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
@@ -254,7 +247,7 @@ def _run_grouped_gemm(
         k,
         max_active_clusters,
         stream,
-        deinterleave_output,
+        fuse_swiglu,
     )
     compiled(
         weight_ptr,
@@ -325,17 +318,9 @@ def launch_w4a16_moe(
         tile_idx_to_mn_limit,
         num_non_exiting_tiles,
         w1_alpha,
-        workspace.gemm1_output,
+        workspace.intermediate,
         num_experts,
         True,
-    )
-    moe_swiglu(
-        input=workspace.gemm1_output,
-        output=workspace.intermediate,
-        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-        num_non_exiting_tiles=num_non_exiting_tiles,
-        max_num_permuted_tokens=route_slots,
-        tile_size=_ROUTE_TILE,
     )
     _run_grouped_gemm(
         w2_weight,
