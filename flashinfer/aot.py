@@ -786,7 +786,7 @@ def copy_built_kernels(
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=False)
     for jit_spec in jit_specs:
-        src = jit_env.FLASHINFER_JIT_DIR / jit_spec.name / f"{jit_spec.name}.so"
+        src = jit_spec.jit_library_path
         dst = out_dir / jit_spec.name / f"{jit_spec.name}.so"
         dst.parent.mkdir(exist_ok=False, parents=False)
         shutil.copy2(src, dst)

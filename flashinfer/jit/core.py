@@ -1,9 +1,11 @@
 import abc
 import dataclasses
 import functools
+import hashlib
 import logging
 import os
 from contextlib import nullcontext
+from dataclasses import field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union, Hashable
@@ -328,20 +330,46 @@ class JitSpecNvcc(JitSpec):
     extra_cuda_cflags: Optional[List[str]]
     extra_ldflags: Optional[List[str]]
     extra_include_dirs: Optional[List[Path]]
-    is_class: bool = False
     needs_device_linking: bool = False
+
+    _ninja_build_content_cached: Optional[str] = field(
+        default=None, repr=False, compare=False, init=False
+    )
+    _ninja_build_digest_cached: Optional[str] = field(
+        default=None, repr=False, compare=False, init=False
+    )
+
+    def _ninja_build_content(self) -> str:
+        if self._ninja_build_content_cached is None:
+            self._ninja_build_content_cached = generate_ninja_build_for_op(
+                name=self.name,
+                sources=self.sources,
+                extra_cflags=self.extra_cflags,
+                extra_cuda_cflags=self.extra_cuda_cflags,
+                extra_ldflags=self.extra_ldflags,
+                extra_include_dirs=self.extra_include_dirs,
+                needs_device_linking=self.needs_device_linking,
+            )
+        return self._ninja_build_content_cached
+
+    def _ninja_build_digest(self) -> str:
+        if self._ninja_build_digest_cached is None:
+            self._ninja_build_digest_cached = hashlib.sha256(
+                self._ninja_build_content().encode("utf-8")
+            ).hexdigest()
+        return self._ninja_build_digest_cached
 
     @property
     def ninja_path(self) -> Path:
-        return jit_env.FLASHINFER_JIT_DIR / self.name / "build.ninja"
+        return self.build_dir / "build.ninja"
 
     @property
     def build_dir(self) -> Path:
-        return jit_env.FLASHINFER_JIT_DIR / self.name
+        return jit_env.FLASHINFER_JIT_DIR / self.name / self._ninja_build_digest()
 
     @property
     def jit_library_path(self) -> Path:
-        return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
+        return self.build_dir / f"{self.name}.so"
 
     def get_library_path(self) -> Path:
         if self.is_aot:
@@ -372,21 +400,12 @@ class JitSpecNvcc(JitSpec):
 
     @property
     def lock_path(self) -> Path:
-        return get_tmpdir() / f"{self.name}.lock"
+        return get_tmpdir() / f"{self.name}_{self._ninja_build_digest()}.lock"
 
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
         self.build_dir.mkdir(parents=True, exist_ok=True)
-        content = generate_ninja_build_for_op(
-            name=self.name,
-            sources=self.sources,
-            extra_cflags=self.extra_cflags,
-            extra_cuda_cflags=self.extra_cuda_cflags,
-            extra_ldflags=self.extra_ldflags,
-            extra_include_dirs=self.extra_include_dirs,
-            needs_device_linking=self.needs_device_linking,
-        )
-        write_if_different(ninja_path, content)
+        write_if_different(ninja_path, self._ninja_build_content())
 
     @property
     def is_ninja_generated(self) -> bool:
