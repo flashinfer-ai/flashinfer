@@ -219,10 +219,10 @@ class Sm100W4A16GroupedGemmKernel:
             11,
         )
         # Define expected register count for different warps
-        self.num_regs_epilogue_warps = 192
+        self.num_regs_epilogue_warps = 176
         self.num_regs_mma_warp = 96
         self.num_regs_tma_warps = 80
-        self.num_regs_transform_warps = 208
+        self.num_regs_transform_warps = 224
         self.num_regs_schedule_warp = 64
         self.threads_per_cta = 32 * (
             max(
