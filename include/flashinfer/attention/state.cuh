@@ -53,6 +53,10 @@ struct state_t {
   __device__ __forceinline__ void merge(const vec_t<float, vec_size>& other_o, float other_m,
                                         float other_d) {
     float m_prev = m, d_prev = d;
+    // The empty state is neutral; subtracting two negative infinities would produce NaN.
+    if (m_prev == -math::inf && other_m == -math::inf) {
+      return;
+    }
     m = max(m_prev, other_m);
     d = d_prev * math::ptx_exp2(m_prev - m) + other_d * math::ptx_exp2(other_m - m);
 #pragma unroll
