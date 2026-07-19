@@ -617,8 +617,7 @@ class CuteDslMoEWrapper:
             ``ActivationType.Swiglu`` with non-default values.
         use_fused_finalize : bool
             Use atomic fused finalize; otherwise use the deterministic
-            two-stage finalize. The BF16 activation path requires ``True`` but
-            uses deterministic unpermute internally. Defaults to ``True``.
+            two-stage finalize. Defaults to ``True``.
         """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
@@ -1058,8 +1057,7 @@ def cute_dsl_fused_moe_nvfp4(
         Output dtype.  Defaults to ``torch.bfloat16``.
     use_fused_finalize : bool
         Use atomic fused finalize; otherwise use the deterministic two-stage
-        finalize. The BF16 activation path requires ``True`` but uses
-        deterministic unpermute internally. Defaults to ``True``.
+        finalize. Defaults to ``True``.
     moe_output : Optional[torch.Tensor]
         Pre-allocated output buffer.  Allocated internally if ``None``.
     aux_stream : Optional[torch.cuda.Stream]
