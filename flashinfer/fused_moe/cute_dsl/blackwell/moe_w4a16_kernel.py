@@ -528,12 +528,25 @@ class Sm100W4A16GroupedGemmKernel:
         self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
         if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-            # Get gmem layout for scale tensor
-            self.gmem_layout_scale = mixed_input_utils.get_gmem_layout_scale(
-                a.shape,
-                self.scale_granularity_m,
-                self.scale_granularity_k,
-                self.scale_major_mode,
+            # The public NVFP4 contract stores scales in the 6D MMA layout
+            # M(32x4xrest_m)xK(4xrest_k)xL. Preserve that physical layout so
+            # in-place scale updates are visible without a host-side copy.
+            m, k, group_count = a.shape
+            scale_k = cute.ceil_div(k, self.scale_granularity_k)
+            m_tiles = cute.ceil_div(m, 128)
+            k_tiles = cute.ceil_div(scale_k, 4)
+            tile_elements = 32 * 4 * 4
+            self.gmem_layout_scale = cute.make_layout(
+                (
+                    (self.scale_granularity_m, (32, 4, m_tiles)),
+                    (self.scale_granularity_k, (4, k_tiles)),
+                    group_count,
+                ),
+                stride=(
+                    (0, (16, 4, k_tiles * tile_elements)),
+                    (0, (1, tile_elements)),
+                    m_tiles * k_tiles * tile_elements,
+                ),
             )
 
         # Validate inputs

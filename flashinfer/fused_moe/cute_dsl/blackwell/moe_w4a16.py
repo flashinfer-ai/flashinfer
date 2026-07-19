@@ -40,7 +40,6 @@ class _W4A16Workspace:
 
 _workspace_cache: Dict[Tuple, _W4A16Workspace] = {}
 _kernel_cache: Dict[Tuple[int, bool], object] = {}
-_linear_scale_cache: Dict[Tuple, torch.Tensor] = {}
 
 
 def _get_workspace(
@@ -90,36 +89,6 @@ def _get_workspace(
         )
         _workspace_cache[key] = workspace
     return workspace
-
-
-def _linearize_weight_sf(
-    weight_sf: torch.Tensor, rows: int, k: int, num_experts: int
-) -> torch.Tensor:
-    key = (weight_sf.data_ptr(), tuple(weight_sf.shape), rows, k, num_experts)
-    linear = _linear_scale_cache.get(key)
-    if linear is not None:
-        return linear
-    expected_shape = (
-        32,
-        4,
-        (rows + 127) // 128,
-        4,
-        ((k + 15) // 16 + 3) // 4,
-        num_experts,
-    )
-    if tuple(weight_sf.shape) != expected_shape:
-        raise ValueError(
-            f"weight scales must have MMA layout {expected_shape}, "
-            f"got {tuple(weight_sf.shape)}"
-        )
-    linear = (
-        weight_sf.permute(5, 2, 1, 0, 4, 3)
-        .contiguous()
-        .reshape(num_experts, expected_shape[2] * 128, expected_shape[4] * 4)
-    )
-    linear = linear[:, :rows, : k // 16].transpose(1, 2).contiguous()
-    _linear_scale_cache[key] = linear
-    return linear
 
 
 def _get_compiled_kernel(
@@ -188,7 +157,6 @@ def _run_grouped_gemm(
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
     n = int(activations.size(0))
-    weight_sf = _linearize_weight_sf(weight_sf, m, k, num_experts)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     max_active_clusters = get_max_active_clusters(2)
     weight_ptr = make_ptr(
