@@ -248,6 +248,7 @@ def _moe_core_impl(
             per_token_scale=per_token_scale,
             output_dtype=output_dtype,
             use_fused_finalize=use_fused_finalize,
+            enable_pdl=enable_pdl,
             activation=activation,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
@@ -435,6 +436,7 @@ def _moe_bf16_activation_impl(
     per_token_scale: Optional[torch.Tensor],
     output_dtype: torch.dtype,
     use_fused_finalize: bool,
+    enable_pdl: bool,
     activation: ActivationType,
     swiglu_alpha: float,
     swiglu_beta: float,
@@ -496,6 +498,7 @@ def _moe_bf16_activation_impl(
         w2_weight_sf=w2_weight_sf,
         w2_alpha=w2_alpha,
         moe_output=moe_output,
+        enable_pdl=enable_pdl,
     )
 
 

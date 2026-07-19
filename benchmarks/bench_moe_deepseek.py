@@ -212,6 +212,7 @@ def bench_cute_dsl(
     use_per_token_activation=False,
     use_bf16_activation=False,
     use_fused_finalize=True,
+    enable_pdl=True,
 ):
     """Benchmark CuteDSL MoE.
 
@@ -228,6 +229,7 @@ def bench_cute_dsl(
             deterministic two-stage finalize.
         use_bf16_activation: Keep activations in BF16 and dequantize NVFP4
             weights online in both GEMMs.
+        enable_pdl: Enable Programmatic Dependent Launch for CuTe DSL kernels.
     """
     import contextlib
 
@@ -322,6 +324,7 @@ def bench_cute_dsl(
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
             use_fused_finalize=use_fused_finalize,
+            enable_pdl=enable_pdl,
         )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
@@ -382,6 +385,7 @@ def bench_cute_dsl(
                 local_expert_offset=local_expert_offset,
                 per_token_scale=hidden_per_token_scale,
                 use_fused_finalize=use_fused_finalize,
+                enable_pdl=enable_pdl,
             )
 
     # Pass input tensors via input_kwargs for cold L2 cache rotation
@@ -736,6 +740,7 @@ def run_benchmark(
     use_bf16_activation=False,
     use_fused_finalize=True,
     cute_dsl_only=False,
+    enable_pdl=True,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -771,6 +776,7 @@ def run_benchmark(
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
         cute_dsl_only: Skip CUTLASS and TRTLLM backends.
+        enable_pdl: Enable Programmatic Dependent Launch for CuTe DSL kernels.
 
     Returns:
         List of BenchResult objects
@@ -801,6 +807,7 @@ def run_benchmark(
             use_bf16_activation=use_bf16_activation,
             use_fused_finalize=use_fused_finalize,
             cute_dsl_only=cute_dsl_only,
+            enable_pdl=enable_pdl,
         )
         results.extend(row)
         rows_and_histograms.append((row, histogram_record))
@@ -816,6 +823,7 @@ def run_benchmark(
             use_bf16_activation=use_bf16_activation,
             use_fused_finalize=use_fused_finalize,
             cute_dsl_only=cute_dsl_only,
+            enable_pdl=enable_pdl,
         )
         for row, histogram_record in rows_and_histograms:
             _print_row(row, histogram_record)
@@ -839,6 +847,7 @@ def _benchmark_single(
     use_bf16_activation=False,
     use_fused_finalize=True,
     cute_dsl_only=False,
+    enable_pdl=True,
 ):
     """Benchmark all backends for a single token count.
 
@@ -863,6 +872,7 @@ def _benchmark_single(
         use_per_token_activation=use_per_token_activation,
         use_bf16_activation=use_bf16_activation,
         use_fused_finalize=use_fused_finalize,
+        enable_pdl=enable_pdl,
     )
     if not cute_dsl_only and not use_per_token_activation:
         lat["CUTLASS"] = bench_cutlass(
@@ -912,6 +922,7 @@ def _print_header(
     use_bf16_activation=False,
     use_fused_finalize=True,
     cute_dsl_only=False,
+    enable_pdl=True,
 ):
     """Print benchmark header."""
     print("\n" + "=" * 120)
@@ -939,6 +950,7 @@ def _print_header(
         f"(larger values tend to create expert imbalance)"
     )
     print(f"CuTe DSL activation: {'BF16' if use_bf16_activation else 'NVFP4'}")
+    print(f"CuTe DSL PDL: {'enabled' if enable_pdl else 'disabled'}")
     print(
         "CuteDSL finalize: "
         f"{'atomic fused' if use_fused_finalize else 'deterministic two-stage'}"
@@ -1160,6 +1172,12 @@ def main():
         help="Use deterministic two-stage CuTe DSL finalize instead of atomic fused finalize.",
     )
     parser.add_argument(
+        "--no-pdl",
+        action="store_false",
+        dest="enable_pdl",
+        help="Disable Programmatic Dependent Launch for CuTe DSL kernels.",
+    )
+    parser.add_argument(
         "--routing-bias-scale",
         type=float,
         default=0.01,
@@ -1193,6 +1211,7 @@ def main():
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Per-token activation: {args.use_per_token_activation}")
     print(f"BF16 activation: {args.use_bf16_activation}")
+    print(f"CuTe DSL PDL: {'enabled' if args.enable_pdl else 'disabled'}")
     print(
         "CuteDSL finalize: "
         f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
@@ -1213,6 +1232,7 @@ def main():
         use_bf16_activation=args.use_bf16_activation,
         use_fused_finalize=args.use_fused_finalize,
         cute_dsl_only=args.cute_dsl_only,
+        enable_pdl=args.enable_pdl,
     )
 
     return 0

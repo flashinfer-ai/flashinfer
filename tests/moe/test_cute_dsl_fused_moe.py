@@ -858,7 +858,8 @@ class TestAutotunerBucketConfig:
 @sm100_required
 class TestCuteDslMoeBf16Activation:
     @pytest.mark.parametrize("use_wrapper", [False, True])
-    def test_numerical_accuracy(self, use_wrapper: bool):
+    @pytest.mark.parametrize("enable_pdl", [False, True])
+    def test_numerical_accuracy(self, use_wrapper: bool, enable_pdl: bool):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 129, 256, 512
@@ -894,6 +895,7 @@ class TestCuteDslMoeBf16Activation:
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 use_cuda_graph=False,
+                enable_pdl=enable_pdl,
             )
             result = moe.run(**kwargs)
         else:
@@ -901,6 +903,7 @@ class TestCuteDslMoeBf16Activation:
                 **kwargs,
                 num_experts=num_experts,
                 top_k=top_k,
+                enable_pdl=enable_pdl,
             )
 
         ref_output = compute_reference_moe_fp4(
@@ -935,6 +938,7 @@ class TestCuteDslMoeBf16Activation:
                 **kwargs,
                 num_experts=num_experts,
                 top_k=top_k,
+                enable_pdl=enable_pdl,
             )
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 

@@ -41,6 +41,7 @@ from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
+from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 """
 A mixed-input grouped GEMM example for the NVIDIA Blackwell SM100 architecture using CUTE DSL.
@@ -177,6 +178,7 @@ class Sm100W4A16GroupedGemmKernel:
         group_count: int,
         shuffle_a: bool,
         deinterleave_output: bool,
+        enable_pdl: bool,
     ):
         """
         Initializes the mixed-input GEMM kernel with a specified configuration.
@@ -199,6 +201,7 @@ class Sm100W4A16GroupedGemmKernel:
         self.mma_tiler = mma_tiler_mnk
         self.shuffle_a = shuffle_a
         self.deinterleave_output = deinterleave_output
+        self.enable_pdl = enable_pdl
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
@@ -724,6 +727,7 @@ class Sm100W4A16GroupedGemmKernel:
             cluster=(*self.cluster_shape_mn, 1),
             min_blocks_per_mp=1,
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
         return
 
@@ -1080,6 +1084,8 @@ class Sm100W4A16GroupedGemmKernel:
 
         # Cluster wait before TMEM alloc and ensure pipelines are ready
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+
+        griddepcontrol_wait()
 
         # TMEM allocation
         tmem.allocate(self.num_tmem_alloc_cols)
@@ -1975,6 +1981,8 @@ class Sm100W4A16GroupedGemmKernel:
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
             c_pipeline.producer_tail()
+
+        griddepcontrol_launch_dependents()
 
     @staticmethod
     def _compute_stages_and_tmem_cols(
