@@ -66,7 +66,7 @@ def e2m1x16_e4m3_to_bf16x16(
         {
             .reg .b8 q0, q1, q2, q3, q4, q5, q6, q7, scale;
             .reg .b16 scale_pair, lo, hi;
-            .reg .b32 scale_f16x2, product_f16x2;
+            .reg .b32 scale_f16x2;
             .reg .f32 lo_f32, hi_f32;
 
             mov.b32 {q0, q1, q2, q3}, $8;
@@ -75,58 +75,59 @@ def e2m1x16_e4m3_to_bf16x16(
             mov.b16 scale_pair, {scale, scale};
             cvt.rn.f16x2.e4m3x2 scale_f16x2, scale_pair;
 
-            cvt.rn.f16x2.e2m1x2 product_f16x2, q0;
-            mul.rn.f16x2 product_f16x2, product_f16x2, scale_f16x2;
-            mov.b32 {lo, hi}, product_f16x2;
+            cvt.rn.f16x2.e2m1x2 $0, q0;
+            cvt.rn.f16x2.e2m1x2 $1, q1;
+            cvt.rn.f16x2.e2m1x2 $2, q2;
+            cvt.rn.f16x2.e2m1x2 $3, q3;
+            cvt.rn.f16x2.e2m1x2 $4, q4;
+            cvt.rn.f16x2.e2m1x2 $5, q5;
+            cvt.rn.f16x2.e2m1x2 $6, q6;
+            cvt.rn.f16x2.e2m1x2 $7, q7;
+            mul.rn.f16x2 $0, $0, scale_f16x2;
+            mul.rn.f16x2 $1, $1, scale_f16x2;
+            mul.rn.f16x2 $2, $2, scale_f16x2;
+            mul.rn.f16x2 $3, $3, scale_f16x2;
+            mul.rn.f16x2 $4, $4, scale_f16x2;
+            mul.rn.f16x2 $5, $5, scale_f16x2;
+            mul.rn.f16x2 $6, $6, scale_f16x2;
+            mul.rn.f16x2 $7, $7, scale_f16x2;
+
+            mov.b32 {lo, hi}, $0;
             cvt.f32.f16 lo_f32, lo;
             cvt.f32.f16 hi_f32, hi;
             cvt.rn.bf16x2.f32 $0, hi_f32, lo_f32;
 
-            cvt.rn.f16x2.e2m1x2 product_f16x2, q1;
-            mul.rn.f16x2 product_f16x2, product_f16x2, scale_f16x2;
-            mov.b32 {lo, hi}, product_f16x2;
+            mov.b32 {lo, hi}, $1;
             cvt.f32.f16 lo_f32, lo;
             cvt.f32.f16 hi_f32, hi;
             cvt.rn.bf16x2.f32 $1, hi_f32, lo_f32;
 
-            cvt.rn.f16x2.e2m1x2 product_f16x2, q2;
-            mul.rn.f16x2 product_f16x2, product_f16x2, scale_f16x2;
-            mov.b32 {lo, hi}, product_f16x2;
+            mov.b32 {lo, hi}, $2;
             cvt.f32.f16 lo_f32, lo;
             cvt.f32.f16 hi_f32, hi;
             cvt.rn.bf16x2.f32 $2, hi_f32, lo_f32;
 
-            cvt.rn.f16x2.e2m1x2 product_f16x2, q3;
-            mul.rn.f16x2 product_f16x2, product_f16x2, scale_f16x2;
-            mov.b32 {lo, hi}, product_f16x2;
+            mov.b32 {lo, hi}, $3;
             cvt.f32.f16 lo_f32, lo;
             cvt.f32.f16 hi_f32, hi;
             cvt.rn.bf16x2.f32 $3, hi_f32, lo_f32;
 
-            cvt.rn.f16x2.e2m1x2 product_f16x2, q4;
-            mul.rn.f16x2 product_f16x2, product_f16x2, scale_f16x2;
-            mov.b32 {lo, hi}, product_f16x2;
+            mov.b32 {lo, hi}, $4;
             cvt.f32.f16 lo_f32, lo;
             cvt.f32.f16 hi_f32, hi;
             cvt.rn.bf16x2.f32 $4, hi_f32, lo_f32;
 
-            cvt.rn.f16x2.e2m1x2 product_f16x2, q5;
-            mul.rn.f16x2 product_f16x2, product_f16x2, scale_f16x2;
-            mov.b32 {lo, hi}, product_f16x2;
+            mov.b32 {lo, hi}, $5;
             cvt.f32.f16 lo_f32, lo;
             cvt.f32.f16 hi_f32, hi;
             cvt.rn.bf16x2.f32 $5, hi_f32, lo_f32;
 
-            cvt.rn.f16x2.e2m1x2 product_f16x2, q6;
-            mul.rn.f16x2 product_f16x2, product_f16x2, scale_f16x2;
-            mov.b32 {lo, hi}, product_f16x2;
+            mov.b32 {lo, hi}, $6;
             cvt.f32.f16 lo_f32, lo;
             cvt.f32.f16 hi_f32, hi;
             cvt.rn.bf16x2.f32 $6, hi_f32, lo_f32;
 
-            cvt.rn.f16x2.e2m1x2 product_f16x2, q7;
-            mul.rn.f16x2 product_f16x2, product_f16x2, scale_f16x2;
-            mov.b32 {lo, hi}, product_f16x2;
+            mov.b32 {lo, hi}, $7;
             cvt.f32.f16 lo_f32, lo;
             cvt.f32.f16 hi_f32, hi;
             cvt.rn.bf16x2.f32 $7, hi_f32, lo_f32;
