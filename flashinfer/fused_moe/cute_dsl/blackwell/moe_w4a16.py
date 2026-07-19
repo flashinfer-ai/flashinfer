@@ -25,7 +25,7 @@ from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 
 
 _ROUTE_TILE = 128
-_MMA_TILER_MNK = (256, 128, 128)
+_MMA_TILER_MN = (256, 128)
 _CLUSTER_SHAPE_MN = (2, 1)
 
 
@@ -39,7 +39,7 @@ class _W4A16Workspace:
 
 
 _workspace_cache: Dict[Tuple, _W4A16Workspace] = {}
-_kernel_cache: Dict[Tuple[int, bool, bool], object] = {}
+_kernel_cache: Dict[Tuple[int, bool, bool, int], object] = {}
 
 
 def _get_workspace(
@@ -109,7 +109,8 @@ def _get_compiled_kernel(
     deinterleave_output: bool,
     enable_pdl: bool,
 ):
-    cache_key = (num_experts, deinterleave_output, enable_pdl)
+    mma_tiler_k = 256 if k % 256 == 0 else 128
+    cache_key = (num_experts, deinterleave_output, enable_pdl, mma_tiler_k)
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
         kernel = Sm100W4A16GroupedGemmKernel(
@@ -117,7 +118,7 @@ def _get_compiled_kernel(
             scale_granularity_k=16,
             acc_dtype=cutlass.Float32,
             use_2cta_instrs=True,
-            mma_tiler_mnk=_MMA_TILER_MNK,
+            mma_tiler_mnk=(*_MMA_TILER_MN, mma_tiler_k),
             cluster_shape_mn=_CLUSTER_SHAPE_MN,
             group_count=num_experts,
             shuffle_a=False,
