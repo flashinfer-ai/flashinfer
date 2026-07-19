@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <numeric>
+#include <type_traits>
 
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
 #include "flashinfer/trtllm/common/cudaUtils.h"
@@ -32,6 +33,12 @@ namespace flashinfer {
 namespace norm {
 
 using namespace tensorrt_llm::common;
+
+template <typename T>
+constexpr float fp8_max() {
+  static_assert(std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value);
+  return std::is_same<T, __nv_fp8_e5m2>::value ? 57344.0f : 448.0f;
+}
 
 template <uint32_t VEC_SIZE, typename T>
 __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* __restrict__ output,
@@ -159,6 +166,7 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
   const uint32_t num_threads = num_warps * warp_size;
   const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
   const float scale_inv = 1.0f / scale[0];
+  constexpr float output_max = fp8_max<O>();
   extern __shared__ float smem[];
 
   float sum_sq = 0.f;
@@ -214,7 +222,7 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       output_vec[j] =
           float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j])) * scale_inv;
-      output_vec[j] = fmaxf(-448.0f, fminf(output_vec[j], 448.0f));
+      output_vec[j] = fmaxf(-output_max, fminf(output_vec[j], output_max));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.cast_store(output + bx * stride_output + i * num_threads * VEC_SIZE +
@@ -528,6 +536,7 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
   const uint32_t num_threads = num_warps * warp_size;
   const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
   const float scale_inv = 1.0f / scale[0];
+  constexpr float output_max = fp8_max<O>();
   extern __shared__ float smem[];
   float* smem_x = smem + ceil_div(num_warps, 4) * 4;
 
@@ -598,7 +607,7 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       output_vec[j] = x_vec[j] * rms_rcp * (weight_bias + float(weight_vec[j])) * scale_inv;
-      output_vec[j] = fmaxf(-448.0f, fminf(output_vec[j], 448.0f));
+      output_vec[j] = fmaxf(-output_max, fminf(output_vec[j], output_max));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.cast_store(output + bx * stride_output + i * num_threads * VEC_SIZE +

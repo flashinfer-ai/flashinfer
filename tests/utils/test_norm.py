@@ -156,6 +156,32 @@ def test_norm_quant(
     torch.testing.assert_close(y_ref.float(), y.float(), rtol=1, atol=1)
 
 
+@pytest.mark.parametrize(
+    "out_dtype",
+    [torch.float8_e4m3fn, torch.float8_e5m2],
+    ids=["e4m3", "e5m2"],
+)
+def test_norm_quant_respects_output_dtype_range(out_dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if not flashinfer.norm._USE_CUDA_NORM:
+        pytest.skip("legacy CUDA norm backend is required")
+
+    x = torch.ones(1, 128, dtype=torch.float16, device="cuda")
+    value_between_fp8_ranges = 1024.0
+    weight = torch.full(
+        (128,), value_between_fp8_ranges, dtype=torch.float16, device="cuda"
+    )
+    out = torch.empty_like(x, dtype=out_dtype)
+
+    flashinfer.norm.rmsnorm_quant(out, x, weight, 1.0, enable_pdl=False)
+
+    expected = min(value_between_fp8_ranges, torch.finfo(out_dtype).max)
+    torch.testing.assert_close(
+        out.float(), torch.full_like(x, expected), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("num_heads", [4, 7, 16])
 @pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
@@ -263,6 +289,35 @@ def test_fused_add_rmsnorm_quant(
 
     torch.testing.assert_close(y.float(), x_native.float(), rtol=1, atol=1)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "out_dtype",
+    [torch.float8_e4m3fn, torch.float8_e5m2],
+    ids=["e4m3", "e5m2"],
+)
+def test_fused_add_rmsnorm_quant_respects_output_dtype_range(out_dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if not flashinfer.norm._USE_CUDA_NORM:
+        pytest.skip("legacy CUDA norm backend is required")
+
+    x = torch.ones(1, 128, dtype=torch.float16, device="cuda")
+    residual = torch.zeros_like(x)
+    value_between_fp8_ranges = 1024.0
+    weight = torch.full(
+        (128,), value_between_fp8_ranges, dtype=torch.float16, device="cuda"
+    )
+    out = torch.empty_like(x, dtype=out_dtype)
+
+    flashinfer.norm.fused_add_rmsnorm_quant(
+        out, x, residual, weight, 1.0, enable_pdl=False
+    )
+
+    expected = min(value_between_fp8_ranges, torch.finfo(out_dtype).max)
+    torch.testing.assert_close(
+        out.float(), torch.full_like(x, expected), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
