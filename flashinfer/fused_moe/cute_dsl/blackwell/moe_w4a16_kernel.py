@@ -41,7 +41,11 @@ from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
-from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
+from .utils import (
+    blk_reduce_bf16,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)
 
 """
 A mixed-input grouped GEMM example for the NVIDIA Blackwell SM100 architecture using CUTE DSL.
@@ -178,6 +182,7 @@ class Sm100W4A16GroupedGemmKernel:
         group_count: int,
         shuffle_a: bool,
         deinterleave_output: bool,
+        use_fused_finalize: bool,
         enable_pdl: bool,
     ):
         """
@@ -201,6 +206,7 @@ class Sm100W4A16GroupedGemmKernel:
         self.mma_tiler = mma_tiler_mnk
         self.shuffle_a = shuffle_a
         self.deinterleave_output = deinterleave_output
+        self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -301,6 +307,7 @@ class Sm100W4A16GroupedGemmKernel:
             self.c_layout,
             self.c_dtype,
         )
+        self.epi_tile_n = cute.size(self.epi_tile[1])
 
         # Compute tensor memory(TMEM) columns and stages for each pipeline
         (
@@ -326,6 +333,7 @@ class Sm100W4A16GroupedGemmKernel:
             self.scale_granularity_k,
             self.smem_buffer_align_bytes,
             self.scale_mode,
+            self.use_fused_finalize,
         )
 
         # Align TMEM columns for allocation
@@ -414,9 +422,13 @@ class Sm100W4A16GroupedGemmKernel:
         num_non_exiting_tiles_ptr: cute.Pointer,
         alpha_ptr: cute.Pointer,
         output_ptr: cute.Pointer,
+        permuted_idx_to_expanded_idx_ptr: Optional[cute.Pointer],
+        token_final_scales_ptr: Optional[cute.Pointer],
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
+        num_tokens: cutlass.Int64,
+        top_k: cutlass.Int64,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -444,6 +456,14 @@ class Sm100W4A16GroupedGemmKernel:
         else:
             output_layout = cute.make_ordered_layout((m, n, 1), order=(0, 1, 2))
         output = cute.make_tensor(output_ptr, output_layout)
+        final_output = (
+            cute.make_tensor(
+                output_ptr,
+                cute.make_ordered_layout((m, num_tokens, 1), order=(0, 1, 2)),
+            )
+            if cutlass.const_expr(self.use_fused_finalize)
+            else output
+        )
         tile_idx_to_expert_idx = cute.make_tensor(
             tile_idx_to_expert_idx_ptr, cute.make_layout((n // 128,))
         )
@@ -454,6 +474,19 @@ class Sm100W4A16GroupedGemmKernel:
             num_non_exiting_tiles_ptr, cute.make_layout((1,))
         )
         alpha = cute.make_tensor(alpha_ptr, cute.make_layout((self.group_count,)))
+        permuted_idx_to_expanded_idx = (
+            cute.make_tensor(permuted_idx_to_expanded_idx_ptr, cute.make_layout((n,)))
+            if cutlass.const_expr(self.use_fused_finalize)
+            else None
+        )
+        token_final_scales = (
+            cute.make_tensor(
+                token_final_scales_ptr,
+                cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
+            )
+            if cutlass.const_expr(self.use_fused_finalize)
+            else None
+        )
         return self(
             weights,
             weight_sf,
@@ -463,6 +496,9 @@ class Sm100W4A16GroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             output,
+            final_output,
+            permuted_idx_to_expanded_idx,
+            token_final_scales,
             max_active_clusters,
             stream,
         )
@@ -478,6 +514,9 @@ class Sm100W4A16GroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         c: cute.Tensor,
+        final_output: cute.Tensor,
+        permuted_idx_to_expanded_idx: Optional[cute.Tensor],
+        token_final_scales: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -517,6 +556,9 @@ class Sm100W4A16GroupedGemmKernel:
         )
         self.b_dtype: type[cutlass.Numeric] = b.element_type
         self.c_dtype: type[cutlass.Numeric] = c.element_type
+        self.final_scale_dtype: Optional[type[cutlass.Numeric]] = (
+            token_final_scales.element_type if self.use_fused_finalize else None
+        )
         self.mma_dtype = self.b_dtype
 
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
@@ -705,10 +747,13 @@ class Sm100W4A16GroupedGemmKernel:
             tma_atom_c,
             tma_tensor_c,
             c,
+            final_output,
             tile_idx_to_expert_idx,
             tile_idx_to_mn_limit,
             num_non_exiting_tiles,
             alpha,
+            permuted_idx_to_expanded_idx,
+            token_final_scales,
             self.group_count,
             self.cluster_layout_vmnk,
             self.smem_layout_a,
@@ -742,10 +787,13 @@ class Sm100W4A16GroupedGemmKernel:
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
         tensor_c: cute.Tensor,
+        final_output: cute.Tensor,
         tile_idx_to_expert_idx: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
+        permuted_idx_to_expanded_idx: Optional[cute.Tensor],
+        token_final_scales: Optional[cute.Tensor],
         group_count: cutlass.Constexpr[int],
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout: cute.ComposedLayout,
@@ -914,6 +962,19 @@ class Sm100W4A16GroupedGemmKernel:
             byte_alignment=self.smem_buffer_align_bytes,
             swizzle=c_smem_layout_staged.inner,
         )
+        # Fused finalize reuses the first C stage as a linear
+        # [route, hidden] tile for descriptor-free bulk reduction.
+        sFinalize = (
+            cute.make_tensor(
+                sC.iterator,
+                cute.make_layout(
+                    (self.epi_tile_n, self.cta_tile_shape_mnk[0]),
+                    stride=(self.cta_tile_shape_mnk[0], 1),
+                ),
+            )
+            if cutlass.const_expr(self.use_fused_finalize)
+            else None
+        )
         sA_input = smem.allocate_tensor(
             element_type=self.a_dtype,
             layout=a_smem_layout.outer,
@@ -945,6 +1006,15 @@ class Sm100W4A16GroupedGemmKernel:
                 byte_alignment=self.smem_buffer_align_bytes,
                 swizzle=a_smem_layout_transform.inner,
             )
+        sFinalizeScale = (
+            smem.allocate_tensor(
+                element_type=cutlass.Float32,
+                layout=cute.make_layout((self.epi_tile_n,)),
+                byte_alignment=16,
+            )
+            if cutlass.const_expr(self.use_fused_finalize)
+            else None
+        )
         sTile_info = storage.tile_info.get_tensor(
             cute.make_layout((4, self.num_tile_info_stage), stride=(1, 4))
         )
@@ -1906,7 +1976,95 @@ class Sm100W4A16GroupedGemmKernel:
                     # Load accumulator from tensor memory buffer to register
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-                    if tma_distance_to_boundary >= self.cta_tile_shape_mnk[1]:
+                    if cutlass.const_expr(self.use_fused_finalize):
+                        finalize_thr_slice = m_thr_offset[
+                            (None, None, None, subtile_idx)
+                        ]
+                        top_k = token_final_scales.shape[1]
+                        finalize_scale_route = epi_tidx
+                        finalize_scale_route_in_tile = (
+                            subtile_idx * self.epi_tile_n + finalize_scale_route
+                        )
+                        if finalize_scale_route < self.epi_tile_n:
+                            finalize_scale_permuted_row = (
+                                work_tile.coord_n + finalize_scale_route_in_tile
+                            )
+                            finalize_scale_expanded_idx = permuted_idx_to_expanded_idx[
+                                finalize_scale_permuted_row
+                            ]
+                            finalize_scale_safe_idx = cutlass.max(
+                                finalize_scale_expanded_idx, cutlass.Int32(0)
+                            )
+                            finalize_scale_token_idx = finalize_scale_safe_idx // top_k
+                            finalize_scale_topk_idx = finalize_scale_safe_idx % top_k
+                            finalize_scale_is_valid = cutlass.Int32(
+                                finalize_scale_route_in_tile
+                                < work_tile.distance_to_boundary
+                            )
+                            finalize_token_scale = token_final_scales[
+                                (
+                                    finalize_scale_token_idx * finalize_scale_is_valid,
+                                    finalize_scale_topk_idx,
+                                )
+                            ]
+                            sFinalizeScale[finalize_scale_route] = (
+                                cutlass.Float32(alpha_val)
+                                * cutlass.Float32(finalize_token_scale)
+                                * cutlass.Float32(finalize_scale_is_valid)
+                            )
+
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.epilog_sync_barrier.arrive_and_wait()
+                        for i in cutlass.range(cute.size(tTR_rC), unroll_full=True):
+                            finalize_route = finalize_thr_slice[(i)][1]
+                            finalize_value = sFinalizeScale[
+                                finalize_route % self.epi_tile_n
+                            ] * cutlass.Float32(tTR_rAcc[i])
+                            sFinalize[
+                                (
+                                    finalize_route % self.epi_tile_n,
+                                    finalize_thr_slice[(i)][0],
+                                )
+                            ] = self.c_dtype(finalize_value)
+
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.epilog_sync_barrier.arrive_and_wait()
+
+                        reduce_route = epi_tidx
+                        reduce_route_in_tile = (
+                            subtile_idx * self.epi_tile_n + reduce_route
+                        )
+                        if (
+                            reduce_route < self.epi_tile_n
+                            and reduce_route_in_tile < work_tile.distance_to_boundary
+                        ):
+                            reduce_permuted_row = (
+                                work_tile.coord_n + reduce_route_in_tile
+                            )
+                            reduce_expanded_idx = permuted_idx_to_expanded_idx[
+                                reduce_permuted_row
+                            ]
+                            reduce_token_idx = reduce_expanded_idx // top_k
+                            hidden_base = (
+                                work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
+                            )
+                            scatter_out = cute.domain_offset(
+                                (hidden_base, reduce_token_idx, 0), final_output
+                            )
+                            copy_elements = cutlass.min(
+                                cutlass.Int32(self.cta_tile_shape_mnk[0]),
+                                cutlass.Int32(final_output.shape[0]) - hidden_base,
+                            )
+                            blk_reduce_bf16(
+                                scatter_out,
+                                sFinalize[(reduce_route, None)],
+                                copy_elements * (self.c_dtype.width // 8),
+                            )
+
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        self.epilog_sync_barrier.arrive_and_wait()
+                    elif tma_distance_to_boundary >= self.cta_tile_shape_mnk[1]:
                         # Convert to C type
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         acc_vec = cutlass.Float32(alpha_val) * acc_vec
@@ -1981,7 +2139,8 @@ class Sm100W4A16GroupedGemmKernel:
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
-            c_pipeline.producer_tail()
+            if cutlass.const_expr(not self.use_fused_finalize):
+                c_pipeline.producer_tail()
 
         griddepcontrol_launch_dependents()
 
@@ -2000,6 +2159,7 @@ class Sm100W4A16GroupedGemmKernel:
         scale_granularity_k: int,
         smem_buffer_align_bytes: int,
         scale_mode: TransformMode,
+        use_fused_finalize: bool,
     ) -> tuple[int, int, int, int, int, int, int, int]:
         """
         Compute pipeline stages and TMEM column allocation configurations.
@@ -2034,6 +2194,9 @@ class Sm100W4A16GroupedGemmKernel:
         :type smem_buffer_align_bytes: int
         :param scale_mode: The transform mode.
         :type scale_mode: TransformMode
+        :param use_fused_finalize: Whether the epilogue atomically reduces route
+            outputs into token rows.
+        :type use_fused_finalize: bool
 
         :return: A tuple containing the number of stages for:
                  (load2trans, scale_load2trans, transform2mma, accumulator, c, tile_info, tmem_acc_cols, tmem_a_cols)
@@ -2080,7 +2243,7 @@ class Sm100W4A16GroupedGemmKernel:
             + bytes_per_pipeline_stage * num_tile_info_stage
         )
 
-        c_stage_count = 2
+        c_stage_count = 1 if use_fused_finalize else 2
         c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(
             c_dtype,
             c_layout,
@@ -2089,6 +2252,14 @@ class Sm100W4A16GroupedGemmKernel:
         )
         c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
         c_bytes = c_bytes_per_stage * c_stage_count
+        finalize_metadata_bytes = (
+            cute.size_in_bytes(
+                cutlass.Float32,
+                cute.make_layout((cute.size(epi_tile[1]),)),
+            )
+            if use_fused_finalize
+            else 0
+        )
 
         smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         if scale_mode == TransformMode.ConvertOnly:
@@ -2113,6 +2284,7 @@ class Sm100W4A16GroupedGemmKernel:
             bytes_per_pipeline_stage * accumulator_stage_count
             + a_scale_bytes
             + c_bytes
+            + finalize_metadata_bytes
             + tile_info_bytes
         )
 
@@ -2193,14 +2365,15 @@ class Sm100W4A16GroupedGemmKernel:
         ):
             raise ValueError("Not enough SMEM or TMEM capacity for selected tile size")
         num_tmem_a_cols = transform2mma_stage_count * num_tmem_cols_a_per_stage
-        # Check if we can increase c_stage_count with leftover smem
-        c_stage_count += (
-            smem_capacity
-            - load2transform_stage_count * ab_load_bytes_per_stage
-            - transform2mma_stage_count * a_transform_bytes_per_stage
-            - scale_load2trans_stage_count * a_scale_bytes_per_stage
-            - c_bytes
-        ) // c_bytes_per_stage
+        # Fused finalize reuses its single C stage as reduction scratch.
+        if not use_fused_finalize:
+            c_stage_count += (
+                smem_capacity
+                - load2transform_stage_count * ab_load_bytes_per_stage
+                - transform2mma_stage_count * a_transform_bytes_per_stage
+                - scale_load2trans_stage_count * a_scale_bytes_per_stage
+                - c_bytes
+            ) // c_bytes_per_stage
 
         return (
             load2transform_stage_count,
