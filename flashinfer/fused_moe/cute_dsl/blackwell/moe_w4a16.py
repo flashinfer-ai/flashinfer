@@ -25,10 +25,13 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 
 
-_SMALL_ROUTE_TILE = 64
-_LARGE_ROUTE_TILE = 128
-_MMA_TILE_M = 256
-_CLUSTER_SHAPE_MN = (2, 1)
+_SPARSE_ROUTE_TILE = 32
+_MEDIUM_ROUTE_TILE = 64
+_DENSE_ROUTE_TILE = 128
+_SPARSE_ROUTE_MAX_ROWS_PER_EXPERT = 16
+_MEDIUM_ROUTE_MAX_ROWS_PER_EXPERT = 32
+_ONE_CTA_MMA_TILE_M = 128
+_TWO_CTA_MMA_TILE_M = 256
 
 
 @dataclass
@@ -40,17 +43,16 @@ class _W4A16Workspace:
 
 
 _workspace_cache: Dict[Tuple, _W4A16Workspace] = {}
-_kernel_cache: Dict[Tuple[int, bool, bool, bool, int, int], object] = {}
+_kernel_cache: Dict[Tuple[int, bool, bool, bool, bool, int, int], object] = {}
 
 
 def _select_route_tile(num_tokens: int, top_k: int, num_experts: int) -> int:
     routed_rows = num_tokens * top_k
-    # N=64 reduces padding for sparse expert batches; denser routing amortizes N=128.
-    return (
-        _SMALL_ROUTE_TILE
-        if routed_rows <= num_experts * (_SMALL_ROUTE_TILE // 2)
-        else _LARGE_ROUTE_TILE
-    )
+    if routed_rows <= num_experts * _SPARSE_ROUTE_MAX_ROWS_PER_EXPERT:
+        return _SPARSE_ROUTE_TILE
+    if routed_rows <= num_experts * _MEDIUM_ROUTE_MAX_ROWS_PER_EXPERT:
+        return _MEDIUM_ROUTE_TILE
+    return _DENSE_ROUTE_TILE
 
 
 def _get_workspace(
@@ -127,6 +129,7 @@ def _get_compiled_kernel(
     use_fused_finalize: bool,
     enable_pdl: bool,
     route_tile: int,
+    use_1cta: bool,
 ):
     mma_tiler_k = 256 if k % 256 == 0 else 128
     cache_key = (
@@ -134,18 +137,24 @@ def _get_compiled_kernel(
         deinterleave_output,
         use_fused_finalize,
         enable_pdl,
+        use_1cta,
         mma_tiler_k,
         route_tile,
     )
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
+        use_2cta_instrs = not use_1cta
         kernel = Sm100W4A16GroupedGemmKernel(
             scale_granularity_m=1,
             scale_granularity_k=16,
             acc_dtype=cutlass.Float32,
-            use_2cta_instrs=True,
-            mma_tiler_mnk=(_MMA_TILE_M, route_tile, mma_tiler_k),
-            cluster_shape_mn=_CLUSTER_SHAPE_MN,
+            use_2cta_instrs=use_2cta_instrs,
+            mma_tiler_mnk=(
+                _TWO_CTA_MMA_TILE_M if use_2cta_instrs else _ONE_CTA_MMA_TILE_M,
+                route_tile,
+                mma_tiler_k,
+            ),
+            cluster_shape_mn=(2, 1),
             group_count=num_experts,
             shuffle_a=False,
             deinterleave_output=deinterleave_output,
@@ -197,6 +206,11 @@ def _run_grouped_gemm(
     k = int(weight.size(2)) * 2
     n = int(activations.size(0))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    use_1cta = (
+        route_tile in (_SPARSE_ROUTE_TILE, _MEDIUM_ROUTE_TILE)
+        and k % 256 == 0
+        and m < k
+    )
     max_active_clusters = get_max_active_clusters(2)
     weight_ptr = make_ptr(
         cutlass.Float4E2M1FN,
@@ -291,6 +305,7 @@ def _run_grouped_gemm(
         use_fused_finalize,
         enable_pdl,
         route_tile,
+        use_1cta,
     )
     compiled(
         weight_ptr,
