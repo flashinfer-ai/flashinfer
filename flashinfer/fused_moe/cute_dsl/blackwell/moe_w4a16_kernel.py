@@ -2432,8 +2432,13 @@ class Sm100W4A16GroupedGemmKernel:
             mma_tiler, cluster_shape_mn, use_2cta_instrs
         ):
             return False
-        if not mixed_input_utils.is_valid_scale_granularity(
-            scale_granularity_m, scale_granularity_k, a_dtype, k, mma_tiler[2]
+        # Unlike the generic mixed-input kernel, W4A16 consumes multiple
+        # 16-value NVFP4 scale blocks within each MMA K tile.
+        if (
+            scale_granularity_m != 1
+            or scale_granularity_k != 16
+            or k % scale_granularity_k != 0
+            or mma_tiler[2] % scale_granularity_k != 0
         ):
             return False
         if not mixed_input_utils.is_valid_tensor_alignment(

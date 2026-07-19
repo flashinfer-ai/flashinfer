@@ -46,7 +46,7 @@ _workspace_cache: Dict[Tuple, _W4A16Workspace] = {}
 _kernel_cache: Dict[Tuple[int, bool, bool, bool, bool, int, int], object] = {}
 
 
-def _select_route_tile(num_tokens: int, top_k: int, num_experts: int) -> int:
+def select_w4a16_route_tile(num_tokens: int, top_k: int, num_experts: int) -> int:
     routed_rows = num_tokens * top_k
     if routed_rows <= num_experts * _SPARSE_ROUTE_MAX_ROWS_PER_EXPERT:
         return _SPARSE_ROUTE_TILE
@@ -55,20 +55,37 @@ def _select_route_tile(num_tokens: int, top_k: int, num_experts: int) -> int:
     return _DENSE_ROUTE_TILE
 
 
+def get_w4a16_route_tile_candidates(
+    num_tokens: int, top_k: int, num_experts: int
+) -> Tuple[int, ...]:
+    route_tile = select_w4a16_route_tile(num_tokens, top_k, num_experts)
+    if route_tile == _SPARSE_ROUTE_TILE:
+        return (_SPARSE_ROUTE_TILE, _MEDIUM_ROUTE_TILE)
+    if route_tile == _MEDIUM_ROUTE_TILE:
+        return (_MEDIUM_ROUTE_TILE, _DENSE_ROUTE_TILE)
+    return (_DENSE_ROUTE_TILE,)
+
+
 def _get_workspace(
     x: torch.Tensor,
     top_k: int,
     num_experts: int,
     intermediate_size: int,
     route_tile: int,
+    workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> _W4A16Workspace:
     num_tokens = int(x.size(0))
     route_slots = get_max_num_permuted_tokens(
         num_tokens, top_k, num_experts, route_tile
     )
+    cache = _workspace_cache if workspace_cache is None else workspace_cache
     key = (
         x.device,
-        int(torch.cuda.current_stream(x.device).cuda_stream),
+        *(
+            (int(torch.cuda.current_stream(x.device).cuda_stream),)
+            if workspace_cache is None
+            else ()
+        ),
         num_tokens,
         top_k,
         int(x.size(1)),
@@ -76,7 +93,7 @@ def _get_workspace(
         int(num_experts),
         route_tile,
     )
-    workspace = _workspace_cache.get(key)
+    workspace = cache.get(key)
     if workspace is None:
         workspace = _W4A16Workspace(
             moe_sort_buffers=allocate_moe_sort_buffers(
@@ -102,7 +119,7 @@ def _get_workspace(
                 device=x.device,
             ),
         )
-        _workspace_cache[key] = workspace
+        cache[key] = workspace
     return workspace
 
 
@@ -201,16 +218,18 @@ def _run_grouped_gemm(
     token_final_scales: Optional[torch.Tensor],
     enable_pdl: bool,
     route_tile: int,
+    use_1cta: Optional[bool] = None,
 ) -> None:
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
     n = int(activations.size(0))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_1cta = (
-        route_tile in (_SPARSE_ROUTE_TILE, _MEDIUM_ROUTE_TILE)
-        and k % 256 == 0
-        and m < k
-    )
+    if use_1cta is None:
+        use_1cta = (
+            route_tile in (_SPARSE_ROUTE_TILE, _MEDIUM_ROUTE_TILE)
+            and k % 256 == 0
+            and m < k
+        )
     max_active_clusters = get_max_active_clusters(2)
     weight_ptr = make_ptr(
         cutlass.Float4E2M1FN,
@@ -340,13 +359,27 @@ def launch_w4a16_moe(
     moe_output: torch.Tensor,
     use_fused_finalize: bool,
     enable_pdl: bool,
+    tactic: Optional[Tuple[int, bool, bool]] = None,
+    workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
     num_experts = int(w1_weight.size(0))
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
-    route_tile = _select_route_tile(int(x.size(0)), top_k, num_experts)
-    workspace = _get_workspace(x, top_k, num_experts, intermediate_size, route_tile)
+    if tactic is None:
+        route_tile = select_w4a16_route_tile(int(x.size(0)), top_k, num_experts)
+        gemm1_use_1cta = None
+        gemm2_use_1cta = None
+    else:
+        route_tile, gemm1_use_1cta, gemm2_use_1cta = tactic
+    workspace = _get_workspace(
+        x,
+        top_k,
+        num_experts,
+        intermediate_size,
+        route_tile,
+        workspace_cache,
+    )
 
     (
         tile_idx_to_expert_idx,
@@ -393,6 +426,7 @@ def launch_w4a16_moe(
         None,
         enable_pdl,
         route_tile,
+        gemm1_use_1cta,
     )
     moe_swiglu(
         input=workspace.gemm1_output,
@@ -422,6 +456,7 @@ def launch_w4a16_moe(
         token_final_scales if use_fused_finalize else None,
         enable_pdl,
         route_tile,
+        gemm2_use_1cta,
     )
     if not use_fused_finalize:
         moe_unpermute(
