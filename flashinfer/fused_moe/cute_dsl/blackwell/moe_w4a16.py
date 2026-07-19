@@ -4,7 +4,7 @@
 """SM100 NVFP4-weight, BF16-activation fused MoE launcher."""
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -15,6 +15,7 @@ from flashinfer.cute_dsl.utils import get_max_active_clusters, make_ptr
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     allocate_moe_sort_buffers,
     get_max_num_permuted_tokens,
+    moe_output_memset_inplace,
     moe_permute,
     moe_sort,
     moe_swiglu,
@@ -38,7 +39,7 @@ class _W4A16Workspace:
 
 
 _workspace_cache: Dict[Tuple, _W4A16Workspace] = {}
-_kernel_cache: Dict[Tuple[int, bool, bool, int], object] = {}
+_kernel_cache: Dict[Tuple[int, bool, bool, bool, int], object] = {}
 
 
 def _get_workspace(
@@ -100,16 +101,27 @@ def _get_compiled_kernel(
     num_non_exiting_tiles_ptr,
     alpha_ptr,
     output_ptr,
+    permuted_idx_to_expanded_idx_ptr,
+    token_final_scales_ptr,
     m: int,
     n: int,
     k: int,
+    num_tokens: int,
+    top_k: int,
     max_active_clusters: int,
     stream,
     deinterleave_output: bool,
+    use_fused_finalize: bool,
     enable_pdl: bool,
 ):
     mma_tiler_k = 256 if k % 256 == 0 else 128
-    cache_key = (num_experts, deinterleave_output, enable_pdl, mma_tiler_k)
+    cache_key = (
+        num_experts,
+        deinterleave_output,
+        use_fused_finalize,
+        enable_pdl,
+        mma_tiler_k,
+    )
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
         kernel = Sm100W4A16GroupedGemmKernel(
@@ -122,6 +134,7 @@ def _get_compiled_kernel(
             group_count=num_experts,
             shuffle_a=False,
             deinterleave_output=deinterleave_output,
+            use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
         )
         compiled = cute.compile(
@@ -134,9 +147,13 @@ def _get_compiled_kernel(
             num_non_exiting_tiles_ptr,
             alpha_ptr,
             output_ptr,
+            permuted_idx_to_expanded_idx_ptr,
+            token_final_scales_ptr,
             m,
             n,
             k,
+            num_tokens,
+            top_k,
             max_active_clusters=max_active_clusters,
             stream=stream,
         )
@@ -155,6 +172,9 @@ def _run_grouped_gemm(
     output: torch.Tensor,
     num_experts: int,
     deinterleave_output: bool,
+    use_fused_finalize: bool,
+    permuted_idx_to_expanded_idx: Optional[torch.Tensor],
+    token_final_scales: Optional[torch.Tensor],
     enable_pdl: bool,
 ) -> None:
     m = int(weight.size(1))
@@ -210,6 +230,28 @@ def _run_grouped_gemm(
         cute.AddressSpace.gmem,
         assumed_align=32,
     )
+    permuted_idx_to_expanded_idx_ptr = (
+        make_ptr(
+            cutlass.Int32,
+            permuted_idx_to_expanded_idx.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        if permuted_idx_to_expanded_idx is not None
+        else None
+    )
+    token_final_scales_ptr = (
+        make_ptr(
+            cutlass.Float32,
+            token_final_scales.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        if token_final_scales is not None
+        else None
+    )
+    num_tokens = int(output.size(0)) if use_fused_finalize else 0
+    top_k = int(token_final_scales.size(1)) if token_final_scales is not None else 0
     compiled = _get_compiled_kernel(
         num_experts,
         weight_ptr,
@@ -220,12 +262,17 @@ def _run_grouped_gemm(
         num_non_exiting_tiles_ptr,
         alpha_ptr,
         output_ptr,
+        permuted_idx_to_expanded_idx_ptr,
+        token_final_scales_ptr,
         m,
         n,
         k,
+        num_tokens,
+        top_k,
         max_active_clusters,
         stream,
         deinterleave_output,
+        use_fused_finalize,
         enable_pdl,
     )
     compiled(
@@ -237,9 +284,13 @@ def _run_grouped_gemm(
         num_non_exiting_tiles_ptr,
         alpha_ptr,
         output_ptr,
+        permuted_idx_to_expanded_idx_ptr,
+        token_final_scales_ptr,
         m,
         n,
         k,
+        num_tokens,
+        top_k,
         stream=stream,
     )
 
@@ -255,6 +306,7 @@ def launch_w4a16_moe(
     w2_weight_sf: torch.Tensor,
     w2_alpha: torch.Tensor,
     moe_output: torch.Tensor,
+    use_fused_finalize: bool,
     enable_pdl: bool,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
@@ -303,6 +355,9 @@ def launch_w4a16_moe(
         workspace.gemm1_output,
         num_experts,
         True,
+        False,
+        None,
+        None,
         enable_pdl,
     )
     moe_swiglu(
@@ -314,6 +369,9 @@ def launch_w4a16_moe(
         tile_size=_ROUTE_TILE,
         enable_pdl=enable_pdl,
     )
+    gemm2_output = moe_output if use_fused_finalize else workspace.hidden_workspace
+    if use_fused_finalize:
+        moe_output_memset_inplace(moe_output)
     _run_grouped_gemm(
         w2_weight,
         w2_weight_sf,
@@ -322,20 +380,24 @@ def launch_w4a16_moe(
         tile_idx_to_mn_limit,
         num_non_exiting_tiles,
         w2_alpha,
-        workspace.hidden_workspace,
+        gemm2_output,
         num_experts,
         False,
+        use_fused_finalize,
+        permuted_idx_to_expanded_idx if use_fused_finalize else None,
+        token_final_scales if use_fused_finalize else None,
         enable_pdl,
     )
-    moe_unpermute(
-        permuted_input=workspace.hidden_workspace,
-        output=moe_output,
-        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-        topk_scales=token_final_scales,
-        num_tokens=int(x.size(0)),
-        top_k=top_k,
-        enable_pdl=enable_pdl,
-    )
+    if not use_fused_finalize:
+        moe_unpermute(
+            permuted_input=gemm2_output,
+            output=moe_output,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            topk_scales=token_final_scales,
+            num_tokens=int(x.size(0)),
+            top_k=top_k,
+            enable_pdl=enable_pdl,
+        )
     return moe_output
 
 

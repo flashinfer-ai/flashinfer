@@ -449,8 +449,6 @@ def _moe_bf16_activation_impl(
         raise ValueError("the BF16 activation path only supports BF16 output")
     if per_token_scale is not None:
         raise ValueError("per_token_scale is not supported when x_sf is None")
-    if not use_fused_finalize:
-        raise ValueError("the BF16 activation path requires use_fused_finalize=True")
     if num_local_experts != num_experts or local_expert_offset != 0:
         raise ValueError(
             "the BF16 activation path does not yet support expert parallelism"
@@ -498,6 +496,7 @@ def _moe_bf16_activation_impl(
         w2_weight_sf=w2_weight_sf,
         w2_alpha=w2_alpha,
         moe_output=moe_output,
+        use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
     )
 

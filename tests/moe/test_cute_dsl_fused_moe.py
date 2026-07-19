@@ -859,11 +859,17 @@ class TestAutotunerBucketConfig:
 class TestCuteDslMoeBf16Activation:
     @pytest.mark.parametrize("use_wrapper", [False, True])
     @pytest.mark.parametrize("enable_pdl", [False, True])
-    def test_numerical_accuracy(self, use_wrapper: bool, enable_pdl: bool):
+    @pytest.mark.parametrize("use_fused_finalize", [False, True])
+    def test_numerical_accuracy(
+        self,
+        use_wrapper: bool,
+        enable_pdl: bool,
+        use_fused_finalize: bool,
+    ):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 129, 256, 512
-        num_experts, top_k = 256, 1
+        num_experts, top_k = 256, 2
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
@@ -872,8 +878,11 @@ class TestCuteDslMoeBf16Activation:
             num_local_experts=num_experts,
             top_k=top_k,
         )
-        # Exercise one full route tile and one boundary tile for the same expert.
-        tensors["token_selected_experts"].zero_()
+        # Give two experts one full route tile and one boundary tile each, and
+        # exercise the route-to-token reduction in fused finalize.
+        tensors["token_selected_experts"][:] = torch.arange(
+            top_k, device=tensors["token_selected_experts"].device
+        )
 
         kwargs = {
             "x": tensors["x_bf16"],
@@ -896,6 +905,7 @@ class TestCuteDslMoeBf16Activation:
                 intermediate_size=intermediate_size,
                 use_cuda_graph=False,
                 enable_pdl=enable_pdl,
+                use_fused_finalize=use_fused_finalize,
             )
             result = moe.run(**kwargs)
         else:
@@ -904,6 +914,7 @@ class TestCuteDslMoeBf16Activation:
                 num_experts=num_experts,
                 top_k=top_k,
                 enable_pdl=enable_pdl,
+                use_fused_finalize=use_fused_finalize,
             )
 
         ref_output = compute_reference_moe_fp4(
@@ -939,6 +950,7 @@ class TestCuteDslMoeBf16Activation:
                 num_experts=num_experts,
                 top_k=top_k,
                 enable_pdl=enable_pdl,
+                use_fused_finalize=use_fused_finalize,
             )
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 

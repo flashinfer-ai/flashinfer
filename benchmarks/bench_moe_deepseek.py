@@ -1237,8 +1237,6 @@ def main():
         )
     if args.use_bf16_activation and args.ep != 1:
         parser.error("--use-bf16-activation currently requires --ep 1")
-    if args.use_bf16_activation and not args.use_fused_finalize:
-        parser.error("--use-bf16-activation requires fused finalize")
     if args.include_activation_quant and args.use_bf16_activation:
         parser.error("--include-activation-quant is incompatible with BF16 activation")
     if args.include_activation_quant and not args.cute_dsl_only:
