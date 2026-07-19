@@ -71,6 +71,14 @@ EP_CONFIGS = {
 }
 
 
+def _cute_dsl_finalize_name(use_bf16_activation, use_fused_finalize):
+    if use_bf16_activation:
+        return "deterministic unpermute"
+    if use_fused_finalize:
+        return "atomic fused"
+    return "deterministic two-stage"
+
+
 def is_sm100_family():
     """Check for SM100 family (Blackwell: SM100, SM103).
 
@@ -227,7 +235,8 @@ def bench_cute_dsl(
                     interval when bench_gpu_time falls back to events (i.e. when
                     both CUDA graphs and CUPTI are disabled).
         use_fused_finalize: Use atomic fused finalize; otherwise use the
-            deterministic two-stage finalize.
+            deterministic two-stage finalize. The BF16 activation path requires
+            this setting but uses deterministic unpermute internally.
         use_bf16_activation: Keep activations in BF16 and dequantize NVFP4
             weights online in both GEMMs.
         include_activation_quant: Include the initial activation FP4
@@ -994,7 +1003,7 @@ def _print_header(
     print(f"CuTe DSL PDL: {'enabled' if enable_pdl else 'disabled'}")
     print(
         "CuteDSL finalize: "
-        f"{'atomic fused' if use_fused_finalize else 'deterministic two-stage'}"
+        f"{_cute_dsl_finalize_name(use_bf16_activation, use_fused_finalize)}"
     )
     if cute_dsl_only:
         print("CUTLASS and TRTLLM omitted by --cute-dsl-only.")
@@ -1238,7 +1247,7 @@ def main():
     if args.use_bf16_activation and args.ep != 1:
         parser.error("--use-bf16-activation currently requires --ep 1")
     if args.use_bf16_activation and not args.use_fused_finalize:
-        parser.error("--use-bf16-activation requires fused finalize")
+        parser.error("--use-bf16-activation requires use_fused_finalize=True")
     if args.include_activation_quant and args.use_bf16_activation:
         parser.error("--include-activation-quant is incompatible with BF16 activation")
     if args.include_activation_quant and not args.cute_dsl_only:
@@ -1265,7 +1274,7 @@ def main():
     print(f"CuTe DSL PDL: {'enabled' if args.enable_pdl else 'disabled'}")
     print(
         "CuteDSL finalize: "
-        f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
+        f"{_cute_dsl_finalize_name(args.use_bf16_activation, args.use_fused_finalize)}"
     )
 
     run_benchmark(
