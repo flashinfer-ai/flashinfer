@@ -162,8 +162,6 @@ def test_norm_quant(
     ids=["e4m3", "e5m2"],
 )
 def test_norm_quant_respects_output_dtype_range(out_dtype):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
     if not flashinfer.norm._USE_CUDA_NORM:
         pytest.skip("legacy CUDA norm backend is required")
 
@@ -174,7 +172,8 @@ def test_norm_quant_respects_output_dtype_range(out_dtype):
     )
     out = torch.empty_like(x, dtype=out_dtype)
 
-    flashinfer.norm.rmsnorm_quant(out, x, weight, 1.0, enable_pdl=False)
+    scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    flashinfer.norm.rmsnorm_quant(out, x, weight, scale, enable_pdl=False)
 
     expected = min(value_between_fp8_ranges, torch.finfo(out_dtype).max)
     torch.testing.assert_close(
@@ -297,8 +296,6 @@ def test_fused_add_rmsnorm_quant(
     ids=["e4m3", "e5m2"],
 )
 def test_fused_add_rmsnorm_quant_respects_output_dtype_range(out_dtype):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
     if not flashinfer.norm._USE_CUDA_NORM:
         pytest.skip("legacy CUDA norm backend is required")
 
@@ -310,8 +307,9 @@ def test_fused_add_rmsnorm_quant_respects_output_dtype_range(out_dtype):
     )
     out = torch.empty_like(x, dtype=out_dtype)
 
+    scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
     flashinfer.norm.fused_add_rmsnorm_quant(
-        out, x, residual, weight, 1.0, enable_pdl=False
+        out, x, residual, weight, scale, enable_pdl=False
     )
 
     expected = min(value_between_fp8_ranges, torch.finfo(out_dtype).max)

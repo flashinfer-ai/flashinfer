@@ -36,7 +36,8 @@ using namespace tensorrt_llm::common;
 
 template <typename T>
 constexpr float fp8_max() {
-  static_assert(std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value);
+  static_assert(std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value,
+                "T must be __nv_fp8_e4m3 or __nv_fp8_e5m2");
   return std::is_same<T, __nv_fp8_e5m2>::value ? 57344.0f : 448.0f;
 }
 
