@@ -25,8 +25,9 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 
 
-_ROUTE_TILE = 128
-_MMA_TILER_MN = (256, 128)
+_SMALL_ROUTE_TILE = 64
+_LARGE_ROUTE_TILE = 128
+_MMA_TILE_M = 256
 _CLUSTER_SHAPE_MN = (2, 1)
 
 
@@ -39,7 +40,17 @@ class _W4A16Workspace:
 
 
 _workspace_cache: Dict[Tuple, _W4A16Workspace] = {}
-_kernel_cache: Dict[Tuple[int, bool, bool, bool, int], object] = {}
+_kernel_cache: Dict[Tuple[int, bool, bool, bool, int, int], object] = {}
+
+
+def _select_route_tile(num_tokens: int, top_k: int, num_experts: int) -> int:
+    routed_rows = num_tokens * top_k
+    # N=64 reduces padding for sparse expert batches; denser routing amortizes N=128.
+    return (
+        _SMALL_ROUTE_TILE
+        if routed_rows <= num_experts * (_SMALL_ROUTE_TILE // 2)
+        else _LARGE_ROUTE_TILE
+    )
 
 
 def _get_workspace(
@@ -47,10 +58,11 @@ def _get_workspace(
     top_k: int,
     num_experts: int,
     intermediate_size: int,
+    route_tile: int,
 ) -> _W4A16Workspace:
     num_tokens = int(x.size(0))
     route_slots = get_max_num_permuted_tokens(
-        num_tokens, top_k, num_experts, _ROUTE_TILE
+        num_tokens, top_k, num_experts, route_tile
     )
     key = (
         x.device,
@@ -60,6 +72,7 @@ def _get_workspace(
         int(x.size(1)),
         int(intermediate_size),
         int(num_experts),
+        route_tile,
     )
     workspace = _workspace_cache.get(key)
     if workspace is None:
@@ -69,7 +82,7 @@ def _get_workspace(
                 num_experts=num_experts,
                 top_k=top_k,
                 num_local_experts=num_experts,
-                tile_tokens_dim=_ROUTE_TILE,
+                tile_tokens_dim=route_tile,
                 device=x.device,
             ),
             # Permuted input is dead before GEMM2 writes its output.
@@ -113,6 +126,7 @@ def _get_compiled_kernel(
     deinterleave_output: bool,
     use_fused_finalize: bool,
     enable_pdl: bool,
+    route_tile: int,
 ):
     mma_tiler_k = 256 if k % 256 == 0 else 128
     cache_key = (
@@ -121,6 +135,7 @@ def _get_compiled_kernel(
         use_fused_finalize,
         enable_pdl,
         mma_tiler_k,
+        route_tile,
     )
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
@@ -129,7 +144,7 @@ def _get_compiled_kernel(
             scale_granularity_k=16,
             acc_dtype=cutlass.Float32,
             use_2cta_instrs=True,
-            mma_tiler_mnk=(*_MMA_TILER_MN, mma_tiler_k),
+            mma_tiler_mnk=(_MMA_TILE_M, route_tile, mma_tiler_k),
             cluster_shape_mn=_CLUSTER_SHAPE_MN,
             group_count=num_experts,
             shuffle_a=False,
@@ -176,6 +191,7 @@ def _run_grouped_gemm(
     permuted_idx_to_expanded_idx: Optional[torch.Tensor],
     token_final_scales: Optional[torch.Tensor],
     enable_pdl: bool,
+    route_tile: int,
 ) -> None:
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
@@ -274,6 +290,7 @@ def _run_grouped_gemm(
         deinterleave_output,
         use_fused_finalize,
         enable_pdl,
+        route_tile,
     )
     compiled(
         weight_ptr,
@@ -313,7 +330,8 @@ def launch_w4a16_moe(
     num_experts = int(w1_weight.size(0))
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
-    workspace = _get_workspace(x, top_k, num_experts, intermediate_size)
+    route_tile = _select_route_tile(int(x.size(0)), top_k, num_experts)
+    workspace = _get_workspace(x, top_k, num_experts, intermediate_size, route_tile)
 
     (
         tile_idx_to_expert_idx,
@@ -328,7 +346,7 @@ def launch_w4a16_moe(
         num_experts=num_experts,
         top_k=top_k,
         num_local_experts=num_experts,
-        tile_tokens_dim=_ROUTE_TILE,
+        tile_tokens_dim=route_tile,
         enable_pdl=enable_pdl,
         **workspace.moe_sort_buffers,
     )
@@ -341,7 +359,7 @@ def launch_w4a16_moe(
         num_non_exiting_tiles=num_non_exiting_tiles,
         max_num_permuted_tokens=route_slots,
         top_k=top_k,
-        tile_size=_ROUTE_TILE,
+        tile_size=route_tile,
         enable_pdl=enable_pdl,
     )
     _run_grouped_gemm(
@@ -359,6 +377,7 @@ def launch_w4a16_moe(
         None,
         None,
         enable_pdl,
+        route_tile,
     )
     moe_swiglu(
         input=workspace.gemm1_output,
@@ -366,7 +385,7 @@ def launch_w4a16_moe(
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
         max_num_permuted_tokens=route_slots,
-        tile_size=_ROUTE_TILE,
+        tile_size=route_tile,
         enable_pdl=enable_pdl,
     )
     gemm2_output = moe_output if use_fused_finalize else workspace.hidden_workspace
@@ -387,6 +406,7 @@ def launch_w4a16_moe(
         permuted_idx_to_expanded_idx if use_fused_finalize else None,
         token_final_scales if use_fused_finalize else None,
         enable_pdl,
+        route_tile,
     )
     if not use_fused_finalize:
         moe_unpermute(
