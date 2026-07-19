@@ -24,6 +24,16 @@ FP4 GEMM
 
     mm_fp4
 
+SVDQuant NVFP4 GEMM (SM100)
+---------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_nvfp4_svdquant
+    nvfp4_quantize_smooth
+    svdquant_linear
+
 BF16 x FP4 GEMM (W4A16)
 -----------------------
 
