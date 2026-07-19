@@ -211,6 +211,7 @@ def bench_cute_dsl(
     do_autotune=True,
     use_per_token_activation=False,
     use_bf16_activation=False,
+    include_activation_quant=False,
     use_fused_finalize=True,
     enable_pdl=True,
 ):
@@ -229,6 +230,8 @@ def bench_cute_dsl(
             deterministic two-stage finalize.
         use_bf16_activation: Keep activations in BF16 and dequantize NVFP4
             weights online in both GEMMs.
+        include_activation_quant: Include the initial per-tensor activation
+            FP4 quantization in the measured CuTe DSL W4A4 path.
         enable_pdl: Enable Programmatic Dependent Launch for CuTe DSL kernels.
     """
     import contextlib
@@ -250,6 +253,11 @@ def bench_cute_dsl(
     n, sv, dev = inputs["router_logits"].shape[0], 16, "cuda"
     gs1 = torch.tensor([1.0], device=dev)
 
+    if include_activation_quant and (use_bf16_activation or use_per_token_activation):
+        raise ValueError(
+            "include_activation_quant only supports per-tensor NVFP4 activations"
+        )
+
     tv = torch.empty(n, CFG.top_k, dtype=torch.float32, device=dev)
     ti = torch.empty(n, CFG.top_k, dtype=torch.int32, device=dev)
 
@@ -270,6 +278,10 @@ def bench_cute_dsl(
             per_token_activation=True,
             backend="cute-dsl",
         )
+    elif include_activation_quant:
+        xf = inputs["hidden_bf16"]
+        xs = None
+        hidden_per_token_scale = None
     else:
         xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
         hidden_per_token_scale = None
@@ -277,6 +289,16 @@ def bench_cute_dsl(
         xs = (
             xs.view(torch.float8_e4m3fn).reshape(n, CFG.hidden_size // sv).unsqueeze(-1)
         )
+
+    def prepare_activation(x, x_sf):
+        if include_activation_quant:
+            x, x_sf = fp4_quantize(x, gs1, sv, False, False)
+            x_sf = (
+                x_sf.view(torch.float8_e4m3fn)
+                .reshape(n, CFG.hidden_size // sv)
+                .unsqueeze(-1)
+            )
+        return x, x_sf
 
     # Expert range for this EP partition
     expert_start = local_expert_offset
@@ -328,6 +350,7 @@ def bench_cute_dsl(
         )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
+            x, x_sf = prepare_activation(x, x_sf)
             fused_topk_deepseek(
                 scores=router_logits,
                 bias=routing_bias,
@@ -357,6 +380,7 @@ def bench_cute_dsl(
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
+            x, x_sf = prepare_activation(x, x_sf)
             fused_topk_deepseek(
                 scores=router_logits,
                 bias=routing_bias,
@@ -738,6 +762,7 @@ def run_benchmark(
     routing_bias_scale=0.01,
     use_per_token_activation=False,
     use_bf16_activation=False,
+    include_activation_quant=False,
     use_fused_finalize=True,
     cute_dsl_only=False,
     enable_pdl=True,
@@ -773,6 +798,8 @@ def run_benchmark(
             per-token NVFP4 activation scaling.
         use_bf16_activation: Whether CuTe DSL should keep activations in BF16
             and dequantize NVFP4 weights online.
+        include_activation_quant: Include the initial per-tensor activation
+            FP4 quantization in the CuTe DSL timing.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
         cute_dsl_only: Skip CUTLASS and TRTLLM backends.
@@ -805,6 +832,7 @@ def run_benchmark(
             do_autotune=do_autotune,
             use_per_token_activation=use_per_token_activation,
             use_bf16_activation=use_bf16_activation,
+            include_activation_quant=include_activation_quant,
             use_fused_finalize=use_fused_finalize,
             cute_dsl_only=cute_dsl_only,
             enable_pdl=enable_pdl,
@@ -821,6 +849,7 @@ def run_benchmark(
             routing_bias_scale,
             use_per_token_activation=use_per_token_activation,
             use_bf16_activation=use_bf16_activation,
+            include_activation_quant=include_activation_quant,
             use_fused_finalize=use_fused_finalize,
             cute_dsl_only=cute_dsl_only,
             enable_pdl=enable_pdl,
@@ -845,6 +874,7 @@ def _benchmark_single(
     do_autotune=True,
     use_per_token_activation=False,
     use_bf16_activation=False,
+    include_activation_quant=False,
     use_fused_finalize=True,
     cute_dsl_only=False,
     enable_pdl=True,
@@ -871,6 +901,7 @@ def _benchmark_single(
         do_autotune=do_autotune,
         use_per_token_activation=use_per_token_activation,
         use_bf16_activation=use_bf16_activation,
+        include_activation_quant=include_activation_quant,
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
     )
@@ -920,6 +951,7 @@ def _print_header(
     routing_bias_scale,
     use_per_token_activation=False,
     use_bf16_activation=False,
+    include_activation_quant=False,
     use_fused_finalize=True,
     cute_dsl_only=False,
     enable_pdl=True,
@@ -950,6 +982,10 @@ def _print_header(
         f"(larger values tend to create expert imbalance)"
     )
     print(f"CuTe DSL activation: {'BF16' if use_bf16_activation else 'NVFP4'}")
+    print(
+        "Initial CuTe DSL activation quantization: "
+        f"{'included' if include_activation_quant else 'excluded'}"
+    )
     print(f"CuTe DSL PDL: {'enabled' if enable_pdl else 'disabled'}")
     print(
         "CuteDSL finalize: "
@@ -1166,6 +1202,11 @@ def main():
         help="Use BF16 activations with online NVFP4 weight dequantization in CuTe DSL.",
     )
     parser.add_argument(
+        "--include-activation-quant",
+        action="store_true",
+        help="Include initial per-tensor activation FP4 quantization in CuTe DSL timing.",
+    )
+    parser.add_argument(
         "--no-fused-finalize",
         action="store_false",
         dest="use_fused_finalize",
@@ -1193,6 +1234,14 @@ def main():
         parser.error("--use-bf16-activation currently requires --ep 1")
     if args.use_bf16_activation and not args.use_fused_finalize:
         parser.error("--use-bf16-activation requires fused finalize")
+    if args.include_activation_quant and (
+        args.use_bf16_activation or args.use_per_token_activation
+    ):
+        parser.error(
+            "--include-activation-quant only supports per-tensor NVFP4 activations"
+        )
+    if args.include_activation_quant and not args.cute_dsl_only:
+        parser.error("--include-activation-quant requires --cute-dsl-only")
 
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
@@ -1211,6 +1260,7 @@ def main():
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Per-token activation: {args.use_per_token_activation}")
     print(f"BF16 activation: {args.use_bf16_activation}")
+    print(f"Initial activation quantization: {args.include_activation_quant}")
     print(f"CuTe DSL PDL: {'enabled' if args.enable_pdl else 'disabled'}")
     print(
         "CuteDSL finalize: "
@@ -1230,6 +1280,7 @@ def main():
         routing_bias_scale=args.routing_bias_scale,
         use_per_token_activation=args.use_per_token_activation,
         use_bf16_activation=args.use_bf16_activation,
+        include_activation_quant=args.include_activation_quant,
         use_fused_finalize=args.use_fused_finalize,
         cute_dsl_only=args.cute_dsl_only,
         enable_pdl=args.enable_pdl,
