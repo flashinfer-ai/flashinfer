@@ -86,7 +86,14 @@ def _get_dtype_str(dtype: torch.dtype) -> str:
     return _dtype_map[dtype]
 
 
-def _get_module_uri_with_offset(head_dim: int, dtype: torch.dtype, backend: str) -> str:
+def _get_module_uri_with_offset(
+    head_dim: int,
+    dtype: torch.dtype,
+    backend: str,
+    head_dim_vo: Optional[int] = None,
+    dtype_kv: Optional[torch.dtype] = None,
+    dtype_o: Optional[torch.dtype] = None,
+) -> str:
     """Generate unique identifier for with offset module
 
     v2: 4 scalar params (sm_scale, dllm_block_size, q_block_expanding_offset,
@@ -101,7 +108,13 @@ def _get_module_uri_with_offset(head_dim: int, dtype: torch.dtype, backend: str)
             f"Unsupported head_dim {head_dim} for Block Extend Attention. "
             f"Supported (dLLM closed product): {sorted(_supported_head_dims)}."
         )
-    return f"block_expanding_{backend}_with_offset_v2_hdim{head_dim}_{_get_dtype_str(dtype)}"
+    head_dim_vo = head_dim if head_dim_vo is None else head_dim_vo
+    dtype_kv = dtype if dtype_kv is None else dtype_kv
+    dtype_o = dtype if dtype_o is None else dtype_o
+    return (
+        f"block_expanding_{backend}_with_offset_v2_hdim{head_dim}_vo{head_dim_vo}"
+        f"_{_get_dtype_str(dtype)}_{_get_dtype_str(dtype_kv)}_{_get_dtype_str(dtype_o)}"
+    )
 
 
 # V3 FA3 Variant Definition: Block Expanding Attention for Hopper (SM90) architecture
@@ -145,6 +158,9 @@ def get_block_extend_module_with_offset(
     dtype: torch.dtype = torch.float16,
     backend: str = "fa2",
     device: Optional[torch.device] = None,
+    head_dim_vo: Optional[int] = None,
+    dtype_kv: Optional[torch.dtype] = None,
+    dtype_o: Optional[torch.dtype] = None,
 ):
     """
     Get Block Extend Attention module with q_offset/kv_offset support.
@@ -171,6 +187,9 @@ def get_block_extend_module_with_offset(
     if device is None:
         device = torch.device("cuda")
 
+    if backend not in ("fa2", "fa3"):
+        raise ValueError(f"backend must be 'fa2' or 'fa3', got {backend!r}")
+
     # FA3 requires SM90 support
     if backend == "fa3" and not is_sm90a_supported(device):
         raise RuntimeError(
@@ -178,7 +197,12 @@ def get_block_extend_module_with_offset(
             "Use backend='fa2' for older architectures."
         )
 
-    uri = _get_module_uri_with_offset(head_dim, dtype, backend)
+    head_dim_vo = head_dim if head_dim_vo is None else head_dim_vo
+    dtype_kv = dtype if dtype_kv is None else dtype_kv
+    dtype_o = dtype if dtype_o is None else dtype_o
+    uri = _get_module_uri_with_offset(
+        head_dim, dtype, backend, head_dim_vo, dtype_kv, dtype_o
+    )
 
     if backend == "fa3":
         variant_name = "BlockExtendAttentionV3WithOffset"
@@ -191,10 +215,10 @@ def get_block_extend_module_with_offset(
         backend=backend,
         uri=uri,
         dtype_q=dtype,
-        dtype_kv=dtype,
-        dtype_o=dtype,
+        dtype_kv=dtype_kv,
+        dtype_o=dtype_o,
         head_dim_qk=head_dim,
-        head_dim_vo=head_dim,
+        head_dim_vo=head_dim_vo,
         additional_tensor_names=[],
         additional_tensor_dtypes=[],
         additional_scalar_names=["sm_scale", "dllm_block_size", "q_block_expanding_offset", "kv_block_expanding_offset"],

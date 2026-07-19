@@ -10,12 +10,7 @@
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
 
 
-#define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, Params, ...) \
-  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { \
-    constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom; \
-    using AttentionVariant = {{ variant_name }}; \
-    __VA_ARGS__(); \
-  })
+{{ dispatch_context }}
 
 
 using namespace flashinfer;

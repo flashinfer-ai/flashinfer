@@ -25,6 +25,8 @@ from typing import Optional, Tuple, Union, List, Dict, Any
 from ..prefill import (
     BatchPrefillWithRaggedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
+    _prepare_block_diffusion_offset,
+    _validate_block_diffusion_offset_buffer,
 )
 from ..jit import gen_customize_batch_prefill_module
 from ..jit import env as jit_env
@@ -80,11 +82,22 @@ def check_kernel_availability(uri: str) -> tuple:
     return aot_available, jit_available, aot_path
 
 
-def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None, idtype: torch.dtype = torch.int32) -> str:
+def select_best_backend(
+    head_dim: int,
+    dtype: torch.dtype,
+    preferred_backend: str = "auto",
+    device: torch.device = None,
+    idtype: torch.dtype = torch.int32,
+    head_dim_vo: Optional[int] = None,
+    dtype_kv: Optional[torch.dtype] = None,
+    dtype_o: Optional[torch.dtype] = None,
+) -> str:
     """Select backend based on kernel availability and compute capability"""
     from ..utils import is_sm90a_supported
 
-    base_uri = _get_batch_be_module_uri(head_dim, dtype, idtype)
+    base_uri = _get_batch_be_module_uri(
+        head_dim, dtype, idtype, head_dim_vo, dtype_kv, dtype_o
+    )
     fa2_uri = base_uri + "_ragged_offset"
     fa3_uri = base_uri + "_ragged_offset_fa3"
     
@@ -135,11 +148,22 @@ def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: st
     raise ValueError(f"Unknown backend: {preferred_backend}")
 
 
-def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None, idtype: torch.dtype = torch.int32) -> str:
+def select_best_backend_paged(
+    head_dim: int,
+    dtype: torch.dtype,
+    preferred_backend: str = "auto",
+    device: torch.device = None,
+    idtype: torch.dtype = torch.int32,
+    head_dim_vo: Optional[int] = None,
+    dtype_kv: Optional[torch.dtype] = None,
+    dtype_o: Optional[torch.dtype] = None,
+) -> str:
     """Select backend based on Paged kernel availability and compute capability"""
     from ..utils import is_sm90a_supported
 
-    base_uri = _get_batch_be_module_uri(head_dim, dtype, idtype)
+    base_uri = _get_batch_be_module_uri(
+        head_dim, dtype, idtype, head_dim_vo, dtype_kv, dtype_o
+    )
     fa2_uri = base_uri + "_paged_offset"
     fa3_uri = base_uri + "_paged_offset_fa3"
 
@@ -147,7 +171,10 @@ def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backe
     fa3_aot, fa3_jit, _ = check_kernel_availability(fa3_uri)
 
     fa2_available = fa2_aot or fa2_jit
-    fa3_available = fa3_aot or fa3_jit
+    # The current Hopper paged mainloop requires HEAD_DIM_QK == HEAD_DIM_VO.
+    # Auto mode can safely fall back to FA2 for an asymmetric value dimension.
+    fa3_shape_supported = head_dim_vo is None or head_dim_vo == head_dim
+    fa3_available = (fa3_aot or fa3_jit) and fa3_shape_supported
 
     if preferred_backend == "auto":
         if device is None:
@@ -175,6 +202,11 @@ def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backe
         raise RuntimeError(f"FA2 paged kernel '{fa2_uri}' not available")
 
     if preferred_backend == "fa3":
+        if not fa3_shape_supported:
+            raise ValueError(
+                "FA3 paged block-extend currently requires head_dim == head_dim_vo, "
+                f"got {head_dim} and {head_dim_vo}"
+            )
         if device is None:
             device = torch.device("cuda")
         if not is_sm90a_supported(device):
@@ -189,36 +221,46 @@ def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backe
     raise ValueError(f"Unknown backend: {preferred_backend}")
 
 
-def _get_batch_be_module_uri(head_dim: int, dtype: torch.dtype, idtype: torch.dtype) -> str:
-    # The dLLM block-extend URIs are intentionally a CLOSED small cartesian product
-    # (the dedicated front-end's own product), not a value multiplied into the big
-    # shared prefill product. Restrict each axis to what dLLM actually needs so the
-    # dedicated variants cannot silently generalize. See
-    # docs/block-extend-design-response.md §1.
-    _SUPPORTED_HEAD_DIMS = {64, 128}
-    if head_dim not in _SUPPORTED_HEAD_DIMS:
-        raise ValueError(
-            f"Unsupported head_dim {head_dim} for Block Extend Attention. "
-            f"Supported (dLLM closed product): {sorted(_SUPPORTED_HEAD_DIMS)}."
-        )
-    _dtype_map = {torch.float16: "fp16", torch.bfloat16: "bf16"}
-    if dtype not in _dtype_map:
-        raise ValueError(
-            f"Unsupported dtype {dtype} for Block Extend Attention. "
-            f"Supported: {list(_dtype_map.keys())}"
-        )
-    _idtype_map = {torch.int32: "i32", torch.int64: "i64"}
-    if idtype not in _idtype_map:
+def _get_batch_be_module_uri(
+    head_dim: int,
+    dtype: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_vo: Optional[int] = None,
+    dtype_kv: Optional[torch.dtype] = None,
+    dtype_o: Optional[torch.dtype] = None,
+) -> str:
+    # Keep the dedicated dLLM product closed and encode every compile-time axis
+    # in the URI so AOT lookup and JIT source directories cannot alias.
+    supported_head_dims = {64, 128}
+    dtype_uri = {torch.float16: "fp16", torch.bfloat16: "bf16"}
+    idtype_uri = {torch.int32: "i32", torch.int64: "i64"}
+    head_dim_vo = head_dim if head_dim_vo is None else head_dim_vo
+    dtype_kv = dtype if dtype_kv is None else dtype_kv
+    dtype_o = dtype if dtype_o is None else dtype_o
+
+    for name, axis in (("head_dim", head_dim), ("head_dim_vo", head_dim_vo)):
+        if axis not in supported_head_dims:
+            raise ValueError(
+                f"Unsupported {name} {axis} for Block Extend Attention. "
+                f"Supported (dLLM closed product): {sorted(supported_head_dims)}."
+            )
+    for name, axis in (("dtype", dtype), ("dtype_kv", dtype_kv), ("dtype_o", dtype_o)):
+        if axis not in dtype_uri:
+            raise ValueError(
+                f"Unsupported {name} {axis} for Block Extend Attention. "
+                f"Supported: {list(dtype_uri.keys())}"
+            )
+    if idtype not in idtype_uri:
         raise ValueError(
             f"Unsupported idtype {idtype} for Block Extend Attention. "
-            f"Supported: {list(_idtype_map.keys())}"
+            f"Supported: {list(idtype_uri.keys())}"
         )
-    # idtype is embedded in the URI to match the standard batch-prefill URI scheme
-    # (``dtype_idx_{...}``), preventing JIT-cache aliasing between int32 and int64
-    # index builds of the same (head_dim, dtype) — a build for one idtype would
-    # otherwise overwrite the generated source directory of the other.
-    # See docs/block-extend-design-response.md §3.2.
-    return f"batch_prefill_block_expanding_hd{head_dim}_{_dtype_map[dtype]}_idx{_idtype_map[idtype]}"
+
+    return (
+        f"batch_prefill_block_expanding_hd{head_dim}_{dtype_uri[dtype]}_"
+        f"idx{idtype_uri[idtype]}_vo{head_dim_vo}_{dtype_uri[dtype_kv]}_"
+        f"{dtype_uri[dtype_o]}"
+    )
 
 
 def _get_batch_be_aot_path(uri: str) -> Path:
@@ -289,6 +331,9 @@ def build_block_diffusion_jit_args(
     idtype: torch.dtype,
     backend: str,
     layout: str,
+    head_dim_vo: Optional[int] = None,
+    dtype_kv: Optional[torch.dtype] = None,
+    dtype_o: Optional[torch.dtype] = None,
 ) -> Tuple[List[Any], Dict[str, Any]]:
     """Build the (jit_args, jit_kwargs) for a block-diffusion (block-extend) batch
     prefill variant, suitable for passing to the existing
@@ -315,10 +360,18 @@ def build_block_diffusion_jit_args(
     else:
         raise ValueError(f"backend must be 'fa2' or 'fa3', got {backend!r}")
 
-    uri = _get_batch_be_module_uri(head_dim, dtype, idtype) + suffix
+    head_dim_vo = head_dim if head_dim_vo is None else head_dim_vo
+    dtype_kv = dtype if dtype_kv is None else dtype_kv
+    dtype_o = dtype if dtype_o is None else dtype_o
+    uri = (
+        _get_batch_be_module_uri(
+            head_dim, dtype, idtype, head_dim_vo, dtype_kv, dtype_o
+        )
+        + suffix
+    )
 
     jit_args = [
-        uri, dtype, dtype, dtype, idtype, head_dim, head_dim,
+        uri, dtype, dtype_kv, dtype_o, idtype, head_dim, head_dim_vo,
         ["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
         [dtype_map_for_idtype(idtype), dtype_map_for_idtype(idtype)],
         ["sm_scale", "dllm_block_size"], ["double", "int64_t"],
@@ -333,6 +386,27 @@ def build_block_diffusion_jit_args(
         "mask_modes": [MaskMode.BLOCK_EXPANDING.value],
     }
     return jit_args, jit_kwargs
+
+
+def _prepare_shim_block_diffusion_offset(
+    offsets: Optional[torch.Tensor],
+    *,
+    name: str,
+    batch_size: int,
+    idtype: torch.dtype,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Apply the native block-diffusion validation without silently moving devices."""
+    if torch.is_tensor(offsets) and offsets.device != device:
+        raise ValueError(f"{name} must be on {device}, got {offsets.device}")
+    return _prepare_block_diffusion_offset(
+        offsets,
+        name=name,
+        batch_size=batch_size,
+        idtype=idtype,
+        device=device,
+        non_blocking=False,
+    )
 
 
 class BatchBlockExtendPagedOffsetWrapper:
@@ -361,9 +435,7 @@ class BatchBlockExtendPagedOffsetWrapper:
         self._backend = backend
         self._preferred_backend = backend
         self._device = float_workspace_buffer.device
-        self._dtype: Optional[torch.dtype] = None
-        self._head_dim: Optional[int] = None
-        self._idtype: Optional[torch.dtype] = None
+        self._jit_axes: Optional[Tuple[torch.dtype, torch.dtype, torch.dtype, int, int, torch.dtype]] = None
         
         self._float_workspace_buffer = float_workspace_buffer
         self._use_cuda_graph = use_cuda_graph
@@ -378,12 +450,36 @@ class BatchBlockExtendPagedOffsetWrapper:
         self._q_offsets: Optional[torch.Tensor] = None
         self._kv_offsets: Optional[torch.Tensor] = None
     
-    def _create_inner_wrapper(self, dtype: torch.dtype, head_dim: int, idtype: torch.dtype = torch.int32) -> None:
-        effective_backend = select_best_backend_paged(head_dim, dtype, self._preferred_backend, self._device, idtype)
+    def _create_inner_wrapper(
+        self,
+        dtype_q: torch.dtype,
+        dtype_kv: torch.dtype,
+        dtype_o: torch.dtype,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        idtype: torch.dtype = torch.int32,
+    ) -> None:
+        effective_backend = select_best_backend_paged(
+            head_dim_qk,
+            dtype_q,
+            self._preferred_backend,
+            self._device,
+            idtype,
+            head_dim_vo,
+            dtype_kv,
+            dtype_o,
+        )
         self._backend = effective_backend
 
         jit_args, jit_kwargs = build_block_diffusion_jit_args(
-            head_dim, dtype, idtype, self._backend, layout="paged"
+            head_dim=head_dim_qk,
+            dtype=dtype_q,
+            idtype=idtype,
+            backend=self._backend,
+            layout="paged",
+            head_dim_vo=head_dim_vo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_o,
         )
 
         self._inner_wrapper = BatchPrefillWithPagedKVCacheWrapper(
@@ -394,9 +490,7 @@ class BatchBlockExtendPagedOffsetWrapper:
             paged_kv_last_page_len_buf=self._paged_kv_last_page_len_buf,
             backend=self._backend, jit_args=jit_args, jit_kwargs=jit_kwargs,
         )
-        self._dtype = dtype
-        self._head_dim = head_dim
-        self._idtype = idtype
+        self._jit_axes = (dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo, idtype)
     
     def plan(
         self, qo_indptr: torch.Tensor, paged_kv_indptr: torch.Tensor,
@@ -404,26 +498,69 @@ class BatchBlockExtendPagedOffsetWrapper:
         num_qo_heads: int, num_kv_heads: int, head_dim: int, page_size: int,
         q_data_type: torch.dtype = torch.float16, sm_scale: Optional[float] = None,
         q_offsets: Optional[torch.Tensor] = None, kv_offsets: Optional[torch.Tensor] = None,
+        *,
+        head_dim_vo: Optional[int] = None,
+        kv_data_type: Optional[torch.dtype] = None,
+        o_data_type: Optional[torch.dtype] = None,
     ) -> None:
-        if self._inner_wrapper is None or self._head_dim != head_dim or self._dtype != q_data_type or self._idtype != qo_indptr.dtype:
-            self._create_inner_wrapper(q_data_type, head_dim, qo_indptr.dtype)
+        if qo_indptr.dtype != paged_kv_indptr.dtype:
+            raise ValueError("qo_indptr and paged_kv_indptr must use the same dtype")
+        head_dim_vo = head_dim if head_dim_vo is None else head_dim_vo
+        kv_data_type = q_data_type if kv_data_type is None else kv_data_type
+        o_data_type = q_data_type if o_data_type is None else o_data_type
+        jit_axes = (
+            q_data_type,
+            kv_data_type,
+            o_data_type,
+            head_dim,
+            head_dim_vo,
+            qo_indptr.dtype,
+        )
+        if self._inner_wrapper is None or self._jit_axes != jit_axes:
+            self._create_inner_wrapper(*jit_axes)
+
+        batch_size = qo_indptr.numel() - 1
+        q_offsets = _prepare_shim_block_diffusion_offset(
+            q_offsets,
+            name="q_offsets",
+            batch_size=batch_size,
+            idtype=qo_indptr.dtype,
+            device=self._device,
+        )
+        kv_offsets = _prepare_shim_block_diffusion_offset(
+            kv_offsets,
+            name="kv_offsets",
+            batch_size=batch_size,
+            idtype=qo_indptr.dtype,
+            device=self._device,
+        )
         
         self._sm_scale = sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim)
         
         if self._use_cuda_graph:
             if q_offsets is not None:
-                if self._q_offsets_buf is None:
-                    raise ValueError("q_offsets_buf must be provided in CUDA Graph mode")
-                self._q_offsets_buf[:len(q_offsets)].copy_(q_offsets, non_blocking=True)
-                self._q_offsets = self._q_offsets_buf[:len(q_offsets)]
+                q_offsets_buf = _validate_block_diffusion_offset_buffer(
+                    self._q_offsets_buf,
+                    name="q_offsets_buf",
+                    batch_size=batch_size,
+                    idtype=qo_indptr.dtype,
+                    device=self._device,
+                )
+                q_offsets_buf[:batch_size].copy_(q_offsets, non_blocking=True)
+                self._q_offsets = q_offsets_buf[:batch_size]
             else:
                 self._q_offsets = None
             
             if kv_offsets is not None:
-                if self._kv_offsets_buf is None:
-                    raise ValueError("kv_offsets_buf must be provided in CUDA Graph mode")
-                self._kv_offsets_buf[:len(kv_offsets)].copy_(kv_offsets, non_blocking=True)
-                self._kv_offsets = self._kv_offsets_buf[:len(kv_offsets)]
+                kv_offsets_buf = _validate_block_diffusion_offset_buffer(
+                    self._kv_offsets_buf,
+                    name="kv_offsets_buf",
+                    batch_size=batch_size,
+                    idtype=qo_indptr.dtype,
+                    device=self._device,
+                )
+                kv_offsets_buf[:batch_size].copy_(kv_offsets, non_blocking=True)
+                self._kv_offsets = kv_offsets_buf[:batch_size]
             else:
                 self._kv_offsets = None
         else:
@@ -434,9 +571,10 @@ class BatchBlockExtendPagedOffsetWrapper:
             qo_indptr=qo_indptr, paged_kv_indptr=paged_kv_indptr,
             paged_kv_indices=paged_kv_indices, paged_kv_last_page_len=paged_kv_last_page_len,
             num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim, head_dim_vo=head_dim, page_size=page_size,
+            head_dim_qk=head_dim, head_dim_vo=head_dim_vo, page_size=page_size,
             causal=False, pos_encoding_mode="NONE",
-            q_data_type=q_data_type, mask_mode=MaskMode.BLOCK_EXPANDING.value,
+            q_data_type=q_data_type, kv_data_type=kv_data_type,
+            o_data_type=o_data_type, mask_mode=MaskMode.BLOCK_EXPANDING.value,
         )
     
     def run(
@@ -483,9 +621,7 @@ class BatchBlockExtendRaggedOffsetWrapper:
         self._backend = backend
         self._preferred_backend = backend
         self._device = float_workspace_buffer.device
-        self._dtype: Optional[torch.dtype] = None
-        self._head_dim: Optional[int] = None
-        self._idtype: Optional[torch.dtype] = None
+        self._jit_axes: Optional[Tuple[torch.dtype, torch.dtype, torch.dtype, int, int, torch.dtype]] = None
         
         self._float_workspace_buffer = float_workspace_buffer
         self._use_cuda_graph = use_cuda_graph
@@ -498,12 +634,36 @@ class BatchBlockExtendRaggedOffsetWrapper:
         self._q_offsets: Optional[torch.Tensor] = None
         self._kv_offsets: Optional[torch.Tensor] = None
     
-    def _create_inner_wrapper(self, dtype: torch.dtype, head_dim: int, idtype: torch.dtype = torch.int32) -> None:
-        effective_backend = select_best_backend(head_dim, dtype, self._preferred_backend, self._device, idtype)
+    def _create_inner_wrapper(
+        self,
+        dtype_q: torch.dtype,
+        dtype_kv: torch.dtype,
+        dtype_o: torch.dtype,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        idtype: torch.dtype = torch.int32,
+    ) -> None:
+        effective_backend = select_best_backend(
+            head_dim_qk,
+            dtype_q,
+            self._preferred_backend,
+            self._device,
+            idtype,
+            head_dim_vo,
+            dtype_kv,
+            dtype_o,
+        )
         self._backend = effective_backend
 
         jit_args, jit_kwargs = build_block_diffusion_jit_args(
-            head_dim, dtype, idtype, self._backend, layout="ragged"
+            head_dim=head_dim_qk,
+            dtype=dtype_q,
+            idtype=idtype,
+            backend=self._backend,
+            layout="ragged",
+            head_dim_vo=head_dim_vo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_o,
         )
 
         self._inner_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
@@ -512,35 +672,76 @@ class BatchBlockExtendRaggedOffsetWrapper:
             kv_indptr_buf=self._kv_indptr_buf, backend=self._backend,
             jit_args=jit_args, jit_kwargs=jit_kwargs,
         )
-        self._dtype = dtype
-        self._head_dim = head_dim
-        self._idtype = idtype
+        self._jit_axes = (dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo, idtype)
     
     def plan(
         self, qo_indptr: torch.Tensor, kv_indptr: torch.Tensor,
         num_qo_heads: int, num_kv_heads: int, head_dim: int,
         q_data_type: torch.dtype = torch.float16, sm_scale: Optional[float] = None,
         q_offsets: Optional[torch.Tensor] = None, kv_offsets: Optional[torch.Tensor] = None,
+        *,
+        head_dim_vo: Optional[int] = None,
+        kv_data_type: Optional[torch.dtype] = None,
+        o_data_type: Optional[torch.dtype] = None,
     ) -> None:
-        if self._inner_wrapper is None or self._head_dim != head_dim or self._dtype != q_data_type or self._idtype != qo_indptr.dtype:
-            self._create_inner_wrapper(q_data_type, head_dim, qo_indptr.dtype)
+        if qo_indptr.dtype != kv_indptr.dtype:
+            raise ValueError("qo_indptr and kv_indptr must use the same dtype")
+        head_dim_vo = head_dim if head_dim_vo is None else head_dim_vo
+        kv_data_type = q_data_type if kv_data_type is None else kv_data_type
+        o_data_type = q_data_type if o_data_type is None else o_data_type
+        jit_axes = (
+            q_data_type,
+            kv_data_type,
+            o_data_type,
+            head_dim,
+            head_dim_vo,
+            qo_indptr.dtype,
+        )
+        if self._inner_wrapper is None or self._jit_axes != jit_axes:
+            self._create_inner_wrapper(*jit_axes)
+
+        batch_size = qo_indptr.numel() - 1
+        q_offsets = _prepare_shim_block_diffusion_offset(
+            q_offsets,
+            name="q_offsets",
+            batch_size=batch_size,
+            idtype=qo_indptr.dtype,
+            device=self._device,
+        )
+        kv_offsets = _prepare_shim_block_diffusion_offset(
+            kv_offsets,
+            name="kv_offsets",
+            batch_size=batch_size,
+            idtype=qo_indptr.dtype,
+            device=self._device,
+        )
         
         self._sm_scale = sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim)
         
         if self._use_cuda_graph:
             if q_offsets is not None:
-                if self._q_offsets_buf is None:
-                    raise ValueError("q_offsets_buf must be provided in CUDA Graph mode")
-                self._q_offsets_buf[:len(q_offsets)].copy_(q_offsets, non_blocking=True)
-                self._q_offsets = self._q_offsets_buf[:len(q_offsets)]
+                q_offsets_buf = _validate_block_diffusion_offset_buffer(
+                    self._q_offsets_buf,
+                    name="q_offsets_buf",
+                    batch_size=batch_size,
+                    idtype=qo_indptr.dtype,
+                    device=self._device,
+                )
+                q_offsets_buf[:batch_size].copy_(q_offsets, non_blocking=True)
+                self._q_offsets = q_offsets_buf[:batch_size]
             else:
                 self._q_offsets = None
             
             if kv_offsets is not None:
-                if self._kv_offsets_buf is None:
-                    raise ValueError("kv_offsets_buf must be provided in CUDA Graph mode")
-                self._kv_offsets_buf[:len(kv_offsets)].copy_(kv_offsets, non_blocking=True)
-                self._kv_offsets = self._kv_offsets_buf[:len(kv_offsets)]
+                kv_offsets_buf = _validate_block_diffusion_offset_buffer(
+                    self._kv_offsets_buf,
+                    name="kv_offsets_buf",
+                    batch_size=batch_size,
+                    idtype=qo_indptr.dtype,
+                    device=self._device,
+                )
+                kv_offsets_buf[:batch_size].copy_(kv_offsets, non_blocking=True)
+                self._kv_offsets = kv_offsets_buf[:batch_size]
             else:
                 self._kv_offsets = None
         else:
@@ -550,9 +751,10 @@ class BatchBlockExtendRaggedOffsetWrapper:
         self._inner_wrapper.plan(
             qo_indptr=qo_indptr, kv_indptr=kv_indptr,
             num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim, head_dim_vo=head_dim,
+            head_dim_qk=head_dim, head_dim_vo=head_dim_vo,
             causal=False, pos_encoding_mode="NONE",
-            q_data_type=q_data_type, mask_mode=MaskMode.BLOCK_EXPANDING.value,
+            q_data_type=q_data_type, kv_data_type=kv_data_type,
+            o_data_type=o_data_type, mask_mode=MaskMode.BLOCK_EXPANDING.value,
         )
     
     def run(

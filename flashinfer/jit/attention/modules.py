@@ -1291,6 +1291,64 @@ def gen_customize_single_decode_module(
     )
 
 
+def _customize_prefill_dispatch_context(
+    variant_name: str,
+    *,
+    is_batch: bool,
+    is_sm90: bool,
+    is_block_extend: bool,
+) -> str:
+    """Render a dispatcher matching exactly the generated mask specializations."""
+    params = "RaggedParams, PagedParams" if is_batch else "Params"
+    if is_sm90:
+        signature = (
+            "DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, "
+            "HEAD_DIM_VO, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, "
+            f"AttentionVariant, {params}, ..."
+        )
+    else:
+        signature = (
+            "DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, "
+            "HEAD_DIM_VO, POS_ENCODING_MODE, USE_SLIDING_WINDOW, "
+            "USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, "
+            f"AttentionVariant, {params}, ..."
+        )
+
+    if is_block_extend:
+        lines = [
+            f"#define DISPATCH_context({signature}) \\",
+            "  { \\",
+            "    if (mask_mode != MaskMode::kBlockExpanding) { \\",
+            '      FLASHINFER_ERROR("Block-extend JIT module only supports kBlockExpanding"); \\',
+            "    } \\",
+            "    constexpr MaskMode MASK_MODE = MaskMode::kBlockExpanding; \\",
+        ]
+        if not is_sm90:
+            lines.append("    constexpr bool use_custom_mask = false; \\")
+        lines.extend(
+            [
+                f"    using AttentionVariant = {variant_name}; \\",
+                "    __VA_ARGS__(); \\",
+                "  }",
+            ]
+        )
+    else:
+        lines = [
+            f"#define DISPATCH_context({signature}) \\",
+            "  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { \\",
+        ]
+        if not is_sm90:
+            lines.append("    constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom; \\")
+        lines.extend(
+            [
+                f"    using AttentionVariant = {variant_name}; \\",
+                "    __VA_ARGS__(); \\",
+                "  })",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def gen_customize_single_prefill_module(
     backend: str,
     uri: str,
@@ -1345,6 +1403,8 @@ def _gen_customize_single_prefill_module_impl(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
     mask_modes: Optional[List[int]] = None,
+    is_block_extend: bool = False,
+    is_batch: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1370,6 +1430,10 @@ def _gen_customize_single_prefill_module_impl(
                 additional_scalar_names,
                 additional_scalar_dtypes,
             )
+        )
+
+        kwargs["dispatch_context"] = _customize_prefill_dispatch_context(
+            variant_name, is_batch=is_batch, is_sm90=False, is_block_extend=is_block_extend
         )
 
         with open(
@@ -1445,6 +1509,10 @@ def _gen_customize_single_prefill_module_impl(
             _file_kernel_inst = "single_prefill_sm90_kernel_inst.jinja"
             _file_csrc = "single_prefill_sm90.cu"
 
+        kwargs["dispatch_context"] = _customize_prefill_dispatch_context(
+            variant_name, is_batch=is_batch, is_sm90=True, is_block_extend=is_block_extend
+        )
+
         with open(jit_env.FLASHINFER_CSRC_DIR / _file_config) as f:
             config_templ = jinja2.Template(f.read())
 
@@ -1514,11 +1582,19 @@ _BLOCK_EXTEND_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS = {64, 128}
 
 
-def _check_block_extend_axes(dtype_q: torch.dtype, head_dim_qk: int, head_dim_vo: int) -> None:
-    if dtype_q not in _BLOCK_EXTEND_SUPPORTED_DTYPES:
-        raise ValueError(
-            f"Block-extend (dLLM) only supports {_BLOCK_EXTEND_SUPPORTED_DTYPES}, got {dtype_q}."
-        )
+def _check_block_extend_axes(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> None:
+    for name, dtype in (("dtype_q", dtype_q), ("dtype_kv", dtype_kv), ("dtype_o", dtype_o)):
+        if dtype not in _BLOCK_EXTEND_SUPPORTED_DTYPES:
+            raise ValueError(
+                f"Block-extend (dLLM) only supports {_BLOCK_EXTEND_SUPPORTED_DTYPES}, "
+                f"got {name}={dtype}."
+            )
     if head_dim_qk not in _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS or head_dim_vo not in _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS:
         raise ValueError(
             f"Block-extend (dLLM) only supports head_dim in "
@@ -1555,7 +1631,7 @@ def gen_customize_block_extend_single_prefill_module(
     up front — a separate small entry point, not a value multiplied into the big
     shared prefill cartesian product.
     """
-    _check_block_extend_axes(dtype_q, head_dim_qk, head_dim_vo)
+    _check_block_extend_axes(dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo)
     return _gen_customize_single_prefill_module_impl(
         backend, uri, dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo,
         additional_tensor_names, additional_tensor_dtypes,
@@ -1563,6 +1639,7 @@ def gen_customize_block_extend_single_prefill_module(
         variant_name, variant_decl, pos_encoding_mode,
         use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
         [MaskMode.kBlockExpanding.value],
+        is_block_extend=True,
     )
 
 
@@ -1593,7 +1670,7 @@ def gen_customize_block_extend_batch_prefill_module(
     Behaviorally delegates to :func:`gen_customize_batch_prefill_module` with
     ``mask_modes`` fixed to ``[kBlockExpanding]`` and the closed product enforced.
     """
-    _check_block_extend_axes(dtype_q, head_dim_qk, head_dim_vo)
+    _check_block_extend_axes(dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo)
     return _gen_customize_batch_prefill_module_impl(
         backend, uri, dtype_q, dtype_kv, dtype_o, idtype, head_dim_qk, head_dim_vo,
         additional_tensor_names, additional_tensor_dtypes,
@@ -1601,6 +1678,8 @@ def gen_customize_block_extend_batch_prefill_module(
         variant_name, variant_decl, pos_encoding_mode,
         use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
         [MaskMode.kBlockExpanding.value],
+        is_block_extend=True,
+        is_batch=True,
     )
 
 
@@ -1720,6 +1799,7 @@ def gen_customize_batch_prefill_module(
         additional_scalar_dtypes, variant_name, variant_decl, pos_encoding_mode,
         use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
         [0, 1, 2, 3],
+        is_batch=True,
     )
 
 
@@ -1744,6 +1824,8 @@ def _gen_customize_batch_prefill_module_impl(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
     mask_modes: Optional[List[int]] = None,
+    is_block_extend: bool = False,
+    is_batch: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1770,6 +1852,10 @@ def _gen_customize_batch_prefill_module_impl(
                 additional_scalar_names,
                 additional_scalar_dtypes,
             )
+        )
+
+        kwargs["dispatch_context"] = _customize_prefill_dispatch_context(
+            variant_name, is_batch=is_batch, is_sm90=False, is_block_extend=is_block_extend
         )
 
         with open(
@@ -1860,6 +1946,10 @@ def _gen_customize_batch_prefill_module_impl(
             _file_paged_kernel_inst = "batch_prefill_paged_sm90_kernel_inst.jinja"
             _file_ragged_kernel_inst = "batch_prefill_ragged_sm90_kernel_inst.jinja"
             _file_csrc = "batch_prefill_sm90.cu"
+
+        kwargs["dispatch_context"] = _customize_prefill_dispatch_context(
+            variant_name, is_batch=is_batch, is_sm90=True, is_block_extend=is_block_extend
+        )
 
         with open(jit_env.FLASHINFER_CSRC_DIR / _file_config) as f:
             config_templ = jinja2.Template(f.read())

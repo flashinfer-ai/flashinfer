@@ -183,11 +183,6 @@
       __VA_ARGS__                                                 \
       break;                                                      \
     }                                                             \
-    case MaskMode::kBlockExpanding: {                             \
-      constexpr MaskMode MASK_MODE = MaskMode::kBlockExpanding;   \
-      __VA_ARGS__                                                 \
-      break;                                                      \
-    }                                                             \
     default: {                                                    \
       std::ostringstream err_msg;                                 \
       err_msg << "Unsupported mask_mode: " << int(mask_mode);     \

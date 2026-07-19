@@ -181,8 +181,9 @@ struct CollectiveMainloop {
       int64_t q_block = q_global_end / dllm_block_size;
       // Consider kv_offset: max valid kv_idx = (q_block + 1) * B - kv_offset
       int64_t max_kv_global = (q_block + 1) * dllm_block_size;
-      int kv_valid_end = static_cast<int>(std::max(max_kv_global - kv_offset, int64_t(0)));
-      num_kv_tiles = std::min(num_kv_tiles, cute::ceil_div(std::min(kv_len, kv_valid_end), CTA_KV));
+      int64_t kv_valid_end = std::max(max_kv_global - kv_offset, int64_t(0));
+      int visible_kv_len = static_cast<int>(std::min<int64_t>(kv_len, kv_valid_end));
+      num_kv_tiles = std::min(num_kv_tiles, cute::ceil_div(visible_kv_len, CTA_KV));
     }
 
     return num_kv_tiles;
@@ -228,6 +229,8 @@ struct CollectiveMainloop {
                       group_modes<0, 2>(gV));  // (TMA, k), (TMA, PIPE)
 
     int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len, batch_idx);
+    // The producer scheduler filters zero-visible-KV work before entering load().
+    assert(num_kv_tiles > 0);
     int kv_tile_idx = num_kv_tiles - 1;
     int swa_begin_kv_tile_idx = 0;
     if constexpr (LEFT_SLIDING_WINDOW) {

@@ -141,7 +141,8 @@ CUTLASS_DEVICE void mma_f16(
     int64_t q_global = q_block_expanding_offset + qo_idx;
     int64_t q_block = q_global / dllm_block_size;
     int64_t max_kv_global = (q_block + 1) * dllm_block_size;
-    return static_cast<int>(std::max(max_kv_global - kv_block_expanding_offset, int64_t(0)));
+    int64_t visible_kv_len = std::max(max_kv_global - kv_block_expanding_offset, int64_t(0));
+    return static_cast<int>(std::min<int64_t>(kv_len, visible_kv_len));
   };
 
   auto mask_multi_item_scoring = [&](decltype(tSrS)& tSrS, int i, int qo_idx, int kv_idx) {
