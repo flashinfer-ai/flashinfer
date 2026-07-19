@@ -925,6 +925,19 @@ class TestCuteDslMoeBf16Activation:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+        # Weight scales are serving-owned tensors and may be updated in place.
+        # Reuse the same allocation to ensure W4A16 reads the current contents.
+        tensors["w1_weight_sf"].zero_()
+        if use_wrapper:
+            updated = moe.run(**kwargs)
+        else:
+            updated = cute_dsl_fused_moe_nvfp4(
+                **kwargs,
+                num_experts=num_experts,
+                top_k=top_k,
+            )
+        torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
+
 
 # =============================================================================
 # Test Class: Functional API (cute_dsl_fused_moe_nvfp4)
