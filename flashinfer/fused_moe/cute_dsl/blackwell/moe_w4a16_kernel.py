@@ -990,7 +990,7 @@ class Sm100W4A16GroupedGemmKernel:
         gC_mnl_simt = cute.local_tile(
             tensor_c, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
-        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
         # Partition global tensor for TiledMMA_A/B/C
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
@@ -1576,9 +1576,15 @@ class Sm100W4A16GroupedGemmKernel:
                         if cutlass.const_expr(
                             self.scale_mode == TransformMode.ConvertScale
                         ):
+                            packed_fragment = cute.recast_tensor(
+                                tArA_load[(None, idx)], cutlass.Uint8
+                            ).load()
+                            scale_fragment = cute.recast_tensor(
+                                tSrS_load[(None, (None, idx))], cutlass.Uint8
+                            ).load()
                             tensor_transformed = decode_nvfp4_fragment_to_bf16(
-                                tArA_load[(None, idx)].load(),
-                                tSrS_load[(None, (None, idx))].load(),
+                                packed_fragment,
+                                scale_fragment,
                             )
                         else:
                             tensor_transformed = mixed_input_utils.cvt_tensor_a(
