@@ -237,14 +237,11 @@ class Sm100W4A16GroupedGemmKernel:
             + 1
         )
 
-        # Set barrier id for cta sync, epilogue sync, tmem ptr sync, and transform sync
+        # Set barrier id for cta sync, epilogue sync, and tmem ptr sync
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             1, 32 * len(self.epilog_warp_id)
         )
         self.tmem_ptr_sync_barrier = pipeline.NamedBarrier(2, self.threads_per_cta)
-        self.transform_sync_barrier = pipeline.NamedBarrier(
-            3, 32 * len(self.transform_warp_id)
-        )
         self.cta_sync_barrier = pipeline.NamedBarrier(4, self.threads_per_cta)
         self.sched_sync_barrier = pipeline.NamedBarrier(5, 32)
 
@@ -1601,8 +1598,6 @@ class Sm100W4A16GroupedGemmKernel:
                         ],
                         dst_copy_a,
                     )
-                    # Ensure all transform threads have finished the copy and reached the fence
-                    self.transform_sync_barrier.arrive_and_wait()
                     if cutlass.const_expr(
                         self.transform_a_source == tcgen05.OperandSource.TMEM
                     ):
