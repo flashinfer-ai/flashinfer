@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
 import torch
@@ -10,7 +11,13 @@ COMPACT_EMPTY_EXPERTS = False
 EXPERT_PAD = 1
 
 _runner = None
-_weight_cache: dict[int, tuple[torch.Tensor, ...]] = {}
+_QuantizedWeights = tuple[torch.Tensor, ...]
+_WeightCacheEntry = tuple[
+    weakref.ReferenceType[torch.Tensor],
+    weakref.ReferenceType[torch.Tensor],
+    _QuantizedWeights,
+]
+_weight_cache: dict[tuple[int, int], _WeightCacheEntry] = {}
 
 
 def get_runner():
@@ -26,10 +33,13 @@ def get_runner():
 
 
 def quant_weights(w13: torch.Tensor, w2: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    """Quantize expert weights with 128x128 scales and cache by storage identity."""
-    key = w13.data_ptr()
-    if key in _weight_cache:
-        return _weight_cache[key]
+    """Quantize expert weights and cache results for the exact source tensors."""
+    key = (w13.data_ptr(), w2.data_ptr())
+    cached = _weight_cache.get(key)
+    if cached is not None:
+        cached_w13, cached_w2, result = cached
+        if cached_w13() is w13 and cached_w2() is w2:
+            return result
     from flashinfer.testing.utils import per_block_cast_to_fp8
 
     num_experts, two_intermediate, hidden = w13.shape
@@ -59,7 +69,7 @@ def quant_weights(w13: torch.Tensor, w2: torch.Tensor) -> tuple[torch.Tensor, ..
         w2_fp8[expert].copy_(quantized)
         w2_scales[expert].copy_(scales)
     result = (w13_fp8, w13_scales, w2_fp8, w2_scales)
-    _weight_cache[key] = result
+    _weight_cache[key] = (weakref.ref(w13), weakref.ref(w2), result)
     return result
 
 
