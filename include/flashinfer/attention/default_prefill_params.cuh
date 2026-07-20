@@ -155,6 +155,12 @@ struct BatchPrefillRaggedParams {
   uint32_t k_stride_h;
   uint32_t v_stride_n;
   uint32_t v_stride_h;
+  uint32_t k_sf_stride_page;
+  uint32_t k_sf_stride_n;
+  uint32_t k_sf_stride_h;
+  uint32_t v_sf_stride_page;
+  uint32_t v_sf_stride_n;
+  uint32_t v_sf_stride_h;
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
@@ -200,6 +206,12 @@ struct BatchPrefillRaggedParams {
         k_stride_h(0),
         v_stride_n(0),
         v_stride_h(0),
+        k_sf_stride_page(0),
+        k_sf_stride_n(0),
+        k_sf_stride_h(0),
+        v_sf_stride_page(0),
+        v_sf_stride_n(0),
+        v_sf_stride_h(0),
         window_left(0),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
@@ -251,6 +263,12 @@ struct BatchPrefillRaggedParams {
         k_stride_h(kv_stride_h),
         v_stride_n(kv_stride_n),
         v_stride_h(kv_stride_h),
+        k_sf_stride_page(0),
+        k_sf_stride_n(0),
+        k_sf_stride_h(0),
+        v_sf_stride_page(0),
+        v_sf_stride_n(0),
+        v_sf_stride_h(0),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
@@ -301,6 +319,12 @@ struct BatchPrefillPagedParams {
   uint32_t num_qo_heads;
   IdType q_stride_n;
   IdType q_stride_h;
+  uint32_t k_sf_stride_page;
+  uint32_t k_sf_stride_n;
+  uint32_t k_sf_stride_h;
+  uint32_t v_sf_stride_page;
+  uint32_t v_sf_stride_n;
+  uint32_t v_sf_stride_h;
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
@@ -338,6 +362,12 @@ struct BatchPrefillPagedParams {
         num_qo_heads(0),
         q_stride_n(0),
         q_stride_h(0),
+        k_sf_stride_page(0),
+        k_sf_stride_n(0),
+        k_sf_stride_h(0),
+        v_sf_stride_page(0),
+        v_sf_stride_n(0),
+        v_sf_stride_h(0),
         window_left(0),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
@@ -379,6 +409,12 @@ struct BatchPrefillPagedParams {
         num_qo_heads(num_qo_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
+        k_sf_stride_page(0),
+        k_sf_stride_n(0),
+        k_sf_stride_h(0),
+        v_sf_stride_page(0),
+        v_sf_stride_n(0),
+        v_sf_stride_h(0),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),

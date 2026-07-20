@@ -20,7 +20,11 @@ import torch
 
 import flashinfer
 from flashinfer.jit import JitSpec
-from flashinfer.utils import is_fa3_backend_supported, is_sm90a_supported
+from flashinfer.utils import (
+    is_fa3_backend_supported,
+    is_fa3_prefill_head_dim_supported,
+    is_sm90a_supported,
+)
 
 
 def gen_decode_attention_modules(
@@ -153,12 +157,16 @@ def gen_prefill_attention_modules(
             if kv_dtype.itemsize > 1:
                 continue  # skip fp16/bf16 mixed precision
 
-        if is_sm90a_supported(torch.device("cuda")) and is_fa3_backend_supported(
-            pos_encoding_mode,
-            use_fp16_qk_reduction,
-            use_custom_mask=False,
-            dtype_q=q_dtype,
-            dtype_kv=kv_dtype,
+        if (
+            is_sm90a_supported(torch.device("cuda"))
+            and is_fa3_backend_supported(
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                use_custom_mask=False,
+                dtype_q=q_dtype,
+                dtype_kv=kv_dtype,
+            )
+            and is_fa3_prefill_head_dim_supported(head_dim, head_dim)
         ):
             if q_dtype != kv_dtype:
                 continue  # fa3 template do not support mixed precision

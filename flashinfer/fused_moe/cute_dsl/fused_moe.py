@@ -61,11 +61,23 @@ from ...trace.templates.moe import (
     cute_dsl_fused_moe_nvfp4_trace,
     cute_dsl_moe_wrapper_run_trace,
 )
+from ...tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+)
 from ...autotuner import AutoTuner
+from ...cute_dsl.utils import convert_sf_to_mma_layout
+from ...quantization.kernels.nvfp4_quantize import (
+    SF_LAYOUT_128x4,
+    nvfp4_quantize_per_token_cute_dsl,
+)
 from ...utils import supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
+    normalize_cute_dsl_moe_activation_type,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4,
@@ -83,6 +95,17 @@ from .tuner import (
 # =============================================================================
 
 _cuda_graph_resources: Dict[str, Any] = {}
+
+
+def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
+    if output_dtype == torch.float16:
+        return "float16"
+    if output_dtype == torch.bfloat16:
+        return "bfloat16"
+    raise ValueError(
+        "CuTe-DSL MoE per-token FC2 input quantization supports only "
+        f"torch.float16 and torch.bfloat16 intermediate dtypes, got {output_dtype}."
+    )
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:
@@ -135,6 +158,7 @@ def _moe_core_impl(
     gemm1_out: Optional[torch.Tensor] = None,
     gemm1_out_scale: Optional[torch.Tensor] = None,
     moe_output: Optional[torch.Tensor] = None,
+    per_token_scale: Optional[torch.Tensor] = None,
     # Stream resources
     aux_stream: Optional[torch.cuda.Stream] = None,
     main_event: Optional[torch.cuda.Event] = None,
@@ -143,7 +167,10 @@ def _moe_core_impl(
     output_dtype: torch.dtype = torch.bfloat16,
     use_async_memset: bool = True,
     enable_pdl: bool = True,
-    activation: str = "silu",
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -178,17 +205,28 @@ def _moe_core_impl(
         gemm1_out: Pre-allocated GEMM1 output buffer.
         gemm1_out_scale: Pre-allocated GEMM1 output scale buffer.
         moe_output: Pre-allocated final output buffer.
+        per_token_scale: Optional per-token input row scale for GEMM1.
         aux_stream: Auxiliary CUDA stream for async memset.
         main_event: CUDA event for main stream.
         memset_event: CUDA event for memset completion.
         output_dtype: Output data type.
         use_async_memset: Use async memset on aux stream.
+        activation_type: Activation type to apply after GEMM1. Use
+            ActivationType.Swiglu for gated mode and ActivationType.Relu2 for
+            non-gated mode; swiglu_oai is represented as Swiglu with
+            non-default swiglu_alpha/beta/limit.
+        swiglu_alpha: SwiGLU sigmoid multiplier.
+        swiglu_beta: SwiGLU up-projection bias.
+        swiglu_limit: SwiGLU clamp limit.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
+    activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
+    use_per_token_activation = per_token_scale is not None
 
     # Allocate output if not provided.  The caller (wrapper or functional
     # API) should pass a [:num_tokens] slice of the pre-allocated buffer
@@ -239,14 +277,22 @@ def _moe_core_impl(
         moe_output.record_stream(aux_stream)
 
     # Step 2: GEMM1 + activation
-    if activation == "silu":
-        gated = True
-    elif activation == "relu2":
-        gated = False
-    else:
-        raise ValueError(
-            f"CuteDSL MoE GEMM1 supports activation 'silu' or 'relu2', got {activation!r}."
-        )
+    output_kwargs: Dict[str, Any] = (
+        {
+            "out_scale": None,
+            "global_scale": None,
+            "a_per_token_scale": per_token_scale,
+            "c_dtype": _intermediate_c_dtype(output_dtype),
+        }
+        if use_per_token_activation
+        else {
+            "out_scale": gemm1_out_scale,
+            "global_scale": fc2_input_scale,
+            "a_per_token_scale": None,
+            "c_dtype": "float4_e2m1fn",
+        }
+    )
+    intermediate_per_token_scale = None
     intermediate, intermediate_sf = (
         blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             a=x,
@@ -259,16 +305,34 @@ def _moe_core_impl(
             token_id_mapping=permuted_idx_to_expanded_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
             out=gemm1_out,
-            out_scale=gemm1_out_scale,
-            global_scale=fc2_input_scale,
+            **output_kwargs,
             topk=top_k,
-            c_dtype="float4_e2m1fn",
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
             enable_pdl=enable_pdl,
+            activation_type=activation_type.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
             gated=gated,
         )
     )
+    if use_per_token_activation:
+        intermediate, intermediate_sf, intermediate_per_token_scale = (
+            nvfp4_quantize_per_token_cute_dsl(
+                intermediate,
+                fc2_input_scale,
+                sf_layout=SF_LAYOUT_128x4,
+                enable_pdl=enable_pdl,
+            )
+        )
+        intermediate_sf = convert_sf_to_mma_layout(
+            intermediate_sf,
+            m=intermediate.shape[0],
+            k=intermediate.shape[1] * 2,
+            num_groups=1,
+            sf_vec_size=16,
+        )
 
     # Step 3: Zero the active output slice before GEMM2 finalize.
     # Finalize uses atomic scatter-add into `moe_output`, so it must start
@@ -306,6 +370,7 @@ def _moe_core_impl(
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
         out=moe_output,
+        a_per_token_scale=intermediate_per_token_scale,
         mma_tiler_mn=gemm2_mma_tiler_mn,
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
@@ -379,7 +444,10 @@ class CuteDslMoEWrapper:
         output_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         enable_pdl: bool = True,
-        activation: str = "silu",
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     ):
         r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
 
@@ -415,10 +483,15 @@ class CuteDslMoEWrapper:
             Device on which to allocate buffers.  Defaults to ``"cuda"``.
         enable_pdl : bool
             Enable Programmatic Dependent Launch.  Defaults to ``True``.
-        activation : str
-            FC1 activation function: ``"silu"`` for gated SwiGLU (default)
-            or ``"relu2"`` for ReLU².  Defaults to ``"silu"``.
+        activation_type : int
+            FC1 activation type. Use ``ActivationType.Swiglu`` for gated
+            SwiGLU and ``ActivationType.Relu2`` for non-gated ReLU^2.
+        swiglu_alpha, swiglu_beta, swiglu_limit : float
+            SwiGLU parameters. ``swiglu_oai`` is represented as
+            ``ActivationType.Swiglu`` with non-default values.
         """
+        activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -431,7 +504,11 @@ class CuteDslMoEWrapper:
         self.output_dtype = output_dtype
         self.device = device
         self.enable_pdl = enable_pdl
-        self.activation = activation
+        self.activation_type = activation_type
+        self.gated = gated
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -463,7 +540,26 @@ class CuteDslMoEWrapper:
             use_fused_finalize=True,
             output_dtype=output_dtype,
             enable_pdl=enable_pdl,
-            activation=activation,
+            activation_type=activation_type.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            use_per_token_activation=False,
+        )
+        self._per_token_runner = CuteDslFusedMoENvfp4Runner(
+            forward_impl=_forward_with_tactic_weak,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=self.num_local_experts,
+            local_expert_offset=local_expert_offset,
+            use_fused_finalize=True,
+            output_dtype=output_dtype,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            use_per_token_activation=True,
         )
 
         if use_cuda_graph:
@@ -496,6 +592,7 @@ class CuteDslMoEWrapper:
         output_dtype: torch.dtype = torch.bfloat16,
         use_fused_finalize: bool = True,
         moe_output: Optional[torch.Tensor] = None,
+        per_token_scale: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
         **kwargs,
     ) -> torch.Tensor:
@@ -525,13 +622,17 @@ class CuteDslMoEWrapper:
             gemm1_out=None,
             gemm1_out_scale=None,
             moe_output=moe_output,
+            per_token_scale=per_token_scale,
             aux_stream=self._aux_stream,
             main_event=self._main_event,
             memset_event=self._memset_event,
             output_dtype=output_dtype,
             use_async_memset=True,
             enable_pdl=enable_pdl,
-            activation=self.activation,
+            activation_type=self.activation_type.value,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -549,6 +650,8 @@ class CuteDslMoEWrapper:
         w2_weight_sf: torch.Tensor,
         w2_alpha: torch.Tensor,
         tactic: Optional[Tuple] = None,
+        *,
+        per_token_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the CuTe-DSL NVFP4 fused-MoE forward pass.
 
@@ -583,6 +686,9 @@ class CuteDslMoEWrapper:
         tactic : Optional[Tuple]
             Tactic tuple, or ``None`` for auto-selection via the runtime
             tuner.
+        per_token_scale : Optional[torch.Tensor]
+            Per-token input row scale for GEMM1. Passing this enables the
+            per-token activation path.
 
         Returns
         -------
@@ -590,6 +696,8 @@ class CuteDslMoEWrapper:
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
         num_tokens = token_selected_experts.size(0)
+        use_per_token_activation = per_token_scale is not None
+        runner = self._per_token_runner if use_per_token_activation else self._runner
 
         moe_output = torch.empty(
             (num_tokens, self.hidden_size),
@@ -612,22 +720,24 @@ class CuteDslMoEWrapper:
             w2_weight,
             w2_weight_sf,
             w2_alpha,
-            moe_output,
         ]
+        if use_per_token_activation:
+            inputs.append(per_token_scale)
+        inputs.append(moe_output)
 
         if tactic is not None:
             # Use provided tactic
-            return self._runner(inputs, tactic=tactic)
+            return runner(inputs, tactic=tactic)
 
         # Let tuner choose tactic
         _, best_tactic = tuner.choose_one(
-            "CuteDslMoEWrapper::run",
-            [self._runner],
-            self._runner.tuning_config,
+            f"CuteDslMoEWrapper::run::{self.activation_type.name}",
+            [runner],
+            runner.tuning_config,
             inputs,
         )
 
-        return self._runner(inputs, tactic=best_tactic)
+        return runner(inputs, tactic=best_tactic)
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
@@ -663,9 +773,13 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     output_dtype: torch.dtype = torch.bfloat16,
     use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
+    per_token_scale: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
-    activation: str = "silu",
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -690,11 +804,15 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         gemm2_mma_tiler_mn=gemm2_mma_tiler_mn,
         gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
         moe_output=moe_output,
+        per_token_scale=per_token_scale,
         aux_stream=aux_stream,
         output_dtype=output_dtype,
         use_async_memset=True,
         enable_pdl=enable_pdl,
-        activation=activation,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -721,7 +839,12 @@ def cute_dsl_fused_moe_nvfp4(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
-    activation: str = "silu",
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    *,
+    per_token_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -776,17 +899,27 @@ def cute_dsl_fused_moe_nvfp4(
         main computation.
     enable_pdl : bool
         Enable Programmatic Dependent Launch.  Defaults to ``True``.
-    activation : str
-        FC1 activation: ``"silu"`` for gated SwiGLU (default) or ``"relu2"``
-        for non-gated ReLU^2.
+    activation_type : int
+        FC1 activation type. Use ``ActivationType.Swiglu`` for gated SwiGLU
+        and ``ActivationType.Relu2`` for non-gated ReLU^2. ``swiglu_oai`` is
+        represented as ``ActivationType.Swiglu`` with non-default
+        ``swiglu_alpha/beta/limit``.
+    swiglu_alpha, swiglu_beta, swiglu_limit : float
+        SwiGLU parameters.
+    per_token_scale : Optional[torch.Tensor]
+        Per-token input row scale for GEMM1. Passing this enables the
+        per-token activation path.
 
     Returns
     -------
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
+    activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+
     if num_local_experts is None:
         num_local_experts = num_experts
+    use_per_token_activation = per_token_scale is not None
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
@@ -809,7 +942,11 @@ def cute_dsl_fused_moe_nvfp4(
         use_fused_finalize=use_fused_finalize,
         output_dtype=output_dtype,
         enable_pdl=enable_pdl,
-        activation=activation,
+        activation_type=activation_type.value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        use_per_token_activation=use_per_token_activation,
     )
 
     inputs = [
@@ -824,18 +961,24 @@ def cute_dsl_fused_moe_nvfp4(
         w2_weight,
         w2_weight_sf,
         w2_alpha,
-        moe_output,
     ]
+    if use_per_token_activation:
+        inputs.append(per_token_scale)
+    inputs.append(moe_output)
 
     _, best_tactic = tuner.choose_one(
-        "CuteDslFusedMoE::run_moe_nvfp4",
+        f"CuteDslFusedMoE::run_moe_nvfp4::{activation_type.name}",
         [runner],
         runner.tuning_config,
         inputs,
         aux_stream=aux_stream,
     )
 
-    return runner(inputs, tactic=best_tactic, aux_stream=aux_stream)
+    return runner(
+        inputs,
+        tactic=best_tactic,
+        aux_stream=aux_stream,
+    )
 
 
 __all__ = [

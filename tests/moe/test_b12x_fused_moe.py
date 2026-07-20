@@ -32,13 +32,17 @@ Tests include:
 - ReLU2 (non-gated) activation for Nemotron-Super
 """
 
-from typing import Optional
-
 import pytest
 import torch
-from torch.nn import functional as F
 
 from flashinfer.cute_dsl import is_cute_dsl_available
+from .utils import (
+    check_accuracy,
+    compute_reference_moe_fp4,
+    compute_reference_moe_relu2,
+    create_b12x_moe_tensors as create_moe_tensors,
+    create_relu2_moe_tensors,
+)
 
 
 def is_sm120_family():
@@ -610,439 +614,6 @@ def test_preallocated_dynamic_workspace_rejects_remapped_experts():
 
 
 # =============================================================================
-# Helper functions (shared reference logic)
-# =============================================================================
-
-
-def silu(x: torch.Tensor) -> torch.Tensor:
-    """SiLU activation: x * sigmoid(x)"""
-    return x * torch.sigmoid(x)
-
-
-def interleave_linear_and_gate(
-    x: torch.Tensor, group_size: int = 64, dim: int = -1
-) -> torch.Tensor:
-    """Interleave linear and gate weights for SwiGLU."""
-    sizes = x.size()
-    dim = dim % x.dim()
-    assert sizes[dim] % (group_size * 2) == 0
-    prev_sizes = sizes[:dim]
-    post_sizes = sizes[dim + 1 :]
-    x = x.view(*prev_sizes, 2, sizes[dim] // (group_size * 2), group_size, *post_sizes)
-    x = x.transpose(dim, dim + 1).contiguous().view(*sizes)
-    return x
-
-
-def quant_dequant_fp4_reference(
-    tensor: torch.Tensor,
-    global_scale: torch.Tensor,
-    sf_vec_size: int = 16,
-) -> torch.Tensor:
-    """Simulate FP4 quantization and dequantization for reference computation."""
-    from flashinfer.fp4_quantization import fp4_quantize, e2m1_and_ufp8sf_scale_to_float
-
-    tensor_bf16 = tensor.to(torch.bfloat16)
-    fp4_packed, sf = fp4_quantize(
-        tensor_bf16,
-        global_scale=global_scale,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=False,
-    )
-
-    sf_uint8 = sf.view(torch.uint8).reshape(-1)
-    dequantized = e2m1_and_ufp8sf_scale_to_float(
-        fp4_packed.cpu(),
-        sf_uint8.cpu(),
-        (1.0 / global_scale).cpu(),
-        sf_vec_size=sf_vec_size,
-        ufp8_type=1,
-        is_sf_swizzled_layout=False,
-    ).to(tensor.device)
-
-    return dequantized.float()
-
-
-def compute_reference_moe_fp4(
-    hidden_states: torch.Tensor,
-    gemm1_weights: torch.Tensor,
-    gemm2_weights: torch.Tensor,
-    token_selected_experts: torch.Tensor,
-    token_final_scales: torch.Tensor,
-    num_tokens: int,
-    num_experts: int,
-    top_k: int,
-    hidden_size: int,
-    intermediate_size: int,
-    fc2_input_scale: torch.Tensor = None,
-    num_local_experts: int = None,
-    local_expert_offset: int = 0,
-) -> torch.Tensor:
-    """Compute reference MoE output using PyTorch operations on GPU.
-
-    Args:
-        hidden_states: Input hidden states [num_tokens, hidden_size]
-        gemm1_weights: GEMM1 weights [num_local_experts, 2*intermediate_size, hidden_size]
-        gemm2_weights: GEMM2 weights [num_local_experts, hidden_size, intermediate_size]
-        token_selected_experts: Selected expert IDs (global) [num_tokens, top_k]
-        token_final_scales: Routing weights [num_tokens, top_k]
-        num_tokens: Number of tokens
-        num_experts: Total number of experts (global)
-        top_k: Number of experts per token
-        hidden_size: Hidden dimension
-        intermediate_size: Intermediate dimension
-        fc2_input_scale: Optional scale for FC2 input quantization
-        num_local_experts: Number of local experts (for EP). Defaults to num_experts.
-        local_expert_offset: Starting expert ID for this EP rank. Defaults to 0.
-
-    Returns:
-        Output tensor [num_tokens, hidden_size]
-    """
-    if num_local_experts is None:
-        num_local_experts = num_experts
-
-    device = hidden_states.device
-
-    hidden_states = hidden_states.float()
-    gemm1_weights = gemm1_weights.float()
-    gemm2_weights = gemm2_weights.float()
-
-    output = torch.zeros((num_tokens, hidden_size), dtype=torch.float32, device=device)
-
-    for token_idx in range(num_tokens):
-        token_input = hidden_states[token_idx : token_idx + 1]
-
-        for k in range(top_k):
-            expert_idx = token_selected_experts[token_idx, k].item()
-            scale = token_final_scales[token_idx, k].item()
-
-            # Skip invalid expert IDs
-            if expert_idx < 0 or expert_idx >= num_experts:
-                continue
-
-            # Convert global expert ID to local index for EP
-            local_idx = expert_idx - local_expert_offset
-            if local_idx < 0 or local_idx >= num_local_experts:
-                # This expert is not on this EP rank, skip
-                continue
-
-            w1 = gemm1_weights[local_idx]
-            gemm1_out = token_input @ w1.T
-
-            linear = gemm1_out[:, :intermediate_size]
-            gate = gemm1_out[:, intermediate_size:]
-            swiglu_out = silu(gate) * linear
-
-            if fc2_input_scale is not None:
-                swiglu_out = quant_dequant_fp4_reference(
-                    swiglu_out, fc2_input_scale, sf_vec_size=16
-                )
-
-            w2 = gemm2_weights[local_idx]
-            gemm2_out = swiglu_out @ w2.T
-
-            output[token_idx] += scale * gemm2_out.squeeze(0)
-
-    return output
-
-
-def create_moe_tensors(
-    num_tokens: int,
-    hidden_size: int,
-    intermediate_size: int,
-    num_experts: int,
-    num_local_experts: int,
-    top_k: int,
-    device: str = "cuda",
-    seed: int = 42,
-):
-    """Create properly quantized MoE tensors for testing."""
-    from flashinfer.fp4_quantization import fp4_quantize
-    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
-
-    torch.manual_seed(seed)
-    sf_vec_size = 16
-
-    # Input
-    x_bf16 = (
-        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
-    )
-    a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-
-    x_quantized, x_sf = fp4_quantize(
-        x_bf16, global_scale=a1_gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=False
-    )
-    x_sf = x_sf.unsqueeze(-1)
-
-    # Routing
-    router_logits = torch.randn(num_tokens, num_experts, device=device)
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-    routing_weights = routing_weights.float()
-    selected_experts = selected_experts.to(torch.int32)
-
-    # GEMM1 weights
-    w1_bf16 = (
-        torch.randn(
-            num_local_experts,
-            2 * intermediate_size,
-            hidden_size,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        / 10
-    )
-
-    # SM120/121: no interleave — kernel expects [up_0:N, gate_0:N] (contiguous cat)
-    if is_sm120_family():
-        w1_bf16_prepared = w1_bf16  # b12x kernel: non-interleaved
-    else:
-        w1_bf16_prepared = interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
-    w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-
-    w1_flat = w1_bf16_prepared.view(
-        num_local_experts * 2 * intermediate_size, hidden_size
-    )
-    w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_flat, global_scale=w1_gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=True
-    )
-    w1_q = w1_q_flat.view(num_local_experts, 2 * intermediate_size, hidden_size // 2)
-    w1_weight_sf = convert_sf_to_mma_layout(
-        w1_sf_flat,
-        m=2 * intermediate_size,
-        k=hidden_size,
-        num_groups=num_local_experts,
-        sf_vec_size=sf_vec_size,
-    )
-    w1_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
-
-    # GEMM2 weights
-    w2_bf16 = (
-        torch.randn(
-            num_local_experts,
-            hidden_size,
-            intermediate_size,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        / 10
-    )
-
-    w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
-    w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_flat, global_scale=w2_gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=True
-    )
-    w2_q = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2)
-    w2_weight_sf = convert_sf_to_mma_layout(
-        w2_sf_flat,
-        m=hidden_size,
-        k=intermediate_size,
-        num_groups=num_local_experts,
-        sf_vec_size=sf_vec_size,
-    )
-    w2_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
-
-    fc2_input_scale = torch.tensor([1.0], device=device, dtype=torch.float32)
-
-    return {
-        "x": x_quantized,
-        "x_sf": x_sf,
-        "x_bf16": x_bf16,
-        "token_selected_experts": selected_experts,
-        "token_final_scales": routing_weights,
-        "w1_weight": w1_q,
-        "w1_weight_sf": w1_weight_sf,
-        "w1_weight_bf16": w1_bf16,
-        "w1_alpha": w1_alpha,
-        "fc2_input_scale": fc2_input_scale,
-        "w2_weight": w2_q,
-        "w2_weight_sf": w2_weight_sf,
-        "w2_weight_bf16": w2_bf16,
-        "w2_alpha": w2_alpha,
-    }
-
-
-def check_accuracy(
-    actual: torch.Tensor, expected: torch.Tensor, percent_threshold: float = 0.97
-):
-    """Check numerical accuracy with percentage-based tolerance.
-
-    Tolerances are scaled by output magnitude to account for FP4 quantization
-    noise growing with larger hidden dimensions.
-    """
-    actual = actual.float()
-    expected = expected.float()
-
-    output_scale = max(expected.std().item(), 0.01)
-    atol = max(0.05, 1.5 * output_scale)
-    rtol = 0.5
-
-    abs_diff = torch.abs(actual - expected)
-    rel_diff = abs_diff / (torch.abs(expected) + 1e-8)
-    within_tolerance = (abs_diff < atol) | (rel_diff < rtol)
-    percent_within = within_tolerance.float().mean().item()
-
-    return percent_within >= percent_threshold, percent_within, atol
-
-
-def compute_reference_moe_relu2(
-    hidden_states: torch.Tensor,
-    fc1_weights: torch.Tensor,
-    fc2_weights: torch.Tensor,
-    token_selected_experts: torch.Tensor,
-    token_final_scales: torch.Tensor,
-    num_tokens: int,
-    num_experts: int,
-    top_k: int,
-    hidden_size: int,
-    intermediate_size: int,
-    fc2_input_scale: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """Reference ReLU2 MoE: output = relu(FC1(x))^2, then FC2."""
-    output = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device="cuda")
-
-    for token_idx in range(num_tokens):
-        token_input = hidden_states[token_idx].unsqueeze(0)
-
-        for k in range(top_k):
-            expert_idx = token_selected_experts[token_idx, k].item()
-            scale = token_final_scales[token_idx, k].item()
-
-            if expert_idx >= num_experts:
-                continue
-
-            w1 = fc1_weights[expert_idx]
-            fc1_out = token_input @ w1.T
-            activated = torch.square(torch.relu(fc1_out))
-
-            if fc2_input_scale is not None:
-                activated = quant_dequant_fp4_reference(
-                    activated, fc2_input_scale, sf_vec_size=16
-                )
-
-            w2 = fc2_weights[expert_idx]
-            fc2_out = activated @ w2.T
-
-            output[token_idx] += scale * fc2_out.squeeze(0)
-
-    return output
-
-
-def create_relu2_moe_tensors(
-    num_tokens: int,
-    hidden_size: int,
-    intermediate_size: int,
-    num_experts: int,
-    num_local_experts: int,
-    top_k: int,
-    device: str = "cuda",
-    seed: int = 42,
-):
-    """Create MoE tensors for ReLU2 (non-gated: w1_rows = n, not 2*n)."""
-    from flashinfer.fp4_quantization import fp4_quantize
-    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
-
-    torch.manual_seed(seed)
-    sf_vec_size = 16
-
-    x_bf16 = (
-        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
-    )
-    a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    x_quantized, x_sf = fp4_quantize(
-        x_bf16,
-        global_scale=a1_gs,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=False,
-    )
-    x_sf = x_sf.unsqueeze(-1)
-
-    router_logits = torch.randn(num_tokens, num_experts, device=device)
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-    routing_weights = routing_weights.float()
-    selected_experts = selected_experts.to(torch.int32)
-
-    # FC1 weights — NON-GATED: [E, n, k] instead of [E, 2*n, k]
-    w1_bf16 = (
-        torch.randn(
-            num_local_experts,
-            intermediate_size,
-            hidden_size,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        / 10
-    )
-    w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_flat = w1_bf16.view(num_local_experts * intermediate_size, hidden_size)
-    w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_flat,
-        global_scale=w1_gs,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=True,
-    )
-    w1_q = w1_q_flat.view(num_local_experts, intermediate_size, hidden_size // 2)
-    w1_weight_sf = convert_sf_to_mma_layout(
-        w1_sf_flat,
-        m=intermediate_size,
-        k=hidden_size,
-        num_groups=num_local_experts,
-        sf_vec_size=sf_vec_size,
-    )
-    w1_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
-
-    # FC2 weights — same shape as SiLU: [E, k, n]
-    w2_bf16 = (
-        torch.randn(
-            num_local_experts,
-            hidden_size,
-            intermediate_size,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        / 10
-    )
-    w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
-    w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_flat,
-        global_scale=w2_gs,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=True,
-    )
-    w2_q = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2)
-    w2_weight_sf = convert_sf_to_mma_layout(
-        w2_sf_flat,
-        m=hidden_size,
-        k=intermediate_size,
-        num_groups=num_local_experts,
-        sf_vec_size=sf_vec_size,
-    )
-    w2_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
-    fc2_input_scale = torch.tensor([1.0], device=device, dtype=torch.float32)
-
-    return {
-        "x": x_quantized,
-        "x_sf": x_sf,
-        "x_bf16": x_bf16,
-        "token_selected_experts": selected_experts,
-        "token_final_scales": routing_weights,
-        "w1_weight": w1_q,
-        "w1_weight_sf": w1_weight_sf,
-        "w1_weight_bf16": w1_bf16,
-        "w1_alpha": w1_alpha,
-        "fc2_input_scale": fc2_input_scale,
-        "w2_weight": w2_q,
-        "w2_weight_sf": w2_weight_sf,
-        "w2_weight_bf16": w2_bf16,
-        "w2_alpha": w2_alpha,
-    }
-
-
-# =============================================================================
 # Test Class: Functional API (b12x_fused_moe)
 # =============================================================================
 
@@ -1120,6 +691,124 @@ class TestB12xFunctional:
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
+
+    @pytest.mark.parametrize(
+        "activation", ["silu", "gelu_tanh", "swigluoai_uninterleave"]
+    )
+    @pytest.mark.parametrize("num_tokens", [8, 128, 515])
+    def test_activation_accuracy(self, activation: str, num_tokens: int):
+        """Accuracy of each gated activation: SwiGLU, GeGLU and SwiGLU-OAI.
+
+        Num tokens chosen to trigger the micro, static and dynamic backends to ensure
+        that all three backends are tested.
+        """
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 1536, 768
+        num_experts, top_k = 8, 2
+        swiglu_limit = (
+            7.0 if activation == "swigluoai_uninterleave" else None
+        )  # Minimax-M3 clamp limit
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+        )
+        assert not torch.isnan(result).any() and not torch.isinf(result).any()
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+        )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
+
+    @pytest.mark.parametrize(
+        "activation", ["silu", "gelu_tanh", "swigluoai_uninterleave"]
+    )
+    @pytest.mark.parametrize("num_tokens", [8, 128])
+    def test_intermediate_not_128_aligned(self, activation: str, num_tokens: int):
+        """NVFP4 transparently pads non-128-aligned intermediate sizes (e.g.
+        Gemma-4's 704) up to a tile multiple; result matches the unpadded ref."""
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 512, 704  # 704 = 128 * 5.5
+        num_experts, top_k = 8, 2
+        swiglu_limit = 7.0 if activation == "swigluoai_uninterleave" else None
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+        )
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any() and not torch.isinf(result).any()
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+        )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
 
     def test_activation_precision_api_validation(self):
         """W4A4 requires fc2_input_scale; W4A16 tolerates it."""
@@ -1398,6 +1087,66 @@ class TestB12xFunctional:
 @cuda_13_required
 class TestB12xWrapper:
     """Tests for the wrapper API: B12xMoEWrapper."""
+
+    @pytest.mark.parametrize(
+        "activation", ["silu", "gelu_tanh", "swigluoai_uninterleave"]
+    )
+    def test_wrapper_intermediate_not_128_aligned(self, activation: str):
+        """Wrapper transparently pads a non-128-aligned intermediate size
+        (Gemma-4's 704), caching the padded weights across calls."""
+        from flashinfer import B12xMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 128, 512, 704
+        num_experts, top_k = 8, 2
+        swiglu_limit = 7.0 if activation == "swigluoai_uninterleave" else None
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        moe = B12xMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+        )
+        result = moe.run(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+        )
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any() and not torch.isinf(result).any()
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+        )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
 
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
     @pytest.mark.parametrize("top_k", [2, 8])

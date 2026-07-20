@@ -343,6 +343,11 @@ struct TllmGenFmhaRunnerParams {
   // Whether the indices for K & V pages are shared as unified index.
   // true -> vLLM/FlashInfer; false -> TRT-LLM.
   bool mUsesSharedPagedKvIdx;
+  // Whether to use block-sparse attention (per-KV-head page tables and sequence lengths).
+  // When enabled, seqLensKvPtr has shape [numHeadsKv, batchSize] and kvPageIdxPtr has shape
+  // [numHeadsKv, batchSize, maxNumPagesPerSeqKv] (shared paged-KV index layout), where the
+  // selected sparse pages are packed densely at the front of each row.
+  bool mUseBlockSparseAttention;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).

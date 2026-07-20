@@ -34,6 +34,19 @@ except (ImportError, RuntimeError):
     gated_delta_rule_bf16state_cooprow = None  # type: ignore
     gated_delta_rule_bf16state_cooprow_mtp = None  # type: ignore
 
+# Bank-conflict-eliminated, no-prepack, OUTPUT-ONLY BF16-state MTP decode (v18).
+# Alternative implementation of the bf16_state MTP kernel for the output-only
+# (frozen-state) case; consumes H0 in its natural (pool, HV, V, K) bf16 layout.
+try:
+    from .gdn_decode_bf16_wy_output_only import (
+        gated_delta_rule_mtp as gated_delta_rule_mtp_wy_output_only,
+    )
+
+    _GDN_DECODE_BF16_WY_OUTPUT_ONLY_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _GDN_DECODE_BF16_WY_OUTPUT_ONLY_AVAILABLE = False
+    gated_delta_rule_mtp_wy_output_only = None  # type: ignore
+
 try:
     from .gdn_decode_pretranspose import run_pretranspose_decode
 except (ImportError, RuntimeError):
@@ -67,15 +80,18 @@ try:
         chunk_gated_delta_rule_sm90,
         chunk_gated_delta_rule_sm120,
         cp_delta_rule_dsl_sm90,
+        cp_delta_rule_dsl_sm120,
     )
 except (ImportError, RuntimeError):
     chunk_gated_delta_rule_sm90 = None  # type: ignore
     chunk_gated_delta_rule_sm120 = None  # type: ignore
     cp_delta_rule_dsl_sm90 = None  # type: ignore
+    cp_delta_rule_dsl_sm120 = None  # type: ignore
 
 __all__ = [
     "gated_delta_rule",
     "gated_delta_rule_mtp",
+    "gated_delta_rule_mtp_wy_output_only",
     "gated_delta_rule_bf16state_cooprow",
     "gated_delta_rule_bf16state_cooprow_mtp",
     "run_pretranspose_decode",
@@ -88,4 +104,5 @@ __all__ = [
     "chunk_gated_delta_rule_sm100",
     "chunk_gated_delta_rule_sm120",
     "cp_delta_rule_dsl_sm90",
+    "cp_delta_rule_dsl_sm120",
 ]

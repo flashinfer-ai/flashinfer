@@ -54,6 +54,42 @@ class FleetAlgoKnobTopologyCapacity(AlgoKnob):
     n: int
 
 
+@dataclass(frozen=True)
+class FleetAlgoKnobAllocator(AlgoKnob):
+    """Route NCCL-EP device buffers through a custom allocator.
+
+    Without this knob the group uses NCCL-EP's default ``cudaMalloc`` /
+    ``cudaFree``. Two mutually-exclusive modes:
+
+    * ``torch_caching=True`` — FlashInfer installs allocator trampolines
+      backed by torch's CUDA caching allocator, so EP transport buffers draw
+      from the same pool as the rest of the process (e.g. vLLM's memory
+      budget) instead of a second, invisible cudaMalloc arena. FlashInfer
+      owns the trampoline lifetime (anchored on the Fleet).
+    * ``alloc_fn`` / ``free_fn`` addresses — use these C-callable addresses
+      directly (``ncclEpAllocFn_t`` / ``ncclEpFreeFn_t``; see
+      ``nccl.ep.allocator``). The CALLER owns their lifetime and MUST keep
+      them alive at least as long as the Fleet.
+    """
+
+    torch_caching: bool = False
+    alloc_fn: int = 0
+    free_fn: int = 0
+    context: int = 0
+
+    def __post_init__(self) -> None:
+        if self.torch_caching and (self.alloc_fn or self.free_fn):
+            raise ValueError(
+                "FleetAlgoKnobAllocator: set either torch_caching=True OR "
+                "explicit alloc_fn/free_fn addresses, not both."
+            )
+        if (self.alloc_fn == 0) != (self.free_fn == 0):
+            raise ValueError(
+                "FleetAlgoKnobAllocator: alloc_fn and free_fn must be provided "
+                "together (both non-zero) or both left 0."
+            )
+
+
 # --------------------------------------------------------------- Handle-level
 
 
