@@ -79,6 +79,12 @@ from ..utils import (
     register_custom_op,
     register_fake_op,
 )
+
+# These helpers moved to prepare.py; keep aliases here for backward compatibility.
+from .prepare import (
+    interleave_moe_scales_for_sm90_mixed_gemm as interleave_moe_scales_for_sm90_mixed_gemm,
+    interleave_moe_weights_for_sm90_mixed_gemm as interleave_moe_weights_for_sm90_mixed_gemm,
+)
 from .utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
