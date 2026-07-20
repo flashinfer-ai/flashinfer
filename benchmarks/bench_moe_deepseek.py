@@ -86,9 +86,10 @@ EP_CONFIGS = {
 
 @dataclass
 class DistributedBenchResult:
-    tokens_per_rank: int
+    num_tokens: int
     routing_ms: float
     activation_prep_ms: float
+    allgather_ms: float
     dispatch_ms: float
     moe_ms: float
     combine_ms: float
@@ -1301,43 +1302,53 @@ def _create_distributed_weights(num_local_experts, intermediate_size, rank, devi
     return w13, w2
 
 
-def _create_distributed_inputs(num_tokens, rank, replicate, device):
-    seed = 42 if replicate else 42 + rank
-    generator = torch.Generator(device=device).manual_seed(seed)
+def _token_partition(num_tokens, rank, world_size):
+    tokens_per_rank, remainder = divmod(num_tokens, world_size)
+    local_num_tokens = tokens_per_rank + int(rank < remainder)
+    token_offset = rank * tokens_per_rank + min(rank, remainder)
+    return local_num_tokens, token_offset
+
+
+def _create_distributed_inputs(num_tokens, rank, world_size, device):
+    local_num_tokens, token_offset = _token_partition(num_tokens, rank, world_size)
+    input_generator = torch.Generator(device=device).manual_seed(42 + rank)
     hidden_states = (
         torch.randn(
-            num_tokens,
+            local_num_tokens,
             CFG.hidden_size,
             dtype=torch.bfloat16,
             device=device,
-            generator=generator,
+            generator=input_generator,
         )
         / 10
     )
-    router_logits = torch.randn(
+    routing_generator = torch.Generator(device=device).manual_seed(137)
+    global_router_logits = torch.randn(
         num_tokens,
         CFG.num_experts,
         dtype=torch.float32,
         device=device,
-        generator=generator,
+        generator=routing_generator,
     )
+    router_logits = global_router_logits.narrow(0, token_offset, local_num_tokens)
+    bias_generator = torch.Generator(device=device).manual_seed(911)
     routing_bias = (
         torch.randn(
             CFG.num_experts,
             dtype=torch.bfloat16,
             device=device,
-            generator=generator,
+            generator=bias_generator,
         )
         * 0.01
     ).float()
-    topk_values = torch.empty(num_tokens, CFG.top_k, dtype=torch.float32, device=device)
-    topk_indices = torch.empty(num_tokens, CFG.top_k, dtype=torch.int32, device=device)
-    return hidden_states, router_logits, routing_bias, topk_values, topk_indices
+    return hidden_states, router_logits, global_router_logits, routing_bias
 
 
 def _route_tokens(router_logits, routing_bias, topk_values, topk_indices):
     from flashinfer.fused_moe import fused_topk_deepseek
 
+    if router_logits.shape[0] == 0:
+        return
     fused_topk_deepseek(
         scores=router_logits,
         bias=routing_bias,
@@ -1378,6 +1389,8 @@ def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
     )
     from flashinfer.testing.utils import get_l2_cache_size
 
+    local_num_tokens, _ = _token_partition(num_tokens, rank, world_size)
+    max_tokens_per_rank = (num_tokens + world_size - 1) // world_size
     num_local_experts = CFG.num_experts // world_size
     local_expert_offset = rank * num_local_experts
     moe_config = _distributed_moe_config(
@@ -1385,7 +1398,7 @@ def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
         CFG.intermediate_size,
         num_local_experts,
         local_expert_offset,
-        num_tokens * world_size,
+        max_tokens_per_rank * world_size,
     )
     w13, w2 = _create_distributed_weights(
         num_local_experts, CFG.intermediate_size, rank, device
@@ -1398,7 +1411,7 @@ def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
     )
     fleet_params = FleetParams(
         num_experts=CFG.num_experts,
-        max_tokens_per_rank=num_tokens,
+        max_tokens_per_rank=max_tokens_per_rank,
         token_hidden_size=CFG.hidden_size,
         dtype_bytes=2,
         algorithm=EpAlgorithm.LOW_LATENCY,
@@ -1415,8 +1428,14 @@ def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
     )
     layer.enable_timing = True
 
-    hidden_states, router_logits, routing_bias, topk_values, topk_indices = (
-        _create_distributed_inputs(num_tokens, rank, False, device)
+    hidden_states, router_logits, _, routing_bias = _create_distributed_inputs(
+        num_tokens, rank, world_size, device
+    )
+    topk_values = torch.empty(
+        local_num_tokens, CFG.top_k, dtype=torch.float32, device=device
+    )
+    topk_indices = torch.empty(
+        local_num_tokens, CFG.top_k, dtype=torch.int32, device=device
     )
     tensors = MoEEpTensors(
         hidden_states=hidden_states,
@@ -1441,6 +1460,7 @@ def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
         return [
             routing_start.elapsed_time(routing_end),
             timings["activation_prep"],
+            0.0,
             timings["dispatch"],
             timings["moe"],
             timings["combine"],
@@ -1554,9 +1574,23 @@ def _benchmark_distributed_tp(
         ),
     )
     layer = MoELayer(moe_config, device=device)
-    hidden_states, router_logits, routing_bias, topk_values, topk_indices = (
-        _create_distributed_inputs(num_tokens, rank, True, device)
+    local_hidden_states, _, router_logits, routing_bias = _create_distributed_inputs(
+        num_tokens, rank, world_size, device
     )
+    topk_values = torch.empty(num_tokens, CFG.top_k, dtype=torch.float32, device=device)
+    topk_indices = torch.empty(num_tokens, CFG.top_k, dtype=torch.int32, device=device)
+    hidden_states = torch.empty(
+        num_tokens,
+        CFG.hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    gathered_hidden_states = list(
+        hidden_states.split(
+            [_token_partition(num_tokens, r, world_size)[0] for r in range(world_size)]
+        )
+    )
+    dist.all_gather(gathered_hidden_states, local_hidden_states)
     global_scale = make_nvfp4_global_scale(
         hidden_states,
         per_token_activation=args.use_per_token_activation,
@@ -1582,6 +1616,8 @@ def _benchmark_distributed_tp(
         e2e_end = torch.cuda.Event(enable_timing=True)
         routing_start = torch.cuda.Event(enable_timing=True)
         routing_end = torch.cuda.Event(enable_timing=True)
+        allgather_start = torch.cuda.Event(enable_timing=True)
+        allgather_end = torch.cuda.Event(enable_timing=True)
         quant_start = torch.cuda.Event(enable_timing=True)
         quant_end = torch.cuda.Event(enable_timing=True)
         moe_start = torch.cuda.Event(enable_timing=True)
@@ -1590,6 +1626,9 @@ def _benchmark_distributed_tp(
         allreduce_end = torch.cuda.Event(enable_timing=True)
 
         e2e_start.record()
+        allgather_start.record()
+        dist.all_gather(gathered_hidden_states, local_hidden_states)
+        allgather_end.record()
         routing_start.record()
         _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
         routing_end.record()
@@ -1619,6 +1658,7 @@ def _benchmark_distributed_tp(
         return [
             routing_start.elapsed_time(routing_end),
             (0.0 if args.use_bf16_activation else quant_start.elapsed_time(quant_end)),
+            allgather_start.elapsed_time(allgather_end),
             0.0,
             moe_start.elapsed_time(moe_end),
             0.0,
@@ -1668,8 +1708,8 @@ def _run_distributed_benchmark(args, token_counts):
                 "timing=max rank CUDA events, cache=cold L2"
             )
             print(
-                "tokens/rank | routing | act prep/quant | dispatch | local MoE | "
-                "combine | all-reduce | end-to-end (ms)"
+                "global tokens | routing | act prep/quant | all-gather | dispatch | "
+                "local MoE | combine | all-reduce | end-to-end (ms)"
             )
 
         results = []
@@ -1690,9 +1730,10 @@ def _run_distributed_benchmark(args, token_counts):
             results.append(result)
             if rank == 0:
                 print(
-                    f"{result.tokens_per_rank:>11} | "
+                    f"{result.num_tokens:>13} | "
                     f"{result.routing_ms:>7.3f} | "
                     f"{result.activation_prep_ms:>14.3f} | "
+                    f"{result.allgather_ms:>10.3f} | "
                     f"{result.dispatch_ms:>8.3f} | "
                     f"{result.moe_ms:>9.3f} | "
                     f"{result.combine_ms:>7.3f} | "
@@ -1703,6 +1744,7 @@ def _run_distributed_benchmark(args, token_counts):
                     "DISTRIBUTED_CSV,"
                     f"{mode},{variant},{num_tokens},{world_size},"
                     f"{result.routing_ms:.6f},{result.activation_prep_ms:.6f},"
+                    f"{result.allgather_ms:.6f},"
                     f"{result.dispatch_ms:.6f},{result.moe_ms:.6f},"
                     f"{result.combine_ms:.6f},{result.allreduce_ms:.6f},"
                     f"{result.e2e_ms:.6f}"
@@ -1723,7 +1765,7 @@ def main():
         "--num-tokens",
         type=str,
         default=None,
-        help="Comma-separated token counts (default: 128-4096 for throughput, 1-128 for gen-phase)",
+        help="Comma-separated global token counts (default: 128-4096 for throughput, 1-128 for gen-phase)",
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
     parser.add_argument("--iters", type=int, default=100, help="Benchmark iterations")
