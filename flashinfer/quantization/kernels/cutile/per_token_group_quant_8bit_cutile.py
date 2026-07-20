@@ -213,8 +213,12 @@ def per_token_group_quant_8bit_cutile(
         bit8_min = info.min
         bit8_max = info.max
 
-    # Pre-zero output buffers to avoid NaN from beta=0 epilogue (PR #3426 pattern)
-    x_q = torch.zeros_like(x, device=x.device, dtype=dst_dtype)
+    # These kernels are pure element-wise scatters: every group writes its full
+    # [g*group_size, g*group_size+group_size) span of x_q, so the union over all
+    # groups covers the whole output — no pre-zeroing needed (unlike the beta=0
+    # GEMM epilogue). Using empty_like avoids a redundant full-tensor memset on a
+    # bandwidth-bound path.
+    x_q = torch.empty_like(x, device=x.device, dtype=dst_dtype)
     M = x.numel() // group_size
     N = group_size
 
@@ -229,7 +233,10 @@ def per_token_group_quant_8bit_cutile(
         if scale_tma_aligned:
             # TMA-friendly layout: (num_groups, aligned_num_tokens), align to 4 floats (16B)
             aligned_size = _ceil_align(num_tokens, 4)
-            x_s_raw = torch.zeros(
+            # Every (group, token) slot is written by the kernel; the only
+            # uninitialized region is the [num_tokens:aligned_size] alignment
+            # pad, which is sliced off below before returning, so empty is safe.
+            x_s_raw = torch.empty(
                 (num_groups, aligned_size),
                 device=x.device,
                 dtype=torch.float32,
@@ -237,14 +244,14 @@ def per_token_group_quant_8bit_cutile(
             x_s_col_stride = aligned_size
         else:
             shape = (num_groups,) + x.shape[:-1]
-            x_s_raw = torch.zeros(shape, device=x.device, dtype=torch.float32).permute(
+            x_s_raw = torch.empty(shape, device=x.device, dtype=torch.float32).permute(
                 -1, -2
             )
             x_s_col_stride = x_s_raw.stride(1)
         x_s = x_s_raw
     else:
         shape = x.shape[:-1] + (x.shape[-1] // group_size,)
-        x_s = torch.zeros(shape, device=x.device, dtype=torch.float32)
+        x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
     BLOCK = _next_power_of_2(N)
 
