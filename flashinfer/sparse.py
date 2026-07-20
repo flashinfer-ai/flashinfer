@@ -514,8 +514,39 @@ class BlockSparseAttentionWrapper:
             self._head_dim = head_dim
             self._causal = causal
             self._sm_scale = sm_scale
-            self._sparse_indptr = indptr.to(self.device, non_blocking=non_blocking)
-            self._sparse_indices = indices.to(self.device, non_blocking=non_blocking)
+            indptr = indptr.to(self.device, non_blocking=non_blocking)
+            indices = indices.to(self.device, non_blocking=non_blocking)
+            self._sparse_indptr = indptr
+            self._sparse_indices = indices
+
+            # Materialize the dense block table and the per-batch length/offset
+            # arrays now (at plan time) so run() is CUDA-graph-capturable:
+            # everything here derives only from (indptr, indices, R, C), which
+            # are fixed at plan time. Reconstructing it in run() -- as an earlier
+            # version did -- forced a host `.item()` sync on max_pages plus ~6
+            # tensor allocations on every call, breaking graph capture (mirrors
+            # the plan-time block-table build in decode.py's cuTile backend).
+            num_block_rows = indptr.numel() - 1
+            nnz_per_row = (indptr[1:] - indptr[:-1]).to(torch.int32)
+            actual_seq_lens_q = torch.full(
+                (num_block_rows,), R, dtype=torch.int32, device=self.device
+            )
+            max_pages = int(nnz_per_row.max().item()) if num_block_rows > 0 else 0
+            block_tables = torch.zeros(
+                (num_block_rows, max_pages), dtype=torch.int32, device=self.device
+            )
+            col = torch.arange(max_pages, device=self.device)
+            valid = col[None, :] < nnz_per_row[:, None]
+            block_tables[valid] = indices.to(torch.int32)
+            actual_seq_offset = torch.nn.functional.pad(
+                actual_seq_lens_q.cumsum(0), (1, 0)
+            ).to(torch.int32)
+
+            self._sparse_num_block_rows = num_block_rows
+            self._sparse_actual_seq_lens_q = actual_seq_lens_q
+            self._sparse_actual_seq_lens_kv = (nnz_per_row * C).to(torch.int32)
+            self._sparse_block_tables = block_tables
+            self._sparse_actual_seq_offset = actual_seq_offset
             return
 
         # ---- VSA Blackwell backend (BSA blk128 kernel) ----------------------------
@@ -979,29 +1010,19 @@ class BlockSparseAttentionWrapper:
             )
 
             R, C = self._R, self._C
-            indptr = self._sparse_indptr
-            indices = self._sparse_indices
-            num_block_rows = indptr.numel() - 1
+            num_block_rows = self._sparse_num_block_rows
 
             # KV as page_size==C paged cache: [N, H_kv, D] -> [N // C, C, H_kv, D].
             k_cache = k.reshape(self._N // C, C, self._num_kv_heads, self._head_dim)
             v_cache = v.reshape(self._N // C, C, self._num_kv_heads, v.shape[-1])
 
-            nnz_per_row = (indptr[1:] - indptr[:-1]).to(torch.int32)
-            actual_seq_lens_q = torch.full(
-                (num_block_rows,), R, dtype=torch.int32, device=q.device
-            )
-            actual_seq_lens_kv = (nnz_per_row * C).to(torch.int32)
-            max_pages = int(nnz_per_row.max().item())
-            block_tables = torch.zeros(
-                (num_block_rows, max_pages), dtype=torch.int32, device=q.device
-            )
-            col = torch.arange(max_pages, device=q.device)
-            valid = col[None, :] < nnz_per_row[:, None]
-            block_tables[valid] = indices.to(torch.int32)
-            actual_seq_offset = torch.nn.functional.pad(
-                actual_seq_lens_q.cumsum(0), (1, 0)
-            ).to(torch.int32)
+            # Block table + per-batch length/offset arrays were materialized at
+            # plan() time (they derive only from indptr/indices/R/C), so run()
+            # does no host sync or allocation here and stays graph-capturable.
+            actual_seq_lens_q = self._sparse_actual_seq_lens_q
+            actual_seq_lens_kv = self._sparse_actual_seq_lens_kv
+            block_tables = self._sparse_block_tables
+            actual_seq_offset = self._sparse_actual_seq_offset
 
             # The kernel folds the softmax scale into k_scale (qk_scale =
             # k_scale * INV_LOG_2), so k_scale must carry the 1/sqrt(head_dim)
