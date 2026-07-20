@@ -910,10 +910,10 @@ _CURATED = [
         4,
         "mxfp8",
         "uniform",
-        900_014,
+        900_016,
         routing_method=RoutingMethodType.Default,
         routing_input_mode="fromlogits",
-    ),
+    ),  # seed % 4 == 0 deliberately exercises production autotuning for MXFP8
 ]
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _curated_by_seed = {c.seed: c for c in _CURATED}
@@ -1202,6 +1202,8 @@ def test_unified_moe_fuzz(cfg):
             intermediate_size=cfg.intermediate,
             device=dev,
         )
+        # TrtllmFp8BlockConfig is shared by DeepSeekFp8 and MxFp8, so pass the
+        # handler's variant explicitly to select the native scale/layout format.
         if BackendCfg is TrtllmFp8BlockConfig:
             prepare_kwargs["variant"] = handler.variant
         weight_pack.prepare_for(
@@ -1465,6 +1467,8 @@ def test_autotune_cache_coherence(base, variant):
             intermediate_size=I,
             device=dev,
         )
+        # TrtllmFp8BlockConfig is shared by DeepSeekFp8 and MxFp8, so pass the
+        # handler's variant explicitly to select the native scale/layout format.
         if B is TrtllmFp8BlockConfig:
             prepare_kwargs["variant"] = variant
         weight_pack.prepare_for(
