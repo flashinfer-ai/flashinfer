@@ -184,7 +184,7 @@ class TllmGenFmhaKernel {
                          int tileSizeQ, int tileSizeKv, int numTokensPerPage,
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
                          bool groupsTokensHeadsQ, int sparseMlaType, bool skipsSoftmax,
-                         int bf16QFp8KvTransformMode) const {
+                         int bf16QFp8KvTransformMode, bool uses2QSlidingWindowKernel) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -221,6 +221,7 @@ class TllmGenFmhaKernel {
     // Bit 58 - 58: dynamicNumTokensPerPage.
     // Bit 59 - 60: BF16Q FP8KV transform mode (0=full, 1=K-only, 2=separate K/V).
     // Bit 61 - 61: groupsTokensHeadsQ.
+    // Bit 62 - 62: uses2QSlidingWindowKernel (Keeps generation 2Qx1KV SlidingWindowCustom).
     uint64_t const numTokensPerPageLog2 =
         numTokensPerPage == 0 ? 0 : static_cast<uint64_t>(log2(numTokensPerPage));
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
@@ -237,7 +238,13 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(skipsSoftmax) << 57) |
            (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58) |
            (static_cast<uint64_t>(bf16QFp8KvTransformMode) << 59) |
-           (static_cast<uint64_t>(groupsTokensHeadsQ) << 61);
+           (static_cast<uint64_t>(groupsTokensHeadsQ) << 61) |
+           (static_cast<uint64_t>(uses2QSlidingWindowKernel) << 62);
+  }
+
+  inline bool is2QSlidingWindowKernel(KernelMeta const& kernelMeta) const {
+    return kernelMeta.mKernelType == static_cast<int>(FmhaKernelType::KeepsMmaAbForGeneration) &&
+           kernelMeta.mGroupsTokensHeadsQ && kernelMeta.mStepQ == 2 * kernelMeta.mTileSizeQ;
   }
 
   inline bool isDynamicNumTokensPerPageKernel(KernelMeta const& kernelMeta) const {
@@ -254,7 +261,8 @@ class TllmGenFmhaKernel {
                   kernelMeta.m2CtaMma, kernelMeta.mGroupsTokensHeadsQ, kernelMeta.mSparseAttn,
                   kernelMeta.mSkipsSoftmaxWhenPossible,
                   getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
-                                             kernelMeta.mSeparateTransformedKv));
+                                             kernelMeta.mSeparateTransformedKv),
+                  is2QSlidingWindowKernel(kernelMeta));
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
@@ -1053,7 +1061,8 @@ class TllmGenFmhaKernel {
                selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
                selectKernelParams.mGroupsTokensHeadsQ, static_cast<int>(params.mSparseMlaType),
                selectKernelParams.mSkipsSoftmaxWhenPossible,
-               static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)),
+               static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode),
+               /*uses2QSlidingWindowKernel=*/false),
         info);
   }
 
