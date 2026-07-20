@@ -90,36 +90,6 @@ class DistributedBenchResult:
     e2e_ms: float
 
 
-class _TorchDistributedCommBackend:
-    """Adapt an existing process group for FlashInfer MNNVL setup."""
-
-    def __init__(self, group):
-        self._group = group
-
-    def Get_rank(self):
-        return self._group.rank()
-
-    def Get_size(self):
-        return self._group.size()
-
-    def allgather(self, data):
-        gathered = [None] * self.Get_size()
-        torch.distributed.all_gather_object(gathered, data, group=self._group)
-        return gathered
-
-    def bcast(self, data, root=0):
-        objects = [data]
-        torch.distributed.broadcast_object_list(objects, src=root, group=self._group)
-        return objects[0]
-
-    def Split(self, color, key):
-        # The caller already supplies the complete EP process group.
-        return self
-
-    def barrier(self):
-        torch.distributed.barrier(group=self._group)
-
-
 def is_sm100_family():
     """Check for SM100 family (Blackwell: SM100, SM103).
 
@@ -1384,15 +1354,14 @@ def _route_tokens(router_logits, routing_bias, topk_values, topk_indices):
     )
 
 
-def _max_rank_sample(values, dist, device):
-    sample = torch.tensor(values, dtype=torch.float64, device=device)
+def _max_rank_sample(value, dist, device):
+    sample = torch.tensor(value, dtype=torch.float64, device=device)
     dist.all_reduce(sample, op=dist.ReduceOp.MAX)
-    return sample.cpu().tolist()
+    return sample.item()
 
 
 def _median_distributed_samples(num_tokens, samples):
-    medians = np.median(np.asarray(samples), axis=0)
-    return DistributedBenchResult(num_tokens, *medians.tolist())
+    return DistributedBenchResult(num_tokens, float(np.median(samples)))
 
 
 def _run_distributed_iterations(args, run_once, l2_flush, dist, device):
@@ -1424,9 +1393,7 @@ def _run_distributed_iterations(args, run_once, l2_flush, dist, device):
         run_once()
         e2e_end.record()
         e2e_end.synchronize()
-        samples.append(
-            _max_rank_sample([e2e_start.elapsed_time(e2e_end)], dist, device)
-        )
+        samples.append(_max_rank_sample(e2e_start.elapsed_time(e2e_end), dist, device))
     return samples
 
 
@@ -1442,7 +1409,7 @@ def _benchmark_distributed_ep(
 
     from flashinfer.comm import MoeAlltoAll
     from flashinfer.comm.mapping import Mapping
-    from flashinfer.comm.mnnvl import MnnvlConfig
+    from flashinfer.comm.mnnvl import MnnvlConfig, TorchDistBackend
     from flashinfer.quantization.nvfp4_quantization_utils import (
         current_nvfp4_4over6_config,
         make_nvfp4_global_scale,
@@ -1497,9 +1464,7 @@ def _benchmark_distributed_ep(
             top_k=CFG.top_k,
             num_experts=CFG.num_experts,
             workspace_size_per_rank=workspace_size_per_rank,
-            mnnvl_config=MnnvlConfig(
-                comm_backend=_TorchDistributedCommBackend(dist.group.WORLD)
-            ),
+            mnnvl_config=MnnvlConfig(comm_backend=TorchDistBackend(dist.group.WORLD)),
         ),
     )
     hidden_states, router_logits, _, routing_bias = _create_distributed_inputs(
@@ -1766,7 +1731,6 @@ def _benchmark_distributed_tp(
 
 
 def _run_distributed_benchmark(args, token_counts):
-    import gc
     import os
     import torch.distributed as dist
 
