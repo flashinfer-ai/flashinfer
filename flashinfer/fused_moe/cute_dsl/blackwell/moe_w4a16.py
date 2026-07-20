@@ -53,13 +53,14 @@ def _get_workspace(
     x: torch.Tensor,
     top_k: int,
     num_experts: int,
+    num_local_experts: int,
     intermediate_size: int,
     route_tile: int,
     workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> _W4A16Workspace:
     num_tokens = int(x.size(0))
     route_slots = get_max_num_permuted_tokens(
-        num_tokens, top_k, num_experts, route_tile
+        num_tokens, top_k, num_local_experts, route_tile
     )
     key = (
         x.device,
@@ -67,6 +68,7 @@ def _get_workspace(
         int(x.size(1)),
         int(intermediate_size),
         int(num_experts),
+        int(num_local_experts),
         route_tile,
     )
     workspace = workspace_cache.get(key) if workspace_cache is not None else None
@@ -77,7 +79,7 @@ def _get_workspace(
                 num_tokens=num_tokens,
                 num_experts=num_experts,
                 top_k=top_k,
-                num_local_experts=num_experts,
+                num_local_experts=num_local_experts,
                 tile_tokens_dim=route_tile,
                 device=x.device,
             ),
@@ -330,6 +332,9 @@ def launch_w4a16_moe(
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
     w2_alpha: torch.Tensor,
+    num_experts: int,
+    num_local_experts: int,
+    local_expert_offset: int,
     moe_output: torch.Tensor,
     use_fused_finalize: bool,
     enable_pdl: bool,
@@ -337,7 +342,6 @@ def launch_w4a16_moe(
     workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
-    num_experts = int(w1_weight.size(0))
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
     if tactic is None:
@@ -347,6 +351,7 @@ def launch_w4a16_moe(
         x,
         top_k,
         num_experts,
+        num_local_experts,
         intermediate_size,
         route_tile,
         workspace_cache,
@@ -364,14 +369,15 @@ def launch_w4a16_moe(
         token_final_scales=token_final_scales,
         num_experts=num_experts,
         top_k=top_k,
-        num_local_experts=num_experts,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=num_local_experts,
         tile_tokens_dim=route_tile,
         enable_pdl=enable_pdl,
         **workspace.moe_sort_buffers,
     )
     num_tokens = int(x.size(0))
     route_slots = get_max_num_permuted_tokens(
-        num_tokens, top_k, num_experts, route_tile
+        num_tokens, top_k, num_local_experts, route_tile
     )
     num_route_tiles = route_slots // route_tile
     tile_idx_to_expert_idx = tile_idx_to_expert_idx[:num_route_tiles]
@@ -401,7 +407,7 @@ def launch_w4a16_moe(
         num_non_exiting_tiles,
         w1_alpha,
         gemm1_output,
-        num_experts,
+        num_local_experts,
         True,
         False,
         None,
@@ -431,7 +437,7 @@ def launch_w4a16_moe(
         num_non_exiting_tiles,
         w2_alpha,
         gemm2_output,
-        num_experts,
+        num_local_experts,
         False,
         use_fused_finalize,
         permuted_idx_to_expanded_idx if use_fused_finalize else None,

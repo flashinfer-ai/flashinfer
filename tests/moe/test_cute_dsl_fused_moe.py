@@ -983,6 +983,7 @@ class TestAutotunerBucketConfig:
 @cute_dsl_available
 @sm100_required
 class TestCuteDslMoeBf16Activation:
+    @pytest.mark.parametrize("ep_size,ep_rank", [(1, 0), (8, 4)])
     @pytest.mark.parametrize("use_wrapper", [False, True])
     @pytest.mark.parametrize("enable_pdl", [False, True])
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
@@ -991,24 +992,29 @@ class TestCuteDslMoeBf16Activation:
         use_wrapper: bool,
         enable_pdl: bool,
         use_fused_finalize: bool,
+        ep_size: int,
+        ep_rank: int,
     ):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 129, 256, 512
         num_experts, top_k = 256, 2
+        num_local_experts = num_experts // ep_size
+        local_expert_offset = ep_rank * num_local_experts
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_experts=num_experts,
-            num_local_experts=num_experts,
+            num_local_experts=num_local_experts,
             top_k=top_k,
         )
-        # Give two experts one full fallback route tile and one boundary tile
-        # each, and exercise the route-to-token reduction in fused finalize.
-        tensors["token_selected_experts"][:] = torch.arange(
-            top_k, device=tensors["token_selected_experts"].device
-        )
+        if ep_size == 1:
+            # Give two experts one full fallback route tile and one boundary
+            # tile each, and exercise route-to-token reduction.
+            tensors["token_selected_experts"][:] = torch.arange(
+                top_k, device=tensors["token_selected_experts"].device
+            )
 
         kwargs = {
             "x": tensors["x_bf16"],
@@ -1029,6 +1035,8 @@ class TestCuteDslMoeBf16Activation:
                 top_k=top_k,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
+                num_local_experts=num_local_experts,
+                local_expert_offset=local_expert_offset,
                 use_cuda_graph=False,
                 enable_pdl=enable_pdl,
                 use_fused_finalize=use_fused_finalize,
@@ -1039,6 +1047,8 @@ class TestCuteDslMoeBf16Activation:
                 **kwargs,
                 num_experts=num_experts,
                 top_k=top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=local_expert_offset,
                 enable_pdl=enable_pdl,
                 use_fused_finalize=use_fused_finalize,
             )
@@ -1056,6 +1066,8 @@ class TestCuteDslMoeBf16Activation:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1075,6 +1087,8 @@ class TestCuteDslMoeBf16Activation:
                 **kwargs,
                 num_experts=num_experts,
                 top_k=top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=local_expert_offset,
                 enable_pdl=enable_pdl,
                 use_fused_finalize=use_fused_finalize,
             )
