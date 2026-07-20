@@ -1,6 +1,15 @@
 # TODO: split MoEWeightPack into a discriminated union (Unquantized | Prequantized)
 
-Status: analysis only, nothing implemented yet (2026-07-14). Suggested in
+Status: IMPLEMENTED 2026-07-19 (tests: `tests/moe_ep/test_weight_pack_union.py`).
+One deviation from the sketch below: instead of a bare union alias + a
+separately-named factory, `MoEWeightPack` stayed a real base class whose
+`__new__` dispatches to the frozen variant — this keeps all ~48 construction
+sites, every `weights: MoEWeightPack` annotation, and the
+`isinstance(pack, MoEWeightPack)` validation site working unchanged, while
+the mixed one-scale state raises at construction. Backends discriminate via
+`isinstance(weights, PrequantizedMoEWeights)`. Original analysis follows.
+
+Original status: analysis only (2026-07-14). Suggested in
 review: replace the single optional-field dataclass with
 
 ```python
