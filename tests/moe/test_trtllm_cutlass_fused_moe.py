@@ -1512,6 +1512,7 @@ def test_moe_mxfp8_mxfp4(
     alpha,
     beta,
     limit,
+    use_autotune=False,
 ):
     """
     Test MoE with MXFP8 activations and MXFP4 weights.
@@ -1562,21 +1563,22 @@ def test_moe_mxfp8_mxfp4(
         beta_t = None
 
     # Call cutlass_fused_moe with MXFP8 activations and MXFP4 weights
-    _ = fused_moe.cutlass_fused_moe(
-        mxfp8_x,
-        selected_experts.to(torch.int),
-        routing_weights,
-        mxfp4_w1.contiguous().view(torch.long),
-        mxfp4_w2.contiguous().view(torch.long),
-        otype,
-        swiglu_alpha=alpha_t,
-        swiglu_limit=limit_t,
-        swiglu_beta=beta_t,
-        quant_scales=quant_scales,
-        input_sf=mxfp8_x_sf,
-        use_mxfp8_act_scaling=True,
-        output=flash_output,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            mxfp8_x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            mxfp4_w1.contiguous().view(torch.long),
+            mxfp4_w2.contiguous().view(torch.long),
+            otype,
+            swiglu_alpha=alpha_t,
+            swiglu_limit=limit_t,
+            swiglu_beta=beta_t,
+            quant_scales=quant_scales,
+            input_sf=mxfp8_x_sf,
+            use_mxfp8_act_scaling=True,
+            output=flash_output,
+        )
 
     dq_mxfp8_x = (
         mxfp8_dequantize_host(
@@ -1620,6 +1622,25 @@ def test_moe_mxfp8_mxfp4(
     )
 
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() not in [(12, 0), (12, 1)],
+    reason="Regression test is specific to SM120/SM121 autotuning",
+)
+def test_moe_mxfp8_mxfp4_autotune_sm120():
+    test_moe_mxfp8_mxfp4(
+        batch_size=1,
+        hidden_size=128,
+        num_experts=2,
+        top_k=2,
+        intermediate_size=128,
+        otype=torch.bfloat16,
+        alpha=None,
+        beta=None,
+        limit=None,
+        use_autotune=True,
+    )
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
