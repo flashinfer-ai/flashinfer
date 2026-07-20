@@ -226,6 +226,7 @@ def moe_permute(
         top_k,
         tile_size,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 
@@ -775,6 +776,7 @@ def moe_activation(
         interm_size,
         tile_size,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 
