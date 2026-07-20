@@ -642,22 +642,21 @@ _W4A16_ROUTE_TILES = (32, 64, 128)
 _W4A16_K_TILES = (64, 128, 256)
 # Grouped expert scheduling requires cluster N=1 when multiple routed rows
 # target the same expert.
-_W4A16_GEMM_TOPOLOGIES = (
-    (128, (1, 1)),
-    (128, (2, 1)),
-    (256, (2, 1)),
-)
-_W4A16_SHARED_GEMM_TACTICS = tuple(
-    ((mma_m, mma_k), cluster_shape)
-    for (mma_m, cluster_shape), mma_k in itertools.product(
-        _W4A16_GEMM_TOPOLOGIES, _W4A16_K_TILES
-    )
+_W4A16_GEMM_TOPOLOGY_PAIRS = (
+    ((128, (1, 1)), (128, (1, 1))),
+    ((128, (2, 1)), (128, (2, 1))),
+    ((256, (2, 1)), (256, (2, 1))),
+    ((128, (2, 1)), (256, (2, 1))),
 )
 _W4A16_GEMM_TACTIC_PAIRS = tuple(
-    (gemm_tactic, gemm_tactic) for gemm_tactic in _W4A16_SHARED_GEMM_TACTICS
-) + (
-    # Mixed 1-CTA GEMM1 and 2-CTA GEMM2 pipeline.
-    (((128, 256), (2, 1)), ((256, 256), (2, 1))),
+    (
+        ((gemm1_mma_m, mma_k), gemm1_cluster_shape),
+        ((gemm2_mma_m, mma_k), gemm2_cluster_shape),
+    )
+    for (
+        (gemm1_mma_m, gemm1_cluster_shape),
+        (gemm2_mma_m, gemm2_cluster_shape),
+    ), mma_k in itertools.product(_W4A16_GEMM_TOPOLOGY_PAIRS, _W4A16_K_TILES)
 )
 W4A16_MOE_TACTICS = tuple(
     (route_tile, gemm1_tactic, gemm2_tactic)

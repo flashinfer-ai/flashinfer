@@ -274,7 +274,7 @@ class TestTacticEnumeration:
 
         assert len(W4A16_MOE_TACTICS) == len(set(W4A16_MOE_TACTICS))
         assert DEFAULT_W4A16_MOE_TACTIC in W4A16_MOE_TACTICS
-        assert len(W4A16_MOE_TACTICS) == 30
+        assert len(W4A16_MOE_TACTICS) == 36
 
         route_tiles = {tactic[0] for tactic in W4A16_MOE_TACTICS}
         assert route_tiles == {32, 64, 128}
@@ -291,7 +291,9 @@ class TestTacticEnumeration:
         expected_gemm_pairs = {
             (gemm_tactic, gemm_tactic) for gemm_tactic in shared_gemm_tactics
         }
-        expected_gemm_pairs.add((((128, 256), (2, 1)), ((256, 256), (2, 1))))
+        expected_gemm_pairs.update(
+            (((128, mma_k), (2, 1)), ((256, mma_k), (2, 1))) for mma_k in (64, 128, 256)
+        )
         for route_tile in route_tiles:
             route_tactics = [
                 (gemm1_tactic, gemm2_tactic)
