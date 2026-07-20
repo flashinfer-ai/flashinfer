@@ -1401,12 +1401,15 @@ def _nvfp4_kernel_name(
     sf_layout: int,
     enable_pdl: bool,
     disable_fp4_quant_fast_math: bool,
+    silu_and_mul: bool,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> str:
     """Specialization name within the nvfp4_quantize module, encoding every
     parameter that affects codegen.
     """
     name = f"{variant}_{dtype_key}_k{K}_sf{sf_layout}_pdl{int(enable_pdl)}"
+    if silu_and_mul:
+        name += "_silu"
     if disable_fp4_quant_fast_math:
         name += "_nofastmath"
     if nvfp4_4over6_config is not None:
@@ -1483,12 +1486,13 @@ def _get_compiled_kernel_nvfp4(
         compiled_kernel = build_and_load_cute_dsl_kernel(
             _CUTE_DSL_MODULE,
             _nvfp4_kernel_name(
-                "silu_linear" if silu_and_mul else "linear",
+                "linear",
                 dtype_key,
                 K,
                 sf_layout,
                 enable_pdl,
                 disable_fp4_quant_fast_math,
+                silu_and_mul,
                 nvfp4_4over6_config,
             ),
             lambda: cute.compile(
@@ -1521,12 +1525,13 @@ def _get_compiled_kernel_nvfp4(
         compiled_kernel = build_and_load_cute_dsl_kernel(
             _CUTE_DSL_MODULE,
             _nvfp4_kernel_name(
-                "silu_swizzled" if silu_and_mul else "swizzled",
+                "swizzled",
                 dtype_key,
                 K,
                 sf_layout,
                 enable_pdl,
                 disable_fp4_quant_fast_math,
+                silu_and_mul,
                 nvfp4_4over6_config,
             ),
             lambda: cute.compile(
@@ -1600,7 +1605,8 @@ def _get_compiled_kernel_nvfp4_per_token(
             sf_layout,
             enable_pdl,
             disable_fp4_quant_fast_math,
-            nvfp4_4over6_config,
+            silu_and_mul=False,
+            nvfp4_4over6_config=nvfp4_4over6_config,
         ),
         lambda: cute.compile(
             kernel_obj,
@@ -1693,6 +1699,7 @@ def _get_compiled_kernel_nvfp4_tma(
             sf_layout,
             enable_pdl,
             disable_fp4_quant_fast_math,
+            silu_and_mul=False,
         ),
         lambda: cute.compile(
             kernel_obj,
