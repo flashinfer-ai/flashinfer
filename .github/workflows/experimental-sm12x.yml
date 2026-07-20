@@ -1,0 +1,64 @@
+# CI lane for flashinfer/experimental (proposal rule §5: lightweight,
+# separate, non-blocking for kernel tests; the cheap structural lints are
+# blocking because they are what "minimal mechanical review" leans on).
+name: experimental-sm12x
+
+on:
+  pull_request:
+    paths:
+      - "flashinfer/experimental/**"
+      - "tests/experimental/**"
+      - ".github/workflows/experimental-sm12x.yml"
+
+jobs:
+  # Blocking: stdlib-only structural lints (~30s). Proves the isolation and
+  # arch rules hold without installing torch.
+  lints:
+    name: isolation + arch lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      # --confcutdir skips the repo-root tests/conftest.py (which imports
+      # flashinfer and therefore torch); the lint tests are stdlib-only.
+      - run: pytest --confcutdir=tests/experimental tests/experimental/lint -q
+
+  # Non-blocking: CPU import hygiene (FutureWarning-once, lazy-import purity,
+  # registry contract). Needs a working `import flashinfer` on CPU torch.
+  import-hygiene:
+    name: cpu import hygiene (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -r requirements.txt
+      - run: BUILD_NVEP=0 pip install --no-build-isolation --no-deps -e .
+      - run: pip install pytest
+      - run: >
+          pytest tests/experimental/test_import_hygiene.py
+          tests/experimental/test_registry.py
+          tests/experimental/_lib -q
+
+  # GPU kernel tests require an SM12x (SM120/SM121) runner, which the fleet
+  # does not have yet. Until one exists the GPU lane is the local runbook in
+  # flashinfer/experimental/README.md. Template for when a labeled runner
+  # lands:
+  #
+  # gpu-tests:
+  #   name: sm12x kernel tests (non-blocking)
+  #   runs-on: [self-hosted, sm120]
+  #   continue-on-error: true
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with: { submodules: recursive }
+  #     - run: pip install -e . && pip install pytest
+  #     - run: pytest tests/experimental -q

@@ -40,8 +40,15 @@ repos:
     hooks:
       - id: clang-format
         types_or: [c++, c, cuda]
+        # flashinfer/experimental/ .cu sources are a mechanical port kept
+        # byte-faithful to their upstream; exempt from formatting like the
+        # subtree's mypy/ruff style exemptions.
         exclude: |
-          (?x)^(3rdparty/.* flashinfer/jit/aot_config.py)$
+          (?x)^(
+            3rdparty/.*|
+            flashinfer/experimental/.*|
+            flashinfer/jit/aot_config.py
+          )$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at
@@ -49,7 +56,7 @@ repos:
       -   id: mypy
           args: ["--config-file", "pyproject.toml", "--exclude", "flashinfer-cubin/"]
           files: ^flashinfer/
-          exclude: ^(flashinfer-cubin/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/))
+          exclude: ^(flashinfer-cubin/|3rdparty/|build/|flashinfer/experimental/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/))
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.

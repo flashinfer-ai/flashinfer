@@ -24,8 +24,8 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.optional-dependencies]
-cu12 = ["nvidia-cutlass-dsl>=4.5.0"]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
+cu12 = ["nvidia-cutlass-dsl>=4.5.2"]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.2"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
 # working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
 # BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
@@ -69,6 +69,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer" = ["_build_meta.py"]
+# JIT sources for the experimental PCIe collectives (compiled on-demand via
+# torch.utils.cpp_extension.load in flashinfer/experimental/sm12x/comm/pcie/).
+"flashinfer.experimental.sm12x.comm.pcie" = ["*.cu"]
 # JIT sources for the blk64 BSA kernel extension (compiled on-demand via
 # torch.utils.cpp_extension.load in flashinfer/cute_dsl/sparse/blk64/loader.py).
 # These live inside the package tree rather than csrc/, so they must be
@@ -104,6 +107,7 @@ exclude = [
   "flashinfer-jit-cache/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
+  "flashinfer/experimental/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers/",
@@ -167,3 +171,7 @@ ignore = [
 ]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+# Mechanically ported b12x kernels (one-time port): bugbear/simplify style
+# families off to keep the port diffable against upstream; correctness rules
+# (E/F) stay on. See flashinfer/experimental/README.md.
+"flashinfer/experimental/sm12x/**" = ["B", "SIM", "F401", "F841"]
