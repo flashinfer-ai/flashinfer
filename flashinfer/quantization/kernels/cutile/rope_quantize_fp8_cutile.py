@@ -371,8 +371,7 @@ def rope_quantize_fp8_cutile(
 
     if quantize_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
         raise ValueError(
-            "quantize_dtype must be float8_e4m3fn or float8_e5m2; "
-            f"got {quantize_dtype}"
+            f"quantize_dtype must be float8_e4m3fn or float8_e5m2; got {quantize_dtype}"
         )
 
     # The kernel tiles the full (token, head, rope/nope-chunk) space and writes

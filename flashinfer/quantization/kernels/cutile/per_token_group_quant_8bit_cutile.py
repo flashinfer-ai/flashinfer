@@ -203,8 +203,7 @@ def per_token_group_quant_8bit_cutile(
         dst_dtype = torch.float8_e4m3fn
     if dst_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8):
         raise ValueError(
-            "dst_dtype must be float8_e4m3fn, float8_e5m2, or int8; "
-            f"got {dst_dtype}"
+            f"dst_dtype must be float8_e4m3fn, float8_e5m2, or int8; got {dst_dtype}"
         )
     assert x.shape[-1] % group_size == 0, (
         f"the last dimension of `x` {x.shape[-1]} must be divisible by `group_size` {group_size}"
