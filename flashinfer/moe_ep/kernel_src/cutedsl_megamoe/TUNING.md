@@ -340,7 +340,7 @@ before comparing MoE backends.
 
 ## TRT-LLM-import knobs (landed)
 
-From `../todo_trtllm_import.md` (TRT-LLM PR #16190), both idea families are
+Imported from TRT-LLM PR #16190, both idea families are
 plumbed through `get_symm_buffer_for_mega_moe` and the backend configs
 (`Nvfp4CutedslMegaMoeConfig`):
 
@@ -506,4 +506,6 @@ Each `run_sweep.sh` invocation writes its own timestamped CSV under
 CUDA-graph capture of the launch thunk (landed — `MoEEpMegaLayer.warmup()`
 + capture guards, `tests/moe_ep/test_mega_cuda_graph*.py`; with ikr
 the thunk is zero+launch, both graphable), streaming weight reload
-(on demand — see `../todo_trtllm_import.md`).
+(on demand — from TRT-LLM PR #16190: a load/reload lifecycle with
+partial-group coverage tracking for serving-oriented live weight updates;
+import only if the FI serving integration needs reload).
