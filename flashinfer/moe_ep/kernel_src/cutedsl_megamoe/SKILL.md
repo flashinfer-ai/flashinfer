@@ -8,6 +8,7 @@ kernel_src/cutedsl_megamoe/
 │   ├── common/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, …)
 │   ├── moe_mxfp8_glu/      ← MXFP8 kernel implementation
+│   ├── moe_bf16_glu/       ← BF16 kernel implementation
 │   └── moe_nvfp4_swapab/   ← NVFP4 kernel implementation
 ├── __init__.py             ← public API for moe_ep; talks ONLY to shim/ (our code)
 ├── shim/                   ← thin adapters over src/ (our code) — ALL adaptation lives here
@@ -15,6 +16,7 @@ kernel_src/cutedsl_megamoe/
 │   ├── comm.py             ← dist bootstrap, sym heap, compile state, resolve_gate_up_clamp
 │   ├── nvfp4.py            ← NVFP4 frontend + symm-buffer/launch wrappers (self-contained)
 │   ├── mxfp8.py            ← MXFP8 frontend + symm-buffer/launch wrappers (self-contained)
+│   ├── bf16.py             ← BF16 frontend + symm-buffer/launch wrappers (self-contained)
 │   ├── kernel_helpers.py   ← SINGLE re-export point for raw-kernel helpers/constants/
 │   │                          reference the FI backend + tests need (drop-audit point)
 │   ├── tuner.py            ← kernel tuning knobs (tactic enumeration + config apply);
@@ -58,11 +60,11 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 ## When the kernel team drops a new version of src/
 
-1. **Replace `src/` verbatim** with the drop's four kernel packages — no injected
+1. **Replace `src/` verbatim** with the drop's five kernel packages — no injected
    files, no edits (the drop is a full repo; copy only these four dirs):
    ```bash
-   rm -rf flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab}
-   cp -r <new_drop>/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab} \
+   rm -rf flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab}
+   cp -r <new_drop>/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab} \
        flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/
    ```
    Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,

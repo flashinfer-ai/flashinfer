@@ -87,6 +87,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
@@ -176,6 +177,7 @@ run_oracle() {
   MEGA_NO_DIST=1 "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+    tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
     -m arch_blackwell || rc=1
 
@@ -196,12 +198,14 @@ run_mega() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
+    tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v \
     -m "gpu_4 and arch_blackwell" || rc=1
 
   MEGA_NO_DIST=1 "${TORCHRUN}" --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+    tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
     -m arch_blackwell || rc=1
 

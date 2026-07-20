@@ -20,7 +20,7 @@ import torch
 import cutlass
 
 from common.megamoe_constants import Nvfp4BlockSize, Nvfp4E2M1RcpLimit
-from common.host_utils import mxfp8_quantize_per_block_32
+from common.host_utils import get_cutedsl_target_arch, mxfp8_quantize_per_block_32
 from moe_nvfp4_swapab.runner_common import (
     nvfp4_quantize_per_block_16,
     swiglu_fold_interleave,
@@ -108,19 +108,14 @@ def reference_expert_fc12(
     """
     intermediate_downproj = intermediate // 2
     fc1_fp32 = ref_scaled_mm(
-        a=act_packed,
-        sfa=act_sf,
-        b=fc1_weight_packed,
-        sfb=fc1_weight_sf,
-        n=intermediate,
-        k=hidden,
+        a=act_packed, sfa=act_sf,
+        b=fc1_weight_packed, sfb=fc1_weight_sf,
+        n=intermediate, k=hidden,
     )
     fc1_fp32 = fc1_fp32 * fc1_alpha
 
     swiglu = swiglu_fold_interleave(
-        fc1_fp32,
-        gate_up_interleave,
-        gate_up_clamp=gate_up_clamp,
+        fc1_fp32, gate_up_interleave, gate_up_clamp=gate_up_clamp,
     )
     if ref_compute_graph == "deepgemm":
         swiglu = swiglu * topk_weights.unsqueeze(-1)
@@ -128,12 +123,9 @@ def reference_expert_fc12(
     fc1_q, fc1_sf_out = quantize_fn(swiglu, fc1_norm_const)
 
     fc2_fp32 = ref_scaled_mm(
-        a=fc1_q,
-        sfa=fc1_sf_out,
-        b=fc2_weight_packed,
-        sfb=fc2_weight_sf,
-        n=hidden,
-        k=intermediate_downproj,
+        a=fc1_q, sfa=fc1_sf_out,
+        b=fc2_weight_packed, sfb=fc2_weight_sf,
+        n=hidden, k=intermediate_downproj,
     )
     fc2_fp32 = fc2_fp32 * fc2_alpha
     return fc2_fp32, fc1_q, fc1_sf_out, fc1_fp32
@@ -154,7 +146,7 @@ _combine_snr_floor_db = {
 
 
 def combine_roundtrip_to_fp32(
-    terms_fp32: torch.Tensor,  # (..., hidden) fp32 per-(token, topk) fc2 terms
+    terms_fp32: torch.Tensor,           # (..., hidden) fp32 per-(token, topk) fc2 terms
     combine_format: CombineFormat,
 ) -> torch.Tensor:
     """Round-trip the fc2 terms through the combine wire format.
@@ -207,17 +199,17 @@ def compute_megamoe_reference(
     # NVFP4 tensors below carry STORAGE shape: a logical dim of size N is
     # stored as a packed dim of size N // 2 (one byte holds two fp4 values).
     # ``unpack_fp4_to_f32`` reverses the packing by doubling the packed dim.
-    input_activation: torch.Tensor,  # storage (num_ranks, num_tokens_per_rank, hidden//2)
-    input_activation_sf: torch.Tensor,  # (num_ranks, num_tokens_per_rank, hidden//Nvfp4BlockSize) fp8 plain K-major
-    input_topk_idx: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) int64
-    input_topk_weights: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) fp32
-    fc1_weight: torch.Tensor,  # storage (num_ranks, num_experts_per_rank, hidden//2, intermediate); hidden is the packed dim
-    fc1_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate, hidden//Nvfp4BlockSize) fp8 plain
-    fc2_weight: torch.Tensor,  # storage (num_ranks, num_experts_per_rank, intermediate//4, hidden); intermediate//2 is the packed dim
-    fc2_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//Nvfp4BlockSize) fp8 plain
-    fc1_alpha: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
-    fc2_alpha: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
-    fc1_norm_const: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
+    input_activation: torch.Tensor,        # storage (num_ranks, num_tokens_per_rank, hidden//2)
+    input_activation_sf: torch.Tensor,     # (num_ranks, num_tokens_per_rank, hidden//Nvfp4BlockSize) fp8 plain K-major
+    input_topk_idx: torch.Tensor,          # (num_ranks, num_tokens_per_rank, num_topk) int64
+    input_topk_weights: torch.Tensor,      # (num_ranks, num_tokens_per_rank, num_topk) fp32
+    fc1_weight: torch.Tensor,              # storage (num_ranks, num_experts_per_rank, hidden//2, intermediate); hidden is the packed dim
+    fc1_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, intermediate, hidden//Nvfp4BlockSize) fp8 plain
+    fc2_weight: torch.Tensor,              # storage (num_ranks, num_experts_per_rank, intermediate//4, hidden); intermediate//2 is the packed dim
+    fc2_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//Nvfp4BlockSize) fp8 plain
+    fc1_alpha: torch.Tensor,                # (num_ranks, num_experts_per_rank) fp32
+    fc2_alpha: torch.Tensor,                # (num_ranks, num_experts_per_rank) fp32
+    fc1_norm_const: torch.Tensor,           # (num_ranks, num_experts_per_rank) fp32
     ref_compute_graph: Literal["transformers", "deepgemm"],
     combine_format: CombineFormat,
     gate_up_clamp: Optional[float] = None,
@@ -338,13 +330,9 @@ def compute_megamoe_reference(
             quantize_fn=nvfp4_quantize_per_block_16,
             act_packed=gathered_act,
             act_sf=gathered_act_sf,
-            fc1_weight_packed=_byte_select_expert(
-                fc1_weight, target_rank, local_expert
-            ),
+            fc1_weight_packed=_byte_select_expert(fc1_weight, target_rank, local_expert),
             fc1_weight_sf=_byte_select_expert(fc1_weight_sf, target_rank, local_expert),
-            fc2_weight_packed=_byte_select_expert(
-                fc2_weight, target_rank, local_expert
-            ),
+            fc2_weight_packed=_byte_select_expert(fc2_weight, target_rank, local_expert),
             fc2_weight_sf=_byte_select_expert(fc2_weight_sf, target_rank, local_expert),
             intermediate=intermediate,
             hidden=hidden,
@@ -375,8 +363,7 @@ def compute_megamoe_reference(
         signal = ideal_terms.pow(2).mean()
         noise = (terms_fp32 - ideal_terms).pow(2).mean()
         snr_db = (
-            float("inf")
-            if noise.item() == 0
+            float("inf") if noise.item() == 0
             else 10.0 * torch.log10(signal / noise).item()
         )
         floor_db = _combine_snr_floor_db.get(combine_format.name)
@@ -406,7 +393,9 @@ def compute_megamoe_reference(
     )
 
 
+
 import cuda.bindings.driver as cuda
+import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
@@ -461,8 +450,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             num_threads=self.threads_per_warp
             * len((self.mma_warp_id, *self.epilog_warp_id)),
         )
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+        # Resolve SMEM from the active cuTeDSL target (e.g. SM100 vs SM107).
+        self.arch = get_cutedsl_target_arch()
+        self.smem_capacity = utils.get_smem_capacity_in_bytes()
+        self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1066,6 +1057,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             allocator_warp_id=self.epilog_warp_id[0],
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+            arch=self.arch,
         )
 
         # Cluster arrive after barrier init
@@ -2593,7 +2585,7 @@ class _BlockScaledGemmReferenceLauncher:
                 stream,
             )
             self._compiled[key] = compiled
-
+        
         compiled(
             a_cute,
             b_cute,
@@ -2605,6 +2597,7 @@ class _BlockScaledGemmReferenceLauncher:
         )
         torch.cuda.current_stream().synchronize()
         return c_3d.squeeze(-1)
+
 
 
 __all__ = ["MegaMoEReference", "compute_megamoe_reference", "Nvfp4BlockSize"]
