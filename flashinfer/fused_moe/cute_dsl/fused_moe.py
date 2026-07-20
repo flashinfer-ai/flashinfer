@@ -458,10 +458,6 @@ def _moe_bf16_activation_impl(
         raise ValueError("the BF16 activation path only supports BF16 output")
     if per_token_scale is not None:
         raise ValueError("per_token_scale is not supported when x_sf is None")
-    if num_local_experts != num_experts or local_expert_offset != 0:
-        raise ValueError(
-            "the BF16 activation path does not yet support expert parallelism"
-        )
 
     if activation == ActivationType.Swiglu:
         if (
@@ -504,6 +500,9 @@ def _moe_bf16_activation_impl(
         w2_weight=w2_weight,
         w2_weight_sf=w2_weight_sf,
         w2_alpha=w2_alpha,
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
         moe_output=moe_output,
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,

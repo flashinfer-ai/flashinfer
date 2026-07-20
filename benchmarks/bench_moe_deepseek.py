@@ -302,7 +302,7 @@ def bench_cute_dsl(
                     backend="cute-dsl",
                 )
             else:
-                x, x_sf = fp4_quantize(x, gs1, sv, False, False)
+                x, x_sf = fp4_quantize(x, gs1, sv, False, False, backend="cute-dsl")
             x_sf = x_sf.unsqueeze(-1)
         return x, x_sf, per_token_scale
 
@@ -1240,8 +1240,6 @@ def main():
         parser.error(
             "--use-bf16-activation and --use-per-token-activation are mutually exclusive"
         )
-    if args.use_bf16_activation and args.ep != 1:
-        parser.error("--use-bf16-activation currently requires --ep 1")
     if args.include_activation_quant and args.use_bf16_activation:
         parser.error("--include-activation-quant is incompatible with BF16 activation")
     if args.include_activation_quant and not args.cute_dsl_only:
