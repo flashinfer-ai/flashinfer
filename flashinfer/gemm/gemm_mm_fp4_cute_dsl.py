@@ -20,17 +20,9 @@ from typing import Optional
 
 import torch
 
+from ..utils import get_device_index
+
 logger = logging.getLogger(__name__)
-
-_TORCH_TO_CUTLASS_DTYPE_ATTR = {
-    torch.bfloat16: "BFloat16",
-    torch.float16: "Float16",
-}
-
-
-def _device_index(device) -> int:
-    """Get the CUDA device index for a torch.device."""
-    return device.index if device.index is not None else torch.cuda.current_device()
 
 
 def _blockscaled_gemm_cache_key_files() -> tuple:
@@ -251,6 +243,7 @@ def _mm_fp4_precompile_worker(payload):
 
         import cutlass
 
+        from ..cute_dsl.utils import torch_to_cutlass_dtype
         from ..jit.cute_dsl_core import JitSpecCuteDsl, _hash_source_files
         from .kernels.dense_blockscaled_gemm_sm100 import (
             Sm100BlockScaledPersistentDenseGemmKernel,
@@ -281,7 +274,7 @@ def _mm_fp4_precompile_worker(payload):
             sf_dtype=cutlass.Float8E4M3FN
             if sf_vec_size == 16
             else cutlass.Float8E8M0FNU,
-            c_cutlass_dtype=getattr(cutlass, _TORCH_TO_CUTLASS_DTYPE_ATTR[out_dtype]),
+            c_cutlass_dtype=torch_to_cutlass_dtype(out_dtype),
             ab_assumed_align=32,
             swap_ab=swap_ab,
             sf_m=payload["sf_m"],
@@ -431,7 +424,7 @@ def precompile_mm_fp4_tactics(
     from flashinfer.cute_dsl.utils import get_max_active_clusters
 
     sf_vec_size = 16 if use_nvfp4 else 32
-    device_index = _device_index(device)
+    device_index = get_device_index(device)
     key_files = _blockscaled_gemm_cache_key_files()
     source_sha256 = _hash_source_files(tuple(key_files))
 

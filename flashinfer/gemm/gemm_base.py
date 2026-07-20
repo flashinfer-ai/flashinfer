@@ -54,9 +54,7 @@ from ..fused_moe.utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from .gemm_mm_fp4_cute_dsl import (
-    _TORCH_TO_CUTLASS_DTYPE_ATTR,
     _compile_block_scaled_gemm,
-    _device_index,
     _mm_fp4_cache_key,
     precompile_mm_fp4_tactics,
 )
@@ -67,6 +65,7 @@ from .kernels.utils import (
     _select_sm100_mm_fp4_cute_dsl_tactic,
 )
 from ..utils import (
+    get_device_index,
     get_device_sm_count,
     get_native_fp4_dtype,
     is_sm100a_supported,
@@ -4741,13 +4740,14 @@ def _cute_dsl_gemm_mxfp8_runner(
             "Supported: torch.bfloat16, torch.float16."
         )
 
-    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
-    if cutlass_dtype_attr is None:
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+
+    if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
             f"cute_dsl mm_mxfp8 does not support output dtype {out_dtype}. "
             "Supported: torch.bfloat16, torch.float16."
         )
-    c_cutlass_dtype = getattr(cutlass, cutlass_dtype_attr)
+    c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
     _ = sm_major, sm_minor
 
     class CuteDSLMxfp8GemmRunner(TunableRunner):
@@ -5813,15 +5813,14 @@ def _cute_dsl_gemm_fp4_runner(
     #     except ImportError:
     #         pass
 
-    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
-    c_cutlass_dtype = (
-        getattr(cutlass, cutlass_dtype_attr) if cutlass_dtype_attr is not None else None
-    )
-    if c_cutlass_dtype is None:
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+
+    if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
             f"cute_dsl backend does not support output dtype {out_dtype}. "
             f"Supported: torch.bfloat16, torch.float16."
         )
+    c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
 
     class CuteDSLFp4GemmRunner(TunableRunner):
         """TunableRunner for CuTe DSL block-scaled FP4 dense GEMM.
@@ -6061,7 +6060,7 @@ def _cute_dsl_gemm_fp4_runner(
                 sf_k=sf_k,
                 batch_size=batch_size,
                 cache_module_name="mm_fp4",
-                device_index=_device_index(a.device),
+                device_index=get_device_index(a.device),
             )
 
             alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
@@ -6112,15 +6111,14 @@ def _b12x_gemm_fp4_runner(
         _select_default_dense_gemm_plan,
     )
 
-    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
-    c_cutlass_dtype = (
-        getattr(cutlass, cutlass_dtype_attr) if cutlass_dtype_attr is not None else None
-    )
-    if c_cutlass_dtype is None:
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+
+    if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
             f"b12x backend does not support output dtype {out_dtype}. "
             f"Supported: torch.bfloat16, torch.float16."
         )
+    c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
 
     def _default_dense_plan(m, n, real_k, device):
         return _select_default_dense_gemm_plan(
