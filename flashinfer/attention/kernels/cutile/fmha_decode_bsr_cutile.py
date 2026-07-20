@@ -156,18 +156,11 @@ def _splitk_reduce_with_seq_len(
         attn_out.copy_(attn_splitk_out[0])
         return attn_out
 
-    if NUM_KV_SPLITS == 2:
-        lse_0, lse_1 = lse_splitk_out[:, :, 0], lse_splitk_out[:, :, 1]
-        lse_max = torch.maximum(lse_0, lse_1)
-        w0, w1 = torch.exp2(lse_0 - lse_max), torch.exp2(lse_1 - lse_max)
-        w_sum = w0 + w1
-        result = (
-            attn_splitk_out[0].float() * w0.unsqueeze(-1)
-            + attn_splitk_out[1].float() * w1.unsqueeze(-1)
-        ) / w_sum.unsqueeze(-1)
-        attn_out.copy_(result.to(attn_out.dtype))
-        return attn_out
-
+    # NUM_KV_SPLITS >= 2 all go through the cuTile _splitk_reduce_kernel below.
+    # (A former torch-pointwise fast path for exactly 2 splits used torch.exp2,
+    # which routes through PyTorch's nvrtc jiterator — a portability hazard on
+    # toolchains where jiterator can't compile for the running arch. 2 is
+    # already a power of two, so the kernel path handles it with no padding.)
     NUM_KV_SPLITS_POW2 = _next_power_of_2(NUM_KV_SPLITS)
     BLOCK_D = _next_power_of_2(head_dim)
 
