@@ -952,8 +952,6 @@ def _compute_ref(act_pack, tensors, shape):
     )
 
 
-
-
 @sm100_required
 class TestUnifiedMoECalibratedScales:
     """Calibrated (non-1.0) global scales must reach the kernels (gh #3548).
@@ -1060,6 +1058,7 @@ class TestUnifiedMoECalibratedScales:
             f"{pct * 100:.2f}% within tolerance (atol={atol:.4f}) vs bf16 "
             f"reference — gh #3548 regression"
         )
+
 
 # ---------------------------------------------------------------------------
 # 2. Dispatch plumbing

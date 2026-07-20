@@ -397,6 +397,8 @@ def interleave_moe_weights_for_sm90_mixed_gemm(
         weight, out, qtype_map[quant_type]
     )
     return out
+
+
 def _resolve_expert_global_scales(
     scales: Optional[torch.Tensor],
     weights_bf16: torch.Tensor,
