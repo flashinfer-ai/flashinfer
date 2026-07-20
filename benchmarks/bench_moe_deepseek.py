@@ -18,6 +18,9 @@ Usage:
     python bench_moe_deepseek.py --ep 8    # 32 local experts (8-way EP)
     python bench_moe_deepseek.py --ep 16   # 16 local experts (16-way EP)
 
+    # With Tensor Parallelism simulation
+    python bench_moe_deepseek.py --tp 8    # 256-wide local expert intermediate
+
     # Custom token counts
     python bench_moe_deepseek.py --num-tokens 64,128,256
 
@@ -56,6 +59,7 @@ class DeepSeekConfig:
 
 
 CFG = DeepSeekConfig()
+BASE_INTERMEDIATE_SIZE = CFG.intermediate_size
 TOKEN_COUNTS = [128, 256, 512, 1024, 2048, 4096]
 
 # Generation phase token counts (small batches typical in decode)
@@ -760,6 +764,7 @@ def run_benchmark(
     warmup=10,
     iters=100,
     ep_config=1,
+    tp_config=1,
     do_autotune=True,
     verbose=True,
     use_cuda_graph=True,
@@ -794,6 +799,7 @@ def run_benchmark(
         warmup: Warmup iterations
         iters: Benchmark iterations
         ep_config: Expert Parallelism config (1, 8, or 16)
+        tp_config: Tensor Parallelism degree used to reduce expert intermediate size
         do_autotune: Whether to autotune during benchmarking
         verbose: Print results to stdout
         use_cuda_graph: Whether to use CUDA graph for benchmarking
@@ -814,10 +820,16 @@ def run_benchmark(
     Returns:
         List of BenchResult objects
     """
+    if tp_config < 1 or BASE_INTERMEDIATE_SIZE % tp_config != 0:
+        raise ValueError(
+            f"tp_config must be a positive divisor of {BASE_INTERMEDIATE_SIZE}"
+        )
+
     # Get EP configuration
     ep_cfg = EP_CONFIGS.get(ep_config, EP_CONFIGS[1])
     num_local = ep_cfg["num_local_experts"]
     local_offset = ep_cfg["local_expert_offset"]
+    CFG.intermediate_size = BASE_INTERMEDIATE_SIZE // tp_config
 
     results = []
     rows_and_histograms = []
@@ -853,6 +865,7 @@ def run_benchmark(
     if verbose:
         _print_header(
             ep_config,
+            tp_config,
             num_local,
             use_cuda_graph,
             use_cupti,
@@ -955,6 +968,7 @@ def _benchmark_single(
 
 def _print_header(
     ep_config,
+    tp_config,
     num_local,
     use_cuda_graph,
     use_cupti,
@@ -969,12 +983,16 @@ def _print_header(
     """Print benchmark header."""
     print("\n" + "=" * 120)
     if cute_dsl_only:
-        print(f"DeepSeek-V3 MoE Benchmark: CuteDSL (EP={ep_config})")
+        print(f"DeepSeek-V3 MoE Benchmark: CuteDSL (EP={ep_config}, TP={tp_config})")
     elif use_per_token_activation:
-        print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs TRTLLM (EP={ep_config})")
+        print(
+            "DeepSeek-V3 MoE Benchmark: CuteDSL vs TRTLLM "
+            f"(EP={ep_config}, TP={tp_config})"
+        )
     else:
         print(
-            f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})"
+            "DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM "
+            f"(EP={ep_config}, TP={tp_config})"
         )
     print("=" * 120)
     print(
@@ -983,6 +1001,10 @@ def _print_header(
     )
     print(
         f"EP Config: {num_local} local experts (simulating {CFG.num_experts // num_local}-way parallelism)"
+    )
+    print(
+        f"TP Config: intermediate size {CFG.intermediate_size} "
+        f"(simulating {tp_config}-way parallelism)"
     )
     print(
         f"CUDA Graph: {'enabled' if use_cuda_graph else 'disabled'}, CUPTI: {'enabled' if use_cupti else 'disabled'}"
@@ -1182,6 +1204,12 @@ def main():
         help="Expert Parallelism: 1 (256 local), 8 (32 local), 16 (16 local)",
     )
     parser.add_argument(
+        "--tp",
+        type=int,
+        default=1,
+        help="Tensor Parallelism simulation: divide the expert intermediate size by TP.",
+    )
+    parser.add_argument(
         "--no-cuda-graph",
         action="store_true",
         help="Disable CUDA graph for benchmarking (enabled by default)",
@@ -1244,6 +1272,12 @@ def main():
         parser.error("--include-activation-quant is incompatible with BF16 activation")
     if args.include_activation_quant and not args.cute_dsl_only:
         parser.error("--include-activation-quant requires --cute-dsl-only")
+    if args.tp < 1:
+        parser.error("--tp must be positive")
+    if BASE_INTERMEDIATE_SIZE % args.tp != 0:
+        parser.error(
+            f"--tp must divide the expert intermediate size ({BASE_INTERMEDIATE_SIZE})"
+        )
 
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
@@ -1263,6 +1297,7 @@ def main():
     print(f"Per-token activation: {args.use_per_token_activation}")
     print(f"BF16 activation: {args.use_bf16_activation}")
     print(f"Initial activation quantization: {args.include_activation_quant}")
+    print(f"Tensor parallelism simulation: TP={args.tp}")
     print(f"CuTe DSL PDL: {'enabled' if args.enable_pdl else 'disabled'}")
     print(
         "CuteDSL finalize: "
@@ -1274,6 +1309,7 @@ def main():
         warmup=args.warmup,
         iters=args.iters,
         ep_config=args.ep,
+        tp_config=args.tp,
         do_autotune=not args.no_autotune,
         verbose=not args.quiet,
         use_cuda_graph=not args.no_cuda_graph,
