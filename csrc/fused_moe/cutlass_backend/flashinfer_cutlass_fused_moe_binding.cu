@@ -431,10 +431,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
     auto stream = get_stream(input.device());
 
-    WorkspaceInfo workspace_info = getWorkspaceInfo(
-        num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-        base_activation_type, parallelism_config, min_latency_mode, input.device(),
-        workspace_buffer);
+    WorkspaceInfo workspace_info =
+        getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
+                         static_cast<int>(experts_per_token), base_activation_type,
+                         parallelism_config, min_latency_mode, input.device(), workspace_buffer);
 
     int64_t const routed_tokens = input.size(0) * token_selected_experts.size(1);
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
@@ -458,11 +458,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         activation_params, fc2_expert_weights.data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token),
-        static_cast<char*>(workspace_info.workspace_ptr), output.data_ptr(),
-        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-        use_lora, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode,
-        min_latency_params, enable_pdl, stream);
+        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
+        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+        enable_alltoall, use_lora, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
+        min_latency_mode, min_latency_params, enable_pdl, stream);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -475,11 +474,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         activation_params, fc2_expert_weights.data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token),
-        static_cast<char*>(workspace_info.workspace_ptr), output.data_ptr(),
-        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-        mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode, min_latency_params,
-        enable_pdl, stream);
+        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
+        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+        false, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode,
+        min_latency_params, enable_pdl, stream);
 #endif
   }
 
@@ -625,10 +623,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     min_latency_params.active_expert_global_ids =
         static_cast<int*>(active_expert_global_ids.data_ptr());
 
-    WorkspaceInfo workspace_info = getWorkspaceInfo(
-        num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-        base_activation_type, parallelism_config, min_latency_mode, input.device(),
-        workspace_buffer);
+    WorkspaceInfo workspace_info =
+        getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
+                         static_cast<int>(experts_per_token), base_activation_type,
+                         parallelism_config, min_latency_mode, input.device(), workspace_buffer);
 
     int64_t const routed_tokens = input.size(0) * token_selected_experts.size(1);
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
@@ -651,10 +649,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         activation_params, fc2_expert_weights.data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, unpadded_hidden_size_ml, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token),
-        static_cast<char*>(workspace_info.workspace_ptr), output.data_ptr(),
-        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-        use_lora_ml, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
+        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
+        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+        enable_alltoall, use_lora_ml, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
         min_latency_mode, min_latency_params, enable_pdl, stream);
 #else
     mKernelRunner->runMoe(
@@ -668,11 +665,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         activation_params, fc2_expert_weights.data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, unpadded_hidden_size_ml, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token),
-        static_cast<char*>(workspace_info.workspace_ptr), output.data_ptr(),
-        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, use_lora_ml,
-        lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode,
-        min_latency_params, enable_pdl, stream);
+        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
+        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+        false, use_lora_ml, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
+        min_latency_mode, min_latency_params, enable_pdl, stream);
 #endif
   }
 
@@ -756,8 +752,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #endif
 
       size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
-      mProfileWorkspace = alloc_tensor({static_cast<int64_t>(profile_workspace_size)}, dl_int8,
-                                       input.device());
+      mProfileWorkspace =
+          alloc_tensor({static_cast<int64_t>(profile_workspace_size)}, dl_int8, input.device());
 
       mProfiler->prepare(num_rows, static_cast<char*>(mProfileWorkspace.data_ptr()),
                          expert_weights_ptr, enable_pdl, stream);
@@ -852,23 +848,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                               static_cast<ActivationType>(base_activation_type), workspace_buffer);
           });
     } else if (name == "get_workspace_size") {
-      return Function::FromTyped(
-          [this](int64_t num_rows, int64_t hidden_size, int64_t inter_size,
-                 int64_t num_experts_total, int64_t experts_per_token,
-                 int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
-                 bool min_latency_mode, int64_t base_activation_type) -> int64_t {
-            std::lock_guard<std::mutex> lock(mMutex);
-            auto parallelism_config =
-                kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
-            auto [moe_ws, src_map] = getWorkspaceSizes(
-                num_rows, hidden_size, inter_size, static_cast<int>(num_experts_total),
-                static_cast<int>(experts_per_token),
-                static_cast<ActivationType>(base_activation_type), parallelism_config,
-                min_latency_mode);
-            std::vector<size_t> ws{moe_ws, src_map};
-            return static_cast<int64_t>(
-                common::calculateTotalWorkspaceSize(ws.data(), ws.size()));
-          });
+      return Function::FromTyped([this](int64_t num_rows, int64_t hidden_size, int64_t inter_size,
+                                        int64_t num_experts_total, int64_t experts_per_token,
+                                        int64_t tp_size, int64_t tp_rank, int64_t ep_size,
+                                        int64_t ep_rank, bool min_latency_mode,
+                                        int64_t base_activation_type) -> int64_t {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
+        auto [moe_ws, src_map] = getWorkspaceSizes(
+            num_rows, hidden_size, inter_size, static_cast<int>(num_experts_total),
+            static_cast<int>(experts_per_token), static_cast<ActivationType>(base_activation_type),
+            parallelism_config, min_latency_mode);
+        std::vector<size_t> ws{moe_ws, src_map};
+        return static_cast<int64_t>(common::calculateTotalWorkspaceSize(ws.data(), ws.size()));
+      });
     } else {
       return Function(nullptr);
     }
@@ -876,8 +869,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
  private:
   struct WorkspaceInfo {
-    Tensor workspace{};    // owns allocation when caller does not provide a buffer
-    void* workspace_ptr{}; // raw pointer valid in both cases
+    Tensor workspace{};     // owns allocation when caller does not provide a buffer
+    void* workspace_ptr{};  // raw pointer valid in both cases
     void* src_to_dest_map{};
   };
 
@@ -1043,17 +1036,16 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   // Returns {moe_workspace_size, src_to_dest_map_size}.
   std::pair<size_t, size_t> getWorkspaceSizes(int64_t num_rows, int64_t hidden_size,
-                                               int64_t inter_size, int num_experts,
-                                               int experts_per_token,
-                                               ActivationType activation_type,
-                                               kernels::MOEParallelismConfig parallelism_config,
-                                               bool min_latency_mode) {
+                                              int64_t inter_size, int num_experts,
+                                              int experts_per_token, ActivationType activation_type,
+                                              kernels::MOEParallelismConfig parallelism_config,
+                                              bool min_latency_mode) {
     size_t moe_ws = mKernelRunner->getWorkspaceSize(
         num_rows, hidden_size, inter_size, num_experts, experts_per_token, activation_type,
-        parallelism_config, /*use_lora=*/false, mUseDeepSeekFP8BlockScaling,
-        mUseMxfp8ActScaling, min_latency_mode, mUseW4GroupScaling);
-    size_t src_map = static_cast<size_t>(experts_per_token) *
-                     static_cast<size_t>(num_rows) * sizeof(int);
+        parallelism_config, /*use_lora=*/false, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
+        min_latency_mode, mUseW4GroupScaling);
+    size_t src_map =
+        static_cast<size_t>(experts_per_token) * static_cast<size_t>(num_rows) * sizeof(int);
     return {moe_ws, src_map};
   }
 
@@ -1063,9 +1055,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                                  kernels::MOEParallelismConfig parallelismConfig,
                                  bool min_latency_mode, DLDevice expected_device,
                                  Optional<TensorView> provided_workspace = Optional<TensorView>{}) {
-    auto [moe_workspace_size, src_to_dest_map_size] = getWorkspaceSizes(
-        num_rows, hidden_size, inter_size, num_experts, experts_per_token,
-        activation_type, parallelismConfig, min_latency_mode);
+    auto [moe_workspace_size, src_to_dest_map_size] =
+        getWorkspaceSizes(num_rows, hidden_size, inter_size, num_experts, experts_per_token,
+                          activation_type, parallelismConfig, min_latency_mode);
 
     std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
     size_t total_workspace_size =
@@ -1076,11 +1068,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       auto const& ws = provided_workspace.value();
       // dtype: int8 or uint8 (1 byte per element so size(0) == nbytes)
       TVM_FFI_ICHECK(ws.dtype() == dl_int8 || ws.dtype() == dl_uint8)
-          << "workspace_buffer dtype must be int8 or uint8, got "
-          << DLDataTypeToString(ws.dtype());
+          << "workspace_buffer dtype must be int8 or uint8, got " << DLDataTypeToString(ws.dtype());
       // must be 1-D
-      TVM_FFI_ICHECK_EQ(ws.ndim(), 1)
-          << "workspace_buffer must be 1-D, got ndim=" << ws.ndim();
+      TVM_FFI_ICHECK_EQ(ws.ndim(), 1) << "workspace_buffer must be 1-D, got ndim=" << ws.ndim();
       // must be on CUDA, same device as the input
       TVM_FFI_ICHECK_EQ(ws.device().device_type, kDLCUDA)
           << "workspace_buffer must be a CUDA tensor";
@@ -1089,23 +1079,22 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << ") does not match input device (" << expected_device.device_id << ")";
       // sufficient bytes
       TVM_FFI_ICHECK(static_cast<size_t>(ws.size(0)) >= total_workspace_size)
-          << "workspace_buffer too small: need " << total_workspace_size
-          << " bytes, got " << ws.size(0);
+          << "workspace_buffer too small: need " << total_workspace_size << " bytes, got "
+          << ws.size(0);
       // must be contiguous (non-contiguous strides corrupt the workspace layout)
-      TVM_FFI_ICHECK(ws.IsContiguous())
-          << "workspace_buffer must be contiguous";
+      TVM_FFI_ICHECK(ws.IsContiguous()) << "workspace_buffer must be contiguous";
       // 128-byte alignment required by nextWorkspacePtr
       TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(ws.data_ptr()) % common::kCudaMemAlign == 0)
           << "workspace_buffer data pointer must be " << common::kCudaMemAlign
           << "-byte aligned (torch.empty on CUDA satisfies this by default)";
       info.workspace_ptr = ws.data_ptr();
     } else {
-      info.workspace = alloc_tensor({static_cast<int64_t>(total_workspace_size)}, dl_int8,
-                                    expected_device);
+      info.workspace =
+          alloc_tensor({static_cast<int64_t>(total_workspace_size)}, dl_int8, expected_device);
       info.workspace_ptr = info.workspace.data_ptr();
     }
-    info.src_to_dest_map = common::nextWorkspacePtr(
-        static_cast<int8_t*>(info.workspace_ptr), moe_workspace_size);
+    info.src_to_dest_map =
+        common::nextWorkspacePtr(static_cast<int8_t*>(info.workspace_ptr), moe_workspace_size);
 
     return info;
   }
