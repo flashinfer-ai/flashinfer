@@ -884,7 +884,15 @@ def test_block_diffusion_named_option(
     # --- Paged: existing wrapper with block_diffusion=True ---
     page_size = 16
     num_pages = (kv_len + page_size - 1) // page_size
-    kv_data = torch.randn(num_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=device)
+    # Page the same K/V tensors used by the ragged path and reference; otherwise
+    # the comparison measures different random inputs instead of the paged wrapper.
+    kv_data = torch.stack(
+        (
+            k.reshape(num_pages, page_size, num_kv_heads, head_dim),
+            v.reshape(num_pages, page_size, num_kv_heads, head_dim),
+        ),
+        dim=1,
+    )
     paged_kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
     paged_kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
     last_page_len = kv_len - (num_pages - 1) * page_size if kv_len % page_size != 0 else page_size
