@@ -69,6 +69,21 @@ struct LinearCombinationF32x2Operation
     : cutlass::epilogue::fusion::LinearCombination<ElementOutput, ElementCompute, ElementSource,
                                                    ElementScalar, RoundStyle> {};
 
+template <class ElementOutput, class ElementCompute, class ElementSource, class ElementScalar,
+          cutlass::FloatRoundStyle RoundStyle>
+using LinearCombinationF32x2Impl = cutlass::epilogue::fusion::Sm90EVT<
+    cutlass::epilogue::fusion::Sm90Compute<cutlass::homogeneous_multiply_add, ElementOutput,
+                                           ElementCompute, RoundStyle>,
+    cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementScalar,
+                                                   cute::Stride<cute::_0, cute::_0, int64_t>>,
+    cutlass::epilogue::fusion::Sm90SrcFetch<ElementSource>,
+    cutlass::epilogue::fusion::Sm90EVT<
+        cutlass::epilogue::fusion::Sm90Compute<PackedF32x2Multiplies, ElementCompute,
+                                               ElementCompute, RoundStyle>,
+        cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementScalar,
+                                                       cute::Stride<cute::_0, cute::_0, int64_t>>,
+        cutlass::epilogue::fusion::Sm90AccFetch>>;
+
 // Layout-compatible replacement for CUTLASS Sm90LinearCombination. Keeping
 // the outer beta*C node, even though ElementSource is void here, preserves the
 // incumbent callback and shared-storage layout. Only alpha*acc uses FMUL2.
@@ -76,30 +91,10 @@ template <class ElementOutput, class ElementCompute, class ElementSource = Eleme
           class ElementScalar = ElementCompute,
           cutlass::FloatRoundStyle RoundStyle = cutlass::FloatRoundStyle::round_to_nearest>
 struct LinearCombinationF32x2
-    : cutlass::epilogue::fusion::Sm90EVT<
-          cutlass::epilogue::fusion::Sm90Compute<cutlass::homogeneous_multiply_add, ElementOutput,
-                                                 ElementCompute, RoundStyle>,
-          cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementScalar,
-                                                         cute::Stride<cute::_0, cute::_0, int64_t>>,
-          cutlass::epilogue::fusion::Sm90SrcFetch<ElementSource>,
-          cutlass::epilogue::fusion::Sm90EVT<
-              cutlass::epilogue::fusion::Sm90Compute<PackedF32x2Multiplies, ElementCompute,
-                                                     ElementCompute, RoundStyle>,
-              cutlass::epilogue::fusion::Sm90ScalarBroadcast<
-                  ElementScalar, cute::Stride<cute::_0, cute::_0, int64_t>>,
-              cutlass::epilogue::fusion::Sm90AccFetch>> {
-  using Impl = cutlass::epilogue::fusion::Sm90EVT<
-      cutlass::epilogue::fusion::Sm90Compute<cutlass::homogeneous_multiply_add, ElementOutput,
-                                             ElementCompute, RoundStyle>,
-      cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementScalar,
-                                                     cute::Stride<cute::_0, cute::_0, int64_t>>,
-      cutlass::epilogue::fusion::Sm90SrcFetch<ElementSource>,
-      cutlass::epilogue::fusion::Sm90EVT<
-          cutlass::epilogue::fusion::Sm90Compute<PackedF32x2Multiplies, ElementCompute,
-                                                 ElementCompute, RoundStyle>,
-          cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementScalar,
-                                                         cute::Stride<cute::_0, cute::_0, int64_t>>,
-          cutlass::epilogue::fusion::Sm90AccFetch>>;
+    : LinearCombinationF32x2Impl<ElementOutput, ElementCompute, ElementSource, ElementScalar,
+                                 RoundStyle> {
+  using Impl = LinearCombinationF32x2Impl<ElementOutput, ElementCompute, ElementSource,
+                                          ElementScalar, RoundStyle>;
 
   struct Arguments {
     ElementScalar alpha = ElementScalar(1);
