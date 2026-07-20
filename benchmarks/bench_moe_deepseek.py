@@ -1765,18 +1765,6 @@ def _benchmark_distributed_tp(
         workspace.destroy()
 
 
-def _configure_distributed_environment(enable_pdl):
-    import os
-
-    # Match the communication environment configured by SGLang before it
-    # initializes process groups and the FlashInfer dispatcher.
-    os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
-    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
-    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
-    os.environ["TRTLLM_ENABLE_PDL"] = str(int(enable_pdl))
-
-
 def _run_distributed_benchmark(args, token_counts):
     import gc
     import os
@@ -2019,8 +2007,6 @@ def main():
                 "real W4A4 mode starts from BF16 and requires "
                 "--include-activation-quant"
             )
-        _configure_distributed_environment(args.enable_pdl)
-
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
         return 1
