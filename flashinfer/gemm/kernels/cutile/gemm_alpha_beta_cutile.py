@@ -389,8 +389,10 @@ def gemm_alpha_beta(
     # aliased A/B input. A/B sharing storage with each other is read-only and
     # safe (e.g. a Gram matrix A @ A.T), so it is allowed.
     def _overlaps(x, y):
-        return x.device.type == "cuda" and y.device.type == "cuda" and (
-            x.untyped_storage().data_ptr() == y.untyped_storage().data_ptr()
+        return (
+            x.device.type == "cuda"
+            and y.device.type == "cuda"
+            and (x.untyped_storage().data_ptr() == y.untyped_storage().data_ptr())
         )
 
     if _overlaps(a, c) or _overlaps(b, c):
