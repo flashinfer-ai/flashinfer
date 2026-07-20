@@ -1154,7 +1154,7 @@ class TestCuteDslMoeBf16Activation:
         with torch.cuda.graph(graph):
             graph_output = moe.run(**kwargs)
 
-        tensors["x_bf16"].normal_()
+        tensors["x_bf16"].normal_().div_(10)
         ref_output = compute_reference_moe_fp4(
             hidden_states=tensors["x_bf16"],
             gemm1_weights=tensors["w1_weight_bf16"],
