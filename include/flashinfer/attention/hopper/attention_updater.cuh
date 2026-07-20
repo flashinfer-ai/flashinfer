@@ -228,12 +228,21 @@ struct OnlineSoftmax {
 #pragma unroll
     for (int mi = 0; mi < size(row_max); ++mi) {
       float sum = row_sum(mi);
-      float inv_sum = pv_scale / sum;
-      scores_scale(mi) = inv_sum;
-      if constexpr (WITH_SCALE) {
-        row_sum(mi) = row_max(mi) * sm_scale_log2 + math::ptx_log2(sum);
+      // math::inf is a finite mask sentinel, so a fully masked row otherwise
+      // becomes a uniform softmax over masked entries.  Such rows can occur
+      // inside an otherwise visible CTA (for example with block-expanding
+      // offsets), and therefore cannot always take the CTA-level store_zero
+      // fast path.
+      if (row_max(mi) == fill_value) {
+        scores_scale(mi) = 0.f;
+        row_sum(mi) = fill_value;
       } else {
-        row_sum(mi) = row_max(mi) + math::ptx_log2(sum);
+        scores_scale(mi) = pv_scale / sum;
+        if constexpr (WITH_SCALE) {
+          row_sum(mi) = row_max(mi) * sm_scale_log2 + math::ptx_log2(sum);
+        } else {
+          row_sum(mi) = row_max(mi) + math::ptx_log2(sum);
+        }
       }
     }
   };
