@@ -27,12 +27,6 @@ from .modules import (
     gen_customize_batch_prefill_module as gen_customize_batch_prefill_module,
 )
 from .modules import (
-    gen_customize_block_extend_batch_prefill_module as gen_customize_block_extend_batch_prefill_module,
-)
-from .modules import (
-    gen_customize_block_extend_single_prefill_module as gen_customize_block_extend_single_prefill_module,
-)
-from .modules import (
     gen_customize_single_decode_module as gen_customize_single_decode_module,
 )
 from .modules import (

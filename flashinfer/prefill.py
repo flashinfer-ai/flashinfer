@@ -37,7 +37,6 @@ from .trace.templates.page import trtllm_fmha_v2_prefill_trace
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
-    gen_customize_block_extend_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
     gen_fmha_v2_module,
     gen_single_prefill_module,
@@ -47,6 +46,7 @@ from .jit import (
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
+from .jit.attention.modules import gen_customize_block_extend_batch_prefill_module
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
@@ -1224,7 +1224,7 @@ def single_prefill_with_kv_cache(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     block_diffusion: bool = False,
-    dllm_block_size: Optional[int] = None,
+    block_size: Optional[int] = None,
     q_offset: int = 0,
     kv_offset: int = 0,
 ) -> torch.Tensor: ...
@@ -1256,7 +1256,7 @@ def single_prefill_with_kv_cache(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     block_diffusion: bool = False,
-    dllm_block_size: Optional[int] = None,
+    block_size: Optional[int] = None,
     q_offset: int = 0,
     kv_offset: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
@@ -1288,7 +1288,7 @@ def single_prefill_with_kv_cache(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     block_diffusion: bool = False,
-    dllm_block_size: Optional[int] = None,
+    block_size: Optional[int] = None,
     q_offset: int = 0,
     kv_offset: int = 0,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -1442,11 +1442,11 @@ def single_prefill_with_kv_cache(
     # variant jit module via the dedicated gen and run through the jit-module
     # path with mask_mode=kBlockExpanding. See docs/block-extend-design-response.md §2.
     if block_diffusion:
-        if dllm_block_size is None:
-            raise ValueError("dllm_block_size must be provided when block_diffusion=True")
-        if dllm_block_size <= 0 or (dllm_block_size & (dllm_block_size - 1)) != 0:
+        if block_size is None:
+            raise ValueError("block_size must be provided when block_diffusion=True")
+        if block_size <= 0 or (block_size & (block_size - 1)) != 0:
             raise ValueError(
-                f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
+                f"block_size must be a positive power of 2, got {block_size}"
             )
         if custom_mask is not None or packed_custom_mask is not None:
             raise ValueError(
@@ -1481,13 +1481,14 @@ def single_prefill_with_kv_cache(
             raise RuntimeError("block_diffusion fa3 backend requires SM90/Hopper architecture")
         if o_dtype is None:
             o_dtype = q.dtype
-        from .dllm.block_extend import get_block_extend_module_with_offset
-        module = get_block_extend_module_with_offset(
+        from ._block_diffusion import get_block_diffusion_single_prefill_module
+
+        module = get_block_diffusion_single_prefill_module(
             head_dim=q.shape[-1], dtype=q.dtype, dtype_kv=k.dtype, dtype_o=o_dtype,
             head_dim_vo=v.shape[-1], backend=_bd_backend, device=q.device,
         )
         return single_prefill_with_kv_cache_with_jit_module(
-            module, q, k, v, sm_scale, dllm_block_size, q_offset, kv_offset,
+            module, q, k, v, sm_scale, block_size, q_offset, kv_offset,
             kv_layout=kv_layout,
             mask_mode=MaskMode.BLOCK_EXPANDING.value,
             window_left=window_left,
@@ -1764,7 +1765,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
         block_diffusion: bool = False,
-        dllm_block_size: Optional[int] = None,
+        block_size: Optional[int] = None,
         q_offsets_buf: Optional[torch.Tensor] = None,
         kv_offsets_buf: Optional[torch.Tensor] = None,
     ) -> None:
@@ -1850,7 +1851,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # are not known until then), mirroring the dedicated helper. See
         # docs/block-extend-design-response.md §2.
         self._block_diffusion = bool(block_diffusion)
-        self._dllm_block_size = dllm_block_size
+        self._block_size = block_size
         self._q_offsets = None
         self._kv_offsets = None
         self._block_diffusion_backend: Optional[str] = None
@@ -1867,11 +1868,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "block_diffusion=True only supports the fa2/fa3 backends (or auto), "
                     f"got {backend!r}"
                 )
-            if dllm_block_size is None:
-                raise ValueError("dllm_block_size must be provided when block_diffusion=True")
-            if dllm_block_size <= 0 or (dllm_block_size & (dllm_block_size - 1)) != 0:
+            if block_size is None:
+                raise ValueError("block_size must be provided when block_diffusion=True")
+            if block_size <= 0 or (block_size & (block_size - 1)) != 0:
                 raise ValueError(
-                    f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
+                    f"block_size must be a positive power of 2, got {block_size}"
                 )
             if jit_args is not None or jit_kwargs is not None:
                 raise ValueError(
@@ -2618,7 +2619,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._block_diffusion and (
             self._jit_module is None or self._bd_built_key != _bd_key
         ):
-            from .dllm.batch_block_extend import build_block_diffusion_jit_args
+            from ._block_diffusion_batch import build_block_diffusion_jit_args
             jit_args_bd, jit_kwargs_bd = build_block_diffusion_jit_args(
                 head_dim=head_dim_qk,
                 dtype=q_data_type,
@@ -2753,7 +2754,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         # block_diffusion: store per-request offsets and force mask_mode to
         # kBlockExpanding (auto-flip, mirroring the prefix_len_ptr→MULTIITEMSCORING
-        # pattern). The offsets + dllm_block_size are injected at run time.
+        # pattern). The offsets + block_size are injected at run time.
         if self._block_diffusion:
             if mask_mode is not None and mask_mode != MaskMode.BLOCK_EXPANDING.value:
                 raise ValueError(
@@ -3135,8 +3136,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     ),
                 }
                 # block_diffusion: inject per-request offsets from self (not *args)
-                # and append the variant's scalar slots (sm_scale, dllm_block_size),
-                # mirroring the dedicated dLLM wrapper's run args.
+                # and append the variant's scalar slots (sm_scale, block_size).
                 if self._block_diffusion:
                     _jit_known_bufs["maybe_q_block_expanding_offset"] = self._q_offsets
                     _jit_known_bufs["maybe_kv_block_expanding_offset"] = self._kv_offsets
@@ -3145,7 +3145,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                             self._jit_additional_tensor_names, _jit_known_bufs, []
                         )
                     )
-                    run_args.extend([sm_scale, self._dllm_block_size])
+                    run_args.extend([sm_scale, self._block_size])
                 else:
                     run_args.extend(
                         prepare_jit_additional_args(
@@ -3362,7 +3362,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
         block_diffusion: bool = False,
-        dllm_block_size: Optional[int] = None,
+        block_size: Optional[int] = None,
         q_offsets_buf: Optional[torch.Tensor] = None,
         kv_offsets_buf: Optional[torch.Tensor] = None,
     ) -> None:
@@ -3425,7 +3425,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         # block_diffusion: named mask option (reviewers' design #2). Variant jit
         # module built lazily at plan(). Only block_diffusion users are affected.
         self._block_diffusion = bool(block_diffusion)
-        self._dllm_block_size = dllm_block_size
+        self._block_size = block_size
         self._q_offsets = None
         self._kv_offsets = None
         self._block_diffusion_backend: Optional[str] = None
@@ -3442,11 +3442,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "block_diffusion=True only supports the fa2/fa3 backends (or auto), "
                     f"got {backend!r}"
                 )
-            if dllm_block_size is None:
-                raise ValueError("dllm_block_size must be provided when block_diffusion=True")
-            if dllm_block_size <= 0 or (dllm_block_size & (dllm_block_size - 1)) != 0:
+            if block_size is None:
+                raise ValueError("block_size must be provided when block_diffusion=True")
+            if block_size <= 0 or (block_size & (block_size - 1)) != 0:
                 raise ValueError(
-                    f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
+                    f"block_size must be a positive power of 2, got {block_size}"
                 )
             if jit_args is not None or jit_kwargs is not None:
                 raise ValueError(
@@ -3847,7 +3847,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if self._block_diffusion and (
             self._jit_module is None or self._bd_built_key != _bd_key
         ):
-            from .dllm.batch_block_extend import build_block_diffusion_jit_args
+            from ._block_diffusion_batch import build_block_diffusion_jit_args
             jit_args_bd, jit_kwargs_bd = build_block_diffusion_jit_args(
                 head_dim=head_dim_qk,
                 dtype=q_data_type,
@@ -4496,7 +4496,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         self._jit_additional_tensor_names, _jit_known_bufs, []
                     )
                 )
-                run_args.extend([sm_scale, self._dllm_block_size])
+                run_args.extend([sm_scale, self._block_size])
             else:
                 run_args.extend(
                     prepare_jit_additional_args(

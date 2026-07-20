@@ -612,10 +612,10 @@ jobs:
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_run_unit_tests.sh
 
   # ---------------------------------------------------------------------------
-  # DLLM Block Extend Attention Tests
+  # Native Block-Diffusion Prefill Tests
   # ---------------------------------------------------------------------------
-  gpu-tests-dllm-a10g:
-    name: DLLM Block Extend Tests (A10G)
+  gpu-tests-block-diffusion-a10g:
+    name: Block-Diffusion Prefill Tests (A10G)
     needs: [gate, setup]
     if: |
       needs.gate.outputs.authorized == 'true' &&
@@ -651,11 +651,11 @@ jobs:
           WORKSPACE: ${{ github.workspace }}
           BUILD_NUMBER: ${{ github.run_number }}
 
-      - name: Run DLLM Block Extend Tests
-        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_dllm.sh
+      - name: Run Block-Diffusion Prefill Tests
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_block_diffusion.sh
 
-  gpu-tests-dllm-h100:
-    name: DLLM Block Extend Tests (H100)
+  gpu-tests-block-diffusion-h100:
+    name: Block-Diffusion Prefill Tests (H100)
     needs: [gate, setup]
     if: |
       needs.gate.outputs.authorized == 'true' &&
@@ -693,8 +693,8 @@ jobs:
           WORKSPACE: ${{ github.workspace }}
           BUILD_NUMBER: ${{ github.run_number }}
 
-      - name: Run DLLM Block Extend Tests
-        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_dllm.sh
+      - name: Run Block-Diffusion Prefill Tests
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_block_diffusion.sh
 
   # ---------------------------------------------------------------------------
   # Test Results Summary
@@ -715,8 +715,8 @@ jobs:
       - analyze-gpu-t4-failure
       - gpu-tests-t4-rerun
       - gpu-tests-h100
-      - gpu-tests-dllm-a10g
-      - gpu-tests-dllm-h100
+      - gpu-tests-block-diffusion-a10g
+      - gpu-tests-block-diffusion-h100
     runs-on: ubuntu-latest
     steps:
       - name: Check Authorization
@@ -824,18 +824,18 @@ jobs:
             FAILED=true
           fi
 
-          # DLLM tests (no rerun logic - short-running jobs)
+          # Block-diffusion tests (no rerun logic - short-running jobs)
           echo "" >> $GITHUB_STEP_SUMMARY
-          DLLM_A10G="${{ needs.gpu-tests-dllm-a10g.result }}"
-          echo "DLLM Tests (A10G): $DLLM_A10G" >> $GITHUB_STEP_SUMMARY
-          if [ "$DLLM_A10G" != "success" ] && [ "$DLLM_A10G" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
+          BLOCK_DIFFUSION_A10G="${{ needs.gpu-tests-block-diffusion-a10g.result }}"
+          echo "Block-Diffusion Tests (A10G): $BLOCK_DIFFUSION_A10G" >> $GITHUB_STEP_SUMMARY
+          if [ "$BLOCK_DIFFUSION_A10G" != "success" ] && [ "$BLOCK_DIFFUSION_A10G" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
             FAILED=true
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
-          DLLM_H100="${{ needs.gpu-tests-dllm-h100.result }}"
-          echo "DLLM Tests (H100): $DLLM_H100" >> $GITHUB_STEP_SUMMARY
-          if [ "$DLLM_H100" != "success" ] && [ "$DLLM_H100" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
+          BLOCK_DIFFUSION_H100="${{ needs.gpu-tests-block-diffusion-h100.result }}"
+          echo "Block-Diffusion Tests (H100): $BLOCK_DIFFUSION_H100" >> $GITHUB_STEP_SUMMARY
+          if [ "$BLOCK_DIFFUSION_H100" != "success" ] && [ "$BLOCK_DIFFUSION_H100" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
             FAILED=true
           fi
 

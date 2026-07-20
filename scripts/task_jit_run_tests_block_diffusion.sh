@@ -13,5 +13,5 @@ if [ "$SKIP_INSTALL" = "0" ]; then
   pip install -e . -v
 fi
 
-# DLLM Block Extend Attention precision tests
-pytest -s tests/attention/test_dllm_blockwise_mask_attention.py
+# Native block-diffusion prefill tests.
+pytest -s tests/attention/test_block_diffusion_attention.py
