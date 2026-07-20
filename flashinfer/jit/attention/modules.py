@@ -29,12 +29,12 @@ from ..core import (
     current_compilation_context,
 )
 from ...jit.cubin_loader import get_artifact, get_meta_hash
+from ...utils import MaskMode
 from ..utils import (
     dtype_map,
     dtype_map_kv,
     filename_safe_dtype_map,
     mask_mode_literal,
-    MaskMode,
     pos_encoding_mode_literal,
     write_if_different,
 )
@@ -1638,7 +1638,7 @@ def gen_customize_block_extend_single_prefill_module(
         additional_scalar_names, additional_scalar_dtypes,
         variant_name, variant_decl, pos_encoding_mode,
         use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
-        [MaskMode.kBlockExpanding.value],
+        [MaskMode.BLOCK_EXPANDING.value],
         is_block_extend=True,
     )
 
@@ -1677,7 +1677,7 @@ def gen_customize_block_extend_batch_prefill_module(
         additional_scalar_names, additional_scalar_dtypes,
         variant_name, variant_decl, pos_encoding_mode,
         use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
-        [MaskMode.kBlockExpanding.value],
+        [MaskMode.BLOCK_EXPANDING.value],
         is_block_extend=True,
         is_batch=True,
     )
