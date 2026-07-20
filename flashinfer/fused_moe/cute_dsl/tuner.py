@@ -640,19 +640,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
 _W4A16_ROUTE_TILES = (32, 64, 128)
 _W4A16_K_TILES = (64, 128, 256)
-_W4A16_BASE_GEMM1_TOPOLOGY = (128, (2, 1))
-_W4A16_BASE_GEMM2_TOPOLOGY = (256, (2, 1))
-_W4A16_BASE_GEMM1_TACTIC = ((128, 128), (2, 1))
-_W4A16_BASE_GEMM2_TACTIC = ((256, 128), (2, 1))
-_W4A16_2CTA_K256_TACTIC = ((256, 256), (2, 1))
 # Grouped expert scheduling requires cluster N=1 when multiple routed rows
 # target the same expert.
 _W4A16_GEMM_TOPOLOGIES = (
     (128, (1, 1)),
     (128, (2, 1)),
-    (128, (4, 1)),
     (256, (2, 1)),
-    (256, (4, 1)),
 )
 _W4A16_GEMM_TACTICS = tuple(
     ((mma_m, mma_k), cluster_shape)
@@ -660,48 +653,12 @@ _W4A16_GEMM_TACTICS = tuple(
         _W4A16_GEMM_TOPOLOGIES, _W4A16_K_TILES
     )
 )
-
-
-def get_w4a16_moe_tactics() -> Tuple[Tuple, ...]:
-    """Return a curated W4A16 pipeline search space.
-
-    MMA K tiles are tuned independently for GEMM1 and GEMM2. Each GEMM also
-    varies its K tile and CTA/cluster topology against the baseline tactic for
-    the other GEMM, avoiding the full pipeline Cartesian product.
-    """
-    tactics = []
-    for route_tile in _W4A16_ROUTE_TILES:
-        for gemm1_k, gemm2_k in itertools.product(_W4A16_K_TILES, _W4A16_K_TILES):
-            gemm1_m, gemm1_cluster = _W4A16_BASE_GEMM1_TOPOLOGY
-            gemm2_m, gemm2_cluster = _W4A16_BASE_GEMM2_TOPOLOGY
-            tactics.append(
-                (
-                    route_tile,
-                    ((gemm1_m, gemm1_k), gemm1_cluster),
-                    ((gemm2_m, gemm2_k), gemm2_cluster),
-                )
-            )
-
-        tactics.extend(
-            (route_tile, gemm1_tactic, _W4A16_BASE_GEMM2_TACTIC)
-            for gemm1_tactic in _W4A16_GEMM_TACTICS
-        )
-        tactics.extend(
-            (route_tile, _W4A16_BASE_GEMM1_TACTIC, gemm2_tactic)
-            for gemm2_tactic in _W4A16_GEMM_TACTICS
-        )
-        tactics.append(
-            (
-                route_tile,
-                _W4A16_2CTA_K256_TACTIC,
-                _W4A16_2CTA_K256_TACTIC,
-            )
-        )
-
-    return tuple(dict.fromkeys(tactics))
-
-
-W4A16_MOE_TACTICS = get_w4a16_moe_tactics()
+W4A16_MOE_TACTICS = tuple(
+    (route_tile, gemm_tactic, gemm_tactic)
+    for route_tile, gemm_tactic in itertools.product(
+        _W4A16_ROUTE_TILES, _W4A16_GEMM_TACTICS
+    )
+)
 
 
 class CuteDslFusedMoEW4A16Runner(TunableRunner):

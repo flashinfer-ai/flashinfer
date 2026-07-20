@@ -29,7 +29,6 @@ Tests include:
 """
 
 import gc
-import itertools
 import weakref
 
 import pytest
@@ -267,7 +266,7 @@ class TestTacticEnumeration:
                 f"gemm2_cluster_m={gemm2_cluster_m}"
             )
 
-    def test_w4a16_tactics_cover_independent_launch_axes(self):
+    def test_w4a16_tactics_cover_shared_launch_axes(self):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             DEFAULT_W4A16_MOE_TACTIC,
         )
@@ -275,42 +274,33 @@ class TestTacticEnumeration:
 
         assert len(W4A16_MOE_TACTICS) == len(set(W4A16_MOE_TACTICS))
         assert DEFAULT_W4A16_MOE_TACTIC in W4A16_MOE_TACTICS
+        assert len(W4A16_MOE_TACTICS) == 27
 
         route_tiles = {tactic[0] for tactic in W4A16_MOE_TACTICS}
         assert route_tiles == {32, 64, 128}
 
-        base_gemm1 = ((128, 128), (2, 1))
-        base_gemm2 = ((256, 128), (2, 1))
+        expected_gemm_tactics = {
+            ((mma_m, mma_k), cluster_shape)
+            for mma_m, cluster_shape in (
+                (128, (1, 1)),
+                (128, (2, 1)),
+                (256, (2, 1)),
+            )
+            for mma_k in (64, 128, 256)
+        }
         for route_tile in route_tiles:
-            route_tactics = {
+            route_tactics = [
                 (gemm1_tactic, gemm2_tactic)
                 for route, gemm1_tactic, gemm2_tactic in W4A16_MOE_TACTICS
                 if route == route_tile
-            }
-            for gemm1_k, gemm2_k in itertools.product((64, 128, 256), repeat=2):
-                assert (
-                    ((128, gemm1_k), (2, 1)),
-                    ((256, gemm2_k), (2, 1)),
-                ) in route_tactics
-
-            for (mma_m, cluster_shape), mma_k in itertools.product(
-                (
-                    (128, (1, 1)),
-                    (128, (2, 1)),
-                    (128, (4, 1)),
-                    (256, (2, 1)),
-                    (256, (4, 1)),
-                ),
-                (64, 128, 256),
-            ):
-                gemm_tactic = ((mma_m, mma_k), cluster_shape)
-                assert (gemm_tactic, base_gemm2) in route_tactics
-                assert (base_gemm1, gemm_tactic) in route_tactics
-
-            assert (
-                ((256, 256), (2, 1)),
-                ((256, 256), (2, 1)),
-            ) in route_tactics
+            ]
+            assert {gemm1_tactic for gemm1_tactic, _ in route_tactics} == (
+                expected_gemm_tactics
+            )
+            assert all(
+                gemm1_tactic == gemm2_tactic
+                for gemm1_tactic, gemm2_tactic in route_tactics
+            )
 
 
 # =============================================================================
