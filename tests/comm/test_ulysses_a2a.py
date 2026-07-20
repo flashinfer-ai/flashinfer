@@ -76,9 +76,7 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
 
                 # ---- mode 0: [B,S_local,H,D] -> [B,S_global,H_local,D] ----
                 ref = _ref_input_a2a(x, world_size, rank, H_local, group)
-                out = torch.empty(
-                    B, S_global, H_local, D, dtype=dtype, device=device
-                )
+                out = torch.empty(B, S_global, H_local, D, dtype=dtype, device=device)
                 comm.ulysses_a2a(custom_ptr, x, out, B, S_local, H, D, 0)
                 torch.cuda.synchronize()
                 assert torch.equal(out, ref), (

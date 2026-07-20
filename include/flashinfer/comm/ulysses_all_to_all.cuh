@@ -102,7 +102,7 @@ class UlyssesA2A {
 // small).
 template <typename T, int NGPUS, int MODE>
 __device__ __forceinline__ void ulysses_a2a_move(const T* __restrict__ local_in, RankData out_ptrs,
-                                                  int rank, int B, int S_local, int H_local, int D) {
+                                                 int rank, int B, int S_local, int H_local, int D) {
   static_assert(MODE == 0 || MODE == 1, "MODE must be 0 or 1");
   const int W = NGPUS;
   const int64_t H = static_cast<int64_t>(H_local) * W;
@@ -115,8 +115,8 @@ __device__ __forceinline__ void ulysses_a2a_move(const T* __restrict__ local_in,
   using Vec = int4;
   constexpr int kVecBytes = sizeof(Vec);
   const int64_t row_bytes = block_len * static_cast<int64_t>(sizeof(T));
-  const bool vec_ok = (row_bytes % kVecBytes) == 0 &&
-                      (reinterpret_cast<uintptr_t>(local_in) % kVecBytes) == 0;
+  const bool vec_ok =
+      (row_bytes % kVecBytes) == 0 && (reinterpret_cast<uintptr_t>(local_in) % kVecBytes) == 0;
 
   // Contiguous slab of rows for this block.
   const int64_t rows_per_block = (num_rows + gridDim.x - 1) / gridDim.x;
