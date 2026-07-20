@@ -87,13 +87,6 @@ EP_CONFIGS = {
 @dataclass
 class DistributedBenchResult:
     num_tokens: int
-    routing_ms: float
-    activation_prep_ms: float
-    allgather_ms: float
-    dispatch_ms: float
-    moe_ms: float
-    combine_ms: float
-    allreduce_ms: float
     e2e_ms: float
 
 
@@ -1372,6 +1365,41 @@ def _median_distributed_samples(num_tokens, samples):
     return DistributedBenchResult(num_tokens, *medians.tolist())
 
 
+def _run_distributed_iterations(args, run_once, l2_flush, dist, device):
+    for _ in range(args.warmup):
+        run_once()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    if args.profile_cuda:
+        torch.cuda.cudart().cudaProfilerStart()
+        for _ in range(args.profile_iters):
+            l2_flush.zero_()
+            torch.cuda.synchronize()
+            dist.barrier()
+            run_once()
+        torch.cuda.synchronize()
+        dist.barrier()
+        torch.cuda.cudart().cudaProfilerStop()
+        return None
+
+    samples = []
+    for _ in range(args.iters):
+        l2_flush.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
+        e2e_start = torch.cuda.Event(enable_timing=True)
+        e2e_end = torch.cuda.Event(enable_timing=True)
+        e2e_start.record()
+        run_once()
+        e2e_end.record()
+        e2e_end.synchronize()
+        samples.append(
+            _max_rank_sample([e2e_start.elapsed_time(e2e_end)], dist, device)
+        )
+    return samples
+
+
 def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
     import torch.distributed as dist
 
@@ -1426,8 +1454,6 @@ def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
             kernel=FusedMoeKernelConfig(moe_config=moe_config),
         ),
     )
-    layer.enable_timing = True
-
     hidden_states, router_logits, _, routing_bias = _create_distributed_inputs(
         num_tokens, rank, world_size, device
     )
@@ -1445,39 +1471,13 @@ def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
     l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
 
     def run_once():
-        e2e_start = torch.cuda.Event(enable_timing=True)
-        e2e_end = torch.cuda.Event(enable_timing=True)
-        routing_start = torch.cuda.Event(enable_timing=True)
-        routing_end = torch.cuda.Event(enable_timing=True)
-        e2e_start.record()
-        routing_start.record()
         _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
-        routing_end.record()
         layer.forward(tensors)
-        e2e_end.record()
-        e2e_end.synchronize()
-        timings = layer.last_timings_ms
-        return [
-            routing_start.elapsed_time(routing_end),
-            timings["activation_prep"],
-            0.0,
-            timings["dispatch"],
-            timings["moe"],
-            timings["combine"],
-            0.0,
-            e2e_start.elapsed_time(e2e_end),
-        ]
 
     try:
-        for _ in range(args.warmup):
-            run_once()
-        dist.barrier()
-        samples = []
-        for _ in range(args.iters):
-            l2_flush.zero_()
-            torch.cuda.synchronize()
-            dist.barrier()
-            samples.append(_max_rank_sample(run_once(), dist, device))
+        samples = _run_distributed_iterations(args, run_once, l2_flush, dist, device)
+        if samples is None:
+            return None
         return _median_distributed_samples(num_tokens, samples)
     finally:
         layer.destroy()
@@ -1612,27 +1612,8 @@ def _benchmark_distributed_tp(
     l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
 
     def run_once():
-        e2e_start = torch.cuda.Event(enable_timing=True)
-        e2e_end = torch.cuda.Event(enable_timing=True)
-        routing_start = torch.cuda.Event(enable_timing=True)
-        routing_end = torch.cuda.Event(enable_timing=True)
-        allgather_start = torch.cuda.Event(enable_timing=True)
-        allgather_end = torch.cuda.Event(enable_timing=True)
-        quant_start = torch.cuda.Event(enable_timing=True)
-        quant_end = torch.cuda.Event(enable_timing=True)
-        moe_start = torch.cuda.Event(enable_timing=True)
-        moe_end = torch.cuda.Event(enable_timing=True)
-        allreduce_start = torch.cuda.Event(enable_timing=True)
-        allreduce_end = torch.cuda.Event(enable_timing=True)
-
-        e2e_start.record()
-        allgather_start.record()
         dist.all_gather(gathered_hidden_states, local_hidden_states)
-        allgather_end.record()
-        routing_start.record()
         _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
-        routing_end.record()
-        quant_start.record()
         activation_pack = _make_tp_activation_pack(
             args,
             hidden_states,
@@ -1640,11 +1621,7 @@ def _benchmark_distributed_tp(
             topk_values,
             global_scale,
         )
-        quant_end.record()
-        moe_start.record()
         local_output = layer(activation_pack, weight_pack)
-        moe_end.record()
-        allreduce_start.record()
         allreduce_fusion(
             input=local_output,
             workspace=workspace,
@@ -1652,30 +1629,11 @@ def _benchmark_distributed_tp(
             launch_with_pdl=args.enable_pdl,
             output=allreduce_output,
         )
-        allreduce_end.record()
-        e2e_end.record()
-        e2e_end.synchronize()
-        return [
-            routing_start.elapsed_time(routing_end),
-            (0.0 if args.use_bf16_activation else quant_start.elapsed_time(quant_end)),
-            allgather_start.elapsed_time(allgather_end),
-            0.0,
-            moe_start.elapsed_time(moe_end),
-            0.0,
-            allreduce_start.elapsed_time(allreduce_end),
-            e2e_start.elapsed_time(e2e_end),
-        ]
 
     try:
-        for _ in range(args.warmup):
-            run_once()
-        dist.barrier()
-        samples = []
-        for _ in range(args.iters):
-            l2_flush.zero_()
-            torch.cuda.synchronize()
-            dist.barrier()
-            samples.append(_max_rank_sample(run_once(), dist, device))
+        samples = _run_distributed_iterations(args, run_once, l2_flush, dist, device)
+        if samples is None:
+            return None
         return _median_distributed_samples(num_tokens, samples)
     finally:
         workspace.destroy()
@@ -1703,14 +1661,17 @@ def _run_distributed_benchmark(args, token_counts):
         variant = "w4a16" if args.use_bf16_activation else "w4a4"
         if rank == 0:
             print("\nDeepSeek-V3 distributed MoE benchmark")
-            print(
-                f"Mode: real {mode.upper()}{world_size}, variant={variant}, "
-                "timing=max rank CUDA events, cache=cold L2"
-            )
-            print(
-                "global tokens | routing | act prep/quant | all-gather | dispatch | "
-                "local MoE | combine | all-reduce | end-to-end (ms)"
-            )
+            if args.profile_cuda:
+                print(
+                    f"Mode: real {mode.upper()}{world_size}, variant={variant}, "
+                    "capture=cudaProfilerStart/Stop, cache=cold L2"
+                )
+            else:
+                print(
+                    f"Mode: real {mode.upper()}{world_size}, variant={variant}, "
+                    "timing=max rank CUDA events, cache=cold L2"
+                )
+                print("global tokens | end-to-end (ms)")
 
         results = []
         for num_tokens in token_counts:
@@ -1727,28 +1688,21 @@ def _run_distributed_benchmark(args, token_counts):
                     device,
                     report_backend=not results,
                 )
-            results.append(result)
             if rank == 0:
-                print(
-                    f"{result.num_tokens:>13} | "
-                    f"{result.routing_ms:>7.3f} | "
-                    f"{result.activation_prep_ms:>14.3f} | "
-                    f"{result.allgather_ms:>10.3f} | "
-                    f"{result.dispatch_ms:>8.3f} | "
-                    f"{result.moe_ms:>9.3f} | "
-                    f"{result.combine_ms:>7.3f} | "
-                    f"{result.allreduce_ms:>10.3f} | "
-                    f"{result.e2e_ms:>10.3f}"
-                )
-                print(
-                    "DISTRIBUTED_CSV,"
-                    f"{mode},{variant},{num_tokens},{world_size},"
-                    f"{result.routing_ms:.6f},{result.activation_prep_ms:.6f},"
-                    f"{result.allgather_ms:.6f},"
-                    f"{result.dispatch_ms:.6f},{result.moe_ms:.6f},"
-                    f"{result.combine_ms:.6f},{result.allreduce_ms:.6f},"
-                    f"{result.e2e_ms:.6f}"
-                )
+                if result is None:
+                    print(
+                        f"Captured {args.profile_iters} iteration(s) at "
+                        f"{num_tokens} global tokens"
+                    )
+                else:
+                    print(f"{result.num_tokens:>13} | {result.e2e_ms:>10.3f}")
+                    print(
+                        "DISTRIBUTED_CSV,"
+                        f"{mode},{variant},{num_tokens},{world_size},"
+                        f"{result.e2e_ms:.6f}"
+                    )
+            if result is not None:
+                results.append(result)
             dist.barrier()
             gc.collect()
             torch.cuda.empty_cache()
@@ -1851,7 +1805,7 @@ def main():
     parser.add_argument(
         "--profile-cuda",
         action="store_true",
-        help="Capture cold-L2 CUDA graph replays between cudaProfilerStart/Stop.",
+        help="Capture steady-state iterations between cudaProfilerStart/Stop.",
     )
     parser.add_argument(
         "--profile-iters",
@@ -1902,8 +1856,6 @@ def main():
                 "real W4A4 mode starts from BF16 and requires "
                 "--include-activation-quant"
             )
-        if args.profile_cuda:
-            parser.error("--profile-cuda is not supported in real multi-GPU mode")
 
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")

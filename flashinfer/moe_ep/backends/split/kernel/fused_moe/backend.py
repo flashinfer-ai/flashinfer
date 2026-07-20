@@ -5,8 +5,6 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING, Optional
 
-import torch
-
 from .....config import BootstrapConfig, EpAlgorithm, EpLayout, FleetParams
 from .....core.kernel.base import SplitKernelBackend, SplitKernelContext
 from .....core.kernel.registry import register_split_kernel
@@ -35,8 +33,6 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
             )
         self._moe_config = config.moe_config
         self._compute: Optional["MoELayer"] = None
-        self.enable_timing = False
-        self._timing_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -89,13 +85,6 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
 
         fleet_params = ctx.fleet_params
         is_ht = fleet_params.algorithm is EpAlgorithm.HIGH_THROUGHPUT
-        if self.enable_timing:
-            prepare_start = torch.cuda.Event(enable_timing=True)
-            prepare_end = torch.cuda.Event(enable_timing=True)
-            moe_start = torch.cuda.Event(enable_timing=True)
-            moe_end = torch.cuda.Event(enable_timing=True)
-            prepare_start.record()
-
         if is_ht or fleet_params.layout is EpLayout.RANK_MAJOR:
             if ctx.recv_topk_idx is None or ctx.recv_topk_weights is None:
                 raise RuntimeError(
@@ -121,20 +110,5 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 per_token_activation=per_token_activation,
             )
 
-        if self.enable_timing:
-            prepare_end.record()
-            moe_start.record()
         out_2d = self._ensure_compute(fleet_params)(act_pack, self._transformed_weights)
-        if self.enable_timing:
-            moe_end.record()
-            self._timing_events = {
-                "activation_prep": (prepare_start, prepare_end),
-                "moe": (moe_start, moe_end),
-            }
         return reshape_for_combine(out_2d, dim0, dim1)
-
-    def get_last_timings_ms(self):
-        return {
-            name: start.elapsed_time(end)
-            for name, (start, end) in self._timing_events.items()
-        }
