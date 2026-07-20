@@ -793,8 +793,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     def _cutlass_fused_moe_workspace_size(
         max_num_tokens: int,
         hidden_size: int,
-        inter_size: int,
-        num_experts: int,
+        intermediate_size: int,
+        num_experts_total: int,
         top_k: int,
         *,
         x_dtype: torch.dtype,
@@ -840,8 +840,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             moe_runner.fused_moe_runner.get_workspace_size(
                 max_num_tokens,
                 hidden_size,
-                inter_size,
-                num_experts,
+                intermediate_size,
+                num_experts_total,
                 top_k,
                 tp_size,
                 tp_rank,
@@ -1044,8 +1044,9 @@ def cutlass_fused_moe(
         1. Query the required size once at model-load time::
 
                ws_bytes = cutlass_fused_moe_workspace_size(
-                   max_num_tokens, hidden_size, inter_size, num_experts, top_k,
-                   x_dtype=..., weight_dtype=..., use_fused_finalize=<same as here>)
+                   max_num_tokens, hidden_size, intermediate_size,
+                   num_experts_total, top_k, x_dtype=..., weight_dtype=...,
+                   use_fused_finalize=<same as here>, device=input.device)
                workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=input.device)
 
         2. Pass ``workspace_buffer=workspace`` on every forward call.
@@ -1076,7 +1077,7 @@ def cutlass_fused_moe(
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
     """
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = get_compute_capability(input.device)
     device_arch = f"{major * 10 + minor}"
 
     if use_wfp4afp8_humming and device_arch != "90":
@@ -1113,49 +1114,53 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
-    return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
-        output,
-        input,
-        token_selected_experts,
-        token_final_scales,
-        fc1_expert_weights,
-        fc1_expert_biases,
-        fc2_expert_weights,
-        fc2_expert_biases,
-        output_dtype,
-        quant_scales,
-        input_sf,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
-        swizzled_input_sf,
-        tp_size,
-        tp_rank,
-        ep_size,
-        ep_rank,
-        cluster_size,
-        cluster_rank,
-        use_packed_weights=use_packed_weights,
-        enable_alltoall=enable_alltoall,
-        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-        use_w4_group_scaling=use_w4_group_scaling,
-        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        min_latency_mode=min_latency_mode,
-        tune_max_num_tokens=tune_max_num_tokens,
-        enable_pdl=enable_pdl,
-        activation_type=activation_type,
-        use_fused_finalize=use_fused_finalize,
-        use_wfp4afp8_humming=use_wfp4afp8_humming,
-        profile_ids=profile_ids,
-        workspace_buffer=workspace_buffer,
-    )
+    # Module loading and runner construction inspect the current CUDA device.
+    # Keep the Python-side context aligned with the input; the C++ runner also
+    # installs its own guard for execution and workspace allocation.
+    with torch.cuda.device(input.device):
+        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
+            output,
+            input,
+            token_selected_experts,
+            token_final_scales,
+            fc1_expert_weights,
+            fc1_expert_biases,
+            fc2_expert_weights,
+            fc2_expert_biases,
+            output_dtype,
+            quant_scales,
+            input_sf,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            swizzled_input_sf,
+            tp_size,
+            tp_rank,
+            ep_size,
+            ep_rank,
+            cluster_size,
+            cluster_rank,
+            use_packed_weights=use_packed_weights,
+            enable_alltoall=enable_alltoall,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            min_latency_mode=min_latency_mode,
+            tune_max_num_tokens=tune_max_num_tokens,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            use_fused_finalize=use_fused_finalize,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
+            profile_ids=profile_ids,
+            workspace_buffer=workspace_buffer,
+        )
 
 
 def cutlass_fused_moe_workspace_size(
     max_num_tokens: int,
     hidden_size: int,
-    inter_size: int,
-    num_experts: int,
+    intermediate_size: int,
+    num_experts_total: int,
     top_k: int,
     *,
     x_dtype: torch.dtype,
@@ -1173,6 +1178,7 @@ def cutlass_fused_moe_workspace_size(
     use_fused_finalize: bool = True,
     use_packed_weights: bool = False,
     use_wfp4afp8_humming: bool = False,
+    device: Optional[torch.device] = None,
 ) -> int:
     """Return the workspace buffer size in bytes required by :func:`cutlass_fused_moe`.
 
@@ -1187,13 +1193,24 @@ def cutlass_fused_moe_workspace_size(
         Maximum ``input.shape[0]`` that will be seen at runtime.  The buffer
         is monotonically sized by this value, so a buffer allocated for the
         maximum shape is valid for all smaller shapes on the same call.
-    hidden_size, inter_size, num_experts, top_k : int
-        Expert geometry -- must match the weights passed to
-        :func:`cutlass_fused_moe`.
+    hidden_size : int
+        Logical hidden dimension.
+    intermediate_size : int
+        Logical, unpacked intermediate dimension. For packed weights this is
+        ``fc2_expert_weights.shape[2]`` multiplied by the format's packing
+        factor, not the packed storage dimension itself.
+    num_experts_total : int
+        Global expert count across all EP ranks. This must equal
+        ``fc2_expert_weights.shape[0] * ep_size``.
+    top_k : int
+        Number of selected experts per token.
     x_dtype, weight_dtype : torch.dtype
         Input and weight dtypes, used to select the kernel runner.
     output_dtype : torch.dtype, optional
         Output dtype (default: ``torch.bfloat16``).
+    device : torch.device, optional
+        CUDA device on which the workspace will be used. Defaults to the
+        current CUDA device.
 
     Note
     ----
@@ -1204,40 +1221,62 @@ def cutlass_fused_moe_workspace_size(
         raise ValueError(f"max_num_tokens must be positive, got {max_num_tokens}")
     if hidden_size <= 0:
         raise ValueError(f"hidden_size must be positive, got {hidden_size}")
-    if inter_size <= 0:
-        raise ValueError(f"inter_size must be positive, got {inter_size}")
-    if num_experts <= 0:
-        raise ValueError(f"num_experts must be positive, got {num_experts}")
+    if intermediate_size <= 0:
+        raise ValueError(f"intermediate_size must be positive, got {intermediate_size}")
+    if num_experts_total <= 0:
+        raise ValueError(f"num_experts_total must be positive, got {num_experts_total}")
     if top_k <= 0:
         raise ValueError(f"top_k must be positive, got {top_k}")
     if tp_size <= 0:
         raise ValueError(f"tp_size must be positive, got {tp_size}")
     if ep_size <= 0:
         raise ValueError(f"ep_size must be positive, got {ep_size}")
-    major, minor = torch.cuda.get_device_capability()
-    device_arch = f"{major * 10 + minor}"
-    return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe_workspace_size(
-        max_num_tokens,
-        hidden_size,
-        inter_size,
-        num_experts,
-        top_k,
-        x_dtype=x_dtype,
-        weight_dtype=weight_dtype,
-        output_dtype=output_dtype,
-        activation_type=activation_type,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-        ep_size=ep_size,
-        ep_rank=ep_rank,
-        min_latency_mode=min_latency_mode,
-        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-        use_w4_group_scaling=use_w4_group_scaling,
-        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        use_fused_finalize=use_fused_finalize,
-        use_packed_weights=use_packed_weights,
-        use_wfp4afp8_humming=use_wfp4afp8_humming,
-    )
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
+    if not 0 <= ep_rank < ep_size:
+        raise ValueError(f"ep_rank must be in [0, {ep_size}), got {ep_rank}")
+    if num_experts_total % ep_size != 0:
+        raise ValueError(
+            f"num_experts_total ({num_experts_total}) must be divisible by "
+            f"ep_size ({ep_size})"
+        )
+
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError(f"device must be a CUDA device, got {device}")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+
+    with torch.cuda.device(device):
+        major, minor = get_compute_capability(device)
+        device_arch = f"{major * 10 + minor}"
+        return get_cutlass_fused_moe_module(
+            device_arch
+        ).cutlass_fused_moe_workspace_size(
+            max_num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts_total,
+            top_k,
+            x_dtype=x_dtype,
+            weight_dtype=weight_dtype,
+            output_dtype=output_dtype,
+            activation_type=activation_type,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            min_latency_mode=min_latency_mode,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            use_fused_finalize=use_fused_finalize,
+            use_packed_weights=use_packed_weights,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
+        )
 
 
 # trtllmgen-moe-fp8

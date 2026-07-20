@@ -3376,6 +3376,7 @@ def _run_w4a8_moe_hopper(
     intermediate_size,
     dtype=torch.bfloat16,
     use_autotune=False,
+    use_workspace=False,
 ):
     torch.manual_seed(42)
     group_size = 128
@@ -3445,6 +3446,24 @@ def _run_w4a8_moe_hopper(
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
     flash_output = torch.zeros_like(x)
+    workspace_buffer = None
+    if use_workspace:
+        workspace_bytes = fused_moe.cutlass_fused_moe_workspace_size(
+            m,
+            k,
+            n,
+            e,
+            top_k,
+            x_dtype=dtype,
+            weight_dtype=fc1_weights_il.dtype,
+            output_dtype=dtype,
+            use_w4_group_scaling=True,
+            use_packed_weights=True,
+            device=device,
+        )
+        workspace_buffer = torch.empty(
+            workspace_bytes, dtype=torch.uint8, device=device
+        )
     with autotune(True) if use_autotune else nullcontext():
         fused_moe.cutlass_fused_moe(
             x,
@@ -3457,6 +3476,7 @@ def _run_w4a8_moe_hopper(
             use_w4_group_scaling=True,
             output=flash_output,
             use_packed_weights=True,
+            workspace_buffer=workspace_buffer,
         )
 
     w31_list, w2_list = [], []
@@ -3523,6 +3543,22 @@ def test_moe_w4a8_hopper_autotune():
     _run_w4a8_moe_hopper(4, 512, 2, 2, 512, dtype=torch.bfloat16, use_autotune=True)
 
 
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="W4A8 MoE (Hopper mixed-input) requires SM90",
+)
+def test_workspace_exact_size_accepted_with_packed_weights():
+    _run_w4a8_moe_hopper(
+        1,
+        512,
+        2,
+        2,
+        512,
+        dtype=torch.bfloat16,
+        use_workspace=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Workspace buffer tests (issue #3364, Option A)
 # ---------------------------------------------------------------------------
@@ -3533,7 +3569,7 @@ _WS_SM100_SKIP = pytest.mark.skipif(
 
 _WS_CFG = dict(
     hidden_size=256,
-    inter_size=512,
+    intermediate_size=512,
     num_experts=8,
     top_k=2,
     dtype=torch.bfloat16,
@@ -3542,7 +3578,7 @@ _WS_CFG = dict(
 
 def _make_ws_inputs(num_tokens, cfg=_WS_CFG):
     E, K, H = cfg["num_experts"], cfg["top_k"], cfg["hidden_size"]
-    I = cfg["inter_size"]
+    I = cfg["intermediate_size"]
     dtype = cfg["dtype"]
     x = torch.randn(num_tokens, H, dtype=dtype, device="cuda")
     topk_ids = torch.stack(
@@ -3554,7 +3590,7 @@ def _make_ws_inputs(num_tokens, cfg=_WS_CFG):
     return x, topk_ids, topk_w, w1, w2
 
 
-def _call_ws(x, topk_ids, topk_w, w1, w2, workspace_buffer=None):
+def _call_ws(x, topk_ids, topk_w, w1, w2, workspace_buffer=None, **kwargs):
     from flashinfer.fused_moe.core import cutlass_fused_moe
 
     return cutlass_fused_moe(
@@ -3568,21 +3604,25 @@ def _call_ws(x, topk_ids, topk_w, w1, w2, workspace_buffer=None):
         use_fused_finalize=False,
         tune_max_num_tokens=max(x.shape[0], 256),
         workspace_buffer=workspace_buffer,
+        **kwargs,
     )
 
 
-def _ws_size(num_tokens, cfg=_WS_CFG):
+def _ws_size(num_tokens, cfg=_WS_CFG, *, ep_size=1, ep_rank=0, device=None):
     from flashinfer.fused_moe.core import cutlass_fused_moe_workspace_size
 
     return cutlass_fused_moe_workspace_size(
         num_tokens,
         cfg["hidden_size"],
-        cfg["inter_size"],
-        cfg["num_experts"],
+        cfg["intermediate_size"],
+        cfg["num_experts"] * ep_size,
         cfg["top_k"],
         x_dtype=cfg["dtype"],
         weight_dtype=cfg["dtype"],
+        ep_size=ep_size,
+        ep_rank=ep_rank,
         use_fused_finalize=False,
+        device=device,
     )
 
 
@@ -3607,6 +3647,17 @@ def test_workspace_exact_size_accepted():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(_ws_size(256), dtype=torch.uint8, device="cuda")
     _call_ws(*inputs, workspace_buffer=ws)  # must not raise
+
+
+@_WS_SM100_SKIP
+def test_workspace_exact_size_accepted_with_ep():
+    inputs = _make_ws_inputs(256)
+    ws = torch.empty(
+        _ws_size(256, ep_size=2, ep_rank=0),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    _call_ws(*inputs, workspace_buffer=ws, ep_size=2, ep_rank=0)
 
 
 @_WS_SM100_SKIP
@@ -3641,7 +3692,7 @@ def test_workspace_cpu_tensor_rejected():
 def test_workspace_device_tracks_input_not_current_device():
     with torch.cuda.device(1):
         inputs = _make_ws_inputs(64)
-        n = _ws_size(64)
+        n = _ws_size(64, device=torch.device("cuda:1"))
         ws = torch.empty(n, dtype=torch.uint8, device="cuda:1")
 
     with torch.cuda.device(0):
@@ -3679,8 +3730,12 @@ def test_workspace_size_rejects_nonpositive_dims():
     from flashinfer.fused_moe.core import cutlass_fused_moe_workspace_size
 
     base = dict(
-        hidden_size=256, inter_size=512, num_experts=8, top_k=2,
-        x_dtype=torch.bfloat16, weight_dtype=torch.bfloat16,
+        hidden_size=256,
+        intermediate_size=512,
+        num_experts_total=8,
+        top_k=2,
+        x_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
     )
     with pytest.raises(ValueError, match="max_num_tokens"):
         cutlass_fused_moe_workspace_size(0, **base)
@@ -3688,8 +3743,16 @@ def test_workspace_size_rejects_nonpositive_dims():
         cutlass_fused_moe_workspace_size(-1, **base)
     with pytest.raises(ValueError, match="hidden_size"):
         cutlass_fused_moe_workspace_size(64, **{**base, "hidden_size": -1})
+    with pytest.raises(ValueError, match="intermediate_size"):
+        cutlass_fused_moe_workspace_size(64, **{**base, "intermediate_size": -1})
+    with pytest.raises(ValueError, match="num_experts_total"):
+        cutlass_fused_moe_workspace_size(64, **{**base, "num_experts_total": 0})
     with pytest.raises(ValueError, match="top_k"):
         cutlass_fused_moe_workspace_size(64, **{**base, "top_k": 0})
+    with pytest.raises(ValueError, match="divisible"):
+        cutlass_fused_moe_workspace_size(
+            64, **{**base, "num_experts_total": 7}, ep_size=2
+        )
 
 
 @_WS_SM100_SKIP
