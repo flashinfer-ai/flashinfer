@@ -78,6 +78,28 @@ def _select_bf16_fp4_tile_shape(
     return ((64, 64, tile_k), (2, 2, 1))
 
 
+def _select_bf16_fp4_k_splits(
+    m: int, n: int, k: int, tile_shape_mnk: Tuple[int, int, int], sm_count: int
+) -> int:
+    """Static split-K pick for the no-autotune fallback.
+
+    Conservative by design: only clear-win underfill grids split; closer
+    calls need the autotuner's timing.
+    """
+    tile_m, tile_n, tile_k = tile_shape_mnk
+    if tile_m != (16 if tile_k == 128 else 32):
+        # Only the tile shapes the tactic space pairs with splits.
+        return 1
+    tiles = -(-m // tile_m) * -(-n // tile_n)
+    if tiles * 3 > sm_count:
+        return 1
+    k_tiles = k // tile_k
+    for splits in (8, 4, 2):
+        if splits <= k_tiles and tiles * splits <= sm_count:
+            return splits
+    return 1
+
+
 _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE: dict = {}
 
 
@@ -440,7 +462,10 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             if tactic < 0:
                 # Fallback == pre-autotuner heuristic (M-aware), default knobs.
                 tile_shape_mnk, atom_layout = _select_bf16_fp4_tile_shape(m, n, k)
-                pipeline_depth, use_fp16_mma, tile_swizzle, k_splits = 1, 1, 1, 1
+                pipeline_depth, use_fp16_mma, tile_swizzle = 1, 1, 1
+                k_splits = _select_bf16_fp4_k_splits(
+                    m, n, k, tile_shape_mnk, get_device_sm_count(a.device)
+                )
             else:
                 (
                     tile_shape_mnk,

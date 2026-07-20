@@ -83,6 +83,7 @@ PROBLEM_SIZES = [
     (4, 256, 512),
     (16, 256, 256),
     # mid: typical decode at a few model widths
+    (1, 512, 2048),  # small-n decode: the fallback's static split-K region
     (1, 1024, 1024),
     (4, 1024, 1024),
     (16, 1024, 1024),
@@ -313,6 +314,41 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
         assert torch.equal(outs[0], outs[1]), (
             f"tactic {tactic} {cfg} is not deterministic across runs"
         )
+
+
+def test_cute_dsl_fallback_k_splits_selector():
+    """Pin the no-autotune fallback's static split-K rule.
+
+    Expected picks mirror the autotuner's choices on 48/84/188-SM parts.
+    """
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _select_bf16_fp4_k_splits,
+        _select_bf16_fp4_tile_shape,
+    )
+
+    def pick(m, n, k, sm_count):
+        tile, _ = _select_bf16_fp4_tile_shape(m, n, k)
+        return _select_bf16_fp4_k_splits(m, n, k, tile, sm_count)
+
+    # Strong underfill: split, sized to the SM count.
+    assert pick(1, 512, 2048, 48) == 4
+    assert pick(1, 512, 2048, 84) == 8
+    assert pick(1, 512, 4096, 188) == 8
+    assert pick(1, 1024, 4096, 48) == 2
+    assert pick(1, 1024, 4096, 84) == 4
+    # Never more splits than K tiles.
+    assert pick(1, 512, 512, 188) == 4
+    assert pick(1, 128, 128, 188) == 1
+    # Grid large enough to fill the GPU: no split.
+    assert pick(1, 2048, 2048, 48) == 1
+    assert pick(1, 2048, 4096, 84) == 1
+    assert pick(1, 4096, 512, 48) == 1
+    assert pick(1, 14336, 4096, 188) == 1
+    # tile_k=64 shapes split on their (32, 64, 64) base tile.
+    assert pick(1, 512, 2112, 84) == 8
+    # m > 16 picks larger tiles, which the tactic space never pairs with splits.
+    assert pick(64, 512, 2048, 84) == 1
+    assert pick(512, 512, 2048, 84) == 1
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
