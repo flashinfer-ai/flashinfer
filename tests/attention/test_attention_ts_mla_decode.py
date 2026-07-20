@@ -1035,6 +1035,39 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
     assert violations == []
 
 
+def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
+    """Trace packed-Q shapes from the live MLA wrapper plan state."""
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = BatchMLADecodePagedTSWrapper()
+    query = torch.empty((5, 8, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((9, 32, 576), dtype=torch.bfloat16)
+    kwargs = {"query": query, "kv_cache": kv_cache}
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
+    ):
+        wrapper.run.fi_trace(**kwargs)
+    with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
+        fi_trace(wrapper.run, **kwargs)
+
+    wrapper._planned = True
+    wrapper._packed_query = True
+    defn = fi_trace(wrapper.run, **kwargs)
+    assert defn["name"].startswith("prims_ts_decode_mla_wrapper_packed_q")
+    assert defn["inputs"]["query"]["shape"] == [
+        "total_q",
+        "num_heads",
+        "head_dim_qk",
+    ]
+    assert defn["outputs"]["output"]["shape"] == [
+        "total_q",
+        "num_heads",
+        "kv_lora_rank",
+    ]
+
+
 def test_attention_ts_mla_output_guard_covers_every_live_allocation():
     """Reject output overlap with inputs retained through an MLA launch."""
 

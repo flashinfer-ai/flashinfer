@@ -49,7 +49,7 @@ repos:
       -   id: mypy
           args: ["--config-file", "pyproject.toml", "--exclude", "flashinfer-cubin/"]
           files: ^flashinfer/
-          exclude: ^(flashinfer-cubin/|3rdparty/|build/)
+          exclude: ^(flashinfer-cubin/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/)
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.

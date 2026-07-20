@@ -1399,6 +1399,43 @@ def test_attention_ts_decode_public_surfaces_have_no_internal_tuning_knobs() -> 
     assert violations == []
 
 
+def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
+    """Trace packed-Q shape and planned output dtype from the live wrapper."""
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = BatchDecodePagedTSWrapper()
+    q = torch.empty((5, 32, 128), dtype=_FP8)
+    k_cache = torch.empty((8, 4, 32, 128), dtype=_FP8)
+    v_cache = torch.empty_like(k_cache)
+    kwargs = {"q": q, "paged_kv_cache": (k_cache, v_cache)}
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
+    ):
+        wrapper.run.fi_trace(**kwargs)
+    with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
+        fi_trace(wrapper.run, **kwargs)
+
+    # A successful plan publishes these fields atomically. Set them directly
+    # here so the trace dispatcher remains a CPU-only contract test.
+    wrapper._planned = True
+    wrapper._use_packed_q = True
+    wrapper._output_dtype = torch.float16
+    defn = fi_trace(wrapper.run, **kwargs)
+    assert defn["name"].startswith("prims_ts_decode_wrapper_tuple_fp16_output_packed_q")
+    assert defn["inputs"]["q"]["shape"] == [
+        "total_q",
+        "num_qo_heads",
+        "head_dim",
+    ]
+    assert defn["outputs"]["output"] == {
+        "shape": ["total_q", "num_qo_heads", "head_dim"],
+        "dtype": "float16",
+        "param": "out",
+    }
+
+
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 

@@ -170,9 +170,9 @@ class MlaTsWorkTileInfo:
         self,
         tile_idx,
         is_valid,
-        k_len=Int32(0),
-        k_tile_count=Int32(0),
-        k_index_base=Int32(0),
+        k_len=0,
+        k_tile_count=0,
+        k_index_base=0,
     ):
         """Initialize the staged tile coordinate and cached K-domain metadata."""
         cluster_idx, seq_q_idx, batch_idx, split_kv_idx = tile_idx

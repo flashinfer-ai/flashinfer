@@ -1412,7 +1412,10 @@ def create_padding_task(
     @schedule
     def padding_schedule(work_queue=None):
         """Captured no-op schedule with optional persistent work-queue tail."""
-        with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
+        # Keep the task-scheduling and domain-loop scopes distinct for CuTe DSL.
+        with work_tile_schedule_loop(  # noqa: SIM117
+            work_queue, skip_if=work_tile_skip_if
+        ):
             with domain_loop(0, 1, 1):
                 pass
 

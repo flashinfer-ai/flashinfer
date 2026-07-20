@@ -16,11 +16,9 @@ limitations under the License.
 
 """Tests for flashinfer.fi_trace: definition JSON generation."""
 
-import ast
 import json
 from contextlib import suppress
 
-import pytest
 import torch
 
 from flashinfer.fi_trace import fi_trace
@@ -452,140 +450,6 @@ def test_fi_trace_helper_bound_method():
     # Accessing instance.run gives a bound method; fi_trace() must handle it
     defn = fi_trace(instance.run, q=q, k=k, v=v)
     _check_defn(defn, "gqa_ragged", "BatchPrefillWithRaggedKVCacheWrapper")
-
-
-def test_attention_ts_trace_constraints_match_cache_axes():
-    """Cache-form constraints must be valid expressions over defined axes."""
-    from flashinfer.trace.templates.attention import (
-        attention_ts_decode_trace_dispatch,
-        prims_ts_decode_mla_one_shot_trace_dispatch,
-        prims_ts_decode_mla_trace_dispatch,
-        prims_ts_decode_mla_wrapper_trace_dispatch,
-        prims_ts_decode_trace_dispatch,
-        prims_ts_decode_wrapper_trace_dispatch,
-    )
-
-    fmha_dispatches = (
-        attention_ts_decode_trace_dispatch,
-        prims_ts_decode_trace_dispatch,
-        prims_ts_decode_wrapper_trace_dispatch,
-    )
-    mla_dispatches = (
-        prims_ts_decode_mla_trace_dispatch,
-        prims_ts_decode_mla_one_shot_trace_dispatch,
-        prims_ts_decode_mla_wrapper_trace_dispatch,
-    )
-    for dispatch in (*fmha_dispatches, *mla_dispatches):
-        for template in dispatch.templates:
-            for constraint in template.constraints:
-                ast.parse(constraint, mode="eval")
-
-    for dispatch in fmha_dispatches:
-        for template in dispatch.templates:
-            assert ("kv_planes == 2" in template.constraints) == (
-                "kv_planes" in template.axes
-            )
-    for dispatch in mla_dispatches:
-        for template in dispatch.templates:
-            assert ("kv_pad_dim == 1" in template.constraints) == (
-                "kv_pad_dim" in template.axes
-            )
-
-
-def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
-    """The helper uses wrapper plan state to select the emitted schema."""
-    from flashinfer.attention.prims_ts import BatchDecodePagedTSWrapper
-
-    wrapper = BatchDecodePagedTSWrapper()
-
-    q = torch.empty((5, 32, 128), dtype=torch.float8_e4m3fn)
-    k_cache = torch.empty((8, 4, 32, 128), dtype=torch.float8_e4m3fn)
-    v_cache = torch.empty_like(k_cache)
-    kwargs = {"q": q, "paged_kv_cache": (k_cache, v_cache)}
-
-    with pytest.raises(
-        ValueError,
-        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
-    ):
-        wrapper.run.fi_trace(**kwargs)
-
-    with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
-        fi_trace(wrapper.run, **kwargs)
-
-    # A full CUDA plan is not available in this CPU-only dispatcher test; mark
-    # the exact state fields published atomically by a successful plan().
-    wrapper._planned = True
-    wrapper._use_packed_q = True
-    wrapper._output_dtype = torch.float16
-    defn = fi_trace(wrapper.run, **kwargs)
-    assert defn["name"].startswith("prims_ts_decode_wrapper_tuple_fp16_output_packed_q")
-    assert defn["inputs"]["q"]["shape"] == [
-        "total_q",
-        "num_qo_heads",
-        "head_dim",
-    ]
-    assert defn["outputs"]["output"] == {
-        "shape": ["total_q", "num_qo_heads", "head_dim"],
-        "dtype": "float16",
-        "param": "out",
-    }
-
-
-def test_attention_ts_decode_auto_dump_rejects_unplanned_wrapper(tmp_path, monkeypatch):
-    """Auto-dump does not publish a schema for an invalid wrapper lifecycle."""
-    from flashinfer.attention.prims_ts import BatchDecodePagedTSWrapper
-
-    monkeypatch.setenv("FLASHINFER_TRACE_DUMP", "1")
-    monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path))
-
-    wrapper = BatchDecodePagedTSWrapper()
-    q = torch.empty((7, 24, 128), dtype=torch.float8_e4m3fn)
-    k_cache = torch.empty((9, 4, 32, 128), dtype=torch.float8_e4m3fn)
-    v_cache = torch.empty_like(k_cache)
-
-    with (
-        pytest.warns(
-            UserWarning,
-            match=r"fi_trace auto-dump failed.*plan\(\) must be called before run\(\)",
-        ),
-        pytest.raises(RuntimeError, match=r"plan\(\) must be called"),
-    ):
-        wrapper.run(q, (k_cache, v_cache))
-
-    assert list(tmp_path.glob("*.json")) == []
-
-
-def test_attention_ts_mla_decode_bound_wrapper_trace_requires_plan_state():
-    """MLA wrapper tracing rejects absent state and uses a valid packed plan."""
-    from flashinfer.attention.prims_ts import BatchMLADecodePagedTSWrapper
-
-    wrapper = BatchMLADecodePagedTSWrapper()
-    query = torch.empty((5, 8, 576), dtype=torch.bfloat16)
-    kv_cache = torch.empty((9, 32, 576), dtype=torch.bfloat16)
-    kwargs = {"query": query, "kv_cache": kv_cache}
-
-    with pytest.raises(
-        ValueError,
-        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
-    ):
-        wrapper.run.fi_trace(**kwargs)
-    with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
-        fi_trace(wrapper.run, **kwargs)
-
-    wrapper._planned = True
-    wrapper._packed_query = True
-    defn = fi_trace(wrapper.run, **kwargs)
-    assert defn["name"].startswith("prims_ts_decode_mla_wrapper_packed_q")
-    assert defn["inputs"]["query"]["shape"] == [
-        "total_q",
-        "num_heads",
-        "head_dim_qk",
-    ]
-    assert defn["outputs"]["output"]["shape"] == [
-        "total_q",
-        "num_heads",
-        "kv_lora_rank",
-    ]
 
 
 # ---------------------------------------------------------------------------

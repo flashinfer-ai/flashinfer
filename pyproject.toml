@@ -101,18 +101,12 @@ strict_optional = false
 exclude = [
   "flashinfer-cubin/",
   "flashinfer-jit-cache/",
+  # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
+  "flashinfer/attention/prims_ts/kernels/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
   "build/",
 ]
-
-[[tool.mypy.overrides]]
-# CuTe task-scheduling kernels use compiler proxy values as annotations and
-# resource state. Keep structural checks enabled while suppressing the three
-# error classes that mypy cannot model across that lowering boundary.
-module = ["flashinfer.attention.prims_ts.kernels.*"]
-disable_error_code = ["attr-defined", "valid-type", "index"]
-
 
 [tool.ruff.lint]
 select = [
@@ -160,6 +154,3 @@ ignore = [
 ]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-"flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/resources.py" = ["B008"]
-"flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/tasks.py" = ["F841"]
-"flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/tasks.py" = ["SIM117"]

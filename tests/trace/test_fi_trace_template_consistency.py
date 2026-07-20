@@ -37,6 +37,7 @@ See the docstring in ``flashinfer/trace/templates/__init__.py`` for the full
 how-to guide.
 """
 
+import ast
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -358,6 +359,44 @@ def test_template_signature_consistency(func, template, label):
 def test_template_axes_covered(func, template, label):
     """Every Const axis must be reachable from at least one input tensor, scalar, or function param."""
     assert_template_axes_covered(template, label=label, func=func)
+
+
+def test_attention_ts_trace_constraints_match_cache_axes():
+    """PrimTS cache constraints are valid expressions over defined axes."""
+    from flashinfer.trace.templates.attention import (
+        attention_ts_decode_trace_dispatch,
+        prims_ts_decode_mla_one_shot_trace_dispatch,
+        prims_ts_decode_mla_trace_dispatch,
+        prims_ts_decode_mla_wrapper_trace_dispatch,
+        prims_ts_decode_trace_dispatch,
+        prims_ts_decode_wrapper_trace_dispatch,
+    )
+
+    fmha_dispatches = (
+        attention_ts_decode_trace_dispatch,
+        prims_ts_decode_trace_dispatch,
+        prims_ts_decode_wrapper_trace_dispatch,
+    )
+    mla_dispatches = (
+        prims_ts_decode_mla_trace_dispatch,
+        prims_ts_decode_mla_one_shot_trace_dispatch,
+        prims_ts_decode_mla_wrapper_trace_dispatch,
+    )
+    for dispatch in (*fmha_dispatches, *mla_dispatches):
+        for template in dispatch.templates:
+            for constraint in template.constraints:
+                ast.parse(constraint, mode="eval")
+
+    for dispatch in fmha_dispatches:
+        for template in dispatch.templates:
+            assert ("kv_planes == 2" in template.constraints) == (
+                "kv_planes" in template.axes
+            )
+    for dispatch in mla_dispatches:
+        for template in dispatch.templates:
+            assert ("kv_pad_dim == 1" in template.constraints) == (
+                "kv_pad_dim" in template.axes
+            )
 
 
 # ---------------------------------------------------------------------------

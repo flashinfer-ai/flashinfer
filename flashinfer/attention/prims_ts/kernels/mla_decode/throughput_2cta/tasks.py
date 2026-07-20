@@ -925,7 +925,7 @@ def create_softmax_task(
             no_correction_out,
         ) = softmax_state
 
-        with domain_loop(loop_start, loop_end, loop_step) as d:
+        with domain_loop(loop_start, loop_end, loop_step):
             tmem_s.wait()
             if softmax_group_id == 1:
                 (
