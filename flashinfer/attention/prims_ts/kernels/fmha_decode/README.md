@@ -253,6 +253,5 @@ split-KV, and resource-safety coverage lives in:
 
 ```bash
 pytest -q tests/attention/test_attention_ts_decode.py
-pytest -q tests/attention/test_attention_ts_decode_resources.py
 pytest -q tests/trace/test_fi_trace.py
 ```

@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import inspect
 import math
 from typing import Optional, Sequence
+import warnings
 
 import pytest
 import torch
@@ -29,9 +31,24 @@ pytest.importorskip(
     reason="PrimTS attention tests require nvidia-cutlass-dsl>=4.7.0",
 )
 
+from cutlass import BFloat16, Float16, Float8E4M3FN
+from cutlass import utils as cutlass_utils
+from cutlass.experimental.task_scheduling.memory import SmemAllocation
+
 from flashinfer.attention.prims_ts import (
     BatchDecodePagedTSWrapper,
     batch_decode_with_paged_kv_cache,
+)
+from flashinfer.attention.prims_ts.decode import (
+    _DecodeRuntime,
+    _validate_decode_output_aliasing,
+)
+from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+    make_decode_config,
+)
+from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
+    _build_decode_gen_schedule,
+    build_decode_task_manager,
 )
 from flashinfer.decode import (
     get_prims_ts_batch_decode_workspace_size,
@@ -1230,6 +1247,406 @@ def _apply_speculative_tail_markers(case):
             )
             case.v_cache[page_id, :, page_offset, 0] = value_marker
     return _with_reference(case)
+
+
+def _decode_runtime_for_aliasing() -> _DecodeRuntime:
+    """Build the smallest runtime object accepted by the alias validator."""
+
+    return _DecodeRuntime(
+        q=torch.empty(8),
+        k_cache=torch.empty(8),
+        v_cache=torch.empty(8),
+        out=torch.empty(8),
+        num_physical_pages=1,
+        k_page_stride=8,
+        v_page_stride=8,
+        bmm1_scale=1.0,
+        bmm2_scale=1.0,
+    )
+
+
+def test_attention_ts_decode_alias_guard_covers_every_live_allocation() -> None:
+    """The output may not reuse storage that remains live during a launch."""
+
+    for aliased_name in (
+        "k_cache",
+        "v_cache",
+        "seq_lens",
+        "qo_indptr",
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "paged_kv_last_page_len",
+        "workspace_buffer",
+    ):
+        runtime = _decode_runtime_for_aliasing()
+        metadata = {
+            "seq_lens": torch.empty(8),
+            "qo_indptr": torch.empty(8),
+            "paged_kv_indptr": torch.empty(8),
+            "paged_kv_indices": torch.empty(8),
+            "paged_kv_last_page_len": torch.empty(8),
+            "workspace_buffer": torch.empty(8),
+        }
+        if aliased_name in ("k_cache", "v_cache"):
+            runtime = replace(runtime, **{aliased_name: runtime.out})
+        else:
+            metadata[aliased_name] = runtime.out
+
+        with pytest.raises(
+            ValueError,
+            match=rf"out must not overlap {aliased_name} storage",
+        ):
+            _validate_decode_output_aliasing(runtime, **metadata)
+
+
+_DECODE_PUBLIC_SURFACES = (
+    BatchDecodePagedTSWrapper.__init__,
+    BatchDecodePagedTSWrapper.plan,
+    BatchDecodePagedTSWrapper.run,
+    batch_decode_with_paged_kv_cache,
+    get_prims_ts_batch_decode_workspace_size,
+    prims_ts_batch_decode_with_kv_cache,
+)
+_FORBIDDEN_DECODE_TUNING_PARAMETERS = frozenset(
+    {
+        "args",
+        "auto_tuner",
+        "autotuner",
+        "config",
+        "enable_clc",
+        "enable_pdl",
+        "fixed_split_size",
+        "groups_tokens_heads_q",
+        "kv_stages",
+        "mma_variant",
+        "num_insts_kv",
+        "num_stages",
+        "num_warps",
+        "o_stages",
+        "profile",
+        "q_stages",
+        "reduction_mode",
+        "schedule",
+        "single_kv",
+        "split_kv",
+        "split_kv_mode",
+        "splits_kv",
+        "tile_size_kv",
+        "tile_size_q",
+        "use_cga_smem_reduction",
+        "use_keeps_mma_ab",
+        "use_persistent_scheduler",
+        "use_separate_reduction_kernel",
+        "warp_specialization",
+    }
+)
+_FORBIDDEN_TUNING_TOKEN_PREFIXES = frozenset(
+    {
+        "autotun",
+        "clc",
+        "config",
+        "cta",
+        "impl",
+        "inst",
+        "kernel",
+        "mma",
+        "pdl",
+        "persist",
+        "profil",
+        "reduc",
+        "schedul",
+        "split",
+        "stag",
+        "tile",
+        "warp",
+    }
+)
+_FORBIDDEN_TUNING_TOKEN_SEQUENCES = (
+    ("groups", "tokens", "heads"),
+    ("single", "kv"),
+    ("tensor", "cores"),
+)
+
+
+def test_attention_ts_decode_public_surfaces_have_no_internal_tuning_knobs() -> None:
+    """Keep launch-policy controls private without freezing whole signatures."""
+
+    violations = []
+    for surface in _DECODE_PUBLIC_SURFACES:
+        parameters = inspect.signature(surface).parameters
+        for parameter in parameters.values():
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                violations.append(f"{surface.__qualname__}.**{parameter.name}")
+                continue
+            tokens = tuple(parameter.name.split("_"))
+            has_forbidden_token = any(
+                token.startswith(prefix)
+                for token in tokens
+                for prefix in _FORBIDDEN_TUNING_TOKEN_PREFIXES
+            )
+            has_forbidden_sequence = any(
+                tokens[index : index + len(sequence)] == sequence
+                for sequence in _FORBIDDEN_TUNING_TOKEN_SEQUENCES
+                for index in range(len(tokens) - len(sequence) + 1)
+            )
+            if (
+                parameter.name in _FORBIDDEN_DECODE_TUNING_PARAMETERS
+                or has_forbidden_token
+                or has_forbidden_sequence
+            ):
+                violations.append(f"{surface.__qualname__}.{parameter.name}")
+
+    assert violations == []
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _decode_resources_by_name(resource_dependency_graph):
+    resources_by_id = {}
+    for resource, dependencies in resource_dependency_graph.items():
+        resources_by_id[id(resource)] = resource
+        for dependency in dependencies:
+            resources_by_id[id(dependency)] = dependency
+    return {resource.name: resource for resource in resources_by_id.values()}
+
+
+def _make_contiguous_keeps_config(*, dtype, tile_size_q: int, headdim: int = 128):
+    return make_decode_config(
+        headdim=headdim,
+        args={
+            "use_keeps_mma_ab": True,
+            "tile_size_q": tile_size_q,
+            "groups_tokens_heads_q": False,
+        },
+        seq_len_q=1,
+        seq_len_kv=4096,
+        batch_size=8,
+        num_heads_q=4 * tile_size_q,
+        num_heads_kv=4,
+        qkv_dtype=dtype,
+        o_dtype=Float16 if dtype == Float8E4M3FN else dtype,
+        qkv_layout="contiguousKv",
+        split_kv_mode="disabled",
+        splits_kv=1,
+        mask_type="dense",
+        auto_tuner=False,
+    )
+
+
+def _make_paged_window_crossing_config(*, page_size: int):
+    """Build two visible K tiles whose page IDs cross the 32-ID window."""
+
+    pages_per_tile = 128 // page_size
+    page_window_tiles = 32 // pages_per_tile
+    return make_decode_config(
+        headdim=128,
+        args={
+            "use_keeps_mma_ab": True,
+            "tile_size_q": 64,
+            "groups_tokens_heads_q": False,
+        },
+        seq_len_q=1,
+        seq_len_kv=(page_window_tiles + 1) * 128,
+        batch_size=1,
+        num_heads_q=64,
+        num_heads_kv=1,
+        qkv_dtype=BFloat16,
+        o_dtype=BFloat16,
+        qkv_layout="pagedKv",
+        num_tokens_per_page=page_size,
+        split_kv_mode="disabled",
+        splits_kv=1,
+        sliding_window_causal=True,
+        attention_window_size=256,
+        mask_type="causal",
+        auto_tuner=False,
+    )
+
+
+def _build_decode_resources(cfg):
+    cfg.total_kv_tiles = 32
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        (
+            _tasks,
+            resource_dependency_graph,
+            _dma_consumer_release_labels,
+            smem_allocator,
+            tmem_allocator,
+            _correction_resources,
+        ) = _build_decode_gen_schedule(
+            cfg,
+            total_kv_tiles=cfg.total_kv_tiles,
+            # Resource construction stores but does not dereference this marker.
+            tma_desc_q=object(),
+        )
+    return (
+        _decode_resources_by_name(resource_dependency_graph),
+        smem_allocator,
+        tmem_allocator,
+    )
+
+
+def _assert_decode_smem_within_capacity(cfg, smem_allocator) -> None:
+    unified_smem_bytes = (
+        _align_up(smem_allocator.total_smem_bytes, 8)
+        + smem_allocator.barrier_smem_bytes
+    )
+    launch_smem_bytes = _align_up(unified_smem_bytes, cfg.stensor_align)
+    assert launch_smem_bytes <= cutlass_utils.get_smem_capacity_in_bytes("sm_100")
+
+
+@pytest.mark.parametrize("page_size", (16, 32, 64, 128))
+def test_attention_ts_decode_page_offsets_cross_window_schedule_is_safe(
+    page_size: int,
+) -> None:
+    """Exhaustively check the schedule when page loading crosses ID 32."""
+
+    cfg = _make_paged_window_crossing_config(page_size=page_size)
+    pages_per_tile = cfg.tile_size_kv // page_size
+    page_window_tiles = 32 // pages_per_tile
+    seq_len_kv = (page_window_tiles + 1) * cfg.tile_size_kv
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        build_decode_task_manager(
+            cfg,
+            seq_len_kv=seq_len_kv,
+            batch_size=1,
+            num_heads_kv=1,
+            verbose=False,
+            skip_validation=False,
+            exhaustive_deadlock_race_check=True,
+        )
+
+    assert cfg.static_num_skipped_kv_tiles == page_window_tiles - 1
+    assert cfg.total_kv_tiles == 2
+    assert cfg.static_num_skipped_kv_tiles * pages_per_tile == 32 - pages_per_tile
+    assert (cfg.static_num_skipped_kv_tiles + 1) * pages_per_tile == 32
+
+
+@pytest.mark.parametrize("dtype", (BFloat16, Float8E4M3FN))
+@pytest.mark.parametrize("headdim", (64, 128))
+def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
+    dtype,
+    headdim: int,
+) -> None:
+    """Q128 P overlays only its own consumed S region within capacity."""
+
+    cfg = _make_contiguous_keeps_config(
+        dtype=dtype,
+        tile_size_q=128,
+        headdim=headdim,
+    )
+    assert cfg.uses_two_inst_tmem_p
+    resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
+    s0 = resources["tmemS0"]._alloc
+    s1 = resources["tmemS1"]._alloc
+    p0 = resources["smemP0"]._tmem_alloc
+    p1 = resources["smemP1"]._tmem_alloc
+    output = resources["tmemO"]._alloc
+
+    expected_p_cols = cfg.tile_size_kv * cfg.q_dtype_bytes // 4
+    assert p0.num_columns == p1.num_columns == expected_p_cols
+    assert s0.offset <= p0.offset
+    assert p0.offset + p0.num_columns <= s0.offset + s0.num_columns
+    assert s1.offset <= p1.offset
+    assert p1.offset + p1.num_columns <= s1.offset + s1.num_columns
+    assert output.offset >= s1.offset + s1.num_columns
+    assert resources["smemP0"]._alloc is None
+    assert resources["smemP1"]._alloc is None
+    assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resources.keys()
+    assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
+    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+@pytest.mark.parametrize("dtype", (BFloat16, Float8E4M3FN))
+@pytest.mark.parametrize("headdim", (64, 128))
+def test_attention_ts_decode_q64_keeps_p_in_smem_within_capacity(
+    dtype,
+    headdim: int,
+) -> None:
+    """Q64 keeps P in SMEM so the next QK wave can reuse released S."""
+
+    cfg = _make_contiguous_keeps_config(
+        dtype=dtype,
+        tile_size_q=64,
+        headdim=headdim,
+    )
+    assert not cfg.uses_tmem_p
+    resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
+    for name in ("smemP0", "smemP1"):
+        p = resources[name]
+        assert isinstance(p._alloc, SmemAllocation)
+        assert p._alloc.size_bytes == cfg.smem_p_tile_bytes
+        assert p._tmem_alloc is None
+    assert "tmemStatsDone0" not in resources
+    assert "tmemStatsDone1" not in resources
+    assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
+    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+@pytest.mark.parametrize("dtype", (BFloat16, Float8E4M3FN))
+@pytest.mark.parametrize("tile_size_q", (64, 128))
+def test_attention_ts_decode_d256_staged_tmem_p_has_overwrite_gate(
+    dtype,
+    tile_size_q: int,
+) -> None:
+    """D256 P remains inside S and retains its overwrite-credit gate."""
+
+    cfg = _make_contiguous_keeps_config(
+        dtype=dtype,
+        tile_size_q=tile_size_q,
+        headdim=256,
+    )
+    assert cfg.uses_staged_one_inst_tmem_p
+    resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
+    s = resources["tmemS0"]._alloc
+    p = resources["smemP0"]._tmem_alloc
+
+    assert "tmemStatsDone0" in resources
+    assert "tmemStatsDone1" not in resources
+    assert resources["smemP0"]._alloc is None
+    assert s.offset <= p.offset
+    assert p.offset + p.num_columns <= s.offset + s.num_columns
+    assert cfg.tmem_total_cols <= tmem_allocator.total_tmem_columns <= 512
+    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+@pytest.mark.parametrize(
+    ("tile_size_q", "dtype", "headdim"),
+    (
+        (128, BFloat16, 128),
+        (128, Float8E4M3FN, 128),
+        (64, BFloat16, 64),
+        (64, Float8E4M3FN, 128),
+    ),
+    ids=("q128-bf16", "q128-fp8", "q64-bf16-d64", "q64-fp8-d128"),
+)
+def test_attention_ts_decode_keeps_alias_schedule_is_race_free(
+    tile_size_q: int,
+    dtype,
+    headdim: int,
+) -> None:
+    """Exhaust HEAD, LOOP, and odd TAIL reuse for representative profiles."""
+
+    cfg = _make_contiguous_keeps_config(
+        dtype=dtype,
+        tile_size_q=tile_size_q,
+        headdim=headdim,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        build_decode_task_manager(
+            cfg,
+            seq_len_kv=3 * cfg.tile_size_kv,
+            batch_size=1,
+            num_heads_kv=4,
+            verbose=False,
+            skip_validation=False,
+            exhaustive_deadlock_race_check=True,
+        )
 
 
 def test_attention_ts_decode_run_requires_plan():

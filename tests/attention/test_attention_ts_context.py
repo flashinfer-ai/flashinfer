@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import inspect
 import math
 from types import SimpleNamespace
 from typing import Optional, Sequence
@@ -40,6 +41,10 @@ from flashinfer.attention.prims_ts import (
     BatchPrefillTSWrapper,
     batch_prefill,
     batch_prefill_with_paged_kv_cache,
+)
+from flashinfer.attention.prims_ts._tensor_aliasing import (
+    _tensor_byte_span,
+    _tensors_overlap,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
     FmhaTs,
@@ -435,6 +440,207 @@ def _run_one_shot(case: _ContextCase, *, out: Optional[torch.Tensor] = None):
 # ---------------------------------------------------------------------------
 # CPU-only oracle and public API contract
 # ---------------------------------------------------------------------------
+
+
+def test_attention_ts_context_storage_span_includes_stride_and_offset() -> None:
+    storage = torch.empty(64, dtype=torch.bfloat16)
+    tensor = storage.as_strided((2, 3), (10, 2), storage_offset=3)
+
+    assert _tensor_byte_span(tensor) == (
+        tensor.data_ptr(),
+        tensor.data_ptr() + 15 * tensor.element_size(),
+    )
+
+
+def test_attention_ts_context_paged_views_are_conservatively_bounded() -> None:
+    combined_cache = torch.empty((3, 2, 2, 4), dtype=torch.uint8)
+    k_cache = combined_cache[:, 0]
+    v_cache = combined_cache[:, 1]
+
+    # The views select disjoint elements, but their outer-stride bounding spans
+    # overlap. Treating them as overlapping is safer than under-bounding a
+    # strided paged cache.
+    assert _tensors_overlap(k_cache, v_cache)
+
+
+def test_attention_ts_context_disjoint_storage_slices_do_not_overlap() -> None:
+    storage = torch.empty(16, dtype=torch.float32)
+
+    assert not _tensors_overlap(storage[:4], storage[8:12])
+
+
+def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
+    monkeypatch,
+) -> None:
+    """The fixed wrapper checks every retained non-Q launch allocation."""
+
+    monkeypatch.setattr(context_module, "_validate_runtime_inputs", lambda *_: None)
+    monkeypatch.setattr(
+        context_module,
+        "_prepare_out",
+        lambda out, *, q, output_dtype: out,
+    )
+    argument_names = ("k", "v")
+    retained_names = (
+        "qo_indptr",
+        "kv_indptr",
+        "scale_softmax_log2",
+        "output_scale",
+    )
+
+    for aliased_name in (*argument_names, *retained_names):
+        out = torch.empty(8)
+        q = torch.empty(8)
+        arguments = {name: torch.empty(8) for name in argument_names}
+        wrapper = BatchPrefillTSWrapper()
+        wrapper._planned = True
+        wrapper._geometry = SimpleNamespace(output_dtype=out.dtype)
+        wrapper._compiled = lambda *_: None
+        for name in retained_names:
+            setattr(wrapper, f"_{name}", torch.empty(8))
+
+        if aliased_name in arguments:
+            arguments[aliased_name] = out
+        else:
+            setattr(wrapper, f"_{aliased_name}", out)
+
+        with pytest.raises(
+            ValueError,
+            match=rf"out must not overlap {aliased_name} storage",
+        ):
+            wrapper.run(q, arguments["k"], arguments["v"], out=out)
+
+
+def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
+    monkeypatch,
+) -> None:
+    """The paged wrapper checks every retained non-Q launch allocation."""
+
+    monkeypatch.setattr(
+        context_module, "_validate_paged_runtime_inputs", lambda *_: None
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_prepare_out",
+        lambda out, *, q, output_dtype: out,
+    )
+    argument_names = ("k_cache", "v_cache")
+    retained_names = (
+        "qo_indptr",
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "paged_kv_last_page_len",
+        "logical_kv_indptr",
+        "seq_lens_kv",
+        "dense_page_idx_kv",
+        "scale_softmax_log2",
+        "output_scale",
+    )
+
+    for aliased_name in (*argument_names, *retained_names):
+        out = torch.empty(8)
+        q = torch.empty(8)
+        arguments = {name: torch.empty(8) for name in argument_names}
+        wrapper = BatchPrefillPagedTSWrapper()
+        wrapper._planned = True
+        wrapper._geometry = SimpleNamespace(output_dtype=out.dtype)
+        wrapper._compiled = lambda *_: None
+        for name in retained_names:
+            setattr(wrapper, f"_{name}", torch.empty(8))
+
+        if aliased_name in arguments:
+            arguments[aliased_name] = out
+        else:
+            setattr(wrapper, f"_{aliased_name}", out)
+
+        with pytest.raises(
+            ValueError,
+            match=rf"out must not overlap {aliased_name} storage",
+        ):
+            wrapper.run(
+                q,
+                arguments["k_cache"],
+                arguments["v_cache"],
+                out=out,
+            )
+
+
+def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
+    surfaces = (
+        BatchPrefillTSWrapper.__init__,
+        BatchPrefillTSWrapper.plan,
+        BatchPrefillTSWrapper.run,
+        batch_prefill,
+        BatchPrefillPagedTSWrapper.__init__,
+        BatchPrefillPagedTSWrapper.plan,
+        BatchPrefillPagedTSWrapper.run,
+        batch_prefill_with_paged_kv_cache,
+    )
+    forbidden_token_prefixes = {
+        "autotun",
+        "clc",
+        "config",
+        "cta",
+        "impl",
+        "inst",
+        "kernel",
+        "mma",
+        "pdl",
+        "persist",
+        "profil",
+        "reduc",
+        "schedul",
+        "split",
+        "stag",
+        "tile",
+        "warp",
+    }
+    forbidden_token_sequences = (
+        ("groups", "tokens", "heads"),
+        ("single", "kv"),
+        ("tensor", "cores"),
+    )
+    forbidden_exact_names = {
+        "args",
+        "backend",
+        "enable_pdl",
+        "groups_tokens_heads_q",
+        "head_dim_per_cta_v",
+        "implementation",
+        "kernel",
+        "mma_variant",
+        "num_ctas_per_head_dim",
+        "num_insts_kv",
+        "separate_reducer_impl",
+        "use_cga_reduction",
+        "use_cga_smem_reduction",
+        "use_tensor_cores",
+    }
+    violations = []
+    for surface in surfaces:
+        for parameter in inspect.signature(surface).parameters.values():
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                violations.append(f"{surface.__qualname__}.**{parameter.name}")
+                continue
+            tokens = tuple(parameter.name.split("_"))
+            has_forbidden_sequence = any(
+                tokens[index : index + len(sequence)] == sequence
+                for sequence in forbidden_token_sequences
+                for index in range(len(tokens) - len(sequence) + 1)
+            )
+            has_forbidden_token = any(
+                token.startswith(prefix)
+                for token in tokens
+                for prefix in forbidden_token_prefixes
+            )
+            if (
+                parameter.name in forbidden_exact_names
+                or has_forbidden_token
+                or has_forbidden_sequence
+            ):
+                violations.append(f"{surface.__qualname__}.{parameter.name}")
+
+    assert violations == []
 
 
 def test_attention_ts_context_fixed_oracle_is_bottom_right_causal():

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import inspect
 import math
 from typing import Sequence
 
@@ -29,9 +30,28 @@ pytest.importorskip(
     reason="PrimTS attention tests require nvidia-cutlass-dsl>=4.7.0",
 )
 
+import cutlass.pipeline as pipeline
+from cutlass.experimental.task_scheduling.enums import (
+    SignalingThreads,
+    TileSchedulerType,
+)
+from cutlass.experimental.task_scheduling.resources import (
+    PipelineConfig,
+    TileSchedulerConfig,
+)
+
 from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
     batch_decode_mla_with_paged_kv_cache,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
+    make_mla_decode_config,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
+    build_mla_decode_task_manager,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.resources import (
+    MlaWorkQueue,
 )
 from flashinfer.mla import (
     get_prims_ts_batch_decode_mla_workspace_size,
@@ -53,6 +73,51 @@ _ROPE_DIM = 64
 _QK_DIM = _LATENT_DIM + _ROPE_DIM
 _DEFAULT_PAGE_SIZE = 32
 _FP8_PROBABILITY_SCALE = 448.0
+_MLA_INTERNAL_TUNING_PARAMETERS = frozenset(
+    {
+        "autotuner",
+        "config",
+        "head_dim_per_cta_v",
+        "kernel",
+        "num_ctas_per_head_dim",
+        "num_insts_kv",
+        "num_stages",
+        "num_warps",
+        "separate_reducer_impl",
+        "split_kv",
+        "tile_size_kv",
+        "tile_size_q",
+        "use_cga_reduction",
+        "use_clc_dynamic_persistent_scheduler",
+        "use_persistent_scheduler",
+    }
+)
+_INTERNAL_TUNING_TOKEN_PREFIXES = frozenset(
+    {
+        "autotun",
+        "clc",
+        "config",
+        "cta",
+        "impl",
+        "inst",
+        "kernel",
+        "mma",
+        "pdl",
+        "persist",
+        "profil",
+        "reduc",
+        "schedul",
+        "split",
+        "stag",
+        "tile",
+        "warp",
+    }
+)
+_INTERNAL_TUNING_TOKEN_SEQUENCES = (
+    ("groups", "tokens", "heads"),
+    ("single", "kv"),
+    ("tensor", "cores"),
+)
 
 
 @dataclass(frozen=True)
@@ -880,6 +945,173 @@ def _apply_mla_tail_markers(case):
             # value makes visibility of these tail tokens numerically decisive.
             case.kv_cache[page_id, 0, page_offset, 0] = 80
     return case
+
+
+def _make_clc_work_queue(cfg) -> MlaWorkQueue:
+    """Construct the 2CTA CLC queue used to inspect skip-path scheduling."""
+
+    return MlaWorkQueue(
+        tile_sched_params=None,
+        cfg=cfg,
+        static_split_kv=1,
+        static_seq_len_k=128,
+        groups_tokens_heads_q_ratio=1,
+        logical_num_heads_q=128,
+        logical_seq_len_q=1,
+        static_problem_shape_b=1,
+        static_problem_shape_s=1,
+        use_clc_dynamic=True,
+        name="mla_work_queue",
+        tile_scheduler_config=TileSchedulerConfig(
+            TileSchedulerType.ClcDynamicPersistent,
+            None,
+            None,
+        ),
+        pipeline_config=PipelineConfig.create_clc_fetch_async_pipeline_cfg(
+            num_stages=2,
+            num_bytes=16,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                cfg.threads_per_cta * cfg.num_mma_ctas - 2 * cfg.threads_per_warp,
+            ),
+            cta_layout_vmnk=(cfg.num_mma_ctas, 1, 1, 1),
+            producer_signaling_threads=SignalingThreads.CtaLeader,
+            consumer_signaling_threads=SignalingThreads.All,
+        ),
+    )
+
+
+def _schedule_slot(entry):
+    resource, schedule_stage, call_id, _ = entry
+    return id(resource), schedule_stage, call_id
+
+
+def _empty_mla_runtime() -> mla_decode_module._MLARuntime:
+    return mla_decode_module._MLARuntime(
+        query=torch.empty(8),
+        normalized_cache=torch.empty(8),
+        out=torch.empty(8),
+        bmm1_scale=1.0,
+        bmm2_scale=1.0,
+    )
+
+
+def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
+    """Keep kernel policy automatic and the public signatures explicit."""
+
+    surfaces = (
+        BatchMLADecodePagedTSWrapper.__init__,
+        BatchMLADecodePagedTSWrapper.plan,
+        BatchMLADecodePagedTSWrapper.run,
+        batch_decode_mla_with_paged_kv_cache,
+        get_prims_ts_batch_decode_mla_workspace_size,
+        prims_ts_batch_decode_with_kv_cache_mla,
+    )
+    violations = []
+    for surface in surfaces:
+        for parameter in inspect.signature(surface).parameters.values():
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                violations.append(f"{surface.__qualname__}.**{parameter.name}")
+                continue
+            tokens = tuple(parameter.name.split("_"))
+            has_forbidden_token = any(
+                token.startswith(prefix)
+                for token in tokens
+                for prefix in _INTERNAL_TUNING_TOKEN_PREFIXES
+            )
+            has_forbidden_sequence = any(
+                tokens[index : index + len(sequence)] == sequence
+                for sequence in _INTERNAL_TUNING_TOKEN_SEQUENCES
+                for index in range(len(tokens) - len(sequence) + 1)
+            )
+            if (
+                parameter.name in _MLA_INTERNAL_TUNING_PARAMETERS
+                or has_forbidden_token
+                or has_forbidden_sequence
+            ):
+                violations.append(f"{surface.__qualname__}.{parameter.name}")
+
+    assert violations == []
+
+
+def test_attention_ts_mla_output_guard_covers_every_live_allocation():
+    """Reject output overlap with inputs retained through an MLA launch."""
+
+    for aliased_name in (
+        "kv_cache",
+        "block_tables",
+        "seq_lens",
+        "qo_indptr",
+        "workspace_buffer",
+    ):
+        runtime = _empty_mla_runtime()
+        inputs = {
+            "block_tables": torch.empty(8),
+            "seq_lens": torch.empty(8),
+            "qo_indptr": torch.empty(8),
+            "workspace_buffer": torch.empty(8),
+        }
+        if aliased_name == "kv_cache":
+            runtime = replace(runtime, normalized_cache=runtime.out)
+        else:
+            inputs[aliased_name] = runtime.out
+
+        with pytest.raises(
+            ValueError,
+            match=rf"out must not overlap {aliased_name} storage",
+        ):
+            mla_decode_module._validate_mla_output_aliasing(runtime, **inputs)
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_attention_ts_mla_bf16_clc_skipped_tiles_preserve_progress():
+    """Skip data work symmetrically while preserving CLC queue progress."""
+
+    cfg = make_mla_decode_config(
+        qkv_dtype="bf16",
+        o_dtype="bf16",
+        is_persistent=True,
+    )
+    work_queue = _make_clc_work_queue(cfg)
+    task_manager, _, _ = build_mla_decode_task_manager(
+        cfg,
+        domain=1,
+        work_queue=work_queue,
+        exhaustive_deadlock_race_check=False,
+    )
+
+    queue_entries = 0
+    throttle_stages = set()
+    for task in task_manager.tasks:
+        assert task.skip_if is not None
+        for entries, skippable_slots in (
+            (task.head_schedule_list, task.skippable_head_slots),
+            (task.tail_schedule_list, task.skippable_tail_slots),
+        ):
+            for entry in entries:
+                resource, stage, _, _ = entry
+                is_skippable = _schedule_slot(entry) in skippable_slots
+                if resource is work_queue:
+                    # A zero-K tile still has to fetch and retire its CLC work.
+                    assert not is_skippable
+                    queue_entries += 1
+                elif resource.name == "work_throttle":
+                    # Both sides of the cross-CTA throttle disappear together.
+                    assert is_skippable
+                    throttle_stages.add(stage.name)
+                elif not is_skippable:
+                    # Register initializers must dominate the loop and tail.
+                    assert stage.name in {"ProducerAuxWork", "ConsumerAuxWork"}
+
+    assert queue_entries
+    assert {
+        "ProducerTryAcquire",
+        "ProducerAcquire",
+        "ProducerCommit",
+        "ConsumerWait",
+        "ConsumerRelease",
+    }.issubset(throttle_stages)
 
 
 def test_attention_ts_mla_run_requires_plan():

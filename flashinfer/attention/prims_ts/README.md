@@ -30,10 +30,6 @@ contracts:
 pytest -q \
   tests/attention/test_attention_ts_context.py \
   tests/attention/test_attention_ts_decode.py \
-  tests/attention/test_attention_ts_decode_resources.py \
   tests/attention/test_attention_ts_mask.py \
-  tests/attention/test_attention_ts_mla_decode.py \
-  tests/attention/test_attention_ts_mla_2cta_schedule.py \
-  tests/attention/test_attention_ts_aliasing.py \
-  tests/attention/test_attention_ts_public_surface.py
+  tests/attention/test_attention_ts_mla_decode.py
 ```

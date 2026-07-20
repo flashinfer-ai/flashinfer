@@ -249,6 +249,5 @@ output/workspace contracts, and CUDA graphs:
 
 ```bash
 pytest -q tests/attention/test_attention_ts_mla_decode.py
-pytest -q tests/attention/test_attention_ts_mla_2cta_schedule.py
 pytest -q tests/trace/test_fi_trace.py
 ```
