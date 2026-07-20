@@ -239,16 +239,7 @@ _DETERMINISTIC = {
 # "unexpectedly passed -> remove this entry" signal. A crash is never tolerated (only wrong answers).
 _KNOWN_FAILURES = [
     # Entries: (backend_key, predicate(cfg), "reason; gh #NNNN").
-    # This routing stage is shared by DeepSeekFp8 and MxFp8; the all-zero
-    # output reproduces with both variants, so the predicate is intentionally
-    # backend-wide rather than variant-specific.
-    (
-        "trtllm_fp8_block",
-        lambda cfg: cfg.is_fromlogits
-        and cfg.routing_method == RoutingMethodType.DeepSeekV3,
-        "block-FP8 DeepSeekV3 FromLogits can emit all-zero output; "
-        "tracked as a follow-up to gh #4026",
-    ),
+    # Empty since the gh #3547 EP-offset double-subtraction fix.
 ]
 
 

@@ -397,6 +397,8 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         routing_input_mode = act.routing_input_mode
         if routing_input_mode == RoutingInputMode.FromLogits:
             # In-kernel routing: topk_ids/expert_weights are OUTPUT buffers the kernel fills.
+            # Unlike the FP8 launcher, FP4 receives routing_input_mode explicitly;
+            # non-empty output buffers therefore do not select precomputed routing.
             # We allocate them here (mirroring trtllm_fp4_block_scale_moe_op, core.py ~2268)
             # because MoERunner.forward calls the raw op directly, bypassing the buffer-allocating
             # wrapper. Weight dtype mirrors logits dtype (core.py:2253).
@@ -717,12 +719,12 @@ class TrtllmFp8BlockRunner(TunableRunner):
             )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
-            topk_ids = act.hidden_states_q.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.int32
-            )
-            expert_weights = routing_logits.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.bfloat16
-            )
+            # FP8 infers the routing mode from the expert-index tensor: a
+            # non-empty 2D tensor means PackedPrecomputed and suppresses
+            # routing_logits. Empty placeholders select FromLogits, matching
+            # the canonical trtllm_fp8_block_scale_moe wrapper.
+            topk_ids = act.hidden_states_q.new_empty((0,), dtype=torch.int32)
+            expert_weights = act.hidden_states_q.new_empty((0,), dtype=torch.bfloat16)
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
             _validate_prerouted_inputs(
                 act, num_tokens, routing.top_k, "TrtllmFp8BlockRunner"

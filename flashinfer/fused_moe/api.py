@@ -273,9 +273,9 @@ class TrtllmFp8BlockConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # This adapter delegates to get_trtllm_moe_sm100_module(), whose
-        # trtllm-gen kernels require Blackwell SM100+.
-        return arch >= 100
+        # The JIT and C++ launcher support only SM major 10 and 12. Keep this
+        # explicit so SM110 is rejected before JIT compilation.
+        return arch in (100, 103, 120, 121)
 
     @staticmethod
     def prepare_weights(

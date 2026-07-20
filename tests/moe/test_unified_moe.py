@@ -266,6 +266,8 @@ class TestBackendOptions:
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
+        assert not TrtllmFp8BlockConfig.supported(110)
+        assert TrtllmFp8BlockConfig.supported(120)
 
     def test_iteration(self):
         opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))

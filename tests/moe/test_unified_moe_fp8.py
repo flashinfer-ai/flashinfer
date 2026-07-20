@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -19,6 +21,7 @@ from flashinfer.fused_moe import (
     QuantVariant,
     RoutingConfig,
     RoutingInputMode,
+    RoutingMethodType,
     TrtllmFp8BlockConfig,
 )
 from flashinfer.quantization.fp8_quantization import (
@@ -29,15 +32,15 @@ from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
 
 
-def _is_sm100_plus() -> bool:
+def _is_trtllm_fp8_arch() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, _ = get_compute_capability(torch.device("cuda"))
-    return major >= 10
+    major, minor = get_compute_capability(torch.device("cuda"))
+    return major * 10 + minor in (100, 103, 120, 121)
 
 
 pytestmark = pytest.mark.skipif(
-    not _is_sm100_plus(), reason="TRTLLM block-FP8 MoE requires SM100+"
+    not _is_trtllm_fp8_arch(), reason="TRTLLM block-FP8 MoE requires SM100/103/120/121"
 )
 
 HIDDEN = 256
@@ -278,6 +281,22 @@ def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
     )
 
 
+def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
+    """Run in-kernel routing and assert its selected expert set exactly."""
+    runner = layer.runners[0]
+    inputs = runner.pack_inputs(act_pack, weights)
+    routing_replay = torch.empty_like(expected_ids, dtype=torch.int16)
+    runner._static_kwargs["routing_replay_out"] = routing_replay
+    actual = runner.forward(inputs, tactic=-1)
+    torch.testing.assert_close(
+        torch.sort(routing_replay.to(torch.int32), dim=-1).values,
+        torch.sort(expected_ids.to(torch.int32), dim=-1).values,
+        rtol=0,
+        atol=0,
+    )
+    return actual
+
+
 @pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
 def test_block_fp8_from_logits_matches_prerouted(variant):
     pack, weights, config, _ = _make_case(variant)
@@ -298,7 +317,86 @@ def test_block_fp8_from_logits_matches_prerouted(variant):
     )
     layer = MoELayer(config)
     expected = layer(prerouted, weights).clone()
-    actual = layer(from_logits, weights)
+    actual = _run_from_logits_with_replay(layer, from_logits, weights, topk_ids)
+    _assert_fp8_close(actual, expected)
+
+
+def _deepseek_v3_route(logits, bias, *, top_k, n_group, topk_group, scale):
+    scores = torch.sigmoid(logits.float())
+    selection_scores = scores + bias.float()
+    grouped = selection_scores.view(logits.shape[0], n_group, -1)
+    group_scores = torch.topk(grouped, k=2, dim=-1).values.sum(dim=-1)
+    selected_groups = torch.topk(group_scores, k=topk_group, dim=-1).indices
+    group_mask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(
+        -1, selected_groups, True
+    )
+    expert_mask = (
+        group_mask.unsqueeze(-1).expand_as(grouped).reshape_as(selection_scores)
+    )
+    selected = torch.topk(
+        selection_scores.masked_fill(~expert_mask, float("-inf")),
+        k=top_k,
+        dim=-1,
+    ).indices
+    weights = torch.gather(scores, -1, selected)
+    weights = weights / weights.sum(dim=-1, keepdim=True) * scale
+    return selected.to(torch.int32), weights
+
+
+@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+def test_block_fp8_deepseek_v3_from_logits_matches_prerouted(variant):
+    num_experts = 64
+    pack, weights, config, _ = _make_case(variant, local_experts=num_experts)
+    generator = torch.Generator(device="cuda").manual_seed(20260719)
+    logits = torch.randn(
+        TOKENS,
+        num_experts,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    bias = torch.randn(
+        num_experts,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    n_group, topk_group, routed_scale = 8, 4, 2.5
+    topk_ids, topk_weights = _deepseek_v3_route(
+        logits,
+        bias,
+        top_k=TOP_K,
+        n_group=n_group,
+        topk_group=topk_group,
+        scale=routed_scale,
+    )
+    config = dataclasses.replace(
+        config,
+        routing=RoutingConfig(
+            num_experts=num_experts,
+            top_k=TOP_K,
+            method=RoutingMethodType.DeepSeekV3,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scale,
+        ),
+    )
+    prerouted = MoEActivationPack(
+        hidden_states_q=pack.hidden_states_q,
+        hidden_states_scale=pack.hidden_states_scale,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+    from_logits = MoEActivationPack(
+        hidden_states_q=pack.hidden_states_q,
+        hidden_states_scale=pack.hidden_states_scale,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=logits,
+        routing_bias=bias,
+    )
+    layer = MoELayer(config)
+    expected = layer(prerouted, weights).clone()
+    actual = _run_from_logits_with_replay(layer, from_logits, weights, topk_ids)
     _assert_fp8_close(actual, expected)
 
 
