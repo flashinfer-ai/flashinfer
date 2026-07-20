@@ -17,7 +17,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 import functools
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, cast
 
 import torch
 
@@ -28,6 +28,7 @@ from flashinfer.trace.templates.attention import (
     prims_ts_decode_mla_wrapper_trace_dispatch,
 )
 
+from ._tensor_aliasing import _validate_out_does_not_overlap_inputs
 from .decode import (
     _WorkspaceSection,
     _align_up,
@@ -51,6 +52,12 @@ _MLA_ROPE_DIM = 64
 _MLA_QUERY_DIM = _MLA_LATENT_DIM + _MLA_ROPE_DIM
 _SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_OUTPUT_DTYPES = (torch.bfloat16,)
+_INT32_MAX = 2**31 - 1
+# The largest public 1CTA schedule can pad one K/V split group across 128
+# splits, two 128-token K/V instructions apiece. Reserve that complete span so
+# every padded tile boundary remains representable as signed Int32.
+_MLA_MAX_KV_COORDINATE_SPAN = 128 * 2 * 128
+_MLA_MAX_KV_LEN = _INT32_MAX - (_MLA_MAX_KV_COORDINATE_SPAN - 1)
 
 
 @dataclass(frozen=True)
@@ -134,6 +141,62 @@ def _validate_mla_dims(kv_lora_rank: int, qk_rope_head_dim: int) -> None:
         )
 
 
+def _validate_mla_max_kv_len(value: int, name: str) -> int:
+    """Reserve the largest padded split-KV coordinate span in signed Int32."""
+    value = _validate_positive_int(value, name)
+    if value > _MLA_MAX_KV_LEN:
+        raise NotImplementedError(
+            f"{name} must be <= {_MLA_MAX_KV_LEN} so padded MLA K/V "
+            "coordinates fit in a signed int32"
+        )
+    return value
+
+
+def _validate_mla_int32_extent(value: int, name: str) -> int:
+    """Validate a flattened metadata/cache extent used by Int32 coordinates."""
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    if value > _INT32_MAX:
+        raise NotImplementedError(f"{name} must fit in a signed int32")
+    return value
+
+
+def _validate_mla_query_head_extent(
+    *,
+    batch_size: int,
+    num_heads: int,
+    max_seq_len_q: int,
+    total_q: Optional[int] = None,
+) -> None:
+    """Keep fixed-capacity and packed query-head coordinates in signed Int32."""
+    _validate_mla_int32_extent(
+        batch_size * max_seq_len_q * num_heads,
+        "batch_size * max_seq_len_q * num_heads",
+    )
+    if total_q is not None:
+        _validate_mla_int32_extent(
+            total_q * num_heads,
+            "total_q * num_heads",
+        )
+
+
+def _validate_mla_policy_coordinate_span(
+    policy: tuple[tuple[str, object], ...],
+) -> None:
+    """Keep the host K/V bound coupled to the automatically selected policy."""
+    resolved = dict(policy)
+    span = (
+        int(cast(int, resolved["tile_size_kv"]))
+        * int(cast(int, resolved["num_insts_kv"]))
+        * max(int(cast(int, resolved["split_kv"])), 1)
+    )
+    if span > _MLA_MAX_KV_COORDINATE_SPAN:
+        raise RuntimeError(
+            "MLA Int32 extent safety assumes a padded K/V coordinate span no "
+            f"larger than {_MLA_MAX_KV_COORDINATE_SPAN}, got {span}"
+        )
+
+
 def _validate_mla_dtype_pair(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
@@ -198,6 +261,8 @@ def _validate_mla_metadata(
     max_num_pages = int(block_tables.shape[1])
     if max_num_pages <= 0:
         raise ValueError("block_tables must contain at least one page column")
+    _validate_mla_int32_extent(batch_size, "batch_size")
+    _validate_mla_int32_extent(int(block_tables.numel()), "block_tables elements")
     return seq_lens.device, batch_size, max_num_pages
 
 
@@ -340,6 +405,13 @@ def _validate_query(
                 "fixed query length must equal the planned max_seq_len_q "
                 f"({max_seq_len_q}), got {query.shape[1]}"
             )
+        if batch_size is not None and num_heads is not None:
+            _validate_mla_query_head_extent(
+                batch_size=batch_size,
+                num_heads=num_heads,
+                max_seq_len_q=max_seq_len_q,
+                total_q=int(query.shape[0]) if packed_query else None,
+            )
     if q_dtype is not None and query.dtype != q_dtype:
         raise ValueError(
             f"query dtype must match the plan ({q_dtype}), got {query.dtype}"
@@ -381,6 +453,7 @@ def _normalize_mla_kv_cache(
         )
     if normalized.shape[0] <= 0 or normalized.shape[1] <= 0:
         raise ValueError("kv_cache page count and page size must be positive")
+    _validate_mla_int32_extent(int(normalized.shape[0]), "kv_cache physical pages")
     if normalized.shape[2] != _MLA_QUERY_DIM:
         raise ValueError(
             f"kv_cache last dimension must be {_MLA_QUERY_DIM}, "
@@ -476,6 +549,8 @@ def _resolve_mla_decode_launch_spec(
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
+    max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
+
     import cutlass
     import cutlass.utils as cutlass_utils
     from cuda.bindings import driver as cuda_drv
@@ -504,6 +579,11 @@ def _resolve_mla_decode_launch_spec(
     if q_dtype_key != kv_dtype_key:
         raise ValueError("the cached TS MLA compiler requires one QKV dtype")
     seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
+    _validate_mla_query_head_extent(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        max_seq_len_q=seq_len_q,
+    )
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
     qkv_dtype_name = _kernel_dtype_name(q_dtype_key)
     output_dtype_name = _kernel_dtype_name(output_dtype_key)
@@ -862,6 +942,7 @@ def _resolve_mla_decode_launch_spec(
                 ("reducer_cluster_size", reducer_cluster_size),
             )
 
+        _validate_mla_policy_coordinate_span(policy)
         workspace_size = compute_workspace_size(
             num_heads=workspace_heads,
             seq_len_q=workspace_seq_len_q,
@@ -902,7 +983,7 @@ def _get_compiled_mla_decode(
 
     import cutlass
     import cutlass.cute as cute
-    from cutlass.base_dsl.dsl import BaseDSL
+    from cutlass.cutlass_dsl import BaseDSL
 
     spec = _resolve_mla_decode_launch_spec(
         device_index,
@@ -1123,13 +1204,18 @@ def get_prims_ts_batch_decode_mla_workspace_size(
     num_heads = _validate_positive_int(num_heads, "num_heads")
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
     page_size = _validate_page_size(page_size)
-    max_seq_len = _validate_positive_int(max_seq_len, "max_seq_len")
+    max_seq_len = _validate_mla_max_kv_len(max_seq_len, "max_seq_len")
     max_seq_len_q = _resolve_max_seq_len_q_alias(
         seq_len_q=seq_len_q,
         max_seq_len_q=max_seq_len_q,
         default=1,
     )
     assert max_seq_len_q is not None
+    _validate_mla_query_head_extent(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        max_seq_len_q=max_seq_len_q,
+    )
     _validate_mask(mask_type)
     if kv_dtype is None:
         kv_dtype = q_dtype
@@ -1230,6 +1316,27 @@ def _prepare_mla_runtime(
         out=out,
         bmm1_scale=effective_bmm1_scale,
         bmm2_scale=effective_bmm2_scale,
+    )
+
+
+def _validate_mla_output_aliasing(
+    runtime: _MLARuntime,
+    *,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    qo_indptr: Optional[torch.Tensor],
+    workspace_buffer: torch.Tensor,
+) -> None:
+    """Keep output disjoint from every live MLA decode allocation."""
+
+    _validate_out_does_not_overlap_inputs(
+        runtime.out,
+        ("query", runtime.query),
+        ("kv_cache", runtime.normalized_cache),
+        ("block_tables", block_tables),
+        ("seq_lens", seq_lens),
+        ("qo_indptr", qo_indptr),
+        ("workspace_buffer", workspace_buffer),
     )
 
 
@@ -1366,7 +1473,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
         num_heads = int(query.shape[2])
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
     _validate_page_size(page_size)
-    max_seq_len = _validate_positive_int(max_seq_len, "max_seq_len")
+    max_seq_len = _validate_mla_max_kv_len(max_seq_len, "max_seq_len")
     required_page_columns = _ceil_div(max_seq_len, page_size)
     if max_num_pages < required_page_columns:
         raise ValueError(
@@ -1399,6 +1506,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
         device=query.device,
         required_bytes=layout.total_bytes,
     )
+    caller_provided_out = out is not None
     runtime = _prepare_mla_runtime(
         query,
         normalized_cache,
@@ -1415,6 +1523,14 @@ def prims_ts_batch_decode_with_kv_cache_mla(
         bmm2_scale=bmm2_scale,
         out=out,
     )
+    if caller_provided_out:
+        _validate_mla_output_aliasing(
+            runtime,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            qo_indptr=qo_indptr,
+            workspace_buffer=workspace_buffer,
+        )
     compiled, policy, kernel_workspace_bytes = _get_compiled_mla_decode(
         *spec_key, packed_query
     )
@@ -1465,14 +1581,15 @@ class BatchMLADecodePagedTSWrapper:
         offsets. Planning always validates those offsets and their final total
         with one device-to-host synchronization. If ``max_seq_len_q`` is
         omitted, their exact maximum delta becomes the plan bound; an explicit
-        bound may be larger. Supplying an explicit KV bound avoids its separate
-        plan-time metadata read. With ``qo_indptr=None``, the Q bound is the
-        exact fixed query length and defaults to one. ``seq_len_q`` remains a
-        backward-compatible alias for the same static bound. CUDA graph use
-        requires stable ``qo_indptr`` storage. Interior offsets may change only
-        when they remain strictly increasing, every delta stays within the
-        plan bound, and the final offset continues to match the packed
-        query/output extent fixed by the plan.
+        bound may be larger. Planning also reads and validates every K/V length;
+        an explicit KV bound is checked against all rows. With
+        ``qo_indptr=None``, the Q bound is the exact fixed query length and
+        defaults to one. ``seq_len_q`` remains a backward-compatible alias for
+        the same static bound. CUDA graph use requires stable ``qo_indptr``
+        storage. Interior offsets may change only when they remain strictly
+        increasing, every delta stays within the plan bound, and the final
+        offset continues to match the packed query/output extent fixed by the
+        plan.
         """
 
         _validate_mask(mask_type)
@@ -1514,18 +1631,31 @@ class BatchMLADecodePagedTSWrapper:
         else:
             max_seq_len_q = resolved_q_bound
 
+        _validate_mla_query_head_extent(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            max_seq_len_q=max_seq_len_q,
+            total_q=planned_total_q,
+        )
+
         if kv_data_type is None:
             kv_data_type = q_data_type
         _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
 
+        seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
+        if any(seq_len <= 0 for seq_len in seq_lens_host):
+            raise ValueError("every planned request must contain at least one KV token")
+        metadata_max_kv_len = max(seq_lens_host)
         if max_kv_len is None:
-            exact_max_kv_len = int(seq_lens.max().item())
-            if exact_max_kv_len <= 0:
-                raise ValueError(
-                    "every planned request must contain at least one KV token"
-                )
+            exact_max_kv_len = metadata_max_kv_len
         else:
-            exact_max_kv_len = _validate_positive_int(max_kv_len, "max_kv_len")
+            exact_max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
+            if metadata_max_kv_len > exact_max_kv_len:
+                raise ValueError(
+                    "planned KV metadata contains a request longer than "
+                    f"max_kv_len ({exact_max_kv_len}): got {metadata_max_kv_len}"
+                )
+        exact_max_kv_len = _validate_mla_max_kv_len(exact_max_kv_len, "max_kv_len")
         required_page_columns = _ceil_div(exact_max_kv_len, page_size)
         if max_num_pages < required_page_columns:
             raise ValueError(
@@ -1608,6 +1738,7 @@ class BatchMLADecodePagedTSWrapper:
                 "packed query rows must match the final planned qo_indptr "
                 f"offset ({self._planned_total_q}), got {query.shape[0]}"
             )
+        caller_provided_out = out is not None
         runtime = _prepare_mla_runtime(
             query,
             kv_cache,
@@ -1624,6 +1755,14 @@ class BatchMLADecodePagedTSWrapper:
             bmm2_scale=bmm2_scale,
             out=out,
         )
+        if caller_provided_out:
+            _validate_mla_output_aliasing(
+                runtime,
+                block_tables=self._block_tables,
+                seq_lens=self._seq_lens,
+                qo_indptr=self._qo_indptr,
+                workspace_buffer=self._workspace_buffer,
+            )
         return _launch_mla_decode(
             runtime,
             block_tables=self._block_tables,
@@ -1676,16 +1815,37 @@ def batch_decode_mla_with_paged_kv_cache(
             batch_size=batch_size,
         )
         num_heads = int(query.shape[1])
+        if max_seq_len_q is None:
+            _validate_mla_int32_extent(
+                int(query.shape[0]) * num_heads,
+                "total_q * num_heads",
+            )
+        else:
+            max_seq_len_q = _validate_positive_int(max_seq_len_q, "max_seq_len_q")
+            _validate_mla_query_head_extent(
+                batch_size=batch_size,
+                num_heads=num_heads,
+                max_seq_len_q=max_seq_len_q,
+                total_q=int(query.shape[0]),
+            )
     else:
         num_heads = int(query.shape[2])
         fixed_seq_len_q = int(query.shape[1])
         if max_seq_len_q is None:
             max_seq_len_q = fixed_seq_len_q
-        elif max_seq_len_q != fixed_seq_len_q:
-            raise ValueError(
-                "fixed query length must equal max_seq_len_q: "
-                f"got SQ={fixed_seq_len_q} and max_seq_len_q={max_seq_len_q}"
-            )
+        else:
+            max_seq_len_q = _validate_positive_int(max_seq_len_q, "max_seq_len_q")
+            if max_seq_len_q != fixed_seq_len_q:
+                raise ValueError(
+                    "fixed query length must equal max_seq_len_q: "
+                    f"got SQ={fixed_seq_len_q} and "
+                    f"max_seq_len_q={max_seq_len_q}"
+                )
+        _validate_mla_query_head_extent(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            max_seq_len_q=max_seq_len_q,
+        )
     if out is not None:
         _validate_out(
             out,

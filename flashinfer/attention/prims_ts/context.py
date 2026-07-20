@@ -15,12 +15,18 @@
 """Task-scheduled contiguous and paged context attention.
 
 The public surface intentionally exposes attention semantics, not scheduler
-choices. Every plan uses persistent scheduling; contiguous K/V uses the CLC
-dynamic scheduler and paged K/V uses the static scheduler required by its
-page-offset producer. The private policy is query-paired unless a positive
-left window requires head-paired GQA. Causal windows are bottom-right aligned:
-for row ``q``, the inclusive right position is ``q + (S_kv - S_q)`` and
-``window_left`` is measured from that position.
+choices. Contiguous K/V uses persistent CLC scheduling. Single-instance paged
+plans use a static persistent launch when their logical CTA grid exceeds one
+resident wave; smaller grids launch one CTA per tile. Fixed/uniform causal
+paged plans use a static-persistent raster: zero-offset triangular work runs
+heavy tiles first, while bottom-right-offset work retains sequence-local
+order. Paired persistent plans and causal live-ragged single-instance plans
+use CLC; dense live-ragged single-instance plans keep the static queue. The
+private policy is query-paired unless a positive left window requires
+head-paired GQA.
+Causal windows are bottom-right aligned: for row ``q``, the inclusive right
+position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
+position.
 """
 
 from dataclasses import dataclass
@@ -28,16 +34,23 @@ import functools
 import math
 import numbers
 import struct
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 
 from flashinfer.api_logging import flashinfer_api
 
+from ._tensor_aliasing import _validate_out_does_not_overlap_inputs
+
+
+if TYPE_CHECKING:
+    from .kernels.fmha_context.fmha_resources import FmhaConfig
+
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _SUPPORTED_HEAD_DIMS = (128, 256)
-_PAGED_KV_PAGE_SIZE = 32
+_DEFAULT_PAGED_KV_PAGE_SIZE = 32
+_SUPPORTED_PAGED_KV_PAGE_SIZES = (16, 32, 64, 128)
 _SUPPORTED_DTYPES = (
     torch.float16,
     torch.bfloat16,
@@ -45,6 +58,15 @@ _SUPPORTED_DTYPES = (
 )
 _SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 _INT32_MAX = 2**31 - 1
+_CUDA_GRID_YZ_MAX = 65_535
+_CONTEXT_KV_TILE_N = 128
+# Query-paired D128 represents two 128-row Q tiles in one work tile.  Kernel
+# coordinates include the padded tail of that 256-row span and, for masking,
+# its exclusive right boundary.  Reserve the maximum 255-row tail padding in
+# every packed logical data extent so all such coordinates remain signed
+# Int32 even when the final request ends at the plan's packed extent.
+_CONTEXT_MAX_Q_ROWS_PER_WORK_TILE = 256
+_CONTEXT_PADDED_EXTENT_MAX = _INT32_MAX - (_CONTEXT_MAX_Q_ROWS_PER_WORK_TILE - 1)
 
 
 @dataclass(frozen=True)
@@ -67,9 +89,10 @@ class _ContextGeometry:
     mask_type: str
     window_left: int
     head_paired: bool
+    uniform_packed_lengths: bool
     has_q_offset: bool
-    max_q_offset: int
     causal_single_kv_tile: bool
+    packed_dense_k_mask: bool
     q_shape: tuple[int, ...]
     kv_shape: tuple[int, ...]
 
@@ -84,6 +107,7 @@ class _PagedContextGeometry:
     total_q: int
     max_seq_len_q: int
     max_seq_len_k: int
+    page_size: int
     max_num_pages_per_seq_kv: int
     num_physical_pages: int
     num_qo_heads: int
@@ -94,8 +118,9 @@ class _PagedContextGeometry:
     mask_type: str
     window_left: int
     head_paired: bool
+    uniform_packed_lengths: bool
     has_q_offset: bool
-    max_q_offset: int
+    packed_dense_k_mask: bool
     q_shape: tuple[int, ...]
     kv_shape: tuple[int, ...]
 
@@ -238,6 +263,27 @@ def _validate_extent(value: int, name: str) -> int:
     return value
 
 
+def _validate_padded_data_extent(value: int, name: str) -> int:
+    """Validate an Int32 data extent while reserving work-tile tail padding."""
+    _validate_extent(value, name)
+    if value > _CONTEXT_PADDED_EXTENT_MAX:
+        raise NotImplementedError(
+            f"{name} must be <= {_CONTEXT_PADDED_EXTENT_MAX} so padded "
+            "context work-tile coordinates fit in a signed int32"
+        )
+    return value
+
+
+def _validate_query_work_tile_span(config: "FmhaConfig") -> None:
+    """Keep the public Int32 padding guard coupled to generated topology."""
+    q_rows = int(config.q_tile_m) * int(config.work_tile_q_seq_tiles)
+    if q_rows > _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE:
+        raise RuntimeError(
+            "context Int32 extent safety assumes at most "
+            f"{_CONTEXT_MAX_Q_ROWS_PER_WORK_TILE} Q rows per work tile, got {q_rows}"
+        )
+
+
 def _validate_indptr_tensor(
     indptr: torch.Tensor,
     name: str,
@@ -316,10 +362,10 @@ def _validate_paged_metadata_tensor(
 def _validate_page_size(page_size: int) -> int:
     if isinstance(page_size, bool) or not isinstance(page_size, int):
         raise TypeError("page_size must be an integer")
-    if page_size != _PAGED_KV_PAGE_SIZE:
+    if page_size not in _SUPPORTED_PAGED_KV_PAGE_SIZES:
         raise NotImplementedError(
-            "attention-ts paged context currently requires page_size="
-            f"{_PAGED_KV_PAGE_SIZE}; got {page_size}"
+            "attention-ts paged context supports page_size in "
+            f"{_SUPPORTED_PAGED_KV_PAGE_SIZES}; got {page_size}"
         )
     return page_size
 
@@ -378,20 +424,161 @@ def _validate_head_dim(q_head_dim: int, kv_head_dim: int) -> int:
     return q_head_dim
 
 
-def _derive_q_offset_geometry(
+def _derive_has_q_offset(
     q_lengths: tuple[int, ...],
     k_lengths: tuple[int, ...],
     mask_type: str,
-) -> tuple[bool, int]:
-    """Return whether causal Q offsets exist and their safe domain maximum."""
+) -> bool:
+    """Return whether any request has a bottom-right causal Q offset."""
 
     if mask_type != "causal":
-        return False, 0
-    q_offsets = tuple(
-        k_length - q_length
+        return False
+    return any(
+        k_length != q_length
         for q_length, k_length in zip(q_lengths, k_lengths, strict=True)
     )
-    return any(offset != 0 for offset in q_offsets), max(q_offsets)
+
+
+def _uses_heavy_first_static_causal_raster(
+    *,
+    mask_type: str,
+    window_left: int,
+    has_q_offset: bool,
+) -> bool:
+    """Return whether a static paged plan has triangular causal tile costs.
+
+    Zero-offset, unwindowed causal attention grows from short to long K-tile
+    domains across Q tiles, so reversing the sequence raster retires the
+    heaviest work first. A bottom-right offset makes the short-Q context rows
+    similarly heavy, while a finite left window bounds their work; both keep
+    the ordinary sequence-local raster.
+    """
+
+    return mask_type == "causal" and window_left < 0 and not has_q_offset
+
+
+def _paged_context_uses_clc_scheduler(
+    *,
+    is_persistent: bool,
+    single_qkv_instance: bool,
+    is_causal: bool,
+    uniform_packed_lengths: bool,
+) -> bool:
+    """Return whether a persistent paged plan needs the dynamic CLC queue."""
+
+    return is_persistent and (
+        not single_qkv_instance or (is_causal and not uniform_packed_lengths)
+    )
+
+
+def _contiguous_context_uses_clc_scheduler(
+    *,
+    single_qkv_instance: bool,
+    head_paired: bool,
+    packed: bool,
+    uniform_packed_lengths: bool,
+    is_causal: bool,
+    has_q_offset: bool,
+) -> bool:
+    """Return whether contiguous persistence needs dynamic work discovery.
+
+    Paired and zero-offset triangular task graphs use CLC to distribute their
+    heavier work tiles. A bottom-right-offset single-instance fixed or
+    uniform-packed plan has a near-uniform immutable domain, so its persistent
+    CTAs can advance through the static queue without a CLC request/response
+    on every tile. General packed plans retain CLC because live cumulative
+    offsets can change the active query-tile domain.
+    """
+
+    return (
+        head_paired
+        or not single_qkv_instance
+        or (packed and not uniform_packed_lengths)
+        or (is_causal and not has_q_offset)
+    )
+
+
+def _contiguous_context_uses_persistent_scheduler(
+    *,
+    single_qkv_instance: bool,
+    head_paired: bool,
+    packed: bool,
+    uniform_packed_lengths: bool,
+    logical_work_tiles: int,
+    max_active_clusters: int,
+    batch_size: int,
+    num_qo_heads: int,
+    is_causal: bool,
+    has_q_offset: bool,
+) -> bool:
+    """Return whether contiguous work needs a persistent launch.
+
+    Paired, live-ragged, and zero-offset triangular task graphs keep dynamic
+    persistence. Near-uniform bottom-right-offset single-instance domains
+    launch directly when they fit in one resident wave and use static
+    persistence only when more work remains. Oversized logical Y/Z dimensions
+    also require the flattened persistent grid.
+    """
+
+    return (
+        head_paired
+        or not single_qkv_instance
+        or (packed and not uniform_packed_lengths)
+        or (is_causal and not has_q_offset)
+        or logical_work_tiles > max_active_clusters
+        or batch_size > _CUDA_GRID_YZ_MAX
+        or num_qo_heads > _CUDA_GRID_YZ_MAX
+    )
+
+
+def _needs_packed_dense_k_mask(
+    *,
+    packed: bool,
+    mask_type: str,
+    k_lengths: tuple[int, ...],
+) -> bool:
+    """Return whether packed-contiguous or paged dense K needs right masking.
+
+    Uniform K lengths that are exact K-tile multiples give every request the
+    same full-tile domain.  That specialization needs no runtime ``seqlen_k``
+    mask; mixed lengths or a partial final tile retain the general mask.
+    """
+
+    return (
+        packed
+        and mask_type == "dense"
+        and (
+            any(length != k_lengths[0] for length in k_lengths[1:])
+            or k_lengths[0] % _CONTEXT_KV_TILE_N != 0
+        )
+    )
+
+
+def _paged_context_uses_persistent_scheduler(
+    *,
+    mask_type: str,
+    head_paired: bool,
+    logical_work_tiles: int,
+    max_active_clusters: int,
+    batch_size: int,
+    num_qo_heads: int,
+) -> bool:
+    """Return whether paged context should use the static persistent grid.
+
+    A one-wave dense query-paired grid has no inter-wave launch imbalance to
+    amortize, so it launches one CTA per logical tile.  Larger grids use the
+    persistent scheduler to balance work across resident CTAs.  CUDA limits
+    grid Y and Z to 65,535; retaining persistent scheduling for oversized
+    public geometries keeps every otherwise-valid int32 plan launchable.
+    """
+
+    return (
+        mask_type == "causal"
+        or head_paired
+        or logical_work_tiles > max_active_clusters
+        or batch_size > _CUDA_GRID_YZ_MAX
+        or num_qo_heads > _CUDA_GRID_YZ_MAX
+    )
 
 
 def _resolve_geometry(
@@ -429,8 +616,8 @@ def _resolve_geometry(
             )
         total_q, num_qo_heads, q_head_dim = map(int, q.shape)
         total_k, num_kv_heads, kv_head_dim = map(int, k.shape)
-        _validate_extent(total_q, "total_q")
-        _validate_extent(total_k, "total_k")
+        _validate_padded_data_extent(total_q, "total_q")
+        _validate_padded_data_extent(total_k, "total_k")
         _validate_compact(q, "q", "[total_q, Hq, D]")
         _validate_compact(k, "k", "[total_k, Hkv, D]")
         _validate_compact(v, "v", "[total_k, Hkv, D]")
@@ -467,8 +654,8 @@ def _resolve_geometry(
         _validate_extent(max_seq_len_k, "seq_len_k")
         total_q = batch_size * max_seq_len_q
         total_k = batch_size * max_seq_len_k
-        _validate_extent(total_q, "B * seq_len_q")
-        _validate_extent(total_k, "B * seq_len_k")
+        _validate_padded_data_extent(total_q, "B * seq_len_q")
+        _validate_padded_data_extent(total_k, "B * seq_len_k")
         _validate_compact(q, "q", "[B, Sq, Hq, D]")
         _validate_compact(k, "k", "[B, Sk, Hkv, D]")
         _validate_compact(v, "v", "[B, Sk, Hkv, D]")
@@ -495,8 +682,11 @@ def _resolve_geometry(
             "a positive left window requires grouped-query attention with an "
             f"even Hq/Hkv ratio greater than one; got {head_ratio}"
         )
-    has_q_offset, max_q_offset = _derive_q_offset_geometry(
-        q_lengths, k_lengths, mask_type
+    has_q_offset = _derive_has_q_offset(q_lengths, k_lengths, mask_type)
+    uniform_packed_lengths = (
+        packed
+        and all(length == q_lengths[0] for length in q_lengths[1:])
+        and all(length == k_lengths[0] for length in k_lengths[1:])
     )
     causal_single_kv_tile = (
         mask_type == "causal"
@@ -504,6 +694,11 @@ def _resolve_geometry(
         and not head_paired
         and max_seq_len_q == max_seq_len_k
         and max_seq_len_k <= 128
+    )
+    packed_dense_k_mask = _needs_packed_dense_k_mask(
+        packed=packed,
+        mask_type=mask_type,
+        k_lengths=k_lengths,
     )
     return _ContextGeometry(
         device=device,
@@ -522,9 +717,10 @@ def _resolve_geometry(
         mask_type=mask_type,
         window_left=window_left,
         head_paired=head_paired,
+        uniform_packed_lengths=uniform_packed_lengths,
         has_q_offset=has_q_offset,
-        max_q_offset=max_q_offset,
         causal_single_kv_tile=causal_single_kv_tile,
+        packed_dense_k_mask=packed_dense_k_mask,
         q_shape=q_shape,
         kv_shape=kv_shape,
     )
@@ -568,7 +764,7 @@ def _resolve_paged_geometry(
     num_physical_pages, num_kv_heads, cache_page_size, kv_head_dim = map(
         int, k_cache.shape
     )
-    _validate_extent(total_q, "total_q")
+    _validate_padded_data_extent(total_q, "total_q")
     _validate_extent(num_physical_pages, "num_physical_pages")
     if cache_page_size != page_size:
         raise ValueError(
@@ -630,10 +826,21 @@ def _resolve_paged_geometry(
     )
     max_seq_len_q = max(q_lengths)
     max_seq_len_k = max(k_lengths)
-    max_num_pages_per_seq_kv = max(page_counts)
+    # Paged TMA issues one complete KV-tile fragment at a time. Keep every
+    # dense page-table row fragment-aligned so the elected direct-load lane
+    # cannot cross into the peer K/V row on a partial final fragment.
+    pages_per_kv_tile = _CONTEXT_KV_TILE_N // page_size
+    max_page_count = max(page_counts)
+    max_num_pages_per_seq_kv = (
+        (max_page_count + pages_per_kv_tile - 1) // pages_per_kv_tile
+    ) * pages_per_kv_tile
     _validate_extent(max_seq_len_q, "max_seq_len_q")
     _validate_extent(max_seq_len_k, "max_seq_len_k")
     _validate_extent(max_num_pages_per_seq_kv, "max_num_pages_per_seq_kv")
+    _validate_extent(
+        2 * batch_size * max_num_pages_per_seq_kv,
+        "dense page-table elements",
+    )
 
     head_ratio = _validate_head_geometry(num_qo_heads, num_kv_heads)
     if mask_type == "causal":
@@ -651,14 +858,26 @@ def _resolve_paged_geometry(
             "a positive left window requires grouped-query attention with an "
             f"even Hq/Hkv ratio greater than one; got {head_ratio}"
         )
-    has_q_offset, max_q_offset = _derive_q_offset_geometry(
-        q_lengths, k_lengths, mask_type
+    has_q_offset = _derive_has_q_offset(q_lengths, k_lengths, mask_type)
+    # The paged wrapper retains a fixed total packed-Q extent and contracts
+    # every live request to the planned maximum. If the plan initially fills
+    # every request to that maximum, no legal live redistribution exists.
+    # K/V lengths are snapshotted, so uniform K is immutable as well.
+    uniform_packed_lengths = (
+        all(length == max_seq_len_q for length in q_lengths)
+        and total_q == batch_size * max_seq_len_q
+        and all(length == max_seq_len_k for length in k_lengths)
+    )
+    packed_dense_k_mask = _needs_packed_dense_k_mask(
+        packed=True,
+        mask_type=mask_type,
+        k_lengths=k_lengths,
     )
 
     logical_kv_indptr = [0]
     for k_length in k_lengths:
         logical_kv_indptr.append(logical_kv_indptr[-1] + k_length)
-    _validate_extent(logical_kv_indptr[-1], "sum_seq_len_k")
+    _validate_padded_data_extent(logical_kv_indptr[-1], "sum_seq_len_k")
     # The upstream ABI is [B, 2, max_pages], so batch is the outer dimension.
     # Preserve arbitrary and repeated physical page indices from the
     # FlashInfer CSR representation.
@@ -666,7 +885,10 @@ def _resolve_paged_geometry(
     for batch_idx, page_count in enumerate(page_counts):
         page_start = page_indptr_values[batch_idx]
         row = page_indices[page_start : page_start + page_count]
-        padded_row = row + (0,) * (max_num_pages_per_seq_kv - page_count)
+        # Invalid tail tokens are masked before softmax, but their TMA page
+        # fragments must still resolve to valid storage. Repeating this
+        # request's last page is safe for both direct and SMEM-cached loads.
+        padded_row = row + (row[-1],) * (max_num_pages_per_seq_kv - page_count)
         dense_page_indices.extend(padded_row)
         dense_page_indices.extend(padded_row)
 
@@ -677,6 +899,7 @@ def _resolve_paged_geometry(
         total_q=total_q,
         max_seq_len_q=max_seq_len_q,
         max_seq_len_k=max_seq_len_k,
+        page_size=page_size,
         max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
         num_physical_pages=num_physical_pages,
         num_qo_heads=num_qo_heads,
@@ -687,8 +910,9 @@ def _resolve_paged_geometry(
         mask_type=mask_type,
         window_left=window_left,
         head_paired=head_paired,
+        uniform_packed_lengths=uniform_packed_lengths,
         has_q_offset=has_q_offset,
-        max_q_offset=max_q_offset,
+        packed_dense_k_mask=packed_dense_k_mask,
         q_shape=tuple(q.shape),
         kv_shape=tuple(k_cache.shape),
     )
@@ -715,9 +939,10 @@ def _semantic_key(geometry: _ContextGeometry) -> tuple[object, ...]:
         geometry.window_left,
         geometry.packed,
         geometry.head_paired,
+        geometry.uniform_packed_lengths,
         geometry.has_q_offset,
-        geometry.max_q_offset,
         geometry.causal_single_kv_tile,
+        geometry.packed_dense_k_mask,
     )
 
 
@@ -729,6 +954,7 @@ def _paged_semantic_key(
         geometry.batch_size,
         geometry.max_seq_len_q,
         geometry.max_seq_len_k,
+        geometry.page_size,
         geometry.max_num_pages_per_seq_kv,
         geometry.num_qo_heads,
         geometry.num_kv_heads,
@@ -738,8 +964,9 @@ def _paged_semantic_key(
         geometry.mask_type,
         geometry.window_left,
         geometry.head_paired,
+        geometry.uniform_packed_lengths,
         geometry.has_q_offset,
-        geometry.max_q_offset,
+        geometry.packed_dense_k_mask,
     )
 
 
@@ -758,16 +985,17 @@ def _get_compiled_context(
     window_left: int,
     packed: bool,
     head_paired: bool,
+    uniform_packed_lengths: bool,
     has_q_offset: bool,
-    max_q_offset: int,
     causal_single_kv_tile: bool,
+    packed_dense_k_mask: bool,
 ):
     """Compile and cache one exact semantic context-attention specialization."""
 
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
-    from cutlass.base_dsl.dsl import BaseDSL
+    from cutlass.cutlass_dsl import BaseDSL
     import cutlass.utils as utils
 
     from .kernels.fmha_context.fmha_kernel import FmhaTs
@@ -780,6 +1008,9 @@ def _get_compiled_context(
     input_dtype = dtype_map[q_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     is_causal = mask_type == "causal"
+    # Construct the scheduler-independent topology first. Immutable
+    # single-instance domains can use the lower-overhead static persistent
+    # queue; paired or live-ragged domains are reconstructed with CLC.
     fmha = FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
@@ -788,19 +1019,90 @@ def _get_compiled_context(
         d=head_dim,
         is_persistent=True,
         is_causal=is_causal,
-        is_clc_dynamic=True,
+        balance_causal_workload=_uses_heavy_first_static_causal_raster(
+            mask_type=mask_type,
+            window_left=window_left,
+            has_q_offset=has_q_offset,
+        ),
+        is_clc_dynamic=False,
         head_paired=head_paired,
         window_size_left=window_left if window_left > 0 else 0,
         h_r=num_qo_heads // num_kv_heads,
         enable_skip_correction=True,
         causal_single_kv_tile=causal_single_kv_tile,
     )
-    fmha.cfg.has_varlen = packed
-    fmha.cfg.has_q_offset = has_q_offset
-    if not is_causal and not packed:
-        fmha.cfg.fixed_dense_k_tail = max_seq_len_k % fmha.cfg.kv_tile_n
     with torch.cuda.device(device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
+    num_seq_tiles = (max_seq_len_q + fmha.cfg.cta_tiler[0] - 1) // fmha.cfg.cta_tiler[0]
+    num_head_tiles = num_qo_heads // fmha.cfg.work_tile_q_heads
+    logical_work_tiles = batch_size * num_seq_tiles * num_head_tiles
+    is_persistent = _contiguous_context_uses_persistent_scheduler(
+        single_qkv_instance=fmha.cfg.single_qkv_instance,
+        head_paired=head_paired,
+        packed=packed,
+        uniform_packed_lengths=uniform_packed_lengths,
+        logical_work_tiles=logical_work_tiles,
+        max_active_clusters=max_active_clusters,
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        is_causal=is_causal,
+        has_q_offset=has_q_offset,
+    )
+    uses_clc = is_persistent and _contiguous_context_uses_clc_scheduler(
+        single_qkv_instance=fmha.cfg.single_qkv_instance,
+        head_paired=head_paired,
+        packed=packed,
+        uniform_packed_lengths=uniform_packed_lengths,
+        is_causal=is_causal,
+        has_q_offset=has_q_offset,
+    )
+    if uses_clc:
+        fmha = FmhaTs(
+            qk_acc_dtype=cutlass.Float32,
+            pv_acc_dtype=cutlass.Float32,
+            in_dtype=input_dtype,
+            out_dtype=output_dtype,
+            d=head_dim,
+            is_persistent=True,
+            is_causal=is_causal,
+            is_clc_dynamic=True,
+            head_paired=head_paired,
+            window_size_left=window_left if window_left > 0 else 0,
+            h_r=num_qo_heads // num_kv_heads,
+            enable_skip_correction=True,
+            causal_single_kv_tile=causal_single_kv_tile,
+        )
+    elif not is_persistent:
+        fmha = FmhaTs(
+            qk_acc_dtype=cutlass.Float32,
+            pv_acc_dtype=cutlass.Float32,
+            in_dtype=input_dtype,
+            out_dtype=output_dtype,
+            d=head_dim,
+            is_persistent=False,
+            is_causal=is_causal,
+            is_clc_dynamic=False,
+            head_paired=head_paired,
+            window_size_left=window_left if window_left > 0 else 0,
+            h_r=num_qo_heads // num_kv_heads,
+            enable_skip_correction=True,
+            causal_single_kv_tile=causal_single_kv_tile,
+        )
+    fmha.cfg.has_varlen = packed
+    fmha.cfg.has_uniform_varlen = uniform_packed_lengths
+    if uniform_packed_lengths:
+        fmha.cfg.uniform_seq_len_q = max_seq_len_q
+        fmha.cfg.uniform_seq_len_k = max_seq_len_k
+    fmha.cfg.has_q_offset = has_q_offset
+    if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
+        raise RuntimeError(
+            "context packed-K specialization assumes kv_tile_n="
+            f"{_CONTEXT_KV_TILE_N}, got {fmha.cfg.kv_tile_n}"
+        )
+    _validate_query_work_tile_span(fmha.cfg)
+    fmha.cfg.packed_dense_k_mask = packed_dense_k_mask
+    if not is_causal and not packed:
+        fmha.cfg.fixed_dense_k_tail = max_seq_len_k % fmha.cfg.kv_tile_n
 
     @cute.jit
     def tensor_adapter(
@@ -815,19 +1117,12 @@ def _get_compiled_context(
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
-        static_has_q_offset: cutlass.Constexpr[bool],
         static_max_seq_len_q: cutlass.Constexpr[int],
         static_max_seq_len_k: cutlass.Constexpr[int],
-        static_max_q_offset: cutlass.Constexpr[int],
     ) -> None:
         """Adapt torch TVM-FFI tensors to the FmhaTs host entry point."""
 
         if cutlass.const_expr(static_packed):
-            # Independent Q/K maxima do not determine the largest per-request
-            # bottom-right offset, so pass the exact plan-time maximum.
-            max_q_offset_arg = None
-            if cutlass.const_expr(static_has_q_offset):
-                max_q_offset_arg = cutlass.Int32(static_max_q_offset)
             fmha(
                 q,
                 k,
@@ -841,7 +1136,6 @@ def _get_compiled_context(
                 kv_indptr,
                 cutlass.Int32(static_max_seq_len_q),
                 cutlass.Int32(static_max_seq_len_k),
-                max_q_offset_arg,
             )
         else:
             fmha(
@@ -904,16 +1198,19 @@ def _get_compiled_context(
             stream_fake,
             max_active_clusters,
             packed,
-            has_q_offset,
             max_seq_len_q,
             max_seq_len_k,
-            max_q_offset,
             options=_COMPILE_OPTIONS,
         )
     policy = (
-        ("scheduler", "clc_dynamic_persistent"),
+        (
+            "scheduler",
+            ("clc_dynamic_persistent" if fmha.is_clc_dynamic else "static_persistent"),
+        ),
         ("pairing", "head" if head_paired else "query"),
+        ("uniform_packed_lengths", uniform_packed_lengths),
         ("causal_single_kv_tile", causal_single_kv_tile),
+        ("packed_dense_k_mask", packed_dense_k_mask),
     )
     return compiled, policy
 
@@ -924,6 +1221,7 @@ def _get_compiled_paged_context(
     batch_size: int,
     max_seq_len_q: int,
     max_seq_len_k: int,
+    page_size: int,
     max_num_pages_per_seq_kv: int,
     num_qo_heads: int,
     num_kv_heads: int,
@@ -933,15 +1231,16 @@ def _get_compiled_paged_context(
     mask_type: str,
     window_left: int,
     head_paired: bool,
+    uniform_packed_lengths: bool,
     has_q_offset: bool,
-    max_q_offset: int,
+    packed_dense_k_mask: bool,
 ):
-    """Compile one packed-Q, page-size-32 context specialization."""
+    """Compile one packed-Q, paged-K/V context specialization."""
 
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
-    from cutlass.base_dsl.dsl import BaseDSL
+    from cutlass.cutlass_dsl import BaseDSL
     import cutlass.utils as utils
 
     from .kernels.fmha_context.fmha_kernel import FmhaTs
@@ -954,6 +1253,13 @@ def _get_compiled_paged_context(
     input_dtype = dtype_map[q_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     is_causal = mask_type == "causal"
+    with torch.cuda.device(device_index):
+        max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
+
+    # Build the persistent topology first to obtain its actual work-tile shape.
+    # Scheduler selection then follows the logical CTA wave count rather than a
+    # head-dimension or sequence-length performance threshold.  The tiler is
+    # scheduler-independent; reconstruct only the one-wave nonpersistent case.
     fmha = FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
@@ -962,26 +1268,99 @@ def _get_compiled_paged_context(
         d=head_dim,
         is_persistent=True,
         is_causal=is_causal,
-        # CUTLASS DSL 4.7 requires the sole CLC scheduler task to produce only
-        # WorkQueue. Paged context also needs the auxiliary warp to produce
-        # smem_page_offsets_kv, so retain persistent scheduling but use the
-        # static scheduler and its dedicated PageOffsetsTask.
+        # This topology probe is scheduler-independent. Persistent paired
+        # plans are reconstructed below with CLC after their logical wave
+        # count is known; single-instance plans retain the staged page-offset
+        # producer and static scheduling.
+        balance_causal_workload=_uses_heavy_first_static_causal_raster(
+            mask_type=mask_type,
+            window_left=window_left,
+            has_q_offset=has_q_offset,
+        ),
         is_clc_dynamic=False,
         head_paired=head_paired,
         window_size_left=window_left if window_left > 0 else 0,
         h_r=num_qo_heads // num_kv_heads,
         enable_skip_correction=True,
         use_paged_kv=True,
-        num_tokens_per_page=_PAGED_KV_PAGE_SIZE,
+        num_tokens_per_page=page_size,
         max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
         # The fixed one-tile shortcut assumes contiguous fixed-shape K/V and
         # is intentionally disabled for the page-table path.
         causal_single_kv_tile=False,
     )
+    num_seq_tiles = (max_seq_len_q + fmha.cfg.cta_tiler[0] - 1) // fmha.cfg.cta_tiler[0]
+    num_head_tiles = num_qo_heads // fmha.cfg.work_tile_q_heads
+    logical_work_tiles = batch_size * num_seq_tiles * num_head_tiles
+    paged_is_persistent = _paged_context_uses_persistent_scheduler(
+        mask_type=mask_type,
+        head_paired=head_paired,
+        logical_work_tiles=logical_work_tiles,
+        max_active_clusters=max_active_clusters,
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+    )
+    # A fixed/uniform causal plan has an immutable task domain. Its static
+    # queue avoids CLC response overhead; causal live-ragged plans retain CLC
+    # so request-local work changes are redistributed at runtime. Dense work
+    # does not have the causal request-dependent K-tile domain and stays static.
+    paged_uses_clc = _paged_context_uses_clc_scheduler(
+        is_persistent=paged_is_persistent,
+        single_qkv_instance=fmha.cfg.single_qkv_instance,
+        is_causal=is_causal,
+        uniform_packed_lengths=uniform_packed_lengths,
+    )
+    if paged_uses_clc:
+        fmha = FmhaTs(
+            qk_acc_dtype=cutlass.Float32,
+            pv_acc_dtype=cutlass.Float32,
+            in_dtype=input_dtype,
+            out_dtype=output_dtype,
+            d=head_dim,
+            is_persistent=True,
+            is_causal=is_causal,
+            is_clc_dynamic=True,
+            head_paired=head_paired,
+            window_size_left=window_left if window_left > 0 else 0,
+            h_r=num_qo_heads // num_kv_heads,
+            enable_skip_correction=True,
+            use_paged_kv=True,
+            num_tokens_per_page=page_size,
+            max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+            causal_single_kv_tile=False,
+        )
+    elif not paged_is_persistent:
+        fmha = FmhaTs(
+            qk_acc_dtype=cutlass.Float32,
+            pv_acc_dtype=cutlass.Float32,
+            in_dtype=input_dtype,
+            out_dtype=output_dtype,
+            d=head_dim,
+            is_persistent=False,
+            is_causal=is_causal,
+            is_clc_dynamic=False,
+            head_paired=head_paired,
+            window_size_left=window_left if window_left > 0 else 0,
+            h_r=num_qo_heads // num_kv_heads,
+            enable_skip_correction=True,
+            use_paged_kv=True,
+            num_tokens_per_page=page_size,
+            max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+            causal_single_kv_tile=False,
+        )
     fmha.cfg.has_varlen = True
+    fmha.cfg.has_uniform_varlen = uniform_packed_lengths
+    if uniform_packed_lengths:
+        fmha.cfg.uniform_seq_len_q = max_seq_len_q
+        fmha.cfg.uniform_seq_len_k = max_seq_len_k
     fmha.cfg.has_q_offset = has_q_offset
-    with torch.cuda.device(device_index):
-        max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
+    if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
+        raise RuntimeError(
+            "context packed-K specialization assumes kv_tile_n="
+            f"{_CONTEXT_KV_TILE_N}, got {fmha.cfg.kv_tile_n}"
+        )
+    _validate_query_work_tile_span(fmha.cfg)
+    fmha.cfg.packed_dense_k_mask = packed_dense_k_mask
 
     @cute.jit
     def tensor_adapter(
@@ -997,14 +1376,9 @@ def _get_compiled_paged_context(
         seq_lens_kv: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
-        static_has_q_offset: cutlass.Constexpr[bool],
         static_max_seq_len_q: cutlass.Constexpr[int],
         static_max_seq_len_k: cutlass.Constexpr[int],
-        static_max_q_offset: cutlass.Constexpr[int],
     ) -> None:
-        max_q_offset_arg = None
-        if cutlass.const_expr(static_has_q_offset):
-            max_q_offset_arg = cutlass.Int32(static_max_q_offset)
         fmha(
             q,
             k_cache,
@@ -1018,7 +1392,6 @@ def _get_compiled_paged_context(
             kv_indptr,
             cutlass.Int32(static_max_seq_len_q),
             cutlass.Int32(static_max_seq_len_k),
-            max_q_offset_arg,
             page_idx_kv,
             seq_lens_kv,
         )
@@ -1037,7 +1410,7 @@ def _get_compiled_paged_context(
     kv_shape = (
         runtime_num_pages,
         num_kv_heads,
-        _PAGED_KV_PAGE_SIZE,
+        page_size,
         head_dim,
     )
     k_fake = fake_compact(input_dtype, kv_shape, 16)
@@ -1070,18 +1443,26 @@ def _get_compiled_paged_context(
             seq_lens_fake,
             stream_fake,
             max_active_clusters,
-            has_q_offset,
             max_seq_len_q,
             max_seq_len_k,
-            max_q_offset,
             options=_COMPILE_OPTIONS,
         )
     policy = (
-        ("scheduler", "static_persistent"),
+        (
+            "scheduler",
+            (
+                "clc_dynamic_persistent"
+                if paged_uses_clc
+                else "static_persistent"
+                if paged_is_persistent
+                else "nonpersistent"
+            ),
+        ),
         ("pairing", "head" if head_paired else "query"),
         ("kv_layout", "paged_hnd"),
-        ("page_size", _PAGED_KV_PAGE_SIZE),
+        ("page_size", page_size),
         ("causal_single_kv_tile", False),
+        ("packed_dense_k_mask", packed_dense_k_mask),
     )
     return compiled, policy
 
@@ -1157,40 +1538,31 @@ def _prepare_out(
     return out
 
 
-def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
-    """Return whether two compact tensors overlap in their storage byte ranges."""
-
-    lhs_start = lhs.data_ptr()
-    lhs_end = lhs_start + lhs.numel() * lhs.element_size()
-    rhs_start = rhs.data_ptr()
-    rhs_end = rhs_start + rhs.numel() * rhs.element_size()
-    return lhs_start < rhs_end and rhs_start < lhs_end
-
-
-def _validate_out_does_not_overlap_inputs(
-    out: torch.Tensor,
-    *named_inputs: tuple[str, torch.Tensor],
-) -> None:
-    """Reject output aliasing with any live kernel input tensor."""
-
-    for name, tensor in named_inputs:
-        if _tensors_overlap(out, tensor):
-            raise ValueError(f"out must not overlap {name} storage")
-
-
 class BatchPrefillTSWrapper:
     """Plan and reuse task-scheduled fixed or packed-ragged context attention.
 
     ``plan`` may compile, allocate two one-element scale tensors, and copy
-    packed cumulative offsets to the host for validation.  ``run`` performs no
-    metadata read or synchronization.  With caller-provided ``out``, its Python
-    path allocates no tensors and is suitable for CUDA graph capture. ``out``
-    must not overlap any Q, K, V, packed-offset, or scale input storage.
+    packed cumulative offsets to the host for validation. The ``run`` host
+    path performs no metadata read or synchronization. With caller-provided
+    ``out``, its Python path allocates no tensors and is suitable for CUDA
+    graph capture. ``out`` must not overlap any Q, K, V, packed-offset, or
+    scale input storage.
 
-    Packed metadata storage is retained by the plan and must remain alive and
-    at stable addresses.  If its values are changed, callers must preserve the
-    plan-time batch, total token counts, positive lengths, static maximum Q/K
-    lengths, maximum Q offset, and per-request bottom-right causal contract.
+    Packed ``qo_indptr`` and ``kv_indptr`` storage is retained as live plan
+    input, so it must remain alive and at stable addresses. General ragged
+    kernels reread the values; a uniform packed plan may compile its fixed
+    offsets into the specialization. Values may change while preserving the
+    planned batch, zero starting offsets, final packed extents, strictly
+    positive deltas, and the plan-time global Q/K capacities: every runtime
+    ``Sq[b]`` must be no greater than the planned maximum Q length and every
+    ``Sk[b]`` no greater than the planned maximum K length. Every causal replay
+    must also satisfy ``Sq[b] <= Sk[b]``. The request-local bottom-right offset
+    ``Sk[b] - Sq[b]`` may change between runs. Fixed totals plus the
+    per-request capacity bounds force plan-time uniform Q or K lengths to
+    remain unchanged, preserving a dense aligned-K specialization that
+    compiled away request-local K-tail masking. The ``run`` host path trusts
+    live offset values; violating this contract can produce incorrect results
+    or out-of-bounds access.
     """
 
     @flashinfer_api
@@ -1212,7 +1584,11 @@ class BatchPrefillTSWrapper:
         output_scale: float = 1.0,
         out_dtype: Optional[torch.dtype] = None,
     ) -> None:
-        """Validate semantics, select the private policy, and compile once."""
+        """Validate semantics, establish Q/K capacities, and compile once.
+
+        Packed cumulative offsets remain live device inputs. Their runtime
+        values must follow the replay contract documented on this wrapper.
+        """
 
         if out_dtype is None:
             if not isinstance(q, torch.Tensor):
@@ -1237,7 +1613,6 @@ class BatchPrefillTSWrapper:
         scale_softmax_log2 = _validate_scale(
             sm_scale * math.log2(math.e), "sm_scale * log2(e)"
         )
-        compiled, policy = _get_compiled_context(*_semantic_key(geometry))
         scale_tensor = torch.tensor(
             [scale_softmax_log2], dtype=torch.float32, device=geometry.device
         )
@@ -1251,12 +1626,17 @@ class BatchPrefillTSWrapper:
         else:
             # Uniform TVM-FFI signature; fixed specializations compile these
             # arguments away but still keep stable runtime placeholders.
-            planned_qo_indptr = torch.zeros(
+            planned_qo_indptr = torch.empty(
                 1, dtype=torch.int32, device=geometry.device
             )
-            planned_kv_indptr = torch.zeros(
+            planned_kv_indptr = torch.empty(
                 1, dtype=torch.int32, device=geometry.device
             )
+        # Keep all runtime tensor allocation ahead of CUTLASS JIT. Besides
+        # making plan publication atomic, this lets compute-sanitizer patch the
+        # generated attention kernel without interleaving later PyTorch setup
+        # launches with the DSL compiler/runtime callbacks.
+        compiled, policy = _get_compiled_context(*_semantic_key(geometry))
 
         # Publish only after validation, compilation, and allocation succeed.
         self._geometry = geometry
@@ -1282,17 +1662,19 @@ class BatchPrefillTSWrapper:
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
         _validate_runtime_inputs(q, k, v, self._geometry)
+        caller_provided_out = out is not None
         out = _prepare_out(out, q=q, output_dtype=self._geometry.output_dtype)
-        _validate_out_does_not_overlap_inputs(
-            out,
-            ("q", q),
-            ("k", k),
-            ("v", v),
-            ("qo_indptr", self._qo_indptr),
-            ("kv_indptr", self._kv_indptr),
-            ("scale_softmax_log2", self._scale_softmax_log2),
-            ("output_scale", self._output_scale),
-        )
+        if caller_provided_out:
+            _validate_out_does_not_overlap_inputs(
+                out,
+                ("q", q),
+                ("k", k),
+                ("v", v),
+                ("qo_indptr", self._qo_indptr),
+                ("kv_indptr", self._kv_indptr),
+                ("scale_softmax_log2", self._scale_softmax_log2),
+                ("output_scale", self._output_scale),
+            )
         self._compiled(
             q,
             k,
@@ -1312,14 +1694,27 @@ class BatchPrefillPagedTSWrapper:
     ``plan`` validates FlashInfer CSR page metadata once, translates it to the
     dense page-table ABI consumed by the context kernel, and retains both the
     original and derived device tensors. Arbitrary, repeated, and nonidentity
-    physical page indices are preserved. Metadata values are immutable for the
-    life of the plan; call ``plan`` again after changing them.
+    physical page indices are preserved. The three paged K/V metadata tensors
+    are snapshotted: call ``plan`` again after changing any of their values.
 
-    ``run`` reads no metadata values and performs no synchronization. With a
-    caller-provided ``out``, it allocates no tensors and is suitable for CUDA
-    graph capture. K and V are separate compact HND tensors with shape
-    ``[num_pages, Hkv, 32, D]`` and Q/output use packed
-    ``[total_q, Hq, D]`` storage.
+    ``qo_indptr`` is different: its storage is retained as a live device input
+    and the kernel rereads it on every run. Its values may change while
+    preserving the planned batch, a zero starting offset, the final packed-Q
+    extent, strictly positive deltas, and the plan-time maximum Q-length
+    global capacity. For a causal plan, every live ``Sq[b]`` must be no greater
+    than that request's snapshotted ``Sk[b]``. The request-local bottom-right
+    offset may change between runs; it is derived from the live Q and
+    snapshotted K lengths. The ``run`` host path trusts these live values;
+    violating this contract can produce incorrect results or out-of-bounds
+    access.
+
+    The ``run`` host path reads no metadata values and performs no
+    synchronization. With a caller-provided ``out``, it allocates no tensors
+    and is suitable for CUDA graph capture. K and V are separate compact HND
+    tensors with shape ``[num_pages, Hkv, page_size, D]`` and Q/output use
+    packed ``[total_q, Hq, D]`` storage. Supported page sizes are 16, 32, 64,
+    and 128. Dense plans with uniform snapshotted logical K lengths aligned to
+    128 rows compile the request-local softmax K mask away.
     """
 
     @flashinfer_api
@@ -1339,14 +1734,18 @@ class BatchPrefillPagedTSWrapper:
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
         *,
-        page_size: int = _PAGED_KV_PAGE_SIZE,
+        page_size: int = _DEFAULT_PAGED_KV_PAGE_SIZE,
         mask_type: Literal["dense", "causal"] = "dense",
         window_left: int = -1,
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
         out_dtype: Optional[torch.dtype] = None,
     ) -> None:
-        """Validate metadata, compile one specialization, and own its ABI."""
+        """Snapshot K/V metadata, retain live Q offsets, and compile once.
+
+        Runtime Q lengths may vary within the planned maximum-Q capacity and
+        must remain no greater than the snapshotted K length for causal plans.
+        """
 
         if out_dtype is None:
             if not isinstance(q, torch.Tensor):
@@ -1427,22 +1826,24 @@ class BatchPrefillPagedTSWrapper:
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
         _validate_paged_runtime_inputs(q, k_cache, v_cache, self._geometry)
+        caller_provided_out = out is not None
         out = _prepare_out(out, q=q, output_dtype=self._geometry.output_dtype)
-        _validate_out_does_not_overlap_inputs(
-            out,
-            ("q", q),
-            ("k_cache", k_cache),
-            ("v_cache", v_cache),
-            ("qo_indptr", self._qo_indptr),
-            ("paged_kv_indptr", self._paged_kv_indptr),
-            ("paged_kv_indices", self._paged_kv_indices),
-            ("paged_kv_last_page_len", self._paged_kv_last_page_len),
-            ("logical_kv_indptr", self._logical_kv_indptr),
-            ("seq_lens_kv", self._seq_lens_kv),
-            ("dense_page_idx_kv", self._dense_page_idx_kv),
-            ("scale_softmax_log2", self._scale_softmax_log2),
-            ("output_scale", self._output_scale),
-        )
+        if caller_provided_out:
+            _validate_out_does_not_overlap_inputs(
+                out,
+                ("q", q),
+                ("k_cache", k_cache),
+                ("v_cache", v_cache),
+                ("qo_indptr", self._qo_indptr),
+                ("paged_kv_indptr", self._paged_kv_indptr),
+                ("paged_kv_indices", self._paged_kv_indices),
+                ("paged_kv_last_page_len", self._paged_kv_last_page_len),
+                ("logical_kv_indptr", self._logical_kv_indptr),
+                ("seq_lens_kv", self._seq_lens_kv),
+                ("dense_page_idx_kv", self._dense_page_idx_kv),
+                ("scale_softmax_log2", self._scale_softmax_log2),
+                ("output_scale", self._output_scale),
+            )
         self._compiled(
             q,
             k_cache,
@@ -1459,7 +1860,7 @@ class BatchPrefillPagedTSWrapper:
 
 
 @flashinfer_api
-def batch_prefill_with_kv_cache(
+def batch_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1513,7 +1914,7 @@ def batch_prefill_with_paged_kv_cache(
     paged_kv_indices: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
     *,
-    page_size: int = _PAGED_KV_PAGE_SIZE,
+    page_size: int = _DEFAULT_PAGED_KV_PAGE_SIZE,
     kv_layout: Literal["HND"] = "HND",
     mask_type: Literal["dense", "causal"] = "dense",
     window_left: int = -1,
@@ -1525,8 +1926,9 @@ def batch_prefill_with_paged_kv_cache(
     """Run one-shot packed-Q context attention over separate HND page pools.
 
     Q/output use ``[total_q, Hq, D]`` storage and K/V each use
-    ``[num_pages, Hkv, 32, D]``. ``qo_indptr`` describes Q rows while the
-    three paged-KV metadata tensors use FlashInfer's CSR representation.
+    ``[num_pages, Hkv, page_size, D]`` with page size 16, 32, 64, or 128.
+    ``qo_indptr`` describes Q rows while the three paged-KV metadata tensors
+    use FlashInfer's CSR representation.
     Physical page indices need not be identity ordered. ``D`` may be 128 or
     256; Q, K, and V must share one supported dtype.
     """
@@ -1556,6 +1958,6 @@ def batch_prefill_with_paged_kv_cache(
 __all__ = [
     "BatchPrefillTSWrapper",
     "BatchPrefillPagedTSWrapper",
-    "batch_prefill_with_kv_cache",
+    "batch_prefill",
     "batch_prefill_with_paged_kv_cache",
 ]

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Configuration traits for the throughput-latency 1CTA MLA TS path.
 
@@ -1202,32 +1195,30 @@ def automatic_unsplit_profiles(
     batch_size: int,
     num_heads_q: int,
     seq_len_q: int,
-    seq_len_kv: int,
     tile_size_q: int,
-    qkv_dtype: str,
     max_active_clusters: int,
 ) -> tuple[MlaProfile, ...]:
     """Return automatic scheduler candidates for an unsplit 1CTA launch.
 
-    FP8 never defaults to CLC.  A fixed static work queue is preferred only
-    for short-K grids that exceed one CTA wave; all other FP8 shapes use the
-    direct nonpersistent grid.  BF16 retains the existing candidate order.
+    A direct grid that fits one resident wave has no launch work for a
+    persistent CTA to replace. Once logical work exceeds resident capacity,
+    CLC becomes the preferred scheduler independent of dtype, K length, or a
+    shape-specific threshold.
     """
 
-    candidates = persistent_profiles(num_heads_q, tile_size_q)
-    if qkv_dtype != "e4m3":
-        return candidates
-
-    clc, static, nonpersistent = candidates
+    clc, static, nonpersistent = persistent_profiles(num_heads_q, tile_size_q)
     base_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, tile_size_q)
-    steady_steps = ceil(seq_len_kv / (MlaConfig.tile_size_kv * MlaConfig.num_insts_kv))
-    if base_work > max_active_clusters and steady_steps <= 8:
-        return (static, nonpersistent, clc)
-    return (nonpersistent, static, clc)
+    if base_work > max_active_clusters:
+        return (clc, static, nonpersistent)
+    return (nonpersistent, clc, static)
 
 
 def keeps_mma_ab_profiles(
-    *, num_heads_q: int, batch_size: int, seq_len_kv: int
+    *,
+    num_heads_q: int,
+    batch_size: int,
+    seq_len_q: int,
+    max_active_clusters: int,
 ) -> tuple[MlaProfile, ...]:
     """Return keeps-MMA-AB candidates for large head tiles."""
 
@@ -1236,42 +1227,38 @@ def keeps_mma_ab_profiles(
     if num_heads_q not in (64, 128):
         return ()
 
-    profiles = [
-        MlaProfile(
-            name="h64_keeps_mma_ab",
-            num_ctas_per_head_dim=1,
-            use_persistent_scheduler=0,
-            use_clc_dynamic_persistent_scheduler=0,
-            use_multi_ctas_kv=0,
-            kernel_variant="keeps_mma_ab",
-            tile_size_q=64,
-        ),
-        MlaProfile(
-            name="h64_keeps_mma_ab_splitkv_gmem",
-            num_ctas_per_seq_kv=4,
-            num_ctas_per_head_dim=1,
-            use_persistent_scheduler=0,
-            use_clc_dynamic_persistent_scheduler=0,
-            use_multi_ctas_kv=1,
-            kernel_variant="keeps_mma_ab",
-            tile_size_q=64,
-        ),
-    ]
-    # CLC persistent scheduling is useful when a large batch supplies enough
-    # work tiles and K is long enough for prefetching the next tile to matter.
-    if batch_size >= 128 and seq_len_kv >= 4096:
-        profiles.append(
-            MlaProfile(
-                name="h64_keeps_mma_ab_clc",
-                num_ctas_per_head_dim=1,
-                use_persistent_scheduler=1,
-                use_clc_dynamic_persistent_scheduler=1,
-                use_multi_ctas_kv=0,
-                kernel_variant="keeps_mma_ab",
-                tile_size_q=64,
-            )
-        )
-    return tuple(profiles)
+    nonpersistent = MlaProfile(
+        name="h64_keeps_mma_ab",
+        num_ctas_per_head_dim=1,
+        use_persistent_scheduler=0,
+        use_clc_dynamic_persistent_scheduler=0,
+        use_multi_ctas_kv=0,
+        kernel_variant="keeps_mma_ab",
+        tile_size_q=64,
+    )
+    split = MlaProfile(
+        name="h64_keeps_mma_ab_splitkv_gmem",
+        num_ctas_per_seq_kv=4,
+        num_ctas_per_head_dim=1,
+        use_persistent_scheduler=0,
+        use_clc_dynamic_persistent_scheduler=0,
+        use_multi_ctas_kv=1,
+        kernel_variant="keeps_mma_ab",
+        tile_size_q=64,
+    )
+    clc = MlaProfile(
+        name="h64_keeps_mma_ab_clc",
+        num_ctas_per_head_dim=1,
+        use_persistent_scheduler=1,
+        use_clc_dynamic_persistent_scheduler=1,
+        use_multi_ctas_kv=0,
+        kernel_variant="keeps_mma_ab",
+        tile_size_q=64,
+    )
+    base_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, 64)
+    if base_work > max_active_clusters:
+        return clc, nonpersistent, split
+    return nonpersistent, clc, split
 
 
 def keeps_mma_ab_explicit_split_profile(
@@ -1724,24 +1711,21 @@ def enumerate_throughput_latency_mla_profiles(
             for profile in keeps_mma_ab_profiles(
                 num_heads_q=num_heads_q,
                 batch_size=batch_size,
-                seq_len_kv=seq_len_kv,
+                seq_len_q=seq_len_q,
+                max_active_clusters=max_active_clusters,
             )
             if profile.name not in {candidate.name for candidate in profiles}
         )
-    elif batch_size >= 128:
+    else:
         profiles.extend(
             automatic_unsplit_profiles(
                 batch_size=batch_size,
                 num_heads_q=num_heads_q,
                 seq_len_q=seq_len_q,
-                seq_len_kv=seq_len_kv,
                 tile_size_q=selected_tile_size_q,
-                qkv_dtype=qkv_dtype,
                 max_active_clusters=max_active_clusters,
             )
         )
-    elif not profiles:
-        profiles.append(baseline_profile(selected_tile_size_q))
 
     if selected_tile_size_q < 64:
         baseline = baseline_profile(selected_tile_size_q)

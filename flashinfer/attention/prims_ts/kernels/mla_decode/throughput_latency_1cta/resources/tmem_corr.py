@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Correction, normalization, and output-store resource."""
 
@@ -324,9 +317,8 @@ class TmemCorrResource(MlaResource):
         ) + Int64(local_head_dim_byte_offset)
         remote_ptr = self._cga_remote_smem_ptr(owner_rank, byte_offset, Int32)
         remote_barrier = prims.mapa(self._cga_reduction_barrier, owner_rank)
-        # CTK 13.3 cannot lower the vector form of ``nvvm.store.async``. Keep
-        # one 16-byte publication through the public inline-PTX API instead of
-        # expanding it into four scalar stores.
+        # Keep the vectorized publication on the public inline-PTX API so the
+        # operation remains one 16-byte store instead of four scalar stores.
         cute.arch.inline_ptx(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 "
             "[{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}}, [{$r5}];",

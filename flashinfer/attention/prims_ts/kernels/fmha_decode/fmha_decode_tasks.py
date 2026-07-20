@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Task definitions for the FMHA decode TS kernel.
 
@@ -45,7 +38,7 @@ from cutlass.experimental.task_scheduling.task import Task
 
 from ..stage import FmhaStage
 from .fmha_decode_config import FmhaDecodeConfig
-from .fmha_decode_constants import KV_INST0, KV_INST1
+from .fmha_decode_constants import KV_INST0, KV_INST1, KV_KIND_K, KV_KIND_V
 from .fmha_decode_resources.helpers_common import _q_group_token_base, _q_seq_bounds
 from .fmha_decode_resources.helpers_kv_tile_idx import (
     _runtime_total_kv_tiles,
@@ -183,23 +176,54 @@ def _staged_kv_load(
     *,
     smem_page_offsets: MemoryResource | None = None,
     page_offsets_label: str = "read_offsets",
-) -> None:
+    manage_page_offsets: bool = True,
+    cached_page_ids: Any = None,
+) -> Any:
     """Issue all head-dim stages for one logical K/V load.
 
     H256 SwapsMmaAb uses two 128-wide K/V stages, but both slices address the
     same token tile and therefore the same page IDs. Keep one page-offset
     consumer stage live across the complete logical K/V load.
     """
+    reuse_page_ids = smem_page_offsets is not None and cfg.num_head_dim_stages_kv > 1
     # Optional ConsWait/ConsWork: fetch page IDs for this logical K/V tile.
-    _page_offsets_consume(smem_page_offsets, page_offsets_label)
+    # The cached D256 path performs its ConsumerWork below while materializing
+    # the register array; single-stage kernels keep the original no-cache path.
+    if manage_page_offsets:
+        if reuse_page_ids:
+            smem_page_offsets.wait()
+        else:
+            _page_offsets_consume(smem_page_offsets, page_offsets_label)
+    load_label = label
+    if reuse_page_ids:
+        inst_id = KV_INST1 if label.endswith("1") else KV_INST0
+        kv_kind = KV_KIND_V if "_v" in label else KV_KIND_K
+        cached_page_ids = smem_page_offsets.cache_page_ids(
+            cached_page_ids=cached_page_ids,
+            inst_id=inst_id,
+            kv_kind=kv_kind,
+            section=section,
+        )
+        load_label = f"{label}_cached"
     for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
         # ProdAcquire/ProdWork/ProdCommit: issue one K or V slice into the
         # matching SMEM stage.
         resource.acquire()
-        getattr(resource, label)(section=section, head_dim_stage_idx=head_dim_stage_idx)
+        if cached_page_ids is None:
+            getattr(resource, load_label)(
+                section=section, head_dim_stage_idx=head_dim_stage_idx
+            )
+        else:
+            getattr(resource, load_label)(
+                cached_page_ids=cached_page_ids,
+                section=section,
+                head_dim_stage_idx=head_dim_stage_idx,
+            )
         resource.commit()
     # ConsRelease: every head-dimension slice consumed the staged page IDs.
-    _page_offsets_release(smem_page_offsets)
+    if manage_page_offsets:
+        _page_offsets_release(smem_page_offsets)
+    return cached_page_ids
 
 
 def _produce_staged_page_offsets(
@@ -415,6 +439,10 @@ class DecodeGenTask(Task):
         self._kv_raw_tile_base = cutlass.Int32(0)
         self._kv_valid_tile_end = cutlass.Int32(0)
         self._kv_window_start = cutlass.Int32(0)
+        # Keep the DSL loop-carried task structure stable. Persistent loops
+        # assign this liveness marker on every path, so it must exist before
+        # the first dynamic ``while`` is lowered by the stock compiler.
+        self.dummy = cutlass.Boolean(False)
 
     def init_variables(self, context: cute.Pointer | None = None) -> None:
         """Initialize per-task thread and TMEM cached values."""
@@ -507,8 +535,6 @@ class DecodeGenTask(Task):
         bookkeeping_domain = cutlass.Int32(1)
         for is_skippable_head, head_entries in self._head_exec_groups:
             if cutlass.const_expr(not is_skippable_head):
-                for resource, _, _, _ in head_entries:
-                    assert resource is self.work_queue
                 self._run_head_entry_group(
                     head_entries,
                     work_tile,
@@ -517,8 +543,6 @@ class DecodeGenTask(Task):
                 )
         for is_skippable_tail, tail_entries in self._tail_exec_groups:
             if cutlass.const_expr(not is_skippable_tail):
-                for resource, _, _, _ in tail_entries:
-                    assert resource is self.work_queue
                 self._run_tail_entry_group(
                     tail_entries,
                     work_tile,
@@ -652,7 +676,7 @@ class DecodeGenTask(Task):
             self._kv_request_begin = request_begin
             self._kv_page_idx_ub = request_end - request_begin - cutlass.Int32(1)
         if self.seqlens_kv is None:
-            if not self.cfg.use_split_kv and not self.cfg.uses_q_cta_sliding_union:
+            if not self.cfg.use_split_kv and not self.cfg.uses_runtime_q_kv_union:
                 return self.domain
             seq_len_kv = cutlass.Int32(self.max_seq_len_kv)
         else:
@@ -757,17 +781,24 @@ def create_load_task(
         """Build the shared-KV load cadence for HEAD, LOOP, and TAIL."""
         smem_q.init_load_state()
         smem_kv.init_load_state()
+        cached_page_ids = None
         if smem_page_offsets is not None:
-            smem_page_offsets.init_read_state()
+            if cfg.num_head_dim_stages_kv > 1:
+                cached_page_ids = smem_page_offsets.init_cached_read_state()
+            else:
+                smem_page_offsets.init_read_state()
 
         def _kv_load(label: str, section: FmhaStage) -> None:
             """Run one staged shared-KV load with optional page-offset handoff."""
-            _staged_kv_load(
+            nonlocal cached_page_ids
+            cached_page_ids = _staged_kv_load(
                 smem_kv,
                 label,
                 section,
                 cfg,
-                smem_page_offsets=(None if hold_page_window else smem_page_offsets),
+                smem_page_offsets=smem_page_offsets,
+                manage_page_offsets=not hold_page_window,
+                cached_page_ids=cached_page_ids,
             )
 
         # HEAD: load Q once, then prefetch the first two K tiles.
@@ -779,7 +810,10 @@ def create_load_task(
             # 32-ID consumer stage live across every K/V and head-dimension
             # load owned by this split CTA, matching TRTLLM-gen's page-window
             # lifetime and avoiding redundant pipeline handoffs.
-            _page_offsets_consume(smem_page_offsets)
+            if cfg.num_head_dim_stages_kv > 1:
+                smem_page_offsets.wait()
+            else:
+                _page_offsets_consume(smem_page_offsets)
         for label in ("load_k0", "load_k1"):
             _kv_load(label, FmhaStage.Head)
 
@@ -830,23 +864,34 @@ def create_load_task(
         )
 
     if smem_page_offsets is None:
-        captured_schedule = (
-            load_schedule(smem_q, smem_kv)
-            if work_queue is None
-            else load_schedule(smem_q, smem_kv, work_queue, work_id_throttle)
-        )
+        if work_queue is None:
+            captured_schedule = load_schedule(smem_q, smem_kv)
+        elif work_id_throttle is None:
+            captured_schedule = load_schedule(smem_q, smem_kv, work_queue)
+        else:
+            captured_schedule = load_schedule(
+                smem_q, smem_kv, work_queue, work_id_throttle
+            )
     else:
-        captured_schedule = (
-            load_page_offsets_schedule(smem_q, smem_kv, smem_page_offsets)
-            if work_queue is None
-            else load_page_offsets_schedule(
+        if work_queue is None:
+            captured_schedule = load_page_offsets_schedule(
+                smem_q, smem_kv, smem_page_offsets
+            )
+        elif work_id_throttle is None:
+            captured_schedule = load_page_offsets_schedule(
+                smem_q,
+                smem_kv,
+                smem_page_offsets,
+                work_queue,
+            )
+        else:
+            captured_schedule = load_page_offsets_schedule(
                 smem_q,
                 smem_kv,
                 smem_page_offsets,
                 work_queue,
                 work_id_throttle,
             )
-        )
     src = []
     if smem_page_offsets is not None:
         src.append(smem_page_offsets)
@@ -970,20 +1015,24 @@ def create_page_offsets_task_split_kv(
         smem_page_offsets_k: MemoryResource,
         smem_page_offsets_v: MemoryResource,
     ) -> None:
-        """Schedule independent K and V page-offset windows for split-KV loads."""
+        """Publish one page-offset stage for every paired K/V tile."""
         smem_page_offsets_k.init_load_state()
         smem_page_offsets_v.init_load_state()
 
-        # HEAD: one K window covers the initial K0/K1 prefetch pair.
+        # HEAD: publish the initial K0/K1 pair as two independent stages.
         _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Head)
+        _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
 
-        # LOOP: one K window and one V window cover K0/K1 and V0/V1.
+        # LOOP: mirror LoadTask's cross-resource consumption order exactly.
         with domain_loop(0, domain, 1):
-            _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Loop)
             _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
+            _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Loop)
+            _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
+            _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Loop)
 
-        # TAIL: one V window covers the final V0/V1 drain pair.
+        # TAIL: drain V0/V1 through distinct page-offset stages.
         _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Tail)
+        _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
 
     @schedule
     def page_offsets_schedule(
@@ -1138,74 +1187,33 @@ def create_load_task_split_kv(
             label: str,
             offsets: MemoryResource | None,
             section: FmhaStage,
-            *,
-            consume_offsets: bool = True,
-            release_offsets: bool = True,
         ) -> None:
             """Acquire, load all head-dim stages, and release page offsets."""
-            if consume_offsets:
-                _page_offsets_consume(offsets, label.replace("load", "read_offsets"))
+            _page_offsets_consume(offsets, label.replace("load", "read_offsets"))
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
                 resource.acquire()
                 getattr(resource, label)(
                     section=section, head_dim_stage_idx=head_dim_stage_idx
                 )
                 resource.commit()
-            if release_offsets:
-                _page_offsets_release(offsets)
+            _page_offsets_release(offsets)
 
         smem_q.acquire()
         smem_q.tma_load()
         smem_q.commit()
         if smem_page_offsets_v is not None:
-            load_tile(
-                smem_k0,
-                "load_k0",
-                smem_page_offsets_k,
-                FmhaStage.Head,
-                release_offsets=False,
-            )
-            load_tile(
-                smem_k1,
-                "load_k1",
-                smem_page_offsets_k,
-                FmhaStage.Head,
-                consume_offsets=False,
-            )
+            load_tile(smem_k0, "load_k0", smem_page_offsets_k, FmhaStage.Head)
+            load_tile(smem_k1, "load_k1", smem_page_offsets_k, FmhaStage.Head)
         else:
             load_tile(smem_k0, "load_k0", smem_page_offsets, FmhaStage.Head)
             load_tile(smem_k1, "load_k1", smem_page_offsets, FmhaStage.Head)
 
         with domain_loop(0, domain, 1):
             if smem_page_offsets_v is not None:
-                load_tile(
-                    smem_v0,
-                    "load_v0",
-                    smem_page_offsets_v_local,
-                    FmhaStage.Loop,
-                    release_offsets=False,
-                )
-                load_tile(
-                    smem_k0,
-                    "load_k0",
-                    smem_page_offsets_k,
-                    FmhaStage.Loop,
-                    release_offsets=False,
-                )
-                load_tile(
-                    smem_v1,
-                    "load_v1",
-                    smem_page_offsets_v_local,
-                    FmhaStage.Loop,
-                    consume_offsets=False,
-                )
-                load_tile(
-                    smem_k1,
-                    "load_k1",
-                    smem_page_offsets_k,
-                    FmhaStage.Loop,
-                    consume_offsets=False,
-                )
+                load_tile(smem_v0, "load_v0", smem_page_offsets_v_local, FmhaStage.Loop)
+                load_tile(smem_k0, "load_k0", smem_page_offsets_k, FmhaStage.Loop)
+                load_tile(smem_v1, "load_v1", smem_page_offsets_v_local, FmhaStage.Loop)
+                load_tile(smem_k1, "load_k1", smem_page_offsets_k, FmhaStage.Loop)
             else:
                 load_tile(smem_v0, "load_v0", smem_page_offsets, FmhaStage.Loop)
                 load_tile(smem_k0, "load_k0", smem_page_offsets, FmhaStage.Loop)
@@ -1213,20 +1221,8 @@ def create_load_task_split_kv(
                 load_tile(smem_k1, "load_k1", smem_page_offsets, FmhaStage.Loop)
 
         if smem_page_offsets_v is not None:
-            load_tile(
-                smem_v0,
-                "load_v0",
-                smem_page_offsets_v_local,
-                FmhaStage.Tail,
-                release_offsets=False,
-            )
-            load_tile(
-                smem_v1,
-                "load_v1",
-                smem_page_offsets_v_local,
-                FmhaStage.Tail,
-                consume_offsets=False,
-            )
+            load_tile(smem_v0, "load_v0", smem_page_offsets_v_local, FmhaStage.Tail)
+            load_tile(smem_v1, "load_v1", smem_page_offsets_v_local, FmhaStage.Tail)
         else:
             load_tile(smem_v0, "load_v0", smem_page_offsets, FmhaStage.Tail)
             load_tile(smem_v1, "load_v1", smem_page_offsets, FmhaStage.Tail)
@@ -1288,10 +1284,19 @@ def create_load_task_split_kv(
         )
 
     if smem_page_offsets is None:
-        schedule_result = (
-            load_schedule(smem_q, smem_k0, smem_k1, smem_v0, smem_v1)
-            if work_queue is None
-            else load_schedule(
+        if work_queue is None:
+            schedule_result = load_schedule(smem_q, smem_k0, smem_k1, smem_v0, smem_v1)
+        elif work_id_throttle is None:
+            schedule_result = load_schedule(
+                smem_q,
+                smem_k0,
+                smem_k1,
+                smem_v0,
+                smem_v1,
+                work_queue,
+            )
+        else:
+            schedule_result = load_schedule(
                 smem_q,
                 smem_k0,
                 smem_k1,
@@ -1300,10 +1305,9 @@ def create_load_task_split_kv(
                 work_queue,
                 work_id_throttle,
             )
-        )
     else:
-        schedule_result = (
-            load_page_offsets_schedule(
+        if work_queue is None:
+            schedule_result = load_page_offsets_schedule(
                 smem_q,
                 smem_k0,
                 smem_k1,
@@ -1312,8 +1316,19 @@ def create_load_task_split_kv(
                 smem_page_offsets,
                 smem_page_offsets_v,
             )
-            if work_queue is None
-            else load_page_offsets_schedule(
+        elif work_id_throttle is None:
+            schedule_result = load_page_offsets_schedule(
+                smem_q,
+                smem_k0,
+                smem_k1,
+                smem_v0,
+                smem_v1,
+                smem_page_offsets,
+                smem_page_offsets_v,
+                work_queue,
+            )
+        else:
+            schedule_result = load_page_offsets_schedule(
                 smem_q,
                 smem_k0,
                 smem_k1,
@@ -1324,7 +1339,6 @@ def create_load_task_split_kv(
                 work_queue,
                 work_id_throttle,
             )
-        )
     src = []
     if smem_page_offsets is not None:
         src.append(smem_page_offsets)
@@ -1450,16 +1464,29 @@ def create_load_task_one_inst_qkv(
         )
 
     if smem_page_offsets is None:
-        schedule_result = (
-            load_schedule(smem_q, smem_k, smem_v)
-            if work_queue is None
-            else load_schedule(smem_q, smem_k, smem_v, work_queue, work_id_throttle)
-        )
+        if work_queue is None:
+            schedule_result = load_schedule(smem_q, smem_k, smem_v)
+        elif work_id_throttle is None:
+            schedule_result = load_schedule(smem_q, smem_k, smem_v, work_queue)
+        else:
+            schedule_result = load_schedule(
+                smem_q, smem_k, smem_v, work_queue, work_id_throttle
+            )
     else:
-        schedule_result = (
-            load_page_offsets_schedule(smem_q, smem_k, smem_v, smem_page_offsets)
-            if work_queue is None
-            else load_page_offsets_schedule(
+        if work_queue is None:
+            schedule_result = load_page_offsets_schedule(
+                smem_q, smem_k, smem_v, smem_page_offsets
+            )
+        elif work_id_throttle is None:
+            schedule_result = load_page_offsets_schedule(
+                smem_q,
+                smem_k,
+                smem_v,
+                smem_page_offsets,
+                work_queue,
+            )
+        else:
+            schedule_result = load_page_offsets_schedule(
                 smem_q,
                 smem_k,
                 smem_v,
@@ -1467,7 +1494,6 @@ def create_load_task_one_inst_qkv(
                 work_queue,
                 work_id_throttle,
             )
-        )
     src = []
     if smem_page_offsets is not None:
         src.append(smem_page_offsets)

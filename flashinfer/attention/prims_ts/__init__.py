@@ -23,7 +23,7 @@ from .decode import (
 from .context import (
     BatchPrefillPagedTSWrapper,
     BatchPrefillTSWrapper,
-    batch_prefill_with_kv_cache,
+    batch_prefill,
     batch_prefill_with_paged_kv_cache,
 )
 from .mla_decode import (
@@ -36,7 +36,7 @@ from .mla_decode import (
 __all__ = [
     "BatchPrefillTSWrapper",
     "BatchPrefillPagedTSWrapper",
-    "batch_prefill_with_kv_cache",
+    "batch_prefill",
     "batch_prefill_with_paged_kv_cache",
     "BatchDecodePagedTSWrapper",
     "batch_decode_with_paged_kv_cache",

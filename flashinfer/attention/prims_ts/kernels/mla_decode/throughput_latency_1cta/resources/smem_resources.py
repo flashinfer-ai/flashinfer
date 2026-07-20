@@ -1,17 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """SMEM staging resources for Q, page offsets, and K/V tiles."""
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar, Optional
 
 from cutlass.experimental import primitives as prims
 from ....tensor_map import transform_ragged_coords
@@ -19,6 +12,8 @@ from ....tensor_map import transform_ragged_coords
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
+from cutlass.cutlass_dsl import Boolean, dsl_user_op, if_generate
+from cutlass.pipeline import PipelineAsync, PipelineState
 from cutlass.experimental import primitives as cprims
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
@@ -335,6 +330,60 @@ class SmemQResource(MlaResource):
 # =====================================================================
 
 
+@dataclass(frozen=True)
+class _StructuredWaitPipelineAsync(PipelineAsync):
+    """Page-offset pipeline with a public structured mbarrier retry loop."""
+
+    @cute.jit
+    def _retry_wait(
+        self,
+        sync_object: object,
+        state: PipelineState,
+        *,
+        loc: Any = None,
+        ip: Any = None,
+    ) -> None:
+        while not sync_object.try_wait(
+            state.index,
+            state.phase,
+            loc=loc,
+            ip=ip,
+        ):
+            pass
+
+    @dsl_user_op
+    def producer_acquire(
+        self,
+        state: PipelineState,
+        try_acquire_token: Optional[Boolean] = None,
+        *,
+        loc: Any = None,
+        ip: Any = None,
+    ) -> None:
+        if_generate(
+            try_acquire_token is None or try_acquire_token == 0,
+            lambda: self._retry_wait(self.sync_object_empty, state, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def consumer_wait(
+        self,
+        state: PipelineState,
+        try_wait_token: Optional[Boolean] = None,
+        *,
+        loc: Any = None,
+        ip: Any = None,
+    ) -> None:
+        if_generate(
+            try_wait_token is None or try_wait_token == 0,
+            lambda: self._retry_wait(self.sync_object_full, state, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+
 @dataclass(kw_only=True)
 class SmemPageOffsetsResource(MlaResource):
     """Prefetch page ids for the K/V tile currently owned by the load task."""
@@ -356,6 +405,22 @@ class SmemPageOffsetsResource(MlaResource):
     cached_page_ids: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+
+    def create_pipeline(self, pipeline_config):
+        """Preserve stock barrier objects and specialize only their wait path."""
+        base = super().create_pipeline(pipeline_config)
+        if not isinstance(base, PipelineAsync):
+            raise TypeError(
+                "page-offset staging requires cutlass.pipeline.PipelineAsync, "
+                f"got {type(base).__name__}"
+            )
+        return _StructuredWaitPipelineAsync(
+            base.sync_object_full,
+            base.sync_object_empty,
+            base.num_stages,
+            base.producer_mask,
+            base.consumer_mask,
+        )
 
     def get_smem_requirements(self):
         """Return the SMEM allocation for cached page offsets."""

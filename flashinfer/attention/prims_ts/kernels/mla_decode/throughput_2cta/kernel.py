@@ -1,24 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Throughput 2CTA MLA decode TS kernel implementation.
 
 Warp-specialized MLA decode kernel using the Resource-Task Scheduler.
 
-7 tasks, 12 warps (3 warpgroups):
-  LoadPageOffsetsTask      (warp 10)    : Page-offset cp.async loads.
-  LoadTmaTask     (warp 9)     : TMA loads Q, K, V from GMEM to SMEM.
-  MmaTask         (warp 8)     : QK MMA -> S, PV MMA -> O in TMEM.
-  SoftmaxTask     (warps 0-3)  : Softmax on S -> P, produce correction.
-  CorrectionTask  (warps 4-7)  : Rescale O using correction, epilogue store.
-  PaddingTask     (warp 11)    : Unused (warpgroup alignment).
+The graph depends on dtype and scheduler policy. BF16 uses 12 warps and a
+combined TMA/MMA schedule; CLC adds a scheduler task to that graph. FP8 uses
+16 warps, separate K/V and QK/PV tasks, and two softmax groups. In both paths,
+softmax and correction own the first two four-warp groups.
 
 Entry points:
   - build_mla_decode_task_manager() -- pure Python, used for validation only
@@ -41,7 +31,7 @@ from cutlass.experimental.task_scheduling.resources import (
     PipelineConfig,
     TileSchedulerConfig,
 )
-from cutlass.experimental.task_scheduling.enums import PipelineType, SignalingThreads
+from cutlass.experimental.task_scheduling.enums import SignalingThreads
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 from ...tensor_map import (
     create_tensor_map_ragged_from_tensor,
@@ -71,7 +61,7 @@ from .work_partition import (
     runtime_split_tile_range,
 )
 from .resources import (
-    SmemPageOffsetsResource,
+    PageOffsetWindowResource,
     SmemQResource,
     SmemKResource,
     SmemKVResource,
@@ -82,6 +72,7 @@ from .resources import (
     TmemOResource,
     GmemOResource,
     MlaWorkQueue,
+    WorkThrottleBarrierResource,
 )
 from ..helpers.math import qkv_dtype
 from ..parallel_reduction_topology import (
@@ -96,9 +87,9 @@ from .parallel_reduction import (
 )
 from .reduction import run_reduction_kernel
 from .tasks import (
+    MlaClcTask,
     MlaInterleavedTask,
     MlaTask,
-    create_load_page_offsets_task,
     create_load_k_task,
     create_load_v_task,
     create_load_tma_task,
@@ -125,7 +116,6 @@ def build_mla_decode_task_manager(
     smem_kc_arr=None,
     smem_vc_arr=None,
     smem_p_arr=None,
-    smem_page_offsets_arr=None,
     # TMA descriptors (None for validate-only)
     tma_desc_q_latent=None,
     tma_desc_q_rope=None,
@@ -159,12 +149,12 @@ def build_mla_decode_task_manager(
 ) -> "tuple[TaskManager, list[MemoryResource], dict[str, MemoryResource]]":
     """Build the MLA decode TaskManager with all resources, tasks, and dependency graph.
 
-    The throughput 2CTA graph uses a page-offset loader, Q/K/V TMA loader,
-    QK/PV MMA, softmax, and correction/store tasks. Validation-only calls pass a
-    concrete integer ``domain`` and no runtime tensors; JIT calls pass symbolic
-    runtime state and skip schedule validation. The dependency graph relies on
-    TaskManager DMA-order validation to keep SMEM producers alive until async
-    TMEM consumers have launched.
+    The throughput 2CTA graph uses Q/K/V TMA loads, a register-held BF16 page-ID
+    window, QK/PV MMA, softmax, and correction/store tasks. Validation-only
+    calls pass a concrete integer ``domain`` and no runtime tensors; JIT calls
+    pass symbolic runtime state and skip schedule validation. The dependency
+    graph relies on TaskManager DMA-order validation to keep SMEM producers
+    alive until async TMEM consumers have launched.
 
     Parameters
     ----------
@@ -186,6 +176,13 @@ def build_mla_decode_task_manager(
     WARP_SIZE = 32
     Agent = pipeline.Agent
     use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
+    use_work_throttle = use_clc_dynamic and not cfg.use_fp8_split_mma_schedule
+    non_interleaved_task_class = MlaClcTask if use_clc_dynamic else MlaTask
+    task_domain = (
+        MlaClcTask.get_domain
+        if use_clc_dynamic and not isinstance(domain, int)
+        else domain
+    )
 
     # Cooperative groups
     tma_producer_group = pipeline.CooperativeGroup(Agent.Thread)  # elect_one TMA
@@ -206,26 +203,9 @@ def build_mla_decode_task_manager(
     correction_group_local = pipeline.CooperativeGroup(
         Agent.Thread, cfg.num_compute_warps * WARP_SIZE
     )
-    # Page-offset load warp
-    load_page_offsets_group = pipeline.CooperativeGroup(Agent.Thread, WARP_SIZE)
-    # Load TMA warp
-    load_tma_group = pipeline.CooperativeGroup(Agent.Thread, WARP_SIZE)
-
     # ──────────────────────────────────────────────────────────────
     # Pipeline configs
     # ──────────────────────────────────────────────────────────────
-
-    # SmemPageOffsets: AsyncAsync, 4 stages, LoadPageOffsets -> LoadTma.
-    # LoadTma caches page indices in registers before releasing each stage.
-    smem_page_offsets_pipeline_cfg = PipelineConfig(
-        num_stages=cfg.page_offsets_stage,
-        num_bytes=0,
-        producer_group=load_page_offsets_group,
-        consumer_group=load_tma_group,
-        pipeline_type=PipelineType.AsyncAsync,
-        cta_layout_vmnk=cluster_shape_vmnk,
-        advance_on_wait=True,
-    )
 
     # SmemQ: TmaUmma, 1 stage, LoadTma -> Mma
     smem_q_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
@@ -316,18 +296,29 @@ def build_mla_decode_task_manager(
     # OInit removed: TMEM visibility is ensured by kernel-level named
     # barrier sync before task_manager.run(), so no pipeline needed.
 
+    work_throttle = None
+    if use_work_throttle:
+        work_throttle = WorkThrottleBarrierResource(
+            pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
+                num_stages=2,
+                producer_group=pipeline.CooperativeGroup(Agent.Thread, WARP_SIZE),
+                consumer_group=pipeline.CooperativeGroup(Agent.Thread, WARP_SIZE),
+                cta_layout_vmnk=cluster_shape_vmnk,
+                producer_signaling_threads=SignalingThreads.CtaLeader,
+                consumer_signaling_threads=SignalingThreads.CtaLeader,
+            ),
+            name="work_throttle",
+        )
+
     # ──────────────────────────────────────────────────────────────
     # Create resource instances
     # ──────────────────────────────────────────────────────────────
 
-    smem_page_offsets = SmemPageOffsetsResource(
-        smem_page_offsets=smem_page_offsets_arr,
+    page_offset_window = PageOffsetWindowResource(
         page_offsets=page_offsets,
-        cache_seqs=cache_seqs,
-        split_kv=split_kv,
         cfg=cfg,
-        pipeline_config=smem_page_offsets_pipeline_cfg,
-        name="smem_page_offsets",
+        pipeline_config=None,
+        name="page_offset_window",
     )
 
     smem_q = SmemQResource(
@@ -444,13 +435,6 @@ def build_mla_decode_task_manager(
     # register-budget check accounts for the real MLA warpgroup layout.
     wg2_reg_count = cfg.other_reg_num
 
-    load_page_offsets_task = create_load_page_offsets_task(
-        smem_page_offsets,
-        work_queue=work_queue,
-        domain=domain,
-        num_registers=wg2_reg_count,
-    )
-
     if cfg.use_fp8_split_mma_schedule:
         load_k_task = create_load_k_task(
             smem_q,
@@ -492,13 +476,14 @@ def build_mla_decode_task_manager(
         load_k_task = None
         load_v_task = None
         load_tma_task = create_load_tma_task(
-            smem_page_offsets,
+            page_offset_window,
             smem_q,
             smem_kv,
             iterations_qk=cfg.iterations_qk_stages,
             iterations_pv=cfg.iterations_pv_stages,
             work_queue=work_queue,
-            domain=domain,
+            task_class=non_interleaved_task_class,
+            domain=task_domain,
             num_registers=wg2_reg_count,
         )
         mma_task = create_mma_task(
@@ -510,7 +495,9 @@ def build_mla_decode_task_manager(
             iterations_qk=cfg.iterations_qk_stages,
             iterations_pv=cfg.iterations_pv_stages,
             work_queue=work_queue,
-            domain=domain,
+            work_throttle=work_throttle,
+            task_class=non_interleaved_task_class,
+            domain=task_domain,
             num_registers=wg2_reg_count,
         )
         mma_qk_task = None
@@ -524,9 +511,11 @@ def build_mla_decode_task_manager(
         smem_p,
         work_queue=work_queue,
         task_class=(
-            MlaInterleavedTask if cfg.use_fp8_dual_softmax_schedule else MlaTask
+            MlaInterleavedTask
+            if cfg.use_fp8_dual_softmax_schedule
+            else non_interleaved_task_class
         ),
-        domain=domain,
+        domain=(domain if cfg.use_fp8_dual_softmax_schedule else task_domain),
         domain_start=0,
         step=2 if cfg.use_fp8_dual_softmax_schedule else 1,
         num_registers=cfg.softmax_reg_num,
@@ -559,7 +548,8 @@ def build_mla_decode_task_manager(
         iterations_pv_n=cfg.iterations_pv_n,
         per_n_o_pipeline=cfg.use_fp8_split_mma_schedule,
         work_queue=work_queue,
-        domain=domain,
+        task_class=non_interleaved_task_class,
+        domain=task_domain,
         num_registers=cfg.correction_reg_num,
     )
 
@@ -574,14 +564,23 @@ def build_mla_decode_task_manager(
         task_list.extend([mma_pv_task, correction_task])
     else:
         task_list = [
-            load_page_offsets_task,
             load_tma_task,
         ]
         task_list.extend([mma_task, softmax_task, correction_task])
 
     if not cfg.use_fp8_split_mma_schedule and use_clc_dynamic:
+        padding_task = create_padding_task(
+            work_queue=work_queue,
+            task_class=non_interleaved_task_class,
+            domain=task_domain,
+            num_registers=wg2_reg_count,
+            warp_idx=10,
+        )
+        task_list.append(padding_task)
         scheduler_task = create_scheduler_task(
             work_queue,
+            work_throttle,
+            task_class=non_interleaved_task_class,
             num_registers=wg2_reg_count,
         )
         task_list.append(scheduler_task)
@@ -593,6 +592,8 @@ def build_mla_decode_task_manager(
             work_queue=work_queue,
             domain=domain,
             num_registers=wg2_reg_count,
+            warp_idx=10,
+            num_warps=2,
         )
         task_list.append(padding_task)
 
@@ -616,7 +617,7 @@ def build_mla_decode_task_manager(
         }
     else:
         resource_dependency_graph = {
-            smem_page_offsets: [],  # page-offset loads (independent)
+            page_offset_window: [],  # register-held page-table window
             smem_q: [],  # Q loads (independent)
             # Page offsets are cached into registers inside LoadTmaTask before K/V TMA.
             smem_kv: [],
@@ -633,9 +634,21 @@ def build_mla_decode_task_manager(
     if work_queue is not None:
         if use_clc_dynamic:
             for resource, dependencies in tuple(resource_dependency_graph.items()):
-                if resource is not work_queue and work_queue not in dependencies:
+                if (
+                    resource is not work_queue
+                    and resource is not page_offset_window
+                    and work_queue not in dependencies
+                ):
                     dependencies.append(work_queue)
-            resource_dependency_graph[work_queue] = [work_queue]
+            resource_dependency_graph[work_queue] = (
+                [work_queue, work_throttle]
+                if work_throttle is not None
+                else [work_queue]
+            )
+            if work_throttle is not None:
+                # The leader MMA produces both S and the throttle token after
+                # it observes Q for the current work tile.
+                resource_dependency_graph[work_throttle] = [tmem_s]
         else:
             resource_dependency_graph[work_queue] = []
 
@@ -1447,12 +1460,6 @@ class MlaDecodeTs:
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
-        smem_page_offsets_arr = cutlass.Array(
-            Int32,
-            cfg.smem_page_offsets_elems,
-            space=cutlass.AddressSpace.smem,
-            alignment=4,
-        )
         softmax_exchange_arr = cutlass.Array(
             self.acc_dtype,
             cfg.softmax_exchange_elems,
@@ -1658,11 +1665,11 @@ class MlaDecodeTs:
             # that pipeline mbarrier init writes to. Without this ordering,
             # the lifecycle barrier is uninitialized and crashes.
 
-            # Create MlaWorkQueue for persistent tile scheduling.
-            # The work queue wraps MLAStaticTileScheduler so each task's
-            # persistent loop (_run_task_body_persistent) iterates over
-            # all work tiles assigned to this CTA.  pipeline_config=None
-            # because the static scheduler needs no mbarrier signaling.
+            # Create one MLA-coordinate work queue for persistent scheduling.
+            # Static dispatch wraps MLAStaticTileScheduler and needs no
+            # response pipeline. CLC dispatch installs the fetch pipeline and
+            # response parameters below; all participating tasks still consume
+            # the same cached per-tile MLA coordinate and K-domain state.
             work_queue_pipeline_config = None
             work_queue_tile_scheduler_config = None
             if cutlass.const_expr(use_clc_dynamic):
@@ -1717,7 +1724,6 @@ class MlaDecodeTs:
                 smem_kc_arr=smem_kc_arr,
                 smem_vc_arr=smem_vc_arr,
                 smem_p_arr=smem_p_arr,
-                smem_page_offsets_arr=smem_page_offsets_arr,
                 tma_desc_q_latent=tma_desc_q_latent.get_ptr(),
                 tma_desc_q_rope=tma_desc_q_rope.get_ptr(),
                 tma_desc_c_latent=tma_desc_c_latent.get_ptr(),

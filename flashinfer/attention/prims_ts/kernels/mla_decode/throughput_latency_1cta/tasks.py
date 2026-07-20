@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Captured task schedules for the throughput-latency 1CTA MLA TS path."""
 
@@ -30,6 +23,7 @@ from ..helpers.schedule import (
     staged_pv_mma,
     staged_pv_mma_tmem_p,
     staged_qk_mma,
+    runtime_work_tile_skip_if,
     work_id_throttle_head,
     work_id_throttle_tail,
     work_tile_schedule_loop,
@@ -169,6 +163,8 @@ def create_throughput_latency_softmax_task_impl(
     P for PV MMA, and stores per-iteration statistics for correction.
     """
 
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+
     @schedule
     def softmax_schedule(
         tmem_s,
@@ -199,7 +195,16 @@ def create_throughput_latency_softmax_task_impl(
             )
             tmem_softmax_local.commit()
 
-        with work_tile_schedule_loop(work_queue):
+        def init_work_tile_state():
+            return tmem_s.init_softmax_work_tile_state()
+
+        with work_tile_schedule_loop(
+            work_queue,
+            skip_if=work_tile_skip_if,
+            non_skippable_prelude=(
+                init_work_tile_state if work_queue is not None else None
+            ),
+        ) as (_, work_tile_state):
             if work_queue is not None:
                 (
                     old_max_arr,
@@ -207,7 +212,7 @@ def create_throughput_latency_softmax_task_impl(
                     new_max_arr,
                     local_sum_arr,
                     s_arr,
-                ) = tmem_s.init_softmax_work_tile_state()
+                ) = work_tile_state
             with domain_loop(0, domain, 1) as d:
                 tmem_s.wait()
                 (
@@ -327,6 +332,8 @@ def create_keeps_mma_ab_correction_task(
     **kw,
 ) -> Task:
     """Create the single-pipe correction/store task for keeps-MMA-AB."""
+
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
 
     @schedule
     def correction_schedule(
@@ -504,14 +511,24 @@ def create_keeps_mma_ab_correction_task(
         _, tail_o_stage_idx_0, tail_o_stage_idx_1 = tmem_o.init_stage_state()
         tmem_corr.init_store_state()
 
-        with work_tile_schedule_loop(work_queue):
+        def init_work_tile_state():
+            local_state = tmem_softmax_local.init_stats_work_tile_state()
+            _, tail_stage_0, tail_stage_1 = tmem_o.init_stage_work_tile_state()
+            return local_state, tail_stage_0, tail_stage_1
+
+        with work_tile_schedule_loop(
+            work_queue,
+            skip_if=work_tile_skip_if,
+            non_skippable_prelude=(
+                init_work_tile_state if work_queue is not None else None
+            ),
+        ) as (_, work_tile_state):
             if work_queue is not None:
-                local_state = tmem_softmax_local.init_stats_work_tile_state()
                 (
-                    _,
+                    local_state,
                     tail_o_stage_idx_0,
                     tail_o_stage_idx_1,
-                ) = tmem_o.init_stage_work_tile_state()
+                ) = work_tile_state
             local_state = load_initial_local_stats(local_state)
             with domain_loop(0, domain, 1):
                 (
@@ -625,6 +642,8 @@ def create_throughput_latency_correction_task(
     interleaved MMA pipes, applies online-softmax correction, and stores O/LSE
     or split-KV partials.
     """
+
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
 
     @schedule
     def correction_schedule(
@@ -773,15 +792,26 @@ def create_throughput_latency_correction_task(
         tmem_corr0.init_store_state()
         tmem_corr1.init_store_state()
 
-        with work_tile_schedule_loop(work_queue):
+        def init_work_tile_state():
+            local0_state = tmem_softmax_local0.init_stats_work_tile_state()
+            local1_state = tmem_softmax_local1.init_stats_work_tile_state()
+            _, tail_stage_0, tail_stage_1 = tmem_o.init_stage_work_tile_state()
+            return local0_state, local1_state, tail_stage_0, tail_stage_1
+
+        with work_tile_schedule_loop(
+            work_queue,
+            skip_if=work_tile_skip_if,
+            non_skippable_prelude=(
+                init_work_tile_state if work_queue is not None else None
+            ),
+        ) as (_, work_tile_state):
             if work_queue is not None:
-                local0_state = tmem_softmax_local0.init_stats_work_tile_state()
-                local1_state = tmem_softmax_local1.init_stats_work_tile_state()
                 (
-                    _,
+                    local0_state,
+                    local1_state,
                     tail_o_stage_idx_0,
                     tail_o_stage_idx_1,
-                ) = tmem_o.init_stage_work_tile_state()
+                ) = work_tile_state
             local0_state = load_initial_local_stats(tmem_softmax_local0, local0_state)
             local1_state = load_initial_local_stats(tmem_softmax_local1, local1_state)
 
@@ -958,12 +988,14 @@ def create_load_page_offsets_task(
     consumed by the generic load task.
     """
 
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+
     @schedule
     def page_offsets_schedule(smem_page_offsets, work_queue=None):
         """Stage page offsets in the selected K-before-V cadence."""
         smem_page_offsets.init_load_state()
 
-        with work_tile_schedule_loop(work_queue):
+        with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             if cfg.kernel_variant == "keeps_mma_ab":
                 page_offsets_produce(
                     smem_page_offsets, "load_k0", section=MlaStage.Head
@@ -1065,6 +1097,7 @@ def create_throughput_latency_load_task(
     single K stream followed by the deferred V stream.
     """
     page_offsets = smem_page_offsets if use_page_offsets else None
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
 
     def load_schedule_body(
         smem_q,
@@ -1115,7 +1148,7 @@ def create_throughput_latency_load_task(
                     cached_page_ids=cached_page_ids,
                 )
 
-        with work_tile_schedule_loop(work_queue):
+        with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             work_id_throttle_head(work_id_throttle)
             smem_q.acquire()
             smem_q.load_q()
@@ -1374,10 +1407,12 @@ def create_padding_task(
 ) -> Task:
     """Create the padding task used to reserve otherwise idle warps."""
 
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+
     @schedule
     def padding_schedule(work_queue=None):
         """Captured no-op schedule with optional persistent work-queue tail."""
-        with work_tile_schedule_loop(work_queue):
+        with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             with domain_loop(0, 1, 1):
                 pass
 
@@ -1419,6 +1454,8 @@ def create_throughput_latency_mma_task(
     materializes PV output into TMEM O, and drains the final V tiles in tail.
     """
 
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+
     @schedule
     def mma_schedule(
         smem_q,
@@ -1437,7 +1474,7 @@ def create_throughput_latency_mma_task(
         smem_p1.init_descriptor_state()
         tmem_o.init_mma_state()
 
-        with work_tile_schedule_loop(work_queue):
+        with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             if work_queue is not None:
                 tmem_s0.reset_softmax_work_tile_state()
                 tmem_s1.reset_softmax_work_tile_state()
@@ -1565,6 +1602,8 @@ def create_keeps_mma_ab_mma_task(
     K[n-1], and TAIL drains PV for K[last].
     """
 
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+
     @schedule
     def mma_schedule(
         smem_q,
@@ -1580,7 +1619,7 @@ def create_keeps_mma_ab_mma_task(
         tmem_o.init_mma_state()
         tmem_p.init_stage_state()
 
-        with work_tile_schedule_loop(work_queue):
+        with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             if work_queue is not None:
                 tmem_s.reset_softmax_work_tile_state()
                 tmem_p.init_stage_work_tile_state()

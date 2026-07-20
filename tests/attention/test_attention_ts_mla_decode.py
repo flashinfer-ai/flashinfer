@@ -17,12 +17,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import inspect
 import math
 from typing import Sequence
 
 import pytest
 import torch
+
+pytest.importorskip(
+    "cutlass",
+    minversion="4.7.0",
+    reason="PrimTS attention tests require nvidia-cutlass-dsl>=4.7.0",
+)
 
 from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
@@ -32,6 +37,7 @@ from flashinfer.mla import (
     get_prims_ts_batch_decode_mla_workspace_size,
     prims_ts_batch_decode_with_kv_cache_mla,
 )
+import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
 
 
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
@@ -450,18 +456,10 @@ _MLA_CASES = (
     ),
     _param(
         _case(128, 32, 2048, torch.bfloat16, 32003),
-        _policy(
-            "throughput_latency_1cta",
-            32,
-            1,
-            512,
-            cga=False,
-            persistent=True,
-            clc=True,
-        ),
+        _policy("throughput_latency_1cta", 32, 1, 512, cga=False),
         None,
         False,
-        id="M3-bf16-q32-v512-direct-clc",
+        id="M3-bf16-q32-v512-direct-one-wave",
     ),
     _param(
         _case(128, 64, 2048, torch.float8_e4m3fn, 32004),
@@ -535,6 +533,36 @@ _MLA_CASES = (
         False,
         id="M10-bf16-2cta-q128-direct-clc",
     ),
+    _param(
+        _case(5, 65, 256, torch.bfloat16, 32010, seq_len_q=2),
+        _policy("throughput_2cta", 128, 2, 256, cga=False)
+        | {"separate_reducer_impl": "reference"},
+        None,
+        False,
+        id="M11-bf16-2cta-q128-s2-reducer-tail",
+    ),
+    _param(
+        _case(
+            128,
+            128,
+            4097,
+            torch.bfloat16,
+            32011,
+            page_size=128,
+        ),
+        _policy(
+            "throughput_2cta",
+            128,
+            1,
+            256,
+            cga=False,
+            persistent=True,
+            clc=True,
+        ),
+        None,
+        False,
+        id="M12-bf16-b128-h128-k4097-page128-direct-clc",
+    ),
 )
 
 
@@ -585,6 +613,7 @@ def _run_standalone(
     *,
     qo_indptr: torch.Tensor | None = None,
     max_seq_len_q: int | None = None,
+    out: torch.Tensor | None = None,
 ):
     """Run the caller-workspace public entry point for wrapper parity."""
 
@@ -622,10 +651,14 @@ def _run_standalone(
             _LATENT_DIM,
         )
     )
-    output = torch.empty(
-        output_shape,
-        dtype=case.output_dtype,
-        device=case.query.device,
+    output = (
+        torch.empty(
+            output_shape,
+            dtype=case.output_dtype,
+            device=case.query.device,
+        )
+        if out is None
+        else out
     )
     result = prims_ts_batch_decode_with_kv_cache_mla(
         case.query,
@@ -849,51 +882,188 @@ def _apply_mla_tail_markers(case):
     return case
 
 
-def test_attention_ts_mla_public_surface_is_semantic():
-    surfaces = (
-        BatchMLADecodePagedTSWrapper.plan,
-        BatchMLADecodePagedTSWrapper.run,
-        get_prims_ts_batch_decode_mla_workspace_size,
-        prims_ts_batch_decode_with_kv_cache_mla,
-    )
-    forbidden = (
-        "autotuner",
-        "config",
-        "persistent",
-        "profile",
-        "reduction",
-        "schedule",
-        "split",
-        "stage",
-        "tile",
-        "warp",
-    )
-    violations = [
-        parameter
-        for surface in surfaces
-        for parameter in inspect.signature(surface).parameters
-        if any(part in parameter for part in forbidden)
-    ]
-    assert violations == []
+def test_attention_ts_mla_run_requires_plan():
+    wrapper = BatchMLADecodePagedTSWrapper()
+    with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
+        wrapper.run(None, None)
+
+
+def test_attention_ts_mla_int32_kv_coordinate_bound():
+    """The public K/V bound reserves the largest padded split-KV span."""
+
+    safe_max = 2**31 - 32768
+    assert safe_max == mla_decode_module._MLA_MAX_KV_LEN
     assert (
-        inspect.signature(get_prims_ts_batch_decode_mla_workspace_size)
-        .parameters["max_seq_len_q"]
-        .default
-        is None
+        mla_decode_module._validate_mla_max_kv_len(safe_max, "max_seq_len") == safe_max
     )
-    assert (
-        inspect.signature(get_prims_ts_batch_decode_mla_workspace_size)
-        .parameters["seq_len_q"]
-        .default
-        is None
-    )
-    for surface in (
-        BatchMLADecodePagedTSWrapper.plan,
-        prims_ts_batch_decode_with_kv_cache_mla,
+    assert safe_max + mla_decode_module._MLA_MAX_KV_COORDINATE_SPAN == 2**31
+
+    with pytest.raises(
+        NotImplementedError,
+        match=rf"max_seq_len must be <= {safe_max}.*signed int32",
     ):
-        parameters = inspect.signature(surface).parameters
-        assert parameters["qo_indptr"].default is None
-        assert parameters["max_seq_len_q"].default is None
+        mla_decode_module._validate_mla_max_kv_len(safe_max + 1, "max_seq_len")
+
+    assert (
+        mla_decode_module._validate_mla_int32_extent(2**31 - 1, "block_tables elements")
+        == 2**31 - 1
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match=r"kv_cache physical pages must fit in a signed int32",
+    ):
+        mla_decode_module._validate_mla_int32_extent(2**31, "kv_cache physical pages")
+
+    mla_decode_module._validate_mla_query_head_extent(
+        batch_size=1,
+        num_heads=1,
+        max_seq_len_q=2**31 - 1,
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match=r"batch_size \* max_seq_len_q \* num_heads must fit",
+    ):
+        mla_decode_module._validate_mla_query_head_extent(
+            batch_size=1,
+            num_heads=2,
+            max_seq_len_q=2**30,
+        )
+    with pytest.raises(
+        NotImplementedError,
+        match=r"total_q \* num_heads must fit",
+    ):
+        mla_decode_module._validate_mla_query_head_extent(
+            batch_size=1,
+            num_heads=2,
+            max_seq_len_q=1,
+            total_q=2**30,
+        )
+
+    maximal_policy = (
+        ("tile_size_kv", 128),
+        ("num_insts_kv", 2),
+        ("split_kv", 128),
+    )
+    mla_decode_module._validate_mla_policy_coordinate_span(maximal_policy)
+    with pytest.raises(RuntimeError, match=r"span no larger than 32768.*got 33024"):
+        mla_decode_module._validate_mla_policy_coordinate_span(
+            (*maximal_policy[:-1], ("split_kv", 129))
+        )
+
+
+def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
+    """Workspace policy resolution rejects unsafe bounds before CUDA work."""
+
+    with pytest.raises(NotImplementedError, match=r"padded MLA K/V coordinates"):
+        get_prims_ts_batch_decode_mla_workspace_size(
+            1,
+            8,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            _DEFAULT_PAGE_SIZE,
+            mla_decode_module._MLA_MAX_KV_LEN + 1,
+        )
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"batch_size \* max_seq_len_q \* num_heads must fit",
+    ):
+        get_prims_ts_batch_decode_mla_workspace_size(
+            1,
+            2,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            _DEFAULT_PAGE_SIZE,
+            1,
+            max_seq_len_q=2**30,
+        )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_public_interfaces_reject_output_alias():
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=8,
+        max_seq_len=128,
+        qkv_dtype=torch.bfloat16,
+        seq_len_q=1,
+        device="cuda",
+        seed=20260718,
+    )
+    # O is a compact view over the leading bytes of the 576-element query.
+    output_shape = (*case.query.shape[:-1], _LATENT_DIM)
+    output_elements = math.prod(output_shape)
+    aliased_out = case.query.view(-1)[:output_elements].view(output_shape)
+    wrapper = _plan_case(case)
+
+    with pytest.raises(ValueError, match="out must not overlap query storage"):
+        _run_case(wrapper, case, out=aliased_out)
+    with pytest.raises(ValueError, match="out must not overlap query storage"):
+        _run_standalone(case, out=aliased_out)
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "max_kv_len", "message"),
+    (
+        ((0, 1), 64, "at least one KV token"),
+        ((-1, 1), 64, "at least one KV token"),
+        ((65, 32), 64, r"longer than max_kv_len \(64\): got 65"),
+    ),
+    ids=("zero-length", "negative-length", "exceeds-explicit-bound"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_plan_rejects_invalid_kv_lengths(
+    seq_lens,
+    max_kv_len,
+    message,
+):
+    """Validate every planned MLA K/V length and its explicit static bound."""
+
+    device = torch.device("cuda")
+    block_tables = torch.zeros((2, 3), dtype=torch.int32, device=device)
+    planned_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match=message):
+        BatchMLADecodePagedTSWrapper().plan(
+            block_tables,
+            planned_seq_lens,
+            8,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            _DEFAULT_PAGE_SIZE,
+            max_kv_len=max_kv_len,
+        )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
+    """The standalone ABI cannot derive a packed-Q JIT bound on its hot path."""
+
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=8,
+        max_seq_len=32,
+        kv_seq_lens=(32, 31),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=32098,
+    )
+    case, qo_indptr = _pack_mla_case(case, (1, 1))
+    workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="max_seq_len_q is required"):
+        prims_ts_batch_decode_with_kv_cache_mla(
+            case.query,
+            case.kv_cache,
+            workspace,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            case.block_tables,
+            case.seq_lens,
+            case.max_seq_len,
+            qo_indptr=qo_indptr,
+        )
 
 
 def test_attention_ts_mla_fp8_reference_uses_p448():
@@ -960,6 +1130,15 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
     assert wrapper._packed_query is True
     assert wrapper._max_seq_len_q == max_seq_len_q
     policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_2cta",
+            "split_kv": 17,
+            "separate_reducer_impl": "reference",
+        },
+        device=case.query.device,
+    )
 
     eager = _exercise_public_paths(
         wrapper,
@@ -984,6 +1163,52 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
     )
     _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
     torch.testing.assert_close(one_shot, eager, rtol=0, atol=0)
+
+    derived_bound_one_shot = batch_decode_mla_with_paged_kv_cache(
+        case.query,
+        case.kv_cache,
+        case.block_tables,
+        case.seq_lens,
+        qo_indptr=qo_indptr,
+        mask_type=case.mask_type,
+        max_kv_len=case.max_seq_len,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+        out_dtype=case.output_dtype,
+    )
+    torch.testing.assert_close(derived_bound_one_shot, eager, rtol=0, atol=0)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_packed_q_clc_empty_group_progress():
+    """Advance CLC bookkeeping when a packed request has no row in a Q group."""
+
+    q_lens = tuple(1 if batch_idx % 2 == 0 else 2 for batch_idx in range(64))
+    max_seq_len_q = max(q_lens)
+    case = _make_mla_case(
+        batch_size=len(q_lens),
+        num_qo_heads=128,
+        max_seq_len=129,
+        seq_len_q=max_seq_len_q,
+        qkv_dtype=torch.bfloat16,
+        mask_type="causal",
+        device="cuda",
+        seed=32101,
+    )
+    case, qo_indptr = _pack_mla_case(case, q_lens)
+    policy = _exercise_auto_mla_case(
+        case,
+        expected_b200={
+            "kernel": "throughput_2cta",
+            "split_kv": 1,
+            "use_persistent_scheduler": True,
+            "use_clc_dynamic_persistent_scheduler": True,
+        },
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+    )
+    assert policy["source"] == "auto"
 
 
 @pytest.mark.parametrize(
@@ -1042,6 +1267,134 @@ def test_attention_ts_mla_decode_compact_variable_k_acceptance(
         policy,
         exercise_all_paths=exercise_all_paths,
     )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_2cta_graph_reloads_remapped_page_window():
+    """Graph replay reloads a 33-page table through the 2CTA page window."""
+
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=128,
+        max_seq_len=4097,
+        qkv_dtype=torch.bfloat16,
+        page_size=128,
+        device="cuda",
+        seed=32012,
+    )
+    assert case.block_tables.shape == (1, 33)
+
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {"kernel": "throughput_2cta"},
+        device=case.query.device,
+    )
+    assert policy["kernel"] == "throughput_2cta"
+
+    eager = _run_case(wrapper, case).clone()
+    _assert_case_correct(eager, case, policy)
+
+    graph_out = torch.full_like(eager, float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run_case(wrapper, case, out=graph_out)
+    assert captured is graph_out
+
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
+
+    table_ptr = case.block_tables.data_ptr()
+    table_shape = case.block_tables.shape
+    table_stride = case.block_tables.stride()
+    original_page_ids = case.block_tables.clone()
+    num_physical_pages = case.kv_cache.shape[0]
+    remapped_page_ids = (original_page_ids + 1) % num_physical_pages
+    case.block_tables.copy_(remapped_page_ids)
+    assert case.block_tables.data_ptr() == table_ptr
+    assert case.block_tables.shape == table_shape
+    assert case.block_tables.stride() == table_stride
+    assert not torch.equal(case.block_tables, original_page_ids)
+
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_case_correct(graph_out, case, policy)
+    assert not torch.allclose(graph_out.float(), eager.float(), rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
+    """One replay reloads packed Q offsets, K lengths, and every page-table row."""
+
+    q_lens = tuple(1 if batch_idx % 2 == 0 else 2 for batch_idx in range(64))
+    replay_q_lens = tuple(reversed(q_lens))
+    max_seq_len_q = max(q_lens)
+    case = _make_mla_case(
+        batch_size=len(q_lens),
+        num_qo_heads=128,
+        max_seq_len=129,
+        seq_len_q=max_seq_len_q,
+        qkv_dtype=torch.bfloat16,
+        mask_type="causal",
+        device="cuda",
+        seed=32102,
+    )
+    case, qo_indptr = _pack_mla_case(case, q_lens)
+    wrapper = _plan_case(
+        case,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+    )
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_2cta",
+            "split_kv": 1,
+            "use_persistent_scheduler": True,
+            "use_clc_dynamic_persistent_scheduler": True,
+        },
+        device=case.query.device,
+    )
+
+    eager = _run_case(wrapper, case).clone()
+    _assert_case_correct(eager, case, policy, qo_indptr=qo_indptr)
+
+    graph_out = torch.full_like(eager, float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run_case(wrapper, case, out=graph_out)
+    assert captured is graph_out
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
+
+    replay_offsets = [0]
+    for q_len in replay_q_lens:
+        replay_offsets.append(replay_offsets[-1] + q_len)
+    qo_indptr.copy_(
+        torch.tensor(replay_offsets, dtype=torch.int32, device=case.query.device)
+    )
+    original_seq_lens = case.seq_lens.clone()
+    case.seq_lens.copy_(torch.roll(original_seq_lens, 1))
+    original_page_ids = case.block_tables.clone()
+    case.block_tables.copy_((original_page_ids + 1) % int(case.kv_cache.shape[0]))
+    assert not torch.equal(case.seq_lens, original_seq_lens)
+    assert not torch.equal(case.block_tables, original_page_ids)
+
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    _assert_case_correct(graph_out, case, policy, qo_indptr=qo_indptr)
+    assert not torch.allclose(graph_out.float(), eager.float(), rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize(

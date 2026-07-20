@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Integer constants shared by the FMHA decode TS implementation.
 
@@ -18,8 +11,8 @@ resource, and reduction code can use named values without duplicating comments.
 # so auto split-KV selection remains deterministic in offline/test flows.
 FALLBACK_SM_COUNT_B200 = 148
 
-# Shared-memory budget constants are in KiB because DKG profile sizing is
-# based on the hardware SMEM carveout. KV staging is capped below the full
+# Shared-memory budget constants are in KiB because profile sizing is based on
+# the hardware SMEM carveout. KV staging is capped below the full
 # 218 KiB budget so Q staging, page-offset staging, and scratch can coexist.
 TOTAL_SMEM_BUDGET_KIB = 218
 MAX_KV_STAGE_SMEM_KIB = 144
@@ -56,10 +49,8 @@ MIN_LOOP_ITERS_PER_SPLIT = 2
 AUTO_LAUNCH_TILE_SIZE_KV = 128
 
 # Split-KV is worthwhile below one static SM wave only when each CTA still owns
-# enough K/V tiles to amortize GMEM reduction. Persistent scheduling wins for
-# many waves of small CTAs.
+# enough K/V tiles to amortize GMEM reduction.
 SPLIT_KV_MIN_TILES_PER_CTA = 16
-PERSISTENT_HIGH_WAVES = 3
 
 # Two interleaved K/V instances form the decode cadence: instance 0 is the
 # first K/P/V stream in each loop iteration and instance 1 is the second. These

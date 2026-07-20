@@ -4,6 +4,20 @@ FlashInfer Attention Kernels
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
+Experimental Task-Scheduled Attention
+=====================================
+
+The experimental Blackwell task-scheduled FMHA context, FMHA decode, and MLA
+decode APIs are imported from ``flashinfer.attention.prims_ts``. Scheduling,
+tile selection, and split-KV reduction are automatic implementation details;
+there are no public tuning knobs.
+
+See the `PrimTS guide index <https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/attention/prims_ts/README.md>`_
+for the public entry points, supported contracts, examples, and pinned stock
+CUTLASS DSL wheel. Current accuracy and performance signoff is on SM100a/B200;
+SM103a/B300 is architecture-gated but not yet signoff-qualified.
+
+
 flashinfer.decode
 =================
 

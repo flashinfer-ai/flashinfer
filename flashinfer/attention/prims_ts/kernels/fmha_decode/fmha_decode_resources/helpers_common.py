@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Common helpers shared across FMHA decode TS resource files.
 
@@ -33,9 +26,9 @@ from ..fmha_decode_config import FmhaDecodeConfig
 
 Constexpr = cutlass.Constexpr
 NEG_FLT_MAX = -3.4028235e38
-fadd2 = partial(prims.add_packed_f32x2, ftz=False, rnd="rn")
-fmul2 = partial(prims.mul_packed_f32x2, ftz=False, rnd="rn")
-ffma2 = partial(prims.fma_packed_f32x2, ftz=False, rnd="rn")
+fadd2 = partial(cute.arch.add_packed_f32x2, ftz=False, rnd="rn")
+fmul2 = partial(cute.arch.mul_packed_f32x2, ftz=False, rnd="rn")
+ffma2 = partial(cute.arch.fma_packed_f32x2, ftz=False, rnd="rn")
 
 TaskCache = tuple[Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32]
 DescriptorValue = prims.Tcgen05SmemDesc | cutlass.Int64
@@ -168,7 +161,7 @@ def _keeps_tcgen05_ld(
         )
     # The 16x32bx2 variant has a required half-split offset operand.  Route
     # through the public primitive wrapper so Python constants are materialized
-    # as MLIR values before reaching the raw NVVM op.
+    # as MLIR values before reaching the low-level operation.
     return prims.tcgen05_ld(
         "16x32bx2",
         tmem_addr,
@@ -312,6 +305,11 @@ def _logical_q_group_idx(
     fallback_q_group_idx: Int32,
 ) -> Int32:
     """Resolve the q-group from the persistent work tile or static launch."""
+    if cutlass.const_expr(cfg.has_single_q_cta):
+        # A split coordinate may still vary in grid X, but every physical CTA
+        # maps to logical Q group zero. State this explicitly because the
+        # release compiler does not infer the range from the launch geometry.
+        return Int32(0)
     if cutlass.const_expr(stage_info.work_tile is not None):
         q_group_cta_idx = Int32(stage_info.work_tile.tile_idx[0])
         if cutlass.const_expr(cfg.use_split_kv):

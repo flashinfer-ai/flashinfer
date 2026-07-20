@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Captured-schedule helper functions for MLA decode TS examples."""
 
@@ -36,37 +29,42 @@ def work_queue_tail(work_queue, *, advance_label: str = "get_and_advance_work_ti
     work_queue.release()
 
 
+def runtime_work_tile_skip_if(work_queue):
+    """Return a concrete work queue's public runtime-skip predicate."""
+    if work_queue is None or not getattr(work_queue, "enable_runtime_skip", False):
+        return None
+    return getattr(type(work_queue), "skip_work_tile_if", None)
+
+
 @contextmanager
-def work_tile_schedule_loop(work_queue):
+def work_tile_schedule_loop(
+    work_queue,
+    *,
+    skip_if=None,
+    non_skippable_prelude=None,
+):
     """Wrap a captured task body in the standard TS persistent work-tile loop.
 
     A decode work queue may expose ``skip_work_tile_if`` for runtime-padded
     tiles. Only task data work is skippable; queue wait/advance/release remains
-    outside the guard so every persistent task advances in lockstep.
+    outside the guard so every persistent task advances in lockstep. Pure
+    register initializers may run in ``non_skippable_prelude`` so their values
+    dominate the stock executor's separately guarded HEAD, LOOP, and TAIL
+    regions. The prelude must not issue memory or pipeline operations.
     """
     if work_queue is not None:
-        # Fixed-Q persistent profiles retain the original straight-line
-        # schedule. Queue types opt into the dynamic guard only when the JIT
-        # specialization actually carries compact variable-Q metadata.
-        skip_if = None
-        # Captured schedules receive a ResourceProxy. Runtime-skip policy and
-        # the unbound predicate belong to its concrete WorkQueue resource.
-        concrete_work_queue = getattr(work_queue, "_resource", work_queue)
-        if getattr(concrete_work_queue, "enable_runtime_skip", False):
-            skip_if = getattr(
-                type(concrete_work_queue),
-                "skip_work_tile_if",
-                None,
-            )
         with work_tile_loop(work_queue, skip_if=skip_if) as work_tile:
+            prelude_state = (
+                non_skippable_prelude() if non_skippable_prelude is not None else None
+            )
             if skip_if is None:
-                yield work_tile
+                yield work_tile, prelude_state
             else:
                 with work_tile.skippable():
-                    yield work_tile
+                    yield work_tile, prelude_state
             work_queue_tail(work_queue)
     else:
-        yield None
+        yield None, None
 
 
 def page_offsets_consume(smem_page_offsets, cached_page_ids=None):

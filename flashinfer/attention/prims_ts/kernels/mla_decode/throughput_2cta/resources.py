@@ -3,13 +3,16 @@
 
 """Resource definitions for the throughput 2CTA MLA decode TS kernel.
 
-9 resource classes matching the throughput 2CTA pipeline structure:
+Resource classes matching the throughput 2CTA pipeline structure:
+
+GMEM/register resources (not pipelined)
+----------------------------------------
+- PageOffsetWindowResource: one warp-wide, 32-page-ID register window
 
 SMEM resources (pipelined)
 --------------------------
-- SmemPageOffsetsResource    : Async(4 stages),         LoadPageOffsets -> LoadTma
 - SmemQResource     : TmaUmmaAsync(1 stage),   LoadTma -> Mma
-- SmemKVResource    : TmaUmmaAsync(15 stages), LoadTma -> Mma
+- SmemKVResource    : TmaUmmaAsync(7 stages), LoadTma -> Mma
 
 SMEM/TMEM resources (pipelined)
 -------------------------------
@@ -40,6 +43,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 from cutlass.experimental.task_scheduling.resources import consumer_work, producer_work
 from cutlass.experimental.task_scheduling.enums import WorkAttr
+from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
 from .config import (
@@ -49,14 +53,12 @@ from .config import (
 )
 from ..helpers.constants import (
     BF16_OUTPUT_VECTOR_ELEMENTS,
-    CP_ASYNC_CACHE_CA,
     EPILOGUE_COLUMN_GROUP_SHIFT,
     EPILOGUE_ROW_MASK,
     EPILOGUE_THREAD_TILE_MASK,
     EPILOGUE_THREAD_TILE_THREADS,
     FP8_OUTPUT_VECTOR_ELEMENTS,
     PACKED_FP8_OUTPUT_REGS,
-    PAGE_OFFSET_BYTES,
     TCGEN05_32B_REGS_PER_LOAD,
     TCGEN05_32B_SHAPE,
     WARP_LANE_SHIFT,
@@ -71,9 +73,9 @@ from ..helpers.math import (
     ceil_div,
     mma_k_step_for_qkv,
     mma_kind_for_qkv,
-    nvvm_add_packed_f32x2,
-    nvvm_fma_packed_f32x2,
-    nvvm_mul_packed_f32x2,
+    add_packed_f32x2,
+    fma_packed_f32x2,
+    mul_packed_f32x2,
     output_dtype,
     p_desc_layout,
     p_desc_leading_byte_offset,
@@ -90,7 +92,7 @@ from ..helpers.math import (
 from ..helpers.ops import (
     fp8_log2_quant_scale,
     fp8_quant_scale_rcp,
-    nvvm_fmax,
+    fmax_f32,
     pack_float4_to_fp8_e4m3,
 )
 from ..helpers.mask import MaskType, mask_visible_k_length
@@ -130,6 +132,23 @@ class HighThroughputMlaResource(MemoryResource):
 
     def __post_init__(self) -> None:
         _install_task_local_specs(self, self._task_local_specs)
+
+
+# =====================================================================
+# WorkThrottleBarrierResource — Cluster-safe CLC scheduler pacing
+# =====================================================================
+
+
+@dataclass(kw_only=True)
+class WorkThrottleBarrierResource(MemoryResource):
+    """Pace CLC work-ID reuse against the leader CTA's active MMA task.
+
+    The barrier has no payload.  Its producer task already runs only on CTA 0,
+    so ordinary public pipeline ownership is sufficient for every stage and
+    producer-tail operation.
+    """
+
+    is_barrier: cutlass.Constexpr[bool] = True
 
 
 # =====================================================================
@@ -402,12 +421,6 @@ class MlaWorkQueue(WorkQueue):
         )
 
     @cute.jit
-    def _work_tile_info_from_clc_response(self, response_ptr):
-        """Decode a cluster response through the public WorkQueue helper."""
-        work_tile = WorkQueue._work_tile_info_from_clc_response(self, response_ptr)
-        return self._work_tile_from_clc_tile(work_tile)
-
-    @cute.jit
     def _make_work_tile_info(
         self,
         tile_idx,
@@ -486,6 +499,18 @@ class MlaWorkQueue(WorkQueue):
         return MlaTsWorkTileInfo(tile_idx, is_valid, K, k_tile_count, k_index_base)
 
     @cute.jit
+    def k_tile_count_for_tile(self, tile_idx):
+        """Return the dynamic K-loop bound required by stock Task."""
+
+        return self._make_work_tile_info(tile_idx, Boolean(True)).k_tile_count
+
+    @cute.jit
+    def skip_work_tile_if(self, work_tile):
+        """Skip zero-K CLC tiles while retaining WorkQueue bookkeeping."""
+
+        return work_tile.k_tile_count <= Int32(0)
+
+    @cute.jit
     def _work_tile_from_linear_idx(self, current_work_linear_idx):
         params = self.tile_sched_params
         current_work_cluster_batch, cluster_idx = (
@@ -558,35 +583,34 @@ class MlaWorkQueue(WorkQueue):
     def advance_tile(self, stage_info: StageInfo):
         """Advance CLC through its response pipeline; static is task-owned."""
         if cutlass.const_expr(self.use_clc_dynamic):
-            # CUTLASS DSL 4.7's base implementation decodes the staged CLC
-            # response directly through the tile scheduler, which returns a
-            # generic WorkTileInfo and bypasses this resource's MLA adapter.
-            # Decode through the override here so the task-local value keeps
-            # its MlaTsWorkTileInfo type and cached runtime K-domain fields.
-            stage_response_ptr = self._get_stage_response_ptr(stage_info.stage_idx)
-            return self._work_tile_info_from_clc_response(stage_response_ptr)
+            # Decode through the public scheduler/config surfaces so the
+            # task-local value keeps its MLA type and cached runtime K-domain
+            # fields without depending on WorkQueue's private response helpers.
+            assert self.tile_scheduler_config is not None
+            assert self.tile_scheduler_config.response_ptr is not None
+            assert self.tile_scheduler is not None
+            assert self.pipeline_config is not None
+            stage_response_ptr = self.tile_scheduler_config.response_ptr
+            if cutlass.const_expr(self.pipeline_config.num_stages > 1):
+                stage_response_ptr = stage_response_ptr + stage_info.stage_idx
+            work_tile = self.tile_scheduler.work_tile_info_from_clc_response(
+                stage_response_ptr
+            )
+            return self._work_tile_from_clc_tile(work_tile)
         return stage_info.work_tile
 
 
 # =====================================================================
-# SmemPageOffsetsResource — Page-offset SMEM buffer with Async pipeline
+# PageOffsetWindowResource — TMA-warp register page-table window
 # =====================================================================
 
 
 @dataclass(kw_only=True)
-class SmemPageOffsetsResource(HighThroughputMlaResource):
-    """SMEM page-offset buffer.  Producer: LoadPageOffsets.  Consumer: LoadTma.
+class PageOffsetWindowResource(HighThroughputMlaResource):
+    """GMEM page table cached as one register per lane of the TMA warp."""
 
-    Pipeline: Async, 4 stages.
-    Full barrier: 32 (one warp arrive).  Empty barrier: 32.
-    """
-
-    smem_page_offsets: Any = None  # SMEM page-offset array (Int32)
     page_offsets: Any = None  # GMEM page-offset tensor
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
-    cache_seqs: Any = None  # cache_seqs tensor (for k_tile_total)
-    split_kv: Any = None  # split_kv value
-    cta_rank: Any = field(init=False, default=None)
     cached_k_pages: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
@@ -594,6 +618,9 @@ class SmemPageOffsetsResource(HighThroughputMlaResource):
         TaskLocalVariable.uninitialized()
     )
     cached_next_v_pages: cutlass.Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    cached_window_page: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
@@ -615,24 +642,27 @@ class SmemPageOffsetsResource(HighThroughputMlaResource):
             None,
             "Cached page ids for the next delayed V tile.",
         ),
+        (
+            "cached_window_page",
+            Int32,
+            Int32(0),
+            "Per-lane page id retained across one 32-entry page-table window.",
+        ),
     )
-
-    @producer_work(work_attrs=WorkAttr.AUXILIARY)
-    @cute.jit
-    def init_load_state(self, stage_info: StageInfo) -> None:
-        """Initialize CTA-local state used by page-offset producers."""
-        del stage_info
-        self.cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
 
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,
-        returns=(cached_k_pages, cached_v_pages, cached_next_v_pages),
+        returns=(
+            cached_k_pages,
+            cached_v_pages,
+            cached_next_v_pages,
+            cached_window_page,
+        ),
     )
     @cute.jit
     def init_read_state(self, stage_info: StageInfo):
         """Create cached page-index arrays used by staged KV TMA loads."""
         del stage_info
-        self.cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cfg = self.cfg
         return (
             cutlass.Array(
@@ -650,103 +680,108 @@ class SmemPageOffsetsResource(HighThroughputMlaResource):
                 cfg.pages_per_v_tile,
                 space=cutlass.AddressSpace.rmem,
             ),
+            Int32(0),
         )
 
-    @producer_work
+    @consumer_work(
+        returns=(
+            cached_k_pages,
+            cached_v_pages,
+            cached_next_v_pages,
+            cached_window_page,
+        )
+    )
     @cute.jit
-    def cp_async_load(self, stage_info: StageInfo) -> None:
-        """cp.async load page offsets for one k-tile into an SMEM stage."""
-        cfg = self.cfg
-        work_tile = stage_info.work_tile
-        blk_coord = work_tile.tile_idx
-
-        # Compute k_index from loop_offset and blk_coord
-        k_index = self._compute_k_index(stage_info, blk_coord)
-        page_offsets_batch = self.page_offsets[None, blk_coord[2]]
-        pages_per_k_tile = cfg.pages_per_k_tile
-        tidx = cute.arch.thread_idx()[0] % cfg.threads_per_warp
-        n_pages = cutlass.const_expr(cfg.mma_qk_tiler[1] // 2)
-        stage_idx = stage_info.stage_idx
-        elem_per_thread = ceil_div(pages_per_k_tile, cfg.threads_per_warp)
-
-        page_offsets_flat = cute.flat_divide(page_offsets_batch, (1,))
-        for i in range(elem_per_thread):
-            idx = i * cfg.threads_per_warp + tidx
-            if cute.elem_less(
-                k_index * pages_per_k_tile + idx, page_offsets_batch.shape[0]
-            ) and cute.elem_less(idx, pages_per_k_tile):
-                src_offset = k_index * pages_per_k_tile + idx
-                gmem_ptr = page_offsets_flat[None, src_offset].iterator.llvm_ptr
-                smem_ptr = cutlass.inttoptr(
-                    self.smem_page_offsets.data_ptr(idx + stage_idx * n_pages).toint(
-                        cutlass.Int32
-                    ),
-                    3,
-                    cutlass.Int32,
-                )
-                prims.cp_async_shared_global(
-                    smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
-                )
-            else:
-                self.smem_page_offsets[idx + stage_idx * n_pages] = Int32(0)
-
-        prims.cp_async_commit_group()
-        prims.cp_async_wait_group(0)
-
-    @consumer_work(returns=(cached_k_pages, cached_v_pages, cached_next_v_pages))
-    @cute.jit
-    def read_page_offsets(
+    def read_page_offset_window(
         self,
         stage_info: StageInfo,
         *,
         cached_k_pages,
         cached_v_pages,
         cached_next_v_pages,
+        cached_window_page,
         init_v_cache: cutlass.Constexpr[bool] = False,
     ):
-        """Cache K and delayed-V page indices from the waited SMEM stage."""
+        """Load and reuse one warp-wide 32-page-ID window.
+
+        The TMA warp owns one page ID per lane. It refreshes the register
+        window after ``32 / pages_per_k_tile`` logical K tiles, when the next
+        group of 32 page-table entries is needed, then uses indexed warp
+        shuffles to assemble the IDs for the current K/V tile. The refresh
+        cadence is derived entirely from page and tile geometry.
+        """
         cfg = self.cfg
-        cta_v = self.cta_rank
-        page_offsets_stage = stage_info.stage_idx
-        n_pages = cutlass.const_expr(cfg.mma_qk_tiler[1] // 2)
-        page_offsets_offset = page_offsets_stage * Int32(n_pages)
-        pages_per_k_cta = cfg.pages_per_k_cta
-        pages_per_v_tile = cfg.pages_per_v_tile
+        work_tile = stage_info.work_tile
+        blk_coord = work_tile.tile_idx
+        local_k_index = Int32(stage_info.loop_offset)
+        global_k_index = work_tile.k_index_base + local_k_index
+        pages_per_k_tile = cutlass.const_expr(cfg.pages_per_k_tile)
+        page_window_tiles = cutlass.const_expr(32 // pages_per_k_tile)
+        page_window_mask = cutlass.const_expr(page_window_tiles - 1)
+        page_offsets_batch = self.page_offsets[None, blk_coord[2]]
+        lane_idx = cute.arch.thread_idx()[0] & Int32(31)
+
+        if (local_k_index & Int32(page_window_mask)) == Int32(0):
+            logical_page_idx = global_k_index * Int32(pages_per_k_tile) + lane_idx
+            bounded_page_idx = cute.math.min(
+                logical_page_idx, Int32(page_offsets_batch.shape[0] - 1)
+            )
+            cached_window_page = Int32(page_offsets_batch[bounded_page_idx])
+
+        page_lane_base = (local_k_index & Int32(page_window_mask)) * Int32(
+            pages_per_k_tile
+        )
+        cta_v = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cached_k = cached_k_pages
         cached_v = cached_v_pages
         cached_next_v = cached_next_v_pages
 
         if cutlass.const_expr(init_v_cache):
-            for pk in cutlass.range(pages_per_v_tile):
+            for pk in cutlass.range_constexpr(cfg.pages_per_v_tile):
                 cached_v[pk] = Int32(0)
         else:
-            # Promote the previously read V tile before replacing the next-V cache.
-            for pk in cutlass.range(pages_per_v_tile):
+            for pk in cutlass.range_constexpr(cfg.pages_per_v_tile):
                 cached_v[pk] = cached_next_v[pk]
 
-        for pk in cutlass.range_constexpr(pages_per_k_cta):
-            cached_k[pk] = (
-                self.smem_page_offsets[
-                    pk + cta_v * pages_per_k_cta + page_offsets_offset
-                ]
+        for pk in cutlass.range_constexpr(cfg.pages_per_k_cta):
+            source_lane = (
+                page_lane_base + cta_v * Int32(cfg.pages_per_k_cta) + Int32(pk)
                 if cfg.pages_per_k_tile > 1
-                else self.smem_page_offsets[page_offsets_offset]
+                else page_lane_base
+            )
+            cached_k[pk] = Int32(
+                cprims.shfl_sync(
+                    thread_mask=0xFFFFFFFF,
+                    val=cached_window_page,
+                    offset=source_lane,
+                    mask_and_clamp=0x1F,
+                    kind=cprims.Shfl.IDX,
+                )
             )
 
-        for pk in cutlass.range(pages_per_v_tile):
-            cached_next_v[pk] = (
-                self.smem_page_offsets[page_offsets_offset]
-                if pages_per_v_tile == 1
-                else self.smem_page_offsets[pk + page_offsets_offset]
+        for pk in cutlass.range_constexpr(cfg.pages_per_v_tile):
+            source_lane = (
+                page_lane_base
+                if cfg.pages_per_v_tile == 1
+                else page_lane_base + Int32(pk)
             )
-        return cached_k, cached_v, cached_next_v
+            cached_next_v[pk] = Int32(
+                cprims.shfl_sync(
+                    thread_mask=0xFFFFFFFF,
+                    val=cached_window_page,
+                    offset=source_lane,
+                    mask_and_clamp=0x1F,
+                    kind=cprims.Shfl.IDX,
+                )
+            )
+        return cached_k, cached_v, cached_next_v, cached_window_page
 
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,
         returns=(cached_k_pages, cached_v_pages, cached_next_v_pages),
     )
     @cute.jit
-    def forward_page_offsets(
+    def forward_page_ids(
         self,
         stage_info: StageInfo,
         *,
@@ -754,19 +789,9 @@ class SmemPageOffsetsResource(HighThroughputMlaResource):
         cached_v_pages,
         cached_next_v_pages,
     ):
-        """Forward the latest cached page offsets after the domain loop."""
+        """Forward the latest delayed-V page IDs after the domain loop."""
         del stage_info
         return cached_k_pages, cached_v_pages, cached_next_v_pages
-
-    def _compute_k_index(self, stage_info, blk_coord):
-        """Compute k_index for the current iteration.
-
-        k_index = k_index_base + loop_offset, where k_index_base accounts
-        for the split_kv_idx offset so that split 0 processes k-tiles
-        0..k_tile_per_cta-1 and split 1 processes k_tile_per_cta..2*k_tile_per_cta-1.
-        """
-        del blk_coord
-        return stage_info.work_tile.k_index_base + Int32(stage_info.loop_offset)
 
 
 # =====================================================================
@@ -917,7 +942,7 @@ class SmemQResource(HighThroughputMlaResource):
 class SmemKVResource(HighThroughputMlaResource):
     """SMEM K/V buffer.  Producer: LoadTma (TMA).  Consumer: Mma.
 
-    Pipeline: TmaUmmaAsync, 15 stages.
+    Pipeline: TmaUmmaAsync, 7 stages.
     Per logical k-tile: K sub-tiles are loaded before delayed V sub-tiles.
     """
 
@@ -1899,7 +1924,7 @@ class TmemSResource(HighThroughputMlaResource):
         row_sum = row_sum * correction_factor_out
         row_sum_vec = (Float32(0), Float32(0))
         for i in cutlass.range_constexpr(0, 64, 2):
-            row_sum_vec = nvvm_add_packed_f32x2(
+            row_sum_vec = add_packed_f32x2(
                 row_sum_vec,
                 (qk_acc_regs[i], qk_acc_regs[i + 1]),
             )
@@ -1924,7 +1949,7 @@ class TmemSResource(HighThroughputMlaResource):
         row_sum = row_sum_odd * correction_factor_out_odd
         row_sum_vec = (Float32(0), Float32(0))
         for i in cutlass.range_constexpr(0, 64, 2):
-            row_sum_vec = nvvm_add_packed_f32x2(
+            row_sum_vec = add_packed_f32x2(
                 row_sum_vec,
                 (qk_acc_regs_odd[i], qk_acc_regs_odd[i + 1]),
             )
@@ -1957,43 +1982,18 @@ class TmemSResource(HighThroughputMlaResource):
         K = Int32(work_tile.k_len)
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
         tile_offset_k = k_index * Int32(cfg.mma_qk_tiler[1])
-        tidx_col = (
-            local_tidx >> EPILOGUE_COLUMN_GROUP_SHIFT
-        ) << EPILOGUE_COLUMN_GROUP_SHIFT
-        row_k_len = K
-        needs_mask = tile_offset_k + Int32(cfg.mma_qk_tiler[1]) > row_k_len
-        if cutlass.const_expr(
+        needs_row_causal_mask = cutlass.const_expr(
             cfg.mask_type == MaskType.CAUSAL.value
             and self.groups_tokens_heads_q_ratio > 1
-        ):
-            # Group scheduling uses the last row's (largest) causal K domain.
-            # Earlier rows recover their own limit here; non-grouped causal and
-            # dense CTAs need only the ordinary tail mask above.
-            batch_idx = Int32(work_tile.tile_idx[2])
-            _, logical_seq_len_q = query_batch_bounds(
-                self.cu_seqlens_q,
-                batch_idx,
-                self.logical_seq_len_q,
-            )
-            effective_head_idx = self.cta_rank * Int32(
-                cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
-            ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
-            _, _, logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-                effective_head_idx,
-                work_tile.tile_idx[1],
-                self.groups_tokens_heads_q_ratio,
-                self.logical_num_heads_q,
-                self.logical_seq_len_q,
-                self.cu_seqlens_q,
-                batch_idx,
-            )
-            row_k_len = mask_visible_k_length(
-                cfg.mask_type,
-                self.cache_seqs[batch_idx],
-                logical_q_idx,
-                logical_seq_len_q,
-            )
-            needs_mask = tile_offset_k + Int32(cfg.mma_qk_tiler[1]) > row_k_len
+        )
+        min_visible_k_len = K
+        if cutlass.const_expr(needs_row_causal_mask):
+            min_visible_k_len = K - Int32(self.groups_tokens_heads_q_ratio - 1)
+        group_needs_mask = kv_tile_needs_right_mask(
+            tile_offset_k,
+            Int32(cfg.mma_qk_tiler[1]),
+            min_visible_k_len,
+        )
 
         neg_inf = Float32(-Float32.inf)
         row_max_tile = row_max
@@ -2010,7 +2010,37 @@ class TmemSResource(HighThroughputMlaResource):
             )
             qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
 
-        if needs_mask:
+        if group_needs_mask:
+            row_k_len = K
+            if cutlass.const_expr(needs_row_causal_mask):
+                # Recover this row's exact endpoint only on a group boundary.
+                batch_idx = Int32(work_tile.tile_idx[2])
+                _, logical_seq_len_q = query_batch_bounds(
+                    self.cu_seqlens_q,
+                    batch_idx,
+                    self.logical_seq_len_q,
+                )
+                effective_head_idx = self.cta_rank * Int32(
+                    cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
+                ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
+                _, _, logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
+                    effective_head_idx,
+                    work_tile.tile_idx[1],
+                    self.groups_tokens_heads_q_ratio,
+                    self.logical_num_heads_q,
+                    self.logical_seq_len_q,
+                    self.cu_seqlens_q,
+                    batch_idx,
+                )
+                row_k_len = mask_visible_k_length(
+                    cfg.mask_type,
+                    self.cache_seqs[batch_idx],
+                    logical_q_idx,
+                    logical_seq_len_q,
+                )
+            tidx_col = (
+                local_tidx >> EPILOGUE_COLUMN_GROUP_SHIFT
+            ) << EPILOGUE_COLUMN_GROUP_SHIFT
             for i in cutlass.range_constexpr(64):
                 token_idx = tile_offset_k + tidx_col + Int32(i)
                 qk_acc_regs[i] = qk_acc_regs[i] if token_idx < row_k_len else neg_inf
@@ -2020,13 +2050,13 @@ class TmemSResource(HighThroughputMlaResource):
         max2 = neg_inf
         max3 = neg_inf
         for i in cutlass.range_constexpr(16):
-            max0 = nvvm_fmax(max0, qk_acc_regs[i])
-            max1 = nvvm_fmax(max1, qk_acc_regs[i + 16])
-            max2 = nvvm_fmax(max2, qk_acc_regs[i + 32])
-            max3 = nvvm_fmax(max3, qk_acc_regs[i + 48])
-        row_max_tile = nvvm_fmax(
+            max0 = fmax_f32(max0, qk_acc_regs[i])
+            max1 = fmax_f32(max1, qk_acc_regs[i + 16])
+            max2 = fmax_f32(max2, qk_acc_regs[i + 32])
+            max3 = fmax_f32(max3, qk_acc_regs[i + 48])
+        row_max_tile = fmax_f32(
             row_max_tile,
-            nvvm_fmax(nvvm_fmax(max0, max1), nvvm_fmax(max2, max3)),
+            fmax_f32(fmax_f32(max0, max1), fmax_f32(max2, max3)),
         )
         cute.arch.fence_view_async_tmem_load()
         return (
@@ -2143,7 +2173,7 @@ class TmemSResource(HighThroughputMlaResource):
             thread_count=cfg.softmax_sync_threads,
         )
         peer_idx = (local_tidx + 64) % num_compute_threads
-        row_max_tile = nvvm_fmax(
+        row_max_tile = fmax_f32(
             row_max_tile, self.smem_exchange[group_exchange_base + peer_idx]
         )
         # The exchange buffer is reused on the next KV iteration.  Keep every
@@ -2187,7 +2217,7 @@ class TmemSResource(HighThroughputMlaResource):
                     cute.arch.fence_acq_rel_cta()
                     row_max_prev, row_sum_prev = load_peer_state()
 
-        row_max_new = nvvm_fmax(row_max_prev, row_max_tile)
+        row_max_new = fmax_f32(row_max_prev, row_max_tile)
         row_has_values = row_max_new != neg_inf
         safe_row_max_prev = row_max_prev if row_has_values else Float32(0)
         safe_row_max_new = row_max_new if row_has_values else Float32(0)
@@ -2209,7 +2239,7 @@ class TmemSResource(HighThroughputMlaResource):
             # the 1CTA implementation.
             fma_c = fma_c + fp8_log2_quant_scale()
         for i in cutlass.range_constexpr(0, 64, 2):
-            fma_result = nvvm_fma_packed_f32x2(
+            fma_result = fma_packed_f32x2(
                 (qk_acc_regs[i], qk_acc_regs[i + 1]),
                 (fma_b, fma_b),
                 (fma_c, fma_c),
@@ -3106,7 +3136,7 @@ class GmemOResource(HighThroughputMlaResource):
 
             # Normalize: O = O * output_scale / row_sum
             for i in cutlass.range_constexpr(0, 128, 2):
-                scaled = nvvm_mul_packed_f32x2(
+                scaled = mul_packed_f32x2(
                     (qk_acc_regs[i], qk_acc_regs[i + 1]),
                     (norm_scale, norm_scale),
                 )
@@ -3318,7 +3348,7 @@ class GmemOResource(HighThroughputMlaResource):
         safe_row_sum = row_sum if row_has_values else Float32(1)
         norm_scale = self.output_scale * cute.math.rcp(safe_row_sum, approx=True)
         for i in cutlass.range_constexpr(0, 128, 2):
-            scaled = nvvm_mul_packed_f32x2(
+            scaled = mul_packed_f32x2(
                 (qk_acc_regs[i], qk_acc_regs[i + 1]),
                 (norm_scale, norm_scale),
             )

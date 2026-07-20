@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Ragged tensor-map helpers vendored for FlashInfer Attention-TS kernels.
 
@@ -10,13 +10,16 @@ orchestrate DSL/IR-level work and delegate to the tensor-map primitives in
 
 from typing import Sequence, Tuple, Type
 
-from cutlass.base_dsl import dsl_user_op
-from cutlass.base_dsl.dsl import is_dynamic_expression
-from cutlass.base_dsl.typing import Int8, Int32, Int64, Numeric
 import cutlass.cute as cute
-from cutlass.cute.core import depth, leading_dim
-import cutlass._mlir.ir as ir
-from cutlass.experimental.cuda import tensor_map as _cuda_tensor_map
+from cutlass.cute import depth, leading_dim
+from cutlass.cutlass_dsl import (
+    Int8,
+    Int32,
+    Int64,
+    Numeric,
+    dsl_user_op,
+    is_dynamic_expression,
+)
 
 from cutlass.experimental.cuda.tensor_map import (
     TensorMap,
@@ -27,22 +30,10 @@ from cutlass.experimental.cuda.tensor_map import (
     TensorMapL2Promotion,
     TensorMapSwizzle,
     create_tensor_map_tiled,
+    create_tensor_map_tiled_from_view,  # noqa: F401 - public re-export
     get_dsl_type_to_tensormap_type,
     get_tensormap_type_to_dsl_type,
 )
-
-
-# The 4.7 release wheel publishes this API as ``*_from_view``.  DKG snapshots
-# predating that public spelling expose the same implementation and signature
-# as ``*_from_tensor``.  Resolve the name once so the kernels use the public
-# API while the unchanged local-development bootstrap remains usable.
-create_tensor_map_tiled_from_view = getattr(
-    _cuda_tensor_map, "create_tensor_map_tiled_from_view", None
-)
-if create_tensor_map_tiled_from_view is None:
-    create_tensor_map_tiled_from_view = (
-        _cuda_tensor_map.create_tensor_map_tiled_from_tensor
-    )
 
 
 # Module-private constants used by the ragged-TMA helpers below. The
@@ -94,8 +85,8 @@ def create_tensor_map_ragged(
     swizzle: TensorMapSwizzle | None = None,
     l2_promotion: TensorMapL2Promotion | None = None,
     oob_fill: TensorMapFloatOOBFill | None = None,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
+    loc=None,
+    ip=None,
 ) -> TensorMap:
     """Low-level: build a ragged TMA descriptor from explicit parameters.
 
@@ -278,8 +269,8 @@ def create_tensor_map_ragged_from_tensor(
     l2_promotion: TensorMapL2Promotion | None = None,
     oob_fill: TensorMapFloatOOBFill | None = None,
     tma_format: TensorMapDataType | None = None,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
+    loc=None,
+    ip=None,
 ) -> TensorMap:
     """Build a ragged TMA descriptor from a :class:`cute.Tensor`.
 

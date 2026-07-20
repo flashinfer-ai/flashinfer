@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """KV tile-index resolution helpers for FMHA decode TS resources.
 
@@ -21,6 +14,7 @@ from cutlass import Int32
 
 from cutlass.experimental.task_scheduling.resources import StageInfo
 
+from ...mask import kv_tile_is_fully_visible
 from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
 from .helpers_common import (
     _TASK_CACHE_SEQ_LEN_KV,
@@ -146,6 +140,56 @@ def _runtime_effective_seq_len_kv(
             seq_len_kv,
         )
     return cute.math.max(visible_k_end - skipped_tokens, Int32(0))
+
+
+@cute.jit
+def _kv_tile_is_fully_unmasked_for_q_group(
+    cfg: FmhaDecodeConfig,
+    tile_offset_k: Int32,
+    seq_len_kv: Int32,
+    seq_len_q: Int32,
+    q_token_base: Int32,
+    tile_has_valid_scores: cutlass.Boolean,
+) -> cutlass.Boolean:
+    """Return whether a KV tile needs no score mask for any active Q row.
+
+    Grouped causal rows expose an intersection bounded on the right by the
+    earliest Q token.  A sliding window also bounds it on the left by the
+    latest active Q token.  Tiles outside that intersection retain the exact
+    per-row boundary path.
+    """
+    visible_k_begin = Int32(0)
+    visible_k_end = seq_len_kv
+    if cutlass.const_expr(cfg.mask_type == CAUSAL):
+        visible_k_end = cute.math.min(
+            cute.math.max(
+                seq_len_kv - seq_len_q + q_token_base + Int32(1),
+                Int32(0),
+            ),
+            seq_len_kv,
+        )
+        if cutlass.const_expr(cfg.use_sliding_window_causal):
+            q_token_end = cute.math.min(
+                q_token_base + Int32(cfg.q_tokens_per_cta),
+                seq_len_q,
+            )
+            latest_causal_end = cute.math.min(
+                cute.math.max(
+                    seq_len_kv - seq_len_q + q_token_end,
+                    Int32(0),
+                ),
+                seq_len_kv,
+            )
+            visible_k_begin = cute.math.max(
+                latest_causal_end - Int32(cfg.attention_window_size),
+                Int32(0),
+            )
+    return tile_has_valid_scores and kv_tile_is_fully_visible(
+        tile_offset_k,
+        Int32(cfg.tile_size_kv),
+        visible_k_begin,
+        visible_k_end,
+    )
 
 
 @cute.jit

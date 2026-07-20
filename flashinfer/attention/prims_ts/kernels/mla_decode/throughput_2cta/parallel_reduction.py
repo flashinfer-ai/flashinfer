@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Parallel standalone split-KV reduction for throughput 2CTA MLA."""
 
@@ -19,7 +12,7 @@ from ...separate_reduction import finalize_log2_sum_exp, normalized_lse_weight
 from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.math import ceil_div
-from ..helpers.ops import nvvm_fmax, nvvm_warp_reduction_max, nvvm_warp_reduction_sum
+from ..helpers.ops import fmax_f32, warp_reduce_max_f32, warp_reduce_sum_f32
 from ..helpers.query import groups_tokens_heads_q_row_state, query_batch_bounds
 from .work_partition import (
     runtime_row_prefix_active_split_count,
@@ -272,12 +265,12 @@ def run_parallel_reduction_kernel(
                 lane_lse[lane_slot_i] = Float32(
                     acc_lse[effective_head_idx, split_idx, seq_q_idx, batch_idx]
                 )
-            local_lse_max = nvvm_fmax(
+            local_lse_max = fmax_f32(
                 local_lse_max,
                 lane_lse[lane_slot_i],
             )
 
-        local_lse_max = nvvm_warp_reduction_max(local_lse_max)
+        local_lse_max = warp_reduce_max_f32(local_lse_max)
         local_exp_frame = local_lse_max if local_lse_max != neg_inf else Float32(0.0)
         lane_exp = cutlass.Array(
             Float32,
@@ -293,7 +286,7 @@ def run_parallel_reduction_kernel(
                 )
             )
             local_sum_lse += lane_exp[lane_slot_i]
-        local_sum_lse = nvvm_warp_reduction_sum(local_sum_lse)
+        local_sum_lse = warp_reduce_sum_f32(local_sum_lse)
         local_lse_value = finalize_log2_sum_exp(local_exp_frame, local_sum_lse)
         if lane_idx == Int32(0):
             smem_local_lse[0] = local_lse_value
@@ -424,7 +417,7 @@ def run_parallel_reduction_kernel(
                 if lane_idx == peer_rank:
                     lane_peer_lse = peer_lse_ptr.load()
 
-            merged_lse_max = nvvm_warp_reduction_max(lane_peer_lse)
+            merged_lse_max = warp_reduce_max_f32(lane_peer_lse)
             merged_exp_frame = (
                 merged_lse_max if merged_lse_max != neg_inf else Float32(0.0)
             )
@@ -434,7 +427,7 @@ def run_parallel_reduction_kernel(
                     fastmath=True,
                 )
             )
-            merged_sum_lse = nvvm_warp_reduction_sum(lane_peer_exp)
+            merged_sum_lse = warp_reduce_sum_f32(lane_peer_exp)
             merged_lse = finalize_log2_sum_exp(merged_exp_frame, merged_sum_lse)
             if lane_idx == Int32(0):
                 smem_merged_lse[0] = merged_lse

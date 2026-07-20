@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """``TmemSResource`` — BMM1 accumulator / softmax input.
 
@@ -72,6 +65,7 @@ from .helpers_common import (
     _softmax_tile_idx,
 )
 from .helpers_kv_tile_idx import (
+    _kv_tile_is_fully_unmasked_for_q_group,
     _load_runtime_seq_len_kv,
     _runtime_split_kv_global_tile_idx,
     _num_skipped_kv_tiles,
@@ -564,37 +558,58 @@ class TmemSResource(DecodeGenResourceBase):
                             crosses_64b_chunk=cfg.headdim == 128 and ki == 3,
                         )
         else:
+            mma_k_steps = cfg.head_dim_kv_stage // _mma_k_step(cfg)
             if prims.elect_sync():
-                scale_d = False
-                if cutlass.const_expr(head_dim_stage_idx != 0):
-                    scale_d = True
-                for ki in cutlass.range_constexpr(
-                    cfg.head_dim_kv_stage // _mma_k_step(cfg)
-                ):
-                    # Preserve the same operand orientation for staged K.
+                # Peel the first MMA so overwrite-vs-accumulate remains a
+                # compile-time value rather than loop-carried state.
+                if cutlass.const_expr(q_is_a):
+                    first_a_desc, first_b_desc = q_desc, k_desc
+                else:
+                    first_a_desc, first_b_desc = k_desc, q_desc
+                prims.tcgen05_mma(
+                    _mma_kind_for_qkv(cfg),
+                    prims.CTAGroup.CTA_1,
+                    tmem_col,
+                    first_a_desc,
+                    first_b_desc,
+                    idesc,
+                    cutlass.Boolean(head_dim_stage_idx != 0),
+                )
+
+            # Derive every remaining descriptor from the immutable roots. At
+            # each 64-column boundary the recurrence replaces its ordinary +2
+            # step with +1018 for K and +(8 * TileQ - 6), or +58, for Q; the
+            # closed form therefore adds each boundary jump minus that +2.
+            # Keeping descriptors out of iter_args avoids staged-D256 spills.
+            for ki in cutlass.range(1, mma_k_steps, 1, unroll=1):
+                if cutlass.const_expr(cfg.use_fp8_qkv):
+                    k_desc_offset = ki * Int32(2)
+                    q_desc_offset = ki * Int32(2)
+                else:
+                    chunk_idx = (ki * Int32(_mma_k_step(cfg))) // Int32(64)
+                    k_desc_offset = ki * Int32(2) + chunk_idx * Int32(1016)
+                    q_chunk_extra = (
+                        8 * cfg.tile_size_q - 8
+                        if cutlass.const_expr(cfg.tile_size_q >= 16)
+                        else 56
+                    )
+                    q_desc_offset = ki * Int32(2) + chunk_idx * Int32(q_chunk_extra)
+                iter_k_desc = k_desc + k_desc_offset
+                iter_q_desc = q_desc + q_desc_offset
+                if prims.elect_sync():
                     if cutlass.const_expr(q_is_a):
-                        a_desc, b_desc = q_desc, k_desc
+                        iter_a_desc, iter_b_desc = iter_q_desc, iter_k_desc
                     else:
-                        a_desc, b_desc = k_desc, q_desc
+                        iter_a_desc, iter_b_desc = iter_k_desc, iter_q_desc
                     prims.tcgen05_mma(
                         _mma_kind_for_qkv(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
-                        a_desc,
-                        b_desc,
+                        iter_a_desc,
+                        iter_b_desc,
                         idesc,
-                        scale_d,
+                        cutlass.Boolean(True),
                     )
-                    scale_d = True
-                    if cutlass.const_expr(
-                        ki + 1 < cfg.head_dim_kv_stage // _mma_k_step(cfg)
-                    ):
-                        crosses_64b_chunk = ((ki + 1) * _mma_k_step(cfg)) % 64 == 0
-                        k_desc, q_desc = self._advance_qk_descs_after_mma_k(
-                            k_desc,
-                            q_desc,
-                            crosses_64b_chunk=crosses_64b_chunk,
-                        )
 
     @cute.jit
     def _load_mask_reduce_keeps(
@@ -607,6 +622,7 @@ class TmemSResource(DecodeGenResourceBase):
         seq_len_kv: Int32,
         logical_q_group_idx: Int32,
         is_valid_effective_tile: cutlass.Boolean,
+        is_masked_final_wave: cutlass.Boolean,
         *,
         apply_boundary_mask: Constexpr[bool],
     ) -> Float32:
@@ -656,7 +672,11 @@ class TmemSResource(DecodeGenResourceBase):
                 and (cfg.q_tiles_are_full or cfg.uses_guarded_grouped_keeps_output_rows)
             )
             if cutlass.const_expr(not per_row_paged_upper_mask_covers_invalid_tile):
-                if not (is_valid_effective_tile and tile_offset_k < seq_len_kv):
+                if not (
+                    is_valid_effective_tile
+                    and tile_offset_k < seq_len_kv
+                    and not is_masked_final_wave
+                ):
                     for reg_idx in cutlass.range_constexpr(num_s_regs):
                         s_vals[reg_idx] = _neg_max_f32()
 
@@ -685,24 +705,29 @@ class TmemSResource(DecodeGenResourceBase):
                     causal_start = cute.math.max(
                         causal_end - Int32(cfg.attention_window_size), Int32(0)
                     )
-                if cutlass.const_expr(cfg.tile_size_q == 64):
-                    for reg_idx in cutlass.range_constexpr(num_s_regs):
-                        token_idx = tile_offset_k + col_base + Int32(reg_idx)
-                        if token_idx < causal_start or token_idx >= causal_end:
+                causal_start_rel = causal_start - tile_offset_k - col_base
+                causal_end_rel = causal_end - tile_offset_k - col_base
+                for reg_idx in cutlass.range_constexpr(num_s_regs):
+                    if cutlass.const_expr(cfg.use_sliding_window_causal):
+                        if (
+                            Int32(reg_idx) < causal_start_rel
+                            or Int32(reg_idx) >= causal_end_rel
+                        ):
                             s_vals[reg_idx] = _neg_max_f32()
-                else:
-                    causal_start_rel = causal_start - tile_offset_k - col_base
-                    causal_end_rel = causal_end - tile_offset_k - col_base
-                    for reg_idx in cutlass.range_constexpr(num_s_regs):
-                        if cutlass.const_expr(cfg.use_sliding_window_causal):
-                            if (
-                                Int32(reg_idx) < causal_start_rel
-                                or Int32(reg_idx) >= causal_end_rel
-                            ):
-                                s_vals[reg_idx] = _neg_max_f32()
-                        else:
-                            if Int32(reg_idx) >= causal_end_rel:
-                                s_vals[reg_idx] = _neg_max_f32()
+                    else:
+                        if Int32(reg_idx) >= causal_end_rel:
+                            s_vals[reg_idx] = _neg_max_f32()
+
+        if cutlass.const_expr(cfg.q_score_rows_need_mask):
+            if not _q_row_is_valid_for_seq(
+                cfg,
+                self.h_r,
+                logical_q_group_idx,
+                tile_row_idx,
+                self.seq_len_q,
+            ):
+                for reg_idx in cutlass.range_constexpr(num_s_regs):
+                    s_vals[reg_idx] = _neg_max_f32()
 
         max_chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
         for chain_idx in cutlass.range_constexpr(4):
@@ -763,7 +788,10 @@ class TmemSResource(DecodeGenResourceBase):
             and not cfg.use_sliding_window_causal
             and cfg.tile_size_q in (64, 128)
         )
-        if cutlass.const_expr(not use_runtime_paged_dense_load):
+        use_preload_mask_split = (
+            use_runtime_paged_dense_load or cfg.uses_per_row_causal_mask
+        )
+        if cutlass.const_expr(not use_preload_mask_split):
             for reg_idx in cutlass.range_constexpr(num_s_regs):
                 s_vals[reg_idx] = _neg_max_f32()
 
@@ -785,7 +813,7 @@ class TmemSResource(DecodeGenResourceBase):
         if cutlass.const_expr(cfg.uses_uniform_causal_mask):
             element_mask_end_idx = seq_len_kv - self.seq_len_q + q_token_base + Int32(1)
         use_runtime_kv_domain = (
-            self.seqlens_kv is not None or cfg.uses_q_cta_sliding_union
+            self.seqlens_kv is not None or cfg.uses_runtime_q_kv_union
         )
         local_tile_idx = _softmax_tile_idx(cfg, stage_info, self.inst_id)
         if cutlass.const_expr(not use_runtime_kv_domain):
@@ -836,21 +864,22 @@ class TmemSResource(DecodeGenResourceBase):
             if cutlass.const_expr(cfg.has_odd_kv_tail and self.inst_id == 1):
                 is_masked_final_wave = _is_last_loop_iteration(stage_info)
 
-        if cutlass.const_expr(use_runtime_paged_dense_load):
+        if cutlass.const_expr(use_preload_mask_split):
             # Select the complete unmasked/masked LDTM+max path before any S
-            # registers are materialized. The earliest grouped-Q row owns the
-            # strictest causal endpoint, so a tile ending before it is valid
-            # for every row in the CTA.
-            next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
-            earliest_mask_end_idx = element_mask_end_idx
-            if cutlass.const_expr(cfg.uses_per_row_causal_mask):
-                earliest_mask_end_idx = (
-                    seq_len_kv - self.seq_len_q + q_token_base + Int32(1)
-                )
-            tile_is_unmasked = (
+            # registers are materialized. The shared predicate covers the
+            # intersection of all active grouped-Q causal/window intervals.
+            tile_has_valid_scores = (
                 is_valid_effective_tile
                 and (tile_offset_k < seq_len_kv)
-                and (next_tile_offset_k <= earliest_mask_end_idx)
+                and not is_masked_final_wave
+            )
+            tile_is_unmasked = _kv_tile_is_fully_unmasked_for_q_group(
+                cfg,
+                tile_offset_k,
+                seq_len_kv,
+                self.seq_len_q,
+                q_token_base,
+                tile_has_valid_scores,
             )
             tile_max = _neg_max_f32()
             if tile_is_unmasked:
@@ -863,6 +892,7 @@ class TmemSResource(DecodeGenResourceBase):
                     seq_len_kv,
                     logical_q_group_idx,
                     is_valid_effective_tile,
+                    is_masked_final_wave,
                     apply_boundary_mask=False,
                 )
             else:
@@ -875,6 +905,7 @@ class TmemSResource(DecodeGenResourceBase):
                     seq_len_kv,
                     logical_q_group_idx,
                     is_valid_effective_tile,
+                    is_masked_final_wave,
                     apply_boundary_mask=True,
                 )
 
@@ -886,13 +917,11 @@ class TmemSResource(DecodeGenResourceBase):
                 s_arr[reg_idx] = s_vals[reg_idx]
             return old_max_arr, sum_arr, new_max_arr, s_arr
 
-        should_load_s = True
-        if cutlass.const_expr(not use_runtime_paged_dense_load):
-            should_load_s = (
-                is_valid_effective_tile
-                and (tile_offset_k < seq_len_kv)
-                and not is_masked_final_wave
-            )
+        should_load_s = (
+            is_valid_effective_tile
+            and (tile_offset_k < seq_len_kv)
+            and not is_masked_final_wave
+        )
         if should_load_s:
             base_addr = (
                 task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
@@ -915,15 +944,6 @@ class TmemSResource(DecodeGenResourceBase):
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
                 for atom_reg_idx in cutlass.range_constexpr(load_atom_regs):
                     s_vals[atom_col + atom_reg_idx] = loaded[atom_reg_idx]
-
-        if cutlass.const_expr(use_runtime_paged_dense_load):
-            if not (
-                is_valid_effective_tile
-                and (tile_offset_k < seq_len_kv)
-                and not is_masked_final_wave
-            ):
-                for reg_idx in cutlass.range_constexpr(num_s_regs):
-                    s_vals[reg_idx] = _neg_max_f32()
 
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
@@ -1092,7 +1112,7 @@ class TmemSResource(DecodeGenResourceBase):
         if cutlass.const_expr(cfg.uses_uniform_causal_mask):
             element_mask_end_idx = seq_len_kv - self.seq_len_q + q_token_base + Int32(1)
         use_runtime_kv_domain = (
-            self.seqlens_kv is not None or cfg.uses_q_cta_sliding_union
+            self.seqlens_kv is not None or cfg.uses_runtime_q_kv_union
         )
         local_tile_idx = _softmax_tile_idx(cfg, stage_info, self.inst_id)
         if cutlass.const_expr(not use_runtime_kv_domain):
@@ -1262,43 +1282,57 @@ class TmemSResource(DecodeGenResourceBase):
                             s_vals[s_base + 1] = _neg_max_f32()
 
         if cutlass.const_expr(cfg.uses_per_row_causal_mask):
-            # Grouped causal decode has a distinct causal/window bound for every
-            # Q token. Adjacent registers can belong to different Q rows and
-            # therefore cannot share a mask.
-            warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
-            lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
-            col_group_idx = lane_idx & Int32(0x3)
-            local_idx_k0 = warp_idx * Int32(32) + (lane_idx >> Int32(2))
-            for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                repeat_idx = scale_idx // 2
-                pair_idx = scale_idx % 2
-                tile_row_idx = (
-                    Int32(repeat_idx * 8) + col_group_idx * Int32(2) + Int32(pair_idx)
-                )
-                q_token_idx, _ = _q_row_token_and_local_head(
-                    cfg,
-                    self.h_r,
-                    logical_q_group_idx,
-                    tile_row_idx,
-                )
-                causal_end = seq_len_kv - self.seq_len_q + q_token_idx + Int32(1)
-                causal_start = Int32(0)
-                if cutlass.const_expr(cfg.use_sliding_window_causal):
-                    causal_start = cute.math.max(
-                        causal_end - Int32(cfg.attention_window_size), Int32(0)
+            tile_has_valid_scores = (
+                is_valid_effective_tile
+                and (tile_offset_k < seq_len_kv)
+                and not is_masked_final_wave
+            )
+            if not _kv_tile_is_fully_unmasked_for_q_group(
+                cfg,
+                tile_offset_k,
+                seq_len_kv,
+                self.seq_len_q,
+                q_token_base,
+                tile_has_valid_scores,
+            ):
+                # Grouped causal decode has a distinct causal/window bound for
+                # every Q token. Only boundary tiles need this row-exact pass.
+                warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+                lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+                col_group_idx = lane_idx & Int32(0x3)
+                local_idx_k0 = warp_idx * Int32(32) + (lane_idx >> Int32(2))
+                for scale_idx in cutlass.range_constexpr(num_scale_groups):
+                    repeat_idx = scale_idx // 2
+                    pair_idx = scale_idx % 2
+                    tile_row_idx = (
+                        Int32(repeat_idx * 8)
+                        + col_group_idx * Int32(2)
+                        + Int32(pair_idx)
                     )
-                for token_group_idx in cutlass.range_constexpr(4):
-                    token_idx = (
-                        tile_offset_k + local_idx_k0 + Int32(token_group_idx * 8)
+                    q_token_idx, _ = _q_row_token_and_local_head(
+                        cfg,
+                        self.h_r,
+                        logical_q_group_idx,
+                        tile_row_idx,
                     )
-                    s_idx = (
-                        repeat_idx * 4
-                        + pair_idx
-                        + (token_group_idx & 1) * 2
-                        + (token_group_idx >> 1) * q_repeats * 4
-                    )
-                    if token_idx < causal_start or token_idx >= causal_end:
-                        s_vals[s_idx] = _neg_max_f32()
+                    causal_end = seq_len_kv - self.seq_len_q + q_token_idx + Int32(1)
+                    causal_start = Int32(0)
+                    if cutlass.const_expr(cfg.use_sliding_window_causal):
+                        causal_start = cute.math.max(
+                            causal_end - Int32(cfg.attention_window_size), Int32(0)
+                        )
+                    for token_group_idx in cutlass.range_constexpr(4):
+                        token_idx = (
+                            tile_offset_k + local_idx_k0 + Int32(token_group_idx * 8)
+                        )
+                        s_idx = (
+                            repeat_idx * 4
+                            + pair_idx
+                            + (token_group_idx & 1) * 2
+                            + (token_group_idx >> 1) * q_repeats * 4
+                        )
+                        if token_idx < causal_start or token_idx >= causal_end:
+                            s_vals[s_idx] = _neg_max_f32()
 
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
         if cutlass.const_expr(cfg.q_score_rows_need_mask):

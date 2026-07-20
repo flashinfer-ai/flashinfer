@@ -1,16 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Task definitions for the throughput 2CTA MLA decode TS kernel.
 
-Defines 6 tasks matching the MLA decode's 12-warp layout.
+The selected graph depends on dtype and scheduler policy. BF16 uses a 12-warp
+combined TMA/MMA graph, with an additional scheduler task under CLC. FP8 uses a
+16-warp split K/V and QK/PV graph with two softmax groups.
 
 Domain semantics: domain = k_tile_count (total k-tiles to process).
 Tasks with domain_start=1 handle the first k-tile in HEAD, then LOOP
@@ -23,29 +18,33 @@ Stagger pattern (K loads 1 ahead of V, QK MMA 1 ahead of PV MMA):
   k-tile N-1: load K[N-1]+V[N-2], PV MMA(P[N-2],V[N-2])->O[N-2], QK MMA->S[N-1]
   tail: load V[N-1], PV MMA(P[N-1],V[N-1])->O[N-1]
 
-Register budgets mirror the bare-metal kernel's setmaxregister calls:
-  LoadPageOffsetsTask      (warp 10,   1 warp,   96 regs)
-  LoadTmaTask     (warp 9,    1 warp,   96 regs)
+The BF16 register roles are:
+  LoadTmaTask     (warp 9,    1 warp,   96 regs; owns page-ID window)
   MmaTask         (warp 8,    1 warp,   96 regs)
   SoftmaxTask     (warps 0-3, 4 warps, 192 regs)
   CorrectionTask  (warps 4-7, 4 warps, 208 regs)
-  PaddingTask     (warp 11,   1 warp,   96 regs)
+  PaddingTask     (warps 10-11,          96 regs; non-CLC alignment)
+  SchedulerTask   (warp 11,              96 regs; CLC only)
 """
+
+from collections.abc import Callable
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, Int32
 
 from cutlass.experimental.task_scheduling.memory import ResourceContext
-from cutlass.experimental.task_scheduling.schedule_builder import domain_loop, schedule
-from cutlass.experimental.task_scheduling.enums import ScheduleStageType
+from cutlass.experimental.task_scheduling.schedule_builder import (
+    domain_loop,
+    schedule,
+    work_tile_loop,
+)
 from cutlass.experimental.task_scheduling.resources import StageInfo
 from cutlass.experimental.task_scheduling.task import Task
 
 from .resources import (
-    MlaTsWorkTileInfo,
     MlaWorkQueue,
-    SmemPageOffsetsResource,
+    WorkThrottleBarrierResource,
+    PageOffsetWindowResource,
     SmemQResource,
     SmemKResource,
     SmemKVResource,
@@ -79,6 +78,61 @@ def _fixed_lane_work_tile_bounds(fixed_lane, cumulative_k_parity, actual_domain)
     lane_iterations = (actual_domain - mapped_start + 1) // 2
     fixed_loop_end = fixed_lane + lane_iterations * 2
     return mapped_start, fixed_loop_end
+
+
+def _capture_clc_work_tile_body(
+    work_queue,
+    body: Callable[..., None],
+    non_skippable_prelude: Callable[[], object] | None = None,
+    *,
+    use_clc_dynamic: bool = False,
+) -> None:
+    """Capture one MLA tile with data work skippable and WQ progress mandatory.
+
+    Pure register-state initializers may run in ``non_skippable_prelude`` so
+    values they create dominate the separately guarded HEAD, LOOP, and TAIL
+    regions emitted by the stock skipped-tile executor.  The prelude must not
+    issue memory operations or advance pipeline state.
+    """
+
+    def run_body():
+        prelude_state = (
+            non_skippable_prelude() if non_skippable_prelude is not None else None
+        )
+        if non_skippable_prelude is None:
+            body()
+        else:
+            body(prelude_state)
+
+    if work_queue is not None and use_clc_dynamic:
+        with work_tile_loop(
+            work_queue,
+            skip_if=MlaWorkQueue.skip_work_tile_if,
+        ) as work_tiles:
+            prelude_state = (
+                non_skippable_prelude() if non_skippable_prelude is not None else None
+            )
+            with work_tiles.skippable():
+                if non_skippable_prelude is None:
+                    body()
+                else:
+                    body(prelude_state)
+            work_queue_tail(work_queue, advance_label="advance_tile")
+        return
+
+    run_body()
+    work_queue_tail(work_queue, advance_label="advance_tile")
+
+
+class MlaClcTask(Task):
+    """Stock Task persistent loop with an MLA-specific dynamic K domain."""
+
+    @cute.jit
+    def get_domain(self, tile_coord):
+        """Recompute the loop bound required by the stock Task public API."""
+
+        assert isinstance(self.work_queue, MlaWorkQueue)
+        return self.work_queue.k_tile_count_for_tile(tile_coord)
 
 
 class MlaTask(Task):
@@ -145,10 +199,6 @@ class MlaTask(Task):
             self._drain_mla_work_tile_tails()
             return
 
-        if cutlass.const_expr(self.work_queue.use_clc_dynamic):
-            self._run_task_body_clc_persistent(context)
-            return
-
         current_work_linear_idx = cute.arch.block_idx()[0]
         num_blocks = (
             params.cluster_shape_mnk[0]
@@ -183,103 +233,6 @@ class MlaTask(Task):
         )
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
         self._run_post_work_loop_entries(work_tile, context)
-        self._drain_mla_work_tile_tails()
-
-    @cute.jit
-    def _advance_empty_clc_work_tile(
-        self,
-        work_tile,
-        context: ResourceContext | None = None,
-    ) -> None:
-        """Run only WorkQueue tail slots for a zero-K CLC tile."""
-
-        for resource, schedule_stage, call_id, label in self.tail_schedule_list:
-            if cutlass.const_expr(resource is self.work_queue):
-                work_method = self._resolve_work_method(
-                    resource,
-                    schedule_stage,
-                    label,
-                    require_label_for_named=self.captured_schedule,
-                )
-                routing_slot = self._routing_slot(
-                    resource,
-                    schedule_stage,
-                    ScheduleStageType.Tail,
-                    call_id,
-                )
-                stage_info = self._create_stage_info(
-                    resource,
-                    Int32(0),
-                    work_tile,
-                    is_producer=self._is_producer_stage(schedule_stage),
-                    resolved_domain=Int32(0),
-                    label=label,
-                    schedule_stage=schedule_stage,
-                    routing_slot=routing_slot,
-                    context=context,
-                )
-                self._run_step(
-                    resource,
-                    stage_info,
-                    schedule_stage,
-                    work_method,
-                    routing_slot,
-                )
-
-    @cute.jit
-    def _run_task_body_clc_persistent(
-        self,
-        context: ResourceContext | None = None,
-    ) -> None:
-        """Consume cluster-wide CLC responses while preserving MLA domains."""
-
-        work_tile = self.work_queue.initial_work_tile_info()
-        self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
-        self._run_pre_work_loop_entries(work_tile, context)
-
-        # Carry scalar fields through the dynamic loop and reconstruct the
-        # value object for each body.  Mutating one Python container in place
-        # only threads its validity/K-domain fields through PyIR; the tile
-        # coordinate members otherwise remain bound to the initial CTA and
-        # stolen work overwrites that CTA's output.
-        next_work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
-        cluster_idx, seq_q_idx, batch_idx, split_kv_idx = next_work_tile.tile_idx
-        is_valid = Boolean(next_work_tile.is_valid_tile)
-        k_len = Int32(next_work_tile.k_len)
-        k_tile_count = Int32(next_work_tile.k_tile_count)
-        k_index_base = Int32(next_work_tile.k_index_base)
-
-        while is_valid:
-            current_work_tile = MlaTsWorkTileInfo(
-                (cluster_idx, seq_q_idx, batch_idx, split_kv_idx),
-                is_valid,
-                k_len,
-                k_tile_count,
-                k_index_base,
-            )
-            if k_tile_count > Int32(0):
-                self._run_one_mla_work_tile(current_work_tile, context)
-            else:
-                # Runtime K may be much shorter than the planned maximum.
-                # Empty splits must still consume/release this response stage
-                # so every warp in both CTAs advances to the same next tile.
-                self._advance_empty_clc_work_tile(current_work_tile, context)
-            next_work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
-            cluster_idx, seq_q_idx, batch_idx, split_kv_idx = next_work_tile.tile_idx
-            is_valid = Boolean(next_work_tile.is_valid_tile)
-            k_len = Int32(next_work_tile.k_len)
-            k_tile_count = Int32(next_work_tile.k_tile_count)
-            k_index_base = Int32(next_work_tile.k_index_base)
-            self.dummy = True
-
-        final_work_tile = MlaTsWorkTileInfo(
-            (cluster_idx, seq_q_idx, batch_idx, split_kv_idx),
-            is_valid,
-            k_len,
-            k_tile_count,
-            k_index_base,
-        )
-        self._run_post_work_loop_entries(final_work_tile, context)
         self._drain_mla_work_tile_tails()
 
 
@@ -363,48 +316,8 @@ class MlaInterleavedTask(MlaTask):
         )
 
 
-def create_load_page_offsets_task(
-    smem_page_offsets: SmemPageOffsetsResource,
-    work_queue: MlaWorkQueue = None,
-    task_class: type = MlaTask,
-    **task_kwargs,
-) -> Task:
-    """Create the page-offset load task (warp 10, 1 warp, 96 regs).
-
-    domain_start=0: produces one page-offset stage per k-tile.
-    """
-    loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
-
-    @schedule
-    def load_page_offsets_schedule(smem_page_offsets, work_queue=None):
-        """Produce one SMEM page-offset stage for every k-tile."""
-        smem_page_offsets.init_load_state()
-
-        with domain_loop(loop_start, loop_end, loop_step) as d:
-            smem_page_offsets.acquire()
-            smem_page_offsets.cp_async_load()
-            smem_page_offsets.commit()
-        work_queue_tail(work_queue, advance_label="advance_tile")
-
-    captured_schedule = (
-        load_page_offsets_schedule(smem_page_offsets)
-        if work_queue is None
-        else load_page_offsets_schedule(smem_page_offsets, work_queue)
-    )
-    src = [work_queue] if work_queue is not None else []
-    return task_class(
-        src_resources=src,
-        dst_resources=[smem_page_offsets],
-        warp_idx=10,
-        num_warps=1,
-        schedule=captured_schedule,
-        name="LoadPageOffsetsTask",
-        **task_kwargs,
-    )
-
-
 def create_load_tma_task(
-    smem_page_offsets: SmemPageOffsetsResource,
+    page_offset_window: PageOffsetWindowResource,
     smem_q: SmemQResource,
     smem_kv: SmemKVResource,
     iterations_qk: int = 9,
@@ -422,30 +335,35 @@ def create_load_tma_task(
     TAIL: load V[last].
     """
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 1)
+    use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
 
-    @schedule
-    def load_tma_schedule(smem_page_offsets, smem_q, smem_kv, work_queue=None):
-        """Load Q once and load K/V tiles with the K-before-V cadence."""
-        cached_k_pages, cached_v_pages, cached_next_v_pages = (
-            smem_page_offsets.init_read_state()
-        )
+    def load_tma_prelude(page_offset_window, smem_q, smem_kv):
+        """Create register and descriptor state before any dynamic skip guard."""
+        cached_page_state = page_offset_window.init_read_state()
         smem_q.init_load_state()
         smem_kv.init_load_state()
+        return cached_page_state
 
-        # HEAD: cache page offsets for K[0]/V[0], then load Q and K[0].
-        smem_page_offsets.wait()
-        cached_k_pages, cached_v_pages, cached_next_v_pages = (
-            smem_page_offsets.read_page_offsets(
-                cached_k_pages=cached_k_pages,
-                cached_v_pages=cached_v_pages,
-                cached_next_v_pages=cached_next_v_pages,
-                init_v_cache=True,
-            )
+    def load_tma_body(page_offset_window, smem_q, smem_kv, cached_page_state):
+        """Load Q once and load K/V tiles with the K-before-V cadence."""
+        cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
+            cached_page_state
         )
-        smem_page_offsets.release()
+
+        # HEAD: Q is independent of page IDs.  Enqueue it before the TMA warp
+        # refreshes its first coalesced 32-entry page-table window.
         smem_q.acquire()
         smem_q.tma_load()
         smem_q.commit()
+        cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
+            page_offset_window.read_page_offset_window(
+                cached_k_pages=cached_k_pages,
+                cached_v_pages=cached_v_pages,
+                cached_next_v_pages=cached_next_v_pages,
+                cached_window_page=cached_window_page,
+                init_v_cache=True,
+            )
+        )
         staged_kv_tma_load(
             smem_kv,
             iterations_qk,
@@ -457,15 +375,14 @@ def create_load_tma_task(
 
         with domain_loop(loop_start, loop_end, loop_step):
             # LOOP: cache K[n]/V[n] offsets, load K[n], then deferred V[n-1].
-            smem_page_offsets.wait()
-            cached_k_pages, cached_v_pages, cached_next_v_pages = (
-                smem_page_offsets.read_page_offsets(
+            cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
+                page_offset_window.read_page_offset_window(
                     cached_k_pages=cached_k_pages,
                     cached_v_pages=cached_v_pages,
                     cached_next_v_pages=cached_next_v_pages,
+                    cached_window_page=cached_window_page,
                 )
             )
-            smem_page_offsets.release()
             # K sub-tiles then deferred V sub-tiles, each with its own local
             # sub-tile index; ``is_v`` tells the loader which path to take.
             staged_kv_tma_load(
@@ -487,7 +404,7 @@ def create_load_tma_task(
 
         # TAIL: V[last] uses the next-V offsets cached by the final wait.
         cached_k_pages, cached_v_pages, cached_next_v_pages = (
-            smem_page_offsets.forward_page_offsets(
+            page_offset_window.forward_page_ids(
                 cached_k_pages=cached_k_pages,
                 cached_v_pages=cached_v_pages,
                 cached_next_v_pages=cached_next_v_pages,
@@ -502,15 +419,34 @@ def create_load_tma_task(
             is_v=True,
             use_next_v_pages=True,
         )
-        work_queue_tail(work_queue, advance_label="advance_tile")
 
-    captured_schedule = (
-        load_tma_schedule(smem_page_offsets, smem_q, smem_kv)
-        if work_queue is None
-        else load_tma_schedule(smem_page_offsets, smem_q, smem_kv, work_queue)
-    )
+    @schedule
+    def load_tma_schedule(page_offset_window, smem_q, smem_kv, work_queue=None):
+        """Capture one active TMA tile and unconditional queue progress."""
 
-    src = [smem_page_offsets]
+        _capture_clc_work_tile_body(
+            work_queue,
+            lambda cached_page_state: load_tma_body(
+                page_offset_window,
+                smem_q,
+                smem_kv,
+                cached_page_state,
+            ),
+            lambda: load_tma_prelude(page_offset_window, smem_q, smem_kv),
+            use_clc_dynamic=use_clc_dynamic,
+        )
+
+    if work_queue is None:
+        captured_schedule = load_tma_schedule(page_offset_window, smem_q, smem_kv)
+    else:
+        captured_schedule = load_tma_schedule(
+            page_offset_window,
+            smem_q,
+            smem_kv,
+            work_queue,
+        )
+
+    src = [page_offset_window]
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
@@ -617,6 +553,7 @@ def create_mma_task(
     iterations_qk: int = 9,
     iterations_pv: int = 8,
     work_queue: MlaWorkQueue = None,
+    work_throttle: WorkThrottleBarrierResource = None,
     task_class: type = MlaTask,
     **task_kwargs,
 ) -> Task:
@@ -631,12 +568,26 @@ def create_mma_task(
     TAIL: PV MMA for last k-tile -> O[last], release Q.
     """
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 1)
+    use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
 
-    @schedule
-    def mma_schedule(smem_q, smem_kv, smem_p, tmem_s, tmem_o, work_queue=None):
+    def mma_body(
+        smem_q,
+        smem_kv,
+        smem_p,
+        tmem_s,
+        tmem_o,
+        work_throttle=None,
+    ):
         """Run QK one tile ahead of PV and keep UMMA on the leader CTA."""
         # HEAD: wait Q once and compute S[0] from K[0].
         smem_q.wait()
+        if work_throttle is not None:
+            # The leader MMA reaching Q proves that this cluster has started
+            # the current tile.  Permit the scheduler to prepare one more work
+            # ID without relying on CTA-private resource-ownership fields.
+            work_throttle.try_acquire()
+            work_throttle.acquire()
+            work_throttle.commit()
         smem_q.q_desc()
         staged_qk_mma(smem_kv, tmem_s, iterations_qk)
 
@@ -660,20 +611,63 @@ def create_mma_task(
             is_tail=True,
         )
         smem_q.release()
-        work_queue_tail(work_queue, advance_label="advance_tile")
 
-    captured_schedule = (
-        mma_schedule(smem_q, smem_kv, smem_p, tmem_s, tmem_o)
-        if work_queue is None
-        else mma_schedule(smem_q, smem_kv, smem_p, tmem_s, tmem_o, work_queue)
-    )
+    @schedule
+    def mma_schedule(
+        smem_q,
+        smem_kv,
+        smem_p,
+        tmem_s,
+        tmem_o,
+        work_queue=None,
+        work_throttle=None,
+    ):
+        """Capture one active MMA tile and unconditional queue progress."""
+
+        _capture_clc_work_tile_body(
+            work_queue,
+            lambda: mma_body(
+                smem_q,
+                smem_kv,
+                smem_p,
+                tmem_s,
+                tmem_o,
+                work_throttle,
+            ),
+            use_clc_dynamic=use_clc_dynamic,
+        )
+
+    if work_queue is None:
+        captured_schedule = mma_schedule(smem_q, smem_kv, smem_p, tmem_s, tmem_o)
+    elif work_throttle is None:
+        captured_schedule = mma_schedule(
+            smem_q,
+            smem_kv,
+            smem_p,
+            tmem_s,
+            tmem_o,
+            work_queue,
+        )
+    else:
+        captured_schedule = mma_schedule(
+            smem_q,
+            smem_kv,
+            smem_p,
+            tmem_s,
+            tmem_o,
+            work_queue,
+            work_throttle,
+        )
 
     src = [smem_q, smem_kv, smem_p]
     if work_queue is not None:
         src.append(work_queue)
+    dst = [tmem_s, tmem_o]
+    if work_throttle is not None:
+        dst.append(work_throttle)
     return task_class(
         src_resources=src,
-        dst_resources=[tmem_s, tmem_o],
+        dst_resources=dst,
         warp_idx=8,
         num_warps=1,
         schedule=captured_schedule,
@@ -893,20 +887,24 @@ def create_softmax_task(
     LOOP: consume S, compute softmax, produce correction factors + P.
     """
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
+    use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
 
-    @schedule
-    def softmax_schedule(tmem_s, tmem_corr, smem_p, work_queue=None):
+    def softmax_prelude(tmem_s):
+        """Create softmax register arrays before the dynamic skip guard."""
+        init_softmax_state = (
+            tmem_s.init_softmax_state_odd
+            if softmax_group_id == 1
+            else tmem_s.init_softmax_state
+        )
+        return init_softmax_state()
+
+    def softmax_body(tmem_s, tmem_corr, smem_p, softmax_state):
         """Consume S tiles, materialize P, and publish correction factors."""
         load_s = tmem_s.load_s_odd if softmax_group_id == 1 else tmem_s.load_s
         finish_softmax = (
             tmem_s.finish_softmax_odd
             if softmax_group_id == 1
             else tmem_s.finish_softmax
-        )
-        init_softmax_state = (
-            tmem_s.init_softmax_state_odd
-            if softmax_group_id == 1
-            else tmem_s.init_softmax_state
         )
         finish_row_sum = (
             tmem_s.finish_row_sum_odd
@@ -925,7 +923,7 @@ def create_softmax_task(
             row_max_new,
             correction_factor_out,
             no_correction_out,
-        ) = init_softmax_state()
+        ) = softmax_state
 
         with domain_loop(loop_start, loop_end, loop_step) as d:
             tmem_s.wait()
@@ -1036,7 +1034,22 @@ def create_softmax_task(
                     no_correction_out=no_correction_out,
                 )
             tmem_corr.commit()
-        work_queue_tail(work_queue, advance_label="advance_tile")
+
+    @schedule
+    def softmax_schedule(tmem_s, tmem_corr, smem_p, work_queue=None):
+        """Capture one active softmax tile and unconditional queue progress."""
+
+        _capture_clc_work_tile_body(
+            work_queue,
+            lambda softmax_state: softmax_body(
+                tmem_s,
+                tmem_corr,
+                smem_p,
+                softmax_state,
+            ),
+            lambda: softmax_prelude(tmem_s),
+            use_clc_dynamic=use_clc_dynamic,
+        )
 
     schedule_result = (
         softmax_schedule(tmem_s, tmem_corr, smem_p)
@@ -1081,11 +1094,15 @@ def create_correction_task(
     TAIL: consume O[last], final epilogue store O + LSE to GMEM.
     """
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 1)
+    use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
 
-    @schedule
-    def correction_schedule(tmem_corr, tmem_o, gmem_o, work_queue=None):
+    def correction_prelude(tmem_corr):
+        """Create correction and epilogue register state before skip guards."""
+        return tmem_corr.init_load_state()
+
+    def correction_body(tmem_corr, tmem_o, gmem_o, correction_state):
         """Apply online-softmax correction and store the final O/LSE result."""
-        tmem_corr.init_load_state()
+        row_sum, row_max, correction_factor, no_correction = correction_state
 
         # HEAD: consume the first correction factors. There is no O tile yet.
         tmem_corr.wait()
@@ -1133,7 +1150,22 @@ def create_correction_task(
             tmem_o.wait()
             gmem_o.epilogue_store()
             tmem_o.release()
-        work_queue_tail(work_queue, advance_label="advance_tile")
+
+    @schedule
+    def correction_schedule(tmem_corr, tmem_o, gmem_o, work_queue=None):
+        """Capture one active correction tile and unconditional queue progress."""
+
+        _capture_clc_work_tile_body(
+            work_queue,
+            lambda correction_state: correction_body(
+                tmem_corr,
+                tmem_o,
+                gmem_o,
+                correction_state,
+            ),
+            lambda: correction_prelude(tmem_corr),
+            use_clc_dynamic=use_clc_dynamic,
+        )
 
     captured_schedule = (
         correction_schedule(tmem_corr, tmem_o, gmem_o)
@@ -1158,20 +1190,30 @@ def create_correction_task(
 def create_padding_task(
     work_queue: MlaWorkQueue = None,
     task_class: type = MlaTask,
+    warp_idx: int = 11,
+    num_warps: int = 1,
     **task_kwargs,
 ) -> Task:
-    """Create the padding task (warp 11, 1 warp, 96 regs).
+    """Create a padding task for unused warps in producer warpgroup 2.
 
     Empty task for warp-group alignment.
     """
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
+    use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
 
     @schedule
     def padding_schedule(work_queue=None):
-        """Reserve warp 11 in validation without issuing kernel work."""
-        with domain_loop(loop_start, loop_end, loop_step):
-            pass
-        work_queue_tail(work_queue, advance_label="advance_tile")
+        """Reserve unused producer warps without issuing kernel work."""
+
+        def padding_body():
+            with domain_loop(loop_start, loop_end, loop_step):
+                pass
+
+        _capture_clc_work_tile_body(
+            work_queue,
+            padding_body,
+            use_clc_dynamic=use_clc_dynamic,
+        )
 
     captured_schedule = (
         padding_schedule() if work_queue is None else padding_schedule(work_queue)
@@ -1180,8 +1222,8 @@ def create_padding_task(
     return task_class(
         src_resources=src,
         dst_resources=[],
-        warp_idx=11,
-        num_warps=1,
+        warp_idx=warp_idx,
+        num_warps=num_warps,
         schedule=captured_schedule,
         name="PaddingTask",
         **task_kwargs,
@@ -1190,28 +1232,45 @@ def create_padding_task(
 
 def create_scheduler_task(
     work_queue: MlaWorkQueue,
+    work_throttle: WorkThrottleBarrierResource = None,
     task_class: type = MlaTask,
     **task_kwargs,
 ) -> Task:
     """Create the BF16 cluster-wide CLC scheduler on warp 11."""
 
     @schedule
-    def scheduler_schedule(work_queue):
+    def scheduler_schedule(work_queue, work_throttle=None):
         """Fetch and distribute the next logical MLA cluster tile."""
-        work_queue.init_work_tile()
-        with domain_loop(0, 0, 1):
-            pass
-        work_queue.acquire()
-        work_queue.fetch_work_tile()
-        work_queue.commit()
-        work_queue_tail(work_queue, advance_label="advance_tile")
 
+        with work_tile_loop(
+            work_queue,
+            skip_if=MlaWorkQueue.skip_work_tile_if,
+        ) as work_tiles:
+            with work_tiles.skippable():
+                with domain_loop(0, 0, 1):
+                    pass
+                if work_throttle is not None:
+                    work_throttle.wait()
+                    work_throttle.release()
+            work_queue.acquire()
+            work_queue.fetch_work_tile()
+            work_queue.commit()
+            work_queue_tail(work_queue, advance_label="advance_tile")
+
+    captured_schedule = (
+        scheduler_schedule(work_queue)
+        if work_throttle is None
+        else scheduler_schedule(work_queue, work_throttle)
+    )
+    src = [work_queue]
+    if work_throttle is not None:
+        src.append(work_throttle)
     return task_class(
-        src_resources=[work_queue],
+        src_resources=src,
         dst_resources=[work_queue],
         warp_idx=11,
         num_warps=1,
-        schedule=scheduler_schedule(work_queue),
+        schedule=captured_schedule,
         name="SchedulerTask",
         run_only_on_cta_id=0,
         **task_kwargs,

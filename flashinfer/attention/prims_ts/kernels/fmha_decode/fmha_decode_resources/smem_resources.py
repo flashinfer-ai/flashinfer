@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """SMEM-side resources for FMHA decode TS kernel.
 
@@ -590,7 +583,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 + tile_idx
             )
         if cutlass.const_expr(
-            self.seqlens_kv is None and not self.cfg.uses_q_cta_sliding_union
+            self.seqlens_kv is None and not self.cfg.uses_runtime_q_kv_union
         ):
             if cutlass.const_expr(self.cfg.use_split_kv):
                 tile_idx = _static_split_kv_global_tile_idx(
@@ -849,15 +842,13 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     The TMA load warp then reads these SMEM-cached offsets when issuing the
     page-sized TMA copies, matching the split producer layout.
 
-    Each pipeline stage holds 32 consecutive page IDs from one side of the
-    page table (K or V). All 32 lanes participate in one coalesced read
-    from ``page_idx_kv`` so a 32-page-aligned window is fetched as a single
-    cache-line transaction. Several consecutive tiles whose page IDs fall
-    within the same 32-page window therefore reuse the same SMEM stage via
-    ``page_ids``.
+    Paired K0/K1/V0/V1 schedules publish one stage per logical tile and store
+    exactly that tile's page IDs. Shared-offset schedules retain a warp-aligned
+    32-ID window so one coalesced load can serve adjacent logical tiles.
     """
 
     cfg: Constexpr[FmhaDecodeConfig] = None
+    stage_page_ids_per_tile: Constexpr[bool] = False
     page_idx_kv: cute.Pointer | None = None
     seqlens_kv: cute.Pointer | None = None
     use_native_paged_kv: Constexpr[bool] = False
@@ -870,23 +861,47 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     seq_len_q: Int32 = None
     _alloc: Constexpr[SmemAllocation | None] = None
     _smem_page_offsets: cutlass.Array = None
+    cached_page_ids: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    def __post_init__(self) -> None:
+        """Create a shape-stable register slot before task dispatch branches."""
+        object.__setattr__(
+            self,
+            "cached_page_ids",
+            TaskLocalVariable(
+                dtype=cutlass.Array,
+                default_factory=lambda: cutlass.Array(
+                    Int32,
+                    self.cfg.tile_size_kv // self.cfg.num_tokens_per_page,
+                    space=cutlass.AddressSpace.rmem,
+                ),
+                docs="Page IDs reused by every head-dimension stage of one K/V tile.",
+            ),
+        )
+        self._init_placeholder_state()
 
     def _init_placeholder_state(self) -> None:
         """Create placeholder storage for per-stage page-offset windows."""
         num_stages = (
             self.pipeline_config.num_stages if self.pipeline_config is not None else 1
         )
-        self._smem_page_offsets = _placeholder_smem_array(Int32, num_stages * 32)
+        pages_per_tile = self.cfg.tile_size_kv // self.cfg.num_tokens_per_page
+        page_ids_per_stage = pages_per_tile if self.stage_page_ids_per_tile else 32
+        self._smem_page_offsets = _placeholder_smem_array(
+            Int32, num_stages * page_ids_per_stage
+        )
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
-        """Allocate 32 cached page IDs per page-offset pipeline stage."""
+        """Allocate one tile or one held window per page-offset stage."""
         num_stages = (
             self.pipeline_config.num_stages if self.pipeline_config is not None else 1
         )
+        pages_per_tile = self.cfg.tile_size_kv // self.cfg.num_tokens_per_page
+        page_ids_per_stage = pages_per_tile if self.stage_page_ids_per_tile else 32
         if self._alloc is None:
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
-                size_bytes=num_stages * 32 * 4,
+                size_bytes=num_stages * page_ids_per_stage * 4,
                 alignment=16,
             )
         return [self._alloc]
@@ -901,16 +916,17 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     ) -> ResourceVars:
         """Bind the page-offset SMEM cache for producer and consumer tasks."""
         if cutlass.const_expr(context is not None and context.smem_base is not None):
-            # Each stage holds a 32-entry window that several tiles can share.
             num_stages = (
                 self.pipeline_config.num_stages
                 if self.pipeline_config is not None
                 else 1
             )
+            pages_per_tile = self.cfg.tile_size_kv // self.cfg.num_tokens_per_page
+            page_ids_per_stage = pages_per_tile if self.stage_page_ids_per_tile else 32
             self._smem_page_offsets = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
                 dtype=cutlass.Int32,
-                shape=(num_stages * 32,),
+                shape=(num_stages * page_ids_per_stage,),
                 addrspace=3,
             )
         return {}
@@ -931,19 +947,31 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         # work can slice out the page IDs for each tile.
         self._create_initial_task_locals(stage_info.context)
 
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=cached_page_ids)
+    @cute.jit
+    def init_cached_read_state(self, stage_info: StageInfo) -> cutlass.Array:
+        """Initialize D256's per-tile page-ID register cache."""
+        self._create_initial_task_locals(stage_info.context)
+        return cutlass.Array(
+            Int32,
+            self.cfg.tile_size_kv // self.cfg.num_tokens_per_page,
+            space=cutlass.AddressSpace.rmem,
+        )
+
     @cute.jit
     def page_ids(self, tile_idx: Int32) -> cutlass.Array:
-        """Load the tile's page IDs from the grouped 32-entry cache stage.
+        """Load the tile's page IDs from its staged cache entry.
 
-        ``tile_idx`` is the global, runtime-resolved K/V tile index produced
-        by the same logic as the page-offsets producer. The 32-page-aligned
-        base is implicit in the stage's contents; this LDS only picks the
-        ``pages_per_tile`` IDs that belong to ``tile_idx``.
+        Single-tile stages begin at offset zero. Multi-tile stages use the
+        runtime-resolved tile index to select from their aligned 32-ID window.
         """
         cfg = self.cfg
         pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
-        group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(31)
-        offset = self.consumer_work_stage * Int32(32) + group_page_idx
+        if cutlass.const_expr(self.stage_page_ids_per_tile):
+            offset = self.consumer_work_stage * Int32(pages_per_tile)
+        else:
+            group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(31)
+            offset = self.consumer_work_stage * Int32(32) + group_page_idx
         if cutlass.const_expr(pages_per_tile == 8):
             # Native shared-memory vector loads top out at four Int32 values.
             # Page-16 tiles therefore consume their eight page IDs as two
@@ -967,6 +995,41 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             return self._smem_page_offsets.load(offset, vector_size=2, alignment=8)
         return self._smem_page_offsets.load(offset, vector_size=1, alignment=4)
 
+    @consumer_work(returns=cached_page_ids)
+    @cute.jit
+    def cache_page_ids(
+        self,
+        stage_info: StageInfo,
+        *,
+        cached_page_ids: cutlass.Array,
+        inst_id: Constexpr[int],
+        kv_kind: Constexpr[int],
+        section: Constexpr[FmhaStage],
+    ) -> cutlass.Array:
+        """Load one tile's page IDs once for all of its head-dim stages."""
+        cfg = self.cfg
+        local_tile_idx = _local_kv_tile_idx_for_section(
+            cfg, stage_info, inst_id, kv_kind, section
+        )
+        tile_idx = (
+            Int32(_decode_gen_task_cache(stage_info)[_TASK_CACHE_KV_RAW_TILE_BASE])
+            + local_tile_idx
+        )
+        pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
+
+        # BF16 TMA is issued only by the elected lane, so only that lane needs
+        # the register cache. FP8's predicated helper builds coordinates in
+        # every lane and therefore keeps the existing all-lane semantics.
+        if cutlass.const_expr(cfg.use_fp8_qkv):
+            fp8_page_ids = self.page_ids(tile_idx)
+            for page_frag in cutlass.range_constexpr(pages_per_tile):
+                cached_page_ids[page_frag] = Int32(fp8_page_ids[page_frag])
+        elif prims.elect_sync():
+            bf16_page_ids = self.page_ids(tile_idx)
+            for page_frag in cutlass.range_constexpr(pages_per_tile):
+                cached_page_ids[page_frag] = Int32(bf16_page_ids[page_frag])
+        return cached_page_ids
+
     @cute.jit
     def _producer_load_page_offsets(
         self,
@@ -975,7 +1038,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         kv_kind: int,
         section: Constexpr[FmhaStage],
     ) -> None:
-        """Prefetch one 32-page K or V window for the current schedule phase."""
+        """Prefetch one K/V tile or aligned multi-tile window."""
         cfg = self.cfg
         local_tile_idx = _local_kv_tile_idx_for_section(
             cfg, stage_info, inst_id, kv_kind, section
@@ -1017,47 +1080,55 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             page_idx_kv = self.page_idx_kv
         smem_page_offsets = self._smem_page_offsets
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
-        # All 32 lanes participate in one coalesced gmem read aligned to a
-        # 32-page window. L2 absorbs the duplicate reads from subsequent
-        # producer fires that target the same window, and consumers slice
-        # out the per-tile entries via ``page_ids``.
-        grouped_base_page_idx = ((tile_idx * pages_per_tile) >> Int32(5)) << Int32(5)
-        grouped_logical_page_idx = cute.math.min(
-            grouped_base_page_idx + lane_idx, page_idx_ub
-        )
-        grouped_smem_offset = stage_info.stage_idx * Int32(32) + lane_idx
-        # Publish the clamped page ID into the current SMEM cache stage. K/V TMA
-        # producers later consume only the entries needed for their tile.
-        smem_page_offsets[grouped_smem_offset] = Int32(
-            page_idx_kv[page_table_offset + grouped_logical_page_idx]
-        )
+        if cutlass.const_expr(self.stage_page_ids_per_tile):
+            if lane_idx < pages_per_tile:
+                logical_page_idx = cute.math.min(
+                    tile_idx * pages_per_tile + lane_idx, page_idx_ub
+                )
+                smem_offset = stage_info.stage_idx * pages_per_tile + lane_idx
+                smem_page_offsets[smem_offset] = Int32(
+                    page_idx_kv[page_table_offset + logical_page_idx]
+                )
+        else:
+            # Shared-offset schedules use one coalesced warp load for an
+            # aligned 32-ID window; consumers select their tile within it.
+            grouped_base_page_idx = ((tile_idx * pages_per_tile) >> Int32(5)) << Int32(
+                5
+            )
+            grouped_logical_page_idx = cute.math.min(
+                grouped_base_page_idx + lane_idx, page_idx_ub
+            )
+            grouped_smem_offset = stage_info.stage_idx * Int32(32) + lane_idx
+            smem_page_offsets[grouped_smem_offset] = Int32(
+                page_idx_kv[page_table_offset + grouped_logical_page_idx]
+            )
 
     @producer_work
     @cute.jit
     def load_k0(self, stage_info: StageInfo, *, section: Constexpr[FmhaStage]) -> None:
-        """Produce the first K page-offset window."""
-        # ProdWork: prefetch the 32-page window that covers K0's tile(s).
+        """Produce the first K page-offset stage."""
+        # ProdWork: prefetch the page IDs that cover K0's tile.
         self._producer_load_page_offsets(stage_info, KV_INST0, KV_KIND_K, section)
 
     @producer_work
     @cute.jit
     def load_k1(self, stage_info: StageInfo, *, section: Constexpr[FmhaStage]) -> None:
-        """Produce the second K page-offset window."""
-        # ProdWork: prefetch the 32-page window that covers K1's tile(s).
+        """Produce the second K page-offset stage."""
+        # ProdWork: prefetch the page IDs that cover K1's tile.
         self._producer_load_page_offsets(stage_info, KV_INST1, KV_KIND_K, section)
 
     @producer_work
     @cute.jit
     def load_v0(self, stage_info: StageInfo, *, section: Constexpr[FmhaStage]) -> None:
-        """Produce the first V page-offset window."""
-        # ProdWork: prefetch the 32-page window that covers V0's tile(s).
+        """Produce the first V page-offset stage."""
+        # ProdWork: prefetch the page IDs that cover V0's tile.
         self._producer_load_page_offsets(stage_info, KV_INST0, KV_KIND_V, section)
 
     @producer_work
     @cute.jit
     def load_v1(self, stage_info: StageInfo, *, section: Constexpr[FmhaStage]) -> None:
-        """Produce the second V page-offset window."""
-        # ProdWork: prefetch the 32-page window that covers V1's tile(s).
+        """Produce the second V page-offset stage."""
+        # ProdWork: prefetch the page IDs that cover V1's tile.
         self._producer_load_page_offsets(stage_info, KV_INST1, KV_KIND_V, section)
 
     @consumer_work
@@ -1302,7 +1373,7 @@ class SmemKvResource(DecodeGenResourceBase):
         # Apply runtime sequence-length, split-KV, and sliding-window
         # transforms to a local prefetch tile.
         if cutlass.const_expr(
-            self.seqlens_kv is None and not self.cfg.uses_q_cta_sliding_union
+            self.seqlens_kv is None and not self.cfg.uses_runtime_q_kv_union
         ):
             if cutlass.const_expr(self.cfg.use_split_kv):
                 tile_idx = _static_split_kv_global_tile_idx(
@@ -1367,6 +1438,7 @@ class SmemKvResource(DecodeGenResourceBase):
         kv_kind: int,
         section: Constexpr[FmhaStage],
         head_dim_stage_idx: Constexpr[int],
+        cached_page_ids: cutlass.Array | None = None,
     ) -> None:
         """Issue one shared-ring K or V TMA load for the schedule phase."""
         cfg = self.cfg
@@ -1389,11 +1461,16 @@ class SmemKvResource(DecodeGenResourceBase):
             # runtime-resolved tile_idx so the right per-tile slice is
             # selected from the shared window.
             page_fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
-            grouped_tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
             if cutlass.const_expr(cfg.use_fp8_qkv):
                 # FP8 pages are contiguous across the staged head dimension.
                 fp8_stage_base = self._stage_base(stage_info)
-                fp8_page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
+                if cutlass.const_expr(cached_page_ids is None):
+                    grouped_tile_idx = self._maybe_runtime_tile_idx(
+                        stage_info, local_tile_idx
+                    )
+                    fp8_page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
+                else:
+                    fp8_page_ids = cached_page_ids
                 for fp8_page_frag in cutlass.range_constexpr(page_fragments):
                     fp8_page_id = Int32(fp8_page_ids[fp8_page_frag])
                     fp8_smem_page_offset = Int32(
@@ -1417,9 +1494,19 @@ class SmemKvResource(DecodeGenResourceBase):
                 num_chunks = head_dim_stage // chunk_hd
                 tile_chunk_elems = chunk_hd * cfg.tile_size_kv
                 page_chunk_elems = chunk_hd * cfg.num_tokens_per_page
+                if cutlass.const_expr(cached_page_ids is None):
+                    # Resolve the tile on every lane before the elected-lane
+                    # branch. The release compiler rejects a local that is
+                    # materialized only on the elected dynamic path.
+                    grouped_tile_idx = self._maybe_runtime_tile_idx(
+                        stage_info, local_tile_idx
+                    )
                 if prims.elect_sync():
                     stage_base = self._stage_base(stage_info)
-                    page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
+                    if cutlass.const_expr(cached_page_ids is None):
+                        page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
+                    else:
+                        page_ids = cached_page_ids
                     # Consume each cached page ID across every head-dimension
                     # chunk before advancing. The copies are independent, and
                     # this order bounds coordinate live ranges in the unrolled
@@ -1549,6 +1636,86 @@ class SmemKvResource(DecodeGenResourceBase):
         # ProdWork: V1 occupies the second V instruction slot in the shared ring.
         self._producer_load_kv(
             stage_info, KV_INST1, KV_KIND_V, section, head_dim_stage_idx
+        )
+
+    @producer_work
+    @cute.jit
+    def load_k0_cached(
+        self,
+        stage_info: StageInfo,
+        *,
+        cached_page_ids: cutlass.Array,
+        section: Constexpr[FmhaStage],
+        head_dim_stage_idx: Constexpr[int],
+    ) -> None:
+        """Produce K0 while reusing page IDs across head-dim stages."""
+        self._producer_load_kv(
+            stage_info,
+            KV_INST0,
+            KV_KIND_K,
+            section,
+            head_dim_stage_idx,
+            cached_page_ids,
+        )
+
+    @producer_work
+    @cute.jit
+    def load_k1_cached(
+        self,
+        stage_info: StageInfo,
+        *,
+        cached_page_ids: cutlass.Array,
+        section: Constexpr[FmhaStage],
+        head_dim_stage_idx: Constexpr[int],
+    ) -> None:
+        """Produce K1 while reusing page IDs across head-dim stages."""
+        self._producer_load_kv(
+            stage_info,
+            KV_INST1,
+            KV_KIND_K,
+            section,
+            head_dim_stage_idx,
+            cached_page_ids,
+        )
+
+    @producer_work
+    @cute.jit
+    def load_v0_cached(
+        self,
+        stage_info: StageInfo,
+        *,
+        cached_page_ids: cutlass.Array,
+        section: Constexpr[FmhaStage],
+        head_dim_stage_idx: Constexpr[int],
+    ) -> None:
+        """Produce V0 while reusing page IDs across head-dim stages."""
+        self._producer_load_kv(
+            stage_info,
+            KV_INST0,
+            KV_KIND_V,
+            section,
+            head_dim_stage_idx,
+            cached_page_ids,
+        )
+
+    @producer_work
+    @cute.jit
+    def load_v1_cached(
+        self,
+        stage_info: StageInfo,
+        *,
+        cached_page_ids: cutlass.Array,
+        section: Constexpr[FmhaStage],
+        head_dim_stage_idx: Constexpr[int],
+    ) -> None:
+        """Produce V1 while reusing page IDs across head-dim stages."""
+        self._producer_load_kv(
+            stage_info,
+            KV_INST1,
+            KV_KIND_V,
+            section,
+            head_dim_stage_idx,
+            cached_page_ids,
         )
 
     @cute.jit

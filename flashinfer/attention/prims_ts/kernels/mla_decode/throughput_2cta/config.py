@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Configuration for the throughput 2CTA MLA decode TS kernel.
 
@@ -168,16 +161,16 @@ class MlaDecodeConfig:
     p_mma_stage: int = 2
     p_cor_stage: int = 2
     mma_o_stage: int = 1
-    page_offsets_stage: int = 4
 
-    # Warp assignments for the 12-warps CTA.  Softmax and correction each own a
-    # contiguous four-warp group; the remaining warps issue MMA, TMA, page
-    # offsets, and delayed PV work.
+    # Base BF16 warp assignments for the 12-warp CTA. Softmax and correction
+    # each own a contiguous four-warp group; the remaining warps issue MMA and
+    # TMA (including register-held page IDs) or provide scheduler/alignment
+    # roles. The FP8 factory extends the CTA to 16 warps for its second softmax
+    # group and split QK/PV schedule.
     compute_warp_ids: Tuple[int, ...] = (0, 1, 2, 3)
     correction_warp_ids: Tuple[int, ...] = (4, 5, 6, 7)
     mma_warp_id: int = 8
     load_tma_warp_id: int = 9
-    page_offsets_warp_id: int = 10
     pv_mma_warp_id: int = 11
     empty_warp_ids: Tuple[int, ...] = (11,)
     second_compute_warp_ids: Tuple[int, ...] = ()
@@ -221,7 +214,6 @@ class MlaDecodeConfig:
     smem_k_stage_elems: int = 0
     smem_v_stage_elems: int = 0
     smem_p_elems: int = 0
-    smem_page_offsets_elems: int = 0
     softmax_exchange_elems: int = 128
 
     # Page geometry.  Physical page-table geometry is independent of the V
@@ -536,7 +528,6 @@ def make_mla_decode_config(
         * cfg.iterations_pv_k
         * cfg.p_mma_stage
     )
-    cfg.smem_page_offsets_elems = cfg.page_offsets_stage * cfg.mma_qk_tiler[1] // 2
     cfg.softmax_exchange_elems = (
         cfg.num_compute_warps
         * cfg.threads_per_warp

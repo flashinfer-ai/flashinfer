@@ -31,6 +31,8 @@ from flashinfer.trace.templates.attention import (
     prims_ts_decode_wrapper_trace_dispatch,
 )
 
+from ._tensor_aliasing import _validate_out_does_not_overlap_inputs
+
 
 PagedKVCache = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
 
@@ -39,8 +41,7 @@ if TYPE_CHECKING:
 
 _SUPPORTED_HEAD_DIMS = (64, 128, 256)
 _SUPPORTED_PAGE_SIZES = (16, 32, 64, 128)
-_SUPPORTED_SEQ_LENS_Q = (1, 2, 4, 8)
-_MAX_KV_LEN = 16_384
+_MAX_INT32 = 2**31 - 1
 _SUPPORTED_INPUT_DTYPES = (
     torch.float16,
     torch.bfloat16,
@@ -212,6 +213,26 @@ def _planned_full_split_prefix(
     return True
 
 
+def _planned_kv_lengths_mode(
+    seq_lens: tuple[int, ...],
+    *,
+    max_kv_len: int,
+) -> Literal["dynamic", "planned_uniform_max"]:
+    """Classify immutable plan lengths for fixed-length kernel scheduling.
+
+    The wrapper owns ``seq_lens`` for the lifetime of a plan. When every
+    request is exactly the compiled maximum, native CSR page addressing still
+    uses the runtime indptr/indices while task domains and masks can use the
+    compile-time length. This is an equality proof, not a size heuristic.
+    """
+
+    if not seq_lens or max_kv_len <= 0:
+        return "dynamic"
+    if all(seq_len == max_kv_len for seq_len in seq_lens):
+        return "planned_uniform_max"
+    return "dynamic"
+
+
 def _align_up(value: int, alignment: int = _WORKSPACE_ALIGNMENT) -> int:
     return (value + alignment - 1) // alignment * alignment
 
@@ -352,13 +373,7 @@ def _validate_head_dim(head_dim: int) -> int:
 
 
 def _validate_seq_len_q(seq_len_q: int) -> int:
-    seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
-    if seq_len_q not in _SUPPORTED_SEQ_LENS_Q:
-        raise NotImplementedError(
-            "attention-ts decode requires fixed seq_len_q in "
-            f"{_SUPPORTED_SEQ_LENS_Q}, got {seq_len_q}"
-        )
-    return seq_len_q
+    return _validate_positive_int(seq_len_q, "seq_len_q")
 
 
 def _validate_window_left(window_left: int, mask_type: str) -> int:
@@ -414,10 +429,8 @@ def _resolve_q_mode(
 
 def _validate_max_kv_len(value: int, name: str) -> int:
     value = _validate_positive_int(value, name)
-    if value > _MAX_KV_LEN:
-        raise NotImplementedError(
-            f"attention-ts decode currently supports {name} <= {_MAX_KV_LEN}"
-        )
+    if value > _MAX_INT32:
+        raise ValueError(f"{name} must fit in signed int32 metadata")
     return value
 
 
@@ -876,6 +889,46 @@ def _validate_paged_kv_metadata(
     )
 
 
+def _read_paged_kv_plan_values(
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    *,
+    page_size: int,
+) -> tuple[int, ...]:
+    """Validate CSR values at plan time and return per-request K/V lengths."""
+
+    batch_size = int(paged_kv_last_page_len.numel())
+    values = torch.cat((paged_kv_indptr, paged_kv_last_page_len)).tolist()
+    indptr = tuple(int(value) for value in values[: batch_size + 1])
+    last_page_lens = tuple(int(value) for value in values[batch_size + 1 :])
+
+    if indptr[0] != 0:
+        raise ValueError("paged_kv_indptr must start at zero")
+    if any(end <= start for start, end in zip(indptr[:-1], indptr[1:], strict=True)):
+        raise ValueError(
+            "paged_kv_indptr must be strictly increasing so every request "
+            "contains at least one page"
+        )
+    if indptr[-1] != int(paged_kv_indices.numel()):
+        raise ValueError(
+            "the final paged_kv_indptr offset must equal paged_kv_indices.numel(): "
+            f"expected {paged_kv_indices.numel()}, got {indptr[-1]}"
+        )
+    if any(length < 1 or length > page_size for length in last_page_lens):
+        raise ValueError(f"paged_kv_last_page_len values must be in [1, {page_size}]")
+
+    return tuple(
+        (end - start - 1) * page_size + last_page_len
+        for start, end, last_page_len in zip(
+            indptr[:-1],
+            indptr[1:],
+            last_page_lens,
+            strict=True,
+        )
+    )
+
+
 def _decode_output_shape(
     *,
     batch_size: int,
@@ -1041,12 +1094,16 @@ def _get_compiled_decode(
     use_packed_q: bool,
     window_left: int,
     kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic",
+    kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic",
 ):
     """Compile and cache one exact semantic TS decode plan."""
 
     if kv_prefix_mode not in ("dynamic", "planned_full"):
         raise ValueError(f"unsupported KV-prefix compile mode {kv_prefix_mode!r}")
+    if kv_lengths_mode not in ("dynamic", "planned_uniform_max"):
+        raise ValueError(f"unsupported KV-length compile mode {kv_lengths_mode!r}")
     static_full_split_prefix = kv_prefix_mode == "planned_full"
+    static_native_uniform_kv = kv_lengths_mode == "planned_uniform_max"
 
     import cutlass
     import cutlass.cute as cute
@@ -1124,6 +1181,7 @@ def _get_compiled_decode(
         static_max_kv_len: cutlass.Constexpr[int],
         static_max_active_clusters: cutlass.Constexpr[int],
         static_full_split_prefix: cutlass.Constexpr[bool],
+        static_native_uniform_kv: cutlass.Constexpr[bool],
     ) -> None:
         """Adapt TVM-FFI tensors to the raw native-CSR pointer launcher."""
 
@@ -1172,6 +1230,7 @@ def _get_compiled_decode(
             k_page_stride,
             v_page_stride,
             static_full_split_prefix,
+            static_native_uniform_kv,
         )
 
     reduction_tensor_adapter = None
@@ -1322,6 +1381,7 @@ def _get_compiled_decode(
             max_kv_len,
             max_active_clusters,
             static_full_split_prefix,
+            static_native_uniform_kv,
             options=_COMPILE_OPTIONS,
         )
         compiled_reducer = None
@@ -1348,7 +1408,10 @@ def _get_compiled_decode(
                 options=_COMPILE_OPTIONS,
             )
 
-    policy = spec.policy + (("kv_prefix_mode", kv_prefix_mode),)
+    policy = spec.policy + (
+        ("kv_prefix_mode", kv_prefix_mode),
+        ("kv_lengths_mode", kv_lengths_mode),
+    )
     return compiled_main, compiled_reducer, policy, spec.scratch_shapes
 
 
@@ -1534,6 +1597,32 @@ def _prepare_decode_runtime(
     )
 
 
+def _validate_decode_output_aliasing(
+    runtime: _DecodeRuntime,
+    *,
+    seq_lens: torch.Tensor,
+    qo_indptr: Optional[torch.Tensor],
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len: Optional[torch.Tensor],
+    workspace_buffer: torch.Tensor,
+) -> None:
+    """Keep output disjoint from every live FMHA decode allocation."""
+
+    _validate_out_does_not_overlap_inputs(
+        runtime.out,
+        ("query", runtime.q),
+        ("k_cache", runtime.k_cache),
+        ("v_cache", runtime.v_cache),
+        ("seq_lens", seq_lens),
+        ("qo_indptr", qo_indptr),
+        ("paged_kv_indptr", paged_kv_indptr),
+        ("paged_kv_indices", paged_kv_indices),
+        ("paged_kv_last_page_len", paged_kv_last_page_len),
+        ("workspace_buffer", workspace_buffer),
+    )
+
+
 def _launch_decode(
     runtime: _DecodeRuntime,
     *,
@@ -1620,17 +1709,28 @@ def prims_ts_batch_decode_with_kv_cache(
     ``[pages, Hkv, page_size, D]`` tensors. The metadata uses FlashInfer's
     native CSR page-ID ABI; ``seq_lens`` is explicit and ``max_seq_len`` is the
     exact static maximum used for automatic policy selection and JIT caching.
+    Each request must own enough CSR entries for its live length::
+
+        (seq_lens[b] + page_size - 1) // page_size <= (
+            paged_kv_indptr[b + 1] - paged_kv_indptr[b]
+        )
+
+    The indptr must start at zero, increase strictly, and end at
+    ``paged_kv_indices.numel()``; every live page ID must index ``kv_cache``.
 
     ``workspace_buffer`` must be zero-initialized before its first use and is
     exclusive to one in-flight launch or captured graph. Runtime sequence
     lengths must remain positive and no larger than ``max_seq_len``; this hot
-    path deliberately does not read device metadata back to the host. Warm the
-    semantic key before CUDA graph capture and provide ``out`` to avoid an
-    output allocation. Captured graphs must retain stable ``qo_indptr`` storage;
-    its values may change only while the packed-offset contract remains valid,
-    every delta stays within the compiled bound, and the final offset continues
-    to match the captured query/output extent. ``window_left=-1`` disables the
-    left window; a
+    path deliberately does not read device metadata back to the host. Live CSR,
+    length, page-ID, and packed-Q values may change between completed launches
+    or graph replays only while all of their contracts remain valid. They must
+    not be mutated concurrently with a launch or replay that reads them. Warm
+    the semantic key before CUDA graph capture and provide ``out`` to avoid an
+    output allocation. Captured graphs must retain stable metadata storage;
+    ``qo_indptr`` values may change only while the packed-offset contract
+    remains valid, every delta stays within the compiled bound, and the final
+    offset continues to match the captured query/output extent.
+    ``window_left=-1`` disables the left window; a
     non-negative value requires causal masking and includes the current token.
     No backend fallback or scheduling knob is exposed.
     """
@@ -1717,6 +1817,7 @@ def prims_ts_batch_decode_with_kv_cache(
         device=query.device,
         required_bytes=layout.total_bytes,
     )
+    caller_provided_out = out is not None
     runtime = _prepare_decode_runtime(
         query,
         kv_cache,
@@ -1735,8 +1836,18 @@ def prims_ts_batch_decode_with_kv_cache(
         bmm2_scale=bmm2_scale,
         out=out,
     )
+    if caller_provided_out:
+        _validate_decode_output_aliasing(
+            runtime,
+            seq_lens=seq_lens,
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=None,
+            workspace_buffer=workspace_buffer,
+        )
     compiled_main, compiled_reducer, _, scratch_shapes = _get_compiled_decode(
-        *semantic_key, "dynamic"
+        *semantic_key, "dynamic", "dynamic"
     )
     if scratch_shapes != spec.scratch_shapes:
         raise RuntimeError("FMHA workspace policy changed during compilation")
@@ -1798,12 +1909,18 @@ class BatchDecodePagedTSWrapper:
         every delta remains within the plan bound, and the final offset still
         matches the packed query/output extent fixed by the plan.
 
-        If ``max_kv_len`` is omitted, planning transfers the bounded sequence
-        metadata once to resolve its exact maximum. Supplying the exact maximum
-        avoids that maximum reduction; split-KV plans may still transfer the
-        same metadata once to classify an internal full-prefix specialization.
-        The caller is responsible for keeping an explicit maximum consistent
-        with the metadata.
+        Planning snapshots the bounded derived K/V lengths once on the host,
+        validates that every row is positive, and classifies internal
+        full-prefix and fixed-length specializations. If ``max_kv_len`` is
+        omitted, the metadata maximum becomes the exact plan bound. An explicit
+        value is a static upper bound and planning rejects metadata that exceeds
+        it. The fixed-length specialization is selected only when every row is
+        exactly equal to that bound. Because the launch still uses the planned
+        CSR row starts, both ``paged_kv_indptr`` and
+        ``paged_kv_last_page_len`` values must remain unchanged until the next
+        successful plan. Valid ``paged_kv_indices`` values may be remapped only
+        between completed runs or graph replays; no retained metadata tensor may
+        be mutated concurrently with a run or replay that reads it.
         """
 
         _validate_mask(mask_type)
@@ -1856,22 +1973,28 @@ class BatchDecodePagedTSWrapper:
             o_data_type,
         )
 
+        # Validate the CSR during the plan's existing metadata synchronization
+        # before deriving the device-side lengths used by the raw native path.
+        seq_lens_host = _read_paged_kv_plan_values(
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            page_size=page_size,
+        )
         # This is the only metadata-derived device tensor needed by the raw
         # native path. It remains stable across every run of this plan.
         num_pages = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
         seq_lens = ((num_pages - 1) * page_size + paged_kv_last_page_len).contiguous()
-        seq_lens_host: tuple[int, ...] | None = None
+        metadata_max_kv_len = max(seq_lens_host)
         if max_kv_len is None:
-            # One bounded transfer resolves the exact maximum and can be reused
-            # below if the selected plan needs split-prefix classification.
-            seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
-            exact_max_kv_len = max(seq_lens_host)
-            if exact_max_kv_len <= 0:
-                raise ValueError(
-                    "every planned request must contain at least one KV token"
-                )
+            exact_max_kv_len = metadata_max_kv_len
         else:
             exact_max_kv_len = _validate_positive_int(max_kv_len, "max_kv_len")
+            if metadata_max_kv_len > exact_max_kv_len:
+                raise ValueError(
+                    "planned KV metadata contains a request longer than "
+                    f"max_kv_len ({exact_max_kv_len}): got {metadata_max_kv_len}"
+                )
         exact_max_kv_len = _validate_max_kv_len(exact_max_kv_len, "max_kv_len")
 
         semantic_key = (
@@ -1892,20 +2015,20 @@ class BatchDecodePagedTSWrapper:
             window_left,
         )
         spec = _resolve_decode_launch_spec(*semantic_key)
-        if spec.config.use_split_kv and seq_lens_host is None:
-            # This plan-time classification stays outside every run and graph
-            # replay. Direct S1 plans with an explicit maximum avoid the copy.
-            seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
         static_full_split_prefix = _planned_full_split_prefix(
             spec.config,
-            seq_lens_host or (),
+            seq_lens_host,
             seq_len_q=seq_len_q,
             max_kv_len=exact_max_kv_len,
             mask_type=mask_type,
         )
         kv_prefix_mode = "planned_full" if static_full_split_prefix else "dynamic"
+        kv_lengths_mode = _planned_kv_lengths_mode(
+            seq_lens_host,
+            max_kv_len=exact_max_kv_len,
+        )
         compiled_main, compiled_reducer, policy, scratch_shapes = _get_compiled_decode(
-            *semantic_key, kv_prefix_mode
+            *semantic_key, kv_prefix_mode, kv_lengths_mode
         )
         workspace_layout = _make_decode_workspace_layout(scratch_shapes, o_data_type)
         workspace_buffer = torch.empty(
@@ -1950,6 +2073,7 @@ class BatchDecodePagedTSWrapper:
         self._compiled_main = compiled_main
         self._compiled_reducer = compiled_reducer
         self._kv_prefix_mode = kv_prefix_mode
+        self._kv_lengths_mode = kv_lengths_mode
         self._policy = policy
         self._planned = True
 
@@ -1984,6 +2108,7 @@ class BatchDecodePagedTSWrapper:
                 "packed q token count must match qo_indptr at plan time: "
                 f"expected {self._planned_total_q_tokens}, got {q.shape[0]}"
             )
+        caller_provided_out = out is not None
         runtime = _prepare_decode_runtime(
             q,
             paged_kv_cache,
@@ -2002,6 +2127,16 @@ class BatchDecodePagedTSWrapper:
             bmm2_scale=bmm2_scale,
             out=out,
         )
+        if caller_provided_out:
+            _validate_decode_output_aliasing(
+                runtime,
+                seq_lens=self._seq_lens,
+                qo_indptr=self._qo_indptr,
+                paged_kv_indptr=self._paged_kv_indptr,
+                paged_kv_indices=self._paged_kv_indices,
+                paged_kv_last_page_len=self._paged_kv_last_page_len,
+                workspace_buffer=self._workspace_buffer,
+            )
         return _launch_decode(
             runtime,
             seq_lens=self._seq_lens,

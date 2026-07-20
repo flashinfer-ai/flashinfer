@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Softmax / P-compute helpers for FMHA decode TS resources.
 
@@ -17,9 +10,7 @@ Used by ``TmemSResource`` (softmax reduction, atomic-max scratch),
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Float8E4M3FN, Int32, Uint32
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import T
+from cutlass import Float32, Int32, Uint32
 
 from cutlass.experimental import primitives as prims
 
@@ -40,23 +31,17 @@ def _pack_float4_to_fp8_e4m3(
     v0: Float32, v1: Float32, v2: Float32, v3: Float32
 ) -> Int32:
     """Pack four FP32 values into one FP8 E4M3x4 register."""
-    # Pack four softmax/output values into one 32-bit register in the order
-    # expected by the transposed STSM paths.
-    lo = prims.cvt_f32x2_to_f8x2(
-        v1,
-        v0,
-        Float8E4M3FN,
-        rnd=prims.FPRoundingMode.RN,
-        sat=prims.SaturationMode.SATFINITE,
+    return cute.arch.inline_ptx(
+        "{\n"
+        "  .reg .b16 lo;\n"
+        "  .reg .b16 hi;\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 lo, {$r1}, {$r0};\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 hi, {$r3}, {$r2};\n"
+        "  mov.b32 {$w0}, {lo, hi};\n"
+        "}",
+        write_only_types=[Int32],
+        read_only_args=[v0, v1, v2, v3],
     )
-    hi = prims.cvt_f32x2_to_f8x2(
-        v3,
-        v2,
-        Float8E4M3FN,
-        rnd=prims.FPRoundingMode.RN,
-        sat=prims.SaturationMode.SATFINITE,
-    )
-    return Int32(Uint32(lo) | (Uint32(hi) << Uint32(16)))
 
 
 @cute.jit
@@ -69,28 +54,20 @@ def _pack_float4_to_fp8_e4m3_inline(
     loc=None,
     ip=None,
 ) -> Int32:
-    """Pack FP8x4 in one PTX block without NVVM's join permutation."""
-    packed_i32 = llvm.inline_asm(
-        T.i32(),
-        [
-            Float32(v0).ir_value(loc=loc, ip=ip),
-            Float32(v1).ir_value(loc=loc, ip=ip),
-            Float32(v2).ir_value(loc=loc, ip=ip),
-            Float32(v3).ir_value(loc=loc, ip=ip),
-        ],
+    """Pack FP8x4 in one public inline-PTX block."""
+    return cute.arch.inline_ptx(
         "{\n"
         "  .reg .b16 lo;\n"
         "  .reg .b16 hi;\n"
-        "  cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n"
-        "  cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n"
-        "  mov.b32 $0, {lo, hi};\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 lo, {$r1}, {$r0};\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 hi, {$r3}, {$r2};\n"
+        "  mov.b32 {$w0}, {lo, hi};\n"
         "}",
-        "=r,f,f,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
+        write_only_types=[Int32],
+        read_only_args=[v0, v1, v2, v3],
+        loc=loc,
+        ip=ip,
     )
-    return Int32(packed_i32)
 
 
 @cute.jit

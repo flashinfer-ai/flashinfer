@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """
 Configuration for the FMHA decode TS kernel.
@@ -45,7 +38,6 @@ from .fmha_decode_constants import (
     PARTIAL_STATS_VALUES_PER_ROW,
     Q_REPETITION_GROUP_HEADS,
     Q_ROW_ALIGNMENT_BYTES,
-    PERSISTENT_HIGH_WAVES,
     REDUCTION_BYTES_PER_SLICE,
     REDUCTION_THREADS_PER_CTA,
     SPLIT_KV_MIN_TILES_PER_CTA,
@@ -241,10 +233,10 @@ _GROUPED_Q_MMA_TILES = (
     ("keeps_mma_ab", 128),
 )
 
-# Empirical GQA-generation factors from TRTLLM-gen FmhaAutoTuner.cpp at
-# da589566365382ba94794af12d7fb6d322b902e0.  TS reuses the measured relative
-# costs but resolves its own legal profiles, Q geometry, split fanout, and CGA
-# promotion instead of copying TRTLLM-gen's final shape policy.
+# Empirical GQA-generation factors from TRTLLM-gen's FmhaAutoTuner.cpp. TS
+# reuses the measured relative costs but resolves its own legal profiles, Q
+# geometry, split fanout, and CGA promotion instead of copying TRTLLM-gen's
+# final shape policy.
 _GROUPED_Q_MAINLOOP_COST = {
     8: 1.0,
     16: 1.2,
@@ -588,6 +580,30 @@ class FmhaDecodeConfig:
             self.tile_size_q,
             self.heads_q_per_kv,
             self.groups_tokens_heads_q,
+        )
+
+    @property
+    def num_q_ctas(self) -> int:
+        """Return Q-CTA groups per ``(batch, KV head)`` launch tile.
+
+        Shape-aware decode configs always carry a positive head ratio. Keep
+        raw shape-less configs conservative so this scheduling predicate can
+        never specialize geometry that has not been resolved yet.
+        """
+        if self.heads_q_per_kv <= 0 or self.max_seq_len_q <= 0:
+            return max(self.max_seq_len_q, 1)
+        q_geometry = make_q_tile_geometry(
+            rows_per_cta=self.tile_size_q,
+            heads_q_per_kv=self.heads_q_per_kv,
+            groups_tokens_heads_q=self.groups_tokens_heads_q,
+        )
+        return max(q_geometry.num_q_ctas(self.max_seq_len_q), 1)
+
+    @property
+    def has_single_q_cta(self) -> bool:
+        """Whether every physical split maps to one logical Q CTA."""
+        return (
+            self.heads_q_per_kv > 0 and self.max_seq_len_q > 0 and self.num_q_ctas == 1
         )
 
     @property
@@ -1122,11 +1138,10 @@ class FmhaDecodeConfig:
             and self.q_manual_padding_rows == 0
             and profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES
             and self.supports_grouped_keeps
-            # TileQ64's staged one-instance TMEM-P schedule relies on the
-            # original per-row mask shape for its best generated code.  Its
-            # TileQ128 sibling and every two-instance profile benefit from the
-            # guarded-output fast path below.
-            and not (self.uses_tmem_p and self.tile_size_q == 64)
+            # The staged TileQ64 one-instance TMEM-P schedule keeps per-row
+            # score masking because its generated code is sensitive to that
+            # control-flow shape.
+            and not (self.uses_staged_one_inst_tmem_p and self.tile_size_q == 64)
         )
 
     @property
@@ -1137,7 +1152,7 @@ class FmhaDecodeConfig:
         launch, structural padding and a partial final token group therefore
         cannot affect a valid row; direct output, split scratch, and reduction
         publication already guard row validity. Keep the staged one-instance
-        TileQ64/D256 exception on its established score-mask path because its
+        TileQ64/D256 exception on its per-row score-mask path because its
         generated schedule is sensitive to that control-flow shape.
         """
         profile = (
@@ -1155,7 +1170,7 @@ class FmhaDecodeConfig:
             and not self.use_variable_seqlens_q
             and profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES
             and self.supports_grouped_keeps
-            and not (self.uses_tmem_p and self.tile_size_q == 64)
+            and not (self.uses_staged_one_inst_tmem_p and self.tile_size_q == 64)
         )
 
     @property
@@ -1247,7 +1262,24 @@ class FmhaDecodeConfig:
     @property
     def uses_q_cta_sliding_union(self) -> bool:
         """Whether the causal/window KV union depends on the logical Q CTA."""
-        return self.mask_type == CAUSAL and self.max_seq_len_q > 1
+        return (
+            self.mask_type == CAUSAL
+            and self.max_seq_len_q > 1
+            and not self.has_single_q_cta
+        )
+
+    @property
+    def uses_runtime_q_kv_union(self) -> bool:
+        """Whether task/resource KV geometry must retain runtime Q metadata.
+
+        Multiple causal Q CTAs have distinct right bounds. A multi-token
+        sliding-window launch also retains the runtime path even when it fits
+        in one Q CTA, because the existing static window-prefix metadata is
+        specialized only for SQ1.
+        """
+        return self.uses_q_cta_sliding_union or (
+            self.use_sliding_window_causal and self.max_seq_len_q > 1
+        )
 
     @property
     def uses_tmem_p(self) -> bool:
@@ -1256,7 +1288,7 @@ class FmhaDecodeConfig:
 
     @property
     def uses_staged_one_inst_tmem_p(self) -> bool:
-        """Whether P uses the established staged-D256 TMEM overlay."""
+        """Whether P uses the double-buffered D256 TMEM overlay."""
         return (
             self.use_keeps_mma_ab
             and self.headdim == 256
@@ -1267,33 +1299,24 @@ class FmhaDecodeConfig:
 
     @property
     def uses_two_inst_tmem_p(self) -> bool:
-        """Whether a two-instance FP8 Keeps profile uses the TMEM-P overlay.
+        """Whether a two-instance Keeps profile uses the TMEM-P overlay.
 
-        Q64 and Q128 are structurally legal. This internal profitability choice
-        retains the overlay only for Q128, whose packed P row occupies 32 TMEM
-        columns. Q64 uses SMEM-P because its non-aliasing P storage permits
-        earlier S-stage release and measured faster than paired-half-warp
-        TMEM-P.
+        Q128 amortizes the TMEM publication and needs the overlay to avoid the
+        larger SMEM-P footprint. Q64's paired-half-warp publication keeps S
+        live longer than its SMEM path, which can release S immediately and
+        overlap the next QK wave.
         """
-        # Persistent scheduling was historically excluded here because the
-        # softmax stats payload aliased the same S columns, tying the
-        # overwrite-credit cadence to each instruction. Stats no longer
-        # alias S in any Keeps profile (standalone TMEM columns or the SMEM
-        # ring via keeps_stats_via_smem), so the TMEM-P overlay is legal for
-        # persistent work tiles as well; TRTLLM-gen stores P to TMEM on the
-        # matching persistent recipe. The overlay is retained only for the
-        # full-width 32-register Q128 row. Q64's paired-half-warp STTM keeps S
-        # live through P publication, while its SMEM-P layout can release S
-        # immediately after the register load and overlap the next QK wave.
-        tmem_p_layout_is_profitable = self.tile_size_q == 128
+        # Two-instance Keeps keeps stats outside S, so both static and persistent
+        # work tiles can overlay P on the consumed S instance. The split K/V
+        # schedule preserves same-instance PV -> QK order, while Softmax delays
+        # S release through STTM completion and the P-pipeline commit.
         return (
             self.use_keeps_mma_ab
-            and self.use_fp8_qkv
+            and self.tile_size_q == 128
             and self.tile_size_kv == 128
             and self.head_dim_per_stage_kv == 0
             and self.num_insts_kv == 2
             and self.o_stages == 2
-            and tmem_p_layout_is_profitable
             and self.tmem_total_cols <= 512
         )
 
@@ -2076,9 +2099,9 @@ def _select_auto_launch_mode(
           tens of CTAs unlocks the remaining bandwidth.
 
       ``"persistent"``
-          Switch to the CLC dynamic persistent scheduler after one resident
-          CTA wave for short per-CTA work, or after three waves for longer
-          work. Both gates are occupancy/work based and shape independent.
+          Switch to the CLC dynamic persistent scheduler whenever the direct
+          launch contains more than one resident CTA wave. Persistence has no
+          launch work to eliminate within one wave.
 
       ``"static"``
           Everything else. The default static grid is a good fit when the
@@ -2095,9 +2118,7 @@ def _select_auto_launch_mode(
     tiles_per_cta = (seq_len_kv + tile_size_kv - 1) // tile_size_kv
     if waves < 1 and tiles_per_cta >= SPLIT_KV_MIN_TILES_PER_CTA:
         return "gmem_reduction"
-    if ctas > sm_count and (
-        waves >= PERSISTENT_HIGH_WAVES or tiles_per_cta <= SPLIT_KV_MIN_TILES_PER_CTA
-    ):
+    if ctas > sm_count:
         return "persistent"
     return "static"
 
@@ -2445,22 +2466,10 @@ def _apply_auto_grouped_q_mma_config(
             headdim=cfg.headdim,
         )
     _apply_grouped_q_mma_candidate(cfg, selected.mma)
-    persistent_wave_threshold = service_capacity
-    if selected.mma.tile_size_q >= 128:
-        # A measured B200 scheduler A/B on the pinned Q128 grouped recipe
-        # (2026-07-09, KV16384, 500-iter screens) showed the CLC path costs
-        # +1.8%/+0.9%/+0.3% at 0.86/1.73/2.16 waves and only wins (-1.2%) at
-        # 3.46 waves: the long Q128 mainloop amortizes launch overhead well
-        # enough that a static multi-wave grid stays ahead until deep
-        # multi-wave occupancy. Narrower grouped tiles (Q64, e.g. GPT-OSS
-        # D64) measured the opposite (+8.3% -> +13.5% when forced static), so
-        # they keep the original half-wave transition below.
-        persistent_wave_threshold = 4 * service_capacity
-    if selected.splits_kv == 1 and selected.base_ctas * 2 > persistent_wave_threshold:
-        # Match the grouped-generation launch transition used by TRTLLM-gen:
-        # once the direct Q grid consumes more than the profile's wave
-        # threshold, no second KV split fits. The direct kernel then uses CLC
-        # persistent work scheduling rather than a static multi-wave grid.
+    if selected.splits_kv == 1 and selected.base_ctas > service_capacity:
+        # CLC persistence pays for work discovery by reusing one resident CTA
+        # wave. Select it only when the direct launch has more than one wave;
+        # a single-wave grid has no launch work for persistence to eliminate.
         persistent_probe = deepcopy(cfg)
         persistent_probe.use_persistent_scheduler = True
         try:
@@ -2551,17 +2560,18 @@ def _should_auto_select_launch_mode(
 ) -> bool:
     """Return whether automatic launch-mode selection is allowed for this shape."""
     single_query = seq_len_q == 1
-    fixed_full_grouped_query = (
-        cfg.groups_tokens_heads_q and seq_len_q > 1 and cfg.q_tiles_are_full
-    )
+    grouped_query = cfg.groups_tokens_heads_q and seq_len_q > 1
     return (
         auto_tuner
         and split_kv_mode == "disabled"
         and not cfg.use_persistent_scheduler
-        and not cfg.use_variable_seqlens_q
-        and not cfg.use_sliding_window_causal
         and not cfg.use_attention_sinks
-        and (single_query or fixed_full_grouped_query)
+        and (
+            single_query
+            or grouped_query
+            or cfg.use_variable_seqlens_q
+            or cfg.use_sliding_window_causal
+        )
     )
 
 
@@ -2601,6 +2611,14 @@ def _apply_auto_launch_mode(
         seq_len_kv=seq_len_kv,
         num_q_tiles=_num_q_tiles_for_launch(cfg),
     )
+    if (cfg.use_variable_seqlens_q or cfg.use_sliding_window_causal) and mode == (
+        "gmem_reduction"
+    ):
+        # Runtime Q offsets and sliding-window bounds are compatible with CLC
+        # work discovery, but they deliberately remain nonsplit. Underfilled
+        # grids therefore stay direct while grids above one resident wave use
+        # the same structural persistence rule as fixed-Q decode.
+        return split_kv_mode
     if mode not in ("gmem_reduction", "persistent"):
         return split_kv_mode
 
@@ -2796,7 +2814,11 @@ def _validate_profile_support(
     if cfg.mask_type not in (DENSE, CAUSAL):
         raise ValueError("mask_type must be DENSE or CAUSAL")
     if cfg.use_paged_kv:
-        validate_page_size(cfg.num_tokens_per_page)
+        validate_paged_kv_staging_config(
+            tile_size_kv=cfg.tile_size_kv,
+            num_tokens_per_page=cfg.num_tokens_per_page,
+            page_offsets_num_warps=cfg.page_offsets_num_warps,
+        )
     if num_heads_q % num_heads_kv != 0:
         raise ValueError("fmha_decode requires num_heads_q divisible by num_heads_kv")
     heads_q_per_kv = num_heads_q // num_heads_kv
@@ -3086,6 +3108,29 @@ def validate_page_size(num_tokens_per_page: int) -> None:
         raise ValueError("num_tokens_per_page must divide the 128-token KV tile")
 
 
+def validate_paged_kv_staging_config(
+    *,
+    tile_size_kv: int,
+    num_tokens_per_page: int,
+    page_offsets_num_warps: int,
+) -> None:
+    """Validate page-ID staging geometry and its single producer-warp contract."""
+    validate_page_size(num_tokens_per_page)
+    if tile_size_kv <= 0:
+        raise ValueError("paged-KV tile_size_kv must be positive")
+    if tile_size_kv % num_tokens_per_page != 0:
+        raise ValueError(
+            "paged-KV num_tokens_per_page must divide tile_size_kv exactly"
+        )
+    pages_per_tile = tile_size_kv // num_tokens_per_page
+    if pages_per_tile not in (1, 2, 4, 8):
+        raise ValueError("paged-KV staging supports 1, 2, 4, or 8 pages per KV tile")
+    if page_offsets_num_warps != 1:
+        raise ValueError(
+            "paged-KV page-offset staging requires exactly one producer warp"
+        )
+
+
 def make_decode_config(
     headdim: int = 128,
     args: object | None = None,
@@ -3128,9 +3173,11 @@ def make_decode_config(
        mainloop-plus-reduction proxy using their actual Q-grid CTA waves.
        TileQ128 remains automatic over TileQ64 only for staged D256.
     3. Shapes outside that qualified joint selector retain the general launch
-       policy: under-filled long-sequence grids use split-KV GMEM reduction,
-       many waves of small CTAs may use persistent scheduling, and the rest
-       stay static. An unsupported automatic mode falls back to direct.
+       policy: under-filled fixed-Q long-sequence grids use split-KV GMEM
+       reduction, direct grids above one resident wave use persistent
+       scheduling, and the rest stay static. Packed-Q and sliding-window grids
+       remain nonsplit but use the same structural persistence boundary. An
+       unsupported automatic mode falls back to direct.
     4. If split-KV is selected or requested, compute the split fanout from the
        effective KV length, requested split count, max split cap, SM count, and
        ``batch_size * num_heads_kv * q_tiles`` physical grid size.
@@ -3141,9 +3188,8 @@ def make_decode_config(
        may search downward for a one-wave CGA split.
     6. Validate the final profile combination before returning the config.
 
-    Packed Q, sliding-window causal, and attention-sink paths skip automatic
-    launch-mode selection because their additional scheduling constraints are
-    not modeled by the heuristic. Explicit launch modes are still validated.
+    Attention-sink paths skip automatic launch-mode selection. Explicit launch
+    modes are still validated.
     """
     shape_values = (seq_len_kv, batch_size, num_heads_q, num_heads_kv)
     if all(value is None for value in shape_values):
@@ -3239,10 +3285,9 @@ def make_decode_config(
             mask_type=cfg.mask_type,
         )
 
-    # Auto launch-mode selection. Only kicks in if the caller hasn't
-    # already opted into a specific mode and the shape isn't using a path
-    # the heuristic hasn't been validated for (sliding window, attention
-    # sinks).
+    # Auto launch-mode selection. Only kicks in if the caller has not already
+    # opted into a specific mode. Packed-Q and sliding-window shapes may select
+    # CLC persistence, but remain nonsplit.
     if grouped_q_launch is not None:
         if grouped_q_launch.splits_kv > 1:
             split_kv_mode = grouped_q_launch.split_kv_mode

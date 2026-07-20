@@ -1,23 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Reusable low-level operations for MLA decode TS kernels."""
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float8E4M3FN, Float32, Int32, Int64, Uint32
-from cutlass._mlir.dialects import vector as vector_d
-from cutlass._mlir.dialects import nvvm as nvvm_raw
-from cutlass._mlir.dialects.nvvm import Tcgen05LdStShape
-from cutlass.cutlass_dsl import T
-from cutlass._mlir_helpers.vector import Vector
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.experimental import primitives as cprims
 
 from .constants import (
@@ -39,7 +27,7 @@ from .constants import (
 
 
 primitives_inline_ptx = cprims.inline_ptx
-"""CTM inline PTX entry point used by MLA helper ops."""
+"""Public primitive inline-PTX entry point used by MLA helper ops."""
 
 inline_ptx = cute.arch.inline_ptx
 """CuTe inline PTX entry point used by MLA helper ops."""
@@ -94,22 +82,17 @@ def softmax_sum_state_ptr(state_ptr):
 @cutlass.dsl_user_op
 def vector_from_scalars(values, dtype, *, loc=None, ip=None):
     """Pack scalar register values into a DSL vector."""
-    elems = []
-    for value in values:
-        typed_value = dtype(value)
-        elems.append(typed_value.ir_value(loc=loc, ip=ip))
-    vec_ty = T.vector(len(elems), dtype.mlir_type)
-    return Vector(
-        vector_d.from_elements(vec_ty, elems, loc=loc, ip=ip),
-        dtype=dtype,
+    return cutlass.Vector.from_elements(
+        tuple(dtype(value) for value in values),
+        dtype,
         loc=loc,
         ip=ip,
     )
 
 
 @cutlass.dsl_user_op
-def nvvm_fmax(a, b, *, loc=None, ip=None):
-    """Return the NVVM fmax of two values as Float32."""
+def fmax_f32(a, b, *, loc=None, ip=None):
+    """Return the maximum of two values as Float32."""
     return Float32(
         cute.math.max(Float32(a), Float32(b), ftz=True, loc=loc, ip=ip),
         loc=loc,
@@ -118,11 +101,11 @@ def nvvm_fmax(a, b, *, loc=None, ip=None):
 
 
 @cutlass.dsl_user_op
-def nvvm_warp_reduction_max(val, *, loc=None, ip=None):
+def warp_reduce_max_f32(val, *, loc=None, ip=None):
     """Reduce a Float32 value to the warp maximum with butterfly shuffles."""
     val = Float32(val)
     for dist in WARP_REDUCTION_BFLY_DISTANCES:
-        val = nvvm_fmax(
+        val = fmax_f32(
             val,
             Float32(
                 cprims.shfl_sync(
@@ -142,7 +125,7 @@ def nvvm_warp_reduction_max(val, *, loc=None, ip=None):
 
 
 @cutlass.dsl_user_op
-def nvvm_warp_reduction_sum(val, *, loc=None, ip=None):
+def warp_reduce_sum_f32(val, *, loc=None, ip=None):
     """Reduce a Float32 value to the warp sum with butterfly shuffles."""
     val = Float32(val)
     for dist in WARP_REDUCTION_BFLY_DISTANCES:
@@ -171,23 +154,17 @@ def tcgen05_ld_16x32bx2_f32(
     ip=None,
 ):
     """Load Float32 registers from a split 16x32bx2 TMEM tile."""
-    tmem_value = tmem_addr.ir_value() if hasattr(tmem_addr, "ir_value") else tmem_addr
-    offset_value = Int64(offset).ir_value(loc=loc, ip=ip)
-    result = nvvm_raw.tcgen05_ld(
-        T.i32() if num == 1 else T.vector(num, T.i32()),
-        Tcgen05LdStShape.SHAPE_16X32BX2,
-        tmem_value,
-        offset=offset_value,
+    result = cprims.tcgen05_ld(
+        cprims.Tcgen05LdStShape.SHAPE_16X32BX2,
+        tmem_addr,
+        num=num,
+        offset=Int64(offset),
         loc=loc,
         ip=ip,
     )
     if num == 1:
-        return Int32(result).bitcast(Float32, loc=loc, ip=ip)
-    return Vector(result, dtype=Int32, loc=loc, ip=ip).bitcast(
-        Float32,
-        loc=loc,
-        ip=ip,
-    )
+        return result[0]
+    return result
 
 
 @cutlass.dsl_user_op
@@ -200,15 +177,11 @@ def tcgen05_st_16x32bx2_f32(
     ip=None,
 ):
     """Store Float32 registers to a split 16x32bx2 TMEM tile."""
-    tmem_value = tmem_addr.ir_value() if hasattr(tmem_addr, "ir_value") else tmem_addr
-    offset_value = Int64(offset).ir_value(loc=loc, ip=ip)
-    value_i32 = value.bitcast(Int32, loc=loc, ip=ip)
-    value_ir = value_i32.ir_value() if hasattr(value_i32, "ir_value") else value_i32
-    nvvm_raw.tcgen05_st(
-        Tcgen05LdStShape.SHAPE_16X32BX2,
-        tmem_value,
-        value_ir,
-        offset=offset_value,
+    cprims.tcgen05_st(
+        cprims.Tcgen05LdStShape.SHAPE_16X32BX2,
+        tmem_addr,
+        value,
+        offset=Int64(offset),
         loc=loc,
         ip=ip,
     )
@@ -217,21 +190,20 @@ def tcgen05_st_16x32bx2_f32(
 @cute.jit
 def pack_float4_to_fp8_e4m3(v0: Float32, v1: Float32, v2: Float32, v3: Float32):
     """Pack four Float32 values into one E4M3 x4 register."""
-    lo = cprims.cvt_f32x2_to_f8x2(
-        v1,
-        v0,
-        Float8E4M3FN,
-        rnd=cprims.FPRoundingMode.RN,
-        sat=cprims.SaturationMode.SATFINITE,
+    # Spell the canonical pair conversions through CuTe's public inline-PTX
+    # operation so the generated f8x2 instruction receives only its supported
+    # operands.
+    return inline_ptx(
+        "{\n"
+        "  .reg .b16 lo;\n"
+        "  .reg .b16 hi;\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 lo, {$r1}, {$r0};\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 hi, {$r3}, {$r2};\n"
+        "  mov.b32 {$w0}, {lo, hi};\n"
+        "}",
+        write_only_types=[Int32],
+        read_only_args=[v0, v1, v2, v3],
     )
-    hi = cprims.cvt_f32x2_to_f8x2(
-        v3,
-        v2,
-        Float8E4M3FN,
-        rnd=cprims.FPRoundingMode.RN,
-        sat=cprims.SaturationMode.SATFINITE,
-    )
-    return Int32(Uint32(lo) | (Uint32(hi) << Uint32(16)))
 
 
 @cute.jit

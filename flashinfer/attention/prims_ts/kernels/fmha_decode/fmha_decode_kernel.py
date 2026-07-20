@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """FMHA decode TS kernel assembly.
 
@@ -43,6 +36,7 @@ from ..tensor_map import (
 from cutlass.experimental.task_scheduling.enums import PipelineType
 from cutlass.experimental.task_scheduling.memory import (
     ResourceContext,
+    SmemAllocation,
     SmemAllocator,
     TmemAllocator,
 )
@@ -55,7 +49,7 @@ from cutlass.experimental.task_scheduling.resources import (
 from cutlass.experimental.task_scheduling.task import Task
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 
-from .fmha_decode_config import FmhaDecodeConfig
+from .fmha_decode_config import FmhaDecodeConfig, validate_paged_kv_staging_config
 from .fmha_decode_constants import KV_KIND_K, KV_KIND_V
 from .fmha_decode_resources import (
     SmemKvTileResource,
@@ -96,11 +90,21 @@ from .fmha_decode_tasks import (
     create_softmax1_task,
 )
 
-_PERSISTENT_WORK_ID_STAGES = 2
 from .reduction import (  # noqa: F401
     decode_gen_separate_reduction_kernel,
     fmha_decode_separate_reduction_launch,
 )
+
+_PERSISTENT_WORK_ID_STAGES = 2
+
+
+def _stages_page_ids_per_tile(uses_paired_page_offset_resources: bool) -> bool:
+    """Return whether each published page-offset stage owns exactly one tile."""
+
+    # Shared resources retain an aligned 32-ID window so all lanes issue one
+    # coalesced page-table transaction. Paired K0/K1 and V0/V1 resources use
+    # exact per-tile stages so a pair may safely cross a 32-ID boundary.
+    return uses_paired_page_offset_resources
 
 
 def _compute_decode_gen_loop_domain(total_kv_tiles: int, num_insts_kv: int) -> int:
@@ -199,6 +203,7 @@ def _build_decode_gen_schedule(
     clc_response_ptr: cute.Pointer | None = None,
     use_variable_seqlens_kv: bool = False,
     use_native_paged_kv: bool = False,
+    use_static_native_seqlens_kv: bool = False,
     paged_kv_indptr: cute.Pointer | None = None,
     paged_kv_indices: cute.Pointer | None = None,
 ) -> tuple[
@@ -237,6 +242,12 @@ def _build_decode_gen_schedule(
         )
     if use_native_paged_kv and not cfg.use_paged_kv:
         raise ValueError("native paged-KV ABI requires cfg.use_paged_kv=True")
+    if cfg.use_paged_kv:
+        validate_paged_kv_staging_config(
+            tile_size_kv=cfg.tile_size_kv,
+            num_tokens_per_page=cfg.num_tokens_per_page,
+            page_offsets_num_warps=cfg.page_offsets_num_warps,
+        )
     if corr_max_seq_len_kv is None:
         corr_max_seq_len_kv = max_seq_len_kv
     if h_k_idx is None:
@@ -263,10 +274,8 @@ def _build_decode_gen_schedule(
     )
     load_grp = pipeline.CooperativeGroup(Agent.Thread, cfg.load_num_warps * WARP_SIZE)
     umma_hw = pipeline.CooperativeGroup(Agent.Thread)
-    # Construction validates the configured group size; no pipeline binds it.
-    mma_grp = pipeline.CooperativeGroup(  # noqa: F841
-        Agent.Thread, cfg.mma_num_warps * WARP_SIZE
-    )
+    # The staged one-instance S/P overlay uses this group for overwrite credit.
+    mma_grp = pipeline.CooperativeGroup(Agent.Thread, cfg.mma_num_warps * WARP_SIZE)
     softmax0_grp = pipeline.CooperativeGroup(
         Agent.Thread, cfg.softmax0_num_warps * WARP_SIZE
     )
@@ -281,9 +290,11 @@ def _build_decode_gen_schedule(
     )
 
     # ------------------------------------------------------------------
-    # Pipeline configs — ALL with manual barrier_ptr
-    # (SmemAllocator.assign_barrier_ptrs doesn't work reliably in kernel)
+    # Pipeline configs
     # ------------------------------------------------------------------
+    # Leave barrier_ptr unset so SmemAllocator packs every pipeline barrier
+    # into the unified block. Separate barrier arrays create an alignment gap
+    # before the 1024-byte-aligned data block and overflow near-capacity Q128.
     use_paged_kv = cfg.use_paged_kv
     use_one_inst_qkv = cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1
     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
@@ -348,24 +359,18 @@ def _build_decode_gen_schedule(
     split_head_dim_page_offsets_kv = (
         use_paged_kv and use_split_head_dim_kv and not use_one_inst_qkv
     )
-
-    # Pipeline configs — each pipeline gets its own SMEM barrier allocation
-    # (matching the working test_minimal_rts.py pattern)
-    def _bar(n_stages: int) -> cute.Pointer | None:
-        """Allocate the SMEM barrier storage for one pipeline config."""
-        if tma_desc_q is None:
-            return None  # validation mode
-        b = cutlass.Array(cutlass.Int64, n_stages * 2, space=cutlass.AddressSpace.smem)
-        return cute.make_ptr(
-            cutlass.Int64, b.data_ptr(), mem_space=cutlass.AddressSpace.smem
-        )
+    # Paired resources publish independent K0/K1 and V0/V1 stages. Shared
+    # split-KV retains the aligned 32-ID representation for its optional
+    # native held-window path.
+    stage_page_ids_per_tile = _stages_page_ids_per_tile(
+        split_head_dim_page_offsets_kv,
+    )
 
     smem_q_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.q_stages,
         num_bytes=cfg.smem_q_tile_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
-        barrier_ptr=_bar(cfg.q_stages),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -374,7 +379,6 @@ def _build_decode_gen_schedule(
         num_bytes=cfg.smem_kv_tile_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
-        barrier_ptr=_bar(cfg.kv_stages),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -383,7 +387,6 @@ def _build_decode_gen_schedule(
         num_bytes=cfg.smem_kv_tile_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
-        barrier_ptr=_bar(split_k0_stages),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -392,7 +395,6 @@ def _build_decode_gen_schedule(
         num_bytes=cfg.smem_kv_tile_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
-        barrier_ptr=_bar(split_k1_stages),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -401,7 +403,6 @@ def _build_decode_gen_schedule(
         num_bytes=cfg.smem_kv_tile_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
-        barrier_ptr=_bar(split_v0_stages),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -410,7 +411,6 @@ def _build_decode_gen_schedule(
         num_bytes=cfg.smem_kv_tile_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
-        barrier_ptr=_bar(split_v1_stages),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -425,7 +425,6 @@ def _build_decode_gen_schedule(
             producer_group=page_offsets_grp,
             consumer_group=load_grp,
             pipeline_type=PipelineType.AsyncAsync,
-            barrier_ptr=_bar(num_stages),
             cta_layout_vmnk=cta_layout,
             advance_on_wait=True,
         )
@@ -448,7 +447,6 @@ def _build_decode_gen_schedule(
         producer_group=umma_hw,
         consumer_group=softmax0_grp,
         pipeline_type=PipelineType.UmmaAsync,
-        barrier_ptr=_bar(one_inst_tmem_stages),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -458,7 +456,6 @@ def _build_decode_gen_schedule(
         producer_group=umma_hw,
         consumer_group=softmax1_grp,
         pipeline_type=PipelineType.UmmaAsync,
-        barrier_ptr=_bar(1),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -468,7 +465,6 @@ def _build_decode_gen_schedule(
         producer_group=softmax0_grp,
         consumer_group=umma_hw,
         pipeline_type=PipelineType.AsyncUmma,
-        barrier_ptr=_bar(one_inst_tmem_stages),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -478,7 +474,6 @@ def _build_decode_gen_schedule(
         producer_group=softmax1_grp,
         consumer_group=umma_hw,
         pipeline_type=PipelineType.AsyncUmma,
-        barrier_ptr=_bar(1),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -488,7 +483,6 @@ def _build_decode_gen_schedule(
         producer_group=umma_hw,
         consumer_group=correction_grp,
         pipeline_type=PipelineType.UmmaAsync,
-        barrier_ptr=_bar(cfg.o_stages),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -498,7 +492,6 @@ def _build_decode_gen_schedule(
         producer_group=softmax0_grp,
         consumer_group=correction_grp,
         pipeline_type=PipelineType.AsyncAsync,
-        barrier_ptr=_bar(one_inst_tmem_stages),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
@@ -509,17 +502,24 @@ def _build_decode_gen_schedule(
         producer_group=softmax1_grp,
         consumer_group=correction_grp,
         pipeline_type=PipelineType.AsyncAsync,
-        barrier_ptr=_bar(1),
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
 
-    # Keeps profiles whose stats payload would alias S route the payload
-    # through an SMEM ring instead (cfg.keeps_stats_via_smem), so no
-    # stats-done credit pipeline has to gate QK re-issue on correction's
-    # stats read. Profiles with standalone TMEM stats never needed one.
+    # Two-instance Keeps keeps stats outside S and orders each same-instance PV
+    # before the next QK, so it needs no stats-done credit.
+    # The staged one-instance path needs an overwrite-credit gate across its
+    # double-buffered S/P overlay: correction returns the stage credit before
+    # MMA can reissue QK into those columns.
     stats_done0_cfg = None
     stats_done1_cfg = None
+    if use_one_inst_qkv:
+        stats_done0_cfg = PipelineConfig.create_async_async_pipeline_cfg(
+            num_stages=one_inst_tmem_stages,
+            producer_group=mma_grp,
+            consumer_group=correction_grp,
+            cta_layout_vmnk=cta_layout,
+        )
 
     # tmemSoftmaxGlobal, tmemCorr: no pipeline (pipeline_config=None)
 
@@ -528,8 +528,10 @@ def _build_decode_gen_schedule(
     # ------------------------------------------------------------------
     work_queue = None
     work_id_throttle = None
-    # Persistent scheduling uses the CLC dynamic scheduler. Split-KV mode
-    # disables persistent scheduling at config-construction time.
+    # CLC remains the single persistent policy for every supported topology.
+    # The stock static WorkQueue advances and decodes coordinates separately
+    # in every task, which regresses multi-wave decode workloads. CLC computes
+    # each work ID once on the scheduler warp and broadcasts it to the workers.
     use_clc_dynamic = cfg.use_persistent_scheduler
     if use_clc_dynamic:
         num_consumer_threads = 16 * WARP_SIZE
@@ -564,11 +566,9 @@ def _build_decode_gen_schedule(
                 producer_group=load_grp,
                 consumer_group=scheduler_grp,
                 cta_layout_vmnk=cta_layout,
-                barrier_ptr=_bar(_PERSISTENT_WORK_ID_STAGES),
             ),
             name="work_id_throttle",
         )
-
     smem_q = SmemQResource(
         pipeline_config=smem_q_cfg,
         cfg=cfg,
@@ -581,17 +581,19 @@ def _build_decode_gen_schedule(
         name="smemQ",
     )
     # FlashInfer materializes one canonical sequence-length tensor from its
-    # native CSR metadata. Native mode therefore reuses every existing DKG
-    # variable-length domain, split, sliding-window, and masking path.
-    kv_seqlens = (
-        seqlens_kv if (use_variable_seqlens_kv or use_native_paged_kv) else None
+    # native CSR metadata, so native mode reuses the existing variable-length
+    # domain, split, sliding-window, and masking paths.
+    use_runtime_seqlens_kv = use_variable_seqlens_kv or (
+        use_native_paged_kv and not use_static_native_seqlens_kv
     )
+    kv_seqlens = seqlens_kv if use_runtime_seqlens_kv else None
     smem_page_offsets = None
     smem_page_offsets_v = None
     if use_paged_kv:
         smem_page_offsets = SmemPageOffsetsKvResource(
             pipeline_config=smem_page_offsets_cfg,
             cfg=cfg,
+            stage_page_ids_per_tile=stage_page_ids_per_tile,
             page_idx_kv=page_idx_kv,
             seqlens_kv=kv_seqlens,
             use_native_paged_kv=use_native_paged_kv,
@@ -612,6 +614,7 @@ def _build_decode_gen_schedule(
             smem_page_offsets_v = SmemPageOffsetsKvResource(
                 pipeline_config=smem_page_offsets_v_cfg,
                 cfg=cfg,
+                stage_page_ids_per_tile=stage_page_ids_per_tile,
                 page_idx_kv=page_idx_kv,
                 seqlens_kv=kv_seqlens,
                 use_native_paged_kv=use_native_paged_kv,
@@ -748,7 +751,7 @@ def _build_decode_gen_schedule(
         pipeline_config=smem_p0_cfg,
         cfg=cfg,
         scale_softmax_log2=scale_softmax_log2,
-        use_variable_seqlens_kv=(use_variable_seqlens_kv or use_native_paged_kv),
+        use_variable_seqlens_kv=use_runtime_seqlens_kv,
         name="smemP0",
     )
     smem_p1 = SmemPResource(
@@ -756,7 +759,7 @@ def _build_decode_gen_schedule(
         pipeline_config=smem_p1_cfg,
         cfg=cfg,
         scale_softmax_log2=scale_softmax_log2,
-        use_variable_seqlens_kv=(use_variable_seqlens_kv or use_native_paged_kv),
+        use_variable_seqlens_kv=use_runtime_seqlens_kv,
         name="smemP1",
     )
 
@@ -1231,9 +1234,9 @@ def _build_decode_gen_schedule(
                 dma_consumer_release_labels.update(
                     {
                         (smem_page_offsets, smem_k0): {"read_offsets_k0"},
-                        (smem_page_offsets, smem_k1): {"read_offsets_k0"},
+                        (smem_page_offsets, smem_k1): {"read_offsets_k1"},
                         (smem_page_offsets_v, smem_v0): {"read_offsets_v0"},
-                        (smem_page_offsets_v, smem_v1): {"read_offsets_v0"},
+                        (smem_page_offsets_v, smem_v1): {"read_offsets_v1"},
                     }
                 )
             else:
@@ -1246,7 +1249,9 @@ def _build_decode_gen_schedule(
                     }
                 )
         else:
-            dma_consumer_release_labels[(smem_page_offsets, smem_kv)] = {"read_offsets"}
+            dma_consumer_release_labels[(smem_page_offsets, smem_kv)] = {
+                "cache_page_ids" if cfg.num_head_dim_stages_kv > 1 else "read_offsets"
+            }
     if smem_kv is not None:
         dma_consumer_release_labels.update(
             {
@@ -1260,6 +1265,10 @@ def _build_decode_gen_schedule(
     # SMEM / TMEM allocators
     # ------------------------------------------------------------------
     smem_allocator = SmemAllocator()
+    if work_queue is not None:
+        smem_allocator.add_resource(work_queue)
+    if work_id_throttle is not None:
+        smem_allocator.add_resource(work_id_throttle)
     smem_allocator.add_resource(smem_q)
     if smem_page_offsets is not None:
         smem_allocator.add_resource(smem_page_offsets)
@@ -1291,6 +1300,9 @@ def _build_decode_gen_schedule(
     smem_allocator.add_resource(tmem_corr0)
     if not use_one_inst_qkv:
         smem_allocator.add_resource(tmem_corr1)
+    smem_allocator.add_tmem_ptr(
+        SmemAllocation("fmha_tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
+    )
     smem_allocator.compute_layout()
 
     tmem_allocator = TmemAllocator()
@@ -1363,7 +1375,12 @@ def _build_decode_gen_schedule(
             stats0_alloc.offset = 0
             stats1_alloc.offset = cfg.tmem_s_cols
             o_alloc.offset = 2 * cfg.tmem_s_cols
-        assert p0_alloc.num_columns == p1_alloc.num_columns == 32
+        expected_p_cols = cfg.tile_size_kv * cfg.q_dtype_bytes // 4
+        assert p0_alloc.num_columns == p1_alloc.num_columns == expected_p_cols
+        assert s0_alloc.offset <= p0_alloc.offset
+        assert p0_alloc.offset + expected_p_cols <= s0_alloc.offset + cfg.tmem_s_cols
+        assert s1_alloc.offset <= p1_alloc.offset
+        assert p1_alloc.offset + expected_p_cols <= s1_alloc.offset + cfg.tmem_s_cols
         assert (
             o_alloc.offset + cfg.tmem_o_stage_cols * cfg.o_stages == cfg.tmem_total_cols
         )
@@ -1481,6 +1498,7 @@ def _run_decode_gen_active(
     seq_len_kv: cutlass.Constexpr[int] = 2048,
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
+    use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
     g_paged_kv_indptr: cute.Pointer | None = None,
     g_paged_kv_indices: cute.Pointer | None = None,
 ) -> None:
@@ -1510,7 +1528,9 @@ def _run_decode_gen_active(
     )
     total_kv_tiles = _compute_total_kv_tiles(effective_seq_len_kv, cfg.tile_size_kv)
     cfg.total_kv_tiles = total_kv_tiles
-    use_runtime_seqlens_kv = use_variable_seqlens_kv or use_native_paged_kv
+    use_runtime_seqlens_kv = use_variable_seqlens_kv or (
+        use_native_paged_kv and not use_static_native_seqlens_kv
+    )
     runtime_seqlens_kv = (
         g_seqlens_kv if cutlass.const_expr(use_runtime_seqlens_kv) else None
     )
@@ -1577,6 +1597,7 @@ def _run_decode_gen_active(
         clc_response_ptr=clc_response_ptr,
         use_variable_seqlens_kv=use_variable_seqlens_kv,
         use_native_paged_kv=use_native_paged_kv,
+        use_static_native_seqlens_kv=use_static_native_seqlens_kv,
         paged_kv_indptr=g_paged_kv_indptr,
         paged_kv_indices=g_paged_kv_indices,
     )
@@ -1585,7 +1606,9 @@ def _run_decode_gen_active(
 
     tmem_cols = tmem_allocator.total_tmem_columns
     tmem_alloc_cols = _round_up_tmem_columns(tmem_cols)
-    tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem)
+    tmem_ptr_alloc = smem_allocator.tmem_ptr_alloc
+    assert tmem_ptr_alloc is not None
+    tmem_ptr_i32 = smem_allocator.get(tmem_ptr_alloc)
     if warp_idx == init_warp:
         prims.tcgen05_alloc(tmem_ptr_i32, Int32(tmem_alloc_cols))
         prims.tcgen05_relinquish_alloc_permit()
@@ -1737,6 +1760,7 @@ def _run_decode_gen_runtime_prefix(
     seq_len_kv: cutlass.Constexpr[int],
     use_variable_seqlens_kv: cutlass.Constexpr[bool],
     use_native_paged_kv: cutlass.Constexpr[bool],
+    use_static_native_seqlens_kv: cutlass.Constexpr[bool],
     g_paged_kv_indptr: cute.Pointer | None,
     g_paged_kv_indices: cute.Pointer | None,
 ) -> None:
@@ -1746,7 +1770,10 @@ def _run_decode_gen_runtime_prefix(
     active_splits_kv = Int32(1)
     if cutlass.const_expr(cfg.use_split_kv):
         runtime_seq_len_kv = g_s_k
-        if cutlass.const_expr(use_variable_seqlens_kv or use_native_paged_kv):
+        if cutlass.const_expr(
+            use_variable_seqlens_kv
+            or (use_native_paged_kv and not use_static_native_seqlens_kv)
+        ):
             runtime_seq_len_kv = Int32(g_seqlens_kv[b_idx])
         active_splits_kv = _runtime_active_splits_kv(
             cfg,
@@ -1791,6 +1818,7 @@ def _run_decode_gen_runtime_prefix(
                 seq_len_kv,
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
+                use_static_native_seqlens_kv,
                 g_paged_kv_indptr,
                 g_paged_kv_indices,
             )
@@ -1827,6 +1855,7 @@ def _run_decode_gen_runtime_prefix(
                 seq_len_kv,
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
+                use_static_native_seqlens_kv,
                 g_paged_kv_indptr,
                 g_paged_kv_indices,
             )
@@ -1857,6 +1886,7 @@ def decode_gen_kernel(
     seq_len_kv: cutlass.Constexpr[int] = 2048,
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
+    use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
     g_paged_kv_indptr: cute.Pointer | None = None,
     g_paged_kv_indices: cute.Pointer | None = None,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
@@ -1912,6 +1942,7 @@ def decode_gen_kernel(
                 seq_len_kv,
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
+                use_static_native_seqlens_kv,
                 g_paged_kv_indptr,
                 g_paged_kv_indices,
             )
@@ -1945,6 +1976,7 @@ def decode_gen_kernel(
                 seq_len_kv,
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
+                use_static_native_seqlens_kv,
                 g_paged_kv_indptr,
                 g_paged_kv_indices,
             )
@@ -1984,6 +2016,7 @@ def fmha_decode_launch(
     k_page_stride: Int64 = 0,
     v_page_stride: Int64 = 0,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
+    use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Standalone JIT launcher for FMHA decode TS."""
     log2_e = math.log2(math.e)
@@ -2193,6 +2226,7 @@ def fmha_decode_launch(
         seq_len_kv,
         use_variable_seqlens_kv,
         use_native_paged_kv,
+        use_static_native_seqlens_kv,
         paged_kv_indptr_iter,
         paged_kv_indices_iter,
         static_full_split_prefix,

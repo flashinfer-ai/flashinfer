@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Split-KV reduction body for the throughput 2CTA MLA TS kernel."""
 
@@ -25,9 +18,9 @@ from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.math import ceil_div
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.ops import (
-    nvvm_fmax,
-    nvvm_warp_reduction_max,
-    nvvm_warp_reduction_sum,
+    fmax_f32,
+    warp_reduce_max_f32,
+    warp_reduce_sum_f32,
     vector_from_scalars,
 )
 from ..helpers.query import groups_tokens_heads_q_row_state, query_batch_bounds
@@ -178,13 +171,13 @@ def run_reduction_kernel(
                 if query_is_valid and cute.elem_less(split_kv_idx, local_split_kv)
                 else -kernel.lse_dtype.inf
             )
-            lse_max = nvvm_fmax(lse_max, local_lse[i])
-        lse_max = nvvm_warp_reduction_max(lse_max)
+            lse_max = fmax_f32(lse_max, local_lse[i])
+        lse_max = warp_reduce_max_f32(lse_max)
         lse_max = lse_max if lse_max != -kernel.lse_dtype.inf else 0.0
         sum_lse = kernel.lse_dtype(0.0)
         for i in cutlass.range_constexpr(lse_per_thread):
             sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
-        sum_lse = nvvm_warp_reduction_sum(sum_lse)
+        sum_lse = warp_reduce_sum_f32(sum_lse)
         has_finite_mass = sum_lse == sum_lse and sum_lse != kernel.lse_dtype(0.0)
         global_lse = (
             lse_max + cute.math.log2(sum_lse, fastmath=True)
@@ -222,28 +215,27 @@ def run_reduction_kernel(
     )
     acc_output_ptr = acc_output.iterator.raw_ptr()
     if query_is_valid:
+        partial_elem_offset_base = Int64(
+            batch_idx
+            * Int32(
+                cute.size(acc_output.shape[3])
+                * effective_num_heads_q
+                * split_kv
+                * cfg.latent_dim
+            )
+            + seq_q_idx * Int32(effective_num_heads_q * split_kv * cfg.latent_dim)
+            + safe_effective_head_idx * Int32(split_kv * cfg.latent_dim)
+            + element_idx
+        )
+        partial_output_ptr = acc_output_ptr + partial_elem_offset_base
         # S2 is the common two-wave 2CTA decode reducer.  Materialize its two
         # fixed partials directly; larger reducers retain the compact dynamic
         # loop because fully unrolling S4 increases instruction pressure.
         if cutlass.const_expr(max_splits == 2):
             for i in cutlass.range_constexpr(max_splits):
                 if Int32(i) < local_split_kv:
-                    partial_elem_offset = Int64(
-                        batch_idx
-                        * Int32(
-                            cute.size(acc_output.shape[3])
-                            * effective_num_heads_q
-                            * split_kv
-                            * cfg.latent_dim
-                        )
-                        + seq_q_idx
-                        * Int32(effective_num_heads_q * split_kv * cfg.latent_dim)
-                        + safe_effective_head_idx * Int32(split_kv * cfg.latent_dim)
-                        + Int32(i * cfg.latent_dim)
-                        + element_idx
-                    )
                     partial_vec = (
-                        (acc_output_ptr + partial_elem_offset)
+                        (partial_output_ptr + Int32(i * cfg.latent_dim))
                         .load(
                             count=REDUCTION_VALUES_PER_THREAD,
                             alignment=REDUCTION_VECTOR_BYTES,
@@ -254,22 +246,8 @@ def run_reduction_kernel(
                     acc_vec = acc_vec + partial_vec * scale
         else:
             for i in range(local_split_kv):
-                partial_elem_offset = Int64(
-                    batch_idx
-                    * Int32(
-                        cute.size(acc_output.shape[3])
-                        * effective_num_heads_q
-                        * split_kv
-                        * cfg.latent_dim
-                    )
-                    + seq_q_idx
-                    * Int32(effective_num_heads_q * split_kv * cfg.latent_dim)
-                    + safe_effective_head_idx * Int32(split_kv * cfg.latent_dim)
-                    + i * Int32(cfg.latent_dim)
-                    + element_idx
-                )
                 partial_vec = (
-                    (acc_output_ptr + partial_elem_offset)
+                    (partial_output_ptr + i * Int32(cfg.latent_dim))
                     .load(
                         count=REDUCTION_VALUES_PER_THREAD,
                         alignment=REDUCTION_VECTOR_BYTES,

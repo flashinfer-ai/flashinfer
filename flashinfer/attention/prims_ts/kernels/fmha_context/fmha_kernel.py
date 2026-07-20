@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """FMHA TS context/prefill kernels.
 
@@ -35,14 +28,14 @@ Feature Support Matrix:
   |------------------|-----------------------------------------------------------------------------------------------|
   | Workload         | Context (prefill)                                                                             |
   | Head-paired mode | Optional under GQA; auto-enabled for GQA with any positive left window                         |
-  | Paged KV         | Page size 32; fp16/bf16/e4m3; non-persistent or static-persistent (CLC is rejected)            |
+  | Paged KV         | Page size 16/32/64/128; fp16/bf16/e4m3; scheduler mode is selected internally                   |
   | Variable seqlen  | Supported through flattened tensors + `cum_seqlen_*`                                          |
   | dtype            | fp16/bf16/e4m3 Q/K/V/O, fp32 QK and PV accumulation                                           |
   | Masking          | non-causal and causal; causal left sliding window uses head-paired mode                       |
   | head dimension   | D=128 and D=256                                                                                |
-  | `S_q` / `S_kv`   | Query-paired causal requires `S_q <= S_kv`; head-paired mode uses 128-token tile multiples    |
-  | GQA              | Must satisfy `h_q % h_kv == 0`; causal GQA can use `--head_paired`                            |
-  | Sliding window   | `--is_causal --window_size_left N`, left window only                                          |
+  | `S_q` / `S_kv`   | Query-paired causal requires `S_q <= S_kv`; arbitrary positive tails are supported             |
+  | GQA              | Must satisfy `h_q % h_kv == 0`; causal GQA can use head-paired scheduling                    |
+  | Sliding window   | `mask_type="causal", window_left=N`; left window only                                        |
   | Scheduler modes  | Query-paired: static CTAs, persistent, CLC; head-paired: persistent, CLC                      |
 
 ASCII Flow Chart:
@@ -100,11 +93,11 @@ ASCII Flow Chart:
                    | GmemO0/1 |
                    +----------+
 
-P readiness is not a separate resource. It is the TmemSP0/1 pipeline state in
-the TS ping-pong pattern: Softmax0/1Task stores P and releases the S/P slot;
-MmaTask re-acquires the same slot for BMM2. CorrectionTask releases each TmemO
-stage after rescaling it; in the interleaved MMA schedule, the next TmemO
-acquire happens before the following BMM1 writes S in TmemSP0/1.
+In the illustrated D128 schedule, P readiness is the TmemSP0/1 pipeline state:
+Softmax0/1Task stores P and releases the S/P slot, then MmaTask re-acquires the
+same slot for BMM2. Staged D256 instead has a separate TmemPResource handoff so
+next-tile QK can overlap previous-tile PV. CorrectionTask releases each TmemO
+stage after rescaling it.
 
 TmemStats0/1 in the diagram are TmemStatsResource instances. They store the
 correction statistics old_row_max, row_max, row_sum, and pad.
@@ -123,7 +116,7 @@ described by ``FmhaConfig``):
   PaddingTask    warp 15      warp-group register participation
 
 Entry points:
-  - build_fmha_task_manager() -- pure Python, used for validation only
+  - build_fmha_task_manager() -- constructs and validates the runtime task graph
   - fmha_ts_kernel()         -- @cute.kernel, the GPU kernel
   - FmhaTs                   -- class with @cute.jit __call__ and kernel
 """
@@ -157,6 +150,7 @@ from cutlass.experimental.task_scheduling.task import Task
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 
 from .fmha_resources import (
+    _SUPPORTED_CONTEXT_PAGE_SIZES,
     FmhaConfig,
     GmemOResource,
     GmemQKVResource,
@@ -172,6 +166,7 @@ from .fmha_resources import (
     TmemStatsDoneResource,
 )
 from .fmha_tasks import (
+    PackedContextWorkQueue,
     create_correction_task,
     create_epilogue_task,
     create_load_task,
@@ -181,6 +176,8 @@ from .fmha_tasks import (
     create_scheduler_task,
     create_softmax_task,
 )
+
+
 from .helpers import (
     bottom_right_window_max_tiles,
     bottom_right_window_tile_start,
@@ -230,6 +227,10 @@ def _init_causal_domain_state(
     kv_n: int | Int32,
     q_offset: int | Int32,
     seq_idx: int,
+    batch_idx: int | None,
+    cum_seqlen_q: cute.Tensor | None,
+    cum_seqlen_k: cute.Tensor | None,
+    runtime_kv_tile_multiple: int,
     reverse_seq_tiles: int | Int32 | None,
     offset: int,
     window_size_left: int,
@@ -275,6 +276,13 @@ def _init_causal_domain_state(
     task._q_offset = q_offset
     # Index of the sequence coordinate in tile_coord.
     task._seq_idx = seq_idx
+    # Mixed packed causal launches derive a request-local safe K-loop extent
+    # from live metadata. Fixed and uniform-packed launches leave these fields
+    # unset and retain the static plan-time domain calculation above.
+    task._batch_idx = batch_idx
+    task._cum_seqlen_q = cum_seqlen_q
+    task._cum_seqlen_k = cum_seqlen_k
+    task._runtime_kv_tile_multiple = runtime_kv_tile_multiple
     task._reverse_seq_tiles = reverse_seq_tiles
     # Offset adjusts the domain count.
     task._offset = offset
@@ -299,6 +307,10 @@ class CausalDomainTask(Task):
         kv_n: int | Int32,
         q_offset: int | Int32 = 0,
         seq_idx: int = 0,
+        batch_idx: int | None = None,
+        cum_seqlen_q: cute.Tensor | None = None,
+        cum_seqlen_k: cute.Tensor | None = None,
+        runtime_kv_tile_multiple: int = 1,
         reverse_seq_tiles: int | Int32 | None = None,
         offset: int = 0,
         window_size_left: int = 0,
@@ -313,6 +325,15 @@ class CausalDomainTask(Task):
             kv_n: Number of K/V rows covered by one K-loop iteration.
             q_offset: Causal row-index shift for S_q < S_kv.
             seq_idx: Index of the sequence coordinate in ``tile_coord``.
+            batch_idx: Index of the request coordinate in ``tile_coord`` for
+                packed causal launches.
+            cum_seqlen_q: Live packed-Q cumulative offsets. Together with
+                ``cum_seqlen_k``, selects a request-local causal domain.
+            cum_seqlen_k: Live packed-K/V cumulative offsets. Paged context
+                passes its plan-time logical-K snapshot through this tensor.
+            runtime_kv_tile_multiple: Round a request-local K/V tile count up
+                to this multiple. Query-paired zero-offset causal scheduling
+                uses two to retain its synthetic peer-0 tail slot.
             reverse_seq_tiles: Number of Q sequence work tiles when causal
                 balancing reverses launch order. ``None`` keeps natural order.
             offset: Loop-count decrement after the causal/window tile count is
@@ -331,6 +352,10 @@ class CausalDomainTask(Task):
             kv_n=kv_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
+            batch_idx=batch_idx,
+            cum_seqlen_q=cum_seqlen_q,
+            cum_seqlen_k=cum_seqlen_k,
+            runtime_kv_tile_multiple=runtime_kv_tile_multiple,
             reverse_seq_tiles=reverse_seq_tiles,
             offset=offset,
             window_size_left=window_size_left,
@@ -347,31 +372,62 @@ class CausalDomainTask(Task):
         seq_coord = tile_coord[self._seq_idx]
         if cutlass.const_expr(self._reverse_seq_tiles is not None):
             seq_coord = self._reverse_seq_tiles - seq_coord - 1
+        q_offset = self._q_offset
+        num_kv_tiles = self._num_kv_tiles
+        runtime_q_tile_active = None
+        if cutlass.const_expr(self._cum_seqlen_q is not None):
+            assert self._cum_seqlen_k is not None
+            assert self._batch_idx is not None
+            batch_coord = Int32(tile_coord[self._batch_idx])
+            q_begin = Int32(self._cum_seqlen_q[batch_coord])
+            k_begin = Int32(self._cum_seqlen_k[batch_coord])
+            seqlen_q = Int32(self._cum_seqlen_q[batch_coord + Int32(1)]) - q_begin
+            seqlen_k = Int32(self._cum_seqlen_k[batch_coord + Int32(1)]) - k_begin
+            runtime_q_tile_active = Int32(seq_coord * self._cta_m < seqlen_q)
+            q_offset = seqlen_k - seqlen_q
+            num_kv_tiles = cute.ceil_div(seqlen_k, self._kv_n)
+            if cutlass.const_expr(self._runtime_kv_tile_multiple > 1):
+                num_kv_tiles = (
+                    cute.ceil_div(num_kv_tiles, self._runtime_kv_tile_multiple)
+                    * self._runtime_kv_tile_multiple
+                )
         if self._packed_window:
             max_window_tiles = bottom_right_window_max_tiles(
                 q_tile_m=self._cta_m,
                 kv_tile_n=self._kv_n,
                 window_size_left=self._window_size_left,
             )
-            result = _domain_min(self._num_kv_tiles, max_window_tiles)
+            result = _domain_min(num_kv_tiles, max_window_tiles)
         else:
-            max_q_row = self._q_offset + seq_coord * self._cta_m + self._cta_m - 1
+            max_q_row = q_offset + seq_coord * self._cta_m + self._cta_m - 1
             causal_n = max_q_row // self._kv_n + 1
             # Softmax assumes there is at least one Q-tile-width of K work.
             result = _domain_max(
                 self._cta_m // self._kv_n,
-                _domain_min(self._num_kv_tiles, causal_n),
+                _domain_min(num_kv_tiles, causal_n),
             )
         if self._window_size_left > 0 and not self._packed_window:
             result -= bottom_right_window_tile_start(
                 seq_coord=seq_coord,
                 q_tile_m=self._cta_m,
                 kv_tile_n=self._kv_n,
-                q_offset=self._q_offset,
+                q_offset=q_offset,
                 window_size_left=self._window_size_left,
             )
         if self._offset:
             result = result - self._offset
+        if cutlass.const_expr(runtime_q_tile_active is not None):
+            # The outer grid is sized by the planned maximum Q length, so a
+            # mixed packed request can have trailing work-tile slots with no Q
+            # rows. Retain the smallest legal N/N-1/N-2 pipeline domains for
+            # those slots instead of traversing K/V according to a large
+            # bottom-right offset. Resource-level ragged extents suppress the
+            # dummy Q/O traffic; the minimum domains preserve task handoffs.
+            minimum_domain = max(self._cta_m // self._kv_n - self._offset, 0)
+            result = (
+                runtime_q_tile_active * result
+                + (Int32(1) - runtime_q_tile_active) * minimum_domain
+            )
         return result
 
 
@@ -385,6 +441,10 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
         kv_n: int | Int32,
         q_offset: int | Int32 = 0,
         seq_idx: int = 0,
+        batch_idx: int | None = None,
+        cum_seqlen_q: cute.Tensor | None = None,
+        cum_seqlen_k: cute.Tensor | None = None,
+        runtime_kv_tile_multiple: int = 1,
         reverse_seq_tiles: int | Int32 | None = None,
         offset: int = 0,
         window_size_left: int = 0,
@@ -405,6 +465,13 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
             Causal row-index shift for S_q < S_kv.
         seq_idx : int
             Index of the sequence coordinate in ``tile_coord``.
+        batch_idx : int or None
+            Index of the request coordinate for packed causal launches.
+        cum_seqlen_q, cum_seqlen_k : cute.Tensor or None
+            Live cumulative offsets used to derive the request-local causal
+            shift and K/V tile count.
+        runtime_kv_tile_multiple : int
+            Request-local K/V tile-count alignment for paired-tail scheduling.
         reverse_seq_tiles : int or Int32 or None
             Number of Q sequence work tiles for reversed causal-balanced order.
         offset : int
@@ -425,6 +492,10 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
             kv_n=kv_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
+            batch_idx=batch_idx,
+            cum_seqlen_q=cum_seqlen_q,
+            cum_seqlen_k=cum_seqlen_k,
+            runtime_kv_tile_multiple=runtime_kv_tile_multiple,
             reverse_seq_tiles=reverse_seq_tiles,
             offset=offset,
             window_size_left=window_size_left,
@@ -433,7 +504,7 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
         )
 
 
-DomainPolicyValue = int | bool | Int32 | type[Task]
+DomainPolicyValue = int | bool | Int32 | type[Task] | cute.Tensor
 DomainKwargs = dict[str, DomainPolicyValue]
 
 
@@ -513,7 +584,14 @@ def build_context_task_manager(
     clc_response_ptr: cute.Pointer | None = None,
     exhaustive_deadlock_race_check: bool = True,
     debug_print: bool = False,
-) -> Tuple[TaskManager, list[MemoryResource], SmemAllocation, SmemAllocation]:
+) -> Tuple[
+    TaskManager,
+    list[MemoryResource],
+    SmemAllocation,
+    SmemAllocation,
+    WorkQueue | None,
+    SmemAllocation | None,
+]:
     """Build the FMHA TaskManager with all resources, tasks, and dependency graph.
 
     ``scale_softmax_log2`` and ``output_scale`` are optional one-element
@@ -535,7 +613,7 @@ def build_context_task_manager(
     cfg : FmhaConfig
         Kernel-wide configuration.
     tile_sched_params : PersistentTileSchedulerParams or ClcDynamicPersistentTileSchedulerParams, optional
-        Persistent tile scheduler params. ``None`` in validation-only builds.
+        Persistent tile scheduler params. ``None`` for static or validation-only builds.
     tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc : cutlass.Pointer, optional
         TMA descriptor pointers for Q, K, V, O.
     cum_seqlen_q, cum_seqlen_k : cute.Tensor, optional
@@ -543,7 +621,8 @@ def build_context_task_manager(
     num_kv_tiles : int or Int32
         Number of KV tiles in the loop domain.
     q_offset : int or Int32
-        Maximum right shift of Q rows for causal S_q < S_kv masking.
+        Default right shift of Q rows for causal S_q < S_kv masking. Mixed
+        packed launches derive the request-local shift from live metadata.
     domain_n_kwargs : dict
         Domain policy for tasks that process the full KV loop.
     domain_n_minus_1_kwargs : dict
@@ -569,17 +648,14 @@ def build_context_task_manager(
     Returns
     -------
     tuple
-        ``(TaskManager, tmem_resources, tmem_ptr_alloc, dealloc_mbar_alloc)``.
+        ``(TaskManager, tmem_resources, tmem_ptr_alloc, dealloc_mbar_alloc,
+        work_queue, clc_response_alloc)``.
     """
     if cfg.use_paged_kv:
-        if is_clc_dynamic:
+        if cfg.num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
             raise ValueError(
-                "paged KV does not support CLC dynamic scheduling; use "
-                "static-persistent or non-persistent scheduling"
-            )
-        if cfg.num_tokens_per_page != 32:
-            raise ValueError(
-                "paged context requires num_tokens_per_page=32; got "
+                "paged context requires num_tokens_per_page in "
+                f"{_SUPPORTED_CONTEXT_PAGE_SIZES}; got "
                 f"{cfg.num_tokens_per_page}"
             )
     if cfg.causal_single_kv_tile and (cfg.use_paged_kv or cfg.has_varlen):
@@ -615,9 +691,9 @@ def build_context_task_manager(
     # Pipeline configs
     # ---------------------------------------------------------------------------
 
-    # SmemQ: TmaUmma, 2 stages, Load -> MMA.
-    # advance_on_wait=True advances consumer_state on ConsumerWait so Q0 waits
-    # for Q_full[0] and Q1 waits for Q_full[1].
+    # SmemQ: TmaUmma, topology-derived stages, Load -> MMA. The paired D128
+    # schedule uses two Q instances; staged D256 uses one.
+    # advance_on_wait=True advances consumer_state on ConsumerWait.
     smem_q_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.q_stage,
         num_bytes=cfg.tma_copy_q_bytes,
@@ -626,7 +702,7 @@ def build_context_task_manager(
         cta_layout_vmnk=cluster_shape_vmnk,
         advance_on_wait=True,
     )
-    # SmemKV: TmaUmma, 3 stages, Load -> MMA.
+    # SmemKV: capacity-derived stages, Load -> MMA.
     # advance_on_wait=True advances consumer_state at ConsumerWait rather than
     # ConsumerRelease. This keeps the previous V tile live while MMA starts the
     # next QK tile, giving QK0 -> PV1(previous V) -> QK1 ordering without
@@ -643,21 +719,47 @@ def build_context_task_manager(
     # the load warp consumes.
     # Async-async because both are CUDA-thread groups (no TMA arrival barrier).
     smem_page_offsets_pipeline_cfg = None
-    if cfg.use_paged_kv:
+    smem_page_offsets_v_pipeline_cfg = None
+    split_page_offset_pipelines = False
+    if cfg.use_paged_kv and cfg.single_qkv_instance:
+        # A staged single-instance schedule keeps independent K and V page-ID
+        # rings because its K-ahead/V-delayed lifetimes overlap.  Split the
+        # ordinary page-offset stage budget across those two rings, just as
+        # FMHA decode does for its split-head-dimension page-offset flow.  V
+        # needs one fewer credit because the boundary tile's IDs are retained
+        # in registers before its SMEM window is released.  The shared K/V
+        # ring used by every other topology retains the full depth.
+        page_offset_stage_counts = cfg.page_offset_pipeline_stage_counts
+        page_offsets_k_stages = page_offset_stage_counts[0]
+        page_offsets_v_stages = None
+        if len(page_offset_stage_counts) == 2:
+            split_page_offset_pipelines = True
+            page_offsets_v_stages = page_offset_stage_counts[1]
+
         # The load warp (1 warp = 32 threads) is the only consumer; signal-All
         # requires the consumer group to size match num_warps × warp_size.
-        smem_page_offsets_pipeline_cfg = PipelineConfig.create_async_async_pipeline_cfg(
-            num_stages=cfg.page_offsets_stages,
-            producer_group=pipeline.CooperativeGroup(
-                Agent.Thread,
-                cfg.page_offsets_num_warps * warp_size,
-            ),
-            consumer_group=pipeline.CooperativeGroup(
-                Agent.Thread,
-                warp_size,
-            ),
-            cta_layout_vmnk=cluster_shape_vmnk,
+        def make_page_offsets_pipeline_cfg(num_stages: int) -> PipelineConfig:
+            return PipelineConfig.create_async_async_pipeline_cfg(
+                num_stages=num_stages,
+                producer_group=pipeline.CooperativeGroup(
+                    Agent.Thread,
+                    cfg.page_offsets_num_warps * warp_size,
+                ),
+                consumer_group=pipeline.CooperativeGroup(
+                    Agent.Thread,
+                    warp_size,
+                ),
+                cta_layout_vmnk=cluster_shape_vmnk,
+                producer_op=pipeline.PipelineOp.AsyncLoad,
+            )
+
+        smem_page_offsets_pipeline_cfg = make_page_offsets_pipeline_cfg(
+            page_offsets_k_stages
         )
+        if page_offsets_v_stages is not None:
+            smem_page_offsets_v_pipeline_cfg = make_page_offsets_pipeline_cfg(
+                page_offsets_v_stages
+            )
 
     softmax_group = pipeline.CooperativeGroup(
         Agent.Thread,
@@ -714,7 +816,9 @@ def build_context_task_manager(
     smem_o_0_pipeline_cfg = PipelineConfig.create_async_async_pipeline_cfg(
         num_stages=1,
         producer_group=correction_group,
-        consumer_group=epilogue_group,
+        consumer_group=(
+            correction_group if cfg.fuse_epilogue_into_correction else epilogue_group
+        ),
         cta_layout_vmnk=cluster_shape_vmnk,
     )
     smem_o_1_pipeline_cfg = PipelineConfig.create_async_async_pipeline_cfg(
@@ -772,19 +876,35 @@ def build_context_task_manager(
         name="smem_q",
     )
     smem_page_offsets_kv: SmemPageOffsetsKvResource | None = None
-    if cfg.use_paged_kv:
+    smem_page_offsets_v: SmemPageOffsetsKvResource | None = None
+    if cfg.use_paged_kv and cfg.single_qkv_instance:
         smem_page_offsets_kv = SmemPageOffsetsKvResource(
             page_idx_kv=g_page_idx_kv,
             pipeline_config=smem_page_offsets_pipeline_cfg,
             cfg=cfg,
             name="smem_page_offsets_kv",
         )
+        if split_page_offset_pipelines:
+            # The migrated D256 schedule keeps independent K/V page-window
+            # stages because its K-ahead/V-delayed pipeline crosses window
+            # boundaries.  D128 consumes K and V together and FlashInfer's
+            # public paged API supplies one shared page-ID row, so it retains
+            # one stage for both sides.
+            smem_page_offsets_v = SmemPageOffsetsKvResource(
+                page_idx_kv=g_page_idx_kv,
+                pipeline_config=smem_page_offsets_v_pipeline_cfg,
+                cfg=cfg,
+                page_table_is_v=True,
+                name="smem_page_offsets_v",
+            )
     smem_kv = SmemKVResource(
         tma_k_desc=tma_k_desc,
         tma_v_desc=tma_v_desc,
         pipeline_config=smem_kv_pipeline_cfg,
         cfg=cfg,
         page_offsets_kv=smem_page_offsets_kv,
+        page_offsets_v=smem_page_offsets_v,
+        page_idx_kv=g_page_idx_kv,
         name="smem_kv",
     )
 
@@ -819,21 +939,47 @@ def build_context_task_manager(
                 response_ptr=clc_response_ptr,
             )
         )
-        work_queue = WorkQueue(
-            tile_scheduler_config=tile_scheduler_config,
-            pipeline_config=work_queue_pipeline_cfg,
-            name="work_queue",
-        )
+        work_queue_kwargs = {
+            "tile_scheduler_config": tile_scheduler_config,
+            "pipeline_config": work_queue_pipeline_cfg,
+            "name": "work_queue",
+        }
+        if (
+            cfg.is_causal
+            and cfg.has_varlen
+            and not cfg.has_uniform_varlen
+            and cum_seqlen_q is not None
+        ):
+            work_queue = PackedContextWorkQueue(
+                cfg=cfg,
+                cum_seqlen_q=cum_seqlen_q,
+                **work_queue_kwargs,
+            )
+        else:
+            work_queue = WorkQueue(**work_queue_kwargs)
     elif is_persistent:
         tile_scheduler_config = (
             TileSchedulerConfig.create_static_persistent_tile_scheduler_params(
                 tile_scheduler_params=tile_sched_params,
             )
         )
-        work_queue = WorkQueue(
-            tile_scheduler_config=tile_scheduler_config,
-            name="work_queue",
-        )
+        work_queue_kwargs = {
+            "tile_scheduler_config": tile_scheduler_config,
+            "name": "work_queue",
+        }
+        if (
+            cfg.is_causal
+            and cfg.has_varlen
+            and not cfg.has_uniform_varlen
+            and cum_seqlen_q is not None
+        ):
+            work_queue = PackedContextWorkQueue(
+                cfg=cfg,
+                cum_seqlen_q=cum_seqlen_q,
+                **work_queue_kwargs,
+            )
+        else:
+            work_queue = WorkQueue(**work_queue_kwargs)
 
     tmem_sp0 = TmemSPResource(
         pipeline_config=tmem_sp0_pipeline_cfg,
@@ -981,6 +1127,7 @@ def build_context_task_manager(
         smem_kv,
         work_queue,
         smem_page_offsets_kv=smem_page_offsets_kv,
+        smem_page_offsets_v=smem_page_offsets_v,
         debug_print=debug_print,
         **domain_n_kwargs,
     )
@@ -1030,29 +1177,50 @@ def build_context_task_manager(
         tmem_o,
         smem_o_0,
         smem_o_1,
+        gmem_o_0,
+        gmem_o_1,
         tmem_stats_done_0,
         tmem_stats_done_1,
         work_queue,
         debug_print=debug_print,
         **domain_n_minus_1_kwargs,
     )
-    epilogue_task = create_epilogue_task(
-        smem_o_0,
-        smem_o_1,
-        gmem_o_0,
-        gmem_o_1,
-        work_queue,
-        debug_print=debug_print,
-        **domain_n_kwargs,
-    )
-    if is_clc_dynamic:
-        auxiliary_task = create_scheduler_task(
+    epilogue_task: Task | None = None
+    freed_epilogue_task: Task | None = None
+    if cfg.fuse_epilogue_into_correction:
+        if not is_clc_dynamic:
+            # Warp 10 remains part of the producer/correction warpgroup and
+            # must participate in setmaxnreg before it becomes a scheduler.
+            freed_epilogue_task = create_padding_task(
+                work_queue,
+                warp_idx=cfg.epilogue_warp_id,
+                num_registers=cfg.num_regs_other,
+                name="EpiloguePaddingTask",
+                **domain_n_kwargs,
+            )
+    else:
+        epilogue_task = create_epilogue_task(
+            smem_o_0,
+            smem_o_1,
+            gmem_o_0,
+            gmem_o_1,
             work_queue,
-            warp_idx=cfg.empty_warp_id,
+            debug_print=debug_print,
+            **domain_n_kwargs,
+        )
+    scheduler_task: Task | None = None
+    if is_clc_dynamic:
+        scheduler_task = create_scheduler_task(
+            work_queue,
+            warp_idx=(
+                cfg.epilogue_warp_id
+                if cfg.fuse_epilogue_into_correction
+                else cfg.empty_warp_id
+            ),
             num_registers=cfg.num_regs_other,
             domain=0,
         )
-    elif smem_page_offsets_kv is not None:
+    if smem_page_offsets_kv is not None:
         # Paged-KV: the auxiliary warp prefetches page-table entries instead
         # of padding and still participates in setmaxnreg.sync.
         auxiliary_task = create_page_offsets_task(
@@ -1060,8 +1228,14 @@ def build_context_task_manager(
             smem_page_offsets_kv,
             work_queue,
             num_registers=cfg.num_regs_other,
+            smem_page_offsets_v=smem_page_offsets_v,
             **domain_n_kwargs,
         )
+    elif scheduler_task is not None and not cfg.fuse_epilogue_into_correction:
+        # D128 retains the original topology where the scheduler itself is the
+        # final warp-group participant.
+        auxiliary_task = scheduler_task
+        scheduler_task = None
     else:
         # setmaxnreg.sync requires every warp in the final warp group to
         # participate, so the empty warp needs a padding/scheduler task.
@@ -1075,15 +1249,14 @@ def build_context_task_manager(
     task_list = [softmax0_task]
     if softmax1_task is not None:
         task_list.append(softmax1_task)
-    task_list.extend(
-        [
-            correction_task,
-            mma_task,
-            load_task,
-            epilogue_task,
-            auxiliary_task,
-        ]
-    )
+    task_list.extend([correction_task, mma_task, load_task])
+    if epilogue_task is not None:
+        task_list.append(epilogue_task)
+    if freed_epilogue_task is not None:
+        task_list.append(freed_epilogue_task)
+    if scheduler_task is not None:
+        task_list.append(scheduler_task)
+    task_list.append(auxiliary_task)
 
     if single_qkv_instance:
         tmem_o_source = tmem_p0 if tmem_p0 is not None else tmem_sp0
@@ -1103,16 +1276,20 @@ def build_context_task_manager(
     smem_kv_deps: list[MemoryResource] = [gmem_qkv]
     if smem_page_offsets_kv is not None:
         smem_kv_deps.append(smem_page_offsets_kv)
+    if smem_page_offsets_v is not None:
+        smem_kv_deps.append(smem_page_offsets_v)
+    stats_done_0_deps = [] if cfg.stats_via_smem else [tmem_stats_done_0]
     resource_dependency_graph: dict[MemoryResource, list[MemoryResource]] = {
         smem_q: scheduler_deps(gmem_qkv),
         smem_kv: scheduler_deps(*smem_kv_deps),
-        tmem_sp0: scheduler_deps(tmem_sp0, smem_q, smem_kv, tmem_stats_done_0),
+        tmem_sp0: scheduler_deps(tmem_sp0, smem_q, smem_kv, *stats_done_0_deps),
         tmem_vec0: scheduler_deps(tmem_sp0),
         tmem_o: tmem_o_dependencies,
         smem_o_0: scheduler_deps(tmem_vec0, tmem_o),
         gmem_o_0: scheduler_deps(smem_o_0),
-        tmem_stats_done_0: [tmem_vec0],
     }
+    if not cfg.stats_via_smem:
+        resource_dependency_graph[tmem_stats_done_0] = [tmem_vec0]
     if tmem_p0 is not None:
         resource_dependency_graph[tmem_p0] = scheduler_deps(tmem_sp0)
     if not single_qkv_instance:
@@ -1123,28 +1300,63 @@ def build_context_task_manager(
                     smem_q,
                     smem_kv,
                     s0s1_seq,
-                    tmem_stats_done_1,
+                    *([] if cfg.stats_via_smem else [tmem_stats_done_1]),
                 ),
                 tmem_vec1: scheduler_deps(tmem_sp1),
                 smem_o_1: scheduler_deps(tmem_vec1, tmem_o),
                 gmem_o_1: scheduler_deps(smem_o_1),
                 s0s1_seq: [tmem_sp0],
-                tmem_stats_done_1: [tmem_vec1],
             }
         )
+        if not cfg.stats_via_smem:
+            resource_dependency_graph[tmem_stats_done_1] = [tmem_vec1]
     if work_queue is not None:
         resource_dependency_graph[work_queue] = [work_queue] if is_clc_dynamic else []
     if smem_page_offsets_kv is not None:
         resource_dependency_graph[smem_page_offsets_kv] = scheduler_deps(gmem_qkv)
+    if smem_page_offsets_v is not None:
+        resource_dependency_graph[smem_page_offsets_v] = scheduler_deps(gmem_qkv)
 
     smem_allocator = SmemAllocator()
-    smem_allocator.add_resource(smem_q)
-    smem_allocator.add_resource(smem_kv)
+    registered_smem_resource_ids: set[int] = set()
+
+    def add_smem_resource(resource: MemoryResource | None) -> None:
+        """Register one resource's data and barriers exactly once."""
+        if resource is None or id(resource) in registered_smem_resource_ids:
+            return
+        smem_allocator.add_resource(resource)
+        registered_smem_resource_ids.add(id(resource))
+
+    add_smem_resource(smem_q)
+    add_smem_resource(smem_kv)
     if smem_page_offsets_kv is not None:
-        smem_allocator.add_resource(smem_page_offsets_kv)
+        add_smem_resource(smem_page_offsets_kv)
+    if smem_page_offsets_v is not None:
+        add_smem_resource(smem_page_offsets_v)
+    # Register every pipeline resource, including pipeline-only TMEM handoffs,
+    # with the unified allocator.  Otherwise CUTLASS materializes those
+    # barriers as separate dynamic-SMEM arrays that the capacity selector
+    # cannot see.
+    add_smem_resource(tmem_sp0)
+    if tmem_p0 is not None:
+        add_smem_resource(tmem_p0)
+    add_smem_resource(tmem_vec0)
+    add_smem_resource(tmem_o)
+    if not cfg.stats_via_smem:
+        add_smem_resource(tmem_stats_done_0)
+    if tmem_sp1 is not None:
+        add_smem_resource(tmem_sp1)
+    if tmem_vec1 is not None:
+        add_smem_resource(tmem_vec1)
+    if s0s1_seq is not None:
+        add_smem_resource(s0s1_seq)
+    if tmem_stats_done_1 is not None and not cfg.stats_via_smem:
+        add_smem_resource(tmem_stats_done_1)
+    if work_queue is not None and work_queue.pipeline_config is not None:
+        add_smem_resource(work_queue)
     if single_qkv_instance:
-        smem_allocator.add_resource(smem_o_0)
-        smem_allocator.add_resource(gmem_o_0)
+        add_smem_resource(smem_o_0)
+        add_smem_resource(gmem_o_0)
         smem_allocator.add_alias_group(
             [
                 [smem_o_0._alloc],
@@ -1152,10 +1364,10 @@ def build_context_task_manager(
             ]
         )
     else:
-        smem_allocator.add_resource(smem_o_0)
-        smem_allocator.add_resource(smem_o_1)
-        smem_allocator.add_resource(gmem_o_0)
-        smem_allocator.add_resource(gmem_o_1)
+        add_smem_resource(smem_o_0)
+        add_smem_resource(smem_o_1)
+        add_smem_resource(gmem_o_0)
+        add_smem_resource(gmem_o_1)
         smem_allocator.add_alias_group(
             [
                 [smem_o_0._alloc],
@@ -1174,14 +1386,45 @@ def build_context_task_manager(
     dealloc_mbar_alloc = smem_allocator.add(
         SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
     )
+    clc_response_alloc: SmemAllocation | None = None
+    if is_clc_dynamic and clc_response_ptr is None:
+        # Keep the CLC response inside the unified TS allocation. The kernel
+        # derives its pointer from this descriptor after allocate(), so no
+        # assumption about its physical offset is required.
+        assert work_queue is not None
+        assert work_queue.pipeline_config is not None
+        clc_response_alloc = smem_allocator.add(
+            SmemAllocation(
+                "clc_response",
+                dtype=cutlass.Int128,
+                count=work_queue.pipeline_config.num_stages,
+                alignment=16,
+            )
+        )
     smem_allocator.compute_layout()
+    expected_barrier_bytes = (
+        sum(
+            _context_pipeline_stage_counts(
+                cfg,
+                kv_stages=cfg.kv_stage,
+                is_clc_dynamic=is_clc_dynamic,
+            ).values()
+        )
+        * _PIPELINE_BARRIER_BYTES_PER_STAGE
+    )
+    if smem_allocator.barrier_smem_bytes != expected_barrier_bytes:
+        raise AssertionError(
+            "context pipeline barrier accounting drifted: allocator has "
+            f"{smem_allocator.barrier_smem_bytes} bytes, topology requires "
+            f"{expected_barrier_bytes} bytes"
+        )
 
     tmem_allocator = TmemAllocator()
     if single_qkv_instance:
         tmem_allocator.add_resource(tmem_o)
         tmem_allocator.add_resource(tmem_sp0)
         tmem_allocator.add_resource(tmem_vec0)
-        if cfg.stage_scoped_tmem_stats:
+        if cfg.stage_scoped_tmem_stats and not cfg.stats_via_smem:
             tmem_allocator.add_alias_group(
                 [
                     [tmem_sp0._alloc],
@@ -1231,38 +1474,178 @@ def build_context_task_manager(
             smem_o_0,
             smem_o_1,
         ]
-    return task_manager, tmem_resources, tmem_ptr_alloc, dealloc_mbar_alloc
+    return (
+        task_manager,
+        tmem_resources,
+        tmem_ptr_alloc,
+        dealloc_mbar_alloc,
+        work_queue,
+        clc_response_alloc,
+    )
 
 
 def _should_use_tmem_p_pipeline(cfg: FmhaConfig) -> bool:
     """Return whether P readiness needs its own TMEM pipeline resource.
 
-    The TMEM P pipeline is a D>128 single-instance heuristic. That path stages
-    K/V by 128-wide head-dimension slices and benefits from a separate P-ready
-    handoff so the MMA task can overlap next-tile QK with previous-tile PV. The
-    D=128 paired path keeps P on TmemSPResource to avoid the extra pipeline edge.
+    The TMEM P pipeline belongs to the staged, single-QKV-instance topology.
+    That path stages K/V by 128-wide head-dimension slices and uses a separate
+    P-ready handoff so the MMA task can overlap next-tile QK with previous-tile
+    PV. The paired D128 path keeps P on TmemSPResource.
     """
     return cfg.single_qkv_instance and cfg.stage_kv_by_head_dim
 
 
-def _configure_pipeline_stages(cfg: FmhaConfig) -> None:
-    """Set the fixed pipeline stage counts for the context FMHA schedule."""
+_Q_ROW_SMEM_ALIGNMENT_BYTES = 128
+_PIPELINE_BARRIER_BYTES_PER_STAGE = 2 * cutlass.Int64.width // 8
+
+
+def _context_pipeline_stage_counts(
+    cfg: FmhaConfig,
+    *,
+    kv_stages: int,
+    is_clc_dynamic: bool,
+) -> dict[str, int]:
+    """Return every physical pipeline's mbarrier stage count."""
+    counts = {
+        "smem_q": cfg.q_stage,
+        "smem_kv": kv_stages,
+        "smem_page_offsets": sum(cfg.page_offset_pipeline_stage_counts),
+        "tmem_sp": cfg.mma_softmax_stage * cfg.num_qkv_instances,
+        "tmem_p": cfg.mma_softmax_stage if cfg.has_tmem_p_pipeline else 0,
+        "tmem_vec": cfg.softmax_corr_stage * cfg.num_qkv_instances,
+        "tmem_o": cfg.mma_corr_stage,
+        "smem_o": cfg.num_qkv_instances,
+        "s0s1_seq": 0 if cfg.single_qkv_instance else 1,
+        "tmem_stats_done": 0 if cfg.stats_via_smem else cfg.num_qkv_instances,
+        "work_queue": 1 if is_clc_dynamic else 0,
+    }
+    return {name: stages for name, stages in counts.items() if stages}
+
+
+def _infer_single_instance_kv_stages(
+    cfg: FmhaConfig,
+    *,
+    is_clc_dynamic: bool,
+    page_table_window_entries: int | None = None,
+    require_cadence: bool = True,
+) -> int:
+    """Return the deepest K/V ring that fits the exact TS SMEM footprint.
+
+    All terms come from resource topology or public CUTLASS hardware metadata:
+    Q, O, correction statistics, page-ID rings, fixed control records, and one
+    16-byte pipeline barrier per physical stage. The task manager remains the
+    authoritative check and uses the same stage-count policy below.
+    """
+    q_row_bytes = (cfg.q_dtype.width * cfg.qk_mma_tiler[2] + 7) // 8
+    q_row_bytes = (
+        (q_row_bytes + _Q_ROW_SMEM_ALIGNMENT_BYTES - 1)
+        // _Q_ROW_SMEM_ALIGNMENT_BYTES
+        * _Q_ROW_SMEM_ALIGNMENT_BYTES
+    )
+    q_tile_bytes = q_row_bytes * cfg.qk_mma_tiler[0]
+
+    o_head_dim = (
+        cfg.head_dim_per_stage_kv if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
+    )
+    o_stage_bytes = (cfg.epi_tile[0] * o_head_dim * cfg.o_dtype.width + 7) // 8
+
+    stats_bytes = 0
+    if cfg.stats_via_smem:
+        stats_rows = len(cfg.softmax0_warp_ids) * cute.arch.WARP_SIZE
+        stats_values_per_row = 2
+        stats_bytes = (
+            cfg.softmax_corr_stage
+            * stats_rows
+            * stats_values_per_row
+            * cutlass.Float32.width
+            // 8
+        )
+
+    page_offset_stage_counts = cfg.page_offset_pipeline_stage_counts
+    page_offset_stages = sum(page_offset_stage_counts)
+    if page_table_window_entries is None:
+        page_table_window_entries = cfg.page_table_window_entries
+    page_offsets_bytes = (
+        page_offset_stages * page_table_window_entries * cutlass.Int32.width // 8
+    )
+
+    control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
+    if is_clc_dynamic:
+        control_bytes += cutlass.Int128.width // 8
+    fixed_barrier_stages = sum(
+        _context_pipeline_stage_counts(
+            cfg,
+            kv_stages=0,
+            is_clc_dynamic=is_clc_dynamic,
+        ).values()
+    )
+    fixed_smem_bytes = (
+        q_tile_bytes * cfg.q_stage
+        + o_stage_bytes
+        + stats_bytes
+        + page_offsets_bytes
+        + control_bytes
+        + fixed_barrier_stages * _PIPELINE_BARRIER_BYTES_PER_STAGE
+    )
+    kv_dtype_width = max(cfg.k_dtype.width, cfg.v_dtype.width)
+    kv_stage_bytes = (
+        cfg.qk_mma_tiler[1] * cfg.head_dim_per_stage_kv * kv_dtype_width // 8
+    )
+    kv_stage_footprint_bytes = kv_stage_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
+    kv_budget_bytes = utils.get_smem_capacity_in_bytes("sm_100") - fixed_smem_bytes
+    memory_fit_stages = kv_budget_bytes // kv_stage_footprint_bytes
+    cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
+    if require_cadence and memory_fit_stages < cadence_stages:
+        raise ValueError(
+            "single-instance context staging requires at least "
+            f"{cadence_stages} K/V stages, but the shared-memory budget fits "
+            f"only {memory_fit_stages}"
+        )
+    return memory_fit_stages
+
+
+def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
+    """Set topology- and capacity-derived context pipeline stage counts."""
     cfg.q_stage = cfg.num_qkv_instances
     cfg.kv_stage = 3
-    if cfg.single_qkv_instance:
-        # The single-instance load schedule gives every explicit K and V
-        # head-dimension slice its own slot in the shared KV FIFO.
-        cfg.kv_stage = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
     cfg.has_tmem_p_pipeline = _should_use_tmem_p_pipeline(cfg)
     cfg.stage_scoped_tmem_stats = cfg.has_tmem_p_pipeline
     cfg.mma_softmax_stage = 2 if cfg.has_tmem_p_pipeline else 1
     cfg.softmax_corr_stage = 2 if cfg.stage_scoped_tmem_stats else 1
-    cfg.mma_corr_stage = 2
-    cfg.epi_stage = 2
-    cfg.softmax_warpgroup_count = cfg.num_qkv_instances
+    # SMEM-backed D256 removes the independent StatsDone credit and always
+    # writes the same physical O0 accumulator. Its MMA->Correction handoff must
+    # therefore be single-stage so PV(i+1) cannot overwrite O0 before
+    # Correction consumes PV(i). TMEM-stats schedules retain their established
+    # two-stage O + StatsDone ordering.
+    cfg.mma_corr_stage = 1 if cfg.single_qkv_instance and cfg.stats_via_smem else 2
+    if cfg.single_qkv_instance:
+        natural_page_window_entries = cute.arch.WARP_SIZE
+        cfg.page_table_window_entries = natural_page_window_entries
+        candidate_page_window_entries = cfg.page_table_window_candidate_entries
+        if candidate_page_window_entries > natural_page_window_entries:
+            candidate_kv_stages = _infer_single_instance_kv_stages(
+                cfg,
+                is_clc_dynamic=is_clc_dynamic,
+                page_table_window_entries=candidate_page_window_entries,
+                require_cadence=False,
+            )
+            cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
+            if candidate_kv_stages >= cadence_stages:
+                cfg.page_table_window_entries = candidate_page_window_entries
+        cfg.kv_stage = _infer_single_instance_kv_stages(
+            cfg,
+            is_clc_dynamic=is_clc_dynamic,
+        )
 
 
-_EARLY_TILE_SUM_REGISTER_BUDGET = (176, 80, 80)
+# Dense work traverses the full K domain for every Q tile, so its persistent
+# mainloop keeps more registers on the load/MMA/epilogue/scheduler warpgroup.
+# Causal work has a triangular, request-local K domain and retains the
+# softmax/correction-heavy allocation. Both policies consume the same complete
+# CTA register budget across the 8/4/4 participating warps; neither depends on
+# batch size, sequence length, head count, layout, or a measured crossover.
+_EARLY_TILE_SUM_DENSE_REGISTER_BUDGET = (176, 80, 80)
+_EARLY_TILE_SUM_CAUSAL_REGISTER_BUDGET = (184, 88, 56)
 
 
 def _configure_early_tile_sum_policy(
@@ -1275,18 +1658,19 @@ def _configure_early_tile_sum_policy(
     # single-instance topology.  Q2/KV1 benefits across scheduler and head
     # mappings; keep the persistence condition explicit for parity with the
     # upstream policy if another paired geometry is added later.
-    # DKG 4baa has no paged-KV schedule.  On this fork, moving the reduction
-    # onto P publication regresses the static-persistent paged pipeline, so it
-    # retains the cd442fd8 algorithm and register split.
-    cfg.enable_early_tile_sum = (
-        cfg.uses_early_tile_sum
-        and not cfg.use_paged_kv
-        and (not cfg.single_qkv_instance or is_persistent)
+    # D256 staged FP8 retires each probability through conversion and row-sum
+    # reduction eight values after EXP2. It therefore returns a scalar tile
+    # sum through the same task-local path as the paired early-sum policy while
+    # retaining the D256 200/192/112 register split below.
+    # D128 uses the same early-sum dataflow for every scheduler and storage
+    # layout; scheduler selection must not silently change its math pipeline.
+    cfg.enable_early_tile_sum = cfg.uses_d256_fp8_softmax_cadence or (
+        cfg.uses_early_tile_sum and (not cfg.single_qkv_instance or is_persistent)
     )
     if cfg.single_qkv_instance:
         return
     if not cfg.enable_early_tile_sum:
-        # Preserve the cd442fd8 register split for unsupported paired paths.
+        # Preserve the established register split for unsupported paired paths.
         # Upstream's legacy 192/96/32 fallback serves Q1/KV2, which this fork
         # does not implement.
         return
@@ -1294,7 +1678,11 @@ def _configure_early_tile_sum_policy(
         cfg.num_regs_softmax,
         cfg.num_regs_correction,
         cfg.num_regs_other,
-    ) = _EARLY_TILE_SUM_REGISTER_BUDGET
+    ) = (
+        _EARLY_TILE_SUM_CAUSAL_REGISTER_BUDGET
+        if cfg.is_causal
+        else _EARLY_TILE_SUM_DENSE_REGISTER_BUDGET
+    )
 
 
 def _configure_smem_shapes(cfg: FmhaConfig) -> None:
@@ -1313,7 +1701,7 @@ def _configure_smem_shapes(cfg: FmhaConfig) -> None:
         cfg.kv_stage,
         cfg.qk_mma_tiler[1] * kv_head_dim,
     )
-    cfg.sO_shape = (cfg.epi_stage, cfg.epi_tile[0] * o_head_dim)
+    cfg.sO_stage_elements = cfg.epi_tile[0] * o_head_dim
 
 
 def _validate_tmem_columns(cfg: FmhaConfig) -> None:
@@ -1474,6 +1862,10 @@ def _causal_domain_kwargs(
     kv_n: int,
     q_offset: int | Int32,
     seq_idx: int,
+    batch_idx: int | None = None,
+    cum_seqlen_q: cute.Tensor | None = None,
+    cum_seqlen_k: cute.Tensor | None = None,
+    runtime_kv_tile_multiple: int = 1,
     offset: int,
     reverse_seq_tiles: int | Int32 | None = None,
     window_size_left: int | None = None,
@@ -1497,6 +1889,17 @@ def _causal_domain_kwargs(
     }
     if reverse_seq_tiles is not None:
         result["reverse_seq_tiles"] = reverse_seq_tiles
+    if cum_seqlen_q is not None:
+        if batch_idx is None or cum_seqlen_k is None:
+            raise ValueError(
+                "runtime causal domains require batch_idx and both cumulative "
+                "sequence-length tensors"
+            )
+        result["batch_idx"] = batch_idx
+        result["cum_seqlen_q"] = cum_seqlen_q
+        result["cum_seqlen_k"] = cum_seqlen_k
+        if runtime_kv_tile_multiple > 1:
+            result["runtime_kv_tile_multiple"] = runtime_kv_tile_multiple
     if window_size_left is not None:
         result["window_size_left"] = window_size_left
     if packed_window:
@@ -1509,9 +1912,12 @@ def _select_fmha_domain_policy(
     *,
     num_kv_tiles: int | Int32,
     q_offset: int | Int32,
+    cum_seqlen_q: cute.Tensor | None,
+    cum_seqlen_k: cute.Tensor | None,
 ) -> FmhaDomainPolicy:
     """Select loop domains and softmax masks for the configured FMHA mode."""
     seq_idx = cfg.work_tile_coord_indices[0]
+    batch_idx = cfg.work_tile_coord_indices[2]
     reverse_seq_tiles = (
         cfg.num_seq_tiles
         if cfg.uses_causal_reversed_head_batch_seq_tile_order
@@ -1580,12 +1986,21 @@ def _select_fmha_domain_policy(
                 softmax0_domain_kwargs=domain_n_minus_1_kwargs,
                 softmax1_domain_kwargs=domain_n_minus_1_kwargs,
             )
+        runtime_kv_tile_multiple = (
+            (cfg.cta_tiler[0] + cfg.kv_tile_n - 1) // cfg.kv_tile_n
+            if cfg.skip_causal_invalid_peer0
+            else 1
+        )
         causal_n = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
             cta_m=cfg.cta_tiler[0],
             kv_n=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
+            batch_idx=batch_idx,
+            cum_seqlen_q=cum_seqlen_q,
+            cum_seqlen_k=cum_seqlen_k,
+            runtime_kv_tile_multiple=runtime_kv_tile_multiple,
             offset=0,
             reverse_seq_tiles=reverse_seq_tiles,
         )
@@ -1595,6 +2010,10 @@ def _select_fmha_domain_policy(
             kv_n=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
+            batch_idx=batch_idx,
+            cum_seqlen_q=cum_seqlen_q,
+            cum_seqlen_k=cum_seqlen_k,
+            runtime_kv_tile_multiple=runtime_kv_tile_multiple,
             offset=1,
             reverse_seq_tiles=reverse_seq_tiles,
         )
@@ -1604,6 +2023,10 @@ def _select_fmha_domain_policy(
             kv_n=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
+            batch_idx=batch_idx,
+            cum_seqlen_q=cum_seqlen_q,
+            cum_seqlen_k=cum_seqlen_k,
+            runtime_kv_tile_multiple=runtime_kv_tile_multiple,
             offset=2,
             reverse_seq_tiles=reverse_seq_tiles,
         )
@@ -1667,7 +2090,14 @@ def build_fmha_task_manager(
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
     exhaustive_deadlock_race_check: bool = True,
-) -> Tuple[TaskManager, list[MemoryResource], SmemAllocation, SmemAllocation]:
+) -> Tuple[
+    TaskManager,
+    list[MemoryResource],
+    SmemAllocation,
+    SmemAllocation,
+    WorkQueue | None,
+    SmemAllocation | None,
+]:
     """Build the FMHA TaskManager using the shared context TS graph.
 
     Runtime scale arguments follow the same contract as
@@ -1688,13 +2118,22 @@ def build_fmha_task_manager(
     if cfg.skip_causal_invalid_peer0:
         # Query-paired causal skips peer0 work with a constexpr last-loop test.
         # Partial final CTAs need the task domain padded so the extra peer0 slot
-        # remains statically invalid; already aligned static domains keep the
-        # original value so full-tile rows follow the old scheduling path.
+        # remains statically invalid; aligned static domains need no padding.
         paired_kv_tiles = (cfg.cta_tiler[0] + cfg.kv_tile_n - 1) // cfg.kv_tile_n
         if not isinstance(num_kv_tiles, int) or num_kv_tiles % paired_kv_tiles != 0:
             domain_num_kv_tiles = (
                 cute.ceil_div(num_kv_tiles, paired_kv_tiles) * paired_kv_tiles
             )
+    if cfg.reuses_page_table_windows:
+        # The paged plan's maximum page count is compile-time semantic geometry.
+        # Its tile count equals ceil(max_seq_len_kv / kv_tile_n), so exposing it
+        # here gives stock TaskManager a structural stride-window loop without a
+        # shape-tuned threshold or a custom control-flow feature.
+        pages_per_kv_tile = cfg.kv_tile_n // cfg.num_tokens_per_page
+        static_paged_num_kv_tiles = (
+            cfg.max_num_pages_per_seq_kv + pages_per_kv_tile - 1
+        ) // pages_per_kv_tile
+        domain_num_kv_tiles = static_paged_num_kv_tiles
     # Keep equal-length fixed launches constexpr-zero while preserving the
     # runtime per-request offset path for packed/bottom-right attention.
     effective_q_offset = q_offset if cfg.has_q_offset else 0
@@ -1702,6 +2141,16 @@ def build_fmha_task_manager(
         cfg,
         num_kv_tiles=domain_num_kv_tiles,
         q_offset=effective_q_offset,
+        # A uniform packed plan remains uniform under its replay contract, so
+        # keep that specialization free of redundant GMEM indptr loads. Mixed
+        # packed and paged plans derive their causal domain from live Q and
+        # logical-K cumulative offsets instead.
+        cum_seqlen_q=(
+            cum_seqlen_q if cfg.has_varlen and not cfg.has_uniform_varlen else None
+        ),
+        cum_seqlen_k=(
+            cum_seqlen_k if cfg.has_varlen and not cfg.has_uniform_varlen else None
+        ),
     )
 
     return build_context_task_manager(
@@ -1718,7 +2167,7 @@ def build_fmha_task_manager(
         g_page_idx_kv=g_page_idx_kv,
         g_seq_lens_kv=g_seq_lens_kv,
         max_seq_len_kv=max_seq_len_kv,
-        num_kv_tiles=num_kv_tiles,
+        num_kv_tiles=domain_num_kv_tiles,
         q_offset=effective_q_offset,
         domain_n_kwargs=domain_policy.domain_n_kwargs,
         domain_n_minus_1_kwargs=domain_policy.domain_n_minus_1_kwargs,
@@ -1765,8 +2214,9 @@ class FmhaTs:
         Enable causal masking (default: False).
     balance_causal_workload : bool, optional
         Use TRT-style causal workload balancing: head_batch_seq logical tile
-        order with reversed Q sequence tiles. Disabled by default to preserve
-        K/V locality.
+        order with reversed Q sequence tiles. Paired causal CLC schedules
+        enable this automatically; setting the flag also requests it for other
+        causal scheduler topologies.
     is_clc_dynamic : bool, optional
         Use CLC dynamic persistent scheduling (default: False).
         Requires ``is_persistent=True``.
@@ -1823,14 +2273,10 @@ class FmhaTs:
             raise ValueError("Head-paired scheduling requires persistent mode")
         validate_head_paired_head_ratio(head_paired=head_paired, h_r=h_r)
         if use_paged_kv:
-            if is_clc_dynamic:
+            if num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
                 raise ValueError(
-                    "paged KV does not support CLC dynamic scheduling; use "
-                    "static-persistent or non-persistent scheduling"
-                )
-            if num_tokens_per_page != 32:
-                raise ValueError(
-                    "paged context requires num_tokens_per_page=32; got "
+                    "paged context requires num_tokens_per_page in "
+                    f"{_SUPPORTED_CONTEXT_PAGE_SIZES}; got "
                     f"{num_tokens_per_page}"
                 )
             if max_num_pages_per_seq_kv < 1:
@@ -1850,19 +2296,35 @@ class FmhaTs:
 
         cfg = FmhaConfig()
         self.cfg = cfg
+        if d > 128:
+            cfg.num_qkv_instances = 1
         cfg.use_paged_kv = use_paged_kv
+        dense_single_instance_persistent = (
+            is_persistent
+            and cfg.single_qkv_instance
+            and not is_causal
+            and not head_paired
+        )
+        # Paired Q2 schedules route correction statistics through a compact
+        # SMEM ring and omit the per-K StatsDone serialization. Dense D256
+        # persistent schedules use the same public SMEM-statistics topology,
+        # while their S/P pipelines drain normally at each work-tile boundary.
+        cfg.stats_via_smem = dense_single_instance_persistent or (
+            not cfg.single_qkv_instance
+        )
+        cfg.fuse_epilogue_into_correction = cfg.single_qkv_instance
         cfg.num_tokens_per_page = num_tokens_per_page
         cfg.max_num_pages_per_seq_kv = max_num_pages_per_seq_kv
         cfg.causal_single_kv_tile = causal_single_kv_tile
-        # FP16/BF16 causal attention benefits from the default 192/96/32
-        # softmax/correction/auxiliary split.  Dense and FP8 schedules use
-        # 184/88/56.  Both splits total 2048 registers across the 16 warps.
+        # FP16/BF16 causal attention retains the default 192/96/32
+        # softmax/correction/auxiliary split. Other topologies start from
+        # 184/88/56; the paired D128 early-sum policy is rebalanced below.
+        # Every selected split totals 2048 registers across the 16 warps.
         if not (is_causal and q_dtype.width == 16):
             cfg.num_regs_softmax = 184
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
-        cfg.rescale_threshold = 8.0 if enable_skip_correction else 0.0
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
 
@@ -1872,13 +2334,15 @@ class FmhaTs:
         cfg.v_dtype = v_dtype
         cfg.o_dtype = o_dtype
         cfg.head_paired = head_paired
-        if d > 128:
-            cfg.num_qkv_instances = 1
+        cfg.is_causal = is_causal
+        balance_causal_workload = balance_causal_workload or (
+            is_causal and is_clc_dynamic and not cfg.single_qkv_instance
+        )
 
         if head_paired:
             _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=d)
             _configure_head_dim_staging(cfg)
-            _configure_pipeline_stages(cfg)
+            _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
             if cfg.single_qkv_instance:
                 _configure_single_instance_tmem_layout(cfg)
                 _configure_single_instance_warp_layout(cfg)
@@ -1907,7 +2371,7 @@ class FmhaTs:
         cfg.pv_mma_tiler = (mma_tiler[0], mma_tiler[2], mma_tiler[1])
         cfg.epi_tile = cfg.pv_mma_tiler[:2]
         _configure_head_dim_staging(cfg)
-        _configure_pipeline_stages(cfg)
+        _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
         if cfg.single_qkv_instance:
             _configure_single_instance_tmem_layout(cfg)
             _configure_single_instance_warp_layout(cfg)
@@ -1985,7 +2449,6 @@ class FmhaTs:
         cum_seqlen_k: cute.Tensor | None = None,
         max_seqlen_q: Int32 | None = None,
         max_seqlen_k: Int32 | None = None,
-        max_q_offset: Int32 | None = None,
         page_idx_kv: cute.Tensor | None = None,
         seq_lens_kv: cute.Tensor | None = None,
     ) -> None:
@@ -2005,7 +2468,15 @@ class FmhaTs:
         # varlen launches drop it because the flattened tensors are indexed via
         # cum_seqlen metadata.
         tma_qkv_swizzle = cuda.TensorMapSwizzle.s128b
-        tma_kv_l2_promotion = cuda.TensorMapL2Promotion.none
+        # Paged K/V issues one 128-byte tensor-map fragment per physical page.
+        # Promote that exact fragment width so the Q-head tiles sharing each
+        # logical K/V tile reuse the same cache line, matching TRTLLM-Gen's
+        # public tensor-map descriptor policy.
+        tma_kv_l2_promotion = (
+            cuda.TensorMapL2Promotion.l2_128b
+            if cutlass.const_expr(cfg.use_paged_kv)
+            else cuda.TensorMapL2Promotion.none
+        )
         if cutlass.const_expr(cfg.head_paired):
             inner_dim_size = cfg.qk_mma_tiler[2] * cfg.q_dtype.width // 8
             tma_qkv_swizzle = cuda.TensorMapSwizzle.none
@@ -2163,22 +2634,19 @@ class FmhaTs:
         q_offset = Int32(0) if cutlass.const_expr(cfg.head_paired) else 0
         if cutlass.const_expr(self.is_causal):
             q_offset = s_k - s_q
-            # Packed batches need the maximum per-request K-Q offset; it is
-            # not generally equal to max(S_k)-max(S_q).
-            if cutlass.const_expr(max_q_offset is not None):
-                q_offset = max_q_offset
 
         # Tile scheduling order:
         #
         # Causal defaults to seq_head_batch to keep adjacent Q sequence tiles
-        # close for K/V locality. Paired FP8 uses head_batch_seq because the
-        # measured shorter runtime benefits more from launch-wave balance than
-        # adjacent-Q reuse. Explicit balance_causal_workload also switches to
-        # head_batch_seq and reverses sequence order.
+        # close for K/V locality. Paired FP8 uses head_batch_seq, and paired
+        # causal CLC additionally reverses its sequence axis so the dynamic
+        # queue retires the heaviest causal tiles first. An explicit
+        # balance_causal_workload request uses that same reversed order.
         #
-        # Dense: seq_head_batch. All tiles have equal work, so seq-first keeps
-        # adjacent Q rows on the same SM for better L2 reuse.
-        if cutlass.const_expr(cfg.uses_causal_head_batch_seq_tile_order):
+        # Dense GQA uses head_batch_seq so Q-head groups that share one K/V
+        # head stay adjacent. Dense MHA retains seq_head_batch because it has
+        # no cross-head K/V reuse.
+        if cutlass.const_expr(cfg.uses_head_batch_seq_tile_order):
             problem_shape = (num_head_tiles, b, num_seq_tiles)
         else:
             problem_shape = (num_seq_tiles, num_head_tiles, b)
@@ -2303,38 +2771,61 @@ class FmhaTs:
             prims.prefetch_tensormap(tma_v_desc.get_ptr())
             prims.prefetch_tensormap(tma_o_desc.get_ptr())
 
-        # 2. CLC dynamic: allocate SMEM response buffer for CLC tile fetch
-        # (remains separate — consumed before SmemAllocator.allocate())
+        # 2. CLC dynamic: the response buffer is declared by the builder and
+        # bound from the unified task-manager SMEM allocation below.
         clc_response_ptr = None
-        if cutlass.const_expr(is_clc_dynamic):
-            # Allocate CLC response buffer (1 stage, 16 bytes).
-            num_workid_stages = 1
-            clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, num_workid_stages)
 
         # 3. Build TaskManager (infrastructure slots via SmemAllocator)
-        task_manager, tmem_resources, tmem_ptr_alloc, dealloc_mbar_alloc = (
-            build_fmha_task_manager(
-                cfg=cfg,
-                tile_sched_params=tile_sched_params,
-                tma_q_desc=tma_q_desc.get_ptr(),
-                tma_k_desc=tma_k_desc.get_ptr(),
-                tma_v_desc=tma_v_desc.get_ptr(),
-                tma_o_desc=tma_o_desc.get_ptr(),
-                cum_seqlen_q=cum_seqlen_q,
-                cum_seqlen_k=cum_seqlen_k,
-                g_page_idx_kv=page_idx_kv,
-                g_seq_lens_kv=seq_lens_kv,
-                max_seq_len_kv=max_seq_len_kv,
-                num_kv_tiles=num_kv_tiles,
-                scale_softmax_log2=scale_softmax_log2,
-                output_scale=output_scale,
-                q_offset=q_offset,
-                is_persistent=is_persistent,
-                is_clc_dynamic=is_clc_dynamic,
-                clc_response_ptr=clc_response_ptr,
-                exhaustive_deadlock_race_check=self.exhaustive_deadlock_race_check,
-            )
+        (
+            task_manager,
+            tmem_resources,
+            tmem_ptr_alloc,
+            dealloc_mbar_alloc,
+            work_queue,
+            clc_response_alloc,
+        ) = build_fmha_task_manager(
+            cfg=cfg,
+            tile_sched_params=tile_sched_params,
+            tma_q_desc=tma_q_desc.get_ptr(),
+            tma_k_desc=tma_k_desc.get_ptr(),
+            tma_v_desc=tma_v_desc.get_ptr(),
+            tma_o_desc=tma_o_desc.get_ptr(),
+            cum_seqlen_q=cum_seqlen_q,
+            cum_seqlen_k=cum_seqlen_k,
+            g_page_idx_kv=page_idx_kv,
+            g_seq_lens_kv=seq_lens_kv,
+            max_seq_len_kv=max_seq_len_kv,
+            num_kv_tiles=num_kv_tiles,
+            scale_softmax_log2=scale_softmax_log2,
+            output_scale=output_scale,
+            q_offset=q_offset,
+            is_persistent=is_persistent,
+            is_clc_dynamic=is_clc_dynamic,
+            clc_response_ptr=clc_response_ptr,
+            exhaustive_deadlock_race_check=self.exhaustive_deadlock_race_check,
         )
+
+        # Bind the CLC scheduler to its exact suballocation before WorkQueue
+        # create() materializes the concrete scheduler during normal setup.
+        if cutlass.const_expr(is_clc_dynamic):
+            assert work_queue is not None
+            assert clc_response_alloc is not None
+            smem_allocator = task_manager.smem_allocator
+            assert smem_allocator is not None
+            smem_allocator.allocate()
+            clc_response = smem_allocator.get(clc_response_alloc)
+            clc_response_ptr = cute.make_ptr(
+                cutlass.Int128,
+                clc_response.data_ptr(),
+                mem_space=cutlass.AddressSpace.smem,
+                assumed_align=16,
+            )
+            work_queue.tile_scheduler_config = (
+                TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
+                    tile_scheduler_params=tile_sched_params,
+                    response_ptr=clc_response_ptr,
+                )
+            )
 
         # 4. Initialize all pipeline barriers + allocate unified SMEM
         task_manager.setup_resources_and_tasks()

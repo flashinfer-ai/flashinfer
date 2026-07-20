@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Parallel standalone split-KV reduction for throughput-latency 1CTA MLA."""
 
@@ -19,9 +12,9 @@ from ...separate_reduction import finalize_log2_sum_exp, normalized_lse_weight
 from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.math import ceil_div
 from ..helpers.ops import (
-    nvvm_fmax,
-    nvvm_warp_reduction_max,
-    nvvm_warp_reduction_sum,
+    fmax_f32,
+    warp_reduce_max_f32,
+    warp_reduce_sum_f32,
 )
 from ..helpers.query import groups_tokens_heads_q_row_state, public_query_flat_row
 from ..parallel_reduction_topology import ParallelReductionTopology
@@ -257,9 +250,9 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                     if split_idx < Int32(cfg.num_ctas_per_seq_kv)
                     else Float32(-Float32.inf)
                 )
-                lse_max = nvvm_fmax(lse_max, lane_lse[lane_slot_i])
+                lse_max = fmax_f32(lse_max, lane_lse[lane_slot_i])
 
-            lse_max = nvvm_warp_reduction_max(lse_max)
+            lse_max = warp_reduce_max_f32(lse_max)
             lse_max = lse_max if lse_max != Float32(-Float32.inf) else Float32(0.0)
             lse_sum = Float32(0.0)
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
@@ -267,7 +260,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                     lane_lse[lane_slot_i] - lse_max,
                     fastmath=True,
                 )
-            lse_sum = nvvm_warp_reduction_sum(lse_sum)
+            lse_sum = warp_reduce_sum_f32(lse_sum)
             global_lse = finalize_log2_sum_exp(lse_max, lse_sum)
             if (
                 lane_idx == Int32(0)
@@ -488,9 +481,9 @@ def _run_parallel_gmem_reduction_shared_stats(
                     actual_splits
                 ):
                     lane_lse[lane_slot_i] = Float32(row_lse[split_idx])
-                local_max = nvvm_fmax(local_max, lane_lse[lane_slot_i])
+                local_max = fmax_f32(local_max, lane_lse[lane_slot_i])
 
-            local_max = nvvm_warp_reduction_max(local_max)
+            local_max = warp_reduce_max_f32(local_max)
             safe_local_max = local_max if local_max != neg_inf else Float32(0.0)
             local_sum = Float32(0.0)
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
@@ -501,7 +494,7 @@ def _run_parallel_gmem_reduction_shared_stats(
                     )
                 )
                 local_sum += lane_exp[lane_slot_i]
-            local_sum = nvvm_warp_reduction_sum(local_sum)
+            local_sum = warp_reduce_sum_f32(local_sum)
             local_lse = finalize_log2_sum_exp(safe_local_max, local_sum)
 
         if lane_idx == Int32(0):
@@ -666,7 +659,7 @@ def _run_parallel_gmem_reduction_shared_stats(
                         + stats_row
                     ).load()
 
-            global_max = nvvm_warp_reduction_max(peer_lse)
+            global_max = warp_reduce_max_f32(peer_lse)
             safe_global_max = global_max if global_max != neg_inf else Float32(0.0)
             peer_exp = Float32(
                 cute.math.exp2(
@@ -674,7 +667,7 @@ def _run_parallel_gmem_reduction_shared_stats(
                     fastmath=True,
                 )
             )
-            global_sum = nvvm_warp_reduction_sum(peer_exp)
+            global_sum = warp_reduce_sum_f32(peer_exp)
             global_lse = finalize_log2_sum_exp(safe_global_max, global_sum)
             if lane_idx == Int32(0):
                 smem_global_lse[stats_row] = global_lse

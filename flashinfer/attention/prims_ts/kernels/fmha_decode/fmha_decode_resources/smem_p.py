@@ -1,19 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """``SmemPResource`` — P operand staging for BMM2.
 
 Producer (Softmax): converts S in registers to P and publishes per-lane local
-sums back through ``TmemSResource``. The one-instance Keeps path writes two
-physical TMEM stages; other profiles retain the SMEM operand layout. Consumer
-(MmaTask) publishes the corresponding TMEM address or SMEM descriptor.
+sums back through ``TmemSResource``. Keeps Q64/Q128 overlays P on consumed S
+columns in TMEM; Swaps retains the SMEM operand layout. Consumer (MmaTask)
+publishes the corresponding TMEM address or SMEM descriptor.
 """
 
 from dataclasses import dataclass
@@ -372,13 +365,28 @@ class SmemPResource(DecodeGenResourceBase):
                     packed_p.data_ptr().load(count=4, alignment=4), alignment=16
                 )
         if cutlass.const_expr(cfg.uses_two_inst_tmem_p):
-            assert cfg.num_packed_p_regs in (16, 32)
-            _keeps_tcgen05_st(
-                cfg,
-                prims.make_tmem_ptr(p_tmem_stage_base, Int32),
-                packed_p.data_ptr().load(count=cfg.num_packed_p_regs, alignment=4),
-                offset=cfg.num_packed_p_regs,
-            )
+            # FP8 publishes Q64/Q128 with one x16/x32 STTM. FP16/BF16 uses x16
+            # slices to limit Softmax register pressure, producing two/four
+            # stores. Every slice targets this instance's consumed S region.
+            assert cfg.num_packed_p_regs in (16, 32, 64)
+            regs_per_store = cfg.num_packed_p_regs if cfg.use_fp8_qkv else 16
+            assert cfg.num_packed_p_regs % regs_per_store == 0
+            for store_idx in cutlass.range_constexpr(
+                cfg.num_packed_p_regs // regs_per_store
+            ):
+                packed_offset = store_idx * regs_per_store
+                _keeps_tcgen05_st(
+                    cfg,
+                    prims.make_tmem_ptr(
+                        p_tmem_stage_base + Int32(packed_offset), Int32
+                    ),
+                    (packed_p.data_ptr() + packed_offset).load(
+                        count=regs_per_store, alignment=4
+                    ),
+                    # Q64's 16x32bx2 mapping uses this as the low/high-half
+                    # split: 16 columns for FP8 and 32 for FP16/BF16.
+                    offset=cfg.num_packed_p_regs,
+                )
             if cutlass.const_expr(cfg.ordered_softmax_early_release):
                 # Hand the baton over as soon as this group's STTM has
                 # issued: the partner's exp2/pack/STTM touch only its own
@@ -400,7 +408,8 @@ class SmemPResource(DecodeGenResourceBase):
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             cute.arch.fence_view_async_tmem_store()
             if cutlass.const_expr(cfg.uses_staged_one_inst_tmem_p):
-                # Preserve the established one-instance D256 rendezvous.
+                # Synchronize the D256 producer warp group after its TMEM stores
+                # are visible.
                 prims.barrier_cta_sync(4 + self.inst_id, thread_count=128)
         else:
             # Each producer thread orders its own SMEM P stores with an

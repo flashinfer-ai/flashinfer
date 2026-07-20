@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Split-KV GMEM reduction helpers for throughput-latency 1CTA MLA."""
 
@@ -18,9 +11,9 @@ from cutlass import Float32, Int32, Int64
 from .config import MlaConfig
 from ..helpers.math import ceil_div
 from ..helpers.ops import (
-    nvvm_fmax,
-    nvvm_warp_reduction_max,
-    nvvm_warp_reduction_sum,
+    fmax_f32,
+    warp_reduce_max_f32,
+    warp_reduce_sum_f32,
     vector_from_scalars,
 )
 from ..helpers.query import groups_tokens_heads_q_row_state, public_query_flat_row
@@ -305,7 +298,7 @@ def run_gmem_reduction_kernel(
                 lse_max = kernel.lse_dtype(-kernel.lse_dtype.inf)
                 for split_idx in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
                     local_lse[split_idx] = row_lse[split_idx]
-                    lse_max = nvvm_fmax(lse_max, local_lse[split_idx])
+                    lse_max = fmax_f32(lse_max, local_lse[split_idx])
 
                 lse_max = (
                     lse_max
@@ -460,8 +453,8 @@ def run_gmem_reduction_kernel(
                         if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv))
                         else -kernel.lse_dtype.inf
                     )
-                    lse_max = nvvm_fmax(lse_max, local_lse[i])
-                lse_max = nvvm_warp_reduction_max(lse_max)
+                    lse_max = fmax_f32(lse_max, local_lse[i])
+                lse_max = warp_reduce_max_f32(lse_max)
                 lse_max = (
                     lse_max
                     if lse_max != -kernel.lse_dtype.inf
@@ -470,7 +463,7 @@ def run_gmem_reduction_kernel(
                 sum_lse = kernel.lse_dtype(0.0)
                 for i in cutlass.range_constexpr(lse_per_thread):
                     sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
-                sum_lse = nvvm_warp_reduction_sum(sum_lse)
+                sum_lse = warp_reduce_sum_f32(sum_lse)
                 has_finite_mass = sum_lse == sum_lse and sum_lse != kernel.lse_dtype(
                     0.0
                 )
@@ -631,8 +624,8 @@ def run_gmem_reduction_kernel(
                         if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv))
                         else -kernel.lse_dtype.inf
                     )
-                    lse_max = nvvm_fmax(lse_max, local_lse[i])
-                lse_max = nvvm_warp_reduction_max(lse_max)
+                    lse_max = fmax_f32(lse_max, local_lse[i])
+                lse_max = warp_reduce_max_f32(lse_max)
                 lse_max = (
                     lse_max
                     if lse_max != -kernel.lse_dtype.inf
@@ -641,7 +634,7 @@ def run_gmem_reduction_kernel(
                 sum_lse = kernel.lse_dtype(0.0)
                 for i in cutlass.range_constexpr(lse_per_thread):
                     sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
-                sum_lse = nvvm_warp_reduction_sum(sum_lse)
+                sum_lse = warp_reduce_sum_f32(sum_lse)
                 has_finite_mass = sum_lse == sum_lse and sum_lse != kernel.lse_dtype(
                     0.0
                 )
@@ -797,13 +790,13 @@ def run_gmem_reduction_kernel(
                 and cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv))
                 else -kernel.lse_dtype.inf
             )
-            lse_max = nvvm_fmax(lse_max, local_lse[i])
-        lse_max = nvvm_warp_reduction_max(lse_max)
+            lse_max = fmax_f32(lse_max, local_lse[i])
+        lse_max = warp_reduce_max_f32(lse_max)
         lse_max = lse_max if lse_max != -kernel.lse_dtype.inf else kernel.lse_dtype(0.0)
         sum_lse = kernel.lse_dtype(0.0)
         for i in cutlass.range_constexpr(lse_per_thread):
             sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
-        sum_lse = nvvm_warp_reduction_sum(sum_lse)
+        sum_lse = warp_reduce_sum_f32(sum_lse)
         has_finite_mass = sum_lse == sum_lse and sum_lse != kernel.lse_dtype(0.0)
         global_lse = (
             lse_max + cute.math.log2(sum_lse, fastmath=True)

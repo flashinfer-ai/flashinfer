@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Math, dtype, and atomic helper functions for MLA decode TS examples."""
 
@@ -25,13 +18,13 @@ NEG_FLT_MAX = -3.4028235e38
 # E4M3FN finite maximum used when clamping FP8 output conversion.
 FP8_E4M3_MAX = 448.0
 
-nvvm_fma_packed_f32x2 = partial(prims.fma_packed_f32x2, rnd="rn")
-nvvm_add_packed_f32x2 = partial(prims.add_packed_f32x2, rnd="rn")
-nvvm_mul_packed_f32x2 = partial(prims.mul_packed_f32x2, rnd="rn")
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
+add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd="rn")
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 
-fadd2 = partial(prims.add_packed_f32x2, ftz=False, rnd="rn")
-fmul2 = partial(prims.mul_packed_f32x2, ftz=False, rnd="rn")
-ffma2 = partial(prims.fma_packed_f32x2, ftz=False, rnd="rn")
+fadd2 = partial(cute.arch.add_packed_f32x2, ftz=False, rnd="rn")
+fmul2 = partial(cute.arch.mul_packed_f32x2, ftz=False, rnd="rn")
+ffma2 = partial(cute.arch.fma_packed_f32x2, ftz=False, rnd="rn")
 
 
 def ceil_div(a, b):

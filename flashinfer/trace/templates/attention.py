@@ -326,6 +326,11 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str):
         output_dtype = out.dtype
     elif isinstance(requested_out_dtype, torch.dtype):
         output_dtype = requested_out_dtype
+    elif isinstance(getattr(kwargs.get("self"), "_output_dtype", None), torch.dtype):
+        # Reusable wrappers retain the planned output dtype.  In particular,
+        # an FP8-input plan may allocate FP16 output even though run() has no
+        # out_dtype argument and the caller omits an explicit out buffer.
+        output_dtype = kwargs["self"]._output_dtype
     elif isinstance(query, torch.Tensor):
         output_dtype = query.dtype
     else:
@@ -378,12 +383,13 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (16, 32, 64, 128)",
-        "kv_planes == 2 when the combined cache form is used",
         "len_indptr == batch_size + 1",
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
         "window_left == -1 or mask_type == 'causal'",
     ]
+    if combined:
+        constraints.append("kv_planes == 2")
     if q_mode == _Q_PACKED:
         constraints.extend(
             [
@@ -495,13 +501,14 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         "head_dim in (64, 128, 256)",
         "page_size in (16, 32, 64, 128)",
         "max_seq_len <= 16384",
-        "kv_planes == 2 when the combined cache form is used",
         "len_indptr == batch_size + 1",
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
         "kv_layout == 'HND'",
         "window_left == -1 or mask_type == 'causal'",
     ]
+    if combined:
+        constraints.append("kv_planes == 2")
     if q_mode == _Q_PACKED:
         constraints.extend(
             [
@@ -599,6 +606,20 @@ def _make_prims_ts_decode_wrapper_trace(
             "bmm2_scale": Scalar("float32", optional=True),
         }
     )
+    constraints = [
+        "head_dim in (64, 128, 256)",
+        "page_size in (16, 32, 64, 128)",
+        "num_qo_heads % num_kv_heads == 0",
+        "1 <= num_qo_heads // num_kv_heads <= 32",
+        "window_left == -1 or mask_type == 'causal'",
+        *(
+            ["len_qo_indptr == batch_size + 1", "total_q == qo_indptr[-1].item()"]
+            if q_mode == _Q_PACKED
+            else []
+        ),
+    ]
+    if combined:
+        constraints.append("kv_planes == 2")
     return TraceTemplate(
         op_type="gqa_paged",
         name_prefix=f"prims_ts_decode_wrapper_{cache_form}{output_suffix}{q_suffix}",
@@ -617,19 +638,7 @@ def _make_prims_ts_decode_wrapper_trace(
                 param="out",
             )
         },
-        constraints=[
-            "head_dim in (64, 128, 256)",
-            "page_size in (16, 32, 64, 128)",
-            "kv_planes == 2 when the combined cache form is used",
-            "num_qo_heads % num_kv_heads == 0",
-            "1 <= num_qo_heads // num_kv_heads <= 32",
-            "window_left == -1 or mask_type == 'causal'",
-            *(
-                ["len_qo_indptr == batch_size + 1", "total_q == qo_indptr[-1].item()"]
-                if q_mode == _Q_PACKED
-                else []
-            ),
-        ],
+        constraints=constraints,
         tags=["stage:decode", "backend:prims-ts", "status:experimental"],
     )
 
@@ -647,11 +656,19 @@ _PRIMS_TS_DECODE_WRAPPER_TRACES = {
 def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     """Select the wrapper schema, using plan state to disambiguate rank-3 Q."""
 
+    wrapper = kwargs.get("self")
+    if wrapper is None:
+        raise ValueError(
+            "Tracing BatchDecodePagedTSWrapper.run requires the live wrapper's "
+            "plan state. Use flashinfer.fi_trace(wrapper.run, ...) instead of "
+            "wrapper.run.fi_trace(...)."
+        )
+    if not bool(getattr(wrapper, "_planned", False)):
+        raise RuntimeError("plan() must be called before run()")
     combined, fp16_output, q_mode = _fmha_trace_variant(
         kwargs, query_param="q", cache_param="paged_kv_cache"
     )
-    wrapper = kwargs.get("self")
-    if wrapper is not None and bool(getattr(wrapper, "_use_packed_q", False)):
+    if bool(getattr(wrapper, "_use_packed_q", False)):
         q_mode = _Q_PACKED
     return _PRIMS_TS_DECODE_WRAPPER_TRACES[(combined, fp16_output, q_mode)]
 
@@ -739,9 +756,8 @@ def _make_prims_ts_decode_mla_trace(*, rank4_cache: bool, packed_query: bool):
             "kv_lora_rank == 512",
             "qk_rope_head_dim == 64",
             "page_size in (16, 32, 64, 128)",
-            "kv_pad_dim == 1 when the rank-4 cache form is used",
+            *(["kv_pad_dim == 1"] if rank4_cache else []),
             "block_tables.shape[0] == batch_size",
-            "output.dtype == bfloat16",
             *(
                 [
                     "len_qo_indptr == batch_size + 1",
@@ -844,7 +860,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
             "kv_lora_rank == 512",
             "qk_rope_head_dim == 64",
             "page_size in (16, 32, 64, 128)",
-            "kv_pad_dim == 1 when the rank-4 cache form is used",
+            *(["kv_pad_dim == 1"] if rank4_cache else []),
             "block_tables.shape[0] == batch_size",
             *(
                 [
@@ -939,7 +955,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(*, rank4_cache: bool, packed_query: 
             "head_dim_qk == 576",
             "kv_lora_rank == 512",
             "page_size in (16, 32, 64, 128)",
-            "kv_pad_dim == 1 when the rank-4 cache form is used",
+            *(["kv_pad_dim == 1"] if rank4_cache else []),
             *(
                 ["len_qo_indptr == batch_size + 1", "total_q == qo_indptr[-1].item()"]
                 if packed_query
@@ -960,13 +976,16 @@ _PRIMS_TS_DECODE_MLA_WRAPPER_TRACES = {
 
 
 def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
-    query = kwargs.get("query")
     wrapper = kwargs.get("self")
-    packed_query = (
-        bool(getattr(wrapper, "_packed_query", False))
-        if wrapper is not None
-        else isinstance(query, torch.Tensor) and query.ndim == 3
-    )
+    if wrapper is None:
+        raise ValueError(
+            "Tracing BatchMLADecodePagedTSWrapper.run requires the live wrapper's "
+            "plan state. Use flashinfer.fi_trace(wrapper.run, ...) instead of "
+            "wrapper.run.fi_trace(...)."
+        )
+    if not bool(getattr(wrapper, "_planned", False)):
+        raise RuntimeError("plan() must be called before run()")
+    packed_query = bool(wrapper._packed_query)
     kv_cache = kwargs.get("kv_cache")
     key = (
         isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
