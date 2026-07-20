@@ -104,6 +104,50 @@ def test_column_major_scales(num_tokens, hidden_dim, group_size, dst_dtype, back
     assert x_s.stride(0) == 1, f"expected column-major scales, got strides {x_s.stride()}"
 
 
+@pytest.mark.parametrize("num_tokens", [128, 130])  # 130 -> aligned to 132
+@pytest.mark.parametrize("hidden_dim", [2048])
+@pytest.mark.parametrize("group_size", [128])
+@pytest.mark.parametrize("dst_dtype", [torch.float8_e4m3fn])
+@pytest.mark.parametrize("backend", ["cutile"])
+def test_tma_aligned_scales(num_tokens, hidden_dim, group_size, dst_dtype, backend):
+    """scale_tma_aligned must return a padded column-major VIEW (no contiguous copy).
+
+    Regression for a `.contiguous()` that repacked the scales to a tight
+    row-major layout, silently destroying the column-major property and the
+    16B TMA leading-dim padding this path exists to produce.
+    """
+    torch.manual_seed(11)
+    x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
+
+    x_q, x_s = per_token_group_quant_8bit(
+        x,
+        group_size=group_size,
+        dst_dtype=dst_dtype,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        backend=backend,
+    )
+
+    n_groups = hidden_dim // group_size
+    aligned_tokens = ((num_tokens + 3) // 4) * 4  # ceil-align to 4 floats (16B)
+
+    assert x_s.shape == (num_tokens, n_groups), (
+        f"expected ({num_tokens},{n_groups}) got {x_s.shape}"
+    )
+    # Column-major: token dim unit-stride.
+    assert x_s.stride(0) == 1, f"expected column-major, got strides {x_s.stride()}"
+    # TMA padding preserved: group stride is the ALIGNED token count, not the
+    # tight num_tokens a .contiguous() copy would give.
+    assert x_s.stride(1) == aligned_tokens, (
+        f"expected group stride {aligned_tokens} (TMA-padded), got {x_s.stride(1)}"
+    )
+    assert not x_s.isnan().any()
+
+    # Values still correct through the padded view.
+    ref_q, ref_s = _ref_quant(x, group_size, dst_dtype)
+    torch.testing.assert_close(x_s.float(), ref_s, rtol=2e-1, atol=1e-2)
+
+
 @pytest.mark.parametrize(
     "num_tokens,hidden_dim,group_size", [(128, 2048, 64), (256, 4096, 128)]
 )
