@@ -1449,18 +1449,30 @@ def _benchmark_distributed_ep(
     )
     from flashinfer.testing.utils import get_l2_cache_size
 
+    def run_setup_phase(name, fn):
+        prefix = f"[rank {rank}] EP setup tokens={num_tokens} {name}"
+        print(f"{prefix}: start", flush=True)
+        result = fn()
+        torch.cuda.synchronize()
+        print(f"{prefix}: complete", flush=True)
+        dist.barrier()
+        return result
+
     local_num_tokens, _ = _token_partition(num_tokens, rank, world_size)
     runtime_max_tokens_per_rank = (num_tokens + world_size - 1) // world_size
     num_local_experts = CFG.num_experts // world_size
     local_expert_offset = rank * num_local_experts
-    layer, weight_pack = _create_distributed_moe_layer(
-        args,
-        CFG.intermediate_size,
-        num_local_experts,
-        local_expert_offset,
-        max_tokens_per_rank_budget * world_size,
-        rank,
-        device,
+    layer, weight_pack = run_setup_phase(
+        "local MoE construction",
+        lambda: _create_distributed_moe_layer(
+            args,
+            CFG.intermediate_size,
+            num_local_experts,
+            local_expert_offset,
+            max_tokens_per_rank_budget * world_size,
+            rank,
+            device,
+        ),
     )
     mapping = Mapping(
         rank=rank,
@@ -1477,14 +1489,17 @@ def _benchmark_distributed_ep(
         max_tokens_per_rank_budget,
         CFG.hidden_size,
     )
-    moe_a2a = MoeAlltoAll(
-        mapping=mapping,
-        max_num_tokens=max_tokens_per_rank_budget,
-        top_k=CFG.top_k,
-        num_experts=CFG.num_experts,
-        workspace_size_per_rank=workspace_size_per_rank,
-        mnnvl_config=MnnvlConfig(
-            comm_backend=_TorchDistributedCommBackend(dist.group.WORLD)
+    moe_a2a = run_setup_phase(
+        "MoeAlltoAll construction",
+        lambda: MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=max_tokens_per_rank_budget,
+            top_k=CFG.top_k,
+            num_experts=CFG.num_experts,
+            workspace_size_per_rank=workspace_size_per_rank,
+            mnnvl_config=MnnvlConfig(
+                comm_backend=_TorchDistributedCommBackend(dist.group.WORLD)
+            ),
         ),
     )
     hidden_states, router_logits, _, routing_bias = _create_distributed_inputs(
@@ -1542,14 +1557,6 @@ def _benchmark_distributed_ep(
     def run_once():
         _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
         combine(compute(*dispatch()))
-
-    def run_setup_phase(name, fn):
-        print(f"[rank {rank}] EP setup {name}: start", flush=True)
-        result = fn()
-        torch.cuda.synchronize()
-        print(f"[rank {rank}] EP setup {name}: complete", flush=True)
-        dist.barrier()
-        return result
 
     # Finish the setup collective before CuTe DSL selects a tactic. Inference
     # warmup likewise tunes the local runner outside the steady-state A2A phase.
@@ -1776,11 +1783,21 @@ def _run_distributed_benchmark(args, token_counts):
     import torch.distributed as dist
 
     local_rank = int(os.environ["LOCAL_RANK"])
+    print(f"[local rank {local_rank}] distributed setup: start", flush=True)
     torch.cuda.set_device(local_rank)
+    print(
+        f"[local rank {local_rank}] NCCL process-group initialization: start",
+        flush=True,
+    )
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device("cuda", local_rank)
+    print(
+        f"[rank {rank}] NCCL process-group initialization: complete "
+        f"(world_size={world_size})",
+        flush=True,
+    )
 
     try:
         if world_size != args.num_gpus:
