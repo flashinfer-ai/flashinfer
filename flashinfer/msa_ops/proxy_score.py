@@ -302,8 +302,14 @@ def msa_proxy_score(
         ``num_qo_heads`` must be a multiple of ``num_kv_heads``.
     cu_seqlens_q, cu_seqlens_k : torch.Tensor
         ``(batch_size + 1,)`` int32 cumulative lengths.
+    page_table : torch.Tensor, optional
+        Page-table mapping for paged KV layout. Required when ``k`` is paged.
+    seqused_k : torch.Tensor, optional
+        Per-sequence valid KV-token counts for paged KV layout.
     causal : bool
         Right-aligned causal masking, applied *before* the block max.
+    max_seqlen_q : int, optional
+        Maximum query length. Required by some CUDA Graph / compilation paths.
     max_k_tiles : int, optional
         Number of KV-block columns in the output; defaults to the maximum
         ``ceil(seqlen_k / 128)`` over the batch.
@@ -318,6 +324,8 @@ def msa_proxy_score(
         shared block selection per query (MiniMax-M3 indexer semantics).
         Defaults to ``False``: per-head ``max_score``, where each head selects
         its own blocks.
+    q_offset : int or torch.Tensor, optional
+        Optional query-position offset used by the causal alignment logic.
 
         The reduction is currently a post-kernel ``amax`` over the per-head
         buffer (the kernel is one CTA per head, so a cross-head epilogue would
@@ -635,8 +643,23 @@ def msa_proxy_score_fp4(
         (128x4 layout, ``sf_vec_size=16``); shared with the attention + decode kernels.
     q_global_scale, k_global_scale : float
         Per-tensor inverse global scales (``1 / global_scale``).
-    cu_seqlens_q, cu_seqlens_k, causal, max_seqlen_q, max_k_tiles, output,
-    reduce_heads, q_offset
+    cu_seqlens_q, cu_seqlens_k : torch.Tensor
+        As in :func:`msa_proxy_score`.
+    page_table : torch.Tensor, optional
+        As in :func:`msa_proxy_score`.
+    seqused_k : torch.Tensor, optional
+        As in :func:`msa_proxy_score`.
+    causal : bool
+        As in :func:`msa_proxy_score`.
+    max_seqlen_q : int, optional
+        As in :func:`msa_proxy_score`.
+    max_k_tiles : int, optional
+        As in :func:`msa_proxy_score`.
+    output : torch.Tensor, optional
+        As in :func:`msa_proxy_score`.
+    reduce_heads : bool
+        As in :func:`msa_proxy_score`.
+    q_offset : int or torch.Tensor, optional
         As in :func:`msa_proxy_score`.
 
     Returns
