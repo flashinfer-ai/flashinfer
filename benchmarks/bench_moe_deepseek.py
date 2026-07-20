@@ -219,6 +219,8 @@ def bench_cute_dsl(
     include_activation_quant=False,
     use_fused_finalize=True,
     enable_pdl=True,
+    profile_cuda=False,
+    profile_iters=10,
 ):
     """Benchmark CuteDSL MoE.
 
@@ -238,6 +240,9 @@ def bench_cute_dsl(
         include_activation_quant: Include the initial activation FP4
             quantization in the measured CuTe DSL W4A4 path.
         enable_pdl: Enable Programmatic Dependent Launch for CuTe DSL kernels.
+        profile_cuda: Capture steady-state CUDA graph replays between
+            cudaProfilerStart/Stop instead of benchmarking.
+        profile_iters: Number of cold-L2 graph replays to capture.
     """
     import contextlib
 
@@ -444,6 +449,29 @@ def bench_cute_dsl(
     with autotune(True) if do_autotune else contextlib.nullcontext():
         run(**input_kwargs)
         torch.cuda.synchronize()
+
+    if profile_cuda:
+        from flashinfer.testing.utils import get_l2_cache_size
+
+        runner = lambda: run(**input_kwargs)
+        if use_cuda_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run(**input_kwargs)
+            runner = graph.replay
+        for _ in range(3):
+            runner()
+        torch.cuda.synchronize()
+
+        l2_flush = torch.empty(2 * get_l2_cache_size(), device=dev, dtype=torch.int8)
+        torch.cuda.cudart().cudaProfilerStart()
+        for _ in range(profile_iters):
+            l2_flush.zero_()
+            torch.cuda.synchronize()
+            runner()
+            torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        return float("nan")
 
     times = bench_gpu_time(
         run,
@@ -777,6 +805,8 @@ def run_benchmark(
     use_fused_finalize=True,
     cute_dsl_only=False,
     enable_pdl=True,
+    profile_cuda=False,
+    profile_iters=10,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -816,6 +846,8 @@ def run_benchmark(
             deterministic two-stage finalize.
         cute_dsl_only: Skip CUTLASS and TRTLLM backends.
         enable_pdl: Enable Programmatic Dependent Launch for CuTe DSL kernels.
+        profile_cuda: Capture the CuTe DSL pipeline for an external CUDA profiler.
+        profile_iters: Number of cold-L2 graph replays to capture.
 
     Returns:
         List of BenchResult objects
@@ -854,6 +886,8 @@ def run_benchmark(
             use_fused_finalize=use_fused_finalize,
             cute_dsl_only=cute_dsl_only,
             enable_pdl=enable_pdl,
+            profile_cuda=profile_cuda,
+            profile_iters=profile_iters,
         )
         results.extend(row)
         rows_and_histograms.append((row, histogram_record))
@@ -901,6 +935,8 @@ def _benchmark_single(
     use_fused_finalize=True,
     cute_dsl_only=False,
     enable_pdl=True,
+    profile_cuda=False,
+    profile_iters=10,
 ):
     """Benchmark all backends for a single token count.
 
@@ -927,6 +963,8 @@ def _benchmark_single(
         include_activation_quant=include_activation_quant,
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
+        profile_cuda=profile_cuda,
+        profile_iters=profile_iters,
     )
     if not cute_dsl_only and not use_per_token_activation:
         lat["CUTLASS"] = bench_cutlass(
@@ -1257,6 +1295,17 @@ def main():
         help="Disable Programmatic Dependent Launch for CuTe DSL kernels.",
     )
     parser.add_argument(
+        "--profile-cuda",
+        action="store_true",
+        help="Capture cold-L2 CUDA graph replays between cudaProfilerStart/Stop.",
+    )
+    parser.add_argument(
+        "--profile-iters",
+        type=int,
+        default=10,
+        help="Number of CUDA graph replays captured by --profile-cuda.",
+    )
+    parser.add_argument(
         "--routing-bias-scale",
         type=float,
         default=0.01,
@@ -1278,6 +1327,10 @@ def main():
         parser.error(
             f"--tp must divide the expert intermediate size ({BASE_INTERMEDIATE_SIZE})"
         )
+    if args.profile_cuda and not args.cute_dsl_only:
+        parser.error("--profile-cuda requires --cute-dsl-only")
+    if args.profile_iters < 1:
+        parser.error("--profile-iters must be positive")
 
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
@@ -1290,6 +1343,8 @@ def main():
         tokens = GEN_PHASE_TOKENS  # [1, 2, 4, 8, 16, 32, 64, 128]
     else:
         tokens = TOKEN_COUNTS  # [128, 256, 512, 1024, 2048, 4096]
+    if args.profile_cuda and len(tokens) != 1:
+        parser.error("--profile-cuda requires exactly one token count")
 
     print("\nDeepSeek-V3 MoE Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -1298,6 +1353,7 @@ def main():
     print(f"BF16 activation: {args.use_bf16_activation}")
     print(f"Initial activation quantization: {args.include_activation_quant}")
     print(f"Tensor parallelism simulation: TP={args.tp}")
+    print(f"CUDA profiler capture: {args.profile_cuda}")
     print(f"CuTe DSL PDL: {'enabled' if args.enable_pdl else 'disabled'}")
     print(
         "CuteDSL finalize: "
@@ -1311,7 +1367,7 @@ def main():
         ep_config=args.ep,
         tp_config=args.tp,
         do_autotune=not args.no_autotune,
-        verbose=not args.quiet,
+        verbose=not args.quiet and not args.profile_cuda,
         use_cuda_graph=not args.no_cuda_graph,
         use_cupti=not args.no_cupti,
         use_wrapper=not args.functional_api,
@@ -1322,6 +1378,8 @@ def main():
         use_fused_finalize=args.use_fused_finalize,
         cute_dsl_only=args.cute_dsl_only,
         enable_pdl=args.enable_pdl,
+        profile_cuda=args.profile_cuda,
+        profile_iters=args.profile_iters,
     )
 
     return 0
