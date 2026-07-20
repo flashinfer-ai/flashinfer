@@ -14,6 +14,7 @@ design's Fleet / Handle split by:
 from __future__ import annotations
 
 import contextlib
+import itertools
 from typing import TYPE_CHECKING, Sequence
 
 from ..... import _require_built
@@ -66,6 +67,45 @@ def _load_nixl_ep():
     return nixl_ep
 
 
+# Per-process generation counter namespacing derived rendezvous stores. Fleet
+# creation is collective over the EP group, so the counter agrees across the
+# group's ranks; re-created fleets then never reuse a prior fleet's keys.
+_STORE_GEN = itertools.count()
+
+
+def _resolve_store(bootstrap: "BootstrapConfig"):
+    """Return the rendezvous store the NIXL ``Buffer`` bootstraps over.
+
+    Resolution order (the NIXL analogue of nccl_ep's ``_resolve_comm``):
+
+    1. ``bootstrap.tcp_store`` set — use it as-is (previous behavior).
+    2. otherwise — derive a ``PrefixStore`` from torch.distributed's default
+       store, so hosts that pass only ``process_group`` (e.g. vLLM's EP group,
+       the same ``BootstrapConfig`` shape the nccl_ep backend consumes) work
+       without constructing a second TCPStore on a sibling port. The prefix is
+       namespaced by the EP group's global ranks plus a per-process generation
+       counter so disjoint EP subgroups and re-created fleets never collide on
+       store keys.
+    """
+    if bootstrap.tcp_store is not None:
+        return bootstrap.tcp_store
+
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        raise ValueError(
+            "NixlEpFleet needs a rendezvous store: set bootstrap.tcp_store "
+            "(a torch.distributed.TCPStore), or initialize torch.distributed "
+            "so one can be derived from the default store."
+        )
+
+    from .....core.bootstrap_utils import bootstrap_comm_group
+
+    ranks = dist.get_process_group_ranks(bootstrap_comm_group(bootstrap))
+    prefix = f"flashinfer/moe_ep/nixl_ep/{min(ranks)}x{len(ranks)}/{next(_STORE_GEN)}"
+    return dist.PrefixStore(prefix, dist.distributed_c10d._get_default_store())
+
+
 class NixlEpFleet(Fleet):
     """Owns a ``nixl_ep.Buffer`` for one rank."""
 
@@ -79,12 +119,7 @@ class NixlEpFleet(Fleet):
         _require_built("nixl_ep")
         validate_arch_for_backend("nixl_ep")
         validate_bootstrap_world_size(bootstrap)
-
-        if bootstrap.tcp_store is None:
-            raise ValueError(
-                "NixlEpFleet requires bootstrap.tcp_store to be set; "
-                "construct a torch.distributed.TCPStore and pass it in."
-            )
+        store = _resolve_store(bootstrap)
 
         self._params = params
         self._fleet_knobs = _index_knobs(algo_knobs)
@@ -111,7 +146,7 @@ class NixlEpFleet(Fleet):
         self._buffer = nixl_ep.Buffer(
             rank=bootstrap.rank,
             low_latency_mode=True,  # MVP: LL only
-            tcp_store_group=bootstrap.tcp_store,
+            tcp_store_group=store,
         )
         num_experts_per_rank = params.num_experts // cap
         self._buffer.update_memory_buffers(cap, num_experts_per_rank, num_rdma_bytes)
@@ -138,6 +173,11 @@ class NixlEpFleet(Fleet):
     @property
     def params(self) -> FleetParams:
         return self._params
+
+    @property
+    def capacity(self) -> int:
+        """Rank capacity the Buffer was sized to (≥ current world_size)."""
+        return self._capacity
 
     # @flashinfer_api  # disabled per PR #3453 review
     def create_handle(self, params, algo_knobs: Sequence[AlgoKnob] = ()) -> "Handle":
