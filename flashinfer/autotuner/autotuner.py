@@ -24,18 +24,24 @@ from flashinfer.tllm_utils import delay_kernel
 from flashinfer.utils import (
     get_globaltimer_kernel,
     is_confidential_compute,
+    last_positive_power_of_2,
     next_positive_power_of_2,
 )
 
 from flashinfer.jit.core import logger
 from flashinfer.version import __version__ as _flashinfer_version
 from flashinfer.autotuner.abstractions import (
+    Arithmetic,
+    BucketGen,
     Dim,
     DimensionCoordinates,
     DynamicDim,
+    Geometric,
+    Identity,
+    PowerOfTwoFloor,
     StaticDim,
+    Union,
 )
-from flashinfer.autotuner.bucket_generators import BucketGen
 from flashinfer.autotuner.bucket_mappers import (
     BucketMapper,
     make_bucket_mapper,
@@ -54,9 +60,47 @@ from flashinfer.autotuner.initializers import (
 _nvfp4_cutlass_version = "0.1"
 
 
+def gen_buckets(gen: BucketGen, n: int) -> tuple[int, ...]:
+    """Materialize the concrete tuning-bucket set a :class:`BucketGen` describes
+    for a tuned dimension of runtime size ``n``.
+
+    The declarative ``BucketGen`` variants (see
+    :mod:`flashinfer.autotuner.abstractions`) carry no logic; this is the single
+    place that interprets them. :class:`Union` recurses into its parts and
+    returns their sorted, de-duplicated merge.
+    """
+    match gen:
+        case Geometric(start=start, ratio=ratio, stop=stop):
+            upper = n if stop is None else min(stop, n)
+            out: list[int] = []
+            m = start
+            while m <= upper:
+                out.append(m)
+                m *= ratio
+            return tuple(out)
+        case Arithmetic(start=start, step=step, stop=stop):
+            upper = n if stop is None else min(stop, n)
+            out = []
+            m = start
+            while m <= upper:
+                out.append(m)
+                m += step
+            return tuple(out)
+        case Identity():
+            return (n,) if n >= 1 else ()
+        case PowerOfTwoFloor():
+            return (last_positive_power_of_2(n),)
+        case Union(parts=parts):
+            merged: set[int] = set()
+            for part in parts:
+                merged.update(gen_buckets(part, n))
+            return tuple(sorted(merged))
+
+
 @dataclass(frozen=True)
 class _ClampedPow2ToBuckets:
-    """Override-path mapper: ceil ``next_positive_power_of_2(x)`` into ``gen(x)``.
+    """Override-path mapper: ceil ``next_positive_power_of_2(x)`` into the bucket
+    set ``gen_buckets(gen, x)``.
 
     Used by ``AutoTuner._apply_tuning_overrides`` when a ``round_up`` override is
     active over a generator-valued ``gen_tuning_buckets``. Holds the (hashable)
@@ -66,7 +110,7 @@ class _ClampedPow2ToBuckets:
     gen: BucketGen
 
     def __call__(self, x: int) -> int:
-        buckets = tuple(sorted(set(self.gen(x))))
+        buckets = tuple(sorted(set(gen_buckets(self.gen, x))))
         return round_to_nearest_bucket(
             next_positive_power_of_2(x), buckets, round_map=True
         )
@@ -1893,22 +1937,21 @@ class AutoTuner:
         dynamic_dims: list[tuple[Any, ...]] = []
 
         for spec in tuning_config.dynamic_tensor_specs:
-            assert callable(spec.gen_tuning_buckets) or isinstance(
-                spec.gen_tuning_buckets, (list, tuple)
-            ), (
-                "The given dynamic dimension must provide a opt value generation function or a list of opt values"
+            assert isinstance(spec.gen_tuning_buckets, (list, tuple, BucketGen)), (
+                "The given dynamic dimension must provide a BucketGen generator or a list of opt values"
             )
 
-            if callable(spec.gen_tuning_buckets):
-                opt_shapes = spec.gen_tuning_buckets(
+            if isinstance(spec.gen_tuning_buckets, (list, tuple)):
+                opt_shapes = spec.gen_tuning_buckets
+            else:
+                opt_shapes = gen_buckets(
+                    spec.gen_tuning_buckets,
                     _get_opt(
                         base_shapes[spec.dimensions[0].input_idx][
                             spec.dimensions[0].dim_idx
                         ]
-                    )
+                    ),
                 )
-            else:
-                opt_shapes = spec.gen_tuning_buckets
 
             # Normalize candidate buckets to be monotonically non-decreasing and non-empty
             opt_shapes = tuple(sorted(set(opt_shapes)))

@@ -1,10 +1,11 @@
 """
 Composable bucket *mappers* for AutoTuner inference-time lookup.
 
-A bucket mapper is the inference-time inverse of a bucket generator (see
-:mod:`flashinfer.autotuner.bucket_generators`): given the runtime size of a
-tuned dimension it returns the single bucket value used to build the profiling
-cache key (see ``AutoTuner._find_nearest_profile``).
+A bucket mapper is the inference-time inverse of a bucket generator (the
+:data:`BucketGen` variants in :mod:`flashinfer.autotuner.abstractions`,
+materialized by ``gen_buckets``): given the runtime size of a tuned dimension it
+returns the single bucket value used to build the profiling cache key (see
+``AutoTuner._find_nearest_profile``).
 
 Like the generators, mappers are small frozen (hence trivially hashable)
 dataclasses with a ``__call__(int) -> int`` so a :class:`DynamicTensorSpec` --

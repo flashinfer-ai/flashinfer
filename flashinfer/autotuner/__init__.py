@@ -1,8 +1,14 @@
 from flashinfer.autotuner.abstractions import (
+    Arithmetic,
+    BucketGen,
     Dim,
     DimensionCoordinates,
     DynamicDim,
+    Geometric,
+    Identity,
+    PowerOfTwoFloor,
     StaticDim,
+    Union,
 )
 from flashinfer.autotuner.initializers import (
     Empty,
@@ -20,14 +26,6 @@ from flashinfer.autotuner.initializers import (
     autotuner_initializer_randn,
     autotuner_initializer_rand,
     autotuner_initializer_rand_scaled,
-)
-from flashinfer.autotuner.bucket_generators import (
-    Arithmetic,
-    BucketGen,
-    Geometric,
-    Identity,
-    PowerOfTwoFloor,
-    Union,
 )
 from flashinfer.autotuner.bucket_mappers import (
     BucketMapper,
@@ -63,6 +61,7 @@ from flashinfer.autotuner.autotuner import (
     _tactic_to_json,
     _tactic_to_json_hashable,
     autotune,
+    gen_buckets,
     get_autotune_process_group,
     is_in_profile_measurement,
     set_autotune_process_group,
@@ -119,6 +118,7 @@ __all__ = [
     "autotuner_initializer_rand_scaled",
     "autotuner_initializer_randn",
     "autotuner_initializer_zeros",
+    "gen_buckets",
     "get_autotune_process_group",
     "is_in_profile_measurement",
     "make_bucket_mapper",
