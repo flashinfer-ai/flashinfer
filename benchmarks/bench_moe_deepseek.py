@@ -38,6 +38,7 @@ Metrics:
 """
 
 import argparse
+import gc
 from dataclasses import dataclass
 import numpy as np
 import torch
@@ -844,6 +845,10 @@ def run_benchmark(
         )
         results.extend(row)
         rows_and_histograms.append((row, histogram_record))
+        # Each row rebuilds full-model weights; release cached allocations so
+        # measurements do not depend on the token-count scan order.
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if verbose:
         _print_header(
