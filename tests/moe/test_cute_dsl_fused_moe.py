@@ -990,6 +990,73 @@ class TestCuteDslMoeBf16Activation:
             )
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 
+    @pytest.mark.parametrize("route_tile", [32, 64])
+    def test_route_tile_numerical_accuracy(self, route_tile: int):
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+
+        num_tokens, hidden_size, intermediate_size = 17, 256, 512
+        num_experts, top_k = 8, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        tensors["token_selected_experts"].copy_(
+            torch.arange(
+                num_tokens * top_k,
+                dtype=torch.int32,
+                device=tensors["token_selected_experts"].device,
+            ).reshape(num_tokens, top_k)
+            % num_experts
+        )
+        tactic = (
+            route_tile,
+            ((128, 64), (1, 1)),
+            ((128, 64), (1, 1)),
+        )
+
+        result = _moe_core_impl(
+            x=tensors["x_bf16"],
+            x_sf=None,
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=None,
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            w4a16_tactic=tactic,
+            use_fused_finalize=False,
+            enable_pdl=False,
+        )
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"],
+            gemm1_weights=tensors["w1_weight_bf16"],
+            gemm2_weights=tensors["w2_weight_bf16"],
+            gemm1_alpha=tensors["w1_alpha"],
+            gemm2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
     def test_autotune_cuda_graph(self):
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
@@ -1040,6 +1107,11 @@ class TestCuteDslMoeBf16Activation:
         with autotune(True):
             eager_output = moe.run(**kwargs)
         torch.cuda.synchronize()
+        assert 0 < len(moe._w4a16_workspace_cache) <= 3
+        assert all(
+            workspace.num_tokens_capacity >= num_tokens
+            for workspace in moe._w4a16_workspace_cache.values()
+        )
         ref_output = compute_reference_moe_fp4(
             hidden_states=tensors["x_bf16"],
             gemm1_weights=tensors["w1_weight_bf16"],

@@ -464,11 +464,12 @@ class Sm100W4A16GroupedGemmKernel:
             if cutlass.const_expr(self.use_fused_finalize)
             else output
         )
+        num_route_tiles = n // self.mma_tiler[1]
         tile_idx_to_expert_idx = cute.make_tensor(
-            tile_idx_to_expert_idx_ptr, cute.make_layout((n // 128,))
+            tile_idx_to_expert_idx_ptr, cute.make_layout((num_route_tiles,))
         )
         tile_idx_to_mn_limit = cute.make_tensor(
-            tile_idx_to_mn_limit_ptr, cute.make_layout((n // 128,))
+            tile_idx_to_mn_limit_ptr, cute.make_layout((num_route_tiles,))
         )
         num_non_exiting_tiles = cute.make_tensor(
             num_non_exiting_tiles_ptr, cute.make_layout((1,))
