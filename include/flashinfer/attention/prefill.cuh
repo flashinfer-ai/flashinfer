@@ -1109,14 +1109,22 @@ __device__ __forceinline__ void logits_mask(
         bool position_mask;
         if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
           const uint32_t dllm_block_size = params.dllm_block_size;
-          const uint64_t q_offset = static_cast<uint64_t>(
-              (params.maybe_q_block_expanding_offset != nullptr)
-                  ? params.maybe_q_block_expanding_offset[batch_idx]
-                  : 0);
-          const uint64_t kv_offset = static_cast<uint64_t>(
-              (params.maybe_kv_block_expanding_offset != nullptr)
-                  ? params.maybe_kv_block_expanding_offset[batch_idx]
-                  : 0);
+          uint64_t q_offset = 0;
+          if constexpr (has_maybe_q_block_expanding_offset_v<Params>) {
+            if (params.maybe_q_block_expanding_offset != nullptr) {
+              q_offset = static_cast<uint64_t>(params.maybe_q_block_expanding_offset[batch_idx]);
+            }
+          } else if constexpr (has_q_block_expanding_offset_v<Params>) {
+            q_offset = static_cast<uint64_t>(params.q_block_expanding_offset);
+          }
+          uint64_t kv_offset = 0;
+          if constexpr (has_maybe_kv_block_expanding_offset_v<Params>) {
+            if (params.maybe_kv_block_expanding_offset != nullptr) {
+              kv_offset = static_cast<uint64_t>(params.maybe_kv_block_expanding_offset[batch_idx]);
+            }
+          } else if constexpr (has_kv_block_expanding_offset_v<Params>) {
+            kv_offset = static_cast<uint64_t>(params.kv_block_expanding_offset);
+          }
           const uint64_t q_global = q_offset + q_idx;
           const uint64_t q_block = q_global / dllm_block_size;
           const uint64_t kv_global = kv_offset + kv_idx;
