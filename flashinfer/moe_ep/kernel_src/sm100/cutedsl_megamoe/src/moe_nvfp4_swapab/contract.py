@@ -23,7 +23,8 @@ class ContractMismatchError(ContractError):
 class MappingSpec(Protocol):
     """Protocol for objects that can produce a canonical mapping table."""
 
-    def normalize(self, *, domain: "Space", codomain: "Space") -> tuple[int, ...]: ...
+    def normalize(self, *, domain: "Space", codomain: "Space") -> tuple[int, ...]:
+        ...
 
 
 def _as_tuple(value: Iterable[object], *, name: str) -> tuple[object, ...]:
@@ -82,7 +83,7 @@ class Space:
 
         linear = 0
         stride = 1
-        for axis, (idx, size) in enumerate(zip(coord_tuple, self.sizes, strict=False)):
+        for axis, (idx, size) in enumerate(zip(coord_tuple, self.sizes)):
             if not isinstance(idx, int):
                 raise ContractError(
                     f"Coordinate {self.names[axis]!r} must be int, got {type(idx)!r}"
@@ -194,9 +195,7 @@ class FunctionMapping:
 
     @staticmethod
     def _function_name(function: Callable[..., object]) -> str:
-        return getattr(
-            function, "__qualname__", getattr(function, "__name__", repr(function))
-        )
+        return getattr(function, "__qualname__", getattr(function, "__name__", repr(function)))
 
     @classmethod
     def _validate_signature(
@@ -289,7 +288,7 @@ class FunctionMapping:
 
         table: list[int] = []
         for domain_coord in domain.coordinates():
-            binding = dict(zip(domain.names, domain_coord, strict=False))
+            binding = dict(zip(domain.names, domain_coord))
             result = self.function(**binding)
             codomain_coord = self._result_to_codomain_coord(
                 result,
@@ -357,9 +356,7 @@ class Contract:
             mismatch_idx = next(
                 (
                     idx
-                    for idx, (lhs, rhs) in enumerate(
-                        zip(self.table, other.table, strict=False)
-                    )
+                    for idx, (lhs, rhs) in enumerate(zip(self.table, other.table))
                     if lhs != rhs
                 ),
                 None,
@@ -424,7 +421,10 @@ def eval_function_mapping(contract: Contract, **domain_coord):
                 "FunctionMapping result rank does not match codomain rank: "
                 f"{len(result)} vs {contract.codomain.rank}"
             )
-        return {name: result[i] for i, name in enumerate(contract.codomain.names)}
+        return {
+            name: result[i]
+            for i, name in enumerate(contract.codomain.names)
+        }
     if contract.codomain.rank == 1:
         return {contract.codomain.names[0]: result}
     raise TypeError(

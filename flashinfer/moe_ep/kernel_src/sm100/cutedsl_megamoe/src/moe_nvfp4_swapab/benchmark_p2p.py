@@ -39,9 +39,7 @@ TMA_CACHE_HINT_EVICT_FIRST = 0x12F0000000000000
 
 
 @dsl_user_op
-def ublkcp_pull_raw(
-    dst_smem, src_gmem_addr: Int64, mbar_smem, num_bytes: Int32, *, loc=None, ip=None
-) -> None:
+def ublkcp_pull_raw(dst_smem, src_gmem_addr: Int64, mbar_smem, num_bytes: Int32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
         [
@@ -62,9 +60,7 @@ def ublkcp_pull_raw(
 
 
 @dsl_user_op
-def ublkcp_push_raw(
-    dst_gmem_addr: Int64, src_smem, num_bytes: Int32, *, loc=None, ip=None
-) -> None:
+def ublkcp_push_raw(dst_gmem_addr: Int64, src_smem, num_bytes: Int32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
         [
@@ -159,9 +155,14 @@ def ublkcp_bench_kernel(
 
         for u in cutlass.range_constexpr(0, y_copy_per_iter, 1):
             copy_linear = (
-                (Int64(iter_idx) * Int64(x_ctas) + Int64(bidx)) * Int64(NUM_WARPS)
-                + Int64(warp_idx)
-            ) * Int64(y_copy_per_iter) + Int64(u)
+                (
+                    (Int64(iter_idx) * Int64(x_ctas) + Int64(bidx))
+                    * Int64(NUM_WARPS)
+                    + Int64(warp_idx)
+                )
+                * Int64(y_copy_per_iter)
+                + Int64(u)
+            )
             remote_addr = (
                 remote_base_addr
                 + Int64(base_offset)
@@ -196,9 +197,10 @@ def ublkcp_bench_kernel(
                 sample = ld_shared_u32(
                     payload + warp_idx * Int32(y_copy_per_iter * z_bytes_per_inst)
                 )
-                sink_idx = (iter_idx * Int32(x_ctas) + Int32(bidx)) * Int32(
-                    NUM_WARPS
-                ) + warp_idx
+                sink_idx = (
+                    (iter_idx * Int32(x_ctas) + Int32(bidx)) * Int32(NUM_WARPS)
+                    + warp_idx
+                )
                 local_sink[sink_idx] = sample
         else:
             if lane_idx == Int32(0):
@@ -215,7 +217,8 @@ def ublkcp_bench_kernel(
         iter_idx = iter_idx + Int32(1)
 
     if cutlass.const_expr(
-        (mode == "push" and push_clock_stats) or (mode == "pull" and pull_clock_stats)
+        (mode == "push" and push_clock_stats)
+        or (mode == "pull" and pull_clock_stats)
     ):
         if lane_idx == Int32(0):
             stats_base = (Int32(bidx) * Int32(NUM_WARPS) + warp_idx) * Int32(2)
@@ -437,9 +440,7 @@ def iter_configs(args: argparse.Namespace) -> Iterable[BenchConfig]:
                         )
 
 
-def compile_config(
-    config: BenchConfig, local_sink, clock_stats, remote_base_ptr, iters: int
-):
+def compile_config(config: BenchConfig, local_sink, clock_stats, remote_base_ptr, iters: int):
     @cute.jit
     def launcher(
         local_sink: cute.Tensor,
@@ -481,14 +482,15 @@ def run_one_config(
     if config.y_copy_per_iter <= 0:
         return skipped_result(config, "y_copy_per_iter must be positive")
     if config.z_bytes_per_inst <= 0 or config.z_bytes_per_inst % 128 != 0:
-        return skipped_result(
-            config, "z_bytes_per_inst must be a positive multiple of 128"
-        )
+        return skipped_result(config, "z_bytes_per_inst must be a positive multiple of 128")
     if config.w_comm_mbytes <= 0:
         return skipped_result(config, "w_comm_mbytes must be positive")
 
     bytes_per_iter = (
-        config.x_ctas * NUM_WARPS * config.y_copy_per_iter * config.z_bytes_per_inst
+        config.x_ctas
+        * NUM_WARPS
+        * config.y_copy_per_iter
+        * config.z_bytes_per_inst
     )
     requested_bytes = mib_to_bytes(config.w_comm_mbytes)
     iters = max(1, math.ceil(requested_bytes / bytes_per_iter))
@@ -510,13 +512,9 @@ def run_one_config(
     buffer_mib = math.ceil(buffer_bytes / (1024 * 1024))
 
     torch.cuda.set_device(0)
-    local_sink_t = torch.empty(
-        (config.x_ctas * NUM_WARPS * iters,), dtype=torch.int32, device="cuda"
-    )
+    local_sink_t = torch.empty((config.x_ctas * NUM_WARPS * iters,), dtype=torch.int32, device="cuda")
     local_sink = from_dlpack(local_sink_t).mark_layout_dynamic()
-    clock_stats_t = torch.empty(
-        (config.x_ctas * NUM_WARPS * 2,), dtype=torch.int64, device="cuda"
-    )
+    clock_stats_t = torch.empty((config.x_ctas * NUM_WARPS * 2,), dtype=torch.int64, device="cuda")
     clock_stats = from_dlpack(clock_stats_t).mark_layout_dynamic()
 
     if remote_buf.numel() < buffer_bytes:
@@ -526,15 +524,11 @@ def run_one_config(
         )
     remote_ptr = int(remote_buf.data_ptr())
     if remote_ptr % 128 != 0:
-        raise RuntimeError(
-            f"remote buffer pointer is not 128B aligned: 0x{remote_ptr:x}"
-        )
+        raise RuntimeError(f"remote buffer pointer is not 128B aligned: 0x{remote_ptr:x}")
     owner = pointer_owner_device(remote_ptr)
     if owner is not None and int(owner) != 1:
         raise RuntimeError(f"remote pointer owner device is {owner}, expected 1")
-    remote_base_ptr = make_ptr(
-        Uint8, remote_ptr, cute.AddressSpace.gmem, assumed_align=128
-    )
+    remote_base_ptr = make_ptr(Uint8, remote_ptr, cute.AddressSpace.gmem, assumed_align=128)
 
     print(
         f"compile mode={config.mode} x={config.x_ctas} y={config.y_copy_per_iter} "
@@ -701,7 +695,10 @@ def allocate_remote_buffer(configs: list[BenchConfig], sm_count: int) -> torch.T
         if config.y_copy_per_iter <= 0 or config.z_bytes_per_inst <= 0:
             continue
         bytes_per_iter = (
-            config.x_ctas * NUM_WARPS * config.y_copy_per_iter * config.z_bytes_per_inst
+            config.x_ctas
+            * NUM_WARPS
+            * config.y_copy_per_iter
+            * config.z_bytes_per_inst
         )
         requested = mib_to_bytes(config.w_comm_mbytes)
         actual = max(1, math.ceil(requested / bytes_per_iter)) * bytes_per_iter

@@ -25,10 +25,10 @@
 # stderr is passed through verbatim; the [CMD] line printed before each test
 # is the exact command to copy-paste for standalone debugging.
 
-export PATH=/usr/bin:$PATH
-export LD=/usr/bin/ld
-export CC=/usr/bin/gcc
-export CXX=/usr/bin/g++
+export PATH=/usr/bin:$PATH 
+export LD=/usr/bin/ld 
+export CC=/usr/bin/gcc 
+export CXX=/usr/bin/g++ 
 export CUDAHOSTCXX=/usr/bin/g++
 export TRITON_CC=/usr/bin/gcc
 export CFLAGS="-B/usr/bin"

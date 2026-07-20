@@ -8,6 +8,7 @@ kernel_src/sm100/cutedsl_megamoe/
 │   ├── common/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, …)
 │   ├── moe_mxfp8_glu/      ← MXFP8 kernel implementation
+│   ├── moe_bf16_glu/       ← BF16 kernel implementation
 │   └── moe_nvfp4_swapab/   ← NVFP4 kernel implementation
 ├── __init__.py             ← public API for moe_ep; talks ONLY to shim/ (our code)
 ├── shim/                   ← thin adapters over src/ (our code) — ALL adaptation lives here
@@ -15,6 +16,7 @@ kernel_src/sm100/cutedsl_megamoe/
 │   ├── comm.py             ← dist bootstrap, sym heap, compile state, resolve_gate_up_clamp
 │   ├── nvfp4.py            ← NVFP4 frontend + symm-buffer/launch wrappers (self-contained)
 │   ├── mxfp8.py            ← MXFP8 frontend + symm-buffer/launch wrappers (self-contained)
+│   ├── bf16.py             ← BF16 frontend + symm-buffer/launch wrappers (self-contained)
 │   ├── kernel_helpers.py   ← SINGLE re-export point for raw-kernel helpers/constants/
 │   │                          reference the FI backend + tests need (drop-audit point)
 │   ├── tuner.py            ← kernel tuning knobs (tactic enumeration + config apply);
@@ -59,11 +61,11 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 ## When the kernel team drops a new version of src/
 
-1. **Replace `src/` verbatim** with the drop's four kernel packages — no injected
+1. **Replace `src/` verbatim** with the drop's five kernel packages — no injected
    files, no edits (the drop is a full repo; copy only these four dirs):
    ```bash
-   rm -rf flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab}
-   cp -r <new_drop>/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab} \
+   rm -rf flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab}
+   cp -r <new_drop>/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab} \
        flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/
    ```
    Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
@@ -75,9 +77,9 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 3. **Audit the kernel construct + launch signatures FIRST** — the highest-churn
    surface, and one a symbol-existence grep will NOT catch (the args change, not
-   the names). `shim/{nvfp4,mxfp8}.py` `_ensure_mega_compiled` (constructor) and
+   the names). `shim/{bf16,nvfp4,mxfp8}.py` `_ensure_mega_compiled` (constructor) and
    `_build_mega_runtime_kwargs` (the `cute.compile` / launch kwargs) must match
-   `Sm100MegaMoE{,Mxfp8}Kernel.__init__` and `.__call__`. The authoritative
+   `Sm100MegaMoE{Bf16,Mxfp8,}Kernel.__init__` and `.__call__`. The authoritative
    templates to mirror are the training integration's drivers:
    `moe_ep_training/megamoe/forward_nvfp4.py` and `forward.py` (kernel construct,
    `output_activation`, workspace pointer vs cute-tensor handling, `combine_format`).
@@ -85,8 +87,8 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    `tester/solvers/inference_solver.py` (`_correctness_knobs` / `_perf_knobs` /
    `filter_invalid`).
 
-4. **Audit shim compatibility** — `shim/nvfp4.py` and `shim/mxfp8.py` call into `common`,
-   `moe_nvfp4_swapab`, `moe_mxfp8_glu`, and `src` via sys.path imports. Check these
+4. **Audit shim compatibility** — `shim/bf16.py`, `shim/nvfp4.py` and `shim/mxfp8.py` call into `common`,
+   `moe_bf16_glu`, `moe_nvfp4_swapab`, `moe_mxfp8_glu`, and `src` via sys.path imports. Check these
    entrypoints after updating src/:
 
    | Shim import | Kernel src file |
@@ -96,6 +98,7 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    | `from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel` | `src/moe_nvfp4_swapab/megamoe_kernel.py` |
    | `from moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue` | `src/moe_nvfp4_swapab/epilogue_refactor.py` |
    | `from moe_mxfp8_glu.megamoe_kernel_mxfp8 import Sm100MegaMoEMxfp8Kernel` | `src/moe_mxfp8_glu/megamoe_kernel_mxfp8.py` |
+   | `from moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel` | `src/moe_bf16_glu/megamoe_kernel_bf16.py` |
    | `from src.sym_buffer import SymBufferHost` | `src/src/sym_buffer.py` |
    | `from src.bootstrap import finalize_dist_and_nvshmem` | `src/src/bootstrap.py` |
 
@@ -109,14 +112,17 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    | `from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype, ceil_div, round_up, to_blocked, nvfp4_quantize_per_block_16, _stack_byte_reinterpretable_tensors` | `src/moe_nvfp4_swapab/runner_common.py` |
    | `from moe_mxfp8_glu.mega_runner import _make_fp8_tensor, _make_e8m0_scale_tensor` (lazy) | `src/moe_mxfp8_glu/mega_runner.py` |
    | `from moe_mxfp8_glu.mega_reference_mxfp8 import compute_megamoe_reference_mxfp8` (lazy) | `src/moe_mxfp8_glu/mega_reference_mxfp8.py` |
+   | `from moe_bf16_glu.mega_reference_bf16 import compute_megamoe_reference` (lazy as `compute_megamoe_reference_bf16`) | `src/moe_bf16_glu/mega_reference_bf16.py` |
 
 5. **Run the cutedsl tests** to confirm everything still works:
    ```bash
    # Blackwell-only; requires torchrun + 4+ GPUs
    torchrun --standalone --nproc_per_node=4 -m pytest \
        tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
+       tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
        tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
        tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+       tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
        -x -v
    ```
 
