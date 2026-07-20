@@ -375,26 +375,30 @@ def rope_quantize_fp8_cutile(
             f"got {quantize_dtype}"
         )
 
-    # Pre-zero output buffers to avoid NaN from beta=0 epilogue (PR #3426 pattern)
+    # The kernel tiles the full (token, head, rope/nope-chunk) space and writes
+    # every in-bounds output element (tail token-blocks are bounds-clipped on
+    # store, mirroring the mm_bf16 idiom); empty nope buffers are 0-byte. So the
+    # outputs need no pre-zeroing — empty_like avoids a redundant memset on this
+    # fused hot path (unlike the beta=0 GEMM epilogue the #3426 pattern guards).
     q_rope_out = (
         q_rope_out
         if q_rope_out is not None
-        else torch.zeros_like(q_rope, dtype=quantize_dtype)
+        else torch.empty_like(q_rope, dtype=quantize_dtype)
     )
     k_rope_out = (
         k_rope_out
         if k_rope_out is not None
-        else torch.zeros_like(k_rope, dtype=quantize_dtype)
+        else torch.empty_like(k_rope, dtype=quantize_dtype)
     )
     q_nope_out = (
         q_nope_out
         if q_nope_out is not None
-        else torch.zeros_like(q_nope, dtype=quantize_dtype)
+        else torch.empty_like(q_nope, dtype=quantize_dtype)
     )
     k_nope_out = (
         k_nope_out
         if k_nope_out is not None
-        else torch.zeros_like(k_nope, dtype=quantize_dtype)
+        else torch.empty_like(k_nope, dtype=quantize_dtype)
     )
 
     num_tokens = q_rope.shape[0]
