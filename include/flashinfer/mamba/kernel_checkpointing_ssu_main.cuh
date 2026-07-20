@@ -116,7 +116,6 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
   // Per-tile smem slots: offset by tile_buf into the STATE_PIPE-strided ring arrays.
   auto* old_x_slot = smem.old_x + tile_buf * SmemT::OLD_X_ELEMS;
   float* old_dt_slot = smem.old_dt + tile_buf * MAX_WINDOW;
-  float* old_cumAdt_slot = smem.old_cumAdt + tile_buf * MAX_WINDOW;
   auto* z_slot = smem.z + tile_buf * SmemT::Z_ELEMS;
   auto* old_B_slot = smem.old_B + tile_buf * SmemT::OLD_B_ELEMS;
 
@@ -143,28 +142,18 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
                                                     (int)params.B_cache_stride_pos, lane,
                                                     ring_start, params.ring_buffer_len);
     if (warp == 2 && lane < MAX_WINDOW) {
-      // dt rows from the RING; decay rows from the cumAdt_old scratch the
-      // precompute wrote (zeros beyond prev_k) — the pre-ring scalar-LDG pair
-      // with the decay read redirected from the retired cache to the scratch.
+      // dt rows from the RING — previous-step rows only, so PDL-safe on the
+      // pre-gdc side.  The decay rows come from the cumAdt_old scratch the
+      // precompute writes THIS step and load in load_old_coeff (post-gdc).
       // (The recompute lives in the precompute — the coefficient kernel — not
       // here on the replay's critical path; see .plans/ssu_persistent_main.md.)
       auto const* __restrict__ dtc_ptr = reinterpret_cast<float const*>(params.dt_cache);
-      auto const* __restrict__ ca_ptr = reinterpret_cast<float const*>(params.cumAdt_old);
       int64_t const dt_base = cache_slot * params.dt_cache_stride_seq +
                               (int64_t)(head * (int)params.dt_cache_stride_head);
       int ring_row = ring_start + lane;
       if (ring_row >= params.ring_buffer_len) ring_row -= params.ring_buffer_len;
       old_dt_slot[lane] = dtc_ptr[dt_base + ring_row];
-      old_cumAdt_slot[lane] = ca_ptr[((int64_t)seq * params.nheads + head) * MAX_WINDOW + lane];
     }
-  } else if (prev_k > 0 && warp == 0 && lane == 0) {
-    // β tail (one float) from the cumAdt_old scratch.  cp.async, NOT a
-    // synchronous LDG→STS: as a single-lane sync load it made W0 the laggard
-    // at the publish barrier; as cp.async it drains with the bundle.
-    auto const* __restrict__ ca_ptr = reinterpret_cast<float const*>(params.cumAdt_old);
-    __pipeline_memcpy_async(
-        &old_cumAdt_slot[prev_k - 1],
-        &ca_ptr[((int64_t)seq * params.nheads + head) * MAX_WINDOW + prev_k - 1], sizeof(float));
   }
   if (warp == 3 && z_ptr) {
     int64_t const z_base = outer * params.z_stride_seq + (int64_t)(head * DIM + d_tile_off);
@@ -263,6 +252,31 @@ __device__ __forceinline__ void load_cb_async(SmemT& smem, CheckpointingSsuParam
     input_t* cb_old_s = smem.cb_old + tile_buf * SmemT::CB_OLD_ELEMS;
     __pipeline_memcpy_async(cb_old_s + lane * CB_OLD_REGS_B, cb_old_g + lane * CB_OLD_REGS_B,
                             CB_OLD_REGS_B * sizeof(input_t));
+  }
+}
+
+// Old-token decay coefficients from the cumAdt_old scratch — written by the
+// PRECOMPUTE this step.  The internal precompute→main PDL launches this kernel
+// while the precompute is still running (trigger fires at its top), and only
+// cudaGridDependencySynchronize() orders its output — so these reads must stay
+// on the post-gdc side.  Loading them pre-gdc raced the precompute under SM
+// contention (flaky two-kernel out-mismatches on the shared-GPU CI runner).
+template <int MAX_WINDOW, typename SmemT>
+__device__ __forceinline__ void load_old_coeff(SmemT& smem, CheckpointingSsuParams const& params,
+                                               int lane, int warp, int seq, int head,
+                                               bool must_checkpoint, int prev_k, int tile_buf) {
+  auto const* __restrict__ ca_ptr = reinterpret_cast<float const*>(params.cumAdt_old);
+  float* old_cumAdt_slot = smem.old_cumAdt + tile_buf * MAX_WINDOW;
+  if (must_checkpoint) {
+    if (warp == 2 && lane < MAX_WINDOW)
+      old_cumAdt_slot[lane] = ca_ptr[((int64_t)seq * params.nheads + head) * MAX_WINDOW + lane];
+  } else if (prev_k > 0 && warp == 0 && lane == 0) {
+    // β tail (one float).  cp.async, NOT a synchronous LDG→STS: as a
+    // single-lane sync load it made W0 the laggard at the publish barrier;
+    // as cp.async it drains with the bundle.
+    __pipeline_memcpy_async(
+        &old_cumAdt_slot[prev_k - 1],
+        &ca_ptr[((int64_t)seq * params.nheads + head) * MAX_WINDOW + prev_k - 1], sizeof(float));
   }
 }
 
@@ -739,7 +753,8 @@ __device__ __forceinline__ void prefetch_async_pre_gdc(SmemT& smem,
                                coords.outer, coords.seq_len, must_checkpoint, coords.prev_k, slot);
 }
 
-template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, typename SmemT>
+template <typename input_t, int NPREDICTED, int MAX_WINDOW, int DIM, int D_PER_CTA, int DSTATE,
+          typename SmemT>
 __device__ __forceinline__ void prefetch_async_post_gdc(SmemT& smem,
                                                         CheckpointingSsuParams const& params,
                                                         int lane, int warp,
@@ -755,6 +770,8 @@ __device__ __forceinline__ void prefetch_async_post_gdc(SmemT& smem,
     load_cb_async<input_t>(smem, params, lane, warp, coords.seq, coords.first_head, must_checkpoint,
                            slot);
   }
+  load_old_coeff<MAX_WINDOW>(smem, params, lane, warp, coords.seq, coords.first_head,
+                             must_checkpoint, coords.prev_k, slot);
 }
 
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
@@ -768,7 +785,7 @@ __device__ __forceinline__ void prefetch_async(SmemT& smem, CheckpointingSsuPara
       derive_head<NHEADS, HEADS_PER_GROUP, D_SPLIT, NPREDICTED, VARLEN>(params, meta);
   prefetch_async_pre_gdc<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                          NUM_WARPS>(smem, params, lane, warp, meta, coords, slot, must_checkpoint);
-  prefetch_async_post_gdc<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
+  prefetch_async_post_gdc<input_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE>(
       smem, params, lane, warp, coords, slot, must_checkpoint);
 }
 
@@ -1031,8 +1048,10 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
     return meta.pnat + NPREDICTED > MAX_WINDOW;
   };
 
-  // ── PROLOGUE: fill meta window 0, then tile 0 (smem buffer 0), pre-gdc half first to overlap
-  // the precompute. ──
+  // ── PROLOGUE: fill meta window 0, then tile 0 (smem buffer 0).  The pre-gdc cp.asyncs
+  // (state + ring tiles — previous-step data only) are issued first so they fly during the
+  // gdc wait; everything the precompute produces (cb / cumAdt / cumAdt_old / x / C) — and the
+  // replay, which consumes old_cumAdt — comes strictly after the gdc. ──
   fill_meta(0);
   HeadMetaSSU const meta0 = load_meta(0);  // wu(0)=blockIdx.x < total_work (CTA has ≥1 work-unit)
   bool const valid0 = is_valid(meta0);
@@ -1046,20 +1065,21 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
   }
   __pipeline_commit();  // G_pre0 (empty if tile 0 is a pad)
 
-  __pipeline_wait_prior(0);  // tile-0 pre-gdc bundle ready for replay
+  cudaGridDependencySynchronize();  // gdc ONCE — precompute outputs (cb / cumAdt / cumAdt_old /
+                                    // x / C) now visible
+
+  if (valid0)
+    prefetch_async_post_gdc<input_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE>(
+        smem, params, lane, warp, coords0, /*slot=*/0, must_checkpoint0);
+  __pipeline_commit();  // G_post0
+
+  __pipeline_wait_prior(0);  // tile-0 full bundle (G_pre0 + G_post0) ready for replay
   __syncthreads();           // publish it cross-warp
   if (must_checkpoint0)
     replay_state<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                  PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane,
                                                                             warp, meta0, 0);
-  __syncthreads();                  // publish replayed state + gdc convergence
-  cudaGridDependencySynchronize();  // gdc ONCE — precompute outputs (cb / cumAdt / x / C) now
-                                    // visible
-
-  if (valid0)
-    prefetch_async_post_gdc<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
-        smem, params, lane, warp, coords0, /*slot=*/0, must_checkpoint0);
-  __pipeline_commit();  // G_post0
+  __syncthreads();  // publish replayed state
 
   // Prefetch units 1..STAGES-1 (full bundles; gdc already fired) — unit p into smem buffer p,
   // seeding the register queue (meta_q[k] == meta(tile+k) at the top of steady iteration tile).
@@ -1074,7 +1094,8 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
     __pipeline_commit();  // G_full_p (empty if pad / past-the-end)
   }
 
-  // FIFO: [G_post0, G_full_1 .. G_full_{STAGES-1}] = STAGES groups.  Drain + output tile 0.
+  // FIFO: [G_full_1 .. G_full_{STAGES-1}] = STAGES−1 groups (tile-0's bundle drained before the
+  // replay above) — the wait is a no-op backstop keeping the steady invariant.  Output tile 0.
   __pipeline_wait_prior(STAGES - 1);
   __syncthreads();  // publish tile-0 post-gdc data (C / x / cumAdt) cross-warp before its output
   if (valid0) {
