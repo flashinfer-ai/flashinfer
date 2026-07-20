@@ -53,7 +53,10 @@ def find_loaded_library(lib_name) -> Optional[str]:
     # libcudart.so.13). Because /proc/self/maps is address-sorted, the first hit is
     # whichever mapping has the lowest base address, so the stub can win and later
     # raise "undefined symbol" on load. Scan every mapping and keep only names that
-    # are really lib_name, i.e. `lib_name.so[.ver]` or `lib_name-<hash>.so[.ver]`.
+    # are really lib_name: `lib_name.so[.ver]` or `lib_name-<hash>.so[.ver]`. Stub
+    # builds (e.g. libcudart_stub.so, libcudart-stub.so) are rejected outright, and
+    # dotted look-alikes such as libcudart.foo.so do not match because a real version
+    # lives after `.so` and is already covered by the exact `stem == lib_name` case.
     # See https://github.com/flashinfer-ai/flashinfer/issues/3676.
     with open("/proc/self/maps") as f:
         for line in f:
@@ -61,8 +64,10 @@ def find_loaded_library(lib_name) -> Optional[str]:
                 continue
             path = line[line.index("/"):].strip()
             filename = path.split("/")[-1]
+            if "stub" in filename.lower():
+                continue
             stem = filename.rpartition(".so")[0]
-            if stem == lib_name or stem.startswith(lib_name + ".") or stem.startswith(lib_name + "-"):
+            if stem == lib_name or (stem.startswith(lib_name + "-") and stem != lib_name + "-"):
                 return path
     # the library is not loaded in the current process
     return None
