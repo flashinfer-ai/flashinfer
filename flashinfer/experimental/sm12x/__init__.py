@@ -40,7 +40,14 @@ from ._lib.runtime_control import (
 
 # Static op registry: one entry per op directory, kept in lockstep by
 # tests/experimental/test_registry.py.  Grows as port phases land.
-_OPS: tuple[str, ...] = ()
+_OPS: tuple[str, ...] = (
+    "gemm.blockscaled",
+    "gemm.block_fp8_linear",
+    "gemm.mxfp8_linear",
+    "gemm.wo_projection",
+    "quantization.mxfp8",
+    "quantization.nvfp4",
+)
 
 _GROUPS = ("attention", "comm", "gemm", "moe", "norm", "quantization")
 _LAZY_ROOT_ATTRS: dict[str, tuple[str, str]] = {
