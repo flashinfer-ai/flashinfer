@@ -16,10 +16,23 @@
 
 #pragma once
 
-#include "scheduler.cuh"
-#include "utils.cuh"
+// clang-format off
+#include <type_traits>
 
-namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled {
+#include <cuda_runtime.h>
+
+#include <cutlass/arch/barrier.h>
+#include <cutlass/cutlass.h>
+
+#include "cute_sm120_mxfp8_groupwise/sm120_common/ab_tma_load.cuh"
+#include "cute_sm120_mxfp8_groupwise/sm120_common/epilogue.cuh"
+#include "cute_sm120_mxfp8_groupwise/sm120_common/math.cuh"
+#include "cute_sm120_mxfp8_groupwise/sm120_common/scheduler.cuh"
+#include "cute_sm120_mxfp8_groupwise/sm120_blockscaled/sf_mxfp8_tma_load.cuh"
+// clang-format on
+
+namespace flashinfer::gemm::mxfp8_cute_sm120 {
+namespace sm120_blockscaled {
 
 template <typename KT>
 struct SM120BlockScaledGemmKernel {
@@ -28,11 +41,10 @@ struct SM120BlockScaledGemmKernel {
   static constexpr int MaxThreadsPerBlock = kNumTMAThreads + kNumMathThreads;
   static constexpr int MinBlocksPerMultiprocessor = 1;
 
-  static constexpr GemmType kGemmType = KT::kGemmType;
+  static constexpr sm120_common::GemmType kGemmType = KT::kGemmType;
   using Scheduler =
-      std::conditional_t<KT::kSwapAB,
-                         sm120_blockscaled::Scheduler<kGemmType, KT::kTileN, KT::kTileM>,
-                         sm120_blockscaled::Scheduler<kGemmType, KT::kTileM, KT::kTileN>>;
+      std::conditional_t<KT::kSwapAB, sm120_common::Scheduler<kGemmType, KT::kTileN, KT::kTileM>,
+                         sm120_common::Scheduler<kGemmType, KT::kTileM, KT::kTileN>>;
   using ProblemShape = typename KT::ProblemShape;
 
   struct Params {
@@ -63,13 +75,16 @@ struct SM120BlockScaledGemmKernel {
 
   static Params to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args) {
     auto [M, N, K, num_experts] = problem_shape;
-    auto [tma_load_a, tma_load_b, tma_load_sfa, tma_load_sfb] = utils::make_tma_descriptors<KT>(
-        args.ptr_A, args.dA, args.ptr_B, args.dB, args.ptr_SFA, args.ptr_SFB, M, N, K, num_experts);
+    auto [tma_load_a, tma_load_b] = sm120_common::utils::make_ab_tma_descriptors<KT>(
+        args.ptr_A, args.dA, args.ptr_B, args.dB, M, N, K, num_experts);
+    auto [tma_load_sfa, tma_load_sfb] =
+        utils::make_sf_tma_descriptors<KT>(args.ptr_SFA, args.ptr_SFB, M, N, K, num_experts);
 
     typename KT::TmaStoreConfig::TMA_D tma_store_d{};
     if constexpr (KT::kUseTmaStore) {
-      auto tensor_d = make_tensor(make_gmem_ptr(args.ptr_D),
-                                  utils::deduce_d_layout<KT::kSwapAB>(M, N, num_experts));
+      auto tensor_d =
+          make_tensor(make_gmem_ptr(args.ptr_D),
+                      sm120_common::utils::deduce_d_layout<KT::kSwapAB>(M, N, num_experts));
       tma_store_d = make_tma_copy_C_sm90(typename KT::TmaStoreConfig::CopyOpS2G{}, tensor_d,
                                          take<0, 2>(typename KT::TmaStoreConfig::SmemLayoutD{}),
                                          typename KT::TmaStoreConfig::EpilogueTile_MN{});
@@ -169,9 +184,9 @@ struct SM120BlockScaledGemmKernel {
                                   BlkCoord const& blk_coord, int32_t m_offset,
                                   int32_t num_sf_cycles, uint32_t& ab_phase,
                                   uint32_t& store_phase) {
-    auto [tAgA, tBgB] =
-        utils::tma_ab_partition<KT>(params.tma_load_a, params.tma_load_b, params.M, params.N,
-                                    params.K, params.num_experts, blk_coord, m_offset);
+    auto [tAgA, tBgB] = sm120_common::utils::tma_ab_partition<KT>(
+        params.tma_load_a, params.tma_load_b, params.M, params.N, params.K, params.num_experts,
+        blk_coord, m_offset);
 
     auto block_tma_a = params.tma_load_a.get_slice(0);
     auto block_tma_b = params.tma_load_b.get_slice(0);
@@ -307,6 +322,8 @@ struct SM120BlockScaledGemmKernel {
                      [&](auto k_in_sf) {
                        constexpr int stage = sf_stage * KT::SFConfig::kNumTileKPerPackSF + k_in_sf;
                        constexpr int ab_stage = stage & (KT::AB_Stages - 1);
+                       constexpr bool is_last_k_tile =
+                           stage == KT::SFConfig::SF_Stages * KT::SFConfig::kNumTileKPerPackSF - 1;
 
                        ab_full_mbar[ab_stage].wait(ab_phase);
                        cute::copy(s2r_copy_A, tXsA(_, _, _, Int<ab_stage>{}), tXrA);
@@ -316,8 +333,7 @@ struct SM120BlockScaledGemmKernel {
                          ab_phase ^= 1;
                        }
 
-                       if constexpr (sf_stage == KT::SFConfig::SF_Stages - 1 &&
-                                     k_in_sf == KT::SFConfig::kNumTileKPerPackSF - 1) {
+                       if constexpr (KT::kUnionSmem && is_last_k_tile) {
                          cutlass::arch::NamedBarrier::sync(KT::MMAConfig::kNumMathThreads, 0);
                        }
 
@@ -331,14 +347,15 @@ struct SM120BlockScaledGemmKernel {
     //   SwapAB MoE (!kFlat && kSwapAB) → direct STG
     //   non-SwapAB MoE                 → smem+R2G with smem_O union
     if constexpr (KT::kUseTmaStore) {
-      utils::epi_r2s<KT>(params, shared_storage, accum, thread_idx, epi_stage, se_phase,
-                         store_full_mbar, store_empty_mbar);
+      sm120_common::utils::epi_r2s<KT>(params, shared_storage, accum, thread_idx, epi_stage,
+                                       se_phase, store_full_mbar, store_empty_mbar);
     } else if constexpr (!KT::kFlat && KT::kSwapAB) {
-      utils::epi_pred_stg<KT>(params, accum, thread_idx, m_offset, m_boundary, m_block_idx,
-                              n_block_idx, store_empty_mbar);
+      sm120_common::utils::epi_pred_stg<KT>(params, accum, thread_idx, m_offset, m_boundary,
+                                            m_block_idx, n_block_idx, store_empty_mbar);
     } else {
-      utils::epi_pred_r2g<KT>(params, shared_storage, accum, thread_idx, m_offset, m_boundary,
-                              m_block_idx, n_block_idx, expert_idx, store_empty_mbar);
+      sm120_common::utils::epi_pred_r2g<KT>(params, shared_storage, accum, thread_idx, m_offset,
+                                            m_boundary, m_block_idx, n_block_idx, expert_idx,
+                                            store_empty_mbar);
     }
   }
 
@@ -348,16 +365,16 @@ struct SM120BlockScaledGemmKernel {
     if constexpr (KT::kUseTmaStore) {
       auto [ab_full_mbar, ab_empty_mbar, sf_full_mbar, sf_empty_mbar, store_full_mbar,
             store_empty_mbar] = get_mbarriers(shared_storage);
-      utils::tma_store<KT>(params, shared_storage, cute::get<0>(blk_coord), cute::get<1>(blk_coord),
-                           cute::get<2>(blk_coord), sf_phase, epi_stage, store_full_mbar,
-                           store_empty_mbar);
+      sm120_common::utils::tma_store<KT>(params, shared_storage, cute::get<0>(blk_coord),
+                                         cute::get<1>(blk_coord), cute::get<2>(blk_coord), sf_phase,
+                                         epi_stage, store_full_mbar, store_empty_mbar);
     }
   }
 
   CUTE_DEVICE
   void operator()(Params const& params, char* smem_buf) {
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-    int warp_idx = canonical_warp_idx_sync();
+    int warp_idx = cutlass::canonical_warp_idx_sync();
     int lane_predicate = cute::elect_one_sync();
     bool is_tma_thread = warp_idx == 0 && lane_predicate;
 
@@ -392,8 +409,8 @@ struct SM120BlockScaledGemmKernel {
     }
     __syncthreads();
 
-    int32_t num_sf_cycles =
-        math::ceil_div(params.K, int(KT::SFConfig::PACK_NK * KT::SFConfig::SF_Stages));
+    int32_t num_sf_cycles = sm120_common::math::ceil_div(
+        params.K, int(KT::SFConfig::PACK_NK * KT::SFConfig::SF_Stages));
 
     if (warp_idx >= KT::MMAConfig::kNumMathWarps) {
       constexpr int epi_warp_idx = KT::MMAConfig::kNumMathWarps;
@@ -408,7 +425,7 @@ struct SM120BlockScaledGemmKernel {
             Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout);
             int32_t m_block_idx, n_block_idx;
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-              auto blk_coord = utils::make_blk_coord<KT::kSwapAB>(
+              auto blk_coord = sm120_common::utils::make_blk_coord<KT::kSwapAB>(
                   m_block_idx, n_block_idx, scheduler.get_expert_idx(m_block_idx));
               store(params, shared_storage, blk_coord, sf_phase, epi_stage);
             }
@@ -423,7 +440,7 @@ struct SM120BlockScaledGemmKernel {
           Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout);
           int32_t m_block_idx, n_block_idx;
           while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            auto blk_coord = utils::make_blk_coord<KT::kSwapAB>(
+            auto blk_coord = sm120_common::utils::make_blk_coord<KT::kSwapAB>(
                 m_block_idx, n_block_idx, scheduler.get_expert_idx(m_block_idx));
             load_ab(params, shared_storage, blk_coord, scheduler.get_m_offset(), num_sf_cycles,
                     ab_phase, store_phase);
@@ -438,7 +455,7 @@ struct SM120BlockScaledGemmKernel {
           Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout);
           int32_t m_block_idx, n_block_idx;
           while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            auto blk_coord = utils::make_blk_coord<KT::kSwapAB>(
+            auto blk_coord = sm120_common::utils::make_blk_coord<KT::kSwapAB>(
                 m_block_idx, n_block_idx, scheduler.get_expert_idx(m_block_idx));
             load_sf(params, shared_storage, blk_coord, scheduler.get_m_offset(), num_sf_cycles,
                     sf_phase, store_phase);
@@ -456,8 +473,8 @@ struct SM120BlockScaledGemmKernel {
       Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout);
       int32_t m_block_idx, n_block_idx;
       while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-        auto blk_coord = utils::make_blk_coord<KT::kSwapAB>(m_block_idx, n_block_idx,
-                                                            scheduler.get_expert_idx(m_block_idx));
+        auto blk_coord = sm120_common::utils::make_blk_coord<KT::kSwapAB>(
+            m_block_idx, n_block_idx, scheduler.get_expert_idx(m_block_idx));
         mma(params, shared_storage, num_sf_cycles, scheduler.get_m_offset(),
             scheduler.get_m_boundary(), cute::get<0>(blk_coord), cute::get<1>(blk_coord),
             cute::get<2>(blk_coord), sf_phase, ab_phase, epi_stage, se_phase);
@@ -466,4 +483,5 @@ struct SM120BlockScaledGemmKernel {
   }
 };
 
-}  // namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled
+}  // namespace sm120_blockscaled
+}  // namespace flashinfer::gemm::mxfp8_cute_sm120

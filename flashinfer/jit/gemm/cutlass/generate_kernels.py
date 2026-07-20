@@ -17,7 +17,6 @@ from .cutlass_library import (
     EpilogueScheduleTag,
     EpilogueScheduleSuffixes,
 )
-from ...cpp_ext import is_cuda_version_at_least
 
 
 ################################################################################
@@ -121,6 +120,16 @@ CudaTypeName = {
     DataType.u4: "cutlass::uint4b_t",
 }
 
+MixedInputScaleModeTag = {
+    "post_mma": "cutlass::gemm::collective::MixedInputScaleMode::kPostMma",
+    "pre_mma_e8m0": "cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0",
+}
+
+Sm90MixedInputKernelScheduleTag = {
+    "single_warpgroup_prefill": "tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_PREFILL",
+    "single_warpgroup_rolling": "tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING",
+}
+
 
 ################################################################################
 # A data structure holding all info to instantiate gemm launchers in TRT LLM.
@@ -144,6 +153,8 @@ class TrtLlm_GemmLauncher:
         epi_schedule,
         epi_fusion=None,
         is_mx_fpx=False,
+        mixed_input_scale_mode="post_mma",
+        sm90_mixed_input_kernel_type="warp_specialized",
         dynamic_cga=False,
         swap_ab=False,
     ):
@@ -165,6 +176,8 @@ class TrtLlm_GemmLauncher:
         self.epi_schedule = epi_schedule
         self.epi_fusion = epi_fusion
         self.is_mx_fpx = is_mx_fpx
+        self.mixed_input_scale_mode = mixed_input_scale_mode
+        self.sm90_mixed_input_kernel_type = sm90_mixed_input_kernel_type
         self.swap_ab = swap_ab
 
     def __repr__(self):
@@ -197,6 +210,10 @@ class TrtLlm_GemmLauncher:
             "_mxfpx_" if self.is_mx_fpx else "",
             "_swap_ab" if self.swap_ab else "",
         )
+        if self.mixed_input_scale_mode != "post_mma":
+            hopper_suffix += f"_{self.mixed_input_scale_mode}"
+        if self.sm90_mixed_input_kernel_type != "warp_specialized":
+            hopper_suffix += f"_{self.sm90_mixed_input_kernel_type}"
 
         if self.arch >= 90:
             return kernel_prefix + hopper_suffix
@@ -238,14 +255,35 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
 {out_tag}*, int, int, int, const int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig, char*, size_t, cudaStream_t, int*
 );"""
     elif operation.gemm_kind == GemmKind.Grouped:
-        if operation.act_type != operation.weight_type and (
-            operation.act_type != DataType.e4m3 or operation.weight_type != e2m1
-        ):
+        if operation.arch == 90 and operation.act_type != operation.weight_type:
             # Mixed MoE GEMM
             weight_tag = CudaTypeName[operation.weight_type]
+            optional_template_args = []
+            if operation.mixed_input_scale_mode != "post_mma":
+                optional_template_args.append(
+                    MixedInputScaleModeTag[operation.mixed_input_scale_mode]
+                )
+            if operation.sm90_mixed_input_kernel_type != "warp_specialized":
+                if operation.mixed_input_scale_mode == "post_mma":
+                    optional_template_args.append(
+                        MixedInputScaleModeTag[operation.mixed_input_scale_mode]
+                    )
+                optional_template_args.append(
+                    Sm90MixedInputKernelScheduleTag[
+                        operation.sm90_mixed_input_kernel_type
+                    ]
+                )
+            optional_template_args = "".join(
+                f", {arg}" for arg in optional_template_args
+            )
+            launcher_name = (
+                "sm90_generic_mixed_moe_gemm_kernelLauncher"
+                if operation.sm90_mixed_input_kernel_type == "warp_specialized"
+                else "sm90_generic_mixed_moe_small_k_kernelLauncher"
+            )
             instantiation = f"""
-template void sm90_generic_mixed_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {out_tag},
-{epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}> (
+template void {launcher_name}<{act_tag}, {weight_tag}, {out_tag},
+{epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}{optional_template_args}> (
 GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size);
 """
         else:
@@ -658,34 +696,43 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
         (DataType.e4m3, DataType.u4, DataType.bf16, DataType.bf16, DataType.bf16),
     ]
 
-    if is_cuda_version_at_least("12.8"):
-        supported_dtypes_fp4 = [
-            (DataType.f16, DataType.e2m1, DataType.ue8m0, DataType.f16, DataType.f16),
-            (
-                DataType.bf16,
-                DataType.e2m1,
-                DataType.ue8m0,
-                DataType.bf16,
-                DataType.bf16,
-            ),
-        ]
-    else:
-        supported_dtypes_fp4 = []
+    supported_dtypes_fp4 = [
+        (
+            DataType.bf16,
+            e2m1,
+            DataType.ue8m0,
+            DataType.bf16,
+            DataType.bf16,
+        ),
+        (
+            DataType.e4m3,
+            e2m1,
+            DataType.ue8m0,
+            DataType.f16,
+            DataType.f16,
+        ),
+        (
+            DataType.e4m3,
+            e2m1,
+            DataType.ue8m0,
+            DataType.bf16,
+            DataType.bf16,
+        ),
+    ]
 
     quant_ops = [TrtLlm_QuantOp.finegrained_scale_only]
 
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
 
-    M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
-    N_TILES = [16, 32, 64, 128]
-    K_TILES = [128, 256, 512]
-    cta_shapes_mnk_int4 = list(product(M_TILES, N_TILES, K_TILES))
-
-    M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
-    N_TILES = [16, 32, 64]
-    K_TILES = [128, 256]
-    cta_shapes_mnk_fp4 = list(product(M_TILES, N_TILES, K_TILES))
-    cta_shapes_mnk_fp4.append((128, 128, 128))
+    cta_shapes_mnk_mixed_input = list(product([64], [16, 32, 64, 128], [128, 256, 512]))
+    cta_shapes_mnk_mixed_input.extend(
+        product([128], [16, 32, 64, 128], [128, 256, 512])
+    )
+    cta_shapes_mnk_mixed_input.extend([(128, 256, k_tile) for k_tile in [128, 256]])
+    cta_shapes_mnk_mixed_input.extend([(256, 128, k_tile) for k_tile in [128, 256]])
+    cta_shapes_mnk_mixed_input.append((256, 256, 128))
+    cta_shapes_mnk_int4 = list(cta_shapes_mnk_mixed_input)
+    cta_shapes_mnk_fp4 = list(cta_shapes_mnk_mixed_input)
 
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto
@@ -702,6 +749,9 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
 
     operations = list()
     for dtype_combo, quant_op, epi_tag, cta_shape_mnk, cga_shape in partial_args:
+        is_fp8_mxfp4 = dtype_combo[0] == DataType.e4m3 and dtype_combo[1] == e2m1
+        mixed_input_scale_mode = "pre_mma_e8m0" if is_fp8_mxfp4 else "post_mma"
+
         use_coop = cta_shape_mnk[0] >= 128
         mainloop_schedules = (
             [
@@ -713,13 +763,6 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
         )
         epi_schedule = EpilogueScheduleType.TmaWarpSpecializedCooperative
         for mainloop_schedule in mainloop_schedules:
-            if (
-                cta_shape_mnk[0] == 128
-                and cta_shape_mnk[1] == 128
-                and mainloop_schedule
-                == KernelScheduleType.TmaWarpSpecializedCooperative
-            ):
-                continue
             moe_gemm_operation = TrtLlm_GemmLauncher(
                 GemmKind.Grouped,
                 arch,
@@ -732,8 +775,36 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
                 cga_shape,
                 mainloop_schedule,
                 epi_schedule,
+                mixed_input_scale_mode=mixed_input_scale_mode,
             )
             operations.append(moe_gemm_operation)
+
+    small_k_shapes = [(128, token_tile, 128) for token_tile in [8, 16, 32, 40]]
+    small_k_kernel_types = [
+        "single_warpgroup_prefill",
+        "single_warpgroup_rolling",
+    ]
+    for dtype_combo in supported_dtypes_fp4:
+        if dtype_combo[0] != DataType.e4m3:
+            continue
+        for cta_shape_mnk, kernel_type in product(small_k_shapes, small_k_kernel_types):
+            operations.append(
+                TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    *dtype_combo,
+                    TrtLlm_QuantOp.finegrained_scale_only,
+                    TrtLlm_EpilogueTag.epilogue_op_default,
+                    cta_shape_mnk,
+                    warp_shape,
+                    3,
+                    (1, 1, 1),
+                    KernelScheduleType.TmaWarpSpecializedPingpong,
+                    EpilogueScheduleType.TmaWarpSpecializedCooperative,
+                    mixed_input_scale_mode="pre_mma_e8m0",
+                    sm90_mixed_input_kernel_type=kernel_type,
+                )
+            )
     return operations
 
 
@@ -1059,15 +1130,14 @@ def generate_gemm_operations(output_dir, architectures):
     def should_skip(op):
         return False  # All kernels have a public implementation
 
-    # The mixed dtype grouped gemm for w4afp8 has a different launcher
+    # SM90 mixed-input grouped GEMMs have a dedicated launcher.
     def is_mixed_dtype_grouped(op):
         if isinstance(op, GemmSm80LauncherConfig):
             return False
-        # Only w4a8fp8 and not wfp4afp8
         return (
-            (op.act_type != op.weight_type)
+            (op.arch == 90)
+            and (op.act_type != op.weight_type)
             and (op.gemm_kind == GemmKind.Grouped)
-            and (op.act_type != DataType.e4m3 or op.weight_type != e2m1)
         )
 
     # Fix OOM error in CI. If len(operations) is more than GROUP_SIZE, it will be split into multiple sub groups.
