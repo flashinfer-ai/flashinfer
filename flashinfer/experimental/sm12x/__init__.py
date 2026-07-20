@@ -41,6 +41,11 @@ from ._lib.runtime_control import (
 # Static op registry: one entry per op directory, kept in lockstep by
 # tests/experimental/test_registry.py.  Grows as port phases land.
 _OPS: tuple[str, ...] = (
+    "attention.paged",
+    "attention.sparse_mla",
+    "attention.compressed_mla",
+    "attention.nsa_indexer",
+    "attention.varlen",
     "gemm.blockscaled",
     "gemm.block_fp8_linear",
     "gemm.mxfp8_linear",
