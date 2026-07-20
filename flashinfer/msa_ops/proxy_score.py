@@ -300,12 +300,17 @@ def msa_proxy_score(
         paged ``(num_pages, num_kv_heads, 128, 128)`` with ``page_table`` +
         ``seqused_k``. May be fp8 E4M3 (upconverted in-kernel).
         ``num_qo_heads`` must be a multiple of ``num_kv_heads``.
-    cu_seqlens_q, cu_seqlens_k : torch.Tensor
-        ``(batch_size + 1,)`` int32 cumulative lengths.
+    cu_seqlens_q : torch.Tensor
+        ``(batch_size + 1,)`` int32 cumulative query lengths.
+    cu_seqlens_k : torch.Tensor, optional
+        ``(batch_size + 1,)`` int32 cumulative KV lengths. Required for flat
+        KV layout and unused for paged KV layout.
     page_table : torch.Tensor, optional
-        Page-table mapping for paged KV layout. Required when ``k`` is paged.
+        Page-table mapping for paged KV layout. Required together with
+        ``seqused_k`` when ``k`` is paged.
     seqused_k : torch.Tensor, optional
-        Per-sequence valid KV-token counts for paged KV layout.
+        Per-sequence valid KV-token counts. Required together with
+        ``page_table`` for paged KV layout.
     causal : bool
         Right-aligned causal masking, applied *before* the block max.
     max_seqlen_q : int, optional
@@ -324,13 +329,12 @@ def msa_proxy_score(
         shared block selection per query (MiniMax-M3 indexer semantics).
         Defaults to ``False``: per-head ``max_score``, where each head selects
         its own blocks.
-    q_offset : int or torch.Tensor, optional
-        Optional query-position offset used by the causal alignment logic.
-
         The reduction is currently a post-kernel ``amax`` over the per-head
         buffer (the kernel is one CTA per head, so a cross-head epilogue would
         need cross-CTA float atomics); folding it into the kernel is a possible
         future optimization (saves materializing the per-head buffer).
+    q_offset : int or torch.Tensor, optional
+        Optional query-position offset used by the causal alignment logic.
 
     Returns
     -------
