@@ -851,7 +851,8 @@ cudaError_t AppendPagedKVMlaCache(paged_kv_mla_t<DType, IdType> paged_kv, DType*
   constexpr uint32_t HEAD_KPE_DIM = 64;
   FLASHINFER_CHECK(head_dim_ckv == HEAD_CKV_DIM, "head_dim_ckv must be equal to 512");
   FLASHINFER_CHECK(head_dim_kpe == HEAD_KPE_DIM, "head_dim_kpe must be equal to 64");
-  constexpr uint32_t vec_size = 2;
+  constexpr uint32_t vec_size =
+      std::max(uint32_t(16 / sizeof(DType)), uint32_t(HEAD_CKV_DIM / 128));
 
   uint32_t bdx = HEAD_CKV_DIM / vec_size;
   uint32_t num_threads = bdx;

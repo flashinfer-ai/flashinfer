@@ -18,10 +18,14 @@
 
 namespace moe::dev::routing {
 namespace routingCustom {
-// Forward declarations of launch functions
-void launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
-void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
-void launchClusterKernel(Data const& data, void* stream);
+// Forward declarations of launch functions.
+// Block/DynBlock/Cluster return whether a compiled tier covered (numExperts, topK)
+// and the kernel was actually launched; the definitions live in
+// trtllm_fused_moe_routing_custom.cu. Keep these signatures in sync (the return
+// type is not part of the mangled name, so a mismatch would silently be UB).
+bool launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+bool launchClusterKernel(Data const& data, void* stream);
 void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHist, void* stream);
 void launchInitExpertCounts(Data const& data, uint32_t numThreadsHist, void* stream);
 void launchHistogramKernel(Data const& data, int numBlocksHistogram, uint32_t numThreadsHist,
@@ -83,11 +87,27 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
       (smMajor >= 9) && (data.mNumTokens <= routingCustom::MaxNumTokensSingleCluster);
 
   if (useDynBlock) {
-    routingCustom::launchDynBlockKernel(customData, numThreadsHist, stream);
+    bool const launched = routingCustom::launchDynBlockKernel(customData, numThreadsHist, stream);
+    FLASHINFER_CHECK(
+        launched, "runPostTopKPipeline: no compiled tier covers numExperts=", data.mNumExperts,
+        " topK=", data.mTopK,
+        " for the post-topK permutation (dyn-block path). Add a matching Tier<E, K> to "
+        "PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in RoutingCustomPolicy.cuh.");
   } else if (useStaticBlock) {
-    routingCustom::launchBlockKernel(customData, numThreadsHist, stream);
+    bool const launched = routingCustom::launchBlockKernel(customData, numThreadsHist, stream);
+    FLASHINFER_CHECK(
+        launched, "runPostTopKPipeline: no compiled tier covers numExperts=", data.mNumExperts,
+        " topK=", data.mTopK,
+        " for the post-topK permutation (static-block path). Add a matching Tier<E, K> "
+        "to PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in RoutingCustomPolicy.cuh.");
   } else if (useSingleCluster) {
-    routingCustom::launchClusterKernel(customData, stream);
+    bool const launched = routingCustom::launchClusterKernel(customData, stream);
+    FLASHINFER_CHECK(launched,
+                     "runPostTopKPipeline: no compiled tier covers numExperts=", data.mNumExperts,
+                     " topK=", data.mTopK,
+                     " for the post-topK permutation (single-cluster path). Add a matching "
+                     "Tier<E, K> to (Cluster)PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in "
+                     "RoutingCustomPolicy.cuh.");
   } else {
     // Check if we can use the coop path (more efficient for medium token counts)
     // Requires SM90+ (grid-sync), numExperts <= 1024.

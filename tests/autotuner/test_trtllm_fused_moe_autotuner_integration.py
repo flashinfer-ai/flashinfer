@@ -57,7 +57,7 @@ def _overwrite_cached_tactic_for_op(custom_op: str, new_tactic):
     tuner = AutoTuner.get()
     updated = 0
     for key, (runner_id, _tactic, profile) in list(tuner.profiling_cache.items()):
-        if key[0] == custom_op:
+        if key.custom_op == custom_op:
             tuner.profiling_cache[key] = (runner_id, new_tactic, profile)
             updated += 1
     assert updated > 0, f"No autotuner cache entries found for {custom_op}"

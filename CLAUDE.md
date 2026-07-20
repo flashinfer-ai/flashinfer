@@ -185,11 +185,17 @@ FlashInfer's JIT system has three layers:
 
 ### Layer 1: JitSpec (flashinfer/jit/core.py)
 
-`JitSpec` defines compilation metadata:
+`JitSpec` is an abstract base class defining the kernel-module lifecycle
+(`try_load()` / `build()` / `load()`, with the shared `build_and_load()`
+template method handling caching, locking, and `FLASHINFER_DISABLE_JIT`).
+One subclass per compilation toolchain:
 
-- `name`: Unique identifier (URI hash from parameters)
-- `sources`: List of .cu/.cpp files to compile
-- `extra_cuda_cflags`, `extra_cflags`, `extra_ldflags`: Compiler flags
+- `JitSpecNvcc` (nvcc/ninja modules, returned by `gen_jit_spec()`) defines:
+  - `name`: Unique identifier (URI hash from parameters)
+  - `sources`: List of .cu/.cpp files to compile
+  - `extra_cuda_cflags`, `extra_cflags`, `extra_ldflags`: Compiler flags
+- `JitSpecCuteDsl` (flashinfer/jit/cute_dsl_core.py) caches CuTe-DSL kernels
+  (see "CuTe-DSL kernels" under Module Caching below)
 
 ### JIT Directory Rules
 
@@ -250,7 +256,7 @@ def gen_some_module(dtype_in, dtype_out, ...):
 
 ### Layer 3: Compilation and Loading
 
-`JitSpec` methods:
+`JitSpecNvcc` methods:
 
 - `write_ninja()` - Generates `build.ninja` file
 - `build()` - Executes `ninja` to compile sources
@@ -385,6 +391,20 @@ URI computed as: `hash(operation_type + parameters + source_hashes + flags + cud
 - Clear cache: `rm -rf ~/.cache/flashinfer/`
 - Override location: `export FLASHINFER_WORKSPACE_BASE="/scratch"`
 
+**CuTe-DSL kernels** (`flashinfer/jit/cute_dsl_core.py`): `cute.compile()` has no
+persistent cache, so `JitSpecCuteDsl` (a `JitSpec` subclass, wrapped by the
+`build_and_load_cute_dsl_kernel()` helper) exports compiled kernels as
+object files (`export_to_c()`) and reloads them with `cute.runtime.load_module(...,
+enable_tvm_ffi=True)`. Artifacts live in `cached_ops/` next to the nvcc modules, one
+directory per op family — `cached_ops/<module>_<arch>_cute_dsl/` (e.g.
+`nvfp4_quantize_sm100a_cute_dsl/`) holding one `meta.json` plus one `.o` per
+specialization. The arch comes from the DSL's compile target (`CUTE_DSL_ARCH` or the
+current device) since the artifacts are single-arch, unlike nvcc fatbins.
+Invalidation is module-granular: a changed nvidia-cutlass-dsl version or
+kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
+`flashinfer/quantization/kernels/nvfp4_quantize.py`. Disable with
+`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`.
+
 ### Dispatch Macros
 
 Handle combinatorial parameter spaces:
@@ -479,6 +499,7 @@ match what the code uses today; values are strings unless noted.
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
 | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
+| `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the AOT/JIT-cache version check that pins flashinfer-jit-cache to the installed flashinfer-python. Bypass only when you intentionally mix versions. |
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
 | `FLASHINFER_NVCC` | `$cuda_home/bin/nvcc` | `flashinfer/jit/cpp_ext.py` | Override the nvcc binary used by the JIT (useful for sccache wrappers or non-default CUDA installs). |
@@ -530,14 +551,16 @@ Used by `flashinfer.trace` / `fi_trace`.
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Adds host-side overhead; intended for debugging. |
-| `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
+| `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120.py` | Override the disk path for MLA AutoTuner cache files. Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
+| `FLASHINFER_AUTOTUNE_TIMER` | unset (auto) | `flashinfer/autotuner/autotuner.py` | Selects the autotuner's per-tactic timer: `globaltimer` forces the GPU `%globaltimer` register, `cuda_event` forces `cudaEvent`, unset/anything-else auto-detects (uses `%globaltimer` only when Confidential Computing is detected). Under CC `cudaEventElapsedTime` is unreliable (can go negative), so the globaltimer path keeps tactic ranking stable. |
+| `FLASHINFER_CONFIDENTIAL_COMPUTE` | unset | `flashinfer/utils.py` | Override NVIDIA Confidential Computing (CC) auto-detection used by `is_confidential_compute()` (which drives the autotuner timer above): `1` forces CC, `0` forces non-CC. Useful for CI or hosts without `pynvml`. |
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k algorithm (otherwise the dispatcher chooses based on shape). Used for benchmarking / regression bisection. |
 | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
 | `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN` | unset | `csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu` | Forces the TRT-LLM MoE custom-routing kernel into "one-block-per-token" mode regardless of the active routing policy. Mainly used to reproduce specific perf points. |
 | `FLASHINFER_B12X_MICRO_SHARE_INPUT` | `1` | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `0` disables the B12x MoE micro-batch input-sharing optimization. Internal/experimental — leave at the default unless investigating an SM12x MoE regression. |
 | `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | When set (any non-empty value), forces the SM12x MoE dispatcher onto the W4A16 kernel path regardless of weight dtype. Internal/experimental — used to reproduce W4A16-specific issues. |
-| `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
+| `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
 
 ## Development Workflow
 
