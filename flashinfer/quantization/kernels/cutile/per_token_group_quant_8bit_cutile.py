@@ -311,7 +311,14 @@ def per_token_group_quant_8bit_cutile(
             ),
         )
         if scale_tma_aligned:
-            x_s = x_s_raw[:, :num_tokens].t().contiguous()
+            # Return a transposed VIEW, not a contiguous copy: x_s_raw is
+            # (num_groups, aligned_size) row-major, so .t() yields a
+            # (num_tokens, num_groups) column-major tensor whose token dim is
+            # unit-stride and whose group stride keeps the aligned_size (16B)
+            # TMA padding. .contiguous() here would repack to a tight row-major
+            # layout, destroying both the column-major property and the TMA
+            # alignment this branch exists to produce.
+            x_s = x_s_raw[:, :num_tokens].t()
     else:
         assert not scale_ue8m0
 
