@@ -40,7 +40,7 @@ from flashinfer.fused_moe.utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from flashinfer.jit import setup_cubin_loader
-from flashinfer.utils import _get_cache_buf
+from flashinfer.utils import _get_cache_buf, get_compute_capability
 
 # Tensor index constants for trtllm_low_latency_gemm inputs: [A, B, global_scale, out]
 _LLGEMM_A_IDX = 0
@@ -146,7 +146,7 @@ def trtllm_low_latency_gemm(
     out: torch.Tensor,
 ) -> None:
     r"""GEMM optimized for low M dimension. B needs to be shuffled and its layout needs to be adjusted.
-    Only supported on Blackwell GPUs.
+    Only supported on SM10x datacenter Blackwell GPUs.
 
     Parameters
     ----------
@@ -182,6 +182,20 @@ def trtllm_low_latency_gemm(
     >>> out.shape
     torch.Size([16, 2560])
     """
+
+    # The only backend is the TRT-LLM Gen FP8 kernel used by the SM10x
+    # datacenter Blackwell path (see gen_trtllm_low_latency_gemm_module). On
+    # other architectures -- including consumer Blackwell sm_120/sm_121 -- the
+    # cubin has no matching kernel image and the launch fails opaquely. Reject
+    # early with a clear message instead. Guard lives here (not in mm_fp8) so
+    # direct callers of this exported helper are covered too.
+    major, minor = get_compute_capability(A.device)
+    if major != 10:
+        raise NotImplementedError(
+            "trtllm_low_latency_gemm / mm_fp8 requires an SM10x datacenter "
+            "Blackwell GPU, e.g. SM100/B200; the TRT-LLM Gen FP8 kernel is not "
+            f"available on compute capability {major}.{minor}."
+        )
 
     tuner = AutoTuner.get()
     inputs = [A, B, global_scale, out]
