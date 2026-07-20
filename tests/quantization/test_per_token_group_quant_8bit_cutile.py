@@ -101,7 +101,9 @@ def test_column_major_scales(num_tokens, hidden_dim, group_size, dst_dtype, back
     assert not x_s.isnan().any()
     # Column-major (Fortran order): the token dim is the contiguous one, so its
     # stride is 1 — this is what makes the scales TMA-loadable per group.
-    assert x_s.stride(0) == 1, f"expected column-major scales, got strides {x_s.stride()}"
+    assert x_s.stride(0) == 1, (
+        f"expected column-major scales, got strides {x_s.stride()}"
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [128, 130])  # 130 -> aligned to 132
