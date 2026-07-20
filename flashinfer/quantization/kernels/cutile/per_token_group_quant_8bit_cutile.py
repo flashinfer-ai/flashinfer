@@ -69,6 +69,13 @@ def _per_token_group_quant_8bit_kernel(
 
     # Quantize: clamp(y * y_s_inv, bit8_min, bit8_max)
     y_q = ct.minimum(ct.maximum(y * y_s_inv, bit8_min), bit8_max)
+    # ct.astype float->int truncates toward zero, but the INT8 reference rounds
+    # to nearest -- truncation would leave a systematic ~0.5-LSB bias. cuda.tile
+    # exposes no round op, so round-half-up via floor(x + 0.5) on the (already
+    # clamped, so in-range) value. FP8 casts round in hardware, so only the
+    # integer path needs this.
+    if y_quantized.dtype == ct.int8:
+        y_q = ct.floor(y_q + 0.5)
     y_q = ct.astype(y_q, y_quantized.dtype)
 
     # Store quantized values with mask (use OOB offsets for invalid positions)
@@ -145,6 +152,10 @@ def _per_token_group_quant_8bit_colmajor_kernel(
 
     # Quantize: clamp(y / y_s, bit8_min, bit8_max)
     y_q = ct.minimum(ct.maximum(y / y_s, bit8_min), bit8_max)
+    # ct.astype float->int truncates toward zero; round-half-up for INT8 to
+    # match the rounding reference (see row-major kernel). FP8 rounds in HW.
+    if y_quantized.dtype == ct.int8:
+        y_q = ct.floor(y_q + 0.5)
     y_q = ct.astype(y_q, y_quantized.dtype)
 
     # Store quantized values with mask
