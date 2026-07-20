@@ -39,13 +39,13 @@ DEFAULT_W4A16_MOE_TACTIC: W4A16MoeTactic = (
 
 @dataclass
 class _W4A16Workspace:
+    num_tokens_capacity: int
     moe_sort_buffers: Dict[str, torch.Tensor]
     hidden_workspace: torch.Tensor
     gemm1_output: torch.Tensor
     intermediate: torch.Tensor
 
 
-_workspace_cache: Dict[Tuple, _W4A16Workspace] = {}
 _kernel_cache: Dict[Tuple, object] = {}
 
 
@@ -61,24 +61,18 @@ def _get_workspace(
     route_slots = get_max_num_permuted_tokens(
         num_tokens, top_k, num_experts, route_tile
     )
-    cache = _workspace_cache if workspace_cache is None else workspace_cache
     key = (
         x.device,
-        *(
-            (int(torch.cuda.current_stream(x.device).cuda_stream),)
-            if workspace_cache is None
-            else ()
-        ),
-        num_tokens,
         top_k,
         int(x.size(1)),
         int(intermediate_size),
         int(num_experts),
         route_tile,
     )
-    workspace = cache.get(key)
-    if workspace is None:
+    workspace = workspace_cache.get(key) if workspace_cache is not None else None
+    if workspace is None or workspace.num_tokens_capacity < num_tokens:
         workspace = _W4A16Workspace(
+            num_tokens_capacity=num_tokens,
             moe_sort_buffers=allocate_moe_sort_buffers(
                 num_tokens=num_tokens,
                 num_experts=num_experts,
@@ -102,7 +96,8 @@ def _get_workspace(
                 device=x.device,
             ),
         )
-        cache[key] = workspace
+        if workspace_cache is not None:
+            workspace_cache[key] = workspace
     return workspace
 
 
@@ -374,10 +369,21 @@ def launch_w4a16_moe(
         enable_pdl=enable_pdl,
         **workspace.moe_sort_buffers,
     )
-    route_slots = int(permuted_idx_to_expanded_idx.numel())
+    num_tokens = int(x.size(0))
+    route_slots = get_max_num_permuted_tokens(
+        num_tokens, top_k, num_experts, route_tile
+    )
+    num_route_tiles = route_slots // route_tile
+    tile_idx_to_expert_idx = tile_idx_to_expert_idx[:num_route_tiles]
+    tile_idx_to_mn_limit = tile_idx_to_mn_limit[:num_route_tiles]
+    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx[:num_tokens]
+    permuted_idx_to_expanded_idx = permuted_idx_to_expanded_idx[:route_slots]
+    hidden_workspace = workspace.hidden_workspace[:route_slots]
+    gemm1_output = workspace.gemm1_output[:route_slots]
+    intermediate = workspace.intermediate[:route_slots]
     moe_permute(
         input=x,
-        permuted_output=workspace.hidden_workspace,
+        permuted_output=hidden_workspace,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         num_non_exiting_tiles=num_non_exiting_tiles,
@@ -389,12 +395,12 @@ def launch_w4a16_moe(
     _run_grouped_gemm(
         w1_weight,
         w1_weight_sf,
-        workspace.hidden_workspace,
+        hidden_workspace,
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
         num_non_exiting_tiles,
         w1_alpha,
-        workspace.gemm1_output,
+        gemm1_output,
         num_experts,
         True,
         False,
@@ -405,21 +411,21 @@ def launch_w4a16_moe(
         gemm1_tactic,
     )
     moe_swiglu(
-        input=workspace.gemm1_output,
-        output=workspace.intermediate,
+        input=gemm1_output,
+        output=intermediate,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
         max_num_permuted_tokens=route_slots,
         tile_size=route_tile,
         enable_pdl=enable_pdl,
     )
-    gemm2_output = moe_output if use_fused_finalize else workspace.hidden_workspace
+    gemm2_output = moe_output if use_fused_finalize else hidden_workspace
     if use_fused_finalize:
         moe_output_memset_inplace(moe_output)
     _run_grouped_gemm(
         w2_weight,
         w2_weight_sf,
-        workspace.intermediate,
+        intermediate,
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
         num_non_exiting_tiles,
