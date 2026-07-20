@@ -738,10 +738,6 @@ jobs:
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          echo "" >> $GITHUB_STEP_SUMMARY
           if [ "$FAILED" == "true" ]; then
             echo "Result: Tests Failed" >> $GITHUB_STEP_SUMMARY
             exit 1
