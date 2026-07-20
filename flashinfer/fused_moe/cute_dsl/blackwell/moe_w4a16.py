@@ -32,7 +32,7 @@ W4A16MoeTactic = Tuple[int, W4A16GemmTactic, W4A16GemmTactic]
 # performance selection belongs to CuteDslFusedMoEW4A16Runner.
 DEFAULT_W4A16_MOE_TACTIC: W4A16MoeTactic = (
     128,
-    ((128, 128), (2, 1)),
+    ((256, 128), (2, 1)),
     ((256, 128), (2, 1)),
 )
 
