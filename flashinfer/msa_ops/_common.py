@@ -90,29 +90,15 @@ def _resolve_packed_kv(k, v, head_dim, *, paged, kv_nvfp4):
     """Shared wrapper plumbing: detect packed K/V split views (paged,
     non-NVFP4 only) via :func:`_packed_kv_view`, enforcing contiguity for
     every other input."""
-    packed = None if kv_nvfp4 or not paged else _packed_kv_view_cached(k, v, head_dim)
+    packed = None if kv_nvfp4 or not paged else _packed_kv_view(k, v, head_dim)
     if packed is None and not (k.is_contiguous() and v.is_contiguous()):
         raise ValueError("k/v must be contiguous")
     return packed
 
 
-# Cached views pin their storage, hence the small cap.
-_PACKED_VIEW_CACHE: dict = {}
-
-
-def _packed_kv_view_cached(k, v, head_dim):
-    """Memoized :func:`_packed_kv_view`: callers pass the same cache views
-    every step, and the per-call detection cost lands on the decode hot path."""
-    if k.is_contiguous() and v.is_contiguous():
-        return None
-    key = (k.data_ptr(), v.data_ptr(), k.shape, k.stride(), v.stride(), k.dtype)
-    hit = _PACKED_VIEW_CACHE.get(key)
-    if hit is None:
-        if len(_PACKED_VIEW_CACHE) >= 32:
-            _PACKED_VIEW_CACHE.clear()
-        hit = _packed_kv_view(k, v, head_dim)
-        _PACKED_VIEW_CACHE[key] = hit
-    return hit
+# Geometry only, never tensors: a cached view would pin the KV cache's
+# storage, and plain-tuple entries cannot go stale.
+_PACKED_GEO_CACHE: dict = {}
 
 
 def _packed_kv_view(k, v, head_dim):
@@ -123,46 +109,64 @@ def _packed_kv_view(k, v, head_dim):
     stride_order)``: the storage re-viewed as a 5-D cache with K at plane 0
     and V at plane 1 of dim 3, plus its dim ranks for ``cute.compile``. The
     view must be compact, meaning its strides telescope in some dim order (a
-    permuted-contiguous NHD cache qualifies); any other layout raises."""
+    permuted-contiguous NHD cache qualifies); any other layout raises. The
+    geometry is memoized because this runs on the decode hot path."""
     if k.is_contiguous() and v.is_contiguous():
         return None
+    key = (
+        tuple(k.shape),
+        k.stride(),
+        v.stride(),
+        v.data_ptr() - k.data_ptr(),
+        k.element_size(),
+        head_dim,
+    )
+    geo = _PACKED_GEO_CACHE.get(key)
+    if geo is None:
+        geo = _packed_kv_geometry(head_dim, key)
+        if len(_PACKED_GEO_CACHE) >= 64:
+            _PACKED_GEO_CACHE.clear()
+        _PACKED_GEO_CACHE[key] = geo
+    shape, strides, rank = geo
+    return k.as_strided(shape, strides), rank
+
+
+def _packed_kv_geometry(head_dim, key):
+    """Validate a non-contiguous K/V pair as packed split views and return the
+    packed ``(shape, strides, stride_order)`` as plain tuples."""
+    k_shape, k_strides, v_strides, ptr_diff, elt, _ = key
     if (
-        k.ndim != 4
-        or k.stride() != v.stride()
-        or k.stride(-1) != 1
-        or v.data_ptr() - k.data_ptr() != head_dim * k.element_size()
+        len(k_shape) != 4
+        or k_strides != v_strides
+        or k_strides[-1] != 1
+        or ptr_diff != head_dim * elt
     ):
         raise ValueError(
             "k/v must be contiguous, or K/V views split from a paged KV cache "
             "that packs K and V in one 2*head_dim content dim per token"
         )
-    num_pages, num_kv_heads, page, _ = k.shape
-    packed = k.as_strided(
-        (num_pages, num_kv_heads, page, 2, head_dim),
-        (k.stride(0), k.stride(1), k.stride(2), head_dim, 1),
-    )
+    num_pages, num_kv_heads, page, _ = k_shape
+    shape = (num_pages, num_kv_heads, page, 2, head_dim)
+    raw = (k_strides[0], k_strides[1], k_strides[2], head_dim, 1)
     # Sized strides must telescope: the kernel derives addresses from the
     # compact layout. Size-1 dims carry arbitrary strides, so they rank
     # outermost (inner they would break the kernel's static alignment proof)
     # and get rebuilt strides.
-    ones = [i for i in range(5) if packed.shape[i] == 1]
-    sized = sorted(
-        (i for i in range(5) if packed.shape[i] > 1), key=lambda i: packed.stride(i)
-    )
+    ones = [i for i in range(5) if shape[i] == 1]
+    sized = sorted((i for i in range(5) if shape[i] > 1), key=lambda i: raw[i])
     strides = [0] * 5
     expected = 1
     for i in sized:
-        if packed.stride(i) != expected:
+        if raw[i] != expected:
             raise ValueError(
                 "packed K/V views must cover a compact KV cache, got strides "
-                f"{tuple(packed.stride())} for shape {tuple(packed.shape)}"
+                f"{raw} for shape {shape}"
             )
         strides[i] = expected
-        expected *= packed.shape[i]
+        expected *= shape[i]
     for i in ones:
         strides[i] = expected
-    packed = k.as_strided(packed.shape, strides)
     rank = [0] * 5
     for pos, dim in enumerate(sized + ones):
         rank[dim] = pos
-    return packed, tuple(rank)
+    return shape, tuple(strides), tuple(rank)

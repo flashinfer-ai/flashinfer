@@ -134,3 +134,22 @@ def test_unrelated_strided_views_rejected():
         msa_sparse_decode_attention(
             q, k_bad, v_bad, idx, page_table=ptab, seqused_k=seqused, seqlen_q=1
         )
+
+
+def test_packed_kv_detection_memoized():
+    """The memoized detection must match a fresh computation and hold no
+    tensors (a cached view would pin the KV cache's storage)."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import _common
+
+    k, v, _, _ = _split_cache(torch.bfloat16, "HND", 2)
+    _common._PACKED_GEO_CACHE.clear()
+    miss, miss_rank = _common._packed_kv_view(k, v, HD)
+    assert len(_common._PACKED_GEO_CACHE) == 1
+    hit, hit_rank = _common._packed_kv_view(k, v, HD)
+    assert hit_rank == miss_rank
+    assert hit.shape == miss.shape
+    assert hit.stride() == miss.stride()
+    assert hit.data_ptr() == miss.data_ptr()
+    for cached in _common._PACKED_GEO_CACHE.values():
+        assert not any(torch.is_tensor(x) for x in cached)
