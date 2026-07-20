@@ -9,11 +9,16 @@ the profiling cache and verify serialization behavior.
 """
 
 import json
+import logging
 import os
+import sys
 import tempfile
+import types
 
 import pytest
+import torch
 
+import flashinfer.autotuner.autotuner as autotuner_module
 from flashinfer.autotuner import (
     AutoTuner,
     TunableRunner,
@@ -983,3 +988,283 @@ class TestThreadSafety:
         assert not tuner.is_tuning_mode, "is_tuning_mode was not properly restored"
         assert tuner._active_tuning_contexts == 0, "reference count leak"
         assert len(errors) == 0, f"Errors in threads: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# Metadata compatibility: hard vs soft mismatch, cache healing
+# ---------------------------------------------------------------------------
+
+
+_FAKE_META = {
+    "flashinfer_version": "0.6.13",
+    "cuda_version": "13.0",
+    "cublas_version": "13.0.2",
+    "cudnn_version": "92101",
+    "cudnn_frontend_version": "1.14.1",
+    "gpu": "NVIDIA B200",
+}
+
+_OLD_KEY = "('old_op', 'FakeRunnerA', ((1, 1),))"
+
+
+def _write_cache_file(path, metadata):
+    data = {_METADATA_KEY: metadata} if metadata is not None else {}
+    data[_OLD_KEY] = ("FakeRunnerA", 3)
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+def _read_cache_file(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+class _RecordingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+class TestClassifyMetadataMismatches:
+    def test_exact_match(self):
+        hard, soft = autotuner_module._classify_metadata_mismatches(
+            dict(_FAKE_META), dict(_FAKE_META)
+        )
+        assert hard == {} and soft == {}
+
+    def test_wildcard_matches_anything(self):
+        saved = dict(_FAKE_META, cudnn_version="*")
+        hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
+        assert hard == {} and soft == {}
+
+    def test_definite_conflict_is_hard(self):
+        saved = dict(_FAKE_META, cudnn_version="91900")
+        hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
+        assert set(hard) == {"cudnn_version"} and soft == {}
+
+    def test_unknown_is_soft(self):
+        saved = dict(_FAKE_META, cudnn_version="unknown")
+        hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
+        assert hard == {} and set(soft) == {"cudnn_version"}
+
+    def test_stringified_none_is_soft(self):
+        saved = dict(_FAKE_META, cudnn_version="None")
+        hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
+        assert hard == {} and set(soft) == {"cudnn_version"}
+
+    def test_missing_key_is_soft(self):
+        saved = dict(_FAKE_META)
+        del saved["cudnn_frontend_version"]
+        hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
+        assert hard == {} and set(soft) == {"cudnn_frontend_version"}
+
+    def test_unknown_matches_unknown(self):
+        saved = dict(_FAKE_META, cudnn_version="unknown")
+        current = dict(_FAKE_META, cudnn_version="unknown")
+        hard, soft = autotuner_module._classify_metadata_mismatches(saved, current)
+        assert hard == {} and soft == {}
+
+    def test_extra_saved_key_ignored(self):
+        saved = dict(_FAKE_META, future_field="whatever")
+        hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
+        assert hard == {} and soft == {}
+
+    def test_hard_and_soft_split(self):
+        saved = dict(_FAKE_META, cudnn_version="unknown", gpu="NVIDIA H100")
+        hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
+        assert set(hard) == {"gpu"} and set(soft) == {"cudnn_version"}
+
+    def test_non_dict_metadata_is_all_soft(self):
+        hard, soft = autotuner_module._classify_metadata_mismatches(
+            "garbage", _FAKE_META
+        )
+        assert hard == {} and set(soft) == set(_FAKE_META)
+
+
+class TestMetadataCompatibility:
+    def setup_method(self):
+        AutoTuner._instance = None
+        self.tuner = AutoTuner.get()
+
+    def teardown_method(self):
+        AutoTuner._instance = None
+
+    @pytest.fixture(autouse=True)
+    def _fixed_current_meta(self, monkeypatch):
+        monkeypatch.setattr(
+            autotuner_module, "_collect_metadata", lambda: dict(_FAKE_META)
+        )
+
+    def _populate_new_entry(self):
+        _populate_cache(self.tuner, FakeRunnerA(), "new_op", ((4, 8),), tactic=5)
+
+    def test_corrupt_metadata_rejected_on_load_then_healed_on_save(self):
+        """A file whose _metadata is not a dict (corruption) must be rejected
+        gracefully on load — not crash — and replaced on save."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "configs.json")
+            _write_cache_file(path, "not-a-dict")
+
+            assert self.tuner.load_configs(path) is False
+            assert self.tuner._file_configs == {}
+
+            self._populate_new_entry()
+            self.tuner.save_configs(path)
+
+            data = _read_cache_file(path)
+            assert data[_METADATA_KEY] == _FAKE_META
+            assert _OLD_KEY not in data
+
+    def test_soft_mismatch_rejected_on_load_then_healed_on_save(self):
+        """A cache poisoned with cudnn_version="unknown" is ignored, but the
+        next save replaces it with fresh configs + real metadata."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "configs.json")
+            _write_cache_file(path, dict(_FAKE_META, cudnn_version="unknown"))
+
+            assert self.tuner.load_configs(path) is False
+            assert self.tuner._file_configs == {}
+
+            self._populate_new_entry()
+            self.tuner.save_configs(path)
+
+            data = _read_cache_file(path)
+            assert data[_METADATA_KEY] == _FAKE_META
+            assert _OLD_KEY not in data
+            assert len(_config_entries(data)) == 1
+
+            AutoTuner._instance = None
+            tuner2 = AutoTuner.get()
+            assert tuner2.load_configs(path) is True
+            assert len(tuner2._file_configs) == 1
+
+    def test_hard_mismatch_rejected_on_load_and_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "configs.json")
+            saved_meta = dict(_FAKE_META, cudnn_version="91900")
+            _write_cache_file(path, saved_meta)
+
+            assert self.tuner.load_configs(path) is False
+            assert self.tuner._file_configs == {}
+
+            self._populate_new_entry()
+            self.tuner.save_configs(path)
+
+            data = _read_cache_file(path)
+            assert data[_METADATA_KEY] == saved_meta
+            assert _OLD_KEY in data
+            assert len(_config_entries(data)) == 1
+
+    def test_missing_metadata_key_is_healed_on_save(self):
+        """Files from flashinfer versions predating a metadata field are
+        rejected on load but replaced (not stranded) on save."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "configs.json")
+            old_meta = dict(_FAKE_META)
+            del old_meta["cudnn_frontend_version"]
+            _write_cache_file(path, old_meta)
+
+            assert self.tuner.load_configs(path) is False
+
+            self._populate_new_entry()
+            self.tuner.save_configs(path)
+
+            data = _read_cache_file(path)
+            assert data[_METADATA_KEY] == _FAKE_META
+            assert _OLD_KEY not in data
+
+    def test_matching_metadata_merges_and_preserves_record(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "configs.json")
+            _write_cache_file(path, dict(_FAKE_META))
+
+            assert self.tuner.load_configs(path) is True
+            assert len(self.tuner._file_configs) == 1
+
+            self._populate_new_entry()
+            self.tuner.save_configs(path)
+
+            data = _read_cache_file(path)
+            assert data[_METADATA_KEY] == _FAKE_META
+            assert _OLD_KEY in data
+            assert len(_config_entries(data)) == 2
+
+    def test_wildcard_metadata_loads(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "configs.json")
+            _write_cache_file(path, dict(_FAKE_META, cudnn_version="*"))
+            assert self.tuner.load_configs(path) is True
+            assert len(self.tuner._file_configs) == 1
+
+    def test_autotune_context_heals_poisoned_cache(self):
+        """End-to-end regression for the poisoned-cache deadlock: previously
+        the exit save was suppressed on any metadata mismatch, so a file
+        with cudnn_version="unknown" was never read NOR overwritten and
+        every future process re-autotuned from scratch."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "configs.json")
+            _write_cache_file(path, dict(_FAKE_META, cudnn_version="unknown"))
+
+            with autotune(True, cache=path):
+                self._populate_new_entry()
+
+            data = _read_cache_file(path)
+            assert data[_METADATA_KEY] == _FAKE_META
+            assert _OLD_KEY not in data
+            assert len(_config_entries(data)) == 1
+
+            AutoTuner._instance = None
+            tuner2 = AutoTuner.get()
+            with autotune(False, cache=path):
+                assert len(tuner2._file_configs) == 1
+
+    def test_mismatch_warning_logged_once_per_process(self):
+        handler = _RecordingHandler()
+        tuner_logger = autotuner_module.logger
+        tuner_logger.addHandler(handler)
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                for name in ("a.json", "b.json", "c.json"):
+                    path = os.path.join(tmp_dir, name)
+                    _write_cache_file(path, dict(_FAKE_META, cudnn_version="unknown"))
+                    assert self.tuner.load_configs(path) is False
+        finally:
+            tuner_logger.removeHandler(handler)
+
+        warnings = tuple(
+            r
+            for r in handler.records
+            if r.levelno == logging.WARNING
+            and "different environment" in r.getMessage()
+        )
+        assert len(warnings) == 1
+        # Repeats are demoted to DEBUG; the dedup state records the severity.
+        assert self.tuner._warned_cache_mismatch == {"soft"}
+
+
+class TestCudnnVersionDetection:
+    def test_falls_back_to_cudnn_frontend(self, monkeypatch):
+        monkeypatch.setattr(torch.backends.cudnn, "version", lambda: None)
+        fake = types.SimpleNamespace(backend_version=lambda: 92101)
+        monkeypatch.setitem(sys.modules, "cudnn", fake)
+        assert autotuner_module._get_cudnn_backend_version() == "92101"
+
+    def test_prefers_torch_report(self, monkeypatch):
+        monkeypatch.setattr(torch.backends.cudnn, "version", lambda: 91900)
+        fake = types.SimpleNamespace(backend_version=lambda: 92101)
+        monkeypatch.setitem(sys.modules, "cudnn", fake)
+        assert autotuner_module._get_cudnn_backend_version() == "91900"
+
+    def test_unknown_when_undeterminable(self, monkeypatch):
+        monkeypatch.setattr(torch.backends.cudnn, "version", lambda: None)
+        monkeypatch.setitem(sys.modules, "cudnn", None)
+        assert autotuner_module._get_cudnn_backend_version() == "unknown"
+
+    def test_never_records_stringified_none(self, monkeypatch):
+        monkeypatch.setattr(torch.backends.cudnn, "version", lambda: None)
+        monkeypatch.setitem(sys.modules, "cudnn", None)
+        meta = autotuner_module._collect_metadata()
+        assert meta["cudnn_version"] == "unknown"

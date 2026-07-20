@@ -406,6 +406,52 @@ try:
 except Exception:
     pass  # Requires Blackwell (SM100+)
 
+# ── SVDQuant fused NVFP4 GEMM (Blackwell SM100: M×3072@3072×3072, rank 32) ──
+try:
+    M, K, N, RANK = 128, 3072, 3072, 32
+    a_svdq = torch.zeros(M, K // 2, dtype=torch.uint8, device=device)
+    b_svdq = torch.zeros(N, K // 2, dtype=torch.uint8, device=device)
+    sf_len = ((M + 127) // 128 * 128) * (K // 16)
+    wsf_len = ((N + 127) // 128 * 128) * (K // 16)
+    a_sf_svdq = torch.zeros(sf_len, dtype=torch.uint8, device=device)
+    b_sf_svdq = torch.zeros(wsf_len, dtype=torch.uint8, device=device)
+    alpha_svdq = torch.ones(1, dtype=torch.float32, device=device)
+    d_svdq = torch.zeros(M, RANK, dtype=torch.bfloat16, device=device)
+    l1_svdq = torch.zeros(N, RANK, dtype=torch.bfloat16, device=device)
+    flashinfer.gemm.mm_nvfp4_svdquant(
+        a_svdq, b_svdq, a_sf_svdq, b_sf_svdq, alpha_svdq, d_svdq, l1_svdq
+    )
+except Exception:
+    pass  # Requires Blackwell (SM100)
+
+# ── SVDQuant smooth-quantize + composed linear (Blackwell SM100) ─────────────
+try:
+    M, K, N, RANK = 128, 3072, 3072, 32
+    x_sq = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
+    pqs_sq = torch.ones(K, dtype=torch.bfloat16, device=device)
+    gs_sq = torch.ones(1, dtype=torch.float32, device=device)
+    flashinfer.gemm.nvfp4_quantize_smooth(x_sq, pqs_sq, gs_sq)
+except Exception:
+    pass  # Requires Blackwell (SM100)
+
+try:
+    M, K, N, RANK = 128, 3072, 3072, 32
+    x_sl = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
+    w_sl = torch.zeros(N, K // 2, dtype=torch.uint8, device=device)
+    wsf_sl = torch.zeros(
+        ((N + 127) // 128 * 128) * (K // 16), dtype=torch.uint8, device=device
+    )
+    alpha_sl = torch.ones(1, dtype=torch.float32, device=device)
+    pqs_sl = torch.ones(K, dtype=torch.bfloat16, device=device)
+    l2t_sl = torch.zeros(K, RANK, dtype=torch.bfloat16, device=device)
+    l1_sl = torch.zeros(N, RANK, dtype=torch.bfloat16, device=device)
+    gs_sl = torch.ones(1, dtype=torch.float32, device=device)
+    flashinfer.gemm.svdquant_linear(
+        x_sl, w_sl, wsf_sl, alpha_sl, pqs_sl, l2t_sl, l1_sl, gs_sl
+    )
+except Exception:
+    pass  # Requires Blackwell (SM100)
+
 # ── GEMM bf16 x fp4: mm_bf16_fp4 (weight-only) ──────────────────────────────
 # Blackwell SM100+: M×7168@2048×7168, block=16. b/b_descale shapes are the
 # *prepared* layouts (prepare_bf16_fp4_weights).
