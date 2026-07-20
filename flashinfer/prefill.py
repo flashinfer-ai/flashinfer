@@ -67,6 +67,7 @@ from .utils import (
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     _unpack_paged_kv_cache,
+    _should_use_fmha_v2_sm120,
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
@@ -3450,6 +3451,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_token_per_sequence = max_token_per_sequence
         self._max_sequence_kv = max_sequence_kv
 
+        # Precompute sequence length maxima (used by fmha_v2 and other backends)
+        max_seq_in_batch = int(kv_len_arr.max().item())
+        max_qo_len = int((qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item())
+
         if self._backend == "cute-dsl":
             if custom_mask is not None or packed_custom_mask is not None:
                 raise NotImplementedError(
@@ -3534,6 +3539,44 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     head_dim_qk=head_dim_qk,
                     head_dim_vo=head_dim_vo,
                 )
+                # SM12x: use fmha_v2 HMMA kernels for large-sequence MHA.
+                # fmha_v2 outperforms FA2 at longer sequences (S>=256) on SM120
+                # due to optimized tiled flash attention, but has higher CTA
+                # launch overhead for small sequences or high head counts.
+                # Only supports: MHA, standard symmetric head dims, matching
+                # q/kv dtype, no sliding window, no softcap, equal q/kv
+                # segments, NHD layout. The kernel reduces QK in fp16 on bf16,
+                # so only auto-select it when the caller allows fp16 QK
+                # reduction (mirrors is_fa3_backend_supported's convention).
+                same_qk_segments = torch.equal(qo_indptr_host, kv_indptr_host)
+                is_standard_shape = head_dim_qk == head_dim_vo and head_dim_qk in (
+                    64,
+                    128,
+                    256,
+                )
+                if (
+                    self._backend == "fa2"
+                    and self._kv_layout == "NHD"
+                    and num_qo_heads == num_kv_heads
+                    and same_qk_segments
+                    and is_standard_shape
+                    and q_data_type == kv_data_type
+                    and use_fp16_qk_reduction
+                    and max_seq_in_batch >= 256
+                    and window_left < 0
+                    and logits_soft_cap == 0.0
+                    and prefix_len_ptr is None
+                    and token_pos_in_items_ptr is None
+                    and max_item_len_ptr is None
+                    and _should_use_fmha_v2_sm120(
+                        self.device,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        self._custom_mask_buf is not None,
+                        q_data_type,
+                        kv_data_type,
+                    )
+                ):
+                    self._backend = "fmha_v2"
 
             get_module_args = (
                 q_data_type,
@@ -3547,7 +3590,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
             )
-            if self._backend == "cutlass":
+            if self._backend == "fmha_v2":
+                # Cache plan data for run() — avoid GPU-CPU sync in hot path
+                self._fmha_v2_seq_lens = kv_len_arr.to(torch.int32).to(
+                    self.device, non_blocking=non_blocking
+                )
+                self._fmha_v2_batch_size = batch_size
+                self._fmha_v2_max_q_len = max_qo_len
+                self._fmha_v2_max_kv_len = max_seq_in_batch
+                self._fmha_v2_qo_indptr = self._qo_indptr_buf.to(torch.int32)
+                self._fmha_v2_kv_indptr = self._kv_indptr_buf.to(torch.int32)
+            elif self._backend == "cutlass":
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
                     get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
@@ -3563,6 +3616,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
+        elif self._backend == "fmha_v2":
+            # fmha_v2 handles planning internally — no JIT module plan needed
+            pass
         elif self._backend not in ("cudnn", "cute-dsl"):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
@@ -3799,7 +3855,54 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.device,
                 "out",
             )
-        if self._backend == "cute-dsl":
+        if self._backend == "fmha_v2":
+            if return_lse:
+                raise NotImplementedError(
+                    "return_lse is not yet supported for backend='fmha_v2'. "
+                    "TRT-LLM fmha_v2 softmax stats have a different format "
+                    "than the expected [total_q_tokens, num_heads] LSE tensor."
+                )
+            fmha_v2_mask_mode = "causal" if self._causal else "padding"
+            # Use CONTIGUOUS_Q_KV layout: pass Q separately and stack only
+            # K+V into [num_tokens, 2, num_kv_heads, head_dim]. This avoids
+            # the 3-way torch.stack copy that PACKED_QKV requires.
+            # (fmha_v2 auto-selection already requires MHA, so Q/K head counts match)
+            #
+            # CONTIGUOUS_Q_KV requires Q to be contiguous. torch.stack() below
+            # materializes a contiguous kv_packed, but Q is forwarded directly, so a
+            # non-contiguous (e.g. packed/strided) Q would be read with the wrong
+            # strides and yield garbage. .contiguous() is a no-op when Q is already
+            # contiguous (the common hot path), so it restores correctness for
+            # non-contiguous Q with no cost otherwise.
+            q = q.contiguous()
+            kv_packed = torch.stack([k, v], dim=1)
+            # Pass window_left and sinks for sliding-window + attention sink
+            # support. sinks is stored on the wrapper by vLLM's metadata builder.
+            fmha_v2_sinks = getattr(self, "_sinks", None)
+            fmha_v2_kwargs = {}
+            if self._window_left >= 0:
+                fmha_v2_kwargs["window_left"] = self._window_left
+            if fmha_v2_sinks is not None:
+                fmha_v2_kwargs["sinks"] = fmha_v2_sinks
+            out = trtllm_fmha_v2_prefill(
+                (q, kv_packed),
+                input_layout="CONTIGUOUS_Q_KV",
+                workspace_buffer=self._float_workspace_buffer,
+                seq_lens=self._fmha_v2_seq_lens,
+                max_q_len=self._fmha_v2_max_q_len,
+                max_kv_len=self._fmha_v2_max_kv_len,
+                bmm1_scale=sm_scale,
+                bmm2_scale=1.0,
+                batch_size=self._fmha_v2_batch_size,
+                cum_seq_lens_q=self._fmha_v2_qo_indptr,
+                cum_seq_lens_kv=self._fmha_v2_kv_indptr,
+                out=out,
+                mask_mode=fmha_v2_mask_mode,
+                save_softmax_stats=False,
+                **fmha_v2_kwargs,
+            )
+            return out
+        elif self._backend == "cute-dsl":
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
                 raise NotImplementedError(
                     "cute-dsl backend does not support FP8 scale parameters"
