@@ -18,7 +18,7 @@ import functools
 import logging
 import math
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union, overload
 
 import torch
 
@@ -190,7 +190,7 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
-    mask_modes: Optional[List[int]] = None,
+    mask_modes: Optional[Sequence[int]] = None,
 ):
     # Route the dLLM block-diffusion ("block-expanding") variant through its
     # dedicated front-end when mask_mode is fixed to kBlockExpanding. The
@@ -199,7 +199,9 @@ def get_customize_batch_prefill_module(
     # one) — see docs/block-extend-design-response.md §1. For any other
     # mask_modes (including the default [0,1,2,3]) the shared path is used
     # unchanged, so existing prefill URIs never compile mode 4.
-    if mask_modes == [MaskMode.BLOCK_EXPANDING.value]:
+    if mask_modes is not None and tuple(mask_modes) == (
+        MaskMode.BLOCK_EXPANDING.value,
+    ):
         return gen_customize_block_extend_batch_prefill_module(
             backend,
             uri,

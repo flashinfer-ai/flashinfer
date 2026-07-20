@@ -41,6 +41,51 @@ def get_available_backends(device=None):
         return ["fa2"]
 
 
+def test_block_diffusion_batch_generator_routing(monkeypatch):
+    """The cache decorator tuple-normalizes list arguments before dispatch."""
+    import flashinfer.prefill as prefill_module
+    from flashinfer.utils import MaskMode
+
+    class DummySpec:
+        def build_and_load(self):
+            return "block-extend-module"
+
+    def dedicated_generator(*args, **kwargs):
+        return DummySpec()
+
+    def shared_generator(*args, **kwargs):
+        raise AssertionError("block-expanding mask must use the dedicated generator")
+
+    monkeypatch.setattr(
+        prefill_module,
+        "gen_customize_block_extend_batch_prefill_module",
+        dedicated_generator,
+    )
+    monkeypatch.setattr(
+        prefill_module, "gen_customize_batch_prefill_module", shared_generator
+    )
+
+    module = prefill_module.get_customize_batch_prefill_module(
+        backend="fa2",
+        uri="test_block_diffusion_batch_generator_routing",
+        dtype_q=torch.float16,
+        dtype_kv=torch.float16,
+        dtype_o=torch.float16,
+        idtype=torch.int32,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        additional_tensor_names=[],
+        additional_tensor_dtypes=[],
+        additional_scalar_names=[],
+        additional_scalar_dtypes=[],
+        variant_name="TestBlockExtendAttention",
+        variant_decl="",
+        mask_modes=[MaskMode.BLOCK_EXPANDING.value],
+    )
+
+    assert module == "block-extend-module"
+
+
 def compute_block_extend_reference(
     q: torch.Tensor,
     k: torch.Tensor,
