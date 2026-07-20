@@ -21,7 +21,10 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
     TrtllmFp8BlockConfig,
 )
-from flashinfer.quantization.fp8_quantization import mxfp8_dequantize_host
+from flashinfer.quantization.fp8_quantization import (
+    mxfp8_dequantize_host,
+    mxfp8_quantize,
+)
 from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
 
@@ -60,6 +63,12 @@ def _mxfp8_dequant_matrix(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     ).to(q.device)
 
 
+def _mxfp8_quant_matrix(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize one logical matrix without applying the MoE weight shuffle."""
+    q, scale = mxfp8_quantize(x, is_sf_swizzled_layout=False)
+    return q, scale.view(torch.uint8).reshape(x.shape[0], x.shape[1] // 32)
+
+
 def _dequant_view(variant, x_q, x_scale, view, canonical_w1, canonical_w2):
     if variant is QuantVariant.DeepSeekFp8:
         x = _deepseek_dequant_activations(x_q, x_scale)
@@ -73,17 +82,13 @@ def _dequant_view(variant, x_q, x_scale, view, canonical_w1, canonical_w2):
         x = _mxfp8_dequant_matrix(x_q, x_scale)
         w1 = torch.stack(
             [
-                _mxfp8_dequant_matrix(
-                    *TrtllmFp8BlockConfig.prepare_activations(expert, variant=variant)
-                )
+                _mxfp8_dequant_matrix(*_mxfp8_quant_matrix(expert))
                 for expert in canonical_w1
             ]
         )
         w2 = torch.stack(
             [
-                _mxfp8_dequant_matrix(
-                    *TrtllmFp8BlockConfig.prepare_activations(expert, variant=variant)
-                )
+                _mxfp8_dequant_matrix(*_mxfp8_quant_matrix(expert))
                 for expert in canonical_w2
             ]
         )
@@ -91,11 +96,12 @@ def _dequant_view(variant, x_q, x_scale, view, canonical_w1, canonical_w2):
 
 
 def _requant_intermediate(inter: torch.Tensor, variant) -> torch.Tensor:
-    q, sf = TrtllmFp8BlockConfig.prepare_activations(
-        inter.to(torch.bfloat16), variant=variant
-    )
     if variant is QuantVariant.DeepSeekFp8:
+        q, sf = TrtllmFp8BlockConfig.prepare_activations(
+            inter.to(torch.bfloat16), variant=variant
+        )
         return _deepseek_dequant_activations(q, sf)
+    q, sf = _mxfp8_quant_matrix(inter.to(torch.bfloat16))
     return _mxfp8_dequant_matrix(q, sf)
 
 
@@ -115,7 +121,9 @@ def _reference(x, w1, w2, ids, weights, variant, expert_offset=0):
 
 
 def _assert_fp8_close(actual, expected):
-    check_accuracy(expected.float(), actual.float(), atol=0.1, rtol=0.85, percent=0.79)
+    # Calibrated on the deterministic SM100 cases below: DeepSeek FP8 reached
+    # 100% and MXFP8 99.68% within this bound. Recalibrate when shapes expand.
+    check_accuracy(expected.float(), actual.float(), atol=0.05, rtol=0.3, percent=0.99)
 
 
 def _make_case(variant, *, expert_offset=0, local_experts=NUM_EXPERTS):
@@ -207,6 +215,67 @@ def test_block_fp8_layer_and_direct_runner_match_reference(variant):
     direct = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
     _assert_fp8_close(direct, reference)
     _assert_fp8_close(layer(pack, weights), reference)
+
+
+def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(20260718)
+    w1 = torch.randn(
+        1,
+        2 * INTERMEDIATE,
+        HIDDEN,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    w2 = torch.randn(
+        1,
+        HIDDEN,
+        INTERMEDIATE,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    view = TrtllmFp8BlockConfig.prepare_weights(
+        w1,
+        w2,
+        variant=QuantVariant.MxFp8,
+        num_local_experts=1,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        device=torch.device("cuda"),
+    )
+
+    cache = {}
+    w1_q, w1_sf = _mxfp8_quant_matrix(w1[0])
+    w1_perm = _maybe_get_cached_w3_w1_permute_indices(
+        cache, w1_q.view(torch.uint8), 128, is_gated_act_gemm=True
+    )
+    w1_sf_perm = _maybe_get_cached_w3_w1_permute_indices(
+        cache,
+        w1_sf,
+        128,
+        num_elts_per_sf=32,
+        is_gated_act_gemm=True,
+    )
+    torch.testing.assert_close(view["gemm1_weights"][0], w1_q[w1_perm], rtol=0, atol=0)
+    torch.testing.assert_close(
+        view["gemm1_weights_scale"][0], w1_sf[w1_sf_perm], rtol=0, atol=0
+    )
+
+    w2_q, w2_sf = _mxfp8_quant_matrix(w2[0])
+    w2_perm = get_w2_permute_indices_with_cache(cache, w2_q.view(torch.uint8), 128)
+    w2_sf_perm = get_w2_permute_indices_with_cache(
+        cache, w2_sf, 128, num_elts_per_sf=32
+    )
+    torch.testing.assert_close(view["gemm2_weights"][0], w2_q[w2_perm], rtol=0, atol=0)
+    torch.testing.assert_close(
+        view["gemm2_weights_scale"][0], w2_sf[w2_sf_perm], rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])

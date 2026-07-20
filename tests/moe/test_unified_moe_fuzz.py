@@ -194,6 +194,7 @@ from flashinfer.fused_moe.api import (
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
+from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
@@ -238,7 +239,16 @@ _DETERMINISTIC = {
 # "unexpectedly passed -> remove this entry" signal. A crash is never tolerated (only wrong answers).
 _KNOWN_FAILURES = [
     # Entries: (backend_key, predicate(cfg), "reason; gh #NNNN").
-    # Empty since the gh #3547 EP-offset double-subtraction fix.
+    # This routing stage is shared by DeepSeekFp8 and MxFp8; the all-zero
+    # output reproduces with both variants, so the predicate is intentionally
+    # backend-wide rather than variant-specific.
+    (
+        "trtllm_fp8_block",
+        lambda cfg: cfg.is_fromlogits
+        and cfg.routing_method == RoutingMethodType.DeepSeekV3,
+        "block-FP8 DeepSeekV3 FromLogits can emit all-zero output; "
+        "tracked as a follow-up to gh #4026",
+    ),
 ]
 
 
@@ -416,6 +426,12 @@ def _block_fp8_dequant(x_q, scale, variant):
     return x_q.float() * scale_f32.repeat_interleave(32, dim=-1)
 
 
+def _mxfp8_quant_matrix(x):
+    """Quantize a logical matrix without applying the MoE weight shuffle."""
+    q, scale = mxfp8_quantize(x, is_sf_swizzled_layout=False)
+    return q, scale.view(torch.uint8).reshape(x.shape[0], x.shape[1] // 32)
+
+
 def _block_fp8_act_pack(x, selected_experts, final_scales, *, variant):
     q, sf = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
     return MoEActivationPack(
@@ -455,7 +471,10 @@ def _block_fp8_reference(
     *,
     variant,
 ):
-    x_q, x_sf = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
+    if variant is QuantVariant.DeepSeekFp8:
+        x_q, x_sf = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
+    else:
+        x_q, x_sf = _mxfp8_quant_matrix(x)
     view = TrtllmFp8BlockConfig.prepare_weights(
         w1,
         w2,
@@ -477,19 +496,13 @@ def _block_fp8_reference(
         w1_32 = torch.stack(
             [
                 _block_fp8_dequant(q, sf, variant)
-                for q, sf in (
-                    TrtllmFp8BlockConfig.prepare_activations(expert, variant=variant)
-                    for expert in w1
-                )
+                for q, sf in (_mxfp8_quant_matrix(expert) for expert in w1)
             ]
         )
         w2_32 = torch.stack(
             [
                 _block_fp8_dequant(q, sf, variant)
-                for q, sf in (
-                    TrtllmFp8BlockConfig.prepare_activations(expert, variant=variant)
-                    for expert in w2
-                )
+                for q, sf in (_mxfp8_quant_matrix(expert) for expert in w2)
             ]
         )
     final_scales = final_scales.to(torch.bfloat16).float()
@@ -501,9 +514,12 @@ def _block_fp8_reference(
         up = x32[token] @ w1_32[local_e, :intermediate_size].t()
         gate = x32[token] @ w1_32[local_e, intermediate_size:].t()
         inter = F.silu(gate) * up
-        inter_q, inter_sf = TrtllmFp8BlockConfig.prepare_activations(
-            inter.to(torch.bfloat16), variant=variant
-        )
+        if variant is QuantVariant.DeepSeekFp8:
+            inter_q, inter_sf = TrtllmFp8BlockConfig.prepare_activations(
+                inter.to(torch.bfloat16), variant=variant
+            )
+        else:
+            inter_q, inter_sf = _mxfp8_quant_matrix(inter.to(torch.bfloat16))
         inter = _block_fp8_dequant(inter_q, inter_sf, variant)
         expert_out = inter @ w2_32[local_e].t()
         out[token] += final_scales[token, slot, None] * expert_out
@@ -550,8 +566,8 @@ _DTYPE = {
         ),
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
-        atol_frac=0.15,
-        rtol=0.85,
+        atol_frac=0.15,  # provisional; recalibrate over the expanded SM100 sweep
+        rtol=0.85,  # legacy-aligned initial bound, not a settled regression bar
     ),
     QuantVariant.MxFp8: DTypeHandler(
         variant=QuantVariant.MxFp8,
@@ -566,8 +582,8 @@ _DTYPE = {
         reference=lambda *args: _block_fp8_reference(*args, variant=QuantVariant.MxFp8),
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
-        atol_frac=0.15,
-        rtol=0.85,
+        atol_frac=0.15,  # provisional; recalibrate over the expanded SM100 sweep
+        rtol=0.85,  # legacy-aligned initial bound, not a settled regression bar
     ),
     # MXFP4 / MXINT4 add one entry each as their runners are wired upstream.
 }

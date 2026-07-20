@@ -66,8 +66,6 @@ from .core import (
 from .prepare import (
     interleave_moe_scales_for_sm90_mixed_gemm,
     interleave_moe_weights_for_sm90_mixed_gemm,
-    prepare_trtllm_fp8_block_activations,
-    prepare_trtllm_fp8_block_weights,
     preprocess_moe_weights_for_sm90_mixed_gemm_humming,
 )
 
@@ -151,8 +149,6 @@ __all__ = [
     "cutlass_fused_moe",
     "interleave_moe_scales_for_sm90_mixed_gemm",
     "interleave_moe_weights_for_sm90_mixed_gemm",
-    "prepare_trtllm_fp8_block_activations",
-    "prepare_trtllm_fp8_block_weights",
     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
     "gen_cutlass_fused_moe_sm120_module",
     "gen_cutlass_fused_moe_sm103_module",

@@ -773,6 +773,8 @@ class TrtllmFp8BlockRunner(TunableRunner):
             weight_layout=int(WeightLayout.MajorK),
             do_finalize=True,
             enable_pdl=self._enable_pdl,
+            # Matches the legacy block-FP8 FromLogits wrapper. Pre-routed
+            # execution ignores this flag because weights are already final.
             norm_topk_prob=True,
             routing_replay_out=None,
         )
