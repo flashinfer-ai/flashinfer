@@ -173,6 +173,8 @@ class MoEEpSplitLayer(nn.Module):
         )
         result: torch.Tensor | None = None
         try:
+            if hasattr(self._kernel, "enable_timing"):
+                self._kernel.enable_timing = self.enable_timing
             if not self.enable_timing:
                 dispatch = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
                 expert_out = self._inner_compute(dispatch)
@@ -209,6 +211,8 @@ class MoEEpSplitLayer(nn.Module):
                 self.last_timings_ms = {
                     k: start.elapsed_time(end) for k, (start, end) in ev.items()
                 }
+                if hasattr(self._kernel, "get_last_timings_ms"):
+                    self.last_timings_ms.update(self._kernel.get_last_timings_ms())
                 result = combine.x
         finally:
             handle.complete()

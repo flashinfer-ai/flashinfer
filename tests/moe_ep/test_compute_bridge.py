@@ -172,3 +172,22 @@ def test_nvfp4_pack_quantizes():
     assert pack.hidden_states_q.shape[1] == hidden // 2
     assert pack.hidden_states_scale.numel() > 0
     assert pack.topk_ids.shape == (m, 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_nvfp4_w4a16_pack_preserves_bf16_activation():
+    num_local_experts, cap, hidden = 4, 8, 128
+    et = _dispatch_tensor(num_local_experts, cap, hidden, "cuda")
+
+    pack = build_activation_pack(
+        et,
+        local_expert_offset=0,
+        is_nvfp4=True,
+        quantize_input=False,
+    )
+
+    flat = et.reshape(num_local_experts * cap, hidden)
+    assert pack.hidden_states_q.dtype == torch.bfloat16
+    assert torch.equal(pack.hidden_states_q, flat)
+    assert pack.hidden_states_scale is None
+    assert pack.per_token_scale is None

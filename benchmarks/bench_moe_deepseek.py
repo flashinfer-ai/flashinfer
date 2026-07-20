@@ -21,6 +21,12 @@ Usage:
     # With Tensor Parallelism simulation
     python bench_moe_deepseek.py --tp 8    # 256-wide local expert intermediate
 
+    # Real 8-GPU EP or TP, including communication
+    torchrun --standalone --nproc-per-node=8 bench_moe_deepseek.py \
+        --num-gpus 8 --ep 8 --cute-dsl-only --use-bf16-activation
+    torchrun --standalone --nproc-per-node=8 bench_moe_deepseek.py \
+        --num-gpus 8 --tp 8 --cute-dsl-only --use-bf16-activation
+
     # Custom token counts
     python bench_moe_deepseek.py --num-tokens 64,128,256
 
@@ -71,9 +77,23 @@ GEN_PHASE_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]
 # EP=16: 16 experts per GPU (256/16)
 EP_CONFIGS = {
     1: {"num_local_experts": 256, "local_expert_offset": 0},
+    2: {"num_local_experts": 128, "local_expert_offset": 0},
+    4: {"num_local_experts": 64, "local_expert_offset": 0},
     8: {"num_local_experts": 32, "local_expert_offset": 0},
     16: {"num_local_experts": 16, "local_expert_offset": 0},
 }
+
+
+@dataclass
+class DistributedBenchResult:
+    tokens_per_rank: int
+    routing_ms: float
+    activation_prep_ms: float
+    dispatch_ms: float
+    moe_ms: float
+    combine_ms: float
+    allreduce_ms: float
+    e2e_ms: float
 
 
 def is_sm100_family():
@@ -1215,6 +1235,486 @@ def _collect_expert_histogram(inputs, num_local, local_offset):
     }
 
 
+def _distributed_moe_config(
+    args,
+    intermediate_size,
+    num_local_experts,
+    local_expert_offset,
+    tune_max_num_tokens,
+):
+    from flashinfer.fused_moe import (
+        BackendOptions,
+        CuteDslConfig,
+        ExecutionConfig,
+        ExpertConfig,
+        MoEConfig,
+        QuantConfig,
+        QuantVariant,
+        RoutingConfig,
+    )
+
+    return MoEConfig(
+        routing=RoutingConfig(num_experts=CFG.num_experts, top_k=CFG.top_k),
+        quant=QuantConfig(
+            variant=QuantVariant.NVFP4,
+            per_token_scale=args.use_per_token_activation,
+            quantize_input=not args.use_bf16_activation,
+        ),
+        experts=ExpertConfig(
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=num_local_experts,
+        ),
+        backend=BackendOptions(candidates=(CuteDslConfig(),)),
+        execution=ExecutionConfig(
+            enable_pdl=args.enable_pdl,
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_fused_finalize=args.use_fused_finalize,
+        ),
+    )
+
+
+def _create_distributed_weights(num_local_experts, intermediate_size, rank, device):
+    generator = torch.Generator(device=device).manual_seed(1000 + rank)
+    w13 = (
+        torch.randn(
+            num_local_experts,
+            2 * intermediate_size,
+            CFG.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        / 10
+    )
+    w2 = (
+        torch.randn(
+            num_local_experts,
+            CFG.hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        / 10
+    )
+    return w13, w2
+
+
+def _create_distributed_inputs(num_tokens, rank, replicate, device):
+    seed = 42 if replicate else 42 + rank
+    generator = torch.Generator(device=device).manual_seed(seed)
+    hidden_states = (
+        torch.randn(
+            num_tokens,
+            CFG.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        / 10
+    )
+    router_logits = torch.randn(
+        num_tokens,
+        CFG.num_experts,
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    routing_bias = (
+        torch.randn(
+            CFG.num_experts,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        * 0.01
+    ).float()
+    topk_values = torch.empty(num_tokens, CFG.top_k, dtype=torch.float32, device=device)
+    topk_indices = torch.empty(num_tokens, CFG.top_k, dtype=torch.int32, device=device)
+    return hidden_states, router_logits, routing_bias, topk_values, topk_indices
+
+
+def _route_tokens(router_logits, routing_bias, topk_values, topk_indices):
+    from flashinfer.fused_moe import fused_topk_deepseek
+
+    fused_topk_deepseek(
+        scores=router_logits,
+        bias=routing_bias,
+        n_group=CFG.n_group,
+        topk_group=CFG.topk_group,
+        topk=CFG.top_k,
+        routed_scaling_factor=CFG.routed_scaling_factor,
+        topk_values=topk_values,
+        topk_indices=topk_indices,
+    )
+
+
+def _max_rank_sample(values, dist, device):
+    sample = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(sample, op=dist.ReduceOp.MAX)
+    return sample.cpu().tolist()
+
+
+def _median_distributed_samples(num_tokens, samples):
+    medians = np.median(np.asarray(samples), axis=0)
+    return DistributedBenchResult(num_tokens, *medians.tolist())
+
+
+def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetParams,
+        FusedMoeKernelConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        NcclEpConfig,
+        SplitConfig,
+    )
+    from flashinfer.testing.utils import get_l2_cache_size
+
+    num_local_experts = CFG.num_experts // world_size
+    local_expert_offset = rank * num_local_experts
+    moe_config = _distributed_moe_config(
+        args,
+        CFG.intermediate_size,
+        num_local_experts,
+        local_expert_offset,
+        num_tokens * world_size,
+    )
+    w13, w2 = _create_distributed_weights(
+        num_local_experts, CFG.intermediate_size, rank, device
+    )
+    weights = MoEWeightPack(w13=w13, w2=w2)
+    bootstrap = BootstrapConfig(
+        world_size=world_size,
+        rank=rank,
+        stream=torch.cuda.current_stream().cuda_stream,
+    )
+    fleet_params = FleetParams(
+        num_experts=CFG.num_experts,
+        max_tokens_per_rank=num_tokens,
+        token_hidden_size=CFG.hidden_size,
+        dtype_bytes=2,
+        algorithm=EpAlgorithm.LOW_LATENCY,
+        layout=EpLayout.RANK_MAJOR,
+    )
+    layer = MoEEpLayer(
+        bootstrap,
+        fleet_params,
+        weights=weights,
+        backend=SplitConfig(
+            comm=NcclEpConfig(),
+            kernel=FusedMoeKernelConfig(moe_config=moe_config),
+        ),
+    )
+    layer.enable_timing = True
+
+    hidden_states, router_logits, routing_bias, topk_values, topk_indices = (
+        _create_distributed_inputs(num_tokens, rank, False, device)
+    )
+    tensors = MoEEpTensors(
+        hidden_states=hidden_states,
+        topk_ids=topk_indices,
+        topk_weights=topk_values,
+    )
+    l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
+
+    def run_once():
+        e2e_start = torch.cuda.Event(enable_timing=True)
+        e2e_end = torch.cuda.Event(enable_timing=True)
+        routing_start = torch.cuda.Event(enable_timing=True)
+        routing_end = torch.cuda.Event(enable_timing=True)
+        e2e_start.record()
+        routing_start.record()
+        _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
+        routing_end.record()
+        layer.forward(tensors)
+        e2e_end.record()
+        e2e_end.synchronize()
+        timings = layer.last_timings_ms
+        return [
+            routing_start.elapsed_time(routing_end),
+            timings["activation_prep"],
+            timings["dispatch"],
+            timings["moe"],
+            timings["combine"],
+            0.0,
+            e2e_start.elapsed_time(e2e_end),
+        ]
+
+    try:
+        for _ in range(args.warmup):
+            run_once()
+        dist.barrier()
+        samples = []
+        for _ in range(args.iters):
+            l2_flush.zero_()
+            torch.cuda.synchronize()
+            dist.barrier()
+            samples.append(_max_rank_sample(run_once(), dist, device))
+        return _median_distributed_samples(num_tokens, samples)
+    finally:
+        layer.destroy()
+
+
+def _make_tp_activation_pack(
+    args,
+    hidden_states,
+    topk_indices,
+    topk_values,
+    global_scale,
+):
+    from flashinfer.fused_moe import MoEActivationPack
+
+    if args.use_bf16_activation:
+        return MoEActivationPack(
+            hidden_states_q=hidden_states,
+            hidden_states_scale=None,
+            topk_ids=topk_indices,
+            topk_weights=topk_values,
+        )
+
+    from flashinfer import SfLayout, nvfp4_quantize
+    from flashinfer.fp4_quantization import fp4_quantize
+
+    if args.use_per_token_activation:
+        hidden_states_q, hidden_states_scale, per_token_scale = nvfp4_quantize(
+            hidden_states,
+            global_scale,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+    else:
+        hidden_states_q, hidden_states_scale = fp4_quantize(
+            hidden_states,
+            global_scale,
+            16,
+            False,
+            False,
+            backend="cute-dsl",
+        )
+        per_token_scale = None
+    if hidden_states_scale.dim() > 2:
+        hidden_states_scale = hidden_states_scale.squeeze(-1)
+    return MoEActivationPack(
+        hidden_states_q=hidden_states_q,
+        hidden_states_scale=hidden_states_scale,
+        topk_ids=topk_indices,
+        topk_weights=topk_values,
+        per_token_scale=per_token_scale,
+    )
+
+
+def _benchmark_distributed_tp(
+    args, num_tokens, rank, world_size, device, report_backend=False
+):
+    import torch.distributed as dist
+
+    from flashinfer.comm import (
+        AllReduceFusionPattern,
+        allreduce_fusion,
+        create_allreduce_fusion_workspace,
+    )
+    from flashinfer.comm.mnnvl import TorchDistBackend
+    from flashinfer.fused_moe import CuteDslConfig, MoELayer, MoEWeightPack
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
+    from flashinfer.testing.utils import get_l2_cache_size
+
+    intermediate_size = BASE_INTERMEDIATE_SIZE // world_size
+    moe_config = _distributed_moe_config(
+        args,
+        intermediate_size,
+        CFG.num_experts,
+        0,
+        num_tokens,
+    )
+    w13, w2 = _create_distributed_weights(
+        CFG.num_experts, intermediate_size, rank, device
+    )
+    weight_pack = MoEWeightPack()
+    weight_pack.prepare_for(
+        "cute_dsl_nvfp4",
+        CuteDslConfig.prepare_weights(
+            w13,
+            w2,
+            num_local_experts=CFG.num_experts,
+            hidden_size=CFG.hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        ),
+    )
+    layer = MoELayer(moe_config, device=device)
+    hidden_states, router_logits, routing_bias, topk_values, topk_indices = (
+        _create_distributed_inputs(num_tokens, rank, True, device)
+    )
+    global_scale = make_nvfp4_global_scale(
+        hidden_states,
+        per_token_activation=args.use_per_token_activation,
+        nvfp4_4over6_config=current_nvfp4_4over6_config(),
+    )
+    allreduce_output = torch.empty_like(hidden_states)
+    workspace = create_allreduce_fusion_workspace(
+        backend=args.allreduce_backend,
+        world_size=world_size,
+        rank=rank,
+        max_token_num=num_tokens,
+        hidden_dim=CFG.hidden_size,
+        dtype=torch.bfloat16,
+        gpus_per_node=world_size,
+        comm_backend=TorchDistBackend(),
+    )
+    if rank == 0 and report_backend:
+        print(f"FlashInfer all-reduce backend: {workspace.backend}")
+    l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
+
+    def run_once():
+        e2e_start = torch.cuda.Event(enable_timing=True)
+        e2e_end = torch.cuda.Event(enable_timing=True)
+        routing_start = torch.cuda.Event(enable_timing=True)
+        routing_end = torch.cuda.Event(enable_timing=True)
+        quant_start = torch.cuda.Event(enable_timing=True)
+        quant_end = torch.cuda.Event(enable_timing=True)
+        moe_start = torch.cuda.Event(enable_timing=True)
+        moe_end = torch.cuda.Event(enable_timing=True)
+        allreduce_start = torch.cuda.Event(enable_timing=True)
+        allreduce_end = torch.cuda.Event(enable_timing=True)
+
+        e2e_start.record()
+        routing_start.record()
+        _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
+        routing_end.record()
+        quant_start.record()
+        activation_pack = _make_tp_activation_pack(
+            args,
+            hidden_states,
+            topk_indices,
+            topk_values,
+            global_scale,
+        )
+        quant_end.record()
+        moe_start.record()
+        local_output = layer(activation_pack, weight_pack)
+        moe_end.record()
+        allreduce_start.record()
+        allreduce_fusion(
+            input=local_output,
+            workspace=workspace,
+            pattern=AllReduceFusionPattern.kAllReduce,
+            launch_with_pdl=args.enable_pdl,
+            output=allreduce_output,
+        )
+        allreduce_end.record()
+        e2e_end.record()
+        e2e_end.synchronize()
+        return [
+            routing_start.elapsed_time(routing_end),
+            (0.0 if args.use_bf16_activation else quant_start.elapsed_time(quant_end)),
+            0.0,
+            moe_start.elapsed_time(moe_end),
+            0.0,
+            allreduce_start.elapsed_time(allreduce_end),
+            e2e_start.elapsed_time(e2e_end),
+        ]
+
+    try:
+        for _ in range(args.warmup):
+            run_once()
+        dist.barrier()
+        samples = []
+        for _ in range(args.iters):
+            l2_flush.zero_()
+            torch.cuda.synchronize()
+            dist.barrier()
+            samples.append(_max_rank_sample(run_once(), dist, device))
+        return _median_distributed_samples(num_tokens, samples)
+    finally:
+        workspace.destroy()
+
+
+def _run_distributed_benchmark(args, token_counts):
+    import gc
+    import os
+    import torch.distributed as dist
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device("cuda", local_rank)
+
+    try:
+        if world_size != args.num_gpus:
+            raise ValueError(
+                f"torchrun world size {world_size} does not match --num-gpus "
+                f"{args.num_gpus}"
+            )
+        mode = "ep" if args.ep == world_size else "tp"
+        variant = "w4a16" if args.use_bf16_activation else "w4a4"
+        if rank == 0:
+            print("\nDeepSeek-V3 distributed MoE benchmark")
+            print(
+                f"Mode: real {mode.upper()}{world_size}, variant={variant}, "
+                "timing=max rank CUDA events, cache=cold L2"
+            )
+            print(
+                "tokens/rank | routing | act prep/quant | dispatch | local MoE | "
+                "combine | all-reduce | end-to-end (ms)"
+            )
+
+        results = []
+        for num_tokens in token_counts:
+            if mode == "ep":
+                result = _benchmark_distributed_ep(
+                    args, num_tokens, rank, world_size, device
+                )
+            else:
+                result = _benchmark_distributed_tp(
+                    args,
+                    num_tokens,
+                    rank,
+                    world_size,
+                    device,
+                    report_backend=not results,
+                )
+            results.append(result)
+            if rank == 0:
+                print(
+                    f"{result.tokens_per_rank:>11} | "
+                    f"{result.routing_ms:>7.3f} | "
+                    f"{result.activation_prep_ms:>14.3f} | "
+                    f"{result.dispatch_ms:>8.3f} | "
+                    f"{result.moe_ms:>9.3f} | "
+                    f"{result.combine_ms:>7.3f} | "
+                    f"{result.allreduce_ms:>10.3f} | "
+                    f"{result.e2e_ms:>10.3f}"
+                )
+                print(
+                    "DISTRIBUTED_CSV,"
+                    f"{mode},{variant},{num_tokens},{world_size},"
+                    f"{result.routing_ms:.6f},{result.activation_prep_ms:.6f},"
+                    f"{result.dispatch_ms:.6f},{result.moe_ms:.6f},"
+                    f"{result.combine_ms:.6f},{result.allreduce_ms:.6f},"
+                    f"{result.e2e_ms:.6f}"
+                )
+            dist.barrier()
+            gc.collect()
+            torch.cuda.empty_cache()
+        return 0
+    finally:
+        dist.destroy_process_group()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DeepSeek-V3 MoE Performance Benchmark"
@@ -1238,14 +1738,26 @@ def main():
         "--ep",
         type=int,
         default=1,
-        choices=[1, 8, 16],
-        help="Expert Parallelism: 1 (256 local), 8 (32 local), 16 (16 local)",
+        choices=[1, 2, 4, 8, 16],
+        help="Expert parallelism simulation, or real EP size with --num-gpus.",
     )
     parser.add_argument(
         "--tp",
         type=int,
         default=1,
         help="Tensor Parallelism simulation: divide the expert intermediate size by TP.",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="GPU count. One preserves simulated EP/TP; values above one require torchrun and enable real communication.",
+    )
+    parser.add_argument(
+        "--allreduce-backend",
+        choices=["auto", "trtllm", "mnnvl"],
+        default="auto",
+        help="FlashInfer all-reduce backend for real TP.",
     )
     parser.add_argument(
         "--no-cuda-graph",
@@ -1331,6 +1843,25 @@ def main():
         parser.error("--profile-cuda requires --cute-dsl-only")
     if args.profile_iters < 1:
         parser.error("--profile-iters must be positive")
+    if not 1 <= args.num_gpus <= 8:
+        parser.error("--num-gpus must be between 1 and 8")
+    if args.num_gpus > 1:
+        real_ep = args.ep == args.num_gpus and args.tp == 1
+        real_tp = args.tp == args.num_gpus and args.ep == 1
+        if real_ep == real_tp:
+            parser.error(
+                "real multi-GPU mode requires exactly one of --ep or --tp to "
+                "equal --num-gpus; combined EP x TP is not supported"
+            )
+        if not args.cute_dsl_only:
+            parser.error("real multi-GPU mode requires --cute-dsl-only")
+        if not args.use_bf16_activation and not args.include_activation_quant:
+            parser.error(
+                "real W4A4 mode starts from BF16 and requires "
+                "--include-activation-quant"
+            )
+        if args.profile_cuda:
+            parser.error("--profile-cuda is not supported in real multi-GPU mode")
 
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
@@ -1345,6 +1876,8 @@ def main():
         tokens = TOKEN_COUNTS  # [128, 256, 512, 1024, 2048, 4096]
     if args.profile_cuda and len(tokens) != 1:
         parser.error("--profile-cuda requires exactly one token count")
+    if args.num_gpus > 1:
+        return _run_distributed_benchmark(args, tokens)
 
     print("\nDeepSeek-V3 MoE Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(0)}")

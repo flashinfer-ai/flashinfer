@@ -182,19 +182,40 @@ class CuteDslNvfp4Runner(MoERunner):
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from .cute_dsl.fused_moe import _cute_dsl_fused_moe_nvfp4_impl
-        from .cute_dsl.tuner import CuteDslFusedMoENvfp4Runner
+        from .cute_dsl.tuner import (
+            CuteDslFusedMoENvfp4Runner,
+            CuteDslFusedMoEW4A16Runner,
+        )
 
         self.config = config
         experts = config.experts
         routing = config.routing
         num_local_experts = experts.local_num_experts or routing.num_experts
 
-        self._inner = CuteDslFusedMoENvfp4Runner(
+        self._quantize_input = config.quant.quantize_input
+        runner_cls = (
+            CuteDslFusedMoENvfp4Runner
+            if self._quantize_input
+            else CuteDslFusedMoEW4A16Runner
+        )
+        self._inner = runner_cls(
             forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
             num_experts=routing.num_experts,
             top_k=routing.top_k,
             num_local_experts=num_local_experts,
             local_expert_offset=experts.local_expert_offset,
+            use_fused_finalize=config.execution.use_fused_finalize,
+            enable_pdl=(
+                True
+                if config.execution.enable_pdl is None
+                else config.execution.enable_pdl
+            ),
+            activation_type=int(config.activation.type),
+            **(
+                {"use_per_token_activation": bool(config.quant.per_token_scale)}
+                if self._quantize_input
+                else {}
+            ),
         )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
@@ -246,24 +267,34 @@ class CuteDslNvfp4Runner(MoERunner):
         _validate_prerouted_inputs(
             act, num_tokens, self._inner.top_k, "CuteDslNvfp4Runner"
         )
-        hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
+        hidden_size = act.hidden_states_q.shape[1]
+        x_sf = None
+        fc2_input_scale = None
+        if self._quantize_input:
+            hidden_size *= 2  # FP4 packed
+            assert act.hidden_states_scale is not None
+            x_sf = act.hidden_states_scale.unsqueeze(-1)
+            fc2_input_scale = v["fc2_input_scale"]
         moe_output = act.hidden_states_q.new_empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16
         )
-        return [
+        inputs = [
             act.hidden_states_q,
-            act.hidden_states_scale.unsqueeze(-1),  # CuteDSL expects [M, H//16, 1]
+            x_sf,
             act.topk_ids,
             act.topk_weights,
             v["w1_weight"],
             v["w1_weight_sf"],
             v["w1_alpha"],
-            v["fc2_input_scale"],
+            fc2_input_scale,
             v["w2_weight"],
             v["w2_weight_sf"],
             v["w2_alpha"],
-            moe_output,
         ]
+        if self._quantize_input and act.per_token_scale is not None:
+            inputs.append(act.per_token_scale)
+        inputs.append(moe_output)
+        return inputs
 
     def __hash__(self):
         return hash(("cute_dsl_nvfp4", hash(self._inner)))
