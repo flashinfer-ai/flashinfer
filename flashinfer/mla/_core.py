@@ -1518,7 +1518,8 @@ class BatchMLAPagedAttentionWrapper:
             User-reserved buffer to back the ``kv_len_arr`` array, shape ``[batch_size]``,
             dtype ``int32``.  Only consulted when ``use_cuda_graph=True``.
         backend : str
-            One of ``"auto"``, ``"fa2"``, ``"fa3"``, ``"cutlass"``. Default ``"auto"``.
+            One of ``"auto"``, ``"fa2"``, ``"fa3"``, ``"cutlass"``, ``"cutile"``.
+            Default ``"auto"``.
 
             ``"auto"`` picks ``"fa3"`` on SM90a, else ``"fa2"``. On SM>=100 neither
             is Blackwell-native; for MLA decode prefer
@@ -1535,6 +1536,13 @@ class BatchMLAPagedAttentionWrapper:
         self.device = float_workspace_buffer.device
 
         if backend == "cutlass":
+            self._backend = backend
+            return
+
+        if backend == "cutile":
+            # cuda.tile MLA decode: like cutlass, it needs no JIT module, no int
+            # workspace, and no plan-info. run() consumes block_tables + kv_len
+            # directly. Skip the fa2/fa3 workspace setup below.
             self._backend = backend
             return
 
@@ -1645,6 +1653,29 @@ class BatchMLAPagedAttentionWrapper:
                     "head_dim_ckv=512 and head_dim_kpe=64 (DeepSeek MLA), got "
                     f"head_dim_ckv={head_dim_ckv}, head_dim_kpe={head_dim_kpe}."
                 )
+
+        if self._backend == "cutile":
+            # cuda.tile MLA decode needs no JIT module or workspace plan; it
+            # takes block_tables + kv_len at run() time. Stash only the metadata
+            # run() consumes, then return.
+            if kv_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "cutile MLA backend supports only fp16/bf16 kv_data_type, "
+                    f"got {kv_data_type}."
+                )
+            if head_dim_ckv != 512 or head_dim_kpe != 64:
+                raise ValueError(
+                    "cutile MLA backend supports only head_dim_ckv=512 and "
+                    f"head_dim_kpe=64 (DeepSeek MLA), got "
+                    f"head_dim_ckv={head_dim_ckv}, head_dim_kpe={head_dim_kpe}."
+                )
+            self._causal = causal
+            self._page_size = page_size
+            self._sm_scale = sm_scale
+            self._q_data_type = q_data_type
+            self._kv_data_type = kv_data_type
+            self._use_profiler = use_profiler
+            return
 
         self._cached_module = get_batch_mla_module(
             self._backend,
@@ -1775,9 +1806,9 @@ class BatchMLAPagedAttentionWrapper:
         profiler_buffer : Optional[torch.Tensor]
             The buffer to store the profiler data.
         kv_len : Optional[torch.Tensor]
-            The query length of each request, shape: ``[batch_size]``. Required when ``backend`` is ``cutlass``.
+            The query length of each request, shape: ``[batch_size]``. Required when ``backend`` is ``cutlass`` or ``cutile``.
         page_table : Optional[torch.Tensor]
-            The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
+            The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass`` or ``cutile``.
         return_lse_base_on_e : bool, optional
             Controls the base of the returned LSE values when ``return_lse=True``.
             If ``False`` (default), the LSE is returned in base-2
@@ -1799,6 +1830,55 @@ class BatchMLAPagedAttentionWrapper:
             ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Same
             usage rules as ``ckv_scale``.
         """
+        if self._backend == "cutile":
+            if return_lse:
+                raise ValueError(
+                    "return_lse is not supported by the cutile MLA backend."
+                )
+            if profiler_buffer is not None:
+                raise ValueError(
+                    "profiler_buffer is not supported by the cutile MLA backend."
+                )
+            if o_scale is not None or ckv_scale is not None or kpe_scale is not None:
+                raise ValueError(
+                    "o_scale / ckv_scale / kpe_scale (FP8 paths) are not supported "
+                    "by the cutile MLA backend."
+                )
+            if kv_len is None or page_table is None:
+                raise ValueError(
+                    "cutile MLA backend requires kv_len and page_table at run() "
+                    "(like the cutlass backend)."
+                )
+            if out is None:
+                out = torch.empty_like(q_nope)
+            else:
+                check_shape_dtype_device(
+                    out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
+                )
+            # Lazy import keeps cuda.tile an optional dependency.
+            from ..attention.kernels.cutile.fmha_decode_bsr_cutile import (
+                decode_mla_kv_paged_cutile,
+            )
+
+            # K and V share the single compressed-latent cache (ckv_cache); the
+            # kernel reads it for both. k_scale carries the full softmax scale
+            # (sm_scale), v_scale=1.0 (no output dequant). max_seq_len=-1 lets the
+            # kernel infer the bound from block_tables (no host sync -> CUDA-graph
+            # safe).
+            decode_mla_kv_paged_cutile(
+                q_nope,
+                q_pe,
+                ckv_cache,
+                kpe_cache,
+                kv_len.to(torch.int32),
+                page_table.to(torch.int32),
+                self._sm_scale,
+                1.0,
+                max_seq_len=-1,
+                outputs=out,
+            )
+            return out
+
         if self._backend == "cutlass":
             if return_lse:
                 raise ValueError("return_lse does not support cutlass backend for now.")
