@@ -13,7 +13,12 @@ from filelock import FileLock
 
 from ..compilation_context import CompilationContext
 from . import env as jit_env
-from .cpp_ext import generate_ninja_build_for_op, get_nvcc_parallelism_flags, run_ninja
+from .cpp_ext import (
+    generate_ninja_build_for_op,
+    get_nvcc_parallelism_flags,
+    run_ninja,
+    run_ninja_restat,
+)
 from .utils import write_if_different
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
@@ -423,6 +428,7 @@ class JitSpecNvcc(JitSpec):
         )
         with lock:
             self.write_ninja()
+            run_ninja_restat(self.build_dir, self.ninja_path, verbose)
             run_ninja(self.build_dir, self.ninja_path, verbose)
 
     def load(self, so_path: Optional[Path] = None):
