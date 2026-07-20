@@ -1038,7 +1038,7 @@ def cutlass_fused_moe(
 
     workspace_buffer : Optional[torch.Tensor]
         Pre-allocated scratch buffer reused across calls to eliminate per-call workspace
-        allocation (which can reach 10–20 GiB at large batch size). If ``None`` (default),
+        allocation (which can reach 10-20 GiB at large batch size). If ``None`` (default),
         the workspace is allocated and freed on every call. To opt in:
 
         1. Query the required size once at model-load time::

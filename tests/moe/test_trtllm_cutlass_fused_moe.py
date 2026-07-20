@@ -3770,7 +3770,7 @@ def test_workspace_no_alloc_during_buffered_call():
     peak = torch.cuda.max_memory_allocated()
 
     # only the output tensor (~H * num_tokens * 2 bytes) should appear
-    max_expected = 512 * _WS_CFG["hidden_size"] * 2 * 4  # 4× slack
+    max_expected = 512 * _WS_CFG["hidden_size"] * 2 * 4  # 4x slack
     assert peak - before <= max_expected, (
         f"workspace_peak={peak - before} exceeds output-only budget {max_expected}"
     )
