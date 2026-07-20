@@ -566,7 +566,17 @@ class MoEConfig:
 
 @dataclass
 class MoEActivationPack:
-    """Per-call transient data — pre-quantized NVFP4 activations plus routing inputs.
+    """Per-call backend-native activations plus routing inputs.
+
+    Activation encoding depends on ``QuantConfig.variant``:
+
+    * NVFP4: packed ``uint8 [M, H/2]`` values with
+      ``float8_e4m3fn [M, H/16]`` block scales.
+    * BF16: raw ``bfloat16 [M, H]`` values with no scale tensor.
+    * DeepSeek FP8: ``float8_e4m3fn [M, H]`` values with transposed
+      ``float32 [H/128, M]`` block scales.
+    * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
+      ``uint8 [M, H/32]`` UE8M0 scales.
 
     ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
 
@@ -578,9 +588,9 @@ class MoEActivationPack:
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
       runner allocates internal kernel-filled buffers, and the routing result is not surfaced
-      back through the pack (routing replay is a separate, future capability).  Currently only
-      the TRTLLM FP4 runner supports this mode; ``MoELayer`` dispatches a logits pack only to
-      capable backends (see each runner's ``supported_routing_modes``).
+      back through the pack (routing replay is a separate, future capability). TRTLLM FP4 and
+      block-FP8 runners support this mode; ``MoELayer`` dispatches a logits pack only to capable
+      backends (see each runner's ``supported_routing_modes``).
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so
@@ -588,10 +598,10 @@ class MoEActivationPack:
     are keyword-only.
     """
 
-    hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4) or [M, H] bf16
-    hidden_states_scale: Optional[
-        Tensor
-    ]  # [M, H//16] float8_e4m3fn block scales; None for BF16
+    # Backend-native activation payload; layouts documented above.
+    hidden_states_q: Tensor
+    # Variant-specific scales documented above; None for BF16.
+    hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     topk_weights: Optional[Tensor] = None  # [M, top_k] float32 (routing weights)
