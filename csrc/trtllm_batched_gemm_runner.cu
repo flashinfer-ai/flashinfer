@@ -94,8 +94,8 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
   auto sm_version = getSMVersion();
 
   for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
-    auto const config = configs[i];
-    auto const options = config.mOptions;
+    auto const& config = configs[i];
+    auto const& options = config.mOptions;
     auto const tileSize = mOptions.transposeMmaOutput ? options.mTileN : options.mTileM;
     // When we include low-latency kernels we can set transposeMmaOutput via constructor
     if (options.mDtypeA == mOptions.dtypeA && options.mDtypeB == mOptions.dtypeB &&
