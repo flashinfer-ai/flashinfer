@@ -104,7 +104,7 @@ def _get_workspace(
 
 
 def _get_compiled_kernel(
-    num_experts: int,
+    num_local_experts: int,
     weight_ptr,
     weight_sf_ptr,
     activation_ptr,
@@ -132,7 +132,7 @@ def _get_compiled_kernel(
     mma_tiler_m, mma_tiler_k = mma_tiler_mk
     use_2cta_instrs = mma_tiler_m == 256
     cache_key = (
-        num_experts,
+        num_local_experts,
         deinterleave_output,
         use_fused_finalize,
         enable_pdl,
@@ -150,8 +150,7 @@ def _get_compiled_kernel(
             use_2cta_instrs=use_2cta_instrs,
             mma_tiler_mnk=(mma_tiler_m, route_tile, mma_tiler_k),
             cluster_shape_mn=cluster_shape_mn,
-            group_count=num_experts,
-            shuffle_a=False,
+            group_count=num_local_experts,
             deinterleave_output=deinterleave_output,
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
@@ -189,7 +188,7 @@ def _run_grouped_gemm(
     num_non_exiting_tiles: torch.Tensor,
     alpha: torch.Tensor,
     output: torch.Tensor,
-    num_experts: int,
+    num_local_experts: int,
     deinterleave_output: bool,
     use_fused_finalize: bool,
     permuted_idx_to_expanded_idx: Optional[torch.Tensor],
@@ -277,7 +276,7 @@ def _run_grouped_gemm(
     num_tokens = int(output.size(0)) if use_fused_finalize else 0
     top_k = int(token_final_scales.size(1)) if token_final_scales is not None else 0
     compiled = _get_compiled_kernel(
-        num_experts,
+        num_local_experts,
         weight_ptr,
         weight_sf_ptr,
         activation_ptr,

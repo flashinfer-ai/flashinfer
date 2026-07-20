@@ -47,129 +47,16 @@ from .utils import (
     griddepcontrol_wait,
 )
 
-"""
-A mixed-input grouped GEMM example for the NVIDIA Blackwell SM100 architecture using CUTE DSL.
+"""SM100 grouped GEMM for NVFP4 expert weights and BF16 activations.
 
-This example demonstrates an implementation of mixed-input grouped GEMM using a TMA plus Blackwell
-SM100 TensorCore warp-specialized persistent kernel. It can be viewed as an extension of the batched
-mixed-input GEMM example to support a specific grouped GEMM pattern: grouped GEMM with contiguous offsets.
-
-Specifically, the input A tensor is still in the shape of (M, K, L), and L is the number of groups. The
-input B tensor is in the shape of (N, K) and the result C tensor is in the shape of (M, N). Tensor B
-and tensor C are not divided into groups explicitly and there is an extra input tensor cumsum defining
-the mapping between the N mode to groups. The cumsum tensor is in the shape of (N+1) and cumsum[i]
-defines the accumulated size along N mode for groups up to i (not including i):
-
-   ```
-           Group 0  Group 1  Group 2 .....    Group L-1
-        -+--------+--------+--------+.....+----------------+
-         |        |        |        |                         |
-         |<- N0 ->|<- N1 ->|<- N2 ->|.....|<--    NL-1     -->|
-         |        |        |        |                         |
-        -+--------+--------+--------+.....+-------------------+
-cumsum:  |   0    |   N0   | N0+N1  |.....| sum(N0,N1,...NL-2) | sum(N0,N1,...NL-1)
-   ```
-
-The computation flow is the same as the batched mixed-input GEMM example. A is the narrow-precision tensor
-and B holds data with a wider precision. MMA will work in the wide precision of tensor B and tensor A
-will be transformed to the wide precision of tensor B following 1 of the 2 possible modes as follows:
-
-1. convert-only mode:
-    C = type_convert(A) x B
-
-In convert-only mode, tensor A is directly converted to the wide precision of tensor B.
-
-2. convert-scale mode:
-    C = (type_convert(A) * scale) x B
-
-In convert-scale mode, tensor A is first converted to the wide precision of tensor B and then scaled by the scale tensor.
-The scale tensor is in the same precision as tensor B.
-The mode is determined by tensor A's data type as follows:
-- if tensor A is in int8 or uint8, convert-only mode is used.
-- if tensor A is in int4, convert-scale mode is used.
-
-The output tensor C could have the same precision as tensor B or fp32.
-
-To run this example:
-
-.. code-block:: bash
-
-    python examples/blackwell/grouped_mixed_input_gemm.py      \
-      --a_dtype Int8 --b_dtype BFloat16                        \
-      --scale_granularity_m 0 --scale_granularity_k 0          \
-      --c_dtype BFloat16 --acc_dtype Float32                   \
-      --mma_tiler_mnk 128,128,64 --cluster_shape_mn 1,1        \
-      --mnkl 256,512,8192,1
-
-Input A and B have int8 and bf16 data types, respectively. The Blackwell tcgen05 MMA tile shape
-is specified as (128,128,64) and the cluster shape is (1,1). The MMA accumulator and output data type
-are set as fp32 and bf16, respectively. As tensor A is int8, convert-only mode is used.
-scale_granularity_m and scale_granularity_k are set as 0 for convert-only mode.
-
-Here is an example of running convert-scale mode:
-
-.. code-block:: bash
-
-    python examples/blackwell/mixed_input_gemm/grouped_mixed_input_gemm.py    \
-      --a_dtype Int4 --b_dtype BFloat16                                       \
-      --scale_granularity_m 1 --scale_granularity_k 256                       \
-      --c_dtype BFloat16 --acc_dtype Float32                                  \
-      --mma_tiler_mnk 256,128,128 --cluster_shape_mn 2,1                      \
-      --use_2cta_instrs --mnkl 1024,8192,6144,16                              \
-
-Input A and B have int4 and bf16 data types, respectively. The scale granularity is set as (1,256),
-which means each element along the m mode of tensor A has its own scale element and 256 contiguous elements
-along the k mode share the same scale element. There is no scale reuse along the L mode. If the GEMM shape is
-(M, N, K, L), then the scale tensor shape is (M // scale_granularity_m, K // scale_granularity_k, L),
-which is (1024, 6144/256, 16) in this example.
-The Blackwell tcgen05 MMA tile shape is specified as (256,128,128) and tcgen05 2CTA feature is enabled.
-The cluster shape is (2,1). The MMA accumulator and output data type are set as fp32 and bf16, respectively.
-As tensor A is int4, the convert-scale mode is used.
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/blackwell/mixed_input_gemm/grouped_mixed_input_gemm.py    \
-      --a_dtype Int8 --b_dtype BFloat16                                           \
-      --scale_granularity_m 0 --scale_granularity_k 0                             \
-      --c_dtype BFloat16 --acc_dtype Float32                                      \
-      --mma_tiler_mnk 128,128,64 --cluster_shape_mn 1,1                           \
-      --mnkl 256,512,8192,1                                                       \
-      --warmup_iterations 1 --iterations 10 --skip_ref_check
-
-Besides the requirements from the batched mixed-input GEMM example, there are some constraints for this example:
-* --use_tma_store option is removed as no alignment assumption is made for each group.
+Each routed-row tile selects one expert through FlashInfer's MoE sort metadata.
+The kernel decodes each 16-value E2M1 weight block and its E4M3 scale to BF16,
+then executes BF16 tensor-core MMA with FP32 accumulation.
 """
 
 
 class Sm100W4A16GroupedGemmKernel:
-    """
-    Mixed-input grouped GEMM kernel for NVIDIA Blackwell SM100 architecture.
-
-    This kernel supports GEMM operations where input tensors A and B have different
-    data types, with tensor A being transformed to the precision of tensor B before
-    matrix multiplication.
-    Tensor A is in shape of [M, K, L] with L being the number of groups. Tensor B is in shape of [N, K] and a group search algorithm
-    is applied along the N mode to find the group index for each CTA tile. A cumsum tensor provides the offsets of each group along the N mode.
-
-    :param scale_granularity_m: Number of elements sharing the same scale factor along the M mode
-    :type scale_granularity_m: int
-    :param scale_granularity_k: Number of elements sharing the same scale factor along the K mode
-    :type scale_granularity_k: int
-    :param acc_dtype: Data type for accumulation during computation
-    :type acc_dtype: type[cutlass.Numeric]
-    :param use_2cta_instrs: Whether to use CTA group 2 for advanced thread cooperation
-    :type use_2cta_instrs: bool
-    :param mma_tiler_mnk: Shape of the Matrix Multiply-Accumulate (MMA) tile (M, N, K)
-    :type mma_tiler_mnk: tuple[int, int, int]
-    :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
-    :type cluster_shape_mn: tuple[int, int]
-    :param group_count: The total number of groups
-    :type group_count: int
-    :param shuffle_a: Whether to use shuffle intrinsic for int4-to-bf16 conversion
-    :type shuffle_a: bool
-    """
+    """Warp-specialized grouped GEMM for the W4A16 MoE pipeline."""
 
     def __init__(
         self,
@@ -180,7 +67,6 @@ class Sm100W4A16GroupedGemmKernel:
         mma_tiler_mnk: tuple[int, int, int],
         cluster_shape_mn: tuple[int, int],
         group_count: int,
-        shuffle_a: bool,
         deinterleave_output: bool,
         use_fused_finalize: bool,
         enable_pdl: bool,
@@ -204,7 +90,6 @@ class Sm100W4A16GroupedGemmKernel:
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler = mma_tiler_mnk
-        self.shuffle_a = shuffle_a
         self.deinterleave_output = deinterleave_output
         self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
@@ -216,7 +101,7 @@ class Sm100W4A16GroupedGemmKernel:
         self.mma_warp_id = 4
         self.tma_warp_id = 5
         self.scale_tma_warp_id = 6
-        # Schedule warp to do the group search
+        # Schedule warp assigns routed-row tiles to experts.
         self.schedule_warp_id = 7
         self.transform_warp_id = (
             8,
@@ -521,34 +406,7 @@ class Sm100W4A16GroupedGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        """
-        Executes the Mixed Input Grouped GEMM operation.
-
-        This method sets up the kernel parameters, computes the grid size,
-        defines the shared storage, and launches the kernel.
-
-        The execution steps are as follows:
-        - Setup static attributes before smem/grid/tma computation.
-        - Setup TMA load/store atoms and tensors.
-        - Compute grid size with regard to hardware constraints.
-        - Define shared storage for kernel.
-        - Launch the kernel synchronously.
-
-        :param a: Input tensor A.
-        :type a: cute.Tensor
-        :param a_scale: Scale tensor for tensor A (None for ConvertOnly mode).
-        :type a_scale: Optional[cute.Tensor]
-        :param b: Input tensor B.
-        :type b: cute.Tensor
-        :param cumsum: tensor containing the cumulative size of each group along the search mode(aka, N mode in this example).
-        :type cumsum: cute.Tensor
-        :param c: Output tensor C.
-        :type c: cute.Tensor
-        :param max_active_clusters: Maximum number of active clusters to launch.
-        :type max_active_clusters: cutlass.Constexpr
-        :param stream: CUDA stream to launch the kernel on.
-        :type stream: cuda.CUstream
-        """
+        """Configure and launch the grouped GEMM."""
         self.a_dtype: type[cutlass.Numeric] = a.element_type
         self.a_scale_dtype: type[cutlass.Numeric] = (
             a_scale.element_type
@@ -697,7 +555,7 @@ class Sm100W4A16GroupedGemmKernel:
 
         @cute.struct
         class SharedStorage:
-            # buffer holding group search results
+            # Routed-tile scheduling metadata.
             tile_info: cute.struct.MemRange[cutlass.Int32, 4 * self.num_tile_info_stage]
             a_load2trans_full_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_load2trans_stage
@@ -1253,7 +1111,7 @@ class Sm100W4A16GroupedGemmKernel:
                         work_tile.group_idx,
                     )
                 ]
-                # Apply offset to B tensor based on group search result
+                # Select the routed-row tile assigned by the scheduler.
                 coord_n_offset = (
                     (work_tile.coord_n, 0)
                     if cutlass.const_expr(
@@ -1658,7 +1516,7 @@ class Sm100W4A16GroupedGemmKernel:
                             tensor_transformed = mixed_input_utils.cvt_tensor_a(
                                 tArA_load[(None, idx)],
                                 self.mma_dtype,
-                                self.shuffle_a,
+                                False,
                             )
                         tArA_transform_store[(None, idx)].store(tensor_transformed)
                     # Store transformed A to tensor memory or shared memory
