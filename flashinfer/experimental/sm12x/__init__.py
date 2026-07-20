@@ -52,6 +52,7 @@ _OPS: tuple[str, ...] = (
     "gemm.wo_projection",
     "moe.fused_moe",
     "moe.ep_moe",
+    "norm.mhc",
     "quantization.mxfp8",
     "quantization.nvfp4",
 )
