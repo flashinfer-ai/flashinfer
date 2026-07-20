@@ -25,13 +25,16 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 
 
-_SPARSE_ROUTE_TILE = 32
-_MEDIUM_ROUTE_TILE = 64
-_DENSE_ROUTE_TILE = 128
-_SPARSE_ROUTE_MAX_ROWS_PER_EXPERT = 16
-_MEDIUM_ROUTE_MAX_ROWS_PER_EXPERT = 32
-_ONE_CTA_MMA_TILE_M = 128
-_TWO_CTA_MMA_TILE_M = 256
+W4A16GemmTactic = Tuple[Tuple[int, int], Tuple[int, int]]
+W4A16MoeTactic = Tuple[int, W4A16GemmTactic, W4A16GemmTactic]
+
+# Fixed correctness fallback used when no tuned tactic is available. Runtime
+# performance selection belongs to CuteDslFusedMoEW4A16Runner.
+DEFAULT_W4A16_MOE_TACTIC: W4A16MoeTactic = (
+    128,
+    ((128, 128), (2, 1)),
+    ((256, 128), (2, 1)),
+)
 
 
 @dataclass
@@ -43,27 +46,7 @@ class _W4A16Workspace:
 
 
 _workspace_cache: Dict[Tuple, _W4A16Workspace] = {}
-_kernel_cache: Dict[Tuple[int, bool, bool, bool, bool, int, int], object] = {}
-
-
-def select_w4a16_route_tile(num_tokens: int, top_k: int, num_experts: int) -> int:
-    routed_rows = num_tokens * top_k
-    if routed_rows <= num_experts * _SPARSE_ROUTE_MAX_ROWS_PER_EXPERT:
-        return _SPARSE_ROUTE_TILE
-    if routed_rows <= num_experts * _MEDIUM_ROUTE_MAX_ROWS_PER_EXPERT:
-        return _MEDIUM_ROUTE_TILE
-    return _DENSE_ROUTE_TILE
-
-
-def get_w4a16_route_tile_candidates(
-    num_tokens: int, top_k: int, num_experts: int
-) -> Tuple[int, ...]:
-    route_tile = select_w4a16_route_tile(num_tokens, top_k, num_experts)
-    if route_tile == _SPARSE_ROUTE_TILE:
-        return (_SPARSE_ROUTE_TILE, _MEDIUM_ROUTE_TILE)
-    if route_tile == _MEDIUM_ROUTE_TILE:
-        return (_MEDIUM_ROUTE_TILE, _DENSE_ROUTE_TILE)
-    return (_DENSE_ROUTE_TILE,)
+_kernel_cache: Dict[Tuple, object] = {}
 
 
 def _get_workspace(
@@ -146,32 +129,30 @@ def _get_compiled_kernel(
     use_fused_finalize: bool,
     enable_pdl: bool,
     route_tile: int,
-    use_1cta: bool,
+    mma_tiler_mk: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
 ):
-    mma_tiler_k = 256 if k % 256 == 0 else 128
+    mma_tiler_m, mma_tiler_k = mma_tiler_mk
+    use_2cta_instrs = mma_tiler_m == 256
     cache_key = (
         num_experts,
         deinterleave_output,
         use_fused_finalize,
         enable_pdl,
-        use_1cta,
+        mma_tiler_m,
         mma_tiler_k,
         route_tile,
+        cluster_shape_mn,
     )
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
-        use_2cta_instrs = not use_1cta
         kernel = Sm100W4A16GroupedGemmKernel(
             scale_granularity_m=1,
             scale_granularity_k=16,
             acc_dtype=cutlass.Float32,
             use_2cta_instrs=use_2cta_instrs,
-            mma_tiler_mnk=(
-                _TWO_CTA_MMA_TILE_M if use_2cta_instrs else _ONE_CTA_MMA_TILE_M,
-                route_tile,
-                mma_tiler_k,
-            ),
-            cluster_shape_mn=(2, 1),
+            mma_tiler_mnk=(mma_tiler_m, route_tile, mma_tiler_k),
+            cluster_shape_mn=cluster_shape_mn,
             group_count=num_experts,
             shuffle_a=False,
             deinterleave_output=deinterleave_output,
@@ -218,19 +199,16 @@ def _run_grouped_gemm(
     token_final_scales: Optional[torch.Tensor],
     enable_pdl: bool,
     route_tile: int,
-    use_1cta: Optional[bool] = None,
+    tactic: W4A16GemmTactic,
 ) -> None:
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
     n = int(activations.size(0))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    if use_1cta is None:
-        use_1cta = (
-            route_tile in (_SPARSE_ROUTE_TILE, _MEDIUM_ROUTE_TILE)
-            and k % 256 == 0
-            and m < k
-        )
-    max_active_clusters = get_max_active_clusters(2)
+    mma_tiler_mk, cluster_shape_mn = tactic
+    max_active_clusters = get_max_active_clusters(
+        cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
     weight_ptr = make_ptr(
         cutlass.Float4E2M1FN,
         weight.data_ptr(),
@@ -324,7 +302,8 @@ def _run_grouped_gemm(
         use_fused_finalize,
         enable_pdl,
         route_tile,
-        use_1cta,
+        mma_tiler_mk,
+        cluster_shape_mn,
     )
     compiled(
         weight_ptr,
@@ -359,7 +338,7 @@ def launch_w4a16_moe(
     moe_output: torch.Tensor,
     use_fused_finalize: bool,
     enable_pdl: bool,
-    tactic: Optional[Tuple[int, bool, bool]] = None,
+    tactic: Optional[W4A16MoeTactic] = None,
     workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
@@ -367,11 +346,8 @@ def launch_w4a16_moe(
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
     if tactic is None:
-        route_tile = select_w4a16_route_tile(int(x.size(0)), top_k, num_experts)
-        gemm1_use_1cta = None
-        gemm2_use_1cta = None
-    else:
-        route_tile, gemm1_use_1cta, gemm2_use_1cta = tactic
+        tactic = DEFAULT_W4A16_MOE_TACTIC
+    route_tile, gemm1_tactic, gemm2_tactic = tactic
     workspace = _get_workspace(
         x,
         top_k,
@@ -426,7 +402,7 @@ def launch_w4a16_moe(
         None,
         enable_pdl,
         route_tile,
-        gemm1_use_1cta,
+        gemm1_tactic,
     )
     moe_swiglu(
         input=workspace.gemm1_output,
@@ -456,7 +432,7 @@ def launch_w4a16_moe(
         token_final_scales if use_fused_finalize else None,
         enable_pdl,
         route_tile,
-        gemm2_use_1cta,
+        gemm2_tactic,
     )
     if not use_fused_finalize:
         moe_unpermute(
