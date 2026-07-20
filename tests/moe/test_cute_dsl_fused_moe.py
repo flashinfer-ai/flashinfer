@@ -266,7 +266,7 @@ class TestTacticEnumeration:
                 f"gemm2_cluster_m={gemm2_cluster_m}"
             )
 
-    def test_w4a16_tactics_cover_shared_launch_axes(self):
+    def test_w4a16_tactics_cover_launch_axes(self):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             DEFAULT_W4A16_MOE_TACTIC,
         )
@@ -274,12 +274,12 @@ class TestTacticEnumeration:
 
         assert len(W4A16_MOE_TACTICS) == len(set(W4A16_MOE_TACTICS))
         assert DEFAULT_W4A16_MOE_TACTIC in W4A16_MOE_TACTICS
-        assert len(W4A16_MOE_TACTICS) == 27
+        assert len(W4A16_MOE_TACTICS) == 30
 
         route_tiles = {tactic[0] for tactic in W4A16_MOE_TACTICS}
         assert route_tiles == {32, 64, 128}
 
-        expected_gemm_tactics = {
+        shared_gemm_tactics = {
             ((mma_m, mma_k), cluster_shape)
             for mma_m, cluster_shape in (
                 (128, (1, 1)),
@@ -288,19 +288,17 @@ class TestTacticEnumeration:
             )
             for mma_k in (64, 128, 256)
         }
+        expected_gemm_pairs = {
+            (gemm_tactic, gemm_tactic) for gemm_tactic in shared_gemm_tactics
+        }
+        expected_gemm_pairs.add((((128, 256), (2, 1)), ((256, 256), (2, 1))))
         for route_tile in route_tiles:
             route_tactics = [
                 (gemm1_tactic, gemm2_tactic)
                 for route, gemm1_tactic, gemm2_tactic in W4A16_MOE_TACTICS
                 if route == route_tile
             ]
-            assert {gemm1_tactic for gemm1_tactic, _ in route_tactics} == (
-                expected_gemm_tactics
-            )
-            assert all(
-                gemm1_tactic == gemm2_tactic
-                for gemm1_tactic, gemm2_tactic in route_tactics
-            )
+            assert set(route_tactics) == expected_gemm_pairs
 
 
 # =============================================================================
