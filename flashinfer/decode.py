@@ -3022,6 +3022,18 @@ def _get_uniform_cum_seq_lens_q(
     key = (batch_size, q_len, device.index)
     t = _uniform_cum_seq_lens_cache.get(key)
     if t is None:
+        if torch.cuda.is_current_stream_capturing():
+            # The tensor would be allocated from the capture's private memory
+            # pool and then cached: correct within this graph, but any other
+            # graph hitting the cache later would bake a pointer whose contents
+            # only this graph's replays maintain.
+            warnings.warn(
+                "cum_seq_lens_q synthesized during CUDA-graph capture for "
+                f"(batch_size={batch_size}, q_len_per_req={q_len}); run an "
+                "eager warmup call with the same shape before capturing so the "
+                "cached layout tensor lives outside the capture pool.",
+                stacklevel=3,
+            )
         t = torch.arange(
             0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=device
         )

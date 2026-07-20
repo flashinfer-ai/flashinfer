@@ -1744,7 +1744,7 @@ def test_trtllm_batch_decode_spec(
     )
 
 
-@pytest.mark.parametrize("q_len_per_req", [5, 6, 7])
+@pytest.mark.parametrize("q_len_per_req", [5, 6, 7, 8])
 def test_trtllm_batch_decode_uniform_qlen_packed_layout(q_len_per_req):
     """Regression test for #3929: uniform multi-token decode (q_len_per_req
     only, no cum_seq_lens_q) must index packed Q/O correctly when
@@ -1753,6 +1753,10 @@ def test_trtllm_batch_decode_uniform_qlen_packed_layout(q_len_per_req):
     every request > 0 was read/written at padded offsets: batched outputs
     diverged from per-request outputs and late requests wrote past `out`
     (asynchronous illegal memory access when the stray write left mapped VA).
+
+    q_len_per_req=8 (divides the token group; correct before the synthesis
+    too) is the control locking output+LSE equivalence of the var-seq routing
+    for previously-working shapes.
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -1788,13 +1792,14 @@ def test_trtllm_batch_decode_uniform_qlen_packed_layout(q_len_per_req):
             bmm2_scale=1.0,
             q_len_per_req=q_len_per_req,
             out_dtype=dtype,
+            return_lse=True,
         )
 
-    batched = run(q, block_tables, seq_lens)
+    batched, batched_lse = run(q, block_tables, seq_lens)
     torch.cuda.synchronize()
     for req in range(batch_size):
         lo, hi = req * q_len_per_req, (req + 1) * q_len_per_req
-        single = run(
+        single, single_lse = run(
             q[lo:hi].contiguous(),
             block_tables[req : req + 1].contiguous(),
             seq_lens[req : req + 1].contiguous(),
@@ -1802,4 +1807,7 @@ def test_trtllm_batch_decode_uniform_qlen_packed_layout(q_len_per_req):
         torch.cuda.synchronize()
         torch.testing.assert_close(
             batched[lo:hi].float(), single.float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            batched_lse[lo:hi].float(), single_lse.float(), atol=2e-2, rtol=2e-2
         )
