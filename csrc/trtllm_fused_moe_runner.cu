@@ -863,6 +863,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     }
     if (mPermuteGemm1.mDtypeOutput == btg::Dtype::E2m1) {
       FLASHINFER_CHECK(workspace.gemm1_output_scale != nullptr);
+      FLASHINFER_CHECK(workspace.activation_output_scale != nullptr);
       invokeScaleOnlyQuantAndPerTokenScale(
           args.num_tokens * totalExpertsPerToken, args.intermediate_size,
           static_cast<float const*>(workspace.gemm1_output_scale), globalScaleInv,
@@ -870,6 +871,9 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
           reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
           reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
     } else {
+      FLASHINFER_CHECK(workspace.gemm1_output != nullptr);
+      FLASHINFER_CHECK(workspace.activation_output != nullptr);
+      FLASHINFER_CHECK(workspace.activation_output_scale != nullptr);
       FLASHINFER_CHECK(mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
                        "When using explicit per-token quantization, PermuteGemm1 output dtype must "
                        "be Bfloat16 or E2m1.");

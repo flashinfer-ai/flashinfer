@@ -117,10 +117,10 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         if (options.mFusedBiasShuffleMode != mOptions.fusedBiasShuffleMode) continue;
         if (options.mBiasDtype != mOptions.biasDtype) continue;
       }
-      bool const isNonStandardSfC = (options.mDtypeSfC != tg::Dtype::Void &&
-                                     options.mDtypeSfC != tg::dtypeGetBlockSfType(mOptions.dtypeC));
+      bool const isNonStandardSfC = (options.mDtypeSfC != Dtype::Void &&
+                                     options.mDtypeSfC != dtypeGetBlockSfType(mOptions.dtypeC));
       // if use non-standard sfC, force sf layout to linear
-      if (isNonStandardSfC && options.mSfLayoutC != tg::SfLayout::Linear) continue;
+      if (isNonStandardSfC && options.mSfLayoutC != SfLayout::Linear) continue;
       if (mOptions.usePerChannelScaling) {
         if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
         if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
