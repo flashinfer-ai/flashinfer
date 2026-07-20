@@ -709,8 +709,8 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                   "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
                   shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
                   params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
-                  params.ep_rank, params.ep_size, params.num_experts,
-                  params.eplb_stats_num_experts, params.enable_pdl);
+                  params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts,
+                  params.enable_pdl);
             })
       } else {
         int shared_bytes = 2 * params.top_k * (int)sizeof(int);
