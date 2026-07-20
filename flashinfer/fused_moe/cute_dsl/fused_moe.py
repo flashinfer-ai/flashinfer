@@ -156,7 +156,7 @@ def _moe_core_impl(
     gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
-    w4a16_tactic: Optional[Tuple[int, bool, bool]] = None,
+    w4a16_tactic: Optional[Tuple] = None,
     w4a16_workspace_cache: Optional[Dict[Tuple, Any]] = None,
     # Pre-allocated buffers (for CUDA graph)
     moe_sort_buffers: Optional[Dict[str, torch.Tensor]] = None,
@@ -208,7 +208,7 @@ def _moe_core_impl(
         gemm1_cluster_shape_mn: GEMM1 cluster shape.
         gemm2_mma_tiler_mn: GEMM2 MMA tiler shape.
         gemm2_cluster_shape_mn: GEMM2 cluster shape.
-        w4a16_tactic: Route tile and GEMM topology for BF16 activations.
+        w4a16_tactic: Internal route tile and GEMM tactics for BF16 activations.
         w4a16_workspace_cache: Wrapper-owned BF16 activation workspaces.
         moe_sort_buffers: Pre-allocated moe_sort output buffers.
         gemm1_out: Pre-allocated GEMM1 output buffer.
@@ -449,7 +449,7 @@ def _moe_bf16_activation_impl(
     swiglu_alpha: float,
     swiglu_beta: float,
     swiglu_limit: float,
-    tactic: Optional[Tuple[int, bool, bool]],
+    tactic: Optional[Tuple],
     workspace_cache: Optional[Dict[Tuple, Any]],
 ) -> torch.Tensor:
     """Run the BF16-activation, online-NVFP4-weight-dequantization path."""
@@ -745,7 +745,7 @@ class CuteDslMoEWrapper:
         gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
         gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
         gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
-        w4a16_tactic: Optional[Tuple[int, bool, bool]] = None,
+        w4a16_tactic: Optional[Tuple] = None,
         output_dtype: torch.dtype = torch.bfloat16,
         use_fused_finalize: bool = True,
         moe_output: Optional[torch.Tensor] = None,
@@ -968,7 +968,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
-    w4a16_tactic: Optional[Tuple[int, bool, bool]] = None,
+    w4a16_tactic: Optional[Tuple] = None,
     output_dtype: torch.dtype = torch.bfloat16,
     use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,

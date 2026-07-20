@@ -23,6 +23,8 @@ kernels, enabling automatic performance tuning across different GEMM tactics.
 Tactic format follows TRT-LLM's style:
 - GEMM1 (Gather + SwiGLU): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 - GEMM2 (Finalize): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+- W4A16: (route_tile, (gemm1_mma_mk, cluster_shape_mn),
+  (gemm2_mma_mk, cluster_shape_mn))
 
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 - Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner.get_valid_tactics (line 1867)
@@ -636,14 +638,70 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         )
 
 
-# W4A16 tuning is intentionally limited to route padding and GEMM1's
-# 1-CTA/2-CTA topology. GEMM2 keeps the 2-CTA topology, avoiding a full
-# pipeline Cartesian product.
-W4A16_MOE_TACTICS: Tuple[Tuple[int, bool, bool], ...] = tuple(
-    (route_tile, gemm1_use_1cta, False)
-    for route_tile in (32, 64, 128)
-    for gemm1_use_1cta in (True, False)
+_W4A16_ROUTE_TILES = (32, 64, 128)
+_W4A16_K_TILES = (64, 128, 256)
+_W4A16_BASE_GEMM1_TOPOLOGY = (128, (2, 1))
+_W4A16_BASE_GEMM2_TOPOLOGY = (256, (2, 1))
+_W4A16_BASE_GEMM1_TACTIC = ((128, 128), (2, 1))
+_W4A16_BASE_GEMM2_TACTIC = ((256, 128), (2, 1))
+_W4A16_2CTA_K256_TACTIC = ((256, 256), (2, 1))
+# Grouped expert scheduling requires cluster N=1 when multiple routed rows
+# target the same expert.
+_W4A16_GEMM_TOPOLOGIES = (
+    (128, (1, 1)),
+    (128, (2, 1)),
+    (128, (4, 1)),
+    (256, (2, 1)),
+    (256, (4, 1)),
 )
+_W4A16_GEMM_TACTICS = tuple(
+    ((mma_m, mma_k), cluster_shape)
+    for (mma_m, cluster_shape), mma_k in itertools.product(
+        _W4A16_GEMM_TOPOLOGIES, _W4A16_K_TILES
+    )
+)
+
+
+def get_w4a16_moe_tactics() -> Tuple[Tuple, ...]:
+    """Return a curated W4A16 pipeline search space.
+
+    MMA K tiles are tuned independently for GEMM1 and GEMM2. Each GEMM also
+    varies its K tile and CTA/cluster topology against the baseline tactic for
+    the other GEMM, avoiding the full pipeline Cartesian product.
+    """
+    tactics = []
+    for route_tile in _W4A16_ROUTE_TILES:
+        for gemm1_k, gemm2_k in itertools.product(_W4A16_K_TILES, _W4A16_K_TILES):
+            gemm1_m, gemm1_cluster = _W4A16_BASE_GEMM1_TOPOLOGY
+            gemm2_m, gemm2_cluster = _W4A16_BASE_GEMM2_TOPOLOGY
+            tactics.append(
+                (
+                    route_tile,
+                    ((gemm1_m, gemm1_k), gemm1_cluster),
+                    ((gemm2_m, gemm2_k), gemm2_cluster),
+                )
+            )
+
+        tactics.extend(
+            (route_tile, gemm1_tactic, _W4A16_BASE_GEMM2_TACTIC)
+            for gemm1_tactic in _W4A16_GEMM_TACTICS
+        )
+        tactics.extend(
+            (route_tile, _W4A16_BASE_GEMM1_TACTIC, gemm2_tactic)
+            for gemm2_tactic in _W4A16_GEMM_TACTICS
+        )
+        tactics.append(
+            (
+                route_tile,
+                _W4A16_2CTA_K256_TACTIC,
+                _W4A16_2CTA_K256_TACTIC,
+            )
+        )
+
+    return tuple(dict.fromkeys(tactics))
+
+
+W4A16_MOE_TACTICS = get_w4a16_moe_tactics()
 
 
 class CuteDslFusedMoEW4A16Runner(TunableRunner):
@@ -678,9 +736,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
 
-        self._inputs_helper = CuteDslMoEInputsHelper(
-            num_experts, top_k, num_local_experts, local_expert_offset
-        )
+        # Seeded random routing retains realistic load variance around route
+        # tile boundaries; the balanced W4A4 hook intentionally does not apply.
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
@@ -719,7 +776,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                     ],
                 ),
             ),
-            inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
             use_cold_l2_cache=True,
         )
 
@@ -762,7 +818,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
     ) -> List[Tuple[Any, ...]]:
         import cutlass
 
-        from .blackwell.moe_w4a16 import get_w4a16_route_tile_candidates
         from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
         from .moe_utils import get_max_num_permuted_tokens
 
@@ -774,10 +829,12 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             weight: torch.Tensor,
             route_slots: int,
             route_tile: int,
-            use_1cta: bool,
+            gemm_tactic: Tuple,
         ) -> bool:
             m = weight.shape[1]
             k = weight.shape[2] * 2
+            mma_tiler_mk, cluster_shape_mn = gemm_tactic
+            mma_tiler_m, mma_tiler_k = mma_tiler_mk
             return Sm100W4A16GroupedGemmKernel.can_implement(
                 mnkl=(m, route_slots, k, self.num_local_experts),
                 a_dtype=cutlass.Float4E2M1FN,
@@ -788,23 +845,14 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 c_major="m",
                 scale_granularity_m=1,
                 scale_granularity_k=16,
-                mma_tiler=(
-                    128 if use_1cta else 256,
-                    route_tile,
-                    256 if k % 256 == 0 else 128,
-                ),
-                cluster_shape_mn=(2, 1),
-                use_2cta_instrs=not use_1cta,
+                mma_tiler=(mma_tiler_m, route_tile, mma_tiler_k),
+                cluster_shape_mn=cluster_shape_mn,
+                use_2cta_instrs=mma_tiler_m == 256,
             )
 
-        route_tile_candidates = get_w4a16_route_tile_candidates(
-            num_tokens, self.top_k, self.num_local_experts
-        )
         valid_tactics = []
         for tactic in W4A16_MOE_TACTICS:
-            route_tile, gemm1_use_1cta, gemm2_use_1cta = tactic
-            if route_tile not in route_tile_candidates:
-                continue
+            route_tile, gemm1_tactic, gemm2_tactic = tactic
             route_slots = get_max_num_permuted_tokens(
                 num_tokens,
                 self.top_k,
@@ -812,15 +860,26 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 route_tile,
             )
             if can_implement(
-                w1_weight, route_slots, route_tile, gemm1_use_1cta
-            ) and can_implement(w2_weight, route_slots, route_tile, gemm2_use_1cta):
+                w1_weight, route_slots, route_tile, gemm1_tactic
+            ) and can_implement(w2_weight, route_slots, route_tile, gemm2_tactic):
                 valid_tactics.append(tactic)
+        if not valid_tactics:
+            from .blackwell.moe_w4a16 import DEFAULT_W4A16_MOE_TACTIC
+
+            logger.warning(
+                "No valid W4A16 tactics found for tokens=%d, experts=%d, top_k=%d. "
+                "Falling back to the default tactic.",
+                num_tokens,
+                self.num_local_experts,
+                self.top_k,
+            )
+            valid_tactics = [DEFAULT_W4A16_MOE_TACTIC]
         return valid_tactics
 
     def forward(  # type: ignore[override]
         self,
         inputs: List[torch.Tensor],
-        tactic: Tuple[int, bool, bool] = None,  # type: ignore[assignment]
+        tactic: Tuple = None,  # type: ignore[assignment]
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
