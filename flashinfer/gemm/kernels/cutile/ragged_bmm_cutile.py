@@ -731,11 +731,21 @@ def ragged_bmm(
     else:
         Q, K_B, N = b.shape
 
-    assert K == K_B, "incompatible dimensions"
-    assert m_indptr.shape[0] == Q + 1, "m_indptr must have Q+1 elements"
-    assert a.is_contiguous(), "A matrix must be contiguous"
-    assert b.is_contiguous(), "B matrix must be contiguous"
-    assert m_indptr.is_contiguous(), "m_indptr must be contiguous"
+    # Shape sanity checks — use explicit ValueErrors instead of `assert` so
+    # the validation isn't elided when Python is run with `-O` (which strips
+    # assert statements and would let bad inputs reach the cuda.tile kernel).
+    if K != K_B:
+        raise ValueError(f"incompatible dimensions: K ({K}) must match K_B ({K_B})")
+    if m_indptr.shape[0] != Q + 1:
+        raise ValueError(
+            f"m_indptr must have Q+1 ({Q + 1}) elements, got {m_indptr.shape[0]}"
+        )
+    if not a.is_contiguous():
+        raise ValueError("A matrix must be contiguous")
+    if not b.is_contiguous():
+        raise ValueError("B matrix must be contiguous")
+    if not m_indptr.is_contiguous():
+        raise ValueError("m_indptr must be contiguous")
 
     # Determine output dtype
     if out_dtype is None:

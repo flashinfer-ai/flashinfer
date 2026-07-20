@@ -388,16 +388,25 @@ def masked_bmm(
     else:
         Q_B, K_B, N = b.shape
 
-    assert K_A == K_B, "incompatible dimensions"
-    assert Q_A == Q_B, "incompatible dimensions"
+    # Shape sanity checks — use explicit ValueErrors instead of `assert` so
+    # the validation isn't elided when Python is run with `-O` (which strips
+    # assert statements and would let bad inputs reach the cuda.tile kernel).
+    if K_A != K_B:
+        raise ValueError(f"incompatible dimensions: K_A ({K_A}) must match K_B ({K_B})")
+    if Q_A != Q_B:
+        raise ValueError(f"incompatible dimensions: Q_A ({Q_A}) must match Q_B ({Q_B})")
     Q = Q_A
 
-    assert a.is_contiguous(), "A matrix must be contiguous"
-    assert b.is_contiguous(), "B matrix must be contiguous"
-    assert masked_m.is_contiguous(), "Masked matrix must be contiguous"
-    assert masked_m.shape.numel() == Q, (
-        "Masked matrix must have the same shape as the number of batches"
-    )
+    if not a.is_contiguous():
+        raise ValueError("A matrix must be contiguous")
+    if not b.is_contiguous():
+        raise ValueError("B matrix must be contiguous")
+    if not masked_m.is_contiguous():
+        raise ValueError("Masked matrix must be contiguous")
+    if masked_m.shape.numel() != Q:
+        raise ValueError(
+            f"Masked matrix must have the same shape as the number of batches ({Q})"
+        )
     c = torch.empty((Q, M, N), device=a.device, dtype=a.dtype)
 
     enable_autotune = not _AUTOTUNE_DISABLED
