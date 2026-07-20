@@ -90,6 +90,36 @@ class DistributedBenchResult:
     e2e_ms: float
 
 
+class _TorchDistributedCommBackend:
+    """Adapt an existing process group for FlashInfer MNNVL setup."""
+
+    def __init__(self, group):
+        self._group = group
+
+    def Get_rank(self):
+        return self._group.rank()
+
+    def Get_size(self):
+        return self._group.size()
+
+    def allgather(self, data):
+        gathered = [None] * self.Get_size()
+        torch.distributed.all_gather_object(gathered, data, group=self._group)
+        return gathered
+
+    def bcast(self, data, root=0):
+        objects = [data]
+        torch.distributed.broadcast_object_list(objects, src=root, group=self._group)
+        return objects[0]
+
+    def Split(self, color, key):
+        # The caller already supplies the complete EP process group.
+        return self
+
+    def barrier(self):
+        torch.distributed.barrier(group=self._group)
+
+
 def is_sm100_family():
     """Check for SM100 family (Blackwell: SM100, SM103).
 
@@ -1400,58 +1430,61 @@ def _run_distributed_iterations(args, run_once, l2_flush, dist, device):
     return samples
 
 
-def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
+def _benchmark_distributed_ep(
+    args,
+    num_tokens,
+    max_tokens_per_rank_budget,
+    rank,
+    world_size,
+    device,
+):
     import torch.distributed as dist
 
-    from flashinfer.moe_ep import (
-        BootstrapConfig,
-        EpAlgorithm,
-        EpLayout,
-        FleetParams,
-        FusedMoeKernelConfig,
-        MoEEpLayer,
-        MoEEpTensors,
-        MoEWeightPack,
-        NcclEpConfig,
-        SplitConfig,
+    from flashinfer.comm import MoeAlltoAll
+    from flashinfer.comm.mapping import Mapping
+    from flashinfer.comm.mnnvl import MnnvlConfig
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
     )
     from flashinfer.testing.utils import get_l2_cache_size
 
     local_num_tokens, _ = _token_partition(num_tokens, rank, world_size)
-    max_tokens_per_rank = (num_tokens + world_size - 1) // world_size
+    runtime_max_tokens_per_rank = (num_tokens + world_size - 1) // world_size
     num_local_experts = CFG.num_experts // world_size
     local_expert_offset = rank * num_local_experts
-    moe_config = _distributed_moe_config(
+    layer, weight_pack = _create_distributed_moe_layer(
         args,
         CFG.intermediate_size,
         num_local_experts,
         local_expert_offset,
-        max_tokens_per_rank * world_size,
+        max_tokens_per_rank_budget * world_size,
+        rank,
+        device,
     )
-    w13, w2 = _create_distributed_weights(
-        num_local_experts, CFG.intermediate_size, rank, device
-    )
-    weights = MoEWeightPack(w13=w13, w2=w2)
-    bootstrap = BootstrapConfig(
-        world_size=world_size,
+    mapping = Mapping(
         rank=rank,
-        stream=torch.cuda.current_stream().cuda_stream,
+        tp_size=world_size,
+        moe_ep_size=world_size,
+        world_size=world_size,
+        gpus_per_node=world_size,
+        pp_size=1,
+        cp_size=1,
     )
-    fleet_params = FleetParams(
+    workspace_size_per_rank = MoeAlltoAll.get_moe_workspace_size_per_rank(
+        world_size,
+        CFG.top_k,
+        max_tokens_per_rank_budget,
+        CFG.hidden_size,
+    )
+    moe_a2a = MoeAlltoAll(
+        mapping=mapping,
+        max_num_tokens=max_tokens_per_rank_budget,
+        top_k=CFG.top_k,
         num_experts=CFG.num_experts,
-        max_tokens_per_rank=max_tokens_per_rank,
-        token_hidden_size=CFG.hidden_size,
-        dtype_bytes=2,
-        algorithm=EpAlgorithm.LOW_LATENCY,
-        layout=EpLayout.RANK_MAJOR,
-    )
-    layer = MoEEpLayer(
-        bootstrap,
-        fleet_params,
-        weights=weights,
-        backend=SplitConfig(
-            comm=NcclEpConfig(),
-            kernel=FusedMoeKernelConfig(moe_config=moe_config),
+        workspace_size_per_rank=workspace_size_per_rank,
+        mnnvl_config=MnnvlConfig(
+            comm_backend=_TorchDistributedCommBackend(dist.group.WORLD)
         ),
     )
     hidden_states, router_logits, _, routing_bias = _create_distributed_inputs(
@@ -1463,27 +1496,92 @@ def _benchmark_distributed_ep(args, num_tokens, rank, world_size, device):
     topk_indices = torch.empty(
         local_num_tokens, CFG.top_k, dtype=torch.int32, device=device
     )
-    tensors = MoEEpTensors(
-        hidden_states=hidden_states,
-        topk_ids=topk_indices,
-        topk_weights=topk_values,
+    global_scale = make_nvfp4_global_scale(
+        hidden_states,
+        per_token_activation=args.use_per_token_activation,
+        global_scale=1.0,
+        nvfp4_4over6_config=current_nvfp4_4over6_config(),
     )
     l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
 
+    def dispatch():
+        # Match SGLang's FlashInfer dispatcher: send BF16 activations with the
+        # routing payloads, then sanitize routes this rank does not own.
+        recv_hidden_states, recv_topk_indices, recv_topk_values = moe_a2a.dispatch(
+            topk_indices,
+            [hidden_states, topk_indices, topk_values],
+            runtime_max_tokens_per_rank,
+            invalid_token_expert_id=CFG.num_experts,
+            expert_id_payload_index=1,
+        )
+        num_received_tokens = world_size * runtime_max_tokens_per_rank
+        return (
+            recv_hidden_states.view(num_received_tokens, CFG.hidden_size),
+            recv_topk_indices.view(num_received_tokens, CFG.top_k),
+            recv_topk_values.view(num_received_tokens, CFG.top_k),
+        )
+
+    def compute(recv_hidden_states, recv_topk_indices, recv_topk_values):
+        activation_pack = _make_distributed_activation_pack(
+            args,
+            recv_hidden_states,
+            recv_topk_indices,
+            recv_topk_values,
+            global_scale,
+        )
+        return layer(activation_pack, weight_pack)
+
+    def combine(local_output):
+        # SGLang's CuTe DSL runner does not write into the A2A workspace, so
+        # combine stages the local output before returning it to source ranks.
+        return moe_a2a.combine(
+            local_output.view(world_size, runtime_max_tokens_per_rank, CFG.hidden_size),
+            runtime_max_tokens_per_rank,
+        )
+
     def run_once():
         _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
-        layer.forward(tensors)
+        combine(compute(*dispatch()))
 
-    try:
-        samples = _run_distributed_iterations(args, run_once, l2_flush, dist, device)
-        if samples is None:
-            return None
-        return _median_distributed_samples(num_tokens, samples)
-    finally:
-        layer.destroy()
+    def run_setup_phase(name, fn):
+        print(f"[rank {rank}] EP setup {name}: start", flush=True)
+        result = fn()
+        torch.cuda.synchronize()
+        print(f"[rank {rank}] EP setup {name}: complete", flush=True)
+        dist.barrier()
+        return result
+
+    # Finish the setup collective before CuTe DSL selects a tactic. Inference
+    # warmup likewise tunes the local runner outside the steady-state A2A phase.
+    run_setup_phase(
+        "routing",
+        lambda: _route_tokens(router_logits, routing_bias, topk_values, topk_indices),
+    )
+    dispatched_inputs = run_setup_phase("dispatch", dispatch)
+    tuning_inputs = run_setup_phase(
+        "preserve dispatched inputs",
+        lambda: tuple(tensor.clone() for tensor in dispatched_inputs),
+    )
+    run_setup_phase(
+        "combine",
+        lambda: combine(
+            torch.zeros(
+                world_size * runtime_max_tokens_per_rank,
+                CFG.hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        ),
+    )
+    run_setup_phase("CuTe DSL tactic selection", lambda: compute(*tuning_inputs))
+
+    samples = _run_distributed_iterations(args, run_once, l2_flush, dist, device)
+    if samples is None:
+        return None
+    return _median_distributed_samples(num_tokens, samples)
 
 
-def _make_tp_activation_pack(
+def _make_distributed_activation_pack(
     args,
     hidden_states,
     topk_indices,
@@ -1532,6 +1630,42 @@ def _make_tp_activation_pack(
     )
 
 
+def _create_distributed_moe_layer(
+    args,
+    intermediate_size,
+    num_local_experts,
+    local_expert_offset,
+    tune_max_num_tokens,
+    rank,
+    device,
+):
+    from flashinfer.fused_moe import CuteDslConfig, MoELayer, MoEWeightPack
+
+    moe_config = _distributed_moe_config(
+        args,
+        intermediate_size,
+        num_local_experts,
+        local_expert_offset,
+        tune_max_num_tokens,
+    )
+    w13, w2 = _create_distributed_weights(
+        num_local_experts, intermediate_size, rank, device
+    )
+    weight_pack = MoEWeightPack()
+    weight_pack.prepare_for(
+        "cute_dsl_nvfp4",
+        CuteDslConfig.prepare_weights(
+            w13,
+            w2,
+            num_local_experts=num_local_experts,
+            hidden_size=CFG.hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        ),
+    )
+    return MoELayer(moe_config, device=device), weight_pack
+
+
 def _benchmark_distributed_tp(
     args, num_tokens, rank, world_size, device, report_backend=False
 ):
@@ -1543,7 +1677,6 @@ def _benchmark_distributed_tp(
         create_allreduce_fusion_workspace,
     )
     from flashinfer.comm.mnnvl import TorchDistBackend
-    from flashinfer.fused_moe import CuteDslConfig, MoELayer, MoEWeightPack
     from flashinfer.quantization.nvfp4_quantization_utils import (
         current_nvfp4_4over6_config,
         make_nvfp4_global_scale,
@@ -1551,29 +1684,15 @@ def _benchmark_distributed_tp(
     from flashinfer.testing.utils import get_l2_cache_size
 
     intermediate_size = BASE_INTERMEDIATE_SIZE // world_size
-    moe_config = _distributed_moe_config(
+    layer, weight_pack = _create_distributed_moe_layer(
         args,
         intermediate_size,
         CFG.num_experts,
         0,
         num_tokens,
+        rank,
+        device,
     )
-    w13, w2 = _create_distributed_weights(
-        CFG.num_experts, intermediate_size, rank, device
-    )
-    weight_pack = MoEWeightPack()
-    weight_pack.prepare_for(
-        "cute_dsl_nvfp4",
-        CuteDslConfig.prepare_weights(
-            w13,
-            w2,
-            num_local_experts=CFG.num_experts,
-            hidden_size=CFG.hidden_size,
-            intermediate_size=intermediate_size,
-            device=device,
-        ),
-    )
-    layer = MoELayer(moe_config, device=device)
     local_hidden_states, _, router_logits, routing_bias = _create_distributed_inputs(
         num_tokens, rank, world_size, device
     )
@@ -1614,7 +1733,7 @@ def _benchmark_distributed_tp(
     def run_once():
         dist.all_gather(gathered_hidden_states, local_hidden_states)
         _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
-        activation_pack = _make_tp_activation_pack(
+        activation_pack = _make_distributed_activation_pack(
             args,
             hidden_states,
             topk_indices,
@@ -1637,6 +1756,18 @@ def _benchmark_distributed_tp(
         return _median_distributed_samples(num_tokens, samples)
     finally:
         workspace.destroy()
+
+
+def _configure_distributed_environment(enable_pdl):
+    import os
+
+    # Match the communication environment configured by SGLang before it
+    # initializes process groups and the FlashInfer dispatcher.
+    os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
+    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    os.environ["TRTLLM_ENABLE_PDL"] = str(int(enable_pdl))
 
 
 def _run_distributed_benchmark(args, token_counts):
@@ -1673,11 +1804,26 @@ def _run_distributed_benchmark(args, token_counts):
                 )
                 print("global tokens | end-to-end (ms)")
 
+        if mode == "ep":
+            # SGLang reserves at least 4096 dispatch tokens per rank. The live
+            # collective still uses each case's runtime_max_tokens_per_rank.
+            max_tokens_per_rank_budget = max(
+                4096,
+                max(
+                    (num_tokens + world_size - 1) // world_size
+                    for num_tokens in token_counts
+                ),
+            )
         results = []
         for num_tokens in token_counts:
             if mode == "ep":
                 result = _benchmark_distributed_ep(
-                    args, num_tokens, rank, world_size, device
+                    args,
+                    num_tokens,
+                    max_tokens_per_rank_budget,
+                    rank,
+                    world_size,
+                    device,
                 )
             else:
                 result = _benchmark_distributed_tp(
@@ -1856,6 +2002,7 @@ def main():
                 "real W4A4 mode starts from BF16 and requires "
                 "--include-activation-quant"
             )
+        _configure_distributed_environment(args.enable_pdl)
 
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
