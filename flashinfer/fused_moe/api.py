@@ -130,11 +130,17 @@ class QuantConfig:
     per_token_scale : bool or None
         Whether activations carry a per-token scale (vs per-tensor / block).
         ``None`` → backend default.
+    quantize_input : bool
+        Whether NVFP4-weight compute uses NVFP4 activations. EP split backends
+        quantize their BF16 dispatch output when this is ``True``; direct
+        :class:`MoELayer` callers provide an already-quantized activation pack.
+        Set to ``False`` for BF16 activations (W4A16).
     """
 
     variant: QuantVariant = QuantVariant.BF16
     swizzled_scale_factors: Optional[bool] = None
     per_token_scale: Optional[bool] = None
+    quantize_input: bool = True
 
 
 @dataclass(frozen=True)
@@ -202,11 +208,14 @@ class ExecutionConfig:
         Persistent device launch.  ``None`` → auto (True for sm90+).
     tune_max_num_tokens : int
         Token budget hint for autotuner / CUDA graph capture.
+    use_fused_finalize : bool
+        Whether supported backends reduce routed outputs in the GEMM2 epilogue.
     """
 
     do_finalize: bool = True
     enable_pdl: Optional[bool] = None
     tune_max_num_tokens: int = 8192
+    use_fused_finalize: bool = True
 
     def __repr__(self) -> str:
         parts = []
@@ -216,6 +225,8 @@ class ExecutionConfig:
             parts.append(f"enable_pdl={self.enable_pdl!r}")
         if self.tune_max_num_tokens != 8192:
             parts.append(f"tune_max_num_tokens={self.tune_max_num_tokens!r}")
+        if not self.use_fused_finalize:
+            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
         return f"ExecutionConfig({', '.join(parts)})"
 
 
@@ -775,6 +786,7 @@ class MoEActivationPack:
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
     # float32 for TRTLLM FP4 UnpackedPrecomputed.
     topk_weights: Optional[Tensor] = None
+    per_token_scale: Optional[Tensor] = None  # [M] float32 for per-token NVFP4
     # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
     # call site fails loudly instead of silently binding a tensor to the mode.
     routing_input_mode: RoutingInputMode = field(
@@ -877,6 +889,7 @@ class MoEActivationPack:
             "hidden_states_scale",
             "topk_ids",
             "topk_weights",
+            "per_token_scale",
             "routing_logits",
             "routing_bias",
         ):

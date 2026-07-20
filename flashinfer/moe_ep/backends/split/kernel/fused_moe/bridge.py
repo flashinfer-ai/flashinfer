@@ -40,6 +40,8 @@ def build_activation_pack(
     *,
     local_expert_offset: int = 0,
     is_nvfp4: bool,
+    quantize_input: bool = True,
+    per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D expert-major dispatch output into a token-major pack.
@@ -53,10 +55,12 @@ def build_activation_pack(
         ``(row // cap) + local_expert_offset``; the compute runner subtracts the same
         offset, so the two must agree (they share one :class:`MoEConfig`).
     is_nvfp4 : bool
-        When True, quantize the flattened activations to NVFP4 (``hidden_states_q`` +
-        ``hidden_states_scale``).  When False (bf16 path), the raw bf16 activations are
-        carried in ``hidden_states_q`` and ``hidden_states_scale`` is a 0-d placeholder
-        (the bf16 runner ignores it).
+        Whether the MoE weights use NVFP4.
+    quantize_input : bool
+        For NVFP4 weights, quantize the flattened BF16 activations to NVFP4 when
+        true, or carry BF16 activations for W4A16 when false.
+    per_token_activation : bool
+        Use per-token NVFP4 activation scaling when quantizing the input.
     global_scale : torch.Tensor, optional
         Per-tensor global scale for NVFP4 quantization (shape ``[1]``, float32).
     """
@@ -83,6 +87,8 @@ def build_activation_pack(
         selected_experts,
         final_scales,
         is_nvfp4=is_nvfp4,
+        quantize_input=quantize_input,
+        per_token_activation=per_token_activation,
         global_scale=global_scale,
     )
 
@@ -95,6 +101,8 @@ def build_activation_pack_rank_major(
     num_local_experts: int,
     local_expert_offset: int = 0,
     is_nvfp4: bool,
+    quantize_input: bool = True,
+    per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D RANK_MAJOR dispatch output into a token-major pack.
@@ -130,7 +138,7 @@ def build_activation_pack_rank_major(
         Number of experts this rank owns (carried for API symmetry / validation).
     local_expert_offset : int
         Global id of this rank's first local expert (see EXPERT_MAJOR builder).
-    is_nvfp4, global_scale :
+    is_nvfp4, quantize_input, per_token_activation, global_scale :
         Same semantics as :func:`build_activation_pack`.
     """
     if recv_tensors.dim() != 3:
@@ -176,6 +184,8 @@ def build_activation_pack_rank_major(
         selected_experts,
         final_scales,
         is_nvfp4=is_nvfp4,
+        quantize_input=quantize_input,
+        per_token_activation=per_token_activation,
         global_scale=global_scale,
     )
 
@@ -186,9 +196,11 @@ def _quantize_and_pack(
     final_scales: torch.Tensor,
     *,
     is_nvfp4: bool,
+    quantize_input: bool,
+    per_token_activation: bool,
     global_scale: Optional[torch.Tensor],
 ) -> "MoEActivationPack":
-    """Quantize ``flat`` (NVFP4) or pass it through (bf16) and assemble the pack.
+    """Prepare ``flat`` for the configured activation path and assemble the pack.
 
     Shared by the EXPERT_MAJOR and RANK_MAJOR builders, which differ only in how
     ``selected_experts`` / ``final_scales`` are synthesized.
@@ -196,8 +208,12 @@ def _quantize_and_pack(
     from ......fused_moe.api import MoEActivationPack
 
     device = flat.device
-    if is_nvfp4:
-        from ......quantization.fp4_quantization import fp4_quantize
+    per_token_scale = None
+    if is_nvfp4 and quantize_input:
+        from ......quantization.fp4_quantization import (
+            fp4_quantize,
+            nvfp4_quantize,
+        )
 
         if global_scale is None:
             # NVFP4 requires a global scale (fp4Quantize asserts it is set when
@@ -210,25 +226,47 @@ def _quantize_and_pack(
         # False), matching the runners' expectation (see create_moe_tensors in
         # tests/moe/test_b12x_fused_moe.py).  The default swizzled layout makes
         # the kernel index the scale tensor out of bounds → illegal memory access.
-        hidden_states_q, hidden_states_scale = fp4_quantize(
-            flat,
-            global_scale=global_scale,
-            sf_vec_size=16,
-            is_sf_swizzled_layout=False,
-        )
+        if per_token_activation:
+            from ......quantization.nvfp4_quantization_utils import (
+                current_nvfp4_4over6_config,
+                make_nvfp4_global_scale,
+            )
+            from ......tllm_enums import SfLayout
+
+            global_scale = make_nvfp4_global_scale(
+                flat,
+                per_token_activation=True,
+                nvfp4_4over6_config=current_nvfp4_4over6_config(),
+            )
+            hidden_states_q, hidden_states_scale, per_token_scale = nvfp4_quantize(
+                flat,
+                global_scale,
+                sfLayout=SfLayout.layout_linear,
+                per_token_activation=True,
+                backend="cute-dsl",
+            )
+        else:
+            hidden_states_q, hidden_states_scale = fp4_quantize(
+                flat,
+                global_scale=global_scale,
+                sf_vec_size=16,
+                is_sf_swizzled_layout=False,
+                backend="cute-dsl",
+            )
         # Runners expect a 2D [M, H//16] scale; fp4_quantize may return a trailing dim.
         if hidden_states_scale.dim() > 2:
             hidden_states_scale = hidden_states_scale.squeeze(-1)
     else:
         # bf16 path: carry the raw activations; the bf16 runner reads them directly.
         hidden_states_q = flat
-        hidden_states_scale = torch.empty(0, device=device)
+        hidden_states_scale = None
 
     return MoEActivationPack(
         hidden_states_q=hidden_states_q,
         hidden_states_scale=hidden_states_scale,
         topk_ids=selected_experts,
         topk_weights=final_scales,
+        per_token_scale=per_token_scale,
     )
 
 
