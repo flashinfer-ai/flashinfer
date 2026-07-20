@@ -312,13 +312,13 @@ class _FlashInferHunyuanMLP(nn.Module):
                 f"cur_dev={torch.cuda.current_device()}",
                 flush=True,
             )
-        with _device_ctx(fused_input):
-            if fused_input.dtype == torch.float32:
-                # ``silu_and_mul`` is BF16/FP16-only.
-                hidden = _flashinfer_silu_and_mul(fused_input.to(torch.bfloat16)).to(
-                    torch.float32
-                )
-            else:
+        if fused_input.dtype == torch.float32:
+            # ``silu_and_mul`` is BF16/FP16-only; a round-trip through BF16
+            # would silently drop float32 precision, so compute the SwiGLU
+            # eagerly in float32 instead (same ``x1 * silu(x2)`` convention).
+            hidden = gate * F.silu(up)
+        else:
+            with _device_ctx(fused_input):
                 hidden = _flashinfer_silu_and_mul(fused_input)
         return self.down_proj(hidden)
 

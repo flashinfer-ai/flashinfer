@@ -481,6 +481,10 @@ class FlashInferLinear(nn.Module):
         self.register_buffer("_weight_fp8_nt", None)
         self.register_buffer("_weight_scale_nt", None)
         self._fp8_nt_prepared = False
+        # Reused (1,) int32 buffer for batch_deepgemm's masked_m: allocating
+        # it per forward would break CUDA-graph capture (fresh tensor identity
+        # every replay) and add a H2D copy per call.
+        self._cached_masked_m: Optional[torch.Tensor] = None
 
     def _init_mxfp8_weights(self, dtype: torch.dtype):
         """Initialize weights for MXFP8 backend (mm_mxfp8)."""
@@ -1262,7 +1266,10 @@ class FlashInferLinear(nn.Module):
         )  # (1, k_blocks, n_blocks) -> need (1, n_blocks, k_blocks)
         # batch_deepgemm b_scale expects (batch, n_blocks, k_blocks)
         b_scale_batch = b_scale_batch.transpose(1, 2).contiguous()
-        masked_m = torch.tensor([m], dtype=torch.int32, device=x.device)
+        if self._cached_masked_m is None or self._cached_masked_m.device != x.device:
+            self._cached_masked_m = torch.empty(1, dtype=torch.int32, device=x.device)
+        self._cached_masked_m.fill_(m)
+        masked_m = self._cached_masked_m
 
         out = batch_deepgemm_fp8_nt_groupwise(
             a,

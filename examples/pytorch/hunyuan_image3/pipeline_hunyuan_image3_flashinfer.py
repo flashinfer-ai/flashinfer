@@ -509,7 +509,9 @@ class _CudagraphStepModule(torch.nn.Module):
                 cloned = list(out)
                 cloned[0] = cloned[0].clone()
                 out = type(out)(cloned)
-        except Exception:
+        except (AttributeError, TypeError, NotImplementedError):
+            # Output type we don't know how to clone — hand it back as-is.
+            # Real runtime failures (RuntimeError, CUDA OOM) must propagate.
             pass
         return out
 
@@ -520,12 +522,16 @@ class _CudagraphStepModule(torch.nn.Module):
             return getattr(self._compiled, name)
 
 
-def _bench_generate(gen_fn, args: argparse.Namespace, label: str):
+def _bench_generate(
+    gen_fn, args: argparse.Namespace, label: str, steps: Optional[int] = None
+):
     """Run ``gen_fn`` with warmup + timed repeats; print GPU-synced latency.
 
     ``gen_fn`` must be a zero-arg callable that performs one full generation
     and returns its result (e.g. a list of PIL images). Returns the result of
-    the final timed run.
+    the final timed run. ``steps`` enables the per-step latency breakdown for
+    diffusion modalities; autoregressive text generation passes ``None`` and
+    reports end-to-end time only (the generated token count varies per run).
     """
     import time
 
@@ -546,18 +552,24 @@ def _bench_generate(gen_fn, args: argparse.Namespace, label: str):
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
         times.append(dt)
-        per_step = dt / max(1, args.steps)
+        per_step = (
+            ""
+            if steps is None
+            else (f", {dt / max(1, steps) * 1e3:.1f} ms/step ({steps} steps)")
+        )
         print(
-            f"[bench:{label}] run {r + 1}/{args.timed_runs}: "
-            f"{dt:.3f} s total, {per_step * 1e3:.1f} ms/step ({args.steps} steps)"
+            f"[bench:{label}] run {r + 1}/{args.timed_runs}: {dt:.3f} s total{per_step}"
         )
 
     best = min(times)
     mean = sum(times) / len(times)
     peak = torch.cuda.max_memory_allocated() / 1e9
+    per_step_best = (
+        "" if steps is None else (f"per_step_best={best / max(1, steps) * 1e3:.1f}ms ")
+    )
     print(
         f"[bench:{label}] SUMMARY best={best:.3f}s mean={mean:.3f}s "
-        f"per_step_best={best / max(1, args.steps) * 1e3:.1f}ms "
+        f"{per_step_best}"
         f"peak_mem={peak:.1f}GB"
     )
     return result
@@ -615,7 +627,7 @@ def _run_text2img(model, prompts: list[str], args: argparse.Namespace) -> None:
             )
             return samples
 
-        images = _bench_generate(_gen, args, label=f"text2img[{idx}]")
+        images = _bench_generate(_gen, args, label=f"text2img[{idx}]", steps=args.steps)
         for j, img in enumerate(images):
             save_path = Path(args.output) / f"output_{idx}_{j}.png"
             img.save(save_path)
@@ -630,14 +642,18 @@ def _run_img2img(
     img_arg = input_images[0] if len(input_images) == 1 else input_images
     for idx, prompt in enumerate(prompts):
         print(f"\n[{idx + 1}/{len(prompts)}] Editing image for: {prompt!r}")
-        images = pipeline(
-            prompt=prompt,
-            image=img_arg,
-            num_inference_steps=args.steps,
-            guidance_scale=args.guidance_scale,
-            seed=args.seed,
-            verbose=args.verbose,
-        )
+
+        def _gen():
+            return pipeline(
+                prompt=prompt,
+                image=img_arg,
+                num_inference_steps=args.steps,
+                guidance_scale=args.guidance_scale,
+                seed=args.seed,
+                verbose=args.verbose,
+            )
+
+        images = _bench_generate(_gen, args, label=f"img2img[{idx}]", steps=args.steps)
         for j, img in enumerate(images):
             save_path = Path(args.output) / f"output_{idx}_{j}.png"
             img.save(save_path)
@@ -655,19 +671,23 @@ def _run_img2text(
     img_arg = input_images[0] if len(input_images) == 1 else input_images
     for idx, prompt in enumerate(prompts):
         print(f"\n[{idx + 1}/{len(prompts)}] Captioning image with: {prompt!r}")
-        inputs = model.prepare_model_inputs(
-            prompt=prompt,
-            image=img_arg,
-            mode="gen_text",
-            system_prompt=args.sys_type,
-            bot_task=bot_task or "auto",
-            max_new_tokens=args.max_new_tokens,
-        )
-        out = model.generate(
-            **inputs,
-            verbose=args.verbose,
-            decode_text=True,
-        )
+
+        def _gen():
+            inputs = model.prepare_model_inputs(
+                prompt=prompt,
+                image=img_arg,
+                mode="gen_text",
+                system_prompt=args.sys_type,
+                bot_task=bot_task or "auto",
+                max_new_tokens=args.max_new_tokens,
+            )
+            return model.generate(
+                **inputs,
+                verbose=args.verbose,
+                decode_text=True,
+            )
+
+        out = _bench_generate(_gen, args, label=f"img2text[{idx}]")
         text = (
             out
             if isinstance(out, str)
@@ -682,18 +702,22 @@ def _run_text2text(
     """Pure text-to-text generation via the model's ``.generate`` path."""
     for idx, prompt in enumerate(prompts):
         print(f"\n[{idx + 1}/{len(prompts)}] Generating text for: {prompt!r}")
-        inputs = model.prepare_model_inputs(
-            prompt=prompt,
-            mode="gen_text",
-            system_prompt=args.sys_type,
-            bot_task=bot_task or "auto",
-            max_new_tokens=args.max_new_tokens,
-        )
-        out = model.generate(
-            **inputs,
-            verbose=args.verbose,
-            decode_text=True,
-        )
+
+        def _gen():
+            inputs = model.prepare_model_inputs(
+                prompt=prompt,
+                mode="gen_text",
+                system_prompt=args.sys_type,
+                bot_task=bot_task or "auto",
+                max_new_tokens=args.max_new_tokens,
+            )
+            return model.generate(
+                **inputs,
+                verbose=args.verbose,
+                decode_text=True,
+            )
+
+        out = _bench_generate(_gen, args, label=f"text2text[{idx}]")
         text = (
             out
             if isinstance(out, str)

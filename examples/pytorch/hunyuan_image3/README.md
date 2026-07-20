@@ -171,9 +171,11 @@ steps, `--seed 42`, same prompt, `--vae-use-tiling`, torch 2.11 (nvcr
 pytorch:26.03), transformers 4.57. `FLASHINFER_MOE_FREE_MASTERS=1` is
 required for every quantized/trtllm MoE backend — without it the BF16
 masters plus the quantized copies exceed the single GPU (the whole matrix
-peaks at 171–179 GB with it). GEMM stays `torch` in the MoE rows; the two
-SM90-only backends (`cutlass_fp8_blockscale`, `cutlass_w4a16`) fall back to
-`torch` here and are absent.
+peaks at 171–179 GB with it). GEMM stays `torch` in the `--moe-backend`-only
+rows; the last two rows additionally swap the dense linears to the `bf16` /
+`fp8_groupwise` GEMM backends. The two SM90-only MoE backends
+(`cutlass_fp8_blockscale`, `cutlass_w4a16`) fall back to `torch` here and are
+absent.
 
 | Config | ms/step | Total (50 steps) | Speedup | PSNR vs baseline |
 | :--- | ---: | ---: | ---: | ---: |
