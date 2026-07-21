@@ -654,6 +654,7 @@ def _benchmark_distributed_ep(
 ):
     import torch.distributed as dist
 
+    from flashinfer.autotuner import autotune
     from flashinfer.comm import MoeAlltoAll
     from flashinfer.comm.mapping import Mapping
     from flashinfer.comm.mnnvl import MnnvlConfig, TorchDistBackend
@@ -832,7 +833,12 @@ def _benchmark_distributed_ep(
             )
         ),
     )
-    run_setup_phase("CuTe DSL tactic selection", lambda: compute(*tuning_inputs))
+
+    def tune_local_moe():
+        with autotune(True):
+            return compute(*tuning_inputs)
+
+    run_setup_phase("CuTe DSL tactic selection", tune_local_moe)
 
     return _run_distributed_iterations(
         args,
@@ -1028,6 +1034,7 @@ def _benchmark_distributed_tp(
 ):
     import torch.distributed as dist
 
+    from flashinfer.autotuner import autotune
     from flashinfer.comm import (
         AllReduceFusionPattern,
         allreduce_fusion,
@@ -1156,6 +1163,20 @@ def _benchmark_distributed_tp(
                 ("all-reduce", profile_all_reduce),
             )
         )
+
+    _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
+    tuning_activation_pack = _make_distributed_activation_pack(
+        args,
+        variant,
+        hidden_states,
+        topk_indices,
+        topk_values,
+        global_scale,
+    )
+    with autotune(True):
+        layer(tuning_activation_pack, weight_pack)
+    torch.cuda.synchronize()
+    dist.barrier()
 
     try:
         return _run_distributed_iterations(
