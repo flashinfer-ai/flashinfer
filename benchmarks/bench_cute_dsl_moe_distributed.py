@@ -12,11 +12,18 @@ Use torchrun to benchmark both real expert- and tensor-parallel communication:
     torchrun --standalone --nproc-per-node=8 \\
         benchmarks/bench_cute_dsl_moe_distributed.py
 
-Run profile mode directly to capture and report per-kernel Nsight Systems
-breakdowns for all four topology/activation combinations:
+Run Nsight Systems mode directly to capture and report per-kernel breakdowns
+for all four topology/activation combinations:
 
     python3 benchmarks/bench_cute_dsl_moe_distributed.py \
-        --mode profile --num-tokens 4096
+        --mode profile_nsys
+
+Nsight Compute mode captures every non-communication kernel with the full
+metric set and embeds correlated sources found recursively under the
+FlashInfer repository:
+
+    python3 benchmarks/bench_cute_dsl_moe_distributed.py \
+        --mode profile_ncu --profile-iters 1
 
 The workload stages remain available as NVTX ranges. Kernel attribution uses
 those ranges rather than matching kernel names.
@@ -25,6 +32,7 @@ those ranges rather than matching kernel names.
 import argparse
 import csv
 import gc
+import itertools
 import os
 import shutil
 import sqlite3
@@ -46,6 +54,8 @@ from bench_moe_deepseek import (
 
 DISTRIBUTED_TOKEN_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 _PROFILE_CASE_ENV = "FLASHINFER_CUTE_DSL_MOE_PROFILE_CASE"
+_PROFILE_MODES = ("profile_nsys", "profile_ncu")
+_NCU_PROFILE_STAGES = ("routing", "activation prep/quant", "local MoE")
 # Nsight global thread IDs reserve the low 24 bits for the thread ID.
 _NSYS_GLOBAL_ID_PROCESS_MASK = -(1 << 24)
 
@@ -98,7 +108,7 @@ def _profile_worker_arguments(args, num_tokens):
         "--allreduce-backend",
         args.allreduce_backend,
         "--mode",
-        "profile",
+        args.mode,
         "--profile-iters",
         str(args.profile_iters),
     ]
@@ -269,13 +279,13 @@ def _print_nsys_kernel_breakdown(mode, variant, num_tokens, num_gpus, rows, repo
     print(f"Kernel CSV: {csv_report}")
 
 
-def _run_nsys_profiles(args, num_tokens):
+def _run_nsys_profiles(args, token_counts):
     nsys = shutil.which("nsys")
     torchrun = shutil.which("torchrun")
     if nsys is None:
-        raise RuntimeError("--mode profile requires Nsight Systems (nsys)")
+        raise RuntimeError("--mode profile_nsys requires Nsight Systems (nsys)")
     if torchrun is None:
-        raise RuntimeError("--mode profile requires torchrun")
+        raise RuntimeError("--mode profile_nsys requires torchrun")
 
     if args.nsys_output_dir is None:
         output_dir = Path(tempfile.mkdtemp(prefix="flashinfer-cute-dsl-moe-nsys-"))
@@ -283,51 +293,123 @@ def _run_nsys_profiles(args, num_tokens):
         output_dir = Path(args.nsys_output_dir).expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    worker_arguments = _profile_worker_arguments(args, num_tokens)
     script = Path(__file__).resolve()
-    for mode in ("ep", "tp"):
-        for variant in BENCH_VARIANTS:
-            profile_label = f"{mode}::{variant.name}"
-            output = output_dir / f"{mode}_{variant.name}_t{num_tokens}"
-            env = os.environ.copy()
-            env[_PROFILE_CASE_ENV] = profile_label
-            command = [
-                nsys,
-                "profile",
-                "--force-overwrite=true",
-                "--sample=none",
-                "--cpuctxsw=none",
-                "--trace=cuda,nvtx,nccl",
-                "--capture-range=cudaProfilerApi",
-                "--capture-range-end=stop",
-                f"--show-output={'true' if args.verbose else 'false'}",
-                f"--output={output}",
-                torchrun,
-                "--standalone",
-                f"--nproc-per-node={args.num_gpus}",
-                str(script),
-                *worker_arguments,
-            ]
-            print(
-                f"\nCapturing {mode.upper()}{args.num_gpus} "
-                f"{variant.name.upper()} with Nsight Systems...",
-                flush=True,
-            )
-            _verbose_print(args, "Command:", " ".join(command))
-            subprocess.run(command, check=True, env=env)
+    for num_tokens, mode, variant in itertools.product(
+        token_counts, ("ep", "tp"), BENCH_VARIANTS
+    ):
+        profile_label = f"{mode}::{variant.name}"
+        output = output_dir / f"{mode}_{variant.name}_t{num_tokens}"
+        env = os.environ.copy()
+        env[_PROFILE_CASE_ENV] = profile_label
+        command = [
+            nsys,
+            "profile",
+            "--force-overwrite=true",
+            "--sample=none",
+            "--cpuctxsw=none",
+            "--trace=cuda,nvtx,nccl",
+            "--capture-range=cudaProfilerApi",
+            "--capture-range-end=stop",
+            f"--show-output={'true' if args.verbose else 'false'}",
+            f"--output={output}",
+            torchrun,
+            "--standalone",
+            f"--nproc-per-node={args.num_gpus}",
+            str(script),
+            *_profile_worker_arguments(args, num_tokens),
+        ]
+        print(
+            f"\nCapturing {mode.upper()}{args.num_gpus} "
+            f"{variant.name.upper()} at {num_tokens} tokens "
+            "with Nsight Systems...",
+            flush=True,
+        )
+        _verbose_print(args, "Command:", " ".join(command))
+        subprocess.run(command, check=True, env=env)
 
-            report = output.with_suffix(".nsys-rep")
-            rows = _load_nsys_kernel_rows(nsys, report, args.verbose)
-            _print_nsys_kernel_breakdown(
-                mode,
-                variant.name,
-                num_tokens,
-                args.num_gpus,
-                rows,
-                report,
-            )
+        report = output.with_suffix(".nsys-rep")
+        rows = _load_nsys_kernel_rows(nsys, report, args.verbose)
+        _print_nsys_kernel_breakdown(
+            mode,
+            variant.name,
+            num_tokens,
+            args.num_gpus,
+            rows,
+            report,
+        )
 
     print(f"\nNsight Systems reports: {output_dir}")
+    return 0
+
+
+def _run_ncu_profiles(args, token_counts):
+    ncu = shutil.which("ncu")
+    torchrun = shutil.which("torchrun")
+    if ncu is None:
+        raise RuntimeError("--mode profile_ncu requires Nsight Compute (ncu)")
+    if torchrun is None:
+        raise RuntimeError("--mode profile_ncu requires torchrun")
+
+    if args.ncu_output_dir is None:
+        output_dir = Path(tempfile.mkdtemp(prefix="flashinfer-cute-dsl-moe-ncu-"))
+    else:
+        output_dir = Path(args.ncu_output_dir).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve()
+    source_root = script.parents[1]
+    lineinfo_cache = output_dir / "cute_dsl_lineinfo_cache"
+    lineinfo_cache.mkdir(exist_ok=True)
+    for num_tokens, mode, variant in itertools.product(
+        token_counts, ("ep", "tp"), BENCH_VARIANTS
+    ):
+        profile_label = f"{mode}::{variant.name}"
+        output = output_dir / f"{mode}_{variant.name}_t{num_tokens}"
+        log_file = output.with_suffix(".ncu.log")
+        env = os.environ.copy()
+        env[_PROFILE_CASE_ENV] = profile_label
+        env["CUTE_DSL_CACHE_DIR"] = str(lineinfo_cache)
+        env["CUTE_DSL_LINEINFO"] = "1"
+        command = [
+            ncu,
+            "--set=full",
+            "--target-processes=all",
+            "--replay-mode=kernel",
+            "--profile-from-start=off",
+            "--nvtx",
+            *(
+                argument
+                for stage in _NCU_PROFILE_STAGES
+                for argument in ("--nvtx-include", f"stage::{stage}/")
+            ),
+            "--import-source=yes",
+            f"--source-folders={source_root}",
+            "--print-summary=per-kernel",
+            "--force-overwrite",
+            f"--log-file={log_file}",
+            f"--export={output}",
+            torchrun,
+            "--standalone",
+            f"--nproc-per-node={args.num_gpus}",
+            str(script),
+            *_profile_worker_arguments(args, num_tokens),
+        ]
+        print(
+            f"\nCapturing non-communication kernels for "
+            f"{mode.upper()}{args.num_gpus} {variant.name.upper()} "
+            f"at {num_tokens} tokens with Nsight Compute...",
+            flush=True,
+        )
+        _verbose_print(args, "Command:", " ".join(command))
+        subprocess.run(command, check=True, env=env)
+
+        reports = sorted(output_dir.glob(f"{output.name}*.ncu-rep"))
+        if not reports:
+            raise RuntimeError(f"Nsight Compute did not create a report for {output}")
+        for report in reports:
+            print(f"Nsight Compute report: {report}")
+        print(f"Nsight Compute log: {log_file}")
+
+    print(f"\nNsight Compute reports: {output_dir}")
     return 0
 
 
@@ -517,7 +599,7 @@ def _run_distributed_iterations(
     torch.cuda.synchronize()
     dist.barrier()
 
-    if args.mode == "profile":
+    if args.mode in _PROFILE_MODES:
         samples_by_stage = {}
         torch.cuda.cudart().cudaProfilerStart()
         torch.cuda.nvtx.range_push(profile_label)
@@ -1024,7 +1106,7 @@ def _run_parallel_mode(
     selected_variant=None,
 ):
     if rank == 0:
-        if args.mode == "profile":
+        if args.mode in _PROFILE_MODES:
             print(
                 f"\nMode: real {mode.upper()}{world_size}, "
                 "timing=semantic CUDA-event stages, cache=cold L2"
@@ -1176,7 +1258,10 @@ def main():
         "--num-tokens",
         type=str,
         default=None,
-        help="Comma-separated global token counts (default: powers of two from 1 to 4096).",
+        help=(
+            "Comma-separated global token counts (default: powers of two from 1 to "
+            "4096 for benchmark, 32 and 4096 for profiling)."
+        ),
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
@@ -1211,21 +1296,27 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["benchmark", "profile"],
+        choices=["benchmark", *_PROFILE_MODES],
         default="benchmark",
-        help="Benchmark both variants or report per-kernel Nsight Systems breakdowns.",
+        help="Benchmark, capture Nsight Systems timelines, or capture Nsight Compute metrics.",
     )
     parser.add_argument(
         "--profile-iters",
         type=int,
         default=10,
-        help="Number of iterations captured in each Nsight Systems profile.",
+        help="Number of iterations captured in each profiler run.",
     )
     parser.add_argument(
         "--nsys-output-dir",
         type=str,
         default=None,
         help="Directory for Nsight Systems reports (default: a temporary directory).",
+    )
+    parser.add_argument(
+        "--ncu-output-dir",
+        type=str,
+        default=None,
+        help="Directory for Nsight Compute reports (default: a temporary directory).",
     )
     parser.add_argument(
         "--verbose",
@@ -1251,18 +1342,20 @@ def main():
 
     if args.num_tokens:
         tokens = [int(value) for value in args.num_tokens.split(",")]
+    elif args.mode in _PROFILE_MODES:
+        tokens = [32, 4096]
     else:
         tokens = DISTRIBUTED_TOKEN_COUNTS
-    if args.mode == "profile" and len(tokens) != 1:
-        parser.error("profile mode requires exactly one token count")
 
     profile_case = os.environ.get(_PROFILE_CASE_ENV)
-    if args.mode == "profile" and profile_case is None:
+    if args.mode in _PROFILE_MODES and profile_case is None:
         if "LOCAL_RANK" in os.environ:
-            parser.error("run profile mode directly, without torchrun")
-        return _run_nsys_profiles(args, tokens[0])
+            parser.error(f"run {args.mode} mode directly, without torchrun")
+        if args.mode == "profile_nsys":
+            return _run_nsys_profiles(args, tokens)
+        return _run_ncu_profiles(args, tokens)
     if "LOCAL_RANK" not in os.environ:
-        parser.error("benchmark mode must be launched with torchrun")
+        parser.error(f"{args.mode} mode must be launched with torchrun")
 
     return _run_distributed_benchmark(args, tokens)
 
