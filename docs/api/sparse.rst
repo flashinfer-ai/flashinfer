@@ -24,3 +24,20 @@ Kernels for block sparse flashattention.
         :align: center
 
     .. automethod:: __init__
+
+
+flashinfer.msa_ops
+==================
+
+Minimax Sparse Attention (MSA) APIs for SM120/SM121 (Blackwell).
+
+.. currentmodule:: flashinfer.msa_ops
+
+.. autosummary::
+    :toctree: ../generated
+
+    msa_proxy_score
+    msa_proxy_score_fp4
+    msa_sparse_attention
+    msa_sparse_decode_attention
+    msa_topk_select
