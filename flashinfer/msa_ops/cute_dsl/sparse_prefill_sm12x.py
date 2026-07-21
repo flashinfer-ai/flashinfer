@@ -42,6 +42,7 @@ class SparsePrefillSm12x:
         paged: bool = False,
         kv_fp8: bool = False,
         kv_nvfp4: bool = False,
+        kv_packed: bool = False,
     ):
         if head_dim != 128 or n_block_size != 128:
             raise ValueError("only head_dim == n_block_size == 128 is supported")
@@ -49,6 +50,8 @@ class SparsePrefillSm12x:
             raise ValueError("group_size must divide m_block_size")
         if kv_fp8 and kv_nvfp4:
             raise ValueError("kv_fp8 and kv_nvfp4 are mutually exclusive")
+        if kv_packed and (not paged or kv_nvfp4):
+            raise ValueError("kv_packed requires the paged bf16/fp16/fp8 path")
         self._head_dim = head_dim
         self._m_block_size = m_block_size
         self._n_block_size = n_block_size
@@ -64,10 +67,19 @@ class SparsePrefillSm12x:
         # the K/V HBM read shrinks to ~1 / ~0.5 byte per element.
         self._kv_fp8 = kv_fp8
         self._kv_nvfp4 = kv_nvfp4
+        # K/V packed in one cache: mK/mV are the same 5-D tensor
+        # (pages, Hkv, blk, 2, d); K is plane 0 of dim 3 and V plane 1.
+        self._kv_packed = kv_packed
         self._q_smem_stride = head_dim + 8
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=num_threads
         )
+
+    def _paged_kv_block(self, mK, mV, page, kv_head):
+        """(128, d) K/V block views for one page; picks the planes when packed."""
+        if cutlass.const_expr(self._kv_packed):
+            return mK[page, kv_head, None, 0, None], mV[page, kv_head, None, 1, None]
+        return mK[page, kv_head, None, None], mV[page, kv_head, None, None]
 
     def _make_skv_layout(self):
         """Bank-swizzled K/V SMEM layout."""
@@ -97,8 +109,7 @@ class SparsePrefillSm12x:
         bf16 path fills. Rows past ``seqlen_k`` are zero-filled (epilogue masks)."""
         if cutlass.const_expr(self._paged):
             page = mPageTable[batch_idx, kv_block]
-            mK_h8 = mK[page, kv_head, None, None]
-            mV_h8 = mV[page, kv_head, None, None]
+            mK_h8, mV_h8 = self._paged_kv_block(mK, mV, page, kv_head)
             row_off = cutlass.Int32(0)
         else:
             mK_h8 = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
@@ -551,13 +562,15 @@ class SparsePrefillSm12x:
                     # bf16/fp16: cp.async load. Paged remaps the block through the
                     # page table (block coord 0); flat reuses the batch tile.
                     if cutlass.const_expr(self._paged):
+                        page = mPageTable[batch_idx, kv_block]
+                        mK_pg, mV_pg = self._paged_kv_block(mK, mV, page, kv_head)
                         gK_b = cute.local_tile(
-                            mK[mPageTable[batch_idx, kv_block], kv_head, None, None],
+                            mK_pg,
                             (self._n_block_size, self._head_dim),
                             (None, 0),
                         )
                         gV_b = cute.local_tile(
-                            mV[mPageTable[batch_idx, kv_block], kv_head, None, None],
+                            mV_pg,
                             (self._n_block_size, self._head_dim),
                             (None, 0),
                         )

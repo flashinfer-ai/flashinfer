@@ -69,16 +69,104 @@ def _cutlass_dtype(torch_dtype: torch.dtype):
     }[torch_dtype]
 
 
-def _fake(dtype, shape, align=16):
-    """Make a fake compact row-major tensor for ``cute.compile``.
+def _fake(dtype, shape, align=16, stride_order=None):
+    """Make a fake compact tensor for ``cute.compile`` (row-major by default).
 
     Compiling against symbolic shapes (``cute.sym_int()``) yields one kernel
     that accepts torch tensors of any matching-rank shape at runtime."""
     import cutlass.cute as cute
 
+    if stride_order is None:
+        stride_order = tuple(reversed(range(len(shape))))
     return cute.runtime.make_fake_compact_tensor(
         dtype,
         shape,
-        stride_order=tuple(reversed(range(len(shape)))),
+        stride_order=stride_order,
         assumed_align=align,
     )
+
+
+def _resolve_packed_kv(k, v, head_dim, *, paged, kv_nvfp4):
+    """Shared wrapper plumbing: detect packed K/V split views (paged,
+    non-NVFP4 only) via :func:`_packed_kv_view`, enforcing contiguity for
+    every other input."""
+    packed = None if kv_nvfp4 or not paged else _packed_kv_view(k, v, head_dim)
+    if packed is None and not (k.is_contiguous() and v.is_contiguous()):
+        raise ValueError("k/v must be contiguous")
+    return packed
+
+
+# Geometry only, never tensors: a cached view would pin the KV cache's
+# storage, and plain-tuple entries cannot go stale.
+_PACKED_GEO_CACHE: dict = {}
+
+
+def _packed_kv_view(k, v, head_dim):
+    """Recover the packed cache behind K/V views split from a paged KV cache
+    that stores K and V in one ``2 * head_dim`` content dim per token.
+
+    Returns ``None`` when both tensors are plain contiguous, else ``(packed,
+    stride_order)``: the storage re-viewed as a 5-D cache with K at plane 0
+    and V at plane 1 of dim 3, plus its dim ranks for ``cute.compile``. The
+    view must be compact, meaning its strides telescope in some dim order (a
+    permuted-contiguous NHD cache qualifies); any other layout raises. The
+    geometry is memoized because this runs on the decode hot path."""
+    if k.is_contiguous() and v.is_contiguous():
+        return None
+    key = (
+        tuple(k.shape),
+        k.stride(),
+        v.stride(),
+        v.data_ptr() - k.data_ptr(),
+        k.element_size(),
+        head_dim,
+    )
+    geo = _PACKED_GEO_CACHE.get(key)
+    if geo is None:
+        geo = _packed_kv_geometry(head_dim, key)
+        if len(_PACKED_GEO_CACHE) >= 64:
+            _PACKED_GEO_CACHE.clear()
+        _PACKED_GEO_CACHE[key] = geo
+    shape, strides, rank = geo
+    return k.as_strided(shape, strides), rank
+
+
+def _packed_kv_geometry(head_dim, key):
+    """Validate a non-contiguous K/V pair as packed split views and return the
+    packed ``(shape, strides, stride_order)`` as plain tuples."""
+    k_shape, k_strides, v_strides, ptr_diff, elt, _ = key
+    if (
+        len(k_shape) != 4
+        or k_strides != v_strides
+        or k_strides[-1] != 1
+        or ptr_diff != head_dim * elt
+    ):
+        raise ValueError(
+            "k/v must be contiguous, or K/V views split from a paged KV cache "
+            "that packs K and V in one 2*head_dim content dim per token"
+        )
+    num_pages, num_kv_heads, page, _ = k_shape
+    shape = (num_pages, num_kv_heads, page, 2, head_dim)
+    raw = (k_strides[0], k_strides[1], k_strides[2], head_dim, 1)
+    # Sized strides must telescope: the kernel derives addresses from the
+    # compact layout. Size-1 dims carry arbitrary strides, so they rank
+    # outermost (inner they would break the kernel's static alignment proof)
+    # and get rebuilt strides.
+    ones = [i for i in range(5) if shape[i] == 1]
+    sized = sorted((i for i in range(5) if shape[i] > 1), key=lambda i: raw[i])
+    strides = [0] * 5
+    expected = 1
+    for i in sized:
+        if raw[i] != expected:
+            raise ValueError(
+                "packed K/V views must cover a compact KV cache, got strides "
+                f"{raw} for shape {shape}"
+            )
+        strides[i] = expected
+        expected *= shape[i]
+    for i in ones:
+        strides[i] = expected
+    rank = [0] * 5
+    for pos, dim in enumerate(sized + ones):
+        rank[dim] = pos
+    return shape, tuple(strides), tuple(rank)
