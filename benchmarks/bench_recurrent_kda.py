@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Recurrent KDA (Key-Driven Attention) Benchmark
+Recurrent KDA (Kimi Delta Attention) Benchmark
 
 Benchmarks the recurrent KDA register-tile kernel with per-K-dimension gating.
 T=1 is standard decode; T>1 is fused speculative decode with
@@ -56,7 +56,7 @@ def recurrent_kda_flops(
     seq_len: int = 1,
 ) -> int:
     """
-    Calculate FLOPs for KDA (Key-Driven Attention) decode.
+    Calculate FLOPs for KDA (Kimi Delta Attention) decode.
 
     8 * K * V FLOPs per token per head:
     1. k @ state (prediction):    2 * K * V

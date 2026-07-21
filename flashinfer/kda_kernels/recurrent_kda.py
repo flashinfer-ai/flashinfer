@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Recurrent KDA (Key-Driven Attention) decode kernels using CuTe DSL for SM100.
+Recurrent KDA (Kimi Delta Attention) decode kernels using CuTe DSL for SM100.
 
 Supports single-token decode and fused speculative-token updates with
 per-key-dimension gating.
@@ -1153,7 +1153,7 @@ def run_recurrent_kda(
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    r"""Recurrent KDA (Key-Driven Attention) decode kernel.
+    r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
 
     This implements the decode phase of KDA linear attention with per-key-dimension
     gating, processing one token at a time and updating the recurrent state in-place.

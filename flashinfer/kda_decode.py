@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 """
-Key-Driven Attention Decode - API Layer
+Kimi Delta Attention Decode - API Layer
 =======================================
 
 This file provides the public API for recurrent KDA decode operations.
@@ -62,7 +62,7 @@ def recurrent_kda(
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    r"""Recurrent KDA (Key-Driven Attention) decode kernel.
+    r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
 
     This is the public API layer for the CuTe DSL implementation in
     ``flashinfer.kda_kernels.recurrent_kda``. It supports single-token decode,
