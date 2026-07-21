@@ -87,7 +87,7 @@ def _env_nonnegative_float(env: str, default: float) -> float:
 
 @dataclass(frozen=True)
 class DAConfig:
-    """DA policy snapshot, with each omitted field read from its legacy envvar."""
+    """DA policy snapshot, with each omitted field read from the environment."""
 
     # Enables value-aware distribution autotuning and capture dispatch.
     enabled: bool = field(
@@ -111,7 +111,7 @@ class DAConfig:
     )
     # Optional path to a serialized DAKNNv2 selector bundle.
     bundle_path: str = field(
-        default_factory=lambda: os.environ.get("FLASHINFER_DA_KNN_BUNDLE", "")
+        default_factory=lambda: os.environ.get("FLASHINFER_DA_BUNDLE", "")
     )
     # Warmup runs for live kNN body profiling.
     auto_warmup: int = field(

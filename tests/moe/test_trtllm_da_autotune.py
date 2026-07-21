@@ -2372,7 +2372,7 @@ def _reset_tuner_and_da(monkeypatch: pytest.MonkeyPatch) -> AutoTuner:
         "FLASHINFER_DA_DISTRIBUTIONS",
         ",".join(str(distribution[0]) for distribution in DA_DISTRIBUTIONS),
     )
-    monkeypatch.delenv("FLASHINFER_DA_KNN_BUNDLE", raising=False)
+    monkeypatch.delenv("FLASHINFER_DA_BUNDLE", raising=False)
     monkeypatch.setattr(da_profile, "_bundle_loaded", False)
     monkeypatch.setattr(da_profile, "_bundle_has_tactics", False)
 
@@ -2565,6 +2565,12 @@ def test_da_baseline_guard_uses_pre_recorded_control_overhead_once():
 
 def test_da_baseline_guard_default_control_overhead_is_twelve_us():
     assert da_profile.DAConfig().control_overhead_us == pytest.approx(12.0)
+
+
+def test_da_config_reads_bundle_path_from_environment(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_DA_BUNDLE", "/tmp/da-bundle.pkl")
+
+    assert da_profile.DAConfig().bundle_path == "/tmp/da-bundle.pkl"
 
 
 @pytest.mark.parametrize(

@@ -1524,7 +1524,7 @@ def _run_precision_sweep(
             bundle_path = _bundle_path_for_precision(
                 args.bundle_output, precision, len(precisions) > 1
             )
-            os.environ["FLASHINFER_DA_KNN_BUNDLE"] = bundle_path
+            os.environ["FLASHINFER_DA_BUNDLE"] = bundle_path
             if args.skip_autotune:
                 tune_result = _tune_result_from_loaded_bundle(
                     tuning_case, tuning_cfg, device, bundle_path
