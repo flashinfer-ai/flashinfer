@@ -17,9 +17,7 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     get_max_num_permuted_tokens,
     moe_output_memset_inplace,
     moe_permute,
-    moe_relu2,
     moe_sort,
-    moe_swiglu,
     moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
 )
@@ -45,7 +43,6 @@ class _W4A16Workspace:
     num_tokens_capacity: int
     moe_sort_buffers: Dict[str, torch.Tensor]
     hidden_workspace: torch.Tensor
-    gemm1_output: torch.Tensor
     intermediate: torch.Tensor
 
 
@@ -58,7 +55,6 @@ def _get_workspace(
     num_experts: int,
     num_local_experts: int,
     intermediate_size: int,
-    gemm1_output_size: int,
     route_tile: int,
     workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> _W4A16Workspace:
@@ -71,7 +67,6 @@ def _get_workspace(
         top_k,
         int(x.size(1)),
         int(intermediate_size),
-        int(gemm1_output_size),
         int(num_experts),
         int(num_local_experts),
         route_tile,
@@ -91,11 +86,6 @@ def _get_workspace(
             # Permuted input is dead before GEMM2 writes its output.
             hidden_workspace=torch.empty(
                 (route_slots, x.size(1)), dtype=torch.bfloat16, device=x.device
-            ),
-            gemm1_output=torch.empty(
-                (route_slots, gemm1_output_size),
-                dtype=torch.bfloat16,
-                device=x.device,
             ),
             intermediate=torch.empty(
                 (route_slots, intermediate_size),
@@ -127,7 +117,7 @@ def _get_compiled_kernel(
     top_k: int,
     max_active_clusters: int,
     stream,
-    deinterleave_output: bool,
+    activation_type: Optional[ActivationType],
     use_fused_finalize: bool,
     enable_pdl: bool,
     route_tile: int,
@@ -138,7 +128,7 @@ def _get_compiled_kernel(
     use_2cta_instrs = mma_tiler_m == 256
     cache_key = (
         num_local_experts,
-        deinterleave_output,
+        activation_type,
         use_fused_finalize,
         enable_pdl,
         mma_tiler_m,
@@ -156,7 +146,9 @@ def _get_compiled_kernel(
             mma_tiler_mnk=(mma_tiler_m, route_tile, mma_tiler_k),
             cluster_shape_mn=cluster_shape_mn,
             group_count=num_local_experts,
-            deinterleave_output=deinterleave_output,
+            activation_type=(
+                int(activation_type) if activation_type is not None else None
+            ),
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
         )
@@ -194,7 +186,7 @@ def _run_grouped_gemm(
     alpha: torch.Tensor,
     output: torch.Tensor,
     num_local_experts: int,
-    deinterleave_output: bool,
+    activation_type: Optional[ActivationType],
     use_fused_finalize: bool,
     permuted_idx_to_expanded_idx: Optional[torch.Tensor],
     token_final_scales: Optional[torch.Tensor],
@@ -299,7 +291,7 @@ def _run_grouped_gemm(
         top_k,
         max_active_clusters,
         stream,
-        deinterleave_output,
+        activation_type,
         use_fused_finalize,
         enable_pdl,
         route_tile,
@@ -365,7 +357,6 @@ def launch_w4a16_moe(
         num_experts,
         num_local_experts,
         intermediate_size,
-        gemm1_output_size,
         route_tile,
         workspace_cache,
     )
@@ -398,7 +389,6 @@ def launch_w4a16_moe(
     expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx[:num_tokens]
     permuted_idx_to_expanded_idx = permuted_idx_to_expanded_idx[:route_slots]
     hidden_workspace = workspace.hidden_workspace[:route_slots]
-    gemm1_output = workspace.gemm1_output[:route_slots]
     intermediate = workspace.intermediate[:route_slots]
     moe_permute(
         input=x,
@@ -419,27 +409,15 @@ def launch_w4a16_moe(
         tile_idx_to_mn_limit,
         num_non_exiting_tiles,
         w1_alpha,
-        gemm1_output,
+        intermediate,
         num_local_experts,
-        gated,
+        activation_type,
         False,
         None,
         None,
         enable_pdl,
         route_tile,
         gemm1_tactic,
-    )
-    activation_fn = (
-        moe_swiglu if activation_type == ActivationType.Swiglu else moe_relu2
-    )
-    activation_fn(
-        input=gemm1_output,
-        output=intermediate,
-        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-        num_non_exiting_tiles=num_non_exiting_tiles,
-        max_num_permuted_tokens=route_slots,
-        tile_size=route_tile,
-        enable_pdl=enable_pdl,
     )
     gemm2_output = moe_output if use_fused_finalize else hidden_workspace
     if use_fused_finalize:
@@ -454,7 +432,7 @@ def launch_w4a16_moe(
         w2_alpha,
         gemm2_output,
         num_local_experts,
-        False,
+        None,
         use_fused_finalize,
         permuted_idx_to_expanded_idx if use_fused_finalize else None,
         token_final_scales if use_fused_finalize else None,

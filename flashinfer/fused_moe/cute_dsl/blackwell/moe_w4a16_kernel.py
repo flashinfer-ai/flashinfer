@@ -47,6 +47,8 @@ import cutlass.utils.mixed_input_helpers as mixed_input_utils
 from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from flashinfer.tllm_enums import ActivationType
+
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
@@ -67,7 +69,7 @@ class Sm100W4A16GroupedGemmKernel:
         mma_tiler_mnk: tuple[int, int, int],
         cluster_shape_mn: tuple[int, int],
         group_count: int,
-        deinterleave_output: bool,
+        activation_type: Optional[int],
         use_fused_finalize: bool,
         enable_pdl: bool,
     ):
@@ -90,7 +92,17 @@ class Sm100W4A16GroupedGemmKernel:
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler = mma_tiler_mnk
-        self.deinterleave_output = deinterleave_output
+        if activation_type not in (
+            None,
+            ActivationType.Swiglu.value,
+            ActivationType.Relu2.value,
+        ):
+            raise ValueError(
+                f"unsupported W4A16 epilogue activation: {activation_type}"
+            )
+        self.fuse_activation = activation_type is not None
+        self.gated = activation_type == ActivationType.Swiglu.value
+        self.output_m_factor = 2 if self.gated else 1
         self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
         self.cta_group = (
@@ -172,6 +184,16 @@ class Sm100W4A16GroupedGemmKernel:
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
+        self.mma_tiler_c = (
+            self.mma_tiler[0] // self.output_m_factor,
+            self.mma_tiler[1],
+            self.mma_tiler[2],
+        )
+        self.cta_tile_shape_mnk_c = (
+            self.cta_tile_shape_mnk[0] // self.output_m_factor,
+            self.cta_tile_shape_mnk[1],
+            self.cta_tile_shape_mnk[2],
+        )
         self.cluster_tile_shape_mnk = (
             self.cluster_shape_mn[0] * self.cta_tile_shape_mnk[0],
             self.cluster_shape_mn[1] * self.cta_tile_shape_mnk[1],
@@ -186,11 +208,16 @@ class Sm100W4A16GroupedGemmKernel:
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
-        self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
+        default_epi_tile = sm100_utils.compute_epilogue_tile_shape(
             self.cta_tile_shape_mnk,
             self.use_2cta_instrs,
             self.c_layout,
             self.c_dtype,
+        )
+        self.epi_tile = (
+            (self.cta_tile_shape_mnk_c[0], default_epi_tile[1])
+            if self.gated
+            else default_epi_tile
         )
         self.epi_tile_n = cute.size(self.epi_tile[1])
 
@@ -219,7 +246,9 @@ class Sm100W4A16GroupedGemmKernel:
             self.smem_buffer_align_bytes,
             self.scale_mode,
             self.use_fused_finalize,
+            self.gated,
         )
+        self.num_c_store_stage = self.num_c_stage - (2 if self.gated else 0)
 
         # Align TMEM columns for allocation
         # TMEM allocation requires power-of-2 column alignment
@@ -234,7 +263,17 @@ class Sm100W4A16GroupedGemmKernel:
             self.c_dtype,
             self.c_layout,
             self.epi_tile,
-            self.num_c_stage,
+            self.num_c_store_stage,
+        )
+        self.c_acc_smem_layout = (
+            sm100_utils.make_smem_layout_epi(
+                self.c_dtype,
+                self.c_layout,
+                default_epi_tile,
+                1,
+            )
+            if self.gated
+            else None
         )
         # Get smem layout for A, transformed A, and B
         (
@@ -331,20 +370,13 @@ class Sm100W4A16GroupedGemmKernel:
             activation_ptr,
             cute.make_ordered_layout((n, k, 1), order=(1, 0, 2)),
         )
-        # Logical C is [weight rows, routed rows], while physical storage is
-        # route-major so GEMM2 can consume GEMM1's result without a transpose.
-        if cutlass.const_expr(self.deinterleave_output):
-            output_layout = cute.make_layout(
-                ((64, 2, m // 128), n, 1),
-                stride=((1, m // 2, 64), m, m * n),
-            )
-        else:
-            output_layout = cute.make_ordered_layout((m, n, 1), order=(0, 1, 2))
+        output_m = m // self.output_m_factor
+        output_layout = cute.make_ordered_layout((output_m, n, 1), order=(0, 1, 2))
         output = cute.make_tensor(output_ptr, output_layout)
         final_output = (
             cute.make_tensor(
                 output_ptr,
-                cute.make_ordered_layout((m, num_tokens, 1), order=(0, 1, 2)),
+                cute.make_ordered_layout((output_m, num_tokens, 1), order=(0, 1, 2)),
             )
             if cutlass.const_expr(self.use_fused_finalize)
             else output
@@ -540,7 +572,7 @@ class Sm100W4A16GroupedGemmKernel:
         self.num_tma_load_bytes_scale = a_scale_copy_size
         self.tile_sched_params, grid = self._compute_grid(
             c,
-            self.cta_tile_shape_mnk,
+            self.cta_tile_shape_mnk_c,
             self.cluster_shape_mn,
             max_active_clusters,
         )
@@ -620,6 +652,7 @@ class Sm100W4A16GroupedGemmKernel:
             self.smem_layout_a_transform,
             self.smem_layout_b,
             self.c_smem_layout_staged,
+            self.c_acc_smem_layout,
             self.epi_tile,
             self.tile_sched_params,
         ).launch(
@@ -660,6 +693,7 @@ class Sm100W4A16GroupedGemmKernel:
         a_smem_layout_transform: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
         c_smem_layout_staged: cute.ComposedLayout,
+        c_acc_smem_layout: Optional[cute.ComposedLayout],
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
     ):
@@ -821,6 +855,16 @@ class Sm100W4A16GroupedGemmKernel:
             byte_alignment=self.smem_buffer_align_bytes,
             swizzle=c_smem_layout_staged.inner,
         )
+        sC_acc = (
+            smem.allocate_tensor(
+                element_type=self.c_dtype,
+                layout=c_acc_smem_layout.outer,
+                byte_alignment=self.smem_buffer_align_bytes,
+                swizzle=c_acc_smem_layout.inner,
+            )
+            if cutlass.const_expr(self.gated)
+            else None
+        )
         # Fused finalize reuses the first C stage as a linear
         # [route, hidden] tile for descriptor-free bulk reduction.
         sFinalize = (
@@ -911,10 +955,14 @@ class Sm100W4A16GroupedGemmKernel:
         )
         # (bM, bN, loopM, loopN, loopL)
         gC_mnl = cute.local_tile(
-            mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+            mC_mnl,
+            cute.slice_(self.mma_tiler_c, (None, None, 0)),
+            (None, None, None),
         )
         gC_mnl_simt = cute.local_tile(
-            tensor_c, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+            tensor_c,
+            cute.slice_(self.mma_tiler_c, (None, None, 0)),
+            (None, None, None),
         )
         k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
@@ -1696,6 +1744,62 @@ class Sm100W4A16GroupedGemmKernel:
             accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             tCtAcc_base = accumulators
             # Partition for epilogue
+            fused_tTR_tAcc_base = None
+            fused_tiled_copy_t2r = None
+            fused_tTR_identity = None
+            fused_tTR_rAcc = None
+            fused_tiled_copy_r2s = None
+            fused_tRS_rC = None
+            fused_tRS_sC = None
+            if cutlass.const_expr(self.gated):
+                # Pair up and gate rows through a logical full-M exchange tile
+                # before storing the reduced activation tile with TMA.
+                fused_epi_tile = (
+                    self.cta_tile_shape_mnk[0],
+                    self.epi_tile_n,
+                )
+                fused_copy_atom_t2r = sm100_utils.get_tmem_load_op(
+                    self.cta_tile_shape_mnk,
+                    self.c_layout,
+                    self.c_dtype,
+                    self.acc_dtype,
+                    fused_epi_tile,
+                    self.use_2cta_instrs,
+                )
+                fused_tAcc_epi = cute.flat_divide(
+                    tCtAcc_base[((None, None), 0, 0, None)],
+                    fused_epi_tile,
+                )
+                fused_tiled_copy_t2r = tcgen05.make_tmem_copy(
+                    fused_copy_atom_t2r,
+                    fused_tAcc_epi[(None, None, 0, 0, 0)],
+                )
+                fused_thr_copy_t2r = fused_tiled_copy_t2r.get_slice(epi_tidx)
+                fused_tTR_tAcc_base = fused_thr_copy_t2r.partition_S(fused_tAcc_epi)
+                fused_identity = cute.make_identity_tensor(self.cta_tile_shape_mnk[:2])
+                fused_identity_epi = cute.flat_divide(fused_identity, fused_epi_tile)
+                fused_tTR_identity = fused_thr_copy_t2r.partition_D(fused_identity_epi)
+                fused_tTR_rAcc = cute.make_rmem_tensor(
+                    fused_tTR_identity[(None, None, None, 0, 0)].shape,
+                    self.acc_dtype,
+                )
+                fused_tTR_rC = cute.make_rmem_tensor(
+                    fused_tTR_rAcc.shape,
+                    self.c_dtype,
+                )
+                (
+                    fused_tiled_copy_r2s,
+                    fused_tRS_rC,
+                    fused_tRS_sC,
+                ) = mixed_input_utils.epilog_smem_copy_and_partition(
+                    self.c_layout,
+                    self.c_dtype,
+                    self.acc_dtype,
+                    fused_tiled_copy_t2r,
+                    fused_tTR_rC,
+                    epi_tidx,
+                    sC_acc,
+                )
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
                 mixed_input_utils.epilog_tmem_copy_and_partition(
                     self.cta_tile_shape_mnk,
@@ -1737,6 +1841,15 @@ class Sm100W4A16GroupedGemmKernel:
                 epi_tile,
                 sC,
             )
+            if cutlass.const_expr(self.gated):
+                gC_epi = cute.local_tile(mC_mnl, epi_tile, (None, None, None))
+                bSG_sC, bSG_gC_partitioned = cpasync.tma_partition(
+                    tma_atom_c,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sC, 0, 2),
+                    cute.group_modes(gC_epi, 0, 2),
+                )
 
             # Predicates
             thr_mapping = cute.make_identity_tensor(
@@ -1756,7 +1869,7 @@ class Sm100W4A16GroupedGemmKernel:
                 32 * len(self.epilog_warp_id),
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
-                num_stages=self.num_c_stage,
+                num_stages=self.num_c_store_stage,
                 producer_group=c_producer_group,
             )
 
@@ -1777,28 +1890,31 @@ class Sm100W4A16GroupedGemmKernel:
             num_prev_subtiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
                 alpha_val = alpha[work_tile.group_idx]
-                bSG_gC = bSG_gC_partitioned[
-                    (
-                        None,
-                        None,
-                        None,
-                        work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
-                        0,
-                        0,
+                if cutlass.const_expr(self.gated):
+                    bSG_gC = bSG_gC_partitioned[(None, work_tile.cta_coord_m, None, 0)]
+                else:
+                    bSG_gC = bSG_gC_partitioned[
+                        (
+                            None,
+                            None,
+                            None,
+                            work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
+                            0,
+                            0,
+                        )
+                    ]
+                    tma_store_offset_coord = (
+                        (work_tile.coord_n, 0)
+                        if cutlass.const_expr(self.c_layout.is_n_major_c())
+                        else (0, work_tile.coord_n)
                     )
-                ]
-                tma_store_offset_coord = (
-                    (work_tile.coord_n, 0)
-                    if cutlass.const_expr(self.c_layout.is_n_major_c())
-                    else (0, work_tile.coord_n)
-                )
-                bSG_gC = cute.make_tensor(
-                    (
-                        tma_store_offset_coord[0] + bSG_gC.iterator[0],
-                        tma_store_offset_coord[1] + bSG_gC.iterator[1],
-                    ),
-                    bSG_gC.layout,
-                )
+                    bSG_gC = cute.make_tensor(
+                        (
+                            tma_store_offset_coord[0] + bSG_gC.iterator[0],
+                            tma_store_offset_coord[1] + bSG_gC.iterator[1],
+                        ),
+                        bSG_gC.layout,
+                    )
                 tTR_gC = tTR_gC_partitioned[
                     (
                         None,
@@ -1821,20 +1937,147 @@ class Sm100W4A16GroupedGemmKernel:
                 ]
                 # Wait for accumulator buffer full
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                if cutlass.const_expr(not self.gated):
+                    bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+
+                if cutlass.const_expr(self.gated):
+                    fused_tTR_tAcc = fused_tTR_tAcc_base[
+                        (None, None, None, None, None, acc_consumer_state.index)
+                    ]
+                    fused_subtile_cnt = cute.size(fused_tTR_tAcc.shape, mode=[4])
+                    gated_alpha_f32 = cutlass.Float32(alpha_val)
+                    for fused_subtile_idx in cutlass.range(fused_subtile_cnt):
+                        fused_tTR_tAcc_mn = fused_tTR_tAcc[
+                            (None, None, None, 0, fused_subtile_idx)
+                        ]
+                        cute.copy(
+                            fused_tiled_copy_t2r,
+                            fused_tTR_tAcc_mn,
+                            fused_tTR_rAcc,
+                        )
+                        fused_acc = fused_tiled_copy_r2s.retile(fused_tTR_rAcc).load()
+                        fused_acc = (gated_alpha_f32 * fused_acc).to(self.c_dtype)
+                        fused_tRS_rC.store(fused_acc)
+                        cute.copy(
+                            fused_tiled_copy_r2s,
+                            fused_tRS_rC,
+                            fused_tRS_sC[(None, None, None, 0)],
+                        )
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.epilog_sync_barrier.arrive_and_wait()
+                        num_prev_subtiles += 1
+                        c_buffer = num_prev_subtiles % self.num_c_store_stage
+                        output_elements_per_thread = (
+                            self.cta_tile_shape_mnk_c[0] * self.epi_tile_n
+                        ) // (32 * len(self.epilog_warp_id))
+                        neg_log2_e = cutlass.Float32(-1.4426950408889634)
+                        for i in cutlass.range_constexpr(
+                            0, output_elements_per_thread, 2
+                        ):
+                            output_idx_0 = epi_tidx + i * (
+                                32 * len(self.epilog_warp_id)
+                            )
+                            output_idx_1 = output_idx_0 + (
+                                32 * len(self.epilog_warp_id)
+                            )
+                            coord_m_0 = output_idx_0 % self.cta_tile_shape_mnk_c[0]
+                            coord_n_0 = output_idx_0 // self.cta_tile_shape_mnk_c[0]
+                            coord_m_1 = output_idx_1 % self.cta_tile_shape_mnk_c[0]
+                            coord_n_1 = output_idx_1 // self.cta_tile_shape_mnk_c[0]
+                            up = (
+                                cutlass.Float32(sC_acc[(coord_m_0, coord_n_0, 0)]),
+                                cutlass.Float32(sC_acc[(coord_m_1, coord_n_1, 0)]),
+                            )
+                            gate = (
+                                cutlass.Float32(
+                                    sC_acc[
+                                        (
+                                            coord_m_0 + self.cta_tile_shape_mnk_c[0],
+                                            coord_n_0,
+                                            0,
+                                        )
+                                    ]
+                                ),
+                                cutlass.Float32(
+                                    sC_acc[
+                                        (
+                                            coord_m_1 + self.cta_tile_shape_mnk_c[0],
+                                            coord_n_1,
+                                            0,
+                                        )
+                                    ]
+                                ),
+                            )
+                            gate_log2e = cute.arch.mul_packed_f32x2(
+                                gate, (neg_log2_e, neg_log2_e)
+                            )
+                            sigmoid = cute.arch.add_packed_f32x2(
+                                (
+                                    cute.math.exp2(gate_log2e[0], fastmath=True),
+                                    cute.math.exp2(gate_log2e[1], fastmath=True),
+                                ),
+                                (1.0, 1.0),
+                            )
+                            sigmoid = (
+                                cute.arch.rcp_approx(sigmoid[0]),
+                                cute.arch.rcp_approx(sigmoid[1]),
+                            )
+                            silu = cute.arch.mul_packed_f32x2(gate, sigmoid)
+                            result = cute.arch.mul_packed_f32x2(up, silu)
+                            sC[(coord_m_0, coord_n_0, c_buffer)] = self.c_dtype(
+                                result[0]
+                            )
+                            sC[(coord_m_1, coord_n_1, c_buffer)] = self.c_dtype(
+                                result[1]
+                            )
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.epilog_sync_barrier.arrive_and_wait()
+                        if warp_idx == self.epilog_warp_id[0]:
+                            cute.copy(
+                                tma_atom_c,
+                                bSG_sC[(None, c_buffer)],
+                                bSG_gC[
+                                    (
+                                        None,
+                                        work_tile.coord_n // self.epi_tile_n
+                                        + fused_subtile_idx,
+                                    )
+                                ],
+                            )
+                            c_pipeline.producer_commit()
+                            c_pipeline.producer_acquire()
+                        self.epilog_sync_barrier.arrive_and_wait()
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
                 tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
                 tma_distance_to_boundary = work_tile.distance_to_boundary
-                if cutlass.const_expr(self.deinterleave_output):
-                    tma_distance_to_boundary = cutlass.Int32(0)
 
                 # Store accumulator to global memory in subtiles
-                subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                subtile_cnt = (
+                    0
+                    if cutlass.const_expr(self.gated)
+                    else cute.size(tTR_tAcc.shape, mode=[3])
+                )
                 for subtile_idx in cutlass.range(subtile_cnt):
                     # Load accumulator from tensor memory buffer to register
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                    if cutlass.const_expr(self.fuse_activation):
+                        alpha_f32 = cutlass.Float32(alpha_val)
+                        acc_up = tTR_rAcc.load()
+                        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                            value = cute.arch.mul_packed_f32x2(
+                                (acc_up[i], acc_up[i + 1]),
+                                (alpha_f32, alpha_f32),
+                            )
+                            relu = (
+                                cute.arch.fmax(value[0], cutlass.Float32(0.0)),
+                                cute.arch.fmax(value[1], cutlass.Float32(0.0)),
+                            )
+                            tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
+                                relu, relu
+                            )
                     if cutlass.const_expr(self.use_fused_finalize):
                         finalize_thr_slice = m_thr_offset[
                             (None, None, None, subtile_idx)
@@ -1926,7 +2169,8 @@ class Sm100W4A16GroupedGemmKernel:
                     elif tma_distance_to_boundary >= self.cta_tile_shape_mnk[1]:
                         # Convert to C type
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                        acc_vec = cutlass.Float32(alpha_val) * acc_vec
+                        if cutlass.const_expr(not self.fuse_activation):
+                            acc_vec = cutlass.Float32(alpha_val) * acc_vec
                         acc_vec = acc_vec.to(self.c_dtype)
                         tRS_rC.store(acc_vec)
                         num_prev_subtiles += 1
@@ -1956,7 +2200,8 @@ class Sm100W4A16GroupedGemmKernel:
                     else:
                         # Convert to C type
                         acc_vec = tTR_rAcc.load()
-                        acc_vec = cutlass.Float32(alpha_val) * acc_vec
+                        if cutlass.const_expr(not self.fuse_activation):
+                            acc_vec = cutlass.Float32(alpha_val) * acc_vec
                         acc_vec = acc_vec.to(self.c_dtype)
                         tTR_rC.store(acc_vec)
                         # Compute predicate for SIMT store
@@ -1968,7 +2213,7 @@ class Sm100W4A16GroupedGemmKernel:
                         for i in cutlass.range(cute.size(tCpC), unroll_full=True):
                             tCpC[i] = (
                                 m_thr_slice[(i)][0]
-                                + work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
+                                + work_tile.cta_coord_m * self.cta_tile_shape_mnk_c[0]
                                 < cute.size(tensor_c.shape[0])
                             ) and (m_thr_slice[(i)][1] < work_tile.distance_to_boundary)
                         # Store C to global memory
@@ -2019,6 +2264,7 @@ class Sm100W4A16GroupedGemmKernel:
         smem_buffer_align_bytes: int,
         scale_mode: TransformMode,
         use_fused_finalize: bool,
+        gated: bool,
     ) -> tuple[int, int, int, int, int, int, int, int]:
         """
         Compute pipeline stages and TMEM column allocation configurations.
@@ -2102,7 +2348,8 @@ class Sm100W4A16GroupedGemmKernel:
             + bytes_per_pipeline_stage * num_tile_info_stage
         )
 
-        c_stage_count = 1 if use_fused_finalize else 2
+        c_store_stage_count = 1 if use_fused_finalize else 2
+        c_stage_count = c_store_stage_count + (2 if gated else 0)
         c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(
             c_dtype,
             c_layout,
