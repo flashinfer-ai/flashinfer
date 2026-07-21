@@ -66,38 +66,39 @@ def _ragged_block_scaled_bmm_kernel(
     pid = ct.bid(0)
 
     num_k_tiles = ct.num_tiles(a, axis=1, shape=(BLOCK_M, BLOCK_K))
-    # Override host max_m with device truth (see docstring).
-    max_m_runtime = ct.load(max_m_device, index=(0,), shape=(1,)).item()
-    num_pid_m = ct.cdiv(max_m_runtime, BLOCK_M)
     num_pid_n = ct.cdiv(n, BLOCK_N)
-    tiles_per_batch = num_pid_m * num_pid_n
-    total_tiles = tiles_per_batch * q
     num_programs = ct.num_blocks(0)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    # Persistent scheduling loop
-    for current_pid in range(pid, total_tiles, num_programs):
-        # Calculate pid_q, pid_m, pid_n with GROUP_SIZE_M swizzling
-        # pid_q = batch index
-        pid_q = current_pid // tiles_per_batch
-        pid_in_batch = current_pid % tiles_per_batch
-
-        group_id = pid_in_batch // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m_actual = ct.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
-
-        pid_m = first_pid_m + (pid_in_batch % group_size_m_actual)
-        pid_n = (pid_in_batch % num_pid_in_group) // group_size_m_actual
-
-        # Load segment boundaries using ct.load with dynamic index
+    # Per-expert (grouped-GEMM megakernel) schedule. The global tile list is the
+    # PREFIX SUM of each expert's REAL tile count `cdiv(valid_m, BLOCK_M) *
+    # num_pid_n`, so an imbalanced expert only adds its own extra M-tiles instead
+    # of the old uniform `cdiv(max_m, BLOCK_M)` grid, which inflated EVERY expert
+    # to the largest one's tile count (mostly-empty tiles the old `if pid_m*BLOCK_M
+    # < valid_m` guard then skipped). Each program strides the global list by
+    # num_programs. `max_m_device` is now unused for scheduling (kept in the
+    # signature for ABI / autotune-cache-key stability).
+    tile_idx = pid
+    last_problem_end = 0
+    for pid_q in range(q):
         m_start_tile = ct.load(m_indptr, index=(pid_q,), shape=(1,))
         m_start = m_start_tile.item()
         m_end_tile = ct.load(m_indptr, index=(pid_q + 1,), shape=(1,))
         m_end = m_end_tile.item()
         valid_m = m_end - m_start
+        num_pid_m = ct.cdiv(valid_m, BLOCK_M)
+        num_tiles_q = num_pid_m * num_pid_n
 
-        # Only process if this tile is within valid M range
-        if pid_m * BLOCK_M < valid_m:
+        # Consume the tiles this program owns within this expert's prefix range.
+        while (
+            tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles_q
+        ):
+            pid_in_batch = tile_idx - last_problem_end
+            group_id = pid_in_batch // num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            group_size_m_actual = ct.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + (pid_in_batch % group_size_m_actual)
+            pid_n = (pid_in_batch % num_pid_in_group) // group_size_m_actual
             # Compute tile-level offset into the flattened global A/C tensors.
             # This integer division is exact only when m_start is BLOCK_M-aligned;
             # the host only selects a BLOCK_M that divides the caller-declared
@@ -188,6 +189,9 @@ def _ragged_block_scaled_bmm_kernel(
 
             # Store to output C using TMA (direct global index, no slice)
             ct.store(c, index=(m_tile_start + pid_m, pid_n), tile=c_block)
+
+            tile_idx += num_programs
+        last_problem_end += num_tiles_q
 
 
 def _get_default_kernel_configs(
