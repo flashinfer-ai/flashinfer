@@ -25,6 +25,9 @@ Interfaces get **replicated** — new code copies the shape of existing code, so
 and especially **naming-convention adherence**. Framework separation: no Torch headers under
 `include/`.
 
+Watch for **reimplementation of helpers that already exist** in the library (e.g. dtype
+conversion utilities) — agent-written code is prone to duplicating them instead of reusing.
+
 ### Testing surface
 Tests guard software quality and tighten the verification loop. Does the change add/extend
 unit tests for the new behavior and edge cases? Are numerical references present
@@ -44,6 +47,10 @@ For a **performance optimization**, the PR description must report the observed 
 improvement: before/after numbers from a reproducible benchmark (e.g.
 `benchmarks/flashinfer_benchmark.py`), with the GPU and problem sizes used. A perf claim
 without numbers is not reviewable — ask for them.
+
+Note that the PR title and description normally become the commit title and message on
+(squash) merge. Humans and agents both rely on them when bisecting changes to identify
+owners and possible bugs — one more reason to keep both accurate.
 
 ### PR defendability
 A PR should be defendable by its human author — **to some extent**. Nowadays it is not
@@ -68,6 +75,10 @@ Where defendability matters more:
 
 ## Non-focus
 
+### Backwards compatibility (API breakage)
+Covered by a dedicated per-PR / per-merge QA check rather than code review, so reviewers
+do not need to audit for API breakage themselves.
+
 ### Kernel implementation details
 Deprioritized **for human reviewers**, because of limited attention span and a genuinely
 different programming model:
@@ -89,8 +100,8 @@ FlashInfer does not gate PRs by size. Instead, an **experimental** track is bein
 some PRs may be submitted on experimental terms — a separate lifecycle, workflow management,
 and quality bar — declared via a tracked issue.
 
-<!-- TODO: to be filled in by the owning team member — declaration workflow (tracked issue),
-review quality bar for experimental code, and graduation / removal criteria. -->
+<!-- TODO(@bkryu): declaration workflow (tracked issue), review quality bar for experimental
+code, and graduation / removal criteria. -->
 
 ## How to leverage agent review
 

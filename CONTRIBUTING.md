@@ -43,7 +43,9 @@ Code Contribution Procedure
 
 * **Use the default PR template.** When opening a PR, fill in the repository's PR template
   (`.github/pull_request_template.md`) — do not overwrite or replace it with a custom or
-  tool-generated description format.
+  tool-generated description format. The PR title and description normally become the commit
+  title and message on (squash) merge, and are relied on when bisecting changes to identify
+  owners and possible bugs — keep both accurate.
 * **Report performance results for optimizations.** If your PR is a performance optimization,
   report the observed performance improvement in the PR description: before/after numbers from
   a reproducible benchmark (e.g. `benchmarks/flashinfer_benchmark.py`), along with the GPU and

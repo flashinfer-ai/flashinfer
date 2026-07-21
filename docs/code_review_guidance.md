@@ -19,7 +19,9 @@ bugs there. See [Kernel review](#kernel-review).
 2. **Interface & API design.** Interfaces get replicated — review with "how will this be
    copied?" in mind. Check convention adherence (argument order, plan/run split, wrapper
    patterns, `@flashinfer_api` / `@backend_requirement`), naming, and extensibility. Framework
-   separation: no Torch headers under `include/`.
+   separation: no Torch headers under `include/`. Check for **reimplemented helpers**:
+   agent-written code tends to duplicate utilities that already exist in the library (e.g.
+   `torch_to_cutlass_dtype()`) — search for an existing helper before accepting a new one.
 3. **Testing surface.** New behavior and edge cases covered by unit tests; numerical refcheck
    present; correct architecture guards; and the code is actually testable.
 4. **Comments & docs.** Flag low-SNR / verbose comments — want concise, explain *why* not
@@ -33,7 +35,12 @@ bugs there. See [Kernel review](#kernel-review).
    (`.github/pull_request_template.md`), filled in — flag descriptions that overwrite it with
    a custom or tool-generated format. A **performance optimization** must report observed
    before/after numbers in the description (reproducible benchmark, GPU, problem sizes) —
-   flag perf claims without numbers.
+   flag perf claims without numbers. The PR title/description normally become the commit
+   title/message on (squash) merge and are relied on when bisecting — hold them to that
+   standard.
+
+**Out of scope:** backwards-compatibility / API-breakage auditing — covered by a dedicated
+per-PR / per-merge QA check, not code review.
 
 ## Kernel review
 
@@ -58,13 +65,14 @@ FlashInfer does not gate PRs by size. Some PRs may instead be submitted on **exp
 terms — a separate lifecycle, workflow management, and quality bar — declared via a tracked
 issue. Review such PRs against the experimental quality bar, not the durable-code bar.
 
-<!-- TODO: to be filled in by the owning team member — declaration workflow (tracked issue),
-review quality bar for experimental code, and graduation / removal criteria. -->
+<!-- TODO(@bkryu): declaration workflow (tracked issue), review quality bar for experimental
+code, and graduation / removal criteria. -->
 
 ## Checklist
 
 - [ ] Crash/OOB/overflow/allocation defects
-- [ ] API shape, naming, convention consistency; `include/` stays Torch-free
+- [ ] API shape, naming, convention consistency; `include/` stays Torch-free; no
+      reimplemented helpers that already exist in the library
 - [ ] Tests cover new behavior/edge cases; refcheck for numerics
 - [ ] Comments concise/high-SNR; docs in sync
 - [ ] Style deviations flagged (esp. durable/high-leverage code)
