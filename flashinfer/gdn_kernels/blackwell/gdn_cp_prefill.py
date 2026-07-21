@@ -16,7 +16,10 @@ from ..delta_rule_dsl.varlen_helper import (
     max_num_chunks_host,
     workspace_num_chunks_host,
 )
-from .gated_delta_net_cp import CPDeltaRuleMNPrecomputeUtcmma1Sm100
+from .gated_delta_net_cp import (
+    CPDeltaRuleMNPrecomputeUtcmma1Sm100,
+    CPDeltaRuleMNPrecomputeUtcmma2Sm100,
+)
 
 
 def _blackwell_arch(device: torch.device) -> cute.GPUArch:
@@ -137,6 +140,7 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
     max_seqlen: int | None = None,
     *,
     _skip_check: bool = False,
+    _kernel_kind: str = "utcmma_2sm",
 ):
     """Precompute local transfer and state workspaces on SM100."""
     import cuda.bindings.driver as cuda_driver
@@ -235,7 +239,13 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
     from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
         *args, **{**kwargs, "enable_tvm_ffi": True}
     )
-    kernel = CPDeltaRuleMNPrecomputeUtcmma1Sm100(kernel_dtype)
+    kernel: Any
+    if _kernel_kind == "utcmma_2sm":
+        kernel = CPDeltaRuleMNPrecomputeUtcmma2Sm100(kernel_dtype)
+    elif _kernel_kind == "utcmma_1sm":
+        kernel = CPDeltaRuleMNPrecomputeUtcmma1Sm100(kernel_dtype)
+    else:
+        raise ValueError(f"Unsupported MN precompute kernel kind: {_kernel_kind}")
     kernel_args = (
         from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
         from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),

@@ -1525,3 +1525,24 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(CPDeltaRuleMNPrecomputeSm120):
             )
         else:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
+
+
+class CPDeltaRuleMNPrecomputeUtcmma2Sm100(CPDeltaRuleMNPrecomputeUtcmma1Sm100):
+    """Split the transfer and state recurrences across a two-SM cluster."""
+
+    def __init__(self, dtype: Type[cutlass.Numeric]):
+        super().__init__(dtype)
+        self.is_two_sm = True
+        self.use_multicast = True
+        self.cluster_shape_mnk = (2, 1, 1)
+        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=32 * (len(self.compute_group_0_warp_ids) + 1),
+        )
+        self.tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=2,
+            num_threads=32 * (len(self.compute_group_1_warp_ids) + 1),
+        )
+        self.manual_cache_key(
+            "dtype", "acc_dtype", "BLK", "D", "is_two_sm", "use_multicast"
+        )
