@@ -29,6 +29,22 @@ def _next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+def _supports_trans_qk(device=None) -> bool:
+    """Datacenter-Blackwell predicate for the MLA TRANS_QK fast path.
+
+    The MLA TRANS_QK swap gives the QK-GEMM an M-dim of BLOCK_N (128) to fill the
+    wide WGMMA tile — a large win on sm100/sm103, but the transposed accumulator
+    is [BLOCK_D=512, BLOCK_H] which spills / cuts occupancy on the smaller SMs of
+    sm120 / SM89 / A100, regressing there. Gate it to datacenter Blackwell.
+    """
+    from flashinfer.utils import get_compute_capability
+
+    major, minor = get_compute_capability(
+        device if device is not None else torch.device("cuda")
+    )
+    return major >= 10 and (major, minor) not in ((12, 0), (12, 1))
+
+
 # Module-level tune caches for paged decode and MLA decode
 _decode_kv_paged_tune_cache: dict = {}
 _decode_mla_paged_tune_cache: dict = {}
@@ -818,6 +834,7 @@ def _decode_mla_kv_paged_kernel(
     stride_block_table,
     LOAD_BLOCK_N: ConstInt,
     NUM_PAGES_PER_BLOCK: ConstInt,
+    TRANS_QK: ConstBool,
 ):
     batch_id = ct.bid(0)
     head_block_id = ct.bid(1)
@@ -869,7 +886,14 @@ def _decode_mla_kv_paged_kernel(
 
     m_i = ct.full((BLOCK_H,), -math.inf, dtype=ct.float32)
     l_i = ct.full((BLOCK_H,), 1.0, dtype=ct.float32)
-    acc = ct.full((BLOCK_H, BLOCK_D), 0.0, dtype=ct.float32)
+    # TRANS_QK=True swaps the QK/PV MMA operands so the GEMM M-dim is BLOCK_N
+    # (large, fills the Blackwell WGMMA tile) instead of BLOCK_H (16/32). Only
+    # pays on datacenter Blackwell (sm100/sm103) wide MMA; the host gates it off
+    # elsewhere. The accumulator is transposed to match: [BLOCK_D, BLOCK_H].
+    if TRANS_QK:
+        acc = ct.full((BLOCK_D, BLOCK_H), 0.0, dtype=ct.float32)
+    else:
+        acc = ct.full((BLOCK_H, BLOCK_D), 0.0, dtype=ct.float32)
 
     for iter_idx in range(num_iters):
         curr_n = start_n + iter_idx * BLOCK_N
@@ -928,27 +952,55 @@ def _decode_mla_kv_paged_kernel(
                 LOAD_BLOCK_N,
             )
 
-        qk = ct.mma(
-            q_nope_tile,
-            ct.transpose(k_tile),
-            acc=ct.full((BLOCK_H, BLOCK_N), 0.0, dtype=ct.float32),
-        )
-        if BLOCK_R > 0:
-            qk = ct.mma(q_rope_tile, ct.transpose(k_rope_tile), acc=qk)
+        # QK: TRANS_QK swaps operands so M=BLOCK_N (large) instead of M=BLOCK_H.
+        if TRANS_QK:
+            qk = ct.mma(
+                k_tile,
+                ct.transpose(q_nope_tile),
+                acc=ct.full((BLOCK_N, BLOCK_H), 0.0, dtype=ct.float32),
+            )
+            if BLOCK_R > 0:
+                qk = ct.mma(k_rope_tile, ct.transpose(q_rope_tile), acc=qk)
+        else:
+            qk = ct.mma(
+                q_nope_tile,
+                ct.transpose(k_tile),
+                acc=ct.full((BLOCK_H, BLOCK_N), 0.0, dtype=ct.float32),
+            )
+            if BLOCK_R > 0:
+                qk = ct.mma(q_rope_tile, ct.transpose(k_rope_tile), acc=qk)
 
         if curr_n >= tail_n:
             offs_n = curr_n + offs_n_base
-            mask = ct.reshape((offs_n < end_n), (1, BLOCK_N))
-            qk = ct.where(
-                mask, qk, ct.full((BLOCK_H, BLOCK_N), -1.0e6, dtype=ct.float32)
+            if TRANS_QK:
+                mask = ct.reshape((offs_n < end_n), (BLOCK_N, 1))
+                qk = ct.where(
+                    mask, qk, ct.full((BLOCK_N, BLOCK_H), -1.0e6, dtype=ct.float32)
+                )
+            else:
+                mask = ct.reshape((offs_n < end_n), (1, BLOCK_N))
+                qk = ct.where(
+                    mask, qk, ct.full((BLOCK_H, BLOCK_N), -1.0e6, dtype=ct.float32)
+                )
+
+        # Online-softmax reduces over the N-dim: axis 0 when TRANS_QK (qk is
+        # [BLOCK_N, BLOCK_H]), axis 1 otherwise ([BLOCK_H, BLOCK_N]).
+        if TRANS_QK:
+            qk_max = ct.max(qk, axis=0, keepdims=False)
+            m_ij = ct.maximum(m_i, (qk_max * qk_scale))
+            p = ct.exp2(
+                qk * qk_scale - ct.reshape(m_ij, (1, BLOCK_H)), flush_to_zero=True
             )
-
-        qk_max = ct.max(qk, axis=1, keepdims=False)
-        m_ij = ct.maximum(m_i, (qk_max * qk_scale))
-        p = ct.exp2(qk * qk_scale - ct.reshape(m_ij, (BLOCK_H, 1)), flush_to_zero=True)
-
-        alpha = ct.exp2((m_i - m_ij), flush_to_zero=True)
-        l_i = l_i * alpha + ct.sum(p, axis=1, keepdims=False)
+            alpha = ct.exp2((m_i - m_ij), flush_to_zero=True)
+            l_i = l_i * alpha + ct.sum(p, axis=0, keepdims=False)
+        else:
+            qk_max = ct.max(qk, axis=1, keepdims=False)
+            m_ij = ct.maximum(m_i, (qk_max * qk_scale))
+            p = ct.exp2(
+                qk * qk_scale - ct.reshape(m_ij, (BLOCK_H, 1)), flush_to_zero=True
+            )
+            alpha = ct.exp2((m_i - m_ij), flush_to_zero=True)
+            l_i = l_i * alpha + ct.sum(p, axis=1, keepdims=False)
 
         if NUM_PAGES_PER_BLOCK == 1:
             # Reuse page_id from K load
@@ -975,15 +1027,31 @@ def _decode_mla_kv_paged_kernel(
                 LOAD_BLOCK_N,
             )
 
-        acc = acc * ct.reshape(alpha, (BLOCK_H, 1))
-        acc = ct.mma(ct.astype(p, q_nope.dtype), v_tile, acc=acc)
+        # PV: TRANS_QK keeps acc as [BLOCK_D, BLOCK_H] via mma(V^T, p).
+        if TRANS_QK:
+            acc = acc * ct.reshape(alpha, (1, BLOCK_H))
+            acc = ct.mma(ct.transpose(v_tile), ct.astype(p, q_nope.dtype), acc=acc)
+        else:
+            acc = acc * ct.reshape(alpha, (BLOCK_H, 1))
+            acc = ct.mma(ct.astype(p, q_nope.dtype), v_tile, acc=acc)
         m_i = m_ij
 
-    l_i_expanded = ct.reshape(l_i, (BLOCK_H, 1))
-    acc = ct.truediv(
-        (acc * V_SCALE), l_i_expanded, flush_to_zero=True, rounding_mode=RMd.APPROX
-    )
-    acc_out = ct.astype(acc, output.dtype)
+    # Epilogue: normalize by l_i, then (TRANS_QK) transpose [BLOCK_D, BLOCK_H] ->
+    # [BLOCK_H, BLOCK_D] so the store layout matches the non-transposed path.
+    if TRANS_QK:
+        acc = ct.truediv(
+            (acc * V_SCALE),
+            ct.reshape(l_i, (1, BLOCK_H)),
+            flush_to_zero=True,
+            rounding_mode=RMd.APPROX,
+        )
+        acc_out = ct.astype(ct.transpose(acc), output.dtype)
+    else:
+        l_i_expanded = ct.reshape(l_i, (BLOCK_H, 1))
+        acc = ct.truediv(
+            (acc * V_SCALE), l_i_expanded, flush_to_zero=True, rounding_mode=RMd.APPROX
+        )
+        acc_out = ct.astype(acc, output.dtype)
 
     acc_4d = ct.reshape(acc_out, (1, 1, BLOCK_H, BLOCK_D))
     ct.store(
@@ -1329,9 +1397,13 @@ def fmha_decode_bsr_cutile(
     return outputs
 
 
-def _mla_decode_autotune_configs():
+def _mla_decode_autotune_configs(trans_qk: bool = False):
     for bh in [16, 32]:
         for bn in [16, 32, 64, 128]:
+            if trans_qk and bn < 64:
+                # With TRANS_QK the QK-GEMM M-dim = BLOCK_N; Blackwell WGMMA needs
+                # M >= 64, so BLOCK_N < 64 defeats the whole point — skip it.
+                continue
             for occupancy in [1, 2]:
                 yield SimpleNamespace(BLOCK_H=bh, BLOCK_N=bn, occupancy=occupancy)
 
@@ -1359,6 +1431,7 @@ def _mla_decode_autotune_base(
     kv_len_per_split,
     HAS_LSE_OUT,
     stride_block_table,
+    TRANS_QK,
 ):
     mla_cache_key = (
         num_batch,
@@ -1370,12 +1443,13 @@ def _mla_decode_autotune_base(
         NUM_KV_SPLITS,
         kv_len_per_split,
         HAS_LSE_OUT,
+        TRANS_QK,
         q.dtype,
         str(q.device),
     )
     if mla_cache_key not in _decode_mla_paged_tune_cache:
         result = exhaustive_search(
-            list(_mla_decode_autotune_configs()),
+            list(_mla_decode_autotune_configs(TRANS_QK)),
             stream,
             lambda cfg: (
                 num_batch,
@@ -1407,6 +1481,7 @@ def _mla_decode_autotune_base(
                 stride_block_table,
                 min(cfg.BLOCK_N, page_size),
                 max(cfg.BLOCK_N // page_size, 1),
+                TRANS_QK,
             ),
             lambda cfg: {"occupancy": cfg.occupancy},
         )
@@ -1448,6 +1523,7 @@ def _mla_decode_autotune_base(
             stride_block_table,
             min(best_cfg.BLOCK_N, page_size),
             max(best_cfg.BLOCK_N // page_size, 1),
+            TRANS_QK,
         ),
     )
     return Att_Out
@@ -1475,6 +1551,10 @@ def decode_mla_kv_paged_cutile(
     page_size = kv_cache.shape[1]
 
     QUERY_GROUP_SIZE = num_qo_heads
+    # TRANS_QK swaps the QK/PV MMA operands so the GEMM M-dim is BLOCK_N; it only
+    # pays on datacenter Blackwell wide WGMMA (see _supports_trans_qk). Off the
+    # gate this stays False = the original M=BLOCK_H path (no regression).
+    TRANS_QK = QUERY_GROUP_SIZE < 64 and _supports_trans_qk(q.device)
 
     use_autotune = not _AUTOTUNE_DISABLED
     if use_autotune:
@@ -1567,6 +1647,7 @@ def decode_mla_kv_paged_cutile(
             kv_len_per_split,
             HAS_LSE_OUT,
             stride_block_table,
+            TRANS_QK,
         )
 
         if should_use_split_kv:
@@ -1712,6 +1793,7 @@ def decode_mla_kv_paged_cutile(
             stride_block_table,
             LOAD_BLOCK_N,
             NUM_PAGES_PER_BLOCK,
+            TRANS_QK,
         ),
     )
 
