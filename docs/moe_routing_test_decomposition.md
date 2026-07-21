@@ -69,11 +69,21 @@ Each step lands as its own commit. `[ ]` → `[x]` as they complete.
     `useDeepSeekFp8` are unused by the dispatcher — not exposed.
   - TODO (follow-up): TraceTemplate + `tests/trace/example.py` entry per the
     CLAUDE.md checklist, once the API shape has settled after GPU validation.
-- [ ] **Step 2 (Phase 2)** — dense routing-only test.
-  - `tests/moe/test_trtllm_gen_routing.py`: all routing methods ×
-    {top_k, num_experts, n_group/topk_group, routed_scaling, bias,
-    logits dtype, token counts incl. edges, tile_tokens_dim} vs
-    `routing_reference_*` oracles.
+- [x] **Step 2 (Phase 2)** — dense routing-only test. Code complete; GPU
+  validation happens in Step 3.
+  - `tests/moe/test_trtllm_gen_routing.py`: 9 routing methods ×
+    {top_k, num_experts, n_group/topk_group, bias dtype, logits dtype,
+    token counts incl. edges, tile_tokens_dim, load skew} vs the
+    `routing_reference_*` oracles (~2.2k cases, all routing-kernel-only).
+  - Selection/weights checked strictly (tie-free positive logits by
+    construction — the shared `routing_reference` oracle ranks the masked
+    dense weight matrix, which breaks for negative routed weights);
+    permutation checked via invariants (round-trip, per-expert padded
+    segments, uniqueness) since intra-expert order is not part of the
+    contract.
+  - Deferred: EP shards (`local_expert_offset > 0`),
+    `num_fused_shared_experts > 0`, routing-replay output — follow-ups after
+    the base op is validated.
 - [ ] **Step 3** — validate Steps 1–2 on a B200 (remote ws1 workflow).
 - [ ] **Step 4 (Phase 3)** — collapse routing axis in fused tests.
   - `test_trtllm_gen_routed_fused_moe.py`: routing_method 3→1 on the flagship
