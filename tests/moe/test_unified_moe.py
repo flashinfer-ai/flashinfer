@@ -14,7 +14,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Two halves:
+Two sections:
 
   * CPU-only config/dataclass tests (no GPU or JIT). These track the actual MVP
     API surface (single-knob ``QuantVariant``, explicit
@@ -44,7 +44,11 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     TrtllmFp4RoutedRunner,
 )
-from flashinfer.fused_moe.runners import TrtllmBf16RoutedRunner
+from flashinfer.fused_moe.runners import (
+    CuteDslNvfp4Runner,
+    MoERunner,
+    TrtllmBf16RoutedRunner,
+)
 from flashinfer.fused_moe.api import (
     ActivationConfig,
     ActivationType,
@@ -73,8 +77,6 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
     create_moe_tensors,
     is_sm100_family,
 )
-
-
 # ---------------------------------------------------------------------------
 # Enum repr round-trip
 # ---------------------------------------------------------------------------
@@ -510,7 +512,7 @@ class TestExpressiveness:
             backend=BackendOptions((CutlassConfig(),)),
         )
         # CUTLASS uses modular (pre-routed) dispatch — supplied at call time via
-        # MoEActivationPack (selected_experts/final_scales), not via config
+        # MoEActivationPack (topk_ids/topk_weights), not via config
         assert any(isinstance(c, CutlassConfig) for c in cfg.backend)
 
     def test_cutedsl_nvfp4(self):
@@ -567,13 +569,11 @@ class TestExpressiveness:
 
 
 # ---------------------------------------------------------------------------
-# MoELayer MVP fail-fast validation (CR6)
+# Unified runner support validation
 # ---------------------------------------------------------------------------
-# These exercise MoELayer._validate_mvp_scope, which runs at construction time
-# before any device/runner setup, so they need no GPU.
 
 
-class TestMoELayerMVPValidation:
+class TestMoERunnerSupport:
     def _nvfp4_swiglu(self, **overrides):
         base = dict(
             routing=RoutingConfig(num_experts=32, top_k=2),
@@ -585,28 +585,55 @@ class TestMoELayerMVPValidation:
         return MoEConfig(**base)
 
     @pytest.mark.parametrize(
-        "variant",
-        # NVFP4 (CuteDSL/TRTLLM-FP4) and BF16 (TRTLLM-BF16, the EP grouped-GEMM
-        # path) are both MVP-supported now; everything else is still rejected.
-        [v for v in QuantVariant if v not in (QuantVariant.NVFP4, QuantVariant.BF16)],
+        "runner_type,variant",
+        (
+            (CuteDslNvfp4Runner, QuantVariant.BF16),
+            (TrtllmFp4RoutedRunner, QuantVariant.BF16),
+            (TrtllmBf16RoutedRunner, QuantVariant.NVFP4),
+        ),
     )
-    def test_non_nvfp4_quant_rejected(self, variant):
-        from flashinfer.fused_moe import MoELayer
-
+    def test_unsupported_quant_variant_rejected(self, runner_type, variant):
         cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
-        with pytest.raises(NotImplementedError, match="NVFP4"):
-            MoELayer(cfg)
+        runner = runner_type.__new__(runner_type)
+        runner.config = cfg
+        with pytest.raises(NotImplementedError, match=f"QuantVariant.{variant.name}"):
+            runner.check_support()
 
     @pytest.mark.parametrize(
         "act",
         [a for a in ActivationType if a is not ActivationType.Swiglu],
     )
-    def test_non_swiglu_activation_rejected(self, act):
-        from flashinfer.fused_moe import MoELayer
-
-        cfg = self._nvfp4_swiglu(activation=ActivationConfig(type=act))
+    @pytest.mark.parametrize(
+        "runner_type,variant",
+        (
+            (CuteDslNvfp4Runner, QuantVariant.NVFP4),
+            (TrtllmFp4RoutedRunner, QuantVariant.NVFP4),
+            (TrtllmBf16RoutedRunner, QuantVariant.BF16),
+        ),
+    )
+    def test_non_swiglu_activation_not_supported(self, runner_type, variant, act):
+        cfg = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=variant),
+            activation=ActivationConfig(type=act),
+        )
+        runner = runner_type.__new__(runner_type)
+        runner.config = cfg
         with pytest.raises(NotImplementedError, match="Swiglu"):
-            MoELayer(cfg)
+            runner.check_support()
+
+    def test_moe_runner_quant_support_check(self):
+        class Runner(MoERunner):
+            supported_quant_variants = (QuantVariant.NVFP4,)
+
+            def get_valid_tactics(self, inputs, profile):
+                return []
+
+            def forward(self, inputs, **kwargs):
+                return None
+
+        runner = Runner()
+        runner.config = self._nvfp4_swiglu()
+        assert runner.check_support() is None
 
 
 # ---------------------------------------------------------------------------

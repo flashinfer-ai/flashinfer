@@ -17,6 +17,8 @@ limitations under the License.
 # Unified MoE API
 from .api import (  # noqa: F401
     ActivationConfig,
+    B12xNvfp4Config,
+    B12xW4A16Config,
     BackendOptions,
     CuteDslConfig,
     CutlassConfig,
@@ -35,7 +37,12 @@ from .api import (  # noqa: F401
     TrtllmMxInt4Config,
 )
 from .layer import MoELayer  # noqa: F401
-from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner  # noqa: F401
+from .runners import (  # noqa: F401
+    B12xNvfp4Runner,
+    B12xW4A16Runner,
+    CuteDslNvfp4Runner,
+    TrtllmFp4RoutedRunner,
+)
 
 # Legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
@@ -115,6 +122,10 @@ except ImportError:
 __all__ = [
     # Unified API
     "ActivationConfig",
+    "B12xNvfp4Config",
+    "B12xNvfp4Runner",
+    "B12xW4A16Config",
+    "B12xW4A16Runner",
     "BackendOptions",
     "CuteDslConfig",
     "CutlassConfig",
