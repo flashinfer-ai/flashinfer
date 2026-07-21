@@ -4714,11 +4714,6 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   // FP4 sizes
   bool const use_humming_pre_mma = isHummingPreMmaScaleMode();
   size_t const fp8_mxfp4_token_scale_size = num_expanded_tokens * sizeof(float);
-  // Plain NVFP4 x NVFP4 (act nvfp4 + weight nvfp4). Before #3738 this was sized
-  // by the broad `is_fp4_w_quant` block; that block was replaced by the two
-  // Wfp4Afp8 branches below (both require FP8 activation, mDType == kFP8), which
-  // dropped coverage for the nvfp4-activation case and left quant_1..6 sized 0,
-  // tripping the TLLM_CHECK in prepare()'s FP4 consumer branch (nvbug 6469722).
   // The sizes are identical to the is_native_wfp4afp8_family branch.
   bool const is_nvfp4_quant =
       mSM >= 100 && (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
