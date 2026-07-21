@@ -507,10 +507,16 @@ def _prefill_attention_paged_body(
         # real data, not zeros) into the softmax. No-op when off_band_hi is a
         # multiple of BLOCK_N (the single-page case), so single-page results are bit-identical.
         offs_n = curr_n + offs_n_base
-        boundary_mask = ct.reshape((offs_n < off_band_hi), (1, BLOCK_N))
-        qk = ct.where(
-            boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
-        )
+        # Skip only when single-page (BLOCK_N == LOAD_BLOCK_N) AND causal:
+        # off_band_hi == start_m is then BLOCK_N-aligned (no overshoot) and no
+        # multi-page load can pull real page-0 data, so the mask is a no-op.
+        # Multi-page or non-causal still need it. Verified vs torch ref incl.
+        # non-BLOCK_N-aligned seq lens.
+        if BLOCK_N > LOAD_BLOCK_N or not IS_CAUSAL:
+            boundary_mask = ct.reshape((offs_n < off_band_hi), (1, BLOCK_N))
+            qk = ct.where(
+                boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
+            )
 
         # Online softmax with flush_to_zero for IR parity with Triton
         qk_max = ct.max(qk, axis=1, keepdims=False)
@@ -587,10 +593,15 @@ def _prefill_attention_paged_body(
             # clamped to seq_len_kv and the causal mask alone (offs_m >= offs_n)
             # does not exclude past-seq_len_kv positions that a multi-page BLOCK_N
             # can pull in. No-op when seq_len_kv is a multiple of BLOCK_N.
-            boundary_mask = ct.reshape((offs_n < seq_len_kv), (1, BLOCK_N))
-            qk = ct.where(
-                boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
-            )
+            # On-band loop runs only when causal. Single-page: the seq_len_kv tail
+            # is already excluded by the causal mask (garbage offs_n >= seq_len_kv
+            # > offs_m for every stored query row), so skip. Multi-page can pull
+            # page-0 data past the band -> keep.
+            if BLOCK_N > LOAD_BLOCK_N:
+                boundary_mask = ct.reshape((offs_n < seq_len_kv), (1, BLOCK_N))
+                qk = ct.where(
+                    boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
+                )
 
             qk_max = ct.max(qk, axis=1, keepdims=False)
             m_ij = ct.maximum(m_i, (qk_max * qk_scale))
@@ -929,7 +940,9 @@ def _prefill_attention_ragged_body(
         # PAD_ZERO-loaded, so padded columns have qk == 0 and would otherwise add
         # exp2(-m_ij) mass to the softmax denominator (their V rows are zero, so
         # only the denominator is corrupted). No-op when off_band_hi is a multiple
-        # of BLOCK_N.
+        # of BLOCK_N. (Kept unconditional: the ragged KV is PAD_ZERO-loaded, so
+        # this drops padded columns from the softmax denominator — a different
+        # mechanism from the paged page-0 case; gating it broke ragged tests.)
         offs_n = curr_n + offs_n_base
         boundary_mask = ct.reshape((offs_n < off_band_hi), (1, BLOCK_N))
         qk = ct.where(
