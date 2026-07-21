@@ -137,7 +137,7 @@ class ArtifactPath:
 
     TRTLLM_GEN_FMHA: str = "ce0795149bb2a183db22de04a3fec3aca65fff04/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "316be87010858eb95c58c1605789099e92bcb57b/batched_gemm-1f0932d-dirty-eb6f7f4/"
+        "c67f69f4f3aa0fce3e67082373211c2c72911b31/batched_gemm-4ade271-cafbfa2/"
     )
     TRTLLM_GEN_GEMM: str = (
         "10f64528a1172dae8e29601a3b99ab9dc78d37be/gemm-91e0ba0-2710384/"
@@ -173,7 +173,7 @@ class CheckSumHash:
         "a8d5d3e86f5ee7dfecd36a8d6cf9a933ca0cb8225a2f954f0212c5db2d250f40"
     )
     TRTLLM_GEN_BMM: str = (
-        "013b447658e3a8baec18f9458e0655cfbb49ca445e126eb5365011e4208c4c6b"
+        "6bcf95d82c3b18025895c40ac089365b7655d549ada381bda27336f34dd4af37"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     DEEPGEMM_RUBIN: str = (
