@@ -1,0 +1,930 @@
+#!/usr/bin/env python3
+"""Distributed CuTe DSL DeepSeek-V3 MoE benchmark.
+
+Compares two activation contracts over the same routed-MoE workload:
+
+- W4A4 quantizes BF16 activations to NVFP4 before the MoE, using per-tensor
+  scaling by default or per-token scaling with ``--use-per-token-activation``.
+- W4A16 keeps activations in BF16 and decodes NVFP4 weights online.
+
+Use torchrun to benchmark both real expert- and tensor-parallel communication:
+
+    torchrun --standalone --nproc-per-node=8 \\
+        benchmarks/bench_cute_dsl_moe_distributed.py
+
+Use ``--mode profile --num-tokens <N>`` to print a semantic runtime breakdown
+for each variant. The same stages are emitted as NVTX ranges for deeper Nsight
+Systems inspection without relying on kernel-name matching.
+"""
+
+import argparse
+import gc
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+
+from bench_moe_deepseek import (
+    BASE_INTERMEDIATE_SIZE,
+    CFG,
+    is_sm100_family,
+)
+
+DISTRIBUTED_TOKEN_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+
+
+@dataclass(frozen=True)
+class BenchVariant:
+    name: str
+    quantize_input: bool
+
+
+BENCH_VARIANTS = (
+    BenchVariant("w4a4", quantize_input=True),
+    BenchVariant("w4a16", quantize_input=False),
+)
+
+
+@dataclass
+class DistributedBenchResult:
+    num_tokens: int
+    e2e_ms: float
+    breakdown_ms: dict[str, float] | None = None
+
+
+def _distributed_moe_config(
+    args,
+    variant,
+    intermediate_size,
+    num_local_experts,
+    local_expert_offset,
+    tune_max_num_tokens,
+):
+    from flashinfer.fused_moe import (
+        BackendOptions,
+        CuteDslConfig,
+        ExecutionConfig,
+        ExpertConfig,
+        MoEConfig,
+        QuantConfig,
+        QuantVariant,
+        RoutingConfig,
+    )
+
+    return MoEConfig(
+        routing=RoutingConfig(num_experts=CFG.num_experts, top_k=CFG.top_k),
+        quant=QuantConfig(
+            variant=QuantVariant.NVFP4,
+            per_token_scale=args.use_per_token_activation and variant.quantize_input,
+            quantize_input=variant.quantize_input,
+        ),
+        experts=ExpertConfig(
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=num_local_experts,
+        ),
+        backend=BackendOptions(candidates=(CuteDslConfig(),)),
+        execution=ExecutionConfig(
+            enable_pdl=args.enable_pdl,
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_fused_finalize=args.use_fused_finalize,
+        ),
+    )
+
+
+def _create_distributed_weights(num_local_experts, intermediate_size, rank, device):
+    generator = torch.Generator(device=device).manual_seed(1000 + rank)
+    w13 = (
+        torch.randn(
+            num_local_experts,
+            2 * intermediate_size,
+            CFG.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        / 10
+    )
+    w2 = (
+        torch.randn(
+            num_local_experts,
+            CFG.hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        / 10
+    )
+    return w13, w2
+
+
+def _token_partition(num_tokens, rank, world_size):
+    tokens_per_rank, remainder = divmod(num_tokens, world_size)
+    local_num_tokens = tokens_per_rank + int(rank < remainder)
+    token_offset = rank * tokens_per_rank + min(rank, remainder)
+    return local_num_tokens, token_offset
+
+
+def _create_distributed_inputs(num_tokens, rank, world_size, device):
+    local_num_tokens, token_offset = _token_partition(num_tokens, rank, world_size)
+    input_generator = torch.Generator(device=device).manual_seed(42 + rank)
+    hidden_states = (
+        torch.randn(
+            local_num_tokens,
+            CFG.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=input_generator,
+        )
+        / 10
+    )
+    routing_generator = torch.Generator(device=device).manual_seed(137)
+    global_router_logits = torch.randn(
+        num_tokens,
+        CFG.num_experts,
+        dtype=torch.float32,
+        device=device,
+        generator=routing_generator,
+    )
+    router_logits = global_router_logits.narrow(0, token_offset, local_num_tokens)
+    bias_generator = torch.Generator(device=device).manual_seed(911)
+    routing_bias = (
+        torch.randn(
+            CFG.num_experts,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=bias_generator,
+        )
+        * 0.01
+    ).float()
+    return hidden_states, router_logits, global_router_logits, routing_bias
+
+
+def _route_tokens(router_logits, routing_bias, topk_values, topk_indices):
+    from flashinfer.fused_moe import fused_topk_deepseek
+
+    if router_logits.shape[0] == 0:
+        return
+    fused_topk_deepseek(
+        scores=router_logits,
+        bias=routing_bias,
+        n_group=CFG.n_group,
+        topk_group=CFG.topk_group,
+        topk=CFG.top_k,
+        routed_scaling_factor=CFG.routed_scaling_factor,
+        topk_values=topk_values,
+        topk_indices=topk_indices,
+    )
+
+
+def _max_rank_sample(value, dist, device):
+    sample = torch.tensor(value, dtype=torch.float64, device=device)
+    dist.all_reduce(sample, op=dist.ReduceOp.MAX)
+    return sample.item()
+
+
+def _critical_rank_profile(timings, dist, device):
+    names = tuple(timings)
+    end_to_end_index = names.index("end-to-end")
+    local_sample = torch.tensor(
+        [timings[name] for name in names], dtype=torch.float64, device=device
+    )
+    rank_samples = [
+        torch.empty_like(local_sample) for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather(rank_samples, local_sample)
+    critical_sample = max(
+        rank_samples, key=lambda sample: sample[end_to_end_index].item()
+    )
+    return dict(zip(names, critical_sample.tolist(), strict=True))
+
+
+def _record_profile_iteration(stage_calls):
+    stage_events = []
+    e2e_start = torch.cuda.Event(enable_timing=True)
+    e2e_end = torch.cuda.Event(enable_timing=True)
+
+    e2e_start.record()
+    for name, stage_call in stage_calls:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        torch.cuda.nvtx.range_push(name)
+        start.record()
+        stage_call()
+        end.record()
+        torch.cuda.nvtx.range_pop()
+        stage_events.append((name, start, end))
+    e2e_end.record()
+    e2e_end.synchronize()
+
+    timings = {name: start.elapsed_time(end) for name, start, end in stage_events}
+    timings["end-to-end"] = e2e_start.elapsed_time(e2e_end)
+    return timings
+
+
+def _run_distributed_iterations(
+    args,
+    num_tokens,
+    run_once,
+    profile_once,
+    l2_flush,
+    dist,
+    device,
+    profile_label,
+):
+    for _ in range(args.warmup):
+        run_once()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    if args.mode == "profile":
+        samples_by_stage = {}
+        torch.cuda.cudart().cudaProfilerStart()
+        torch.cuda.nvtx.range_push(profile_label)
+        for _ in range(args.profile_iters):
+            l2_flush.zero_()
+            torch.cuda.synchronize()
+            dist.barrier()
+            timings = _critical_rank_profile(profile_once(), dist, device)
+            for name, value in timings.items():
+                samples_by_stage.setdefault(name, []).append(value)
+        torch.cuda.synchronize()
+        dist.barrier()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.cudart().cudaProfilerStop()
+        breakdown_ms = {
+            name: float(np.median(samples))
+            for name, samples in samples_by_stage.items()
+        }
+        return DistributedBenchResult(
+            num_tokens,
+            breakdown_ms["end-to-end"],
+            breakdown_ms,
+        )
+
+    samples = []
+    for _ in range(args.iters):
+        l2_flush.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
+        e2e_start = torch.cuda.Event(enable_timing=True)
+        e2e_end = torch.cuda.Event(enable_timing=True)
+        e2e_start.record()
+        run_once()
+        e2e_end.record()
+        e2e_end.synchronize()
+        samples.append(_max_rank_sample(e2e_start.elapsed_time(e2e_end), dist, device))
+    return DistributedBenchResult(num_tokens, float(np.median(samples)))
+
+
+def _benchmark_distributed_ep(
+    args,
+    variant,
+    num_tokens,
+    max_tokens_per_rank_budget,
+    rank,
+    world_size,
+    device,
+):
+    import torch.distributed as dist
+
+    from flashinfer.comm import MoeAlltoAll
+    from flashinfer.comm.mapping import Mapping
+    from flashinfer.comm.mnnvl import MnnvlConfig, TorchDistBackend
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
+    from flashinfer.testing.utils import get_l2_cache_size
+
+    def run_setup_phase(name, fn):
+        prefix = (
+            f"[rank {rank}] EP setup variant={variant.name} tokens={num_tokens} {name}"
+        )
+        print(f"{prefix}: start", flush=True)
+        result = fn()
+        torch.cuda.synchronize()
+        print(f"{prefix}: complete", flush=True)
+        dist.barrier()
+        return result
+
+    local_num_tokens, _ = _token_partition(num_tokens, rank, world_size)
+    runtime_max_tokens_per_rank = (num_tokens + world_size - 1) // world_size
+    num_local_experts = CFG.num_experts // world_size
+    local_expert_offset = rank * num_local_experts
+    layer, weight_pack = run_setup_phase(
+        "local MoE construction",
+        lambda: _create_distributed_moe_layer(
+            args,
+            variant,
+            CFG.intermediate_size,
+            num_local_experts,
+            local_expert_offset,
+            max_tokens_per_rank_budget * world_size,
+            rank,
+            device,
+        ),
+    )
+    mapping = Mapping(
+        rank=rank,
+        tp_size=world_size,
+        moe_ep_size=world_size,
+        world_size=world_size,
+        gpus_per_node=world_size,
+        pp_size=1,
+        cp_size=1,
+    )
+    workspace_size_per_rank = MoeAlltoAll.get_moe_workspace_size_per_rank(
+        world_size,
+        CFG.top_k,
+        max_tokens_per_rank_budget,
+        CFG.hidden_size,
+    )
+    moe_a2a = run_setup_phase(
+        "MoeAlltoAll construction",
+        lambda: MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=max_tokens_per_rank_budget,
+            top_k=CFG.top_k,
+            num_experts=CFG.num_experts,
+            workspace_size_per_rank=workspace_size_per_rank,
+            mnnvl_config=MnnvlConfig(comm_backend=TorchDistBackend(dist.group.WORLD)),
+        ),
+    )
+    hidden_states, router_logits, _, routing_bias = _create_distributed_inputs(
+        num_tokens, rank, world_size, device
+    )
+    topk_values = torch.empty(
+        local_num_tokens, CFG.top_k, dtype=torch.float32, device=device
+    )
+    topk_indices = torch.empty(
+        local_num_tokens, CFG.top_k, dtype=torch.int32, device=device
+    )
+    global_scale = None
+    if variant.quantize_input:
+        global_scale = make_nvfp4_global_scale(
+            hidden_states,
+            per_token_activation=args.use_per_token_activation,
+            global_scale=1.0,
+            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        )
+    l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
+
+    def dispatch():
+        # Match SGLang's FlashInfer dispatcher: send BF16 activations with the
+        # routing payloads, then sanitize routes this rank does not own.
+        recv_hidden_states, recv_topk_indices, recv_topk_values = moe_a2a.dispatch(
+            topk_indices,
+            [hidden_states, topk_indices, topk_values],
+            runtime_max_tokens_per_rank,
+            invalid_token_expert_id=CFG.num_experts,
+            expert_id_payload_index=1,
+        )
+        num_received_tokens = world_size * runtime_max_tokens_per_rank
+        return (
+            recv_hidden_states.view(num_received_tokens, CFG.hidden_size),
+            recv_topk_indices.view(num_received_tokens, CFG.top_k),
+            recv_topk_values.view(num_received_tokens, CFG.top_k),
+        )
+
+    def compute(recv_hidden_states, recv_topk_indices, recv_topk_values):
+        activation_pack = _make_distributed_activation_pack(
+            args,
+            variant,
+            recv_hidden_states,
+            recv_topk_indices,
+            recv_topk_values,
+            global_scale,
+        )
+        return layer(activation_pack, weight_pack)
+
+    def combine(local_output):
+        # SGLang's CuTe DSL runner does not write into the A2A workspace, so
+        # combine stages the local output before returning it to source ranks.
+        return moe_a2a.combine(
+            local_output.view(world_size, runtime_max_tokens_per_rank, CFG.hidden_size),
+            runtime_max_tokens_per_rank,
+        )
+
+    def run_once():
+        _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
+        combine(compute(*dispatch()))
+
+    profile_state = {}
+
+    def profile_dispatch():
+        profile_state["dispatched"] = dispatch()
+
+    def profile_activation_prep():
+        profile_state["activation_pack"] = _make_distributed_activation_pack(
+            args,
+            variant,
+            *profile_state["dispatched"],
+            global_scale,
+        )
+
+    def profile_local_moe():
+        profile_state["local_output"] = layer(
+            profile_state["activation_pack"], weight_pack
+        )
+
+    def profile_once():
+        return _record_profile_iteration(
+            (
+                (
+                    "routing",
+                    lambda: _route_tokens(
+                        router_logits, routing_bias, topk_values, topk_indices
+                    ),
+                ),
+                ("dispatch", profile_dispatch),
+                ("activation prep/quant", profile_activation_prep),
+                ("local MoE", profile_local_moe),
+                ("combine", lambda: combine(profile_state["local_output"])),
+            )
+        )
+
+    # Finish the setup collective before CuTe DSL selects a tactic. Inference
+    # warmup likewise tunes the local runner outside the steady-state A2A phase.
+    run_setup_phase(
+        "routing",
+        lambda: _route_tokens(router_logits, routing_bias, topk_values, topk_indices),
+    )
+    dispatched_inputs = run_setup_phase("dispatch", dispatch)
+    tuning_inputs = run_setup_phase(
+        "preserve dispatched inputs",
+        lambda: tuple(tensor.clone() for tensor in dispatched_inputs),
+    )
+    run_setup_phase(
+        "combine",
+        lambda: combine(
+            torch.zeros(
+                world_size * runtime_max_tokens_per_rank,
+                CFG.hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        ),
+    )
+    run_setup_phase("CuTe DSL tactic selection", lambda: compute(*tuning_inputs))
+
+    return _run_distributed_iterations(
+        args,
+        num_tokens,
+        run_once,
+        profile_once,
+        l2_flush,
+        dist,
+        device,
+        f"ep::{variant.name}",
+    )
+
+
+def _make_distributed_activation_pack(
+    args,
+    variant,
+    hidden_states,
+    topk_indices,
+    topk_values,
+    global_scale,
+):
+    from flashinfer.fused_moe import MoEActivationPack
+
+    if not variant.quantize_input:
+        return MoEActivationPack(
+            hidden_states_q=hidden_states,
+            hidden_states_scale=None,
+            topk_ids=topk_indices,
+            topk_weights=topk_values,
+        )
+
+    from flashinfer import SfLayout, nvfp4_quantize
+    from flashinfer.fp4_quantization import fp4_quantize
+
+    if args.use_per_token_activation:
+        hidden_states_q, hidden_states_scale, per_token_scale = nvfp4_quantize(
+            hidden_states,
+            global_scale,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+    else:
+        hidden_states_q, hidden_states_scale = fp4_quantize(
+            hidden_states,
+            global_scale,
+            16,
+            False,
+            False,
+            backend="cute-dsl",
+        )
+        per_token_scale = None
+    if hidden_states_scale.dim() > 2:
+        hidden_states_scale = hidden_states_scale.squeeze(-1)
+    return MoEActivationPack(
+        hidden_states_q=hidden_states_q,
+        hidden_states_scale=hidden_states_scale,
+        topk_ids=topk_indices,
+        topk_weights=topk_values,
+        per_token_scale=per_token_scale,
+    )
+
+
+def _create_distributed_moe_layer(
+    args,
+    variant,
+    intermediate_size,
+    num_local_experts,
+    local_expert_offset,
+    tune_max_num_tokens,
+    rank,
+    device,
+):
+    from flashinfer.fused_moe import CuteDslConfig, MoELayer, MoEWeightPack
+
+    moe_config = _distributed_moe_config(
+        args,
+        variant,
+        intermediate_size,
+        num_local_experts,
+        local_expert_offset,
+        tune_max_num_tokens,
+    )
+    w13, w2 = _create_distributed_weights(
+        num_local_experts, intermediate_size, rank, device
+    )
+    weight_pack = MoEWeightPack()
+    weight_pack.prepare_for(
+        "cute_dsl_nvfp4",
+        CuteDslConfig.prepare_weights(
+            w13,
+            w2,
+            num_local_experts=num_local_experts,
+            hidden_size=CFG.hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        ),
+    )
+    return MoELayer(moe_config, device=device), weight_pack
+
+
+def _benchmark_distributed_tp(
+    args, variant, num_tokens, rank, world_size, device, report_backend=False
+):
+    import torch.distributed as dist
+
+    from flashinfer.comm import (
+        AllReduceFusionPattern,
+        allreduce_fusion,
+        create_allreduce_fusion_workspace,
+    )
+    from flashinfer.comm.mnnvl import TorchDistBackend
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
+    from flashinfer.testing.utils import get_l2_cache_size
+
+    intermediate_size = BASE_INTERMEDIATE_SIZE // world_size
+    layer, weight_pack = _create_distributed_moe_layer(
+        args,
+        variant,
+        intermediate_size,
+        CFG.num_experts,
+        0,
+        num_tokens,
+        rank,
+        device,
+    )
+    local_hidden_states, _, router_logits, routing_bias = _create_distributed_inputs(
+        num_tokens, rank, world_size, device
+    )
+    topk_values = torch.empty(num_tokens, CFG.top_k, dtype=torch.float32, device=device)
+    topk_indices = torch.empty(num_tokens, CFG.top_k, dtype=torch.int32, device=device)
+    hidden_states = torch.empty(
+        num_tokens,
+        CFG.hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    gathered_hidden_states = list(
+        hidden_states.split(
+            [_token_partition(num_tokens, r, world_size)[0] for r in range(world_size)]
+        )
+    )
+    dist.all_gather(gathered_hidden_states, local_hidden_states)
+    global_scale = None
+    if variant.quantize_input:
+        global_scale = make_nvfp4_global_scale(
+            hidden_states,
+            per_token_activation=args.use_per_token_activation,
+            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        )
+    allreduce_output = torch.empty_like(hidden_states)
+    workspace = create_allreduce_fusion_workspace(
+        backend=args.allreduce_backend,
+        world_size=world_size,
+        rank=rank,
+        max_token_num=num_tokens,
+        hidden_dim=CFG.hidden_size,
+        dtype=torch.bfloat16,
+        gpus_per_node=world_size,
+        comm_backend=TorchDistBackend(),
+    )
+    if rank == 0 and report_backend:
+        print(f"FlashInfer all-reduce backend: {workspace.backend}")
+    l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
+
+    def run_once():
+        dist.all_gather(gathered_hidden_states, local_hidden_states)
+        _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
+        activation_pack = _make_distributed_activation_pack(
+            args,
+            variant,
+            hidden_states,
+            topk_indices,
+            topk_values,
+            global_scale,
+        )
+        local_output = layer(activation_pack, weight_pack)
+        allreduce_fusion(
+            input=local_output,
+            workspace=workspace,
+            pattern=AllReduceFusionPattern.kAllReduce,
+            launch_with_pdl=args.enable_pdl,
+            output=allreduce_output,
+        )
+
+    profile_state = {}
+
+    def profile_activation_prep():
+        profile_state["activation_pack"] = _make_distributed_activation_pack(
+            args,
+            variant,
+            hidden_states,
+            topk_indices,
+            topk_values,
+            global_scale,
+        )
+
+    def profile_local_moe():
+        profile_state["local_output"] = layer(
+            profile_state["activation_pack"], weight_pack
+        )
+
+    def profile_all_reduce():
+        allreduce_fusion(
+            input=profile_state["local_output"],
+            workspace=workspace,
+            pattern=AllReduceFusionPattern.kAllReduce,
+            launch_with_pdl=args.enable_pdl,
+            output=allreduce_output,
+        )
+
+    def profile_once():
+        return _record_profile_iteration(
+            (
+                (
+                    "all-gather",
+                    lambda: dist.all_gather(
+                        gathered_hidden_states, local_hidden_states
+                    ),
+                ),
+                (
+                    "routing",
+                    lambda: _route_tokens(
+                        router_logits, routing_bias, topk_values, topk_indices
+                    ),
+                ),
+                ("activation prep/quant", profile_activation_prep),
+                ("local MoE", profile_local_moe),
+                ("all-reduce", profile_all_reduce),
+            )
+        )
+
+    try:
+        return _run_distributed_iterations(
+            args,
+            num_tokens,
+            run_once,
+            profile_once,
+            l2_flush,
+            dist,
+            device,
+            f"tp::{variant.name}",
+        )
+    finally:
+        workspace.destroy()
+
+
+def _print_profile_breakdown(mode, variant, result, world_size):
+    print(
+        f"\n{variant.name.upper()} profile breakdown at "
+        f"{result.num_tokens} global tokens"
+    )
+    print("stage                     | median critical-rank (ms) | share of end-to-end")
+    for name, value in result.breakdown_ms.items():
+        share = value / result.e2e_ms * 100 if result.e2e_ms else float("nan")
+        print(f"{name:<25} | {value:>25.3f} | {share:>18.1f}%")
+        print(
+            "PROFILE_CSV,"
+            f"{mode},{variant.name},{result.num_tokens},{world_size},"
+            f"{name},{value:.6f}"
+        )
+
+
+def _run_parallel_mode(args, token_counts, mode, rank, world_size, device, dist):
+    if rank == 0:
+        if args.mode == "profile":
+            print(
+                f"\nMode: real {mode.upper()}{world_size}, "
+                "timing=semantic CUDA-event stages, cache=cold L2"
+            )
+        else:
+            print(
+                f"\nMode: real {mode.upper()}{world_size}, "
+                "timing=max rank CUDA events, cache=cold L2"
+            )
+            print(
+                "global tokens | W4A4 + activation quant (ms) | "
+                "W4A16 (ms) | W4A16 / W4A4"
+            )
+
+    max_tokens_per_rank_budget = None
+    if mode == "ep":
+        # SGLang reserves at least 4096 dispatch tokens per rank. The live
+        # collective still uses each case's runtime_max_tokens_per_rank.
+        max_tokens_per_rank_budget = max(
+            4096,
+            max(
+                (num_tokens + world_size - 1) // world_size
+                for num_tokens in token_counts
+            ),
+        )
+
+    reported_backend = False
+    for num_tokens in token_counts:
+        row = {}
+        for variant in BENCH_VARIANTS:
+            if mode == "ep":
+                result = _benchmark_distributed_ep(
+                    args,
+                    variant,
+                    num_tokens,
+                    max_tokens_per_rank_budget,
+                    rank,
+                    world_size,
+                    device,
+                )
+            else:
+                result = _benchmark_distributed_tp(
+                    args,
+                    variant,
+                    num_tokens,
+                    rank,
+                    world_size,
+                    device,
+                    report_backend=not reported_backend,
+                )
+                reported_backend = True
+
+            if rank == 0:
+                if result.breakdown_ms is not None:
+                    _print_profile_breakdown(mode, variant, result, world_size)
+                else:
+                    row[variant.name] = result.e2e_ms
+                    print(
+                        "DISTRIBUTED_CSV,"
+                        f"{mode},{variant.name},{num_tokens},{world_size},"
+                        f"{result.e2e_ms:.6f}"
+                    )
+            dist.barrier()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        if rank == 0 and row:
+            ratio = row["w4a16"] / row["w4a4"]
+            print(
+                f"{num_tokens:>13} | {row['w4a4']:>28.3f} | "
+                f"{row['w4a16']:>10.3f} | {ratio:>13.3f}x"
+            )
+
+
+def _run_distributed_benchmark(args, token_counts):
+    import os
+    import torch.distributed as dist
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    print(f"[local rank {local_rank}] distributed setup: start", flush=True)
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    print(
+        f"[local rank {local_rank}] NCCL process-group initialization: start",
+        flush=True,
+    )
+    dist.init_process_group("nccl", device_id=device)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    print(
+        f"[rank {rank}] NCCL process-group initialization: complete "
+        f"(world_size={world_size})",
+        flush=True,
+    )
+
+    try:
+        if world_size != args.num_gpus:
+            raise ValueError(
+                f"torchrun world size {world_size} does not match --num-gpus "
+                f"{args.num_gpus}"
+            )
+        if rank == 0:
+            print("\nDeepSeek-V3 distributed CuTe DSL MoE benchmark")
+        for mode in ("ep", "tp"):
+            _run_parallel_mode(args, token_counts, mode, rank, world_size, device, dist)
+            dist.barrier()
+        return 0
+    finally:
+        dist.destroy_process_group()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--num-tokens",
+        type=str,
+        default=None,
+        help="Comma-separated global token counts (default: powers of two from 1 to 4096).",
+    )
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=8,
+        help="Number of torchrun processes, up to eight GPUs on one node.",
+    )
+    parser.add_argument(
+        "--allreduce-backend",
+        choices=["auto", "trtllm", "mnnvl"],
+        default="auto",
+        help="FlashInfer all-reduce backend for TP.",
+    )
+    parser.add_argument(
+        "--use-per-token-activation",
+        action="store_true",
+        help="Use per-token NVFP4 activation scaling for the W4A4 case.",
+    )
+    parser.add_argument(
+        "--no-fused-finalize",
+        action="store_false",
+        dest="use_fused_finalize",
+        help="Use deterministic two-stage finalize.",
+    )
+    parser.add_argument(
+        "--no-pdl",
+        action="store_false",
+        dest="enable_pdl",
+        help="Disable Programmatic Dependent Launch.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["benchmark", "profile"],
+        default="benchmark",
+        help="Benchmark both variants or print semantic stage breakdowns.",
+    )
+    parser.add_argument(
+        "--profile-iters",
+        type=int,
+        default=10,
+        help="Number of iterations summarized in profile mode.",
+    )
+    args = parser.parse_args()
+
+    if not 1 <= args.num_gpus <= 8:
+        parser.error("--num-gpus must be between 1 and 8")
+    if CFG.num_experts % args.num_gpus != 0:
+        parser.error(f"--num-gpus must divide the expert count ({CFG.num_experts})")
+    if BASE_INTERMEDIATE_SIZE % args.num_gpus != 0:
+        parser.error(
+            "--num-gpus must divide the expert intermediate size "
+            f"({BASE_INTERMEDIATE_SIZE})"
+        )
+    if args.profile_iters < 1:
+        parser.error("--profile-iters must be positive")
+    if not is_sm100_family():
+        print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
+        return 1
+
+    if args.num_tokens:
+        tokens = [int(value) for value in args.num_tokens.split(",")]
+    else:
+        tokens = DISTRIBUTED_TOKEN_COUNTS
+    if args.mode == "profile" and len(tokens) != 1:
+        parser.error("profile mode requires exactly one token count")
+
+    return _run_distributed_benchmark(args, tokens)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
