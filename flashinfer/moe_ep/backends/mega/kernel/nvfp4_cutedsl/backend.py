@@ -80,6 +80,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             bootstrap.world_size,
             intermediate_size=self._kernel_config.intermediate_size,
             top_k=self._kernel_config.top_k,
+            # cutedsl tiles are tail-safe (ceil-div + predicated epilogue);
+            # the binding bound is TMA row alignment, not the dg SF word.
+            alignment=64,
         )
 
     def preprocess_weights(
