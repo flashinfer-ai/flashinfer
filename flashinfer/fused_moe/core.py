@@ -1363,6 +1363,10 @@ def get_trtllm_moe_sm100_module():
             expert_weights = moe_inputs.expert_weights
             topk_weights = expert_weights
             hidden_states = moe_inputs.hidden_states
+            # The generic helper identifies TRTLLM dtypes whose ABI normally
+            # consumes an auxiliary scale tensor (FP4 and MX formats). Plain
+            # E4m3 returns false, but DeepSeek block-FP8 is an exception: it
+            # requires the real per-1x128-block scales from the activation pack.
             hidden_states_scale = (
                 moe_inputs.hidden_states_scale
                 if (
