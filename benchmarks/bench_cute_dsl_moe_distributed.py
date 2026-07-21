@@ -72,6 +72,7 @@ class DistributedBenchResult:
 @dataclass(frozen=True)
 class KernelProfileRow:
     stage: str
+    stage_launch: int
     name: str
     time_percent: float
     total_ms: float
@@ -143,48 +144,73 @@ def _load_nsys_kernel_rows(nsys, report, verbose):
                     nvtx.end IS NOT NULL
                     AND COALESCE(nvtx.text, range_name.value) LIKE 'stage::%'
             ),
-            stage_launches AS (
+            stage_kernel_launches AS (
                 SELECT
                     stage_ranges.stage,
-                    runtime.correlationId,
-                    (runtime.globalTid & :process_mask) AS globalPid
+                    kernel.shortName,
+                    kernel.start AS kernel_start,
+                    kernel.end AS kernel_end,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            stage_ranges.start,
+                            stage_ranges.end,
+                            stage_ranges.globalTid
+                        ORDER BY kernel.start, kernel.gridId
+                    ) AS stage_launch
                 FROM stage_ranges
                 JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS runtime ON
                     runtime.start >= stage_ranges.start
                     AND runtime.start <= stage_ranges.end
                     AND (runtime.globalTid & :process_mask) =
                         (stage_ranges.globalTid & :process_mask)
+                JOIN CUPTI_ACTIVITY_KIND_KERNEL AS kernel ON
+                    kernel.correlationId = runtime.correlationId
+                    AND kernel.globalPid =
+                        (runtime.globalTid & :process_mask)
             )
             SELECT
-                stage_launches.stage,
+                stage_kernel_launches.stage,
+                stage_kernel_launches.stage_launch,
                 kernel_name.value,
-                SUM(kernel.end - kernel.start) AS total_ns,
+                SUM(
+                    stage_kernel_launches.kernel_end -
+                        stage_kernel_launches.kernel_start
+                ) AS total_ns,
                 COUNT(*) AS instances,
-                AVG(kernel.end - kernel.start) AS average_ns
-            FROM stage_launches
-            JOIN CUPTI_ACTIVITY_KIND_KERNEL AS kernel ON
-                kernel.correlationId = stage_launches.correlationId
-                AND kernel.globalPid = stage_launches.globalPid
-            JOIN StringIds AS kernel_name ON kernel_name.id = kernel.shortName
-            GROUP BY stage_launches.stage, kernel.shortName
-            ORDER BY MIN(kernel.start), stage_launches.stage, kernel.shortName
+                AVG(
+                    stage_kernel_launches.kernel_end -
+                        stage_kernel_launches.kernel_start
+                ) AS average_ns
+            FROM stage_kernel_launches
+            JOIN StringIds AS kernel_name ON
+                kernel_name.id = stage_kernel_launches.shortName
+            GROUP BY
+                stage_kernel_launches.stage,
+                stage_kernel_launches.stage_launch,
+                stage_kernel_launches.shortName
+            ORDER BY
+                MIN(stage_kernel_launches.kernel_start),
+                stage_kernel_launches.stage,
+                stage_kernel_launches.stage_launch,
+                stage_kernel_launches.shortName
             """,
             {"process_mask": _NSYS_GLOBAL_ID_PROCESS_MASK},
         ).fetchall()
 
-    total_kernel_ns = sum(row[2] for row in raw_rows)
+    total_kernel_ns = sum(row[3] for row in raw_rows)
     if not total_kernel_ns:
         raise RuntimeError(f"Nsight Systems reported no staged kernels in {report}")
     return [
         KernelProfileRow(
             stage=stage,
+            stage_launch=stage_launch,
             name=name,
             time_percent=total_ns / total_kernel_ns * 100,
             total_ms=total_ns / 1e6,
             instances=instances,
             average_us=average_ns / 1e3,
         )
-        for stage, name, total_ns, instances, average_ns in raw_rows
+        for stage, stage_launch, name, total_ns, instances, average_ns in raw_rows
     ]
 
 
@@ -194,8 +220,8 @@ def _print_nsys_kernel_breakdown(mode, variant, num_tokens, num_gpus, rows, repo
         f"{variant.upper()}, {num_tokens} global tokens"
     )
     print(
-        "stage                     | GPU time | total (ms) | instances | "
-        "avg (us) | kernel"
+        "stage                     | launch | GPU time | total (ms) | "
+        "instances | avg (us) | kernel"
     )
     csv_report = report.with_suffix(".kernels.csv")
     with csv_report.open("w", newline="") as csv_file:
@@ -207,6 +233,7 @@ def _print_nsys_kernel_breakdown(mode, variant, num_tokens, num_gpus, rows, repo
                 "num_tokens",
                 "num_gpus",
                 "stage",
+                "stage_launch",
                 "gpu_time_percent",
                 "total_ms",
                 "instances",
@@ -217,7 +244,8 @@ def _print_nsys_kernel_breakdown(mode, variant, num_tokens, num_gpus, rows, repo
         for row in rows:
             display_name = row.name if len(row.name) <= 96 else f"{row.name[:93]}..."
             print(
-                f"{row.stage:<25} | {row.time_percent:>7.2f}% | "
+                f"{row.stage:<25} | {row.stage_launch:>6} | "
+                f"{row.time_percent:>7.2f}% | "
                 f"{row.total_ms:>10.3f} | {row.instances:>9} | "
                 f"{row.average_us:>8.3f} | {display_name}"
             )
@@ -228,6 +256,7 @@ def _print_nsys_kernel_breakdown(mode, variant, num_tokens, num_gpus, rows, repo
                     num_tokens,
                     num_gpus,
                     row.stage,
+                    row.stage_launch,
                     f"{row.time_percent:.6f}",
                     f"{row.total_ms:.6f}",
                     row.instances,
