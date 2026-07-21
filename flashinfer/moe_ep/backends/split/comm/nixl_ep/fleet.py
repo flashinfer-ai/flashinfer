@@ -14,7 +14,6 @@ design's Fleet / Handle split by:
 from __future__ import annotations
 
 import contextlib
-import itertools
 from typing import TYPE_CHECKING, Sequence
 
 from ..... import _require_built
@@ -74,10 +73,13 @@ def _load_nixl_ep():
     return nixl_ep
 
 
-# Per-process generation counter namespacing derived rendezvous stores. Fleet
-# creation is collective over the EP group, so the counter agrees across the
-# group's ranks; re-created fleets then never reuse a prior fleet's keys.
-_STORE_GEN = itertools.count()
+# Per-GROUP generation counters namespacing derived rendezvous stores, keyed
+# by the group's sorted global-rank tuple. Fleet creation is collective over
+# the EP group, so each group's counter agrees across its ranks; re-created
+# fleets then never reuse a prior fleet's keys. A single process-wide counter
+# would diverge when a process belongs to several EP subgroups and creates
+# their fleets in a different interleaving than its peers.
+_STORE_GENS: dict = {}
 
 
 def _resolve_store(bootstrap: "BootstrapConfig"):
@@ -90,7 +92,7 @@ def _resolve_store(bootstrap: "BootstrapConfig"):
        store, so hosts that pass only ``process_group`` (e.g. vLLM's EP group,
        the same ``BootstrapConfig`` shape the nccl_ep backend consumes) work
        without constructing a second TCPStore on a sibling port. The prefix is
-       namespaced by the EP group's global ranks plus a per-process generation
+       namespaced by the EP group's global ranks plus that group's generation
        counter so disjoint EP subgroups and re-created fleets never collide on
        store keys.
     """
@@ -108,9 +110,24 @@ def _resolve_store(bootstrap: "BootstrapConfig"):
 
     from .....core.bootstrap_utils import bootstrap_comm_group
 
-    ranks = dist.get_process_group_ranks(bootstrap_comm_group(bootstrap))
-    prefix = f"flashinfer/moe_ep/nixl_ep/{min(ranks)}x{len(ranks)}/{next(_STORE_GEN)}"
-    return dist.PrefixStore(prefix, dist.distributed_c10d._get_default_store())
+    # torch exposes no public accessor for the default store;
+    # _get_default_store has been stable across torch 2.x but is private, so
+    # fail with the explicit-tcp_store escape hatch rather than a raw
+    # AttributeError if it ever moves.
+    try:
+        base_store = dist.distributed_c10d._get_default_store()
+    except (AttributeError, RuntimeError) as e:
+        raise ValueError(
+            "Could not derive a rendezvous store from torch.distributed's "
+            "default store; set bootstrap.tcp_store (a "
+            "torch.distributed.TCPStore) explicitly."
+        ) from e
+
+    ranks = tuple(sorted(dist.get_process_group_ranks(bootstrap_comm_group(bootstrap))))
+    gen = _STORE_GENS.get(ranks, 0)
+    _STORE_GENS[ranks] = gen + 1
+    prefix = f"flashinfer/moe_ep/nixl_ep/{min(ranks)}x{len(ranks)}/{gen}"
+    return dist.PrefixStore(prefix, base_store)
 
 
 class NixlEpFleet(Fleet):

@@ -34,7 +34,6 @@ from ..core.runtime import (
     split_comm_runtime_requirements,
 )
 from ..core.validation.common import (
-    MoEEpConfigError,
     ensure_bootstrap_dist_validated,
     validate_arch_for_backend,
     validate_bootstrap_world_size,
@@ -114,16 +113,11 @@ class MoEEpSplitLayer(nn.Module):
         validate_fleet_weights(
             self._weights, self._fleet_params, self._bootstrap.world_size
         )
-        if backend_name == "nixl_ep" and self._bootstrap.tcp_store is None:
-            import torch.distributed as dist
-
-            if not dist.is_initialized():
-                raise MoEEpConfigError(
-                    "nixl_ep needs a rendezvous store: set "
-                    "BootstrapConfig.tcp_store, or initialize "
-                    "torch.distributed so the fleet can derive one from the "
-                    "default store."
-                )
+        # nixl_ep rendezvous-store validation is deferred to fleet creation
+        # (first forward): layers are routinely constructed before
+        # torch.distributed is initialized, and NixlEpFleet._resolve_store
+        # raises the same actionable error when neither tcp_store nor an
+        # initialized default group is available.
         if backend_name not in ("nccl_ep", "nixl_ep"):
             return
         validate_arch_for_backend(backend_name)
