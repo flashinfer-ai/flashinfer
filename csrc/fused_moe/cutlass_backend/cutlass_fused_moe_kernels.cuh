@@ -4714,7 +4714,6 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   // FP4 sizes
   bool const use_humming_pre_mma = isHummingPreMmaScaleMode();
   size_t const fp8_mxfp4_token_scale_size = num_expanded_tokens * sizeof(float);
-  // The sizes are identical to the is_native_wfp4afp8_family branch.
   bool const is_nvfp4_quant =
       mSM >= 100 && (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
       (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
