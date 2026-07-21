@@ -19,6 +19,9 @@ live in the decode file and are imported here.
 """
 
 import pytest
+import torch
+
+import flashinfer
 
 from tests.attention.test_trtllm_gen_attention_decode import (
     _test_trtllm_batch_decode,
@@ -121,3 +124,138 @@ def test_trtllm_batch_decode(
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
+
+
+@pytest.mark.parametrize("q_len_per_req", [1, 2])
+def test_xqa_query_and_output_contiguity_contract(monkeypatch, q_len_per_req):
+    batch_size = 2
+    num_qo_heads = 8
+    num_kv_heads = 2
+    head_dim = 128
+    num_tokens = batch_size * q_len_per_req
+    device = torch.device("cuda")
+
+    non_contiguous_query = torch.randn(
+        num_tokens,
+        head_dim,
+        num_qo_heads,
+        dtype=torch.float16,
+        device=device,
+    ).transpose(1, 2)
+    assert not non_contiguous_query.is_contiguous()
+
+    kv_cache = tuple(
+        torch.randn(
+            batch_size,
+            1,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float16,
+            device=device,
+        )
+        for _ in range(2)
+    )
+    workspace_buffer = torch.empty(
+        8 * 1024 * 1024 + 1, dtype=torch.uint8, device=device
+    )
+    block_tables = torch.arange(batch_size, dtype=torch.int32, device=device).view(
+        batch_size, 1
+    )
+    seq_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+
+    captured = {}
+
+    def capture_xqa(query, _k, _v, _block_tables, _seq_lens, out, *_args, **_kwargs):
+        captured["query"] = query
+        captured["out"] = out
+
+    monkeypatch.setattr(flashinfer.decode, "xqa", capture_xqa)
+
+    with pytest.raises(ValueError, match="query must be contiguous"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            non_contiguous_query,
+            kv_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_seq_len=1,
+            backend="xqa",
+            kv_layout="NHD",
+            enable_pdl=False,
+            q_len_per_req=q_len_per_req,
+        )
+    assert not captured
+
+    query = non_contiguous_query.contiguous()
+    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query,
+        kv_cache,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        max_seq_len=1,
+        backend="xqa",
+        kv_layout="NHD",
+        enable_pdl=False,
+        q_len_per_req=q_len_per_req,
+    )
+
+    assert output.is_contiguous()
+    assert captured["query"].is_contiguous()
+    assert captured["out"].is_contiguous()
+
+    non_contiguous_out = torch.empty(
+        num_tokens,
+        head_dim,
+        num_qo_heads,
+        dtype=query.dtype,
+        device=device,
+    ).transpose(1, 2)
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query,
+            kv_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_seq_len=1,
+            out=non_contiguous_out,
+            backend="xqa",
+            kv_layout="NHD",
+            enable_pdl=False,
+            q_len_per_req=q_len_per_req,
+        )
+
+    invalid_shape_out = torch.empty(
+        (*query.shape[:-1], head_dim - 1), dtype=query.dtype, device=device
+    )
+    with pytest.raises(ValueError, match="Invalid shape of out"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query,
+            kv_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_seq_len=1,
+            out=invalid_shape_out,
+            backend="xqa",
+            kv_layout="NHD",
+            enable_pdl=False,
+            q_len_per_req=q_len_per_req,
+        )
+
+    invalid_device_out = torch.empty(query.shape, dtype=query.dtype, device="cpu")
+    with pytest.raises(ValueError, match="Invalid device of out"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query,
+            kv_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_seq_len=1,
+            out=invalid_device_out,
+            backend="xqa",
+            kv_layout="NHD",
+            enable_pdl=False,
+            q_len_per_req=q_len_per_req,
+        )
