@@ -1,25 +1,31 @@
 """Accuracy test for the single-kernel block-FP8 MoE (monomoe).
 
-The kernel is hard-specialized to the Qwen3.5-35B shape on Hopper (SM90a):
-E=256 experts, N=512, K=2048, up to BS=8 tokens, block-wise (128x128) FP8
-weights with per-token-dynamic 1x128 activation quantization.
+The kernel serves the fixed E=256/N=512/K=2048 shape on Hopper (SM90a):
+block-wise (128x128) FP8 weights, per-token-dynamic 1x128 activation
+quantization, up to 8 tokens (the BS8 kernel).
 
-The Python reference replicates the kernel's exact math (block-wise dequant
-GEMM, SiLU gating, block-wise re-quant of the intermediate, block-wise down
-GEMM) so the comparison is apples-to-apples in fp8.
+The block-FP8 Python reference (inlined below) replicates the kernel's exact
+math (block-wise dequant GEMM, SiLU gating, block-wise re-quant of the
+intermediate, block-wise down GEMM), so the comparison is apples-to-apples in
+fp8 and measures kernel bugs rather than fp8-vs-fp32 drift.
 """
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from flashinfer.fused_moe import has_monomoe, mono_moe
+from flashinfer.fused_moe import alloc_scratchpad, has_monomoe, mono_moe
 from flashinfer.utils import is_sm90a_supported
 
-# Fixed geometry of the only compiled variant.
-E = 256
-N = 512  # N_half: gate and up each have N rows
-K = 2048
 BLOCK = 128
+
+
+# ── Block-FP8 quantization / reference helpers (inlined) ─────────────────────
+# The block-FP8 Python reference replicates the kernel's exact math (block-wise
+# dequant GEMM, SiLU gating, block-wise re-quant of the intermediate, block-wise
+# down GEMM), so the accuracy comparison is apples-to-apples in fp8 and measures
+# kernel bugs rather than fp8-vs-fp32 drift.  Pure PyTorch, single shape family.
+_FP8_MAX = 448.0  # e4m3 dynamic range
 
 
 def _quant_fp8_block_wise(w, block_row=128, block_col=128):
@@ -36,9 +42,9 @@ def _quant_fp8_block_wise(w, block_row=128, block_col=128):
             c0, c1 = ci * block_col, min((ci + 1) * block_col, cols)
             block = wf[:, r0:r1, c0:c1]
             amax = block.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1e-12)
-            s = amax / 448.0
+            s = amax / _FP8_MAX
             scales[:, ri, ci] = s.reshape(Ee)
-            w_fp8[:, r0:r1, c0:c1] = (block / s).clamp(-448, 448)
+            w_fp8[:, r0:r1, c0:c1] = (block / s).clamp(-_FP8_MAX, _FP8_MAX)
     return w_fp8.to(torch.float8_e4m3fn), scales
 
 
@@ -51,8 +57,12 @@ def _quant_act_block_wise(x_float, group_size=128):
         g0, g1 = g * group_size, (g + 1) * group_size
         block = x_float[g0:g1]
         amax = block.abs().max().clamp(min=1e-12)
-        scales[g] = amax / 448.0
-        x_fp8[g0:g1] = (block * (448.0 / amax)).clamp(-448, 448).to(torch.float8_e4m3fn)
+        scales[g] = amax / _FP8_MAX
+        x_fp8[g0:g1] = (
+            (block * (_FP8_MAX / amax))
+            .clamp(-_FP8_MAX, _FP8_MAX)
+            .to(torch.float8_e4m3fn)
+        )
     return x_fp8, scales
 
 
@@ -88,7 +98,7 @@ def _routing_softmax_topk(logits, top_k):
     return wts, ids
 
 
-def _python_reference(x, w13_fp8, s13, w2_fp8, s2, topk_w, topk_ids):
+def _python_reference_fp8(x, w13_fp8, s13, w2_fp8, s2, topk_w, topk_ids, N, K):
     """Block-wise fp8 reference matching the kernel's math.  Returns out [M, K]."""
     M, top_k = x.shape[0], topk_ids.shape[1]
     out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
@@ -106,27 +116,33 @@ def _python_reference(x, w13_fp8, s13, w2_fp8, s2, topk_w, topk_ids):
     return out
 
 
-@pytest.mark.parametrize("m", [1, 8])
-@pytest.mark.parametrize("top_k", [1, 8])
-def test_monomoe_accuracy(m, top_k):
-    dev = torch.device("cuda")
-    if not is_sm90a_supported(dev):
-        pytest.skip("monomoe requires SM90a (Hopper)")
-    if not has_monomoe():
-        pytest.skip("monomoe extension unavailable (failed to build/load)")
+def _cosine(a, b):
+    """Flattened cosine similarity of two tensors."""
+    return F.cosine_similarity(
+        a.float().reshape(-1), b.float().reshape(-1), dim=0
+    ).item()
 
-    torch.manual_seed(42)
-    # Up weights are stored [E, 2*N, K] = [gate(N rows) || up(N rows)].
-    w13_f = torch.randn(E, 2 * N, K, device=dev) * 0.1
-    w2_f = torch.randn(E, K, N, device=dev) * 0.1
+
+# (E, N, K) test shapes.  e256_n512_k2048: has a BS16 companion;
+# e64_n512_k2048: BS8-only, cheap.
+SHAPES = [(256, 512, 2048), (64, 512, 2048)]
+
+
+def _make_weights(dev, E, N, K, scale=0.1, seed=42):
+    """Quantized block-FP8 up/down weights (fp8 tensors + scales) for a shape."""
+    g = torch.Generator(device=dev).manual_seed(seed)
+    w13_f = torch.randn(E, 2 * N, K, device=dev, generator=g) * scale
+    w2_f = torch.randn(E, K, N, device=dev, generator=g) * scale
     w13_fp8, s13 = _quant_fp8_block_wise(w13_f)
     w2_fp8, s2 = _quant_fp8_block_wise(w2_f)
+    return w13_fp8, s13, w2_fp8, s2
 
-    x = torch.randn(m, K, device=dev, dtype=torch.bfloat16)
-    logits = torch.randn(m, E, device=dev, dtype=torch.bfloat16)
+
+def _run_and_compare(x, logits, weights, N, K, top_k, scratchpad=None):
+    """Run mono_moe against the block-FP8 reference; return (out, cos)."""
+    w13_fp8, s13, w2_fp8, s2 = weights
     topk_w, topk_ids = _routing_softmax_topk(logits, top_k)
-
-    ref = _python_reference(x, w13_fp8, s13, w2_fp8, s2, topk_w, topk_ids)
+    ref = _python_reference_fp8(x, w13_fp8, s13, w2_fp8, s2, topk_w, topk_ids, N, K)
 
     # mono_moe applies the up-weight TMA interleave internally by default.
     out = mono_moe(
@@ -139,14 +155,118 @@ def test_monomoe_accuracy(m, top_k):
         top_k=top_k,
         scoring_func="softmax",
         renormalize=True,
+        scratchpad=scratchpad,
     )
-
-    assert out.shape == (m, K)
+    assert out.shape == x.shape
     assert out.dtype == torch.bfloat16
+    cos = _cosine(out, ref)
+    return out, cos
 
-    cos = torch.nn.functional.cosine_similarity(
-        out.float().reshape(-1), ref.float().reshape(-1), dim=0
-    ).item()
-    max_abs = (out.float() - ref.float()).abs().max().item()
-    print(f"\n[monomoe] m={m} top_k={top_k}: cos_sim={cos:.5f} max_abs={max_abs:.4f}")
+
+def _require_monomoe(dev):
+    if not is_sm90a_supported(dev):
+        pytest.skip("monomoe requires SM90a (Hopper)")
+    if not has_monomoe():
+        pytest.skip("monomoe unavailable for the E=256/N=512/K=2048 shape")
+
+
+# Single fixed shape (E=256, N=512, K=2048), BS8 kernel: M <= 8 tokens.
+@pytest.mark.parametrize("m", [1, 2, 8])
+@pytest.mark.parametrize("top_k", [1, 8])
+def test_monomoe_accuracy(m, top_k):
+    E, N, K = 256, 512, 2048
+    dev = torch.device("cuda")
+    _require_monomoe(dev)
+
+    torch.manual_seed(42)
+    weights = _make_weights(dev, E, N, K)
+    x = torch.randn(m, K, device=dev, dtype=torch.bfloat16)
+    logits = torch.randn(m, E, device=dev, dtype=torch.bfloat16)
+
+    _, cos = _run_and_compare(x, logits, weights, N, K, top_k)
+    print(f"\n[monomoe] E={E} N={N} K={K} m={m} top_k={top_k}: cos_sim={cos:.5f}")
+    assert cos > 0.98, f"cosine similarity too low: {cos:.5f}"
+
+
+@pytest.mark.parametrize("m", [1, 8])
+def test_monomoe_scratchpad_reuse_no_contamination(m):
+    """A scratchpad reused across calls with DIFFERENT inputs must not leak
+    state between launches.
+
+    The kernel's cross-block handoffs (the act-scale sentinel and the
+    Phase-4->5 arrival counters) live in the scratchpad and are meant to be
+    self-maintaining via a per-launch parity double-buffer.  If that reset
+    discipline were wrong, a second launch on the same buffer could observe
+    a stale scale/flag from the first and corrupt its output.  We run several
+    independent problems through ONE scratchpad and require each to match its
+    own reference — a fresh-scratchpad control run is compared against too.
+    """
+    E, N, K = 256, 512, 2048
+    dev = torch.device("cuda")
+    _require_monomoe(dev)
+
+    weights = _make_weights(dev, E, N, K, seed=7)
+    scratch = alloc_scratchpad(dev)
+
+    # Distinct (x, logits) per iteration so a leaked buffer would show up as a
+    # mismatch against THIS iteration's reference.
+    prev_out = None
+    for i in range(4):
+        torch.manual_seed(100 + i)
+        x = torch.randn(m, K, device=dev, dtype=torch.bfloat16)
+        logits = torch.randn(m, E, device=dev, dtype=torch.bfloat16)
+
+        out_reuse, cos_reuse = _run_and_compare(
+            x, logits, weights, N, K, top_k=8, scratchpad=scratch
+        )
+        # Control: a fresh scratchpad for the same inputs must match exactly.
+        out_fresh, _ = _run_and_compare(
+            x, logits, weights, N, K, top_k=8, scratchpad=alloc_scratchpad(dev)
+        )
+
+        print(f"\n[monomoe reuse] m={m} iter={i}: cos_sim={cos_reuse:.5f}")
+        assert cos_reuse > 0.98, f"reuse iter {i}: cos too low {cos_reuse:.5f}"
+        # Reused-buffer output must match the fresh-buffer output for the same
+        # inputs.  Not bit-exact: the Phase-4 cross-block atomicAdd reduces in
+        # nondeterministic order, so runs differ by up to a rounding ULP —
+        # contamination (a leaked scale/flag) would instead flip whole
+        # rows/experts, far above this tolerance.
+        cos_rf = _cosine(out_reuse, out_fresh)
+        assert cos_rf > 0.9999, (
+            f"reuse iter {i}: reuse vs fresh diverged ({cos_rf:.6f})"
+        )
+        if prev_out is not None:
+            # Different inputs must produce a different output (guards against
+            # the kernel silently returning a stale buffer).
+            assert not torch.equal(out_reuse, prev_out)
+        prev_out = out_reuse.clone()
+
+
+@pytest.mark.parametrize("scale", [1e-2, 3e-3])
+def test_monomoe_small_scales(scale):
+    """Correctness must hold when weight/activation magnitudes are tiny.
+
+    Block-FP8 rescales each 128x128 tile to the e4m3 range, so uniformly
+    scaling the inputs is numerically inert *until* the OUTPUT magnitude
+    (~scale^2 here) sinks below the fp8 pipeline's dynamic-range floor — at
+    which point the fp8 reference itself loses correlation with fp32, so the
+    kernel can no longer be distinguished from it.  These scales keep the
+    output above that floor (~1e-6) while still exercising the tiny-scale
+    path: the act-scale sentinel publish clamps to >= FLT_MIN so a
+    legitimately small scale can never flush to the 0.0f "not published"
+    sentinel and mis-handoff a consumer.
+    """
+    E, N, K = 256, 512, 2048
+    dev = torch.device("cuda")
+    _require_monomoe(dev)
+
+    torch.manual_seed(2024)
+    weights = _make_weights(dev, E, N, K, scale=scale, seed=11)
+    x = torch.randn(8, K, device=dev, dtype=torch.bfloat16) * scale
+    logits = torch.randn(8, E, device=dev, dtype=torch.bfloat16)
+
+    out, cos = _run_and_compare(x, logits, weights, N, K, top_k=8)
+    # No NaN/Inf even at the fp8 subnormal boundary.
+    assert torch.isfinite(out.float()).all(), "small-scale output has NaN/Inf"
+    print(f"\n[monomoe small-scale] scale={scale:g}: cos_sim={cos:.5f}")
     assert cos > 0.98, f"cosine similarity too low: {cos:.5f}"
