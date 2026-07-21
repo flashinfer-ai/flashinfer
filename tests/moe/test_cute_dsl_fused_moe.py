@@ -1040,6 +1040,7 @@ class TestCuteDslMoeBf16Activation:
                 use_cuda_graph=False,
                 enable_pdl=enable_pdl,
                 use_fused_finalize=use_fused_finalize,
+                quant_mode="w4a16",
             )
             result = moe.run(**kwargs)
         else:
@@ -1051,6 +1052,7 @@ class TestCuteDslMoeBf16Activation:
                 local_expert_offset=local_expert_offset,
                 enable_pdl=enable_pdl,
                 use_fused_finalize=use_fused_finalize,
+                quant_mode="w4a16",
             )
 
         ref_output = compute_reference_moe_fp4(
@@ -1091,6 +1093,7 @@ class TestCuteDslMoeBf16Activation:
                 local_expert_offset=local_expert_offset,
                 enable_pdl=enable_pdl,
                 use_fused_finalize=use_fused_finalize,
+                quant_mode="w4a16",
             )
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 
@@ -1147,6 +1150,7 @@ class TestCuteDslMoeBf16Activation:
                 enable_pdl=False,
                 use_fused_finalize=False,
                 activation_type=activation_type,
+                quant_mode="w4a16",
             )
             result = moe.run(**kwargs)
         else:
@@ -1157,6 +1161,7 @@ class TestCuteDslMoeBf16Activation:
                 activation_type=activation_type,
                 use_fused_finalize=False,
                 enable_pdl=False,
+                quant_mode="w4a16",
             )
         ref_output = compute_reference_moe_fp4(
             hidden_states=tensors["x_bf16"],
@@ -1222,6 +1227,7 @@ class TestCuteDslMoeBf16Activation:
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_experts,
+            quant_mode="w4a16",
             w4a16_tactic=tactic,
             use_fused_finalize=False,
             enable_pdl=False,
@@ -1288,6 +1294,7 @@ class TestCuteDslMoeBf16Activation:
             intermediate_size=intermediate_size,
             use_cuda_graph=True,
             use_fused_finalize=False,
+            quant_mode="w4a16",
         )
 
         # Profile eagerly so graph capture only performs a cache lookup and
@@ -2183,6 +2190,7 @@ class TestApiConsistency:
             w2_alpha=tensors["w2_alpha"],
             num_experts=num_experts,
             top_k=top_k,
+            quant_mode="nvfp4",
         )
 
         # Wrapper API
@@ -2192,6 +2200,7 @@ class TestApiConsistency:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
+            quant_mode="nvfp4",
         )
 
         result_wrapper = moe.run(
@@ -2540,6 +2549,7 @@ class TestMoeSortBufferInitPoisoned:
             top_k=top_k,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            quant_mode="w4a4",
             tile_size=tile_size,
             moe_sort_buffers=moe_sort_buffers,
             output_dtype=torch.bfloat16,
