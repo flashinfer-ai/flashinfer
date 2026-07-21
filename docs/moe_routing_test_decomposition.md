@@ -46,19 +46,29 @@ Decompose `(routing methods) × (other params)` into
 Each step lands as its own commit. `[ ]` → `[x]` as they complete.
 
 - [x] **Step 0** — this tracking doc.
-- [ ] **Step 1 (Phase 1)** — standalone routing FFI op.
-  - New binding `trtllm_moe_routing` wrapping `Routing::Runner::run`,
-    returning `topk_ids`, `topk_weights` (expert weights),
-    `num_tokens_per_expert`, `expanded_idx_to_permuted_idx`,
-    `permuted_idx_to_token_idx` (and packed format compatible with the
-    `*_routed_moe` ops).
-  - Files: `csrc/trtllm_fused_moe_routing_binding.cu` (new),
-    `flashinfer/jit/fused_moe.py` (add source),
-    `flashinfer/fused_moe/core.py` + `flashinfer/fused_moe/__init__.py`
-    (Python wrapper `trtllm_moe_routing`).
-  - Note: `Routing::Runner` is constructed with `tile_tokens_dim`; the
-    permutation/padding outputs depend on it, so the API takes it as an
-    explicit arg.
+- [x] **Step 1 (Phase 1)** — standalone routing FFI op (`trtllm_gen_routing`).
+  Code complete; GPU validation happens in Step 3.
+  - `Routing::Runner` (the routing dispatcher) moved from
+    `csrc/trtllm_fused_moe_runner.cu` into a new TU
+    `csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu` so it
+    can be linked without the batched-GEMM stack.
+  - New binding `csrc/trtllm_fused_moe_routing_binding.cu` exporting
+    `trtllm_gen_routing` (caller-allocated outputs: packed top-k ids+weights,
+    bf16 weights, permutation and CTA bookkeeping tensors).
+  - New lightweight JIT module `gen_trtllm_gen_routing_module()` in
+    `flashinfer/jit/fused_moe.py` (routing kernels only — no GEMM cubins, so
+    the routing test compiles in a fraction of the fused-module time);
+    registered in `flashinfer/aot.py`.
+  - Python API `flashinfer.fused_moe.trtllm_gen_routing(...)` in
+    `flashinfer/fused_moe/trtllm_gen_routing.py`
+    (returns `TrtllmGenRoutingResult`), following the `hash_topk` custom-op
+    pattern.
+  - Notes: `tile_tokens_dim` is an explicit arg (permutation/padding depends
+    on it). Routing weights are always bf16 (dispatcher hard-codes output
+    dtype). `numTokensPerExpert`/`dtypeElt`/`useRoutingScalesOnInput`/
+    `useDeepSeekFp8` are unused by the dispatcher — not exposed.
+  - TODO (follow-up): TraceTemplate + `tests/trace/example.py` entry per the
+    CLAUDE.md checklist, once the API shape has settled after GPU validation.
 - [ ] **Step 2 (Phase 2)** — dense routing-only test.
   - `tests/moe/test_trtllm_gen_routing.py`: all routing methods ×
     {top_k, num_experts, n_group/topk_group, routed_scaling, bias,
