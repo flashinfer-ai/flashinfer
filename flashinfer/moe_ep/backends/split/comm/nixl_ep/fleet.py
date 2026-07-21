@@ -14,6 +14,7 @@ design's Fleet / Handle split by:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 from typing import TYPE_CHECKING, Sequence
 
 from ..... import _require_built
@@ -126,7 +127,12 @@ def _resolve_store(bootstrap: "BootstrapConfig"):
     ranks = tuple(sorted(dist.get_process_group_ranks(bootstrap_comm_group(bootstrap))))
     gen = _STORE_GENS.get(ranks, 0)
     _STORE_GENS[ranks] = gen + 1
-    prefix = f"flashinfer/moe_ep/nixl_ep/{min(ranks)}x{len(ranks)}/{gen}"
+    # Encode the FULL group identity: a min×len-style prefix collides for
+    # overlapping groups like (0,1,2,3) vs (0,2,4,6). Digest the rank tuple
+    # (not hash(), which is per-process randomized) to keep the prefix
+    # bounded for large groups while staying identical across ranks.
+    group_id = hashlib.sha1("-".join(map(str, ranks)).encode()).hexdigest()[:12]
+    prefix = f"flashinfer/moe_ep/nixl_ep/{group_id}/{gen}"
     return dist.PrefixStore(prefix, base_store)
 
 
