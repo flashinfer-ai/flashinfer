@@ -17,6 +17,7 @@ from ..delta_rule_dsl.delta_rule_sm120 import _FullyFusedDeltaRuleSm120
 from ..delta_rule_dsl.varlen_helper import (
     CP_CHUNK_LEN_GRANULARITY,
     choose_cp_chunk_len_host,
+    choose_sm100_mn_kernel_kind_host,
     max_num_chunks_host,
     workspace_num_chunks_host,
 )
@@ -145,9 +146,14 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
     max_seqlen: int | None = None,
     *,
     _skip_check: bool = False,
-    _kernel_kind: str = "utcmma_2sm",
+    _kernel_kind: str | None = None,
 ):
-    """Precompute local transfer and state workspaces on SM100."""
+    """Precompute local transfer and state workspaces on SM100.
+
+    By default, use the 2-SM multicast kernel for short, low-head workloads
+    and the 1-SM kernel otherwise. ``_kernel_kind`` remains available for
+    tests and tuning to force either UTCMMA implementation.
+    """
     import cuda.bindings.driver as cuda_driver
 
     if not _skip_check:
@@ -244,6 +250,8 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
     from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
         *args, **{**kwargs, "enable_tvm_ffi": True}
     )
+    if _kernel_kind is None:
+        _kernel_kind = choose_sm100_mn_kernel_kind_host(total_seqlen, num_sab_heads)
     kernel: Any
     if _kernel_kind == "utcmma_2sm":
         kernel = CPDeltaRuleMNPrecomputeUtcmma2Sm100(kernel_dtype)

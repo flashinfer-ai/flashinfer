@@ -311,10 +311,16 @@ def chunk_gated_delta_rule(
 
     _sm_count = get_device_sm_count(device)
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    _arch_major = get_compute_capability(device)[0]
+    _device_capability = get_compute_capability(device)
+    _arch_major = _device_capability[0]
     _device_name = torch.cuda.get_device_properties(device).name
     cp_heuristic_matches = _arch_major in (9, 10, 12) and should_use_cp_host(
-        num_seqs * num_sab_heads, _sm_count, _device_name
+        num_seqs * num_sab_heads,
+        _sm_count,
+        _device_name,
+        device_capability=_device_capability,
+        total_seqlen=total_seq_len,
+        num_seqs=num_seqs,
     )
     if use_cp is True or (use_cp == "auto" and cp_heuristic_matches):
         cp_rejection_reason = _cp_delta_rule_rejection_reason(

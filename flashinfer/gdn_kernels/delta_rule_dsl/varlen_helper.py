@@ -12,6 +12,20 @@ CP_DEFAULT_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 1
 CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR = 1
 CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 2
 CP_SM120_SHORT_HEURISTIC_MAX_HEADS = 16
+CP_SM100_MIN_AVG_SEQLEN = 2048
+# (minimum average sequence length, threshold numerator, threshold denominator).
+# CP wins when non-CP parallel work is below the corresponding fraction of SMs.
+CP_SM100_PARALLELISM_TIERS = (
+    (2048, 1, 16),
+    (8192, 1, 8),
+    (16384, 1, 6),
+    (32768, 2, 9),
+)
+CP_SM100_2SM_MN_MAX_HEADS = 8
+CP_SM100_2SM_MN_LOW_HEAD_MAX_HEADS = 2
+CP_SM100_2SM_MN_LOW_HEAD_MAX_WORK = 1 << 18
+CP_SM100_2SM_MN_MAX_WORK = 1 << 19
+CP_SM100_MN_CLUSTER_SIZE = 2
 CP_HBM_PARALLELISM_THRESHOLD_NUMERATOR = 1
 CP_HBM_PARALLELISM_THRESHOLD_DENOMINATOR = 2
 CP_GDDR_PARALLELISM_THRESHOLD_NUMERATOR = 1
@@ -86,15 +100,77 @@ def cp_short_workload_ratio_host(
     )
 
 
-def should_use_cp_host(num_parallel_work: int, num_sms: int, device_name: str) -> bool:
+def should_use_cp_host(
+    num_parallel_work: int,
+    num_sms: int,
+    device_name: str,
+    device_capability: tuple[int, int] | None = None,
+    total_seqlen: int | None = None,
+    num_seqs: int | None = None,
+) -> bool:
     """Return whether a public wrapper should dispatch to the CP path.
 
     `num_parallel_work` is the non-CP kernel parallelism, typically batch times
     output/state heads. CP is selected only when that parallelism is strictly
     below the card-specific threshold.
     """
+    if (
+        device_capability is not None
+        and device_capability[0] == 10
+        and total_seqlen is not None
+        and num_seqs is not None
+    ):
+        avg_seqlen = _ceil_div(total_seqlen, num_seqs)
+        if avg_seqlen < CP_SM100_MIN_AVG_SEQLEN:
+            return False
+        for min_avg_seqlen, threshold_num, threshold_den in reversed(
+            CP_SM100_PARALLELISM_TIERS
+        ):
+            if avg_seqlen >= min_avg_seqlen:
+                return num_parallel_work * threshold_den < num_sms * threshold_num
+        return False
+
     threshold_num, threshold_den = cp_parallelism_threshold_host(device_name)
     return num_parallel_work * threshold_den < num_sms * threshold_num
+
+
+def choose_sm100_mn_kernel_kind_host(total_seqlen: int, num_heads: int) -> str:
+    """Choose the measured-best SM100 UTCMMA MN precompute kernel.
+
+    The 2-SM cluster balance makes its downstream recurrence cost scale with
+    ``total_seqlen * num_heads**2``. Very small head counts cross over sooner
+    because they expose less independent work per cluster wave.
+    """
+    work = total_seqlen * num_heads * num_heads
+    max_work = (
+        CP_SM100_2SM_MN_LOW_HEAD_MAX_WORK
+        if num_heads <= CP_SM100_2SM_MN_LOW_HEAD_MAX_HEADS
+        else CP_SM100_2SM_MN_MAX_WORK
+    )
+    if num_heads <= CP_SM100_2SM_MN_MAX_HEADS and work <= max_work:
+        return "utcmma_2sm"
+    return "utcmma_1sm"
+
+
+def _rebalance_sm100_short_chunk(
+    chunk_len: int,
+    max_seqlen: int,
+    total_seqlen: int,
+    num_heads: int,
+    num_sms: int,
+    device_capability: tuple[int, int] | None,
+) -> int:
+    if (
+        device_capability is None
+        or device_capability[0] != 10
+        or choose_sm100_mn_kernel_kind_host(total_seqlen, num_heads) != "utcmma_2sm"
+    ):
+        return chunk_len
+
+    target_clusters = max(1, num_sms // CP_SM100_MN_CLUSTER_SIZE)
+    target_chunks_per_head = max(1, target_clusters // num_heads)
+    one_wave_chunk_len = _round_up(_ceil_div(max_seqlen, target_chunks_per_head), BLK)
+    return max(chunk_len, one_wave_chunk_len)
 
 
 def choose_cp_chunk_len_host(
@@ -135,12 +211,28 @@ def choose_cp_chunk_len_host(
             balanced_chunk_len = math.isqrt(square)
             if balanced_chunk_len * balanced_chunk_len < square:
                 balanced_chunk_len += 1
-            return max(BLK, _round_up(balanced_chunk_len, BLK))
+            chunk_len = max(BLK, _round_up(balanced_chunk_len, BLK))
+            return _rebalance_sm100_short_chunk(
+                chunk_len,
+                max_seqlen,
+                total_seqlen,
+                num_heads,
+                num_sms,
+                device_capability,
+            )
 
     # target for one wave of CTAs
     target_chunks = max(1, num_sms // num_heads)
     min_chunk_len = _ceil_div(max_seqlen, target_chunks)
-    return _round_up(min_chunk_len, chunk_len_granularity)
+    chunk_len = _round_up(min_chunk_len, chunk_len_granularity)
+    return _rebalance_sm100_short_chunk(
+        chunk_len,
+        max_seqlen,
+        total_seqlen,
+        num_heads,
+        num_sms,
+        device_capability,
+    )
 
 
 @cute.jit

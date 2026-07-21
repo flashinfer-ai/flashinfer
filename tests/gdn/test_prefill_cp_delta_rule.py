@@ -64,6 +64,9 @@ else:
 
 from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import (
     chunk_bound_host,
+    choose_cp_chunk_len_host,
+    choose_sm100_mn_kernel_kind_host,
+    should_use_cp_host,
     workspace_num_chunks_host,
 )
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
@@ -109,6 +112,114 @@ def _make_gates(total_seqlen, num_heads, baseline, device):
         + (1.0 - baseline)
         * torch.rand(total_seqlen, num_heads, dtype=torch.float32, device=device)
     ).contiguous()
+
+
+@pytest.mark.parametrize(
+    "parallel_work, total_seqlen, num_seqs, expected",
+    [
+        (8, 1536, 1, False),
+        (8, 2048, 1, True),
+        (16, 8191, 1, False),
+        (16, 8192, 1, True),
+        (16, 8192, 2, False),
+        (24, 16383, 1, False),
+        (24, 16384, 1, True),
+        (32, 32767, 1, False),
+        (32, 32768, 1, True),
+        (33, 65536, 1, False),
+    ],
+)
+def test_sm100_cp_dispatch_heuristic(parallel_work, total_seqlen, num_seqs, expected):
+    assert (
+        should_use_cp_host(
+            parallel_work,
+            148,
+            "NVIDIA B300 SXM6 AC",
+            device_capability=(10, 3),
+            total_seqlen=total_seqlen,
+            num_seqs=num_seqs,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "max_seqlen, num_heads, expected",
+    [
+        (2048, 8, 384),
+        (4096, 8, 512),
+        (6144, 8, 704),
+        (8192, 8, 960),
+        (16384, 4, 960),
+        (32768, 4, 1856),
+        (32768, 2, 896),
+        (65536, 2, 1792),
+        (65536, 1, 896),
+        (262144, 1, 3584),
+        (16384, 8, 1024),
+        (8192, 16, 1024),
+    ],
+)
+def test_sm100_cp_chunk_balance(max_seqlen, num_heads, expected):
+    assert (
+        choose_cp_chunk_len_host(
+            max_seqlen,
+            num_heads,
+            148,
+            device_capability=(10, 3),
+            total_seqlen=max_seqlen,
+            device_name="NVIDIA B300 SXM6 AC",
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "total_seqlen, num_heads, expected",
+    [
+        (8192, 8, "utcmma_2sm"),
+        (8193, 8, "utcmma_1sm"),
+        (32768, 4, "utcmma_2sm"),
+        (32769, 4, "utcmma_1sm"),
+        (65536, 2, "utcmma_2sm"),
+        (65537, 2, "utcmma_1sm"),
+        (262144, 1, "utcmma_2sm"),
+        (262145, 1, "utcmma_1sm"),
+        (8192, 16, "utcmma_1sm"),
+    ],
+)
+def test_sm100_mn_precompute_kernel_selection(total_seqlen, num_heads, expected):
+    assert choose_sm100_mn_kernel_kind_host(total_seqlen, num_heads) == expected
+
+
+def test_other_arch_cp_heuristics_are_unchanged():
+    assert should_use_cp_host(
+        73,
+        148,
+        "NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+        total_seqlen=128,
+        num_seqs=1,
+    )
+    assert not should_use_cp_host(
+        74,
+        148,
+        "NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+        total_seqlen=65536,
+        num_seqs=1,
+    )
+    assert (
+        choose_cp_chunk_len_host(
+            8192,
+            8,
+            148,
+            device_capability=(9, 0),
+            total_seqlen=8192,
+            device_name="NVIDIA H100 80GB HBM3",
+        )
+        == 512
+    )
 
 
 @torch.inference_mode()
@@ -740,6 +851,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
         (torch.bfloat16, [2048], 1024, 1, 1, 1, 0.99, 1.0),
         (torch.bfloat16, [4096], 2048, 2, 1, 1, 0.9995, 1.0),
         (torch.float16, [2049], 1024, 1, 1, 1, 0.99, "auto"),
+        (torch.float16, [8193], 2048, 1, 1, 1, 0.99, "auto"),
         (torch.bfloat16, [1536, 257], 1024, 1, 1, 2, 0.99, 1.0),
     ],
 )
@@ -955,7 +1067,7 @@ def test_cp_delta_rule_e2e(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("seq_lens", [[128], [256, 64]])
+@pytest.mark.parametrize("seq_lens", [[128], [256, 64], [2048]])
 def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     qkv_factory,
     dtype,
