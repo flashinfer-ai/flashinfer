@@ -1004,6 +1004,91 @@ class TestCuteDslMoeBf16Activation:
             )
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 
+    @pytest.mark.parametrize(
+        "activation_type",
+        [
+            ActivationType.Gelu,
+            ActivationType.Relu,
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Geglu,
+            ActivationType.Relu2,
+            ActivationType.Identity,
+        ],
+    )
+    @pytest.mark.parametrize("use_wrapper", [False, True])
+    def test_activation_dispatch(
+        self, activation_type: ActivationType, use_wrapper: bool
+    ):
+        from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
+
+        num_tokens, hidden_size, intermediate_size = 17, 256, 512
+        num_experts, top_k = 8, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            gated=activation_type.is_gated,
+        )
+
+        kwargs = {
+            "x": tensors["x_bf16"],
+            "x_sf": None,
+            "token_selected_experts": tensors["token_selected_experts"],
+            "token_final_scales": tensors["token_final_scales"],
+            "w1_weight": tensors["w1_weight"],
+            "w1_weight_sf": tensors["w1_weight_sf"],
+            "w1_alpha": tensors["w1_alpha"],
+            "fc2_input_scale": None,
+            "w2_weight": tensors["w2_weight"],
+            "w2_weight_sf": tensors["w2_weight_sf"],
+            "w2_alpha": tensors["w2_alpha"],
+        }
+        if use_wrapper:
+            moe = CuteDslMoEWrapper(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=False,
+                enable_pdl=False,
+                use_fused_finalize=False,
+                activation_type=activation_type,
+            )
+            result = moe.run(**kwargs)
+        else:
+            result = cute_dsl_fused_moe_nvfp4(
+                **kwargs,
+                num_experts=num_experts,
+                top_k=top_k,
+                activation_type=activation_type,
+                use_fused_finalize=False,
+                enable_pdl=False,
+            )
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"],
+            gemm1_weights=tensors["w1_weight_bf16"],
+            gemm2_weights=tensors["w2_weight_bf16"],
+            gemm1_alpha=tensors["w1_alpha"],
+            gemm2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=activation_type,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
     @pytest.mark.parametrize("route_tile", [32, 64])
     def test_route_tile_numerical_accuracy(self, route_tile: int):
         from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl

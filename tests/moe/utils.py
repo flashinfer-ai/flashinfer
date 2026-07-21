@@ -24,14 +24,12 @@ from torch.nn import functional as F
 
 from flashinfer import RoutingMethodType, is_gated_activation
 from flashinfer.fused_moe import WeightLayout
-from flashinfer.fused_moe.cute_dsl.moe_utils import (
-    normalize_cute_dsl_moe_activation_type,
-)
 from flashinfer.tllm_enums import (
     ActivationType,
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
+    normalize_activation_type,
 )
 from flashinfer.utils import get_compute_capability
 
@@ -355,8 +353,7 @@ def compute_reference_moe_fp4(
         use_per_token_activation: Use per-token activation.
         num_local_experts: Number of local experts (for EP). Defaults to num_experts.
         local_expert_offset: Starting expert ID for this EP rank. Defaults to 0.
-        activation_type: GEMM1 activation type. Use ActivationType.Swiglu for
-            gated SwiGLU/OAI and ActivationType.Relu2 for non-gated ReLU^2.
+        activation_type: GEMM1 activation type.
         activation: Optional B12x activation name. When provided, this takes
             precedence over activation_type.
         swiglu_alpha: SwiGLU sigmoid multiplier.
@@ -369,7 +366,8 @@ def compute_reference_moe_fp4(
         Output tensor [num_tokens, hidden_size]
     """
     if activation is None:
-        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        activation_type = normalize_activation_type(activation_type)
+        gated = is_gated_activation(activation_type)
         swiglu_alpha = DEFAULT_SWIGLU_ALPHA if swiglu_alpha is None else swiglu_alpha
         swiglu_beta = DEFAULT_SWIGLU_BETA if swiglu_beta is None else swiglu_beta
         swiglu_limit = DEFAULT_SWIGLU_LIMIT if swiglu_limit is None else swiglu_limit
@@ -436,6 +434,8 @@ def compute_reference_moe_fp4(
                     act_out = F.gelu(gate, approximate="tanh") * linear
                 elif activation == "silu":
                     act_out = silu(gate) * linear
+                elif activation_type == ActivationType.Geglu:
+                    act_out = F.gelu(gate) * linear
                 else:
                     if swiglu_limit is not None:
                         gate = gate.clamp(max=swiglu_limit)
@@ -445,8 +445,18 @@ def compute_reference_moe_fp4(
                         * torch.sigmoid(swiglu_alpha * gate)
                         * (linear + swiglu_beta)
                     )
-            else:
+            elif activation_type == ActivationType.Gelu:
+                act_out = F.gelu(gemm1_out)
+            elif activation_type == ActivationType.Relu:
+                act_out = torch.relu(gemm1_out)
+            elif activation_type == ActivationType.Silu:
+                act_out = silu(gemm1_out)
+            elif activation_type == ActivationType.Relu2:
                 act_out = torch.relu(gemm1_out) ** 2
+            elif activation_type == ActivationType.Identity:
+                act_out = gemm1_out
+            else:
+                raise ValueError(f"Unsupported activation type {activation_type!r}")
 
             if fc2_input_scale is not None:
                 if use_per_token_activation:

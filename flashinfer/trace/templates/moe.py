@@ -2073,16 +2073,25 @@ def _moe_bf16_run_experts(
     gemm1_clamp_limit=None,
     activation_type=ActivationType.Swiglu.value,
 ):
-    """Un-quantized (bf16) MoE expert computation (SwiGLU/OAI or ReLU^2)."""
+    """Un-quantized BF16 MoE expert computation."""
     activation_type = normalize_activation_type(activation_type)
-    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
+    supported_activations = (
+        ActivationType.Gelu,
+        ActivationType.Relu,
+        ActivationType.Silu,
+        ActivationType.Swiglu,
+        ActivationType.Geglu,
+        ActivationType.Relu2,
+        ActivationType.Identity,
+    )
+    if activation_type not in supported_activations:
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; "
-            f"expected {ActivationType.Swiglu!r} or {ActivationType.Relu2!r}"
+            f"expected one of {supported_activations!r}"
         )
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
-    I = gemm1_out // 2
+    I = gemm1_out // 2 if activation_type.is_gated else gemm1_out
     device = hidden_states.device
     A = hidden_states.to(torch.float32)
     W1 = gemm1_weights.to(torch.float32)
@@ -2099,18 +2108,31 @@ def _moe_bf16_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
-        if activation_type == ActivationType.Relu2:
+        if activation_type == ActivationType.Gelu:
+            act = torch.nn.functional.gelu(G1)
+        elif activation_type == ActivationType.Relu:
+            act = torch.relu(G1)
+        elif activation_type == ActivationType.Silu:
+            act = torch.nn.functional.silu(G1)
+        elif activation_type == ActivationType.Relu2:
             act = torch.relu(G1) ** 2
+        elif activation_type == ActivationType.Identity:
+            act = G1
         else:
             X1, X2 = G1[:, :I], G1[:, I:]
-            limit = _moe_expert_param(
-                gemm1_clamp_limit, le, DEFAULT_SWIGLU_LIMIT, X1.device
-            )
-            alpha = _moe_expert_param(gemm1_alpha, le, DEFAULT_SWIGLU_ALPHA, X2.device)
-            beta = _moe_expert_param(gemm1_beta, le, DEFAULT_SWIGLU_BETA, X1.device)
-            up = torch.clamp(X1, min=-limit, max=limit)
-            gate = torch.clamp(X2, max=limit)
-            act = gate * torch.sigmoid(alpha * gate) * (up + beta)
+            if activation_type == ActivationType.Geglu:
+                act = torch.nn.functional.gelu(X2) * X1
+            else:
+                limit = _moe_expert_param(
+                    gemm1_clamp_limit, le, DEFAULT_SWIGLU_LIMIT, X1.device
+                )
+                alpha = _moe_expert_param(
+                    gemm1_alpha, le, DEFAULT_SWIGLU_ALPHA, X2.device
+                )
+                beta = _moe_expert_param(gemm1_beta, le, DEFAULT_SWIGLU_BETA, X1.device)
+                up = torch.clamp(X1, min=-limit, max=limit)
+                gate = torch.clamp(X2, max=limit)
+                act = gate * torch.sigmoid(alpha * gate) * (up + beta)
         expert_out = act.matmul(W2[le].t())
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
@@ -3117,9 +3139,8 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             "int32",
             optional=True,
             description=(
-                "GEMM1 activation type: ActivationType.Swiglu for gated "
-                "SwiGLU/OAI or ActivationType.Relu2 for non-gated ReLU^2. "
-                "Determines gemm1_out_size."
+                "GEMM1 activation type. Determines whether gemm1_out_size is "
+                "gated or non-gated."
             ),
         ),
         "swiglu_alpha": Scalar(
