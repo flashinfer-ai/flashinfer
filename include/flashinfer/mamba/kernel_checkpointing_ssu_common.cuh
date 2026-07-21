@@ -548,8 +548,7 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
 // A · inclusive_scan(dt) over the window (≤ 16 lanes, 4 shfl steps).  All 32
 // lanes join the scan (lanes ≥ count contribute masked zeros) so the shuffles
 // stay convergent; only lanes < count write.  Used by the MONOLITH — the
-// two-kernel main reads its decay from the cumAdt_old scratch the precompute
-// stages, not from a live recompute.
+// two-kernel main runs its own in-register recompute (warp_scan_old_cumAdt).
 __device__ __forceinline__ void load_old_dt_cumAdt(CheckpointingSsuParams const& params, int lane,
                                                    int64_t cache_slot, int ring_start, int head,
                                                    int count, float A_val,

@@ -116,10 +116,12 @@ __device__ __forceinline__ void load_phase1_coeffs(SmemT& smem,
     smem.A[flat_tid] = toFloat(A_ptr[first_head + flat_tid]);
     smem.dt_bias[flat_tid] = dt_bias_ptr ? toFloat(dt_bias_ptr[first_head + flat_tid]) : 0.f;
   }
-  {
+  // Old-decay scan feeds ONLY the cb_old scaling in PHASE 2 (no-write path).  The
+  // main recomputes its own decay in-registers from the dt ring (pre-gdc-pure
+  // replay), so nothing is staged to gmem and the write path skips the scan.
+  if (!must_checkpoint) {
     auto const* __restrict__ dtc_ptr = reinterpret_cast<float const*>(params.dt_cache);
     int64_t const dtc_base = cache_slot * params.dt_cache_stride_seq;
-    auto* __restrict__ ca_gmem = reinterpret_cast<float*>(params.cumAdt_old);
     int const scan_warp = flat_tid >> 5;
     int const scan_lane = flat_tid & 31;
     constexpr int NWARPS = CTA_THREADS / 32;
@@ -137,12 +139,8 @@ __device__ __forceinline__ void load_phase1_coeffs(SmemT& smem,
         if (scan_lane >= off) scan += up;
       }
       if (scan_lane < MAX_WINDOW) {
-        float const cav = (scan_lane < prev_k) ? a * scan : 0.f;
-        ca_gmem[((int64_t)seq * params.nheads + hh) * MAX_WINDOW + scan_lane] = cav;
-        if (!must_checkpoint) {  // cb_old (no-write) scales by these in PHASE 2
-          smem.old_dt[h][scan_lane] = dv;
-          smem.old_cumAdt[h][scan_lane] = cav;
-        }
+        smem.old_dt[h][scan_lane] = dv;
+        smem.old_cumAdt[h][scan_lane] = (scan_lane < prev_k) ? a * scan : 0.f;
       }
     }
   }

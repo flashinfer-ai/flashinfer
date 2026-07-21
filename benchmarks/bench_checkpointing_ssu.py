@@ -457,7 +457,6 @@ class KernelInputs:
     cb_scaled: torch.Tensor | None = None  # (batch, nheads, 32, 8) act_dtype
     cumAdt_vec: torch.Tensor | None = None  # (batch, nheads, T_pad) f32
     cb_old: torch.Tensor | None = None  # (batch, nheads, 32, K_old//2) act_dtype
-    cumAdt_old: torch.Tensor | None = None  # (batch, nheads, max_window) f32
 
     # Varlen (packed) mode: x/dt/B/C/out_incr above are (1, batch*T, ...) VIEWS
     # of the same dense buffers, plus this boundary vector — identical work to
@@ -603,7 +602,7 @@ def build_kernel_inputs(
     # iter).  fragA-native: cb_scaled m16n8k16 (8 regs/lane); cb_old m16n8k{K_old}
     # (K_old/2 regs/lane), K_old = next_multiple_of<8>(max_window); cumAdt_vec f32
     # over T_pad = next_multiple_of<16>(mtp_len).  See .plans/ssu_split.md.
-    cb_scaled = cumAdt_vec = cb_old = cumAdt_old = None
+    cb_scaled = cumAdt_vec = cb_old = None
     if two_kernel:
         t_pad = ((mtp_len + 15) // 16) * 16
         k_old = ((max_window + 7) // 8) * 8
@@ -613,9 +612,6 @@ def build_kernel_inputs(
         )
         cb_old = torch.empty(
             batch, nheads, 32, k_old // 2, device=x.device, dtype=act_dtype
-        )
-        cumAdt_old = torch.empty(
-            batch, nheads, max_window, device=x.device, dtype=torch.float32
         )
 
     return KernelInputs(
@@ -657,7 +653,6 @@ def build_kernel_inputs(
         cb_scaled=cb_scaled,
         cumAdt_vec=cumAdt_vec,
         cb_old=cb_old,
-        cumAdt_old=cumAdt_old,
         cu_seqlens=cu_seqlens,
         max_seqlen=mtp_len if varlen else None,
     )
@@ -846,7 +841,6 @@ def _make_run_closure(
         _cb = inputs.cb_scaled if _two else None
         _ca = inputs.cumAdt_vec if _two else None
         _cbo = inputs.cb_old if _two else None
-        _cao = inputs.cumAdt_old if _two else None
         # Pin the path: "auto" would route small batches to the monolith even
         # with scratch present, silently merging the two rows.
         _algo = "two-kernel" if _two else "monolith"
@@ -895,7 +889,6 @@ def _make_run_closure(
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
                     cb_old=_cbo,
-                    cumAdt_old=_cao,
                     algorithm=_algo,
                     cu_seqlens=inputs.cu_seqlens,
                     max_seqlen=inputs.max_seqlen,
@@ -932,7 +925,6 @@ def _make_run_closure(
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
                     cb_old=_cbo,
-                    cumAdt_old=_cao,
                     algorithm=_algo,
                     cu_seqlens=inputs.cu_seqlens,
                     max_seqlen=inputs.max_seqlen,

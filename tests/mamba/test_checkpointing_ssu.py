@@ -129,9 +129,6 @@ def _two_kernel_scratch(batch, nheads, max_window, dtype, device):
         cb_old=torch.empty(
             batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
         ),
-        cumAdt_old=torch.empty(
-            batch, nheads, max_window, device=device, dtype=torch.float32
-        ),
         algorithm="two-kernel",
     )
 
@@ -559,9 +556,6 @@ def test_two_kernel_matches_monolithic():
             kw["cb_old"] = torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             )
-            kw["cumAdt_old"] = torch.empty(
-                batch, nheads, max_window, device=device, dtype=torch.float32
-            )
             kw["algorithm"] = "two-kernel"
         checkpointing_ssu(
             st,
@@ -691,9 +685,6 @@ def test_two_kernel_d_split2():
             cb_old=torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             ),
-            cumAdt_old=torch.empty(
-                batch, nheads, max_window, device=device, dtype=torch.float32
-            ),
             algorithm="two-kernel",
         )
         return out, st, xc, bc, dtc
@@ -772,9 +763,6 @@ def test_persistent_main_matches_monolithic(monkeypatch):
             )
             kw["cb_old"] = torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            )
-            kw["cumAdt_old"] = torch.empty(
-                batch, nheads, max_window, device=device, dtype=torch.float32
             )
             kw["algorithm"] = "two-kernel"
         checkpointing_ssu(
@@ -878,9 +866,6 @@ def test_two_kernel_meta_ring_refill(monkeypatch):
             )
             kw["cb_old"] = torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            )
-            kw["cumAdt_old"] = torch.empty(
-                batch, nheads, max_window, device=device, dtype=torch.float32
             )
             kw["algorithm"] = "two-kernel"
         checkpointing_ssu(
@@ -997,9 +982,6 @@ def _run_two_kernel_state_dtype_case(
             )
             kw["cb_old"] = torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=act_dtype
-            )
-            kw["cumAdt_old"] = torch.empty(
-                batch, nheads, max_window, device=device, dtype=torch.float32
             )
             kw["algorithm"] = "two-kernel"
         checkpointing_ssu(

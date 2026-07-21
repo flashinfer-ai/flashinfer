@@ -56,7 +56,6 @@ void checkpointing_ssu(
     Optional<TensorView> cb_scaled,    // two-kernel: bf16 (batch, nheads, 32, 8) fragA-native
     Optional<TensorView> cumAdt_vec,   // two-kernel: f32 (batch, nheads, T_pad) raw cumAdt
     Optional<TensorView> cb_old,       // two-kernel: bf16 (batch, nheads, 32, K_old/2) fragA-native
-    Optional<TensorView> cumAdt_old,   // two-kernel: f32 (batch, nheads, MAX_WINDOW) old-decay rows
     int64_t precompute_heads_per_cta) {  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
 
   bool const is_varlen = cu_seqlens.has_value();
@@ -508,11 +507,10 @@ void checkpointing_ssu(
 
   // Two-kernel split scratch (presence of cb_scaled selects precompute+main).
   // Caller-allocated (graph-safe).  The Python wrapper enforces the all-or-none
-  // quartet; shape/device/contiguity/dtype are validated here (like cumAdt_old
-  // below) so a bad scratch fails loudly instead of corrupting memory or
-  // faulting inside the kernel.  Expected layouts (see the wrapper / bench
-  // allocator): cb_scaled/cb_old are input-dtype fragA-native (., ., 32, regs);
-  // cumAdt_vec is f32 (., ., T_pad).
+  // trio; shape/device/contiguity/dtype are validated here so a bad scratch
+  // fails loudly instead of corrupting memory or faulting inside the kernel.
+  // Expected layouts (see the wrapper / bench allocator): cb_scaled/cb_old are
+  // input-dtype fragA-native (., ., 32, regs); cumAdt_vec is f32 (., ., T_pad).
   // fragA-native scratch: each (batch, head)'s CB is one MMA A-fragment stored
   // as [warp lane, register].  The lane axis is a full warp; the register axis
   // is the A-operand size — kCbScaledRegs for the new-token m16n8k16 CB,
@@ -560,22 +558,6 @@ void checkpointing_ssu(
                      cbo.size(0), ", ", cbo.size(1), ", ", cbo.size(2), ", ", cbo.size(3), ")");
     p.cb_old = const_cast<void*>(cbo.data_ptr());
   }
-  if (cumAdt_old.has_value()) {
-    auto const& ca = cumAdt_old.value();
-    CHECK_CUDA(ca);
-    CHECK_DIM(3, ca);
-    CHECK_CONTIGUOUS(ca);
-    FLASHINFER_CHECK(ca.dtype().code == kDLFloat && ca.dtype().bits == 32,
-                     "cumAdt_old must be float32");
-    FLASHINFER_CHECK(ca.size(0) >= batch, "cumAdt_old batch dim = ", ca.size(0),
-                     ", expected >= batch = ", batch);
-    FLASHINFER_CHECK(ca.size(1) == nheads, "cumAdt_old nheads = ", ca.size(1),
-                     ", expected nheads = ", nheads);
-    FLASHINFER_CHECK(ca.size(2) == max_window, "cumAdt_old rows = ", ca.size(2),
-                     ", expected max_window = ", max_window);
-    p.cumAdt_old = const_cast<void*>(ca.data_ptr());
-  }
-
   // Strides
   p.state_stride_seq = state.stride(0);
 

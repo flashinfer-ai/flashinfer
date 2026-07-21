@@ -162,14 +162,6 @@ struct CheckpointingSsuParams {
   // (the write path folds old tokens into state via the replay instead), and
   // the main does OUT.3 = cb_old @ old_x.  Caller-provided when two-kernel.
   void* __restrict__ cb_old{nullptr};  // bf16 (batch, nheads, 32, 8), fragA-native
-  // Old-token decay rows (C7): cumAdt_old[b, h, t] = A·cumsum(cached dt over the window)[t] for
-  // t < prev_k, 0 beyond.  The ring caches no decay (prefix sums are not
-  // ring-shift-invariant), so the precompute recomputes the rows from the dt
-  // ring (warp scan) and stores them here; the main loads them back exactly
-  // like the pre-ring cache reads (full rows on the write path, the one
-  // β tail float on no-write).  Internal to the two-kernel split — exposed as
-  // a caller-provided scratch only to avoid an in-wrapper allocation.
-  void* __restrict__ cumAdt_old{nullptr};  // f32 (batch, nheads, MAX_WINDOW), dense
 };
 
 }  // namespace flashinfer::mamba::checkpointing

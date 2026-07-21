@@ -79,7 +79,6 @@ def _get_module(
         "cb_scaled",
         "cumAdt_vec",
         "cb_old",
-        "cumAdt_old",
     ),
 )
 def _checkpointing_ssu(
@@ -108,7 +107,6 @@ def _checkpointing_ssu(
     cb_scaled: Optional[torch.Tensor],
     cumAdt_vec: Optional[torch.Tensor],
     cb_old: Optional[torch.Tensor],
-    cumAdt_old: Optional[torch.Tensor],
     precompute_heads_per_cta: int,
     enable_pdl: bool,
     philox_rounds: int,
@@ -169,7 +167,6 @@ def _checkpointing_ssu(
         cb_scaled,
         cumAdt_vec,
         cb_old,
-        cumAdt_old,
         precompute_heads_per_cta,
     )
 
@@ -201,7 +198,6 @@ def _checkpointing_ssu_fake(
     cb_scaled: Optional[torch.Tensor],
     cumAdt_vec: Optional[torch.Tensor],
     cb_old: Optional[torch.Tensor],
-    cumAdt_old: Optional[torch.Tensor],
     precompute_heads_per_cta: int,
     enable_pdl: bool,
     philox_rounds: int,
@@ -252,7 +248,6 @@ def checkpointing_ssu(
     cb_scaled: Optional[torch.Tensor] = None,
     cumAdt_vec: Optional[torch.Tensor] = None,
     cb_old: Optional[torch.Tensor] = None,
-    cumAdt_old: Optional[torch.Tensor] = None,
     precompute_heads_per_cta: int = 0,
     algorithm: str = "auto",
 ) -> torch.Tensor:
@@ -337,7 +332,7 @@ def checkpointing_ssu(
         new-token CB matrix, fragment-native layout
         (batch, nheads, WARP_SIZE, MMA_FRAG_SIZE) — each (batch, head)'s CB is
         one m16n8k16 MMA A-fragment stored as [warp lane, register].  Providing
-        it (together with ``cumAdt_vec`` / ``cb_old`` / ``cumAdt_old``) makes the
+        it (together with ``cumAdt_vec`` / ``cb_old``) makes the
         **two-kernel** (precompute + main) path available — ``algorithm`` decides
         whether it runs; leaving all four ``None`` always runs the monolithic
         kernel.  Caller-allocated so the path is CUDA-graph-safe (no in-wrapper
@@ -353,13 +348,6 @@ def checkpointing_ssu(
         K_old = next_multiple_of_8(max_window) — the m16n8k{K_old} MMA
         A-fragment consumed on the no-write (replay) path, stored as
         [warp lane, register].  Must be provided iff ``cb_scaled`` is.
-    cumAdt_old : Optional[torch.Tensor]
-        Pre-allocated fp32 scratch for the old-token decay rows, shape
-        (batch, nheads, max_window).  The ring caches carry no decay (prefix
-        sums are not ring-shift-invariant), so the precompute recomputes
-        cumAdt from the dt ring and stages it here; the main reads it back
-        (full rows on the write path, the β tail float on no-write).  Must be
-        provided iff ``cb_scaled`` is.
 
     Returns
     -------
@@ -470,23 +458,20 @@ def checkpointing_ssu(
     # ── Monolith vs two-kernel split (auto unless forced) ──
     # The split is AVAILABLE iff the caller provides the scratch quartet —
     # graph-safe, the caller pre-allocates like `out` (no wrapper allocation).
-    # All four or none: cb_scaled (C5) + cumAdt_vec (β) are produced on both
+    # All three or none: cb_scaled (C5) + cumAdt_vec (β) are produced on both
     # paths; cb_old (C6) is consumed on the no-write path, which the wrapper
-    # can't predict per-slot; cumAdt_old (C7) carries the precompute's
-    # recomputed old-decay rows to the main (the ring caches no decay).
+    # can't predict per-slot.  (Old decay is recomputed in-registers by the
+    # main from the dt ring — no scratch carries it.)
     # The launcher routes on params.cb_scaled != nullptr.
     scratch_provided = cb_scaled is not None
-    if (
-        scratch_provided != (cumAdt_vec is not None)
-        or scratch_provided != (cb_old is not None)
-        or scratch_provided != (cumAdt_old is not None)
+    if scratch_provided != (cumAdt_vec is not None) or scratch_provided != (
+        cb_old is not None
     ):
         raise ValueError(
-            "cb_scaled, cumAdt_vec, cb_old, and cumAdt_old must be provided together "
+            "cb_scaled, cumAdt_vec, and cb_old must be provided together "
             f"(they make the two-kernel path available); got "
             f"cb_scaled set={cb_scaled is not None}, "
-            f"cumAdt_vec set={cumAdt_vec is not None}, cb_old set={cb_old is not None}, "
-            f"cumAdt_old set={cumAdt_old is not None}"
+            f"cumAdt_vec set={cumAdt_vec is not None}, cb_old set={cb_old is not None}"
         )
     batch = cu_seqlens.numel() - 1 if cu_seqlens is not None else x.size(0)
     nheads = state.size(1)
@@ -506,11 +491,11 @@ def checkpointing_ssu(
         if two_kernel and not scratch_provided:
             raise ValueError(
                 "algorithm='two-kernel' requires the cb_scaled/cumAdt_vec/cb_old/"
-                "cumAdt_old scratch quartet (got none) — allocate them or use "
+                "scratch trio (got none) — allocate them or use "
                 "'auto'/'monolith'"
             )
     if not two_kernel:
-        cb_scaled = cumAdt_vec = cb_old = cumAdt_old = None
+        cb_scaled = cumAdt_vec = cb_old = None
 
     # ── d_split selection (v12 §59) ──
     # Auto-heuristic, measured on B200 (mixed-batch bench): d_split=2 pays
@@ -598,7 +583,6 @@ def checkpointing_ssu(
         cb_scaled,
         cumAdt_vec,
         cb_old,
-        cumAdt_old,
         precompute_heads_per_cta,
         enable_pdl,
         philox_rounds=philox_rounds,
