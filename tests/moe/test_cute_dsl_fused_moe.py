@@ -1008,16 +1008,7 @@ class TestCuteDslMoeBf16Activation:
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 
     @pytest.mark.parametrize(
-        "activation_type",
-        [
-            ActivationType.Gelu,
-            ActivationType.Relu,
-            ActivationType.Silu,
-            ActivationType.Swiglu,
-            ActivationType.Geglu,
-            ActivationType.Relu2,
-            ActivationType.Identity,
-        ],
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
     )
     @pytest.mark.parametrize("use_wrapper", [False, True])
     def test_activation_dispatch(

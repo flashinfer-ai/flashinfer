@@ -15,17 +15,15 @@ from flashinfer.cute_dsl.utils import get_max_active_clusters, make_ptr
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     allocate_moe_sort_buffers,
     get_max_num_permuted_tokens,
-    moe_activation,
     moe_output_memset_inplace,
     moe_permute,
+    moe_relu2,
     moe_sort,
+    moe_swiglu,
     moe_unpermute,
+    normalize_cute_dsl_moe_activation_type,
 )
-from flashinfer.tllm_enums import (
-    ActivationType,
-    is_gated_activation,
-    normalize_activation_type,
-)
+from flashinfer.tllm_enums import ActivationType
 
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 
@@ -351,8 +349,7 @@ def launch_w4a16_moe(
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
-    activation_type = normalize_activation_type(activation_type)
-    gated = is_gated_activation(activation_type)
+    activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
     gemm1_output_size = intermediate_size * (2 if gated else 1)
     if int(w1_weight.size(1)) != gemm1_output_size:
         raise ValueError(
@@ -432,12 +429,14 @@ def launch_w4a16_moe(
         route_tile,
         gemm1_tactic,
     )
-    moe_activation(
+    activation_fn = (
+        moe_swiglu if activation_type == ActivationType.Swiglu else moe_relu2
+    )
+    activation_fn(
         input=gemm1_output,
         output=intermediate,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
-        activation_type=activation_type,
         max_num_permuted_tokens=route_slots,
         tile_size=route_tile,
         enable_pdl=enable_pdl,

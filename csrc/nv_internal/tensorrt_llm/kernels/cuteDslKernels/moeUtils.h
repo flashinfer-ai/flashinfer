@@ -25,16 +25,16 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels::cute_dsl {
 
-// Activation types supported by the standalone moeActivation kernel. Values
-// match ActivationType in cutlass_kernels/include/common.h.
+// Activation type enum for standalone moeActivation kernel
+// Note: Matches ActivationType in cutlass_kernels/include/common.h
 enum class MoeActivationType {
   Gelu = 0,
   Relu = 1,
   Silu = 2,
   Swiglu = 3,
   Geglu = 4,
+  Identity = 5,
   Relu2 = 6,
-  Identity = 9,
 };
 
 template <typename InputType, typename SFType>

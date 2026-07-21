@@ -66,8 +66,6 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
-    is_gated_activation,
-    normalize_activation_type,
 )
 from ...autotuner import AutoTuner
 from ...cute_dsl.utils import convert_sf_to_mma_layout
@@ -77,7 +75,6 @@ from ...quantization.kernels.nvfp4_quantize import (
 )
 from ...utils import supported_compute_capability
 from .moe_utils import (
-    SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES,
     moe_output_memset_inplace,
     moe_sort,
     moe_unpermute,
@@ -228,9 +225,10 @@ def _moe_core_impl(
         use_async_memset: Use async memset on aux stream.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
-        activation_type: Activation type to apply after GEMM1. The BF16 path
-            supports Gelu, Relu, Silu, Swiglu, Geglu, Relu2, and Identity;
-            the NVFP4 path supports Swiglu and Relu2.
+        activation_type: Activation type to apply after GEMM1. Use
+            ActivationType.Swiglu for gated mode and ActivationType.Relu2 for
+            non-gated mode; swiglu_oai is represented as Swiglu with
+            non-default swiglu_alpha/beta/limit.
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
@@ -238,7 +236,7 @@ def _moe_core_impl(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
-    activation = normalize_activation_type(activation_type)
+    activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
     if quant_mode == "w4a16":
         if x.dtype != torch.bfloat16:
             raise TypeError(
@@ -284,7 +282,6 @@ def _moe_core_impl(
         )
     if x_sf is None:
         raise ValueError("x_sf is required when quant_mode='w4a4'")
-    activation, gated = normalize_cute_dsl_moe_activation_type(activation)
     if fc2_input_scale is None:
         raise ValueError("fc2_input_scale is required when quant_mode='w4a4'")
 
@@ -476,15 +473,6 @@ def _moe_bf16_activation_impl(
     """Run the BF16-activation, online-NVFP4-weight-dequantization path."""
     if output_dtype != torch.bfloat16:
         raise ValueError("the BF16 activation path only supports BF16 output")
-    if activation not in SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES:
-        expected = ", ".join(
-            value.name for value in SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES
-        )
-        raise ValueError(
-            f"Unsupported BF16 activation type {activation.name}; "
-            f"expected one of: {expected}"
-        )
-
     if activation == ActivationType.Swiglu:
         if (
             swiglu_alpha != DEFAULT_SWIGLU_ALPHA
@@ -645,9 +633,8 @@ class CuteDslMoEWrapper:
         enable_pdl : bool
             Enable Programmatic Dependent Launch.  Defaults to ``True``.
         activation_type : int
-            FC1 activation type. The BF16 path supports Gelu, Relu, Silu,
-            Swiglu, Geglu, Relu2, and Identity; the NVFP4 path supports Swiglu
-            and Relu2.
+            FC1 activation type. Use ``ActivationType.Swiglu`` for gated
+            SwiGLU and ``ActivationType.Relu2`` for non-gated ReLU^2.
         swiglu_alpha, swiglu_beta, swiglu_limit : float
             SwiGLU parameters. ``swiglu_oai`` is represented as
             ``ActivationType.Swiglu`` with non-default values.
@@ -658,14 +645,12 @@ class CuteDslMoEWrapper:
             Compute mode: ``"w4a4"`` / ``"nvfp4"`` or ``"w4a16"``.
             Defaults to ``"w4a4"``.
         """
-        activation = normalize_activation_type(activation_type)
+        activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         quant_mode = quant_mode.lower()
         if quant_mode not in ("nvfp4", "w4a4", "w4a16"):
             raise ValueError(
                 f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
             )
-        gated = is_gated_activation(activation)
-
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -938,7 +923,6 @@ class CuteDslMoEWrapper:
             )
             return self._w4a16_runner(inputs, tactic=best_tactic)
 
-        normalize_cute_dsl_moe_activation_type(self.activation_type)
         use_per_token_activation = per_token_scale is not None
         runner = self._per_token_runner if use_per_token_activation else self._runner
         if runner is None:
@@ -1154,8 +1138,10 @@ def cute_dsl_fused_moe_nvfp4(
     enable_pdl : bool
         Enable Programmatic Dependent Launch.  Defaults to ``True``.
     activation_type : int
-        FC1 activation type. The BF16 path supports Gelu, Relu, Silu, Swiglu,
-        Geglu, Relu2, and Identity; the NVFP4 path supports Swiglu and Relu2.
+        FC1 activation type. Use ``ActivationType.Swiglu`` for gated SwiGLU
+        and ``ActivationType.Relu2`` for non-gated ReLU^2. ``swiglu_oai`` is
+        represented as ``ActivationType.Swiglu`` with non-default
+        ``swiglu_alpha/beta/limit``.
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
     quant_mode : str
@@ -1169,7 +1155,7 @@ def cute_dsl_fused_moe_nvfp4(
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
-    activation = normalize_activation_type(activation_type)
+    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
     quant_mode = quant_mode.lower()
     if quant_mode not in ("nvfp4", "w4a4", "w4a16"):
         raise ValueError(
@@ -1230,7 +1216,6 @@ def cute_dsl_fused_moe_nvfp4(
         )
         return w4a16_runner(inputs, tactic=best_tactic, aux_stream=aux_stream)
 
-    activation, _ = normalize_cute_dsl_moe_activation_type(activation)
     tuner = AutoTuner.get()
 
     runner = CuteDslFusedMoENvfp4Runner(
