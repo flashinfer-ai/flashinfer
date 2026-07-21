@@ -47,6 +47,15 @@ unsafe shape/alignment assumptions.
 - **Low / medium:** fewer, high-confidence findings — crashes, correctness, interface breaks.
 - **High / max:** broader coverage, uncertain-but-worth-flagging findings, closer kernel reading.
 
+## Experimental APIs
+
+FlashInfer does not gate PRs by size. Some PRs may instead be submitted on **experimental**
+terms — a separate lifecycle, workflow management, and quality bar — declared via a tracked
+issue. Review such PRs against the experimental quality bar, not the durable-code bar.
+
+<!-- TODO: to be filled in by the owning team member — declaration workflow (tracked issue),
+review quality bar for experimental code, and graduation / removal criteria. -->
+
 ## Checklist
 
 - [ ] Crash/OOB/overflow/allocation defects

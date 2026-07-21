@@ -43,6 +43,15 @@ author cannot explain.
 A concrete flag: **coding style that deviates from surrounding code** without reason —
 flag it and discuss rather than silently accepting.
 
+**If the smell test fails:** ask the author to walk through the rationale — green CI alone
+does not settle it. Our principle (the same one
+[Dynamo](https://docs.nvidia.com/dynamo/getting-started/contribution-guide#contribution-workflow)
+applies): we encourage AI-assisted contributions, and we ask that authors understand their
+changes well enough to explain them when asked — a change its author cannot explain is not
+ready to merge yet. We state this as a principle rather than a hard policy: the goal is
+review quality, not discouraging contributions. This principle will also be added to the
+contribution guide.
+
 Where defendability matters more:
 - **Perf / kernel-selection logic, high-level interfaces, widely-used operations.** Design
   rationale drift in these *non-disposable* areas is expensive because it propagates.
@@ -67,9 +76,28 @@ kernel correctness.
 > so for them kernel internals are **in scope** — they read the logic and report bugs (with
 > confidence labels). See [`code_review_guidance.md`](code_review_guidance.md).
 
+## Experimental APIs
+
+FlashInfer does not gate PRs by size. Instead, an **experimental** track is being introduced:
+some PRs may be submitted on experimental terms — a separate lifecycle, workflow management,
+and quality bar — declared via a tracked issue.
+
+<!-- TODO: to be filled in by the owning team member — declaration workflow (tracked issue),
+review quality bar for experimental code, and graduation / removal criteria. -->
+
 ## How to leverage agent review
 
 **Design principle → design doc as markdown → code owner / agent enforce.** When a change
 embodies a design decision for durable code, capture the principle as a markdown design doc
 (see [design_docs/](design_docs/)) so reviewers — human or agent — can enforce against a written
 rationale instead of re-deriving it each PR.
+
+## Checklist
+
+- [ ] Crash/OOB/overflow/allocation defects
+- [ ] API shape, naming, convention consistency; `include/` stays Torch-free
+- [ ] Tests cover new behavior/edge cases; refcheck for numerics
+- [ ] Comments concise/high-SNR; docs in sync
+- [ ] Author can explain the design; style deviations from surrounding code flagged
+- [ ] Kernel internals **not** line-audited — instead, tests/benchmarks/fuzzing confirmed as
+      the correctness backstop
