@@ -66,6 +66,8 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
+    is_gated_activation,
+    normalize_activation_type,
 )
 from ...autotuner import AutoTuner
 from ...cute_dsl.utils import convert_sf_to_mma_layout
@@ -76,6 +78,7 @@ from ...quantization.kernels.nvfp4_quantize import (
 )
 from ...utils import supported_compute_capability
 from .moe_utils import (
+    SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES,
     moe_output_memset_inplace,
     moe_sort,
     moe_unpermute,
@@ -191,7 +194,8 @@ def _moe_core_impl(
         x_sf: Scale factors for an NVFP4 input, or ``None`` for BF16 input.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
-        w1_weight: GEMM1 weights (gate + up fused).
+        w1_weight: GEMM1 weights (gate + up fused for gated activations, or a
+            single projection for non-gated activations).
         w1_weight_sf: Scale factors for w1_weight.
         w1_alpha: Per-expert global scale for GEMM1.
         fc2_input_scale: Global scale for GEMM2 input quantization. Ignored
@@ -222,10 +226,9 @@ def _moe_core_impl(
         use_async_memset: Use async memset on aux stream.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
-        activation_type: Activation type to apply after GEMM1. Use
-            ActivationType.Swiglu for gated mode and ActivationType.Relu2 for
-            non-gated mode; swiglu_oai is represented as Swiglu with
-            non-default swiglu_alpha/beta/limit.
+        activation_type: Activation type to apply after GEMM1. The BF16 path
+            supports Gelu, Relu, Silu, Swiglu, Geglu, Relu2, and Identity;
+            the NVFP4 path supports Swiglu and Relu2.
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
@@ -233,7 +236,7 @@ def _moe_core_impl(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
-    activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation = normalize_activation_type(activation_type)
 
     if x_sf is None:
         return _moe_bf16_activation_impl(
@@ -261,6 +264,7 @@ def _moe_core_impl(
             tactic=w4a16_tactic,
             workspace_cache=w4a16_workspace_cache,
         )
+    activation, gated = normalize_cute_dsl_moe_activation_type(activation)
     if fc2_input_scale is None:
         raise ValueError("fc2_input_scale is required for NVFP4 activations")
 
@@ -457,6 +461,14 @@ def _moe_bf16_activation_impl(
         raise ValueError("the BF16 activation path only supports BF16 output")
     if per_token_scale is not None:
         raise ValueError("per_token_scale is not supported when x_sf is None")
+    if activation not in SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES:
+        expected = ", ".join(
+            value.name for value in SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES
+        )
+        raise ValueError(
+            f"Unsupported BF16 activation type {activation.name}; "
+            f"expected one of: {expected}"
+        )
 
     if activation == ActivationType.Swiglu:
         if (
@@ -467,9 +479,6 @@ def _moe_bf16_activation_impl(
             raise ValueError(
                 "the BF16 activation path only supports standard SwiGLU parameters"
             )
-    else:
-        raise ValueError("the BF16 activation path currently requires SwiGLU")
-
     num_tokens = int(token_selected_experts.size(0))
     hidden_size = int(w2_weight.size(1))
     if tuple(x.shape) != (num_tokens, hidden_size):
@@ -505,6 +514,7 @@ def _moe_bf16_activation_impl(
         moe_output=moe_output,
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
+        activation_type=activation,
         tactic=tactic,
         workspace_cache=workspace_cache,
     )
@@ -594,7 +604,7 @@ class CuteDslMoEWrapper:
         hidden_size : int
             Hidden dimension size.
         intermediate_size : int
-            Intermediate dimension size (after SwiGLU reduction).
+            Intermediate dimension size after the GEMM1 activation.
         use_cuda_graph : bool
             Create persistent CUDA stream/events for async-memset overlap.
             Required for CUDA graph capture, since streams and events must be
@@ -618,8 +628,9 @@ class CuteDslMoEWrapper:
         enable_pdl : bool
             Enable Programmatic Dependent Launch.  Defaults to ``True``.
         activation_type : int
-            FC1 activation type. Use ``ActivationType.Swiglu`` for gated
-            SwiGLU and ``ActivationType.Relu2`` for non-gated ReLU^2.
+            FC1 activation type. The BF16 path supports Gelu, Relu, Silu,
+            Swiglu, Geglu, Relu2, and Identity; the NVFP4 path supports Swiglu
+            and Relu2.
         swiglu_alpha, swiglu_beta, swiglu_limit : float
             SwiGLU parameters. ``swiglu_oai`` is represented as
             ``ActivationType.Swiglu`` with non-default values.
@@ -627,7 +638,8 @@ class CuteDslMoEWrapper:
             Use atomic fused finalize; otherwise use the deterministic
             two-stage finalize. Defaults to ``True``.
         """
-        activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        activation = normalize_activation_type(activation_type)
+        gated = is_gated_activation(activation)
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -830,7 +842,8 @@ class CuteDslMoEWrapper:
         token_final_scales : torch.Tensor
             Routing weights of shape ``[num_tokens, top_k]``.
         w1_weight : torch.Tensor
-            GEMM1 weights (gate + up fused).
+            GEMM1 weights (gate + up fused for gated activations, or a single
+            projection for non-gated activations).
         w1_weight_sf : torch.Tensor
             Scale factors for ``w1_weight``.
         w1_alpha : torch.Tensor
@@ -891,6 +904,7 @@ class CuteDslMoEWrapper:
             )
             return self._w4a16_runner(inputs, tactic=best_tactic)
 
+        normalize_cute_dsl_moe_activation_type(self.activation_type)
         use_per_token_activation = per_token_scale is not None
         runner = self._per_token_runner if use_per_token_activation else self._runner
 
@@ -1068,7 +1082,8 @@ def cute_dsl_fused_moe_nvfp4(
     token_final_scales : torch.Tensor
         Routing weights of shape ``[num_tokens, top_k]``.
     w1_weight : torch.Tensor
-        GEMM1 weights (gate + up fused).
+        GEMM1 weights (gate + up fused for gated activations, or a single
+        projection for non-gated activations).
     w1_weight_sf : torch.Tensor
         Scale factors for ``w1_weight``.
     w1_alpha : torch.Tensor
@@ -1103,10 +1118,8 @@ def cute_dsl_fused_moe_nvfp4(
     enable_pdl : bool
         Enable Programmatic Dependent Launch.  Defaults to ``True``.
     activation_type : int
-        FC1 activation type. Use ``ActivationType.Swiglu`` for gated SwiGLU
-        and ``ActivationType.Relu2`` for non-gated ReLU^2. ``swiglu_oai`` is
-        represented as ``ActivationType.Swiglu`` with non-default
-        ``swiglu_alpha/beta/limit``.
+        FC1 activation type. The BF16 path supports Gelu, Relu, Silu, Swiglu,
+        Geglu, Relu2, and Identity; the NVFP4 path supports Swiglu and Relu2.
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
     per_token_scale : Optional[torch.Tensor]
@@ -1119,7 +1132,7 @@ def cute_dsl_fused_moe_nvfp4(
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
     _require_cute_dsl_arch_for(x.device, native_only=True)
-    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation = normalize_activation_type(activation_type)
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -1175,6 +1188,7 @@ def cute_dsl_fused_moe_nvfp4(
         )
         return w4a16_runner(inputs, tactic=best_tactic, aux_stream=aux_stream)
 
+    activation, _ = normalize_cute_dsl_moe_activation_type(activation)
     tuner = AutoTuner.get()
 
     runner = CuteDslFusedMoENvfp4Runner(

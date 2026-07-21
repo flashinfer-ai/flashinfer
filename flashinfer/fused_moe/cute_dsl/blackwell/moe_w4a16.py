@@ -15,11 +15,16 @@ from flashinfer.cute_dsl.utils import get_max_active_clusters, make_ptr
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     allocate_moe_sort_buffers,
     get_max_num_permuted_tokens,
+    moe_activation,
     moe_output_memset_inplace,
     moe_permute,
     moe_sort,
-    moe_swiglu,
     moe_unpermute,
+)
+from flashinfer.tllm_enums import (
+    ActivationType,
+    is_gated_activation,
+    normalize_activation_type,
 )
 
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
@@ -55,6 +60,7 @@ def _get_workspace(
     num_experts: int,
     num_local_experts: int,
     intermediate_size: int,
+    gemm1_output_size: int,
     route_tile: int,
     workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> _W4A16Workspace:
@@ -67,6 +73,7 @@ def _get_workspace(
         top_k,
         int(x.size(1)),
         int(intermediate_size),
+        int(gemm1_output_size),
         int(num_experts),
         int(num_local_experts),
         route_tile,
@@ -88,7 +95,7 @@ def _get_workspace(
                 (route_slots, x.size(1)), dtype=torch.bfloat16, device=x.device
             ),
             gemm1_output=torch.empty(
-                (route_slots, 2 * intermediate_size),
+                (route_slots, gemm1_output_size),
                 dtype=torch.bfloat16,
                 device=x.device,
             ),
@@ -337,12 +344,21 @@ def launch_w4a16_moe(
     moe_output: torch.Tensor,
     use_fused_finalize: bool,
     enable_pdl: bool,
+    activation_type: ActivationType,
     tactic: Optional[W4A16MoeTactic] = None,
     workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
+    activation_type = normalize_activation_type(activation_type)
+    gated = is_gated_activation(activation_type)
+    gemm1_output_size = intermediate_size * (2 if gated else 1)
+    if int(w1_weight.size(1)) != gemm1_output_size:
+        raise ValueError(
+            f"w1_weight dim 1 must be {gemm1_output_size} for "
+            f"{activation_type.name}, got {w1_weight.size(1)}"
+        )
     if tactic is None:
         tactic = DEFAULT_W4A16_MOE_TACTIC
     route_tile, gemm1_tactic, gemm2_tactic = tactic
@@ -352,6 +368,7 @@ def launch_w4a16_moe(
         num_experts,
         num_local_experts,
         intermediate_size,
+        gemm1_output_size,
         route_tile,
         workspace_cache,
     )
@@ -407,7 +424,7 @@ def launch_w4a16_moe(
         w1_alpha,
         gemm1_output,
         num_local_experts,
-        True,
+        gated,
         False,
         None,
         None,
@@ -415,11 +432,12 @@ def launch_w4a16_moe(
         route_tile,
         gemm1_tactic,
     )
-    moe_swiglu(
+    moe_activation(
         input=gemm1_output,
         output=intermediate,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
+        activation_type=activation_type,
         max_num_permuted_tokens=route_slots,
         tile_size=route_tile,
         enable_pdl=enable_pdl,

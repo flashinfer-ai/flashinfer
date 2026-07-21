@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 import functools
-from enum import IntEnum
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -39,6 +38,16 @@ def _get_cuda_stream_ptr() -> int:
 SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
     ActivationType.Relu2,
+)
+
+SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES = (
+    ActivationType.Gelu,
+    ActivationType.Relu,
+    ActivationType.Silu,
+    ActivationType.Swiglu,
+    ActivationType.Geglu,
+    ActivationType.Relu2,
+    ActivationType.Identity,
 )
 
 
@@ -119,20 +128,6 @@ def get_max_num_permuted_tokens(
     """
     max_num_tiles = get_max_num_tiles(num_tokens, top_k, num_local_experts, tile_size)
     return max_num_tiles * tile_size
-
-
-class MoeActivationType(IntEnum):
-    """Activation types for MoE layers.
-
-    Note: Must match MoeActivationType enum in moeUtils.h
-    """
-
-    Gelu = 0
-    Relu = 1
-    Silu = 2
-    Swiglu = 3
-    Geglu = 4
-    Identity = 5
 
 
 @functools.lru_cache(maxsize=1)
@@ -731,7 +726,7 @@ def moe_activation(
     output: torch.Tensor,
     tile_idx_to_mn_limit: torch.Tensor,
     num_non_exiting_tiles: torch.Tensor,
-    activation_type: MoeActivationType,
+    activation_type: Union[int, ActivationType],
     max_num_permuted_tokens: int,
     tile_size: int,
     enable_pdl: bool = False,
@@ -752,12 +747,21 @@ def moe_activation(
         tile_idx_to_mn_limit: Valid token count per tile from moe_sort.
                              Shape: [num_tiles].
         num_non_exiting_tiles: Number of valid tiles (scalar on device).
-        activation_type: Type of activation to apply. See MoeActivationType.
+        activation_type: Type of activation to apply. See ActivationType.
         max_num_permuted_tokens: Maximum number of permuted tokens.
         tile_size: Tile size for scheduling.
         enable_pdl: Enable Programmatic Dependent Launch for better kernel overlap.
                     Default is False.
     """
+    activation_type = normalize_activation_type(activation_type)
+    if activation_type not in SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES:
+        expected = ", ".join(
+            value.name for value in SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES
+        )
+        raise ValueError(
+            f"Unsupported standalone MoE activation type {activation_type.name}; "
+            f"expected one of: {expected}"
+        )
     module = _get_moe_utils_module()
     dtype_suffix = _get_dtype_suffix(input.dtype)
 
@@ -812,7 +816,7 @@ def moe_swiglu(
         output=output,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
-        activation_type=MoeActivationType.Swiglu,
+        activation_type=ActivationType.Swiglu,
         max_num_permuted_tokens=max_num_permuted_tokens,
         tile_size=tile_size,
         enable_pdl=enable_pdl,
@@ -851,7 +855,7 @@ def moe_geglu(
         output=output,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
-        activation_type=MoeActivationType.Geglu,
+        activation_type=ActivationType.Geglu,
         max_num_permuted_tokens=max_num_permuted_tokens,
         tile_size=tile_size,
         enable_pdl=enable_pdl,
@@ -889,7 +893,7 @@ def moe_gelu(
         output=output,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
-        activation_type=MoeActivationType.Gelu,
+        activation_type=ActivationType.Gelu,
         max_num_permuted_tokens=max_num_permuted_tokens,
         tile_size=tile_size,
         enable_pdl=enable_pdl,
@@ -927,7 +931,7 @@ def moe_silu(
         output=output,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
-        activation_type=MoeActivationType.Silu,
+        activation_type=ActivationType.Silu,
         max_num_permuted_tokens=max_num_permuted_tokens,
         tile_size=tile_size,
         enable_pdl=enable_pdl,
@@ -965,7 +969,7 @@ def moe_relu(
         output=output,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
-        activation_type=MoeActivationType.Relu,
+        activation_type=ActivationType.Relu,
         max_num_permuted_tokens=max_num_permuted_tokens,
         tile_size=tile_size,
         enable_pdl=enable_pdl,

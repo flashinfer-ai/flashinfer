@@ -25,15 +25,16 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels::cute_dsl {
 
-// Activation type enum for standalone moeActivation kernel
-// Note: Matches ActivationType in cutlass_kernels/include/common.h
+// Activation types supported by the standalone moeActivation kernel. Values
+// match ActivationType in cutlass_kernels/include/common.h.
 enum class MoeActivationType {
   Gelu = 0,
   Relu = 1,
   Silu = 2,
   Swiglu = 3,
   Geglu = 4,
-  Identity = 5,
+  Relu2 = 6,
+  Identity = 9,
 };
 
 template <typename InputType, typename SFType>
@@ -66,8 +67,8 @@ void moeOutputMemset(InputType* input, int32_t const* tile_idx_to_mn_limit,
  * where first half is linear projection and second half is gate.
  * Output shape is (num_tokens, interm_size).
  *
- * For non-GLU activations (Gelu, Relu, Silu, Identity), input and output shape
- * are both (num_tokens, interm_size).
+ * For non-GLU activations (Gelu, Relu, Relu2, Silu, Identity), input and output
+ * shape are both (num_tokens, interm_size).
  *
  * @param input Input tensor
  * @param output Output tensor (same dtype as input for non-FP4 output)
