@@ -3501,16 +3501,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             _sm_scale = (
                 sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk)
             )
-            # Route compatible calls to faster trtllm CuTe DSL FMHA kernels.
-            # Sliding-window plans stay on the modular cute-dsl path: it
-            # measures faster than the FMHA route on windows (its banded
-            # masks skip dead work), and the FMHA route's prebuilt artifact
-            # matrix has no windowed variants (windowed calls there need a
-            # JIT compile).
-            self._cute_dsl_use_fmha = (
-                variant is None and head_dim_qk == 128 and window_left < 0
-            )
-            if self._cute_dsl_use_fmha:
+            # Variant-less head-128 plans can be served by the trtllm CuTe
+            # DSL FMHA kernel.  Sliding-window plans default to the modular
+            # cute-dsl path, which measures faster on windows (banded masks
+            # skip dead work).
+            self._cute_dsl_fmha_capable = variant is None and head_dim_qk == 128
+            self._cute_dsl_use_fmha = self._cute_dsl_fmha_capable and window_left < 0
+            if self._cute_dsl_fmha_capable:
+                # Built even when the modular path is the default route:
+                # run() falls back to the FMHA kernel for requests the
+                # modular kernel cannot serve (return_lse, mixed V dtype).
                 q_lens = qo_indptr[1:] - qo_indptr[:-1]
                 k_lens = kv_indptr[1:] - kv_indptr[:-1]
                 self._cute_dsl_fmha_plan = {
@@ -3524,7 +3524,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "causal": causal,
                     "window_left": window_left,
                 }
-            else:
+            if not self._cute_dsl_use_fmha:
+                # The modular kernel requires one uniform dtype; reject
+                # mismatched plan dtypes here with a clear error (they
+                # would otherwise surface as an opaque FFI signature
+                # mismatch at run()).
+                if kv_data_type is not None and q_data_type != kv_data_type:
+                    raise ValueError(
+                        "cute-dsl modular prefill requires q_data_type == "
+                        f"kv_data_type, got {q_data_type} and {kv_data_type}"
+                    )
                 self._cute_dsl_wrapper.plan(
                     qo_indptr,
                     kv_indptr,
@@ -3825,8 +3834,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "cute-dsl backend does not support FP8 scale parameters"
                 )
-            if self._cute_dsl_use_fmha:
-                # Delegate to the trtllm CuTe DSL FMHA kernel (supports LSE).
+            if self._cute_dsl_use_fmha or (
+                self._cute_dsl_fmha_capable and (return_lse or v.dtype != q.dtype)
+            ):
+                # Delegate to the trtllm CuTe DSL FMHA kernel.  Windowed
+                # plans default to the modular path but take this route for
+                # requests the modular kernel cannot serve: return_lse and
+                # mixed V dtype (the FMHA kernel JIT-compiles windowed /
+                # separate-V-dtype variants).
                 p = self._cute_dsl_fmha_plan
                 return trtllm_ragged_attention_deepseek(
                     query=q,

@@ -211,8 +211,8 @@ class BatchPrefillCuteDSLWrapper:
         q_data_type=torch.float16,
         kv_data_type=torch.float16,
         window_left: int = -1,
-        window_right: int = -1,
         variant: AttentionVariant | None = None,
+        window_right: int = -1,
     ) -> None:
         """Compile the FMHA prefill kernel for the given configuration.
 

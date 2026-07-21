@@ -738,6 +738,75 @@ FP16_SHAPE_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,causal,window_left",
+    [
+        (1, 2048, 2048, True, -1),
+        (1, 2048, 2048, True, 127),
+        (3, 512, 512, False, -1),
+    ],
+)
+def test_attention_prefill_fp8(batch_size, qo_len, kv_len, causal, window_left):
+    """Uniform fp8 (e4m3) inputs on the modular kernel.
+
+    The tolerance reflects fp8's inherent error — P (the softmax weights)
+    is stored in e4m3 for the PV GEMM — and was calibrated against the
+    trtllm CuTe DSL FMHA kernel's fp8 output on identical inputs (both
+    kernels reach max_err ~0.066 vs an f32 reference at these shapes).
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    ).to(torch.float8_e4m3fn)
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    ).to(torch.float8_e4m3fn)
+    v = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    ).to(torch.float8_e4m3fn)
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        window_left=window_left,
+    )
+    o = wrapper.run(q, k, v)
+
+    # f32 reference over the dequantized fp8 inputs.
+    o_ref = attention_band_mask_ref(
+        batch_size,
+        q.to(torch.float32),
+        k.to(torch.float32),
+        v.to(torch.float32),
+        SM_SCALE,
+        causal,
+        window_left,
+        window_right=-1,
+    )
+    torch.testing.assert_close(o.float(), o_ref.float(), rtol=1e-2, atol=8e-2)
+
+
 @pytest.mark.parametrize("batch_size,qo_len,kv_len", FP16_SHAPE_PARAMS)
 @pytest.mark.parametrize("causal", [False, True])
 def test_attention_prefill_fp16(
@@ -836,10 +905,11 @@ def attention_band_mask_ref(
     q_idx = torch.arange(qo_len, device=q.device).unsqueeze(1)
     k_idx = torch.arange(kv_len, device=q.device).unsqueeze(0)
     mask = torch.ones(qo_len, kv_len, dtype=torch.bool, device=q.device)
-    if causal:
-        mask &= k_idx <= q_idx + qk_offset
-    elif window_right >= 0:
-        mask &= k_idx - (q_idx + qk_offset) <= window_right
+    # Causal is a right bound of 0 (the kernel's own folding); it must come
+    # from the flag because callers pass causal=True with window_right=-1.
+    wr = 0 if causal else window_right
+    if wr >= 0:
+        mask &= k_idx - (q_idx + qk_offset) <= wr
     if window_left >= 0:
         mask &= (q_idx + qk_offset) - k_idx <= window_left
     logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
