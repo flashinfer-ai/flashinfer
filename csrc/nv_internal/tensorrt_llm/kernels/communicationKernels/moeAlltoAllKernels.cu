@@ -35,8 +35,11 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 #define DISABLE_SYNC_FOR_PROFILING 0
 
 constexpr int kEp4Size = 4;
+// Two 32-thread warps can cover at most 64 16-byte activation vectors.
 constexpr int kCompactDispatchMaxPayloadBytes = 1024;
 constexpr int kCompactDispatchBlockSize = 128;
+constexpr int kDispatchWarpSize = 32;
+constexpr int kDispatchActivationWarps = 2;
 constexpr int kDispatchWideVectorBytes = 16;
 constexpr int kDispatchMetadataVectorBytes = 8;
 constexpr int kDispatchHalfWarpSize = 16;
@@ -44,9 +47,13 @@ constexpr int kNvfp4ActivationToScaleRatio = 8;
 constexpr int kNvfp4H2048ActivationBytes = 2048 / 2;
 constexpr int kNvfp4H2048ScaleBytes = 2048 / 16;
 constexpr int kTopK22MetadataBytes = 22 * sizeof(int32_t);
-constexpr int kNvfp4H2048ActivationWorkers = kNvfp4H2048ActivationBytes / 16;
-constexpr int kNvfp4H2048ScaleWorkers = kNvfp4H2048ScaleBytes / 16;
-constexpr int kTopK22MetadataWorkers = kTopK22MetadataBytes / 8;
+constexpr int kNvfp4H2048ActivationWorkers = kNvfp4H2048ActivationBytes / kDispatchWideVectorBytes;
+constexpr int kNvfp4H2048ScaleWorkers = kNvfp4H2048ScaleBytes / kDispatchWideVectorBytes;
+constexpr int kTopK22MetadataWorkers = kTopK22MetadataBytes / kDispatchMetadataVectorBytes;
+static_assert(kCompactDispatchMaxPayloadBytes % kDispatchWideVectorBytes == 0);
+static_assert(kCompactDispatchMaxPayloadBytes / kDispatchWideVectorBytes <=
+              kDispatchActivationWarps * kDispatchWarpSize);
+static_assert(kCompactDispatchBlockSize == (kDispatchActivationWarps + 2) * kDispatchWarpSize);
 
 #ifndef DISABLE_TIMEOUT
 #define DISABLE_TIMEOUT 0
@@ -59,7 +66,8 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
 }
 
 // The phased schedule reserves two warps for packed activations, one for scales,
-// and splits the last warp between the two routing-metadata payloads.
+// and splits the last warp between the two routing-metadata payloads. The
+// activation cap intentionally limits this path to hidden sizes up to 2048.
 static bool isPhasedNvfp4PayloadLayout(DispatchKernelPointers const& ptrs, int num_payloads,
                                        int top_k) {
   if (num_payloads != 4 || top_k <= kEp4Size) {
@@ -539,19 +547,19 @@ __global__ void moeA2ADispatchKernel(
       // Keep compile-time bounds for the measured Nemotron H2048 target.
       int warp_id = thread_idx / warpSize;
       int lane_id = thread_idx % warpSize;
-      if (warp_id < 2) {
+      if (warp_id < kDispatchActivationWarps) {
         auto const* src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[0]) +
                           static_cast<size_t>(local_token_idx) * kNvfp4H2048ActivationBytes;
         vectorized_dispatch_impl<16, NUM_DESTINATIONS>(
             src, kNvfp4H2048ActivationBytes, rank_id, max_tokens_per_rank, 0, ptrs, target_ranks,
             send_indices, thread_idx, kNvfp4H2048ActivationWorkers);
-      } else if (warp_id == 2 && lane_id < kNvfp4H2048ScaleWorkers) {
+      } else if (warp_id == kDispatchActivationWarps && lane_id < kNvfp4H2048ScaleWorkers) {
         auto const* src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[1]) +
                           static_cast<size_t>(local_token_idx) * kNvfp4H2048ScaleBytes;
         vectorized_dispatch_impl<16, NUM_DESTINATIONS>(
             src, kNvfp4H2048ScaleBytes, rank_id, max_tokens_per_rank, 1, ptrs, target_ranks,
             send_indices, lane_id, kNvfp4H2048ScaleWorkers);
-      } else if (warp_id == 3 && lane_id < 2 * kTopK22MetadataWorkers) {
+      } else if (warp_id == kDispatchActivationWarps + 1 && lane_id < 2 * kTopK22MetadataWorkers) {
         bool second_tail = lane_id >= kTopK22MetadataWorkers;
         int payload_idx = second_tail ? 3 : 2;
         int worker_idx = second_tail ? lane_id - kTopK22MetadataWorkers : lane_id;
@@ -572,19 +580,19 @@ __global__ void moeA2ADispatchKernel(
       int const scale_workers = scale_bytes / kDispatchWideVectorBytes;
       int warp_id = thread_idx / warpSize;
       int lane_id = thread_idx % warpSize;
-      if (warp_id < 2 && thread_idx < activation_workers) {
+      if (warp_id < kDispatchActivationWarps && thread_idx < activation_workers) {
         auto const* src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[0]) +
                           static_cast<size_t>(local_token_idx) * activation_bytes;
         vectorized_dispatch_impl<kDispatchWideVectorBytes, NUM_DESTINATIONS>(
             src, activation_bytes, rank_id, max_tokens_per_rank, 0, ptrs, target_ranks,
             send_indices, thread_idx, activation_workers);
-      } else if (warp_id == 2 && lane_id < scale_workers) {
+      } else if (warp_id == kDispatchActivationWarps && lane_id < scale_workers) {
         auto const* src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[1]) +
                           static_cast<size_t>(local_token_idx) * scale_bytes;
         vectorized_dispatch_impl<kDispatchWideVectorBytes, NUM_DESTINATIONS>(
             src, scale_bytes, rank_id, max_tokens_per_rank, 1, ptrs, target_ranks, send_indices,
             lane_id, scale_workers);
-      } else if (warp_id == 3 && lane_id < 2 * METADATA_WORKERS) {
+      } else if (warp_id == kDispatchActivationWarps + 1 && lane_id < 2 * METADATA_WORKERS) {
         bool second_tail = lane_id >= METADATA_WORKERS;
         int payload_idx = second_tail ? 3 : 2;
         int worker_idx = second_tail ? lane_id - METADATA_WORKERS : lane_id;
@@ -817,6 +825,10 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
     SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
       if (phase_nvfp4_payloads && params.top_k == 22 &&
           kernel_ptrs.payload_bytes_per_token[0] == kNvfp4H2048ActivationBytes) {
+        FLASHINFER_CHECK(kernel_ptrs.payload_bytes_per_token[1] == kNvfp4H2048ScaleBytes &&
+                             kernel_ptrs.payload_bytes_per_token[2] == kTopK22MetadataBytes &&
+                             kernel_ptrs.payload_bytes_per_token[3] == kTopK22MetadataBytes,
+                         "Invalid H2048/top-k-22 NVFP4 dispatch payload layout");
         if (use_compact_ep4) {
           int shared_bytes = kEp4Size * (int)sizeof(int);
           auto kernel_fn =
