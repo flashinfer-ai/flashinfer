@@ -44,7 +44,7 @@ class MoEWeightPack:
 
     Supplying exactly one scale raises: that state used to silently select
     the re-quantize-from-bf16 path in every backend, ignoring the provided
-    scale (see ``todo_weight_pack_union.md``).
+    scale.
     """
 
     # Annotations only — NO class-level defaults here: a plain ``= None`` on
@@ -98,8 +98,9 @@ class UnquantizedMoEWeights(MoEWeightPack):
     w2: torch.Tensor
     # ClassVar: readable as ``pack.w13_scale is None`` but NOT a dataclass
     # field, and invisible to the Prequantized variant's field defaults.
-    w13_scale: ClassVar[None] = None
-    w2_scale: ClassVar[None] = None
+    # mypy flags instance->class overrides; the shadowing is the point here.
+    w13_scale: ClassVar[None] = None  # type: ignore[misc]
+    w2_scale: ClassVar[None] = None  # type: ignore[misc]
 
 
 @dataclass(frozen=True)

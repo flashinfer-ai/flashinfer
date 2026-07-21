@@ -90,10 +90,7 @@ def fused_quant_stage_supported(
     back to torch staging rather than failing.
     """
     sf_align = 64 if quant_type == "nvfp4" else 128
-    return (
-        hidden_states.data_ptr() % 16 == 0
-        and hidden_states.shape[1] % sf_align == 0
-    )
+    return hidden_states.data_ptr() % 16 == 0 and hidden_states.shape[1] % sf_align == 0
 
 
 def fused_quant_stage(

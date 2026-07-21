@@ -1,11 +1,14 @@
 """Unit tests for the MoEWeightPack union (Unquantized | Prequantized).
 
 CPU-only: covers the factory dispatch, the mixed-scale-state rejection (the
-motivating silent-requantize footgun of ``todo_weight_pack_union.md``), and
-that all three mega backends discriminate the variants by type.
+motivating footgun: one-scale-supplied packs used to silently select the
+re-quantize-from-bf16 path, ignoring the provided scale), and that all three
+mega backends discriminate the variants by type.
 """
 
 from __future__ import annotations
+
+import dataclasses
 
 import pytest
 
@@ -85,7 +88,7 @@ def test_direct_variant_construction():
 
 def test_variants_are_frozen():
     pack = MoEWeightPack(*_bf16_tensors())
-    with pytest.raises(Exception):  # dataclasses.FrozenInstanceError
+    with pytest.raises(dataclasses.FrozenInstanceError):
         pack.w13 = torch.zeros(1)
 
 

@@ -300,8 +300,7 @@ def validate_mega_fleet_params(
         )
     if intermediate_size % alignment != 0:
         raise MoEEpConfigError(
-            f"intermediate_size ({intermediate_size}) must be a multiple of "
-            f"{alignment}"
+            f"intermediate_size ({intermediate_size}) must be a multiple of {alignment}"
         )
     if top_k <= 0:
         raise MoEEpConfigError(f"top_k must be positive, got {top_k}")
