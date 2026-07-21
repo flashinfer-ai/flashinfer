@@ -744,7 +744,7 @@ class DenseGemmKernel:
         tCc: cute.Tensor,
         row_limit: Int32,
     ) -> cute.Tensor:
-        tPred = cute.make_fragment(
+        tPred = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     cute.size(tCc, mode=[0, 1]),
@@ -796,7 +796,7 @@ class DenseGemmKernel:
         tC: cute.Tensor,
         row_limit: Int32,
     ) -> None:
-        tP = cute.make_fragment(cute.make_layout(tS.shape), cutlass.Boolean)
+        tP = cute.make_rmem_tensor(cute.make_layout(tS.shape), cutlass.Boolean)
         for i in cutlass.range_constexpr(cute.size(tP)):
             tP[i] = cute.elem_less(tC[i][0][0][0], row_limit)
         for rest_m in cutlass.range_constexpr(cute.size(tS.shape[1])):
@@ -2413,9 +2413,9 @@ class DenseGemmKernel:
         # A must be K-major, B must be K-major
         if a_major != "k" or b_major != "k":
             return False
-        # Alignment: K must be divisible by tile_k
-        tile_k = sf_vec_size * 8
-        if k % tile_k != 0:
+        # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not tile_k: the
+        # mainloop predicates the partial tile, so ragged K works. Mirror gemm_base.py.
+        if k % 32 != 0:
             return False
         return True
 

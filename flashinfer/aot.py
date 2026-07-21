@@ -46,6 +46,7 @@ from .jit.attention import (
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
+from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
@@ -59,6 +60,7 @@ from .jit.fp4_quantization import (
 )
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm90_module,
@@ -68,12 +70,15 @@ from .jit.fused_moe import (
     gen_trtllm_gen_fused_moe_sm100_module,
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
+from .jit.monomoe import gen_monomoe_module
+from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
     gen_gemm_sm90_module,
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_nvfp4_svdquant,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_cutlass_mxfp8,
     gen_gemm_sm120_module,
@@ -89,7 +94,7 @@ from .jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from .jit.mhc import gen_mhc_module
-from .jit.mla import gen_mla_module
+from .jit.mla import gen_mla_module, gen_sparse_mla_sm120_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -106,6 +111,7 @@ from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
+from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
@@ -118,6 +124,7 @@ def gen_fa2(
     head_dim_vo: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    prefill_only: bool = False,
 ) -> Iterator[JitSpec]:
     if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
         return
@@ -151,28 +158,29 @@ def gen_fa2(
         use_fp16_qk_reduction=False,
     )
 
-    yield gen_single_decode_module(
-        dtype_q=dtype_qo,
-        dtype_kv=dtype_kv,
-        dtype_o=dtype_qo,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=0,
-        use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=use_logits_soft_cap,
-    )
+    if not prefill_only:
+        yield gen_single_decode_module(
+            dtype_q=dtype_qo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_qo,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            pos_encoding_mode=0,
+            use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+        )
 
-    yield gen_batch_decode_module(
-        dtype_q=dtype_qo,
-        dtype_kv=dtype_kv,
-        dtype_o=dtype_qo,
-        dtype_idx=torch.int32,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=0,
-        use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=use_logits_soft_cap,
-    )
+        yield gen_batch_decode_module(
+            dtype_q=dtype_qo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_qo,
+            dtype_idx=torch.int32,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            pos_encoding_mode=0,
+            use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+        )
 
 
 def gen_fa3(
@@ -224,6 +232,18 @@ def gen_attention(
     head_dim_ckv = 512
     head_dim_kpe = 64
 
+    # For 16-bit KV, head_dim > 256 FA2 modules use the Ampere+ large-head path.
+    # NVFP4 KV large-head is validated for FA2 batch prefill on SM8+; other
+    # one-byte large-head modules stay SM100+-only until validated separately.
+    from .jit.core import current_compilation_context
+
+    has_sm8_or_newer = any(
+        major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+    )
+    has_sm10_or_newer = any(
+        major >= 10 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+    )
+
     # FA2 MHA / MQA / GQA
     for (
         (head_dim_qk, head_dim_vo),
@@ -238,6 +258,14 @@ def gen_attention(
         use_sliding_window_,
         use_logits_soft_cap_,
     ):
+        large_head = head_dim_qk > 256 or head_dim_vo > 256
+        nvfp4_large_head = large_head and _is_nvfp4_kv_dtype(dtype_kv)
+        if large_head:
+            if dtype_kv.itemsize == 1 and not nvfp4_large_head:
+                if not has_sm10_or_newer:
+                    continue
+            elif not has_sm8_or_newer:
+                continue
         yield from gen_fa2(
             dtype_qo=dtype_qo,
             dtype_kv=dtype_kv,
@@ -245,19 +273,23 @@ def gen_attention(
             head_dim_vo=head_dim_vo,
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
+            prefill_only=nvfp4_large_head and not has_sm10_or_newer,
         )
-        yield gen_batch_attention_module(
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            dtype_idx=torch.int32,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            # use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-            use_profiler=False,
-        )
+        # The holistic (persistent) batch-attention kernel
+        # does not support head_dim=512.
+        if head_dim_qk <= 256 and head_dim_vo <= 256:
+            yield gen_batch_attention_module(
+                dtype_q=dtype_qo,
+                dtype_kv=dtype_kv,
+                dtype_o=dtype_qo,
+                dtype_idx=torch.int32,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                pos_encoding_mode=0,
+                # use_sliding_window=use_sliding_window,
+                use_logits_soft_cap=use_logits_soft_cap,
+                use_profiler=False,
+            )
 
     # FA3 MHA / MQA / GQA
     if has_sm90:
@@ -487,6 +519,8 @@ def gen_all_modules(
             add_oai_oss,
         )
     )
+    if has_sm120 or has_sm121:
+        jit_specs.append(gen_nvfp4_attention_sm120_module())
 
     if add_act:
         for act_name in act_func_def_str:
@@ -496,17 +530,23 @@ def gen_all_modules(
         jit_specs.append(gen_gemm_module())
         # Multi-LoRA MoE BGMV kernel
         jit_specs.append(gen_bgmv_moe_module())
+        # DSv4 hash-based MoE routing (SM-portable)
+        jit_specs.append(gen_hash_topk_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
+            # MonoMoe kernel: single-kernel block-FP8 top-K MoE,
+            # Hopper (SM90a) only — uses wgmma.mma_async + TMA.
+            jit_specs.append(gen_monomoe_module())
         if has_sm100:
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
             jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
             # Add TGV GEMM modules for both bf16 and fp16
@@ -544,6 +584,7 @@ def gen_all_modules(
             # compiles for all SM12x targets.
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module_cute_mxfp8())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
             jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
@@ -720,6 +761,10 @@ def gen_all_modules(
             )
         )
 
+    # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
+    if has_sm120 or has_sm121:
+        jit_specs.append(gen_sparse_mla_sm120_module())
+
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())
 
@@ -870,6 +915,8 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
 def get_default_config():
     """Get default AOT configuration"""
     return {
+        # Note: head_dim=512 (FA2 prefill/decode, SM100+) excluded to reduce
+        # space in the jit-cache wheel.
         "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
         "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
         "f16_dtype": [torch.float16, torch.bfloat16],

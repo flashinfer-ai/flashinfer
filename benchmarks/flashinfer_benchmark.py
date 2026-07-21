@@ -6,7 +6,6 @@ import sys
 from routines.flashinfer_benchmark_utils import (
     benchmark_apis,
     full_output_columns,
-    output_column_dict,
 )
 
 
@@ -68,6 +67,10 @@ def run_test(args):
         from routines.gdn import run_gdn_test
 
         res = run_gdn_test(args)
+    elif args.routine in benchmark_apis["sparse_attention"]:
+        from routines.sparse_attention import run_sparse_attention_test
+
+        res = run_sparse_attention_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -75,9 +78,11 @@ def run_test(args):
     if args.output_path is not None:
         with open(args.output_path, "a") as fout:
             for cur_res in res:
-                for key in output_column_dict["general"]:
-                    # Only set from args if the routine hasn't already set a value
-                    # This preserves routine-specific formatting while providing defaults
+                for key in full_output_columns:
+                    # Backfill every output column the routine didn't set: from
+                    # args when available, else "".  Covers columns belonging to
+                    # other routines (e.g. attention's s_qo) that would otherwise
+                    # KeyError below.  Routine-set values are preserved.
                     if key not in cur_res or cur_res[key] == "":
                         cur_res[key] = getattr(args, key, "")
 
@@ -119,7 +124,8 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["sampling"])
         + list(benchmark_apis["rope"])
         + list(benchmark_apis["mamba"])
-        + list(benchmark_apis["gdn"]),
+        + list(benchmark_apis["gdn"])
+        + list(benchmark_apis["sparse_attention"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -276,6 +282,10 @@ def parse_args(line=sys.argv[1:]):
         from routines.gdn import parse_gdn_args
 
         args = parse_gdn_args(line, parser)
+    elif args.routine in benchmark_apis["sparse_attention"]:
+        from routines.sparse_attention import parse_sparse_attention_args
+
+        args = parse_sparse_attention_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 

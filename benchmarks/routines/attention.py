@@ -24,7 +24,11 @@ except OSError as e:
 from flashinfer import autotune
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.prefill import trtllm_fmha_v2_prefill
-from flashinfer.utils import is_sm12x_supported
+from flashinfer.utils import (
+    get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    is_sm12x_supported,
+)
 from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
@@ -217,6 +221,33 @@ def parse_attention_args(line, parser):
             "measurement reflects the autotuned tactic."
         ),
     )
+    parser.add_argument(
+        "--mla_is_var_seq",
+        choices=["true", "false", "auto"],
+        default=None,
+        help=(
+            "MLA-only: control the is_var_seq argument passed to "
+            "trtllm_batch_decode_with_kv_cache_mla, which selects the var-seq vs. "
+            "persistent scheduler (is_persistent = not is_var_seq). "
+            "'true'/'false' force the value; 'auto' resolves to --random_actual_seq_len. "
+            "If unset (default), is_var_seq is not passed and the API default (True) "
+            "is used, preserving existing behavior and perf baselines."
+        ),
+    )
+    parser.add_argument(
+        "--mla_cute_dsl_impl",
+        choices=["auto", "modular", "monolithic"],
+        default=None,
+        help=(
+            "MLA-only: control the cute_dsl_impl argument passed to "
+            "trtllm_batch_decode_with_kv_cache_mla, selecting the CuTe DSL "
+            "decode implementation. 'auto' (API default) runs monolithic and "
+            "only promotes to modular for modular-only features (e.g. sinks); "
+            "'modular'/'monolithic' force that impl. If unset (default), "
+            "cute_dsl_impl is not passed and the API default ('auto') is used, "
+            "preserving existing behavior and perf baselines."
+        ),
+    )
 
     args = parser.parse_args(line)
 
@@ -383,11 +414,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "[INFO] FA2_TC backend does not support speculative decode. Skipping."
             )
             remove_fa2_tc = True
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] FA2_TC backend does not support FP8. Skipping.")
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            print("[INFO] FA2_TC backend does not support FP8 query. Skipping.")
             remove_fa2_tc = True
         if remove_fa2_tc:
             backends.remove("fa2_tc")
@@ -547,6 +575,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     scale = float(1.0 / (head_dim_qk**0.5))
     workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+    gqa_multi_ctas_kv_counter_buffer = None
+    if "trtllm-native" in backends:
+        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_qo_heads, get_device_sm_count(device)
+        )
+        gqa_multi_ctas_kv_counter_buffer = torch.zeros(
+            counter_bytes, dtype=torch.uint8, device=device
+        )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {kv_cache.shape = }")
@@ -675,6 +711,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 mask=speculative_mask,
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
+                multi_ctas_kv_counter_buffer=gqa_multi_ctas_kv_counter_buffer,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -2278,6 +2315,27 @@ def testBatchMLAPagedAttentionWrapper(args):
     causal = False  # False for MLA
     run_refcheck = args.refcheck
 
+    # Resolve the MLA is_var_seq override (selects var-seq vs. persistent
+    # scheduler). None => do not pass is_var_seq to the API, keeping its default
+    # so existing cases and perf baselines are unchanged.
+    mla_is_var_seq_arg = getattr(args, "mla_is_var_seq", None)
+    if mla_is_var_seq_arg is None:
+        resolved_is_var_seq = None
+    elif mla_is_var_seq_arg == "auto":
+        resolved_is_var_seq = getattr(args, "random_actual_seq_len", False)
+    else:
+        resolved_is_var_seq = mla_is_var_seq_arg == "true"
+    # Only forwarded to the direct trtllm API when explicitly resolved.
+    mla_api_extra_kwargs = (
+        {} if resolved_is_var_seq is None else {"is_var_seq": resolved_is_var_seq}
+    )
+    # Resolve the MLA cute_dsl_impl override (selects modular vs. monolithic
+    # CuTe DSL decode kernel). None => do not pass cute_dsl_impl, keeping the
+    # API default ('auto') so existing cases and perf baselines are unchanged.
+    mla_cute_dsl_impl_arg = getattr(args, "mla_cute_dsl_impl", None)
+    if mla_cute_dsl_impl_arg is not None:
+        mla_api_extra_kwargs["cute_dsl_impl"] = mla_cute_dsl_impl_arg
+
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
     if "fa2" in backends:
@@ -2421,6 +2479,14 @@ def testBatchMLAPagedAttentionWrapper(args):
 
     sm_scale = 1.0 / ((128 + 64) ** 0.5)  # For DeepSeek-R1
     workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+    mla_multi_ctas_kv_counter_buffer = None
+    if "trtllm-native" in backends:
+        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_qo_heads, get_device_sm_count(device)
+        )
+        mla_multi_ctas_kv_counter_buffer = torch.zeros(
+            counter_bytes, dtype=torch.uint8, device=device
+        )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {ckv_cache.shape = }")
@@ -2483,6 +2549,15 @@ def testBatchMLAPagedAttentionWrapper(args):
         block_tables,
         actual_seq_lens_kv,
     ):
+        """
+        Run a single MLA decode backend and return its output tensor.
+
+        Dispatches to the BatchMLAPagedAttentionWrapper for fa2/fa3/cutlass or
+        to the direct trtllm_batch_decode_with_kv_cache_mla API for
+        trtllm-native/auto/cute-dsl. The trtllm/auto/cute-dsl branches also
+        forward the resolved MLA overrides (is_var_seq / cute_dsl_impl) via
+        mla_api_extra_kwargs.
+        """
         if backend in ["fa2", "fa3"]:
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
             # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
@@ -2521,6 +2596,8 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm2_scale=1.0,
                 backend="trtllm-gen",
                 enable_pdl=args.enable_pdl,
+                multi_ctas_kv_counter_buffer=mla_multi_ctas_kv_counter_buffer,
+                **mla_api_extra_kwargs,
             ).squeeze(1)
         elif backend == "auto":
             # Autotune dispatcher: picks between trtllm-gen and cute-dsl per
@@ -2540,6 +2617,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm2_scale=1.0,
                 backend="auto",
                 enable_pdl=args.enable_pdl,
+                **mla_api_extra_kwargs,
             ).squeeze(1)
         elif backend == "cute-dsl":
             return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
@@ -2556,6 +2634,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm2_scale=1.0,
                 backend="cute-dsl",
                 enable_pdl=args.enable_pdl,
+                **mla_api_extra_kwargs,
             ).squeeze(1)
         else:
             print(f"[ERROR] Unsupported backend: {backend}")
@@ -2730,6 +2809,13 @@ def testBatchMLAPagedAttentionWrapper(args):
                 cur_res["kv_dtype"] = kv_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_kv
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
+                # Leave empty (null) when not explicitly overridden so legacy
+                # var-seq rows keep matching historical null baselines.
+                if resolved_is_var_seq is not None:
+                    cur_res["is_var_seq"] = resolved_is_var_seq
+                # Same null-preserving rule for cute_dsl_impl.
+                if mla_cute_dsl_impl_arg is not None:
+                    cur_res["cute_dsl_impl"] = mla_cute_dsl_impl_arg
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

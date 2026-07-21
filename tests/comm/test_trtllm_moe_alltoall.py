@@ -15,13 +15,17 @@ limitations under the License.
 """
 
 from enum import IntEnum
+import itertools
 import pytest
-import torch
 import pynvml
+import torch
+
 from flashinfer.comm.mapping import Mapping
 from flashinfer.fused_moe.utils import make_random_topk_ids
 from flashinfer.tllm_enums import SfLayout
 from flashinfer.utils import get_compute_capability
+from flashinfer import mxfp4_quantize, nvfp4_quantize
+from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
 from tests.utils_fp8 import mxfp8_quantize_reference
 
 import flashinfer.comm.trtllm_moe_alltoall as trtllm_moe_alltoall
@@ -37,6 +41,8 @@ def setup_test_environment():
     torch.manual_seed(0xD5)
     yield
 
+
+NUM_LORA_ADAPTERS = 8
 
 # Single GPU test parameters
 SINGLE_GPU_PARAMS = [
@@ -66,41 +72,37 @@ LARGER_PAYLOADS_PARAMS = [
 class CombineQuantMode(IntEnum):
     NONE = 0
     MXFP8 = 1
+    MXFP4 = 2
+    NVFP4 = 3
 
 
-# (world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace, quant_mode)
+# (world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace)
 COMBINE_PARAMS = [
     # Coverage for popular model specifications
-    (
-        4,
-        16,
-        4096,
-        2,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # Mixtral-8x7B
-    (
-        4,
-        16,
-        2880,
-        4,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # GPT-OSS-120B
-    (
-        8,
-        16,
-        5120,
-        6,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # DeepSeek-V2
+    (4, 16, 4096, 2, torch.bfloat16, True),  # Mixtral-8x7B
+    (4, 16, 2880, 4, torch.bfloat16, True),  # GPT-OSS-120B
+    (8, 16, 5120, 6, torch.bfloat16, True),  # DeepSeek-V2
+    (8, 16, 7168, 8, torch.bfloat16, True),  # DeepSeek-V3
+    (8, 16, 4096, 8, torch.bfloat16, True),  # Qwen3-235B-A22B
+    (8, 16, 4096, 10, torch.bfloat16, True),  # Qwen3.5-397B-A17B
+    (8, 16, 4096, 16, torch.bfloat16, True),  # Fake, no known model with top_k=16
+    (8, 16, 4096, 22, torch.bfloat16, True),  # Nemotron-3-Super-120B-A12B
+]
+
+
+# (quant_mode, sf_layout)
+QUANT_PARAMS = [
+    (CombineQuantMode.NONE, SfLayout.layout_linear),
+    (CombineQuantMode.MXFP8, SfLayout.layout_linear),
+    (CombineQuantMode.MXFP8, SfLayout.layout_128x4),
+    (CombineQuantMode.MXFP8, SfLayout.layout_8x4),
+    (CombineQuantMode.MXFP4, SfLayout.layout_128x4),
+    (CombineQuantMode.NVFP4, SfLayout.layout_128x4),
+]
+
+
+LORA_COMBINE_PARAMS = [
+    # (world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace, quant_mode, sf_layout, use_lora)
     (
         8,
         16,
@@ -110,70 +112,19 @@ COMBINE_PARAMS = [
         True,
         CombineQuantMode.NONE,
         SfLayout.layout_linear,
-    ),  # DeepSeek-V3
+        True,
+    ),  # DeepSeek-V3 with LoRA
     (
-        8,
+        4,
         16,
         4096,
-        8,
+        2,
         torch.bfloat16,
         True,
         CombineQuantMode.NONE,
         SfLayout.layout_linear,
-    ),  # Qwen3-235B-A22B
-    (
-        8,
-        16,
-        4096,
-        10,
-        torch.bfloat16,
         True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # Qwen3.5-397B-A17B
-    (
-        8,
-        16,
-        4096,
-        16,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # Fake, no known model with top_k=16
-    (
-        8,
-        16,
-        4096,
-        22,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # Nemotron-3-Super-120B-A12B
-    # Coverage for num_tokens
-    (
-        8,
-        1,
-        4096,
-        8,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),
-    # Coverage for dtype
-    (
-        8,
-        16,
-        4096,
-        8,
-        torch.float16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),
-    # Coverage for payload_in_workspace
+    ),  # Mixtral-8x7B with LoRA
     (
         8,
         16,
@@ -183,70 +134,38 @@ COMBINE_PARAMS = [
         False,
         CombineQuantMode.NONE,
         SfLayout.layout_linear,
-    ),
-    # MXFP8 quantized combine output
-    (
-        4,
-        16,
-        4096,
-        2,
-        torch.bfloat16,
         True,
-        CombineQuantMode.MXFP8,
-        SfLayout.layout_linear,
-    ),
-    (
-        8,
-        16,
-        4096,
-        8,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.MXFP8,
-        SfLayout.layout_linear,
-    ),
-    (
-        4,
-        16,
-        4096,
-        2,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.MXFP8,
-        SfLayout.layout_128x4,
-    ),
-    (
-        8,
-        16,
-        4096,
-        8,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.MXFP8,
-        SfLayout.layout_128x4,
-    ),
-    (4, 16, 4096, 2, torch.bfloat16, True, CombineQuantMode.MXFP8, SfLayout.layout_8x4),
-    (8, 16, 4096, 8, torch.bfloat16, True, CombineQuantMode.MXFP8, SfLayout.layout_8x4),
+    ),  # LoRA + payload not in workspace
 ]
 
 
-def _compute_mxfp8_sf_size(num_rows, hidden_size, sf_layout):
-    """Number of uint8 scale-factor bytes needed for an [num_rows, hidden_size] MXFP8 tensor."""
-    assert hidden_size % 32 == 0, (
-        "hidden_size must be a multiple of 32 for MXFP8 (sf_vec_size=32)"
-    )
-    cols = hidden_size // 32
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def _compute_sf_size(
+    combine_quant_mode: CombineQuantMode,
+    num_rows: int,
+    hidden_size: int,
+    sf_layout: SfLayout,
+):
+    """Number of scale-factor bytes needed for an [num_rows, hidden_size] tensor."""
+    assert combine_quant_mode != CombineQuantMode.NONE
+    sf_vec_size = 16 if combine_quant_mode == CombineQuantMode.NVFP4 else 32
+    cols = ceil_div(hidden_size, sf_vec_size)
+
     if sf_layout == SfLayout.layout_linear:
         return num_rows * cols
-    if sf_layout == SfLayout.layout_128x4:
+    elif sf_layout == SfLayout.layout_128x4:
         padded_row = (num_rows + 127) // 128 * 128
         padded_col = (cols + 3) // 4 * 4
         return padded_row * padded_col
-    if sf_layout == SfLayout.layout_8x4:
+    elif sf_layout == SfLayout.layout_8x4:
         padded_row = (num_rows + 7) // 8 * 8
         padded_col = (cols + 3) // 4 * 4
         return padded_row * padded_col
-    raise ValueError(f"Unsupported sf_layout: {sf_layout}")
+    else:
+        raise ValueError(f"Unsupported sf_layout: {sf_layout}")
 
 
 # This is a hack to ensure we get forward progress when running multiple kernels on a single GPU
@@ -275,19 +194,76 @@ def make_payload(num_tokens, vector_dim, dtype):
         )
 
 
+def test_moe_a2a_combine_rejects_cpu_output_before_jit(monkeypatch):
+    monkeypatch.setattr(
+        trtllm_moe_alltoall,
+        "get_moe_alltoall_module",
+        lambda: pytest.fail("invalid output should be rejected before JIT loading"),
+    )
+    payload = torch.empty((1, 1, 1))
+
+    with pytest.raises(ValueError, match="output must be a CUDA tensor"):
+        trtllm_moe_alltoall.moe_a2a_combine(
+            payload,
+            1,
+            torch.empty(0),
+            torch.empty(0),
+            1,
+            0,
+            1,
+            1,
+            0,
+            output=torch.empty((1, 1)),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_moe_a2a_combine_rejects_noncontiguous_output_before_jit(monkeypatch):
+    monkeypatch.setattr(
+        trtllm_moe_alltoall,
+        "get_moe_alltoall_module",
+        lambda: pytest.fail("invalid output should be rejected before JIT loading"),
+    )
+    payload = torch.empty((1, 1, 2), device="cuda")
+    output = torch.empty((2, 2), device="cuda").T
+
+    with pytest.raises(ValueError, match="output must be contiguous"):
+        trtllm_moe_alltoall.moe_a2a_combine(
+            payload,
+            1,
+            torch.empty(0, device="cuda"),
+            torch.empty(0),
+            1,
+            0,
+            1,
+            1,
+            0,
+            output=output,
+        )
+
+
 @pytest.mark.parametrize(
     "num_tokens,vector_dim,num_experts,top_k",
     SINGLE_GPU_PARAMS,
 )
+@pytest.mark.parametrize("payload_in_workspace", [False, True])
+@pytest.mark.parametrize("use_output_buffer", [False, True])
 @pytest.mark.skipif(
     not mnnvl_available(),
     reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
 )
-def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
+def test_moe_alltoall_single_gpu(
+    num_tokens,
+    vector_dim,
+    num_experts,
+    top_k,
+    payload_in_workspace,
+    use_output_buffer,
+):
     """Test MOE alltoall communication on single GPU."""
     torch.cuda.set_device(0)
     # Create a random input tensor
-    dtypes = [torch.bfloat16, torch.float16, torch.int32, torch.uint8]
+    dtypes = [torch.bfloat16, torch.float16, torch.int32, torch.uint8, torch.int32]
     hidden_state_index = 0
     input_tensors = [
         make_payload(num_tokens, vector_dim * (i + 1), dtype)
@@ -335,19 +311,30 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
         output_tensor, _ = torch.sort(output_tensor.flatten(end_dim=1), dim=0)
         torch.testing.assert_close(output_tensor, input_tensor, atol=0, rtol=0)
 
-    inplace_combine_tensor = moe_a2a.get_combine_payload_tensor_in_workspace(
-        num_tokens,
-        input_tensors[hidden_state_index].shape[-1],
-        input_tensors[hidden_state_index].dtype,
+    if payload_in_workspace:
+        combine_tensor = moe_a2a.get_combine_payload_tensor_in_workspace(
+            num_tokens,
+            input_tensors[hidden_state_index].shape[-1],
+            input_tensors[hidden_state_index].dtype,
+        )
+        combine_tensor.copy_(output_tensors[hidden_state_index])
+    else:
+        combine_tensor = output_tensors[hidden_state_index].clone()
+
+    output_buffer = (
+        torch.empty_like(input_tensors[hidden_state_index])
+        if use_output_buffer
+        else None
     )
-
-    # Copy first output tensor into inplace_combine_tensor
-    inplace_combine_tensor.copy_(output_tensors[hidden_state_index])
-
     output = moe_a2a.combine(
-        inplace_combine_tensor, num_tokens, payload_in_workspace=True
+        combine_tensor,
+        num_tokens,
+        payload_in_workspace=payload_in_workspace,
+        output=output_buffer,
     )
 
+    if output_buffer is not None:
+        assert output is output_buffer
     # Should just be a direct copy for 1 GPU
     torch.testing.assert_close(
         output, input_tensors[hidden_state_index], atol=0, rtol=0
@@ -463,6 +450,7 @@ def combine_from_single_rank(
     payload_in_workspace,
     output_dtype=None,
     output_scales_list=None,
+    output_scalar_scale=1.0,
     sf_layout=SfLayout.layout_linear,
 ):
     combine_results = []
@@ -490,6 +478,7 @@ def combine_from_single_rank(
                         if output_scales_list is not None
                         else None
                     ),
+                    output_scalar_scale=output_scalar_scale,
                     sf_layout=sf_layout,
                 )
             )
@@ -512,7 +501,8 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
         f"should run with world_size at most {max_world_size}"
     )
 
-    dtypes = [torch.float16, torch.bfloat16, torch.int32, torch.uint8]
+    # 5 payloads (max): the trailing int32 represents the LoRA adapter ID slot.
+    dtypes = [torch.float16, torch.bfloat16, torch.int32, torch.uint8, torch.int32]
     # Create a random input tensor
     input_tensors = [
         make_payload(num_tokens * world_size, vector_dim * (i + 1), dtype)
@@ -544,6 +534,57 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
             actual, _ = torch.sort(actual, dim=0)
             ref, _ = torch.sort(ref, dim=0)
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("top_k", [6, 8, 10, 16, 22])
+def test_moe_alltoall_compact_ep4_dispatch(top_k):
+    """Test the compact EP4 dispatch path with repeated destination ranks."""
+    torch.cuda.set_device(0)
+    world_size = 4
+    num_tokens = 4
+    num_experts = 64
+    total_tokens = world_size * num_tokens
+    num_experts_per_rank = num_experts // world_size
+
+    input_tensors = [
+        make_payload(total_tokens, 256, torch.int32),  # 1024 bytes per token
+        make_payload(total_tokens, 128, torch.uint8),
+        make_payload(total_tokens, 22, torch.int32),
+        make_payload(total_tokens, 22, torch.int32),
+    ]
+
+    # Rotate through experts so each token has repeated destinations and the set
+    # of destination ranks varies with both the token and top-k width.
+    expert_ids = torch.arange(
+        total_tokens * top_k, dtype=torch.int32, device=torch.device("cuda")
+    ).reshape(total_tokens, top_k)
+    token_selected_experts = (
+        expert_ids * 7
+        + torch.arange(
+            total_tokens, dtype=torch.int32, device=torch.device("cuda")
+        ).unsqueeze(1)
+    ).remainder(num_experts)
+
+    output_tensors, _, _, _ = dispatch_from_single_rank(
+        input_tensors,
+        token_selected_experts,
+        world_size,
+        num_experts,
+        num_tokens,
+    )
+    target_ranks = token_selected_experts.div(
+        num_experts_per_rank, rounding_mode="floor"
+    )
+
+    for rank in range(world_size):
+        expected_token_mask = (target_ranks == rank).any(dim=1)
+        for actual, ref in zip(output_tensors[rank], input_tensors, strict=True):
+            actual = actual.flatten(end_dim=1)
+            actual = actual[actual.any(dim=1)]
+            expected = ref[expected_token_mask]
+            actual, _ = torch.sort(actual, dim=0)
+            expected, _ = torch.sort(expected, dim=0)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -648,13 +689,13 @@ def fake_moe(
     is_ep: bool = False,
     ep_rank: int | None = None,
     num_experts_per_rank: int | None = None,
+    lora_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Apply a deterministic fake MoE transformation for validation.
 
     Each expert applies a predictable scale: (expert_id + 1.0) / num_experts + 0.5
-    This allows verifying that communication correctly routes tokens to experts
-    and combines results.
+    When lora_ids is provided, the LoRA adapter ID adds an integer step: scale += lora_id + 1.0
 
     Args:
         hidden_states: Input tensor [num_tokens, hidden_size] or [world_size, num_tokens, hidden_size]
@@ -663,6 +704,7 @@ def fake_moe(
         is_ep: If True, only process experts assigned to this rank
         ep_rank: Rank for expert parallel filtering
         num_experts_per_rank: Number of experts per rank
+        lora_ids: Per-token LoRA adapter IDs [num_tokens] int32, or None
 
     Returns:
         Processed tensor with same shape as hidden_states
@@ -692,6 +734,8 @@ def fake_moe(
                 continue
 
             scale = (expert_id + 1.0) / num_experts + 0.5
+            if lora_ids is not None:
+                scale += lora_ids[token_idx].item() + 1.0
             results.append(hidden_states[token_idx] * scale)
 
         # Summing the results after is closer to the actual implementation as we do a tree reduction.
@@ -703,8 +747,9 @@ def fake_moe(
 
 
 @pytest.mark.parametrize(
-    "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace,quant_mode,sf_layout",
-    COMBINE_PARAMS,
+    "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace,quant_mode,sf_layout,use_lora",
+    [(*x, *y, False) for x, y in itertools.product(COMBINE_PARAMS, QUANT_PARAMS)]
+    + LORA_COMBINE_PARAMS,
 )
 def test_moe_combine_multi_rank_single_gpu(
     world_size,
@@ -715,13 +760,14 @@ def test_moe_combine_multi_rank_single_gpu(
     payload_in_workspace,
     quant_mode,
     sf_layout,
+    use_lora,
 ):
     torch.cuda.set_device(0)
     compute_capability = get_compute_capability(torch.device("cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
-    if quant_mode == CombineQuantMode.MXFP8 and compute_capability_number < 100:
+    if quant_mode != CombineQuantMode.NONE and compute_capability_number < 100:
         pytest.skip(
-            f"MXFP8 quantized combine requires CUDA platform >= 100, got {compute_capability_number}."
+            f"Combine-quantization fusion requires CUDA platform >= 100, got {compute_capability_number}."
         )
 
     check_sufficient_sm_count(num_tokens, world_size)
@@ -731,15 +777,16 @@ def test_moe_combine_multi_rank_single_gpu(
     )
 
     num_experts = world_size * top_k
+    total_tokens = num_tokens * world_size
 
     token_selected_experts_index = 0
     hidden_state_index = 1
 
     token_selected_experts = torch.empty(
-        num_tokens * world_size, top_k, dtype=torch.int32, device=torch.device("cuda")
+        total_tokens, top_k, dtype=torch.int32, device=torch.device("cuda")
     )
 
-    for i in range(num_tokens * world_size):
+    for i in range(total_tokens):
         # Include one extra expert to represent invalid expert IDs
         token_selected_experts[i] = torch.randperm(
             num_experts, dtype=torch.int32, device=torch.device("cuda")
@@ -747,14 +794,28 @@ def test_moe_combine_multi_rank_single_gpu(
     token_selected_experts = token_selected_experts.contiguous()
 
     # Create a random input tensor
-    reference_tensor = make_payload(num_tokens * world_size, vector_dim, dtype)
+    reference_tensor = make_payload(total_tokens, vector_dim, dtype)
     input_tensors = [
         token_selected_experts,
         reference_tensor,
         make_payload(
-            num_tokens * world_size, 1, torch.uint8
+            total_tokens, 1, torch.uint8
         ),  # Some extra payload to test combine alignment logic
     ]
+
+    lora_ids = None
+    lora_id_payload_index = None
+    if use_lora:
+        lora_ids = torch.randint(
+            0,
+            NUM_LORA_ADAPTERS,
+            (total_tokens,),
+            dtype=torch.int32,
+            device=torch.device("cuda"),
+        )
+        lora_id_payload_index = len(input_tensors)
+        # Dispatch kernel requires 2D payloads [num_tokens, elements_per_token]
+        input_tensors.append(lora_ids.unsqueeze(-1))
 
     output_tensors, all_workspaces, metainfo, combine_payload_offsets = (
         dispatch_from_single_rank(
@@ -802,6 +863,9 @@ def test_moe_combine_multi_rank_single_gpu(
             )
 
     for rank in range(world_size):
+        recv_lora_ids = None
+        if use_lora:
+            recv_lora_ids = output_tensors[rank][lora_id_payload_index].flatten()
         inplace_combine_tensors[rank].copy_(
             fake_moe(
                 output_tensors[rank][hidden_state_index],
@@ -810,10 +874,17 @@ def test_moe_combine_multi_rank_single_gpu(
                 is_ep=True,
                 ep_rank=rank,
                 num_experts_per_rank=num_experts // world_size,
+                lora_ids=recv_lora_ids,
             )
         )
 
-    if quant_mode == CombineQuantMode.MXFP8:
+    output_scalar_scale = 1.0
+    if quant_mode != CombineQuantMode.NONE:
+        output_scalar_scale = (
+            2.5  # arbitrary non-one scalar to test scaling path in the kernel
+        )
+        # High-precision (bf16) combine output. The quantized kernel output is
+        # validated by dequantizing it and comparing against this reference.
         reference_result = combine_from_single_rank(
             inplace_combine_tensors,
             num_tokens,
@@ -824,10 +895,22 @@ def test_moe_combine_multi_rank_single_gpu(
             combine_payload_offsets,
             payload_in_workspace=payload_in_workspace,
         )
-        output_dtype = torch.float8_e4m3fn
-        sf_size = _compute_mxfp8_sf_size(num_tokens, vector_dim, sf_layout)
+        sf_size = _compute_sf_size(quant_mode, num_tokens, vector_dim, sf_layout)
+        if quant_mode == CombineQuantMode.MXFP8:
+            output_dtype = torch.float8_e4m3fn
+            sf_dtype = torch.uint8  # UE8M0 scale factors, packed as bytes
+        else:
+            # MXFP4 / NVFP4: two FP4 (e2m1) values packed per uint8 byte. The scale
+            # dtype is how the binding distinguishes the two: uint8 (UE8M0) -> MXFP4,
+            # float8_e4m3fn (UE4M3) -> NVFP4.
+            output_dtype = torch.uint8
+            sf_dtype = (
+                torch.uint8
+                if quant_mode == CombineQuantMode.MXFP4
+                else torch.float8_e4m3fn
+            )
         output_scales_list = [
-            torch.zeros(sf_size, dtype=torch.uint8, device=torch.device("cuda"))
+            torch.zeros(sf_size, dtype=sf_dtype, device=torch.device("cuda"))
             for _ in range(world_size)
         ]
     else:
@@ -846,11 +929,15 @@ def test_moe_combine_multi_rank_single_gpu(
         output_dtype=output_dtype,
         output_scales_list=output_scales_list,
         sf_layout=sf_layout,
+        output_scalar_scale=output_scalar_scale,
     )
 
     if quant_mode == CombineQuantMode.NONE:
         reference_result = fake_moe(
-            input_tensors[hidden_state_index], token_selected_experts, num_experts
+            input_tensors[hidden_state_index],
+            token_selected_experts,
+            num_experts,
+            lora_ids=lora_ids,
         )
         for rank in range(world_size):
             torch.testing.assert_close(
@@ -878,6 +965,47 @@ def test_moe_combine_multi_rank_single_gpu(
                 atol=0,
                 rtol=0,
             )
+    elif quant_mode in (CombineQuantMode.MXFP4, CombineQuantMode.NVFP4):
+        is_nvfp4 = quant_mode == CombineQuantMode.NVFP4
+        sf_vec_size = 16 if is_nvfp4 else 32
+        # e2m1_and_ufp8sf_scale_to_float: ufp8_type 1 = UE4M3 (NVFP4), 0 = UE8M0 (MXFP4).
+        ufp8_type = 1 if is_nvfp4 else 0
+        is_swizzled = sf_layout != SfLayout.layout_linear
+        global_sf = torch.tensor(
+            [output_scalar_scale], dtype=torch.float32, device="cuda"
+        )
+        for rank in range(world_size):
+            if is_nvfp4:
+                ref_fp4, ref_sf = nvfp4_quantize(
+                    reference_result[rank],
+                    global_sf,
+                    sfLayout=sf_layout,
+                    sf_vec_size=16,
+                    do_shuffle=False,
+                )
+            else:
+                ref_fp4, ref_sf = mxfp4_quantize(reference_result[rank])
+            # Packed FP4 bytes can't be compared directly (two e2m1 codes share a byte),
+            # so dequantize both the kernel output and the reference identically and
+            # compare in float space. Both paths share the cvt_warp_fp16_to_fp4 routine,
+            # so the dequantized values should match within FP4 granularity.
+            actual = e2m1_and_ufp8sf_scale_to_float(
+                combine_results[rank].view(torch.uint8),
+                output_scales_list[rank].view(torch.uint8).reshape(-1),
+                global_sf,
+                sf_vec_size,
+                ufp8_type,
+                is_swizzled,
+            )
+            expected = e2m1_and_ufp8sf_scale_to_float(
+                ref_fp4.view(torch.uint8),
+                ref_sf.view(torch.uint8).reshape(-1),
+                global_sf,
+                sf_vec_size,
+                ufp8_type,
+                is_swizzled,
+            )
+            torch.testing.assert_close(actual, expected, atol=1.5e-2, rtol=1.5e-2)
     else:
         raise ValueError(f"Unsupported quant_mode: {quant_mode}")
 

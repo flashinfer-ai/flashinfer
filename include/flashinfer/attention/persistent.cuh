@@ -328,16 +328,18 @@ struct BlockBatchPagedAttentionPersistent {
                                       kv_end, warp_idx, lane_idx);
       page_produce_kv_sf<false, KTraits>(
           smem_storage, maybe_k_cache_sf, block_iter_base + kv_tile_idx * CTA_TILE_KV,
-          packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
-          kv_indices, kv_start + kv_tile_idx * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
+          packed_kv_bound, kv_head_idx, params.k_sf_stride_page, params.k_sf_stride_h,
+          params.k_sf_stride_n, block_size, kv_indices, kv_start + kv_tile_idx * CTA_TILE_KV,
+          kv_end, warp_idx, lane_idx);
       cp_async::commit_group();
       page_produce_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
                                      kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset,
                                      kv_end, warp_idx, lane_idx);
       page_produce_kv_sf<true, KTraits>(
           smem_storage, maybe_v_cache_sf, block_iter_base + kv_tile_idx * CTA_TILE_KV,
-          packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h, v_stride_n, block_size,
-          kv_indices, kv_start + kv_tile_idx * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
+          packed_kv_bound, kv_head_idx, params.v_sf_stride_page, params.v_sf_stride_h,
+          params.v_sf_stride_n, block_size, kv_indices, kv_start + kv_tile_idx * CTA_TILE_KV,
+          kv_end, warp_idx, lane_idx);
       cp_async::commit_group();
 
       // loop with mask
@@ -377,8 +379,9 @@ struct BlockBatchPagedAttentionPersistent {
                                             thr_local_kv_offset, kv_end, warp_idx, lane_idx);
             page_produce_kv_sf<false, KTraits>(
                 smem_storage, maybe_k_cache_sf, block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
-                packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
-                kv_indices, kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
+                packed_kv_bound, kv_head_idx, params.k_sf_stride_page, params.k_sf_stride_h,
+                params.k_sf_stride_n, block_size, kv_indices,
+                kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
             cp_async::commit_group();
             cp_async::wait_group<1>();
 
@@ -395,8 +398,9 @@ struct BlockBatchPagedAttentionPersistent {
                                            thr_local_kv_offset, kv_end, warp_idx, lane_idx);
             page_produce_kv_sf<true, KTraits>(
                 smem_storage, maybe_v_cache_sf, block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
-                packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h, v_stride_n, block_size,
-                kv_indices, kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
+                packed_kv_bound, kv_head_idx, params.v_sf_stride_page, params.v_sf_stride_h,
+                params.v_sf_stride_n, block_size, kv_indices,
+                kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
             cp_async::commit_group();
           });
       cp_async::wait_group<0>();
@@ -641,6 +645,9 @@ template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, ui
 cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
                                           const uint32_t num_blks_x, const uint32_t num_blks_y,
                                           const cudaStream_t stream) {
+  static_assert(HEAD_DIM_VO <= 256 && HEAD_DIM_QK <= 256,
+                "BatchAttention (holistic persistent) kernel does not support "
+                "head_dim > 256; use the FA2 prefill/decode path for large head dims.");
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;

@@ -60,6 +60,8 @@ from .attention import (
     gen_trtllm_fmha_v2_sm120_module as gen_trtllm_fmha_v2_sm120_module,
 )
 from .core import JitSpec as JitSpec
+from .core import JitSpecNvcc as JitSpecNvcc
+from .cute_dsl_core import JitSpecCuteDsl as JitSpecCuteDsl
 from .core import JitSpecStatus as JitSpecStatus
 from .core import JitSpecRegistry as JitSpecRegistry
 from .core import jit_spec_registry as jit_spec_registry
@@ -91,14 +93,20 @@ from .dsv3_optimizations import (
 )
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
+from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
 from .fp4_kv_dequantization import (
     gen_fp4_kv_dequantization_module as gen_fp4_kv_dequantization_module,
 )
 from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
 )
+from .nvfp4_attention_sm120 import (
+    gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
+)
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
+from .monomoe import gen_monomoe_module as gen_monomoe_module
+from .monomoe import load_monomoe_module as load_monomoe_module
 
 
 cuda_lib_path = os.environ.get(

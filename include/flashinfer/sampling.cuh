@@ -750,15 +750,17 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
     DataAndIndex<DType, IdType> cur_data[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      cur_data[j].data = (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d
-                             ? logits_vec[j] + gumbel_noise[j]
-                             : -cuda::std::numeric_limits<DType>::infinity();
-      cur_data[j].index = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+      const uint32_t token_idx = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+      const bool valid = token_idx < d;
+      cur_data[j].data =
+          valid ? logits_vec[j] + gumbel_noise[j] : -cuda::std::numeric_limits<DType>::infinity();
+      cur_data[j].index = valid ? token_idx : 0;
     }
 
     max_data +=
         BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage)
             .template Sum<VEC_SIZE>(cur_data);
+    __syncthreads();
   }
   if (tx == 0) {
     output[bx] = max_data.index;
@@ -1808,7 +1810,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
     } else {
       high = min(pivot_0, max_le_high);
     }
-  } while (min_gt_low != max_le_high);
+  } while (min_gt_low < max_le_high && nextafterf(min_gt_low, max_le_high) < max_le_high);
 
   float normalizer = math::ptx_rcp(max(sum_low, 1e-8));
 
