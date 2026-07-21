@@ -21,7 +21,12 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
 )
-from flashinfer.tllm_enums import ActivationType
+from flashinfer.tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+)
 
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 
@@ -118,6 +123,9 @@ def _get_compiled_kernel(
     max_active_clusters: int,
     stream,
     activation_type: Optional[ActivationType],
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
     use_fused_finalize: bool,
     enable_pdl: bool,
     route_tile: int,
@@ -129,6 +137,9 @@ def _get_compiled_kernel(
     cache_key = (
         num_local_experts,
         activation_type,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
         use_fused_finalize,
         enable_pdl,
         mma_tiler_m,
@@ -149,6 +160,9 @@ def _get_compiled_kernel(
             activation_type=(
                 int(activation_type) if activation_type is not None else None
             ),
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
         )
@@ -187,6 +201,9 @@ def _run_grouped_gemm(
     output: torch.Tensor,
     num_local_experts: int,
     activation_type: Optional[ActivationType],
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
     use_fused_finalize: bool,
     permuted_idx_to_expanded_idx: Optional[torch.Tensor],
     token_final_scales: Optional[torch.Tensor],
@@ -292,6 +309,9 @@ def _run_grouped_gemm(
         max_active_clusters,
         stream,
         activation_type,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
         use_fused_finalize,
         enable_pdl,
         route_tile,
@@ -335,6 +355,9 @@ def launch_w4a16_moe(
     use_fused_finalize: bool,
     enable_pdl: bool,
     activation_type: ActivationType,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     tactic: Optional[W4A16MoeTactic] = None,
     workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> torch.Tensor:
@@ -412,6 +435,9 @@ def launch_w4a16_moe(
         intermediate,
         num_local_experts,
         activation_type,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
         False,
         None,
         None,
@@ -433,6 +459,9 @@ def launch_w4a16_moe(
         gemm2_output,
         num_local_experts,
         None,
+        DEFAULT_SWIGLU_ALPHA,
+        DEFAULT_SWIGLU_BETA,
+        DEFAULT_SWIGLU_LIMIT,
         use_fused_finalize,
         permuted_idx_to_expanded_idx if use_fused_finalize else None,
         token_final_scales if use_fused_finalize else None,

@@ -47,11 +47,17 @@ import cutlass.utils.mixed_input_helpers as mixed_input_utils
 from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from flashinfer.tllm_enums import ActivationType
+from flashinfer.tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+)
 
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
+    fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
 )
@@ -70,6 +76,9 @@ class Sm100W4A16GroupedGemmKernel:
         cluster_shape_mn: tuple[int, int],
         group_count: int,
         activation_type: Optional[int],
+        swiglu_alpha: float,
+        swiglu_beta: float,
+        swiglu_limit: float,
         use_fused_finalize: bool,
         enable_pdl: bool,
     ):
@@ -102,6 +111,14 @@ class Sm100W4A16GroupedGemmKernel:
             )
         self.fuse_activation = activation_type is not None
         self.gated = activation_type == ActivationType.Swiglu.value
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
+        self.parameterized_swiglu = (
+            swiglu_alpha != DEFAULT_SWIGLU_ALPHA
+            or swiglu_beta != DEFAULT_SWIGLU_BETA
+            or swiglu_limit != DEFAULT_SWIGLU_LIMIT
+        )
         self.output_m_factor = 2 if self.gated else 1
         self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
@@ -1970,7 +1987,11 @@ class Sm100W4A16GroupedGemmKernel:
                         output_elements_per_thread = (
                             self.cta_tile_shape_mnk_c[0] * self.epi_tile_n
                         ) // (32 * len(self.epilog_warp_id))
-                        neg_log2_e = cutlass.Float32(-1.4426950408889634)
+                        swiglu_alpha = cutlass.Float32(self.swiglu_alpha)
+                        swiglu_beta = cutlass.Float32(self.swiglu_beta)
+                        swiglu_limit = cutlass.Float32(self.swiglu_limit)
+                        log2_e = cutlass.Float32(1.4426950408889634)
+                        neg_swiglu_alpha_log2_e = -(swiglu_alpha * log2_e)
                         for i in cutlass.range_constexpr(
                             0, output_elements_per_thread, 2
                         ):
@@ -2008,8 +2029,29 @@ class Sm100W4A16GroupedGemmKernel:
                                     ]
                                 ),
                             )
+                            if cutlass.const_expr(self.parameterized_swiglu):
+                                gate = (
+                                    fmin(gate[0], swiglu_limit, nan=True),
+                                    fmin(gate[1], swiglu_limit, nan=True),
+                                )
+                                up = (
+                                    -fmin(
+                                        -fmin(up[0], swiglu_limit, nan=True),
+                                        swiglu_limit,
+                                        nan=True,
+                                    ),
+                                    -fmin(
+                                        -fmin(up[1], swiglu_limit, nan=True),
+                                        swiglu_limit,
+                                        nan=True,
+                                    ),
+                                )
                             gate_log2e = cute.arch.mul_packed_f32x2(
-                                gate, (neg_log2_e, neg_log2_e)
+                                gate,
+                                (
+                                    neg_swiglu_alpha_log2_e,
+                                    neg_swiglu_alpha_log2_e,
+                                ),
                             )
                             sigmoid = cute.arch.add_packed_f32x2(
                                 (
@@ -2023,6 +2065,10 @@ class Sm100W4A16GroupedGemmKernel:
                                 cute.arch.rcp_approx(sigmoid[1]),
                             )
                             silu = cute.arch.mul_packed_f32x2(gate, sigmoid)
+                            if cutlass.const_expr(self.parameterized_swiglu):
+                                up = cute.arch.add_packed_f32x2(
+                                    up, (swiglu_beta, swiglu_beta)
+                                )
                             result = cute.arch.mul_packed_f32x2(up, silu)
                             sC[(coord_m_0, coord_n_0, c_buffer)] = self.c_dtype(
                                 result[0]
