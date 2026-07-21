@@ -48,14 +48,13 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
-    is_gated_activation,
-    normalize_activation_type,
 )
 from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
 from ._inputs_helper import CuteDslMoEInputsHelper
+from .moe_utils import normalize_cute_dsl_moe_activation_type
 
 logger = logging.getLogger(__name__)
 
@@ -286,8 +285,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         use_per_token_activation: bool = False,
     ):
-        activation_type = normalize_activation_type(activation_type)
-        gated = is_gated_activation(activation_type)
+        activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -687,7 +685,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     ):
-        activation_type = normalize_activation_type(activation_type)
+        activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
