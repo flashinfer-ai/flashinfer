@@ -140,7 +140,9 @@ class MoEEpMegaLayer(nn.Module):
 
             fp = self._fleet_params
             device = torch.device("cuda", torch.cuda.current_device())
-            top_k = self._megakernel_config.top_k
+            # Every mega kernel config declares top_k: int; the MegaConfig
+            # field is duck-typed `object` (kernel-specific config union).
+            top_k = int(self._megakernel_config.top_k)  # type: ignore[attr-defined]
             num_tokens = fp.max_tokens_per_rank
             t = MoEEpTensors(
                 hidden_states=torch.zeros(
