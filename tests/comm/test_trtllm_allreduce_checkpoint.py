@@ -82,11 +82,10 @@ def test_graph_replay_after_symmetric_memory_remap(
     import flashinfer.comm as comm
     from flashinfer.comm.mnnvl import TorchDistBackend
 
-    rank, world_size, gpus_per_node = setup_mpi_and_cuda()
+    rank, world_size, _ = setup_mpi_and_cuda()
     init_torch_distributed_from_mpi()
 
-    local_rank = rank % gpus_per_node
-    device = torch.device(f"cuda:{local_rank}")
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     # allreduce sum of (rank+1) across all ranks: 1+2+...+world_size
     expected_first = world_size * (world_size + 1) // 2
