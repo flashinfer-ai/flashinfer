@@ -273,9 +273,10 @@ class TrtllmFp8BlockConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # The JIT and C++ launcher support only SM major 10 and 12. Keep this
-        # explicit so SM110 is rejected before JIT compilation.
-        return arch in (100, 103, 120, 121)
+        # The available TRTLLM block-FP8 BMM cubins are validated only on the
+        # SM100 family. The outer JIT can compile for major 12, but its FP8
+        # kernels currently fail at runtime on SM120/121.
+        return arch in (100, 103)
 
     @staticmethod
     def prepare_weights(

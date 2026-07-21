@@ -466,17 +466,17 @@ def _block_fp8_reference(
         x_q, x_sf = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
     else:
         x_q, x_sf = _mxfp8_quant_matrix(x)
-    view = TrtllmFp8BlockConfig.prepare_weights(
-        w1,
-        w2,
-        variant=variant,
-        num_local_experts=w1.shape[0],
-        hidden_size=x.shape[1],
-        intermediate_size=intermediate_size,
-        device=x.device,
-    )
     x32 = _block_fp8_dequant(x_q, x_sf, variant)
     if variant is QuantVariant.DeepSeekFp8:
+        view = TrtllmFp8BlockConfig.prepare_weights(
+            w1,
+            w2,
+            variant=variant,
+            num_local_experts=w1.shape[0],
+            hidden_size=x.shape[1],
+            intermediate_size=intermediate_size,
+            device=x.device,
+        )
         w1_32 = _block_fp8_dequant(
             view["gemm1_weights"], view["gemm1_weights_scale"], variant
         )
