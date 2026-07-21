@@ -83,12 +83,12 @@ def _select_bf16_fp4_k_splits(
 ) -> int:
     """Static split-K pick for the no-autotune fallback.
 
-    Conservative by design: only clear-win underfill grids split; closer
-    calls need the autotuner's timing.
+    Conservative by design: only clear-win underfill grids get a split;
+    closer calls are left to the autotuner.
     """
     tile_m, tile_n, tile_k = tile_shape_mnk
     if tile_m != (16 if tile_k == 128 else 32):
-        # Only the tile shapes the tactic space pairs with splits.
+        # Split only the tile shapes that the tactic space pairs with splits.
         return 1
     tiles = -(-m // tile_m) * -(-n // tile_n)
     if tiles * 3 > sm_count:
@@ -357,7 +357,7 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     for tile_m, atom in tile_m_atoms[1:]:
         add(tile_m, atom, 1, 1)
 
-    # Split-K variants for small-N grids that underfill the GPU.
+    # Small-N grids underfill the GPU; offer them split-K variants.
     if n // 64 <= 256:
         k_tiles = k // tile_k
         for splits in (2, 4, 8):
@@ -490,8 +490,8 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                         f"k_splits={k_splits} exceeds the K-tile count for "
                         f"k={k}, tile_k={tile_shape_mnk[2]}"
                     )
-                # The module's reduce kernel consumes the partials; no
-                # torch-side reduction follows.
+                # The compiled call launches the reduce kernel as well, so
+                # ``out`` is final on return.
                 partial = _get_cache_buf(
                     "mm_bf16_fp4_split_k_partial",
                     k_splits * m * n * 4,
