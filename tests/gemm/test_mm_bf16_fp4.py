@@ -330,16 +330,16 @@ def test_cute_dsl_fallback_k_splits_selector():
         tile, _ = _select_bf16_fp4_tile_shape(m, n, k)
         return _select_bf16_fp4_k_splits(m, n, k, tile, sm_count)
 
-    # Strong underfill: split, sized to the SM count.
+    # Strong underfill: the chosen split scales with the SM count.
     assert pick(1, 512, 2048, 48) == 4
     assert pick(1, 512, 2048, 84) == 8
     assert pick(1, 512, 4096, 188) == 8
     assert pick(1, 1024, 4096, 48) == 2
     assert pick(1, 1024, 4096, 84) == 4
-    # Never more splits than K tiles.
+    # The pick never exceeds the K-tile count.
     assert pick(1, 512, 512, 188) == 4
     assert pick(1, 128, 128, 188) == 1
-    # Grid large enough to fill the GPU: no split.
+    # Grids that already fill the GPU do not split.
     assert pick(1, 2048, 2048, 48) == 1
     assert pick(1, 2048, 4096, 84) == 1
     assert pick(1, 4096, 512, 48) == 1

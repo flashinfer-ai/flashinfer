@@ -531,8 +531,8 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         mB_sf_kn: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
-        # (k_splits * m, n) fp32 split-K workspace; unused dummy when
-        # k_splits == 1.
+        # fp32 split-K partials of shape (k_splits * m, n); an unused
+        # dummy when k_splits == 1.
         mPartial: cute.Tensor,
         mAlpha: cute.Tensor,
         tiled_mma: cute.TiledMma,
@@ -751,8 +751,6 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             alpha_val = Float32(mAlpha[Int32(0)])
 
             if cutlass.const_expr(self.k_splits > 1):
-                # Per-thread (row, col) coordinates of the accumulator
-                # elements inside the C tile, for predicated partial stores.
                 cC = cute.make_identity_tensor(
                     cute.slice_(self.tile_shape_mnk, (None, None, 0))
                 )
@@ -996,8 +994,6 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                             )
 
                 else:
-                    # Epilogue: accumulator -> smem -> gmem via R2S (StMatrix.x4)
-                    # + TMA bulk store.
                     copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
                         self.c_layout,
                         elem_ty_d=self.c_dtype,
@@ -1049,9 +1045,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                     epi_rest_n = cute.size(tcgc_for_tma_partition, mode=[1, 1])
                     epi_tile_m = self.epi_tile[0]
                     epi_tile_n = self.epi_tile[1]
-                    # mma_tile_{m,n} = per-mma-atom (M,N) size.  tRS_rAcc has
-                    # shape (atom_v, mma_m, mma_n); modes 1, 2 give the atom
-                    # counts in M, N.
+                    # tRS_rAcc holds one fragment per MMA-atom tile, so
+                    # dividing the CTA tile by its (mma_m, mma_n) mode
+                    # extents gives the per-atom tile size.
                     mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
                     mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rAcc, mode=[2])
                     MmaMPerEpiM = epi_tile_m // mma_tile_m
@@ -1066,7 +1062,6 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                         producer_group=tma_store_producer_group,
                     )
 
-                    # Skip OOB epilogue iterations when actual M < tile_M.
                     m_actual = cute.size(mC_mnl, mode=[0])
                     cta_m_offset = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
 
@@ -1080,8 +1075,6 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                                 epi_m * epi_tile_m
                             )
                             if epi_m_global_start < m_actual:
-                                # Copy this epi-tile's slice of acc -> tRS_rD
-                                # using b12x-style (mma_m, mma_n) indexing.
                                 for mma_n_in_epi in cutlass.range_constexpr(
                                     MmaNPerEpiN
                                 ):
@@ -1104,9 +1097,6 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                                 tRS_rD_out = cute.make_rmem_tensor(
                                     tRS_rD_layout.shape, self.c_dtype
                                 )
-                                # Alpha applied once on the fp32 accumulator
-                                # (hoisted out of the per-K-block dequant):
-                                # one rounding, not one per B scale.
                                 acc_vec = tRS_rD.load()
                                 tRS_rD_out.store((alpha_val * acc_vec).to(self.c_dtype))
 
@@ -1391,8 +1381,10 @@ class BlackwellDenseGemmBf16Fp4Kernel:
 
     @cute.jit
     def _split_work_krange(self, tile_coord_l, k_tile_cnt):
-        """Balanced K-tile range of one split; producer and consumer
-        branches both call this so they agree."""
+        """Compute the balanced K-tile range of one split.
+
+        Producer and consumer branches both call this so their ranges agree.
+        """
         split_idx = Int32(tile_coord_l) % Int32(self.k_splits)
         tile_l = Int32(tile_coord_l) // Int32(self.k_splits)
         k_start = split_idx * k_tile_cnt // Int32(self.k_splits)
