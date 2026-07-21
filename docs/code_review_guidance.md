@@ -19,9 +19,7 @@ bugs there. See [Kernel review](#kernel-review).
 2. **Interface & API design.** Interfaces get replicated — review with "how will this be
    copied?" in mind. Check convention adherence (argument order, plan/run split, wrapper
    patterns, `@flashinfer_api` / `@backend_requirement`), naming, and extensibility. Framework
-   separation: no Torch headers under `include/`. Check for **reimplemented helpers**:
-   agent-written code tends to duplicate utilities that already exist in the library (e.g.
-   `torch_to_cutlass_dtype()`) — search for an existing helper before accepting a new one.
+   separation: no Torch headers under `include/`.
 3. **Testing surface.** New behavior and edge cases covered by unit tests; numerical refcheck
    present; correct architecture guards; and the code is actually testable.
 4. **Comments & docs.** Flag low-SNR / verbose comments — want concise, explain *why* not
@@ -39,8 +37,8 @@ bugs there. See [Kernel review](#kernel-review).
    title/message on (squash) merge and are relied on when bisecting — hold them to that
    standard.
 
-**Out of scope:** backwards-compatibility / API-breakage auditing — covered by a dedicated
-per-PR / per-merge QA check, not code review.
+**Out of scope:** backwards-compatibility / API-breakage auditing — delegated to a GitHub
+pre-merge check that QA puts in and maintains, not code review.
 
 ## Kernel review
 
@@ -71,8 +69,7 @@ code, and graduation / removal criteria. -->
 ## Checklist
 
 - [ ] Crash/OOB/overflow/allocation defects
-- [ ] API shape, naming, convention consistency; `include/` stays Torch-free; no
-      reimplemented helpers that already exist in the library
+- [ ] API shape, naming, convention consistency; `include/` stays Torch-free
 - [ ] Tests cover new behavior/edge cases; refcheck for numerics
 - [ ] Comments concise/high-SNR; docs in sync
 - [ ] Style deviations flagged (esp. durable/high-leverage code)

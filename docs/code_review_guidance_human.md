@@ -25,9 +25,6 @@ Interfaces get **replicated** — new code copies the shape of existing code, so
 and especially **naming-convention adherence**. Framework separation: no Torch headers under
 `include/`.
 
-Watch for **reimplementation of helpers that already exist** in the library (e.g. dtype
-conversion utilities) — agent-written code is prone to duplicating them instead of reusing.
-
 ### Testing surface
 Tests guard software quality and tighten the verification loop. Does the change add/extend
 unit tests for the new behavior and edge cases? Are numerical references present
@@ -76,8 +73,8 @@ Where defendability matters more:
 ## Non-focus
 
 ### Backwards compatibility (API breakage)
-Covered by a dedicated per-PR / per-merge QA check rather than code review, so reviewers
-do not need to audit for API breakage themselves.
+Delegated to a GitHub pre-merge check that QA puts in and maintains, rather than code
+review, so reviewers do not need to audit for API breakage themselves.
 
 ### Kernel implementation details
 Deprioritized **for human reviewers**, because of limited attention span and a genuinely
