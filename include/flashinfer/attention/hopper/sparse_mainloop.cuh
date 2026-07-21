@@ -33,7 +33,7 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool BLOCK_EXPANDING = false, bool MULTIITEMSCORING = false>
+template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool BLOCK_EXTEND = false, bool MULTIITEMSCORING = false>
 struct SparseCollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
@@ -165,7 +165,7 @@ struct SparseCollectiveMainloop {
       num_kv_tiles = std::min(num_kv_tiles,
                               cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
     }
-    if constexpr (BLOCK_EXPANDING) {
+    if constexpr (BLOCK_EXTEND) {
       // Block Expanding: Calculate valid KV range based on block boundaries
       int64_t dllm_block_size = 1;
       int64_t q_offset = 0;
@@ -173,23 +173,23 @@ struct SparseCollectiveMainloop {
       if constexpr (has_dllm_block_size_v<AdditionalParams>) {
         dllm_block_size = mainloop_params.additional_params.dllm_block_size;
       }
-      // Prefer reading per-batch offset from maybe_q_block_expanding_offset array
-      if constexpr (has_maybe_q_block_expanding_offset_v<AdditionalParams>) {
-        auto* offset_ptr = mainloop_params.additional_params.maybe_q_block_expanding_offset;
+      // Prefer reading per-batch offset from maybe_q_block_extend_offset array
+      if constexpr (has_maybe_q_block_extend_offset_v<AdditionalParams>) {
+        auto* offset_ptr = mainloop_params.additional_params.maybe_q_block_extend_offset;
         if (offset_ptr != nullptr) {
           q_offset = offset_ptr[batch_idx];
         }
-      } else if constexpr (has_q_block_expanding_offset_v<AdditionalParams>) {
-        q_offset = mainloop_params.additional_params.q_block_expanding_offset;
+      } else if constexpr (has_q_block_extend_offset_v<AdditionalParams>) {
+        q_offset = mainloop_params.additional_params.q_block_extend_offset;
       }
       // Read kv_offset (for Cascade Current Chunk scenario)
-      if constexpr (has_maybe_kv_block_expanding_offset_v<AdditionalParams>) {
-        auto* offset_ptr = mainloop_params.additional_params.maybe_kv_block_expanding_offset;
+      if constexpr (has_maybe_kv_block_extend_offset_v<AdditionalParams>) {
+        auto* offset_ptr = mainloop_params.additional_params.maybe_kv_block_extend_offset;
         if (offset_ptr != nullptr) {
           kv_offset = offset_ptr[batch_idx];
         }
-      } else if constexpr (has_kv_block_expanding_offset_v<AdditionalParams>) {
-        kv_offset = mainloop_params.additional_params.kv_block_expanding_offset;
+      } else if constexpr (has_kv_block_extend_offset_v<AdditionalParams>) {
+        kv_offset = mainloop_params.additional_params.kv_block_extend_offset;
       }
       int q_tile_end = std::min((q_tile_idx + 1) * CTA_Q, qo_len);
       int64_t q_global_end = q_offset + q_tile_end - 1;

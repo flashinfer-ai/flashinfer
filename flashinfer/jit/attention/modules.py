@@ -1370,10 +1370,10 @@ def _customize_prefill_dispatch_context(
         lines = [
             f"#define DISPATCH_context({signature}) \\",
             "  { \\",
-            "    if (mask_mode != MaskMode::kBlockExpanding) { \\",
-            '      FLASHINFER_ERROR("Block-extend JIT module only supports kBlockExpanding"); \\',
+            "    if (mask_mode != MaskMode::kBlockExtend) { \\",
+            '      FLASHINFER_ERROR("Block-extend JIT module only supports kBlockExtend"); \\',
             "    } \\",
-            "    constexpr MaskMode MASK_MODE = MaskMode::kBlockExpanding; \\",
+            "    constexpr MaskMode MASK_MODE = MaskMode::kBlockExtend; \\",
         ]
         if not is_sm90:
             lines.append("    constexpr bool use_custom_mask = false; \\")
@@ -1422,7 +1422,7 @@ def gen_customize_single_prefill_module(
     fp8_enabled: bool = False,
 ) -> JitSpec:
     """Public shared single-prefill gen. Compiles only the standard mask list
-    [0,1,2,3] — kBlockExpanding is NOT a value multiplied into this shared
+    [0,1,2,3] — kBlockExtend is NOT a value multiplied into this shared
     product. The dLLM block-diffusion front-end is the dedicated
     gen_customize_block_extend_single_prefill_module (standalone dispatch;
     reviewers' §1)."""
@@ -1623,7 +1623,7 @@ def _gen_customize_single_prefill_module_impl(
 #
 # These are thin, deliberately-narrow wrappers over the shared
 # ``gen_customize_single/batch_prefill_module`` that compile ONLY
-# ``MaskMode::kBlockExpanding`` over the small closed product dLLM actually needs
+# ``MaskMode::kBlockExtend`` over the small closed product dLLM actually needs
 # (fp16/bf16 x head_dim 64/128 x ragged+paged x fa2/fa3). They are the standalone
 # entry points the reviewers asked for ("move the dispatch into a standalone
 # config/variant class") so the new mask mode is NOT a value multiplied into the
@@ -1679,9 +1679,9 @@ def gen_customize_block_extend_single_prefill_module(
 ) -> "JitSpec":
     """Dedicated single-prefill front-end for dLLM block-diffusion attention.
 
-    Compiles only ``MaskMode::kBlockExpanding`` over the closed dLLM product.
+    Compiles only ``MaskMode::kBlockExtend`` over the closed dLLM product.
     Behaviorally delegates to :func:`gen_customize_single_prefill_module` with
-    ``mask_modes`` fixed to ``[kBlockExpanding]`` and the closed product enforced
+    ``mask_modes`` fixed to ``[kBlockExtend]`` and the closed product enforced
     up front — a separate small entry point, not a value multiplied into the big
     shared prefill cartesian product.
     """
@@ -1692,7 +1692,7 @@ def gen_customize_block_extend_single_prefill_module(
         additional_scalar_names, additional_scalar_dtypes,
         variant_name, variant_decl, pos_encoding_mode,
         use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
-        [MaskMode.BLOCK_EXPANDING.value],
+        [MaskMode.BLOCK_EXTEND.value],
         is_block_extend=True,
     )
 
@@ -1720,9 +1720,9 @@ def gen_customize_block_extend_batch_prefill_module(
 ) -> "JitSpec":
     """Dedicated batch-prefill front-end for dLLM block-diffusion attention.
 
-    Compiles only ``MaskMode::kBlockExpanding`` over the closed dLLM product.
+    Compiles only ``MaskMode::kBlockExtend`` over the closed dLLM product.
     Behaviorally delegates to :func:`gen_customize_batch_prefill_module` with
-    ``mask_modes`` fixed to ``[kBlockExpanding]`` and the closed product enforced.
+    ``mask_modes`` fixed to ``[kBlockExtend]`` and the closed product enforced.
     """
     _check_block_extend_axes(dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo)
     return _gen_customize_batch_prefill_module_impl(
@@ -1731,7 +1731,7 @@ def gen_customize_block_extend_batch_prefill_module(
         additional_scalar_names, additional_scalar_dtypes,
         variant_name, variant_decl, pos_encoding_mode,
         use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
-        [MaskMode.BLOCK_EXPANDING.value],
+        [MaskMode.BLOCK_EXTEND.value],
         is_block_extend=True,
         is_batch=True,
     )
@@ -1843,7 +1843,7 @@ def gen_customize_batch_prefill_module(
     fp8_enabled: bool = False,
 ) -> JitSpec:
     """Public shared batch-prefill gen. Compiles only the standard mask list
-    [0,1,2,3] — kBlockExpanding is NOT a value multiplied into this shared
+    [0,1,2,3] — kBlockExtend is NOT a value multiplied into this shared
     product. The dLLM block-diffusion front-end is the dedicated
     gen_customize_block_extend_batch_prefill_module (standalone dispatch;
     reviewers' §1)."""

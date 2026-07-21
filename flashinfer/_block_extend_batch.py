@@ -70,19 +70,19 @@ def _get_uri(
     dtype_uri = {torch.float16: "fp16", torch.bfloat16: "bf16"}
     idtype_uri = {torch.int32: "i32", torch.int64: "i64"}
     if head_dim_qk not in (64, 128) or head_dim_vo not in (64, 128):
-        raise ValueError("block_diffusion only supports head dimensions 64 and 128")
+        raise ValueError("block_extend only supports head dimensions 64 and 128")
     if dtype_q not in dtype_uri or dtype_kv not in dtype_uri or dtype_o not in dtype_uri:
-        raise ValueError("block_diffusion only supports fp16 and bf16")
+        raise ValueError("block_extend only supports fp16 and bf16")
     if idtype not in idtype_uri:
-        raise ValueError("block_diffusion only supports int32 and int64 indptr")
+        raise ValueError("block_extend only supports int32 and int64 indptr")
     return (
-        f"batch_prefill_block_expanding_hd{head_dim_qk}_{dtype_uri[dtype_q]}_"
+        f"batch_prefill_block_extend_hd{head_dim_qk}_{dtype_uri[dtype_q]}_"
         f"idx{idtype_uri[idtype]}_vo{head_dim_vo}_{dtype_uri[dtype_kv]}_"
         f"{dtype_uri[dtype_o]}"
     )
 
 
-def build_block_diffusion_jit_args(
+def build_block_extend_jit_args(
     head_dim: int,
     dtype: torch.dtype,
     idtype: torch.dtype,
@@ -123,7 +123,7 @@ def build_block_diffusion_jit_args(
         idtype,
         head_dim,
         head_dim_vo,
-        ["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
+        ["maybe_q_block_extend_offset", "maybe_kv_block_extend_offset"],
         [idtype_name, idtype_name],
         ["sm_scale", "dllm_block_size"],
         ["double", "int64_t"],
@@ -135,6 +135,6 @@ def build_block_diffusion_jit_args(
         "use_sliding_window": False,
         "use_logits_soft_cap": False,
         "use_fp16_qk_reduction": False,
-        "mask_modes": [MaskMode.BLOCK_EXPANDING.value],
+        "mask_modes": [MaskMode.BLOCK_EXTEND.value],
     }
     return jit_args, jit_kwargs

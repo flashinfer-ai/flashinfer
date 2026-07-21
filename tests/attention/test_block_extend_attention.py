@@ -17,7 +17,7 @@ def get_available_backends(device: torch.device) -> list[str]:
     return ["fa2", "fa3"] if is_sm90a_supported(device) else ["fa2"]
 
 
-def block_diffusion_reference(
+def block_extend_reference(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -38,7 +38,7 @@ def block_diffusion_reference(
     )
 
 
-def test_block_diffusion_batch_generator_routing(monkeypatch):
+def test_block_extend_batch_generator_routing(monkeypatch):
     """Only a fixed block-expanding request takes the dedicated generator."""
     import flashinfer.prefill as prefill_module
     from flashinfer.utils import MaskMode
@@ -64,7 +64,7 @@ def test_block_diffusion_batch_generator_routing(monkeypatch):
 
     module = prefill_module.get_customize_batch_prefill_module(
         backend="fa2",
-        uri="test_block_diffusion_batch_generator_routing",
+        uri="test_block_extend_batch_generator_routing",
         dtype_q=torch.float16,
         dtype_kv=torch.float16,
         dtype_o=torch.float16,
@@ -77,13 +77,13 @@ def test_block_diffusion_batch_generator_routing(monkeypatch):
         additional_scalar_dtypes=[],
         variant_name="TestBlockDiffusionAttention",
         variant_decl="",
-        mask_modes=[MaskMode.BLOCK_EXPANDING.value],
+        mask_modes=[MaskMode.BLOCK_EXTEND.value],
     )
 
     assert module == "block-diffusion-module"
 
 
-def test_block_diffusion_single_prefill_matches_reference():
+def test_block_extend_single_prefill_matches_reference():
     device = torch.device("cuda:0")
     dtype = torch.float16
     num_heads, num_kv_heads, head_dim = 32, 8, 128
@@ -97,7 +97,7 @@ def test_block_diffusion_single_prefill_matches_reference():
         q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
         k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
         v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
-        ref = block_diffusion_reference(
+        ref = block_extend_reference(
             q, k, v, block_size, q_offset=q_offset, kv_offset=kv_offset, sm_scale=sm_scale
         )
         for backend in get_available_backends(device):
@@ -106,7 +106,7 @@ def test_block_diffusion_single_prefill_matches_reference():
                 k,
                 v,
                 sm_scale=sm_scale,
-                block_diffusion=True,
+                block_extend=True,
                 block_size=block_size,
                 q_offset=q_offset,
                 kv_offset=kv_offset,
@@ -116,7 +116,7 @@ def test_block_diffusion_single_prefill_matches_reference():
             assert diff < tol, (backend, qo_len, kv_len, q_offset, kv_offset, diff)
 
 
-def test_block_diffusion_ragged_wrapper_matches_reference():
+def test_block_extend_ragged_wrapper_matches_reference():
     device = torch.device("cuda:0")
     dtype = torch.float16
     num_heads, num_kv_heads, head_dim = 32, 8, 128
@@ -140,7 +140,7 @@ def test_block_diffusion_ragged_wrapper_matches_reference():
     refs = []
     for i, (_, _, q_offset, kv_offset) in enumerate(requests):
         refs.append(
-            block_diffusion_reference(
+            block_extend_reference(
                 q[qo_indptr[i] : qo_indptr[i + 1]],
                 k[kv_indptr[i] : kv_indptr[i + 1]],
                 v[kv_indptr[i] : kv_indptr[i + 1]],
@@ -158,7 +158,7 @@ def test_block_diffusion_ragged_wrapper_matches_reference():
             workspace,
             kv_layout="NHD",
             backend=backend,
-            block_diffusion=True,
+            block_extend=True,
             block_size=block_size,
         )
         wrapper.plan(
@@ -177,7 +177,7 @@ def test_block_diffusion_ragged_wrapper_matches_reference():
         assert diff < tol, (backend, diff)
 
 
-def test_block_diffusion_paged_wrapper_matches_reference():
+def test_block_extend_paged_wrapper_matches_reference():
     device = torch.device("cuda:0")
     dtype = torch.float16
     num_heads, num_kv_heads, head_dim = 32, 8, 128
@@ -189,7 +189,7 @@ def test_block_diffusion_paged_wrapper_matches_reference():
     q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
     k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
     v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
-    ref = block_diffusion_reference(
+    ref = block_extend_reference(
         q, k, v, block_size, q_offset=q_offset, kv_offset=kv_offset, sm_scale=sm_scale
     )
     num_pages = kv_len // page_size
@@ -213,7 +213,7 @@ def test_block_diffusion_paged_wrapper_matches_reference():
             workspace,
             kv_layout="NHD",
             backend=backend,
-            block_diffusion=True,
+            block_extend=True,
             block_size=block_size,
         )
         wrapper.plan(
