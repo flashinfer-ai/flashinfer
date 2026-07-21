@@ -45,7 +45,35 @@ token-back (-14.5% — see the knob-system section).  Accuracy per the
 `moe_ep_benchmark` `acc_loss_pct` column (rel-L2 vs a bf16 dense-MoE
 reference on random data; real-model distributions typically fare better).
 
-### Corrected full sweep (2026-07-15, e2e_pipelined p50 µs)
+### Current sweep (2026-07-21, e2e_pipelined p50 µs)
+
+Re-run at the branch tip (`29e2d2f8`; includes the fused quant-stage,
+launch-thunk cache, and the %64 cutedsl alignment relaxation). Default
+geometry (7168 hidden / 2048 inter / 256 experts / top-8), 4x GB200,
+heuristic knobs, speedup vs `deep_gemm_mega` in parens; CSV
+`moe_ep_benchmark/model_shapes/results/model_shapes_20260721_111314_deepseek_v3.csv`.
+The 2026-07-15 table below reproduces within run noise (<= ~4% per cell);
+per-variant `acc_loss_pct` is unchanged (dg 20.6 / nvfp4 23.2 / +ikr 23.2 /
++combine_mxfp8 23.3 / +combine_nvfp4 25.0):
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 8        | 212.5  | 219.5 (0.97x)  | 233.1 (0.91x)  | 226.3 (0.94x)      | 227.2 (0.94x)  |
+| 64       | 284.7  | 283.6 (1.00x)  | 312.1 (0.91x)  | 301.5 (0.94x)      | 302.1 (0.94x)  |
+| 512      | 340.0  | 351.8 (0.97x)  | 355.3 (0.96x)  | 321.1 (1.06x)      | 326.7 (1.04x)  |
+| 1024     | 468.0  | 422.9 (1.11x)  | 422.9 (1.11x)  | **363.5 (1.29x)**  | 377.8 (1.24x)  |
+| 2048     | 817.2  | 604.9 (1.35x)  | 602.9 (1.36x)  | **529.4 (1.54x)**  | 560.1 (1.46x)  |
+| 4096     | 1473.5 | 981.5 (1.50x)  | 990.2 (1.49x)  | **862.7 (1.71x)**  | 912.4 (1.61x)  |
+| 8192     | 2993.7 | 1896.8 (1.58x) | 1887.4 (1.59x) | **1677.3 (1.78x)** | 1672.2 (1.79x) |
+
+The same sweep now also runs across real-model MoE geometries (DeepSeek V3 /
+V4-Flash / V4-Pro, Kimi K2.6, Qwen3.5-397B, gpt-oss-120b — the last enabled
+by the %64 relaxation; fp4 variants only, dg's wire format is hard-%128):
+`moe_ep_benchmark/model_shapes/RESULTS.md`. Pattern holds everywhere:
+dg-parity below ~512 tok/rank, fp4 combine-wire best at large tokens
+(1.6-1.9x on 7168-hidden shapes).
+
+### Corrected full sweep (2026-07-15, e2e_pipelined p50 µs — historical)
 
 Corrected K-major nvfp4 weights, speedup vs `deep_gemm_mega` in parens;
 CSVs `moe_ep_benchmark/results/sweep_20260715_*_fi_mega.csv`:
