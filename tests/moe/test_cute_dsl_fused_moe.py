@@ -1008,11 +1008,27 @@ class TestCuteDslMoeBf16Activation:
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 
     @pytest.mark.parametrize(
-        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+        "activation_type,activation_kwargs",
+        [
+            pytest.param(ActivationType.Swiglu, {}, id="swiglu"),
+            pytest.param(
+                ActivationType.Swiglu,
+                {
+                    "swiglu_alpha": 1.702,
+                    "swiglu_beta": 1.0,
+                    "swiglu_limit": 7.0,
+                },
+                id="swiglu-oai",
+            ),
+            pytest.param(ActivationType.Relu2, {}, id="relu2"),
+        ],
     )
     @pytest.mark.parametrize("use_wrapper", [False, True])
     def test_activation_dispatch(
-        self, activation_type: ActivationType, use_wrapper: bool
+        self,
+        activation_type: ActivationType,
+        activation_kwargs: dict,
+        use_wrapper: bool,
     ):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
 
@@ -1052,6 +1068,7 @@ class TestCuteDslMoeBf16Activation:
                 use_fused_finalize=False,
                 activation_type=activation_type,
                 quant_mode="w4a16",
+                **activation_kwargs,
             )
             result = moe.run(**kwargs)
         else:
@@ -1063,6 +1080,7 @@ class TestCuteDslMoeBf16Activation:
                 use_fused_finalize=False,
                 enable_pdl=False,
                 quant_mode="w4a16",
+                **activation_kwargs,
             )
         ref_output = compute_reference_moe_fp4(
             hidden_states=tensors["x_bf16"],
@@ -1078,6 +1096,7 @@ class TestCuteDslMoeBf16Activation:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation_type=activation_type,
+            **activation_kwargs,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -1085,11 +1104,42 @@ class TestCuteDslMoeBf16Activation:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
-    @pytest.mark.parametrize("route_tile", [32, 64])
-    def test_route_tile_numerical_accuracy(self, route_tile: int):
+    @pytest.mark.parametrize(
+        "activation_type,route_tile,gemm1_tactic,gemm2_tactic",
+        [
+            pytest.param(
+                ActivationType.Swiglu,
+                32,
+                ((128, 64), (1, 1)),
+                ((128, 64), (1, 1)),
+                id="route32-1cta",
+            ),
+            pytest.param(
+                ActivationType.Swiglu,
+                64,
+                ((256, 128), (2, 1)),
+                ((256, 128), (2, 1)),
+                id="route64-2cta",
+            ),
+            pytest.param(
+                ActivationType.Relu2,
+                128,
+                ((128, 256), (2, 1)),
+                ((256, 256), (2, 1)),
+                id="route128-mixed",
+            ),
+        ],
+    )
+    def test_route_tile_numerical_accuracy(
+        self,
+        activation_type: ActivationType,
+        route_tile: int,
+        gemm1_tactic: tuple,
+        gemm2_tactic: tuple,
+    ):
         from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
 
-        num_tokens, hidden_size, intermediate_size = 17, 256, 512
+        num_tokens, hidden_size, intermediate_size = route_tile + 1, 256, 512
         num_experts, top_k = 8, 2
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -1098,20 +1148,13 @@ class TestCuteDslMoeBf16Activation:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            gated=activation_type.is_gated,
         )
-        tensors["token_selected_experts"].copy_(
-            torch.arange(
-                num_tokens * top_k,
-                dtype=torch.int32,
-                device=tensors["token_selected_experts"].device,
-            ).reshape(num_tokens, top_k)
-            % num_experts
+        # Give two experts one full route tile and one boundary tile each.
+        tensors["token_selected_experts"][:] = torch.arange(
+            top_k, device=tensors["token_selected_experts"].device
         )
-        tactic = (
-            route_tile,
-            ((128, 64), (1, 1)),
-            ((128, 64), (1, 1)),
-        )
+        tactic = (route_tile, gemm1_tactic, gemm2_tactic)
 
         result = _moe_core_impl(
             x=tensors["x_bf16"],
@@ -1132,6 +1175,7 @@ class TestCuteDslMoeBf16Activation:
             w4a16_tactic=tactic,
             use_fused_finalize=False,
             enable_pdl=False,
+            activation_type=activation_type,
         )
         ref_output = compute_reference_moe_fp4(
             hidden_states=tensors["x_bf16"],
@@ -1146,6 +1190,7 @@ class TestCuteDslMoeBf16Activation:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation_type=activation_type,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)

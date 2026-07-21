@@ -473,15 +473,6 @@ def _moe_bf16_activation_impl(
     """Run the BF16-activation, online-NVFP4-weight-dequantization path."""
     if output_dtype != torch.bfloat16:
         raise ValueError("the BF16 activation path only supports BF16 output")
-    if activation == ActivationType.Swiglu:
-        if (
-            swiglu_alpha != DEFAULT_SWIGLU_ALPHA
-            or swiglu_beta != DEFAULT_SWIGLU_BETA
-            or swiglu_limit != DEFAULT_SWIGLU_LIMIT
-        ):
-            raise ValueError(
-                "the BF16 activation path only supports standard SwiGLU parameters"
-            )
     num_tokens = int(token_selected_experts.size(0))
     hidden_size = int(w2_weight.size(1))
     if tuple(x.shape) != (num_tokens, hidden_size):
@@ -518,6 +509,9 @@ def _moe_bf16_activation_impl(
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
         activation_type=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
         tactic=tactic,
         workspace_cache=workspace_cache,
     )
