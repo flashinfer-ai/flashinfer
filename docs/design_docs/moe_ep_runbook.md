@@ -83,7 +83,16 @@ sm_90+.
 **1. Build with NIXL-EP enabled.** Build deps: `meson`, `ninja`, `pkg-config`,
 `nvcc`, UCX (`pkg-config --exists ucx`), `libibverbs-dev`. The build hook
 pre-installs the `nixl-cu13` wheel it links against (`_ensure_nixl_wheel`), so
-no manual NIXL install is needed:
+no manual NIXL install is needed.
+
+**UCX caveat:** the UCX found via pkg-config must ship the *device API*
+(`ucp/api/device/ucp_device_impl.h`) — NGC images' HPC-X UCX and Ubuntu's apt
+UCX both predate it, and the `flashinfer-ep-pt2605*` images skip this
+provisioning. Follow `docker/Dockerfile.flashinfer-nvep`: install DOCA 3.2
+host packages + GDRCopy, then build UCX `v1.21.x` from source with
+`--enable-experimental-api --with-cuda --with-verbs --with-dm` and put its
+`lib/pkgconfig` first on `PKG_CONFIG_PATH`. Without it, `BUILD_NIXL_EP=1`
+fails compiling `nixl_device.cuh`:
 
 ```shell
 BUILD_NIXL_EP=1 pip install --no-cache-dir --no-build-isolation -e .
