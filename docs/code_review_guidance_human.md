@@ -40,17 +40,13 @@ A PR should be defendable by its human author — **to some extent**. Nowadays i
 necessarily line-by-line defendable, and that is accepted. But watch for design that the
 author cannot explain.
 
-A concrete flag: **coding style that deviates from surrounding code** without reason —
-flag it and discuss rather than silently accepting.
+The principle: we may raise questions about the design especially if the code touches a relatively
+durable area of the library. If the author, upon being asked, cannot walk through the rationale,
+we may reject the PR submission. We support AI-assisted contributions, but we expect the authors
+to understand the idea or rationale of their changes.
 
-**If the smell test fails:** ask the author to walk through the rationale — green CI alone
-does not settle it. Our principle (the same one
-[Dynamo](https://docs.nvidia.com/dynamo/getting-started/contribution-guide#contribution-workflow)
-applies): we encourage AI-assisted contributions, and we ask that authors understand their
-changes well enough to explain them when asked — a change its author cannot explain is not
-ready to merge yet. We state this as a principle rather than a hard policy: the goal is
-review quality, not discouraging contributions. This principle will also be added to the
-contribution guide.
+Possibly flag: **coding style that deviates from surrounding code** without reason —
+flag it and discuss rather than silently accepting.
 
 Where defendability matters more:
 - **Perf / kernel-selection logic, high-level interfaces, widely-used operations.** Design
@@ -95,9 +91,9 @@ rationale instead of re-deriving it each PR.
 ## Checklist
 
 - [ ] Crash/OOB/overflow/allocation defects
-- [ ] API shape, naming, convention consistency; `include/` stays Torch-free
+- [ ] API shape, naming, convention consistency; `include/`/`import` stays Torch-free library-side
 - [ ] Tests cover new behavior/edge cases; refcheck for numerics
-- [ ] Comments concise/high-SNR; docs in sync
+- [ ] Comments concise, to the point; docs in sync
 - [ ] Author can explain the design; style deviations from surrounding code flagged
 - [ ] Kernel internals **not** line-audited — instead, tests/benchmarks/fuzzing confirmed as
       the correctness backstop
