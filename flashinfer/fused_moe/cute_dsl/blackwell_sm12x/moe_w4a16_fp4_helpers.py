@@ -2653,10 +2653,9 @@ def nvfp4_scale_from_amax(
 def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
     """Convert FP8 E4M3 to float32.
 
-    Decodes via the hardware f16x2 path (exact for every finite e4m3 value,
-    including subnormals — the previous manual bit-twiddling decode applied
-    the normal-number formula to subnormal bytes, up to 4.5x off, while the
-    tensor-core MMA decodes them correctly).
+    Uses the hardware conversion instruction, which is exact for every
+    finite e4m3 value, including subnormals, and matches how the tensor
+    core decodes the same byte.
     """
     return Float32(
         llvm.inline_asm(
@@ -2686,10 +2685,9 @@ def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
 def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
     """Convert FP8 E4M3 to float32 AND compute reciprocal (0 stays 0).
 
-    Decodes via the hardware f16x2 path (exact for every finite e4m3 value,
-    including subnormals — the previous manual bit-twiddling decode applied
-    the normal-number formula to subnormal bytes, up to 4.5x off, while the
-    tensor-core MMA decodes them correctly).
+    Uses the hardware conversion instruction, which is exact for every
+    finite e4m3 value, including subnormals, and matches how the tensor
+    core decodes the same byte.
     """
     return Float32(
         llvm.inline_asm(

@@ -1852,10 +1852,9 @@ def testB12xFusedMoe(args):
                 run_b12x_moe(*autotune_args)
         del autotune_args
 
-    # W4A16 packs weights on first use, keyed by tensor address, and packing
-    # is disallowed under CUDA-graph capture; cold-L2 buffer rotation clones
-    # the weight tensors inside capture, so the packed-weight cache would
-    # miss there. Keep L2 warm for that combination instead of crashing.
+    # Cold-L2 rotation clones the weights inside CUDA-graph capture, but
+    # W4A16 packs weights on first use and cannot pack during capture.
+    # Keep L2 warm for that combination.
     cold_l2_cache = not (quant_mode == "w4a16" and is_cuda_graph_compatible)
     if not cold_l2_cache and args.verbose >= 1:
         print(

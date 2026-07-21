@@ -120,11 +120,10 @@ def b12x_fused_moe(
         ``quant_mode="w4a16"``.
     input_global_scale : Optional[torch.Tensor]
         Global scale for FC1 input quantization, scalar or
-        ``[num_experts]``.  Decouples the input-quant scale from
-        ``w1_alpha`` so ``w1_alpha`` can carry an exact fp32 weight scale
-        instead of baking it into the e4m3 block scales; folded into the
-        output multiplier internally.  Defaults to ``w1_alpha`` (legacy
-        dual-use).  Ignored for ``quant_mode="w4a16"``.
+        ``[num_experts]``.  Lets ``w1_alpha`` carry the exact fp32 weight
+        scale; folded into the output multiplier internally.  Defaults to
+        ``w1_alpha``, which then serves both roles.  Ignored for
+        ``quant_mode="w4a16"``.
     num_local_experts : Optional[int]
         Local experts for expert parallelism.  Defaults to ``num_experts``.
     output : Optional[torch.Tensor]

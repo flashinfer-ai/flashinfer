@@ -865,7 +865,7 @@ class TestB12xFunctional:
             f"diff={wrapper_diff:.3e} noise={wrapper_noise:.3e}"
         )
 
-        # Baked encoding (the workaround the new argument removes): scale_2
+        # Baked encoding (the workaround input_global_scale replaces): scale_2
         # multiplied into the e4m3 block scales, alpha = 1.
         w1_sf_baked = (w1_sf.float() * scale_2[0]).to(torch.float8_e4m3fn)
         w2_sf_baked = (w2_sf.float() * scale_2[0]).to(torch.float8_e4m3fn)
@@ -877,8 +877,8 @@ class TestB12xFunctional:
             f"exact={relf_exact:.4f} baked={relf_baked:.4f}"
         )
 
-        # Back-compat: omitting input_global_scale must reproduce the legacy
-        # dual-use within the bf16 atomic scatter-combine noise.
+        # Back-compat: omitting input_global_scale must reproduce the dual-use
+        # behavior within the bf16 atomic scatter-combine noise.
         out_legacy = run(w1_sf, w2_sf, ones, None)
         out_legacy2 = run(w1_sf, w2_sf, ones, None)
         out_explicit = run(w1_sf, w2_sf, ones, ones)
@@ -1636,9 +1636,9 @@ class TestB12xApiConsistency:
         assert not torch.isnan(result_functional).any()
         assert not torch.isnan(result_wrapper).any()
 
-        # Both APIs run the same kernel on the same inputs; any difference is
-        # run-to-run atomic scatter noise, which exceeds a fixed 1e-3 bound a
-        # few percent of the time. Bound by measured rerun noise instead.
+        # Both APIs run the same kernel on the same inputs, so any difference
+        # is run-to-run atomic scatter noise. Bound it by measured rerun
+        # noise, with a floor because a single noise sample can draw low.
         noise = max(
             (result_functional - run_functional()).abs().max().item(),
             (result_wrapper - run_wrapper()).abs().max().item(),
