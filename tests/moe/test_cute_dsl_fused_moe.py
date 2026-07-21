@@ -34,6 +34,7 @@ import weakref
 import pytest
 import torch
 
+from flashinfer.autotuner import BucketGen, gen_buckets
 from flashinfer.tllm_enums import ActivationType
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     normalize_cute_dsl_moe_activation_type,
@@ -682,8 +683,9 @@ class TestGetMaxNumPermutedTokens:
 def bucket_spec():
     """The first ``DynamicTensorSpec`` of a default-configured
     ``CuteDslFusedMoENvfp4Runner`` — the spec that owns the
-    ``gen_tuning_buckets`` / ``map_to_tuning_buckets`` callables under
-    test. Module-scoped: the runner is stateless for these checks.
+    ``gen_tuning_buckets`` (a ``BucketGen``) and ``map_to_tuning_buckets``
+    (a ``BucketMapper``) under test. Module-scoped: the runner is stateless
+    for these checks.
     """
     from flashinfer.fused_moe.cute_dsl.tuner import (
         CuteDslFusedMoENvfp4Runner,
@@ -711,34 +713,35 @@ class TestAutotunerBucketConfig:
     maps to the smaller cached bucket and uses a tactic profiled at
     the wrong workload size.
 
-    The correct form passes the bucket generators as bare callables;
-    the autotuner invokes them with the actual input dim at autotune
-    time so the bucket set adapts to the workload.
+    The correct form passes a BucketGen generator (e.g. the composed
+    ``HYBRID_NUM_TOKENS_BUCKETS``); the autotuner materializes it via
+    ``gen_buckets`` with the actual input dim at autotune time so the
+    bucket set adapts to the workload.
     """
 
-    def test_gen_tuning_buckets_is_callable_not_static_tuple(self, bucket_spec):
-        """``gen_tuning_buckets`` must be a callable that adapts to the
-        actual input dim at autotune time — not a pre-computed
-        tuple/sequence that bakes in a hardcoded cap.
+    def test_gen_tuning_buckets_is_bucketgen_not_static_tuple(self, bucket_spec):
+        """``gen_tuning_buckets`` must be an adaptive ``BucketGen`` generator
+        (materialized against the runtime input dim by ``gen_buckets``) — not
+        a pre-computed tuple/sequence that bakes in a hardcoded cap.
         """
-        assert callable(bucket_spec.gen_tuning_buckets), (
-            f"gen_tuning_buckets must be a callable that adapts to the "
-            f"runtime input dim — got "
+        assert isinstance(bucket_spec.gen_tuning_buckets, BucketGen), (
+            f"gen_tuning_buckets must be a BucketGen generator that adapts "
+            f"to the runtime input dim — got "
             f"{type(bucket_spec.gen_tuning_buckets).__name__}. A "
             f"pre-computed sequence (e.g., a tuple) likely indicates a "
-            f"bucket set with a hardcoded cap; pass the bare function "
-            f"reference instead."
+            f"bucket set with a hardcoded cap; pass the generator "
+            f"(e.g. HYBRID_NUM_TOKENS_BUCKETS) instead."
         )
 
     def test_gen_tuning_buckets_responds_to_input_dim(self, bucket_spec):
-        """Calling ``gen_tuning_buckets`` with successively larger input
-        dims must produce bucket sets whose maximum grows with the
-        input. A capped form would produce identical (capped) bucket
-        sets regardless of input.
+        """Materializing ``gen_tuning_buckets`` (via ``gen_buckets``) with
+        successively larger input dims must produce bucket sets whose maximum
+        grows with the input. A capped form would produce identical (capped)
+        bucket sets regardless of input.
         """
-        small = bucket_spec.gen_tuning_buckets(8192)
-        medium = bucket_spec.gen_tuning_buckets(16384)
-        large = bucket_spec.gen_tuning_buckets(32768)
+        small = gen_buckets(bucket_spec.gen_tuning_buckets, 8192)
+        medium = gen_buckets(bucket_spec.gen_tuning_buckets, 16384)
+        large = gen_buckets(bucket_spec.gen_tuning_buckets, 32768)
         assert max(small) >= 8192, (
             f"gen_tuning_buckets(8192) max should reach 8192; got {max(small)}"
         )
@@ -835,7 +838,7 @@ class TestAutotunerBucketConfig:
         """
         from flashinfer.utils import last_positive_power_of_2
 
-        fi_buckets = set(bucket_spec.gen_tuning_buckets(max_n))
+        fi_buckets = set(gen_buckets(bucket_spec.gen_tuning_buckets, max_n))
         # Mirror TRT-LLM's get_last_power_of_2_num_tokens_buckets:
         # powers of 2 from 1 up to last_positive_power_of_2(max_n).
         trtllm_top = last_positive_power_of_2(max_n)

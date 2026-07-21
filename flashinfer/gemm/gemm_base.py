@@ -18,7 +18,7 @@ import functools
 import logging
 import warnings
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from types import SimpleNamespace
 from typing import Callable, List, Literal, Optional, Tuple
@@ -44,14 +44,17 @@ from ..trace.templates.page import tgv_gemm_sm100_trace
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
+    CopyDim,
+    DimensionCoordinates,
     DynamicTensorSpec,
     OptimizationProfile,
+    PadUpDim,
     TunableRunner,
     TuningConfig,
 )
 from ..fused_moe.utils import (
-    get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket_uncapped,
+    HYBRID_NUM_TOKENS_BUCKETS,
+    HybridTokenMapper,
 )
 from .kernels.utils import (
     _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
@@ -1115,22 +1118,22 @@ def get_gemm_sm100_module_cutlass_fp8():
 _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
-            (0,),  # a_tensor_index
-            (-2,),
-            get_hybrid_num_tokens_buckets,
-            map_to_hybrid_bucket_uncapped,
+            (DimensionCoordinates(0, -2),),  # a_tensor_index
+            HYBRID_NUM_TOKENS_BUCKETS,
+            HybridTokenMapper(),
         ),
     ),
     constraint_specs=(
         ConstraintSpec(
-            4,  # out_tensor_index
-            -2,
-            lambda shapes: shapes[0][-2],
+            DimensionCoordinates(4, -2),  # out_tensor_index
+            CopyDim(DimensionCoordinates(0, -2)),
         ),
         ConstraintSpec(
-            5,  # workspace_buffer index: scratch buffer that a backend may
-            0,  # resize during profiling. Wildcard its size out of the cache
-            lambda shapes: shapes[5][0],  # key so a mid-tune resize never
+            DimensionCoordinates(
+                5,  # workspace_buffer index: scratch buffer that a backend may
+                0,  # resize during profiling. Wildcard its size out of the cache
+            ),
+            CopyDim(DimensionCoordinates(5, 0)),  # key so a mid-tune resize never
         ),  # changes the key (would otherwise cause a silent cache miss).
     ),
 )
@@ -1299,17 +1302,15 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
     use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
-            (0,),  # a_tensor_index
-            (-2,),
-            get_hybrid_num_tokens_buckets,
-            map_to_hybrid_bucket_uncapped,
+            (DimensionCoordinates(0, -2),),  # a_tensor_index
+            HYBRID_NUM_TOKENS_BUCKETS,
+            HybridTokenMapper(),
         ),
     ),
     constraint_specs=(
         ConstraintSpec(
-            4,  # out_tensor_index
-            -2,
-            lambda shapes: shapes[0][-2],
+            DimensionCoordinates(4, -2),  # out_tensor_index
+            CopyDim(DimensionCoordinates(0, -2)),
         ),
     ),
 )
@@ -1724,17 +1725,15 @@ def tgv_gemm_sm100(
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                (a_tensor_index,),
-                (-2,),
-                get_hybrid_num_tokens_buckets,
-                map_to_hybrid_bucket_uncapped,
+                (DimensionCoordinates(a_tensor_index, -2),),
+                HYBRID_NUM_TOKENS_BUCKETS,
+                HybridTokenMapper(),
             ),
         ),
         constraint_specs=(
             ConstraintSpec(
-                4,  # out_tensor_index
-                -2,
-                lambda shapes: shapes[0][-2],
+                DimensionCoordinates(4, -2),  # out_tensor_index
+                CopyDim(DimensionCoordinates(0, -2)),
             ),
         ),
     )
@@ -6466,32 +6465,51 @@ def _mxfp8_swizzled_scale_len(m: int, k: int, swizzle_layout: SfLayout) -> int:
         raise ValueError(f"Unsupported swizzle layout: {swizzle_layout}")
 
 
+@dataclass(frozen=True)
+class _Mxfp8DescaleLen:
+    """infer_shape for the MXFP8 a_descale tensor.
+
+    When the scale tensor is 1D (swizzled) its length is
+    ``_mxfp8_swizzled_scale_len(M, K, layout)``; otherwise it mirrors M
+    (``shapes[0][0]``). A frozen ``InferShape`` so the owning ``ConstraintSpec``
+    stays hashable.
+    """
+
+    swizzle_layout: SfLayout
+
+    def __call__(self, shapes: tuple[tuple[int, ...], ...]) -> int:
+        if len(shapes[2]) == 1:
+            return _mxfp8_swizzled_scale_len(
+                shapes[0][0], shapes[0][1], self.swizzle_layout
+            )
+        return shapes[0][0]
+
+
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
     use_cuda_graph=True,
     use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
-            (0,),  # a_tensor_index
-            (0,),
-            get_hybrid_num_tokens_buckets,
-            map_to_hybrid_bucket_uncapped,
+            (DimensionCoordinates(0, 0),),  # a_tensor_index
+            HYBRID_NUM_TOKENS_BUCKETS,
+            HybridTokenMapper(),
         ),
     ),
     constraint_specs=(
         ConstraintSpec(
-            2,  # a_scale_tensor_index
-            0,
-            lambda shapes: _pad_up(shapes[0][0], 8),
+            DimensionCoordinates(2, 0),  # a_scale_tensor_index
+            PadUpDim(DimensionCoordinates(0, 0), 8),
         ),
         ConstraintSpec(
-            6,  # out_tensor_index
-            0,
-            lambda shapes: shapes[0][0],
+            DimensionCoordinates(6, 0),  # out_tensor_index
+            CopyDim(DimensionCoordinates(0, 0)),
         ),
         ConstraintSpec(
-            9,  # workspace_buffer index: scratch; exclude its (resizable)
-            0,  # size from the cache key so a mid-tune resize never causes
-            lambda shapes: shapes[9][0],  # a silent cache miss.
+            DimensionCoordinates(
+                9,  # workspace_buffer index: scratch; exclude its (resizable)
+                0,  # size from the cache key so a mid-tune resize never causes
+            ),
+            CopyDim(DimensionCoordinates(9, 0)),  # a silent cache miss.
         ),
     ),
 )
@@ -6502,27 +6520,26 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
     use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
-            (0,),  # a_tensor_index
-            (0,),
-            get_hybrid_num_tokens_buckets,
-            map_to_hybrid_bucket_uncapped,
+            (DimensionCoordinates(0, 0),),  # a_tensor_index
+            HYBRID_NUM_TOKENS_BUCKETS,
+            HybridTokenMapper(),
         ),
     ),
     constraint_specs=(
         ConstraintSpec(
-            2,  # a_scale_tensor_index
-            0,
-            lambda shapes: _pad_up(shapes[0][0], 128),
+            DimensionCoordinates(2, 0),  # a_scale_tensor_index
+            PadUpDim(DimensionCoordinates(0, 0), 128),
         ),
         ConstraintSpec(
-            6,  # out_tensor_index
-            0,
-            lambda shapes: shapes[0][0],
+            DimensionCoordinates(6, 0),  # out_tensor_index
+            CopyDim(DimensionCoordinates(0, 0)),
         ),
         ConstraintSpec(
-            9,  # workspace_buffer index: scratch; exclude its (resizable)
-            0,  # size from the cache key so a mid-tune resize never causes
-            lambda shapes: shapes[9][0],  # a silent cache miss.
+            DimensionCoordinates(
+                9,  # workspace_buffer index: scratch; exclude its (resizable)
+                0,  # size from the cache key so a mid-tune resize never causes
+            ),
+            CopyDim(DimensionCoordinates(9, 0)),  # a silent cache miss.
         ),
     ),
 )
@@ -6531,28 +6548,19 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
 _MM_MXFP8_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
-            (0,),  # a_tensor_index
-            (0,),
-            get_hybrid_num_tokens_buckets,
-            map_to_hybrid_bucket_uncapped,
+            (DimensionCoordinates(0, 0),),  # a_tensor_index
+            HYBRID_NUM_TOKENS_BUCKETS,
+            HybridTokenMapper(),
         ),
     ),
     constraint_specs=(
         ConstraintSpec(
-            2,  # a_descale_tensor_index
-            0,
-            lambda shapes: (
-                _mxfp8_swizzled_scale_len(
-                    shapes[0][0], shapes[0][1], SfLayout.layout_128x4
-                )
-                if len(shapes[2]) == 1
-                else shapes[0][0]
-            ),
+            DimensionCoordinates(2, 0),  # a_descale_tensor_index
+            _Mxfp8DescaleLen(SfLayout.layout_128x4),
         ),
         ConstraintSpec(
-            5,  # out_tensor_index
-            0,
-            lambda shapes: shapes[0][0],
+            DimensionCoordinates(5, 0),  # out_tensor_index
+            CopyDim(DimensionCoordinates(0, 0)),
         ),
     ),
 )

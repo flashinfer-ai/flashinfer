@@ -26,6 +26,9 @@ import torch
 from ..api_logging import flashinfer_api
 from flashinfer.autotuner import (
     AutoTuner,
+    DimensionCoordinates,
+    Full,
+    RandInt,
     TunableRunner,
     TuningConfig,
     make_bucket_mapper,
@@ -2156,13 +2159,11 @@ def _mla_decode_tuning_config(
     num_pages: int,
     profile_seq_len: int,
 ) -> TuningConfig:
-    """One TuningConfig (and one pair of initializer closures) per key.
+    """One structurally hashable TuningConfig per profiling-data key.
 
-    Memoized because ``AutoTuner._find_nearest_profile`` lru-caches on
-    ``(shapes, tuning_config)``: a fresh config per dispatcher call shares
-    its hash with all previous ones (``DynamicTensorSpec.__hash__`` skips
-    ``tensor_initializers``) but never compares equal (closures compare by
-    identity), so would result in a leak.
+    Memoization preserves the existing object-reuse guarantee while the
+    frozen initializer values also make independently built equivalent
+    configs compare and hash equally.
 
     The DynamicTensorSpec sweeps batch dim across all four ``inputs`` tensors
     (query, block_tables, seq_lens, out). ``block_tables`` is initialized via
@@ -2171,27 +2172,27 @@ def _mla_decode_tuning_config(
     page reads give correct timing measurements. ``seq_lens`` is filled
     homogeneously with ``profile_seq_len``.
     """
-
-    def init_block_tables(shapes, dtype, device):
-        tensor = torch.empty(shapes, dtype=dtype, device=device)
-        tensor.random_(0, num_pages)
-        return tensor
-
-    def init_seq_lens(shapes, dtype, device):
-        tensor = torch.empty(shapes, dtype=dtype, device=device)
-        tensor.fill_(profile_seq_len)
-        return tensor
+    # block_tables: random valid page indices in [0, num_pages).
+    # seq_lens: constant fill with the profiling sequence length.
+    init_block_tables = RandInt(0, num_pages)
+    init_seq_lens = Full(profile_seq_len)
 
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0, 1, 2, 3),
-                dim_idx=(0, 0, 0, 0),
+                dimensions=(
+                    DimensionCoordinates(0, 0),
+                    DimensionCoordinates(1, 0),
+                    DimensionCoordinates(2, 0),
+                    DimensionCoordinates(3, 0),
+                ),
                 gen_tuning_buckets=buckets,
                 map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
-                tensor_initializers=(None, init_block_tables, init_seq_lens, None),
             ),
         ),
+        # Per-input initializers, aligned positionally by input_idx
+        # (None -> autotuner default): block_tables(1), seq_lens(2).
+        tensor_initializers=(None, init_block_tables, init_seq_lens, None),
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )

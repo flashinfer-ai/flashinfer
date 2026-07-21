@@ -8,7 +8,7 @@ import torch
 import flashinfer.fused_moe.core as core_mod
 from flashinfer import autotune
 from flashinfer.autotuner.initializers import autotuner_initializer_randn
-from flashinfer.fused_moe.core import MoeRunnerInputs, _moe_topk_ids_init
+from flashinfer.fused_moe.core import MoeRunnerInputs, _PackedTopkIds
 from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
@@ -21,7 +21,9 @@ from flashinfer.tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
 from flashinfer.autotuner import (
     AutoTuner,
     ConstraintSpec,
+    DimensionCoordinates,
     DynamicTensorSpec,
+    PowerOfTwoFloor,
     TuningConfig,
     TunableRunner,
     make_bucket_mapper,
@@ -86,16 +88,14 @@ def test_find_nearest_profile_dynamic_and_constraint(leading_dim, expected_bucke
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=(512, 1024, 2048, 4096, 8192),
                 map_to_tuning_buckets=last_positive_power_of_2,
             ),
         ),
         constraint_specs=(
             ConstraintSpec(
-                input_idx=1,
-                dim_idx=2,
+                dimension=DimensionCoordinates(input_idx=1, dim_idx=2),
                 infer_shape=lambda shapes: shapes[0][0] // 2,
             ),
         ),
@@ -123,8 +123,7 @@ def test_find_nearest_profile_single_tensor_bucketization_exact_powers(
     config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=gen_tuning_buckets,
                 map_to_tuning_buckets=lambda x: min(last_positive_power_of_2(x), 8192),
             ),
@@ -158,8 +157,14 @@ def test_find_nearest_profile_moe_shared_num_tokens_axis(num_tokens, expected_bu
                 # MoE test input has 6 tensors:
                 # output, routing_logits, topk_ids, expert_weights, hidden_states, hidden_states_scale.
                 # They all share num_tokens on dim 0, so we link indices (0..5) to dim_idx=0.
-                input_idx=(0, 1, 2, 3, 4, 5),
-                dim_idx=(0, 0, 0, 0, 0, 0),
+                dimensions=(
+                    DimensionCoordinates(0, 0),
+                    DimensionCoordinates(1, 0),
+                    DimensionCoordinates(2, 0),
+                    DimensionCoordinates(3, 0),
+                    DimensionCoordinates(4, 0),
+                    DimensionCoordinates(5, 0),
+                ),
                 gen_tuning_buckets=gen_tuning_buckets,
                 map_to_tuning_buckets=lambda x: min(last_positive_power_of_2(x), 8192),
             ),
@@ -177,8 +182,14 @@ def test_find_nearest_profile_moe_same_bucket_same_profile():
         dynamic_tensor_specs=(
             DynamicTensorSpec(
                 # Same MoE linkage as above: all 6 tensors share num_tokens on dim 0.
-                input_idx=(0, 1, 2, 3, 4, 5),
-                dim_idx=(0, 0, 0, 0, 0, 0),
+                dimensions=(
+                    DimensionCoordinates(0, 0),
+                    DimensionCoordinates(1, 0),
+                    DimensionCoordinates(2, 0),
+                    DimensionCoordinates(3, 0),
+                    DimensionCoordinates(4, 0),
+                    DimensionCoordinates(5, 0),
+                ),
                 gen_tuning_buckets=(512, 1024, 2048, 4096, 8192),
                 map_to_tuning_buckets=lambda x: min(last_positive_power_of_2(x), 8192),
             ),
@@ -194,8 +205,11 @@ def test_find_nearest_profile_maps_all_linked_dims():
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0, 1, 2),
-                dim_idx=(0, 1, 2),
+                dimensions=(
+                    DimensionCoordinates(0, 0),
+                    DimensionCoordinates(1, 1),
+                    DimensionCoordinates(2, 2),
+                ),
                 gen_tuning_buckets=(16, 32, 48, 64),
                 map_to_tuning_buckets=lambda x: ((x + 15) // 16) * 16,
             ),
@@ -221,8 +235,7 @@ def test_get_cache_key_bucketization(shape_a, shape_b, expected_equal):
     config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=(64, 128, 256),
                 map_to_tuning_buckets=last_positive_power_of_2,
             ),
@@ -260,11 +273,10 @@ def test_search_cache_preserving_leading_dims_hits_while_flattened_misses(monkey
                 # In MoE-style kernels, leading dim represents num_tokens.
                 # Keep one dynamic tensor here so this test isolates layout effects
                 # (and does not depend on known linked-dim mapping bugs).
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 # Only cache the current bucket; this makes alternative layouts
                 # map to a miss when their nearest bucket differs.
-                gen_tuning_buckets=lambda x: (last_positive_power_of_2(x),),
+                gen_tuning_buckets=PowerOfTwoFloor(),
                 map_to_tuning_buckets=last_positive_power_of_2,
             ),
         )
@@ -355,16 +367,14 @@ def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
     config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=(8, 16),
                 map_to_tuning_buckets=lambda x: x,
             ),
         ),
         constraint_specs=(
             ConstraintSpec(
-                input_idx=0,
-                dim_idx=1,
+                dimension=DimensionCoordinates(input_idx=0, dim_idx=1),
                 infer_shape=lambda shapes: shapes[0][0] // 2,
             ),
         ),
@@ -461,8 +471,7 @@ def test_choose_one_different_infer_tokens_same_bucket_get_same_cached_tactic(
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=tuning_buckets,
                 map_to_tuning_buckets=lambda x: min(
                     last_positive_power_of_2(x), tune_max
@@ -580,8 +589,7 @@ def test_find_nearest_profile_custom_buckets(leading_dim, expected_bucket):
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=custom_buckets,
                 map_to_tuning_buckets=mapper,
             ),
@@ -613,8 +621,7 @@ def test_find_nearest_profile_round_up(leading_dim, expected_bucket):
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=custom_buckets,
                 map_to_tuning_buckets=mapper,
             ),
@@ -635,8 +642,7 @@ def test_autotune_context_custom_buckets(monkeypatch):
     default_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=(256, 512, 1024),
                 map_to_tuning_buckets=last_positive_power_of_2,
             ),
@@ -668,8 +674,7 @@ def test_autotune_context_round_up(monkeypatch):
     config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=(128, 256, 512),
                 map_to_tuning_buckets=last_positive_power_of_2,
             ),
@@ -705,8 +710,7 @@ def test_autotune_context_both_overrides(monkeypatch):
     config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=(256, 512, 1024),
                 map_to_tuning_buckets=last_positive_power_of_2,
             ),
@@ -758,8 +762,7 @@ def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
     config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=(512, 1024),
                 map_to_tuning_buckets=last_positive_power_of_2,
             ),
@@ -815,8 +818,7 @@ def test_prepare_input_tensors_none_input_preserved():
     config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=(8, 16),
                 map_to_tuning_buckets=lambda x: x,
             ),
@@ -1067,8 +1069,7 @@ def _build_num_tokens_tuning_config(mapper):
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
+                dimensions=(DimensionCoordinates(0, 0),),
                 gen_tuning_buckets=(512, 1024, 2048, 4096, 8192),
                 map_to_tuning_buckets=mapper,
             ),
@@ -1177,16 +1178,15 @@ def _build_moe_style_tuning_config(topk_ids_initializer):
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0, 1),
-                dim_idx=(0, 0),
+                dimensions=(
+                    DimensionCoordinates(0, 0),
+                    DimensionCoordinates(1, 0),
+                ),
                 gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192, 1),
                 map_to_tuning_buckets=make_hybrid_bucket_mapper(8192),
-                tensor_initializers=[
-                    autotuner_initializer_randn,
-                    topk_ids_initializer,
-                ],
             ),
         ),
+        tensor_initializers=(autotuner_initializer_randn, topk_ids_initializer),
     )
 
 
@@ -1194,20 +1194,19 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     """Regression test: rebuilt MoE-style configs with tensor_initializers
     must collapse to a single cache entry.
     """
-    # The factory must return the identical object for the same expert count.
-    assert _moe_topk_ids_init(128) is _moe_topk_ids_init(128)
+    assert _PackedTopkIds(128) == _PackedTopkIds(128)
 
     AutoTuner._find_nearest_profile.cache_clear()
     shapes = ((1024, 4096), (1024, 8))
 
     AutoTuner._find_nearest_profile(
-        shapes, _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+        shapes, _build_moe_style_tuning_config(_PackedTopkIds(128))
     )
     cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
 
     N = 1_000
     for _ in range(N):
-        config = _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+        config = _build_moe_style_tuning_config(_PackedTopkIds(128))
         AutoTuner._find_nearest_profile(shapes, config)
 
     cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
@@ -1219,10 +1218,8 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     )
 
 
-def test_make_tuning_config_reuses_topk_ids_initializer():
-    """_make_tuning_config must return configs whose topk_ids initializer is the
-    same object across calls for the same num_experts.
-    """
+def test_make_tuning_config_builds_equal_topk_ids_initializer():
+    """Equivalent per-call MoE configs must compare and hash equally."""
     fn = core_mod.get_trtllm_moe_sm100_module
     fn.cache_clear()
     try:
@@ -1262,26 +1259,19 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
         config_a = runner._make_tuning_config(moe_inputs)
         config_b = runner._make_tuning_config(moe_inputs)
 
-        spec_a = config_a.dynamic_tensor_specs[0]
-        spec_b = config_b.dynamic_tensor_specs[0]
         topk_idx = MoeRunnerInputs.idx("topk_ids")
-        init_a = spec_a.tensor_initializers[spec_a.input_idx.index(topk_idx)]
-        init_b = spec_b.tensor_initializers[spec_b.input_idx.index(topk_idx)]
+        init_a = config_a.tensor_initializers[topk_idx]
+        init_b = config_b.tensor_initializers[topk_idx]
 
-        assert init_a is init_b, (
-            "_make_tuning_config returned a different topk_ids initializer object "
-            "on each call. It must reuse _moe_topk_ids_init(num_experts) so that "
-            "rebuilt TuningConfigs collapse to the same _find_nearest_profile "
-            "lru_cache key — a per-call closure reintroduces the memory leak."
-        )
+        assert init_a == init_b
+        assert config_a == config_b
+        assert hash(config_a) == hash(config_b)
     finally:
         fn.cache_clear()
 
 
 def test_find_nearest_profile_cache_grows_with_fresh_closure_initializer():
-    """Negative control: a fresh initializer closure per call leaks one
-    entry per call DESPITE equal hashes.
-    """
+    """Arbitrary fresh callable initializers still fragment the LRU cache."""
     AutoTuner._find_nearest_profile.cache_clear()
     shapes = ((1024, 4096), (1024, 8))
 
@@ -1293,7 +1283,7 @@ def test_find_nearest_profile_cache_grows_with_fresh_closure_initializer():
 
     ref_config = _build_moe_style_tuning_config(make_fresh_closure())
     other_config = _build_moe_style_tuning_config(make_fresh_closure())
-    assert hash(ref_config) == hash(other_config), "hashes should match"
+    assert hash(ref_config) != hash(other_config), "fresh callables hash by identity"
     assert ref_config != other_config, "equality should fail on fresh closures"
 
     AutoTuner._find_nearest_profile(shapes, ref_config)

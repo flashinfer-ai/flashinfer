@@ -9,14 +9,16 @@ import torch
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
+    CopyDim,
+    DimensionCoordinates,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
 )
 from ..fused_moe.utils import (
-    get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket_uncapped,
+    HYBRID_NUM_TOKENS_BUCKETS,
+    HybridTokenMapper,
 )
 from .gemm_base import _TORCH_TO_CUTLASS_DTYPE_ATTR, _check_cute_dsl_availability
 from .gemm_bf16_fp4 import _unswizzle_sf_128x4
@@ -349,17 +351,23 @@ def _bf16_fp4_cute_dsl_tactic_configs(
 _BF16_FP4_CUTE_DSL_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
-            (0,),  # a_tensor_index
-            (0,),  # M dimension
-            get_hybrid_num_tokens_buckets,
-            map_to_hybrid_bucket_uncapped,
+            (
+                DimensionCoordinates(
+                    0,  # a_tensor_index
+                    0,  # M dimension
+                ),
+            ),
+            HYBRID_NUM_TOKENS_BUCKETS,
+            HybridTokenMapper(),
         ),
     ),
     constraint_specs=(
         ConstraintSpec(
-            5,  # out_tensor_index follows M
-            0,
-            lambda shapes: shapes[0][0],
+            DimensionCoordinates(
+                5,  # out_tensor_index follows M
+                0,
+            ),
+            CopyDim(DimensionCoordinates(0, 0)),
         ),
     ),
 )

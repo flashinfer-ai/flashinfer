@@ -30,14 +30,16 @@ import torch
 from flashinfer.autotuner import (
     AutoTuner,
     TuningConfig,
+    DimensionCoordinates,
     DynamicTensorSpec,
     ConstraintSpec,
+    CopyDim,
     TunableRunner,
     OptimizationProfile,
 )
 from flashinfer.fused_moe.utils import (
-    get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket_uncapped,
+    HYBRID_NUM_TOKENS_BUCKETS,
+    HybridTokenMapper,
 )
 from flashinfer.jit import setup_cubin_loader
 from flashinfer.utils import _get_cache_buf
@@ -51,14 +53,16 @@ _LLGEMM_OUT_IDX = 3
 _LLGEMM_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
-            (_LLGEMM_A_IDX,),
-            (-2,),
-            get_hybrid_num_tokens_buckets,
-            map_to_hybrid_bucket_uncapped,
+            (DimensionCoordinates(_LLGEMM_A_IDX, -2),),
+            HYBRID_NUM_TOKENS_BUCKETS,
+            HybridTokenMapper(),
         ),
     ),
     constraint_specs=(
-        ConstraintSpec(_LLGEMM_OUT_IDX, -2, lambda shapes: shapes[_LLGEMM_A_IDX][-2]),
+        ConstraintSpec(
+            DimensionCoordinates(_LLGEMM_OUT_IDX, -2),
+            CopyDim(DimensionCoordinates(_LLGEMM_A_IDX, -2)),
+        ),
     ),
 )
 

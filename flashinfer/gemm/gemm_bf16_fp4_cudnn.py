@@ -11,14 +11,16 @@ import torch
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
+    CopyDim,
+    DimensionCoordinates,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
 )
 from ..fused_moe.utils import (
-    get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket_uncapped,
+    HYBRID_NUM_TOKENS_BUCKETS,
+    HybridTokenMapper,
 )
 from ..utils import _get_cache_buf, get_native_fp4_dtype
 
@@ -358,17 +360,23 @@ def execute_cudnn_bf16_fp4_graph_override_shape(
 _BF16_FP4_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
-            (0,),  # a_tensor_index
-            (0,),  # M dimension
-            get_hybrid_num_tokens_buckets,
-            map_to_hybrid_bucket_uncapped,
+            (
+                DimensionCoordinates(
+                    0,  # a_tensor_index
+                    0,  # M dimension
+                ),
+            ),
+            HYBRID_NUM_TOKENS_BUCKETS,
+            HybridTokenMapper(),
         ),
     ),
     constraint_specs=(
         ConstraintSpec(
-            5,  # out_tensor_index follows M
-            0,
-            lambda shapes: shapes[0][0],
+            DimensionCoordinates(
+                5,  # out_tensor_index follows M
+                0,
+            ),
+            CopyDim(DimensionCoordinates(0, 0)),
         ),
     ),
 )
