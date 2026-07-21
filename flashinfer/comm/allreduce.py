@@ -630,11 +630,15 @@ def allreduce_fusion(
     launch_with_pdl : bool
         Use Programmatic Dependent Launch.
     trigger_completion_at_end : bool
-        TRT-LLM only. Controls when PDL completion is signaled. ``True``
-        (default) signals after the kernel finishes (safe, no overlap).
-        ``False`` signals early, allowing the next PDL-aware kernel to
-        overlap with this one. Only safe when the next kernel also calls
-        ``cudaGridDependencySynchronize()``. Ignored by the MNNVL backend.
+        Controls when PDL completion is signaled. ``True`` (default)
+        signals after the kernel finishes (safe, no overlap). ``False``
+        signals early, allowing the next PDL-aware kernel to overlap with
+        this one. Only safe when the next kernel also calls
+        ``cudaGridDependencySynchronize()``. For the MNNVL backend with
+        RMSNorm fusion (two-shot), this controls when the trailing RMSNorm
+        kernel signals completion; the intermediate all-reduce kernel
+        always uses the early trigger so the RMSNorm kernel can be
+        launched eagerly.
     output : Optional[torch.Tensor]
         Pre-allocated AllReduce output buffer, shape
         ``[token_num, hidden_dim]``.
@@ -1078,6 +1082,7 @@ def allreduce_fusion(
                 launch_with_pdl=launch_with_pdl,
                 output=output,
                 strategy=strategy,
+                trigger_completion_at_end=trigger_completion_at_end,
             )
             return output
 
@@ -1107,6 +1112,7 @@ def allreduce_fusion(
                 launch_with_pdl=launch_with_pdl,
                 strategy=strategy,
                 weight_bias=weight_bias,
+                trigger_completion_at_end=trigger_completion_at_end,
             )
             return norm_result
 
@@ -1160,6 +1166,7 @@ def allreduce_fusion(
                 launch_with_pdl=launch_with_pdl,
                 strategy=strategy,
                 weight_bias=weight_bias,
+                trigger_completion_at_end=trigger_completion_at_end,
             )
             return quant_result
 

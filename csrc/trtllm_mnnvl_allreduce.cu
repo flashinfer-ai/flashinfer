@@ -27,16 +27,14 @@ using tvm::ffi::Optional;
     }                                                                               \
   }()
 
-void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_ptr,
-                                   int64_t buffer_ptrs_dev, int64_t buffer_ptr_local,
-                                   TensorView buffer_flags_mnnvl, int64_t nranks, int64_t rank,
-                                   bool rmsnorm_fusion, bool launch_with_pdl, bool use_oneshot,
-                                   Optional<TensorView> output, Optional<TensorView> residual_out,
-                                   Optional<TensorView> residual_in, Optional<TensorView> gamma,
-                                   Optional<double> epsilon, Optional<double> weight_bias,
-                                   Optional<int64_t> quant_type, Optional<TensorView> quant_out,
-                                   Optional<TensorView> sf_out, Optional<TensorView> output_scale,
-                                   Optional<int64_t> layout_code) {
+void trtllm_mnnvl_allreduce_fusion(
+    TensorView input, int64_t multicast_buffer_ptr, int64_t buffer_ptrs_dev,
+    int64_t buffer_ptr_local, TensorView buffer_flags_mnnvl, int64_t nranks, int64_t rank,
+    bool rmsnorm_fusion, bool launch_with_pdl, bool trigger_completion_at_end, bool use_oneshot,
+    Optional<TensorView> output, Optional<TensorView> residual_out,
+    Optional<TensorView> residual_in, Optional<TensorView> gamma, Optional<double> epsilon,
+    Optional<double> weight_bias, Optional<int64_t> quant_type, Optional<TensorView> quant_out,
+    Optional<TensorView> sf_out, Optional<TensorView> output_scale, Optional<int64_t> layout_code) {
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
   auto stream = get_stream(input.device());
 
@@ -169,6 +167,7 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
     params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags_mnnvl.data_ptr());
     params.rmsNormFusion = rmsnorm_fusion;
     params.launchWithPdl = launch_with_pdl;
+    params.triggerCompletionAtEnd = trigger_completion_at_end;
     params.sfLayout = sf_layout;
     params.quantType = quant_type_enum;
 
