@@ -9,7 +9,7 @@ from tests.test_helpers.comm import init_torch_distributed_from_mpi, setup_mpi_a
 
 def _distributed_world_size() -> int:
     """Return world size from launcher env vars without importing mpi4py."""
-    for key in ("SLURM_NTASKS", "WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", "MPI_LOCALNRANKS"):
+    for key in ("SLURM_NTASKS", "WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MPI_LOCALNRANKS"):
         val = os.environ.get(key)
         if val is not None:
             try:
