@@ -162,6 +162,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         tile_swizzle: int = 1,
         raster_along_m: bool = True,
         k_splits: int = 1,
+        occupancy: int = 1,
     ):
         """bf16 x fp4 kernel.
 
@@ -215,7 +216,13 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                 f"(got tile_K={self.tile_shape_mnk[2]})"
             )
 
-        self.occupancy = 1
+        # occupancy > 1 splits the SMEM budget across that many co-resident
+        # CTAs per SM: ab_stage shrinks (less per-CTA latency hiding) but the
+        # resident-warp count multiplies, which is what large weight-bound
+        # grids need to cover DRAM latency (see _compute_stages).
+        self.occupancy = int(occupancy)
+        if self.occupancy < 1:
+            raise ValueError(f"occupancy must be >= 1 (got {occupancy})")
         # 2x2 atom layout: 4 MMA warps arranged as 2 M-warps x 2 N-warps.
         self.atom_layout = tuple(atom_layout)
         if self.atom_layout not in ((2, 2, 1), (1, 2, 1)):

@@ -113,6 +113,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
     enable_pdl: bool = True,
     tile_swizzle: int = 1,
     k_splits: int = 1,
+    occupancy: int = 1,
 ):
     # Normalize to a tuple (callers may pass a list) so the cache key is hashable.
     atom_layout = cast(Tuple[int, int, int], tuple(atom_layout))
@@ -121,6 +122,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
     enable_pdl = bool(enable_pdl)
     tile_swizzle = int(tile_swizzle)
     k_splits = int(k_splits)
+    occupancy = int(occupancy)
     cache_key = (
         tile_shape_mnk,
         a_dtype,
@@ -131,6 +133,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
         enable_pdl,
         tile_swizzle,
         k_splits,
+        occupancy,
     )
     cached = _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -190,8 +193,11 @@ def _get_cute_dsl_bf16_fp4_gemm(
         enable_pdl=enable_pdl,
         tile_swizzle=tile_swizzle,
         k_splits=k_splits,
+        occupancy=occupancy,
     )
-    max_active_clusters = get_max_active_clusters(1)
+    # The persistent grid launches occupancy CTAs per SM; the kernel's stage
+    # budget (_compute_stages) shrinks SMEM per CTA so they co-reside.
+    max_active_clusters = get_max_active_clusters(1) * occupancy
 
     compiled = cute.compile(
         gemm.wrapper,
@@ -316,11 +322,13 @@ def _prepare_cute_dsl(
 
 def _bf16_fp4_cute_dsl_tactic_configs(
     n: int, k: int
-) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int]]:
+) -> List[
+    Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int, int]
+]:
     """Enumerate cute-DSL tactic configs for a given ``(N, K)``.
 
     Returns a list of ``(tile_shape_mnk, atom_layout, pipeline_depth,
-    use_fp16_mma, tile_swizzle, k_splits)`` tuples.
+    use_fp16_mma, tile_swizzle, k_splits, occupancy)`` tuples.
     """
     tile_k = 128 if k % 128 == 0 else 64
 
@@ -333,11 +341,11 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     tile_m_atoms.append((64, (2, 2, 1)))
 
     configs: List[
-        Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int]
+        Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int, int]
     ] = []
     seen = set()
 
-    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None, swz=1, splits=1):
+    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None, swz=1, splits=1, occ=1):
         cfg = (
             (tile_m, tile_n, tile_k if tk is None else tk),
             atom,
@@ -345,8 +353,9 @@ def _bf16_fp4_cute_dsl_tactic_configs(
             fp16,
             swz,
             splits,
+            occ,
         )
-        key = (cfg[0], cfg[1], pdepth, fp16, swz, splits)
+        key = (cfg[0], cfg[1], pdepth, fp16, swz, splits, occ)
         if key not in seen:
             seen.add(key)
             configs.append(cfg)
@@ -386,6 +395,17 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     if tile_k == 128 and n % 128 == 0 and n >= 4096:
         add(64, (2, 2, 1), 1, 1, tile_n=128, swz=8)
         add(64, (2, 2, 1), 1, 1, tile_n=128, swz=1)
+
+    # occupancy=2: two co-resident CTAs per SM (6 resident warps instead of
+    # 3) at half the ab_stage depth.  Large weight-bound grids are latency
+    # bound on resident warps (1 CTA x 3 warps cannot cover DRAM latency at
+    # production bandwidth), so trading pipeline depth for warps wins there;
+    # only offered when the m=1 grid has enough tiles to fill two CTAs on
+    # every SM of the largest deployment targets (~188 SMs needs n >= 24k;
+    # gate at 128 tiles so 5080-class parts qualify too).
+    if tile_k == 128 and n // 64 >= 128:
+        add(base_tile_m, base_atom, 1, 1, occ=2)
+        add(base_tile_m, base_atom, 0, 1, occ=2)
 
     return configs
 
@@ -460,7 +480,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             if tactic < 0:
                 # Fallback == pre-autotuner heuristic (M-aware), default knobs.
                 tile_shape_mnk, atom_layout = _select_bf16_fp4_tile_shape(m, n, k)
-                pipeline_depth, use_fp16_mma, tile_swizzle = 1, 1, 1
+                pipeline_depth, use_fp16_mma, tile_swizzle, occupancy = 1, 1, 1, 1
                 k_splits = _select_bf16_fp4_k_splits(
                     m, n, k, tile_shape_mnk, get_device_sm_count(a.device)
                 )
@@ -472,6 +492,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     use_fp16_mma,
                     tile_swizzle,
                     k_splits,
+                    occupancy,
                 ) = _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic]
             compiled = _get_cute_dsl_bf16_fp4_gemm(
                 tile_shape_mnk,
@@ -483,6 +504,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 enable_pdl=enable_pdl,
                 tile_swizzle=tile_swizzle,
                 k_splits=k_splits,
+                occupancy=occupancy,
             )
             if k_splits > 1:
                 if k_splits > k // tile_shape_mnk[2]:
