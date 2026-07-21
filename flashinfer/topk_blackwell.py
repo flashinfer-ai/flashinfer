@@ -69,7 +69,8 @@ _BLACKWELL_PLUS_CCS = [100, 103, 110, 120, 121]
 @supported_compute_capability(_ALL_CCS)
 def _radix_top_k_decode_check(
     logits, seq_lens, top_k, pre_idx=None, compress_ratio=1,
-    next_n=1, return_values=False, out_indices=None, out_values=None, backend="auto",
+    next_n=1, return_values=False, out_indices=None, out_values=None,
+    backend="auto", load_balance=True,
 ):
     """Radix masked-fallback: runs on all supported SM tiers."""
     return True
@@ -78,7 +79,8 @@ def _radix_top_k_decode_check(
 @supported_compute_capability(_BLACKWELL_PLUS_CCS)
 def _gvr_top_k_decode_check(
     logits, seq_lens, top_k, pre_idx=None, compress_ratio=1,
-    next_n=1, return_values=False, out_indices=None, out_values=None, backend="auto",
+    next_n=1, return_values=False, out_indices=None, out_values=None,
+    backend="auto", load_balance=True,
 ):
     """GVR LB: requires Blackwell hardware, CuTe DSL, and a pre_idx hint."""
     return is_cute_dsl_available() and pre_idx is not None
@@ -94,7 +96,7 @@ def _top_k_decode_heuristic(suitable_backends, **kwargs):
 # ---------------------------------------------------------------------------
 
 if is_cute_dsl_available():
-    from .cute_dsl.top_k import GvrTopKLBKernel, GvrTopKLBPrepareKernel
+    from .cute_dsl.top_k import GvrTopKKernel, GvrTopKLBKernel, GvrTopKLBPrepareKernel
 
 
 @functools.cache
@@ -142,6 +144,34 @@ def _compile_lb(
         cute.runtime.make_fake_compact_tensor(cutlass.Int32, (num_rows, top_k), stride_order=(1, 0), assumed_align=16),
         cute.runtime.make_fake_compact_tensor(cutlass.Int32, (max_batch_size,), stride_order=(0,)),
         cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,)),
+        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+@functools.cache
+def _compile_gvr(
+    cute_dtype, top_k, next_n, num_rows, N, compress_ratio,
+    num_threads, return_output_values,
+):
+    kernel = GvrTopKKernel(
+        dtype=cute_dtype,
+        top_k=top_k,
+        next_n=next_n,
+        num_threads=num_threads,
+        compress_ratio=compress_ratio,
+        return_output_values=return_output_values,
+        cluster_size=1,
+    )
+    n_groups = num_rows // next_n
+    return cute.compile(
+        kernel,
+        cute.runtime.make_fake_compact_tensor(cute_dtype, (num_rows, N), stride_order=(1, 0), assumed_align=16),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (n_groups, top_k), stride_order=(1, 0), assumed_align=16),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (n_groups,), stride_order=(0,)),
+        cute.runtime.make_fake_compact_tensor(cute_dtype, (num_rows, top_k), stride_order=(1, 0), assumed_align=16) if return_output_values else None,
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (num_rows, top_k), stride_order=(1, 0), assumed_align=16),
+        None,  # order_row unused when seqlen_sorted=False
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -196,6 +226,39 @@ def _run_gvr(
         logits, pre_idx, seq_lens,
         out_values if return_output_values else None,
         out_indices, order_row, counters,
+    )
+    return (out_values if return_output_values else None), out_indices
+
+
+def _run_gvr_no_lb(
+    logits: torch.Tensor,
+    pre_idx: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_output_values: bool,
+    out_indices: Optional[torch.Tensor],
+    out_values: Optional[torch.Tensor],
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    """Run GVR without load-balancing: one CTA per row, no prepare kernel."""
+    cute_dtype = torch_to_cutlass_dtype(logits.dtype)
+    num_rows = logits.shape[0]
+    N = logits.shape[1]
+
+    if out_indices is None:
+        out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=logits.device)
+    if return_output_values and out_values is None:
+        out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
+
+    lb_cfg = GvrTopKLBConfig()
+    _compile_gvr(
+        cute_dtype, top_k, next_n, num_rows, N, compress_ratio,
+        lb_cfg.num_threads, return_output_values,
+    )(
+        logits, pre_idx, seq_lens,
+        out_values if return_output_values else None,
+        out_indices, None,
     )
     return (out_values if return_output_values else None), out_indices
 
@@ -276,6 +339,7 @@ def top_k_decode(
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
     backend: Literal["radix", "gvr", "auto"] = "auto",
+    load_balance: bool = True,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
 
@@ -329,6 +393,13 @@ def top_k_decode(
                       ``pre_idx``).
         ``"radix"`` — Masked radix top-K (all GPUs, no ``pre_idx`` needed).
         ``"auto"``  — GVR when requirements are met, else radix.
+    load_balance : bool, optional
+        When ``True`` (default) the GVR backend runs the two-kernel LB path
+        (``GvrTopKLBPrepareKernel`` + ``GvrTopKLBKernel``): a prepare kernel
+        first classifies requests into long/short buckets, then the main
+        kernel dispatches them accordingly.  When ``False``, the simpler
+        single-kernel path (``GvrTopKKernel``) is used: one CTA per row with
+        no prepare step.  Ignored by the radix backend.
 
     Returns
     -------
@@ -346,14 +417,29 @@ def top_k_decode(
     Examples
     --------
     >>> import torch, flashinfer
-    >>> B, N, K = 32, 8192, 1024
-    >>> logits  = torch.randn(B, N, dtype=torch.bfloat16, device="cuda")
-    >>> pre_idx = torch.topk(logits, K, dim=-1).indices.int()
-    >>> seq_lens = torch.full((B,), N, dtype=torch.int32, device="cuda")
-    >>> # auto-selects GVR on Blackwell, radix otherwise
-    >>> indices = flashinfer.top_k_decode(logits, seq_lens, K, pre_idx=pre_idx)
-    >>> # explicit radix backend (any GPU, no pre_idx needed)
-    >>> indices = flashinfer.top_k_decode(logits, seq_lens, K, backend="radix")
+    >>> torch.manual_seed(42)
+    >>> B, N_max, top_k = 32, 8192, 1024
+    >>>
+    >>> # Step t: no prior indices; use radix to get the first top-K.
+    >>> # Each request has a different KV-cache length in [top_k+1, N_max-1].
+    >>> logits = torch.randn(B, N_max, dtype=torch.bfloat16, device="cuda")
+    >>> seq_lens_t = torch.randint(top_k + 1, N_max, (B,), dtype=torch.int32, device="cuda")
+    >>> indices_t = flashinfer.top_k_decode(logits, seq_lens_t, top_k, backend="radix")
+    >>> # Reference check: every selected value must be >= the K-th largest.
+    >>> for i in range(B):
+    ...     s = seq_lens_t[i].item()
+    ...     kth = torch.topk(logits[i, :s].float(), top_k).values[-1]
+    ...     assert (logits[i, :s].float()[indices_t[i].long()] < kth - 1e-5).sum() == 0
+    >>>
+    >>> # Step t+1: one new token appended per request; seq_lens grows by 1.
+    >>> logits_t1 = torch.randn(B, N_max, dtype=torch.bfloat16, device="cuda")
+    >>> seq_lens_t1 = seq_lens_t + 1
+    >>> # Pass indices_t as pre_idx; GVR uses it to warm-start the threshold search.
+    >>> indices_t1 = flashinfer.top_k_decode(logits_t1, seq_lens_t1, top_k, pre_idx=indices_t)
+    >>> for i in range(B):
+    ...     s = seq_lens_t1[i].item()
+    ...     kth = torch.topk(logits_t1[i, :s].float(), top_k).values[-1]
+    ...     assert (logits_t1[i, :s].float()[indices_t1[i].long()] < kth - 1e-5).sum() == 0
 
     See Also
     --------
@@ -366,10 +452,16 @@ def top_k_decode(
         backend = top_k_decode.suitable_auto_backends[0]
 
     if backend == "gvr":
-        out_v, out_i = _run_gvr(
-            logits, pre_idx, seq_lens, top_k, next_n, compress_ratio,
-            return_values, out_indices, out_values,
-        )
+        if load_balance:
+            out_v, out_i = _run_gvr(
+                logits, pre_idx, seq_lens, top_k, next_n, compress_ratio,
+                return_values, out_indices, out_values,
+            )
+        else:
+            out_v, out_i = _run_gvr_no_lb(
+                logits, pre_idx, seq_lens, top_k, next_n, compress_ratio,
+                return_values, out_indices, out_values,
+            )
     else:  # "radix"
         out_v, out_i = _run_radix(
             logits, seq_lens, top_k, next_n, compress_ratio,
