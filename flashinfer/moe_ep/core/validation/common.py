@@ -278,7 +278,14 @@ def validate_mega_fleet_params(
     *,
     intermediate_size: int,
     top_k: int,
+    alignment: int = 128,
 ) -> None:
+    # ``alignment`` is backend-specific: deep_gemm's wire format stores scale
+    # factors 4-per-int32 word (hidden/128 columns, static-asserted host and
+    # device side), so it needs 128. The cutedsl kernels tile with ceil-div +
+    # TMA zero-fill and predicated epilogue tails; their true bound is the
+    # 16B TMA row alignment and SF-word packing, i.e. 64 (verified 2026-07-21
+    # against gpt-oss-120b geometry, hidden=inter=2880).
     if world_size <= 0:
         raise MoEEpConfigError(f"world_size must be positive, got {world_size}")
     if params.num_experts % world_size != 0:
@@ -286,13 +293,15 @@ def validate_mega_fleet_params(
             f"num_experts ({params.num_experts}) must be divisible by "
             f"world_size ({world_size})"
         )
-    if params.token_hidden_size % 128 != 0:
+    if params.token_hidden_size % alignment != 0:
         raise MoEEpConfigError(
-            f"token_hidden_size ({params.token_hidden_size}) must be a multiple of 128"
+            f"token_hidden_size ({params.token_hidden_size}) must be a "
+            f"multiple of {alignment}"
         )
-    if intermediate_size % 128 != 0:
+    if intermediate_size % alignment != 0:
         raise MoEEpConfigError(
-            f"intermediate_size ({intermediate_size}) must be a multiple of 128"
+            f"intermediate_size ({intermediate_size}) must be a multiple of "
+            f"{alignment}"
         )
     if top_k <= 0:
         raise MoEEpConfigError(f"top_k must be positive, got {top_k}")

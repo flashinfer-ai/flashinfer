@@ -74,14 +74,26 @@ def staged_tokens(topk_idx_out: torch.Tensor) -> Optional[int]:
     return _LAST_STAGED_N.get(topk_idx_out.data_ptr())
 
 
-def fused_quant_stage_supported(hidden_states: torch.Tensor) -> bool:
+def fused_quant_stage_supported(
+    hidden_states: torch.Tensor, quant_type: str = "nvfp4"
+) -> bool:
     """True when the fused kernel can take this activation tensor.
 
     The DSL launcher requires 16-byte-aligned data pointers; torch allocations
     satisfy this, but sliced/offset views may not — callers fall back to their
     torch staging path in that case.
+
+    The fused kernel also stages the SF plane at its exact unpadded width, so
+    ``hidden // sf_vec`` must be a multiple of 4 (the buffer's round-up-to-4
+    SF padding must be zero): hidden % 64 for nvfp4 (sf_vec 16), hidden % 128
+    for mxfp8 (sf_vec 32). 128-misaligned mxfp8 shapes (gpt-oss: 2880) fall
+    back to torch staging rather than failing.
     """
-    return hidden_states.data_ptr() % 16 == 0
+    sf_align = 64 if quant_type == "nvfp4" else 128
+    return (
+        hidden_states.data_ptr() % 16 == 0
+        and hidden_states.shape[1] % sf_align == 0
+    )
 
 
 def fused_quant_stage(
@@ -123,15 +135,19 @@ def fused_quant_stage(
     capacity = x_out.shape[0]
     if num_tokens == 0:
         return
-    if hidden % 128 != 0:
-        raise ValueError("hidden_size must be a multiple of 128.")
+    sf_vec = 16 if is_nvfp4 else 32
+    # hidden // sf_vec must be a multiple of 4 so the buffer's round-up-to-4
+    # SF padding is zero and the full-width view is the exact block count —
+    # hidden % 64 (nvfp4) / % 128 (mxfp8). Callers gate on
+    # fused_quant_stage_supported() and fall back to torch staging otherwise.
+    if hidden % (4 * sf_vec) != 0:
+        raise ValueError(
+            f"hidden_size must be a multiple of {4 * sf_vec} for the fused "
+            f"{quant_type} stage (got {hidden}); use the torch staging path."
+        )
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
     topk = topk_ids.shape[1]
-    sf_vec = 16 if is_nvfp4 else 32
-    # hidden % 128 == 0 makes hidden // sf_vec a multiple of 8 (nvfp4) / 4
-    # (mxfp8), so the buffer's round-up-to-4 SF padding is always zero and the
-    # full-width view is the exact block count.
     n_blocks = hidden // sf_vec
     if x_sf_out.shape[1] != n_blocks:
         raise ValueError(
