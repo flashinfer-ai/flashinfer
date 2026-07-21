@@ -41,17 +41,83 @@ between 512 and 1024, win growing to 1.58x at 8192** (1.78x with the fp4
 combine wire).  The small-batch regime is weight-load bound and fp4-vs-fp4
 there is a wash.
 
-The same sweep now also runs across real-model MoE geometries (DeepSeek V3 /
-V4-Flash / V4-Pro, Kimi K2.6, Qwen3.5-397B, gpt-oss-120b — the last enabled
-by the %64 relaxation; fp4 variants only, dg's wire format is hard-%128):
-`moe_ep_benchmark/model_shapes/RESULTS.md`. Pattern holds everywhere:
-dg-parity below ~512 tok/rank, fp4 combine-wire best at large tokens
-(1.6-1.9x on 7168-hidden shapes).
-
 The `mxfp8_cutedsl` backend (latest sweep 2026-07-15; its >=2048 rows use
 the re-derived dispatch-warp default profile) runs 0.63x / 0.84x / 0.86x /
 0.99x vs dg at 1024 / 2048 / 4096 / 8192 tok/rank — dg parity at 8192 at a
 3x better accuracy point (6.4% vs 20.6% rel-L2).
+
+### Real-model geometry sweep (2026-07-21)
+
+The same sweep across the MoE geometries of real models (same recipe,
+session, and node as the table above; CSVs
+`moe_ep_benchmark/model_shapes/results/model_shapes_20260721_1109*_*.csv`,
+generated tables in that repo's `model_shapes/RESULTS.md`).  Pattern holds
+everywhere: dg-parity below ~512 tok/rank, fp4 combine-wire best at large
+tokens (1.6-1.9x on 7168-hidden shapes).  `e2e_pipelined` p50 µs, speedup
+vs `deep_gemm_mega` in parens.
+
+**deepseek_v3** — hidden 7168, inter 2048, 256 experts, top-8 (independent
+same-session re-run of the table above; matches within run noise):
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 8        | 211.1  | 220.5 (0.96x)  | 233.9 (0.90x)  | 228.3 (0.92x)      | 227.2 (0.93x)  |
+| 64       | 286.7  | 285.7 (1.00x)  | 314.4 (0.91x)  | 303.2 (0.95x)      | 306.0 (0.94x)  |
+| 512      | 348.2  | 357.4 (0.97x)  | 361.5 (0.96x)  | 326.7 (1.07x)      | 332.8 (1.05x)  |
+| 2048     | 830.0  | 612.2 (1.36x)  | 609.2 (1.36x)  | **539.6 (1.54x)**  | 566.2 (1.47x)  |
+| 8192     | 3129.4 | 1942.5 (1.61x) | 1916.9 (1.63x) | **1728.0 (1.81x)** | 1784.3 (1.75x) |
+
+**deepseek_v4_flash** — hidden 4096, inter 2048, 256 experts, top-6:
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4    | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|------------------:|---------------:|
+| 8        | 127.8  | 142.1 (0.90x)  | 148.5 (0.86x)  | 148.3 (0.86x)     | 151.6 (0.84x)  |
+| 64       | 176.2  | 190.3 (0.93x)  | 204.7 (0.86x)  | 195.2 (0.90x)     | 197.6 (0.89x)  |
+| 512      | 206.8  | 231.1 (0.89x)  | 229.2 (0.90x)  | 216.0 (0.96x)     | 220.2 (0.94x)  |
+| 2048     | 401.4  | 344.6 (1.16x)  | 344.1 (1.17x)  | **303.1 (1.32x)** | 318.5 (1.26x)  |
+| 8192     | 1294.9 | 1070.1 (1.21x) | 1061.6 (1.22x) | **794.1 (1.63x)** | 901.1 (1.44x)  |
+
+**deepseek_v4_pro** — hidden 7168, inter 3072, 384 experts, top-6:
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 8        | 286.7  | 304.2 (0.94x)  | 310.4 (0.92x)  | 309.2 (0.93x)      | 312.8 (0.92x)  |
+| 64       | 540.7  | 562.2 (0.96x)  | 575.5 (0.94x)  | 566.0 (0.96x)      | 570.1 (0.95x)  |
+| 512      | 603.1  | 621.6 (0.97x)  | 621.8 (0.97x)  | 601.1 (1.00x)      | 607.2 (0.99x)  |
+| 2048     | 921.1  | 760.8 (1.21x)  | 758.1 (1.22x)  | **695.3 (1.32x)**  | 715.7 (1.29x)  |
+| 8192     | 3093.5 | 1897.4 (1.63x) | 1880.4 (1.65x) | **1773.6 (1.74x)** | 1836.5 (1.68x) |
+
+**kimi_k2_6** — hidden 7168, inter 2048, 384 experts, top-8:
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 8        | 247.8  | 253.0 (0.98x)  | 275.4 (0.90x)  | 261.2 (0.95x)      | 263.2 (0.94x)  |
+| 64       | 409.6  | 401.2 (1.02x)  | 440.2 (0.93x)  | 416.8 (0.98x)      | 419.8 (0.98x)  |
+| 512      | 472.2  | 469.0 (1.01x)  | 470.4 (1.00x)  | 442.4 (1.07x)      | 449.0 (1.05x)  |
+| 2048     | 834.5  | 668.8 (1.25x)  | 662.2 (1.26x)  | **603.1 (1.38x)**  | 619.5 (1.35x)  |
+| 8192     | 3188.3 | 2000.3 (1.59x) | 1982.9 (1.61x) | **1701.9 (1.87x)** | 1894.4 (1.68x) |
+
+**qwen3_5_397b** — hidden 4096, inter 1024, 512 experts, top-10:
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 8        | 129.0  | 145.7 (0.89x)  | 167.8 (0.77x)  | 157.7 (0.82x)      | 161.8 (0.80x)  |
+| 64       | 194.6  | 213.0 (0.91x)  | 264.3 (0.74x)  | 234.5 (0.83x)      | 238.6 (0.82x)  |
+| 512      | 233.5  | 253.9 (0.92x)  | 256.0 (0.91x)  | 238.6 (0.98x)      | 243.8 (0.96x)  |
+| 2048     | 495.6  | 459.0 (1.08x)  | 461.8 (1.07x)  | **361.6 (1.37x)**  | 391.0 (1.27x)  |
+| 8192     | 1772.8 | 1506.0 (1.18x) | 1544.7 (1.15x) | **1100.9 (1.61x)** | 1270.8 (1.40x) |
+
+**gpt_oss_120b** — hidden 2880, inter 2880, 128 experts, top-4.  No dg
+column: 2880 fails deep_gemm's hard-%128 wire alignment, so this geometry
+runs only via the cutedsl %64 relaxation (fp4 variants only):
+
+| tok/rank | dg | nvfp4 bf16 | +ikr   | +combine_nvfp4 | +combine_mxfp8 |
+|---------:|:--:|-----------:|-------:|---------------:|---------------:|
+| 8        | —  | 111.6      | 113.9  | 115.1          | 116.7          |
+| 64       | —  | 125.9      | 132.5  | 132.1          | 135.6          |
+| 512      | —  | 150.5      | 150.5  | 150.5          | 150.0          |
+| 2048     | —  | 261.1      | 261.0  | **252.7**      | 259.1          |
+| 8192     | —  | 697.3      | 678.9  | **551.9**      | 609.3          |
 
 ### Accuracy
 
