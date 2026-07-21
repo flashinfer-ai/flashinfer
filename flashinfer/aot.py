@@ -48,6 +48,7 @@ from .jit.attention import (
 )
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
+from .jit.gpt_oss import gen_gpt_oss_reshape_cache_fp8_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
@@ -625,6 +626,16 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        if (
+            has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm110
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
+            jit_specs.append(gen_gpt_oss_reshape_cache_fp8_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
             for C in _SUPPORTED_C:

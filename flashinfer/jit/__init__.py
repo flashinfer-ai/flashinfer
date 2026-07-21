@@ -91,6 +91,9 @@ from .dsv3_optimizations import (
 from .dsv3_optimizations import (
     gen_dsv3_fused_routing_module as gen_dsv3_fused_routing_module,
 )
+from .gpt_oss import (
+    gen_gpt_oss_reshape_cache_fp8_module as gen_gpt_oss_reshape_cache_fp8_module,
+)
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
