@@ -28,9 +28,13 @@ def _bind_trace_init_dependencies(wrapper: Any, *dependencies: Any) -> Any:
     return wrapper
 
 
-# ── Reference helpers ────────────────────────────────────────────────────────
+def _bind_trace_reference_dependencies(wrapper: Any, *dependencies: Any) -> Any:
+    """Mark helpers to inline with a serialized reference."""
+    wrapper._trace_reference_dependencies = dependencies
+    return wrapper
 
-_E2M1_VALUES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]  # FP4 e2m1fn magnitudes
+
+# ── Reference helpers ────────────────────────────────────────────────────────
 
 
 @torch.no_grad()
@@ -42,8 +46,17 @@ def _fp4_e2m1_quantize_block(
     Returns an int64 tensor with values in [0, 15] matching the nibble codes
     used by ``_unpack_fp4_e2m1`` in moe.py: low 3 bits = magnitude index,
     high bit = sign.
+
+    The e2m1fn magnitudes are inlined rather than read from a module-level
+    constant so this helper stays self-contained when serialized as a trace
+    reference dependency.
     """
-    values = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=block.device)
+    # FP4 e2m1fn magnitudes.
+    values = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+        device=block.device,
+    )
     sign_bit = (block < 0).to(torch.int64) << 3
     mag = block.abs()
     # Nearest-magnitude index among the 8 e2m1 values.
@@ -375,6 +388,134 @@ nvfp4_quantize_trace = TraceTemplate(
     tags=["status:verified", "quantization:nvfp4"],
     reference=_nvfp4_quantize_reference,
     init=_nvfp4_quantize_init,
+)
+
+
+# ── SiLU+mul + NVFP4 quantization (fused SwiGLU activation-quantize) ─────────
+
+
+@torch.no_grad()
+def _silu_and_mul_nvfp4_quantize_reference(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 16,
+    is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference SwiGLU followed by NVFP4 quantization with linear E4M3 scales."""
+    half = input.shape[-1] // 2
+    gate = input[..., :half].to(torch.float32)
+    up = input[..., half:].to(torch.float32)
+    activated = (gate * torch.sigmoid(gate) * up).to(input.dtype)
+    packed, scales = _fp4_quantize_reference(
+        activated,
+        global_scale=global_scale,
+        sf_vec_size=int(sf_vec_size),
+        sf_use_ue8m0=False,
+    )
+    # Return linear E4M3 scales as raw bytes to match the API dtype.
+    return packed, scales.view(torch.uint8)
+
+
+# Inline dependencies so the serialized reference is self-contained.
+_bind_trace_reference_dependencies(
+    _silu_and_mul_nvfp4_quantize_reference,
+    _fp4_e2m1_quantize_block,
+    _pack_fp4_pairs,
+    _quantize_fp4_block_scale,
+    _fp4_quantize_reference,
+)
+
+
+# Name traces by 2K because the input concatenates K-wide gate and up tensors,
+# matching silu_and_mul traces.
+_SILU_FP4_AXES: Dict[str, _AxisT] = {
+    "M": Var(description="Number of rows."),
+    "K_doubled": Const(
+        abbrev="k",
+        description="Gated input width (2 * output K; gate and up concatenated).",
+    ),
+    "K_packed": Var(
+        description="Packed output column dim (output_K // 2, two FP4 values per uint8)."
+    ),
+    "num_scale_elems": Var(
+        description="Total number of scale factor elements (layout-dependent)."
+    ),
+    "one": Var(description="Placeholder for shape [1] scalar tensors."),
+}
+
+
+def _silu_and_mul_nvfp4_quantize_init(
+    *,
+    M: int,
+    K_doubled: int = 16384,
+    K_packed: int = 0,
+    num_scale_elems: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build BF16 inputs and an amax-derived global scale for the fused trace."""
+    del K_packed, num_scale_elems, one  # derived from K_doubled
+    torch.manual_seed(seed)
+    inp = torch.randn(M, K_doubled, dtype=torch.bfloat16, device=device)
+    half = K_doubled // 2
+    gate = inp[..., :half].float()
+    up = inp[..., half:].float()
+    ref_y = (gate * torch.sigmoid(gate)) * up
+    amax = ref_y.abs().nan_to_num().max().clamp(min=1e-12)
+    return {
+        "input": inp,
+        "global_scale": (448.0 * 6.0 / amax).reshape(1).contiguous(),
+        "sf_vec_size": 16,
+    }
+
+
+silu_and_mul_nvfp4_quantize_trace = TraceTemplate(
+    op_type="quantization",
+    name_prefix="silu_and_mul_nvfp4_quantize",
+    description=(
+        "Fused SwiGLU (silu(gate) * up) with NVFP4 (sf_vec_size=16) "
+        "quantization. Input is [M, 2K] (gate and up concatenated); emits "
+        "packed FP4 [M, K/2] uint8 plus per-block e4m3 scales."
+    ),
+    axes=_SILU_FP4_AXES,
+    inputs={
+        "input": Tensor(
+            ["M", "K_doubled"],
+            param="input",
+            description="Gated input [M, 2K] (gate and up concatenated), fp16/bf16.",
+        ),
+        "global_scale": Tensor(
+            ["one"],
+            dtype="float32",
+            description="Per-tensor global scale, shape [1].",
+        ),
+        "sf_vec_size": Scalar(
+            "int32",
+            optional=True,
+            description="Scale-factor vector size (fixed at 16 for NVFP4).",
+        ),
+    },
+    outputs={
+        "x_q": Tensor(
+            ["M", "K_packed"],
+            dtype="uint8",
+            description="Packed FP4 output (two e2m1fn values per byte).",
+        ),
+        "sf": Tensor(
+            ["num_scale_elems"],
+            dtype="uint8",
+            description="Block scale factors packed as uint8 bytes (layout-dependent shape).",
+        ),
+    },
+    constraints=[
+        "K_packed == K_doubled // 4",
+    ],
+    tags=["status:verified", "fused", "quantization:nvfp4"],
+    reference=_silu_and_mul_nvfp4_quantize_reference,
+    init=_silu_and_mul_nvfp4_quantize_init,
 )
 
 

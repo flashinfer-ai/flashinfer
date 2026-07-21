@@ -69,6 +69,7 @@ def _collect_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
         "flashinfer.gemm",
         "flashinfer.mamba",
         "flashinfer.mla",
+        "flashinfer.msa_ops",
         "flashinfer.norm",
         "flashinfer.page",
         "flashinfer.prefill",

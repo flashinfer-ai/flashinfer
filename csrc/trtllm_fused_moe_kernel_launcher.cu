@@ -327,7 +327,8 @@ inline void check_routing_metadata(Array<Tensor> const& routing_metadata, int64_
       << "metadata expert_weights dim0 must match num_tokens.";
   TVM_FFI_ICHECK_EQ(expert_weights.size(1), top_k)
       << "metadata expert_weights dim1 must match top_k.";
-  check_tensor_dtype(expert_weights, dl_bfloat16, "metadata expert_weights");
+  TVM_FFI_ICHECK(expert_weights.dtype() == dl_bfloat16 || expert_weights.dtype() == dl_float32)
+      << "metadata expert_weights must be bfloat16 or float32.";
 }
 
 inline int32_t computeRoutingLog2(int64_t value) {
@@ -449,7 +450,6 @@ class FusedMoeLauncher {
   btg::Dtype mRoutingLogitsDtype{btg::Dtype::Bfloat16};
   bool norm_topk_prob{true};
   ActivationType activation_type{ActivationType::Swiglu};
-  btg::Dtype mDtypeScore{btg::Dtype::Bfloat16};
 
   // Optional routing replay output: [num_tokens, top_k] int16 tensor
   Optional<TensorView> routing_replay_out;
@@ -678,15 +678,6 @@ class FusedMoeLauncher {
     workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
     workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
     workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
-
-    // Set dtype of score based on actual routing_logits dtype
-    if (routing_logits.has_value()) {
-      if (routing_logits.value().dtype() == dl_float32) {
-        mDtypeScore = btg::Dtype::Fp32;
-      } else {
-        mDtypeScore = btg::Dtype::Bfloat16;
-      }
-    }
   }
 
   void check_moe_common() const {
@@ -853,6 +844,9 @@ class FusedMoeLauncher {
     expanded_idx_to_permuted_idx = routing_metadata[kExpandedIdxToPermutedIdx];
     permuted_idx_to_token_idx = routing_metadata[kPermutedIdxToTokenIdx];
     FusedMoeLauncher::expert_weights = routing_metadata[kExpertWeights];
+    args->mDtypeExpW = FusedMoeLauncher::expert_weights.dtype() == dl_float32
+                           ? btg::Dtype::Fp32
+                           : btg::Dtype::Bfloat16;
     expert_count_histogram = routing_metadata[kExpertCountHistogram];
     num_tokens_per_expert = routing_metadata[kNumTokensPerExpert];
     cta_idx_xy_to_batch_idx = routing_metadata[kCtaIdxXyToBatchIdx];
@@ -1045,9 +1039,12 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     if (has_precomputed_weights) {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
     } else {
-      auto ew_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
+      // Allocate the routing-output buffer as bf16 to match the kernel's output
+      // (mDtypeOutput is always Bfloat16 in trtllm_fused_moe_runner.cu, never the
+      // logits dtype); a fp32 alloc would mislabel bf16 data when this buffer is
+      // surfaced to the caller verbatim on do_finalize=false. See #3595.
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, ew_dtype, hidden_states.device());
+          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
   }
@@ -1224,9 +1221,12 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     mRoutingLogitsDtype =
         routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
-    auto expert_weights_dtype = mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
+    // Allocate the routing-output buffer as bf16 to match the kernel's output
+    // (always Bfloat16, never the logits dtype); a fp32 alloc would mislabel bf16
+    // data when this buffer is surfaced to the caller verbatim on
+    // do_finalize=false. See #3595.
     expert_weights =
-        alloc_tensor({args->num_tokens, args->top_k}, expert_weights_dtype, hidden_states.device());
+        alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
 
     workspace.expert_weights = expert_weights.data_ptr();
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
@@ -1547,9 +1547,12 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
     bool has_precomputed_weights = expert_weights.ndim() == 2 && expert_weights.size(0) > 0;
     if (!has_precomputed_weights) {
-      auto ew_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
-      FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, totalExpertsPerToken}, ew_dtype, hidden_states.device());
+      // Allocate the routing-output buffer as bf16 to match the kernel's output
+      // (always Bfloat16, never the logits dtype); a fp32 alloc would mislabel
+      // bf16 data when this buffer is surfaced to the caller verbatim on
+      // do_finalize=false. See #3595.
+      FusedMoeLauncher::expert_weights = alloc_tensor({args->num_tokens, totalExpertsPerToken},
+                                                      dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     } else {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
@@ -1936,9 +1939,12 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
     if (has_precomputed_weights) {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
     } else {
-      auto ew_dtype = mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
+      // Allocate the routing-output buffer as bf16 to match the kernel's output
+      // (always Bfloat16, never the logits dtype); a fp32 alloc would mislabel
+      // bf16 data when this buffer is surfaced to the caller verbatim on
+      // do_finalize=false. See #3595.
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, ew_dtype, hidden_states.device());
+          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
   }
@@ -2126,6 +2132,13 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   void check_routing() const override {
     // First call base class common routing checks
     FusedMoeLauncher::check_routing_common();
+
+    if (routing_input_mode_ == RoutingInputMode::UnpackedPrecomputed) {
+      TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32)
+          << "topk_ids must be int32 for unpacked precomputed routing.";
+      TVM_FFI_ICHECK(topk_weights.dtype() == dl_bfloat16 || topk_weights.dtype() == dl_float32)
+          << "topk_weights must be bfloat16 or float32 for unpacked precomputed routing.";
+    }
   }
 
   void prepare_routing() override {
@@ -2171,6 +2184,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         routing_logits.has_value() ? routing_logits.value().dtype() : dl_bfloat16;
     mRoutingLogitsDtype =
         routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+
+    if (routing_input_mode_ == RoutingInputMode::UnpackedPrecomputed) {
+      args->mDtypeExpW =
+          topk_weights.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+    }
   }
 
   void check_moe() const override {
@@ -2359,23 +2377,23 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       replay_ptr = reinterpret_cast<int16_t*>(routing_replay_out.value().data_ptr());
     }
 
-    routing_runner.run(args->routing_logits, args->routing_bias, args->num_tokens,
-                       args->num_experts, args->top_k, args->num_fused_shared_experts,
-                       args->n_group, args->topk_group, args->local_expert_offset,
-                       args->local_num_experts, args->routed_scaling_factor,
-                       static_cast<int*>(topk_ids.data_ptr()),
-                       static_cast<int*>(expert_count_histogram.data_ptr()),
-                       static_cast<int*>(total_num_padded_tokens.data_ptr()),
-                       static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-                       nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
-                       static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
-                       expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
-                       static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
-                       static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-                       static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
-                       mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
-                       static_cast<RoutingMethodType>(routing_method_type), routing_stream,
-                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl);
+    routing_runner.run(
+        args->routing_logits, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
+        args->num_fused_shared_experts, args->n_group, args->topk_group, args->local_expert_offset,
+        args->local_num_experts, args->routed_scaling_factor,
+        static_cast<int*>(topk_ids.data_ptr()),
+        static_cast<int*>(expert_count_histogram.data_ptr()),
+        static_cast<int*>(total_num_padded_tokens.data_ptr()),
+        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+        nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
+        expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+        use_routing_scales_on_input, use_deep_seek_fp8,
+        static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
+        norm_topk_prob, replay_ptr, enable_pdl, args->mDtypeExpW);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -2399,6 +2417,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     expanded_idx_to_permuted_idx = routing_metadata[kExpandedIdxToPermutedIdx];
     permuted_idx_to_token_idx = routing_metadata[kPermutedIdxToTokenIdx];
     FusedMoeLauncher::expert_weights = routing_metadata[kExpertWeights];
+    args->mDtypeExpW = FusedMoeLauncher::expert_weights.dtype() == dl_float32
+                           ? btg::Dtype::Fp32
+                           : btg::Dtype::Bfloat16;
     expert_count_histogram = routing_metadata[kExpertCountHistogram];
     num_tokens_per_expert = routing_metadata[kNumTokensPerExpert];
     cta_idx_xy_to_batch_idx = routing_metadata[kCtaIdxXyToBatchIdx];
@@ -3467,7 +3488,8 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata(
   if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
     TVM_FFI_ICHECK(topk_weights.has_value()) << "unpacked routing metadata requires topk_weights.";
     auto const& weights = topk_weights.value();
-    TVM_FFI_ICHECK_EQ(weights.dtype(), dl_bfloat16) << "unpacked topk_weights must be bfloat16.";
+    TVM_FFI_ICHECK(weights.dtype() == dl_bfloat16 || weights.dtype() == dl_float32)
+        << "unpacked topk_weights must be bfloat16 or float32.";
     TVM_FFI_ICHECK(weights.ndim() == 2 && weights.size(0) == topk_ids.size(0) &&
                    weights.size(1) == top_k)
         << "unpacked topk_weights must match topk_ids shape.";
@@ -3508,7 +3530,11 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata(
       alloc_tensor({num_tokens * top_k}, dl_int32, topk_ids.device());
   Tensor permuted_idx_to_token_idx =
       alloc_tensor({max_num_padded_tokens}, dl_int32, topk_ids.device());
-  Tensor expert_weights = alloc_tensor({num_tokens, top_k}, dl_bfloat16, topk_ids.device());
+  DLDataType const expert_weights_dtype = input_mode == RoutingInputMode::UnpackedPrecomputed
+                                              ? topk_weights.value().dtype()
+                                              : dl_bfloat16;
+  Tensor expert_weights =
+      alloc_tensor({num_tokens, top_k}, expert_weights_dtype, topk_ids.device());
   Tensor expert_count_histogram =
       alloc_tensor({size_of_expert_count_histogram}, dl_int32, topk_ids.device());
   Tensor num_tokens_per_expert = alloc_tensor({num_experts}, dl_int32, topk_ids.device());
@@ -3527,30 +3553,33 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata(
   if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
     unpacked_expert_ids = static_cast<int32_t*>(const_cast<void*>(topk_ids.data_ptr()));
     auto const& weights = topk_weights.value();
-    TVM_FFI_ICHECK_EQ(cudaMemcpyAsync(expert_weights.data_ptr(), weights.data_ptr(),
-                                      static_cast<size_t>(weights.numel()) * sizeof(__nv_bfloat16),
-                                      cudaMemcpyDeviceToDevice, routing_stream),
-                      cudaSuccess)
+    TVM_FFI_ICHECK_EQ(
+        cudaMemcpyAsync(expert_weights.data_ptr(), weights.data_ptr(),
+                        static_cast<size_t>(weights.numel()) *
+                            (weights.dtype() == dl_float32 ? sizeof(float) : sizeof(__nv_bfloat16)),
+                        cudaMemcpyDeviceToDevice, routing_stream),
+        cudaSuccess)
         << "failed to preserve unpacked topk_weights.";
   }
-  routing_runner.run(nullptr, routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr,
-                     num_tokens, num_experts, top_k, 0 /* num_fused_shared_experts */,
-                     n_group.value_or(0), topk_group.value_or(0), local_expert_offset,
-                     local_num_experts, routed_scaling_factor.value_or(1.0),
-                     static_cast<int*>(const_cast<void*>(topk_ids.data_ptr())),
-                     static_cast<int*>(expert_count_histogram.data_ptr()),
-                     static_cast<int*>(total_num_padded_tokens.data_ptr()),
-                     static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-                     nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
-                     static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), unpacked_expert_ids,
-                     expert_weights.data_ptr(), static_cast<int*>(num_tokens_per_expert.data_ptr()),
-                     static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
-                     static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-                     static_cast<int*>(num_non_exiting_ctas.data_ptr()), btg::Dtype::Bfloat16,
-                     mRoutingBiasDtype, false /* use_routing_scales_on_input */,
-                     false /* use_deep_seek_fp8 */,
-                     static_cast<RoutingMethodType>(routing_method_type), routing_stream,
-                     btg::Dtype::Bfloat16, true /* norm_topk_prob */, nullptr /* replay_ptr */);
+  routing_runner.run(
+      nullptr, routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr, num_tokens,
+      num_experts, top_k, 0 /* num_fused_shared_experts */, n_group.value_or(0),
+      topk_group.value_or(0), local_expert_offset, local_num_experts,
+      routed_scaling_factor.value_or(1.0),
+      static_cast<int*>(const_cast<void*>(topk_ids.data_ptr())),
+      static_cast<int*>(expert_count_histogram.data_ptr()),
+      static_cast<int*>(total_num_padded_tokens.data_ptr()),
+      static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+      nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
+      static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), unpacked_expert_ids,
+      expert_weights.data_ptr(), static_cast<int*>(num_tokens_per_expert.data_ptr()),
+      static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+      static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+      static_cast<int*>(num_non_exiting_ctas.data_ptr()), btg::Dtype::Bfloat16, mRoutingBiasDtype,
+      false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
+      static_cast<RoutingMethodType>(routing_method_type), routing_stream, btg::Dtype::Bfloat16,
+      true /* norm_topk_prob */, nullptr /* replay_ptr */, true /* enable_pdl */,
+      expert_weights_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16);
 
   return {total_num_padded_tokens, expanded_idx_to_permuted_idx, permuted_idx_to_token_idx,
           expert_weights,          expert_count_histogram,       num_tokens_per_expert,
@@ -3894,6 +3923,9 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
   if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
     TVM_FFI_ICHECK(topk_weights.has_value()) << "unpacked routing metadata requires topk_weights.";
     unpacked_weights = &topk_weights.value();
+    TVM_FFI_ICHECK(unpacked_weights->dtype() == dl_bfloat16 ||
+                   unpacked_weights->dtype() == dl_float32)
+        << "unpacked topk_weights must be bfloat16 or float32.";
   }
   auto const routing_bias_dtype =
       routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
@@ -3943,7 +3975,11 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
         alloc_tensor({num_tokens * top_k}, dl_int32, topk_ids.device());
     Tensor permuted_idx_to_token_idx =
         alloc_tensor({max_num_padded_tokens}, dl_int32, topk_ids.device());
-    Tensor expert_weights = alloc_tensor({num_tokens, top_k}, dl_bfloat16, topk_ids.device());
+    DLDataType const expert_weights_dtype = input_mode == RoutingInputMode::UnpackedPrecomputed
+                                                ? unpacked_weights->dtype()
+                                                : dl_bfloat16;
+    Tensor expert_weights =
+        alloc_tensor({num_tokens, top_k}, expert_weights_dtype, topk_ids.device());
     Tensor expert_count_histogram =
         alloc_tensor({size_of_expert_count_histogram}, dl_int32, topk_ids.device());
     Tensor num_tokens_per_expert = alloc_tensor({num_experts}, dl_int32, topk_ids.device());
@@ -3952,7 +3988,8 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
     Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, topk_ids.device());
 
     moe::dev::routing::routingDeepSeek::Data data;
-    data.mDtypeOutput = btg::Dtype::Bfloat16;
+    data.mDtypeOutput =
+        expert_weights_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
     data.mDtypeBias = mRoutingBiasDtype;
     data.mDtypeInput = btg::Dtype::Fp32;
     // This multi-tile path consumes top-k assignments that have already been
@@ -4031,7 +4068,8 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
   if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
     TVM_FFI_ICHECK(topk_weights.has_value()) << "unpacked routing metadata requires topk_weights.";
     auto const& weights = topk_weights.value();
-    TVM_FFI_ICHECK_EQ(weights.dtype(), dl_bfloat16) << "unpacked topk_weights must be bfloat16.";
+    TVM_FFI_ICHECK(weights.dtype() == dl_bfloat16 || weights.dtype() == dl_float32)
+        << "unpacked topk_weights must be bfloat16 or float32.";
     TVM_FFI_ICHECK(weights.ndim() == 2 && weights.size(0) == topk_ids.size(0) &&
                    weights.size(1) == top_k)
         << "unpacked topk_weights must match topk_ids shape.";
@@ -4080,16 +4118,19 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
         auto const& weights = topk_weights.value();
         if (metadata[kExpertWeights].data_ptr() != weights.data_ptr()) {
           TVM_FFI_ICHECK_EQ(
-              cudaMemcpyAsync(metadata[kExpertWeights].data_ptr(), weights.data_ptr(),
-                              static_cast<size_t>(weights.numel()) * sizeof(__nv_bfloat16),
-                              cudaMemcpyDeviceToDevice, routing_stream),
+              cudaMemcpyAsync(
+                  metadata[kExpertWeights].data_ptr(), weights.data_ptr(),
+                  static_cast<size_t>(weights.numel()) *
+                      (weights.dtype() == dl_float32 ? sizeof(float) : sizeof(__nv_bfloat16)),
+                  cudaMemcpyDeviceToDevice, routing_stream),
               cudaSuccess)
               << "failed to preserve unpacked topk_weights.";
         }
       }
 
       moe::dev::routing::routingDeepSeek::Data data;
-      data.mDtypeOutput = btg::Dtype::Bfloat16;
+      data.mDtypeOutput =
+          topk_weights.value().dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
       data.mDtypeBias = mRoutingBiasDtype;
       data.mDtypeInput = btg::Dtype::Fp32;
       data.mUsePdl = false;
@@ -4148,9 +4189,11 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
       auto const& weights = topk_weights.value();
       if (metadata[kExpertWeights].data_ptr() != weights.data_ptr()) {
         TVM_FFI_ICHECK_EQ(
-            cudaMemcpyAsync(metadata[kExpertWeights].data_ptr(), weights.data_ptr(),
-                            static_cast<size_t>(weights.numel()) * sizeof(__nv_bfloat16),
-                            cudaMemcpyDeviceToDevice, routing_stream),
+            cudaMemcpyAsync(
+                metadata[kExpertWeights].data_ptr(), weights.data_ptr(),
+                static_cast<size_t>(weights.numel()) *
+                    (weights.dtype() == dl_float32 ? sizeof(float) : sizeof(__nv_bfloat16)),
+                cudaMemcpyDeviceToDevice, routing_stream),
             cudaSuccess)
             << "failed to preserve unpacked topk_weights.";
       }
@@ -4174,7 +4217,11 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
         static_cast<int*>(metadata[kNumNonExitingCtas].data_ptr()), btg::Dtype::Bfloat16,
         mRoutingBiasDtype, false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, btg::Dtype::Bfloat16,
-        true /* norm_topk_prob */, nullptr /* replay_ptr */);
+        true /* norm_topk_prob */, nullptr /* replay_ptr */, true /* enable_pdl */,
+        input_mode == RoutingInputMode::UnpackedPrecomputed &&
+                topk_weights.value().dtype() == dl_float32
+            ? btg::Dtype::Fp32
+            : btg::Dtype::Bfloat16);
   }
 }
 

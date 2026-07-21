@@ -62,14 +62,15 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
-                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl) {
+                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl,
+                 btg::Dtype dtypeExpertWeights) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
     // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess
     // and ScaledSumNormalize postprocess. This is more efficient than the full DeepSeek
     // kernel because it uses the warp-level routingTopKExperts flow.
     moe::dev::routing::routingCustom::Data routingData;
 
-    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeOutput = dtypeExpertWeights;
     routingData.mDtypeInput = dtypeLogits;
     routingData.mUsePdl = enable_pdl;
     routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
@@ -116,7 +117,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     // to match the Python reference: weight / (sum + 1e-20).
     moe::dev::routing::routingCustom::Data routingData;
 
-    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeOutput = dtypeExpertWeights;
     routingData.mDtypeInput = dtypeLogits;
     routingData.mUsePdl = enable_pdl;
     routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
@@ -155,8 +156,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     FLASHINFER_CHECK(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
     moe::dev::routing::routingDeepSeek::Data routingData;
-    routingData.mDtypeOutput =
-        btg::Dtype::Bfloat16;               // for DeepSeek, the expW is currently always bfloat16
+    routingData.mDtypeOutput = dtypeExpertWeights;
     routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
     routingData.mDtypeBias = dtypeBias;     // for DeepSeek, the bias can be bfloat16 or fp32
     routingData.mUsePdl = enable_pdl;
@@ -219,7 +219,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                       topkGroup);
     }
     moe::dev::routing::routingLlama4::Data routingData;
-    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeOutput = dtypeExpertWeights;
     routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
     routingData.mUsePdl = enable_pdl;
 
@@ -267,7 +267,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     // Config
     //
 
-    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeOutput = dtypeExpertWeights;
     routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
     routingData.mUsePdl = enable_pdl;
 

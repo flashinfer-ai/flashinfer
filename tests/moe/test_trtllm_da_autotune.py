@@ -1204,8 +1204,9 @@ def _run_matrix_same_tactic(precision, execution, replay: bool = False) -> None:
     packed_topk_ids = torch.empty(
         num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
     )
-    metadata = list(
-        module.trtllm_moe_allocate_routing_metadata_from_logits(
+    metadata = [
+        torch.from_dlpack(tensor)
+        for tensor in module.trtllm_moe_allocate_routing_metadata_from_logits(
             kwargs["expert_logits"],
             kwargs["routing_bias"],
             num_experts,
@@ -1221,7 +1222,7 @@ def _run_matrix_same_tactic(precision, execution, replay: bool = False) -> None:
             False,
             packed_topk_ids,
         )
-    )
+    ]
     monolithic = torch.empty(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
     )
@@ -1588,8 +1589,13 @@ def test_da_all_precision_production_reference_matrix(
     ],
     ids=lambda item: item.name,
 )
+@pytest.mark.parametrize(
+    "weight_dtype",
+    [torch.bfloat16, torch.float32],
+    ids=["bf16_weights", "fp32_weights"],
+)
 def test_fp4_unpacked_public_wrapper_da_graph_is_numerically_stable(
-    monkeypatch, precision
+    monkeypatch, precision, weight_dtype
 ):
     """Every supported FP4 activation mode captures raw routing numerically."""
     _require_sm100()
@@ -1642,7 +1648,7 @@ def test_fp4_unpacked_public_wrapper_da_graph_is_numerically_stable(
             0.125,
             0.875,
             expert_ids.numel(),
-            dtype=torch.bfloat16,
+            dtype=weight_dtype,
             device=expert_ids.device,
         ).reshape_as(expert_ids)
 

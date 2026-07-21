@@ -265,6 +265,59 @@ def test_backend_filter_skips_unselected_backends(monkeypatch):
     assert [result.backend for result in results] == ["TRTLLM"]
 
 
+def test_per_token_activation_preserves_supported_backend_controls(monkeypatch):
+    calls = {}
+    routed_input = (object(), object())
+    monkeypatch.setattr(
+        bench_moe_deepseek, "create_inputs", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        bench_moe_deepseek,
+        "_collect_expert_histogram",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        bench_moe_deepseek,
+        "prepare_routed_input",
+        lambda *_args, **_kwargs: routed_input,
+    )
+
+    def record_call(name):
+        def mock_backend(*_args, **kwargs):
+            calls[name] = kwargs
+            return 1.0
+
+        return mock_backend
+
+    monkeypatch.setattr(bench_moe_deepseek, "bench_cute_dsl", record_call("cutedsl"))
+    monkeypatch.setattr(
+        bench_moe_deepseek,
+        "bench_cutlass",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError()),
+    )
+    monkeypatch.setattr(bench_moe_deepseek, "bench_trtllm", record_call("trtllm"))
+
+    bench_moe_deepseek._benchmark_single(
+        8,
+        1,
+        1,
+        16,
+        0,
+        True,
+        False,
+        routing_input_mode="routed",
+        backends=("cutedsl", "cutlass", "trtllm"),
+        use_per_token_activation=True,
+        use_fused_finalize=False,
+    )
+
+    assert set(calls) == {"cutedsl", "trtllm"}
+    assert calls["cutedsl"]["use_per_token_activation"] is True
+    assert calls["cutedsl"]["use_fused_finalize"] is False
+    assert calls["trtllm"]["use_per_token_activation"] is True
+    assert all(call["routing_input_mode"] == "routed" for call in calls.values())
+
+
 def test_backend_parser_rejects_unknown_or_empty_values():
     assert bench_moe_deepseek.parse_backends("trtllm,cutedsl,trtllm") == (
         "trtllm",

@@ -39,6 +39,10 @@ Usage:
     # Disable CUPTI (use CUDA events for timing instead)
     python bench_moe_deepseek.py --no-cupti
 
+    # CuTe DSL finalize modes
+    python bench_moe_deepseek.py --functional-api  # atomic fused (default)
+    python bench_moe_deepseek.py --functional-api --no-fused-finalize  # deterministic
+
 Metrics:
     - ms: Latency in milliseconds
     - TFLOPS: Computational throughput
@@ -337,6 +341,8 @@ def bench_cute_dsl(
     routing_input_mode="logits",
     routed_input=None,
     tuning_buckets=None,
+    use_per_token_activation=False,
+    use_fused_finalize=True,
 ):
     """Benchmark CuteDSL MoE.
 
@@ -349,13 +355,20 @@ def bench_cute_dsl(
                     choose_one cache lookups don't appear inside the CUDA-event
                     interval when bench_gpu_time falls back to events (i.e. when
                     both CUDA graphs and CUPTI are disabled).
+        use_fused_finalize: Use atomic fused finalize; otherwise use the
+            deterministic two-stage finalize.
     """
     import contextlib
 
+    from flashinfer import SfLayout, nvfp4_quantize
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
     from flashinfer.testing.utils import bench_gpu_time
 
     if num_local_experts is None:
@@ -370,8 +383,23 @@ def bench_cute_dsl(
         tv = torch.empty(n, CFG.top_k, dtype=torch.float32, device=dev)
         ti = torch.empty(n, CFG.top_k, dtype=torch.int32, device=dev)
 
-    xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
-    xs = xs.unsqueeze(-1)
+    if use_per_token_activation:
+        hidden_global_scale = make_nvfp4_global_scale(
+            inputs["hidden_bf16"],
+            per_token_activation=True,
+            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        )
+        xf, xs, hidden_per_token_scale = nvfp4_quantize(
+            inputs["hidden_bf16"],
+            hidden_global_scale,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+    else:
+        xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
+        hidden_per_token_scale = None
+    xs = xs.view(torch.float8_e4m3fn).reshape(n, CFG.hidden_size // sv).unsqueeze(-1)
 
     # Expert range for this EP partition
     expert_start = local_expert_offset
@@ -418,6 +446,7 @@ def bench_cute_dsl(
             max_num_tokens=n,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            use_fused_finalize=use_fused_finalize,
         )
 
         def run(
@@ -451,6 +480,7 @@ def bench_cute_dsl(
                 w2_weight=w2q,
                 w2_weight_sf=w2s,
                 w2_alpha=alpha,
+                per_token_scale=hidden_per_token_scale,
             )
     else:
         # Use functional API
@@ -491,6 +521,8 @@ def bench_cute_dsl(
                 top_k=CFG.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=local_expert_offset,
+                per_token_scale=hidden_per_token_scale,
+                use_fused_finalize=use_fused_finalize,
             )
 
     # Pass input tensors via input_kwargs for cold L2 cache rotation
@@ -686,6 +718,7 @@ def bench_trtllm(
     routing_input_mode="logits",
     routed_input=None,
     tuning_buckets=None,
+    use_per_token_activation=False,
 ):
     """Benchmark TRT-LLM-Gen MoE.
 
@@ -694,6 +727,7 @@ def bench_trtllm(
     """
     import contextlib
 
+    from flashinfer import SfLayout, nvfp4_quantize
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import (
         RoutingMethodType,
@@ -705,6 +739,10 @@ def bench_trtllm(
         get_w2_permute_indices_with_cache,
     )
     from flashinfer.fp4_quantization import fp4_quantize, block_scale_interleave
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
     from flashinfer.testing.utils import bench_gpu_time
 
     if num_local_experts is None:
@@ -718,7 +756,22 @@ def bench_trtllm(
     expert_end = local_expert_offset + num_local_experts
 
     hg = inputs["hidden_gs"]
-    hfp, hsf = fp4_quantize(inputs["hidden_bf16"], hg, sv, False, True)
+    if use_per_token_activation:
+        hidden_global_scale = make_nvfp4_global_scale(
+            inputs["hidden_bf16"],
+            per_token_activation=True,
+            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        )
+        hfp, hsf, hidden_per_token_scale = nvfp4_quantize(
+            inputs["hidden_bf16"],
+            hidden_global_scale,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+    else:
+        hfp, hsf = fp4_quantize(inputs["hidden_bf16"], hg, sv, False, True)
+        hidden_per_token_scale = None
     hfp = hfp.view(torch.uint8).reshape(n, CFG.hidden_size // 2)
     hsc = (
         hsf.view(torch.float8_e4m3fn)
@@ -788,12 +841,12 @@ def bench_trtllm(
         local_num_experts=num_local_experts,
         routed_scaling_factor=CFG.routed_scaling_factor,
         routing_method_type=RoutingMethodType.DeepSeekV3,
+        per_token_scale=hidden_per_token_scale,
         do_finalize=True,
     )
 
     if routing_input_mode == "routed":
         topk_ids, topk_weights = routed_input or prepare_routed_input(inputs)
-        topk_weights = topk_weights.to(torch.bfloat16)
 
         def run(topk_ids, topk_weights, hidden_states, hidden_states_scale):
             return trtllm_fp4_block_scale_routed_moe(
@@ -882,6 +935,8 @@ def run_benchmark(
     routing_input_mode="logits",
     backends=BACKENDS,
     distributions=None,
+    use_per_token_activation=False,
+    use_fused_finalize=True,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -917,10 +972,20 @@ def run_benchmark(
         backends: Backends to benchmark
         distributions: Optional explicit uniform/ddist routing profiles. The
             default preserves the benchmark's random router logits.
+        use_per_token_activation: Whether supported FP4 MoE backends should use
+            per-token NVFP4 activation scaling.
+        use_fused_finalize: Use atomic fused finalize; otherwise use the
+            deterministic two-stage finalize.
 
     Returns:
         List of BenchResult objects
     """
+    if use_per_token_activation and not {"cutedsl", "trtllm"}.intersection(backends):
+        raise ValueError(
+            "Per-token activation requires the cutedsl or trtllm backend; "
+            "CUTLASS does not consume the per-token activation scale."
+        )
+
     # Simulate rank 0 of the requested expert-parallel configuration.
     num_local = CFG.num_experts // ep_config
     local_offset = 0
@@ -952,6 +1017,8 @@ def run_benchmark(
                 backends=backends,
                 distribution=distribution,
                 tuning_buckets=tuning_buckets,
+                use_per_token_activation=use_per_token_activation,
+                use_fused_finalize=use_fused_finalize,
             )
             results.extend(row)
             rows_and_histograms.append((row, histogram_record, distribution))
@@ -969,13 +1036,19 @@ def run_benchmark(
             routing_bias_scale,
             routing_input_mode,
             backends,
+            use_per_token_activation=use_per_token_activation,
+            use_fused_finalize=use_fused_finalize,
         )
         current_distribution = None
         for row, histogram_record, distribution in rows_and_histograms:
             if distribution is not None and distribution != current_distribution:
                 print(f"Distribution: {distribution}")
                 current_distribution = distribution
-            _print_row(row, histogram_record)
+            _print_row(
+                row,
+                histogram_record,
+                use_per_token_activation=use_per_token_activation,
+            )
         _print_footer(ep_config, num_local)
 
     return results
@@ -996,6 +1069,8 @@ def _benchmark_single(
     backends=BACKENDS,
     distribution=None,
     tuning_buckets=None,
+    use_per_token_activation=False,
+    use_fused_finalize=True,
 ):
     """Benchmark all backends for a single token count.
 
@@ -1034,8 +1109,10 @@ def _benchmark_single(
             routing_input_mode=routing_input_mode,
             routed_input=routed_input,
             tuning_buckets=tuning_buckets,
+            use_per_token_activation=use_per_token_activation,
+            use_fused_finalize=use_fused_finalize,
         )
-    if "cutlass" in backends:
+    if "cutlass" in backends and not use_per_token_activation:
         lat["CUTLASS"] = bench_cutlass(
             inputs,
             warmup,
@@ -1062,6 +1139,7 @@ def _benchmark_single(
             routing_input_mode=routing_input_mode,
             routed_input=routed_input,
             tuning_buckets=tuning_buckets,
+            use_per_token_activation=use_per_token_activation,
         )
 
     # Build results
@@ -1086,10 +1164,17 @@ def _print_header(
     routing_bias_scale,
     routing_input_mode,
     backends,
+    use_per_token_activation=False,
+    use_fused_finalize=True,
 ):
     """Print benchmark header."""
     print("\n" + "=" * 120)
-    print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})")
+    if use_per_token_activation:
+        print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs TRTLLM (EP={ep_config})")
+    else:
+        print(
+            f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})"
+        )
     print("=" * 120)
     print(
         f"Model: hidden={CFG.hidden_size}, intermediate={CFG.intermediate_size}, "
@@ -1107,31 +1192,57 @@ def _print_header(
     )
     print(f"Routing input: {routing_input_mode}")
     print(f"Backends: {','.join(backends)}")
+    print(
+        "CuteDSL finalize: "
+        f"{'atomic fused' if use_fused_finalize else 'deterministic two-stage'}"
+    )
+    if use_per_token_activation:
+        print("CUTLASS omitted: it does not consume the per-token activation scale.")
     print("-" * 120)
-    print(
-        f"{'Tokens':>6} | "
-        f"{'CuteDSL':^15} | "
-        f"{'CUTLASS':^15} | "
-        f"{'TRTLLM':^15} | "
-        f"{'Speedup (CuteDSL/X)':^18} | "
-        f"{'Winner':^8} | "
-        f"{'Active':^7} | "
-        f"{'Stats':^14}"
-    )
-    print(
-        f"{'':>6} | "
-        f"{'ms':>7} {'TFLOPS':>7} | "
-        f"{'ms':>7} {'TFLOPS':>7} | "
-        f"{'ms':>7} {'TFLOPS':>7} | "
-        f"{'CUTLASS':>9} {'TRTLLM':>9} | "
-        f"{'':^8} | "
-        f"{'experts':^7} | "
-        f"{'min/max/median':^14}"
-    )
+    if use_per_token_activation:
+        print(
+            f"{'Tokens':>6} | "
+            f"{'CuteDSL':^15} | "
+            f"{'TRTLLM':^15} | "
+            f"{'Speedup':^9} | "
+            f"{'Winner':^8} | "
+            f"{'Active':^7} | "
+            f"{'Stats':^14}"
+        )
+        print(
+            f"{'':>6} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'TRTLLM':>9} | "
+            f"{'':^8} | "
+            f"{'experts':^7} | "
+            f"{'min/max/median':^14}"
+        )
+    else:
+        print(
+            f"{'Tokens':>6} | "
+            f"{'CuteDSL':^15} | "
+            f"{'CUTLASS':^15} | "
+            f"{'TRTLLM':^15} | "
+            f"{'Speedup (CuteDSL/X)':^18} | "
+            f"{'Winner':^8} | "
+            f"{'Active':^7} | "
+            f"{'Stats':^14}"
+        )
+        print(
+            f"{'':>6} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'CUTLASS':>9} {'TRTLLM':>9} | "
+            f"{'':^8} | "
+            f"{'experts':^7} | "
+            f"{'min/max/median':^14}"
+        )
     print("-" * 120)
 
 
-def _print_row(results, histogram_record):
+def _print_row(results, histogram_record, use_per_token_activation=False):
     """Print a single row of benchmark results."""
     # Extract values by backend
     r = {r.backend: r for r in results}
@@ -1158,16 +1269,27 @@ def _print_row(results, histogram_record):
         f"{histogram_record['max_count']:>3}/"
         f"{histogram_record['median_count']:>7.2f}"
     )
-    print(
-        f"{results[0].tokens:>6} | "
-        f"{backend_columns(cute)} | "
-        f"{backend_columns(cutlass)} | "
-        f"{backend_columns(trtllm)} | "
-        f"{speedup_column(cutlass)} {speedup_column(trtllm)} | "
-        f"{winner:^8} | "
-        f"{active_experts:>7} | "
-        f"{stats:>14}"
-    )
+    if use_per_token_activation:
+        print(
+            f"{results[0].tokens:>6} | "
+            f"{backend_columns(cute)} | "
+            f"{backend_columns(trtllm)} | "
+            f"{speedup_column(trtllm)} | "
+            f"{winner:^8} | "
+            f"{active_experts:>7} | "
+            f"{stats:>14}"
+        )
+    else:
+        print(
+            f"{results[0].tokens:>6} | "
+            f"{backend_columns(cute)} | "
+            f"{backend_columns(cutlass)} | "
+            f"{backend_columns(trtllm)} | "
+            f"{speedup_column(cutlass)} {speedup_column(trtllm)} | "
+            f"{winner:^8} | "
+            f"{active_experts:>7} | "
+            f"{stats:>14}"
+        )
 
 
 def _print_footer(ep_config, num_local):
@@ -1253,6 +1375,17 @@ def main():
         help="Use functional API instead of CuteDslMoEWrapper for CuteDSL benchmark",
     )
     parser.add_argument(
+        "--use-per-token-activation",
+        action="store_true",
+        help="Use per-token NVFP4 activation scaling for supported FP4 MoE backends.",
+    )
+    parser.add_argument(
+        "--no-fused-finalize",
+        action="store_false",
+        dest="use_fused_finalize",
+        help="Use deterministic two-stage CuTe DSL finalize instead of atomic fused finalize.",
+    )
+    parser.add_argument(
         "--routing-bias-scale",
         type=float,
         default=0.01,
@@ -1312,6 +1445,11 @@ def main():
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Routing input: {args.routing_input_mode}")
     print(f"Backends: {','.join(args.backends)}")
+    print(f"Per-token activation: {args.use_per_token_activation}")
+    print(
+        "CuteDSL finalize: "
+        f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
+    )
 
     run_benchmark(
         token_counts=tokens,
@@ -1327,6 +1465,8 @@ def main():
         routing_input_mode=args.routing_input_mode,
         backends=args.backends,
         distributions=args.distributions,
+        use_per_token_activation=args.use_per_token_activation,
+        use_fused_finalize=args.use_fused_finalize,
     )
 
     return 0

@@ -54,6 +54,10 @@ moe_fp8_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
+msa_proxy_score_fp4_h4_kv1.json
+msa_proxy_score_h4_kv1_d128.json
+msa_sparse_attention_h64_kv4_d128_topk16.json
+msa_sparse_decode_attention_h64_kv4_d128_topk16.json
 mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
@@ -61,6 +65,7 @@ rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
+silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -71,6 +76,8 @@ Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
 FP4 MoE files are only generated on Blackwell (SM100+) GPUs with fp4_quantize available.
 GDN prefill files require SM90+ (Hopper) GPU.
+MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
+trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 """
 
 import contextlib
@@ -226,6 +233,7 @@ from flashinfer.quantization.fp4_quantization import (
     nvfp4_kv_dequantize_paged,
     mxfp4_quantize,
     nvfp4_quantize,
+    silu_and_mul_nvfp4_quantize,
 )
 from flashinfer.quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
@@ -244,6 +252,13 @@ with contextlib.suppress(Exception):
     mxfp4_quantize(quant_input_bf16)
 with contextlib.suppress(Exception):
     mxfp8_quantize(quant_input_bf16)
+# Match silu_and_mul_h16384 with a gated [M, 2K] input and packed [M, K/2] output.
+with contextlib.suppress(Exception):
+    silu_and_mul_nvfp4_quantize(
+        torch.randn(quant_M, 2 * 8192, dtype=torch.bfloat16, device=device),
+        quant_global_sf,
+        sf_vec_size=16,
+    )
 
 # Paged NVFP4 KV dequantization helper: NHD and HND cache layouts.
 with contextlib.suppress(Exception):
@@ -399,6 +414,52 @@ try:
     flashinfer.gemm.mm_fp4(a_fp4, b_fp4, a_d4, b_d4, block_size=BS4)
 except Exception:
     pass  # Requires Blackwell (SM100+)
+
+# ── SVDQuant fused NVFP4 GEMM (Blackwell SM100: M×3072@3072×3072, rank 32) ──
+try:
+    M, K, N, RANK = 128, 3072, 3072, 32
+    a_svdq = torch.zeros(M, K // 2, dtype=torch.uint8, device=device)
+    b_svdq = torch.zeros(N, K // 2, dtype=torch.uint8, device=device)
+    sf_len = ((M + 127) // 128 * 128) * (K // 16)
+    wsf_len = ((N + 127) // 128 * 128) * (K // 16)
+    a_sf_svdq = torch.zeros(sf_len, dtype=torch.uint8, device=device)
+    b_sf_svdq = torch.zeros(wsf_len, dtype=torch.uint8, device=device)
+    alpha_svdq = torch.ones(1, dtype=torch.float32, device=device)
+    d_svdq = torch.zeros(M, RANK, dtype=torch.bfloat16, device=device)
+    l1_svdq = torch.zeros(N, RANK, dtype=torch.bfloat16, device=device)
+    flashinfer.gemm.mm_nvfp4_svdquant(
+        a_svdq, b_svdq, a_sf_svdq, b_sf_svdq, alpha_svdq, d_svdq, l1_svdq
+    )
+except Exception:
+    pass  # Requires Blackwell (SM100)
+
+# ── SVDQuant smooth-quantize + composed linear (Blackwell SM100) ─────────────
+try:
+    M, K, N, RANK = 128, 3072, 3072, 32
+    x_sq = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
+    pqs_sq = torch.ones(K, dtype=torch.bfloat16, device=device)
+    gs_sq = torch.ones(1, dtype=torch.float32, device=device)
+    flashinfer.gemm.nvfp4_quantize_smooth(x_sq, pqs_sq, gs_sq)
+except Exception:
+    pass  # Requires Blackwell (SM100)
+
+try:
+    M, K, N, RANK = 128, 3072, 3072, 32
+    x_sl = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
+    w_sl = torch.zeros(N, K // 2, dtype=torch.uint8, device=device)
+    wsf_sl = torch.zeros(
+        ((N + 127) // 128 * 128) * (K // 16), dtype=torch.uint8, device=device
+    )
+    alpha_sl = torch.ones(1, dtype=torch.float32, device=device)
+    pqs_sl = torch.ones(K, dtype=torch.bfloat16, device=device)
+    l2t_sl = torch.zeros(K, RANK, dtype=torch.bfloat16, device=device)
+    l1_sl = torch.zeros(N, RANK, dtype=torch.bfloat16, device=device)
+    gs_sl = torch.ones(1, dtype=torch.float32, device=device)
+    flashinfer.gemm.svdquant_linear(
+        x_sl, w_sl, wsf_sl, alpha_sl, pqs_sl, l2t_sl, l1_sl, gs_sl
+    )
+except Exception:
+    pass  # Requires Blackwell (SM100)
 
 # ── GEMM bf16 x fp4: mm_bf16_fp4 (weight-only) ──────────────────────────────
 # Blackwell SM100+: M×7168@2048×7168, block=16. b/b_descale shapes are the
@@ -1185,6 +1246,26 @@ with contextlib.suppress(Exception):
         is_var_seq=False,
     )
 
+# trtllm_batch_decode_with_kv_cache with block-sparse attention (per-KV-head
+# page tables and seq lens; SM100/103 only).
+with contextlib.suppress(Exception):
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+    from flashinfer.trace.templates.attention import (
+        _trtllm_batch_decode_block_sparse_init,
+    )
+
+    _tbs_inputs = _trtllm_batch_decode_block_sparse_init(
+        num_tokens=4,
+        num_heads=16,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=16,
+        batch_size=4,
+        max_pages_per_seq=8,
+        device=device,
+    )
+    trtllm_batch_decode_with_kv_cache(**_tbs_inputs)
+
 # concat_mla_k (DeepSeek MLA K concat, fixed shape per docstring).
 with contextlib.suppress(Exception):
     from flashinfer.concat_ops import concat_mla_k as _concat_mla_k
@@ -1349,3 +1430,99 @@ with contextlib.suppress(Exception):
         page_size=_rqfap_PS,
         kv_layout="NHD",
     )
+
+# ── Minimax Sparse Attention (MSA) numeric ops (SM120/SM121) ─────────────────
+# M3 shapes: indexer 4 index heads / 1 index-kv-head; attention 64 qo / 4 kv,
+# topk=16 blocks of 128 tokens. Traces dump before launch, so the JSONs appear
+# on any GPU; the kernels themselves require SM120/SM121.
+with contextlib.suppress(Exception):
+    import flashinfer.msa_ops as _msa
+
+    _msa_BLK = 128
+    _msa_dev, _msa_dt = device, torch.bfloat16
+
+    _idx_seqs_q, _idx_seqs_k = [128, 128], [2048, 2048]
+    _idx_cu_q = torch.tensor(
+        [0] + list(torch.tensor(_idx_seqs_q).cumsum(0)),
+        dtype=torch.int32,
+        device=_msa_dev,
+    )
+    _idx_cu_k = torch.tensor(
+        [0] + list(torch.tensor(_idx_seqs_k).cumsum(0)),
+        dtype=torch.int32,
+        device=_msa_dev,
+    )
+    _idx_tq, _idx_tk = int(_idx_cu_q[-1]), int(_idx_cu_k[-1])
+    _idx_Hq, _idx_Hkv = 4, 1
+    _idx_q = torch.randn(_idx_tq, _idx_Hq, 128, dtype=_msa_dt, device=_msa_dev) / 3
+    _idx_k = torch.randn(_idx_tk, _idx_Hkv, 128, dtype=_msa_dt, device=_msa_dev) / 3
+
+    with contextlib.suppress(Exception):
+        _msa.msa_proxy_score(_idx_q, _idx_k, _idx_cu_q, _idx_cu_k, causal=True)
+
+    with contextlib.suppress(Exception):
+        from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
+
+        _q_fp4, _q_sf, _inv_q = _quantize_qk_to_nvfp4(_idx_q)
+        _k_fp4, _k_sf, _inv_k = _quantize_qk_to_nvfp4(_idx_k)
+        _msa.msa_proxy_score_fp4(
+            _q_fp4,
+            _k_fp4,
+            _q_sf,
+            _k_sf,
+            _inv_q,
+            _inv_k,
+            _idx_cu_q,
+            _idx_cu_k,
+            causal=True,
+        )
+
+    # block ids ascending and in range per (kv-head, query): the msa_topk_select format
+    _sp_Hq, _sp_Hkv, _sp_topk = 64, 4, 16
+    _sp_q = torch.randn(_idx_tq, _sp_Hq, 128, dtype=_msa_dt, device=_msa_dev) / 3
+    _sp_k = torch.randn(_idx_tk, _sp_Hkv, 128, dtype=_msa_dt, device=_msa_dev) / 3
+    _sp_v = torch.randn(_idx_tk, _sp_Hkv, 128, dtype=_msa_dt, device=_msa_dev) / 3
+    _sp_idx = torch.full(
+        (_sp_Hkv, _idx_tq, _sp_topk), -1, dtype=torch.int32, device=_msa_dev
+    )
+    _cuq_l, _cuk_l = _idx_cu_q.tolist(), _idx_cu_k.tolist()
+    for _b in range(len(_idx_seqs_q)):
+        _nb = (_cuk_l[_b + 1] - _cuk_l[_b] + _msa_BLK - 1) // _msa_BLK
+        _keep = min(_sp_topk, _nb)
+        _sp_idx[:, _cuq_l[_b] : _cuq_l[_b + 1], :_keep] = torch.arange(
+            _keep, dtype=torch.int32, device=_msa_dev
+        )
+
+    with contextlib.suppress(Exception):
+        _msa.msa_sparse_attention(
+            _sp_q, _sp_k, _sp_v, _sp_idx, _idx_cu_q, _idx_cu_k, causal=True
+        )
+
+    _dec_B, _dec_Hq, _dec_Hkv, _dec_topk = 128, 64, 4, 16
+    _dec_seqs_k = [4096] * _dec_B
+    _dec_cu_k = torch.tensor(
+        [0] + list(torch.tensor(_dec_seqs_k).cumsum(0)),
+        dtype=torch.int32,
+        device=_msa_dev,
+    )
+    _dec_tk = int(_dec_cu_k[-1])
+    _dec_q = torch.randn(_dec_B, _dec_Hq, 128, dtype=_msa_dt, device=_msa_dev) / 3
+    _dec_k = torch.randn(_dec_tk, _dec_Hkv, 128, dtype=_msa_dt, device=_msa_dev) / 3
+    _dec_v = torch.randn(_dec_tk, _dec_Hkv, 128, dtype=_msa_dt, device=_msa_dev) / 3
+    _dec_nb = (4096 + _msa_BLK - 1) // _msa_BLK
+    _dec_idx = torch.full(
+        (_dec_Hkv, _dec_B, _dec_topk), -1, dtype=torch.int32, device=_msa_dev
+    )
+    _dec_idx[:, :, : min(_dec_topk, _dec_nb)] = torch.arange(
+        min(_dec_topk, _dec_nb), dtype=torch.int32, device=_msa_dev
+    )
+    with contextlib.suppress(Exception):
+        _msa.msa_sparse_decode_attention(
+            _dec_q,
+            _dec_k,
+            _dec_v,
+            _dec_idx,
+            cu_seqlens_k=_dec_cu_k,
+            seqlen_q=1,
+            causal=True,
+        )
