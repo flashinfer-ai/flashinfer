@@ -361,6 +361,7 @@ def _render_reference_source(fn: Callable) -> str:
             if not dep_src.endswith("\n"):
                 parts.append("\n")
             parts.append("\n")
+        parts.append("# ----- reference -----\n")
     parts.append(inspect.getsource(fn))
     return "".join(parts)
 

@@ -15,7 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backends consume different native weight layouts (quantization + swizzle +
-MMA reorder).  These helpers turn canonical bf16 expert weights into the
+MMA reorder).  These helpers turn canonical or checkpoint expert weights into
 backend-native ``MoEWeightPack`` views, so that preparation lives in the
 implementation surface rather than being copy-pasted into tests and benchmarks
 (design doc CR2/CR7; reviewer comments C6, C7, C31, C32).
@@ -23,7 +23,7 @@ implementation surface rather than being copy-pasted into tests and benchmarks
 The canonical NVFP4 and BF16 helpers are exposed as
 ``TrtllmFp4Config.prepare_weights(...)`` /
 ``CuteDslConfig.prepare_weights(...)`` /
-``TrtllmBf16Config.prepare_weights(...)`` static helpers (see ``api.py``).
+``TrtllmBf16Config.prepare_weights(...)`` / ... static helpers (see ``api.py``).
 The SM90 Humming-style MXFP4 x FP8 helper is currently exposed as a flat helper
 for the CUTLASS fused-MoE path.
 """
@@ -722,4 +722,183 @@ def prepare_cute_dsl_nvfp4_weights(
         "w2_weight": w2_weight,
         "w2_weight_sf": w2_weight_sf,
         "w2_alpha": ones,
+    }
+
+
+def _quantize_b12x_expert_weights(
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize canonical expert weights in the b12x non-interleaved layout."""
+    from ..cute_dsl.utils import convert_sf_to_mma_layout
+    from ..fp4_quantization import fp4_quantize
+
+    num_experts, rows, columns = weights.shape
+    weight_q, weight_sf = fp4_quantize(
+        weights.reshape(num_experts * rows, columns),
+        global_scale=torch.ones(1, device=weights.device, dtype=torch.float32),
+        sf_vec_size=16,
+        is_sf_swizzled_layout=True,
+    )
+    weight_q = weight_q.reshape(num_experts, rows, columns // 2)
+    weight_sf = convert_sf_to_mma_layout(
+        weight_sf,
+        m=rows,
+        k=columns,
+        num_groups=num_experts,
+        sf_vec_size=16,
+    )
+    return weight_q, weight_sf
+
+
+def prepare_b12x_nvfp4_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation: str = "silu",
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the SM12x NVFP4 ``b12x_nvfp4`` weight view.
+
+    Both gemms are NVFP4 block-quantized in the b12x non-interleaved layout.
+    ``B12xMoEWrapper`` handles ragged padding and kernel weight-view caching.
+
+    Parameters
+    ----------
+    w1_bf16 : Tensor
+        Up+gate expert weights ``[E, 2*I, H]`` stored as ``[up, gate]``, or
+        ReLU2 weights ``[E, I, H]``.
+    w2_bf16 : Tensor
+        Down-projection expert weights ``[E, H, I]``.
+    num_local_experts, hidden_size, intermediate_size : int
+        Expert geometry.
+    activation : str
+        Kernel activation name: ``"silu"``, ``"gelu_tanh"``, or ``"relu2"``.
+    device : torch.device, optional
+        Target device; defaults to ``w1_bf16.device``.
+
+    Returns
+    -------
+    dict
+        Keys expected by ``B12xNvfp4Runner.pack_inputs``: ``w1_weight``,
+        ``w1_weight_sf``, ``w1_alpha``, ``fc2_input_scale``, ``w2_weight``,
+        ``w2_weight_sf``, ``w2_alpha``.
+    """
+    from .cute_dsl.blackwell_sm12x.moe_activation import is_gated_activation
+
+    supported_activations = {"silu", "gelu_tanh", "relu2"}
+    if activation not in supported_activations:
+        raise ValueError(
+            f"unsupported b12x NVFP4 activation {activation!r}; expected one of "
+            f"{sorted(supported_activations)}."
+        )
+
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    w1_bf16 = w1_bf16.to(device)
+    w2_bf16 = w2_bf16.to(device)
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise TypeError("b12x canonical weights must use torch.bfloat16.")
+
+    is_gated = is_gated_activation(activation)
+    w1_rows = intermediate_size * (2 if is_gated else 1)
+    expected_w1 = (num_local_experts, w1_rows, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1:
+        raise ValueError(
+            f"expected w1_bf16 shape {expected_w1}, got {tuple(w1_bf16.shape)}"
+        )
+    if tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"expected w2_bf16 shape {expected_w2}, got {tuple(w2_bf16.shape)}"
+        )
+    if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
+        raise ValueError("b12x NVFP4 dimensions must be multiples of 16.")
+
+    w1_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    w2_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    fc2_input_scale = torch.ones(1, device=device, dtype=torch.float32)
+    w1_weight, w1_weight_sf = _quantize_b12x_expert_weights(w1_bf16)
+    w2_weight, w2_weight_sf = _quantize_b12x_expert_weights(w2_bf16)
+
+    return {
+        "w1_weight": w1_weight,
+        "w1_weight_sf": w1_weight_sf,
+        "w1_alpha": w1_alpha,
+        "fc2_input_scale": fc2_input_scale.contiguous(),
+        "w2_weight": w2_weight,
+        "w2_weight_sf": w2_weight_sf,
+        "w2_alpha": w2_alpha,
+    }
+
+
+def prepare_b12x_w4a16_weights(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_global_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    *,
+    activation: str,
+    source_format: str = "modelopt",
+) -> Dict[str, torch.Tensor]:
+    """Build the SM12x W4A16 ``b12x_w4a16`` weight view.
+
+    The existing b12x packed-weight cache is populated for bf16 activations.
+    Returned tensors retain the ``B12xMoEWrapper.run`` input layout.
+
+    Parameters
+    ----------
+    w1_fp4, w2_fp4 : Tensor
+        Packed checkpoint expert weights.
+    w1_blockscale, w2_blockscale : Tensor
+        Per-block checkpoint scales.
+    w1_global_scale, w2_global_scale : Tensor
+        Per-expert checkpoint scales.
+    activation : str
+        Kernel activation name: ``"silu"`` or ``"relu2"``.
+    source_format : str
+        Checkpoint scale convention: ``"modelopt"`` or
+        ``"compressed_tensors"``.
+
+    Returns
+    -------
+    dict
+        Keys expected by ``B12xMoEWrapper.run``: ``w1_weight``,
+        ``w1_weight_sf``, ``w1_alpha``, ``w2_weight``, ``w2_weight_sf``,
+        ``w2_alpha``.
+    """
+    from .cute_dsl.blackwell_sm12x.moe_dispatch import (
+        _get_w4a16_packed_weights,
+    )
+    from .cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
+        _normalize_source_format,
+        _source_global_scale,
+    )
+
+    source_format = _normalize_source_format(source_format)
+    w1_global_scale = _source_global_scale(w1_global_scale, source_format=source_format)
+    w2_global_scale = _source_global_scale(w2_global_scale, source_format=source_format)
+    _get_w4a16_packed_weights(
+        w1_weight=w1_fp4,
+        w1_weight_sf=w1_blockscale,
+        w1_alpha=w1_global_scale,
+        w2_weight=w2_fp4,
+        w2_weight_sf=w2_blockscale,
+        w2_alpha=w2_global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        source_format="modelopt",
+    )
+    return {
+        "w1_weight": w1_fp4,
+        "w1_weight_sf": w1_blockscale,
+        "w1_alpha": w1_global_scale,
+        "w2_weight": w2_fp4,
+        "w2_weight_sf": w2_blockscale,
+        "w2_alpha": w2_global_scale,
     }
