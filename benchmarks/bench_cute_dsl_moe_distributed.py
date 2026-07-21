@@ -69,7 +69,6 @@ class BenchVariant:
 
 BENCH_VARIANTS = (
     BenchVariant("w4a4", quantize_input=True),
-    BenchVariant("w4a8", quantize_input=True),
     BenchVariant("w4a16", quantize_input=False),
 )
 
@@ -120,8 +119,6 @@ def _profile_worker_arguments(args, num_tokens):
         args.mode,
         "--profile-iters",
         str(args.profile_iters),
-        "--quant-modes",
-        ",".join(variant.name for variant in args.bench_variants),
     ]
     if args.use_per_token_activation:
         arguments.append("--use-per-token-activation")
@@ -306,7 +303,7 @@ def _run_nsys_profiles(args, token_counts):
 
     script = Path(__file__).resolve()
     for num_tokens, mode, variant in itertools.product(
-        token_counts, ("ep", "tp"), args.bench_variants
+        token_counts, ("ep", "tp"), BENCH_VARIANTS
     ):
         profile_label = f"{mode}::{variant.name}"
         output = output_dir / f"{mode}_{variant.name}_t{num_tokens}"
@@ -368,7 +365,7 @@ def _run_ncu_profiles(args, token_counts):
     lineinfo_cache = output_dir / "cute_dsl_lineinfo_cache"
     lineinfo_cache.mkdir(exist_ok=True)
     for num_tokens, mode, variant in itertools.product(
-        token_counts, ("ep", "tp"), args.bench_variants
+        token_counts, ("ep", "tp"), BENCH_VARIANTS
     ):
         profile_label = f"{mode}::{variant.name}"
         output = output_dir / f"{mode}_{variant.name}_t{num_tokens}"
@@ -442,7 +439,7 @@ def _distributed_moe_config(
         routing=RoutingConfig(num_experts=CFG.num_experts, top_k=CFG.top_k),
         quant=QuantConfig(
             variant=QuantVariant.NVFP4,
-            per_token_scale=args.use_per_token_activation and variant.name == "w4a4",
+            per_token_scale=args.use_per_token_activation and variant.quantize_input,
             quantize_input=variant.quantize_input,
         ),
         experts=ExpertConfig(
@@ -450,7 +447,7 @@ def _distributed_moe_config(
             local_expert_offset=local_expert_offset,
             local_num_experts=num_local_experts,
         ),
-        backend=BackendOptions(candidates=(CuteDslConfig(quant_mode=variant.name),)),
+        backend=BackendOptions(candidates=(CuteDslConfig(),)),
         execution=ExecutionConfig(
             enable_pdl=args.enable_pdl,
             tune_max_num_tokens=tune_max_num_tokens,
@@ -687,7 +684,7 @@ def _benchmark_distributed_ep(
         local_num_tokens, CFG.top_k, dtype=torch.int32, device=device
     )
     global_scale = None
-    if variant.name == "w4a4":
+    if variant.quantize_input:
         global_scale = make_nvfp4_global_scale(
             hidden_states,
             per_token_activation=args.use_per_token_activation,
@@ -821,7 +818,7 @@ def _make_distributed_activation_pack(
 ):
     from flashinfer.fused_moe import MoEActivationPack
 
-    if variant.name == "w4a16":
+    if not variant.quantize_input:
         return MoEActivationPack(
             hidden_states_q=hidden_states,
             hidden_states_scale=None,
@@ -829,22 +826,8 @@ def _make_distributed_activation_pack(
             topk_weights=topk_values,
         )
 
-    from flashinfer import SfLayout, mxfp8_quantize, nvfp4_quantize
+    from flashinfer import SfLayout, nvfp4_quantize
     from flashinfer.fp4_quantization import fp4_quantize
-
-    if variant.name == "w4a8":
-        hidden_states_q, hidden_states_scale = mxfp8_quantize(
-            hidden_states,
-            backend="cute-dsl",
-            sf_swizzle_layout=SfLayout.layout_linear,
-            enable_pdl=args.enable_pdl,
-        )
-        return MoEActivationPack(
-            hidden_states_q=hidden_states_q,
-            hidden_states_scale=hidden_states_scale,
-            topk_ids=topk_indices,
-            topk_weights=topk_values,
-        )
 
     if args.use_per_token_activation:
         hidden_states_q, hidden_states_scale, per_token_scale = nvfp4_quantize(
@@ -947,7 +930,7 @@ def _run_ncu_compute_profile(args, num_tokens, mode, variant):
     topk_values = torch.empty(rows, CFG.top_k, dtype=torch.float32, device=device)
     topk_indices = torch.empty(rows, CFG.top_k, dtype=torch.int32, device=device)
     global_scale = None
-    if variant.name == "w4a4":
+    if variant.quantize_input:
         global_scale = make_nvfp4_global_scale(
             hidden_states,
             per_token_activation=args.use_per_token_activation,
@@ -1049,7 +1032,7 @@ def _benchmark_distributed_tp(
     )
     dist.all_gather(gathered_hidden_states, local_hidden_states)
     global_scale = None
-    if variant.name == "w4a4":
+    if variant.quantize_input:
         global_scale = make_nvfp4_global_scale(
             hidden_states,
             per_token_activation=args.use_per_token_activation,
@@ -1187,16 +1170,10 @@ def _run_parallel_mode(
                 f"\nMode: real {mode.upper()}{world_size}, "
                 "timing=max rank CUDA events, cache=cold L2"
             )
-            columns = [
-                f"{variant.name.upper()} (ms)" for variant in args.bench_variants
-            ]
-            if any(variant.name == "w4a4" for variant in args.bench_variants):
-                columns.extend(
-                    f"{variant.name.upper()} / W4A4"
-                    for variant in args.bench_variants
-                    if variant.name != "w4a4"
-                )
-            print("global tokens | " + " | ".join(columns))
+            print(
+                "global tokens | W4A4 + activation quant (ms) | "
+                "W4A16 (ms) | W4A16 / W4A4"
+            )
 
     max_tokens_per_rank_budget = None
     if mode == "ep":
@@ -1214,11 +1191,11 @@ def _run_parallel_mode(
     for num_tokens in token_counts:
         row = {}
         variants = (
-            args.bench_variants
+            BENCH_VARIANTS
             if selected_variant is None
             else tuple(
                 variant
-                for variant in args.bench_variants
+                for variant in BENCH_VARIANTS
                 if variant.name == selected_variant
             )
         )
@@ -1257,14 +1234,11 @@ def _run_parallel_mode(
             torch.cuda.empty_cache()
 
         if rank == 0 and row:
-            values = [f"{row[variant.name]:.3f}" for variant in variants]
-            if "w4a4" in row:
-                values.extend(
-                    f"{row[variant.name] / row['w4a4']:.3f}x"
-                    for variant in variants
-                    if variant.name != "w4a4"
-                )
-            print(f"{num_tokens:>13} | " + " | ".join(values))
+            ratio = row["w4a16"] / row["w4a4"]
+            print(
+                f"{num_tokens:>13} | {row['w4a4']:>28.3f} | "
+                f"{row['w4a16']:>10.3f} | {ratio:>13.3f}x"
+            )
 
 
 def _run_distributed_benchmark(args, token_counts):
@@ -1355,12 +1329,6 @@ def main():
         help="FlashInfer all-reduce backend for TP.",
     )
     parser.add_argument(
-        "--quant-modes",
-        type=str,
-        default="w4a4,w4a8,w4a16",
-        help="Comma-separated modes to run (default: w4a4,w4a8,w4a16).",
-    )
-    parser.add_argument(
         "--use-per-token-activation",
         action="store_true",
         help="Use per-token NVFP4 activation scaling for the W4A4 case.",
@@ -1407,14 +1375,6 @@ def main():
         help="Print distributed setup progress and profiler worker output.",
     )
     args = parser.parse_args()
-
-    variants_by_name = {variant.name: variant for variant in BENCH_VARIANTS}
-    quant_modes = tuple(value.strip().lower() for value in args.quant_modes.split(","))
-    if not quant_modes or any(mode not in variants_by_name for mode in quant_modes):
-        parser.error("--quant-modes must contain w4a4, w4a8, and/or w4a16")
-    if len(set(quant_modes)) != len(quant_modes):
-        parser.error("--quant-modes must not contain duplicates")
-    args.bench_variants = tuple(variants_by_name[mode] for mode in quant_modes)
 
     if not 1 <= args.num_gpus <= 8:
         parser.error("--num-gpus must be between 1 and 8")

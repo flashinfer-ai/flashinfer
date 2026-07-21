@@ -47,7 +47,7 @@ import cutlass.utils.mixed_input_helpers as mixed_input_utils
 from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from .moe_w4ax_utils import decode_nvfp4_fragment_to_bf16
+from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
     griddepcontrol_launch_dependents,
