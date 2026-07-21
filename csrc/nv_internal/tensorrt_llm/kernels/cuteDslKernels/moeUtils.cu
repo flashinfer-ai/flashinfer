@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "cutlass_extensions/epilogue/thread/fused_activations.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -433,9 +432,6 @@ void moeActivation(InputType const* input, InputType* output, int32_t const* til
                                     kThreadsPerBlock>;
       case MoeActivationType::Relu:
         return &moeActivationKernel<InputType, IdentityAdaptor<cutlass::epilogue::thread::ReLu>,
-                                    kThreadsPerBlock>;
-      case MoeActivationType::Relu2:
-        return &moeActivationKernel<InputType, IdentityAdaptor<cutlass::epilogue::thread::Relu2>,
                                     kThreadsPerBlock>;
       case MoeActivationType::Silu:
         return &moeActivationKernel<InputType, IdentityAdaptor<cutlass::epilogue::thread::SiLu>,

@@ -133,7 +133,6 @@ class MoeActivationType(IntEnum):
     Swiglu = 3
     Geglu = 4
     Identity = 5
-    Relu2 = 6
 
 
 @functools.lru_cache(maxsize=1)
@@ -777,7 +776,6 @@ def moe_activation(
         interm_size,
         tile_size,
         enable_pdl,
-        _get_cuda_stream_ptr(),
     )
 
 
@@ -967,28 +965,6 @@ def moe_relu(
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
         activation_type=MoeActivationType.Relu,
-        max_num_permuted_tokens=max_num_permuted_tokens,
-        tile_size=tile_size,
-        enable_pdl=enable_pdl,
-    )
-
-
-def moe_relu2(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    tile_idx_to_mn_limit: torch.Tensor,
-    num_non_exiting_tiles: torch.Tensor,
-    max_num_permuted_tokens: int,
-    tile_size: int,
-    enable_pdl: bool = False,
-) -> None:
-    """Apply squared ReLU to MoE intermediate outputs."""
-    moe_activation(
-        input=input,
-        output=output,
-        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-        num_non_exiting_tiles=num_non_exiting_tiles,
-        activation_type=MoeActivationType.Relu2,
         max_num_permuted_tokens=max_num_permuted_tokens,
         tile_size=tile_size,
         enable_pdl=enable_pdl,
