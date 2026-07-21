@@ -10,6 +10,12 @@ try:
 except (ImportError, RuntimeError):
     chunk_gated_delta_rule_sm100 = None  # type: ignore
 
+try:
+    from .gdn_prefill2 import chunk_gated_delta_rule2_sm100
+except (ImportError, RuntimeError):
+    chunk_gated_delta_rule2_sm100 = None  # type: ignore
+
 __all__ = [
     "chunk_gated_delta_rule_sm100",
+    "chunk_gated_delta_rule2_sm100",
 ]
