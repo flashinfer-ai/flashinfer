@@ -1330,6 +1330,7 @@ def get_trtllm_moe_sm100_module():
                 self.top_k + nfse,
                 self.hidden_size,
                 self.intermediate_size,
+                self.num_experts + nfse,
                 self.num_local_experts + nfse,
                 self.activation_type,
                 self.use_shuffled_weight,

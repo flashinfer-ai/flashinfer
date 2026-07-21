@@ -2061,15 +2061,23 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
-                                               int64_t intermediate_size, int64_t num_local_experts,
-                                               int64_t num_tokens, int64_t act_type,
-                                               btg::Dtype dtype_act, btg::Dtype dtype_weights,
+                                               int64_t intermediate_size, int64_t num_experts,
+                                               int64_t num_local_experts, int64_t num_tokens,
+                                               int64_t act_type, btg::Dtype dtype_act,
+                                               btg::Dtype dtype_weights,
                                                bool use_per_token_scaling) {
     Array<Array<int64_t>> valid_configs;
 
     std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act);
-    std::set<int32_t> selected_tile_nums =
-        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
+    std::set<int32_t> selected_tile_nums;
+    if (num_experts > num_local_experts) {
+      // Under expert parallelism, the per-rank expert shard does not describe the global routing
+      // distribution used by the autotuner input. Avoid pruning valid tile-N tactics before they
+      // are benchmarked.
+      selected_tile_nums.insert(tile_sizes.begin(), tile_sizes.end());
+    } else {
+      selected_tile_nums = computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
+    }
 
     for (int32_t tile_N : selected_tile_nums) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
@@ -2676,9 +2684,9 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
 Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     int64_t const dtype_act_, int64_t const dtype_weights_,
     Fp8QuantizationType fp8_quantization_type, int64_t const top_k, int64_t const hidden_size,
-    int64_t const intermediate_size, int64_t const num_local_experts, int64_t const act_type,
-    bool const use_shuffled_weight, int64_t const weight_layout, bool const use_per_token_scaling,
-    int64_t const num_tokens, bool has_gemm1_lora_delta) {
+    int64_t const intermediate_size, int64_t const num_experts, int64_t const num_local_experts,
+    int64_t const act_type, bool const use_shuffled_weight, int64_t const weight_layout,
+    bool const use_per_token_scaling, int64_t const num_tokens, bool has_gemm1_lora_delta) {
   auto activation_type = validateAndCastActivationType(act_type);
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
@@ -2736,9 +2744,9 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
           << "FP4 block-scale MoE does not support lora delta";
     }
     // FP4 block scale
-    return FP4BlockScaleLauncher::getValidConfigs(top_k, hidden_size, intermediate_size,
-                                                  num_local_experts, num_tokens, act_type,
-                                                  dtype_act, dtype_weights, use_per_token_scaling);
+    return FP4BlockScaleLauncher::getValidConfigs(
+        top_k, hidden_size, intermediate_size, num_experts, num_local_experts, num_tokens, act_type,
+        dtype_act, dtype_weights, use_per_token_scaling);
   }
 
   TVM_FFI_LOG_AND_THROW(NotImplementedError)
