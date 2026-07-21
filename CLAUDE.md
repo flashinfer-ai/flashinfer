@@ -29,6 +29,9 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
 | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |
 | Limit parallel ninja jobs | `export MAX_JOBS=4` |
+| Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
+| Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
+| Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
 
 ## Quick Start for Development
 

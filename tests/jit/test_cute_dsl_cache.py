@@ -70,6 +70,7 @@ NVFP4_NAME_BASELINE = {
     "sf_layout": SF_LAYOUT_128x4,
     "enable_pdl": True,
     "disable_fp4_quant_fast_math": False,
+    "silu_and_mul": False,
     "nvfp4_4over6_config": None,
 }
 NVFP4_NAME_PERTURBED = {
@@ -79,6 +80,7 @@ NVFP4_NAME_PERTURBED = {
     "sf_layout": SF_LAYOUT_8x4,
     "enable_pdl": False,
     "disable_fp4_quant_fast_math": True,
+    "silu_and_mul": True,
     "nvfp4_4over6_config": NVFP44Over6Config(),
 }
 
