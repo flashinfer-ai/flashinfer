@@ -182,6 +182,12 @@ class SoftmaxRole:
                 scale_softmax_log2,
             )
 
+        # P-store extent keyed on o_dtype, NOT p_dtype: o is 16-bit in every
+        # dtype combo where they differ (fp8 in -> fp16 out), so this always
+        # covers >= P's extent.  With fp8 P the store's upper half is unread
+        # over-provision inside the reserved P region — same behavior as the
+        # uniform-fp8 build and the vendored kernel; the PV MMA reads P
+        # through p_tmem_layout_staged (v_dtype-keyed) only.
         tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.o_dtype.width
         tScS = qk_thr_mma.partition_C(cS)
         tScS_vec_layout = cute.composition(tScS.layout, cute.make_layout((128, 2)))
@@ -502,6 +508,8 @@ class SoftmaxRole:
         cS_base = cute.make_identity_tensor(
             (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
         )
+        # o_dtype-keyed on purpose (>= P's extent in every combo); see the
+        # comment at step()'s tilePlikeFP32 site.
         tilePlikeFP32 = self.qk_mma_tiler[1] // 32 * self.o_dtype.width
         tScS = qk_thr_mma.partition_C(cS_base)
         tStS_vec_layout = cute.composition(tStS.layout, cute.make_layout((128, 2)))

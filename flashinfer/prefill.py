@@ -3835,6 +3835,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "cute-dsl backend does not support FP8 scale parameters"
                 )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "cute-dsl backend does not support NVFP4 packed KV cache "
+                    "(kv_cache_sf)"
+                )
+            # enable_pdl is a launch-latency hint: forwarded on the FMHA
+            # route below; the modular kernel has no PDL support.
             if self._cute_dsl_use_fmha:
                 # Delegate dense/causal plans to the trtllm CuTe DSL FMHA
                 # kernel (mixed V dtype included: it JIT-compiles
