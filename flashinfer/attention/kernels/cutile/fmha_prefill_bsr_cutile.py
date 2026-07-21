@@ -1250,7 +1250,11 @@ def prefill_attention_kv_paged_cutile(
     # Flatten tensors for kernel
     actual_seq_lens_q_flat = actual_seq_lens_q.reshape(-1).contiguous()
     actual_seq_lens_kv_flat = actual_seq_lens_kv.reshape(-1).contiguous()
-    batch_offsets_flat = actual_seq_offset.reshape(-1).contiguous()
+    # int64: seq_start_index scales the axis-0 base-pointer offset of the q/o
+    # slices (seq_start * num_heads * head_dim). With int32 that product overflows
+    # once a tensor exceeds 2**31 elements (e.g. total_q>=131072 at 128x128),
+    # giving an illegal memory access on large prefills.
+    batch_offsets_flat = actual_seq_offset.reshape(-1).contiguous().to(torch.int64)
     block_tables_flat = block_tables.reshape(-1).contiguous()
     stride_block_table = block_tables.shape[1] if block_tables.dim() > 1 else 1
 
@@ -1528,7 +1532,9 @@ def prefill_attention_kv_ragged_cutile(
     # Flatten tensors for kernel
     actual_seq_lens_q_flat = actual_seq_lens_q.reshape(-1).contiguous()
     actual_seq_lens_kv_flat = actual_seq_lens_kv.reshape(-1).contiguous()
-    batch_offsets_flat = actual_seq_offset.reshape(-1).contiguous()
+    # int64: see paged entry — avoids int32 overflow of the axis-0 base-pointer
+    # offset (seq_start * num_heads * head_dim) on large ragged prefills.
+    batch_offsets_flat = actual_seq_offset.reshape(-1).contiguous().to(torch.int64)
 
     # Autotune key matching Triton's key for consistent caching across problem sizes
     autotune_key = (
