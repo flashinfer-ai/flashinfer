@@ -15,7 +15,7 @@
  */
 
 // FMHAv2 JIT Binding
-// This file exports the fmha_v2_run function via TVM FFI
+// This file exports fmha_v2 functions via TVM FFI
 
 #include <fused_multihead_attention.h>
 
@@ -24,6 +24,7 @@
 using tvm::ffi::Optional;
 using Attention_input_layout = fmha::Attention_input_layout;
 
+// Original run (backward compatible)
 void fmha_v2_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorView o,
                  ffi::TensorView workspace_buffer, size_t workspace_buffer_size_in_bytes,
                  Optional<ffi::TensorView> maybe_block_tables, int page_size,
@@ -35,5 +36,33 @@ void fmha_v2_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::T
                  float skip_softmax_threshold_scale_factor, Optional<ffi::TensorView> softmax_stats,
                  Optional<ffi::TensorView> sinks);
 
-// FMHAv2 attention operator
+// GPU preparation kernel
+void fmha_v2_prepare(ffi::TensorView qo_indptr, ffi::TensorView paged_kv_indptr,
+                      ffi::TensorView paged_kv_last_page_len, ffi::TensorView paged_kv_indices,
+                      ffi::TensorView kv_lens_out, ffi::TensorView block_tables_out,
+                      ffi::TensorView metadata_out, int page_size, int batch_size,
+                      int max_blocks_per_seq);
+
+// Plan: pre-compute static config (SM, launch params, warps, grid)
+void fmha_v2_plan(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+                   const std::string& input_layout_str, const std::string& mask_mode_str,
+                   int max_kv_len, int batch_size, int window_left, int chunked_attention_size,
+                   bool has_alibi, float skip_softmax_threshold_scale_factor,
+                   ffi::TensorView plan_info_out);
+
+// Run with pre-computed plan (skips SM detection, string parsing, launch param computation)
+void fmha_v2_run_with_plan(
+    ffi::TensorView plan_info, ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+    ffi::TensorView o, ffi::TensorView workspace_buffer, size_t workspace_buffer_size_in_bytes,
+    Optional<ffi::TensorView> maybe_block_tables, int page_size, ffi::TensorView seq_lens,
+    ffi::TensorView cum_seq_lens_q, ffi::TensorView cum_seq_lens_kv, int max_q_len, int max_kv_len,
+    int batch_size, float scale_softmax, float scale_bmm1, float scale_bmm2, int window_left,
+    int chunked_attention_size, bool has_alibi, float softcapping_scale,
+    float skip_softmax_threshold_scale_factor, Optional<ffi::TensorView> softmax_stats,
+    Optional<ffi::TensorView> sinks);
+
+// FMHAv2 FFI exports
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, fmha_v2_run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(prepare, fmha_v2_prepare);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, fmha_v2_plan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_with_plan, fmha_v2_run_with_plan);
