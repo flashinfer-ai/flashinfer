@@ -77,7 +77,6 @@ BENCH_VARIANTS = (
 class DistributedBenchResult:
     num_tokens: int
     e2e_ms: float
-    breakdown_ms: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -549,43 +548,11 @@ def _max_rank_sample(value, dist, device):
     return sample.item()
 
 
-def _critical_rank_profile(timings, dist, device):
-    names = tuple(timings)
-    end_to_end_index = names.index("end-to-end")
-    local_sample = torch.tensor(
-        [timings[name] for name in names], dtype=torch.float64, device=device
-    )
-    rank_samples = [
-        torch.empty_like(local_sample) for _ in range(dist.get_world_size())
-    ]
-    dist.all_gather(rank_samples, local_sample)
-    critical_sample = max(
-        rank_samples, key=lambda sample: sample[end_to_end_index].item()
-    )
-    return dict(zip(names, critical_sample.tolist(), strict=True))
-
-
-def _record_profile_iteration(stage_calls):
-    stage_events = []
-    e2e_start = torch.cuda.Event(enable_timing=True)
-    e2e_end = torch.cuda.Event(enable_timing=True)
-
-    e2e_start.record()
+def _run_profile_iteration(stage_calls):
     for name, stage_call in stage_calls:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
         torch.cuda.nvtx.range_push(f"stage::{name}")
-        start.record()
         stage_call()
-        end.record()
         torch.cuda.nvtx.range_pop()
-        stage_events.append((name, start, end))
-    e2e_end.record()
-    e2e_end.synchronize()
-
-    timings = {name: start.elapsed_time(end) for name, start, end in stage_events}
-    timings["end-to-end"] = e2e_start.elapsed_time(e2e_end)
-    return timings
 
 
 def _run_distributed_iterations(
@@ -604,29 +571,18 @@ def _run_distributed_iterations(
     dist.barrier()
 
     if args.mode in _PROFILE_MODES:
-        samples_by_stage = {}
         torch.cuda.cudart().cudaProfilerStart()
         torch.cuda.nvtx.range_push(profile_label)
         for _ in range(args.profile_iters):
             l2_flush.zero_()
             torch.cuda.synchronize()
             dist.barrier()
-            timings = _critical_rank_profile(profile_once(), dist, device)
-            for name, value in timings.items():
-                samples_by_stage.setdefault(name, []).append(value)
+            profile_once()
         torch.cuda.synchronize()
         dist.barrier()
         torch.cuda.nvtx.range_pop()
         torch.cuda.cudart().cudaProfilerStop()
-        breakdown_ms = {
-            name: float(np.median(samples))
-            for name, samples in samples_by_stage.items()
-        }
-        return DistributedBenchResult(
-            num_tokens,
-            breakdown_ms["end-to-end"],
-            breakdown_ms,
-        )
+        return None
 
     samples = []
     for _ in range(args.iters):
@@ -796,7 +752,7 @@ def _benchmark_distributed_ep(
         )
 
     def profile_once():
-        return _record_profile_iteration(
+        _run_profile_iteration(
             (
                 (
                     "routing",
@@ -1022,7 +978,7 @@ def _run_ncu_compute_profile(args, num_tokens, mode, variant):
     for _ in range(args.profile_iters):
         l2_flush.zero_()
         torch.cuda.synchronize()
-        _record_profile_iteration(stage_calls)
+        _run_profile_iteration(stage_calls)
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
     torch.cuda.cudart().cudaProfilerStop()
@@ -1144,7 +1100,7 @@ def _benchmark_distributed_tp(
         )
 
     def profile_once():
-        return _record_profile_iteration(
+        _run_profile_iteration(
             (
                 (
                     "all-gather",
@@ -1193,22 +1149,6 @@ def _benchmark_distributed_tp(
         workspace.destroy()
 
 
-def _print_profile_breakdown(mode, variant, result, world_size):
-    print(
-        f"\n{variant.name.upper()} profile breakdown at "
-        f"{result.num_tokens} global tokens"
-    )
-    print("stage                     | median critical-rank (ms) | share of end-to-end")
-    for name, value in result.breakdown_ms.items():
-        share = value / result.e2e_ms * 100 if result.e2e_ms else float("nan")
-        print(f"{name:<25} | {value:>25.3f} | {share:>18.1f}%")
-        print(
-            "PROFILE_CSV,"
-            f"{mode},{variant.name},{result.num_tokens},{world_size},"
-            f"{name},{value:.6f}"
-        )
-
-
 def _run_parallel_mode(
     args,
     token_counts,
@@ -1223,7 +1163,7 @@ def _run_parallel_mode(
         if args.mode in _PROFILE_MODES:
             print(
                 f"\nMode: real {mode.upper()}{world_size}, "
-                "timing=semantic CUDA-event stages, cache=cold L2"
+                "profiling=NVTX stages, cache=cold L2"
             )
         else:
             print(
@@ -1282,16 +1222,13 @@ def _run_parallel_mode(
                 )
                 reported_backend = True
 
-            if rank == 0:
-                if result.breakdown_ms is not None:
-                    _print_profile_breakdown(mode, variant, result, world_size)
-                else:
-                    row[variant.name] = result.e2e_ms
-                    print(
-                        "DISTRIBUTED_CSV,"
-                        f"{mode},{variant.name},{num_tokens},{world_size},"
-                        f"{result.e2e_ms:.6f}"
-                    )
+            if rank == 0 and result is not None:
+                row[variant.name] = result.e2e_ms
+                print(
+                    "DISTRIBUTED_CSV,"
+                    f"{mode},{variant.name},{num_tokens},{world_size},"
+                    f"{result.e2e_ms:.6f}"
+                )
             dist.barrier()
             gc.collect()
             torch.cuda.empty_cache()
