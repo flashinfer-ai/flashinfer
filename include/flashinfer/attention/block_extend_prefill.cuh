@@ -22,7 +22,7 @@
 
 namespace flashinfer {
 
-// Block Expanding Mask: mask[q, k] = (q / B) >= (k / B)
+// Block Extend Mask: mask[q, k] = (q / B) >= (k / B)
 // For Q tile [q_start, q_end), visible KV range: [0, ceil(q_end / B) * B)
 
 

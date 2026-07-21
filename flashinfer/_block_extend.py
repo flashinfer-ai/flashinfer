@@ -1,4 +1,4 @@
-"""Private JIT wiring for native block-diffusion single prefill."""
+"""Private JIT wiring for native Block Extend single prefill."""
 
 from typing import Optional
 
@@ -9,7 +9,7 @@ from .utils import is_sm90a_supported
 
 
 _FA2_VARIANT_DECL = r"""
-struct BlockDiffusionSingleAttention : AttentionVariantBase {
+struct BlockExtendSingleAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
   uint32_t qo_len;
@@ -18,7 +18,7 @@ struct BlockDiffusionSingleAttention : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename Params>
-  __device__ __host__ BlockDiffusionSingleAttention(
+  __device__ __host__ BlockExtendSingleAttention(
       const Params& params, uint32_t batch_idx, uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
@@ -38,11 +38,11 @@ struct BlockDiffusionSingleAttention : AttentionVariantBase {
 
 
 _FA3_VARIANT_DECL = r"""
-struct BlockDiffusionSingleAttentionFA3 : AttentionVariantBase {
+struct BlockExtendSingleAttentionFA3 : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename MainloopParams, typename BlockCoord>
-  __device__ __host__ BlockDiffusionSingleAttentionFA3(
+  __device__ __host__ BlockExtendSingleAttentionFA3(
       const MainloopParams& params, const BlockCoord& block_coord) {
     sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
   }
@@ -102,10 +102,10 @@ def get_block_extend_single_prefill_module(
     dtype_kv = dtype if dtype_kv is None else dtype_kv
     dtype_o = dtype if dtype_o is None else dtype_o
     if backend == "fa2":
-        variant_name, variant_decl = "BlockDiffusionSingleAttention", _FA2_VARIANT_DECL
+        variant_name, variant_decl = "BlockExtendSingleAttention", _FA2_VARIANT_DECL
     else:
         variant_name, variant_decl = (
-            "BlockDiffusionSingleAttentionFA3",
+            "BlockExtendSingleAttentionFA3",
             _FA3_VARIANT_DECL,
         )
 

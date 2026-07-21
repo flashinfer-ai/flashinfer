@@ -98,7 +98,7 @@ CUTLASS_DEVICE void mma_f16(
   };
 
     // ════════════════════════════════════════════════════════════════════════════════════
-  // Block Expanding Mask Helper
+  // Block Extend Mask Helper
   // ════════════════════════════════════════════════════════════════════════════════════
   //   mask[q, k] = (q_global / B) >= (kv_global / B)
   //   q_global = q_offset + qo_idx
@@ -205,7 +205,7 @@ CUTLASS_DEVICE void mma_f16(
       if constexpr (MULTIITEMSCORING) {
         mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
       } else if constexpr (BLOCK_EXTEND) {
-        // Block Expanding Mask: (q_block >= k_block) && (kv_idx < kv_len)
+        // Block Extend Mask: (q_block >= k_block) && (kv_idx < kv_len)
         if (kv_idx >= std::min(kv_len, block_extend_col_limit(qo_idx))) {
           tSrS(i) = AttentionUpdater::fill_value;
         }

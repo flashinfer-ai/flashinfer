@@ -1,4 +1,4 @@
-"""Private JIT wiring for native block-diffusion batch prefill."""
+"""Private JIT wiring for native Block Extend batch prefill."""
 
 import math
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,7 +9,7 @@ from .utils import MaskMode
 
 
 _FA2_VARIANT_DECL = r"""
-struct BlockDiffusionBatchAttention : AttentionVariantBase {
+struct BlockExtendBatchAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
   uint32_t qo_len;
@@ -18,7 +18,7 @@ struct BlockDiffusionBatchAttention : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename Params>
-  __device__ __host__ BlockDiffusionBatchAttention(
+  __device__ __host__ BlockExtendBatchAttention(
       const Params& params, uint32_t batch_idx, uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
@@ -38,11 +38,11 @@ struct BlockDiffusionBatchAttention : AttentionVariantBase {
 
 
 _FA3_VARIANT_DECL = r"""
-struct BlockDiffusionBatchAttentionFA3 : AttentionVariantBase {
+struct BlockExtendBatchAttentionFA3 : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename MainloopParams, typename BlockCoord>
-  __device__ __host__ BlockDiffusionBatchAttentionFA3(
+  __device__ __host__ BlockExtendBatchAttentionFA3(
       const MainloopParams& params, const BlockCoord& block_coord) {
     sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
   }
@@ -98,13 +98,13 @@ def build_block_extend_jit_args(
     if backend == "fa2":
         suffix, variant_name, variant_decl = (
             f"_{layout}_offset",
-            "BlockDiffusionBatchAttention",
+            "BlockExtendBatchAttention",
             _FA2_VARIANT_DECL,
         )
     elif backend == "fa3":
         suffix, variant_name, variant_decl = (
             f"_{layout}_offset_fa3",
-            "BlockDiffusionBatchAttentionFA3",
+            "BlockExtendBatchAttentionFA3",
             _FA3_VARIANT_DECL,
         )
     else:

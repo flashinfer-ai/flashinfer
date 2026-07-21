@@ -166,7 +166,7 @@ struct SparseCollectiveMainloop {
                               cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
     }
     if constexpr (BLOCK_EXTEND) {
-      // Block Expanding: Calculate valid KV range based on block boundaries
+      // Block Extend: Calculate valid KV range based on block boundaries
       int64_t dllm_block_size = 1;
       int64_t q_offset = 0;
       int64_t kv_offset = 0;

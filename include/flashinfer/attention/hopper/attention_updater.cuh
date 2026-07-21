@@ -230,7 +230,7 @@ struct OnlineSoftmax {
       float sum = row_sum(mi);
       // math::inf is a finite mask sentinel, so a fully masked row otherwise
       // becomes a uniform softmax over masked entries.  Such rows can occur
-      // inside an otherwise visible CTA (for example with block-expanding
+      // inside an otherwise visible CTA (for example with Block Extend
       // offsets), and therefore cannot always take the CTA-level store_zero
       // fast path.
       if (row_max(mi) == fill_value) {

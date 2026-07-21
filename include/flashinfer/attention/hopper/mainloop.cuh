@@ -148,7 +148,7 @@ struct CollectiveMainloop {
                               cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
     }
     if constexpr (BLOCK_EXTEND) {
-      // Block Expanding: Calculate valid KV range based on block boundaries
+      // Block Extend: Calculate valid KV range based on block boundaries
       // q_tile_end = min((q_tile_idx + 1) * CTA_Q, qo_len)
       // q_block = (q_offset + q_tile_end - 1) / B
       // kv_valid_end = (q_block + 1) * B - kv_offset

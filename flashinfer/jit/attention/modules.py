@@ -1423,7 +1423,7 @@ def gen_customize_single_prefill_module(
 ) -> JitSpec:
     """Public shared single-prefill gen. Compiles only the standard mask list
     [0,1,2,3] — kBlockExtend is NOT a value multiplied into this shared
-    product. The dLLM block-diffusion front-end is the dedicated
+    product. The Block Extend front-end is the dedicated
     gen_customize_block_extend_single_prefill_module (standalone dispatch;
     reviewers' §1)."""
     return _gen_customize_single_prefill_module_impl(
@@ -1619,7 +1619,7 @@ def _gen_customize_single_prefill_module_impl(
 
 
 # -----------------------------------------------------------------------------
-# dLLM block-diffusion ("block-expanding") dedicated front-ends.
+# Block Extend dedicated front-ends.
 #
 # These are thin, deliberately-narrow wrappers over the shared
 # ``gen_customize_single/batch_prefill_module`` that compile ONLY
@@ -1677,7 +1677,7 @@ def gen_customize_block_extend_single_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> "JitSpec":
-    """Dedicated single-prefill front-end for dLLM block-diffusion attention.
+    """Dedicated single-prefill front-end for Block Extend attention.
 
     Compiles only ``MaskMode::kBlockExtend`` over the closed dLLM product.
     Behaviorally delegates to :func:`gen_customize_single_prefill_module` with
@@ -1718,7 +1718,7 @@ def gen_customize_block_extend_batch_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> "JitSpec":
-    """Dedicated batch-prefill front-end for dLLM block-diffusion attention.
+    """Dedicated batch-prefill front-end for Block Extend attention.
 
     Compiles only ``MaskMode::kBlockExtend`` over the closed dLLM product.
     Behaviorally delegates to :func:`gen_customize_batch_prefill_module` with
@@ -1844,7 +1844,7 @@ def gen_customize_batch_prefill_module(
 ) -> JitSpec:
     """Public shared batch-prefill gen. Compiles only the standard mask list
     [0,1,2,3] — kBlockExtend is NOT a value multiplied into this shared
-    product. The dLLM block-diffusion front-end is the dedicated
+    product. The Block Extend front-end is the dedicated
     gen_customize_block_extend_batch_prefill_module (standalone dispatch;
     reviewers' §1)."""
     return _gen_customize_batch_prefill_module_impl(

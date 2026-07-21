@@ -196,7 +196,7 @@ def get_customize_batch_prefill_module(
     fp8_enabled: bool = False,
     mask_modes: Optional[Sequence[int]] = None,
 ):
-    # Route the dLLM block-diffusion ("block-expanding") variant through its
+    # Route the Block Extend variant through its
     # dedicated front-end when mask_mode is fixed to kBlockExtend. The
     # dedicated gen compiles ONLY mode 4 over the closed dLLM product (a small
     # separate cartesian product, not a value multiplied into the big shared
@@ -259,7 +259,7 @@ def _prepare_block_extend_offset(
     device: torch.device,
     non_blocking: bool,
 ) -> Optional[torch.Tensor]:
-    """Validate and canonicalize a per-request block-diffusion offset tensor."""
+    """Validate and canonicalize a per-request Block Extend offset tensor."""
     if offsets is None:
         return None
     if not torch.is_tensor(offsets):
@@ -1436,7 +1436,7 @@ def single_prefill_with_kv_cache(
     if rope_theta is None:
         rope_theta = 1e4
 
-    # block_extend: native dLLM block-diffusion ("block-extend") mask option
+    # block_extend: native Block Extend mask option
     # (reviewers' design #2 — a mask option on the existing single-prefill API,
     # not a separate flashinfer/dllm API). When set, build the block-extend
     # variant jit module via the dedicated gen and run through the jit-module
@@ -1845,7 +1845,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
 
         # block_extend: named mask option that makes this wrapper a dLLM
-        # block-diffusion ("block-extend") front-end (reviewers' design #2 — a mask
+        # Block Extend front-end (reviewers' design #2 — a mask
         # option on the existing prefill API, not a separate API family). The
         # variant jit module is built lazily at plan() time (dtype/head_dim/idtype
         # are not known until then), mirroring the dedicated helper. See
