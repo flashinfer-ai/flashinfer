@@ -231,6 +231,11 @@ def _build_nixl_ep() -> None:
         str(build),
         str(src),
         "-Dbuild_nixl_ep=true",
+        # H100 + B200 + B300 native SASS; upstream also emits PTX for the
+        # highest listed arch (compute_103) for forward-compat. Option exists
+        # since NIXL v1.2.0 (ai-dynamo/nixl#1639) — replaces the former
+        # 0001-meson-add-blackwell-arches.patch overlay.
+        "-Dnixl_cuda_arch_list=90,100,103",
         f"-Dprefix={prefix}",
         "--buildtype=release",
     ]
@@ -243,7 +248,7 @@ def _build_nixl_ep() -> None:
             raise RuntimeError(
                 "The NIXL-EP build requires the nixl-cu13 wheel (the build "
                 "hook normally pre-installs it; see _ensure_nixl_wheel).\n"
-                "Run: uv pip install --no-deps 'nixl-cu13>=1.0.1'\n"
+                "Run: uv pip install --no-deps 'nixl-cu13>=1.3.1'\n"
                 "Or set BUILD_NIXL_EP_HERMETIC=1 to build the full NIXL tree."
             )
         setup_args += [
@@ -532,7 +537,7 @@ def _ensure_nixl_wheel() -> None:
     if _find_nixl_wheel_lib_dir() is not None:
         return
     cuda_major = _detect_cuda_major()
-    wheel = f"nixl-cu{cuda_major}>=1.0.1"
+    wheel = f"nixl-cu{cuda_major}>=1.3.1"
     print(f"[BUILD_NVEP] pre-installing NIXL wheel --no-deps: {wheel}")
 
     uv_bin = shutil.which("uv")
@@ -623,7 +628,7 @@ def _nixl_buildable() -> tuple[bool, str]:
         if _find_nixl_wheel_lib_dir() is None:
             return False, (
                 "nixl pip wheel not importable (or libnixl.so missing); install with "
-                "`uv pip install --no-deps 'nixl-cu13>=1.0.1'` "
+                "`uv pip install --no-deps 'nixl-cu13>=1.3.1'` "
                 "or set BUILD_NIXL_EP_HERMETIC=1 to build the full NIXL tree"
             )
     return True, ""
@@ -659,7 +664,7 @@ def _install_nvep_runtime_wheels(built_nixl: bool) -> None:
     cuda_major = _detect_cuda_major()
     wheels: list[str] = []
     if built_nixl:
-        wheels.append(f"nixl-cu{cuda_major}>=1.0.1")
+        wheels.append(f"nixl-cu{cuda_major}>=1.3.1")
     if not wheels:
         return
 
@@ -830,7 +835,7 @@ def _build_nvep_if_enabled() -> None:
             "source, disable isolation:\n"
             "    pip install --no-build-isolation .\n"
             "If NIXL-EP libs were still staged, install the runtime wheel "
-            "manually afterwards: pip install --no-deps 'nixl-cu13>=1.0.1'.",
+            "manually afterwards: pip install --no-deps 'nixl-cu13>=1.3.1'.",
             flush=True,
         )
 

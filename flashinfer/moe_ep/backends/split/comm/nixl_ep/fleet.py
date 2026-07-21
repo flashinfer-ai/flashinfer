@@ -143,6 +143,7 @@ class NixlEpFleet(Fleet):
         self._capacity = cap
 
         nixl_ep = _load_nixl_ep()
+        self._nixl_ep = nixl_ep  # handles read topk_idx_t off it
         # num_rdma_bytes — size the per-rank RDMA buffer via the upstream hint.
         num_rdma_bytes = nixl_ep.Buffer.get_rdma_size_hint(
             params.max_tokens_per_rank,

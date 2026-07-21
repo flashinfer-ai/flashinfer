@@ -37,7 +37,19 @@ class NixlEpHandle(Handle):
         self._fleet = fleet
         self._handle_knobs = _index_knobs(algo_knobs)
         self._staged = HandleAlgoKnobSplitOperation in self._handle_knobs
-        self._topk_ids = params.topk_ids
+        # NIXL builds pick the index width at compile time (TOPK_IDX_BITS,
+        # int32 by default since v1.3); callers hand us int64 (the nccl.ep
+        # convention), so cast to whatever this build binds.
+        import torch
+
+        topk_t = getattr(fleet._nixl_ep, "topk_idx_t", torch.int64)
+        if not isinstance(topk_t, torch.dtype):
+            topk_t = torch.int64
+        self._topk_ids = (
+            params.topk_ids
+            if params.topk_ids.dtype == topk_t
+            else params.topk_ids.to(topk_t)
+        )
 
         # Stream the Buffer kernels should run on: the user-stream knob wins,
         # else the fleet's bootstrap stream; 0 = leave the current stream alone.
