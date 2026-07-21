@@ -1217,7 +1217,10 @@ def prefill_attention_kv_paged_cutile(
     QUERY_GROUP_SIZE = num_qo_heads // num_kv_heads
 
     outputs = (
-        torch.zeros(
+        # torch.empty (not zeros): the kernel masked-scatters every valid query
+        # row, so pre-zeroing the output is wasted bandwidth. Matches the Ocean
+        # tilegym source; the zeros here was a migration perf regression.
+        torch.empty(
             [q.shape[0], num_qo_heads, head_dim_vo],
             dtype=q.dtype,
             device=q.device,
@@ -1493,7 +1496,9 @@ def prefill_attention_kv_ragged_cutile(
     QUERY_GROUP_SIZE = num_qo_heads // num_kv_heads
 
     outputs = (
-        torch.zeros(
+        # torch.empty (not zeros): masked-scatter writes every valid query row;
+        # pre-zeroing is wasted bandwidth. Matches Ocean tilegym source.
+        torch.empty(
             [q.shape[0], num_qo_heads, head_dim_vo],
             device=q.device,
             dtype=q.dtype,
