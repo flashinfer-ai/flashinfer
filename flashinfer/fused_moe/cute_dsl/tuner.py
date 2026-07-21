@@ -699,6 +699,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self._workspace_cache: Dict[Tuple, Any] = {}
 
         # Seeded random routing retains realistic load variance around route
         # tile boundaries; the balanced W4A4 hook intentionally does not apply.
@@ -886,6 +887,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
             w4a16_tactic=None if tactic is None or tactic == -1 else tactic,
+            w4a16_workspace_cache=self._workspace_cache,
             **kwargs,
         )
 

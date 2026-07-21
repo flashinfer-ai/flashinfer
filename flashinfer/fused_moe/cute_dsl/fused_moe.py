@@ -212,7 +212,7 @@ def _moe_core_impl(
         gemm2_mma_tiler_mn: GEMM2 MMA tiler shape.
         gemm2_cluster_shape_mn: GEMM2 cluster shape.
         w4a16_tactic: Internal route tile and GEMM tactics for BF16 activations.
-        w4a16_workspace_cache: Wrapper-owned BF16 activation workspaces.
+        w4a16_workspace_cache: Runner-owned BF16 activation workspaces.
         moe_sort_buffers: Pre-allocated moe_sort output buffers.
         gemm1_out: Pre-allocated GEMM1 output buffer.
         gemm1_out_scale: Pre-allocated GEMM1 output scale buffer.
@@ -724,8 +724,6 @@ class CuteDslMoEWrapper:
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
         )
-        self._w4a16_workspace_cache: Dict[Tuple, Any] = {}
-
         if use_cuda_graph:
             self._aux_stream = torch.cuda.Stream(device=self.device)
             self._main_event = torch.cuda.Event()
@@ -754,6 +752,7 @@ class CuteDslMoEWrapper:
         gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
         gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
         w4a16_tactic: Optional[Tuple] = None,
+        w4a16_workspace_cache: Optional[Dict[Tuple, Any]] = None,
         output_dtype: torch.dtype = torch.bfloat16,
         use_fused_finalize: bool = True,
         moe_output: Optional[torch.Tensor] = None,
@@ -800,7 +799,7 @@ class CuteDslMoEWrapper:
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
             w4a16_tactic=w4a16_tactic,
-            w4a16_workspace_cache=self._w4a16_workspace_cache,
+            w4a16_workspace_cache=w4a16_workspace_cache,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -972,6 +971,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
     w4a16_tactic: Optional[Tuple] = None,
+    w4a16_workspace_cache: Optional[Dict[Tuple, Any]] = None,
     output_dtype: torch.dtype = torch.bfloat16,
     use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
@@ -1006,6 +1006,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         gemm2_mma_tiler_mn=gemm2_mma_tiler_mn,
         gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
         w4a16_tactic=w4a16_tactic,
+        w4a16_workspace_cache=w4a16_workspace_cache,
         moe_output=moe_output,
         per_token_scale=per_token_scale,
         aux_stream=aux_stream,

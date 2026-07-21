@@ -743,12 +743,18 @@ class TestActivationPackValidation:
             MoEActivationPack(x, sf, ids.long(), w)
 
     @pytest.mark.parametrize(
-        "field_name", ["topk_ids", "topk_weights", "hidden_states_scale"]
+        "field_name",
+        ["topk_ids", "topk_weights", "hidden_states_scale", "per_token_scale"],
     )
     def test_device_mismatch_rejected(self, field_name):
         # meta-device tensors give a second device without needing a GPU.
         x, sf, ids, w, _ = _pack_tensors()
-        fields = dict(hidden_states_scale=sf, topk_ids=ids, topk_weights=w)
+        fields = dict(
+            hidden_states_scale=sf,
+            topk_ids=ids,
+            topk_weights=w,
+            per_token_scale=torch.ones(x.shape[0]),
+        )
         t = fields[field_name]
         fields[field_name] = torch.zeros(t.shape, dtype=t.dtype, device="meta")
         with pytest.raises(ValueError, match="device"):

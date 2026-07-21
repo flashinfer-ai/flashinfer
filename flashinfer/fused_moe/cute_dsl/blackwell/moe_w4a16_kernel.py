@@ -26,6 +26,13 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+"""SM100 grouped GEMM for NVFP4 expert weights and BF16 activations.
+
+Each routed-row tile selects one expert through FlashInfer's MoE sort metadata.
+The kernel decodes each 16-value E2M1 weight block and its E4M3 scale to BF16,
+then executes BF16 tensor-core MMA with FP32 accumulation.
+"""
+
 from math import ceil, log2
 from typing import Optional
 
@@ -46,13 +53,6 @@ from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
 )
-
-"""SM100 grouped GEMM for NVFP4 expert weights and BF16 activations.
-
-Each routed-row tile selects one expert through FlashInfer's MoE sort metadata.
-The kernel decodes each 16-value E2M1 weight block and its E4M3 scale to BF16,
-then executes BF16 tensor-core MMA with FP32 accumulation.
-"""
 
 
 class Sm100W4A16GroupedGemmKernel:

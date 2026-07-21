@@ -1197,7 +1197,6 @@ class TestCuteDslMoeBf16Activation:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=True,
-            max_num_tokens=num_tokens,
             use_fused_finalize=False,
         )
 
@@ -1206,11 +1205,6 @@ class TestCuteDslMoeBf16Activation:
         with autotune(True):
             eager_output = moe.run(**kwargs)
         torch.cuda.synchronize()
-        assert 0 < len(moe._w4a16_workspace_cache) <= 3
-        assert all(
-            workspace.num_tokens_capacity >= num_tokens
-            for workspace in moe._w4a16_workspace_cache.values()
-        )
         ref_output = compute_reference_moe_fp4(
             hidden_states=tensors["x_bf16"],
             gemm1_weights=tensors["w1_weight_bf16"],

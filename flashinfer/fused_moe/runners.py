@@ -45,6 +45,7 @@ def _validate_pack_devices(act: MoEActivationPack, runner: str) -> None:
         "hidden_states_scale",
         "topk_ids",
         "topk_weights",
+        "per_token_scale",
         "routing_logits",
         "routing_bias",
     ):
@@ -160,13 +161,12 @@ class MoERunner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
-# CuteDSL NVFP4 runner — delegates to the existing CuteDslFusedMoENvfp4Runner
+# CuteDSL NVFP4 runner — delegates to the matching W4A4 or W4A16 runner
 # ---------------------------------------------------------------------------
 
 
 class CuteDslNvfp4Runner(MoERunner):
-    """Wraps CuteDslFusedMoENvfp4Runner, translating Pack inputs into its
-    List[Tensor] convention."""
+    """Translate activation and weight packs into a CuTe DSL runner input list."""
 
     backend_key = "cute_dsl_nvfp4"
     # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
@@ -193,6 +193,13 @@ class CuteDslNvfp4Runner(MoERunner):
         num_local_experts = experts.local_num_experts or routing.num_experts
 
         self._quantize_input = config.quant.quantize_input
+        self._use_per_token_activation = self._quantize_input and bool(
+            config.quant.per_token_scale
+        )
+        if not self._quantize_input and config.quant.per_token_scale:
+            raise ValueError(
+                "CuteDslNvfp4Runner: per_token_scale requires quantize_input=True"
+            )
         runner_cls = (
             CuteDslFusedMoENvfp4Runner
             if self._quantize_input
@@ -212,7 +219,7 @@ class CuteDslNvfp4Runner(MoERunner):
             ),
             activation_type=int(config.activation.type),
             **(
-                {"use_per_token_activation": bool(config.quant.per_token_scale)}
+                {"use_per_token_activation": self._use_per_token_activation}
                 if self._quantize_input
                 else {}
             ),
@@ -224,6 +231,9 @@ class CuteDslNvfp4Runner(MoERunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         return self._inner.get_valid_tactics(inputs, profile)
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return self._inner.get_cache_key_extras(inputs)
 
     def forward(
         self,
@@ -239,19 +249,13 @@ class CuteDslNvfp4Runner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        """Translate Packs → List[Tensor] expected by CuteDslFusedMoENvfp4Runner.
+        """Translate packs into the selected CuTe DSL runner's input list.
 
         Expected weight view keys: w1_weight, w1_weight_sf, w1_alpha,
         fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha.
-        Input order: x, x_sf, token_selected_experts, token_final_scales,
-                     w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
-                     w2_weight, w2_weight_sf, w2_alpha, moe_output.
-
-        The trailing ``moe_output`` buffer (index 11) is optional for a direct
-        ``forward`` (the inner runner allocates it), but the inner runner's
-        tuning_config declares index 11 as a dynamic tensor, so it must be
-        present for the autotuner profiling path to assign it a per-bucket
-        initializer.
+        The W4A4 per-token path inserts ``per_token_scale`` before the trailing
+        ``moe_output`` buffer. Both inner tuning configurations require that
+        output buffer so profiling can replace it for each token bucket.
         """
         # MoELayer already filters by supported_routing_modes; this guards the
         # direct-runner path (tests/benchmarks) against silently forwarding a
@@ -272,9 +276,28 @@ class CuteDslNvfp4Runner(MoERunner):
         fc2_input_scale = None
         if self._quantize_input:
             hidden_size *= 2  # FP4 packed
-            assert act.hidden_states_scale is not None
+            if act.hidden_states_scale is None:
+                raise ValueError(
+                    "CuteDslNvfp4Runner: hidden_states_scale is required when "
+                    "quantize_input=True"
+                )
             x_sf = act.hidden_states_scale.unsqueeze(-1)
             fc2_input_scale = v["fc2_input_scale"]
+        elif act.hidden_states_scale is not None:
+            raise ValueError(
+                "CuteDslNvfp4Runner: hidden_states_scale must be None when "
+                "quantize_input=False"
+            )
+        if self._use_per_token_activation:
+            if act.per_token_scale is None:
+                raise ValueError(
+                    "CuteDslNvfp4Runner: per_token_scale is required by QuantConfig"
+                )
+        elif act.per_token_scale is not None:
+            raise ValueError(
+                "CuteDslNvfp4Runner: per_token_scale was provided but is disabled "
+                "by QuantConfig"
+            )
         moe_output = act.hidden_states_q.new_empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16
         )
@@ -291,7 +314,7 @@ class CuteDslNvfp4Runner(MoERunner):
             v["w2_weight_sf"],
             v["w2_alpha"],
         ]
-        if self._quantize_input and act.per_token_scale is not None:
+        if self._use_per_token_activation:
             inputs.append(act.per_token_scale)
         inputs.append(moe_output)
         return inputs
@@ -311,10 +334,9 @@ class TrtllmFp4RoutedRunner(MoERunner):
     Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
     plus the static weight/config kwargs that ``core.MoERunner.forward``
     consumes, then delegates tactic enumeration, tuning-config construction, and
-    the tactic'd forward to that inner runner.  This mirrors
-    ``CuteDslNvfp4Runner`` (which wraps ``CuteDslFusedMoENvfp4Runner``) and keeps
-    the fragile raw-op positional launch in exactly one place —
-    ``core.MoERunner.forward``.
+    the tactic'd forward to that inner runner. This mirrors
+    ``CuteDslNvfp4Runner`` and keeps the fragile raw-op positional launch in
+    exactly one place: ``core.MoERunner.forward``.
 
     Routing mode is chosen per-call from ``act.routing_input_mode``:
 
