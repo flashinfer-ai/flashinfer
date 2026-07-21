@@ -1795,6 +1795,13 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   void check_routing() const override {
     // First call base class common routing checks
     FusedMoeLauncher::check_routing_common();
+
+    if (routing_input_mode_ == RoutingInputMode::UnpackedPrecomputed) {
+      TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32)
+          << "topk_ids must be int32 for unpacked precomputed routing.";
+      TVM_FFI_ICHECK(topk_weights.dtype() == dl_bfloat16 || topk_weights.dtype() == dl_float32)
+          << "topk_weights must be bfloat16 or float32 for unpacked precomputed routing.";
+    }
   }
 
   void prepare_routing() override {
@@ -1840,6 +1847,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         routing_logits.has_value() ? routing_logits.value().dtype() : dl_bfloat16;
     mRoutingLogitsDtype =
         routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+
+    if (routing_input_mode_ == RoutingInputMode::UnpackedPrecomputed) {
+      args->mDtypeExpW =
+          topk_weights.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+    }
   }
 
   void check_moe() const override {
