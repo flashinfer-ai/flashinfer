@@ -93,6 +93,7 @@ from .tuner import (
     ALL_MOE_TACTICS,
     CuteDslFusedMoENvfp4Runner,
     CuteDslFusedMoEW4A16Runner,
+    W4A16_MOE_TACTICS,
 )
 
 # =============================================================================
@@ -151,6 +152,7 @@ def _moe_core_impl(
     num_experts: int,
     top_k: int,
     num_local_experts: int,
+    quant_mode: str,
     local_expert_offset: int = 0,
     # Tactic parameters
     tile_size: int = 128,
@@ -206,6 +208,7 @@ def _moe_core_impl(
         top_k: Number of experts per token.
         num_local_experts: Number of local experts (for EP).
         local_expert_offset: Expert offset for EP.
+        quant_mode: Compute mode: ``"w4a4"``/``"nvfp4"`` or ``"w4a16"``.
         tile_size: Tile size for moe_sort.
         gemm1_mma_tiler_mn: GEMM1 MMA tiler shape.
         gemm1_cluster_shape_mn: GEMM1 cluster shape.
@@ -236,8 +239,17 @@ def _moe_core_impl(
         Output tensor [num_tokens, hidden_size].
     """
     activation = normalize_activation_type(activation_type)
-
-    if x_sf is None:
+    if quant_mode == "w4a16":
+        if x.dtype != torch.bfloat16:
+            raise TypeError(
+                f"quant_mode='w4a16' requires x.dtype=torch.bfloat16, got {x.dtype}"
+            )
+        if x_sf is not None:
+            raise ValueError("x_sf must be None when quant_mode='w4a16'")
+        if fc2_input_scale is not None:
+            raise ValueError("fc2_input_scale must be None when quant_mode='w4a16'")
+        if per_token_scale is not None:
+            raise ValueError("per_token_scale is not supported by quant_mode='w4a16'")
         return _moe_bf16_activation_impl(
             x=x,
             token_selected_experts=token_selected_experts,
@@ -252,7 +264,6 @@ def _moe_core_impl(
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
             moe_output=moe_output,
-            per_token_scale=per_token_scale,
             output_dtype=output_dtype,
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
@@ -263,9 +274,19 @@ def _moe_core_impl(
             tactic=w4a16_tactic,
             workspace_cache=w4a16_workspace_cache,
         )
+    if quant_mode not in ("nvfp4", "w4a4"):
+        raise ValueError(
+            f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+        )
+    if x.dtype != torch.uint8:
+        raise TypeError(
+            f"quant_mode='w4a4' requires x.dtype=torch.uint8, got {x.dtype}"
+        )
+    if x_sf is None:
+        raise ValueError("x_sf is required when quant_mode='w4a4'")
     activation, gated = normalize_cute_dsl_moe_activation_type(activation)
     if fc2_input_scale is None:
-        raise ValueError("fc2_input_scale is required for NVFP4 activations")
+        raise ValueError("fc2_input_scale is required when quant_mode='w4a4'")
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
@@ -442,7 +463,6 @@ def _moe_bf16_activation_impl(
     num_local_experts: int,
     local_expert_offset: int,
     moe_output: Optional[torch.Tensor],
-    per_token_scale: Optional[torch.Tensor],
     output_dtype: torch.dtype,
     use_fused_finalize: bool,
     enable_pdl: bool,
@@ -454,12 +474,8 @@ def _moe_bf16_activation_impl(
     workspace_cache: Optional[Dict[Tuple, Any]],
 ) -> torch.Tensor:
     """Run the BF16-activation, online-NVFP4-weight-dequantization path."""
-    if x.dtype != torch.bfloat16:
-        raise TypeError(f"x must be torch.bfloat16 when x_sf is None, got {x.dtype}")
     if output_dtype != torch.bfloat16:
         raise ValueError("the BF16 activation path only supports BF16 output")
-    if per_token_scale is not None:
-        raise ValueError("per_token_scale is not supported when x_sf is None")
     if activation not in SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES:
         expected = ", ".join(
             value.name for value in SUPPORTED_STANDALONE_MOE_ACTIVATION_TYPES
@@ -483,7 +499,7 @@ def _moe_bf16_activation_impl(
     if tuple(x.shape) != (num_tokens, hidden_size):
         raise ValueError(
             "x must have shape "
-            f"{(num_tokens, hidden_size)} when x_sf is None, got {tuple(x.shape)}"
+            f"{(num_tokens, hidden_size)} for quant_mode='w4a16', got {tuple(x.shape)}"
         )
     if moe_output is None:
         moe_output = torch.empty(
@@ -543,6 +559,7 @@ class CuteDslMoEWrapper:
             resources for CUDA graph capture.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
+        quant_mode: Selected W4A4 or W4A16 compute mode.
         max_num_tokens: Deprecated; accepted for backwards compatibility
             but ignored.
 
@@ -591,6 +608,7 @@ class CuteDslMoEWrapper:
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         use_fused_finalize: bool = True,
+        quant_mode: str = "w4a4",
     ):
         r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
 
@@ -636,8 +654,16 @@ class CuteDslMoEWrapper:
         use_fused_finalize : bool
             Use atomic fused finalize; otherwise use the deterministic
             two-stage finalize. Defaults to ``True``.
+        quant_mode : str
+            Compute mode: ``"w4a4"`` / ``"nvfp4"`` or ``"w4a16"``.
+            Defaults to ``"w4a4"``.
         """
         activation = normalize_activation_type(activation_type)
+        quant_mode = quant_mode.lower()
+        if quant_mode not in ("nvfp4", "w4a4", "w4a16"):
+            raise ValueError(
+                f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+            )
         gated = is_gated_activation(activation)
 
         self.num_experts = num_experts
@@ -658,6 +684,7 @@ class CuteDslMoEWrapper:
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
         self.use_fused_finalize = use_fused_finalize
+        self.quant_mode = quant_mode
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -680,50 +707,55 @@ class CuteDslMoEWrapper:
         # Create auto-tuner runner. Use a weak trampoline instead of a bound
         # method so the runner cannot keep CUDA graph resources alive after the
         # wrapper drops out of scope.
-        self._runner = CuteDslFusedMoENvfp4Runner(
-            forward_impl=_forward_with_tactic_weak,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=self.num_local_experts,
-            local_expert_offset=local_expert_offset,
-            use_fused_finalize=use_fused_finalize,
-            output_dtype=output_dtype,
-            enable_pdl=enable_pdl,
-            activation_type=activation.value,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            use_per_token_activation=False,
-        )
-        self._per_token_runner = CuteDslFusedMoENvfp4Runner(
-            forward_impl=_forward_with_tactic_weak,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=self.num_local_experts,
-            local_expert_offset=local_expert_offset,
-            use_fused_finalize=use_fused_finalize,
-            output_dtype=output_dtype,
-            enable_pdl=enable_pdl,
-            activation_type=activation.value,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            use_per_token_activation=True,
-        )
-        self._w4a16_runner = CuteDslFusedMoEW4A16Runner(
-            forward_impl=_forward_with_tactic_weak,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=self.num_local_experts,
-            local_expert_offset=local_expert_offset,
-            use_fused_finalize=use_fused_finalize,
-            output_dtype=output_dtype,
-            enable_pdl=enable_pdl,
-            activation_type=activation.value,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-        )
+        self._runner: Optional[CuteDslFusedMoENvfp4Runner] = None
+        self._per_token_runner: Optional[CuteDslFusedMoENvfp4Runner] = None
+        self._w4a16_runner: Optional[CuteDslFusedMoEW4A16Runner] = None
+        if quant_mode == "w4a16":
+            self._w4a16_runner = CuteDslFusedMoEW4A16Runner(
+                forward_impl=_forward_with_tactic_weak,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=self.num_local_experts,
+                local_expert_offset=local_expert_offset,
+                use_fused_finalize=use_fused_finalize,
+                output_dtype=output_dtype,
+                enable_pdl=enable_pdl,
+                activation_type=activation.value,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
+            )
+        else:
+            self._runner = CuteDslFusedMoENvfp4Runner(
+                forward_impl=_forward_with_tactic_weak,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=self.num_local_experts,
+                local_expert_offset=local_expert_offset,
+                use_fused_finalize=use_fused_finalize,
+                output_dtype=output_dtype,
+                enable_pdl=enable_pdl,
+                activation_type=activation.value,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
+                use_per_token_activation=False,
+            )
+            self._per_token_runner = CuteDslFusedMoENvfp4Runner(
+                forward_impl=_forward_with_tactic_weak,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=self.num_local_experts,
+                local_expert_offset=local_expert_offset,
+                use_fused_finalize=use_fused_finalize,
+                output_dtype=output_dtype,
+                enable_pdl=enable_pdl,
+                activation_type=activation.value,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
+                use_per_token_activation=True,
+            )
         if use_cuda_graph:
             self._aux_stream = torch.cuda.Stream(device=self.device)
             self._main_event = torch.cuda.Event()
@@ -745,6 +777,7 @@ class CuteDslMoEWrapper:
         num_experts: int,
         top_k: int,
         num_local_experts: int,
+        quant_mode: str,
         local_expert_offset: int = 0,
         tile_size: int = 128,
         gemm1_mma_tiler_mn: Tuple[int, int] = (128, 128),
@@ -777,6 +810,7 @@ class CuteDslMoEWrapper:
             top_k=top_k,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            quant_mode=quant_mode,
             tile_size=tile_size,
             gemm1_mma_tiler_mn=gemm1_mma_tiler_mn,
             gemm1_cluster_shape_mn=gemm1_cluster_shape_mn,
@@ -829,11 +863,11 @@ class CuteDslMoEWrapper:
         Parameters
         ----------
         x : torch.Tensor
-            NVFP4-quantized input of shape ``[num_tokens, hidden_size // 2]``,
-            or BF16 input of shape ``[num_tokens, hidden_size]``.
+            Packed NVFP4 input for ``quant_mode="w4a4"`` or BF16 input for
+            ``quant_mode="w4a16"``.
         x_sf : Optional[torch.Tensor]
-            Scale factors for an NVFP4 input. Passing ``None`` selects BF16
-            activations with online NVFP4 weight dequantization.
+            Scale factors for ``quant_mode="w4a4"``; must be ``None`` for
+            ``quant_mode="w4a16"``.
         token_selected_experts : torch.Tensor
             Expert assignments of shape ``[num_tokens, top_k]``.
         token_final_scales : torch.Tensor
@@ -846,8 +880,8 @@ class CuteDslMoEWrapper:
         w1_alpha : torch.Tensor
             Per-expert global scale for GEMM1.
         fc2_input_scale : Optional[torch.Tensor]
-            Global scale for GEMM2 input quantization. Ignored when ``x_sf``
-            is ``None`` because GEMM1 output stays in BF16.
+            Global scale for W4A4 GEMM2 input quantization; must be ``None``
+            for W4A16 because GEMM1 output stays in BF16.
         w2_weight : torch.Tensor
             GEMM2 weights (down projection).
         w2_weight_sf : torch.Tensor
@@ -856,10 +890,9 @@ class CuteDslMoEWrapper:
             Per-expert global scale for GEMM2.
         tactic : Optional[Tuple]
             Tactic tuple, or ``None`` for auto-selection via the runtime
-            tuner. Explicit tactics are not supported for BF16 activations.
+            tuner. Explicit tactics are not supported for W4A16.
         per_token_scale : Optional[torch.Tensor]
-            Per-token input row scale for GEMM1. Passing this enables the
-            per-token activation path.
+            Optional W4A4 per-token input row scale for GEMM1.
 
         Returns
         -------
@@ -874,14 +907,18 @@ class CuteDslMoEWrapper:
             device=x.device,
         )
 
-        if x_sf is None:
+        if self.quant_mode == "w4a16":
             if tactic is not None:
-                raise ValueError("tactic is not supported for BF16 activations")
+                raise ValueError("tactic is not supported for quant_mode='w4a16'")
             if per_token_scale is not None:
-                raise ValueError("per_token_scale is not supported when x_sf is None")
+                raise ValueError(
+                    "per_token_scale is not supported by quant_mode='w4a16'"
+                )
+            if self._w4a16_runner is None:
+                raise RuntimeError("W4A16 runner was not initialized")
             inputs = [
                 x,
-                None,
+                x_sf,
                 token_selected_experts,
                 token_final_scales,
                 w1_weight,
@@ -904,6 +941,8 @@ class CuteDslMoEWrapper:
         normalize_cute_dsl_moe_activation_type(self.activation_type)
         use_per_token_activation = per_token_scale is not None
         runner = self._per_token_runner if use_per_token_activation else self._runner
+        if runner is None:
+            raise RuntimeError("W4A4 runner was not initialized")
 
         # Use auto-tuner for tactic selection
         tuner = AutoTuner.get()
@@ -941,6 +980,8 @@ class CuteDslMoEWrapper:
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
+        if self.quant_mode == "w4a16":
+            return list(W4A16_MOE_TACTICS)
         return ALL_MOE_TACTICS
 
 
@@ -964,6 +1005,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     num_experts: int,
     top_k: int,
     num_local_experts: int,
+    quant_mode: str,
     local_expert_offset: int = 0,
     tile_size: int = 128,
     gemm1_mma_tiler_mn: Tuple[int, int] = (128, 128),
@@ -1000,6 +1042,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         top_k=top_k,
         num_local_experts=num_local_experts,
         local_expert_offset=local_expert_offset,
+        quant_mode=quant_mode,
         tile_size=tile_size,
         gemm1_mma_tiler_mn=gemm1_mma_tiler_mn,
         gemm1_cluster_shape_mn=gemm1_cluster_shape_mn,
@@ -1049,6 +1092,7 @@ def cute_dsl_fused_moe_nvfp4(
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     *,
+    quant_mode: str = "w4a4",
     per_token_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
@@ -1064,11 +1108,11 @@ def cute_dsl_fused_moe_nvfp4(
     Parameters
     ----------
     x : torch.Tensor
-        NVFP4-quantized input of shape ``[num_tokens, hidden_size // 2]``, or
-        BF16 input of shape ``[num_tokens, hidden_size]``.
+        Packed NVFP4 input for ``quant_mode="w4a4"`` or BF16 input for
+        ``quant_mode="w4a16"``.
     x_sf : Optional[torch.Tensor]
-        Scale factors for an NVFP4 input. Passing ``None`` selects BF16
-        activations with online NVFP4 weight dequantization.
+        Scale factors for ``quant_mode="w4a4"``; must be ``None`` for
+        ``quant_mode="w4a16"``.
     token_selected_experts : torch.Tensor
         Expert assignments of shape ``[num_tokens, top_k]``.
     token_final_scales : torch.Tensor
@@ -1081,8 +1125,8 @@ def cute_dsl_fused_moe_nvfp4(
     w1_alpha : torch.Tensor
         Per-expert global scale for GEMM1.
     fc2_input_scale : Optional[torch.Tensor]
-        Global scale for GEMM2 input quantization. Ignored when ``x_sf`` is
-        ``None`` because GEMM1 output stays in BF16.
+        Global scale for W4A4 GEMM2 input quantization; must be ``None`` for
+        W4A16 because GEMM1 output stays in BF16.
     w2_weight : torch.Tensor
         GEMM2 weights (down projection).
     w2_weight_sf : torch.Tensor
@@ -1114,9 +1158,11 @@ def cute_dsl_fused_moe_nvfp4(
         Geglu, Relu2, and Identity; the NVFP4 path supports Swiglu and Relu2.
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
+    quant_mode : str
+        Compute mode: ``"w4a4"`` / ``"nvfp4"`` or ``"w4a16"``. Defaults
+        to ``"w4a4"``.
     per_token_scale : Optional[torch.Tensor]
-        Per-token input row scale for GEMM1. Passing this enables the
-        per-token activation path.
+        Optional W4A4 per-token input row scale for GEMM1.
 
     Returns
     -------
@@ -1124,6 +1170,11 @@ def cute_dsl_fused_moe_nvfp4(
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
     activation = normalize_activation_type(activation_type)
+    quant_mode = quant_mode.lower()
+    if quant_mode not in ("nvfp4", "w4a4", "w4a16"):
+        raise ValueError(
+            f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+        )
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -1139,9 +1190,9 @@ def cute_dsl_fused_moe_nvfp4(
             device=x.device,
         )
 
-    if x_sf is None:
+    if quant_mode == "w4a16":
         if per_token_scale is not None:
-            raise ValueError("per_token_scale is not supported when x_sf is None")
+            raise ValueError("per_token_scale is not supported by quant_mode='w4a16'")
         w4a16_runner = CuteDslFusedMoEW4A16Runner(
             forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
             num_experts=num_experts,
@@ -1158,7 +1209,7 @@ def cute_dsl_fused_moe_nvfp4(
         )
         inputs = [
             x,
-            None,
+            x_sf,
             token_selected_experts,
             token_final_scales,
             w1_weight,
