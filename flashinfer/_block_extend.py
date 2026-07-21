@@ -64,7 +64,7 @@ def _dtype_uri(dtype: torch.dtype) -> str:
     try:
         return names[dtype]
     except KeyError as error:
-        raise ValueError("block_diffusion only supports fp16 and bf16") from error
+        raise ValueError("block_extend only supports fp16 and bf16") from error
 
 
 def _get_uri(
@@ -76,14 +76,14 @@ def _get_uri(
     backend: str,
 ) -> str:
     if head_dim_qk not in (64, 128) or head_dim_vo not in (64, 128):
-        raise ValueError("block_diffusion only supports head dimensions 64 and 128")
+        raise ValueError("block_extend only supports head dimensions 64 and 128")
     return (
-        f"block_diffusion_{backend}_hd{head_dim_qk}_vo{head_dim_vo}_"
+        f"block_extend_{backend}_hd{head_dim_qk}_vo{head_dim_vo}_"
         f"{_dtype_uri(dtype_q)}_{_dtype_uri(dtype_kv)}_{_dtype_uri(dtype_o)}"
     )
 
 
-def get_block_diffusion_single_prefill_module(
+def get_block_extend_single_prefill_module(
     head_dim: int,
     dtype: torch.dtype,
     backend: str,
@@ -96,7 +96,7 @@ def get_block_diffusion_single_prefill_module(
     if backend not in ("fa2", "fa3"):
         raise ValueError(f"backend must be 'fa2' or 'fa3', got {backend!r}")
     if backend == "fa3" and not is_sm90a_supported(device):
-        raise RuntimeError("block_diffusion fa3 backend requires SM90/Hopper architecture")
+        raise RuntimeError("block_extend fa3 backend requires SM90/Hopper architecture")
 
     head_dim_vo = head_dim if head_dim_vo is None else head_dim_vo
     dtype_kv = dtype if dtype_kv is None else dtype_kv
@@ -122,8 +122,8 @@ def get_block_diffusion_single_prefill_module(
         additional_scalar_names=[
             "sm_scale",
             "dllm_block_size",
-            "q_block_expanding_offset",
-            "kv_block_expanding_offset",
+            "q_block_extend_offset",
+            "kv_block_extend_offset",
         ],
         additional_scalar_dtypes=["double", "int64_t", "int64_t", "int64_t"],
         variant_name=variant_name,

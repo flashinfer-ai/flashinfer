@@ -23,7 +23,7 @@ enum class MaskMode {
   kCausal = 1U,  // Causal mask
   kCustom = 2U,  // Custom mask
   kMultiItemScoring = 3U,
-  kBlockExpanding = 4U,
+  kBlockExtend = 4U,
 };
 
 }  // namespace flashinfer

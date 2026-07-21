@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef FLASHINFER_ATTENTION_BLOCK_EXPANDING_PREFILL_CUH_
-#define FLASHINFER_ATTENTION_BLOCK_EXPANDING_PREFILL_CUH_
+#ifndef FLASHINFER_ATTENTION_BLOCK_EXTEND_PREFILL_CUH_
+#define FLASHINFER_ATTENTION_BLOCK_EXTEND_PREFILL_CUH_
 
 #include <cuda_runtime.h>
 #include "../math.cuh"
@@ -26,18 +26,18 @@ namespace flashinfer {
 // For Q tile [q_start, q_end), visible KV range: [0, ceil(q_end / B) * B)
 
 
-__device__ __forceinline__ uint64_t block_expanding_kv_valid_end(
+__device__ __forceinline__ uint64_t block_extend_kv_valid_end(
     uint32_t q_tile_end, uint32_t dllm_block_size, uint64_t q_offset = 0) {
   const uint64_t q_global_last_idx = q_offset + q_tile_end - 1;
   const uint64_t q_block_id = q_global_last_idx / dllm_block_size;
   return (q_block_id + 1) * dllm_block_size;
 }
 
-__device__ __forceinline__ uint32_t block_expanding_num_iterations(
+__device__ __forceinline__ uint32_t block_extend_num_iterations(
     uint32_t q_tile_end, uint32_t chunk_start, uint32_t chunk_size,
     uint32_t dllm_block_size, uint32_t CTA_TILE_KV, uint64_t q_offset = 0) {
   const uint64_t kv_valid_end =
-      block_expanding_kv_valid_end(q_tile_end, dllm_block_size, q_offset);
+      block_extend_kv_valid_end(q_tile_end, dllm_block_size, q_offset);
   const uint64_t effective_chunk_size =
       kv_valid_end <= chunk_start
           ? 0
@@ -45,7 +45,7 @@ __device__ __forceinline__ uint32_t block_expanding_num_iterations(
   return static_cast<uint32_t>((effective_chunk_size + CTA_TILE_KV - 1) / CTA_TILE_KV);
 }
 
-__device__ __forceinline__ uint32_t block_expanding_mask_iteration(
+__device__ __forceinline__ uint32_t block_extend_mask_iteration(
     uint32_t q_tile_start, uint32_t chunk_start, uint32_t chunk_size,
     uint32_t dllm_block_size, uint32_t CTA_TILE_KV, uint64_t q_offset = 0,
     uint64_t kv_offset = 0) {
@@ -64,4 +64,4 @@ __device__ __forceinline__ uint32_t block_expanding_mask_iteration(
 
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_ATTENTION_BLOCK_EXPANDING_PREFILL_CUH_
+#endif  // FLASHINFER_ATTENTION_BLOCK_EXTEND_PREFILL_CUH_
