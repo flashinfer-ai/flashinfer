@@ -273,12 +273,12 @@ def test_backend_out_dtype_override(backend):
 
 @pytest.mark.parametrize("m,n,k", [(1, 2048, 7168), (16, 10304, 2688)])
 def test_cute_dsl_every_tactic_matches_reference(m, n, k):
-    """Run every enumerated cute-dsl tactic explicitly and twice.
+    """Every enumerated cute-dsl tactic matches the reference and is
+    run-to-run deterministic.
 
-    The autotuner only exercises whichever tactic wins, so split-K and other
-    non-default configs need direct coverage.  The double run checks each
-    tactic is deterministic (a requirement split-K can silently break).
-    The shapes cover an even and an uneven K split plus padded M rows.
+    The autotuner only exercises the winning tactic, so non-default configs
+    need direct coverage.  Shapes cover even and uneven K splits plus
+    padded M rows.
     """
     _skip_if_backend_unavailable("cute-dsl")
     from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (

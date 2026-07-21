@@ -357,8 +357,7 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     for tile_m, atom in tile_m_atoms[1:]:
         add(tile_m, atom, 1, 1)
 
-    # Split-K variants: small-N decode shapes launch too few CTAs to fill
-    # the GPU; splitting the K loop across CTAs restores parallelism.
+    # Split-K variants for small-N grids that underfill the GPU.
     if n // 64 <= 256:
         k_tiles = k // tile_k
         for splits in (2, 4, 8):
@@ -433,10 +432,9 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             configs = _bf16_fp4_cute_dsl_tactic_configs(n, k)
 
             def split_reduces_makespan(cfg) -> bool:
-                # Splitting K must shorten the grid's last wave by enough
-                # (25%) to cover its partials traffic.  The autotuner
-                # cannot police this itself: its warm-cache timing loop
-                # hides the partials cost.
+                # Offer a split only if it shrinks the last wave >= 25%:
+                # the autotuner's warm-cache timing hides the partials
+                # cost, so it cannot reject bad splits itself.
                 splits = cfg[5]
                 if splits == 1:
                     return True
@@ -492,8 +490,8 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                         f"k_splits={k_splits} exceeds the K-tile count for "
                         f"k={k}, tile_k={tile_shape_mnk[2]}"
                     )
-                # The module's own reduce kernel sums the partials after
-                # the GEMM, so no torch ops follow the call.
+                # The module's reduce kernel consumes the partials; no
+                # torch-side reduction follows.
                 partial = _get_cache_buf(
                     "mm_bf16_fp4_split_k_partial",
                     k_splits * m * n * 4,

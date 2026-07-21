@@ -161,9 +161,6 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         enable_pdl: bool = True,
         tile_swizzle: int = 1,
         raster_along_m: bool = True,
-        # Splits each tile's K loop across k_splits CTAs so small-N grids
-        # can fill the GPU.  Partials go to a workspace and a second kernel
-        # sums them in a fixed order to keep results deterministic.
         k_splits: int = 1,
     ):
         """bf16 x fp4 kernel.
@@ -482,10 +479,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         partial: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        """Second launch of this module: sum the fp32 partials into C.
-
-        PDL chains it behind the GEMM grid on the same stream.
-        """
+        """Launch the split-K reduce, PDL-chained behind the GEMM grid."""
         total = cute.size(c, mode=[0]) * cute.size(c, mode=[1])
         reduce_grid = (total + Int32(self.reduce_threads_per_cta) - Int32(1)) // Int32(
             self.reduce_threads_per_cta
@@ -504,15 +498,11 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         mPartial: cute.Tensor,
         mC_mnl: cute.Tensor,
     ):
-        """Sum the (k_splits * m * n) fp32 partials and write C.
-
-        One output element per thread, summed in split order so the result
-        is deterministic; accesses stay contiguous across threads.
-        """
+        """Sum the fp32 partials into C, one element per thread, in fixed
+        split order for determinism."""
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
-        # Wait for the GEMM grid's partial stores.
         cute.arch.griddepcontrol_wait()
 
         m_actual = cute.size(mC_mnl, mode=[0])
@@ -541,8 +531,8 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         mB_sf_kn: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
-        # (k_splits * m, n) fp32 partials workspace; a small unused dummy
-        # when k_splits == 1.
+        # (k_splits * m, n) fp32 split-K workspace; unused dummy when
+        # k_splits == 1.
         mPartial: cute.Tensor,
         mAlpha: cute.Tensor,
         tiled_mma: cute.TiledMma,
@@ -770,9 +760,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
 
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
-                # Balanced chunks guarantee every split gets >= 1 K-tile
-                # (host enforces k_splits <= k_tiles), so the pipeline never
-                # waits on a stage the producer will never fill.
+                # Host enforces k_splits <= k_tiles, so every split owns
+                # >= 1 K-tile and the pipeline never waits on a stage the
+                # producer won't fill.
                 if cutlass.const_expr(self.k_splits > 1):
                     tile_l, split_idx, k_start, k_len = self._split_work_krange(
                         tile_coord_mnl[2], k_tile_cnt
@@ -1052,10 +1042,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                         tcgc_for_tma_partition,
                     )
 
-                    # Epilogue: iterate (epi_m, epi_n) explicitly
-                    # and use (mma_m, mma_n) mode indexing into tRS_rAcc so
-                    # the loop works for any epi_tile_m / epi_tile_n.  Also
-                    # supports OOB-iteration skipping when m_actual < tile_M.
+                    # Iterate (epi_m, epi_n) explicitly, indexing tRS_rAcc
+                    # by (mma_m, mma_n) modes, so the loop works for any
+                    # epi_tile shape.
                     epi_rest_m = cute.size(tcgc_for_tma_partition, mode=[1, 0])
                     epi_rest_n = cute.size(tcgc_for_tma_partition, mode=[1, 1])
                     epi_tile_m = self.epi_tile[0]
@@ -1081,10 +1070,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                     m_actual = cute.size(mC_mnl, mode=[0])
                     cta_m_offset = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
 
-                    # kept_count cycles in lockstep with the TMA-store pipeline.
-                    # epi_buffer = kept_count % num_stages stays in sync with
-                    # producer_commit/acquire calls, regardless of how many
-                    # iterations are skipped.
+                    # Skipped iterations must not advance the TMA-store
+                    # pipeline, so the stage index comes from kept_count,
+                    # not the loop indices.
                     kept_count = 0
                     for epi_n in cutlass.range_constexpr(epi_rest_n):
                         for epi_m in cutlass.range_constexpr(epi_rest_m):
@@ -1116,10 +1104,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                                 tRS_rD_out = cute.make_rmem_tensor(
                                     tRS_rD_layout.shape, self.c_dtype
                                 )
-                                # Apply the global alpha here, once, on the
-                                # fp32 accumulator (hoisted out of the
-                                # per-K-block dequant): one rounding instead
-                                # of folding alpha into every B scale.
+                                # Alpha applied once on the fp32 accumulator
+                                # (hoisted out of the per-K-block dequant):
+                                # one rounding, not one per B scale.
                                 acc_vec = tRS_rD.load()
                                 tRS_rD_out.store((alpha_val * acc_vec).to(self.c_dtype))
 
@@ -1346,8 +1333,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         c_shape = cute.slice_(tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
-        # Split-K reuses the scheduler's otherwise size-1 batch (L) mode,
-        # so no new distribution mechanism is needed.
+        # Split-K reuses the scheduler's otherwise size-1 batch (L) mode.
         if cutlass.const_expr(k_splits > 1):
             num_ctas_mnl = (
                 num_ctas_mnl[0],
@@ -1405,11 +1391,8 @@ class BlackwellDenseGemmBf16Fp4Kernel:
 
     @cute.jit
     def _split_work_krange(self, tile_coord_l, k_tile_cnt):
-        """Balanced K-range of one split work unit.
-
-        The producer and consumer branches must agree on the range, so
-        both call this.
-        """
+        """Balanced K-tile range of one split; producer and consumer
+        branches both call this so they agree."""
         split_idx = Int32(tile_coord_l) % Int32(self.k_splits)
         tile_l = Int32(tile_coord_l) // Int32(self.k_splits)
         k_start = split_idx * k_tile_cnt // Int32(self.k_splits)
