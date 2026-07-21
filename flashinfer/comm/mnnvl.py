@@ -279,6 +279,21 @@ class TorchDistBackend(CommBackend):
     def Get_size(self) -> int:
         return self._dist.get_world_size(self._group)
 
+    def set_timeout(self, timeout_s: float) -> None:
+        from datetime import timedelta
+
+        timeout = timedelta(seconds=timeout_s)
+        set_pg_timeout = getattr(self._dist, "set_timeout", None)
+        if set_pg_timeout is None:
+            distributed_c10d = getattr(self._dist, "distributed_c10d", None)
+            set_pg_timeout = getattr(distributed_c10d, "_set_pg_timeout", None)
+        if set_pg_timeout is None:
+            raise RuntimeError(
+                "torch.distributed exposes neither set_timeout nor "
+                "distributed_c10d._set_pg_timeout"
+            )
+        set_pg_timeout(timeout, self._group)
+
     def allgather(self, data: Any) -> List[Any]:
         """All-gather arbitrary Python objects across all ranks."""
         output_list = [None] * self.Get_size()

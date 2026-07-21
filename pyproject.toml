@@ -80,6 +80,13 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
   "*.hpp",
   "instantiations/*.cu",
 ]
+"flashinfer.moe_ep.kernel_src.sm90_push_megamoe" = [
+  "*.md",
+  "src/a2a/*.cu",
+  "src/a2a/*.cuh",
+  "src/fp8_gemm/*.cu",
+  "src/fp8_gemm/*.cuh",
+]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]

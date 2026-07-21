@@ -23,7 +23,8 @@ moe_ep/
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,…}
+  backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,sm90_push_fp8,…}
+  kernel_src/sm90_push_megamoe/ ← package-local SM90 push A2A/GEMM sources + shim
   kernel_src/cutedsl_megamoe/  ← CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by nvfp4_cutedsl / mxfp8_cutedsl backends
@@ -83,6 +84,7 @@ classDiagram
     MegaKernelBackend <|-- DeepGemmMegaKernelBackend
     MegaKernelBackend <|-- Nvfp4CutedslMegaKernelBackend
     MegaKernelBackend <|-- Mxfp8CutedslMegaKernelBackend
+    MegaKernelBackend <|-- Sm90PushFp8MegaKernelBackend
 ```
 
 ## Built-in plugins
@@ -96,6 +98,13 @@ classDiagram
 | Mega kernel | `deep_gemm_mega` | `DeepGemmMegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `nvfp4_cutedsl` | `Nvfp4CutedslMegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `mxfp8_cutedsl` | `Mxfp8CutedslMegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |
+| Mega kernel | `sm90_push_fp8` | `Sm90PushFp8MegaMoeConfig` — FP8, sm_90; `torch_dist` only |
+
+**`sm90_push_fp8` notes:** its grouped GEMM requires CUDA Toolkit and loaded `cudart` 12.8+.
+Without a Toolkit, detection falls back to `torch.version.cuda`; a warm cache needs a cu128+ PyTorch build.
+AOT packages include the wrapper, not every shape-specialized FC1/FC2 cubin; cold shapes may invoke NVCC,
+while a complete warm cache avoids it. After a sticky CUDA error, device-side abort is best-effort;
+the launcher must terminate the complete rank group from the CPU.
 
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 

@@ -55,11 +55,14 @@ with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 |---------|------|----------|
 | `bash tests/moe_ep/run_tests.sh unit` | 1 (host-only) | none — mocks + single GPU, no multirank |
 | `bash tests/moe_ep/run_tests.sh multirank` | 4 | NCCL-EP (NIXL-EP too if built) |
+| `bash tests/moe_ep/run_tests.sh sm90_push` | 2 | Hopper; `torch.distributed`; CUDA 12.8+ |
 | `bash tests/moe_ep/run_tests.sh split_path_correctness_bf16` | 4 | Blackwell |
 | `bash tests/moe_ep/run_tests.sh mega` | 4 | Blackwell sm_100+; DeepGEMM + NVFP4 + MXFP8 |
 
 - **unit** — host-only pytest (mocks + single-GPU).
 - **multirank** — 4-GPU split path over NCCL-EP (and NIXL-EP when built).
+- **sm90_push** — 2-GPU SM90 push FP8 kernel and backend tests; no NCCL-EP
+  backend is required.
 - **split_path_correctness_bf16** — 4-GPU bf16 split-path numerics vs a
   single-process `MoELayer` reference.
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity, plus a single-rank
@@ -82,10 +85,9 @@ as the reference template.
 
 ### 1. Kernel + frontend (the "backend config" it links to)
 
-Every mega kernel exposes exactly **two entry points** through a thin frontend,
-and the `MegaKernelBackend` subclass links to nothing else. Keep this contract
-stable so new kernels — including future **SM90 (Hopper)** and **SM120
-(Blackwell-consumer)** variants — drop in behind the same backend shape without
+The buffer-oriented mega kernels expose **two entry points** through a thin
+frontend, and the `MegaKernelBackend` subclass links to nothing else. Keep this
+contract stable so new kernels drop in behind the same backend shape without
 touching `modes/` or the registry:
 
 **(a) Workspace allocator** — problem sizes first, tuning knobs keyword-only;
@@ -110,8 +112,8 @@ def get_symm_buffer_for_<name>_mega_moe(
 
 The returned buffer must expose the staging tensors the backend's `stage_inputs`
 writes — at minimum `x`, `x_sf` (quantized paths), `topk_idx`, `topk_weights` —
-plus `destroy()`. Expert weights are **not** owned by the workspace; they are
-passed to the compute call each launch.
+plus `destroy()`. In this variant, expert weights are passed to the compute call
+each launch.
 
 **(b) Compute entry** — output tensor first, then the two kernel-ready
 `(weight, scale)` weight tuples, the workspace, and keyword-only knobs. Model it
@@ -132,6 +134,11 @@ def <name>_mega_moe(
 `compute` fuses dispatch + fc1 + fc2 + combine and writes `y[:num_tokens]`. The
 caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
+
+`sm90_push_fp8` is the equivalent stateful variant: runner construction binds
+the transformed static weights, and `stage_inputs(..., output=...)` pre-binds
+the caller's destination tensor. `compute()` completes that staged round and
+returns the same output tensor; the `MegaKernelBackend` lifecycle is unchanged.
 
 Add both functions under
 `kernel_src/cutedsl_megamoe/shim/` (alongside `nvfp4.py` / `mxfp8.py`) and

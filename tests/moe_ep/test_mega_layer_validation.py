@@ -139,6 +139,46 @@ def test_mega_layer_forward_accepts_partial_batch():
     assert out.shape == (16, 128)
 
 
+def test_mega_layer_allocates_output_before_staging_round():
+    import torch
+
+    from flashinfer.moe_ep import MoEEpTensors
+
+    layer = _mega_layer()
+    layer._workspace = _fake_symm_buffer(max_tokens=64)  # type: ignore[attr-defined]
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(8, 128, dtype=torch.bfloat16),
+        topk_ids=torch.zeros(8, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(8, 2),
+    )
+    events: list[str] = []
+    real_empty = torch.empty
+
+    def allocate_output(*args, **kwargs):
+        events.append("allocate")
+        return real_empty(*args, **kwargs)
+
+    def stage_inputs(*args, **kwargs):
+        events.append("stage")
+
+    def compute(*args, output, **kwargs):
+        events.append("compute")
+        return output
+
+    with (
+        mock.patch(
+            "flashinfer.moe_ep.modes.mega_layer.torch.empty",
+            side_effect=allocate_output,
+        ),
+        mock.patch.object(layer._kernel, "stage_inputs", side_effect=stage_inputs),
+        mock.patch.object(layer._kernel, "compute", side_effect=compute),
+    ):
+        out = layer.forward(t)
+
+    assert events == ["allocate", "stage", "compute"]
+    assert out.shape == (8, 128)
+
+
 def test_mega_layer_forward_rejects_topk_mismatch():
     import torch
 
@@ -238,7 +278,7 @@ def test_mega_layer_init_rejects_bootstrap_world_size_mismatch():
         _mega_layer()
 
 
-def test_mega_layer_forward_passes_quantize_input_to_kernel():
+def test_mega_layer_forward_passes_staging_context_to_kernel():
     import torch
 
     from flashinfer.moe_ep import MoEEpTensors
@@ -251,13 +291,19 @@ def test_mega_layer_forward_passes_quantize_input_to_kernel():
         topk_ids=torch.zeros(8, 2, dtype=torch.int64),
         topk_weights=torch.zeros(8, 2),
     )
+
+    def compute(*args, output, **kwargs):
+        return output
+
     with (
-        mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states),
+        mock.patch.object(layer._kernel, "compute", side_effect=compute),
         mock.patch.object(layer._kernel, "stage_inputs") as stage_mock,
     ):
-        layer.forward(t)
+        out = layer.forward(t)
         stage_mock.assert_called_once()
         assert stage_mock.call_args.kwargs["quantize_input"] is True
+        assert "transformed_weights" not in stage_mock.call_args.kwargs
+        assert stage_mock.call_args.kwargs["output"] is out
 
 
 def test_mega_layer_forward_skips_quantize_when_config_disabled():
@@ -511,3 +557,55 @@ def test_deep_gemm_validate_transformed_weights_accepts_preprocess_output():
         world_size=1,
         num_experts=num_experts,
     )
+
+
+def _uninitialized_mega_layer(kernel, workspace, runtime):
+    import torch.nn as nn
+
+    from flashinfer.moe_ep import MoEEpMegaLayer
+
+    layer = MoEEpMegaLayer.__new__(MoEEpMegaLayer)
+    nn.Module.__init__(layer)
+    layer._kernel = kernel
+    layer._workspace = workspace
+    layer._runtime = runtime
+    return layer
+
+
+def test_mega_layer_explicit_destroy_releases_backend_and_runtime():
+    kernel = mock.Mock()
+    workspace = object()
+    runtime = object()
+    layer = _uninitialized_mega_layer(kernel, workspace, runtime)
+
+    with mock.patch(
+        "flashinfer.moe_ep.modes.mega_layer.finalize_moe_ep_runtime"
+    ) as finalize:
+        layer.destroy()
+        layer.destroy()
+
+    kernel.destroy.assert_called_once_with(workspace)
+    finalize.assert_called_once_with(runtime)
+    assert layer._workspace is None
+    assert layer._runtime is None
+
+
+def test_mega_layer_del_uses_standard_local_cleanup():
+    kernel = mock.Mock()
+    workspace = object()
+    runtime = object()
+    layer = _uninitialized_mega_layer(kernel, workspace, runtime)
+
+    with (
+        mock.patch(
+            "flashinfer.moe_ep.modes.mega_layer.finalize_moe_ep_runtime"
+        ) as finalize,
+        mock.patch("torch.distributed.barrier") as barrier,
+    ):
+        layer.__del__()
+
+    kernel.destroy.assert_called_once_with(workspace)
+    finalize.assert_called_once_with(runtime)
+    barrier.assert_not_called()
+    assert layer._workspace is None
+    assert layer._runtime is None

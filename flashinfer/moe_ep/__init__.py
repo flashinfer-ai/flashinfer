@@ -44,6 +44,10 @@ from .backends.mega.kernel.nvfp4_cutedsl import (
     Nvfp4CutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm90_push_fp8 import (
+    Sm90PushFp8MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
+)
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -139,6 +143,7 @@ __all__ = [
     "NCCLEPConfig",
     "NcclEpConfig",
     "Nvfp4CutedslMegaMoeConfig",
+    "Sm90PushFp8MegaMoeConfig",
     "NvepConfig",
     "QuantType",
     "SplitConfig",
@@ -159,6 +164,7 @@ __all__ = [
     "preprocess_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
+    "preprocess_sm90_push_fp8_mega_weights",
     "run_split_kernel",
     "validate_arch_for_backend",
     "validate_bootstrap_process_group_ready",
