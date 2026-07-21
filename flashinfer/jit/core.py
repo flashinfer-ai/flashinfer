@@ -102,7 +102,8 @@ def refresh_current_compilation_context() -> CompilationContext:
     """
 
     refreshed = CompilationContext()
-    current_compilation_context.TARGET_CUDA_ARCHS = refreshed.TARGET_CUDA_ARCHS
+    current_compilation_context.TARGET_CUDA_ARCHS.clear()
+    current_compilation_context.TARGET_CUDA_ARCHS.update(refreshed.TARGET_CUDA_ARCHS)
     return current_compilation_context
 
 
