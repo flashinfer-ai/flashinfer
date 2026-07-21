@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "flashinfer/utils.cuh"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/thop/moeAlltoAllMeta.h"
 #include "tvm_ffi_utils.h"
@@ -271,11 +273,12 @@ nvinfer1::DataType toNvDataType(DLDataType dtype) {
   return nvinfer1::DataType::kFLOAT;
 }
 
-Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
-                       TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
-                       int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
-                       bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
-                       Optional<TensorView> outputScales, int64_t sfLayout) {
+void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
+                         TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
+                         int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
+                         bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
+                         Optional<TensorView> outputScales, double outputScalarScale,
+                         int64_t sfLayout, TensorView output) {
   using tl_throughput::MoeA2ACombineParams;
   using tl_throughput::MoeA2ACombineQuantMode;
   using tl_throughput::MoeA2ACombineSwizzleSFMode;
@@ -320,8 +323,18 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
 
   auto stream = get_current_stream();
   MoeA2ACombineParams params{};
-  Tensor output = alloc_tensor({localNumTokens, elementsPerToken},
-                               outputDtype_.value_or(payload.dtype()), payload.device());
+  auto const output_shape = outputDtype_.has_value() && outputDtype_.value() == dl_uint8
+                                ? tvm::ffi::Shape{localNumTokens, elementsPerToken / 2}
+                                : tvm::ffi::Shape{localNumTokens, elementsPerToken};
+  CHECK_INPUT(output);
+  CHECK_DEVICE(payload, output);
+  TVM_FFI_ICHECK_EQ(output.ndim(), 2) << "output must be a 2D tensor";
+  TVM_FFI_ICHECK_EQ(output.size(0), output_shape[0]);
+  TVM_FFI_ICHECK_EQ(output.size(1), output_shape[1]);
+  auto const expectedOutputDtype = outputDtype_.value_or(payload.dtype());
+  TVM_FFI_ICHECK(output.dtype() == expectedOutputDtype)
+      << "output dtype must match " << (outputDtype_.has_value() ? "output_dtype" : "payload dtype")
+      << " (expected " << expectedOutputDtype << ", got " << output.dtype() << ")";
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.local_num_tokens = static_cast<int>(localNumTokens);
@@ -332,15 +345,26 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
   params.elements_per_token = static_cast<int>(elementsPerToken);
   params.dtype = toNvDataType(payload.dtype());
   params.swizzle_mode = static_cast<MoeA2ACombineSwizzleSFMode>(sfLayout);
+  params.output_scalar_scale = static_cast<float>(outputScalarScale);
 
+  // Handle quantization parameters if output scales are provided
   if (outputScales.has_value()) {
-    CHECK_INPUT_AND_TYPE(outputScales.value(), dl_uint8);
+    // Quantized combine (MXFP8/MXFP4/NVFP4) relies on Blackwell-only conversion instructions.
+    auto const sm_version = tensorrt_llm::common::getSMVersion();
+    TVM_FFI_ICHECK(sm_version >= 100)
+        << "Quantized moe_a2a_combine requires SM>=100 (Blackwell), but got SM" << sm_version;
     TVM_FFI_ICHECK(payload.dtype() == dl_bfloat16 || payload.dtype() == dl_float16)
-        << "Quantization only supported for fp16 or bf16 inputs";
+        << "Quantization only supports for fp16 or bf16 inputs";
+    params.output_scales = outputScales.value().data_ptr();
+
     if (output.dtype() == dl_float8_e4m3fn) {
       // TODO(siyuan): currently only support MXFP8 quantization
+      CHECK_INPUT_AND_TYPE(outputScales.value(), dl_uint8);
       params.quant_mode = MoeA2ACombineQuantMode::MXFP8;
-      params.output_scales = outputScales.value().data_ptr();
+    } else if (output.dtype() == dl_uint8) {
+      // packed fp4
+      params.quant_mode = outputScales.value().dtype() == dl_uint8 ? MoeA2ACombineQuantMode::MXFP4
+                                                                   : MoeA2ACombineQuantMode::NVFP4;
     } else {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "Quantization not supported for output dtype: " << output.dtype();
@@ -349,6 +373,12 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
     TVM_FFI_ICHECK(output.dtype() == payload.dtype())
         << "output_dtype without output_scales must match payload dtype";
     params.quant_mode = MoeA2ACombineQuantMode::NONE;
+  }
+
+  if (params.quant_mode != MoeA2ACombineQuantMode::NVFP4 && outputScalarScale != 1.0) {
+    TLLM_LOG_WARNING(
+        "moe_a2a_combine: output_scalar_scale=%f is ignored unless output quantization is NVFP4",
+        outputScalarScale);
   }
 
   params.flag_val =
@@ -373,6 +403,26 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
   auto err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)
       << "moe_a2a_combine launch failed: " << cudaGetErrorString(err);
+}
+
+Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
+                       TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
+                       int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
+                       bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
+                       Optional<TensorView> outputScales, double outputScalarScale,
+                       int64_t sfLayout) {
+  CHECK_INPUT(payload);
+  TVM_FFI_ICHECK_EQ(payload.ndim(), 3)
+      << "payload must be [ep_size, runtime_max_tokens_per_rank, hidden]";
+  int64_t const elementsPerToken = payload.size(2);
+  auto const outputShape = outputDtype_.has_value() && outputDtype_.value() == dl_uint8
+                               ? tvm::ffi::Shape{localNumTokens, elementsPerToken / 2}
+                               : tvm::ffi::Shape{localNumTokens, elementsPerToken};
+  Tensor output =
+      alloc_tensor(outputShape, outputDtype_.value_or(payload.dtype()), payload.device());
+  moeA2ACombineIntoOp(payload, localNumTokens, workspace, metainfo, runtimeMaxTokensPerRank, epRank,
+                      epSize, topK, combinePayloadOffset, payloadInWorkspace, outputDtype_,
+                      outputScales, outputScalarScale, sfLayout, output);
   return output;
 }
 
@@ -432,5 +482,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_aux_data_size, getMoeA2AAuxDataSize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_initialize, moeA2AInitializeOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_dispatch, moeA2ADispatchOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine, moeA2ACombineOp);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine_into, moeA2ACombineIntoOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_sanitize_expert_ids, moeA2ASanitizeExpertIdsOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_metainfo_index_pairs, getMoeA2AMetaInfoIndexPairs);

@@ -17,8 +17,14 @@ echo ""
 
 pip install -e . -v
 
+# nvshmem4py-cu12 pins cuda-python<=12.9; letting pip resolve its deps on a
+# cu13 container downgrades cuda-python/cuda-bindings and makes the next
+# requirements resolution evict CUDA torch (aarch64 backtracks to the CPU-only
+# wheel -> "Torch not compiled with CUDA enabled"). Install only if missing,
+# and --no-deps: the image already ships the right-flavor cuda-python and
+# nvidia-nvshmem libraries.
 # TODO: Remove once CI container ships with nvshmem4py pre-installed.
-pip install nvshmem4py-cu12
+python -c "import nvshmem.core" 2>/dev/null || pip install --no-deps nvshmem4py-cu12
 
 # vllm ar
 pytest -s tests/comm/test_vllm_custom_allreduce.py

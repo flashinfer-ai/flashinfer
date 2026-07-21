@@ -36,6 +36,8 @@ from flashinfer.utils import (
     is_sm12x_supported,
 )
 
+pytestmark = pytest.mark.long_running
+
 
 def _is_fp4_supported(device: torch.device) -> bool:
     """Check if FP4 quantization is supported on this device."""
@@ -524,6 +526,27 @@ MXFP4_SF_LAYOUTS = [
 ]
 
 
+@pytest.mark.parametrize("sf_layout", MXFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_mxfp4_quantize_layout(sf_layout: SfLayout, device: str) -> None:
+    """Test MXFP4 quantize/dequantize with the requested scale layout."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("MXFP4 requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.manual_seed(42)
+    # Exercise row padding (127 -> 128) and SF-column padding (96 / 32 = 3 -> 4).
+    x = torch.randn((127, 96), dtype=torch.bfloat16, device=device)
+    quantized, scales = mxfp4_quantize(x, sfLayout=sf_layout)
+    dequantized = mxfp4_dequantize(quantized, scales, sfLayout=sf_layout)
+    torch.testing.assert_close(
+        dequantized,
+        x.cpu().float(),
+        rtol=0.3,
+        atol=0.5,
+    )
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", MXFP4_SHAPES)
 @pytest.mark.parametrize("sf_layout", MXFP4_SF_LAYOUTS)
@@ -537,8 +560,7 @@ def test_mxfp4_quantize_layout_backend_parity(
 ) -> None:
     """Test that CUDA and CuTe-DSL backends agree across MXFP4 SF layouts.
 
-    Uses the low-level fp4_quantize API to exercise the sf_layout knob, since
-    the high-level mxfp4_quantize() hardcodes 128x4 on both backends.
+    Uses the low-level fp4_quantize API to verify underlying backend agreement.
     """
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
@@ -705,23 +727,23 @@ def _te_ref_scale_bytes_for_layout(
     if sf_layout == SfLayout.layout_8x4:
         rows = ((scale_ref.shape[0] + 7) // 8) * 8
         cols = ((scale_ref.shape[1] + 3) // 4) * 4
+        # Vectorized 8x4 swizzle: flat_offset =
+        #   m_tile * (cols//4) * 32 + k_tile * 32 + inner_m * 4 + inner_k
+        row_idx = torch.arange(scale_ref.shape[0], device=scale_ref.device).unsqueeze(1)
+        col_idx = torch.arange(scale_ref.shape[1], device=scale_ref.device).unsqueeze(0)
+        flat_offset = (
+            (row_idx // 8) * (cols // 4) * 32
+            + (col_idx // 4) * 32
+            + (row_idx % 8) * 4
+            + col_idx % 4
+        )
         expected = torch.zeros(
-            (rows, cols),
+            rows * cols,
             dtype=torch.uint8,
             device=scale_ref.device,
         )
-        expected_flat = expected.view(-1)
-        for row in range(scale_ref.shape[0]):
-            for col in range(scale_ref.shape[1]):
-                inner_k = col % 4
-                inner_m = row % 8
-                k_tile = col // 4
-                m_tile = row // 8
-                flat_offset = (
-                    m_tile * (cols // 4) * 32 + k_tile * 32 + inner_m * 4 + inner_k
-                )
-                expected_flat[flat_offset] = scale_ref[row, col]
-        return expected
+        expected[flat_offset.reshape(-1)] = scale_ref.reshape(-1)
+        return expected.view(rows, cols)
     raise ValueError(f"Unknown scale-factor layout: {sf_layout}")
 
 
@@ -1269,12 +1291,17 @@ def test_nvfp4_quantize_tma_backend_parity(
     shape: tuple[int, int],
     sf_layout: SfLayout,
     device: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test that TMA-based CuTe-DSL kernel matches the CUDA backend for large problems."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
+
+    # TMA is disabled by default (flashinfer#3905); force it on so this test
+    # still exercises the CuTe-DSL TMA kernel.
+    monkeypatch.setenv("FLASHINFER_NVFP4_QUANTIZE_USE_TMA", "1")
 
     torch.set_default_device(device)
     torch.manual_seed(42)

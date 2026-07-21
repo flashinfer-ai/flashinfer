@@ -1694,11 +1694,10 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
             num_sab_heads * 64 * 64,
         ),
     )
-    workspace_ctor = torch.empty if num_seqs == 1 else torch.zeros
-    transfer_t = workspace_ctor(
+    transfer_t = torch.empty(
         (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
     )
-    state_t = workspace_ctor(
+    state_t = torch.empty(
         (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
     )
     if total_cp_chunks == 0:
@@ -1745,7 +1744,7 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
     return transfer_t, state_t
 
 
-class CPDeltaRuleFixupSm90(KeyedCompileMixin):
+class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
     class WarpGroupRole(IntEnum):
         LOAD = 0
         MATH = 1
@@ -2247,6 +2246,310 @@ class CPDeltaRuleFixupSm90(KeyedCompileMixin):
                 )
 
 
+class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
+    def __init__(
+        self,
+        needs_initial_state: bool = False,
+        rows_per_cta: int = 4,
+    ):
+        self.needs_initial_state = needs_initial_state
+        self.D = 128
+        self.rows_per_cta = rows_per_cta
+        self.row_ctas = self.D // self.rows_per_cta
+        self.threads_per_cta = 128
+        self.num_warps = 4
+        self.min_blocks_per_mp = 2
+        self.registers_per_thread = 256
+        self.manual_cache_key(
+            "needs_initial_state",
+            "D",
+            "rows_per_cta",
+            "row_ctas",
+            "threads_per_cta",
+            "num_warps",
+            "min_blocks_per_mp",
+            "registers_per_thread",
+        )
+
+    @cute.jit
+    def init_state_tile(
+        self,
+        sState: cute.Tensor,
+        gFixedState: cute.Tensor,
+        gLocalState: cute.Tensor,
+        gInitialState: cute.Tensor,
+        col: cutlass.Int32,
+    ) -> cutlass.Int32:
+        start = cutlass.Int32(0)
+        if cutlass.const_expr(self.needs_initial_state):
+            for i in cutlass.range_constexpr(self.rows_per_cta):
+                sState[i, col] = gInitialState[i, col]
+        else:
+            start = cutlass.Int32(1)
+            for i in cutlass.range_constexpr(self.rows_per_cta):
+                value = gLocalState[i, col, 0]
+                sState[i, col] = value
+                gFixedState[i, col, 0] = value
+        return start
+
+    @cute.jit
+    def load_transfer_fragment(
+        self,
+        rM: cute.Tensor,
+        gTransferTile: cute.Tensor,
+        chunk_idx: cutlass.Int32,
+        k_tile: cutlass.Int32,
+    ):
+        for j in cutlass.range_constexpr(16):
+            rM[j] = gTransferTile[(j, chunk_idx), (k_tile, 0)]
+
+    @cute.jit
+    def load_local_state_fragment(
+        self,
+        rAcc: cute.Tensor,
+        gLocalState: cute.Tensor,
+        chunk_idx: cutlass.Int32,
+        col: cutlass.Int32,
+    ):
+        for i in cutlass.range_constexpr(self.rows_per_cta):
+            rAcc[i] = gLocalState[i, col, chunk_idx]
+
+    @cute.jit
+    def accumulate_state_fragment(
+        self,
+        rAcc: cute.Tensor,
+        sState: cute.Tensor,
+        rM: cute.Tensor,
+        k: cutlass.Int32,
+    ):
+        for i in cutlass.range_constexpr(self.rows_per_cta):
+            for j in cutlass.range_constexpr(16):
+                rAcc[i] = rAcc[i] + sState[i, k + cutlass.Int32(j)] * rM[j]
+
+    @cute.jit
+    def run_simt_fixup_loop(
+        self,
+        sState: cute.Tensor,
+        gTransfer: cute.Tensor,
+        gLocalState: cute.Tensor,
+        gFixedState: cute.Tensor,
+        num_chunks: cutlass.Int32,
+        col: cutlass.Int32,
+        start: cutlass.Int32,
+    ):
+        rAcc = cute.make_rmem_tensor(self.rows_per_cta, cutlass.Float32)
+        rM = cute.make_rmem_tensor(16, cutlass.Float32)
+        rM_next = cute.make_rmem_tensor(16, cutlass.Float32)
+        # ((k_in_tile, chunk_idx), (k_tile, _)); column is fixed by this thread.
+        gTransferTile = cute.zipped_divide(gTransfer[None, col, None], (16, num_chunks))
+        k_tiles = cute.size(gTransferTile, mode=[1, 0])
+        last_k_tile = k_tiles - 1
+        rAccNext = cute.make_rmem_tensor(self.rows_per_cta, cutlass.Float32)
+        if start < num_chunks:
+            self.load_local_state_fragment(rAcc, gLocalState, start, col)
+            self.load_transfer_fragment(rM, gTransferTile, start, cutlass.Int32(0))
+
+        for chunk_idx in cutlass.range(start, num_chunks, unroll=1):
+            next_chunk_idx = chunk_idx + cutlass.Int32(1)
+            for iter_k in cutlass.range_constexpr(last_k_tile):
+                self.load_transfer_fragment(
+                    rM_next,
+                    gTransferTile,
+                    chunk_idx,
+                    cutlass.Int32(iter_k + 1),
+                )
+                self.accumulate_state_fragment(
+                    rAcc, sState, rM, cutlass.Int32(iter_k * 16)
+                )
+                for j in cutlass.range_constexpr(16):
+                    rM[j] = rM_next[j]
+
+            # Last K tile owns the inter-chunk handoff: preload next chunk
+            # before the final accumulation, then publish the new state.
+            if next_chunk_idx < num_chunks:
+                self.load_local_state_fragment(
+                    rAccNext,
+                    gLocalState,
+                    next_chunk_idx,
+                    col,
+                )
+                self.load_transfer_fragment(
+                    rM_next,
+                    gTransferTile,
+                    next_chunk_idx,
+                    cutlass.Int32(0),
+                )
+            self.accumulate_state_fragment(
+                rAcc, sState, rM, cutlass.Int32(last_k_tile * 16)
+            )
+            cute.arch.sync_threads()
+            for i in cutlass.range_constexpr(self.rows_per_cta):
+                value = rAcc[i]
+                sState[i, col] = value
+                gFixedState[i, col, chunk_idx] = value
+            cute.arch.sync_threads()
+            if next_chunk_idx < num_chunks:
+                for i in cutlass.range_constexpr(self.rows_per_cta):
+                    rAcc[i] = rAccNext[i]
+                for j in cutlass.range_constexpr(16):
+                    rM[j] = rM_next[j]
+
+    @cute.jit
+    def zero_invalid_slots(
+        self,
+        gFixedState: cute.Tensor,
+        gap_len: cutlass.Int32,
+        col: cutlass.Int32,
+    ):
+        for slot in cutlass.range(0, gap_len, unroll=1):
+            for i in cutlass.range_constexpr(self.rows_per_cta):
+                gFixedState[i, col, slot] = cutlass.Float32(0.0)
+
+    @cute.jit
+    def __call__(
+        self,
+        g_transfer_t: cute.Tensor,
+        g_local_state_t: cute.Tensor,
+        g_initial_state_t: cute.Tensor,
+        g_fixed_state_t: cute.Tensor,
+        g_cu_seqlens: cute.Tensor,
+        chunk_len: cutlass.Int32,
+        total_cp_chunks: cutlass.Int32,
+        num_seqs: cutlass.Int32,
+        num_heads: cutlass.Int32,
+        stream,
+    ):
+        state_layout = cute.make_layout((self.rows_per_cta, self.D), stride=(self.D, 1))
+
+        @cute.struct
+        class SharedStorage:
+            smem_state: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(state_layout)], 128
+            ]
+
+        self.shared_storage = SharedStorage
+        self.kernel(
+            g_transfer_t,
+            g_local_state_t,
+            g_initial_state_t,
+            g_fixed_state_t,
+            g_cu_seqlens,
+            chunk_len,
+            total_cp_chunks,
+            num_seqs,
+            num_heads,
+        ).launch(
+            grid=(num_seqs * num_heads * self.row_ctas, 1, 1),
+            block=(self.threads_per_cta, 1, 1),
+            max_number_threads=(self.threads_per_cta, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=self.min_blocks_per_mp,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        g_transfer_t: cute.Tensor,
+        g_local_state_t: cute.Tensor,
+        g_initial_state_t: cute.Tensor,
+        g_fixed_state_t: cute.Tensor,
+        g_cu_seqlens: cute.Tensor,
+        chunk_len: cutlass.Int32,
+        total_cp_chunks: cutlass.Int32,
+        num_seqs: cutlass.Int32,
+        num_heads: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bx, _, _ = cute.arch.block_idx()
+        row_cta_idx = bx % self.row_ctas
+        head_seq_idx = bx // self.row_ctas
+        head_idx = head_seq_idx % num_heads
+        seq_idx = head_seq_idx // num_heads
+        seq_start = cutlass.Int32(g_cu_seqlens[seq_idx])
+        seq_end = cutlass.Int32(g_cu_seqlens[seq_idx + 1])
+        seq_len = seq_end - seq_start
+        num_chunks = chunks_for_len(seq_len, chunk_len)
+        chunk_start = varlen_chunk_idx(seq_idx, seq_start, 0, chunk_len)
+        gap_start = chunk_start + num_chunks
+        gap_end = total_cp_chunks
+        if seq_idx + cutlass.Int32(1) < num_seqs:
+            gap_end = varlen_chunk_idx(
+                seq_idx + cutlass.Int32(1), seq_end, 0, chunk_len
+            )
+
+        cute.arch.setmaxregister_increase(self.registers_per_thread)
+        state_layout = cute.make_layout((self.rows_per_cta, self.D), stride=(self.D, 1))
+        out_layout = cute.make_layout(
+            (self.D, self.D, num_heads, total_cp_chunks),
+            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+        )
+        workspace_layout = out_layout
+        allocator = cutlass.utils.SmemAllocator()
+        storage = allocator.allocate(self.shared_storage)
+        gTransfer = cute.make_tensor(g_transfer_t.iterator.align(128), workspace_layout)
+        gLocalState = cute.make_tensor(
+            g_local_state_t.iterator.align(128), workspace_layout
+        )
+        gFixedState = cute.make_tensor(g_fixed_state_t.iterator.align(128), out_layout)
+        fixed_state_layout = cute.make_layout(
+            (self.D, self.D, num_heads, num_seqs),
+            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+        )
+        if cutlass.const_expr(self.needs_initial_state):
+            gInitialState = cute.make_tensor(
+                g_initial_state_t.iterator, fixed_state_layout
+            )
+        else:
+            gInitialState = gFixedState
+
+        sState = storage.smem_state.get_tensor(state_layout)
+        gTransfer_head = gTransfer[None, None, head_idx, None]
+        gLocalState_cta = cute.local_tile(
+            gLocalState[None, None, head_idx, None],
+            (self.rows_per_cta, self.D, total_cp_chunks),
+            (row_cta_idx, 0, 0),
+        )
+        gFixedState_cta = cute.local_tile(
+            gFixedState[None, None, head_idx, None],
+            (self.rows_per_cta, self.D, total_cp_chunks),
+            (row_cta_idx, 0, 0),
+        )
+        gTransfer_seq = cute.domain_offset((0, 0, chunk_start), gTransfer_head)
+        gLocalState_seq = cute.domain_offset((0, 0, chunk_start), gLocalState_cta)
+        gFixedState_seq = cute.domain_offset((0, 0, chunk_start), gFixedState_cta)
+        if cutlass.const_expr(self.needs_initial_state):
+            gInitialState_cta = cute.local_tile(
+                gInitialState[None, None, head_idx, seq_idx],
+                (self.rows_per_cta, self.D),
+                (row_cta_idx, 0),
+            )
+        else:
+            gInitialState_cta = gFixedState_seq
+        col = tidx
+
+        cute.arch.sync_threads()
+        if num_chunks > 0:
+            start = self.init_state_tile(
+                sState,
+                gFixedState_seq,
+                gLocalState_seq,
+                gInitialState_cta,
+                col,
+            )
+            cute.arch.sync_threads()
+            self.run_simt_fixup_loop(
+                sState,
+                gTransfer_seq,
+                gLocalState_seq,
+                gFixedState_seq,
+                num_chunks,
+                col,
+                start,
+            )
+        gFixedState_gap = cute.domain_offset((0, 0, gap_start), gFixedState_cta)
+        self.zero_invalid_slots(gFixedState_gap, gap_end - gap_start, col)
+
+
 def cp_delta_rule_fixup_dsl_sm90(
     local_transfer: torch.Tensor,
     local_state: torch.Tensor,
@@ -2256,6 +2559,7 @@ def cp_delta_rule_fixup_dsl_sm90(
     initial_state: torch.Tensor | None = None,
     *,
     _skip_check: bool = False,
+    _kernel_kind: str | None = None,
 ):
     """Fix CP precompute chunk artifacts into global chunk-boundary states.
 
@@ -2330,11 +2634,7 @@ def cp_delta_rule_fixup_dsl_sm90(
             raise RuntimeError("cu_seqlens must be contiguous")
     num_seqs = cu_seqlens.shape[0] - 1
 
-    fixed_state = (
-        torch.empty_like(local_state)
-        if num_seqs == 1
-        else torch.zeros_like(local_state)
-    )
+    fixed_state = torch.empty_like(local_state)
     if total_cp_chunks == 0:
         return fixed_state
 
@@ -2362,7 +2662,21 @@ def cp_delta_rule_fixup_dsl_sm90(
         if needs_initial_state
         else None
     )
-    kernel = CPDeltaRuleFixupSm90(needs_initial_state)
+    if _kernel_kind is None:
+        if num_heads <= 8:
+            _kernel_kind = "simt_row4"
+        elif num_heads <= 16:
+            _kernel_kind = "simt_row8"
+        else:
+            _kernel_kind = "hmma"
+    if _kernel_kind == "simt_row4":
+        kernel = CPDeltaRuleFixupSimtSm90(needs_initial_state, 4)  # type: ignore
+    elif _kernel_kind == "simt_row8":
+        kernel = CPDeltaRuleFixupSimtSm90(needs_initial_state, 8)  # type: ignore
+    elif _kernel_kind == "hmma":
+        kernel = CPDeltaRuleFixupHmmaSm90(needs_initial_state)  # type: ignore
+    else:
+        raise ValueError(f"Unsupported fixup kernel kind: {_kernel_kind}")
     kernel_args = (
         from_dlpack(local_transfer_tma, assumed_align=128).mark_layout_dynamic(
             leading_dim=1
@@ -2485,40 +2799,38 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         tQKrQK: cute.Tensor,
         tQKcMqk: cute.Tensor,
         sT: cute.Tensor,
+        sQK: cute.Tensor,
         sKK_opd: cute.Tensor,
         sAlpha: cute.Tensor,
         alpha_stage: cutlass.Int32,
         is_final_block: bool,
         B: cutlass.Int32,
         scale: cutlass.Float32,
+        qk_tiled_mma,
         kk_tiled_mma,
-        tKKcMkk: cute.Tensor,
         aux_tidx: cutlass.Int32,
     ):
         alpha_log = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
-        for i in cutlass.range_constexpr(cute.size(tQKrQK)):
-            s, t = tQKcMqk[i]
-            alpha = cute.math.exp2(
-                cutlass.Float32(alpha_log[s]) - cutlass.Float32(alpha_log[t]),
-                fastmath=True,
-            )
-            pred = s >= t
-            if cutlass.const_expr(is_final_block):
-                pred = pred and (s < B or t < B)
-            tQKrQK[i] = tQKrQK[i] * alpha * scale if pred else cutlass.Float32(0.0)
-
         stsm_atom = cute.make_copy_atom(
             warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
         )
-        tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
-        thr_store = tiled_store.get_slice(aux_tidx)
-        tKKsKK = thr_store.partition_D(sKK_opd)
-        tKKcMkk_cv = thr_store.retile(tKKcMkk)
+        qk_tiled_store = cute.make_tiled_copy_C(stsm_atom, qk_tiled_mma)
+        kk_tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
+        qk_thr_store = qk_tiled_store.get_slice(aux_tidx)
+        kk_thr_store = kk_tiled_store.get_slice(aux_tidx)
+        tQKsQK = qk_thr_store.partition_D(sQK)
+        tKKsKK = kk_thr_store.partition_D(sKK_opd)
+        tQKcMqk_cv = kk_thr_store.retile(tQKcMqk)
+        tQKrQK_cv = kk_thr_store.retile(tQKrQK)
+        tQKrQK_cvt = cute.make_fragment_like(tQKrQK, self.dtype)
+        tQKrQK_cvt_cv = kk_thr_store.retile(tQKrQK_cvt)
         tKKrT = cute.make_fragment_like(tKKsKK, self.dtype)
 
         for i in cutlass.range_constexpr(cute.size(tKKrT)):
-            s, t = tKKcMkk_cv[i]
-            value = cutlass.Float32(0.0)
+            s, t = tQKcMqk_cv[i]
+            gamma = cutlass.Float32(0.0)
+            qk_value = cutlass.Float32(0.0)
+            t_value = cutlass.Float32(0.0)
             pred = s >= t
             if cutlass.const_expr(is_final_block):
                 pred = pred and s < B and t < B
@@ -2527,9 +2839,16 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                     cutlass.Float32(alpha_log[s]) - cutlass.Float32(alpha_log[t]),
                     fastmath=True,
                 )
-                value = -gamma * cutlass.Float32(sT[t, s])
-            tKKrT[i] = self.dtype(value)
-        cute.copy(tiled_store, tKKrT, tKKsKK)
+            qk_value = tQKrQK_cv[i] * gamma * scale
+            t_value = -gamma * cutlass.Float32(sT[t, s])
+            if cutlass.const_expr(is_final_block):
+                qk_value = qk_value if pred else cutlass.Float32(0.0)
+                t_value = t_value if pred else cutlass.Float32(0.0)
+
+            tQKrQK_cvt_cv[i] = self.dtype(qk_value)
+            tKKrT[i] = self.dtype(t_value)
+        cute.copy(qk_tiled_store, qk_thr_store.retile(tQKrQK_cvt), tQKsQK)
+        cute.copy(kk_tiled_store, tKKrT, tKKsKK)
 
     @cute.jit
     def run_aux_loop_body(
@@ -2592,18 +2911,20 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         cute.arch.fence_view_async_shared()
 
         kk_pipeline.producer_acquire(kk_producer_state)
+        qk_pipeline.producer_acquire(qk_producer_state)
         self.cp_qk_and_t_epi(
             tQKrQK,
             tQKcMqk,
             sT[None, None, t_consumer_state.index],
+            sQK[None, None, qk_producer_state.index],
             sKK_opd[None, None, kk_producer_state.index],
             sAlpha,
             alpha_consumer_state.index,
             is_final_block,
             B,
             scale,
+            qk_tiled_mma,
             kk_tiled_mma,
-            tKKcMkk,
             aux_tidx,
         )
         cute.arch.fence_view_async_shared()
@@ -2611,15 +2932,6 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         kk_producer_state.advance()
         t_pipeline.consumer_release(t_consumer_state)
         t_consumer_state.advance()
-
-        qk_pipeline.producer_acquire(qk_producer_state)
-        self.qk_store(
-            tQKrQK,
-            sQK[None, None, qk_producer_state.index],
-            qk_tiled_mma,
-            aux_tidx,
-        )
-        cute.arch.fence_view_async_shared()
         qk_pipeline.producer_commit(qk_producer_state)
         qk_producer_state.advance()
 
@@ -3862,6 +4174,9 @@ def cp_delta_rule_dsl_sm90(
             num_heads,
             num_sms,
             chunk_len_granularity=cp_chunk_len_granularity,
+            device_capability=torch.cuda.get_device_capability(q.device),
+            total_seqlen=total_seqlen,
+            device_name=torch.cuda.get_device_properties(q.device).name,
         )
     if q.ndim != 3:
         raise RuntimeError(
@@ -3982,8 +4297,6 @@ def cp_delta_rule_dsl_sm90(
         _skip_check=True,
     )
 
-    if num_seqs != 1:
-        state.zero_()
     cp_delta_rule_prefill_dsl_sm90(
         o,
         state,

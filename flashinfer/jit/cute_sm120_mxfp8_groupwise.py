@@ -26,12 +26,13 @@ from .core import (
 
 @functools.cache
 def gen_gemm_sm120_module_cute_mxfp8() -> JitSpec:
-    """SM120 MXFP8 cute groupwise GEMM module.
+    """SM120 MXFP8 / FP8 cute groupwise GEMM module.
 
-    Bundles the cute SM120 MXFP8 groupwise runner with the public ``group_gemm_*``
-    entries (currently zero_padding; future dispatch will share the same runner).
-    All source is in-tree under ``csrc/cute_sm120_mxfp8_groupwise/{cute_sm120_mxfp8_runner.{h,cu},
-    cute_sm120_mxfp8_op.cu, cute_sm120_mxfp8_op_jit_binding.cu, sm120_blockscaled/}``;
+    Bundles the cute SM120 MXFP8 and FP8 float-scale groupwise runners with their
+    public MoE entries (``moe_gemm_mxfp8_nt_groupwise`` / ``moe_gemm_fp8_nt_groupwise``)
+    in a single ``.so``. All source is in-tree under ``csrc/cute_sm120_mxfp8_groupwise/
+    {cute_sm120_{mxfp8,fp8}_runner.{h,cu}, cute_sm120_{mxfp8,fp8}_op{,_jit_binding}.cu,
+    sm120_blockscaled/, sm120_blockscaling/, sm120_common/}``;
     the kernel uses flashinfer's own ``3rdparty/cutlass``.
     """
     csrc_dir = jit_env.FLASHINFER_CSRC_DIR / "cute_sm120_mxfp8_groupwise"
@@ -39,6 +40,9 @@ def gen_gemm_sm120_module_cute_mxfp8() -> JitSpec:
         csrc_dir / "cute_sm120_mxfp8_runner.cu",
         csrc_dir / "cute_sm120_mxfp8_op.cu",
         csrc_dir / "cute_sm120_mxfp8_op_jit_binding.cu",
+        csrc_dir / "cute_sm120_fp8_runner.cu",
+        csrc_dir / "cute_sm120_fp8_op.cu",
+        csrc_dir / "cute_sm120_fp8_op_jit_binding.cu",
     ]
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(

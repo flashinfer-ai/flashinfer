@@ -26,16 +26,15 @@ license-files = ["LICENSE", "LICENSE*.txt"]
 [project.optional-dependencies]
 cu12 = ["nvidia-cutlass-dsl>=4.5.0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
-# Runtime deps for the moe_ep transport backends. Pair with the BUILD_NVEP=1
-# env var at install time: `BUILD_NVEP=1 pip install -e ".[nvep]"`. The env var
-# triggers the in-tree submodule build (NIXL meson + NCCL make) and the
-# build_backend.py hook also pip-installs `nixl-cu13>=1.0.1` and
-# `nvidia-nccl-cu13>=2.30.4` with --no-deps (matching SGLang's Dockerfile
-# pattern) so they don't drag transitive constraints that downgrade torch.
-# Only cuda-python is listed here because it has no torch-conflicting deps.
-nvep = [
-  "cuda-python>=13.0",
-]
+# DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
+# working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
+# BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
+# default (best-effort) on `pip install .` — see the moe_ep section at the top
+# of build_backend.py. libnccl comes from torch's own nvidia-nccl-cu13 pin;
+# the >=2.30.7 B200 floor is enforced at runtime (moe_ep/core/validation/
+# common.py) and upgraded --no-deps by the build hook on source installs. Opt
+# out of the native build with BUILD_NVEP=0 (or BUILD_NIXL_EP=0 / BUILD_NCCL_EP=0).
+nvep = []
 
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"
@@ -70,16 +69,27 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer" = ["_build_meta.py"]
+# JIT sources for the blk64 BSA kernel extension (compiled on-demand via
+# torch.utils.cpp_extension.load in flashinfer/cute_dsl/sparse/blk64/loader.py).
+# These live inside the package tree rather than csrc/, so they must be
+# registered explicitly or they won't be included in non-editable installs.
+"flashinfer.cute_dsl.sparse.blk64" = [
+  "*.cpp",
+  "*.cu",
+  "*.h",
+  "*.hpp",
+  "instantiations/*.cu",
+]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]
 "flashinfer.data.cccl" = ["cub/cub/**", "libcudacxx/include/**", "thrust/thrust/**"]
-# EP backend shared libraries built in-tree from 3rdparty/{nixl,nccl} when
-# BUILD_NVEP=1 is set during `pip install`. The .so files live under
-# flashinfer/moe_ep/{nixl_ep,nccl_ep}/_libs/ (gitignored; populated by
-# build_backend._build_nvep_if_enabled).
-"flashinfer.moe_ep.nixl_ep" = ["_libs/**"]
-"flashinfer.moe_ep.nccl_ep" = ["_libs/*.so*"]
+# EP backend shared libraries built in-tree from 3rdparty/nixl by default
+# during `pip install` (opt out with BUILD_NIXL_EP=0). The .so files live under
+# flashinfer/moe_ep/backends/split/comm/{nccl,nixl}_ep/_libs/ (gitignored;
+# populated by build_backend._build_nvep_if_enabled).
+"flashinfer.moe_ep.backends.split.comm.nixl_ep" = ["_libs/**", "_vendored/**"]
+"flashinfer.moe_ep.backends.split.comm.nccl_ep" = ["_libs/*.so*"]
 
 [tool.mypy]
 files = ["flashinfer"]
@@ -94,8 +104,26 @@ exclude = [
   "flashinfer-jit-cache/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
+  "flashinfer/cute_dsl/attention/fmha/fmha.py",
+  "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
+  "flashinfer/cute_dsl/attention/fmha/helpers/",
+  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/",
   "build/",
 ]
+
+
+# CuTe DSL FMHA kernels from TRTLLM VisualGen; kept as-is for clean re-sync.
+# cutedsl_megamoe/src kernels are maintained upstream and re-dropped
+# periodically; excluded so lint churn doesn't block syncs. The shim/ layer
+# next to it is ours and stays linted.
+[tool.ruff]
+extend-exclude = [
+  "flashinfer/cute_dsl/attention/fmha/fmha.py",
+  "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
+  "flashinfer/cute_dsl/attention/fmha/helpers",
+  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src",
+]
+force-exclude = true
 
 
 [tool.ruff.lint]

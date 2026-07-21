@@ -23,6 +23,29 @@ if [ -z "${MAX_JOBS:-}" ]; then
 fi
 export MAX_JOBS
 
+# Pin the preinstalled CUDA torch for every job-time pip install. Twice now a
+# runtime dep's transitive constraint has made pip re-resolve torch and evict
+# the CUDA build (the nvidia-nccl-cu13 floor, then nvshmem4py-cu12's
+# cuda-python<=12.9 pin downgrading cuda-bindings on cu13 images) — on aarch64
+# pip backtracks to the CPU-only PyPI wheel and tests fail later with "Torch
+# not compiled with CUDA enabled". A constraints file makes any resolution that
+# would replace torch fail loudly at install time instead. The +cuXXX local
+# tag is stripped: PEP 440 lets the installed 2.X.Y+cuNNN satisfy ==2.X.Y, but
+# PEP-517 build envs (flashinfer-jit-cache's build-system.requires includes
+# torch) inherit PIP_CONSTRAINT and must be able to resolve the pin from PyPI,
+# where local-version wheels don't exist.
+if [ -z "${PIP_CONSTRAINT:-}" ]; then
+    _torch_pin=$(python -c "import torch; print('torch=='+torch.__version__.split('+')[0])" 2>/dev/null || true)
+    if [ -n "${_torch_pin}" ]; then
+        _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
+        echo "${_torch_pin}" > "${_constraint_file}"
+        export PIP_CONSTRAINT="${_constraint_file}"
+        echo "Pinning for all pip installs in this job: ${_torch_pin}"
+        unset _constraint_file
+    fi
+    unset _torch_pin
+fi
+
 # CUDA_VISIBLE_DEVICES: Not set by default - let detect_gpus() auto-detect via nvidia-smi
 : "${SAMPLE_RATE:=5}"  # Run every Nth test in sanity mode (5 = ~20% coverage)
 : "${PARALLEL_TESTS:=false}"  # Disable parallel test execution by default
@@ -1478,6 +1501,8 @@ print_execution_summary() {
 execute_dry_run() {
     local test_files=$1
 
+    derive_scheduling_patterns_from_markers
+
     echo "=========================================="
     echo "DRY RUN: Tests that would be executed"
     echo "=========================================="
@@ -1515,10 +1540,11 @@ LONG_RUNNING_TEST_PATTERNS=(
     "test_trtllm_gen_fused_moe_routing_renormalize_fp4.py"
     "test_trtllm_gen_fused_moe_routing_renormalize_fp8.py"
     "test_trtllm_gen_fused_moe_routing_renormalize_bf16.py"
-    "test_trtllm_gen_fused_moe_other.py"
+    "test_trtllm_gen_fused_moe.py"
     "test_trtllm_gen_attention_decode.py"
     "test_trtllm_gen_attention_decode_xqa.py"
     "test_decode_delta_rule.py"
+    "test_fp4_quantize.py"
 )
 
 is_solo_test() {
@@ -1547,8 +1573,48 @@ is_long_running_test() {
     return 1
 }
 
+SCHEDULING_PATTERNS_DERIVED=false
+derive_scheduling_patterns_from_markers() {
+    [ "$SCHEDULING_PATTERNS_DERIVED" = "true" ] && return 0
+    SCHEDULING_PATTERNS_DERIVED=true
+
+    # scripts/test_utils.sh -> repo root is one level up.
+    local repo_root scanner py tests_root long_list solo_list
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    scanner="${repo_root}/scripts/find_marked_tests.py"
+    tests_root="${repo_root}/tests"
+
+    if [ ! -f "$scanner" ] || [ ! -d "$tests_root" ]; then
+        echo "NOTE: marker scanner or tests/ dir not found; using built-in scheduling pattern defaults."
+        return 0
+    fi
+    py="$(command -v python3 || command -v python)" || {
+        echo "NOTE: python not found; using built-in scheduling pattern defaults."
+        return 0
+    }
+
+    long_list="$("$py" "$scanner" long_running "$tests_root" 2>/dev/null)"
+    solo_list="$("$py" "$scanner" solo "$tests_root" 2>/dev/null)"
+
+    if [ -n "$long_list" ]; then
+        mapfile -t LONG_RUNNING_TEST_PATTERNS <<< "$long_list"
+        echo "Derived ${#LONG_RUNNING_TEST_PATTERNS[@]} long-running test pattern(s) from @pytest.mark.long_running."
+    else
+        echo "NOTE: no @pytest.mark.long_running files found; keeping built-in long-running defaults."
+    fi
+    if [ -n "$solo_list" ]; then
+        mapfile -t SOLO_TEST_PATTERNS <<< "$solo_list"
+        echo "Derived ${#SOLO_TEST_PATTERNS[@]} solo test pattern(s) from @pytest.mark.solo."
+    else
+        echo "NOTE: no @pytest.mark.solo files found; keeping built-in solo defaults."
+    fi
+}
+
 execute_tests() {
     local test_files=$1
+
+    # Refresh scheduling buckets from the pytest markers in the test sources.
+    derive_scheduling_patterns_from_markers
 
     mkdir -p "${JUNIT_DIR}"
     if [ "$MONITOR_TEST_MEMORY" = "true" ]; then

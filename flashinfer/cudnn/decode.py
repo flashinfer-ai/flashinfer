@@ -69,6 +69,15 @@ def _sdpa_decode_key_fn(
         max_sequence_kv,
         tuple(q.shape),
         tuple(k_cache.shape),
+        # attn_scale is baked into the built graph as a compile-time constant;
+        # omitting it silently replays a stale-scale graph on same-shape calls.
+        scale,
+        # These presence flags change the built graph's structure (padding
+        # mask, paged tables) the same way: same-shape calls that differ only
+        # in them must not share a graph.
+        actual_seq_lens_q is not None,
+        actual_seq_lens_kv is not None,
+        block_tables is not None,
     )
 
 

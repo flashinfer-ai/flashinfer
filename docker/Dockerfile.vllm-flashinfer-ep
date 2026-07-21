@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# vLLM + FlashInfer MoE-EP (NCCL-EP) on the NVIDIA PyTorch base image.
+#
+# WHAT THIS IMAGE IS
+# ------------------
+# A single, self-consistent CUDA-13.2 stack that runs vLLM with the FlashInfer
+# `moe_ep`-backed all2all backends (`flashinfer_ep_low_latency` /
+# `flashinfer_ep_high_throughput`), plus DeepEP for perf comparison.
+#
+# It layers on top of docker/Dockerfile.flashinfer-ep-pytorch (which provides
+# the NGC PyTorch 26.05 base + CUDA 13.2 + torch + IB/HPC-X/GPUDirect stack +
+# FlashInfer built with BUILD_NCCL_EP=1 + the pinned nccl4py/nccl 2.30.7 wheels).
+# Build that base first:
+#
+#   docker build -f docker/Dockerfile.flashinfer-ep-pytorch -t flashinfer-ep:pt2605 .
+#   docker build -f docker/Dockerfile.vllm-flashinfer-ep \
+#       --build-arg VLLM_REF=<branch-or-sha> -t vllm-flashinfer-ep:pt2605 .
+#
+# WHY NGC 26.05 (CUDA 13.2), NOT vllm/vllm-openai
+# -----------------------------------------------
+# FlashInfer-EP's nccl.ep HIGH_THROUGHPUT *cross-node* dispatch aborts with
+# `CUDA error nccl_ep.cc:2884 'illegal memory access'` on any stack that is not
+# CUDA 13.2 + the matching IB-RDMA/GPUDirect userspace (verified in
+# Dockerfile.flashinfer-ep-pytorch: single-node HT and all LL pass on 13.0; only
+# cross-node HT fails). This plan needs 2-node HT, so the base is forced to NGC
+# 26.05 and vLLM is built FROM SOURCE against the base image's torch (upstream
+# vLLM ships no wheel for this torch/CUDA combo).
+#
+# BUILD GATE — torch version: upstream vLLM pins torch==2.11.0. `use_existing_torch.py`
+# strips that pin so vLLM builds against the base image's torch. If NGC 26.05's
+# torch is older than what vLLM's C++/CUDA extensions require, the build fails —
+# this is the first thing to validate. Override the base with a newer NGC tag via
+# --build-arg BASE_IMAGE=... if needed.
+
+ARG BASE_IMAGE=flashinfer-ep:pt2605
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+# HPC-X v8's NCCL net plugin segfaults NCCL >= 2.30 (nccl.ep needs 2.30.7) — off.
+ENV NCCL_NET_PLUGIN=none
+
+# --------------------------------------------------------------------------
+# vLLM from source (Anerudhan/vllm fork; feature branch adds the FI-EP backends)
+# --------------------------------------------------------------------------
+ARG VLLM_REPO=https://github.com/Anerudhan/vllm.git
+ARG VLLM_REF=main
+ARG VLLM_SRC=/workspace/vllm
+# Cap parallel nvcc jobs to bound peak build memory (tune to the builder box).
+ARG MAX_JOBS=16
+
+RUN git clone "${VLLM_REPO}" "${VLLM_SRC}" \
+    && cd "${VLLM_SRC}" \
+    && git checkout "${VLLM_REF}"
+
+WORKDIR ${VLLM_SRC}
+# use_existing_torch.py strips torch/torchvision/torchaudio pins so the build
+# uses the base image's (NGC) torch instead of pulling a fresh CPU/other-CUDA
+# wheel. --no-build-isolation reuses that torch for the build hook. PIP_CONSTRAINT=
+# neutralizes the NGC base constraint file for this step.
+RUN python use_existing_torch.py \
+    && PIP_CONSTRAINT= MAX_JOBS=${MAX_JOBS} \
+       pip install --no-cache-dir --no-build-isolation -e . -v
+
+# --------------------------------------------------------------------------
+# DeepEP (+ NVSHMEM) for the perf comparison — optional, heaviest layer.
+# Reuses vLLM's own installer (tools/ep_kernels/install_python_libraries.sh),
+# which fetches NVSHMEM 3.3.24 and builds DeepEP@d4f41e4e93 (with the CUDA-13
+# cccl-include patch). We pre-install cmake/ninja and pass PIP_CONSTRAINT to pin
+# torch so the script's unconditional `uv pip install ... torch` does NOT clobber
+# the NGC torch.
+# --------------------------------------------------------------------------
+ARG BUILD_DEEPEP=1
+RUN if [ "${BUILD_DEEPEP}" = "1" ]; then \
+      set -eux; \
+      command -v uv >/dev/null 2>&1 || pip install --no-cache-dir uv; \
+      TORCH_VER="$(python -c 'import torch; print(torch.__version__.split("+")[0])')"; \
+      printf 'torch==%s\n' "${TORCH_VER}" > /tmp/torch-constraint.txt; \
+      PIP_CONSTRAINT=/tmp/torch-constraint.txt UV_CONSTRAINT=/tmp/torch-constraint.txt \
+        bash "${VLLM_SRC}/tools/ep_kernels/install_python_libraries.sh" \
+          --workspace /workspace/ep_kernels_workspace; \
+    else echo "skipping DeepEP build (BUILD_DEEPEP=${BUILD_DEEPEP})"; fi
+
+# --------------------------------------------------------------------------
+# Smoke probes — fail the build if either backend did not register.
+# --------------------------------------------------------------------------
+RUN python -c "\
+from flashinfer.moe_ep import available_backends; \
+b = available_backends(); print('moe_ep backends:', b); \
+assert 'nccl_ep' in b, 'nccl_ep backend missing'"
+RUN python -c "import vllm; print('vllm', vllm.__version__)"
+
+WORKDIR ${VLLM_SRC}
+CMD ["bash"]
