@@ -167,7 +167,7 @@ def _load_nsys_kernel_rows(nsys, report, verbose):
                 AND kernel.globalPid = stage_launches.globalPid
             JOIN StringIds AS kernel_name ON kernel_name.id = kernel.shortName
             GROUP BY stage_launches.stage, kernel.shortName
-            ORDER BY total_ns DESC
+            ORDER BY MIN(kernel.start), stage_launches.stage, kernel.shortName
             """,
             {"process_mask": _NSYS_GLOBAL_ID_PROCESS_MASK},
         ).fetchall()
