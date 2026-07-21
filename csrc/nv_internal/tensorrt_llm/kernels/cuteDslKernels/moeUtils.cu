@@ -20,7 +20,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cuh"
-#include "tensorrt_llm/kernels/quantization_utils.cuh"
 
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
@@ -73,10 +72,9 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
                                  int32_t const* num_non_exiting_tiles, int32_t const hidden_size,
                                  int32_t const top_k, int32_t const tile_size) {
   int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
-  int32_t constexpr kSFElemPerCopy = sfElemPerCopy<SFType>();
+  [[maybe_unused]] int32_t constexpr kSFElemPerCopy = sfElemPerCopy<SFType>();
   // Need int64_t to prevent overflow when computing pointer offsets.
   int64_t const kCopyPerToken = hidden_size / kElemPerCopy;
-  int64_t const kSFCopyPerToken = hidden_size / kSFVecSize / kSFElemPerCopy;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
@@ -97,15 +95,7 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
       dst_ptr[i] = src_ptr[i];
     }
 
-    if (input_sf != nullptr && permuted_sf != nullptr) {
-      auto const* src_sf =
-          reinterpret_cast<SFCopyType const*>(input_sf) + token_idx * kSFCopyPerToken;
-      for (int32_t i = threadIdx.x; i < kSFCopyPerToken; i += kThreadsPerBlock) {
-        int64_t const sf_offset =
-            get_sf_out_offset_128x4(permuted_idx, i * kSFElemPerCopy, hidden_size / kSFVecSize);
-        *reinterpret_cast<SFCopyType*>(permuted_sf + sf_offset) = src_sf[i];
-      }
-    }
+    // Note: FP4 scale factor handling is deferred to Phase 3
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -121,14 +111,10 @@ void moePermute(InputType const* input, InputType* permuted_output, SFType const
                 int32_t const top_k, int32_t const tile_size, bool enable_pdl,
                 cudaStream_t stream) {
   int32_t constexpr kThreadsPerBlock = 256;
-  int32_t constexpr kSFVecSize = bitsPerElem<InputType>() == 8 ? 32 : 16;
+  int32_t constexpr kSFVecSize = 16;
   int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
-  int32_t constexpr kSFElemPerCopy = sfElemPerCopy<SFType>();
   TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.",
                        kElemPerCopy);
-  TLLM_CHECK_WITH_INFO(input_sf == nullptr || hidden_size % (kSFVecSize * kSFElemPerCopy) == 0,
-                       "hidden_size must be divisible by %d when scale factors are provided.",
-                       kSFVecSize * kSFElemPerCopy);
 
   auto kernel = &moePermuteKernel<InputType, SFType, kSFVecSize, kThreadsPerBlock>;
   static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();

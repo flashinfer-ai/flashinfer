@@ -30,7 +30,6 @@ import torch
 from ..autotuner import TunableRunner, TuningConfig
 from .api import (
     ActivationType,
-    CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
@@ -186,7 +185,6 @@ class CuteDslNvfp4Runner(MoERunner):
         from .cute_dsl.tuner import (
             CuteDslFusedMoENvfp4Runner,
             CuteDslFusedMoEW4A16Runner,
-            CuteDslFusedMoEW4A8Runner,
         )
 
         self.config = config
@@ -194,30 +192,19 @@ class CuteDslNvfp4Runner(MoERunner):
         routing = config.routing
         num_local_experts = experts.local_num_experts or routing.num_experts
 
-        cute_dsl_config = next(
-            backend for backend in config.backend if isinstance(backend, CuteDslConfig)
-        )
-        self._quant_mode = cute_dsl_config.quant_mode
-        if self._quant_mode is None:
-            self._quant_mode = "w4a4" if config.quant.quantize_input else "w4a16"
-        self._quant_mode = self._quant_mode.lower()
-        if self._quant_mode not in ("w4a4", "w4a8", "w4a16"):
-            raise ValueError(
-                "CuteDslNvfp4Runner: quant_mode must be 'w4a4', 'w4a8', "
-                f"or 'w4a16', got {self._quant_mode!r}"
-            )
-        self._use_per_token_activation = self._quant_mode == "w4a4" and bool(
+        self._quantize_input = config.quant.quantize_input
+        self._use_per_token_activation = self._quantize_input and bool(
             config.quant.per_token_scale
         )
-        if self._quant_mode != "w4a4" and config.quant.per_token_scale:
+        if not self._quantize_input and config.quant.per_token_scale:
             raise ValueError(
-                "CuteDslNvfp4Runner: per_token_scale requires quant_mode='w4a4'"
+                "CuteDslNvfp4Runner: per_token_scale requires quantize_input=True"
             )
-        runner_cls = {
-            "w4a4": CuteDslFusedMoENvfp4Runner,
-            "w4a8": CuteDslFusedMoEW4A8Runner,
-            "w4a16": CuteDslFusedMoEW4A16Runner,
-        }[self._quant_mode]
+        runner_cls = (
+            CuteDslFusedMoENvfp4Runner
+            if self._quantize_input
+            else CuteDslFusedMoEW4A16Runner
+        )
         self._inner = runner_cls(
             forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
             num_experts=routing.num_experts,
@@ -233,7 +220,7 @@ class CuteDslNvfp4Runner(MoERunner):
             activation_type=int(config.activation.type),
             **(
                 {"use_per_token_activation": self._use_per_token_activation}
-                if self._quant_mode == "w4a4"
+                if self._quantize_input
                 else {}
             ),
         )
@@ -287,7 +274,7 @@ class CuteDslNvfp4Runner(MoERunner):
         hidden_size = act.hidden_states_q.shape[1]
         x_sf = None
         fc2_input_scale = None
-        if self._quant_mode == "w4a4":
+        if self._quantize_input:
             hidden_size *= 2  # FP4 packed
             if act.hidden_states_scale is None:
                 raise ValueError(
@@ -296,15 +283,6 @@ class CuteDslNvfp4Runner(MoERunner):
                 )
             x_sf = act.hidden_states_scale.unsqueeze(-1)
             fc2_input_scale = v["fc2_input_scale"]
-        elif self._quant_mode == "w4a8":
-            if act.hidden_states_scale is None:
-                raise ValueError(
-                    "CuteDslNvfp4Runner: hidden_states_scale is required when "
-                    "quant_mode='w4a8'"
-                )
-            x_sf = act.hidden_states_scale.view(
-                act.hidden_states_q.size(0), hidden_size // 32, 1
-            )
         elif act.hidden_states_scale is not None:
             raise ValueError(
                 "CuteDslNvfp4Runner: hidden_states_scale must be None when "

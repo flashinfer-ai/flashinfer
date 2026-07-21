@@ -411,13 +411,7 @@ class CuteDslConfig:
     """CuteDSL NVFP4 backend — SM100 family only (Blackwell SM100, SM103).
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
-
-    ``quant_mode`` selects ``"w4a4"``, ``"w4a8"``, or ``"w4a16"``. When
-    omitted, the runner preserves the legacy ``QuantConfig.quantize_input``
-    selection between W4A4 and W4A16.
     """
-
-    quant_mode: Optional[str] = None
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -451,9 +445,7 @@ class CuteDslConfig:
         )
 
     def __repr__(self) -> str:
-        if self.quant_mode is None:
-            return "CuteDslConfig()"
-        return f"CuteDslConfig(quant_mode={self.quant_mode!r})"
+        return "CuteDslConfig()"
 
 
 @dataclass(frozen=True)
