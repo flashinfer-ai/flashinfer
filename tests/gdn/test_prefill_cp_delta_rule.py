@@ -25,7 +25,11 @@ import torch
 
 from .reference_delta_rule import exclusive_cumsum
 from . import reference_delta_rule as reference
-from flashinfer.utils import is_sm90a_supported, is_sm120a_supported
+from flashinfer.utils import (
+    is_sm90a_supported,
+    is_sm100a_supported,
+    is_sm120a_supported,
+)
 
 if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm90 import (
@@ -34,6 +38,14 @@ if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
         cp_delta_rule_mn_precompute_dsl_sm90 as cp_delta_rule_mn_precompute_dsl,
         cp_delta_rule_prefill_dsl_sm90 as cp_delta_rule_prefill_dsl,
         cp_delta_rule_t_precompute_dsl_sm90 as cp_delta_rule_t_precompute_dsl,
+    )
+elif torch.cuda.is_available() and is_sm100a_supported(torch.device("cuda")):
+    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
+        cp_delta_rule_dsl_sm100 as cp_delta_rule_dsl,
+        cp_delta_rule_fixup_dsl_sm100 as cp_delta_rule_fixup_dsl,
+        cp_delta_rule_mn_precompute_dsl_sm100 as cp_delta_rule_mn_precompute_dsl,
+        cp_delta_rule_prefill_dsl_sm100 as cp_delta_rule_prefill_dsl,
+        cp_delta_rule_t_precompute_dsl_sm100 as cp_delta_rule_t_precompute_dsl,
     )
 elif torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda")):
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm120 import (
@@ -60,13 +72,22 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 FIXUP_TF32_ATOL = 2e-3
 FIXUP_TF32_RTOL = 2e-3
 FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
+MN_KERNEL_KINDS = (
+    ["utcmma_1sm", "utcmma_2sm"]
+    if torch.cuda.is_available() and is_sm100a_supported(torch.device("cuda"))
+    else [None]
+)
 
 
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
-    if not (is_sm90a_supported(device) or is_sm120a_supported(device)):
-        pytest.skip("CP GDN prefill requires SM90 or SM120")
+    if not (
+        is_sm90a_supported(device)
+        or is_sm100a_supported(device)
+        or is_sm120a_supported(device)
+    ):
+        pytest.skip("CP GDN prefill requires SM90, SM100, or SM120")
 
 
 def _seed_all(seed):
@@ -284,12 +305,19 @@ def test_cp_delta_rule_t_precompute_varlen_tail_is_projected(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("mn_kernel_kind", MN_KERNEL_KINDS)
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("num_heads", [1, 2])
 @pytest.mark.parametrize("gate_baseline", [0.9, 0.99, 0.9995])
 @pytest.mark.parametrize(
     "seq_lens, cp_chunk_len",
-    [([64, 192], 64), ([128, 200], 128), ([1024, 3000], 1024), ([96, 64, 192], 128)],
+    [
+        ([64, 192], 64),
+        ([128, 200], 128),
+        ([192], 192),
+        ([1024, 3000], 1024),
+        ([96, 64, 192], 128),
+    ],
 )
 def test_cp_delta_rule_mn_precompute(
     qkv_factory,
@@ -298,6 +326,7 @@ def test_cp_delta_rule_mn_precompute(
     cp_chunk_len,
     num_heads,
     gate_baseline,
+    mn_kernel_kind,
     seed=int(os.environ.get("SEED", "0")),
 ):
     _skip_if_cp_unsupported()
@@ -322,6 +351,9 @@ def test_cp_delta_rule_mn_precompute(
     t = cp_delta_rule_t_precompute_dsl(
         k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen
     )
+    mn_kwargs = {}
+    if mn_kernel_kind is not None:
+        mn_kwargs["_kernel_kind"] = mn_kernel_kind
     our_transfer, our_state = cp_delta_rule_mn_precompute_dsl(
         k,
         v,
@@ -331,6 +363,7 @@ def test_cp_delta_rule_mn_precompute(
         total_seqlen,
         cp_chunk_len=cp_chunk_len,
         max_seqlen=max_seqlen,
+        **mn_kwargs,
     )
     torch.cuda.synchronize()
 

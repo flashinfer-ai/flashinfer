@@ -27,6 +27,7 @@ from .gdn_kernels import (
     chunk_gated_delta_rule_sm100,
     chunk_gated_delta_rule_sm120,
     cp_delta_rule_dsl_sm90,
+    cp_delta_rule_dsl_sm100,
     cp_delta_rule_dsl_sm120,
 )
 from .gdn_kernels.delta_rule_dsl.varlen_helper import should_use_cp_host
@@ -62,11 +63,14 @@ def _cp_delta_rule_rejection_reason(
     if arch_major == 9:
         if cp_delta_rule_dsl_sm90 is None:
             return "CP delta rule SM90 DSL kernel is unavailable"
+    elif arch_major == 10:
+        if cp_delta_rule_dsl_sm100 is None:
+            return "CP delta rule SM100 DSL kernel is unavailable"
     elif arch_major == 12:
         if cp_delta_rule_dsl_sm120 is None:
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
-        return "CP delta rule is currently implemented only for SM90 and SM120"
+        return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
     if (
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
@@ -309,7 +313,7 @@ def chunk_gated_delta_rule(
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     _arch_major = get_compute_capability(device)[0]
     _device_name = torch.cuda.get_device_properties(device).name
-    cp_heuristic_matches = _arch_major in (9, 12) and should_use_cp_host(
+    cp_heuristic_matches = _arch_major in (9, 10, 12) and should_use_cp_host(
         num_seqs * num_sab_heads, _sm_count, _device_name
     )
     if use_cp is True or (use_cp == "auto" and cp_heuristic_matches):
@@ -356,9 +360,11 @@ def chunk_gated_delta_rule(
                     total_seq_len, num_sab_heads, dtype=torch.float32, device=device
                 )
             )
-            cp_delta_rule_dsl = (
-                cp_delta_rule_dsl_sm90 if _arch_major == 9 else cp_delta_rule_dsl_sm120
-            )
+            cp_delta_rule_dsl = {
+                9: cp_delta_rule_dsl_sm90,
+                10: cp_delta_rule_dsl_sm100,
+                12: cp_delta_rule_dsl_sm120,
+            }[_arch_major]
             assert cp_delta_rule_dsl is not None
             cp_delta_rule_dsl(
                 output,
