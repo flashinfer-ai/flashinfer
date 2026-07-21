@@ -60,13 +60,14 @@ from .kernels.utils import (
     _select_sm100_mm_fp4_cute_dsl_tactic,
 )
 from ..utils import (
+    LibraryError,
+    backend_requirement,
     get_device_sm_count,
     get_native_fp4_dtype,
     is_sm100a_supported,
     is_sm100f_supported,
+    is_sm103_tinygemm_unsafe,
     is_sm12x_supported,
-    LibraryError,
-    backend_requirement,
     supported_compute_capability,
 )
 from ..jit.gemm import gen_gemm_sm90_module
@@ -118,6 +119,7 @@ from ..utils import (
 )
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
+
 
 # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
@@ -424,6 +426,7 @@ def _tinygemm_mm_bf16_requirement(
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "tinygemm", "auto"] = "cudnn",
 ):
+    """Validate BF16 TinyGEMM layout, dtype, and SM103 safety requirements."""
     if out_dtype != torch.bfloat16:
         raise ValueError("The TinyGEMM backend only supports bfloat16 output.")
     if a.dim() != 2:
@@ -445,6 +448,11 @@ def _tinygemm_mm_bf16_requirement(
         raise ValueError("The TinyGEMM backend requires a contiguous output tensor.")
     if bias is not None and not bias.is_contiguous():
         raise ValueError("The TinyGEMM backend requires a contiguous bias tensor.")
+    if is_sm103_tinygemm_unsafe(a, b):
+        raise ValueError(
+            "The TinyGEMM backend is disabled for this large BF16 projection on SM103 "
+            "to avoid a known kernel hang; see flashinfer-ai/flashinfer#3848."
+        )
     return True
 
 
@@ -502,6 +510,7 @@ def _heuristic_func_mm_bf16(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
 ):
+    """Order valid BF16 GEMM backends for automatic selection."""
     heuristic_backends = []
     if bias is not None or pdl:
         # CUTLASS and cuBLASLt doesn't support bias/pdl, only TGV and cuDNN do

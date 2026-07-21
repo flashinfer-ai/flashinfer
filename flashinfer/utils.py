@@ -73,6 +73,32 @@ class BackendSupportedError(Exception):
     pass
 
 
+_SM103_TINYGEMM_MAX_PROJECTION_ELEMENTS = 32 * 1024 * 1024
+
+
+def is_sm103_tinygemm_unsafe_shape(
+    compute_capability: Tuple[int, int], n: int, k: int
+) -> bool:
+    """Return whether TinyGEMM is unsafe for an SM103 projection shape.
+
+    TinyGEMM can hang indefinitely on B300A/SM103 for large BF16 projection
+    shapes. Keep the workaround scoped to the affected architecture and
+    disable it only once the N*K projection size reaches the smallest
+    reported failure threshold. See flashinfer-ai/flashinfer#3848.
+    """
+    return (
+        compute_capability == (10, 3)
+        and n * k >= _SM103_TINYGEMM_MAX_PROJECTION_ELEMENTS
+    )
+
+
+def is_sm103_tinygemm_unsafe(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Return whether a GEMM's BF16 TinyGEMM projection is unsafe on SM103."""
+    return is_sm103_tinygemm_unsafe_shape(
+        get_compute_capability(a.device), b.shape[1], a.shape[1]
+    )
+
+
 def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
     if x.ndim not in [4, 5]:
         raise ValueError("x must be 4D or 5D")
