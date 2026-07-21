@@ -35,6 +35,16 @@ Agent-written comments are often **low signal-to-noise and too verbose**. We wan
 to-the-point comments that explain *why*, not restate *what*. High-SNR exceptions worth
 keeping: short rationale for a non-obvious algorithmic choice on a hot path.
 
+### PR description hygiene
+The PR description should keep the repository's default PR template
+(`.github/pull_request_template.md`), filled in — not overwritten with a custom or
+tool-generated format.
+
+For a **performance optimization**, the PR description must report the observed performance
+improvement: before/after numbers from a reproducible benchmark (e.g.
+`benchmarks/flashinfer_benchmark.py`), with the GPU and problem sizes used. A perf claim
+without numbers is not reviewable — ask for them.
+
 ### PR defendability
 A PR should be defendable by its human author — **to some extent**. Nowadays it is not
 necessarily line-by-line defendable, and that is accepted. But watch for design that the
@@ -43,7 +53,8 @@ author cannot explain.
 The principle: we may raise questions about the design especially if the code touches a relatively
 durable area of the library. If the author, upon being asked, cannot walk through the rationale,
 we may reject the PR submission. We support AI-assisted contributions, but we expect the authors
-to understand the idea or rationale of their changes.
+to understand the idea or rationale of their changes. This principle is also stated in
+[`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
 Possibly flag: **coding style that deviates from surrounding code** without reason —
 flag it and discuss rather than silently accepting.
@@ -95,5 +106,7 @@ rationale instead of re-deriving it each PR.
 - [ ] Tests cover new behavior/edge cases; refcheck for numerics
 - [ ] Comments concise, to the point; docs in sync
 - [ ] Author can explain the design; style deviations from surrounding code flagged
+- [ ] Default PR template kept (not overwritten); perf-optimization PRs report observed
+      before/after numbers in the description
 - [ ] Kernel internals **not** line-audited — instead, tests/benchmarks/fuzzing confirmed as
       the correctness backstop

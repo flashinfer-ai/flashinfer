@@ -29,6 +29,11 @@ bugs there. See [Kernel review](#kernel-review).
    from surrounding code. Scale scrutiny by durability: **hard** on perf/kernel-selection
    logic, high-level interfaces, and widely-used ops; **lighter** on disposable model-specific
    ops (DSv3, MSA). When unsure, treat as durable.
+6. **PR description hygiene.** The description must keep the repo's default PR template
+   (`.github/pull_request_template.md`), filled in — flag descriptions that overwrite it with
+   a custom or tool-generated format. A **performance optimization** must report observed
+   before/after numbers in the description (reproducible benchmark, GPU, problem sizes) —
+   flag perf claims without numbers.
 
 ## Kernel review
 
@@ -63,4 +68,6 @@ review quality bar for experimental code, and graduation / removal criteria. -->
 - [ ] Tests cover new behavior/edge cases; refcheck for numerics
 - [ ] Comments concise/high-SNR; docs in sync
 - [ ] Style deviations flagged (esp. durable/high-leverage code)
+- [ ] Default PR template kept (not overwritten); perf-optimization PRs report observed
+      before/after numbers in the description
 - [ ] Kernel logic read for real bugs, findings labeled by confidence
