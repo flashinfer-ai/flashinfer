@@ -22,6 +22,10 @@ except OSError as e:
     if not is_lib_missing:
         raise
 from flashinfer import autotune
+from flashinfer.fmha_v2 import (
+    FmhaV2BatchPrefillWithPagedKVCacheWrapper,
+    FmhaV2BatchPrefillWithRaggedKVCacheWrapper,
+)
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.prefill import trtllm_fmha_v2_prefill
 from flashinfer.utils import (
@@ -119,6 +123,8 @@ def parse_attention_args(line, parser):
             "trtllm-gen",
             "trtllm-native",
             "trtllm-fmha-v2",
+            "trtllm-fmha-v2-wrapper",
+            "trtllm-fmha-v2-wrapper-e2e",
             "trtllm-gen-native",  # Deprecated, will be removed in future
             "cute-dsl",
         ],
@@ -993,6 +999,20 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if "trtllm-fmha-v2" in backends and is_nvfp4_kv:
         print("[INFO] trtllm-fmha-v2 backend does not support NVFP4. Skipping.")
         backends.remove("trtllm-fmha-v2")
+    for _wrapper_backend in ("trtllm-fmha-v2-wrapper", "trtllm-fmha-v2-wrapper-e2e"):
+        if _wrapper_backend not in backends:
+            continue
+        remove_fmha_v2_wrapper = False
+        if is_nvfp4_kv:
+            print(
+                f"[INFO] {_wrapper_backend} backend does not support NVFP4. Skipping."
+            )
+            remove_fmha_v2_wrapper = True
+        if q_dtype == torch.float8_e5m2 or kv_dtype == torch.float8_e5m2:
+            print(f"[INFO] {_wrapper_backend} backend does not support e5m2. Skipping.")
+            remove_fmha_v2_wrapper = True
+        if remove_fmha_v2_wrapper:
+            backends.remove(_wrapper_backend)
 
     if "cutlass" in backends:
         print("[INFO] CUTLASS backend does not support prefill. Skipping.")
@@ -1229,10 +1249,23 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     # Ensure trtllm-fmha-v2 sees contiguous HND-physical paged KV cache.
     # Skip if kv_cache is not a plain Tensor (e.g., NVFP4 packed tuple).
     # backend filter further down also drops trtllm-fmha-v2 in that case.
-    if "trtllm-fmha-v2" in backends and isinstance(kv_cache, torch.Tensor):
+    if (
+        "trtllm-fmha-v2" in backends
+        or "trtllm-fmha-v2-wrapper" in backends
+        or "trtllm-fmha-v2-wrapper-e2e" in backends
+    ) and isinstance(kv_cache, torch.Tensor):
         _fmha_v2_kv_cache = kv_cache.contiguous()
     else:
         _fmha_v2_kv_cache = kv_cache
+
+    # Preallocate the output for the wrapper backends so the timed run() does no
+    # allocation, matching the functional trtllm_fmha_v2_prefill baseline whose
+    # per-call torch.empty is allocator-cached and effectively free.
+    _fmha_v2_wrapper_out = None
+    if "trtllm-fmha-v2-wrapper" in backends or "trtllm-fmha-v2-wrapper-e2e" in backends:
+        _fmha_v2_wrapper_out = torch.empty(
+            q.shape[0], num_qo_heads, head_dim_vo, dtype=o_data_type, device=device
+        )
 
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
     backend_wrappers = {}
@@ -1299,6 +1332,39 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 block_tables=block_tables,
             )
             resolved_backends[backend] = backend_wrappers[backend]._backend
+        elif backend in ("trtllm-fmha-v2-wrapper", "trtllm-fmha-v2-wrapper-e2e"):
+            # Standalone FMHAv2 wrapper (flashinfer/fmha_v2.py): plan() is one
+            # fused prep launch; run() is a single kernel launch fed by the
+            # device-resident scale words the prep kernel wrote. The plain
+            # "-wrapper" backend plans once here (plan cost amortized); the
+            # "-e2e" backend re-plans inside every timed iteration.
+            _q_scale = q_scale if q_scale is not None else 1.0
+            _k_scale = k_scale if k_scale is not None else 1.0
+            _v_scale = v_scale if v_scale is not None else 1.0
+            backend_wrappers[backend] = FmhaV2BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer,
+                kv_layout="HND",
+            )
+            _fmha_v2_wrapper_plan_args = (
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len,
+                page_size,
+                s_qo,  # max_q_len
+                s_kv,  # max_kv_len
+                _q_scale * _k_scale * scale,  # bmm1_scale
+                _v_scale,  # bmm2_scale
+            )
+            _fmha_v2_wrapper_plan_kwargs = dict(
+                causal=causal,
+                q_data_type=q_dtype,
+                o_data_type=o_data_type,
+            )
+            backend_wrappers[backend].plan(
+                *_fmha_v2_wrapper_plan_args, **_fmha_v2_wrapper_plan_kwargs
+            )
+            resolved_backends[backend] = backend
         else:
             resolved_backends[backend] = backend
 
@@ -1404,6 +1470,18 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 mask_mode="causal" if causal else "padding",
                 out_dtype=o_data_type,
             )
+        elif backend == "trtllm-fmha-v2-wrapper":
+            return backend_wrappers[backend].run(
+                q, _fmha_v2_kv_cache, out=_fmha_v2_wrapper_out
+            )
+        elif backend == "trtllm-fmha-v2-wrapper-e2e":
+            # E2E cost of the refactored wrapper: fused prep (plan) + run.
+            backend_wrappers[backend].plan(
+                *_fmha_v2_wrapper_plan_args, **_fmha_v2_wrapper_plan_kwargs
+            )
+            return backend_wrappers[backend].run(
+                q, _fmha_v2_kv_cache, out=_fmha_v2_wrapper_out
+            )
         else:
             print(f"[ERROR] Backend {backend} not supported")
             return None
@@ -1474,6 +1552,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             "trtllm-gen",
             "trtllm-native",
             "trtllm-fmha-v2",
+            "trtllm-fmha-v2-wrapper",
+            "trtllm-fmha-v2-wrapper-e2e",
         ]
         for candidate in reference_priority:
             if candidate in tested_backends:
@@ -1705,8 +1785,20 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         if remove_trtllm_native:
             backends.remove("trtllm-native")
 
+    # Layout selection shared by the legacy trtllm-fmha-v2 backend and the
+    # standalone FmhaV2 ragged wrapper backends (the wrapper follows the same
+    # shape-driven layout choice so both benchmark the same kernel).
+    _fmha_v2_backends = [
+        b
+        for b in (
+            "trtllm-fmha-v2",
+            "trtllm-fmha-v2-wrapper",
+            "trtllm-fmha-v2-wrapper-e2e",
+        )
+        if b in backends
+    ]
     fmha_v2_layout = None
-    if "trtllm-fmha-v2" in backends:
+    if _fmha_v2_backends:
         same_token_count = s_qo == s_kv
         same_head_dim = head_dim_qk == head_dim_vo
         if same_token_count and same_head_dim:
@@ -1720,19 +1812,21 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             )
             if is_sm12x_supported(device):
                 print(
-                    "[INFO] trtllm-fmha-v2 backend has no compatible input layout "
+                    "[INFO] FMHAv2 backends have no compatible input layout "
                     f"on SM12x for s_qo={s_qo} != s_kv={s_kv} or "
                     f"head_dim_qk={head_dim_qk} != head_dim_vo={head_dim_vo} "
                     "(SEPARATE_Q_K_V is not compiled for SM12x). Skipping."
                 )
-                backends.remove("trtllm-fmha-v2")
+                for b in _fmha_v2_backends:
+                    backends.remove(b)
             elif fp8_requested:
                 print(
-                    "[INFO] trtllm-fmha-v2 backend does not support FP8 with the "
+                    "[INFO] FMHAv2 backends do not support FP8 with the "
                     "SEPARATE_Q_K_V layout (required by s_qo != s_kv or "
                     "head_dim_qk != head_dim_vo). Skipping."
                 )
-                backends.remove("trtllm-fmha-v2")
+                for b in _fmha_v2_backends:
+                    backends.remove(b)
             else:
                 fmha_v2_layout = "SEPARATE_Q_K_V"
 
@@ -1953,7 +2047,6 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 v_indptr=v_indptr,
                 o_indptr=o_indptr,
             )
-
     q_scale, k_scale, v_scale = None, None, None
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         q_scale = q.abs().amax().item() / 256
@@ -1964,17 +2057,75 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         k = (k / k_scale).to(kv_dtype)
         v = (v / v_scale).to(kv_dtype)
 
-    # Build the input argument for trtllm-fmha-v2 once, in whichever layout was
-    # selected during backend filtering. Done after FP8 quantization so the
+    # Build the input argument for the FMHAv2 backends once, in whichever layout
+    # was selected during backend filtering. Done after FP8 quantization so the
     # stacked tensor inherits the final dtype.
     fmha_v2_qkv = None
-    if "trtllm-fmha-v2" in backends:
+    _fmha_v2_backends = [
+        b
+        for b in (
+            "trtllm-fmha-v2",
+            "trtllm-fmha-v2-wrapper",
+            "trtllm-fmha-v2-wrapper-e2e",
+        )
+        if b in backends
+    ]
+    if _fmha_v2_backends:
         if fmha_v2_layout == "PACKED_QKV":
             fmha_v2_qkv = torch.stack([q, k, v], dim=1)
         elif fmha_v2_layout == "CONTIGUOUS_Q_KV":
             fmha_v2_qkv = (q, torch.stack([k, v], dim=1))
         else:
             fmha_v2_qkv = (q, k, v)
+
+    # Standalone FmhaV2 ragged wrappers (flashinfer/fmha_v2.py). Planned after
+    # FP8 quantization because the fused BMM scales are baked in at plan time.
+    # "-wrapper" plans once here (plan cost amortized across runs); "-e2e"
+    # re-plans inside every timed iteration.
+    _fmha_v2_wrapper_out = None
+    for _wrapper_backend in ("trtllm-fmha-v2-wrapper", "trtllm-fmha-v2-wrapper-e2e"):
+        if _wrapper_backend not in backends:
+            continue
+        _q_scale = q_scale if q_scale is not None else 1.0
+        _k_scale = k_scale if k_scale is not None else 1.0
+        _v_scale = v_scale if v_scale is not None else 1.0
+        _fmha_v2_wrapper_plan_args = (
+            actual_seq_lens_q_device.flatten().int(),
+            actual_seq_lens_kv_device.flatten().int(),
+            s_qo,  # max_q_len
+            s_kv,  # max_kv_len
+            _q_scale * _k_scale * scale,  # bmm1_scale
+            _v_scale,  # bmm2_scale
+        )
+        _fmha_v2_wrapper_plan_kwargs = dict(
+            input_layout=fmha_v2_layout,
+            causal=causal,
+            q_data_type=q_dtype,
+            o_data_type=out_dtype,
+        )
+        backend_wrappers[_wrapper_backend] = FmhaV2BatchPrefillWithRaggedKVCacheWrapper(
+            workspace_buffer
+        )
+        backend_wrappers[_wrapper_backend].plan(
+            *_fmha_v2_wrapper_plan_args, **_fmha_v2_wrapper_plan_kwargs
+        )
+        if _fmha_v2_wrapper_out is None:
+            _fmha_v2_wrapper_out = torch.empty(
+                q.shape[0], num_qo_heads, head_dim_vo, dtype=out_dtype, device=device
+            )
+
+    def _run_fmha_v2_wrapper(backend):
+        # Tensor slots follow the planned layout; out is preallocated so the
+        # timed call does no allocation (the legacy API's torch.empty is
+        # allocator-cached and effectively free).
+        if fmha_v2_layout == "PACKED_QKV":
+            return backend_wrappers[backend].run(fmha_v2_qkv, out=_fmha_v2_wrapper_out)
+        elif fmha_v2_layout == "CONTIGUOUS_Q_KV":
+            return backend_wrappers[backend].run(
+                fmha_v2_qkv[0], fmha_v2_qkv[1], out=_fmha_v2_wrapper_out
+            )
+        else:
+            return backend_wrappers[backend].run(q, k, v, out=_fmha_v2_wrapper_out)
 
     trtllm_out = None
     if "trtllm-native" in backends or "cute-dsl" in backends:
@@ -2101,6 +2252,14 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 mask_mode="causal" if causal else "padding",
                 out_dtype=out_dtype,
             )
+        elif backend == "trtllm-fmha-v2-wrapper":
+            return _run_fmha_v2_wrapper(backend)
+        elif backend == "trtllm-fmha-v2-wrapper-e2e":
+            # E2E cost of the refactored wrapper: fused prep (plan) + run.
+            backend_wrappers[backend].plan(
+                *_fmha_v2_wrapper_plan_args, **_fmha_v2_wrapper_plan_kwargs
+            )
+            return _run_fmha_v2_wrapper(backend)
         else:
             print(f"[ERROR] Backend {backend} not supported")
             return None

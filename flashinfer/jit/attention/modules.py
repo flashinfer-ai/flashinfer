@@ -2052,7 +2052,9 @@ def gen_trtllm_fmha_v2_sm120_module() -> JitSpec:
 
 
 def gen_fmha_v2_module(
-    input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None
+    input_layout: str,
+    input_dtype: torch.dtype,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> JitSpec:
     # Setup generated source directory
     if output_dtype is None:
@@ -2084,19 +2086,21 @@ def gen_fmha_v2_module(
         compilation_context=current_compilation_context,
     )
 
-    # copy static fmha_v2_run.cu
-    static_run_path = csrc_dir / "fmha_v2_run.cu"
-    run_path = gen_directory / "fmha_v2_run.cu"
-    with open(static_run_path, "r") as f:
-        write_if_different(run_path, f.read())
-    source_paths.append(run_path)
-
-    # copy static fmha_v2_jit_binding.cu
-    static_binding_path = csrc_dir / "fmha_v2_jit_binding.cu"
-    binding_path = gen_directory / "fmha_v2_jit_binding.cu"
-    with open(static_binding_path, "r") as f:
-        write_if_different(binding_path, f.read())
-    source_paths.append(binding_path)
+    # Copy the static launcher/binding sources so one loaded module exposes
+    # run() (called once per run) plus prepare()/prepare_paged() — two
+    # instantiations of the same fused prep kernel (cum-scan + scale encode;
+    # the paged variant also derives kv_lens/block_tables), called once per
+    # plan().
+    for fname in [
+        "fmha_v2_run.cu",
+        "fmha_v2_jit_binding.cu",
+        "fmha_v2_prepare.cu",
+        "fmha_v2_prepare_jit_binding.cu",
+    ]:
+        dest_path = gen_directory / fname
+        with open(csrc_dir / fname, "r") as f:
+            write_if_different(dest_path, f.read())
+        source_paths.append(dest_path)
 
     # Setup compilation flags
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
@@ -2109,6 +2113,10 @@ def gen_fmha_v2_module(
             f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}",
             f"-I{jit_env.FLASHINFER_INCLUDE_DIR}",  # For flashinfer headers
             "-Wno-deprecated-gpu-targets",
+            # The module is dtype-specialized; bake the kernel Data_type so the
+            # fmha_v2_prepare launcher can host-encode the BMM scale words with
+            # the same scale-type selection as fmha_v2_run.cu::set_params.
+            f"-DFMHA_V2_DATA_TYPE=DATA_TYPE_{input_dtype_str.upper()}",
         ]
     )
 

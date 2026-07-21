@@ -34,11 +34,11 @@ from .trace.templates.gemm import (
     trtllm_ragged_attention_deepseek_trace,
 )
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
+from .fmha_v2 import get_trtllm_fmha_v2_module
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
-    gen_fmha_v2_module,
     gen_single_prefill_module,
     get_batch_prefill_uri,
     get_single_prefill_uri,
@@ -1659,8 +1659,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``trtllm-gen``.
-            Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/
+            ``trtllm-gen``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
 
@@ -2449,7 +2449,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     ]
                     block_id += num_blocks_needed
 
-        if self._cached_module is not None:
+        if self._cached_module is not None and self._backend != "trtllm-gen":
             args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -3089,9 +3089,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``
-            or ``cute-dsl``.
-            Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``/
+            ``cute-dsl``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
@@ -5004,11 +5003,10 @@ def fmha_v2_prefill_deepseek(
         return out
 
 
-@functools.cache
-def get_trtllm_fmha_v2_module(
-    input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None
-):
-    return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
+# The FMHAv2 batch-prefill wrappers live in flashinfer/fmha_v2.py
+# (FmhaV2BatchPrefillWith{Paged,Ragged}KVCacheWrapper); only the legacy
+# free-function kernel APIs below remain here. get_trtllm_fmha_v2_module is
+# imported at the top for them.
 
 
 @flashinfer_api(trace=trtllm_fmha_v2_prefill_trace)
@@ -5307,6 +5305,10 @@ def trtllm_fmha_v2_prefill(
         skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
         lse,  # Optional LSE tensor (None if not saving softmax stats)
         sinks,  # Optional sinks tensor
+        # The legacy free function does not run the prep kernel; pass None so the kernel
+        # reads the host-encoded scales (current behaviour).
+        None,  # scale_bmm1_d
+        None,  # scale_bmm2_d
     )
 
     if save_softmax_stats:

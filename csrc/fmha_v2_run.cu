@@ -360,7 +360,10 @@ void fmha_v2_run(
     int window_left, int chunked_attention_size, bool has_alibi, float softcapping_scale,
     float skip_softmax_threshold_scale_factor,
     Optional<ffi::TensorView> softmax_stats,  // Optional [batch, s_q, num_heads, 2] for (max, sum)
-    Optional<ffi::TensorView> sinks) {
+    Optional<ffi::TensorView> sinks,
+    // Optional device-resident scale words populated by fmha_v2_prepare. When set, the
+    // kernel-side read sites prefer these over the host-encoded params.scale_bmm{1,2}.
+    Optional<ffi::TensorView> scale_bmm1_d, Optional<ffi::TensorView> scale_bmm2_d) {
   bool is_paged_hnd;
   Attention_input_layout input_layout = string_to_input_layout(input_layout_str, is_paged_hnd);
   Attention_mask_type attention_mask_type = string_to_mask_type(mask_mode_str);
@@ -635,6 +638,16 @@ void fmha_v2_run(
   if (input_layout == Attention_input_layout::Q_PAGED_KV && block_table_max_blocks > 0) {
     params_v2.paged_kv_cache.mMaxBlocksPerSeq = block_table_max_blocks;
     params_v2.paged_kv_cache.mUsesSharedPagedKvIdx = true;
+  }
+
+  // Optional device-resident scale words populated by fmha_v2_prepare. The host-encoded
+  // params.scale_bmm{1,2} stays as a fallback; the kernel-side code paths in
+  // softmax.h / gmem_tile_o_packed.h / epilogue.h prefer the device pointer when set.
+  if (scale_bmm1_d.has_value()) {
+    params_v2.scale_bmm1_d = reinterpret_cast<uint32_t*>(scale_bmm1_d.value().data_ptr());
+  }
+  if (scale_bmm2_d.has_value()) {
+    params_v2.scale_bmm2_d = reinterpret_cast<uint32_t*>(scale_bmm2_d.value().data_ptr());
   }
 
   // Total number of Q tokens is needed to set TMA desc on the host.

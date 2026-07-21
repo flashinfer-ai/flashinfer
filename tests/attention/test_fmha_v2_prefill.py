@@ -5,9 +5,17 @@ from typing import Optional, Tuple, Union
 
 import flashinfer
 
+from flashinfer.fmha_v2 import (
+    FmhaV2BatchPrefillWithPagedKVCacheWrapper,
+    FmhaV2BatchPrefillWithRaggedKVCacheWrapper,
+)
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
-from flashinfer.utils import is_sm12x_supported
+from flashinfer.utils import (
+    is_sm12x_supported,
+    is_sm90a_supported,
+    is_sm120a_supported,
+)
 
 _WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _workspace_buffer: Optional[torch.Tensor] = None
@@ -480,7 +488,14 @@ def run_trtllm_fmha_v2_prefill_case(
     skip_softmax_threshold_scale_factor: float,
     rtol: Optional[float] = None,
     atol: Optional[float] = None,
+    use_wrapper: bool = False,
 ) -> None:
+    """Run one FMHAv2 prefill case against the torch reference.
+
+    ``use_wrapper=False`` drives the legacy ``trtllm_fmha_v2_prefill`` free
+    function; ``use_wrapper=True`` drives the same configuration through the
+    plan/run wrappers (``FmhaV2BatchPrefillWith{Paged,Ragged}KVCacheWrapper``).
+    """
     from flashinfer.prefill import trtllm_fmha_v2_prefill
     from flashinfer.utils import is_sm90a_supported
 
@@ -681,28 +696,108 @@ def run_trtllm_fmha_v2_prefill_case(
     workspace_buffer = _get_workspace_buffer()
 
     # --- Run kernel ---
-    result = trtllm_fmha_v2_prefill(
-        qkv_arg,
-        input_layout,
-        workspace_buffer=workspace_buffer,
-        seq_lens=seq_lens,
-        max_q_len=max_q_len,
-        max_kv_len=max_kv_len,
-        bmm1_scale=bmm1_scale,
-        bmm2_scale=bmm2_scale,
-        batch_size=batch_size,
-        cum_seq_lens_q=cum_seq_lens,
-        cum_seq_lens_kv=cum_seq_lens,
-        block_tables=block_tables,
-        out=o,
-        out_dtype=o_dtype,
-        mask_mode=mask_mode,
-        window_left=window_left,
-        logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
-        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-        pos_encoding_mode=pos_encoding_mode,
-        save_softmax_stats=save_softmax_stats,
-    )
+    if use_wrapper:
+        soft_cap = logits_soft_cap if logits_soft_cap > 0 else None
+        pos_mode = "ALIBI" if pos_encoding_mode == "alibi" else "NONE"
+        if input_layout in ("Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"):
+            # Rebuild the sparse paged representation matching the dense
+            # block_tables constructed above (row i uses blocks
+            # [i*max_num_blocks, i*max_num_blocks + n_i)).
+            blocks_per_seq = torch.tensor(
+                [
+                    (int(seq_lens[i].item()) + page_size - 1) // page_size
+                    for i in range(batch_size)
+                ],
+                dtype=torch.int32,
+                device=device,
+            )
+            paged_kv_indptr = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=device
+            )
+            paged_kv_indptr[1:] = torch.cumsum(blocks_per_seq, dim=0)
+            paged_kv_indices = torch.cat(
+                [
+                    torch.arange(
+                        i * max_num_blocks,
+                        i * max_num_blocks + int(blocks_per_seq[i].item()),
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    for i in range(batch_size)
+                ]
+            )
+            paged_kv_last_page_len = seq_lens - (blocks_per_seq - 1) * page_size
+
+            wrapper = FmhaV2BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer,
+                kv_layout="NHD" if input_layout == "Q_PAGED_KV_NHD" else "HND",
+            )
+            wrapper.plan(
+                cum_seq_lens,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+                page_size,
+                max_q_len,
+                max_kv_len,
+                bmm1_scale,
+                bmm2_scale,
+                causal=causal,
+                pos_encoding_mode=pos_mode,
+                window_left=window_left,
+                logits_soft_cap=soft_cap,
+                q_data_type=dtype,
+                o_data_type=o_dtype,
+            )
+            result = wrapper.run(
+                q, paged_kv_cache, out=o, return_lse=save_softmax_stats
+            )
+        else:
+            wrapper = FmhaV2BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer)
+            wrapper.plan(
+                seq_lens,
+                seq_lens,
+                max_q_len,
+                max_kv_len,
+                bmm1_scale,
+                bmm2_scale,
+                input_layout=input_layout,
+                causal=causal,
+                pos_encoding_mode=pos_mode,
+                window_left=window_left,
+                logits_soft_cap=soft_cap,
+                q_data_type=dtype,
+                o_data_type=o_dtype,
+            )
+            if input_layout == "PACKED_QKV":
+                result = wrapper.run(packed_qkv, out=o, return_lse=save_softmax_stats)
+            elif input_layout == "CONTIGUOUS_Q_KV":
+                result = wrapper.run(q, kv, out=o, return_lse=save_softmax_stats)
+            else:  # SEPARATE_Q_K_V
+                result = wrapper.run(q, k, v, out=o, return_lse=save_softmax_stats)
+    else:
+        result = trtllm_fmha_v2_prefill(
+            qkv_arg,
+            input_layout,
+            workspace_buffer=workspace_buffer,
+            seq_lens=seq_lens,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=batch_size,
+            cum_seq_lens_q=cum_seq_lens,
+            cum_seq_lens_kv=cum_seq_lens,
+            block_tables=block_tables,
+            out=o,
+            out_dtype=o_dtype,
+            mask_mode=mask_mode,
+            window_left=window_left,
+            logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            pos_encoding_mode=pos_encoding_mode,
+            save_softmax_stats=save_softmax_stats,
+        )
 
     if save_softmax_stats:
         output, kernel_lse = result
@@ -848,6 +943,87 @@ def test_trtllm_fmha_v2_prefill(
         pos_encoding_mode=pos_encoding_mode,
         save_softmax_stats=save_softmax_stats,
         skip_softmax_threshold_scale_factor=0.0,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("max_seq_len", [1024])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize(
+    ("dtype", "o_dtype"),
+    [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
+    ],
+)
+@pytest.mark.parametrize(
+    ("input_layout", "page_size", "save_softmax_stats"),
+    [
+        ("PACKED_QKV", None, False),
+        ("CONTIGUOUS_Q_KV", None, False),
+        ("CONTIGUOUS_Q_KV", None, True),
+        ("SEPARATE_Q_K_V", None, False),
+        ("Q_PAGED_KV_NHD", 32, False),
+        ("Q_PAGED_KV_NHD", 128, False),
+        ("Q_PAGED_KV_HND", 32, False),
+        ("Q_PAGED_KV_HND", 128, False),
+    ],
+)
+@pytest.mark.parametrize(
+    ("causal", "window_left", "mask_mode"),
+    [
+        (True, -1, "CAUSAL"),
+        (True, 127, "SLIDING_WINDOW"),
+        (True, 512, "SLIDING_WINDOW"),
+    ],
+)
+@pytest.mark.parametrize("pos_encoding_mode", [None])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+def test_fmha_v2_prefill_wrapper(
+    input_layout: str,
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: Optional[int],
+    dtype: torch.dtype,
+    o_dtype: torch.dtype,
+    causal: bool,
+    mask_mode: str,
+    window_left: int,
+    logits_soft_cap: float,
+    pos_encoding_mode: str,
+    save_softmax_stats: bool,
+) -> None:
+    """The full legacy configuration matrix, driven through the plan/run
+    wrappers instead of the ``trtllm_fmha_v2_prefill`` free function. The
+    fused prep kernel replaces the caller-provided cum-seq-lens / host
+    set_alpha / per-launch memset of the legacy path; everything else
+    (inputs, reference, tolerances, LSE verification) is shared."""
+    run_trtllm_fmha_v2_prefill_case(
+        input_layout=input_layout,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        dtype=dtype,
+        o_dtype=o_dtype,
+        causal=causal,
+        mask_mode=mask_mode,
+        window_left=window_left,
+        logits_soft_cap=logits_soft_cap,
+        pos_encoding_mode=pos_encoding_mode,
+        save_softmax_stats=save_softmax_stats,
+        skip_softmax_threshold_scale_factor=0.0,
+        use_wrapper=True,
     )
 
 
@@ -1306,6 +1482,226 @@ def test_trtllm_fmha_v2_prefill_chunked_attention(
 
     rtol, atol = 1e-2, 1e-2
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
+
+
+def _skip_unless_trtllm_fmhav2_supported() -> None:
+    if not (
+        is_sm90a_supported(torch.device("cuda"))
+        or is_sm120a_supported(torch.device("cuda"))
+    ):
+        pytest.skip("FMHAv2 prefill requires SM90 or SM120")
+
+
+def _make_trtllm_fmhav2_paged_case(
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    kv_layout: str,
+    dtype: torch.dtype,
+    causal: bool,
+    seed: int,
+):
+    """Build paged-KV inputs for ``FmhaV2BatchPrefillWithPagedKVCacheWrapper`` plus the reference output.
+
+    Returns ``(q, paged_kv_cache, plan_args, out_ref)`` where ``plan_args`` are
+    the positional arguments of ``FmhaV2BatchPrefillWithPagedKVCacheWrapper.plan()``
+    and ``out_ref`` is the fp32 ``attention_ref_torch`` output.
+
+    The KV pool is a single interleaved allocation ``[num_pages, 2, ...]``
+    (K at page*2, V at page*2+1) as the FMHAv2 paged kernel requires;
+    k_cache/v_cache are non-owning views so k_cache.data_ptr() == pool base.
+    """
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+
+    # Per-sequence KV lengths; full prefill so q_len == kv_len.
+    kv_seq_lens = torch.randint(
+        max_seq_len // 2,
+        max_seq_len + 1,
+        (batch_size,),
+        dtype=torch.int32,
+        device=device,
+    )
+
+    # FlashInfer paged indptr/indices (the prepare_paged kernel's natural inputs).
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    qo_indptr[1:] = torch.cumsum(kv_seq_lens, dim=0)
+
+    num_pages_per_seq = (kv_seq_lens + page_size - 1) // page_size
+    paged_kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    paged_kv_indptr[1:] = torch.cumsum(num_pages_per_seq, dim=0)
+    total_pages = int(paged_kv_indptr[-1].item())
+    paged_kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)
+    paged_kv_last_page_len = ((kv_seq_lens - 1) % page_size) + 1
+
+    if kv_layout == "NHD":
+        kv_pool = torch.randn(
+            total_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+    else:  # HND
+        kv_pool = torch.randn(
+            total_pages,
+            2,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+    paged_kv_cache = (kv_pool[:, 0], kv_pool[:, 1])
+
+    total_q_tokens = int(qo_indptr[-1].item())
+    q = torch.randn(total_q_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+
+    # Reference: attention_ref_torch expects a 5-D NHD paged cache and dense
+    # block_tables; build both host-side (plan() derives them on device).
+    if kv_layout == "HND":
+        k_ref = kv_pool[:, 0].transpose(-3, -2).contiguous()
+        v_ref = kv_pool[:, 1].transpose(-3, -2).contiguous()
+    else:
+        k_ref = kv_pool[:, 0].contiguous()
+        v_ref = kv_pool[:, 1].contiguous()
+    paged_kv_cache_ref = torch.stack([k_ref, v_ref], dim=1)
+
+    max_blocks = int(num_pages_per_seq.max().item())
+    block_tables_ref = torch.zeros(
+        batch_size, max_blocks, dtype=torch.int32, device=device
+    )
+    indptr_cpu = paged_kv_indptr.cpu()
+    num_pages_cpu = num_pages_per_seq.cpu()
+    for i in range(batch_size):
+        n = int(num_pages_cpu[i].item())
+        s = int(indptr_cpu[i].item())
+        block_tables_ref[i, :n] = paged_kv_indices[s : s + n]
+
+    out_ref = attention_ref_torch(
+        (q, paged_kv_cache_ref),
+        seq_lens=kv_seq_lens,
+        cum_seq_lens_q=qo_indptr,
+        sm_scale=1.0 / math.sqrt(head_dim),
+        causal=causal,
+        block_tables=block_tables_ref,
+    ).float()
+
+    max_len = int(kv_seq_lens.max().item())  # full prefill: q_len == kv_len
+    plan_args = (
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        page_size,
+        max_len,  # max_q_len
+        max_len,  # max_kv_len
+        1.0 / math.sqrt(head_dim),  # bmm1_scale
+        1.0,  # bmm2_scale
+    )
+    return q, paged_kv_cache, plan_args, out_ref
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("max_seq_len", [256, 1024])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("page_size", [16, 64])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [True, False])
+def test_batch_prefill_paged_trtllm_fmhav2_wrapper(
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    kv_layout: str,
+    dtype: torch.dtype,
+    causal: bool,
+) -> None:
+    """End-to-end test for ``FmhaV2BatchPrefillWithPagedKVCacheWrapper``.
+
+    Drives the fused ``prepare_paged`` device kernel through ``wrapper.plan()``
+    (paged→dense block-table scatter + cum-scan / scale encode in one launch)
+    and the device-resident scale-word feed into ``wrapper.run()``.
+    """
+    _skip_unless_trtllm_fmhav2_supported()
+
+    q, paged_kv_cache, plan_args, out_ref = _make_trtllm_fmhav2_paged_case(
+        batch_size,
+        max_seq_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        kv_layout,
+        dtype,
+        causal,
+        seed=42,
+    )
+    wrapper = FmhaV2BatchPrefillWithPagedKVCacheWrapper(
+        _get_workspace_buffer(), kv_layout=kv_layout
+    )
+    wrapper.plan(*plan_args, causal=causal, q_data_type=dtype)
+    out = wrapper.run(q, paged_kv_cache)
+
+    torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("causal", [True, False])
+def test_batch_prefill_paged_trtllm_fmhav2_plan_reuse(
+    kv_layout: str,
+    causal: bool,
+) -> None:
+    """plan() once, run() many times back-to-back.
+
+    On SM90 the warp-specialized kernel's tile scheduler consumes
+    ``tile_id_counter`` via atomicAdd (dma.h), leaving it at ``num_tiles``
+    after each launch; plan-once/run-many correctness relies on the
+    launcher's per-launch cudaMemsetAsync re-zeroing it
+    (kernel_hopper_ws.jinja). This test fails if that re-zero is ever
+    dropped — e.g. by reintroducing an externally-zeroed counter without a
+    per-run reset.
+    """
+    _skip_unless_trtllm_fmhav2_supported()
+
+    dtype = torch.float16
+    num_runs = 32
+    q, paged_kv_cache, plan_args, out_ref = _make_trtllm_fmhav2_paged_case(
+        batch_size=4,
+        max_seq_len=512,
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=128,
+        page_size=16,
+        kv_layout=kv_layout,
+        dtype=dtype,
+        causal=causal,
+        seed=7,
+    )
+    wrapper = FmhaV2BatchPrefillWithPagedKVCacheWrapper(
+        _get_workspace_buffer(), kv_layout=kv_layout
+    )
+    wrapper.plan(*plan_args, causal=causal, q_data_type=dtype)
+
+    for run_idx in range(num_runs):
+        out = wrapper.run(q, paged_kv_cache)
+        torch.testing.assert_close(
+            out.float(),
+            out_ref,
+            rtol=1e-2,
+            atol=1e-2,
+            msg=lambda m, i=run_idx: f"mismatch on run #{i} after single plan(): {m}",
+        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
