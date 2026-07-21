@@ -12,14 +12,28 @@ Use torchrun to benchmark both real expert- and tensor-parallel communication:
     torchrun --standalone --nproc-per-node=8 \\
         benchmarks/bench_cute_dsl_moe_distributed.py
 
-Use ``--mode profile --num-tokens <N>`` to print a semantic runtime breakdown
-for each variant. The same stages are emitted as NVTX ranges for deeper Nsight
-Systems inspection without relying on kernel-name matching.
+Run profile mode directly to capture and report per-kernel Nsight Systems
+breakdowns for all four topology/activation combinations:
+
+    python3 benchmarks/bench_cute_dsl_moe_distributed.py \
+        --mode profile --num-tokens 4096
+
+The workload stages remain available as NVTX ranges. Kernel attribution uses
+those ranges rather than matching kernel names.
 """
 
 import argparse
+import csv
 import gc
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import warnings
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -31,6 +45,9 @@ from bench_moe_deepseek import (
 )
 
 DISTRIBUTED_TOKEN_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+_PROFILE_CASE_ENV = "FLASHINFER_CUTE_DSL_MOE_PROFILE_CASE"
+# Nsight global thread IDs reserve the low 24 bits for the thread ID.
+_NSYS_GLOBAL_ID_PROCESS_MASK = -(1 << 24)
 
 
 @dataclass(frozen=True)
@@ -50,6 +67,239 @@ class DistributedBenchResult:
     num_tokens: int
     e2e_ms: float
     breakdown_ms: dict[str, float] | None = None
+
+
+@dataclass(frozen=True)
+class KernelProfileRow:
+    stage: str
+    name: str
+    time_percent: float
+    total_ms: float
+    instances: int
+    average_us: float
+
+
+def _verbose_print(args, *values):
+    if args.verbose:
+        print(*values, flush=True)
+
+
+def _profile_worker_arguments(args, num_tokens):
+    arguments = [
+        "--num-tokens",
+        str(num_tokens),
+        "--warmup",
+        str(args.warmup),
+        "--iters",
+        str(args.iters),
+        "--num-gpus",
+        str(args.num_gpus),
+        "--allreduce-backend",
+        args.allreduce_backend,
+        "--mode",
+        "profile",
+        "--profile-iters",
+        str(args.profile_iters),
+    ]
+    if args.use_per_token_activation:
+        arguments.append("--use-per-token-activation")
+    if not args.use_fused_finalize:
+        arguments.append("--no-fused-finalize")
+    if not args.enable_pdl:
+        arguments.append("--no-pdl")
+    if args.verbose:
+        arguments.append("--verbose")
+    return arguments
+
+
+def _load_nsys_kernel_rows(nsys, report, verbose):
+    sqlite_report = report.with_suffix(".sqlite")
+    command = [
+        nsys,
+        "export",
+        "--type=sqlite",
+        "--force-overwrite=true",
+        "--output",
+        str(sqlite_report),
+        str(report),
+    ]
+    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    if verbose:
+        print(completed.stdout, end="")
+        print(completed.stderr, end="", file=sys.stderr)
+
+    with sqlite3.connect(sqlite_report) as connection:
+        raw_rows = connection.execute(
+            """
+            WITH stage_ranges AS (
+                SELECT
+                    nvtx.start,
+                    nvtx.end,
+                    nvtx.globalTid,
+                    substr(COALESCE(nvtx.text, range_name.value), 8) AS stage
+                FROM NVTX_EVENTS AS nvtx
+                LEFT JOIN StringIds AS range_name ON range_name.id = nvtx.textId
+                WHERE
+                    nvtx.end IS NOT NULL
+                    AND COALESCE(nvtx.text, range_name.value) LIKE 'stage::%'
+            ),
+            stage_launches AS (
+                SELECT
+                    stage_ranges.stage,
+                    runtime.correlationId,
+                    (runtime.globalTid & :process_mask) AS globalPid
+                FROM stage_ranges
+                JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS runtime ON
+                    runtime.start >= stage_ranges.start
+                    AND runtime.start <= stage_ranges.end
+                    AND (runtime.globalTid & :process_mask) =
+                        (stage_ranges.globalTid & :process_mask)
+            )
+            SELECT
+                stage_launches.stage,
+                kernel_name.value,
+                SUM(kernel.end - kernel.start) AS total_ns,
+                COUNT(*) AS instances,
+                AVG(kernel.end - kernel.start) AS average_ns
+            FROM stage_launches
+            JOIN CUPTI_ACTIVITY_KIND_KERNEL AS kernel ON
+                kernel.correlationId = stage_launches.correlationId
+                AND kernel.globalPid = stage_launches.globalPid
+            JOIN StringIds AS kernel_name ON kernel_name.id = kernel.shortName
+            GROUP BY stage_launches.stage, kernel.shortName
+            ORDER BY total_ns DESC
+            """,
+            {"process_mask": _NSYS_GLOBAL_ID_PROCESS_MASK},
+        ).fetchall()
+
+    total_kernel_ns = sum(row[2] for row in raw_rows)
+    if not total_kernel_ns:
+        raise RuntimeError(f"Nsight Systems reported no staged kernels in {report}")
+    return [
+        KernelProfileRow(
+            stage=stage,
+            name=name,
+            time_percent=total_ns / total_kernel_ns * 100,
+            total_ms=total_ns / 1e6,
+            instances=instances,
+            average_us=average_ns / 1e3,
+        )
+        for stage, name, total_ns, instances, average_ns in raw_rows
+    ]
+
+
+def _print_nsys_kernel_breakdown(mode, variant, num_tokens, num_gpus, rows, report):
+    print(
+        f"\nNsight Systems kernel breakdown: {mode.upper()}{num_gpus} "
+        f"{variant.upper()}, {num_tokens} global tokens"
+    )
+    print(
+        "stage                     | GPU time | total (ms) | instances | "
+        "avg (us) | kernel"
+    )
+    csv_report = report.with_suffix(".kernels.csv")
+    with csv_report.open("w", newline="") as csv_file:
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(
+            (
+                "mode",
+                "variant",
+                "num_tokens",
+                "num_gpus",
+                "stage",
+                "gpu_time_percent",
+                "total_ms",
+                "instances",
+                "average_us",
+                "kernel",
+            )
+        )
+        for row in rows:
+            display_name = row.name if len(row.name) <= 96 else f"{row.name[:93]}..."
+            print(
+                f"{row.stage:<25} | {row.time_percent:>7.2f}% | "
+                f"{row.total_ms:>10.3f} | {row.instances:>9} | "
+                f"{row.average_us:>8.3f} | {display_name}"
+            )
+            csv_writer.writerow(
+                (
+                    mode,
+                    variant,
+                    num_tokens,
+                    num_gpus,
+                    row.stage,
+                    f"{row.time_percent:.6f}",
+                    f"{row.total_ms:.6f}",
+                    row.instances,
+                    f"{row.average_us:.6f}",
+                    row.name,
+                )
+            )
+    print("GPU time is aggregated across all ranks and captured iterations.")
+    print(f"Nsight Systems report: {report}")
+    print(f"Kernel CSV: {csv_report}")
+
+
+def _run_nsys_profiles(args, num_tokens):
+    nsys = shutil.which("nsys")
+    torchrun = shutil.which("torchrun")
+    if nsys is None:
+        raise RuntimeError("--mode profile requires Nsight Systems (nsys)")
+    if torchrun is None:
+        raise RuntimeError("--mode profile requires torchrun")
+
+    if args.nsys_output_dir is None:
+        output_dir = Path(tempfile.mkdtemp(prefix="flashinfer-cute-dsl-moe-nsys-"))
+    else:
+        output_dir = Path(args.nsys_output_dir).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    worker_arguments = _profile_worker_arguments(args, num_tokens)
+    script = Path(__file__).resolve()
+    for mode in ("ep", "tp"):
+        for variant in BENCH_VARIANTS:
+            profile_label = f"{mode}::{variant.name}"
+            output = output_dir / f"{mode}_{variant.name}_t{num_tokens}"
+            env = os.environ.copy()
+            env[_PROFILE_CASE_ENV] = profile_label
+            command = [
+                nsys,
+                "profile",
+                "--force-overwrite=true",
+                "--sample=none",
+                "--cpuctxsw=none",
+                "--trace=cuda,nvtx,nccl",
+                "--capture-range=cudaProfilerApi",
+                "--capture-range-end=stop",
+                f"--show-output={'true' if args.verbose else 'false'}",
+                f"--output={output}",
+                torchrun,
+                "--standalone",
+                f"--nproc-per-node={args.num_gpus}",
+                str(script),
+                *worker_arguments,
+            ]
+            print(
+                f"\nCapturing {mode.upper()}{args.num_gpus} "
+                f"{variant.name.upper()} with Nsight Systems...",
+                flush=True,
+            )
+            _verbose_print(args, "Command:", " ".join(command))
+            subprocess.run(command, check=True, env=env)
+
+            report = output.with_suffix(".nsys-rep")
+            rows = _load_nsys_kernel_rows(nsys, report, args.verbose)
+            _print_nsys_kernel_breakdown(
+                mode,
+                variant.name,
+                num_tokens,
+                args.num_gpus,
+                rows,
+                report,
+            )
+
+    print(f"\nNsight Systems reports: {output_dir}")
+    return 0
 
 
 def _distributed_moe_config(
@@ -209,7 +459,7 @@ def _record_profile_iteration(stage_calls):
     for name, stage_call in stage_calls:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        torch.cuda.nvtx.range_push(name)
+        torch.cuda.nvtx.range_push(f"stage::{name}")
         start.record()
         stage_call()
         end.record()
@@ -302,10 +552,10 @@ def _benchmark_distributed_ep(
         prefix = (
             f"[rank {rank}] EP setup variant={variant.name} tokens={num_tokens} {name}"
         )
-        print(f"{prefix}: start", flush=True)
+        _verbose_print(args, f"{prefix}: start")
         result = fn()
         torch.cuda.synchronize()
-        print(f"{prefix}: complete", flush=True)
+        _verbose_print(args, f"{prefix}: complete")
         dist.barrier()
         return result
 
@@ -632,7 +882,7 @@ def _benchmark_distributed_tp(
         gpus_per_node=world_size,
         comm_backend=TorchDistBackend(),
     )
-    if rank == 0 and report_backend:
+    if rank == 0 and report_backend and args.verbose:
         print(f"FlashInfer all-reduce backend: {workspace.backend}")
     l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
 
@@ -734,7 +984,16 @@ def _print_profile_breakdown(mode, variant, result, world_size):
         )
 
 
-def _run_parallel_mode(args, token_counts, mode, rank, world_size, device, dist):
+def _run_parallel_mode(
+    args,
+    token_counts,
+    mode,
+    rank,
+    world_size,
+    device,
+    dist,
+    selected_variant=None,
+):
     if rank == 0:
         if args.mode == "profile":
             print(
@@ -766,7 +1025,16 @@ def _run_parallel_mode(args, token_counts, mode, rank, world_size, device, dist)
     reported_backend = False
     for num_tokens in token_counts:
         row = {}
-        for variant in BENCH_VARIANTS:
+        variants = (
+            BENCH_VARIANTS
+            if selected_variant is None
+            else tuple(
+                variant
+                for variant in BENCH_VARIANTS
+                if variant.name == selected_variant
+            )
+        )
+        for variant in variants:
             if mode == "ep":
                 result = _benchmark_distributed_ep(
                     args,
@@ -812,24 +1080,23 @@ def _run_parallel_mode(args, token_counts, mode, rank, world_size, device, dist)
 
 
 def _run_distributed_benchmark(args, token_counts):
-    import os
     import torch.distributed as dist
 
     local_rank = int(os.environ["LOCAL_RANK"])
-    print(f"[local rank {local_rank}] distributed setup: start", flush=True)
+    _verbose_print(args, f"[local rank {local_rank}] distributed setup: start")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    print(
+    _verbose_print(
+        args,
         f"[local rank {local_rank}] NCCL process-group initialization: start",
-        flush=True,
     )
     dist.init_process_group("nccl", device_id=device)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    print(
+    _verbose_print(
+        args,
         f"[rank {rank}] NCCL process-group initialization: complete "
         f"(world_size={world_size})",
-        flush=True,
     )
 
     try:
@@ -840,8 +1107,29 @@ def _run_distributed_benchmark(args, token_counts):
             )
         if rank == 0:
             print("\nDeepSeek-V3 distributed CuTe DSL MoE benchmark")
-        for mode in ("ep", "tp"):
-            _run_parallel_mode(args, token_counts, mode, rank, world_size, device, dist)
+
+        selected_mode = None
+        selected_variant = None
+        profile_case = os.environ.get(_PROFILE_CASE_ENV)
+        if profile_case is not None:
+            selected_mode, selected_variant = profile_case.split("::", maxsplit=1)
+            if selected_mode not in ("ep", "tp") or selected_variant not in {
+                variant.name for variant in BENCH_VARIANTS
+            }:
+                raise ValueError(f"Invalid {_PROFILE_CASE_ENV}: {profile_case}")
+
+        modes = ("ep", "tp") if selected_mode is None else (selected_mode,)
+        for mode in modes:
+            _run_parallel_mode(
+                args,
+                token_counts,
+                mode,
+                rank,
+                world_size,
+                device,
+                dist,
+                selected_variant,
+            )
             dist.barrier()
         return 0
     finally:
@@ -849,6 +1137,11 @@ def _run_distributed_benchmark(args, token_counts):
 
 
 def main():
+    warnings.filterwarnings(
+        "ignore",
+        message="cold_l2_cache=True but no GPU tensors found.*",
+        module=r"flashinfer\.testing\.utils",
+    )
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--num-tokens",
@@ -891,13 +1184,24 @@ def main():
         "--mode",
         choices=["benchmark", "profile"],
         default="benchmark",
-        help="Benchmark both variants or print semantic stage breakdowns.",
+        help="Benchmark both variants or report per-kernel Nsight Systems breakdowns.",
     )
     parser.add_argument(
         "--profile-iters",
         type=int,
         default=10,
-        help="Number of iterations summarized in profile mode.",
+        help="Number of iterations captured in each Nsight Systems profile.",
+    )
+    parser.add_argument(
+        "--nsys-output-dir",
+        type=str,
+        default=None,
+        help="Directory for Nsight Systems reports (default: a temporary directory).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print distributed setup progress and profiler worker output.",
     )
     args = parser.parse_args()
 
@@ -922,6 +1226,14 @@ def main():
         tokens = DISTRIBUTED_TOKEN_COUNTS
     if args.mode == "profile" and len(tokens) != 1:
         parser.error("profile mode requires exactly one token count")
+
+    profile_case = os.environ.get(_PROFILE_CASE_ENV)
+    if args.mode == "profile" and profile_case is None:
+        if "LOCAL_RANK" in os.environ:
+            parser.error("run profile mode directly, without torchrun")
+        return _run_nsys_profiles(args, tokens[0])
+    if "LOCAL_RANK" not in os.environ:
+        parser.error("benchmark mode must be launched with torchrun")
 
     return _run_distributed_benchmark(args, tokens)
 
