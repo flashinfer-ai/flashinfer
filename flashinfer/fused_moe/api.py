@@ -773,8 +773,8 @@ class MoEActivationPack:
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so
-    positional construction of pre-routed packs is unchanged.  The in-kernel routing fields
-    are keyword-only.
+    positional construction of pre-routed packs is unchanged. Additional activation metadata
+    and the in-kernel routing fields are keyword-only.
     """
 
     # Backend-native activation payload; layouts documented above.
@@ -786,7 +786,8 @@ class MoEActivationPack:
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
     # float32 for TRTLLM FP4 UnpackedPrecomputed.
     topk_weights: Optional[Tensor] = None
-    per_token_scale: Optional[Tensor] = None  # [M] float32 for per-token NVFP4
+    # Per-token NVFP4 row scale, shape [M].
+    per_token_scale: Optional[Tensor] = field(default=None, kw_only=True)
     # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
     # call site fails loudly instead of silently binding a tensor to the mode.
     routing_input_mode: RoutingInputMode = field(
