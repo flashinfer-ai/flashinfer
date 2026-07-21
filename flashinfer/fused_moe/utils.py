@@ -10,6 +10,8 @@ import torch
 
 from flashinfer.utils import ceil_div, next_positive_power_of_2, round_up
 
+from ..tllm_enums import ActivationType
+
 logger = logging.getLogger(__name__)
 
 is_torch_compiling_flag = False
@@ -349,3 +351,14 @@ def make_random_topk_ids(
         num_tokens, num_experts
     )
     return torch.multinomial(weights, top_k, replacement=False).to(torch.int32)
+
+
+def get_b12x_activation_name(activation_type: ActivationType) -> str:
+    """Translate an activation type to the b12x kernel name."""
+    if activation_type is ActivationType.Swiglu:
+        return "silu"
+    if activation_type is ActivationType.GegluTanh:
+        return "gelu_tanh"
+    if activation_type is ActivationType.Relu2:
+        return "relu2"
+    raise ValueError(f"Unsupported b12x activation type {activation_type!r}.")

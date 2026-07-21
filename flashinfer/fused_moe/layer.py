@@ -30,16 +30,18 @@ import torch
 from ..autotuner import AutoTuner
 from ..utils import get_compute_capability
 from .api import (
-    ActivationType,
+    B12xNvfp4Config,
+    B12xW4A16Config,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
-    QuantVariant,
     TrtllmBf16Config,
     TrtllmFp4Config,
 )
 from .runners import (
+    B12xNvfp4Runner,
+    B12xW4A16Runner,
     CuteDslNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
@@ -50,21 +52,21 @@ from .utils import map_to_hybrid_bucket
 # Union of the concrete runners the layer dispatches to.  All share
 # backend_key / tuning_config / pack_inputs as attributes or class members;
 # typing the list with this Union gives mypy the visibility it needs.
-_RunnerT = Union[CuteDslNvfp4Runner, TrtllmFp4RoutedRunner, TrtllmBf16RoutedRunner]
+_RunnerT = Union[
+    CuteDslNvfp4Runner,
+    TrtllmFp4RoutedRunner,
+    TrtllmBf16RoutedRunner,
+    B12xNvfp4Runner,
+    B12xW4A16Runner,
+]
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
-}
-
-# Quant variants each runner can execute.  Used by _validate_mvp_scope to accept
-# a config only when at least one configured backend supports its quant variant.
-_RUNNER_QUANTS: Dict[type, Tuple[QuantVariant, ...]] = {
-    CuteDslConfig: (QuantVariant.NVFP4,),
-    TrtllmFp4Config: (QuantVariant.NVFP4,),
-    TrtllmBf16Config: (QuantVariant.BF16,),
+    B12xNvfp4Config: B12xNvfp4Runner,
+    B12xW4A16Config: B12xW4A16Runner,
 }
 
 
@@ -86,7 +88,6 @@ class MoELayer:
 
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
         self.config = config
-        self._validate_mvp_scope(config)
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.tuner = AutoTuner.get()
 
@@ -101,19 +102,20 @@ class MoELayer:
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
                 continue  # MVP scope — skip non-MVP backends silently
-            # Skip backends that cannot execute the configured quant variant, so a
-            # mixed candidate list (e.g. BF16 with (CuteDslConfig, TrtllmBf16Config))
-            # never instantiates a runner that would mis-handle the pack contract.
-            if config.quant.variant not in _RUNNER_QUANTS.get(type(backend_cfg), ()):
+            runner = runner_cls(config, device=self.device)
+            try:
+                runner.check_support()
+            except (NotImplementedError, ValueError, RuntimeError):
                 continue
-            self.runners.append(runner_cls(config, device=self.device))
+            self.runners.append(runner)
 
         if not self.runners:
             mvp = ", ".join(c.__name__ for c in _BACKEND_RUNNERS)
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
-                f"arch sm{arch}. The MVP supports only NVFP4 via [{mvp}]."
+                f"arch sm{arch} for this configuration. Registered unified "
+                f"runners: [{mvp}]."
             )
 
         # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
@@ -125,33 +127,6 @@ class MoELayer:
         self._winners: Dict[Tuple[int, Any], Tuple[_RunnerT, Any]] = {}
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
-
-    @staticmethod
-    def _validate_mvp_scope(config: MoEConfig) -> None:
-        """Fail fast on configs no configured backend can execute (CR6).
-
-        Surfacing this at construction time turns a deep C++ crash or silent
-        backend skip into a clear, actionable Python error.  NVFP4 (CuteDSL /
-        TRTLLM-FP4) and BF16 (TRTLLM-BF16, the EP grouped-GEMM path) are
-        supported; FP8 / MXFP4 / MxInt4 remain post-MVP.  Only the Swiglu
-        activation is supported.
-        """
-        variant = config.quant.variant
-        supported = {
-            q for cfg in config.backend for q in _RUNNER_QUANTS.get(type(cfg), ())
-        }
-        if variant not in supported:
-            raise NotImplementedError(
-                f"MoELayer: QuantVariant.{variant.name} is not executable by any "
-                f"configured backend (supported here: "
-                f"{sorted(q.name for q in supported) or 'none'}). "
-                "FP8 / MXFP4 / MxInt4 paths are tracked as post-MVP follow-ups."
-            )
-        act = config.activation.type
-        if act is not ActivationType.Swiglu:
-            raise NotImplementedError(
-                f"MoELayer MVP supports only the Swiglu activation; got {act!r}."
-            )
 
     def __call__(
         self,

@@ -61,6 +61,7 @@ class QuantVariant(Enum):
     NVFP4 = 4  # day-1 MVP target
     MXFP4 = 5
     MxInt4 = 6
+    W4A16 = 7
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}.{self.name}"
@@ -397,6 +398,90 @@ class CuteDslConfig:
         return "CuteDslConfig()"
 
 
+@dataclass(frozen=True)
+class B12xNvfp4Config:
+    """SM120/SM121 CuTe-DSL b12x NVFP4/W4A4 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: ActivationConfig = ActivationConfig.swiglu,
+        device=None,
+    ):
+        """Build the ``b12x_nvfp4`` weight view from canonical bf16 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("b12x_nvfp4", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_b12x_nvfp4_weights`.
+        """
+        from .prepare import prepare_b12x_nvfp4_weights
+        from .utils import get_b12x_activation_name
+
+        return prepare_b12x_nvfp4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=get_b12x_activation_name(activation.type),
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "B12xNvfp4Config()"
+
+
+@dataclass(frozen=True)
+class B12xW4A16Config:
+    """SM120/SM121 CuTe-DSL b12x W4A16 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_global_scale,
+        w2_fp4,
+        w2_blockscale,
+        w2_global_scale,
+        *,
+        activation: ActivationConfig = ActivationConfig.swiglu,
+        source_format: str = "modelopt",
+    ):
+        """Build the ``b12x_w4a16`` weight view from checkpoint fp4 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("b12x_w4a16", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_b12x_w4a16_weights`.
+        """
+        from .prepare import prepare_b12x_w4a16_weights
+        from .utils import get_b12x_activation_name
+
+        return prepare_b12x_w4a16_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_global_scale,
+            w2_fp4,
+            w2_blockscale,
+            w2_global_scale,
+            activation=get_b12x_activation_name(activation.type),
+            source_format=source_format,
+        )
+
+    def __repr__(self) -> str:
+        return "B12xW4A16Config()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
     TrtllmFp4Config,
@@ -406,6 +491,8 @@ BackendConfigType = Union[
     TrtllmMxInt4Config,
     CutlassConfig,
     CuteDslConfig,
+    B12xNvfp4Config,
+    B12xW4A16Config,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -416,6 +503,8 @@ ALL_BACKEND_CONFIGS = (
     TrtllmMxInt4Config,
     CutlassConfig,
     CuteDslConfig,
+    B12xNvfp4Config,
+    B12xW4A16Config,
 )
 
 
