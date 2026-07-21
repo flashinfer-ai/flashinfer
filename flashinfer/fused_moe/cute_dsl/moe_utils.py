@@ -191,15 +191,18 @@ def moe_permute(
         tile_size: Size of each tile for scheduling.
         enable_pdl: Enable Programmatic Dependent Launch for better kernel overlap.
                     Default is False.
-        input_sf: Scale factors for input (required for FP4).
-                  Shape: [num_tokens, hidden_size // 16].
-        permuted_sf: Output scale factors for permuted data (required for FP4).
-                     Shape: [max_num_permuted_tokens, hidden_size // 16].
+        input_sf: Optional linear input scale factors. MXFP8 uses one scale per
+                  32 elements and NVFP4 uses one scale per 16 elements.
+        permuted_sf: Optional output scale-factor storage in the swizzled 128x4
+                     layout consumed by Blackwell tensor cores.
 
     Note:
-        - For FP4 inputs, input_sf and permuted_sf are required.
+        - When scales are provided, both input_sf and permuted_sf are required.
         - The permuted_sf output uses a swizzled layout for efficient TMA access.
     """
+    if (input_sf is None) != (permuted_sf is None):
+        raise ValueError("input_sf and permuted_sf must be provided together")
+
     module = _get_moe_utils_module()
     dtype_suffix = _get_dtype_suffix(input.dtype)
 

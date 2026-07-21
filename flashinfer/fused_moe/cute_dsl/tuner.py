@@ -892,6 +892,192 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         )
 
 
+_W4A8_CP_ASYNC = ((1, 1), False, False)
+_W4A8_CP_ASYNC_RASTER_M = ((1, 1), True, False)
+_W4A8_TMA = ((1, 1), False, True)
+
+_W4A8_GEMM_TACTIC_PAIRS = (
+    (_W4A8_CP_ASYNC, _W4A8_CP_ASYNC),
+    (_W4A8_CP_ASYNC_RASTER_M, _W4A8_CP_ASYNC_RASTER_M),
+    (_W4A8_TMA, _W4A8_TMA),
+)
+W4A8_MOE_TACTICS = tuple(
+    (128, gemm1_tactic, gemm2_tactic)
+    for gemm1_tactic, gemm2_tactic in _W4A8_GEMM_TACTIC_PAIRS
+)
+
+
+class CuteDslFusedMoEW4A8Runner(TunableRunner):
+    """Tunable runner for MXFP8 activations and NVFP4 expert weights."""
+
+    def __init__(
+        self,
+        forward_impl: Callable,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int = 0,
+        use_fused_finalize: bool = True,
+        output_dtype: torch.dtype = torch.bfloat16,
+        enable_pdl: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    ):
+        activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        self.forward_impl = forward_impl
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.local_expert_offset = local_expert_offset
+        self.use_fused_finalize = use_fused_finalize
+        self.output_dtype = output_dtype
+        self.enable_pdl = enable_pdl
+        self.activation_type = activation_type
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
+        self._workspace_cache: Dict[Tuple, Any] = {}
+        self._inputs_helper = CuteDslMoEInputsHelper(
+            num_experts, top_k, num_local_experts, local_expert_offset
+        )
+        self.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0, 1, 2, 3, 11),
+                    dim_idx=(0, 0, 0, 0, 0),
+                    gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                    map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+                    tensor_initializers=[
+                        lambda shapes, dtype, device: torch.randn(
+                            shapes,
+                            dtype=torch.bfloat16,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
+                        ).to(dtype),
+                        lambda shapes, dtype, device: torch.randint(
+                            1,
+                            128,
+                            shapes,
+                            dtype=torch.uint8,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
+                        ),
+                        lambda shapes, dtype, device: torch.randint(
+                            0,
+                            max(num_experts, 1),
+                            shapes,
+                            dtype=torch.int32,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
+                        ),
+                        lambda shapes, dtype, device: torch.softmax(
+                            torch.randn(
+                                shapes,
+                                device=device,
+                                generator=torch.Generator(device=device).manual_seed(
+                                    515
+                                ),
+                            ),
+                            dim=-1,
+                        ).to(torch.float32),
+                        lambda shapes, dtype, device: torch.empty(
+                            shapes, dtype=dtype, device=device
+                        ),
+                    ],
+                ),
+            ),
+            inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
+            use_cold_l2_cache=True,
+        )
+
+    def __hash__(self):
+        return hash(self.get_cache_key_extras([]))
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (
+            self.num_experts,
+            self.top_k,
+            self.num_local_experts,
+            self.local_expert_offset,
+            self.use_fused_finalize,
+            self.output_dtype,
+            self.enable_pdl,
+            int(self.activation_type),
+            self.swiglu_alpha,
+            self.swiglu_beta,
+            self.swiglu_limit,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[Tuple[Any, ...]]:
+        x = inputs[0]
+        w1_weight = inputs[4]
+        w2_weight = inputs[8]
+        if (
+            x.shape[1] % 128 != 0
+            or w1_weight.shape[1] % 128 != 0
+            or w2_weight.shape[1] % 128 != 0
+        ):
+            return []
+        return list(W4A8_MOE_TACTICS)
+
+    def forward(  # type: ignore[override]
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Tuple = None,  # type: ignore[assignment]
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        (
+            x,
+            x_sf,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            fc2_input_scale,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            moe_output,
+        ) = inputs
+        return self.forward_impl(
+            x=x,
+            x_sf=x_sf,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            num_local_experts=self.num_local_experts,
+            local_expert_offset=self.local_expert_offset,
+            quant_mode="w4a8",
+            output_dtype=self.output_dtype,
+            use_fused_finalize=self.use_fused_finalize,
+            moe_output=moe_output,
+            enable_pdl=self.enable_pdl,
+            activation_type=int(self.activation_type),
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
+            w4a8_tactic=None if tactic is None or tactic == -1 else tactic,
+            w4a8_workspace_cache=self._workspace_cache,
+            **kwargs,
+        )
+
+
 # =============================================================================
 # Utility Functions
 # =============================================================================
