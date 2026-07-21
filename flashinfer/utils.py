@@ -833,6 +833,11 @@ def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def get_device_index(device: torch.device) -> int:
+    """Concrete CUDA device index for *device* (bare "cuda" -> current device)."""
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
 def get_trtllm_gen_multi_ctas_kv_counter_bytes(
     batch_size: int, num_qo_heads: int, sm_count: int
 ) -> int:
