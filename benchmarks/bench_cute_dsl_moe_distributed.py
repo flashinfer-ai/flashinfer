@@ -18,9 +18,10 @@ for all four topology/activation combinations:
     python3 benchmarks/bench_cute_dsl_moe_distributed.py \
         --mode profile_nsys
 
-Nsight Compute mode captures every non-communication kernel with the full
-metric set and embeds correlated sources found recursively under the
-FlashInfer repository:
+Nsight Compute mode uses kernel replay to capture every local compute kernel
+with the full metric set and embeds correlated sources found recursively under
+the FlashInfer repository. It simulates the exact post-communication EP/TP
+shapes in one process; use Nsight Systems mode for real communication:
 
     python3 benchmarks/bench_cute_dsl_moe_distributed.py \
         --mode profile_ncu --profile-iters 1
@@ -93,6 +94,14 @@ class KernelProfileRow:
 def _verbose_print(args, *values):
     if args.verbose:
         print(*values, flush=True)
+
+
+def _parse_profile_case(profile_case):
+    mode, variant_name = profile_case.split("::", maxsplit=1)
+    variants = {variant.name: variant for variant in BENCH_VARIANTS}
+    if mode not in ("ep", "tp") or variant_name not in variants:
+        raise ValueError(f"Invalid {_PROFILE_CASE_ENV}: {profile_case}")
+    return mode, variants[variant_name]
 
 
 def _profile_worker_arguments(args, num_tokens):
@@ -344,11 +353,8 @@ def _run_nsys_profiles(args, token_counts):
 
 def _run_ncu_profiles(args, token_counts):
     ncu = shutil.which("ncu")
-    torchrun = shutil.which("torchrun")
     if ncu is None:
         raise RuntimeError("--mode profile_ncu requires Nsight Compute (ncu)")
-    if torchrun is None:
-        raise RuntimeError("--mode profile_ncu requires torchrun")
 
     if args.ncu_output_dir is None:
         output_dir = Path(tempfile.mkdtemp(prefix="flashinfer-cute-dsl-moe-ncu-"))
@@ -387,9 +393,7 @@ def _run_ncu_profiles(args, token_counts):
             "--force-overwrite",
             f"--log-file={log_file}",
             f"--export={output}",
-            torchrun,
-            "--standalone",
-            f"--nproc-per-node={args.num_gpus}",
+            sys.executable,
             str(script),
             *_profile_worker_arguments(args, num_tokens),
         ]
@@ -930,6 +934,95 @@ def _create_distributed_moe_layer(
     return MoELayer(moe_config, device=device), weight_pack
 
 
+def _run_ncu_compute_profile(args, num_tokens, mode, variant):
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
+    from flashinfer.testing.utils import get_l2_cache_size
+
+    torch.cuda.set_device(0)
+    device = torch.device("cuda", 0)
+    if mode == "ep":
+        rows = args.num_gpus * ((num_tokens + args.num_gpus - 1) // args.num_gpus)
+        intermediate_size = CFG.intermediate_size
+        num_local_experts = CFG.num_experts // args.num_gpus
+    else:
+        rows = num_tokens
+        intermediate_size = BASE_INTERMEDIATE_SIZE // args.num_gpus
+        num_local_experts = CFG.num_experts
+
+    layer, weight_pack = _create_distributed_moe_layer(
+        args,
+        variant,
+        intermediate_size,
+        num_local_experts,
+        0,
+        rows,
+        0,
+        device,
+    )
+    hidden_states, _, router_logits, routing_bias = _create_distributed_inputs(
+        rows, 0, 1, device
+    )
+    topk_values = torch.empty(rows, CFG.top_k, dtype=torch.float32, device=device)
+    topk_indices = torch.empty(rows, CFG.top_k, dtype=torch.int32, device=device)
+    global_scale = None
+    if variant.quantize_input:
+        global_scale = make_nvfp4_global_scale(
+            hidden_states,
+            per_token_activation=args.use_per_token_activation,
+            global_scale=1.0,
+            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        )
+    l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
+    profile_state = {}
+
+    def route():
+        _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
+
+    def prepare_activation():
+        profile_state["activation_pack"] = _make_distributed_activation_pack(
+            args,
+            variant,
+            hidden_states,
+            topk_indices,
+            topk_values,
+            global_scale,
+        )
+
+    def run_local_moe():
+        profile_state["local_output"] = layer(
+            profile_state["activation_pack"], weight_pack
+        )
+
+    stage_calls = (
+        ("routing", route),
+        ("activation prep/quant", prepare_activation),
+        ("local MoE", run_local_moe),
+    )
+    for _ in range(args.warmup):
+        for _, stage_call in stage_calls:
+            stage_call()
+    torch.cuda.synchronize()
+
+    print(
+        f"Profiling simulated post-communication {mode.upper()}{args.num_gpus} "
+        f"{variant.name.upper()}: {num_tokens} global tokens, {rows} local rows",
+        flush=True,
+    )
+    torch.cuda.cudart().cudaProfilerStart()
+    torch.cuda.nvtx.range_push(f"{mode}::{variant.name}")
+    for _ in range(args.profile_iters):
+        l2_flush.zero_()
+        torch.cuda.synchronize()
+        _record_profile_iteration(stage_calls)
+    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.cudart().cudaProfilerStop()
+    return 0
+
+
 def _benchmark_distributed_tp(
     args, variant, num_tokens, rank, world_size, device, report_backend=False
 ):
@@ -1220,14 +1313,11 @@ def _run_distributed_benchmark(args, token_counts):
             print("\nDeepSeek-V3 distributed CuTe DSL MoE benchmark")
 
         selected_mode = None
-        selected_variant = None
+        selected_variant_name = None
         profile_case = os.environ.get(_PROFILE_CASE_ENV)
         if profile_case is not None:
-            selected_mode, selected_variant = profile_case.split("::", maxsplit=1)
-            if selected_mode not in ("ep", "tp") or selected_variant not in {
-                variant.name for variant in BENCH_VARIANTS
-            }:
-                raise ValueError(f"Invalid {_PROFILE_CASE_ENV}: {profile_case}")
+            selected_mode, selected_variant = _parse_profile_case(profile_case)
+            selected_variant_name = selected_variant.name
 
         modes = ("ep", "tp") if selected_mode is None else (selected_mode,)
         for mode in modes:
@@ -1239,7 +1329,7 @@ def _run_distributed_benchmark(args, token_counts):
                 world_size,
                 device,
                 dist,
-                selected_variant,
+                selected_variant_name,
             )
             dist.barrier()
         return 0
@@ -1269,7 +1359,10 @@ def main():
         "--num-gpus",
         type=int,
         default=8,
-        help="Number of torchrun processes, up to eight GPUs on one node.",
+        help=(
+            "Number of torchrun processes, up to eight GPUs on one node. In "
+            "Nsight Compute mode, this is the logical EP/TP degree."
+        ),
     )
     parser.add_argument(
         "--allreduce-backend",
@@ -1348,6 +1441,13 @@ def main():
         tokens = DISTRIBUTED_TOKEN_COUNTS
 
     profile_case = os.environ.get(_PROFILE_CASE_ENV)
+    if args.mode == "profile_ncu" and profile_case is not None:
+        if "LOCAL_RANK" in os.environ:
+            parser.error("profile_ncu workers must run without torchrun")
+        if len(tokens) != 1:
+            parser.error("profile_ncu workers require exactly one token count")
+        mode, variant = _parse_profile_case(profile_case)
+        return _run_ncu_compute_profile(args, tokens[0], mode, variant)
     if args.mode in _PROFILE_MODES and profile_case is None:
         if "LOCAL_RANK" in os.environ:
             parser.error(f"run {args.mode} mode directly, without torchrun")
