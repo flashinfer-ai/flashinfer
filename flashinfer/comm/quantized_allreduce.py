@@ -27,6 +27,7 @@ import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
+from ..api_logging import flashinfer_api
 from ..utils import register_custom_op
 from .torch_symmetric_memory import _enable_symm_mem_for_group
 
@@ -472,6 +473,7 @@ def _select_params(numel: int, world_size: int) -> dict:
     )
 
 
+@flashinfer_api
 @register_custom_op("flashinfer::quantized_all_reduce", mutates_args=["output"])
 def quantized_all_reduce(
     inp: torch.Tensor,
