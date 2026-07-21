@@ -128,9 +128,12 @@ class MegaMoENvfp4Config:
                 "num_total_experts must be divisible by world_size "
                 f"({self.num_total_experts} % {self.world_size} != 0)."
             )
-        if self.hidden % 128 != 0 or self.intermediate % 128 != 0:
+        # The GEMM tiles are tail-safe (ceil-div K/M loops, TMA OOB zero-fill,
+        # predicated epilogue stores); 64 covers the TMA 16B row alignment and
+        # SF-word packing. 128-misaligned shapes exist (gpt-oss: 2880).
+        if self.hidden % 64 != 0 or self.intermediate % 64 != 0:
             raise ValueError(
-                "hidden and intermediate must be multiples of 128 "
+                "hidden and intermediate must be multiples of 64 "
                 f"(got hidden={self.hidden}, intermediate={self.intermediate})."
             )
         if self.token_back_mode not in (
@@ -1027,9 +1030,9 @@ def get_symm_buffer_for_mega_moe(
     Expert weights are not allocated here; supply kernel-ready
     ``(weight, scale)`` tuples to :func:`nvfp4_mega_moe` instead.
     """
-    if hidden % 128 != 0 or intermediate % 128 != 0:
+    if hidden % 64 != 0 or intermediate % 64 != 0:
         raise ValueError(
-            "MegaMoE requires hidden and intermediate to be multiples of 128."
+            "MegaMoE requires hidden and intermediate to be multiples of 64."
         )
     if num_total_experts % world_size != 0:
         raise ValueError("num_total_experts must be divisible by world_size.")

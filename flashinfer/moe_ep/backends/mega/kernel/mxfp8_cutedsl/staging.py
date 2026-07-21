@@ -53,12 +53,14 @@ def stage_mega_moe_inputs(
     num_tokens, hidden = hidden_states.shape
     if num_tokens == 0:
         return
-    if hidden % 128 != 0:
-        raise ValueError("hidden_size must be a multiple of 128.")
+    if hidden % 64 != 0:
+        raise ValueError("hidden_size must be a multiple of 64.")
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    if _use_fused_stage() and fused_quant_stage_supported(hidden_states):
+    if _use_fused_stage() and fused_quant_stage_supported(
+        hidden_states, quant_type="mxfp8"
+    ):
         fused_quant_stage(
             hidden_states,
             topk_ids,
