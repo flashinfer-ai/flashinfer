@@ -636,8 +636,12 @@ def _prefill_attention_paged_body(
         latency=2,
     )
 
-    # Store LSE - lse_output is 2D [total_tokens, num_heads]
-    lse_scaled = lse * (1.0 / INV_LOG_2)  # multiply by constant instead of dividing
+    # Store LSE - lse_output is 2D [total_tokens, num_heads].
+    # `lse` (= m_i + log2(l_i)) is already log2(sum exp(S)) = logsumexp_natural *
+    # log2(e), which is FlashInfer's base-2 LSE convention (see fa2 / cutlass /
+    # test_blackwell_fmha reference: lse_ref * math.log2(math.e)). Store it as-is;
+    # rescaling by ln2 here would emit natural-log LSE and break merge/cascade.
+    lse_scaled = lse
     offs_m_store = ct.arange(BLOCK_M, dtype=ct.int32)
     token_indices = seq_start_index + start_m + offs_m_store
     head_indices = ct.full((BLOCK_M,), head_id, dtype=ct.int32)
@@ -1034,7 +1038,8 @@ def _prefill_attention_ragged_body(
         latency=2,
     )
 
-    lse_scaled = lse * (1.0 / INV_LOG_2)
+    # Base-2 LSE = FlashInfer convention (see ragged body above); store as-is.
+    lse_scaled = lse
     offs_m_store = ct.arange(BLOCK_M, dtype=ct.int32)
     token_indices = seq_start_index + start_m + offs_m_store
     head_indices = ct.full((BLOCK_M,), head_id, dtype=ct.int32)

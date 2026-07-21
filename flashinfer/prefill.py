@@ -3089,11 +3089,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``
-            or ``cute-dsl``.
+            /``cute-dsl`` or ``cutile``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
+            The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
+            opt-in); it requires ``qo_indptr == kv_indptr`` (equal-length prefill).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -3520,6 +3522,57 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     window_left=window_left,
                     variant=variant,
                 )
+        elif self._backend == "cutile":
+            # cuTile ragged prefill: no C++ module to build. Materialize the
+            # per-request length/offset arrays the kernel needs from
+            # qo_indptr/kv_indptr here (plan() may host-sync; run() must not).
+            if custom_mask is not None or packed_custom_mask is not None:
+                raise NotImplementedError(
+                    "cuTile ragged prefill does not support custom_mask."
+                )
+            if pos_encoding_mode != "NONE":
+                raise NotImplementedError(
+                    "cuTile ragged prefill only supports pos_encoding_mode='NONE'. "
+                    "Apply RoPE to Q/K before calling the kernel."
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise NotImplementedError(
+                    "cuTile ragged prefill does not support logits_soft_cap."
+                )
+            if window_left >= 0:
+                raise NotImplementedError(
+                    "cuTile ragged prefill does not support sliding window."
+                )
+            # The kernel slices Q and KV with a single shared per-request offset,
+            # so it only supports qo_indptr == kv_indptr (equal-length prefill /
+            # self-attention, no cached prefix). Append/chunked prefill with
+            # kv_len != q_len must use another backend.
+            if not torch.equal(qo_indptr_host, kv_indptr_host):
+                raise NotImplementedError(
+                    "cuTile ragged prefill requires qo_indptr == kv_indptr "
+                    "(equal-length prefill). For append/chunked prefill with "
+                    "kv_len != q_len, use backend='fa2'."
+                )
+            seq_lens_q_host = (qo_indptr_host[1:] - qo_indptr_host[:-1]).to(
+                torch.int32
+            )
+            kv_len_arr_i32 = kv_len_arr.to(torch.int32)
+            self._cutile_num_batch = batch_size
+            self._cutile_seq_lens_q = seq_lens_q_host.to(
+                self.device, non_blocking=non_blocking
+            )
+            self._cutile_seq_lens_kv = kv_len_arr_i32.to(
+                self.device, non_blocking=non_blocking
+            )
+            # Shared exclusive-prefix-sum offset (== qo_indptr[:-1] == kv_indptr[:-1]).
+            self._cutile_seq_offset = self._qo_indptr_buf[:-1].to(torch.int32)
+            self._cutile_max_seq_len = (
+                int(kv_len_arr_i32.max().item()) if batch_size > 0 else 0
+            )
+            # block_tables is accepted but unused by the ragged kernel.
+            self._cutile_block_tables = torch.zeros(
+                batch_size, 1, dtype=torch.int32, device=self.device
+            )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
@@ -3563,7 +3616,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
-        elif self._backend not in ("cudnn", "cute-dsl"):
+        elif self._backend not in ("cudnn", "cute-dsl", "cutile"):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
@@ -3889,6 +3942,39 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
 
             return (out, lse) if return_lse else out
+        elif self._backend == "cutile":
+            if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
+                raise NotImplementedError(
+                    "cuTile ragged prefill does not support FP8 scale parameters."
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "cuTile ragged prefill does not support NVFP4 KV scaling."
+                )
+            from .attention.kernels.cutile.fmha_prefill_bsr_cutile import (  # noqa: PLC0415
+                prefill_attention_kv_ragged_cutile,
+            )
+
+            # k/v are ragged [total_kv, num_kv_heads, head_dim]. The kernel folds
+            # the softmax scale into k_scale (qk_scale = k_scale * INV_LOG_2),
+            # matching single_prefill_with_kv_cache's default.
+            out_ragged, lse_ragged = prefill_attention_kv_ragged_cutile(
+                q=q,
+                k_cache=k,
+                v_cache=v,
+                actual_seq_lens_q=self._cutile_seq_lens_q,
+                actual_seq_lens_kv=self._cutile_seq_lens_kv,
+                actual_seq_offset=self._cutile_seq_offset,
+                block_tables=self._cutile_block_tables,
+                k_scale=sm_scale,
+                v_scale=1.0,
+                num_batch=self._cutile_num_batch,
+                max_seq_len=self._cutile_max_seq_len,
+                is_causal=self._causal,
+                outputs=out,
+                out_lse=lse if return_lse else None,
+            )
+            return (out_ragged, lse_ragged) if return_lse else out_ragged
 
         # Skip FP8->FP16 conversion for FA3 backend with FP8 support
         # The JIT module will handle FP8 natively
