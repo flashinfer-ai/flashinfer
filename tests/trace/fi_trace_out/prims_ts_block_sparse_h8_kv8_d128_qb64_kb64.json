@@ -1,0 +1,151 @@
+{
+  "name": "prims_ts_block_sparse_h8_kv8_d128_qb64_kb64",
+  "description": "One-shot PrimTS block-sparse MHA attention over compact BSHD Q/K/V and per-batch/per-head BSR metadata.",
+  "op_type": "block_sparse",
+  "tags": [
+    "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention",
+    "backend:prims-ts",
+    "sparse:block",
+    "status:experimental"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Number of requests."
+    },
+    "seq_len_q": {
+      "type": "var",
+      "description": "Fixed query length per request."
+    },
+    "seq_len_kv": {
+      "type": "var",
+      "description": "Fixed key/value length per request."
+    },
+    "num_qo_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "num_q_block_offsets": {
+      "type": "var",
+      "description": "Number of BSR row offsets per batch and KV head."
+    },
+    "num_block_indices": {
+      "type": "var",
+      "description": "Number of selected KV blocks."
+    },
+    "num_kv_valid_words": {
+      "type": "var",
+      "description": "Number of optional token-validity words per batch."
+    },
+    "q_block_size": {
+      "type": "const",
+      "value": 64
+    },
+    "kv_block_size": {
+      "type": "const",
+      "value": 64
+    }
+  },
+  "constraints": [
+    "num_qo_heads == num_kv_heads",
+    "head_dim == 128",
+    "q_block_size > 0 and q_block_size % 64 == 0",
+    "kv_block_size > 0 and kv_block_size % 64 == 0",
+    "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
+    "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
+    "mask_type is None or mask_type in ('dense', 'causal')"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "seq_len_q",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "float16"
+    },
+    "k": {
+      "shape": [
+        "batch_size",
+        "seq_len_kv",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "float16"
+    },
+    "v": {
+      "shape": [
+        "batch_size",
+        "seq_len_kv",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "float16"
+    },
+    "block_indptr": {
+      "shape": [
+        "batch_size",
+        "num_kv_heads",
+        "num_q_block_offsets"
+      ],
+      "dtype": "int32",
+      "description": "Absolute offsets into block_indices, consumed by the one-shot call."
+    },
+    "block_indices": {
+      "shape": [
+        "num_block_indices"
+      ],
+      "dtype": "int32",
+      "description": "Selected KV block IDs, consumed by the one-shot call."
+    },
+    "kv_valid_bits": {
+      "shape": [
+        "batch_size",
+        "num_kv_valid_words"
+      ],
+      "dtype": "uint32",
+      "optional": true,
+      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond Skv are ignored; consumed by the one-shot call."
+    },
+    "q_block_size": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "kv_block_size": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "mask_type": {
+      "shape": null,
+      "dtype": "string",
+      "optional": true
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len_q",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "float16",
+      "param": "out"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

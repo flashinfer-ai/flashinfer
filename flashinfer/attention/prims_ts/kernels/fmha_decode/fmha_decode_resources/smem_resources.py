@@ -20,7 +20,7 @@ respectively. All three are TMA producers and tcgen05-descriptor consumers.
 """
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import cutlass
 import cutlass.cute as cute
@@ -77,6 +77,9 @@ from .helpers_kv_tile_idx import (
     _runtime_split_kv_global_tile_idx,
     _static_split_kv_global_tile_idx,
 )
+
+if TYPE_CHECKING:
+    from .smem_block_sparse_metadata import SmemBlockSparseKvMetadataResource
 
 
 @cute.jit
@@ -461,6 +464,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
     cfg: Constexpr[FmhaDecodeConfig] = None
     tma_desc_k: cutlass.Pointer | None = None
     tma_desc_v: cutlass.Pointer | None = None
+    tma_desc_k_64: cutlass.Pointer | None = None
+    tma_desc_v_64: cutlass.Pointer | None = None
+    sparse_kv_metadata: "SmemBlockSparseKvMetadataResource | None" = None
     page_offsets_kv: "SmemPageOffsetsKvResource | None" = None
     seqlens_kv: cute.Pointer | None = None
     max_seq_len_kv: Int32 = None
@@ -662,7 +668,84 @@ class SmemKvTileResource(DecodeGenResourceBase):
             else self.tma_desc_k
         )
 
-        if cutlass.const_expr(cfg.use_paged_kv):
+        if cutlass.const_expr(cfg.use_block_sparse):
+            assert self.sparse_kv_metadata is not None
+            assert self.tma_desc_k_64 is not None
+            assert self.tma_desc_v_64 is not None
+            # One KV128 route always occupies the ordinary 128-token SMEM
+            # shape. Its two KV64 fragments may originate from different BSR
+            # blocks, so use the 64-token TensorMap unless they are physically
+            # adjacent.
+            tma_desc_64 = (
+                self.tma_desc_v_64
+                if cutlass.const_expr(self.kv_kind == KV_KIND_V)
+                else self.tma_desc_k_64
+            )
+            head_dim_stage = cfg.head_dim_kv_stage
+            head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
+            chunk_hd = min(head_dim_stage, 64)
+            num_chunks = head_dim_stage // chunk_hd
+            tile_chunk_elems = chunk_hd * cfg.tile_size_kv
+            fragment_chunk_elems = chunk_hd * 64
+            if prims.elect_sync():
+                origin0 = Int32(self.sparse_kv_metadata.route_origin(Int32(0)))
+                origin1 = Int32(self.sparse_kv_metadata.route_origin(Int32(1)))
+                route_flags = Int32(self.sparse_kv_metadata.route_flags())
+                valid0 = cutlass.Boolean((route_flags & Int32(1)) != Int32(0))
+                valid1 = cutlass.Boolean((route_flags & Int32(2)) != Int32(0))
+                merge_fragments = (valid0 & valid1) & cutlass.Boolean(
+                    origin1 == origin0 + Int32(64)
+                )
+                if not valid0:
+                    origin0 = Int32(self.max_seq_len_kv)
+                if not valid1:
+                    origin1 = Int32(self.max_seq_len_kv)
+                stage_base = self._stage_base(stage_info)
+                for chunk_idx in cutlass.range_constexpr(num_chunks):
+                    local_head_dim_offset = chunk_idx * chunk_hd
+                    global_head_dim_offset = (
+                        head_dim_stage_offset + local_head_dim_offset
+                    )
+                    local_tile_offset = chunk_idx * tile_chunk_elems
+                    if merge_fragments:
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            stage_base.subview(local_tile_offset),
+                            tma_desc,
+                            (
+                                Int32(global_head_dim_offset),
+                                logical_h_k_idx,
+                                origin0,
+                                logical_b_idx,
+                            ),
+                            stage_info.barrier,
+                        )
+                    else:
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            stage_base.subview(local_tile_offset),
+                            tma_desc_64,
+                            (
+                                Int32(global_head_dim_offset),
+                                logical_h_k_idx,
+                                origin0,
+                                logical_b_idx,
+                            ),
+                            stage_info.barrier,
+                        )
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            stage_base.subview(
+                                local_tile_offset + fragment_chunk_elems
+                            ),
+                            tma_desc_64,
+                            (
+                                Int32(global_head_dim_offset),
+                                logical_h_k_idx,
+                                origin1,
+                                logical_b_idx,
+                            ),
+                            stage_info.barrier,
+                        )
+
+        elif cutlass.const_expr(cfg.use_paged_kv):
             # Paged-KV path: the page-offset resource has already staged the
             # page IDs for this tile window into SMEM. This producer slices the
             # page IDs for one tile and emits one TMA per page fragment.

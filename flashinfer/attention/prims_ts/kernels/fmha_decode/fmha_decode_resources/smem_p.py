@@ -565,7 +565,8 @@ class SmemPResource(DecodeGenResourceBase):
                     (packed_p.data_ptr() + packed_offset).load(
                         count=regs_per_store, alignment=4
                     ),
-                    # x16/x32 layouts use this as the packed half-row split.
+                    # Separate the paired Softmax destinations by one packed
+                    # row (the half-row split for x16/x32 TMEM layouts).
                     offset=cfg.num_packed_p_regs,
                 )
             if cutlass.const_expr(cfg.ordered_softmax_early_release):

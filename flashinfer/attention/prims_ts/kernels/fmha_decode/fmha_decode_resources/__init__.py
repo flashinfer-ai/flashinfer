@@ -34,6 +34,13 @@ SMEM resources
                             TMA copies.  Multiple consecutive tiles whose page
                             IDs share a 32-page window reuse the same stage.
 
+- SmemBlockSparseKvMetadataResource : Pipeline-free raw-BSR route metadata
+                            retained from one K load through the matching V.
+
+- SmemBlockSparseSoftmaxMetadataResource : Staged raw-BSR route/token metadata
+                            copied to Softmax task-local registers before the
+                            corresponding pipeline stage is released.
+
 - SmemKvResource          : Shared SMEM ring for K and V tiles.  K and V
                             alternate in one allocation/pipeline; consumer
                             descriptors target the same SMEM but may use
@@ -114,10 +121,14 @@ from .smem_resources import (
     SmemPageOffsetsKvResource,
     SmemQResource,
 )
+from .smem_block_sparse_metadata import (
+    SmemBlockSparseKvMetadataResource,
+    SmemBlockSparseSoftmaxMetadataResource,
+)
 from .tmem_corr import TmemCorrResource
 from .tmem_o import TmemOResource
 from .smem_p import SmemPResource
-from .tmem_s import TmemSResource
+from .tmem_s import TmemSBlockSparseResource, TmemSResource
 from .tmem_softmax_stats import (
     TmemStatsDoneResource,
     TmemSoftmaxGlobalResource,
@@ -132,8 +143,11 @@ __all__ = [
     "SmemPageOffsetsKvResource",
     "SmemPResource",
     "SmemQResource",
+    "SmemBlockSparseKvMetadataResource",
+    "SmemBlockSparseSoftmaxMetadataResource",
     "TmemCorrResource",
     "TmemOResource",
+    "TmemSBlockSparseResource",
     "TmemSResource",
     "TmemStatsDoneResource",
     "TmemSoftmaxGlobalResource",

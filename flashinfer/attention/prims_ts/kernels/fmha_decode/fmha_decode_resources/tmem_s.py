@@ -41,7 +41,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
 from ..fmha_decode_constants import KV_TILE_256_RESCALE_THRESHOLD_LOG2
 from ...tcgen05_compat import tcgen05_mma_ws
 from ...placeholder_helpers import (
@@ -78,6 +78,8 @@ from .helpers_common import (
     _q_group_token_base,
     _softmax_tile_idx,
 )
+from .helpers_block_sparse import sparse_keeps_can_skip_structural_mask
+from .smem_block_sparse_metadata import _ALL_TOKEN_WORDS_VALID_FLAG
 from .helpers_kv_tile_idx import (
     _kv_tile_is_fully_unmasked_for_q_group,
     _load_runtime_seq_len_kv,
@@ -135,6 +137,7 @@ class TmemSResource(DecodeGenResourceBase):
     seq_len_q: Int32 = None
     h_r: Int32 | None = None
     q_group_idx: Int32 | None = None
+    b_idx: Int32 | None = None
     q_ref: Constexpr[MemoryResource | None] = None
     _p_local_sum_arr: cutlass.Array | None = None
     _global_sum_arr: cutlass.Array | None = None
@@ -726,6 +729,98 @@ class TmemSResource(DecodeGenResourceBase):
         )
 
     @cute.jit
+    def _reduce_keeps_row_max(self, s_vals: cutlass.Array) -> Float32:
+        """Reduce one Keeps score row while preserving its lane ownership."""
+
+        cfg = self.cfg
+        max_chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
+        for chain_idx in cutlass.range_constexpr(4):
+            max_chains[chain_idx] = _neg_max_f32()
+        for reg_base in cutlass.range_constexpr(0, cfg.num_s_regs_per_thread, 4):
+            for chain_idx in cutlass.range_constexpr(4):
+                max_chains[chain_idx] = cute.math.max(
+                    max_chains[chain_idx],
+                    s_vals[reg_base + chain_idx],
+                    ftz=True,
+                )
+        tile_max = cute.math.max(
+            cute.math.max(max_chains[0], max_chains[1], ftz=True),
+            cute.math.max(max_chains[2], max_chains[3], ftz=True),
+            ftz=True,
+        )
+        if cutlass.const_expr(cfg.tile_size_q == 64):
+            # A Q64 row is split across lanes xor 16; Q128 already owns the
+            # complete row locally and therefore needs no cross-lane combine.
+            tile_max = cute.math.max(
+                tile_max,
+                Float32(
+                    prims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=tile_max,
+                        offset=16,
+                        mask_and_clamp=0x1F,
+                        kind=prims.Shfl.BFLY,
+                    )
+                ),
+                ftz=True,
+            )
+        return tile_max
+
+    @cute.jit
+    def _publish_keeps_softmax_state(
+        self,
+        s_vals: cutlass.Array,
+        tile_max: Float32,
+        old_max: Float32,
+        running_sum: Float32,
+        old_max_arr: cutlass.Array,
+        sum_arr: cutlass.Array,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+    ) -> None:
+        """Publish a masked Keeps row and its updated running maximum."""
+
+        new_max = cute.math.max(old_max, tile_max, ftz=True)
+        old_max_arr[0] = old_max
+        sum_arr[0] = running_sum
+        new_max_arr[0] = new_max
+        for reg_idx in cutlass.range_constexpr(self.cfg.num_s_regs_per_thread):
+            s_arr[reg_idx] = s_vals[reg_idx]
+
+    @cute.jit
+    def _mask_and_store_sparse_keeps_atom(
+        self,
+        s_vals: cutlass.Array,
+        loaded: cutlass.Vector,
+        token_word: Uint32,
+        *,
+        atom_col: Constexpr[int],
+        token_mask_is_required: cutlass.Boolean,
+    ) -> None:
+        """Store one 32-score atom, applying its token word when required."""
+
+        cfg = self.cfg
+        apply_token_mask = token_mask_is_required
+        if token_mask_is_required:
+            if cutlass.const_expr(cfg.use_token_word_full_guard):
+                if token_word == Uint32(0xFFFFFFFF):
+                    apply_token_mask = cutlass.Boolean(False)
+
+        if apply_token_mask:
+            for atom_reg_idx in cutlass.range_constexpr(32):
+                score_idx = atom_col + atom_reg_idx
+                s_vals[score_idx] = loaded[atom_reg_idx]
+                token_bit_is_valid = (
+                    (token_word >> Int32(atom_reg_idx)) & Uint32(1)
+                ) != Uint32(0)
+                if not token_bit_is_valid:
+                    s_vals[score_idx] = _neg_max_f32()
+        else:
+            for atom_reg_idx in cutlass.range_constexpr(32):
+                score_idx = atom_col + atom_reg_idx
+                s_vals[score_idx] = loaded[atom_reg_idx]
+
+    @cute.jit
     def _load_keeps_fragment_impl(
         self,
         stage_info: StageInfo,
@@ -948,6 +1043,244 @@ class TmemSResource(DecodeGenResourceBase):
         return tile_max
 
     @cute.jit
+    def _load_raw_sparse_mask_metadata(
+        self,
+        routed_origin0: Int32,
+        routed_origin1: Int32,
+        routed_route_flags: Int32,
+        routed_token_word0: Uint32,
+        routed_token_word1: Uint32,
+        routed_token_word2: Uint32,
+        routed_token_word3: Uint32,
+    ) -> tuple[Int32, Int32, Int32, Int32, cutlass.Array, cutlass.Boolean]:
+        """Materialize one explicitly routed register-resident mask payload."""
+
+        origin0 = Int32(routed_origin0)
+        origin1 = Int32(routed_origin1)
+        route_flags = Int32(routed_route_flags)
+        valid0 = route_flags & Int32(1)
+        valid1 = (route_flags >> Int32(1)) & Int32(1)
+        all_token_words_valid = cutlass.Boolean(False)
+        if cutlass.const_expr(self.cfg.use_q128_token_route_full_guard):
+            all_token_words_valid = cutlass.Boolean(
+                (route_flags & Int32(_ALL_TOKEN_WORDS_VALID_FLAG)) != Int32(0)
+            )
+
+        num_local_words = 4 if self.cfg.tile_size_q == 128 else 2
+        local_token_words = cutlass.Array(
+            Uint32,
+            num_local_words,
+            space=cutlass.AddressSpace.rmem,
+        )
+        for word_idx in cutlass.range_constexpr(num_local_words):
+            local_token_words[word_idx] = Uint32(0xFFFFFFFF)
+        if cutlass.const_expr(self.cfg.use_kv_valid_bits):
+            token_words_are_needed = cutlass.Boolean(True)
+            if cutlass.const_expr(self.cfg.use_q128_token_route_full_guard):
+                token_words_are_needed = cutlass.Boolean(False)
+                if not all_token_words_valid:
+                    token_words_are_needed = cutlass.Boolean(True)
+            if token_words_are_needed:
+                if cutlass.const_expr(self.cfg.tile_size_q == 128):
+                    local_token_words[0] = Uint32(routed_token_word0)
+                    local_token_words[1] = Uint32(routed_token_word1)
+                    local_token_words[2] = Uint32(routed_token_word2)
+                    local_token_words[3] = Uint32(routed_token_word3)
+                else:
+                    local_word0 = Uint32(routed_token_word0)
+                    local_word1 = Uint32(routed_token_word1)
+                    local_token_words[0] = local_word0
+                    local_token_words[1] = local_word1
+        return (
+            origin0,
+            origin1,
+            valid0,
+            valid1,
+            local_token_words,
+            all_token_words_valid,
+        )
+
+    @cute.jit
+    def _compute_softmax_loop_sparse_keeps(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_max_arr: cutlass.Array,
+        sum_arr: cutlass.Array,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+        routed_origin0: Int32,
+        routed_origin1: Int32,
+        routed_route_flags: Int32,
+        routed_token_word0: Uint32,
+        routed_token_word1: Uint32,
+        routed_token_word2: Uint32,
+        routed_token_word3: Uint32,
+    ) -> tuple[object, object, object, object]:
+        """Load Keeps scores and mask them in original physical KV coordinates."""
+        cfg = self.cfg
+        num_s_regs = cfg.num_s_regs_per_thread
+        old_max = new_max_arr[0]
+        running_sum = sum_arr[0]
+        s_vals = cutlass.Array(Float32, num_s_regs, space=cutlass.AddressSpace.rmem)
+        task_cache = _decode_gen_task_cache(stage_info)
+        seq_len_kv = Int32(self.max_seq_len_kv)
+        warp_grp_thread_idx = Int32(task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX])
+        lane_idx = Int32(task_cache[_TASK_CACHE_LANE_IDX])
+        tile_row_idx = _keeps_row_idx(cfg, warp_grp_thread_idx)
+        col_base = _keeps_col_base(cfg, lane_idx, num_s_regs)
+        (
+            origin0,
+            origin1,
+            valid0,
+            valid1,
+            local_token_words,
+            all_token_words_valid,
+        ) = self._load_raw_sparse_mask_metadata(
+            routed_origin0=routed_origin0,
+            routed_origin1=routed_origin1,
+            routed_route_flags=routed_route_flags,
+            routed_token_word0=routed_token_word0,
+            routed_token_word1=routed_token_word1,
+            routed_token_word2=routed_token_word2,
+            routed_token_word3=routed_token_word3,
+        )
+
+        base_addr = (
+            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+            + Int32(self._alloc.offset)
+            + self._softmax_loop_stage_slot_offset(stage_info)
+        )
+        num_load_atoms = num_s_regs // 32
+        if cutlass.const_expr(cfg.tile_size_q == 64 and cfg.use_kv_valid_bits):
+            token_mask_is_required = cutlass.Boolean(True)
+
+            # Keep each Q64 atom's load, wait, and mask together. This leaves
+            # the profitable cross-atom prefetch schedule to ptxas.
+            for load_atom_idx in cutlass.range_constexpr(2):
+                atom_col = load_atom_idx * 32
+                loaded = _keeps_tcgen05_ld(
+                    cfg,
+                    prims.make_tmem_ptr(base_addr + Int32(atom_col), Float32),
+                    num=32,
+                    offset=cfg.tile_size_kv // 2,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                self._mask_and_store_sparse_keeps_atom(
+                    s_vals,
+                    loaded,
+                    local_token_words[load_atom_idx],
+                    atom_col=atom_col,
+                    token_mask_is_required=token_mask_is_required,
+                )
+        else:
+            for load_atom_idx in cutlass.range_constexpr(num_load_atoms):
+                atom_col = load_atom_idx * 32
+                loaded = _keeps_tcgen05_ld(
+                    cfg,
+                    prims.make_tmem_ptr(base_addr + Int32(atom_col), Float32),
+                    num=32,
+                    offset=cfg.tile_size_kv // 2,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                for atom_reg_idx in cutlass.range_constexpr(32):
+                    score_idx = atom_col + atom_reg_idx
+                    s_vals[score_idx] = loaded[atom_reg_idx]
+
+        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
+        q_token_idx, _ = _q_row_token_and_local_head(
+            cfg,
+            self.h_r,
+            logical_q_group_idx,
+            tile_row_idx,
+        )
+        q_row_is_valid = _q_row_is_valid_for_seq(
+            cfg,
+            self.h_r,
+            logical_q_group_idx,
+            tile_row_idx,
+            self.seq_len_q,
+        )
+        causal_end = seq_len_kv - self.seq_len_q + q_token_idx + Int32(1)
+        can_skip_structural_mask = sparse_keeps_can_skip_structural_mask(
+            q_row_is_valid,
+            origin0,
+            origin1,
+            valid0,
+            valid1,
+            seq_len_kv,
+            causal_end,
+            apply_causal_mask=cfg.mask_type == CAUSAL,
+        )
+        # This guard covers only route/Q/tail/causal structure. Q64 token
+        # holes were applied while materializing its two LDTM atoms; Q128
+        # applies them in the post-pass below.
+        if not can_skip_structural_mask:
+            for reg_idx in cutlass.range_constexpr(num_s_regs):
+                fragment_offset = Int32(reg_idx)
+                physical_k = origin0 + fragment_offset
+                fragment_valid = valid0
+                if cutlass.const_expr(cfg.tile_size_q == 128 and reg_idx >= 64):
+                    fragment_offset = Int32(reg_idx - 64)
+                    physical_k = origin1 + fragment_offset
+                    fragment_valid = valid1
+                elif cutlass.const_expr(cfg.tile_size_q == 64):
+                    if col_base >= Int32(64):
+                        physical_k = origin1 + fragment_offset
+                        fragment_valid = valid1
+
+                score_is_valid = (
+                    q_row_is_valid
+                    and fragment_valid != Int32(0)
+                    and physical_k < seq_len_kv
+                )
+                if cutlass.const_expr(cfg.mask_type == CAUSAL):
+                    score_is_valid = score_is_valid and physical_k < causal_end
+                if not score_is_valid:
+                    s_vals[reg_idx] = _neg_max_f32()
+
+        # Q128 deliberately keeps all four LDTM atoms adjacent. Its token
+        # post-pass follows structural masking and retains both whole-route and
+        # per-word all-valid guards established by plan-time inspection.
+        if cutlass.const_expr(cfg.tile_size_q == 128 and cfg.use_kv_valid_bits):
+            token_mask_is_required = cutlass.Boolean(True)
+            if cutlass.const_expr(cfg.use_q128_token_route_full_guard):
+                token_mask_is_required = not all_token_words_valid
+            if token_mask_is_required:
+                for word_idx in cutlass.range_constexpr(4):
+                    token_word = local_token_words[word_idx]
+                    if cutlass.const_expr(cfg.use_token_word_full_guard):
+                        if token_word != Uint32(0xFFFFFFFF):
+                            for bit_idx in cutlass.range_constexpr(32):
+                                reg_idx = word_idx * 32 + bit_idx
+                                token_bit_is_valid = (
+                                    (token_word >> Int32(bit_idx)) & Uint32(1)
+                                ) != Uint32(0)
+                                if not token_bit_is_valid:
+                                    s_vals[reg_idx] = _neg_max_f32()
+                    else:
+                        for bit_idx in cutlass.range_constexpr(32):
+                            reg_idx = word_idx * 32 + bit_idx
+                            token_bit_is_valid = (
+                                (token_word >> Int32(bit_idx)) & Uint32(1)
+                            ) != Uint32(0)
+                            if not token_bit_is_valid:
+                                s_vals[reg_idx] = _neg_max_f32()
+
+        tile_max = self._reduce_keeps_row_max(s_vals)
+        self._publish_keeps_softmax_state(
+            s_vals,
+            tile_max,
+            old_max,
+            running_sum,
+            old_max_arr,
+            sum_arr,
+            new_max_arr,
+            s_arr,
+        )
+        return old_max_arr, sum_arr, new_max_arr, s_arr
+
+    @cute.jit
     def _compute_softmax_loop_keeps(
         self,
         stage_info: StageInfo,
@@ -1057,12 +1390,16 @@ class TmemSResource(DecodeGenResourceBase):
             )
             tile_max = self._reduce_keeps_fragment_max(s_vals)
 
-            new_max = cute.math.max(old_max, tile_max, ftz=True)
-            old_max_arr[0] = old_max
-            sum_arr[0] = running_sum
-            new_max_arr[0] = new_max
-            for reg_idx in cutlass.range_constexpr(num_s_regs):
-                s_arr[reg_idx] = s_vals[reg_idx]
+            self._publish_keeps_softmax_state(
+                s_vals,
+                tile_max,
+                old_max,
+                running_sum,
+                old_max_arr,
+                sum_arr,
+                new_max_arr,
+                s_arr,
+            )
             return old_max_arr, sum_arr, new_max_arr, s_arr
 
         should_load_s = (
@@ -1143,46 +1480,17 @@ class TmemSResource(DecodeGenResourceBase):
                 for reg_idx in cutlass.range_constexpr(num_s_regs):
                     s_vals[reg_idx] = _neg_max_f32()
 
-        # Four independent max chains avoid one long dependency chain across
-        # 64/128 score registers.
-        max_chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
-        for chain_idx in cutlass.range_constexpr(4):
-            max_chains[chain_idx] = _neg_max_f32()
-        for reg_base in cutlass.range_constexpr(0, num_s_regs, 4):
-            for chain_idx in cutlass.range_constexpr(4):
-                max_chains[chain_idx] = cute.math.max(
-                    max_chains[chain_idx],
-                    s_vals[reg_base + chain_idx],
-                    ftz=True,
-                )
-        tile_max = cute.math.max(
-            cute.math.max(max_chains[0], max_chains[1], ftz=True),
-            cute.math.max(max_chains[2], max_chains[3], ftz=True),
-            ftz=True,
+        tile_max = self._reduce_keeps_row_max(s_vals)
+        self._publish_keeps_softmax_state(
+            s_vals,
+            tile_max,
+            old_max,
+            running_sum,
+            old_max_arr,
+            sum_arr,
+            new_max_arr,
+            s_arr,
         )
-        if cutlass.const_expr(
-            cfg.tile_size_q == 64 and cfg.tile_size_kv != 256
-        ):
-            tile_max = cute.math.max(
-                tile_max,
-                Float32(
-                    prims.shfl_sync(
-                        thread_mask=0xFFFFFFFF,
-                        val=tile_max,
-                        offset=16,
-                        mask_and_clamp=0x1F,
-                        kind=prims.Shfl.BFLY,
-                    )
-                ),
-                ftz=True,
-            )
-        new_max = cute.math.max(old_max, tile_max, ftz=True)
-
-        old_max_arr[0] = old_max
-        sum_arr[0] = running_sum
-        new_max_arr[0] = new_max
-        for reg_idx in cutlass.range_constexpr(num_s_regs):
-            s_arr[reg_idx] = s_vals[reg_idx]
         return old_max_arr, sum_arr, new_max_arr, s_arr
 
     @consumer_work(returns=s_arr, work_attrs=WorkAttr.AUXILIARY)
@@ -1758,3 +2066,50 @@ class TmemSResource(DecodeGenResourceBase):
             for pair_idx in cutlass.range_constexpr(pair_width):
                 sum_arr[scale_base + pair_idx] = updated_sums[pair_idx]
         return sum_arr
+
+
+@dataclass(kw_only=True)
+class TmemSBlockSparseResource(TmemSResource):
+    """Block-sparse S resource with explicit metadata-to-softmax routing.
+
+    The dense resource keeps its original work signature.  This specialization
+    makes the metadata dependency visible to TaskManager while preserving the
+    same captured ``compute_softmax_loop`` label and masking implementation.
+    """
+
+    @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
+    @cute.jit
+    def compute_softmax_loop(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_max_arr: cutlass.Array,
+        sum_arr: cutlass.Array,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+        sparse_origin0: Int32,
+        sparse_origin1: Int32,
+        sparse_route_flags: Int32,
+        sparse_token_word0: Uint32,
+        sparse_token_word1: Uint32,
+        sparse_token_word2: Uint32,
+        sparse_token_word3: Uint32,
+    ) -> tuple[object, object, object, object]:
+        """Consume S plus one explicitly routed, register-resident payload."""
+
+        assert self.cfg.use_block_sparse
+        assert self.cfg.use_keeps_mma_ab
+        return self._compute_softmax_loop_sparse_keeps(
+            stage_info,
+            old_max_arr=old_max_arr,
+            sum_arr=sum_arr,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            routed_origin0=sparse_origin0,
+            routed_origin1=sparse_origin1,
+            routed_route_flags=sparse_route_flags,
+            routed_token_word0=sparse_token_word0,
+            routed_token_word1=sparse_token_word1,
+            routed_token_word2=sparse_token_word2,
+            routed_token_word3=sparse_token_word3,
+        )

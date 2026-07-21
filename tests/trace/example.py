@@ -75,6 +75,7 @@ msa_sparse_decode_attention_h64_kv4_d128_topk16.json
 mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
+prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -120,6 +121,7 @@ import flashinfer.kda_decode
 import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
+from flashinfer.attention.prims_ts.block_sparse import block_sparse_attention
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
@@ -619,6 +621,48 @@ k_r = torch.randn(512, num_kv, head_dim, dtype=torch.bfloat16, device=device)
 v_r = torch.randn(512, num_kv, head_dim, dtype=torch.bfloat16, device=device)
 rag.run(q_r, k_r, v_r)
 
+# ── PrimTS block-sparse (fixed-top-k MHA, compact BSHD) ───────────────────
+# Trace directly so this example covers the public schemas without compiling
+# the SM100/SM103 kernel or executing an unplanned reusable wrapper.
+bs_B, bs_Sq, bs_Skv, bs_H, bs_D = 2, 128, 512, 8, 128
+bs_q_block, bs_kv_block, bs_topk = 64, 64, 4
+bs_num_q_blocks = (bs_Sq + bs_q_block - 1) // bs_q_block
+bs_num_rows = bs_B * bs_H * bs_num_q_blocks
+bs_q = torch.randn(bs_B, bs_Sq, bs_H, bs_D, dtype=torch.float16, device=device)
+bs_k = torch.randn(bs_B, bs_Skv, bs_H, bs_D, dtype=torch.float16, device=device)
+bs_v = torch.randn_like(bs_k)
+bs_row_bases = (
+    torch.arange(bs_B * bs_H, dtype=torch.int32, device=device)
+    * (bs_num_q_blocks * bs_topk)
+).reshape(bs_B, bs_H, 1)
+bs_row_offsets = (
+    torch.arange(bs_num_q_blocks + 1, dtype=torch.int32, device=device) * bs_topk
+)
+bs_block_indptr = (bs_row_bases + bs_row_offsets).contiguous()
+bs_block_indices = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device=device).repeat(
+    bs_num_rows
+)
+bs_valid_bits = torch.full(
+    (bs_B, (bs_Skv + 31) // 32),
+    0xFFFFFFFF,
+    dtype=torch.uint32,
+    device=device,
+)
+bs_out = torch.empty_like(bs_q)
+
+block_sparse_attention.fi_trace(
+    save_dir=SAVE_DIR,
+    q=bs_q,
+    k=bs_k,
+    v=bs_v,
+    block_indptr=bs_block_indptr,
+    block_indices=bs_block_indices,
+    q_block_size=bs_q_block,
+    kv_block_size=bs_kv_block,
+    kv_valid_bits=bs_valid_bits,
+    mask_type="dense",
+    out=bs_out,
+)
 # ── MLA paged decode (DeepSeek-V3 TP=8, h=16/ckv=512/kpe=64) ─────────────────
 mla_b, mla_h, ckv, kpe = 128, 16, 512, 64
 

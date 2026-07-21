@@ -27,6 +27,7 @@ the backend column indicates which kernel the API wraps.
 | ``prims_ts_batch_decode`` | batched, ragged   | paged HND tuple/combined  | kv_indptr + optional qo | decode  | PrimTS SM100/SM103 |
 | ``gqa_paged_prefill``     | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
 | ``gqa_ragged``            | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
+| ``prims_ts_block_sparse`` | batched, fixed    | contiguous BSHD           | per-head BSR + bits     | both    | PrimTS SM100a   |
 | ``mla_paged_decode``      | batched, ragged   | paged MLA (ckv + kpe)     | kv_indptr + kv_indices  | decode  | DeepSeek MLA    |
 | ``prims_ts_decode_mla``   | batched, ragged Q | paged MLA (ckv + kpe)     | block tables + qo/seq   | decode  | PrimTS SM100/SM103 |
 | ``mla_paged_prefill``     | batched, ragged   | paged MLA (ckv + kpe)     | +qo_indptr              | prefill | DeepSeek MLA    |
@@ -241,6 +242,108 @@ gqa_paged_decode_trace = TraceTemplate(
     reference=_gqa_paged_decode_reference,
     init=_gqa_paged_decode_init,
 )
+
+
+# PrimTS block-sparse schema. Only the one-shot API can fully express its BSR
+# metadata and block geometry in a trace definition.
+
+
+def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
+    axes: dict[str, Var | Const] = {
+        "batch_size": Var(description="Number of requests."),
+        "seq_len_q": Var(description="Fixed query length per request."),
+        "seq_len_kv": Var(description="Fixed key/value length per request."),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "num_q_block_offsets": Var(
+            description="Number of BSR row offsets per batch and KV head."
+        ),
+        "num_block_indices": Var(description="Number of selected KV blocks."),
+        "num_kv_valid_words": Var(
+            description="Number of optional token-validity words per batch."
+        ),
+        "q_block_size": Const(abbrev="qb"),
+        "kv_block_size": Const(abbrev="kb"),
+    }
+    inputs: dict[str, Tensor | Scalar] = {
+        "q": Tensor(["batch_size", "seq_len_q", "num_qo_heads", "head_dim"]),
+        "k": Tensor(["batch_size", "seq_len_kv", "num_kv_heads", "head_dim"]),
+        "v": Tensor(["batch_size", "seq_len_kv", "num_kv_heads", "head_dim"]),
+        "block_indptr": Tensor(
+            ["batch_size", "num_kv_heads", "num_q_block_offsets"],
+            dtype="int32",
+            description=(
+                "Absolute offsets into block_indices, consumed by the one-shot call."
+            ),
+        ),
+        "block_indices": Tensor(
+            ["num_block_indices"],
+            dtype="int32",
+            description="Selected KV block IDs, consumed by the one-shot call.",
+        ),
+        "kv_valid_bits": Tensor(
+            ["batch_size", "num_kv_valid_words"],
+            dtype="uint32",
+            optional=True,
+            description=(
+                "Batch-only token validity bits: token t uses bit t % 32 of "
+                "word t // 32 (LSB-first); one means valid. Padding bits "
+                "beyond Skv are ignored; consumed by the one-shot call."
+            ),
+        ),
+        "q_block_size": Scalar("int32"),
+        "kv_block_size": Scalar("int32"),
+        "mask_type": Scalar("string", optional=True),
+        "sm_scale": Scalar("float32", optional=True),
+    }
+    return TraceTemplate(
+        op_type="block_sparse",
+        name_prefix="prims_ts_block_sparse",
+        description=(
+            "One-shot PrimTS block-sparse MHA attention over compact "
+            "BSHD Q/K/V and per-batch/per-head BSR metadata."
+        ),
+        axes=axes,
+        inputs=inputs,
+        outputs={
+            "output": Tensor(
+                ["batch_size", "seq_len_q", "num_qo_heads", "head_dim"],
+                dtype_from="q",
+                param="out",
+            )
+        },
+        constraints=[
+            "num_qo_heads == num_kv_heads",
+            "head_dim == 128",
+            "q_block_size > 0 and q_block_size % 64 == 0",
+            "kv_block_size > 0 and kv_block_size % 64 == 0",
+            "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
+            "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
+            "mask_type is None or mask_type in ('dense', 'causal')",
+        ],
+        tags=[
+            "backend:prims-ts",
+            "sparse:block",
+            "status:experimental",
+        ],
+    )
+
+
+prims_ts_block_sparse_trace = _make_prims_ts_block_sparse_trace()
+
+
+def prims_ts_block_sparse_trace_dispatch(
+    **_kwargs: object,
+) -> TraceTemplate:
+    """Return the single compact-BSHD one-shot block-sparse schema."""
+
+    return prims_ts_block_sparse_trace
+
+
+prims_ts_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    prims_ts_block_sparse_trace
+]
 
 
 # PrimTS decode schemas. Query storage is part of the public ABI, so fixed SQ1,
