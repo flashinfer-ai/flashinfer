@@ -807,6 +807,86 @@ def test_attention_prefill_fp8(batch_size, qo_len, kv_len, causal, window_left):
     torch.testing.assert_close(o.float(), o_ref.float(), rtol=1e-2, atol=8e-2)
 
 
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,causal,window_left",
+    [
+        (1, 2048, 2048, True, -1),
+        (1, 2048, 2048, True, 127),
+        (3, 512, 512, False, -1),
+    ],
+)
+def test_attention_prefill_mixed_v_dtype(
+    batch_size, qo_len, kv_len, causal, window_left
+):
+    """Mixed dtypes: bf16 Q/K with fp8 (e4m3) V on the modular kernel.
+
+    P (the softmax weights) converts to V's dtype for the PV GEMM, so the
+    tolerance matches the uniform-fp8 test's fp8-P calibration.  The same
+    wrapper serves the uniform bf16 kernel first to exercise the per-V-dtype
+    kernel cache, and LSE (a Q@K quantity, independent of V) must match the
+    bf16 reference exactly within f32 tolerance.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v_bf16 = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = v_bf16.to(torch.float8_e4m3fn)
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        window_left=window_left,
+    )
+    # Uniform kernel first: the mixed run below must not disturb it.
+    o_uniform = wrapper.run(q, k, v_bf16)
+    o_ref_uniform = attention_band_mask_ref(
+        batch_size, q, k, v_bf16, SM_SCALE, causal, window_left, window_right=-1
+    )
+    torch.testing.assert_close(o_uniform, o_ref_uniform, rtol=RTOL, atol=ATOL)
+
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+    o_ref = attention_band_mask_ref(
+        batch_size,
+        q.to(torch.float32),
+        k.to(torch.float32),
+        v.to(torch.float32),
+        SM_SCALE,
+        causal,
+        window_left,
+        window_right=-1,
+    )
+    torch.testing.assert_close(o.float(), o_ref.float(), rtol=1e-2, atol=8e-2)
+    lse_ref = _band_mask_lse_ref(batch_size, q, k, causal, window_left, SM_SCALE)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
 def _band_mask_lse_ref(batch_size, q, k, causal, window_left, sm_scale):
     """Log2-domain LSE reference over band-masked logits (per uniform batch)."""
     qo_len = q.shape[0] // batch_size

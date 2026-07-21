@@ -88,13 +88,19 @@ class SoftmaxRole:
         # Set later via set_dtypes() / set_call_attrs()
         self.q_dtype: Optional[Type[cutlass.Numeric]] = None
         self.o_dtype: Optional[Type[cutlass.Numeric]] = None
+        self.p_dtype: Optional[Type[cutlass.Numeric]] = None
         self.o_layout = None
         self.epi_tile = None
 
-    def set_dtypes(self, q_dtype, o_dtype):
-        """Set tensor-type attributes known only at call time."""
+    def set_dtypes(self, q_dtype, o_dtype, p_dtype=None):
+        """Set tensor-type attributes known only at call time.
+
+        P (the PV MMA A-operand) follows V's dtype, which may differ
+        from Q/K's; defaults to q_dtype for uniform-dtype callers.
+        """
         self.q_dtype = q_dtype
         self.o_dtype = o_dtype
+        self.p_dtype = p_dtype if p_dtype is not None else q_dtype
 
     def set_call_attrs(self, o_layout, epi_tile):
         """Set epilog attributes for transform path (replaces CorrectionRole)."""
@@ -258,7 +264,7 @@ class SoftmaxRole:
 
         tTMEM_STORErS_x4 = cute.make_rmem_tensor(tTMEM_STOREcS.shape, self.qk_acc_dtype)
         tTMEM_STORErS_x4_e = cute.make_tensor(
-            cute.recast_ptr(tTMEM_STORErS_x4.iterator, dtype=self.q_dtype),
+            cute.recast_ptr(tTMEM_STORErS_x4.iterator, dtype=self.p_dtype),
             tTMEM_LOADrS.layout,
         )
 
@@ -279,7 +285,7 @@ class SoftmaxRole:
             for j in range(frg_cnt):
                 self.variant.transform_logits_vec(tTMEM_LOADrS_frg[None, j])
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
-                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.p_dtype))
 
         elif cutlass.const_expr(self.has_logits_transform):
             if cutlass.const_expr(self.has_params and not self.has_score_mod):
@@ -290,13 +296,13 @@ class SoftmaxRole:
                         tTMEM_LOADrS_frg[k, j],
                     )
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
-                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.p_dtype))
 
         else:
             for j in range(frg_cnt):
                 exp2_scale(tTMEM_LOADrS_frg[None, j], scale, row_max_safe)
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
-                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.p_dtype))
 
         if cutlass.const_expr(not self.has_logits_transform):
             if cutlass.const_expr(stage == 0):

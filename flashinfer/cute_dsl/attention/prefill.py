@@ -192,12 +192,15 @@ class BlackwellFusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.v_major_mode != cute.nvgpu.OperandMajorMode.MN):
             raise RuntimeError("The layout of v is not supported")
 
-        # check type consistency
+        # check type consistency: Q and K feed the same GEMM operand dtype;
+        # V (and with it P, the PV MMA A-operand) may differ.
         if cutlass.const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if cutlass.const_expr(self.q_dtype != self.v_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
-        self.mainloop = self.mainloop.resolve(self.q_dtype.width)
+        # Stage counts are sized for the wider K/V operand (the shared
+        # K/V smem ring must fit both tiles per slot).
+        self.mainloop = self.mainloop.resolve(
+            max(self.q_dtype.width, self.v_dtype.width)
+        )
 
         self.softmax_role = SoftmaxRole(
             self.config,
@@ -232,7 +235,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.k_major_mode,
             self.v_major_mode,
         )
-        self.softmax_role.set_dtypes(self.q_dtype, self.o_dtype)
+        self.softmax_role.set_dtypes(self.q_dtype, self.o_dtype, self.v_dtype)
 
         lp = build_fmha_launch_params(
             self.mainloop,
@@ -263,6 +266,13 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.tma_copy_q_bytes = lp.tma_copy_q_bytes
         self.tma_copy_kv_bytes = lp.tma_copy_kv_bytes
+        # The shared K/V ring's barriers are initialized with K's byte
+        # count; with mixed K/V dtypes the loader re-arms each V slot with
+        # V's byte count (None means uniform: plain acquires).
+        self.loader_role.set_v_tx_bytes(
+            lp.tma_copy_v_bytes if self.k_dtype.width != self.v_dtype.width else None,
+            self.mainloop.kv_stages,
+        )
 
         if cutlass.const_expr(not self.has_logits_transform):
             self.correction_role.set_call_attrs(self.o_dtype, lp.o_layout, lp.epi_tile)
@@ -352,7 +362,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         tP = cute.make_tensor(tStS.iterator, p_tmem_layout_staged.outer)
         tOrP = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
-        p_scale = self.config.qk_acc_dtype.width // self.q_dtype.width
+        p_scale = self.config.qk_acc_dtype.width // self.v_dtype.width
         tOrP0 = cute.make_tensor(
             tOrP.iterator + p_scale * self.tmem.p0_offset, tOrP.layout
         )
@@ -457,8 +467,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         sK = storage.sK.get_tensor(
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
+        # V reuses K's smem buffer; recast the element type first so the
+        # MMA descriptor matches v_dtype when K and V dtypes differ.
         sV = cute.make_tensor(
-            cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner),
+            cute.recast_ptr(
+                cute.recast_ptr(sK.iterator, dtype=self.v_dtype),
+                v_smem_layout_staged.inner,
+            ),
             v_smem_layout_staged.outer,
         )
         sO = storage.sO.get_tensor(
@@ -521,6 +536,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 load_q_producer,
                 load_kv_producer,
                 tile_sched_params,
+                storage.load_kv_mbar_ptr.data_ptr(),
             )
 
         # ///////////////////////////////////////////////////////////////////////////////

@@ -29,6 +29,14 @@ from ..fusion.mask import MaskSpec
 from ..fusion.variant import AttentionVariant, StandardAttention
 from ..prefill import BlackwellFusedMultiHeadAttentionForward
 
+# V dtypes accepted when v.dtype differs from the planned q/k dtype
+# (mixed-dtype PV path: P converts to V's dtype for the PV MMA).
+_V_DTYPE_MAP = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+}
+
 
 @functools.cache
 def _get_compiled_prefill_kernel(
@@ -42,6 +50,7 @@ def _get_compiled_prefill_kernel(
     variant,
     params_shape,
     with_lse=False,
+    v_in_dtype=None,
 ):
     """Compile and cache the prefill kernel.
 
@@ -94,7 +103,7 @@ def _get_compiled_prefill_kernel(
         assumed_align=16,
     )
     v_fake = cute.runtime.make_fake_compact_tensor(
-        in_dtype,
+        v_in_dtype if v_in_dtype is not None else in_dtype,
         (sym_s_k, num_kv_heads, head_dim),
         stride_order=(2, 1, 0),
         assumed_align=16,
@@ -389,7 +398,9 @@ class BatchPrefillCuteDSLWrapper:
         )
         self._cache_variant = cache_variant
         self._compiled_fmha = _get_compiled_prefill_kernel(*self._compile_key)
-        self._compiled_fmha_lse = None
+        # Lazily compiled kernel variants, keyed by (with_lse, v_in_dtype):
+        # return_lse and a mixed V dtype are both run()-time properties.
+        self._kernel_cache = {(False, None): self._compiled_fmha}
 
         # Pre-allocate padded output scratch buffer.  The kernel uses a
         # negative pointer offset into the output tensor for TMA varlen
@@ -417,12 +428,20 @@ class BatchPrefillCuteDSLWrapper:
         out: Optional[torch.Tensor],
     ) -> None:
         """Check that run() inputs are consistent with the plan() configuration."""
-        for name, tensor in [("q", q), ("k", k), ("v", v)]:
+        for name, tensor in [("q", q), ("k", k)]:
             if tensor.dtype != self._q_data_type:
                 raise ValueError(
                     f"{name}.dtype={tensor.dtype} does not match the planned "
                     f"q_data_type={self._q_data_type}"
                 )
+        # V may differ from Q/K (mixed-dtype PV path, e.g. fp8 V with
+        # bf16 Q/K); the kernel variant is selected per V dtype in run().
+        if v.dtype != self._q_data_type and v.dtype not in _V_DTYPE_MAP:
+            raise ValueError(
+                f"v.dtype={v.dtype} is not supported; expected "
+                f"{self._q_data_type} or one of {sorted(map(str, _V_DTYPE_MAP))}"
+            )
+        for name, tensor in [("q", q), ("k", k), ("v", v)]:
             if tensor.device != self._device:
                 raise ValueError(
                     f"{name}.device={tensor.device} does not match the planned "
@@ -470,6 +489,8 @@ class BatchPrefillCuteDSLWrapper:
             The key tensor with shape [total_kv_len, num_heads, head_dim].
         v : torch.Tensor
             The value tensor with shape [total_kv_len, num_heads, head_dim].
+            May use a different dtype than q/k (e.g. fp8 V with bf16 Q/K);
+            the matching kernel variant is JIT-compiled on first use.
         out : Optional[torch.Tensor], optional
             The output tensor. If None, a new tensor will be created.
         return_lse : bool
@@ -505,20 +526,23 @@ class BatchPrefillCuteDSLWrapper:
                 raise NotImplementedError(
                     "return_lse is not supported with logits-transform variants"
                 )
-            if self._compiled_fmha_lse is None:
-                self._compiled_fmha_lse = _get_compiled_prefill_kernel(
-                    *self._compile_key, with_lse=True
-                )
             if lse is None:
                 lse = torch.empty(
                     (self._s_q_all, self._num_qo_heads),
                     dtype=torch.float32,
                     device=self._device,
                 )
-            kernel_fn = self._compiled_fmha_lse
         else:
             lse = None
-            kernel_fn = self._compiled_fmha
+
+        v_in_dtype = _V_DTYPE_MAP[v.dtype] if v.dtype != self._q_data_type else None
+        kernel_key = (return_lse, v_in_dtype)
+        kernel_fn = self._kernel_cache.get(kernel_key)
+        if kernel_fn is None:
+            kernel_fn = _get_compiled_prefill_kernel(
+                *self._compile_key, with_lse=return_lse, v_in_dtype=v_in_dtype
+            )
+            self._kernel_cache[kernel_key] = kernel_fn
 
         kernel_fn(
             q,
