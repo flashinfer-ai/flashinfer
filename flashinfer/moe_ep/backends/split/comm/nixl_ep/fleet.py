@@ -40,17 +40,24 @@ if TYPE_CHECKING:
 
 
 def _load_nixl_ep():
-    """Import the vendored ``nixl_ep`` Python module + load the .so."""
-    try:
-        from . import _load_nixl_ep_cpp  # noqa: F401
-    except ImportError as e:
+    """Import the vendored ``nixl_ep`` Python module (staged by the build).
+
+    The base NIXL libs are ctypes-preloaded (RTLD_GLOBAL) so the extension
+    resolves its symbols; the extension itself is then loaded exactly once,
+    as the package submodule (buffer.py does ``from . import nixl_ep_cpp``)
+    — NOT dlopen'd separately, which would double-load its static state.
+    """
+    from . import _libs_dir, _preload_libnixl
+
+    if not list(_libs_dir.glob("nixl_ep_cpp*.so")):
         raise MoEEpNotBuiltError(
             "nixl_ep loaders not staged; rebuild with `pip install -e .` "
             "(BUILD_NIXL_EP=1 makes missing build deps a hard error)"
-        ) from e
-    _load_nixl_ep_cpp()
+        )
+    _preload_libnixl()
     try:
-        # The vendored module is staged under _vendored/ by build_backend._build_nixl_ep.
+        # The vendored package is staged under _vendored/nixl_ep/ by
+        # build_backend._build_nixl_ep, with nixl_ep_cpp*.so inside it.
         import os
         import sys
 

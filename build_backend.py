@@ -287,15 +287,24 @@ def _build_nixl_ep() -> None:
         shutil.copy(cand, dst / cand.name)
         print(f"[BUILD_NVEP] staged: {cand.name}")
 
-    # Vendor the python wrapper sources so we can import from
-    # flashinfer.moe_ep.backends.split.comm.nixl_ep._vendored.
+    # Vendor the python wrapper as an importable `nixl_ep` package under
+    # _vendored/ (the runtime loader puts _vendored on sys.path and does
+    # `import nixl_ep`), and stage the extension INSIDE the package —
+    # buffer.py binds it with a relative `from . import nixl_ep_cpp`.
     vendored_src = src / "examples/device/ep/nixl_ep"
     if vendored_src.exists():
-        shutil.copytree(
-            vendored_src,
-            _moe_ep_pkg / "backends" / "split" / "comm" / "nixl_ep" / "_vendored",
-            dirs_exist_ok=True,
+        vendored_pkg = (
+            _moe_ep_pkg
+            / "backends"
+            / "split"
+            / "comm"
+            / "nixl_ep"
+            / "_vendored"
+            / "nixl_ep"
         )
+        shutil.copytree(vendored_src, vendored_pkg, dirs_exist_ok=True)
+        for cand in (build / "examples/device/ep").glob("nixl_ep_cpp*.so"):
+            shutil.copy(cand, vendored_pkg / cand.name)
 
 
 def _find_nccl_wheel_root() -> Path | None:
