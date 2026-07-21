@@ -87,6 +87,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         window_left: Int32,
         window_right: Int32,
         params_in: cute.Tensor | None,
+        lse_in: cute.Tensor | None,
         stream,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -154,6 +155,18 @@ class BlackwellFusedMultiHeadAttentionForward:
             if self.fusion.has_params
             else None
         )
+
+        # (total_q, h_q) f32 log-sum-exp output, written by the correction
+        # warps (log2 domain, matching the flashinfer LSE convention).
+        mLSE = None
+        if cutlass.const_expr(lse_in is not None):
+            lse_rows = (
+                s_q_all if cutlass.const_expr(cum_seqlen_q is not None) else s_q * b
+            )
+            mLSE = cute.make_tensor(
+                lse_in.iterator,
+                cute.make_layout((lse_rows, h_r * h_k), stride=(h_r * h_k, 1)),
+            )
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q.element_type
@@ -274,6 +287,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             window_left,
             window_right,
             params,
+            mLSE,
             lp.q_smem_layout_staged,
             lp.k_smem_layout_staged,
             lp.p_tmem_layout_staged,
@@ -382,6 +396,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         window_left: Int32,
         window_right: Int32,
         params: cute.Tensor | None,
+        mLSE: cute.Tensor | None,
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         p_tmem_layout_staged: cute.ComposedLayout,
@@ -649,6 +664,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     scale_output,
                     window_left,
                     window_right,
+                    mLSE,
                     s0_corr_consumer,
                     s1_corr_consumer,
                     mma_corr_consumer,

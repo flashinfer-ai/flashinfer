@@ -41,6 +41,7 @@ def _get_compiled_prefill_kernel(
     is_persistent,
     variant,
     params_shape,
+    with_lse=False,
 ):
     """Compile and cache the prefill kernel.
 
@@ -126,6 +127,15 @@ def _get_compiled_prefill_kernel(
             assumed_align=16,
         )
 
+    lse_fake = None
+    if with_lse:
+        lse_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (sym_s_q, num_qo_heads),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+
     problem_size = (1, 1, 1, num_qo_heads, num_kv_heads, head_dim)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -145,6 +155,7 @@ def _get_compiled_prefill_kernel(
         0,
         0,
         params_fake,
+        lse_fake,
         stream_fake,
         options="--enable-tvm-ffi --opt-level 2",
     )
@@ -363,7 +374,9 @@ class BatchPrefillCuteDSLWrapper:
         )
         params_shape = tuple(self._params_torch.shape) if self._has_params else None
 
-        self._compiled_fmha = _get_compiled_prefill_kernel(
+        # Stashed so run(return_lse=True) can lazily compile the LSE
+        # variant (return_lse is a run-time argument).
+        self._compile_key = (
             self._in_dtype,
             self._out_dtype,
             num_qo_heads,
@@ -374,6 +387,9 @@ class BatchPrefillCuteDSLWrapper:
             cache_variant,
             params_shape,
         )
+        self._cache_variant = cache_variant
+        self._compiled_fmha = _get_compiled_prefill_kernel(*self._compile_key)
+        self._compiled_fmha_lse = None
 
         # Pre-allocate padded output scratch buffer.  The kernel uses a
         # negative pointer offset into the output tensor for TMA varlen
@@ -441,7 +457,9 @@ class BatchPrefillCuteDSLWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+        lse: Optional[torch.Tensor] = None,
+    ):
         r"""Run the prefill attention computation.
 
         Parameters
@@ -454,18 +472,55 @@ class BatchPrefillCuteDSLWrapper:
             The value tensor with shape [total_kv_len, num_heads, head_dim].
         out : Optional[torch.Tensor], optional
             The output tensor. If None, a new tensor will be created.
+        return_lse : bool
+            Whether to also return the per-row log-sum-exp, shape
+            [total_q_len, num_heads], float32, log2 domain (flashinfer
+            convention).  Standard attention only.  The LSE kernel variant
+            is JIT-compiled on the first such call.
+        lse : Optional[torch.Tensor], optional
+            Pre-allocated LSE tensor. If None, a new tensor is created.
 
         Returns
         -------
-        torch.Tensor
-            The output tensor with shape [total_q_len, num_heads, head_dim].
+        torch.Tensor or (torch.Tensor, torch.Tensor)
+            The output tensor with shape [total_q_len, num_heads, head_dim],
+            plus the LSE tensor when ``return_lse=True``.
         """
         if self._compiled_fmha is None:
             raise RuntimeError("Plan the prefill attention computation first!")
 
         self._validate_run_inputs(q, k, v, out)
 
-        self._compiled_fmha(
+        if return_lse:
+            if self._cache_variant is not None and (
+                self._cache_variant.has_logits_transform
+                or self._cache_variant.has_vectorized_logits_transform
+            ):
+                # The transform path has no correction warp (softmax warps
+                # own the epilogs) and no softmax normalization — LSE is
+                # undefined there.  score_mod and statistics-update
+                # variants use the standard path and their finals already
+                # reflect the modification (sinks fold into row_sum at
+                # tile 0), so LSE is exact for them.
+                raise NotImplementedError(
+                    "return_lse is not supported with logits-transform variants"
+                )
+            if self._compiled_fmha_lse is None:
+                self._compiled_fmha_lse = _get_compiled_prefill_kernel(
+                    *self._compile_key, with_lse=True
+                )
+            if lse is None:
+                lse = torch.empty(
+                    (self._s_q_all, self._num_qo_heads),
+                    dtype=torch.float32,
+                    device=self._device,
+                )
+            kernel_fn = self._compiled_fmha_lse
+        else:
+            lse = None
+            kernel_fn = self._compiled_fmha
+
+        kernel_fn(
             q,
             k,
             v,
@@ -480,9 +535,13 @@ class BatchPrefillCuteDSLWrapper:
             self._window_left,
             self._window_right,
             self._params_torch if self._has_params else None,
+            lse,
         )
 
         if out is not None:
             out.copy_(self._o_scratch_view)
-            return out
-        return self._o_scratch_view.clone()
+        else:
+            out = self._o_scratch_view.clone()
+        if return_lse:
+            return out, lse
+        return out

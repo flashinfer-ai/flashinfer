@@ -3510,7 +3510,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._cute_dsl_fmha_capable:
                 # Built even when the modular path is the default route:
                 # run() falls back to the FMHA kernel for requests the
-                # modular kernel cannot serve (return_lse, mixed V dtype).
+                # modular kernel cannot serve (mixed V dtype).
                 q_lens = qo_indptr[1:] - qo_indptr[:-1]
                 k_lens = kv_indptr[1:] - kv_indptr[:-1]
                 self._cute_dsl_fmha_plan = {
@@ -3835,13 +3835,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "cute-dsl backend does not support FP8 scale parameters"
                 )
             if self._cute_dsl_use_fmha or (
-                self._cute_dsl_fmha_capable and (return_lse or v.dtype != q.dtype)
+                self._cute_dsl_fmha_capable and v.dtype != q.dtype
             ):
                 # Delegate to the trtllm CuTe DSL FMHA kernel.  Windowed
                 # plans default to the modular path but take this route for
-                # requests the modular kernel cannot serve: return_lse and
-                # mixed V dtype (the FMHA kernel JIT-compiles windowed /
-                # separate-V-dtype variants).
+                # mixed V dtype, which the modular kernel cannot serve (the
+                # FMHA kernel JIT-compiles separate-V-dtype variants).
                 p = self._cute_dsl_fmha_plan
                 return trtllm_ragged_attention_deepseek(
                     query=q,
@@ -3865,10 +3864,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     lse=lse,
                     backend="cute-dsl",
                 )
-            # Generic JIT (ALiBi / soft-cap): prefill.py-based wrapper (no LSE).
             if return_lse:
-                raise NotImplementedError(
-                    "cute-dsl backend does not support return_lse with ALiBi / soft-cap"
+                # Standard-path modular kernel computes LSE natively; the
+                # wrapper raises NotImplementedError for attention variants.
+                return self._cute_dsl_wrapper.run(
+                    q, k, v, out=out, return_lse=True, lse=lse
                 )
             out = self._cute_dsl_wrapper.run(q, k, v, out=out)
             return out

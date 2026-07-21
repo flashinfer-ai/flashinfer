@@ -807,6 +807,262 @@ def test_attention_prefill_fp8(batch_size, qo_len, kv_len, causal, window_left):
     torch.testing.assert_close(o.float(), o_ref.float(), rtol=1e-2, atol=8e-2)
 
 
+def _band_mask_lse_ref(batch_size, q, k, causal, window_left, sm_scale):
+    """Log2-domain LSE reference over band-masked logits (per uniform batch)."""
+    qo_len = q.shape[0] // batch_size
+    kv_len = k.shape[0] // batch_size
+    group_size = q.shape[1] // k.shape[1]
+    kk = torch.repeat_interleave(k, group_size, dim=1)
+    logits = (
+        torch.einsum(
+            "bmhd,bnhd->bhmn",
+            q.view(batch_size, qo_len, q.shape[1], -1).float(),
+            kk.view(batch_size, kv_len, q.shape[1], -1).float(),
+        )
+        * sm_scale
+    )
+    qk_offset = kv_len - qo_len
+    q_idx = torch.arange(qo_len, device=q.device).unsqueeze(1)
+    k_idx = torch.arange(kv_len, device=q.device).unsqueeze(0)
+    mask = torch.ones(qo_len, kv_len, dtype=torch.bool, device=q.device)
+    if causal:
+        mask &= k_idx <= q_idx + qk_offset
+    if window_left >= 0:
+        mask &= (q_idx + qk_offset) - k_idx <= window_left
+    logits = logits.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+    # (b, h, m) -> (b*m, h), log2 domain
+    lse = torch.logsumexp(logits, dim=-1) * math.log2(math.e)
+    return lse.transpose(1, 2).reshape(batch_size * qo_len, q.shape[1])
+
+
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,causal,window_left",
+    [
+        (1, 2048, 2048, True, -1),
+        (1, 2048, 2048, True, 127),
+        (3, 512, 512, False, -1),
+        (1, 128, 512, True, 100),
+    ],
+)
+def test_attention_prefill_lse(batch_size, qo_len, kv_len, causal, window_left):
+    """return_lse on the standard path: log2-domain (total_q, h_q) f32."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn_like(k)
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        window_left=window_left,
+    )
+    o_plain = wrapper.run(q, k, v)
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    # The LSE variant must not perturb the attention output.
+    torch.testing.assert_close(o, o_plain, rtol=0, atol=0)
+    o_ref = attention_band_mask_ref(
+        batch_size, q, k, v, SM_SCALE, causal, window_left, window_right=-1
+    )
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+    lse_ref = _band_mask_lse_ref(batch_size, q, k, causal, window_left, SM_SCALE)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("indptr", [[0, 7, 1291, 1547, 3083]])
+def test_attention_prefill_lse_varlen(indptr):
+    """LSE row indexing over a mixed-length ragged batch (causal+window)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+    window_left = 100
+
+    torch.manual_seed(42)
+    q = torch.randn(indptr[-1], NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn_like(k)
+    qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        qo_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=True,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        window_left=window_left,
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    for i in range(len(indptr) - 1):
+        lo, hi = indptr[i], indptr[i + 1]
+        o_ref = attention_band_mask_ref(
+            1, q[lo:hi], k[lo:hi], v[lo:hi], SM_SCALE, True, window_left, -1
+        )
+        lse_ref = _band_mask_lse_ref(1, q[lo:hi], k[lo:hi], True, window_left, SM_SCALE)
+        torch.testing.assert_close(o[lo:hi], o_ref, rtol=RTOL, atol=ATOL)
+        torch.testing.assert_close(lse[lo:hi], lse_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_attention_prefill_lse_alibi():
+    """LSE with a score_mod variant (standard path): LSE over ALiBi logits."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    batch_size, qo_len, kv_len = 9, 256, 256
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn_like(k)
+    indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    alibi_slopes = ALiBiAttention.get_slopes(NUM_QO_HEADS).cuda()
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        indptr,
+        indptr.clone(),
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=True,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        variant=ALiBiAttention(alibi_slopes),
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    o_ref = attention_alibi_ref(batch_size, q, k, v, True, SM_SCALE, alibi_slopes)
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+    # LSE over the ALiBi-modified logits (mirrors attention_alibi_ref).
+    kk = torch.repeat_interleave(k, NUM_QO_HEADS // num_kv_heads, dim=1)
+    logits = torch.einsum(
+        "bmhd,bnhd->bhmn",
+        q.view(batch_size, qo_len, NUM_QO_HEADS, HEAD_DIM).float(),
+        kk.view(batch_size, kv_len, NUM_QO_HEADS, HEAD_DIM).float(),
+    )
+    qo_pos = torch.arange(qo_len, device=q.device).view(1, 1, -1, 1)
+    kv_pos = torch.arange(kv_len, device=q.device).view(1, 1, 1, -1)
+    logits = (logits + alibi_slopes.view(1, -1, 1, 1) * (kv_pos - qo_pos)) * SM_SCALE
+    mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
+        1
+    ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+    lse_ref = (
+        (torch.logsumexp(logits, dim=-1) * math.log2(math.e))
+        .transpose(1, 2)
+        .reshape(batch_size * qo_len, NUM_QO_HEADS)
+    )
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_attention_prefill_lse_sink():
+    """LSE with attention sinks: the sink term is part of the denominator."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    batch_size, qo_len, kv_len = 1, 256, 256
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn_like(k)
+    indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    sink = torch.randn((NUM_QO_HEADS,), dtype=DTYPE, device="cuda")
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        indptr,
+        indptr.clone(),
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=True,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        variant=AttentionWithSink(sink),
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    o_ref, _ = attention_ref(batch_size, q, k, v, True, SM_SCALE, sink=sink)
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+    # With-sink LSE: log of the actual normalization denominator,
+    # log2(sum_k exp(s_k) + exp(sink)) — attention_ref's lse is sink-less.
+    kk = torch.repeat_interleave(k, NUM_QO_HEADS // num_kv_heads, dim=1)
+    logits = (
+        torch.einsum(
+            "bmhd,bnhd->bhmn",
+            q.view(batch_size, qo_len, NUM_QO_HEADS, HEAD_DIM).float(),
+            kk.view(batch_size, kv_len, NUM_QO_HEADS, HEAD_DIM).float(),
+        )
+        * SM_SCALE
+    )
+    mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
+        1
+    ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+    logits_with_sink = torch.cat(
+        [logits, sink.float().view(1, -1, 1, 1).expand(batch_size, -1, qo_len, 1)],
+        dim=-1,
+    )
+    lse_ref = (
+        (torch.logsumexp(logits_with_sink, dim=-1) * math.log2(math.e))
+        .transpose(1, 2)
+        .reshape(batch_size * qo_len, NUM_QO_HEADS)
+    )
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size,qo_len,kv_len", FP16_SHAPE_PARAMS)
 @pytest.mark.parametrize("causal", [False, True])
 def test_attention_prefill_fp16(

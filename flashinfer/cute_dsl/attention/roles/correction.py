@@ -286,6 +286,7 @@ class CorrectionRole:
         scale_output: Float32,
         window_left: Int32,
         window_right: Int32,
+        mLSE: cute.Tensor | None,
         s0_corr_consumer: PipelineConsumer,
         s1_corr_consumer: PipelineConsumer,
         mma_corr_consumer: PipelineConsumer,
@@ -355,6 +356,11 @@ class CorrectionRole:
                         seqlen_q_,
                     )
                 )
+
+            # Base row of this sequence in the (total_q, h_q) LSE tensor.
+            lse_row_base = batch_coord * seqlen_q_global
+            if cutlass.const_expr(cum_seqlen_q is not None):
+                lse_row_base = cuseqlen_q
 
             if not continue_cond:
                 if cutlass.const_expr(cum_seqlen_k is not None):
@@ -488,6 +494,18 @@ class CorrectionRole:
                 epilogue_scale = scale_output
                 d = tTMEM_LOAD_VECrS[0]  # row sum
                 m = tTMEM_LOAD_VECrS[1]  # row max
+                # Each correction thread owns one Q row of this 128-row
+                # stage (the vec partition's identity coordinate); a fully
+                # masked row has d = 0, m = -inf and stores -inf.
+                # LSE is emitted in log2 domain (flashinfer convention):
+                # (ln(row_sum) + sm_scale * row_max) * log2(e)
+                #   == log2(row_sum) + scale_softmax_log2 * row_max.
+                if cutlass.const_expr(mLSE is not None):
+                    lse_row = qo_idx_offset + tTMEM_LOAD_VECcS[0][0]
+                    if lse_row < seqlen_q_:
+                        mLSE[lse_row_base + lse_row, head_coord] = (
+                            cute.math.log2(d, fastmath=True) + scale_softmax_log2 * m
+                        )
                 self.epilog(
                     pv_thr_mma,
                     tOtO0,
@@ -548,6 +566,14 @@ class CorrectionRole:
                 epilogue_scale = scale_output
                 d = tTMEM_LOAD_VECrS[0]  # row sum
                 m = tTMEM_LOAD_VECrS[1]  # row max
+                if cutlass.const_expr(mLSE is not None):
+                    lse_row = (
+                        qo_idx_offset + self.qk_mma_tiler[0] + tTMEM_LOAD_VECcS[0][0]
+                    )
+                    if lse_row < seqlen_q_:
+                        mLSE[lse_row_base + lse_row, head_coord] = (
+                            cute.math.log2(d, fastmath=True) + scale_softmax_log2 * m
+                        )
                 self.epilog(
                     pv_thr_mma,
                     tOtO1,
