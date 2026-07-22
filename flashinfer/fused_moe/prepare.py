@@ -650,6 +650,7 @@ def prepare_trtllm_fp8_block_weights(
             raise ValueError(
                 "MXFP8 requires hidden_size and intermediate_size divisible by 32."
             )
+        from ..quantization.fp4_quantization import block_scale_interleave
         from ..quantization.fp8_quantization import mxfp8_quantize
         from .core import (
             _maybe_get_cached_w3_w1_permute_indices,
@@ -674,7 +675,11 @@ def prepare_trtllm_fp8_block_weights(
                 is_gated_act_gemm=True,
             )
             w1_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
-            w1_sf.append(sf[permute_sf.to(device)])
+            w1_sf.append(
+                block_scale_interleave(
+                    sf[permute_sf.to(device)].contiguous()
+                ).reshape_as(sf)
+            )
 
             q, sf = mxfp8_quantize(w2_bf16[expert], is_sf_swizzled_layout=False)
             sf = sf.view(torch.uint8).reshape(hidden_size, intermediate_size // 32)
@@ -688,7 +693,11 @@ def prepare_trtllm_fp8_block_weights(
                 num_elts_per_sf=32,
             )
             w2_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
-            w2_sf.append(sf[permute_sf.to(device)])
+            w2_sf.append(
+                block_scale_interleave(
+                    sf[permute_sf.to(device)].contiguous()
+                ).reshape_as(sf)
+            )
         w1_q, w1_sf = torch.stack(w1_q), torch.stack(w1_sf)
         w2_q, w2_sf = torch.stack(w2_q), torch.stack(w2_sf)
 

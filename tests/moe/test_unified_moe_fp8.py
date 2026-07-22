@@ -222,6 +222,7 @@ def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
+    from flashinfer.quantization.fp4_quantization import block_scale_interleave
 
     generator = torch.Generator(device="cuda").manual_seed(20260718)
     w1 = torch.randn(
@@ -264,7 +265,10 @@ def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
     )
     torch.testing.assert_close(view["gemm1_weights"][0], w1_q[w1_perm], rtol=0, atol=0)
     torch.testing.assert_close(
-        view["gemm1_weights_scale"][0], w1_sf[w1_sf_perm], rtol=0, atol=0
+        view["gemm1_weights_scale"][0],
+        block_scale_interleave(w1_sf[w1_sf_perm].contiguous()).reshape_as(w1_sf),
+        rtol=0,
+        atol=0,
     )
 
     w2_q, w2_sf = _mxfp8_quant_matrix(w2[0])
@@ -274,7 +278,10 @@ def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
     )
     torch.testing.assert_close(view["gemm2_weights"][0], w2_q[w2_perm], rtol=0, atol=0)
     torch.testing.assert_close(
-        view["gemm2_weights_scale"][0], w2_sf[w2_sf_perm], rtol=0, atol=0
+        view["gemm2_weights_scale"][0],
+        block_scale_interleave(w2_sf[w2_sf_perm].contiguous()).reshape_as(w2_sf),
+        rtol=0,
+        atol=0,
     )
 
 
