@@ -479,13 +479,16 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
       static_cast<uint32_t>(NUM_CONSUMER_WARPS)  // Number of tiles loaded (for 8 consumer warps)
   };
 
-  // CUtensorMap must be 64-byte aligned
+  // CUtensorMap's declared alignment grew from 64B (CUDA <= 12.x) to 128B
+  // (CUDA 13.0+); an explicit weaker alignas is ill-formed (clang host
+  // compilers reject it, gcc accepts silently).  Use the type's own
+  // alignment so the declaration tracks every toolkit.
   // Use SWIZZLE_128B for half/bf16 (2-byte types), SWIZZLE_NONE for FP8 (1-byte types)
   constexpr CUtensorMapSwizzle swizzle_type =
       (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>)
           ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
           : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE;
-  alignas(64) CUtensorMap tensor_map = make_3d_tma_copy_desc(
+  alignas(alignof(CUtensorMap)) CUtensorMap tensor_map = make_3d_tma_copy_desc(
       const_cast<T*>(input), gmem_dim, stride_in_bytes, smem_dim, swizzle_type);
 
   // Select and launch the TMA kernel
