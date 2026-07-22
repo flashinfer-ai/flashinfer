@@ -84,7 +84,15 @@ Each step lands as its own commit. `[ ]` → `[x]` as they complete.
   - Deferred: EP shards (`local_expert_offset > 0`),
     `num_fused_shared_experts > 0`, routing-replay output — follow-ups after
     the base op is validated.
-- [ ] **Step 3** — validate Steps 1–2 on a B200 (remote ws1 workflow).
+- [x] **Step 3** — validated on B200 (umb-b200-239, sm100a):
+  **555/555 passed in 15.9 s** (post-compile; cold JIT of the routing-only
+  module is ~10 min vs ~25 min for the full fused stack).
+  Two bugs found and fixed on the way:
+  - `RoutingMethodType` lives in the nested `Routing` namespace (f0d6c1e4).
+  - The kernels emit no expert ids in from-logits mode — `mPtrTopKIds` is
+    input-only and `mPtrTopKPacked` is pipeline scratch (confirmed by GPU
+    probe). `topk_ids` is now reconstructed from the permutation:
+    `cta_idx_xy_to_batch_idx[slot // tile_tokens_dim]` (f3a280a1).
 - [ ] **Step 4 (Phase 3)** — collapse routing axis in fused tests.
   - `test_trtllm_gen_routed_fused_moe.py`: routing_method 3→1 on the flagship
     test (3,456 → ~600).
