@@ -19,7 +19,7 @@ weight-memory budget so one config never hogs the GPU (parallel-CI-friendly), pl
 larger-end shapes. Large expert counts are reached with small H/I and/or **expert-parallel shards**
 (global>local + ``local_expert_offset``, the real deployment shape), not by filling the GPU.
 
-A small ``_KNOWN_FAILURES`` ledger xfails already-filed bugs (e.g. the since-fixed trtllm EP
+A small shared ledger (``tests/test_helpers/fuzz_ledger.py``) xfails already-filed bugs (e.g. the since-fixed trtllm EP
 offset>0 all-zero bug, gh #3547): the case is still *run* so the suite stays green on a tracked bug
 yet flags loudly the day it starts passing (fixed). A crash is never tolerated -- only a wrong answer.
 
@@ -100,7 +100,7 @@ CI log alone tells you whether the output is all-zero / all-NaN / Inf without ha
 EXTENDING (cheap, by design):
   * New backend -> nothing to do: it is auto-discovered from ``_BACKEND_RUNNERS`` the moment its
     runner registers and ``supported(sm)`` is true. If it ships with a tracked bug, add one
-    ``_KNOWN_FAILURES`` entry (the case still RUNS; an xpass then flags the fix).
+    ledger ``Finding`` (a non-quarantine case still RUNS; an xpass then hard-fails until the entry is removed).
   * New dtype -> add ONE ``DTypeHandler`` to ``_DTYPE`` (snap / make_act_pack / reference / poison
     / tolerances). Everything else (config gen, all 7 checks, the cache test) is dtype-generic.
 
@@ -151,7 +151,7 @@ POINTERS for future agents (point me at this file and I know the rest):
   * Full context (this fuzzer + the older adapter/GEMM fuzzers + the audit + findings): cuDNN-
     project auto-memory ``flashinfer_quality_fuzzers.md``.
   * Bugs THIS fuzzer found + filed: gh #3547 (trtllm EP offset>0 all-zero -- tracked in the
-    ``_KNOWN_FAILURES`` ledger below until fixed) and
+    ledger below until fixed) and
     gh #3548 (activation global-scale gap == roadmap #5's scale-policy fix).
   * Findings writeups: flashinfer_triage/EP_OFFSET_FINDING.md, flashinfer_triage/WEIGHT_SCALE_FINDING.md.
   * The unified API under test: PR #3093 (branch ``moe_api``); this fuzzer is PR aleozlx/flashinfer#6
@@ -208,7 +208,7 @@ _BACKEND_FILTER = {
 # Debug knob: skip the autotune(True) production-path step entirely -- used to isolate whether
 # cross-call corruption accumulates in the profiling path (cudagraph captures) or the plain
 # forward/tactic path (gh #3957).
-_NO_AUTOTUNE = bool(os.environ.get("FLASHINFER_UMOE_FUZZ_NO_AUTOTUNE"))
+_NO_AUTOTUNE = os.environ.get("FLASHINFER_UMOE_FUZZ_NO_AUTOTUNE", "0") not in ("", "0")
 BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
 # Perfect-repro hook: if set (comma-separated seeds), the suite runs ONLY those configs. A curated
 # seed maps to its hand-written Cfg; any other seed is regenerated via the deterministic _gen(seed),
@@ -224,7 +224,8 @@ _ONLY_SEEDS = os.environ.get("FLASHINFER_UMOE_FUZZ_ONLY_SEED", "")
 # context and the pending c10 error escapes a destructor at interpreter shutdown
 # (std::terminate). It is not a separate Heisenbug: any assert-class *finding* ends this file's
 # pytest process after the failure is reported. CI runners execute each test FILE as its own
-# pytest invocation, so that reds this file only, never the job -- a loud red on a real bug is
+# pytest invocation, so the failure is contained to this FILE (other test files still run and
+# the job reports this file in its failure list) -- a loud red on a real bug is
 # the point of running the fuzzer, not a hazard to waive. One such finding is currently open:
 # gh #3957 (silent OOB device write by an earlier config; deterministic gather-assert at seed 46,
 # which passes in isolation) -- expect this file RED on SM100-family runners until it is fixed.
@@ -1246,7 +1247,13 @@ def test_unified_moe_fuzz(cfg):
         backend=BackendOptions(
             candidates=tuple(BackendCfg() for BackendCfg in wired_backends)
         ),
-        execution=ExecutionConfig(tune_max_num_tokens=max(cfg.num_tokens, 8192)),
+        execution=ExecutionConfig(
+            tune_max_num_tokens=(
+                cfg.num_tokens
+                if os.environ.get("FLASHINFER_UMOE_FUZZ_TUNE_REAL_SHAPE")
+                else max(cfg.num_tokens, 8192)
+            )
+        ),
     )
 
     try:
@@ -1321,6 +1328,8 @@ def test_unified_moe_fuzz(cfg):
     def check_backend(runner, out, tag):
         # (1)+(2) no-NaN + numeric vs the authoritative reference, on a clean run.
         assert_correct(out, tag)
+        if os.environ.get("FLASHINFER_UMOE_FUZZ_LEAN"):
+            return  # debug: minimal per-config work for sanitizer runs (gh #3957)
         # (3) determinism per the backend's contract: deterministic backends must reproduce
         # bitwise; non-deterministic ones (atomic-scatter finalize) are exempt.
         if _DETERMINISTIC.get(runner.backend_key, False):

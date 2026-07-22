@@ -30,7 +30,6 @@ Governance rules (enforced here so every fuzzer inherits them):
 """
 
 import re
-import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence
 
@@ -79,13 +78,22 @@ class FuzzLedger:
         _REGISTRY.append(self)
 
     def find(self, cfg, backend: Optional[str] = None) -> Optional[Finding]:
-        """First entry matching this config (and backend, if scoped)."""
+        """Best entry matching this config (and backend, if scoped).
+
+        Quarantine entries take priority over tolerated-wrong-answer entries
+        regardless of declaration order: if any matching entry says "never
+        launch", that is the safety contract that must win.
+        """
+        best: Optional[Finding] = None
         for f in self.findings:
             if f.backend is not None and backend is not None and f.backend != backend:
                 continue
             if f.match(cfg):
-                return f
-        return None
+                if f.quarantine:
+                    return f
+                if best is None:
+                    best = f
+        return best
 
     def xfail_if_quarantined(self, cfg, backend: Optional[str] = None) -> None:
         """Call at the top of a fuzz case, BEFORE any kernel launch."""
@@ -94,9 +102,14 @@ class FuzzLedger:
             pytest.xfail(f"[{self.op}] quarantined (never run): {f.reason}")
 
     def flag_xpass(self, finding: Finding, tag: str) -> None:
-        """Standardized loud flag when a tolerated-wrong-answer entry passes."""
-        warnings.warn(
-            f"[{self.op}] {tag}: KNOWN-FAILURE unexpectedly PASSED -- fixed? "
-            f"remove its ledger entry ({finding.reason})",
-            stacklevel=2,
+        """Hard-fail when a tolerated-wrong-answer entry unexpectedly passes.
+
+        xfail_strict semantics: a stale waiver silently outliving its bug is
+        exactly what the mandatory issue reference exists to prevent, so the
+        fix must be acknowledged by removing the entry.
+        """
+        pytest.fail(
+            f"[{self.op}] {tag}: KNOWN-FAILURE unexpectedly PASSED -- the bug "
+            f"appears fixed; remove its ledger entry ({finding.reason})",
+            pytrace=False,
         )

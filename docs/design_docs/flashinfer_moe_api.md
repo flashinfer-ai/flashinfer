@@ -869,7 +869,7 @@ local + `local_expert_offset` — the real deployment shape, in scope for the
 single-GPU harness; the EP *collective* is not), all under a weight-memory
 budget so one config never hogs the GPU.
 
-**Known-failure ledger** (`_KNOWN_FAILURES`): a filed-and-tracked bug is `xfail`ed
+**Known-failure ledger** (shared `tests/test_helpers/fuzz_ledger.py`): a filed-and-tracked bug is `xfail`ed
 by `(backend_key, predicate)` — the case is **still run**, so the suite stays
 green yet flags loudly (`xpass` → "remove this entry") the day the bug is fixed.
 A crash is never tolerated, only a wrong answer.
@@ -884,7 +884,8 @@ interpreter shutdown calls `std::terminate` — i.e. it is the natural downstrea
 of an assert-class *finding*, not a separate Heisenbug (the currently open one
 is #3957, a silent OOB device write; its victim config passes in isolation).
 CI runners execute each test file as its own pytest process, so an assert-class
-finding reds only this file, never the job — a loud red on a real bug is the
+finding is contained to this file (other test files still run; the job reports
+the file in its failure list) — a loud red on a real bug is the
 point of running the fuzzer. The gate is therefore flipped: the suite runs by
 default, and `FLASHINFER_UMOE_FUZZ=0` remains as an emergency waiver. On
 non-SM100+ arches every config skips at the no-wired-backend check.
@@ -895,7 +896,7 @@ exercised end-to-end):
   (`local_expert_offset > 0`): the offset is applied twice (pre-subtracted in
   `pack_inputs` *and* forwarded to the kernel). `cute_dsl_nvfp4` is correct
   (passes global ids + offset, kernel localizes once). Encoded as the current
-  `_KNOWN_FAILURES` entry. Fix = stop pre-subtracting (pass global ids), then
+  ledger `Finding` entry. Fix = stop pre-subtracting (pass global ids), then
   delete the ledger entry so the case flips to passing.
 - **gh #3548** — activation **global-scale** gap: `prepare_*_weights` hardcodes
   `gs=1.0`/`fc2_input_scale=1.0`/`alpha=ones` and `MoEActivationPack` has no
