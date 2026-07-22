@@ -831,32 +831,30 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                          "Invalid H2048/top-k-22 NVFP4 dispatch payload layout");
         if (use_compact_ep4) {
           int shared_bytes = kEp4Size * (int)sizeof(int);
-          auto kernel_fn =
-              moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, true, true>;
-          launchWithPdlWhenEnabled(
-              "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
-              shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
-              params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
-              params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts,
-              params.enable_pdl);
+          auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, true, true>;
+          launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
+                                   block_size, shared_bytes, params.stream,
+                                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                                   params.max_tokens_per_rank, params.local_num_tokens,
+                                   params.ep_rank, params.ep_size, params.num_experts,
+                                   params.eplb_stats_num_experts, params.enable_pdl);
         } else {
           int shared_bytes = 2 * params.top_k * (int)sizeof(int);
-          auto kernel_fn =
-              moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, false, true>;
-          launchWithPdlWhenEnabled(
-              "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
-              shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
-              params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
-              params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts,
-              params.enable_pdl);
+          auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, false, true>;
+          launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
+                                   block_size, shared_bytes, params.stream,
+                                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                                   params.max_tokens_per_rank, params.local_num_tokens,
+                                   params.ep_rank, params.ep_size, params.num_experts,
+                                   params.eplb_stats_num_experts, params.enable_pdl);
         }
       } else if (phase_nvfp4_payloads) {
         if (use_compact_ep4) {
           int shared_bytes = kEp4Size * (int)sizeof(int);
           SWITCH_TOP_K(
               params.top_k, TOP_K, if constexpr (TOP_K > kEp4Size && TOP_K % 2 == 0) {
-                auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, true,
-                                                      false, true>;
+                auto kernel_fn =
+                    moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, true, false, true>;
                 launchWithPdlWhenEnabled(
                     "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
                     shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
@@ -868,8 +866,8 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
           int shared_bytes = 2 * params.top_k * (int)sizeof(int);
           SWITCH_TOP_K(
               params.top_k, TOP_K, if constexpr (TOP_K > kEp4Size && TOP_K % 2 == 0) {
-                auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, false,
-                                                      false, true>;
+                auto kernel_fn =
+                    moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, false, false, true>;
                 launchWithPdlWhenEnabled(
                     "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
                     shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
