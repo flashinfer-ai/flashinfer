@@ -1541,11 +1541,13 @@ def test_trtllm_batch_decode_long_sequence_length(
 @pytest.mark.parametrize("q_len_per_req", [1, 2])
 @pytest.mark.parametrize("window_left", [-1, 127])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
-def test_trtllm_batch_decode_dynamic_page_size_gqa(
+@pytest.mark.parametrize("head_grp_size", [1, 5])
+def test_trtllm_batch_decode_dynamic_page_size(
     page_size: int,
     q_len_per_req: int,
     window_left: int,
     uses_shared_paged_kv_idx: bool,
+    head_grp_size: int,
 ) -> None:
     _skip_if_not_blackwell()
     _test_trtllm_batch_decode(
@@ -1555,7 +1557,7 @@ def test_trtllm_batch_decode_dynamic_page_size_gqa(
         q_len_per_req=q_len_per_req,
         page_size=page_size,
         num_kv_heads=2,
-        head_grp_size=5,
+        head_grp_size=head_grp_size,
         window_left=window_left,
         q_dtype="bf16",
         o_dtype="bf16",
