@@ -55,38 +55,72 @@ def msa_sparse_attention(
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
     Query tokens are processed in tiles: each tile runs one online softmax over
-    the *union* of the blocks its tokens selected, writing the final output
+    the union of the blocks its tokens selected, writing the final output
     directly. The union metadata is built internally from ``q2k_indices``.
 
     ``q``/``k``/``v`` are ``(total_tokens, num_heads, head_dim)`` with varlen
     offsets ``cu_seqlens_q``/``cu_seqlens_k``; ``q2k_indices`` is
-    ``(num_kv_heads, total_q, topk)`` int32 (ascending, -1 padded). ``q`` is
+    ``(num_kv_heads, total_q, topk)`` int32 (ascending, ``-1`` padded). ``q`` is
     bf16/fp16; ``k``/``v`` are bf16/fp16, fp8 (E4M3), or packed NVFP4 (uint8 with
     ``k_scale``/``v_scale``), in GQA or MHA layouts, flat or paged.
 
-    Notable optional parameters:
-
-    page_table : torch.Tensor, optional
-        Enables the paged-KV path: ``k``/``v`` are then
-        ``(num_pages, num_kv_heads, 128, head_dim)`` and ``page_table`` is
-        ``(batch_size, max_pages)`` int32 mapping batch-local KV block i to
-        a page. Requires ``seqused_k``.
-    seqused_k : torch.Tensor, optional
-        ``(batch_size,)`` int32, valid KV length per sequence (paged path).
-        ``cu_seqlens_k`` may be omitted when this is given.
-    return_softmax_lse : bool
-        Also return the natural-log LSE, shape ``(total_q, num_qo_heads)``
-        float32 (``-inf`` for queries with no valid selected blocks).
-    return_temperature_lse : bool
-        Also return the MSA temperature LSE (exponent scaled by
-        ``lse_temperature_scale``), same shape as the softmax LSE. When set, the
-        return is ``(out, lse, lse_t)``.
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor of shape ``(total_q, num_qo_heads, head_dim)`` with dtype
+        bf16/fp16.
+    k : torch.Tensor
+        Key tensor. In the dense path, shape is
+        ``(total_k, num_kv_heads, head_dim)``. In the paged path, shape is
+        ``(num_pages, num_kv_heads, 128, head_dim)``.
+    v : torch.Tensor
+        Value tensor with the same layout conventions as ``k``.
+    q2k_indices : torch.Tensor
+        Int32 tensor of shape ``(num_kv_heads, total_q, topk)`` containing the
+        selected KV block indices for each query, sorted ascending and padded
+        with ``-1``.
+    cu_seqlens_q : torch.Tensor
+        Int32 cumulative query sequence lengths of shape ``(batch_size + 1,)``.
+    cu_seqlens_k : Optional[torch.Tensor], default=None
+        Int32 cumulative KV sequence lengths of shape ``(batch_size + 1,)`` for
+        the dense path. May be omitted when ``seqused_k`` is provided.
+    causal : bool, default=False
+        Whether to apply causal masking.
+    softmax_scale : Optional[float], default=None
+        Softmax scale. Defaults to ``head_dim**-0.5``.
+    page_table : Optional[torch.Tensor], default=None
+        Enables the paged-KV path. ``page_table`` has shape
+        ``(batch_size, max_pages)`` and maps batch-local KV block indices to
+        pages. Requires ``seqused_k``.
+    seqused_k : Optional[torch.Tensor], default=None
+        Int32 tensor of shape ``(batch_size,)`` giving the valid KV length per
+        sequence in the paged path.
+    return_softmax_lse : bool, default=False
+        Whether to also return the natural-log LSE with shape
+        ``(total_q, num_qo_heads)``.
+    k_scale : Optional[torch.Tensor], default=None
+        Per-block or per-tensor scale for NVFP4-packed keys.
+    v_scale : Optional[torch.Tensor], default=None
+        Per-block or per-tensor scale for NVFP4-packed values.
+    k_global_scale : Optional[float], default=None
+        Global dequantization scale for fp8/NVFP4 keys when required by the
+        selected kernel path.
+    v_global_scale : Optional[float], default=None
+        Global dequantization scale for fp8/NVFP4 values when required by the
+        selected kernel path.
+    q_offset : optional
+        Optional per-query offset tensor used by specific MSA workflows.
+    return_temperature_lse : bool, default=False
+        Whether to also return the MSA temperature LSE. When enabled, the return
+        value is ``(out, lse, lse_t)``.
+    lse_temperature_scale : float, default=1.0
+        Scale applied to the exponent when computing temperature LSE.
 
     Returns
     -------
     torch.Tensor or tuple of torch.Tensor
         Output ``(total_q, num_qo_heads, head_dim)``; plus LSE if
-        ``return_softmax_lse``; plus the temperature LSE if
+        ``return_softmax_lse``; plus temperature LSE if
         ``return_temperature_lse``.
     """
     if not is_sm12x_supported(q.device):
