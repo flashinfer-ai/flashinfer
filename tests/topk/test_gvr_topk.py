@@ -36,6 +36,9 @@ test_load_balance_auto_num_long_rows_hint  — host-hint 'auto' path correct
 test_load_balance_auto_requires_num_long_rows  — 'auto' w/o hint raises
 test_gvr_row_width_alignment  — GVR rejects non-vec-aligned N
 test_radix_row_width_no_alignment_constraint  — radix accepts any N
+test_auto_gvr_knobs_256bit_alignment_gate  — 256-bit gated on 32B N alignment
+test_lb_256bit_misaligned_no_crash  — N=4104 LB regression (latent crash fixed)
+test_auto_gvr_knobs_shape_aware  — auto() picks shape-appropriate launch config
 """
 
 import pytest
@@ -577,3 +580,64 @@ def test_radix_row_width_no_alignment_constraint():
     indices = flashinfer.top_k_decode(logits, seq_lens, top_k, backend="radix")
     torch.cuda.synchronize()
     assert indices.shape == (batch_size, top_k)
+
+
+# ---------------------------------------------------------------------------
+# Shape-aware launch config (GvrTopKConfig.auto) + 256-bit N-alignment gate
+# ---------------------------------------------------------------------------
+
+
+def test_auto_gvr_knobs_256bit_alignment_gate():
+    """_auto_gvr_knobs force-disables 256-bit loads unless N is 32-byte aligned.
+
+    256-bit loads assume 32B-aligned rows (N*itemsize % 32); the up-front N check
+    only guarantees 16B. The gate keeps a 256-bit kernel from being selected for a
+    16B-but-not-32B-aligned N (which would fault). No GPU needed beyond dtype size.
+    """
+    from flashinfer.topk_blackwell import _n_is_256bit_aligned
+
+    # bf16 itemsize 2 -> 256-bit needs N % 16 == 0.
+    assert _n_is_256bit_aligned(torch.bfloat16, 4096)
+    assert not _n_is_256bit_aligned(torch.bfloat16, 4104)  # %16 == 8
+    # fp32 itemsize 4 -> 256-bit needs N % 8 == 0.
+    assert _n_is_256bit_aligned(torch.float32, 8192)
+    assert not _n_is_256bit_aligned(torch.float32, 8196)  # %8 == 4
+
+
+@requires_blackwell
+def test_lb_256bit_misaligned_no_crash():
+    """LB on N=4104 bf16 (16B-aligned, NOT 32B) runs correctly, not fault.
+
+    Regression for a latent bug: the LB kernel defaulted to 256-bit loads (32B
+    alignment) for all dtypes, faulting on 16B-but-not-32B-aligned N. auto() now
+    gates 256-bit off for such N and the 128-bit path runs correctly.
+    """
+    top_k, N, batch_size = 512, 4104, 16
+    assert N % 8 == 0 and (N * 2) % 32 != 0  # 128-bit OK, 256-bit would fault
+    torch.manual_seed(31)
+    logits = (torch.randn(batch_size, N, dtype=torch.float32, device="cuda") * 2).to(torch.bfloat16)
+    seq_lens = torch.tensor([N] * 4 + [2048] * (batch_size - 4), dtype=torch.int32, device="cuda")
+    lf = logits.float()
+    pre_idx = torch.zeros(batch_size, top_k, dtype=torch.int32, device="cuda")
+    for r in range(batch_size):
+        pre_idx[r, 0] = int(lf[r, : int(seq_lens[r])].argmax().item())
+    pre_idx[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
+
+    indices = flashinfer.top_k_decode(
+        logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr", load_balance=True
+    )
+    torch.cuda.synchronize()  # would surface a misaligned-address fault
+    _check_correct(indices, logits, seq_lens, top_k)
+
+
+@requires_blackwell
+def test_auto_gvr_knobs_shape_aware():
+    """auto() picks a shape-appropriate config: large-N fp32 small-batch -> 1024
+    threads + 256-bit + low min_blocks (vs the frozen 512/mb3 old default)."""
+    from flashinfer.topk_blackwell import _auto_gvr_knobs
+
+    logits = torch.randn(8, 131072, dtype=torch.float32, device="cuda")
+    num_threads, knobs = _auto_gvr_knobs(logits, is_lb=False)
+    assert num_threads == 1024
+    assert knobs["use_256bit_load"] is True  # fp32, N>=16384, 32B-aligned
+    assert knobs["min_blocks_per_mp"] <= 1
