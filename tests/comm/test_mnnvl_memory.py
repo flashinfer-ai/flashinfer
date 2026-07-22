@@ -29,7 +29,7 @@ pynvml.nvmlInit()
 
 @pytest.mark.skipif(
     not mnnvl_available(),
-    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+    reason="Mnnvl memory is not supported on this platform",
 )
 class TestMnnvlMemory:
     @pytest.fixture(autouse=True)
@@ -63,7 +63,7 @@ class TestMnnvlMemory:
 
     @pytest.mark.skipif(
         not mnnvl_available(),
-        reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+        reason="Mnnvl memory is not supported on this platform",
     )
     def test_mnnvl_memory(self):
         # allocate un-aligned memory
@@ -121,7 +121,7 @@ class TestMnnvlMemory:
 
     @pytest.mark.skipif(
         not mnnvl_available(),
-        reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+        reason="Mnnvl memory is not supported on this platform",
     )
     def test_moe_alltoall_multi_rank_single_gpu(self):
         torch.cuda.set_device(self.local_rank)

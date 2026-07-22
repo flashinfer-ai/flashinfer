@@ -48,6 +48,7 @@ from flashinfer.fused_moe.runners import (
     CuteDslNvfp4Runner,
     MoERunner,
     TrtllmBf16RoutedRunner,
+    TrtllmFp8BlockRunner,
 )
 from flashinfer.fused_moe.api import (
     ActivationConfig,
@@ -257,11 +258,10 @@ class TestBackendOptions:
         opts = BackendOptions(
             candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
         )
-        # sm80: BF16 requires 100+, FP8Block requires 80+, Cutlass is universal
+        # TRTLLM-gen BF16 and block-FP8 require SM100+; Cutlass is universal.
         valid = opts.valid_for(80)
-        assert len(valid) == 2
-        assert isinstance(valid[0], TrtllmFp8BlockConfig)
-        assert isinstance(valid[1], CutlassConfig)
+        assert len(valid) == 1
+        assert isinstance(valid[0], CutlassConfig)
 
     def test_valid_for_blackwell(self):
         opts = BackendOptions(
@@ -269,6 +269,8 @@ class TestBackendOptions:
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
+        assert not TrtllmFp8BlockConfig.supported(110)
+        assert not TrtllmFp8BlockConfig.supported(120)
 
     def test_iteration(self):
         opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
@@ -590,6 +592,7 @@ class TestMoERunnerSupport:
             (CuteDslNvfp4Runner, QuantVariant.BF16),
             (TrtllmFp4RoutedRunner, QuantVariant.BF16),
             (TrtllmBf16RoutedRunner, QuantVariant.NVFP4),
+            (TrtllmFp8BlockRunner, QuantVariant.BF16),
         ),
     )
     def test_unsupported_quant_variant_rejected(self, runner_type, variant):
@@ -609,6 +612,7 @@ class TestMoERunnerSupport:
             (CuteDslNvfp4Runner, QuantVariant.NVFP4),
             (TrtllmFp4RoutedRunner, QuantVariant.NVFP4),
             (TrtllmBf16RoutedRunner, QuantVariant.BF16),
+            (TrtllmFp8BlockRunner, QuantVariant.DeepSeekFp8),
         ),
     )
     def test_non_swiglu_activation_not_supported(self, runner_type, variant, act):
@@ -619,6 +623,16 @@ class TestMoERunnerSupport:
         runner = runner_type.__new__(runner_type)
         runner.config = cfg
         with pytest.raises(NotImplementedError, match="Swiglu"):
+            runner.check_support()
+
+    def test_fp8_block_unfinalized_not_supported(self):
+        cfg = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+            execution=ExecutionConfig(do_finalize=False),
+        )
+        runner = TrtllmFp8BlockRunner.__new__(TrtllmFp8BlockRunner)
+        runner.config = cfg
+        with pytest.raises(NotImplementedError, match="do_finalize=True"):
             runner.check_support()
 
     def test_moe_runner_quant_support_check(self):

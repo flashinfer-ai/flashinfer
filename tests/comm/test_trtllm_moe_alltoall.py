@@ -250,7 +250,7 @@ def test_moe_a2a_combine_rejects_noncontiguous_output_before_jit(monkeypatch):
 @pytest.mark.parametrize("use_output_buffer", [False, True])
 @pytest.mark.skipif(
     not mnnvl_available(),
-    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+    reason="Mnnvl memory is not supported on this platform",
 )
 def test_moe_alltoall_single_gpu(
     num_tokens,
@@ -1532,7 +1532,7 @@ def test_moe_combine_fp8(
 
 @pytest.mark.skipif(
     not mnnvl_available(),
-    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+    reason="Mnnvl memory is not supported on this platform",
 )
 def test_moe_workspace_size_per_rank():
     """Test the workspace size per rank for the MoeAlltoAll operation."""
