@@ -51,7 +51,8 @@ void moe_permute_fp16(int64_t input_ptr, int64_t permuted_output_ptr, int64_t in
                       int64_t permuted_sf_ptr, int64_t tile_idx_to_mn_limit_ptr,
                       int64_t permuted_idx_to_expanded_idx_ptr, int64_t num_non_exiting_tiles_ptr,
                       int32_t max_num_permuted_tokens, int32_t hidden_size, int32_t top_k,
-                      int32_t tile_size, bool enable_pdl, int64_t cuda_stream_ptr) {
+                      int32_t tile_size, bool enable_pdl, bool launch_dependents_early,
+                      int64_t cuda_stream_ptr) {
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moePermute<half, uint8_t>(
@@ -60,7 +61,7 @@ void moe_permute_fp16(int64_t input_ptr, int64_t permuted_output_ptr, int64_t in
       reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
       reinterpret_cast<int32_t const*>(permuted_idx_to_expanded_idx_ptr),
       reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr), max_num_permuted_tokens,
-      hidden_size, top_k, tile_size, enable_pdl, stream);
+      hidden_size, top_k, tile_size, enable_pdl, launch_dependents_early, stream);
 }
 
 #ifdef ENABLE_BF16
@@ -68,7 +69,8 @@ void moe_permute_bf16(int64_t input_ptr, int64_t permuted_output_ptr, int64_t in
                       int64_t permuted_sf_ptr, int64_t tile_idx_to_mn_limit_ptr,
                       int64_t permuted_idx_to_expanded_idx_ptr, int64_t num_non_exiting_tiles_ptr,
                       int32_t max_num_permuted_tokens, int32_t hidden_size, int32_t top_k,
-                      int32_t tile_size, bool enable_pdl, int64_t cuda_stream_ptr) {
+                      int32_t tile_size, bool enable_pdl, bool launch_dependents_early,
+                      int64_t cuda_stream_ptr) {
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moePermute<__nv_bfloat16, uint8_t>(
@@ -78,7 +80,7 @@ void moe_permute_bf16(int64_t input_ptr, int64_t permuted_output_ptr, int64_t in
       reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
       reinterpret_cast<int32_t const*>(permuted_idx_to_expanded_idx_ptr),
       reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr), max_num_permuted_tokens,
-      hidden_size, top_k, tile_size, enable_pdl, stream);
+      hidden_size, top_k, tile_size, enable_pdl, launch_dependents_early, stream);
 }
 #endif
 
@@ -87,7 +89,8 @@ void moe_permute_fp8(int64_t input_ptr, int64_t permuted_output_ptr, int64_t inp
                      int64_t permuted_sf_ptr, int64_t tile_idx_to_mn_limit_ptr,
                      int64_t permuted_idx_to_expanded_idx_ptr, int64_t num_non_exiting_tiles_ptr,
                      int32_t max_num_permuted_tokens, int32_t hidden_size, int32_t top_k,
-                     int32_t tile_size, bool enable_pdl, int64_t cuda_stream_ptr) {
+                     int32_t tile_size, bool enable_pdl, bool launch_dependents_early,
+                     int64_t cuda_stream_ptr) {
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moePermute<__nv_fp8_e4m3, uint8_t>(
@@ -97,7 +100,7 @@ void moe_permute_fp8(int64_t input_ptr, int64_t permuted_output_ptr, int64_t inp
       reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
       reinterpret_cast<int32_t const*>(permuted_idx_to_expanded_idx_ptr),
       reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr), max_num_permuted_tokens,
-      hidden_size, top_k, tile_size, enable_pdl, stream);
+      hidden_size, top_k, tile_size, enable_pdl, launch_dependents_early, stream);
 }
 #endif
 
@@ -106,7 +109,8 @@ void moe_permute_fp4(int64_t input_ptr, int64_t permuted_output_ptr, int64_t inp
                      int64_t permuted_sf_ptr, int64_t tile_idx_to_mn_limit_ptr,
                      int64_t permuted_idx_to_expanded_idx_ptr, int64_t num_non_exiting_tiles_ptr,
                      int32_t max_num_permuted_tokens, int32_t hidden_size, int32_t top_k,
-                     int32_t tile_size, bool enable_pdl, int64_t cuda_stream_ptr) {
+                     int32_t tile_size, bool enable_pdl, bool launch_dependents_early,
+                     int64_t cuda_stream_ptr) {
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moePermute<__nv_fp4_e2m1, uint8_t>(
@@ -116,7 +120,7 @@ void moe_permute_fp4(int64_t input_ptr, int64_t permuted_output_ptr, int64_t inp
       reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
       reinterpret_cast<int32_t const*>(permuted_idx_to_expanded_idx_ptr),
       reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr), max_num_permuted_tokens,
-      hidden_size, top_k, tile_size, enable_pdl, stream);
+      hidden_size, top_k, tile_size, enable_pdl, launch_dependents_early, stream);
 }
 #endif
 
