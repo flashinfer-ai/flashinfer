@@ -3,6 +3,7 @@
 """cuDNN backend for the bf16 x fp4 GEMM (graph build / execute / runner)."""
 
 import functools
+import warnings
 from typing import List, Optional, Tuple
 
 import torch
@@ -28,9 +29,14 @@ from .gemm_base import (
     _check_cudnn_fp4_availability,
     _get_cudnn_handle,
     _get_cudnn_override_shape_workspace_size,
+    _get_cudnn_plan_index_for_tactic,
     _get_cudnn_workspace_size,
+    _cudnn_graph_engine_knob_tactics,
+    _finalize_cudnn_graph_for_tactic,
+    _tactic_for_graph_cache,
     _torch_data_type_to_cudnn_data_type,
-    is_cudnn_override_shape_available,
+    _is_cudnn_override_shape_available,
+    _check_cudnn_override_shape_availability,
 )
 from .gemm_bf16_fp4 import _unswizzle_sf_128x4
 
@@ -103,7 +109,7 @@ def _build_bf16_fp4_graph_common(
     return c_final_cudnn_tensor
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def build_cudnn_bf16_fp4_graph(
     batch,
     m,
@@ -115,12 +121,10 @@ def build_cudnn_bf16_fp4_graph(
     device,
     alpha_is_not_none,
     use_nvfp4,
-    policy=None,
+    tactic=-1,
 ):
     """Build a fixed-shape cuDNN bf16 x fp4 GEMM graph (no override-shape)."""
     _check_cudnn_fp4_availability()
-    if policy is None:
-        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
 
@@ -160,15 +164,13 @@ def build_cudnn_bf16_fp4_graph(
             alpha_is_not_none,
         )
 
-        graph.validate()
-        graph.build_operation_graph()
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        graph.check_support()
-        graph.build_plans(policy)
+        _finalize_cudnn_graph_for_tactic(
+            graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+        )
         return graph
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def build_cudnn_bf16_fp4_graph_override_shape(
     batch,
     n,
@@ -180,12 +182,12 @@ def build_cudnn_bf16_fp4_graph_override_shape(
     alpha_is_not_none,
     use_nvfp4,
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
-    policy=None,
+    tactic=-1,
 ):
     """Build a cuDNN bf16 x fp4 GEMM graph with override-shape support."""
     _check_cudnn_fp4_availability()
-    if policy is None:
-        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+
+    _check_cudnn_override_shape_availability()
 
     scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
 
@@ -231,11 +233,9 @@ def build_cudnn_bf16_fp4_graph_override_shape(
         alpha_is_not_none,
     )
 
-    graph.validate()
-    graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
-    graph.build_plans(policy)
+    _finalize_cudnn_graph_for_tactic(
+        graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+    )
     return graph
 
 
@@ -260,21 +260,23 @@ def execute_cudnn_bf16_fp4_graph(
     alpha,
     out,
     workspace_buffer,
-    tactic: int = -1,
+    tactic=-1,
 ):
     variant_pack = _bf16_fp4_variant_pack(a, b, b_descale, alpha, out)
 
-    workspace_size = _get_cudnn_workspace_size(graph, tactic)
+    plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
+
+    workspace_size = _get_cudnn_workspace_size(graph, plan_index)
     if workspace_buffer.numel() < workspace_size:
         workspace_buffer.resize_(workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
     handle = _get_cudnn_handle(a.device, stream)
-    if tactic == -1:
+    if plan_index < 0:
         graph.execute(variant_pack, workspace_buffer, handle=handle)
     else:
         graph.execute_plan_at_index(
-            variant_pack, workspace_buffer, tactic, handle=handle
+            variant_pack, workspace_buffer, plan_index, handle=handle
         )
 
 
@@ -287,7 +289,7 @@ def execute_cudnn_bf16_fp4_graph_override_shape(
     out,
     workspace_buffer,
     block_size: int = 16,
-    tactic: int = 0,
+    tactic=-1,
 ):
     """Execute the bf16 x fp4 graph, overriding A / output to the real M."""
     m, k = int(a.shape[0]), int(a.shape[1])
@@ -318,21 +320,38 @@ def execute_cudnn_bf16_fp4_graph_override_shape(
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
 
+    plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
+
     workspace_size = _get_cudnn_override_shape_workspace_size(
-        graph, tactic, cudnn_handle, override_uids, override_shapes, override_strides
+        graph,
+        plan_index,
+        cudnn_handle,
+        override_uids,
+        override_shapes,
+        override_strides,
     )
     if workspace_buffer.numel() < workspace_size:
         workspace_buffer.resize_(workspace_size)
 
-    graph.execute_plan_at_index(
-        variant_pack,
-        workspace_buffer,
-        tactic,
-        handle=cudnn_handle,
-        override_uids=override_uids,
-        override_shapes=override_shapes,
-        override_strides=override_strides,
-    )
+    if plan_index < 0:
+        graph.execute(
+            variant_pack,
+            workspace_buffer,
+            handle=cudnn_handle,
+            override_uids=override_uids,
+            override_shapes=override_shapes,
+            override_strides=override_strides,
+        )
+    else:
+        graph.execute_plan_at_index(
+            variant_pack,
+            workspace_buffer,
+            plan_index,
+            handle=cudnn_handle,
+            override_uids=override_uids,
+            override_shapes=override_shapes,
+            override_strides=override_strides,
+        )
 
 
 # Autotuner sweeps M (token count) of the bf16 activation ``a``
@@ -365,13 +384,15 @@ def _cudnn_bf16_fp4_runner(tuning_config):
         def __init__(self):
             super().__init__()
             self._m_bucket_mapper = m_bucket_mapper
-            self._use_override_shape = is_cudnn_override_shape_available()
+            self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, alpha, out_dtype, _, block_size, use_nvfp4, _ = inputs
             return (out_dtype, block_size, use_nvfp4, alpha is not None)
 
-        def _get_override_graph(self, a, b, alpha, out_dtype, block_size, use_nvfp4):
+        def _get_override_graph(
+            self, a, b, alpha, out_dtype, block_size, use_nvfp4, tactic=-1
+        ):
             actual_m, k = int(a.shape[0]), int(a.shape[1])
             n = int(b.shape[0])
             cache_m = self._m_bucket_mapper(actual_m)
@@ -386,14 +407,14 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                 alpha_is_not_none=alpha is not None,
                 use_nvfp4=use_nvfp4,
                 cache_m=cache_m,
-                policy=cudnn.build_plan_policy.ALL,
+                tactic=_tactic_for_graph_cache(tactic),
             )
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
-        ) -> List[int]:
+        ) -> List[tuple]:
             (
                 a,
                 b,
@@ -407,7 +428,7 @@ def _cudnn_bf16_fp4_runner(tuning_config):
             ) = inputs
             if self._use_override_shape:
                 graph = self._get_override_graph(
-                    a, b, alpha, out_dtype, block_size, use_nvfp4
+                    a, b, alpha, out_dtype, block_size, use_nvfp4, tactic=0
                 )
             else:
                 graph = build_cudnn_bf16_fp4_graph(
@@ -421,14 +442,14 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                     device=a.device,
                     alpha_is_not_none=alpha is not None,
                     use_nvfp4=use_nvfp4,
-                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                    tactic=0,
                 )
-            return list(range(graph.get_execution_plan_count()))
+            return _cudnn_graph_engine_knob_tactics(graph)
 
         def forward(
             self,
             inputs: List[torch.Tensor],
-            tactic: int = -1,
+            tactic=-1,
             do_preparation: bool = False,
             **kwargs,
         ) -> torch.Tensor:
@@ -443,22 +464,52 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                 use_nvfp4,
                 workspace_buffer,
             ) = inputs
-            if self._use_override_shape:
-                graph = self._get_override_graph(
-                    a, b, alpha, out_dtype, block_size, use_nvfp4
+            try:
+                if self._use_override_shape:
+                    graph = self._get_override_graph(
+                        a, b, alpha, out_dtype, block_size, use_nvfp4, tactic=tactic
+                    )
+                    execute_cudnn_bf16_fp4_graph_override_shape(
+                        graph,
+                        a,
+                        b,
+                        b_descale,
+                        alpha,
+                        out,
+                        workspace_buffer,
+                        block_size=block_size,
+                        tactic=tactic,
+                    )
+                else:
+                    graph = build_cudnn_bf16_fp4_graph(
+                        batch=1,
+                        m=int(a.shape[0]),
+                        n=int(b.shape[0]),
+                        k=int(a.shape[1]),
+                        a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                        o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
+                        block_size=block_size,
+                        device=a.device,
+                        alpha_is_not_none=alpha is not None,
+                        use_nvfp4=use_nvfp4,
+                        tactic=tactic,
+                    )
+                    execute_cudnn_bf16_fp4_graph(
+                        graph,
+                        a,
+                        b,
+                        b_descale,
+                        alpha,
+                        out,
+                        workspace_buffer,
+                        tactic=tactic,
+                    )
+            except Exception as exc:
+                warnings.warn(
+                    "cuDNN bf16-fp4 GEMM tactic failed; falling back to default "
+                    f"tactic=-1. ({exc})",
+                    stacklevel=2,
                 )
-                execute_cudnn_bf16_fp4_graph_override_shape(
-                    graph,
-                    a,
-                    b,
-                    b_descale,
-                    alpha,
-                    out,
-                    workspace_buffer,
-                    block_size=block_size,
-                    tactic=max(tactic, 0),
-                )
-            else:
                 graph = build_cudnn_bf16_fp4_graph(
                     batch=1,
                     m=int(a.shape[0]),
@@ -470,7 +521,7 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                     device=a.device,
                     alpha_is_not_none=alpha is not None,
                     use_nvfp4=use_nvfp4,
-                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                    tactic=-1,
                 )
                 execute_cudnn_bf16_fp4_graph(
                     graph,

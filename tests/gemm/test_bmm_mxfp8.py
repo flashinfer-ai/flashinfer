@@ -3,6 +3,8 @@
 # tests/gemm/test_unified_gemm_fuzz.py -- extend an adapter/axis there. Add cases
 # here only as deliberate regression anchors or for paths the fuzzer cannot express.
 
+import warnings
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -56,10 +58,13 @@ def test_bmm_mxfp8(b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning):
     # it back to row-major and is rejected once cudnn-frontend >= 1.24 enables
     # the override path (CI's older frontend hid this).
     weight = torch.randn([b, n, k], device="cuda", dtype=input_dtype)
-    weight_mxfp8, mat2_scale = mxfp8_quantize(weight, is_sf_swizzled_layout)
+    weight_mxfp8, weight_scale = mxfp8_quantize(weight, is_sf_swizzled_layout)
     mat2_mxfp8 = weight_mxfp8.transpose(-2, -1)
 
-    assert weight_mxfp8.numel() == (mat2_scale.numel() * 32)
+    assert mat2_mxfp8.shape == (b, k, n)
+    assert mat2_mxfp8.stride(-2) == 1
+
+    assert weight_mxfp8.numel() == (weight_scale.numel() * 32)
 
     # Compute reference result
     reference = torch.bmm(input_mat, weight.transpose(-2, -1))
@@ -67,16 +72,25 @@ def test_bmm_mxfp8(b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning):
     # Create output tensor
     res = torch.empty([b, m, n], device="cuda", dtype=res_dtype)
 
-    with autotune(auto_tuning):
-        bmm_mxfp8(
-            input_mxfp8,
-            mat2_mxfp8,
-            input_scale,
-            mat2_scale,
-            res_dtype,
-            res,
-            backend=backend,
-        )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with autotune(auto_tuning):
+            bmm_mxfp8(
+                input_mxfp8,
+                mat2_mxfp8,
+                input_scale,
+                weight_scale,
+                res_dtype,
+                res,
+                backend=backend,
+            )
+
+    fallback_warnings = [
+        warning
+        for warning in caught
+        if "falling back to default tactic=-1" in str(warning.message)
+    ]
+    assert not fallback_warnings
 
     # Verify output properties
     assert res.shape == (b, m, n), f"Expected shape {(b, m, n)}, got {res.shape}"
