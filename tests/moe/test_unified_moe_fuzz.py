@@ -649,8 +649,8 @@ _DTYPE = {
         reference=_fp8_per_tensor_reference,
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
-        atol_frac=0.15,
-        rtol=0.85,
+        atol_frac=0.05,
+        rtol=0.3,
     ),
     # MXFP4 / MXINT4 add one entry each as their runners are wired upstream.
 }

@@ -16,6 +16,8 @@ limitations under the License.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -77,6 +79,7 @@ def _reference(
     input_scale: torch.Tensor,
     intermediate_scale: torch.Tensor,
     expert_offset: int = 0,
+    routing_scales_on_input: bool = False,
 ) -> torch.Tensor:
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     x_q = (x.float() * input_scale).clamp(-fp8_max, fp8_max)
@@ -89,7 +92,10 @@ def _reference(
         token, slot = torch.where(selected_experts == local_expert + expert_offset)
         if token.numel() == 0:
             continue
-        gemm1 = x_deq[token] @ w1_deq[local_expert].t()
+        routed_x = x_deq[token]
+        if routing_scales_on_input:
+            routed_x = routed_x * routing_weights[token, slot, None]
+        gemm1 = routed_x @ w1_deq[local_expert].t()
         up = gemm1[:, :INTERMEDIATE]
         gate = gemm1[:, INTERMEDIATE:]
         intermediate = F.silu(gate) * up
@@ -100,17 +106,27 @@ def _reference(
         expert_out = (
             (intermediate_deq @ w2_deq[local_expert].t()).to(torch.bfloat16).float()
         )
-        out[token] += routing_weights[token, slot, None] * expert_out
+        if routing_scales_on_input:
+            out[token] += expert_out
+        else:
+            out[token] += routing_weights[token, slot, None] * expert_out
     return out
 
 
-def _make_case():
+def _make_case(
+    *,
+    routing_method: RoutingMethodType = RoutingMethodType.Default,
+    top_k: int = TOP_K,
+    num_experts: int = NUM_EXPERTS,
+    local_num_experts: int = NUM_EXPERTS,
+    local_expert_offset: int = 0,
+):
     torch.manual_seed(42)
     device = torch.device("cuda")
     x = torch.randn(TOKENS, HIDDEN, device=device, dtype=torch.bfloat16)
     w1 = (
         torch.randn(
-            NUM_EXPERTS,
+            local_num_experts,
             2 * INTERMEDIATE,
             HIDDEN,
             device=device,
@@ -120,7 +136,7 @@ def _make_case():
     )
     w2 = (
         torch.randn(
-            NUM_EXPERTS,
+            local_num_experts,
             HIDDEN,
             INTERMEDIATE,
             device=device,
@@ -128,10 +144,15 @@ def _make_case():
         )
         / INTERMEDIATE**0.5
     )
-    logits = torch.randn(TOKENS, NUM_EXPERTS, device=device, dtype=torch.float32)
-    routing_weights, selected_experts = torch.topk(
-        torch.softmax(logits, dim=-1), TOP_K, dim=-1
-    )
+    logits = torch.randn(TOKENS, num_experts, device=device, dtype=torch.float32)
+    if routing_method is RoutingMethodType.Llama4:
+        routing_weights, selected_experts = torch.topk(
+            torch.sigmoid(logits), top_k, dim=-1
+        )
+    else:
+        routing_weights, selected_experts = torch.topk(
+            torch.softmax(logits, dim=-1), top_k, dim=-1
+        )
     selected_experts = selected_experts.to(torch.int32)
 
     input_scale = _global_scale(x)
@@ -144,7 +165,7 @@ def _make_case():
         w2,
         hidden_states_scale_global=input_scale,
         intermediate_scale_global=intermediate_scale,
-        num_local_experts=NUM_EXPERTS,
+        num_local_experts=local_num_experts,
         hidden_size=HIDDEN,
         intermediate_size=INTERMEDIATE,
         device=device,
@@ -159,14 +180,15 @@ def _make_case():
     weights.prepare_for("trtllm_fp8_per_tensor", view)
     config = MoEConfig(
         routing=RoutingConfig(
-            num_experts=NUM_EXPERTS,
-            top_k=TOP_K,
-            method=RoutingMethodType.Default,
+            num_experts=num_experts,
+            top_k=top_k,
+            method=routing_method,
         ),
         quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
-            local_num_experts=NUM_EXPERTS,
+            local_num_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
         ),
         activation=ActivationConfig.swiglu,
         backend=BackendOptions((TrtllmFp8PerTensorConfig(),)),
@@ -180,12 +202,14 @@ def _make_case():
         routing_weights,
         input_scale,
         intermediate_scale,
+        expert_offset=local_expert_offset,
+        routing_scales_on_input=(routing_method is RoutingMethodType.Llama4),
     )
     return act, weights, config, ref, selected_experts
 
 
 def _assert_close(out: torch.Tensor, ref: torch.Tensor) -> None:
-    check_accuracy(out.float(), ref.float(), atol=0.1, rtol=0.85, percent=0.92)
+    check_accuracy(out.float(), ref.float(), atol=0.05, rtol=0.3, percent=0.99)
 
 
 def test_fp8_per_tensor_layer_and_direct_runner_match_reference():
@@ -198,6 +222,41 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference():
     inputs = runner.pack_inputs(act, weights)
     direct_out = runner.forward(inputs)
     _assert_close(direct_out, ref)
+
+
+def test_fp8_per_tensor_llama4_routes_scale_on_input():
+    _sm100_required()
+    act, weights, config, ref, _ = _make_case(
+        routing_method=RoutingMethodType.Llama4,
+        top_k=1,
+    )
+    _assert_close(MoELayer(config)(act, weights), ref)
+
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    _assert_close(runner.forward(runner.pack_inputs(act, weights)), ref)
+
+    invalid_config = dataclasses.replace(
+        config,
+        routing=dataclasses.replace(config.routing, top_k=2),
+    )
+    invalid_runner = TrtllmFp8PerTensorRunner.__new__(TrtllmFp8PerTensorRunner)
+    invalid_runner.config = invalid_config
+    with pytest.raises(ValueError, match="top_k=1"):
+        invalid_runner.check_support()
+
+
+def test_fp8_per_tensor_nonzero_expert_offset():
+    _sm100_required()
+    act, weights, config, ref, _ = _make_case(
+        num_experts=NUM_EXPERTS,
+        local_num_experts=NUM_EXPERTS // 2,
+        local_expert_offset=NUM_EXPERTS // 2,
+    )
+    assert torch.count_nonzero(ref)
+    _assert_close(MoELayer(config)(act, weights), ref)
+
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    _assert_close(runner.forward(runner.pack_inputs(act, weights)), ref)
 
 
 def test_fp8_per_tensor_routing_replay_matches_reference():

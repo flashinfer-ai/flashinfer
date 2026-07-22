@@ -861,6 +861,8 @@ class TrtllmFp8PerTensorRunner(MoERunner):
 
     def check_support(self) -> None:
         super().check_support()
+        from ..tllm_enums import RoutingMethodType
+
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
@@ -868,6 +870,13 @@ class TrtllmFp8PerTensorRunner(MoERunner):
         if not self.config.execution.do_finalize:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only do_finalize=True."
+            )
+        if (
+            self.config.routing.method is RoutingMethodType.Llama4
+            and self.config.routing.top_k != 1
+        ):
+            raise ValueError(
+                f"{type(self).__name__} requires top_k=1 for Llama4 routing."
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):

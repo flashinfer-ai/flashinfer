@@ -285,6 +285,39 @@ def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
     )
 
 
+@pytest.mark.parametrize(
+    ("hidden_size", "intermediate_size"),
+    [(64, 128), (128, 64)],
+)
+def test_mxfp8_preparation_rejects_unshufflable_dimensions(
+    hidden_size, intermediate_size
+):
+    w1 = torch.zeros(
+        1,
+        2 * intermediate_size,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    w2 = torch.zeros(
+        1,
+        hidden_size,
+        intermediate_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="divisible by 128"):
+        TrtllmFp8BlockConfig.prepare_weights(
+            w1,
+            w2,
+            variant=QuantVariant.MxFp8,
+            num_local_experts=1,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=torch.device("cuda"),
+        )
+
+
 def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
     """Run in-kernel routing and assert its selected expert set exactly."""
     runner = layer.runners[0]

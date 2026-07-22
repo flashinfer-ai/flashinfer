@@ -614,7 +614,10 @@ def prepare_trtllm_fp8_block_weights(
     DeepSeek FP8 uses E4M3 payloads with FP32 128x128 block scales. MXFP8
     uses E4M3 payloads with linear UE8M0 scales over 32-element K blocks.
     Both native views remain in ``MajorK`` layout; the unified runner records
-    the exact variant and passes the corresponding kernel enum.
+    the exact variant and passes the corresponding kernel enum. Shuffled
+    MXFP8 preparation requires ``hidden_size`` and ``intermediate_size`` to be
+    divisible by 128 because the returned scales use TRTLLM's unpadded 128x4
+    physical layout.
     """
     from .api import QuantVariant
 
@@ -646,9 +649,10 @@ def prepare_trtllm_fp8_block_weights(
         w1_q, w1_sf = _deepseek_fp8_quantize_weights(w1_bf16)
         w2_q, w2_sf = _deepseek_fp8_quantize_weights(w2_bf16)
     else:
-        if hidden_size % 32 != 0 or intermediate_size % 32 != 0:
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
             raise ValueError(
-                "MXFP8 requires hidden_size and intermediate_size divisible by 32."
+                "MXFP8 shuffled MajorK preparation requires hidden_size and "
+                "intermediate_size divisible by 128."
             )
         from ..quantization.fp4_quantization import block_scale_interleave
         from ..quantization.fp8_quantization import mxfp8_quantize

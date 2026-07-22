@@ -294,7 +294,9 @@ class TrtllmFp8BlockConfig:
 
         ``variant`` must be :attr:`QuantVariant.DeepSeekFp8` or
         :attr:`QuantVariant.MxFp8`; their scale formats are intentionally
-        prepared by separate paths.
+        prepared by separate paths. The shuffled MXFP8 view requires both
+        ``hidden_size`` and ``intermediate_size`` to be divisible by 128 so its
+        scale tensors fit TRTLLM's unpadded 128x4 physical layout.
         """
         from .prepare import prepare_trtllm_fp8_block_weights
 
