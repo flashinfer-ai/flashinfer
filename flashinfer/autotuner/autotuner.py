@@ -21,6 +21,7 @@ from typing import (
     Optional,
     Sequence,
     TypeAlias,
+    cast,
 )
 
 import torch
@@ -587,6 +588,12 @@ def _get_nearest_profile_key(tuning_config: TuningConfig) -> _NearestProfileKey:
         )
         tuning_config._nearest_profile_key = key
     return key
+
+
+def _forward_cache_api(wrapper: Callable[..., Any], cached: Callable[..., Any]) -> None:
+    """Expose cache controls on a wrapper that delegates to an LRU cache."""
+    for attribute in ("cache_info", "cache_clear"):
+        setattr(wrapper, attribute, getattr(cached, attribute))
 
 
 @dataclass(frozen=True)
@@ -2141,6 +2148,12 @@ class AutoTuner:
         for constraint_input_idx, constraint_dim_idx in profile_key.constraint_dims:
             base_profile[constraint_input_idx][constraint_dim_idx] = -1
         return tuple(tuple(shape) for shape in base_profile)
+
+    # Preserve the cache-management API on the existing entry point.
+    _forward_cache_api(
+        cast(classmethod, _find_nearest_profile).__func__,
+        cast(classmethod, _find_nearest_profile_cached).__func__,
+    )
 
     @classmethod
     def _get_cache_key(
