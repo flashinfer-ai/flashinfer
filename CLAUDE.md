@@ -18,6 +18,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Run multi-GPU test | `mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py` |
 | Run benchmark | `python benchmarks/flashinfer_benchmark.py --routine <name> <flags>` |
 | Run linting | `pre-commit run -a` |
+| Dump environment report (bug reports) | `python -m flashinfer.collect_env` (or `flashinfer collect-env [--json]`) |
 | Install pre-commit hooks | `pre-commit install` |
 | Clear JIT cache | `rm -rf ~/.cache/flashinfer/` |
 | Enable API logging (basic) | `export FLASHINFER_LOGLEVEL=1` |
