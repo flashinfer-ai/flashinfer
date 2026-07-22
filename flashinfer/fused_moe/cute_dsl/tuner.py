@@ -639,7 +639,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         )
 
 
-_W4A16_ROUTE_TILES = (8, 16, 32, 64, 128)
+_W4A16_ROUTE_TILES = (8, 16, 32, 64, 128, 192)
 _W4A16_K_TILES = (64, 128, 256)
 # Grouped expert scheduling requires cluster N=1 when multiple routed rows
 # target the same expert.
