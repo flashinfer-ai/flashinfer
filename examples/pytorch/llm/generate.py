@@ -138,6 +138,73 @@ class GenerationEngine:
             backend=decode_backend,
         )
 
+    def _make_cache(
+        self, prompt_token_ids: List[List[int]], max_new_tokens: int
+    ) -> PagedKVCache:
+        cfg, device = self.model.config, self.model.device
+        max_pages = sum(
+            math.ceil((len(p) + max_new_tokens) / self.page_size)
+            for p in prompt_token_ids
+        )
+        kv = PagedKVCache(cfg, max_pages, self.page_size, device, self.model.dtype)
+        for ids in prompt_token_ids:
+            req = kv.add_request()
+            kv.extend(req, len(ids))
+        return kv
+
+    def _prefill(
+        self, prompt_token_ids: List[List[int]], kv: PagedKVCache
+    ) -> torch.Tensor:
+        """Run the batched causal prefill; returns last-token logits [batch, vocab]."""
+        model, cfg, device = self.model, self.model.config, self.model.device
+        input_ids = torch.tensor(
+            [t for ids in prompt_token_ids for t in ids],
+            dtype=torch.int64,
+            device=device,
+        )
+        qo_indptr_list = [0]
+        for ids in prompt_token_ids:
+            qo_indptr_list.append(qo_indptr_list[-1] + len(ids))
+        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32, device=device)
+        nnz = input_ids.shape[0]
+        kv_indptr, kv_indices, kv_last_page_len = kv.page_table_tensors()
+        batch_indices, pos_ids = flashinfer.get_batch_indices_positions(
+            qo_indptr, kv.seq_lens_tensor(), nnz
+        )
+        self.prefill_wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            self.page_size,
+            causal=True,
+            q_data_type=model.dtype,
+            kv_data_type=model.dtype,
+        )
+        return model.forward(
+            input_ids,
+            pos_ids,
+            self.prefill_wrapper,
+            kv,
+            batch_indices,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            last_token_rows=(qo_indptr[1:].to(torch.int64) - 1),
+        )
+
+    @torch.inference_mode()
+    def prefill_logits(self, prompt_token_ids: List[List[int]]) -> torch.Tensor:
+        """Last-token prefill logits per prompt (no decode).
+
+        Used by reference checks that compare against another implementation.
+        """
+        kv = self._make_cache(prompt_token_ids, max_new_tokens=1)
+        return self._prefill(prompt_token_ids, kv)
+
     @torch.inference_mode()
     def generate(
         self,
@@ -162,54 +229,11 @@ class GenerationEngine:
             generator = torch.Generator(device=device)
             generator.manual_seed(seed)
 
-        max_pages = sum(
-            math.ceil((len(p) + max_new_tokens) / page_size) for p in prompt_token_ids
-        )
-        kv = PagedKVCache(cfg, max_pages, page_size, device, model.dtype)
-        for ids in prompt_token_ids:
-            req = kv.add_request()
-            kv.extend(req, len(ids))
+        kv = self._make_cache(prompt_token_ids, max_new_tokens)
 
         # ---- Prefill: all prompts in one ragged batch ----
         t_start = time.perf_counter()
-        input_ids = torch.tensor(
-            [t for ids in prompt_token_ids for t in ids],
-            dtype=torch.int64,
-            device=device,
-        )
-        qo_indptr_list = [0]
-        for ids in prompt_token_ids:
-            qo_indptr_list.append(qo_indptr_list[-1] + len(ids))
-        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32, device=device)
-        nnz = input_ids.shape[0]
-        kv_indptr, kv_indices, kv_last_page_len = kv.page_table_tensors()
-        batch_indices, pos_ids = flashinfer.get_batch_indices_positions(
-            qo_indptr, kv.seq_lens_tensor(), nnz
-        )
-        self.prefill_wrapper.plan(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            num_q,
-            num_kv,
-            hd,
-            page_size,
-            causal=True,
-            q_data_type=model.dtype,
-            kv_data_type=model.dtype,
-        )
-        logits = model.forward(
-            input_ids,
-            pos_ids,
-            self.prefill_wrapper,
-            kv,
-            batch_indices,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            last_token_rows=(qo_indptr[1:].to(torch.int64) - 1),
-        )
+        logits = self._prefill(prompt_token_ids, kv)
         next_tokens = sample_tokens(logits, temperature, top_k, top_p, generator)
         torch.cuda.synchronize()
         t_prefill = time.perf_counter()

@@ -25,8 +25,9 @@ from typing import Dict, List, Optional
 import torch
 
 import flashinfer
+import flashinfer.fused_moe  # noqa: F401  (subpackage attribute access)
 
-SUPPORTED_MODEL_TYPES = ("llama", "qwen2", "qwen3")
+SUPPORTED_MODEL_TYPES = ("llama", "qwen2", "qwen3", "qwen3_moe")
 
 
 @dataclasses.dataclass
@@ -44,6 +45,25 @@ class ModelConfig:
     tie_word_embeddings: bool
     rope_scaling: Optional[dict]
     eos_token_ids: List[int]
+    # MoE fields (qwen3_moe); None/0 for dense models.
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    norm_topk_prob: bool = False
+    decoder_sparse_step: int = 1
+    mlp_only_layers: tuple = ()
+
+    @property
+    def is_moe(self) -> bool:
+        return self.num_experts > 0
+
+    def is_sparse_layer(self, layer_idx: int) -> bool:
+        # Mirrors transformers' Qwen3MoeDecoderLayer selection logic.
+        return (
+            self.num_experts > 0
+            and layer_idx not in self.mlp_only_layers
+            and (layer_idx + 1) % self.decoder_sparse_step == 0
+        )
 
     @classmethod
     def from_hf_config(cls, cfg: dict) -> "ModelConfig":
@@ -86,6 +106,12 @@ class ModelConfig:
             tie_word_embeddings=cfg.get("tie_word_embeddings", False),
             rope_scaling=rope_scaling,
             eos_token_ids=eos_token_ids,
+            num_experts=cfg.get("num_experts", 0),
+            num_experts_per_tok=cfg.get("num_experts_per_tok", 0),
+            moe_intermediate_size=cfg.get("moe_intermediate_size", 0),
+            norm_topk_prob=cfg.get("norm_topk_prob", False),
+            decoder_sparse_step=cfg.get("decoder_sparse_step", 1),
+            mlp_only_layers=tuple(cfg.get("mlp_only_layers", ()) or ()),
         )
 
 
@@ -126,7 +152,9 @@ def _load_state_dict(ckpt_dir: Path) -> Dict[str, torch.Tensor]:
 
 
 class DecoderLayerWeights:
-    def __init__(self, sd: Dict[str, torch.Tensor], i: int, device, dtype):
+    def __init__(
+        self, sd: Dict[str, torch.Tensor], i: int, device, dtype, config: "ModelConfig"
+    ):
         p = f"model.layers.{i}."
 
         def get(name: str, required: bool = True) -> Optional[torch.Tensor]:
@@ -150,9 +178,28 @@ class DecoderLayerWeights:
         # Qwen3 per-head q/k RMSNorm over head_dim.
         self.q_norm = get("self_attn.q_norm.weight", required=False)
         self.k_norm = get("self_attn.k_norm.weight", required=False)
-        self.gate_proj = get("mlp.gate_proj.weight")
-        self.up_proj = get("mlp.up_proj.weight")
-        self.down_proj = get("mlp.down_proj.weight")
+        self.is_sparse = config.is_sparse_layer(i)
+        if self.is_sparse:
+            self.gate_proj = self.up_proj = self.down_proj = None
+            self.moe_gate = get("mlp.gate.weight")  # router, [num_experts, hidden]
+            w31, w2 = [], []
+            for j in range(config.num_experts):
+                ep = f"{p}mlp.experts.{j}."
+                gate = sd[ep + "gate_proj.weight"].to(device=device, dtype=dtype)
+                up = sd[ep + "up_proj.weight"].to(device=device, dtype=dtype)
+                down = sd[ep + "down_proj.weight"].to(device=device, dtype=dtype)
+                # cutlass_fused_moe fc1 ("w31") layout: up_proj (w3) stacked
+                # above gate_proj (w1); the kernel computes
+                # silu(x @ w1.T) * (x @ w3.T) internally.
+                w31.append(torch.cat([up, gate], dim=0))
+                w2.append(down)
+            self.moe_w31 = torch.stack(w31).contiguous()  # [E, 2*I, H]
+            self.moe_w2 = torch.stack(w2).contiguous()  # [E, H, I]
+        else:
+            self.moe_gate = self.moe_w31 = self.moe_w2 = None
+            self.gate_proj = get("mlp.gate_proj.weight")
+            self.up_proj = get("mlp.up_proj.weight")
+            self.down_proj = get("mlp.down_proj.weight")
 
 
 class FlashInferLLM:
@@ -182,7 +229,7 @@ class FlashInferLLM:
         else:
             self.lm_head = state_dict["lm_head.weight"].to(device=device, dtype=dtype)
         self.layers = [
-            DecoderLayerWeights(state_dict, i, device, dtype)
+            DecoderLayerWeights(state_dict, i, device, dtype, config)
             for i in range(config.num_hidden_layers)
         ]
 
@@ -275,16 +322,38 @@ class FlashInferLLM:
             flashinfer.fused_add_rmsnorm(
                 attn, residual, w.post_attention_layernorm, cfg.rms_norm_eps
             )
-            gate_up = torch.cat(
-                [
-                    torch.nn.functional.linear(attn, w.gate_proj),
-                    torch.nn.functional.linear(attn, w.up_proj),
-                ],
-                dim=-1,
-            )
-            x = torch.nn.functional.linear(
-                flashinfer.silu_and_mul(gate_up), w.down_proj
-            )
+            if w.is_sparse:
+                # Router in model dtype, softmax in fp32 — mirrors the HF
+                # Qwen3MoeSparseMoeBlock reference implementation.
+                router_logits = torch.nn.functional.linear(attn, w.moe_gate)
+                routing_weights = torch.softmax(router_logits.float(), dim=-1)
+                routing_weights, selected_experts = torch.topk(
+                    routing_weights, cfg.num_experts_per_tok, dim=-1
+                )
+                if cfg.norm_topk_prob:
+                    routing_weights = routing_weights / routing_weights.sum(
+                        dim=-1, keepdim=True
+                    )
+                x = flashinfer.fused_moe.cutlass_fused_moe(
+                    attn,
+                    selected_experts.to(torch.int),
+                    routing_weights,
+                    w.moe_w31,
+                    w.moe_w2,
+                    self.dtype,
+                    quant_scales=None,
+                )[0]
+            else:
+                gate_up = torch.cat(
+                    [
+                        torch.nn.functional.linear(attn, w.gate_proj),
+                        torch.nn.functional.linear(attn, w.up_proj),
+                    ],
+                    dim=-1,
+                )
+                x = torch.nn.functional.linear(
+                    flashinfer.silu_and_mul(gate_up), w.down_proj
+                )
         # Final residual add + norm, only then project the rows we sample from.
         flashinfer.fused_add_rmsnorm(x, residual, self.final_norm, cfg.rms_norm_eps)
         hidden = x[last_token_rows]
