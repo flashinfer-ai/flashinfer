@@ -116,15 +116,23 @@ exclude = [
 # cutedsl_megamoe/src kernels are maintained upstream and re-dropped
 # periodically; excluded so lint churn doesn't block syncs. The shim/ layer
 # next to it is ours and stays linted.
+# The GVR top-k kernels are CuTe-DSL device code ported verbatim from
+# TensorRT-LLM. Exclude them from ruff (both lint and format) so the port stays
+# byte-faithful to upstream and future syncs stay clean -- reflowing or
+# "simplifying" DSL code can also change traced semantics (e.g. SIM109's
+# `x in (a, b)` yields a Python bool, not the DSL Boolean predicate that
+# `x == a or x == b` produces).
 [tool.ruff]
 extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers",
   "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src",
+  "flashinfer/cute_dsl/top_k/gvr_topk_decode.py",
+  "flashinfer/cute_dsl/top_k/gvr_topk_decode_lb.py",
+  "flashinfer/cute_dsl/top_k/block_scan.py",
 ]
 force-exclude = true
-
 
 [tool.ruff.lint]
 select = [

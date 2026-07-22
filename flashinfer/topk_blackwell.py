@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 """Top-K decode: GVR (Blackwell) and radix-masked (all SM) backends.
 
 Public API
@@ -47,7 +48,6 @@ from .topk import get_topk_module
 from .utils import (
     _get_cache_buf,
     backend_requirement,
-    get_compute_capability,
     get_device_sm_count,
     supported_compute_capability,
 )
@@ -69,20 +69,38 @@ _BLACKWELL_PLUS_CCS = [100, 103, 110, 120, 121]
 
 @supported_compute_capability(_ALL_CCS)
 def _radix_top_k_decode_check(
-    logits, seq_lens, top_k, pre_idx=None, compress_ratio=1,
-    next_n=1, return_values=False, out_indices=None, out_values=None,
-    backend="auto", load_balance=True, num_long_rows=None,
-):  # noqa: extra kwargs mirror the public signature; unused by the check
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    num_long_rows=None,
+):  # extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers."""
     return True
 
 
 @supported_compute_capability(_BLACKWELL_PLUS_CCS)
 def _gvr_top_k_decode_check(
-    logits, seq_lens, top_k, pre_idx=None, compress_ratio=1,
-    next_n=1, return_values=False, out_indices=None, out_values=None,
-    backend="auto", load_balance=True, num_long_rows=None,
-):  # noqa: extra kwargs mirror the public signature; unused by the check
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    num_long_rows=None,
+):  # extra kwargs mirror the public signature; unused by the check
     """GVR LB: requires Blackwell hardware, CuTe DSL, and a pre_idx hint."""
     return is_cute_dsl_available() and pre_idx is not None
 
@@ -116,8 +134,12 @@ def _compile_lb_prepare(num_threads: int, long_threshold: int, compress_ratio: i
     sym_batch = cute.sym_int()
     return cute.compile(
         prep,
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_batch,), stride_order=(0,)),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (num_threads,), stride_order=(0,)),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (sym_batch,), stride_order=(0,)
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (num_threads,), stride_order=(0,)
+        ),
         cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,)),
         cutlass.Int32(0),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -127,8 +149,14 @@ def _compile_lb_prepare(num_threads: int, long_threshold: int, compress_ratio: i
 
 @functools.cache
 def _compile_lb(
-    cute_dtype, top_k, next_n, compress_ratio,
-    max_batch_size, num_threads, cluster_size, return_output_values,
+    cute_dtype,
+    top_k,
+    next_n,
+    compress_ratio,
+    max_batch_size,
+    num_threads,
+    cluster_size,
+    return_output_values,
     # Launch-config knobs chosen by GvrTopKConfig.auto() per shape. Defaults
     # preserve the pre-auto() LB behavior (GvrTopKLBKernel's defaults, which
     # DIFFER from _compile_gvr: 256-bit loads ON, phase3-unroll OFF).
@@ -164,12 +192,26 @@ def _compile_lb(
     sym_rows = sym_groups * next_n
     return cute.compile(
         kernel,
-        cute.runtime.make_fake_compact_tensor(cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_groups, top_k), stride_order=(1, 0), assumed_align=16),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_groups,), stride_order=(0,)),
-        cute.runtime.make_fake_compact_tensor(cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16) if return_output_values else None,
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (max_batch_size,), stride_order=(0,)),
+        cute.runtime.make_fake_compact_tensor(
+            cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (sym_groups, top_k), stride_order=(1, 0), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (sym_groups,), stride_order=(0,)
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+        )
+        if return_output_values
+        else None,
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (max_batch_size,), stride_order=(0,)
+        ),
         cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,)),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -178,8 +220,12 @@ def _compile_lb(
 
 @functools.cache
 def _compile_gvr(
-    cute_dtype, top_k, next_n, compress_ratio,
-    num_threads, return_output_values,
+    cute_dtype,
+    top_k,
+    next_n,
+    compress_ratio,
+    num_threads,
+    return_output_values,
     # Launch-config knobs chosen by GvrTopKConfig.auto() per shape. Each is a
     # compile-time specialization keying the JIT cache; defaults preserve the
     # pre-auto() behavior (GvrTopKKernel's defaults at num_threads=512).
@@ -219,11 +265,23 @@ def _compile_gvr(
     sym_rows = sym_groups * next_n
     return cute.compile(
         kernel,
-        cute.runtime.make_fake_compact_tensor(cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_groups, top_k), stride_order=(1, 0), assumed_align=16),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_groups,), stride_order=(0,)),
-        cute.runtime.make_fake_compact_tensor(cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16) if return_output_values else None,
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16),
+        cute.runtime.make_fake_compact_tensor(
+            cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (sym_groups, top_k), stride_order=(1, 0), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (sym_groups,), stride_order=(0,)
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+        )
+        if return_output_values
+        else None,
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+        ),
         None,  # order_row unused when seqlen_sorted=False
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -307,20 +365,34 @@ def _run_gvr(
     )
 
     if out_indices is None:
-        out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=logits.device)
+        out_indices = torch.empty(
+            (num_rows, top_k), dtype=torch.int32, device=logits.device
+        )
     if return_output_values and out_values is None:
-        out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
+        out_values = torch.empty(
+            (num_rows, top_k), dtype=logits.dtype, device=logits.device
+        )
 
     # Shape-aware launch config from GvrTopKConfig.auto().
     num_threads, knobs = _auto_gvr_knobs(logits, is_lb=True)
     _compile_lb(
-        cute_dtype, top_k, next_n, compress_ratio,
-        max_batch_size, num_threads, lb_cfg.cluster_size, return_output_values,
+        cute_dtype,
+        top_k,
+        next_n,
+        compress_ratio,
+        max_batch_size,
+        num_threads,
+        lb_cfg.cluster_size,
+        return_output_values,
         **knobs,
     )(
-        logits, pre_idx, seq_lens,
+        logits,
+        pre_idx,
+        seq_lens,
         out_values if return_output_values else None,
-        out_indices, order_row, counters,
+        out_indices,
+        order_row,
+        counters,
     )
     return (out_values if return_output_values else None), out_indices
 
@@ -341,20 +413,31 @@ def _run_gvr_no_lb(
     num_rows = logits.shape[0]
 
     if out_indices is None:
-        out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=logits.device)
+        out_indices = torch.empty(
+            (num_rows, top_k), dtype=torch.int32, device=logits.device
+        )
     if return_output_values and out_values is None:
-        out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
+        out_values = torch.empty(
+            (num_rows, top_k), dtype=logits.dtype, device=logits.device
+        )
 
     # Shape-aware launch config from GvrTopKConfig.auto().
     num_threads, knobs = _auto_gvr_knobs(logits, is_lb=False)
     _compile_gvr(
-        cute_dtype, top_k, next_n, compress_ratio,
-        num_threads, return_output_values,
+        cute_dtype,
+        top_k,
+        next_n,
+        compress_ratio,
+        num_threads,
+        return_output_values,
         **knobs,
     )(
-        logits, pre_idx, seq_lens,
+        logits,
+        pre_idx,
+        seq_lens,
         out_values if return_output_values else None,
-        out_indices, None,
+        out_indices,
+        None,
     )
     return (out_values if return_output_values else None), out_indices
 
@@ -403,7 +486,9 @@ def _count_long_rows(
     graph capture, compute ``num_long_rows`` on the host from data you already
     track, or use an explicit ``load_balance=True/False``.
     """
-    threshold = long_threshold if compress_ratio == 1 else long_threshold * compress_ratio
+    threshold = (
+        long_threshold if compress_ratio == 1 else long_threshold * compress_ratio
+    )
     return int((seq_lens > threshold).sum().item())
 
 
@@ -426,26 +511,34 @@ def _run_radix(
     num_rows, N = logits.shape
     if next_n > 1:
         row_seq_lens = seq_lens.repeat_interleave(next_n)
-        row_offsets = torch.arange(next_n, device=logits.device, dtype=torch.int32).repeat(
-            seq_lens.shape[0]
-        )
+        row_offsets = torch.arange(
+            next_n, device=logits.device, dtype=torch.int32
+        ).repeat(seq_lens.shape[0])
         row_seq_lens = (row_seq_lens - next_n + row_offsets + 1) // compress_ratio
     else:
         row_seq_lens = (seq_lens // compress_ratio).clamp(max=N)
 
     col_idx = torch.arange(N, device=logits.device).unsqueeze(0)
-    masked_logits = logits.masked_fill(col_idx >= row_seq_lens.unsqueeze(1), float("-inf"))
+    masked_logits = logits.masked_fill(
+        col_idx >= row_seq_lens.unsqueeze(1), float("-inf")
+    )
 
     row_states_buffer = _get_cache_buf(
-        f"radix_topk_row_states_{logits.device}", 1024 * 1024, logits.device, zero_init=True
+        f"radix_topk_row_states_{logits.device}",
+        1024 * 1024,
+        logits.device,
+        zero_init=True,
     )
     if out_values is None:
-        out_values = torch.empty(num_rows, top_k, dtype=logits.dtype, device=logits.device)
+        out_values = torch.empty(
+            num_rows, top_k, dtype=logits.dtype, device=logits.device
+        )
     out_i_int32 = get_topk_module().radix_topk(
-        masked_logits, top_k,
+        masked_logits,
+        top_k,
         False,  # sorted
         False,  # deterministic
-        0,      # tie_break = TopKTieBreak.NONE
+        0,  # tie_break = TopKTieBreak.NONE
         row_states_buffer,
         out_values,
         False,  # dsa_graph_safe
@@ -658,18 +751,38 @@ def top_k_decode(
             use_lb = bool(load_balance)
         if use_lb:
             out_v, out_i = _run_gvr(
-                logits, pre_idx, seq_lens, top_k, next_n, compress_ratio,
-                return_values, out_indices, out_values,
+                logits,
+                pre_idx,
+                seq_lens,
+                top_k,
+                next_n,
+                compress_ratio,
+                return_values,
+                out_indices,
+                out_values,
             )
         else:
             out_v, out_i = _run_gvr_no_lb(
-                logits, pre_idx, seq_lens, top_k, next_n, compress_ratio,
-                return_values, out_indices, out_values,
+                logits,
+                pre_idx,
+                seq_lens,
+                top_k,
+                next_n,
+                compress_ratio,
+                return_values,
+                out_indices,
+                out_values,
             )
     else:  # "radix"
         out_v, out_i = _run_radix(
-            logits, seq_lens, top_k, next_n, compress_ratio,
-            return_values, out_indices, out_values,
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
         )
 
     if return_values:

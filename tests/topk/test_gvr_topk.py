@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 """Correctness tests for flashinfer.top_k_decode.
 
 On Blackwell (sm_100+) with ``pre_idx`` supplied the GVR fast path runs.
@@ -59,6 +60,7 @@ pytestmark = pytest.mark.skipif(
     not _FLASHINFER_AVAILABLE, reason="flashinfer not installed"
 )
 
+
 # True only on Blackwell (sm_100+) with nvidia-cutlass-dsl installed.
 # Use the public is_backend_supported() method exposed by @backend_requirement.
 def _gvr_hw_supported() -> bool:
@@ -70,6 +72,7 @@ def _gvr_hw_supported() -> bool:
         flashinfer.top_k_decode.is_backend_supported("gvr", cc)
         and is_cute_dsl_available()
     )
+
 
 _IS_BLACKWELL = _gvr_hw_supported()
 
@@ -87,7 +90,9 @@ requires_blackwell = pytest.mark.skipif(
 def _make_inputs(num_rows, N, top_k, dtype, seed, next_n=1, compress_ratio=1):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    logits = (torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 2.0).to(dtype)
+    logits = (torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 2.0).to(
+        dtype
+    )
     num_groups = num_rows // next_n
     effective_len = N - next_n + 1
     argmax_idx = logits[::next_n, :effective_len].argmax(dim=-1).int()
@@ -143,7 +148,7 @@ def test_basic_decode(dtype, top_k, N, batch_size):
     """top_k_decode with pre_idx: works on Blackwell (GVR) and any GPU (radix)."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
-    if N < top_k:
+    if top_k > N:
         pytest.skip("N < top_k")
 
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=42)
@@ -249,8 +254,13 @@ def test_preallocated_outputs():
     out_v = torch.empty(batch_size, top_k, dtype=dtype, device="cuda")
 
     ret_i, ret_v = flashinfer.top_k_decode(
-        logits, seq_lens, top_k, pre_idx=pre_idx,
-        out_indices=out_i, return_values=True, out_values=out_v,
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=pre_idx,
+        out_indices=out_i,
+        return_values=True,
+        out_values=out_v,
     )
     torch.cuda.synchronize()
 
@@ -354,9 +364,7 @@ def test_radix_next_n(dtype, top_k, batch_size):
     if N - next_n + 1 < top_k:
         pytest.skip("N_eff < top_k")
     num_rows = batch_size * next_n
-    logits, _, seq_lens = _make_inputs(
-        num_rows, N, top_k, dtype, seed=7, next_n=next_n
-    )
+    logits, _, seq_lens = _make_inputs(num_rows, N, top_k, dtype, seed=7, next_n=next_n)
 
     indices = flashinfer.top_k_decode(
         logits, seq_lens, top_k, pre_idx=None, next_n=next_n, backend="radix"
@@ -377,8 +385,12 @@ def test_radix_compress_ratio(dtype, top_k):
     )
 
     indices = flashinfer.top_k_decode(
-        logits, seq_lens, top_k, pre_idx=None,
-        compress_ratio=compress_ratio, backend="radix"
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=None,
+        compress_ratio=compress_ratio,
+        backend="radix",
     )
     torch.cuda.synchronize()
 
@@ -394,8 +406,14 @@ def test_radix_preallocated_outputs():
     out_v = torch.empty(batch_size, top_k, dtype=dtype, device="cuda")
 
     ret_i, ret_v = flashinfer.top_k_decode(
-        logits, seq_lens, top_k, pre_idx=None,
-        out_indices=out_i, return_values=True, out_values=out_v, backend="radix"
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=None,
+        out_indices=out_i,
+        return_values=True,
+        out_values=out_v,
+        backend="radix",
     )
     torch.cuda.synchronize()
 
@@ -481,7 +499,9 @@ def _make_ragged_gvr_inputs(top_k, dtype=torch.bfloat16):
     seq_len_list = [N] * 4 + [2048] * 12
     batch_size = len(seq_len_list)
     torch.manual_seed(7)
-    logits = (torch.randn(batch_size, N, dtype=torch.float32, device="cuda") * 2.0).to(dtype)
+    logits = (torch.randn(batch_size, N, dtype=torch.float32, device="cuda") * 2.0).to(
+        dtype
+    )
     seq_lens = torch.tensor(seq_len_list, dtype=torch.int32, device="cuda")
     logits_f32 = logits.to(torch.float32)
     pre_idx = torch.zeros(batch_size, top_k, dtype=torch.int32, device="cuda")
@@ -502,8 +522,12 @@ def test_load_balance_modes(load_balance):
     top_k = 512
     logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
     indices = flashinfer.top_k_decode(
-        logits, seq_lens, top_k, pre_idx=pre_idx,
-        backend="gvr", load_balance=load_balance,
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=pre_idx,
+        backend="gvr",
+        load_balance=load_balance,
     )
     torch.cuda.synchronize()
     assert indices.shape == (seq_lens.shape[0], top_k)
@@ -522,8 +546,13 @@ def test_load_balance_auto_num_long_rows_hint(num_long_rows):
     top_k = 512
     logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
     indices = flashinfer.top_k_decode(
-        logits, seq_lens, top_k, pre_idx=pre_idx,
-        backend="gvr", load_balance="auto", num_long_rows=num_long_rows,
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=pre_idx,
+        backend="gvr",
+        load_balance="auto",
+        num_long_rows=num_long_rows,
     )
     torch.cuda.synchronize()
     assert indices.shape == (seq_lens.shape[0], top_k)
@@ -537,8 +566,12 @@ def test_load_balance_auto_requires_num_long_rows():
     logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
     with pytest.raises(ValueError, match="num_long_rows"):
         flashinfer.top_k_decode(
-            logits, seq_lens, top_k, pre_idx=pre_idx,
-            backend="gvr", load_balance="auto",
+            logits,
+            seq_lens,
+            top_k,
+            pre_idx=pre_idx,
+            backend="gvr",
+            load_balance="auto",
         )
 
 
@@ -615,8 +648,12 @@ def test_lb_256bit_misaligned_no_crash():
     top_k, N, batch_size = 512, 4104, 16
     assert N % 8 == 0 and (N * 2) % 32 != 0  # 128-bit OK, 256-bit would fault
     torch.manual_seed(31)
-    logits = (torch.randn(batch_size, N, dtype=torch.float32, device="cuda") * 2).to(torch.bfloat16)
-    seq_lens = torch.tensor([N] * 4 + [2048] * (batch_size - 4), dtype=torch.int32, device="cuda")
+    logits = (torch.randn(batch_size, N, dtype=torch.float32, device="cuda") * 2).to(
+        torch.bfloat16
+    )
+    seq_lens = torch.tensor(
+        [N] * 4 + [2048] * (batch_size - 4), dtype=torch.int32, device="cuda"
+    )
     lf = logits.float()
     pre_idx = torch.zeros(batch_size, top_k, dtype=torch.int32, device="cuda")
     for r in range(batch_size):

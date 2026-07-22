@@ -63,7 +63,10 @@ class LBCase:
 
 
 def build_inputs(
-    case: LBCase, top_k: int, dtype: torch.dtype, device: torch.device,
+    case: LBCase,
+    top_k: int,
+    dtype: torch.dtype,
+    device: torch.device,
     pre_idx_overlap: float = 1.0,
 ):
     """Build (logits, seq_lens, pre_idx) for a mixed long/short batch.
@@ -88,7 +91,9 @@ def build_inputs(
     num_rows = case.num_rows
     N = case.max_len
 
-    logits = (torch.randn(num_rows, N, dtype=torch.float32, device=device) * 2.0).to(dtype)
+    logits = (torch.randn(num_rows, N, dtype=torch.float32, device=device) * 2.0).to(
+        dtype
+    )
     seq_len_list = [case.long_len] * case.num_long + [case.short_len] * case.num_short
     seq_lens = torch.tensor(seq_len_list, dtype=torch.int32, device=device)
 
@@ -103,10 +108,15 @@ def build_inputs(
         # n_true hints from the true top-K (perfect part), rest random valid.
         perm = torch.randperm(top_k, generator=gen, device=device)
         hint = torch.empty(top_k, dtype=torch.int32, device=device)
-        hint[: n_true] = true_topk[perm[:n_true]].int()
+        hint[:n_true] = true_topk[perm[:n_true]].int()
         if n_true < top_k:
             rand_pos = torch.randint(
-                0, n_eff, (top_k - n_true,), generator=gen, device=device, dtype=torch.int32
+                0,
+                n_eff,
+                (top_k - n_true,),
+                generator=gen,
+                device=device,
+                dtype=torch.int32,
             )
             hint[n_true:] = rand_pos
         pre_idx[r] = hint
@@ -151,9 +161,17 @@ def check_correct(indices, logits, seq_lens, top_k):
         assert (sel_vals < kth).sum() == 0, f"row={row}: value below k-th rank"
 
 
-def bench_case(case: LBCase, top_k: int, dtype: torch.dtype, device, args,
-               pre_idx_overlap: float = 1.0) -> dict:
-    logits, seq_lens, pre_idx = build_inputs(case, top_k, dtype, device, pre_idx_overlap)
+def bench_case(
+    case: LBCase,
+    top_k: int,
+    dtype: torch.dtype,
+    device,
+    args,
+    pre_idx_overlap: float = 1.0,
+) -> dict:
+    logits, seq_lens, pre_idx = build_inputs(
+        case, top_k, dtype, device, pre_idx_overlap
+    )
 
     # Host-side long-row count -> the graph-safe LB decision (pure host).
     n_long = _count_long_rows(seq_lens, 1, LONG_THRESHOLD)
@@ -178,9 +196,38 @@ def bench_case(case: LBCase, top_k: int, dtype: torch.dtype, device, args,
         use_cuda_graph=False,
         cold_l2_cache=True,
     )
-    lb_us = float(np.median(bench_gpu_time(fn=run_gvr, input_args=(logits, seq_lens, top_k, pre_idx, True), **kw))) * 1e3
-    no_us = float(np.median(bench_gpu_time(fn=run_gvr, input_args=(logits, seq_lens, top_k, pre_idx, False), **kw))) * 1e3
-    radix_us = float(np.median(bench_gpu_time(fn=run_radix, input_args=(logits, seq_lens, top_k), **kw))) * 1e3
+    lb_us = (
+        float(
+            np.median(
+                bench_gpu_time(
+                    fn=run_gvr,
+                    input_args=(logits, seq_lens, top_k, pre_idx, True),
+                    **kw,
+                )
+            )
+        )
+        * 1e3
+    )
+    no_us = (
+        float(
+            np.median(
+                bench_gpu_time(
+                    fn=run_gvr,
+                    input_args=(logits, seq_lens, top_k, pre_idx, False),
+                    **kw,
+                )
+            )
+        )
+        * 1e3
+    )
+    radix_us = (
+        float(
+            np.median(
+                bench_gpu_time(fn=run_radix, input_args=(logits, seq_lens, top_k), **kw)
+            )
+        )
+        * 1e3
+    )
     # GVR LB heuristic picks between the two GVR paths (kernel cost of the chosen
     # path; the pure-host decision adds no device work).
     oracle_us = lb_us if chose_lb else no_us
@@ -230,9 +277,15 @@ def geomean(xs):
 def run_lb_comparison(dtype, device, args):
     """Table: GVR-LB vs GVR-noLB vs GVR-auto vs radix over the workload spectrum."""
     print("=" * 116)
-    print(f"[LB comparison]  GVR-LB vs GVR-noLB vs GVR-auto vs radix   (top_k={args.top_k}, dtype={args.dtype})")
-    print(f"long_threshold={LONG_THRESHOLD} | LB speedups vs GVR-noLB baseline | gvr/radix = radix_us / gvr-auto_us")
-    print(f"pre_idx_overlap={args.pre_idx_overlap:.2f} (fraction of hints that are true top-K)")
+    print(
+        f"[LB comparison]  GVR-LB vs GVR-noLB vs GVR-auto vs radix   (top_k={args.top_k}, dtype={args.dtype})"
+    )
+    print(
+        f"long_threshold={LONG_THRESHOLD} | LB speedups vs GVR-noLB baseline | gvr/radix = radix_us / gvr-auto_us"
+    )
+    print(
+        f"pre_idx_overlap={args.pre_idx_overlap:.2f} (fraction of hints that are true top-K)"
+    )
     print("=" * 116)
     header = (
         f"{'case':>26} {'rows':>5} {'#long':>6} "
@@ -267,14 +320,20 @@ def run_lb_comparison(dtype, device, args):
     print("-" * len(header))
     if lb_speedups:
         total = len(lb_speedups)
-        print("  [1] GVR LB heuristic — geomean speedup vs GVR-noLB baseline (higher better):")
-        print(f"        always-LB : {geomean(lb_speedups):.3f}x   heuristic : {geomean(auto_speedups):.3f}x "
-              f"  (picked faster path {n_correct}/{total})")
+        print(
+            "  [1] GVR LB heuristic — geomean speedup vs GVR-noLB baseline (higher better):"
+        )
+        print(
+            f"        always-LB : {geomean(lb_speedups):.3f}x   heuristic : {geomean(auto_speedups):.3f}x "
+            f"  (picked faster path {n_correct}/{total})"
+        )
         g_gr = geomean(gvr_vs_radix)
         worst = min(gvr_vs_radix)
         gvr_wins = sum(1 for x in gvr_vs_radix if x > 1.0)
-        print(f"  [2] gvr-auto vs radix : geomean {g_gr:.2f}x, GVR faster in {gvr_wins}/{total} "
-              f"(min {worst:.2f}x)")
+        print(
+            f"  [2] gvr-auto vs radix : geomean {g_gr:.2f}x, GVR faster in {gvr_wins}/{total} "
+            f"(min {worst:.2f}x)"
+        )
     print("=" * 116)
 
 
@@ -282,25 +341,61 @@ def _sweep_one(case, top_k, dtype, device, args):
     """Sweep overlap for one case; return (rows, radix_us). radix is hint-free."""
     overlaps = [1.0, 0.75, 0.5, 0.25, 0.0]
     kw = dict(
-        dry_run_iters=args.dry_run_iters, repeat_iters=args.repeat_iters,
-        enable_cupti=True, use_cuda_graph=False, cold_l2_cache=True,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.repeat_iters,
+        enable_cupti=True,
+        use_cuda_graph=False,
+        cold_l2_cache=True,
     )
     radix_us = None
     rows = []
     for ov in overlaps:
-        logits, seq_lens, pre_idx = build_inputs(case, top_k, dtype, device, pre_idx_overlap=ov)
+        logits, seq_lens, pre_idx = build_inputs(
+            case, top_k, dtype, device, pre_idx_overlap=ov
+        )
         i_lb = run_gvr(logits, seq_lens, top_k, pre_idx, True)
         i_no = run_gvr(logits, seq_lens, top_k, pre_idx, False)
         torch.cuda.synchronize()
         check_correct(i_lb, logits, seq_lens, top_k)
         check_correct(i_no, logits, seq_lens, top_k)
-        lb_us = float(np.median(bench_gpu_time(fn=run_gvr, input_args=(logits, seq_lens, top_k, pre_idx, True), **kw))) * 1e3
-        no_us = float(np.median(bench_gpu_time(fn=run_gvr, input_args=(logits, seq_lens, top_k, pre_idx, False), **kw))) * 1e3
+        lb_us = (
+            float(
+                np.median(
+                    bench_gpu_time(
+                        fn=run_gvr,
+                        input_args=(logits, seq_lens, top_k, pre_idx, True),
+                        **kw,
+                    )
+                )
+            )
+            * 1e3
+        )
+        no_us = (
+            float(
+                np.median(
+                    bench_gpu_time(
+                        fn=run_gvr,
+                        input_args=(logits, seq_lens, top_k, pre_idx, False),
+                        **kw,
+                    )
+                )
+            )
+            * 1e3
+        )
         if radix_us is None:  # hint-independent; measure once
             i_rx = run_radix(logits, seq_lens, top_k)
             torch.cuda.synchronize()
             check_correct(i_rx, logits, seq_lens, top_k)
-            radix_us = float(np.median(bench_gpu_time(fn=run_radix, input_args=(logits, seq_lens, top_k), **kw))) * 1e3
+            radix_us = (
+                float(
+                    np.median(
+                        bench_gpu_time(
+                            fn=run_radix, input_args=(logits, seq_lens, top_k), **kw
+                        )
+                    )
+                )
+                * 1e3
+            )
         rows.append((ov, no_us, lb_us, min(lb_us, no_us)))
     return rows, radix_us
 
@@ -325,17 +420,23 @@ def run_pre_idx_quality_sweep(dtype, device, args):
         ("single_1x128K", LBCase("s", 1, 131072, 0, 2048)),
     ]
     print("=" * 92)
-    print(f"[pre_idx quality sweep]  GVR-vs-radix dependence on hint quality "
-          f"(top_k={args.top_k}, dtype={args.dtype})")
-    print("  overlap = fraction of the K hints that are the TRUE current-step top-K "
-          "(1.0=perfect, 0.0=useless)")
+    print(
+        f"[pre_idx quality sweep]  GVR-vs-radix dependence on hint quality "
+        f"(top_k={args.top_k}, dtype={args.dtype})"
+    )
+    print(
+        "  overlap = fraction of the K hints that are the TRUE current-step top-K "
+        "(1.0=perfect, 0.0=useless)"
+    )
     print("=" * 92)
 
     all_ratios = []
     for name, case in regimes:
         rows, radix_us = _sweep_one(case, args.top_k, dtype, device, args)
         print(f"\n  {name}   (radix, hint-free = {radix_us:.2f} us)")
-        print(f"    {'overlap':>8} {'GVR-noLB(us)':>13} {'GVR-LB(us)':>12} {'radix/GVR-best':>15}")
+        print(
+            f"    {'overlap':>8} {'GVR-noLB(us)':>13} {'GVR-LB(us)':>12} {'radix/GVR-best':>15}"
+        )
         print("    " + "-" * 52)
         for ov, no_us, lb_us, best in rows:
             ratio = radix_us / best
@@ -345,14 +446,24 @@ def run_pre_idx_quality_sweep(dtype, device, args):
 
     print("\n" + "-" * 92)
     lo, hi = min(all_ratios), max(all_ratios)
-    print(f"  radix/GVR-best spans {lo:.2f}x .. {hi:.2f}x across regimes and hint quality.")
+    print(
+        f"  radix/GVR-best spans {lo:.2f}x .. {hi:.2f}x across regimes and hint quality."
+    )
     if lo >= 1.0:
-        print("  => GVR stays >= radix everywhere, even with a useless hint. No pre_idx-quality")
+        print(
+            "  => GVR stays >= radix everywhere, even with a useless hint. No pre_idx-quality"
+        )
         print("     backend heuristic is needed for these shapes.")
     else:
-        print(f"  => radix overtakes GVR in the worst regime ({lo:.2f}x). GVR's runtime is NOT")
-        print("     monotonic in hint quality (a perfect hint can seed a boundary-oscillating")
-        print("     secant search); the crossover is narrow, so a static 'GVR when pre_idx'")
+        print(
+            f"  => radix overtakes GVR in the worst regime ({lo:.2f}x). GVR's runtime is NOT"
+        )
+        print(
+            "     monotonic in hint quality (a perfect hint can seed a boundary-oscillating"
+        )
+        print(
+            "     secant search); the crossover is narrow, so a static 'GVR when pre_idx'"
+        )
         print("     policy is still reasonable, but this is the case to watch.")
     print("=" * 92)
 
@@ -365,17 +476,23 @@ def main():
     parser.add_argument("--dry-run-iters", type=int, default=10)
     parser.add_argument("--repeat-iters", type=int, default=100)
     parser.add_argument(
-        "--op", choices=["all", "lb", "pre_idx_quality"], default="all",
+        "--op",
+        choices=["all", "lb", "pre_idx_quality"],
+        default="all",
         help="Which benchmark to run: lb comparison, pre_idx-quality sweep, or all.",
     )
     parser.add_argument(
-        "--pre-idx-overlap", type=float, default=1.0,
+        "--pre-idx-overlap",
+        type=float,
+        default=1.0,
         help="Fraction of pre_idx hints that are the true top-K, for the lb table "
         "(1.0=perfect hint; lower models a stale previous-step top-K).",
     )
     args = parser.parse_args()
 
-    dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
+    dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[
+        args.dtype
+    ]
     device = torch.device("cuda")
     major, minor = get_compute_capability(device)
     cc = major * 10 + minor
