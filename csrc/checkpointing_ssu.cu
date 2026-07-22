@@ -35,12 +35,12 @@ void checkpointing_ssu(
     TensorView B,   // (batch, NPREDICTED, ngroups, dstate) / (1, total_tokens, ngroups, dstate)
     TensorView C,   // same as B
     TensorView output,  // same layout as x
-    // Cache tensors
-    TensorView old_x,              // (state_cache_size, MAX_WINDOW, nheads, dim)
-    TensorView old_B,              // (state_cache_size, 2, MAX_WINDOW, ngroups, dstate)
-    TensorView old_dt,             // (state_cache_size, 2, nheads, MAX_WINDOW) f32
-    TensorView old_cumAdt,         // (state_cache_size, 2, nheads, MAX_WINDOW) f32
-    TensorView cache_buf_idx,      // (state_cache_size,) int32
+    // Ring-buffer cache tensors (single-buffered, head-major; RING_BUFFER_LEN
+    // = row count, runtime-implicit; MAX_WINDOW = RING_BUFFER_LEN - NPREDICTED)
+    TensorView x_cache,            // (state_cache_size, nheads, RING_BUFFER_LEN, dim)
+    TensorView B_cache,            // (state_cache_size, ngroups, RING_BUFFER_LEN, dstate)
+    TensorView dt_cache,           // (state_cache_size, nheads, RING_BUFFER_LEN) f32
+    TensorView ring_start,         // (state_cache_size,) int32
     TensorView prev_num_accepted,  // (state_cache_size,) int32
     // Optional tensors
     Optional<TensorView> D,        // (nheads, dim)
@@ -49,10 +49,14 @@ void checkpointing_ssu(
     bool dt_softplus,
     Optional<TensorView> state_batch_indices,  // (batch,) int32
     int64_t pad_slot_id,
-    Optional<TensorView> state_scale,   // (state_cache_size, nheads, dim) f32
-    Optional<TensorView> rand_seed,     // single int64
-    int64_t d_split,                    // v12 §59: per-head DIM split factor (1, 2, or 4)
-    Optional<TensorView> cu_seqlens) {  // (batch+1,) int32, varlen mode
+    Optional<TensorView> state_scale,  // (state_cache_size, nheads, dim) f32
+    Optional<TensorView> rand_seed,    // single int64
+    int64_t d_split,                   // v12 §59: per-head DIM split factor (1, 2, or 4)
+    Optional<TensorView> cu_seqlens,   // (batch+1,) int32, varlen mode
+    Optional<TensorView> cb_scaled,    // two-kernel: bf16 (batch, nheads, 32, 8) fragA-native
+    Optional<TensorView> cumAdt_vec,   // two-kernel: f32 (batch, nheads, T_pad) raw cumAdt
+    Optional<TensorView> cb_old,       // two-kernel: bf16 (batch, nheads, 32, K_old/2) fragA-native
+    int64_t precompute_heads_per_cta) {  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
 
   bool const is_varlen = cu_seqlens.has_value();
 
@@ -61,7 +65,7 @@ void checkpointing_ssu(
   auto const nheads = state.size(1);
   auto const dim = state.size(2);
   auto const dstate = state.size(3);
-  auto const max_window = old_x.size(1);
+  auto const ring_buffer_len = x_cache.size(2);
   auto const ngroups = B.size(2);
 
   // In non-varlen mode, batch = x.size(0) and npredicted = x.size(1) (the
@@ -95,10 +99,14 @@ void checkpointing_ssu(
   // user-supplied `max_seqlen` (upper bound on every cu_seqlens diff).
   FLASHINFER_CHECK(npredicted == NPREDICTED, is_varlen ? "max_seqlen=" : "x.size(1)=", npredicted,
                    " must equal JIT NPREDICTED=", NPREDICTED);
-  FLASHINFER_CHECK(max_window == MAX_WINDOW, "old_x.size(1)=", max_window,
+  // The LOGICAL replay window is the ring row count minus one speculative
+  // window (ReplaySSM early-flush rule: pnat + 2T > RING_BUFFER_LEN).
+  auto const max_window = ring_buffer_len - npredicted;
+  FLASHINFER_CHECK(max_window == MAX_WINDOW, "x_cache.size(2) - npredicted = ", max_window,
                    " must equal JIT MAX_WINDOW=", MAX_WINDOW);
   FLASHINFER_CHECK(npredicted <= max_window, "npredicted=", npredicted,
-                   " must be <= max_window=", max_window);
+                   " must be <= max_window=", max_window, " (ring_buffer_len=", ring_buffer_len,
+                   ")");
 
   // ── Validate state ──
   CHECK_CUDA(state);
@@ -224,70 +232,53 @@ void checkpointing_ssu(
   FLASHINFER_CHECK(output.stride(2) == dim, "output.stride(2)=", output.stride(2),
                    " must equal dim=", dim, " ((nheads, dim) must be contiguous)");
 
-  // ── Validate cache tensors ──
-  // old_x: kernel uses `head * DIM + d_tile_off` → (nheads, dim) contig.
-  CHECK_CUDA(old_x);
-  CHECK_DIM(4, old_x);  // (state_cache_size, MAX_WINDOW, nheads, dim)
-  FLASHINFER_CHECK(old_x.size(0) == state_cache_size, "old_x.size(0)=", old_x.size(0),
+  // ── Validate ring-buffer cache tensors ──
+  // x_cache: kernel gathers one head's rows → (RING_BUFFER_LEN, dim) contig per head.
+  CHECK_CUDA(x_cache);
+  CHECK_DIM(4, x_cache);  // (state_cache_size, nheads, RING_BUFFER_LEN, dim)
+  FLASHINFER_CHECK(x_cache.size(0) == state_cache_size, "x_cache.size(0)=", x_cache.size(0),
                    " must equal state_cache_size=", state_cache_size);
-  FLASHINFER_CHECK(old_x.size(1) == max_window, "old_x.size(1)=", old_x.size(1),
-                   " must equal max_window=", max_window);
-  FLASHINFER_CHECK(old_x.size(2) == nheads, "old_x.size(2)=", old_x.size(2),
+  FLASHINFER_CHECK(x_cache.size(1) == nheads, "x_cache.size(1)=", x_cache.size(1),
                    " must equal nheads=", nheads);
-  FLASHINFER_CHECK(old_x.size(3) == dim, "old_x.size(3)=", old_x.size(3), " must equal dim=", dim);
-  CHECK_LAST_DIM_CONTIGUOUS(old_x);
-  FLASHINFER_CHECK(old_x.stride(2) == dim, "old_x.stride(2)=", old_x.stride(2),
-                   " must equal dim=", dim, " ((nheads, dim) must be contiguous)");
+  FLASHINFER_CHECK(x_cache.size(3) == dim, "x_cache.size(3)=", x_cache.size(3),
+                   " must equal dim=", dim);
+  CHECK_LAST_DIM_CONTIGUOUS(x_cache);
+  FLASHINFER_CHECK(x_cache.stride(2) == dim, "x_cache.stride(2)=", x_cache.stride(2),
+                   " must equal dim=", dim, " ((RING_BUFFER_LEN, dim) must be contiguous)");
 
-  // old_B: kernel uses `group_idx * DSTATE` → (ngroups, dstate) contig.
-  CHECK_CUDA(old_B);
-  CHECK_DIM(5, old_B);  // (state_cache_size, 2, MAX_WINDOW, ngroups, dstate)
-  FLASHINFER_CHECK(old_B.size(0) == state_cache_size, "old_B.size(0)=", old_B.size(0),
+  // B_cache: one group's rows → (RING_BUFFER_LEN, dstate) contig per group.
+  CHECK_CUDA(B_cache);
+  CHECK_DIM(4, B_cache);  // (state_cache_size, ngroups, RING_BUFFER_LEN, dstate)
+  FLASHINFER_CHECK(B_cache.size(0) == state_cache_size, "B_cache.size(0)=", B_cache.size(0),
                    " must equal state_cache_size=", state_cache_size);
-  FLASHINFER_CHECK(old_B.size(1) == 2, "old_B.size(1) must be 2 (double-buffered), got ",
-                   old_B.size(1));
-  FLASHINFER_CHECK(old_B.size(2) == max_window, "old_B.size(2)=", old_B.size(2),
-                   " must equal max_window=", max_window);
-  FLASHINFER_CHECK(old_B.size(3) == ngroups, "old_B.size(3)=", old_B.size(3),
+  FLASHINFER_CHECK(B_cache.size(1) == ngroups, "B_cache.size(1)=", B_cache.size(1),
                    " must equal ngroups=", ngroups);
-  FLASHINFER_CHECK(old_B.size(4) == dstate, "old_B.size(4)=", old_B.size(4),
+  FLASHINFER_CHECK(B_cache.size(2) == ring_buffer_len, "B_cache.size(2)=", B_cache.size(2),
+                   " must equal ring_buffer_len=", ring_buffer_len);
+  FLASHINFER_CHECK(B_cache.size(3) == dstate, "B_cache.size(3)=", B_cache.size(3),
                    " must equal dstate=", dstate);
-  CHECK_LAST_DIM_CONTIGUOUS(old_B);
-  FLASHINFER_CHECK(old_B.stride(3) == dstate, "old_B.stride(3)=", old_B.stride(3),
-                   " must equal dstate=", dstate, " ((ngroups, dstate) must be contiguous)");
+  CHECK_LAST_DIM_CONTIGUOUS(B_cache);
+  FLASHINFER_CHECK(B_cache.stride(2) == dstate, "B_cache.stride(2)=", B_cache.stride(2),
+                   " must equal dstate=", dstate,
+                   " ((RING_BUFFER_LEN, dstate) must be contiguous)");
 
-  // old_dt: kernel only assumes last-dim contig (head row).
-  CHECK_CUDA(old_dt);
-  CHECK_DIM(4, old_dt);  // (state_cache_size, 2, nheads, MAX_WINDOW)
-  FLASHINFER_CHECK(old_dt.size(0) == state_cache_size, "old_dt.size(0)=", old_dt.size(0),
+  // dt_cache: one head's row → RING_BUFFER_LEN contig.
+  CHECK_CUDA(dt_cache);
+  CHECK_DIM(3, dt_cache);  // (state_cache_size, nheads, RING_BUFFER_LEN)
+  FLASHINFER_CHECK(dt_cache.size(0) == state_cache_size, "dt_cache.size(0)=", dt_cache.size(0),
                    " must equal state_cache_size=", state_cache_size);
-  FLASHINFER_CHECK(old_dt.size(1) == 2, "old_dt.size(1) must be 2, got ", old_dt.size(1));
-  FLASHINFER_CHECK(old_dt.size(2) == nheads, "old_dt.size(2)=", old_dt.size(2),
+  FLASHINFER_CHECK(dt_cache.size(1) == nheads, "dt_cache.size(1)=", dt_cache.size(1),
                    " must equal nheads=", nheads);
-  FLASHINFER_CHECK(old_dt.size(3) == max_window, "old_dt.size(3)=", old_dt.size(3),
-                   " must equal max_window=", max_window);
-  CHECK_LAST_DIM_CONTIGUOUS(old_dt);
+  FLASHINFER_CHECK(dt_cache.size(2) == ring_buffer_len, "dt_cache.size(2)=", dt_cache.size(2),
+                   " must equal ring_buffer_len=", ring_buffer_len);
+  CHECK_LAST_DIM_CONTIGUOUS(dt_cache);
 
-  // old_cumAdt: same as old_dt.
-  CHECK_CUDA(old_cumAdt);
-  CHECK_DIM(4, old_cumAdt);  // (state_cache_size, 2, nheads, MAX_WINDOW)
-  FLASHINFER_CHECK(old_cumAdt.size(0) == state_cache_size,
-                   "old_cumAdt.size(0)=", old_cumAdt.size(0),
+  CHECK_CUDA(ring_start);
+  CHECK_DIM(1, ring_start);
+  FLASHINFER_CHECK(ring_start.size(0) == state_cache_size,
+                   "ring_start.size(0)=", ring_start.size(0),
                    " must equal state_cache_size=", state_cache_size);
-  FLASHINFER_CHECK(old_cumAdt.size(1) == 2, "old_cumAdt.size(1) must be 2, got ",
-                   old_cumAdt.size(1));
-  FLASHINFER_CHECK(old_cumAdt.size(2) == nheads, "old_cumAdt.size(2)=", old_cumAdt.size(2),
-                   " must equal nheads=", nheads);
-  FLASHINFER_CHECK(old_cumAdt.size(3) == max_window, "old_cumAdt.size(3)=", old_cumAdt.size(3),
-                   " must equal max_window=", max_window);
-  CHECK_LAST_DIM_CONTIGUOUS(old_cumAdt);
-
-  CHECK_CUDA(cache_buf_idx);
-  CHECK_DIM(1, cache_buf_idx);
-  FLASHINFER_CHECK(cache_buf_idx.size(0) == state_cache_size,
-                   "cache_buf_idx.size(0)=", cache_buf_idx.size(0),
-                   " must equal state_cache_size=", state_cache_size);
-  CHECK_CONTIGUOUS(cache_buf_idx);
+  CHECK_CONTIGUOUS(ring_start);
 
   CHECK_CUDA(prev_num_accepted);
   CHECK_DIM(1, prev_num_accepted);
@@ -371,8 +362,8 @@ void checkpointing_ssu(
   }
 
   // ── Dtype consistency ──
-  // input_dtype = x.dtype; all activation tensors (B, C, output, z, old_x,
-  // old_B) and the state cache's "input-side" mirrors must match it.
+  // input_dtype = x.dtype; all activation tensors (B, C, output, z, x_cache,
+  // B_cache) and the state cache's "input-side" mirrors must match it.
   // weight_dtype = D.dtype = dt_bias.dtype (kernel template sees one
   // weight_t for both).
   // Cache scalar tensors have fixed dtypes hardcoded in the kernel.
@@ -381,8 +372,8 @@ void checkpointing_ssu(
     FLASHINFER_CHECK(B.dtype() == input_dtype, "B.dtype must match x.dtype");
     FLASHINFER_CHECK(C.dtype() == input_dtype, "C.dtype must match x.dtype");
     FLASHINFER_CHECK(output.dtype() == input_dtype, "output.dtype must match x.dtype");
-    FLASHINFER_CHECK(old_x.dtype() == input_dtype, "old_x.dtype must match x.dtype");
-    FLASHINFER_CHECK(old_B.dtype() == input_dtype, "old_B.dtype must match x.dtype");
+    FLASHINFER_CHECK(x_cache.dtype() == input_dtype, "x_cache.dtype must match x.dtype");
+    FLASHINFER_CHECK(B_cache.dtype() == input_dtype, "B_cache.dtype must match x.dtype");
     if (z.has_value()) {
       FLASHINFER_CHECK(z.value().dtype() == input_dtype, "z.dtype must match x.dtype");
     }
@@ -390,15 +381,13 @@ void checkpointing_ssu(
       FLASHINFER_CHECK(D.value().dtype() == dt_bias.value().dtype(),
                        "D.dtype must equal dt_bias.dtype (kernel uses a single weight_t)");
     }
-    // old_dt / old_cumAdt are produced by this same kernel in f32 and
-    // consumed back in f32 on the next call.
-    FLASHINFER_CHECK(old_dt.dtype().code == kDLFloat && old_dt.dtype().bits == 32,
-                     "old_dt must be float32");
-    FLASHINFER_CHECK(old_cumAdt.dtype().code == kDLFloat && old_cumAdt.dtype().bits == 32,
-                     "old_cumAdt must be float32");
+    // dt_cache is produced by this same kernel in f32 and consumed back in
+    // f32 on the next call (replay decays are recomputed from it).
+    FLASHINFER_CHECK(dt_cache.dtype().code == kDLFloat && dt_cache.dtype().bits == 32,
+                     "dt_cache must be float32");
     // Index tensors used by the kernel as int32 scalars.
-    FLASHINFER_CHECK(cache_buf_idx.dtype().code == kDLInt && cache_buf_idx.dtype().bits == 32,
-                     "cache_buf_idx must be int32");
+    FLASHINFER_CHECK(ring_start.dtype().code == kDLInt && ring_start.dtype().bits == 32,
+                     "ring_start must be int32");
     FLASHINFER_CHECK(
         prev_num_accepted.dtype().code == kDLInt && prev_num_accepted.dtype().bits == 32,
         "prev_num_accepted must be int32");
@@ -451,6 +440,18 @@ void checkpointing_ssu(
   FLASHINFER_CHECK(dim / d_split >= 32, "d_split=", d_split, " gives D_PER_CTA=", dim / d_split,
                    " < 32 (output MMA m16n8 atom floor with _1×4 warp layout)");
 
+  // ── Validate precompute_heads_per_cta (two-kernel PRECOMPUTE head-tiling, host knob) ──
+  // 0 = use the launcher's co-residency heuristic; >0 overrides (must divide HEADS_PER_GROUP).
+  {
+    int64_t const hpg = nheads / ngroups;
+    FLASHINFER_CHECK(precompute_heads_per_cta >= 0 &&
+                         (precompute_heads_per_cta == 0 || hpg % precompute_heads_per_cta == 0),
+                     "precompute_heads_per_cta=", precompute_heads_per_cta,
+                     " must be 0 (heuristic) or a positive divisor of HEADS_PER_GROUP "
+                     "(nheads/ngroups=",
+                     hpg, ")");
+  }
+
   p.batch = batch;
   p.nheads = nheads;
   p.dim = dim;
@@ -472,11 +473,11 @@ void checkpointing_ssu(
   p.C = const_cast<void*>(C.data_ptr());
   p.output = output.data_ptr();
 
-  p.old_x = old_x.data_ptr();
-  p.old_B = const_cast<void*>(old_B.data_ptr());
-  p.old_dt = const_cast<void*>(old_dt.data_ptr());
-  p.old_cumAdt = const_cast<void*>(old_cumAdt.data_ptr());
-  p.cache_buf_idx = const_cast<void*>(cache_buf_idx.data_ptr());
+  p.x_cache = x_cache.data_ptr();
+  p.B_cache = B_cache.data_ptr();
+  p.dt_cache = dt_cache.data_ptr();
+  p.ring_start = const_cast<void*>(ring_start.data_ptr());
+  p.ring_buffer_len = static_cast<int32_t>(ring_buffer_len);
   p.prev_num_accepted = const_cast<void*>(prev_num_accepted.data_ptr());
 
   if (D.has_value()) p.D = const_cast<void*>(D.value().data_ptr());
@@ -504,6 +505,59 @@ void checkpointing_ssu(
     p.rand_seed = static_cast<const int64_t*>(rs.data_ptr());
   }
 
+  // Two-kernel split scratch (presence of cb_scaled selects precompute+main).
+  // Caller-allocated (graph-safe).  The Python wrapper enforces the all-or-none
+  // trio; shape/device/contiguity/dtype are validated here so a bad scratch
+  // fails loudly instead of corrupting memory or faulting inside the kernel.
+  // Expected layouts (see the wrapper / bench allocator): cb_scaled/cb_old are
+  // input-dtype fragA-native (., ., 32, regs); cumAdt_vec is f32 (., ., T_pad).
+  // fragA-native scratch: each (batch, head)'s CB is one MMA A-fragment stored
+  // as [warp lane, register].  The lane axis is a full warp; the register axis
+  // is the A-operand size — kCbScaledRegs for the new-token m16n8k16 CB,
+  // k_old_half (= K_old/2) for the old-token m16n8k{K_old} CB.
+  constexpr int64_t kWarpSize = 32;
+  constexpr int64_t kCbScaledRegs = 8;                          // m16n8k16 A-operand regs/lane
+  int64_t const t_pad = ((npredicted + 15) / 16) * 16;          // cumAdt_vec: next_multiple_of<16>
+  int64_t const k_old_half = (((max_window + 7) / 8) * 8) / 2;  // K_old/2, K_old=next_mult<8>
+  if (cb_scaled.has_value()) {
+    auto const& cb = cb_scaled.value();
+    CHECK_CUDA(cb);
+    CHECK_DIM(4, cb);
+    CHECK_CONTIGUOUS(cb);
+    FLASHINFER_CHECK(cb.dtype().code == x.dtype().code && cb.dtype().bits == x.dtype().bits,
+                     "cb_scaled dtype must match x (input dtype)");
+    FLASHINFER_CHECK(cb.size(0) >= batch && cb.size(1) == nheads && cb.size(2) == kWarpSize &&
+                         cb.size(3) == kCbScaledRegs,
+                     "cb_scaled must be (>=batch, nheads, ", kWarpSize, ", ", kCbScaledRegs,
+                     "), got (", cb.size(0), ", ", cb.size(1), ", ", cb.size(2), ", ", cb.size(3),
+                     ")");
+    p.cb_scaled = const_cast<void*>(cb.data_ptr());
+  }
+  if (cumAdt_vec.has_value()) {
+    auto const& cv = cumAdt_vec.value();
+    CHECK_CUDA(cv);
+    CHECK_DIM(3, cv);
+    CHECK_CONTIGUOUS(cv);
+    FLASHINFER_CHECK(cv.dtype().code == kDLFloat && cv.dtype().bits == 32,
+                     "cumAdt_vec must be float32");
+    FLASHINFER_CHECK(cv.size(0) >= batch && cv.size(1) == nheads && cv.size(2) == t_pad,
+                     "cumAdt_vec must be (>=batch, nheads, ", t_pad, "), got (", cv.size(0), ", ",
+                     cv.size(1), ", ", cv.size(2), ")");
+    p.cumAdt_vec = const_cast<void*>(cv.data_ptr());
+  }
+  if (cb_old.has_value()) {
+    auto const& cbo = cb_old.value();
+    CHECK_CUDA(cbo);
+    CHECK_DIM(4, cbo);
+    CHECK_CONTIGUOUS(cbo);
+    FLASHINFER_CHECK(cbo.dtype().code == x.dtype().code && cbo.dtype().bits == x.dtype().bits,
+                     "cb_old dtype must match x (input dtype)");
+    FLASHINFER_CHECK(cbo.size(0) >= batch && cbo.size(1) == nheads && cbo.size(2) == kWarpSize &&
+                         cbo.size(3) == k_old_half,
+                     "cb_old must be (>=batch, nheads, ", kWarpSize, ", ", k_old_half, "), got (",
+                     cbo.size(0), ", ", cbo.size(1), ", ", cbo.size(2), ", ", cbo.size(3), ")");
+    p.cb_old = const_cast<void*>(cbo.data_ptr());
+  }
   // Strides
   p.state_stride_seq = state.stride(0);
 
@@ -523,24 +577,36 @@ void checkpointing_ssu(
   p.out_stride_seq = output.stride(seq_dim);
   p.out_stride_token = output.stride(1);
 
-  p.old_x_stride_seq = old_x.stride(0);
-  p.old_x_stride_token = old_x.stride(1);
-  p.old_B_stride_seq = old_B.stride(0);
-  p.old_B_stride_dbuf = old_B.stride(1);
-  p.old_B_stride_token = old_B.stride(2);
-  p.old_dt_stride_seq = old_dt.stride(0);
-  p.old_dt_stride_dbuf = old_dt.stride(1);
-  p.old_dt_stride_head = old_dt.stride(2);
-  p.old_cumAdt_stride_seq = old_cumAdt.stride(0);
-  p.old_cumAdt_stride_dbuf = old_cumAdt.stride(1);
-  p.old_cumAdt_stride_head = old_cumAdt.stride(2);
+  p.x_cache_stride_seq = x_cache.stride(0);
+  p.x_cache_stride_head = x_cache.stride(1);
+  p.x_cache_stride_pos = x_cache.stride(2);
+  p.B_cache_stride_seq = B_cache.stride(0);
+  p.B_cache_stride_group = B_cache.stride(1);
+  p.B_cache_stride_pos = B_cache.stride(2);
+  p.dt_cache_stride_seq = dt_cache.stride(0);
+  p.dt_cache_stride_head = dt_cache.stride(1);
+
+  // 32-bit address-fold guard.  The kernel folds within-buffer inner indices (head*dim*dstate,
+  // head*head_stride, group*dstate, …) into int32 before adding the int64 buffer/slot base — see
+  // load_head / prefetch_state / store_state / the dt_cache scan.  Buffer/slot-distance strides
+  // (*_stride_seq, *_stride_dbuf) stay int64 and are unconstrained; only these inner ceilings must
+  // fit int32.  `nheads*dim*dstate` (the per-slot state extent) dominates every constexpr-stride
+  // fold; the head-stride folds use runtime strides so are checked explicitly.  Assert here so a
+  // future large-tensor layout fails loudly instead of silently truncating an address.
+  constexpr int64_t kInt32Max = 2147483647;
+  FLASHINFER_CHECK(nheads * dim * dstate <= kInt32Max,
+                   "32-bit address fold would overflow: nheads*dim*dstate=", nheads * dim * dstate,
+                   " exceeds int32 max=", kInt32Max);
+  FLASHINFER_CHECK(nheads * p.dt_cache_stride_head <= kInt32Max,
+                   "32-bit address fold would overflow: nheads*dt_cache_stride_head=",
+                   nheads * p.dt_cache_stride_head, " exceeds int32 max=", kInt32Max);
 
   // Launch
   ffi::CUDADeviceGuard device_guard(state.device().device_id);
   const cudaStream_t stream = get_stream(state.device());
 
   launchCheckpointingSsu<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t>(
-      p, stream);
+      p, static_cast<int>(precompute_heads_per_cta), stream);
 }
 
 }  // namespace flashinfer::mamba::checkpointing

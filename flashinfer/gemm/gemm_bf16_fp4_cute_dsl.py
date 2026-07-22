@@ -18,7 +18,7 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from .gemm_base import _TORCH_TO_CUTLASS_DTYPE_ATTR, _check_cute_dsl_availability
+from .gemm_base import _check_cute_dsl_availability
 from .gemm_bf16_fp4 import _unswizzle_sf_128x4
 
 _BF16_FP4_ALPHA_ONE_CACHE: dict = {}
@@ -120,8 +120,10 @@ def _get_cute_dsl_bf16_fp4_gemm(
         BlackwellDenseGemmBf16Fp4Kernel,
     )
 
-    a_cutlass_dtype = getattr(cutlass, _TORCH_TO_CUTLASS_DTYPE_ATTR[a_dtype])
-    c_cutlass_dtype = getattr(cutlass, _TORCH_TO_CUTLASS_DTYPE_ATTR[c_dtype])
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+
+    a_cutlass_dtype = torch_to_cutlass_dtype(a_dtype)
+    c_cutlass_dtype = torch_to_cutlass_dtype(c_dtype)
 
     sym_m = cute.sym_int()
     sym_k = cute.sym_int()

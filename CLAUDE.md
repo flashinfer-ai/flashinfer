@@ -182,6 +182,15 @@ Install hooks to run on every commit:
 pre-commit install
 ```
 
+## Code Review
+
+When reviewing a diff (as an agent or a human), follow the shared focus areas, kernel-review
+policy, and effort calibration in [`docs/code_review_guidance.md`](docs/code_review_guidance.md).
+Note: unlike human review, agents keep **kernel implementation details in scope** — read the
+kernel logic and report bugs, labeling findings by confidence.
+
+→ **For the complete review rule set, see [`docs/code_review_guidance.md`](docs/code_review_guidance.md)**
+
 ## Architecture: JIT Compilation System
 
 FlashInfer's JIT system has three layers:
