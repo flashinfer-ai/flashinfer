@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -89,6 +90,7 @@ from .utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
     make_random_topk_ids,
+    make_balanced_local_topk_ids,
 )
 
 
@@ -1234,6 +1236,7 @@ def get_trtllm_moe_sm100_module():
             self,
             moe_inputs: "MoeRunnerInputs",
             tune_max_num_tokens: int = 8192,
+            local_expert_offset: int = 0,
             **kwargs,
         ) -> TuningConfig:
             """Build a TuningConfig for this runner instance.
@@ -1241,8 +1244,48 @@ def get_trtllm_moe_sm100_module():
             Args:
                 moe_inputs: Input parameters for this call.
                 tune_max_num_tokens: Upper bound for the num_tokens tuning buckets.
+                local_expert_offset: Global id of this rank's first local expert.
+                    Used to synthesize an EP/DP-aware tuning dummy whose top-k is
+                    routed only to this rank's local expert shard (see
+                    :func:`make_balanced_local_topk_ids`).  This makes the
+                    profiled per-expert ``M`` match the real post-all-to-all
+                    local work and makes every EP rank converge on the same
+                    tactic.
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
+            num_local_experts = self.num_local_experts
+
+            # Repro/A-B toggle: when set, fall back to the legacy unseeded-random
+            # dummy routing (the 0.6.12 behavior).  Each EP rank then profiles a
+            # *different* routing distribution and can converge on a different /
+            # slower tactic -- this is the root cause of Rong Song's cross-rank
+            # divergence (issue #3537).  Leave unset for the EP/DP-aware balanced
+            # dummy.  Used only by the EP A/B micro-benchmark.
+            _legacy_random_dummy = bool(
+                os.environ.get("FLASHINFER_AUTOTUNE_LEGACY_RANDOM_DUMMY", "")
+            )
+
+            def _init_packed_topk_ids(shapes, dtype, device):
+                if _legacy_random_dummy:
+                    expert_ids = torch.randint(
+                        local_expert_offset,
+                        local_expert_offset + max(num_local_experts, 1),
+                        shapes,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                else:
+                    expert_ids = make_balanced_local_topk_ids(
+                        num_tokens=math.prod(shapes[:-1]),
+                        top_k=shapes[-1],
+                        num_local_experts=num_local_experts,
+                        local_expert_offset=local_expert_offset,
+                        device=device,
+                    ).view(shapes)
+                expert_weights = torch.ones(
+                    shapes, dtype=torch.bfloat16, device=device
+                ).view(torch.int16)
+                return (expert_ids << 16) | expert_weights
 
             spec = {
                 "output": autotuner_initializer_empty,
@@ -1251,7 +1294,19 @@ def get_trtllm_moe_sm100_module():
             if moe_inputs.routing_logits is not None:
                 spec["routing_logits"] = autotuner_initializer_rand
             if moe_inputs.topk_ids is not None:
-                spec["topk_ids"] = _moe_topk_ids_init(self.num_experts)
+                if moe_inputs.routing_logits is not None:
+                    # ``topk_ids`` is an empty ``(0,)`` placeholder here: routing
+                    # is recomputed from ``routing_logits`` inside the kernel, so
+                    # its contents are unused. The autotuner expands the dynamic
+                    # dim to a 1-D ``(M,)`` shape, which must NOT be read as
+                    # ``(num_tokens, top_k)``. Keep the upstream random init
+                    # (shape-safe over ``num_experts``) for this placeholder.
+                    spec["topk_ids"] = _moe_topk_ids_init(self.num_experts)
+                else:
+                    # Pre-computed routing: use the EP/DP-aware balanced local
+                    # dummy so every EP rank profiles the same representative
+                    # per-expert ``M`` and converges on the same tactic.
+                    spec["topk_ids"] = _init_packed_topk_ids
             if moe_inputs.expert_weights is not None:
                 spec["expert_weights"] = autotuner_initializer_ones
             if moe_inputs.hidden_states_scale is not None:
@@ -1722,6 +1777,7 @@ def get_trtllm_moe_sm100_module():
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            local_expert_offset=local_expert_offset,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
@@ -1914,6 +1970,7 @@ def get_trtllm_moe_sm100_module():
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            local_expert_offset=local_expert_offset,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
@@ -2147,6 +2204,7 @@ def get_trtllm_moe_sm100_module():
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            local_expert_offset=local_expert_offset,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
@@ -2395,6 +2453,7 @@ def get_trtllm_moe_sm100_module():
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            local_expert_offset=local_expert_offset,
             use_cold_l2_cache=True,
             use_cuda_graph=True,
         )
@@ -2618,6 +2677,7 @@ def get_trtllm_moe_sm100_module():
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            local_expert_offset=local_expert_offset,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )

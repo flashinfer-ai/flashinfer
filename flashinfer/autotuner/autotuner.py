@@ -6,6 +6,7 @@ import inspect
 import itertools
 import json
 import os
+import sys
 import tempfile
 import threading
 import weakref
@@ -647,6 +648,7 @@ def autotune(
     tuning_buckets: tuple[int, ...] | None = None,
     round_up: bool | None = None,
     skip_ops: str | set[str] | None = None,
+    distributed_process_group: Any | None = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -714,6 +716,16 @@ def autotune(
             ``autotune(skip_ops={"A"})`` skips both ``"A"`` and ``"B"``.
             Common op names: ``"fp4_gemm"``, ``"bf16_gemm"``,
             ``"fp8_gemm"``, ``"mxfp8_gemm"``.
+        distributed_process_group: Optional ``torch.distributed`` process group
+            used by the ``broadcast`` distributed tuning strategy (enabled via
+            ``FLASHINFER_AUTOTUNE_DISTRIBUTED=broadcast``) to scope the
+            cross-rank tactic broadcast.  Pass the group whose ranks shard the
+            work and must agree on the tactic -- e.g. the MoE expert-parallel
+            group.  ``None`` (default) uses the WORLD group, which is correct
+            when WORLD is a single EP group, but in multi-dimensional layouts
+            (e.g. EP8 + DP2 over 16 ranks) you should pass the EP group so the
+            broadcast does not cross independent EP-group boundaries.  No effect
+            unless the broadcast strategy is enabled.
 
     Raises:
         ValueError: If ``tuning_buckets`` is provided but empty.
@@ -850,6 +862,24 @@ def autotune(
 
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
+            # Align tactics across ranks once the outermost tuning
+            # context closes, so every rank leaves with the same per-key
+            # decision.  No-op unless FLASHINFER_AUTOTUNE_DISTRIBUTED is set.
+            # ``distributed_process_group`` scopes the broadcast to the ranks
+            # that actually shard the work (e.g. the MoE expert-parallel group);
+            # ``None`` falls back to the default WORLD group.
+            #
+            # An exception may be propagating out of the tuning body on *some*
+            # ranks but not others. The broadcast is a collective, so the
+            # decision to run it must be identical on every rank -- otherwise a
+            # rank that raised would skip it while a rank that finished normally
+            # would block forever inside ``broadcast_object_list``. We therefore
+            # hand the local exception state to the sync, which reaches a
+            # collective agreement (all ranks broadcast, or all skip).
+            tuner._maybe_sync_distributed_cache(
+                process_group=distributed_process_group,
+                local_had_exception=sys.exc_info()[0] is not None,
+            )
 
         # Save configs on exit when tuning with a cache path, but only if
         # new profiling results were added this session.  save_configs
@@ -1088,9 +1118,24 @@ class AutoTuner:
     def __init__(
         self, warmup: int = 3, repeat: int = 10, stream_delay_micro_secs: int = 5000
     ):
-        self.repeat = repeat
-        self.warmup = warmup
+        # Allow env overrides so profiling fidelity (back-to-back iters used to
+        # rank tactics) can be tuned without code changes.  A too-small
+        # ``repeat`` can under-measure low-occupancy tactics that only show
+        # their true cost in steady state, making the autotuner pick a tactic
+        # that is slower than the heuristic default in real (CUDA-graph) decode.
+        self.repeat = int(os.environ.get("FLASHINFER_AUTOTUNE_REPEAT", repeat))
+        self.warmup = int(os.environ.get("FLASHINFER_AUTOTUNE_WARMUP", warmup))
         self.stream_delay_micro_secs = stream_delay_micro_secs
+        # Relative speed-up an explicit tactic must beat the op's built-in
+        # heuristic-default (tactic=-1) by before the autotuner switches away
+        # from that default.  This guarantees the tuned choice is *never slower
+        # than default* (the autotuner keeps the default unless a tactic is
+        # genuinely faster) and removes run-to-run / cross-rank flapping among
+        # near-tied tactics.  Override via FLASHINFER_AUTOTUNE_SWITCH_MARGIN
+        # (e.g. "0.0" to restore pure fastest-wins behavior).
+        self.switch_margin = max(
+            0.0, float(os.environ.get("FLASHINFER_AUTOTUNE_SWITCH_MARGIN", "0.03"))
+        )
         self.profiling_cache: dict[
             ProfilingCacheKey, tuple[Any, OptimizationProfile | None]
         ] = {}
@@ -1602,10 +1647,42 @@ class AutoTuner:
                                 unit="profile",
                                 leave=True,
                             )
-                        min_time = float("inf")
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
                         skipped_count = 0
+
+                        # Measure the op's built-in heuristic default (tactic=-1)
+                        # on the fallback runner (runners[0]) up-front and use it
+                        # as the baseline.  An explicit tactic is only adopted when
+                        # it beats this baseline by ``switch_margin`` (decision made
+                        # after the loop) -- this guarantees the tuned choice is
+                        # *never slower than default* and removes run-to-run /
+                        # cross-rank flapping among near-tied tactics.
+                        default_time = float("inf")
+                        _default_runner = runners[0]
+                        if "do_preparation" in runner_arg_names_map[_default_runner]:
+                            _default_runner(
+                                tensors, tactic=-1, do_preparation=True, **kwargs
+                            )
+                        try:
+                            default_time = self._profile_single_kernel(
+                                _default_runner, tensors, -1, tuning_config, **kwargs
+                            )
+                        except torch.cuda.OutOfMemoryError:
+                            raise
+                        except Exception as e:
+                            with contextlib.suppress(Exception):
+                                torch.cuda.synchronize()
+                            with contextlib.suppress(Exception):
+                                torch.cuda.cudart().cudaGetLastError()
+                            logger.debug(
+                                f"[Autotuner]: default tactic (-1) baseline "
+                                f"profiling failed for {custom_op}: {e}"
+                            )
+
+                        # Best explicit (runner, tactic) candidate found so far.
+                        best_time = float("inf")
+                        best_runner_id, best_tactic = None, None
                         for r_id, r in enumerate(runners):
                             # TODO: use FakeTensor here.
                             valid_tactics = r.get_valid_tactics(tensors, p)
@@ -1691,9 +1768,51 @@ class AutoTuner:
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
-                                if time_measured < min_time:
-                                    min_time = time_measured
-                                    runner_id, tactic = r_id, tac
+                                if time_measured < best_time:
+                                    best_time = time_measured
+                                    best_runner_id, best_tactic = r_id, tac
+
+                        # Re-measure the default (tactic=-1) baseline now that the
+                        # GPU is fully warmed up by the tactic loop, and keep the
+                        # faster of the two readings.  The first baseline above is
+                        # the very first kernel profiled this round, so it pays a
+                        # cold-start penalty (SM clocks not ramped, first-touch
+                        # workspace alloc) that makes the heuristic default look
+                        # artificially slow.  Without this, a whole family of
+                        # tactics can measure "faster than default" yet run slower
+                        # in steady state (observed at near-tie buckets, e.g.
+                        # decode M=128).  Taking the min keeps the "never slower
+                        # than default" guarantee honest.
+                        try:
+                            default_time_warm = self._profile_single_kernel(
+                                _default_runner, tensors, -1, tuning_config, **kwargs
+                            )
+                            default_time = min(default_time, default_time_warm)
+                        except torch.cuda.OutOfMemoryError:
+                            raise
+                        except Exception as e:
+                            with contextlib.suppress(Exception):
+                                torch.cuda.synchronize()
+                            with contextlib.suppress(Exception):
+                                torch.cuda.cudart().cudaGetLastError()
+                            logger.debug(
+                                f"[Autotuner]: warm default (-1) baseline "
+                                f"re-profiling failed for {custom_op}: {e}"
+                            )
+
+                        # Adopt the best explicit candidate only when it beats the
+                        # heuristic-default baseline by the relative ``switch_margin``;
+                        # otherwise keep the default (tactic=-1).  If the default
+                        # baseline itself failed to profile, fall back to the best
+                        # candidate (preserving the previous fastest-wins behavior).
+                        if best_runner_id is not None and best_time < default_time * (
+                            1.0 - self.switch_margin
+                        ):
+                            runner_id, tactic = best_runner_id, best_tactic
+                        elif default_time < float("inf"):
+                            runner_id, tactic = 0, -1
+                        else:
+                            runner_id, tactic = best_runner_id, best_tactic
 
                         if skipped_count > 0:
                             logger.info(
@@ -1748,6 +1867,112 @@ class AutoTuner:
             tuple(tensor.size()) if isinstance(tensor, torch.Tensor) else (0,)
             for tensor in inputs
         )
+
+    def _maybe_sync_distributed_cache(
+        self, process_group: Any = None, local_had_exception: bool = False
+    ) -> None:
+        """Align the profiling cache across EP/TP ranks.
+
+        Mirrors TensorRT-LLM's ``DistributedTuningStrategy``:
+
+        - ``broadcast``: the source rank's chosen (runner_id, tactic) per cache
+          key wins on every rank.  This is the robust fix for the EP straggler
+          problem -- even when several tactics are near-tied and per-rank
+          profiling noise would otherwise pick different ones, all ranks end up
+          on the *same* tactic, so the slowest rank no longer bottlenecks the
+          all-to-all (and the bad-tactic-frozen-in-CUDA-graph case disappears).
+
+        Enabled via ``FLASHINFER_AUTOTUNE_DISTRIBUTED=broadcast``.  No-op when
+        torch.distributed is unavailable / uninitialized / world_size==1, so it
+        is safe to leave on for single-process use.
+
+        Args:
+            process_group: The process group whose ranks shard the work and must
+                agree on the tactic -- typically the MoE expert-parallel group.
+                ``None`` uses the default WORLD group.  Scoping matters in
+                multi-dimensional layouts (e.g. EP8 + DP2 over 16 ranks) where
+                WORLD spans several independent EP groups and a WORLD broadcast
+                would cross group boundaries.  The broadcast source is the
+                group-local rank 0 (mapped to its global rank).
+            local_had_exception: Whether the calling rank is unwinding an
+                exception out of the tuning context.  Because the broadcast is a
+                collective, every rank must make the *same* participate/skip
+                decision: a rank that raised must not skip the broadcast while a
+                peer that finished normally blocks in it forever.  All ranks
+                first exchange this flag via a small ``all_gather_object`` (a
+                collective every rank always reaches here), and the broadcast is
+                run only when *no* rank in the group failed.
+
+        Only the chosen tactic per cache key is communicated -- never the
+        ``OptimizationProfile`` object -- so there is nothing fragile to
+        pickle, and each rank keeps its own (shape-identical) profile.
+        """
+        mode = os.environ.get("FLASHINFER_AUTOTUNE_DISTRIBUTED", "").lower()
+        if mode not in ("broadcast",):
+            return
+        try:
+            import torch.distributed as dist
+        except ImportError:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        if dist.get_world_size(group=process_group) <= 1:
+            return
+
+        # Collectively agree on whether to broadcast. Every rank reaches this
+        # ``all_gather_object`` unconditionally (so it cannot deadlock on its
+        # own), then we broadcast only if no rank is unwinding an exception.
+        # This keeps the participate/skip decision identical across ranks even
+        # when a failure is asymmetric (some ranks raised, others did not).
+        try:
+            world_size = dist.get_world_size(group=process_group)
+            exc_flags: list[Any] = [None] * world_size
+            dist.all_gather_object(
+                exc_flags, bool(local_had_exception), group=process_group
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[Autotuner]: distributed exception-state exchange failed, "
+                f"skipping cache broadcast: {e}"
+            )
+            return
+        if any(exc_flags):
+            logger.warning(
+                "[Autotuner]: a rank raised during tuning; skipping distributed "
+                "cache broadcast on all ranks and keeping per-rank tactics."
+            )
+            return
+
+        # Broadcast source = rank 0 *within the group*, expressed as a global
+        # rank (torch's ``src`` is always a global rank).  For the default WORLD
+        # group that is simply global rank 0.
+        src = 0
+        if process_group is not None:
+            try:
+                src = dist.get_global_rank(process_group, 0)
+            except Exception:  # noqa: BLE001
+                src = 0
+
+        with self._lock:
+            # Communicate only the chosen tactic per key -- the local
+            # OptimizationProfile (``v[1]``) is kept per-rank and not sent.
+            snapshot = {k: v[0] for k, v in self.profiling_cache.items()}
+        payload = [snapshot]
+        try:
+            dist.broadcast_object_list(payload, src=src, group=process_group)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[Autotuner]: distributed cache broadcast failed, keeping "
+                f"per-rank tactics: {e}"
+            )
+            return
+        rank0_snapshot = payload[0]
+
+        with self._lock:
+            for k, tactic in rank0_snapshot.items():
+                prev = self.profiling_cache.get(k)
+                profile = prev[1] if prev is not None else None
+                self.profiling_cache[k] = (tactic, profile)
 
     def _profile_single_kernel(
         self,
