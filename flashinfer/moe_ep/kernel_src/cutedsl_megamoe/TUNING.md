@@ -181,7 +181,12 @@ Caught by the torch-oracle tests
 2026-07-15 full sweep reproduces at the 2026-07-21 branch tip within run
 noise (<= ~4% per cell); the tables above are the current reference.
 
-## CuTe-DSL runtime sensitivity: `nvidia-cutlass-dsl[cu13]==4.5.2` (2026-07-15)
+## CuTe-DSL runtime sensitivity: `nvidia-cutlass-dsl[cu13]==4.5.2` (2026-07-15) — OBSOLETE
+
+> **OBSOLETE (2026-07-22):** the regression below is fixed by the MR!27
+> mainloop WAR (see the follow-up subsection) — 4.5.2 now runs at full
+> parity for both nvfp4 and mxfp8, and the perf floor is 4.5.2, not 4.6.1.
+> Kept for the record of what unpatched 4.5.2 codegen did.
 
 Same recipe, geometry and runbook as the microbenchmark table above, with
 the only change being the CuTe-DSL runtime pinned to 4.5.2 instead of
@@ -545,7 +550,9 @@ Takeaways at this (single-node NVLink) geometry, from the 2026-07-21 sweep:
 torch `2.12.0a0+5aff3928d8.nv26.05`, CUDA 13.2, `cuda-bindings 13.2.0`,
 `triton 3.7.0+nv26.5`, `deep_gemm 2.5.0+891d57b`,
 `nvshmem4py-cu13 0.3.1`; `nvidia-cutlass-dsl` upgraded in-container to
-**4.6.1** (the mega kernels require it).  FlashInfer = this branch,
+**4.6.1** (>=4.5.2 suffices since the 2026-07-22 MR!27 WAR; the reference
+numbers were measured on 4.6.1 and 4.5.2 reproduces them within noise).
+FlashInfer = this branch,
 editable-installed inside the container
 (`PIP_CONSTRAINT="" BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`).
 
@@ -595,7 +602,7 @@ srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
   bash -lc '
     export FLASHINFER_DISABLE_VERSION_CHECK=1
     PIP_CONSTRAINT="" BUILD_NIXL_EP=0 python -m pip install --no-build-isolation -e .
-    python -m pip install --upgrade "nvidia-cutlass-dsl[cu13]"   # >= 4.6.1
+    python -m pip install --upgrade "nvidia-cutlass-dsl[cu13]"   # >= 4.5.2
     export SECTION=fi_mega GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3
     export SEQ_LENS="1024 2048 4096 8192"
     for MODE in kernel e2e_pipelined; do
