@@ -1616,6 +1616,13 @@ def _trtllm_batch_decode_reference(
     )
 
 
+# Inlined into the dumped JSON so the rendered reference is runnable standalone.
+_trtllm_batch_decode_reference._trace_reference_dependencies = (
+    _trtllm_kv_from_cache,
+    _trtllm_paged_attention_reference,
+)
+
+
 @torch.no_grad()
 def _trtllm_batch_context_reference(
     query,
@@ -1642,6 +1649,13 @@ def _trtllm_batch_context_reference(
         bmm2_scale=bmm2_scale,
         cum_seq_lens_q=cum_seq_lens_q,
     )
+
+
+# Inlined into the dumped JSON so the rendered reference is runnable standalone.
+_trtllm_batch_context_reference._trace_reference_dependencies = (
+    _trtllm_kv_from_cache,
+    _trtllm_paged_attention_reference,
+)
 
 
 def _trtllm_batch_decode_init(
@@ -1818,6 +1832,199 @@ trtllm_batch_decode_trace = TraceTemplate(
 trtllm_batch_decode_trace.axes["max_pages_per_seq"] = Var(
     description="Maximum number of pages per sequence (block_tables width)."
 )
+
+
+@torch.no_grad()
+def _trtllm_batch_decode_block_sparse_reference(
+    query, kv_cache, workspace_buffer, block_tables, seq_lens, max_seq_len, **kwargs
+):
+    """Reference for block-sparse decode: per-KV-head page tables and seq lens.
+
+    ``block_tables`` is ``[num_kv_heads, batch_size, max_pages_per_seq]`` with
+    each row holding the selected pages packed at the front (ascending
+    original order); ``seq_lens`` is ``[num_kv_heads, batch_size]`` with the
+    per-head surviving KV token counts. For ``q_len_per_req > 1`` the causal
+    mask applies over the compacted per-head sequence (query ``i`` attends to
+    compacted positions ``j <= L - q_len_per_req + i``), which equals the true
+    causal mask when the selected pages include the current-position block.
+    """
+    kv_layout = kwargs.get("kv_layout", "HND")
+    num_tokens, num_heads, head_dim = query.shape
+    if kv_layout == "HND":
+        _, kv_cache_dim, num_kv_heads, page_size, _ = kv_cache.shape
+    else:
+        _, kv_cache_dim, page_size, num_kv_heads, _ = kv_cache.shape
+    gqa_ratio = num_heads // num_kv_heads
+    bmm1_scale = float(kwargs.get("bmm1_scale", 1.0 / math.sqrt(head_dim)) or 1.0)
+    bmm2_scale = float(kwargs.get("bmm2_scale", 1.0) or 1.0)
+    batch_size = block_tables.shape[1]
+    q_len_per_req = int(kwargs.get("q_len_per_req") or (num_tokens // batch_size))
+    output = torch.zeros_like(query, dtype=torch.float32)
+    for b in range(batch_size):
+        q_start = b * q_len_per_req
+        q_end = q_start + q_len_per_req
+        q_b = query[q_start:q_end].to(torch.float32)
+        for kv_h in range(num_kv_heads):
+            kv_len = int(seq_lens[kv_h, b].item())
+            n_pages_used = (kv_len + page_size - 1) // page_size
+            pages = block_tables[kv_h, b, :n_pages_used].to(torch.long)
+            k_b = _trtllm_kv_from_cache(kv_cache[pages], kv_cache_dim, num_heads, "k")
+            v_b = _trtllm_kv_from_cache(kv_cache[pages], kv_cache_dim, num_heads, "v")
+            if kv_layout == "HND":
+                k_flat = k_b[:, kv_h].reshape(-1, head_dim)[:kv_len].to(torch.float32)
+                v_flat = v_b[:, kv_h].reshape(-1, head_dim)[:kv_len].to(torch.float32)
+            else:
+                k_flat = (
+                    k_b[:, :, kv_h].reshape(-1, head_dim)[:kv_len].to(torch.float32)
+                )
+                v_flat = (
+                    v_b[:, :, kv_h].reshape(-1, head_dim)[:kv_len].to(torch.float32)
+                )
+            for g in range(gqa_ratio):
+                h = kv_h * gqa_ratio + g
+                logits = torch.matmul(q_b[:, h], k_flat.T) * bmm1_scale
+                if q_len_per_req > 1:
+                    # Causal over the compacted per-head sequence tail.
+                    mask = torch.full_like(logits, float("-inf"))
+                    for i in range(q_len_per_req):
+                        mask[i, : kv_len - q_len_per_req + 1 + i] = 0.0
+                    logits = logits + mask
+                attn = torch.softmax(logits, dim=-1)
+                output[q_start:q_end, h] = torch.matmul(attn, v_flat) * bmm2_scale
+    return output.to(query.dtype)
+
+
+# Inlined into the dumped JSON so the rendered reference is runnable standalone.
+_trtllm_batch_decode_block_sparse_reference._trace_reference_dependencies = (
+    _trtllm_kv_from_cache,
+)
+
+
+def _trtllm_batch_decode_block_sparse_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 8,
+    num_kv_heads: int = 2,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 0,
+    kv_cache_dim: int = 2,
+    batch_size: int = 1,
+    max_pages_per_seq: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build block-sparse inputs for ``trtllm_batch_decode_with_kv_cache``."""
+    base = _trtllm_batch_decode_init(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        num_pages=num_pages,
+        kv_cache_dim=kv_cache_dim,
+        batch_size=batch_size,
+        max_pages_per_seq=max_pages_per_seq,
+        device=device,
+        seed=seed,
+    )
+    dense_tables = base["block_tables"]  # [batch_size, max_pages_per_seq]
+    bsz, max_p = dense_tables.shape
+    head_tables = torch.zeros(
+        (num_kv_heads, bsz, max_p), dtype=torch.int32, device=device
+    )
+    sparse_lens = torch.zeros((num_kv_heads, bsz), dtype=torch.int32, device=device)
+    # Give each KV head a different page subset: head h keeps the last
+    # (max_p - h) pages — ascending order, always includes the tail page
+    # holding the current query positions.
+    for h in range(num_kv_heads):
+        n_sel = max(1, max_p - h)
+        head_tables[h, :, :n_sel] = dense_tables[:, max_p - n_sel :]
+        sparse_lens[h, :] = n_sel * page_size
+    base["block_tables"] = head_tables.contiguous()
+    base["seq_lens"] = sparse_lens.contiguous()
+    base["max_seq_len"] = int(sparse_lens.max().item())
+    base["enable_block_sparse_attention"] = True
+    return base
+
+
+# Inlined into the dumped JSON so the rendered init is runnable standalone.
+_trtllm_batch_decode_block_sparse_init._trace_init_dependencies = (  # type: ignore[attr-defined]
+    _trtllm_batch_decode_init,
+)
+
+
+trtllm_batch_decode_block_sparse_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="trtllm_batch_decode_block_sparse",
+    description=(
+        "SM100+ TRT-LLM paged decode with block-sparse attention: each KV "
+        "head attends to its own subset of KV cache pages. block_tables and "
+        "seq_lens gain a leading num_kv_heads dimension; selected pages are "
+        "packed densely at the front of each row in ascending original order "
+        "and seq_lens holds the per-head surviving KV token counts."
+    ),
+    axes=_TRTLLM_AXES,
+    inputs={
+        "query": Tensor(["num_tokens", "num_heads", "head_dim"]),
+        "kv_cache": Tensor(
+            ["num_pages", "kv_cache_dim", "num_kv_heads", "page_size", "head_dim"],
+            description="Paged KV cache; kv_cache_dim is 1 (interleaved) or 2 (K+V).",
+        ),
+        "block_tables": Tensor(
+            ["num_kv_heads", "batch_size", "max_pages_per_seq"],
+            dtype="int32",
+            description=(
+                "Per-KV-head page tables; selected pages packed at the front "
+                "of each row in ascending original order."
+            ),
+        ),
+        "seq_lens": Tensor(
+            ["num_kv_heads", "batch_size"],
+            dtype="int32",
+            description="Surviving KV token count per (kv head, sequence).",
+        ),
+        "max_seq_len": Scalar(
+            "int32",
+            description="Maximum surviving K/V length over all (kv head, sequence).",
+        ),
+        "bmm1_scale": Scalar(
+            "float32", optional=True, description="Scale applied after Q @ K^T."
+        ),
+        "bmm2_scale": Scalar(
+            "float32", optional=True, description="Scale applied after softmax @ V."
+        ),
+        "enable_block_sparse_attention": Scalar(
+            "bool", description="Must be True for the block-sparse layout."
+        ),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
+    },
+    tags=["status:verified", "stage:decode", "backend:trtllm"],
+    reference=_trtllm_batch_decode_block_sparse_reference,
+    init=_trtllm_batch_decode_block_sparse_init,
+)
+
+
+def trtllm_batch_decode_trace_dispatch(save_dir=None, name=None, **kwargs):
+    """Select the dense or block-sparse decode template at call time.
+
+    Pass as ``trace=trtllm_batch_decode_trace_dispatch`` to ``@flashinfer_api``
+    so block-sparse calls (per-KV-head ``block_tables``/``seq_lens`` shapes)
+    are dumped with the matching schema instead of corrupting the dense one.
+    """
+    if kwargs.get("enable_block_sparse_attention"):
+        return trtllm_batch_decode_block_sparse_trace
+    return trtllm_batch_decode_trace
+
+
+# Expose both templates so _attach_fi_trace auto-registers them for the
+# template-consistency tests.
+trtllm_batch_decode_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    trtllm_batch_decode_trace,
+    trtllm_batch_decode_block_sparse_trace,
+]
 
 trtllm_batch_context_trace = TraceTemplate(
     op_type="trtllm_paged",

@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
+import logging
 import functools
 import math
 from enum import Enum
+from functools import lru_cache
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
@@ -27,6 +30,8 @@ from torch.torch_version import __version__ as torch_version
 import inspect
 
 from .jit.spdlog import gen_spdlog_module
+
+logger = logging.getLogger(__name__)
 
 
 class PosEncodingMode(Enum):
@@ -492,6 +497,28 @@ def is_cutlass_backend_supported(
     return True
 
 
+def _should_use_fmha_v2_sm120(
+    device: torch.device,
+    pos_encoding_mode: int,
+    use_custom_mask: bool,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+) -> bool:
+    """Check if fmha_v2 HMMA kernels should be used for SM12x attention.
+
+    SM12x supports Ampere-compatible HMMA tensor core instructions (sm_mma=80).
+    The fmha_v2 library has SM120 kernel variants that use these instructions
+    and outperform generic FA2 on SM12x.
+    """
+    return (
+        (is_sm120a_supported(device) or is_sm121a_supported(device))
+        and not use_custom_mask
+        and pos_encoding_mode == PosEncodingMode.NONE.value
+        and dtype_q in {torch.float16, torch.bfloat16}
+        and dtype_kv in {torch.float16, torch.bfloat16}
+    )
+
+
 def determine_attention_backend(
     device: torch.device,
     pos_encoding_mode: int,
@@ -636,14 +663,20 @@ def is_sm12x_supported(device: torch.device) -> bool:
 def is_cvt_rs_supported(device: torch.device = None) -> bool:
     """Check if the GPU supports the PTX cvt.rs.f16x2.f32 instruction.
 
-    This is a non-forward-compatible SM100a feature — not all SM >= 100 have it.
-    In particular, SM120 (Blackwell lite) does NOT support it.
+    Datacenter-Blackwell only: SM100 (B200, cc 10.0) and SM103 (B300, cc 10.3).
+    ptxas REJECTS `.rs` on SM110a (cc 11.0) and it is absent on SM120 (consumer
+    Blackwell) — both must return False, else the kernels silently compile the
+    ~12-instruction software-emulation fallback and stochastic rounding runs
+    ~4x slower (measured on B300 when the CUDA-side guard omitted SM103a).
+    Keep this in lockstep with the FLASHINFER_MAMBA_HAS_CVT_RS guard in
+    include/flashinfer/mamba/conversion.cuh (SM100_ALL || SM103_ALL).
     """
     if device is None:
         device = torch.device("cuda")
-    major, _ = get_compute_capability(device)
-    # SM100a and SM110a support cvt.rs; SM120 does not.
-    return major in (10, 11)
+    # Match the CUDA guard exactly: only the arches where cvt.rs actually
+    # assembles (verified via ptxas).  NOT a `major == 10/11` check — SM110a
+    # (major 11) has no `.rs` feature.
+    return get_compute_capability(device) in ((10, 0), (10, 3))
 
 
 def determine_mla_backend(device: torch.device) -> str:
@@ -653,6 +686,9 @@ def determine_mla_backend(device: torch.device) -> str:
 def _check_block_tables_shape(
     block_tables: torch.Tensor,
     uses_shared_paged_kv_idx: bool,
+    block_sparse: bool = False,
+    num_kv_heads: Optional[int] = None,
+    batch_size: Optional[int] = None,
 ) -> None:
     """Validate ``block_tables`` rank against the paged KV index layout.
 
@@ -660,7 +696,35 @@ def _check_block_tables_shape(
     ``[batch_size, max_num_pages_per_seq]``.  Separate layout expects a 3-D
     tensor ``[batch_size, 2, max_num_pages_per_seq]`` where dim1 distinguishes
     K (0) and V (1) page indices.
+
+    Block-sparse attention (``block_sparse=True``) uses per-KV-head page
+    tables and expects a 3-D tensor ``[num_kv_heads, batch_size,
+    max_num_pages_per_seq]`` with the shared layout; the selected sparse
+    pages must be packed densely at the front of each row.
     """
+    if block_sparse:
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "block-sparse attention currently requires the shared paged-KV "
+                "index layout (uses_shared_paged_kv_idx=True)"
+            )
+        if block_tables.ndim != 3:
+            raise ValueError(
+                f"block_tables must be 3D [num_kv_heads, batch_size, "
+                f"max_num_pages_per_seq] for block-sparse attention, "
+                f"got ndim={block_tables.ndim}"
+            )
+        if num_kv_heads is not None and block_tables.shape[0] != num_kv_heads:
+            raise ValueError(
+                f"block_tables must have shape[0]==num_kv_heads ({num_kv_heads}) "
+                f"for block-sparse attention, got shape={block_tables.shape}"
+            )
+        if batch_size is not None and block_tables.shape[1] != batch_size:
+            raise ValueError(
+                f"block_tables must have shape[1]==batch_size ({batch_size}) "
+                f"for block-sparse attention, got shape={block_tables.shape}"
+            )
+        return
     expected_ndim = 2 if uses_shared_paged_kv_idx else 3
     if block_tables.ndim != expected_ndim:
         layout = "shared" if uses_shared_paged_kv_idx else "separate"
@@ -767,6 +831,11 @@ def round_up(x: int, y: int) -> int:
 @functools.cache
 def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def get_device_index(device: torch.device) -> int:
+    """Concrete CUDA device index for *device* (bare "cuda" -> current device)."""
+    return device.index if device.index is not None else torch.cuda.current_device()
 
 
 def get_trtllm_gen_multi_ctas_kv_counter_bytes(
@@ -1398,3 +1467,69 @@ def prepare_jit_additional_args(
             result.append(None)
     result.extend(user_args_list)
     return result
+
+
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Detected once via NVML and cached.
+    Overridable with ``FLASHINFER_CONFIDENTIAL_COMPUTE=1/0``.
+    """
+    forced = os.environ.get("FLASHINFER_CONFIDENTIAL_COMPUTE")
+    if forced is not None:
+        if forced not in ("0", "1"):
+            raise ValueError(
+                f"FLASHINFER_CONFIDENTIAL_COMPUTE must be '0' or '1', got {forced!r}"
+            )
+        return forced == "1"
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            state = pynvml.nvmlSystemGetConfComputeState()
+            # ccFeature != 0 means CC is enabled (ON or devtools).
+            return int(getattr(state, "ccFeature", 0)) != 0
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.debug("[Flashinfer]: Confidential-compute detection failed: %r", e)
+        return False
+
+
+@lru_cache(maxsize=1)
+def get_globaltimer_kernel():
+    """Lazily JIT-build the %globaltimer kernel."""
+
+    _GLOBALTIMER_KERNEL_CU = r"""
+    #include <torch/extension.h>
+    #include <ATen/cuda/CUDAContext.h>
+    __global__ void _get_globaltimer_timestamp(uint64_t* timestamp) {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(*timestamp));
+    }
+    void get_globaltimer_timestamp(torch::Tensor timestamp) {
+        _get_globaltimer_timestamp<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<uint64_t*>(timestamp.data_ptr<int64_t>()));
+    }
+    """
+
+    try:
+        from torch.utils.cpp_extension import load_inline
+
+        mod = load_inline(
+            name="flashinfer_globaltimer",
+            cpp_sources="void get_globaltimer_timestamp(torch::Tensor);",
+            cuda_sources=_GLOBALTIMER_KERNEL_CU,
+            functions=["get_globaltimer_timestamp"],
+            verbose=False,
+        )
+        return mod.get_globaltimer_timestamp
+    except Exception as e:
+        logger.warning(
+            f"[Flashinfer]: %globaltimer stamp kernel build failed ({e}); "
+            f"falling back to cudaEvent timing."
+        )
+    return None

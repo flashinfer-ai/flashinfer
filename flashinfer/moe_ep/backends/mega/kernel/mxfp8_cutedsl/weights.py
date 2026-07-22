@@ -17,22 +17,16 @@ TransformedMegaWeights = Tuple[
 Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
 
 
-def _require_cutedsl_paths() -> None:
-    from ..cutedsl_backend_kernels import bootstrap_paths
-
-    bootstrap_paths()
-
-
 def _mxfp8_data_dtype(kind: Mxfp8Kind) -> "torch.dtype":
-    _require_cutedsl_paths()
-    from common.host_utils import kind_data_dtype
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
+    # package import also bootstraps sys.path for the kernel packages.
+    from .....kernel_src.cutedsl_megamoe import kind_data_dtype
 
     return kind_data_dtype(kind)
 
 
 def _swizzle_expert_scales(raw_sf: "torch.Tensor") -> "torch.Tensor":
-    _require_cutedsl_paths()
-    from moe_nvfp4_swapab.runner_common import to_blocked
+    from .....kernel_src.cutedsl_megamoe import to_blocked
 
     return to_blocked(raw_sf)
 
@@ -57,8 +51,8 @@ def _fc1_weight_from_w13(
 def _interleave_gate_up_32(
     tensor: "torch.Tensor", *, intermediate_size: int
 ) -> "torch.Tensor":
-    _require_cutedsl_paths()
-    from common.megamoe_constants import Mxfp8BlockSize
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import Mxfp8BlockSize
 
     block = Mxfp8BlockSize
     if intermediate_size % (2 * block) != 0:
@@ -103,8 +97,8 @@ def _quantize_mxfp8_weight_k_major(
     """Quantize with K on the trailing dim; return K-major fp8 + plain E8M0 SF."""
     import torch
 
-    _require_cutedsl_paths()
-    from common.host_utils import mxfp8_quantize_per_block_32
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import mxfp8_quantize_per_block_32
 
     data_dtype = _mxfp8_data_dtype(kind)
     return mxfp8_quantize_per_block_32(weight_k_major.to(torch.float32), data_dtype)
@@ -117,8 +111,8 @@ def _is_mxfp8_weight(weight: "torch.Tensor", *, kind: Mxfp8Kind) -> bool:
 def _as_mxfp8_scale(scale: "torch.Tensor") -> "torch.Tensor":
     import torch
 
-    _require_cutedsl_paths()
-    from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import Mxfp8ScaleDtype
 
     if scale.dtype == Mxfp8ScaleDtype:
         return scale
@@ -142,10 +136,13 @@ def preprocess_mega_weights(
     """bf16 (or pre-quantized) weights → MXFP8 + swizzled-SF mega layout."""
     import torch
 
-    _require_cutedsl_paths()
-    from common.megamoe_constants import Mxfp8BlockSize
-    from moe_nvfp4_swapab.mega_runner import _stack_byte_reinterpretable_tensors
-    from moe_nvfp4_swapab.runner_common import ceil_div
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
+    # shim exposes the cutlass-pulling stacking helper lazily via the boundary.
+    from .....kernel_src.cutedsl_megamoe import (
+        Mxfp8BlockSize,
+        _stack_byte_reinterpretable_tensors,
+        ceil_div,
+    )
 
     del gate_up_clamp, activation_clamp  # MXFP8 weight quant uses a fixed 1.0 norm.
 
@@ -281,8 +278,8 @@ def preprocess_mega_weights(
 def _mxfp8_swizzled_flat_sf_size(rows: int, cols: int) -> int:
     import torch
 
-    _require_cutedsl_paths()
-    from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype, to_blocked
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import Mxfp8ScaleDtype, to_blocked
 
     plain = torch.zeros(rows, cols, dtype=Mxfp8ScaleDtype)
     return to_blocked(plain).numel()
@@ -317,9 +314,8 @@ def validate_transformed_mega_weights(
     fc1_out = 2 * intermediate_size
     data_dtype = _mxfp8_data_dtype(kind)
 
-    _require_cutedsl_paths()
-    from common.megamoe_constants import Mxfp8BlockSize
-    from moe_nvfp4_swapab.runner_common import ceil_div
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from .....kernel_src.cutedsl_megamoe import Mxfp8BlockSize, ceil_div
 
     hidden_sf_cols = ceil_div(hidden_size, Mxfp8BlockSize)
     intermediate_sf_cols = ceil_div(intermediate_size, Mxfp8BlockSize)

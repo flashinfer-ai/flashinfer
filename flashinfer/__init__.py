@@ -73,6 +73,7 @@ from .quantization.fp4_quantization import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
+    silu_and_mul_nvfp4_quantize,
     get_fp4_quantization_module,
     nvfp4_kv_dequantize,
     nvfp4_kv_dequantize_paged,
@@ -110,6 +111,9 @@ from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
+from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
+from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
+from .gemm import svdquant_linear as svdquant_linear
 from .gemm import mm_bf16_fp4 as mm_bf16_fp4
 from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
 from .gemm import mm_fp8 as mm_fp8
@@ -122,6 +126,7 @@ from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
 from .kda_decode import recurrent_kda as recurrent_kda
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
+from . import msa_ops as msa_ops
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
 from .norm import layernorm as layernorm

@@ -7,6 +7,9 @@
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
+#   bash tests/moe_ep/run_tests.sh split_path_correctness_nvfp4  # 4-GPU NVFP4 split-path numerics
+#   bash tests/moe_ep/run_tests.sh split_path_correctness_ht     # 4-GPU HT (FLAT) split-path numerics
+#   bash tests/moe_ep/run_tests.sh oracle        # 1-GPU torch-oracle correctness (all paths)
 #   bash tests/moe_ep/run_tests.sh smoke         # torchrun smoke scripts
 #
 # Install (split NCCL-EP + mega runtime deps):
@@ -85,6 +88,9 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+    --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
+    --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
+    --ignore=tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
     --ignore=tests/moe_ep/test_moe_ep_ht_correctness.py \
@@ -94,29 +100,33 @@ run_unit() {
 run_multirank() {
   require_nccl_ep
 
+  local rc=0
+
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_layer_multirank.py -v \
-    -m "nvep and gpu_4" --backend=nccl_ep
+    -m "nvep and gpu_4" --backend=nccl_ep || rc=1
 
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_split_kernels.py -v \
-    -m "nvep and gpu_4" --backend=nccl_ep
+    -m "nvep and gpu_4" --backend=nccl_ep || rc=1
 
   if have_nixl_ep; then
     "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
       "${MOE_EP_PYTEST_FLAGS[@]}" \
       tests/moe_ep/test_moe_ep_layer_multirank.py -v \
-      -m "nvep and gpu_4" --backend=nixl_ep
+      -m "nvep and gpu_4" --backend=nixl_ep || rc=1
 
     "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
       "${MOE_EP_PYTEST_FLAGS[@]}" \
       tests/moe_ep/test_split_kernels.py -v \
-      -m "nvep and gpu_4" --backend=nixl_ep
+      -m "nvep and gpu_4" --backend=nixl_ep || rc=1
   else
     echo "nixl_ep not built; skipping NIXL multirank (set FI_BUILD_NIXL_EP=1 in fast_install.sh)"
   fi
+
+  return "${rc}"
 }
 
 run_split_path_correctness_bf16() {
@@ -129,30 +139,89 @@ run_split_path_correctness_bf16() {
     -m "nvep and gpu_4 and arch_blackwell" --backend=nccl_ep
 }
 
+run_split_path_correctness_nvfp4() {
+  require_nccl_ep
+
+  NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
+  "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py -v \
+    -m "nvep and gpu_4 and arch_blackwell" --backend=nccl_ep
+}
+
+run_split_path_correctness_ht() {
+  require_nccl_ep
+
+  NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
+  "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_ht_correctness.py -v \
+    -m "nvep and gpu_4 and arch_blackwell" --backend=nccl_ep
+}
+
+# Single-GPU torch-oracle correctness: every compute path (split trtllm
+# bf16/nvfp4, mega cutedsl mxfp8/nvfp4, mega deep_gemm) vs an independent
+# pure-torch reference. EP-vs-kernel equality is covered by the multirank
+# sections; this anchors the kernels themselves to textbook math.
+run_oracle() {
+  # Accumulate failures: a section with several pytest invocations must not
+  # report PASS just because the LAST one passed.
+  local rc=0
+
+  "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py -v \
+    -m arch_blackwell || rc=1
+
+  MEGA_NO_DIST=1 "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+    tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
+    -m arch_blackwell || rc=1
+
+  # deep_gemm's symm buffer needs an initialized process group (no
+  # MEGA_NO_DIST equivalent), hence the 1-proc torchrun.
+  "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py -v \
+    -m arch_blackwell || rc=1
+
+  return "${rc}"
+}
+
 run_mega() {
+  local rc=0
+
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v \
-    -m "gpu_4 and arch_blackwell"
+    -m "gpu_4 and arch_blackwell" || rc=1
 
   MEGA_NO_DIST=1 "${TORCHRUN}" --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py -v \
-    -m arch_blackwell
+    tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+    tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
+    -m arch_blackwell || rc=1
+
+  return "${rc}"
 }
 
 run_smoke() {
   require_nccl_ep
 
-  "${TORCHRUN}" --nproc_per_node="${NPROC_SMOKE}" tests/moe_ep/smoke_nccl_ep.py
+  local rc=0
+
+  "${TORCHRUN}" --nproc_per_node="${NPROC_SMOKE}" tests/moe_ep/smoke_nccl_ep.py || rc=1
 
   if have_nixl_ep; then
-    "${TORCHRUN}" --nproc_per_node="${NPROC_SMOKE}" tests/moe_ep/smoke_nixl_ep.py
+    "${TORCHRUN}" --nproc_per_node="${NPROC_SMOKE}" tests/moe_ep/smoke_nixl_ep.py || rc=1
   else
     echo "nixl_ep not built; skipping smoke_nixl_ep.py"
   fi
+
+  return "${rc}"
 }
 
 print_summary() {
@@ -179,8 +248,11 @@ print_summary() {
 
 run_all() {
   run_section "unit + mock (no multirank)" run_unit
+  run_section "torch-oracle correctness (1 GPU)" run_oracle
   run_section "split-path multirank (NCCL-EP)" run_multirank
   run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16
+  run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4
+  run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht
   run_section "mega multirank (Blackwell)" run_mega
   run_section "smoke scripts" run_smoke
   print_summary
@@ -190,13 +262,16 @@ run_all() {
 # non-zero if any section failed) so CI callers see a real exit code.
 case "${1:-all}" in
   unit) run_section "unit + mock (no multirank)" run_unit; print_summary ;;
+  oracle) run_section "torch-oracle correctness (1 GPU)" run_oracle; print_summary ;;
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
   split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16; print_summary ;;
+  split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
+  split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|multirank|split_path_correctness_bf16|mega|smoke|all]" >&2
+    echo "Usage: $0 [unit|oracle|multirank|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|smoke|all]" >&2
     exit 1
     ;;
 esac

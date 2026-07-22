@@ -75,8 +75,8 @@ now.
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
 under `flashinfer/moe_ep/backends/mega/kernel/<name>/`. The kernel sources
 themselves live under
-`flashinfer/moe_ep/backends/mega/kernel/cutedsl_backend_kernels/` and are exposed
-through its `frontend/` (e.g. `mxfp8_mega_moe`,
+`flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/` and are exposed
+through the `kernel_src/cutedsl_megamoe/` public API (e.g. `mxfp8_mega_moe`,
 `get_symm_buffer_for_mxfp8_mega_moe`). Use the existing `mxfp8_cutedsl` backend
 as the reference template.
 
@@ -134,10 +134,11 @@ caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
 Add both functions under
-`cutedsl_backend_kernels/frontend/` and re-export them from its `__init__.py`
-(or point at your own kernel module). Note: the raw kernel sources currently
-under `cutedsl_backend_kernels/` are planned to move to `moe_ep/extras/`; new
-kernels should expect that relocation. The kernel-specific tuning knobs
+`kernel_src/cutedsl_megamoe/shim/` (alongside `nvfp4.py` / `mxfp8.py`) and
+re-export them from the package `__init__.py` (or point at your own kernel
+module). Raw kernel sources live under `kernel_src/cutedsl_megamoe/src/` — see
+`kernel_src/cutedsl_megamoe/SKILL.md` for how to update that directory when the
+kernel team ships a new drop. The kernel-specific tuning knobs
 (intermediate size, top_k, clamps, dtype `kind`, fast-math, reduce/dispatch
 flags) live on the **config** dataclass in step 2 and are threaded through to
 these two calls by the backend in step 4 — so an SM90/SM120 kernel that needs

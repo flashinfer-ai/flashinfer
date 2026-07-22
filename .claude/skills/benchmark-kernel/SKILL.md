@@ -29,6 +29,16 @@ FlashInfer supports two timing methods:
 
 **The framework automatically uses CUPTI if available, otherwise falls back to CUDA events.**
 
+> **Autotuner timing (separate from the benchmark framework above).** The
+> `AutoTuner`'s internal per-tactic timing has its own selector,
+> `FLASHINFER_AUTOTUNE_TIMER`: `globaltimer` forces the GPU `%globaltimer`
+> register, `cuda_event` forces `cudaEvent`, and unset/auto uses `%globaltimer`
+> only when Confidential Computing (CC) is detected. Under CC
+> `cudaEventElapsedTime` is unreliable (can go negative), which would corrupt
+> tactic ranking — the globaltimer path avoids that. CC auto-detection can be
+> overridden with `FLASHINFER_CONFIDENTIAL_COMPUTE=0/1`. (Full env-var reference
+> in `CLAUDE.md`.)
+
 ## Installation
 
 ### Install CUPTI (Recommended)

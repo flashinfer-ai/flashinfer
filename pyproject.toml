@@ -107,16 +107,21 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers/",
+  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/",
   "build/",
 ]
 
 
 # CuTe DSL FMHA kernels from TRTLLM VisualGen; kept as-is for clean re-sync.
+# cutedsl_megamoe/src kernels are maintained upstream and re-dropped
+# periodically; excluded so lint churn doesn't block syncs. The shim/ layer
+# next to it is ours and stays linted.
 [tool.ruff]
 extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers",
+  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src",
 ]
 force-exclude = true
 

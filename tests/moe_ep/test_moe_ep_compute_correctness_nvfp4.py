@@ -3,6 +3,10 @@
 Mirrors ``test_moe_ep_compute_correctness.py`` (bf16) but exercises the
 ``trtllm_fp4_routed`` path through ``FusedMoeSplitKernelBackend``.
 
+Asserts ``EP == non-EP kernel``; the ``non-EP kernel == torch oracle`` anchor
+for this dtype path is the single-GPU
+``test_split_fused_moe_kernel_vs_reference.py::test_split_nvfp4_kernel_matches_torch_reference``.
+
 Launch (4 GPU, SM100+):
     torchrun --nproc_per_node=4 -m pytest \\
         tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py -v -s \\
@@ -92,8 +96,8 @@ def _kernel_full_moe_reference(x, w1_full, w2_full, topk_ids, topk_weights):
     act = MoEActivationPack(
         hidden_states_q=x_q,
         hidden_states_scale=x_sf,
-        selected_experts=topk_ids.to(torch.int32),
-        final_scales=topk_weights.to(torch.float32),
+        topk_ids=topk_ids.to(torch.int32),
+        topk_weights=topk_weights.to(torch.float32),
     )
     return MoELayer(cfg)(act, wp)
 
