@@ -53,21 +53,22 @@ from .trtllm_gen_fused_moe_utils import (
 pytestmark = pytest.mark.solo
 
 
+# Routing axes are deliberately pinned here: this test feeds *precomputed*
+# routing into the GEMM pipeline, so varying the routing method only varies
+# host-side reference math that tests/moe/test_trtllm_gen_routing.py now
+# covers directly against the same oracles. One method (Renormalize) and one
+# input format exercise the full GEMM grid; packed-vs-unpacked equivalence is
+# covered by test_trtllm_gen_routed_fused_moe_format_parity below.
+# (Was routing_method[3] x routing_format[2] = 6x this grid; see
+# docs/moe_routing_test_decomposition.md.)
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
 @pytest.mark.parametrize("hidden_size", [1024, 2048, 3072, 4096])
 @pytest.mark.parametrize("intermediate_size", [1024, 2048, 3072, 4096])
 @pytest.mark.parametrize("num_experts", [128, 256])
 @pytest.mark.parametrize("top_k", [4, 8])
-@pytest.mark.parametrize(
-    "routing_method_type",
-    [
-        RoutingMethodType.Renormalize,
-        RoutingMethodType.RenormalizeNaive,
-        RoutingMethodType.TopK,
-    ],
-)
+@pytest.mark.parametrize("routing_method_type", [RoutingMethodType.Renormalize])
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
-@pytest.mark.parametrize("routing_format", ["packed", "unpacked"])
+@pytest.mark.parametrize("routing_format", ["packed"])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -267,6 +268,38 @@ def test_trtllm_gen_routed_fused_moe(
     # mismatch percentage
     mismatch_pct = (~mask).float().mean().item() * 100
     assert mismatch_pct < 6, f"Mismatch percentage is {mismatch_pct:.2f}"
+
+
+# Interface smoke for the axes pinned out of the dense grid above: every
+# supported routing method and both precomputed-routing input formats, one
+# shape per quant mode. Each case still checks against the torch reference,
+# so a method- or format-specific plumbing bug in the routed entry points
+# fails here without multiplying the full GEMM grid.
+@pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
+@pytest.mark.parametrize(
+    "routing_method_type",
+    [
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+        RoutingMethodType.TopK,
+    ],
+)
+@pytest.mark.parametrize("routing_format", ["packed", "unpacked"])
+def test_trtllm_gen_routed_fused_moe_format_parity(
+    quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
+    routing_method_type: RoutingMethodType,
+    routing_format: Literal["packed", "unpacked"],
+):
+    test_trtllm_gen_routed_fused_moe(
+        num_tokens=8,
+        hidden_size=1024,
+        intermediate_size=1024,
+        top_k=8,
+        num_experts=128,
+        routing_method_type=routing_method_type,
+        quant_mode=quant_mode,
+        routing_format=routing_format,
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [8, 64])

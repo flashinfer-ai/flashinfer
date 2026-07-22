@@ -81,7 +81,10 @@ def make_logits(num_tokens, num_experts, dtype, seed, hot_expert=None):
     distinct from all others — a worst-case load-imbalance pattern for the
     padding/permutation logic.
     """
-    assert num_experts <= 256, "distinct-in-bf16 construction holds up to 256"
+    assert num_experts <= 256 or dtype != torch.bfloat16, (
+        "distinct-in-bf16 construction holds up to 256 experts; use float32 "
+        "logits beyond that"
+    )
     gen = torch.Generator().manual_seed(seed)
     perm = torch.argsort(torch.rand(num_tokens, num_experts, generator=gen), dim=1)
     logits = perm.float() / 32.0
@@ -235,9 +238,17 @@ def test_custom_routing_methods(
 @pytest.mark.parametrize(
     "num_experts,n_group,topk_group,top_k",
     [
+        # Model-shaped configs, mirroring the routing_config list in
+        # test_trtllm_gen_fused_moe.py::test_deepseekv3_routing — the fused
+        # matrix only keeps a couple of representatives, routing variety is
+        # covered here.
         (256, 8, 4, 8),  # DeepSeek-V3
         (128, 4, 2, 4),
         (96, 1, 1, 8),  # no-groups fast path (routingCustom SigmoidBias)
+        (512, 1, 1, 22),  # nemotron_3_super (top_k kernel maximum)
+        (384, 1, 1, 8),  # kimi_k2
+        (160, 1, 1, 8),  # GLM4_MoE
+        (72, 1, 1, 6),  # DSLite
     ],
 )
 @pytest.mark.parametrize("tile_tokens_dim", [8, 32])
@@ -253,6 +264,8 @@ def test_deepseekv3_routing(
     logits_dtype,
     bias_dtype,
 ):
+    if num_experts > 256 and logits_dtype == torch.bfloat16:
+        pytest.skip("tie-free logits construction needs float32 beyond 256 experts")
     routed_scaling = 2.5
     seed = stable_seed("dsv3", num_tokens, num_experts, n_group, top_k)
     logits = make_logits(num_tokens, num_experts, logits_dtype, seed)
