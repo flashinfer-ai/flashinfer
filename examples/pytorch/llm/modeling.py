@@ -73,7 +73,13 @@ class ModelConfig:
                 f"Unsupported model_type {model_type!r}; this example supports "
                 f"{SUPPORTED_MODEL_TYPES}"
             )
+        # transformers v5 nests rope config under "rope_parameters"; older
+        # checkpoints use top-level "rope_theta" + optional "rope_scaling".
+        rope_params = cfg.get("rope_parameters") or {}
+        rope_theta = rope_params.get("rope_theta", cfg.get("rope_theta", 1e4))
         rope_scaling = cfg.get("rope_scaling")
+        if rope_params.get("rope_type", "default") != "default":
+            rope_scaling = rope_params
         if rope_scaling is not None:
             rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
             if rope_type not in ("llama3", "default"):
@@ -102,11 +108,12 @@ class ModelConfig:
             ),
             vocab_size=cfg["vocab_size"],
             rms_norm_eps=cfg["rms_norm_eps"],
-            rope_theta=cfg.get("rope_theta", 1e4),
+            rope_theta=rope_theta,
             tie_word_embeddings=cfg.get("tie_word_embeddings", False),
             rope_scaling=rope_scaling,
             eos_token_ids=eos_token_ids,
-            num_experts=cfg.get("num_experts", 0),
+            # "num_local_experts" is the transformers-v5 serialization.
+            num_experts=cfg.get("num_experts", cfg.get("num_local_experts", 0)),
             num_experts_per_tok=cfg.get("num_experts_per_tok", 0),
             moe_intermediate_size=cfg.get("moe_intermediate_size", 0),
             norm_topk_prob=cfg.get("norm_topk_prob", False),
