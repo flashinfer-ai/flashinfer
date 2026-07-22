@@ -2757,6 +2757,23 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Skip unsupported final scale dtype, only Float32 is supported
         if final_scale_dtype != cutlass.Float32:
             can_implement = False
+        # N must tile the CTA grid exactly (gh #3957). The epilogue's
+        # raw-pointer bulk scatter (cp.reduce.async.bulk ... add) always
+        # writes the full compile-time ``copy_size`` row segment: rows are
+        # guarded (``is_valid_reduce_row``) but columns have no predicate and
+        # no size clamp, so any CTA whose N-tile extends past ``n``
+        # read-modify-writes into ``out[token, n]`` == ``out[token+1, 0]`` --
+        # off the end of the allocation for the last token (IMA), a silent
+        # add-of-zero into neighboring pool memory otherwise (which
+        # canonicalizes NaN bit patterns, e.g. int sentinels). The single
+        # divisibility check below rejects both ways to get such a CTA:
+        # a partial N-tile (n not a multiple of mma_n), and a cluster-padding
+        # CTA along N (tile count not a multiple of cluster_n -- the
+        # persistent scheduler pads the grid to a cluster multiple with an
+        # M-only validity guard, so the padding CTA scatters zeros anyway).
+        # M needs no analogue: rows are individually validity-guarded.
+        if n % (mma_tiler_mn[1] * cluster_shape_mn[1]) != 0:
+            can_implement = False
         return can_implement
 
     @cute.jit
