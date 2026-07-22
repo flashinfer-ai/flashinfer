@@ -92,15 +92,16 @@ def _prepare_moe_quant_mode_inputs(
             },
             {
                 "hidden_states": tensors["x_bf16"],
-                "gemm1_weights": tensors["w1_weight"],
-                "gemm2_weights": tensors["w2_weight"],
-                "gemm1_weight_sf": tensors["w1_weight_sf"],
-                "gemm2_weight_sf": tensors["w2_weight_sf"],
-                "gemm1_alpha": tensors["w1_alpha"],
-                "gemm2_alpha": tensors["w2_alpha"],
+                "gemm1_weights": (
+                    tensors["w1_weight_bf16"].float()
+                    * tensors["w1_alpha"].view(-1, 1, 1)
+                ).to(torch.bfloat16),
+                "gemm2_weights": (
+                    tensors["w2_weight_bf16"].float()
+                    * tensors["w2_alpha"].view(-1, 1, 1)
+                ).to(torch.bfloat16),
                 "fc2_input_scale": None,
                 "use_per_token_activation": False,
-                "quant_mode": "w4a16",
             },
         )
     if quant_mode == "w4a4":
@@ -115,13 +116,10 @@ def _prepare_moe_quant_mode_inputs(
                 "hidden_states": tensors["x_ref"].float(),
                 "gemm1_weights": tensors["w1_weight_bf16"].float(),
                 "gemm2_weights": tensors["w2_weight_bf16"].float(),
-                "gemm1_weight_sf": None,
-                "gemm2_weight_sf": None,
                 "gemm1_alpha": tensors["w1_alpha"],
                 "gemm2_alpha": tensors["w2_alpha"],
                 "fc2_input_scale": tensors["fc2_input_scale"],
                 "use_per_token_activation": tensors["x_per_token_scale"] is not None,
-                "quant_mode": "w4a4",
             },
         )
     raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
@@ -1009,6 +1007,86 @@ class TestCuteDslMoeW4A16:
         tensors["w1_weight_sf"].zero_()
         updated = run()
         torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("scale_axis", ["row", "k"])
+    @pytest.mark.parametrize(
+        "rows,route_tile,tactic",
+        [
+            pytest.param(128, 32, ((128, 64), (1, 1)), id="1cta"),
+            pytest.param(256, 64, ((256, 128), (2, 1)), id="2cta"),
+            pytest.param(256, 128, ((128, 256), (2, 1)), id="cluster2"),
+        ],
+    )
+    def test_weight_scale_mapping(
+        self,
+        scale_axis: str,
+        rows: int,
+        route_tile: int,
+        tactic: tuple,
+    ):
+        from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+        from flashinfer.fp4_quantization import block_scale_interleave
+        from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
+            _run_grouped_gemm,
+        )
+        from flashinfer.tllm_enums import (
+            DEFAULT_SWIGLU_ALPHA,
+            DEFAULT_SWIGLU_BETA,
+            DEFAULT_SWIGLU_LIMIT,
+        )
+
+        k = 256
+        scale_k = k // 16
+        weight = torch.full((1, rows, k // 2), 0x22, dtype=torch.uint8, device="cuda")
+        # Cycle through positive normal E4M3 codes; 0x7F is NaN.
+        if scale_axis == "row":
+            scale_codes = 0x08 + torch.arange(rows, device="cuda") % (0x7F - 0x08)
+            scale_codes = scale_codes[:, None].expand(rows, scale_k)
+        else:
+            scale_codes = 0x08 + torch.arange(scale_k, device="cuda")
+            scale_codes = scale_codes[None, :].expand(rows, scale_k)
+        scale_codes = scale_codes.to(torch.uint8).contiguous().unsqueeze(0)
+        weight_sf = convert_sf_to_mma_layout(
+            block_scale_interleave(scale_codes),
+            m=rows,
+            k=k,
+            num_groups=1,
+            sf_vec_size=16,
+        )
+
+        activations = torch.zeros((route_tile, k), dtype=torch.bfloat16, device="cuda")
+        block_idx = torch.arange(scale_k, device="cuda")
+        activations[block_idx, block_idx * 16] = 1
+        output = torch.empty((route_tile, rows), dtype=torch.bfloat16, device="cuda")
+        _run_grouped_gemm(
+            weight=weight,
+            weight_sf=weight_sf,
+            activations=activations,
+            tile_idx_to_expert_idx=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            tile_idx_to_mn_limit=torch.full(
+                (1,), route_tile, dtype=torch.int32, device="cuda"
+            ),
+            num_non_exiting_tiles=torch.ones(1, dtype=torch.int32, device="cuda"),
+            alpha=torch.ones(1, dtype=torch.float32, device="cuda"),
+            output=output,
+            num_local_experts=1,
+            activation_type=None,
+            swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
+            swiglu_beta=DEFAULT_SWIGLU_BETA,
+            swiglu_limit=DEFAULT_SWIGLU_LIMIT,
+            use_fused_finalize=False,
+            permuted_idx_to_expanded_idx=None,
+            token_final_scales=None,
+            enable_pdl=False,
+            route_tile=route_tile,
+            tactic=tactic,
+        )
+
+        expected = torch.zeros_like(output)
+        expected[:scale_k] = (
+            scale_codes.squeeze(0).view(torch.float8_e4m3fn).to(torch.bfloat16).T
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
     @pytest.mark.parametrize(
         "activation_type,route_tile,gemm1_tactic,gemm2_tactic",
