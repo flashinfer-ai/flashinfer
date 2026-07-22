@@ -44,7 +44,9 @@ def stage_mega_moe_inputs(
         fused_quant_stage_supported,
     )
 
-    if _use_fused_stage() and fused_quant_stage_supported(hidden_states):
+    if _use_fused_stage() and fused_quant_stage_supported(
+        hidden_states, quant_type="mxfp8_e4m3"
+    ):
         x_out = (
             x_fp8
             if x_fp8.dtype == torch.float8_e4m3fn
