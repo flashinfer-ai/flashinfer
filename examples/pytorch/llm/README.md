@@ -88,7 +88,40 @@ Exit code 0/1, suitable for CI. To force a fully cold first run:
 | `modeling.py` | config/weight loading, paged KV cache, decoder forward pass (dense + MoE) |
 | `generate.py` | CLI generation loop (prefill → decode → sample) + JIT-build counter |
 | `smoke_test.py` | two-process verification harness (see above) |
-| `reference_check.py` | numerical check: tiny random dense/MoE models, last-token prefill logits vs `transformers` eager within a relative-L2 tolerance |
+| `reference_check.py` | numerical check: tiny random dense/MoE models, last-token prefill logits vs `transformers` eager within a relative-L2 tolerance; also runs under `torchrun` for TEP |
+| `health_check.py` | lifecycle metrics (import / load / cold prefill+JIT / warm prefill / decode throughput / steady recompiles) with JSON output — groundwork for performance gates |
+
+## Multi-GPU: TEP (TP = EP)
+
+Launch any of the scripts with `torchrun` to run tensor-parallel attention
+with expert-parallel MoE over the same ranks — the standard single-node
+deployment shape for MoE models, minimally mimicked:
+
+```bash
+torchrun --nproc_per_node=2 reference_check.py           # numerics vs 1-GPU reference
+torchrun --nproc_per_node=2 generate.py --model-id Qwen/Qwen3-0.6B
+torchrun --nproc_per_node=2 health_check.py --tiny moe
+```
+
+Sharding: QKV column-parallel / `o_proj` row-parallel, dense-FFN gate/up
+column- / down row-parallel, MoE experts sliced per rank
+(`cutlass_fused_moe(ep_size=, ep_rank=)` with global routing computed on
+every rank). Exactly two allreduces per layer (post-attention and
+post-FFN/MoE), over NCCL. Requires head counts / intermediate size / expert
+count divisible by the world size.
+
+## Health instrumentation
+
+```bash
+python health_check.py --tiny moe --json health.json
+python health_check.py --model-id Qwen/Qwen3-8B --batch 4 --prompt-len 512 --autotune
+```
+
+Reports import / load / cold-prefill (JIT warmup) / warm prefill / decode
+throughput / steady-state recompile count (must be 0), optionally re-measured
+after an `autotune(True)` warmup pass. The JSON output is the intended input
+for future performance gates. Host-side timings — for trend and gating, not
+kernel benchmarking.
 
 ## Requirements
 

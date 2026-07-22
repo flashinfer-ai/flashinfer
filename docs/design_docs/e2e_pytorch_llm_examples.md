@@ -167,7 +167,27 @@ This is the actual point of the exercise. Checks, each cheap and scriptable:
   the identical kernel path as Qwen3-30B-A3B, so no large download is needed
   for functional verification. Remaining: FP8/FP4 weight-quantized linear
   backends.
-- **Phase 3:** tensor-parallel (2–4 GPU) variant exercising
-  `flashinfer.comm` all-reduce; unlocks the 70B–235B tier.
-- **Phase 4:** wire the smoke harness into CI (it's designed to be a
-  single-command pass/fail).
+- **Phase 3 (in progress):** TEP (TP=EP) multi-GPU — attention
+  tensor-parallel, MoE expert-parallel over the same ranks, two NCCL
+  allreduces per layer, launched with `torchrun`; `reference_check.py`
+  validates the sharded result against the single-GPU transformers
+  reference. Follow-ups: swap NCCL allreduce for `flashinfer.comm`
+  (trtllm/vllm allreduce) as a selectable backend; 4-GPU runs for the
+  70B–235B tier.
+- **Phase 4 (started):** health instrumentation + performance gates.
+  `health_check.py` measures the serving lifecycle (import, load, cold
+  prefill incl. JIT builds, warm prefill/decode throughput, steady-state
+  recompiles, optional autotune delta) and emits JSON — the gate inputs.
+  Planned next: CUDA-graph capture of the decode step
+  (`use_cuda_graph=True` wrapper mode with preallocated page tables),
+  threshold files + trend comparison, then CI wiring of
+  smoke/reference/health checks. Multi-node is explicitly out of scope for
+  now.
+
+### Ops note: persistent JIT cache for GPU-node runs
+
+Node containers are ephemeral; a container-local `~/.cache/flashinfer`
+loses the ~1 h `fused_moe_100` compile on every teardown. Runs now mount an
+NFS-backed cache (`flashinfer2/var/jit_cache` →
+`/home/aleyang/.cache/flashinfer`), so any node/container reuses compiled
+artifacts.
