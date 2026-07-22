@@ -968,7 +968,8 @@ __global__ void nvfp4QuantAndPerTokenScaleFP32Kernel(
 // `scaleInput` contains one fp32 dequant scale (block amax / E2M1 max) per SF_VEC_SIZE block in
 // linear layout. Reconstruct the block amax before deriving the per-token scale. The output layout
 // is linear, 128x4, or 8x4.
-template <uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT_OUT, bool CACHE_SCALE_IN_SMEM = true>
+template <uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT_OUT, int SCALES_PER_LOAD = 8,
+          bool CACHE_SCALE_IN_SMEM = true>
 __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
     // input
     uint32_t m,
@@ -978,6 +979,8 @@ __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
     uint8_t* scaleOutput, float* perTokenScaleOutput) {
   static constexpr int SF_VEC_SIZE = 16;
   static constexpr float E2M1_MAX_VALUE = 6.f;
+  static_assert(SCALES_PER_LOAD == 4 || SCALES_PER_LOAD == 8, "SCALES_PER_LOAD must be 4, or 8");
+  using ScaleVec = std::array<float, SCALES_PER_LOAD>;
   int rowIdx = blockIdx.x;
   if (rowIdx >= m) return;
   if (expandedIdxToPermutedIdx != nullptr) {
@@ -987,53 +990,238 @@ __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
 
   // one input scale per SF_VEC_SIZE block, stored linearly per row
   uint32_t num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
+  float const* rowScaleInput = scaleInput + static_cast<int64_t>(rowIdx) * num_sf_vecs_per_row;
+  uint32_t const num_scale_vecs_per_row = num_sf_vecs_per_row / SCALES_PER_LOAD;
 
   extern __shared__ float scaleSmem[];
 
-  // Find the row-wise amax from the per-block fp32 dequant scales.
-  float globalAmax = 0.f;
-  for (uint32_t vecIdx = threadIdx.x; vecIdx < num_sf_vecs_per_row; vecIdx += blockDim.x) {
-    int64_t sfInOffset = static_cast<int64_t>(rowIdx) * num_sf_vecs_per_row + vecIdx;
-    float localAmax = scaleInput[sfInOffset] * E2M1_MAX_VALUE;
+  // scaleInput contains nonnegative block scales, so unsigned ordering of their IEEE-754 bits is
+  // identical to floating-point ordering. Reduce the bits first and reconstruct the amax once.
+  uint32_t globalAmaxBits = 0;
+  for (uint32_t scaleVecIdx = threadIdx.x; scaleVecIdx < num_scale_vecs_per_row;
+       scaleVecIdx += blockDim.x) {
+    ScaleVec scales;
+    loadPackedVec(scales, reinterpret_cast<ScaleVec const*>(rowScaleInput) + scaleVecIdx);
+#pragma unroll
+    for (int i = 0; i < SCALES_PER_LOAD; ++i) {
+      uint32_t vecIdx = scaleVecIdx * SCALES_PER_LOAD + i;
+      float localAmax = scales[i] * E2M1_MAX_VALUE;
+      if constexpr (CACHE_SCALE_IN_SMEM) {
+        scaleSmem[vecIdx] = localAmax;
+      }
+      globalAmaxBits = max(globalAmaxBits, __float_as_uint(scales[i]));
+    }
+  }
+  for (uint32_t vecIdx = num_scale_vecs_per_row * SCALES_PER_LOAD + threadIdx.x;
+       vecIdx < num_sf_vecs_per_row; vecIdx += blockDim.x) {
+    float localAmax = rowScaleInput[vecIdx] * E2M1_MAX_VALUE;
     if constexpr (CACHE_SCALE_IN_SMEM) {
       scaleSmem[vecIdx] = localAmax;
     }
-    globalAmax = fmaxf(globalAmax, localAmax);
+    globalAmaxBits = max(globalAmaxBits, __float_as_uint(rowScaleInput[vecIdx]));
   }
-  using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
+  using BlockReduce = cub::BlockReduce<uint32_t, BLOCK_SIZE>;
   __shared__ typename BlockReduce::TempStorage tempStorage;
-  globalAmax = BlockReduce(tempStorage).Reduce(globalAmax, cuda::maximum<>{});
+  __shared__ float perTokenScaleSmem;
+  globalAmaxBits = BlockReduce(tempStorage).Reduce(globalAmaxBits, cuda::maximum<>{});
 
   // save the per-token scale
+  float globalAmax = __fmul_rn(__uint_as_float(globalAmaxBits), E2M1_MAX_VALUE);
   float perTokenScale = globalAmax * globalScaleInv;
   if (threadIdx.x == 0) {
     perTokenScaleOutput[rowIdx] = perTokenScale;
+    perTokenScaleSmem = perTokenScale;
   }
   __syncthreads();
-  perTokenScale = perTokenScaleOutput[rowIdx];
+  perTokenScale = perTokenScaleSmem;
+
+  int64_t sfOutputRowBase;
+  if constexpr (SF_LAYOUT_OUT == QuantizationSFLayout::LINEAR) {
+    sfOutputRowBase = static_cast<int64_t>(rowIdx) * num_sf_vecs_per_row;
+  } else if constexpr (SF_LAYOUT_OUT == QuantizationSFLayout::SWIZZLED_128x4) {
+    sfOutputRowBase = get_sf_out_offset_128x4(rowIdx, 0, num_sf_vecs_per_row);
+  } else {
+    sfOutputRowBase = get_sf_out_offset_8x4(rowIdx, 0, num_sf_vecs_per_row);
+  }
+  auto getSfOutputOffset = [&](uint32_t vecIdx) -> int64_t {
+    if constexpr (SF_LAYOUT_OUT == QuantizationSFLayout::LINEAR) {
+      return sfOutputRowBase + vecIdx;
+    } else if constexpr (SF_LAYOUT_OUT == QuantizationSFLayout::SWIZZLED_128x4) {
+      return get_sf_out_offset_128x4(rowIdx, vecIdx, num_sf_vecs_per_row);
+    } else {
+      return get_sf_out_offset_8x4(rowIdx, vecIdx, num_sf_vecs_per_row);
+    }
+  };
 
   // quantize the per-block scales to e4m3 with the per-token scale
-  for (uint32_t vecIdx = threadIdx.x; vecIdx < num_sf_vecs_per_row; vecIdx += blockDim.x) {
+  for (uint32_t scaleVecIdx = threadIdx.x; scaleVecIdx < num_scale_vecs_per_row;
+       scaleVecIdx += blockDim.x) {
+    ScaleVec scales;
+    if constexpr (!CACHE_SCALE_IN_SMEM) {
+      if constexpr (SCALES_PER_LOAD == 8 || SCALES_PER_LOAD == 4) {
+        loadPackedVec(scales, reinterpret_cast<ScaleVec const*>(rowScaleInput) + scaleVecIdx);
+      } else {
+        scales = reinterpret_cast<ScaleVec const*>(rowScaleInput)[scaleVecIdx];
+      }
+    }
+    if constexpr (SCALES_PER_LOAD >= 4) {
+#pragma unroll
+      for (int i = 0; i < SCALES_PER_LOAD; i += 4) {
+        uint32_t packedOutput = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          uint32_t vecIdx = scaleVecIdx * SCALES_PER_LOAD + i + j;
+          float localAmax;
+          if constexpr (CACHE_SCALE_IN_SMEM) {
+            localAmax = scaleSmem[vecIdx];
+          } else {
+            localAmax = scales[i + j] * E2M1_MAX_VALUE;
+          }
+          float localScale =
+              localAmax == 0.f ? 0.f : E2M1_MAX_VALUE * reciprocal_approximate_ftz(localAmax);
+          float fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
+          packedOutput |= static_cast<uint32_t>(__nv_fp8_e4m3(fp32Scale).__x) << (j * 8);
+        }
+        uint32_t vecIdx = scaleVecIdx * SCALES_PER_LOAD + i;
+        constexpr int64_t SF_GROUP_STRIDE =
+            SF_LAYOUT_OUT == QuantizationSFLayout::LINEAR
+                ? 4
+                : (SF_LAYOUT_OUT == QuantizationSFLayout::SWIZZLED_128x4 ? 512 : 32);
+        int64_t sfOffset = sfOutputRowBase + static_cast<int64_t>(vecIdx / 4) * SF_GROUP_STRIDE;
+        *reinterpret_cast<uint32_t*>(scaleOutput + sfOffset) = packedOutput;
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < SCALES_PER_LOAD; ++i) {
+        uint32_t vecIdx = scaleVecIdx * SCALES_PER_LOAD + i;
+        float localAmax;
+        if constexpr (CACHE_SCALE_IN_SMEM) {
+          localAmax = scaleSmem[vecIdx];
+        } else {
+          localAmax = scales[i] * E2M1_MAX_VALUE;
+        }
+        float localScale =
+            localAmax == 0.f ? 0.f : E2M1_MAX_VALUE * reciprocal_approximate_ftz(localAmax);
+        float fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
+        scaleOutput[getSfOutputOffset(vecIdx)] = __nv_fp8_e4m3(fp32Scale).__x;
+      }
+    }
+  }
+  for (uint32_t vecIdx = num_scale_vecs_per_row * SCALES_PER_LOAD + threadIdx.x;
+       vecIdx < num_sf_vecs_per_row; vecIdx += blockDim.x) {
     float localAmax;
     if constexpr (CACHE_SCALE_IN_SMEM) {
       localAmax = scaleSmem[vecIdx];
     } else {
-      int64_t sfInOffset = static_cast<int64_t>(rowIdx) * num_sf_vecs_per_row + vecIdx;
-      localAmax = scaleInput[sfInOffset] * E2M1_MAX_VALUE;
+      localAmax = rowScaleInput[vecIdx] * E2M1_MAX_VALUE;
     }
     float localScale =
         localAmax == 0.f ? 0.f : E2M1_MAX_VALUE * reciprocal_approximate_ftz(localAmax);
     float fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
-    uint8_t fp8Scale = __nv_fp8_e4m3(fp32Scale).__x;
-    int64_t sfOffset;
-    if constexpr (SF_LAYOUT_OUT == QuantizationSFLayout::LINEAR) {
-      sfOffset = static_cast<int64_t>(rowIdx) * num_sf_vecs_per_row + vecIdx;
-    } else if constexpr (SF_LAYOUT_OUT == QuantizationSFLayout::SWIZZLED_128x4) {
-      sfOffset = get_sf_out_offset_128x4(rowIdx, vecIdx, num_sf_vecs_per_row);
-    } else {
-      sfOffset = get_sf_out_offset_8x4(rowIdx, vecIdx, num_sf_vecs_per_row);
+    scaleOutput[getSfOutputOffset(vecIdx)] = __nv_fp8_e4m3(fp32Scale).__x;
+  }
+}
+
+// Runtime-width warp-per-row fast path. One warp owns one row and retains up to
+// MAX_SF_VECS_PER_ROW input scales in registers across the row reduction. Unlike an exact-width
+// specialization, this kernel accepts n at runtime and supports every output layout. The launcher
+// falls back to scaleOnlyQuantAndPerTokenScaleKernel for wider rows.
+template <uint32_t WARPS_PER_BLOCK, QuantizationSFLayout SF_LAYOUT_OUT, uint32_t SCALES_PER_LOAD,
+          uint32_t MAX_SF_VECS_PER_ROW = 512>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void scaleOnlyQuantAndPerTokenScaleWarpKernel(
+    // input
+    uint32_t m, uint32_t n, float const* scaleInput, float globalScaleInv,
+    int32_t* expandedIdxToPermutedIdx,
+    // output
+    uint8_t* scaleOutput, float* perTokenScaleOutput) {
+  static constexpr int SF_VEC_SIZE = 16;
+  static_assert(SCALES_PER_LOAD == 4 || SCALES_PER_LOAD == 8, "SCALES_PER_LOAD must be 4 or 8");
+  static_assert(MAX_SF_VECS_PER_ROW % SCALES_PER_LOAD == 0,
+                "MAX_SF_VECS_PER_ROW must be divisible by SCALES_PER_LOAD");
+  static_assert(MAX_SF_VECS_PER_ROW % 128 == 0, "MAX_SF_VECS_PER_ROW must be a multiple of 128");
+  static constexpr int MAX_SCALE_VECS_PER_ROW = MAX_SF_VECS_PER_ROW / SCALES_PER_LOAD;
+  static constexpr int NUM_ROUNDS = (MAX_SCALE_VECS_PER_ROW + 31) / 32;
+  static constexpr float E2M1_MAX_VALUE = 6.f;
+  using ScaleVec = std::array<float, SCALES_PER_LOAD>;
+
+  int const warpIdx = threadIdx.x / warpSize;
+  int const laneIdx = threadIdx.x % warpSize;
+  int rowIdx = static_cast<int>(blockIdx.x) * WARPS_PER_BLOCK + warpIdx;
+  if (rowIdx >= m) return;
+  if (expandedIdxToPermutedIdx != nullptr) {
+    rowIdx = expandedIdxToPermutedIdx[rowIdx];
+  }
+  if (rowIdx < 0) return;
+
+  uint32_t const numSfVecsPerRow = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
+  uint32_t const numScaleVecsPerRow = numSfVecsPerRow / SCALES_PER_LOAD;
+  ScaleVec const* rowInput = reinterpret_cast<ScaleVec const*>(
+      scaleInput + static_cast<int64_t>(rowIdx) * numSfVecsPerRow);
+  ScaleVec values[NUM_ROUNDS];
+  // scaleInput contains nonnegative block scales, so unsigned ordering of their IEEE-754 bits is
+  // identical to floating-point ordering. On Ampere and newer this becomes one warp REDUX instead
+  // of five shuffle/FMAX stages.
+  uint32_t globalAmaxBits = 0;
+#pragma unroll
+  for (int i = 0; i < NUM_ROUNDS; ++i) {
+    int const scaleVecIdx = laneIdx + i * warpSize;
+    if (scaleVecIdx < numScaleVecsPerRow) {
+      loadPackedVec(values[i], rowInput + scaleVecIdx);
+#pragma unroll
+      for (int j = 0; j < SCALES_PER_LOAD; ++j) {
+        globalAmaxBits = max(globalAmaxBits, __float_as_uint(values[i][j]));
+      }
     }
-    scaleOutput[sfOffset] = fp8Scale;
+  }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  globalAmaxBits = __reduce_max_sync(0xffffffff, globalAmaxBits);
+#else
+#pragma unroll
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    globalAmaxBits =
+        max(globalAmaxBits, __shfl_xor_sync(0xffffffff, globalAmaxBits, offset, warpSize));
+  }
+#endif
+  float const globalAmax = __fmul_rn(__uint_as_float(globalAmaxBits), E2M1_MAX_VALUE);
+
+  float const perTokenScale = globalAmax * globalScaleInv;
+  if (laneIdx == 0) {
+    perTokenScaleOutput[rowIdx] = perTokenScale;
+  }
+
+  int64_t sfOutputRowBase;
+  if constexpr (SF_LAYOUT_OUT == QuantizationSFLayout::LINEAR) {
+    sfOutputRowBase = static_cast<int64_t>(rowIdx) * numSfVecsPerRow;
+  } else if constexpr (SF_LAYOUT_OUT == QuantizationSFLayout::SWIZZLED_128x4) {
+    sfOutputRowBase = get_sf_out_offset_128x4(rowIdx, 0, numSfVecsPerRow);
+  } else {
+    sfOutputRowBase = get_sf_out_offset_8x4(rowIdx, 0, numSfVecsPerRow);
+  }
+  constexpr int64_t SF_GROUP_STRIDE =
+      SF_LAYOUT_OUT == QuantizationSFLayout::LINEAR
+          ? 4
+          : (SF_LAYOUT_OUT == QuantizationSFLayout::SWIZZLED_128x4 ? 512 : 32);
+#pragma unroll
+  for (int i = 0; i < NUM_ROUNDS; ++i) {
+    int const scaleVecIdx = laneIdx + i * warpSize;
+    if (scaleVecIdx >= numScaleVecsPerRow) {
+      continue;
+    }
+#pragma unroll
+    for (int groupIdx = 0; groupIdx < SCALES_PER_LOAD; groupIdx += 4) {
+      uint32_t packedOutput = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        float const localAmax = values[i][groupIdx + j] * E2M1_MAX_VALUE;
+        float const localScale =
+            localAmax == 0.f ? 0.f : E2M1_MAX_VALUE * reciprocal_approximate_ftz(localAmax);
+        float const fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
+        packedOutput |= static_cast<uint32_t>(__nv_fp8_e4m3(fp32Scale).__x) << (j * 8);
+      }
+      uint32_t const vecIdx = scaleVecIdx * SCALES_PER_LOAD + groupIdx;
+      int64_t sfOffset = sfOutputRowBase + static_cast<int64_t>(vecIdx / 4) * SF_GROUP_STRIDE;
+      *reinterpret_cast<uint32_t*>(scaleOutput + sfOffset) = packedOutput;
+    }
   }
 }
 
