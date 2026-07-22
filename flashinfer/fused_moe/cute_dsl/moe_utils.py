@@ -166,6 +166,7 @@ def moe_permute(
     top_k: int,
     tile_size: int,
     enable_pdl: bool = False,
+    launch_dependents_early: bool = False,
     input_sf: Optional[torch.Tensor] = None,
     permuted_sf: Optional[torch.Tensor] = None,
 ) -> None:
@@ -190,6 +191,9 @@ def moe_permute(
         tile_size: Size of each tile for scheduling.
         enable_pdl: Enable Programmatic Dependent Launch for better kernel overlap.
                     Default is False.
+        launch_dependents_early: Allow a dependent kernel to start after this
+                                 kernel has synchronized with its predecessor,
+                                 before the activation copy completes.
         input_sf: Scale factors for input (required for FP4).
                   Shape: [num_tokens, hidden_size // 16].
         permuted_sf: Output scale factors for permuted data (required for FP4).
@@ -226,6 +230,7 @@ def moe_permute(
         top_k,
         tile_size,
         enable_pdl,
+        launch_dependents_early,
         _get_cuda_stream_ptr(),
     )
 

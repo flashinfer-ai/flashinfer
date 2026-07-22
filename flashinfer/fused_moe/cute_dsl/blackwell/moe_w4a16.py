@@ -423,6 +423,7 @@ def launch_w4a16_moe(
         top_k=top_k,
         tile_size=route_tile,
         enable_pdl=enable_pdl,
+        launch_dependents_early=enable_pdl,
     )
     _run_grouped_gemm(
         w1_weight,

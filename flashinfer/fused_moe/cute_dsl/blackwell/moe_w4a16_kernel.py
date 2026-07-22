@@ -1130,9 +1130,6 @@ class Sm100W4A16GroupedGemmKernel:
         # The activation TMA warp is the only role that waits on the preceding grid.
         if warp_idx == self.activation_tma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_tma_warps)
-            if cutlass.const_expr(self.enable_pdl):
-                griddepcontrol_wait()
-
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
@@ -1149,6 +1146,8 @@ class Sm100W4A16GroupedGemmKernel:
             b_load2mma_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_load2trans_stage
             )
+            if cutlass.const_expr(self.enable_pdl):
+                griddepcontrol_wait()
 
             while work_tile.is_valid_tile:
                 coord_n_offset = (
@@ -1219,7 +1218,9 @@ class Sm100W4A16GroupedGemmKernel:
                 if self.scale_mode is TransformMode.ConvertScale
                 else None
             )
-
+            if cutlass.const_expr(self.enable_pdl and self.fuse_activation):
+                with cute.arch.elect_one():
+                    griddepcontrol_launch_dependents()
             while work_tile.is_valid_tile:
                 tAgA_slice = tAgA[
                     (
@@ -1328,9 +1329,6 @@ class Sm100W4A16GroupedGemmKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-            if cutlass.const_expr(self.enable_pdl and self.fuse_activation):
-                with cute.arch.elect_one():
-                    griddepcontrol_launch_dependents()
             a_load2trans_pipeline.producer_tail(a_load2trans_producer_state)
             if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
                 scale_load2trans_pipeline.producer_tail(scale_load2trans_producer_state)

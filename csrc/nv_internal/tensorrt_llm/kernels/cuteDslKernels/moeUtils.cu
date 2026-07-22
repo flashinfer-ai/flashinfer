@@ -63,7 +63,8 @@ int32_t getMaxActiveBlocksPerSM(KernelFunc kernel, int32_t threadsPerBlock,
 
 }  // namespace
 
-template <typename InputType, typename SFType, int32_t kSFVecSize, int32_t kThreadsPerBlock>
+template <typename InputType, typename SFType, int32_t kSFVecSize, int32_t kThreadsPerBlock,
+          bool kLaunchDependentsEarly>
 __global__ void moePermuteKernel(InputType const* input, InputType* permuted_output,
                                  SFType const* input_sf, SFType* permuted_sf,
                                  int32_t const* tile_idx_to_mn_limit,
@@ -77,6 +78,9 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
+  if constexpr (kLaunchDependentsEarly) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
 #endif
 
   int32_t const num_tokens = num_non_exiting_tiles[0] * tile_size;
@@ -98,7 +102,9 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaTriggerProgrammaticLaunchCompletion();
+  if constexpr (!kLaunchDependentsEarly) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
 #endif
 }
 
@@ -108,14 +114,16 @@ void moePermute(InputType const* input, InputType* permuted_output, SFType const
                 int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles,
                 int32_t const max_num_permuted_tokens, int32_t const hidden_size,
                 int32_t const top_k, int32_t const tile_size, bool enable_pdl,
-                cudaStream_t stream) {
+                bool launch_dependents_early, cudaStream_t stream) {
   int32_t constexpr kThreadsPerBlock = 256;
   int32_t constexpr kSFVecSize = 16;
   int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
   TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.",
                        kElemPerCopy);
 
-  auto kernel = &moePermuteKernel<InputType, SFType, kSFVecSize, kThreadsPerBlock>;
+  auto kernel = launch_dependents_early
+                    ? &moePermuteKernel<InputType, SFType, kSFVecSize, kThreadsPerBlock, true>
+                    : &moePermuteKernel<InputType, SFType, kSFVecSize, kThreadsPerBlock, false>;
   static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   int32_t const maxBlocksPerSM = getMaxActiveBlocksPerSM(kernel, kThreadsPerBlock, 0);
   int32_t const blocks = std::min(smCount * maxBlocksPerSM, max_num_permuted_tokens);
@@ -142,7 +150,7 @@ void moePermute(InputType const* input, InputType* permuted_output, SFType const
       SFType* permuted_sf, int32_t const* tile_idx_to_mn_limit,                              \
       int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles,     \
       int32_t const max_num_permuted_tokens, int32_t const hidden_size, int32_t const top_k, \
-      int32_t const tile_size, bool enable_pdl, cudaStream_t stream)
+      int32_t const tile_size, bool enable_pdl, bool launch_dependents_early, cudaStream_t stream)
 
 INSTANTIATE_MOE_PERMUTE(half, uint8_t);
 #ifdef ENABLE_BF16

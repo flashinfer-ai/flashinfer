@@ -41,7 +41,8 @@ void moePermute(InputType const* input, InputType* permuted_output, SFType const
                 SFType* permuted_sf, int32_t const* tile_idx_to_mn_limit,
                 int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles,
                 int32_t const max_num_permuted_tokens, int32_t const hidden_size,
-                int32_t const top_k, int32_t const tile_size, bool enable_pdl, cudaStream_t stream);
+                int32_t const top_k, int32_t const tile_size, bool enable_pdl,
+                bool launch_dependents_early, cudaStream_t stream);
 
 template <typename InputType, typename TopKScaleType>
 void moeUnpermute(InputType const* permuted_input, InputType* output,
