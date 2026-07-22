@@ -111,9 +111,11 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
     if _mega_no_dist() or _nvshmem_initialized():
         return False
 
-    from ...kernel_src.cutedsl_megamoe import bootstrap_paths
-
-    bootstrap_paths()
+    # No kernel-tree path bootstrap here: nvshmem.core is a pip package, and
+    # each kernel tree's shim bootstraps its own src/ paths at import. Pulling
+    # a specific tree's package in from core would eagerly import that tree's
+    # kernel modules and trip the sm90/sm100 process-exclusivity guard for the
+    # other tree's sessions.
     import numpy as np
     import nvshmem.core
     import torch
@@ -255,6 +257,14 @@ def mxfp8_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[
     return nvfp4_cutedsl_runtime_requirements(bootstrap)
 
 
+def sm90_pull_fp8_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the SM90 (Hopper) FP8 pull-style mega kernel.
+
+    Same NVSHMEM symmetric-heap model as the SM100 cutedsl kernels.
+    """
+    return nvfp4_cutedsl_runtime_requirements(bootstrap)
+
+
 __all__ = [
     "MoEEpRuntimeHandle",
     "NVSHMEM",
@@ -264,5 +274,6 @@ __all__ = [
     "finalize_moe_ep_runtime",
     "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
+    "sm90_pull_fp8_runtime_requirements",
     "split_comm_runtime_requirements",
 ]
