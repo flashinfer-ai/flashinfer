@@ -649,6 +649,17 @@ def prepare_trtllm_fp8_block_weights(
             raise ValueError(
                 "MXFP8 requires hidden_size and intermediate_size divisible by 32."
             )
+        if hidden_size % 128 != 0 or (2 * intermediate_size) % 128 != 0:
+            # The shuffled-weight layout interleaves scale rows in 128-row
+            # tiles; the exact (non-padded) reshape below needs both scale
+            # matrices' row counts (2*intermediate and hidden) to be 128-row
+            # aligned -- same constraint the legacy pipeline carried
+            # implicitly (gh #4087).
+            raise ValueError(
+                "MXFP8 shuffled-weight layout requires hidden_size and "
+                "2*intermediate_size divisible by 128."
+            )
+        from ..fp4_quantization import block_scale_interleave
         from ..quantization.fp8_quantization import mxfp8_quantize
         from .core import (
             _maybe_get_cached_w3_w1_permute_indices,
@@ -673,7 +684,21 @@ def prepare_trtllm_fp8_block_weights(
                 is_gated_act_gemm=True,
             )
             w1_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
-            w1_sf.append(sf[permute_sf.to(device)])
+            # Row permutation alone is NOT the layout the MxFp8 kernels consume:
+            # legacy shuffle_matrix_sf_a = row permute THEN 128x4
+            # block_scale_interleave (gh #4087 -- dropping the interleave reads
+            # ~99.8% of scale bytes from the wrong address; errors stay sparse
+            # only because random E8M0 exponents often coincide).
+            # block_scale_interleave returns the flattened interleaved buffer;
+            # reshape restores the logical (rows, cols) view the runner
+            # validates (the kernel consumes the raw interleaved bytes) --
+            # the legacy pipeline's exact idiom. The exact reshape is safe:
+            # both row counts are multiples of 128, so no padding is added.
+            w1_sf.append(
+                block_scale_interleave(sf[permute_sf.to(device)].contiguous()).reshape(
+                    2 * intermediate_size, hidden_size // 32
+                )
+            )
 
             q, sf = mxfp8_quantize(w2_bf16[expert], is_sf_swizzled_layout=False)
             sf = sf.view(torch.uint8).reshape(hidden_size, intermediate_size // 32)
@@ -687,7 +712,11 @@ def prepare_trtllm_fp8_block_weights(
                 num_elts_per_sf=32,
             )
             w2_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
-            w2_sf.append(sf[permute_sf.to(device)])
+            w2_sf.append(
+                block_scale_interleave(sf[permute_sf.to(device)].contiguous()).reshape(
+                    hidden_size, intermediate_size // 32
+                )
+            )
         w1_q, w1_sf = torch.stack(w1_q), torch.stack(w1_sf)
         w2_q, w2_sf = torch.stack(w2_q), torch.stack(w2_sf)
 
