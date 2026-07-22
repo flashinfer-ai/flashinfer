@@ -262,7 +262,7 @@ benchmark_apis = {
         "top_k",
         "top_k_page_table_transform",
         "top_k_ragged_transform",
-        "top_k_decode",
+        "top_k_varlen",
     ],
     "rope": [
         "apply_rope",
@@ -852,7 +852,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
-    "top_k_decode": {
+    "top_k_varlen": {
         "7.5": ["radix"],
         "8.0": ["radix"],
         "8.6": ["radix"],

@@ -1,6 +1,6 @@
 """Benchmark GVR top-k load-balancing (``load_balance=True`` vs ``False``).
 
-``flashinfer.top_k_decode`` with ``backend="gvr"`` has two kernel paths, selected
+``flashinfer.top_k_varlen`` with ``backend="gvr"`` has two kernel paths, selected
 by the ``load_balance`` flag:
 
   * ``load_balance=True``  (default) — two-kernel LB path: a prepare kernel
@@ -34,7 +34,6 @@ import torch
 
 import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
-from flashinfer.topk_blackwell import _count_long_rows, _lb_decision_from_counts
 from flashinfer.utils import get_compute_capability
 
 # GVR prepare-kernel long/short cutoff (GvrTopKLBConfig.long_threshold). Rows with
@@ -125,22 +124,21 @@ def build_inputs(
     return logits, seq_lens, pre_idx
 
 
-def run_gvr(logits, seq_lens, top_k, pre_idx, load_balance, num_long_rows=None):
-    return flashinfer.top_k_decode(
+def run_gvr(logits, seq_lens, top_k, pre_idx, load_balance):
+    return flashinfer.top_k_varlen(
         logits,
         seq_lens,
         top_k,
         pre_idx=pre_idx,
         backend="gvr",
         load_balance=load_balance,
-        num_long_rows=num_long_rows,
     )
 
 
 def run_radix(logits, seq_lens, top_k):
     # Radix masked fallback: no pre_idx, runs on any GPU. Masks logits to
     # seq_lens then calls the shared FlashInfer radix top-K kernel.
-    return flashinfer.top_k_decode(logits, seq_lens, top_k, backend="radix")
+    return flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix")
 
 
 def check_correct(indices, logits, seq_lens, top_k):
@@ -173,19 +171,13 @@ def bench_case(
         case, top_k, dtype, device, pre_idx_overlap
     )
 
-    # Host-side long-row count -> the graph-safe LB decision (pure host).
-    n_long = _count_long_rows(seq_lens, 1, LONG_THRESHOLD)
-    chose_lb = _lb_decision_from_counts(n_long, seq_lens.shape[0])
-
-    # Warmup + JIT compile of every path, then verify correctness of each.
+    # Warmup + JIT compile of both paths, then verify correctness.
     idx_lb = run_gvr(logits, seq_lens, top_k, pre_idx, True)
     idx_no = run_gvr(logits, seq_lens, top_k, pre_idx, False)
-    idx_auto = run_gvr(logits, seq_lens, top_k, pre_idx, "auto", num_long_rows=n_long)
     idx_radix = run_radix(logits, seq_lens, top_k)
     torch.cuda.synchronize()
     check_correct(idx_lb, logits, seq_lens, top_k)
     check_correct(idx_no, logits, seq_lens, top_k)
-    check_correct(idx_auto, logits, seq_lens, top_k)
     check_correct(idx_radix, logits, seq_lens, top_k)
 
     # GVR LB uses dynamic counters => not CUDA-graph safe; use_cuda_graph=False.
@@ -228,24 +220,15 @@ def bench_case(
         )
         * 1e3
     )
-    # GVR LB heuristic picks between the two GVR paths (kernel cost of the chosen
-    # path; the pure-host decision adds no device work).
-    oracle_us = lb_us if chose_lb else no_us
-    gvr_best = min(lb_us, no_us)  # best fixed GVR policy for this case
+    gvr_best_us = min(lb_us, no_us)
     return {
         "lb_us": lb_us,
         "no_us": no_us,
         "radix_us": radix_us,
-        "oracle_us": oracle_us,
-        "chose": "LB" if chose_lb else "noLB",
-        # Speedups vs non-LB single-kernel GVR path (the LB heuristic's baseline).
+        # Speedup of LB vs noLB.
         "lb_speedup": no_us / lb_us,
-        "oracle_speedup": no_us / oracle_us,
-        # Did the LB heuristic pick the genuinely faster fixed GVR path?
-        "correct_pick": abs(oracle_us - gvr_best) < 1e-6,
-        # Radix vs the heuristic-chosen GVR path: >1 means GVR (auto) is faster,
-        # <1 means radix would have been the better backend for this case.
-        "gvr_vs_radix": radix_us / oracle_us,
+        # Radix vs best GVR path: >1 means GVR is faster.
+        "gvr_vs_radix": radix_us / gvr_best_us,
     }
 
 
@@ -275,28 +258,27 @@ def geomean(xs):
 
 
 def run_lb_comparison(dtype, device, args):
-    """Table: GVR-LB vs GVR-noLB vs GVR-auto vs radix over the workload spectrum."""
-    print("=" * 116)
+    """Table: GVR-LB vs GVR-noLB vs radix over the workload spectrum."""
+    print("=" * 100)
     print(
-        f"[LB comparison]  GVR-LB vs GVR-noLB vs GVR-auto vs radix   (top_k={args.top_k}, dtype={args.dtype})"
+        f"[LB comparison]  GVR-LB vs GVR-noLB vs radix   (top_k={args.top_k}, dtype={args.dtype})"
     )
     print(
-        f"long_threshold={LONG_THRESHOLD} | LB speedups vs GVR-noLB baseline | gvr/radix = radix_us / gvr-auto_us"
+        f"long_threshold={LONG_THRESHOLD} | LB speedup vs GVR-noLB baseline | gvr/radix = radix_us / best-gvr_us"
     )
     print(
         f"pre_idx_overlap={args.pre_idx_overlap:.2f} (fraction of hints that are true top-K)"
     )
-    print("=" * 116)
+    print("=" * 100)
     header = (
         f"{'case':>26} {'rows':>5} {'#long':>6} "
-        f"{'LB(us)':>8} {'noLB(us)':>8} {'auto(us)':>8} {'radix(us)':>9} "
-        f"{'auto spdup':>11} {'ok':>3} {'gvr/radix':>10}"
+        f"{'LB(us)':>8} {'noLB(us)':>8} {'radix(us)':>9} "
+        f"{'LB spdup':>9} {'gvr/radix':>10}"
     )
     print(header)
     print("-" * len(header))
 
-    lb_speedups, auto_speedups, gvr_vs_radix = [], [], []
-    n_correct = 0
+    lb_speedups, gvr_vs_radix = [], []
     for case in build_cases():
         try:
             r = bench_case(case, args.top_k, dtype, device, args, args.pre_idx_overlap)
@@ -307,34 +289,27 @@ def run_lb_comparison(dtype, device, args):
                 continue
             raise
         lb_speedups.append(r["lb_speedup"])
-        auto_speedups.append(r["oracle_speedup"])
         gvr_vs_radix.append(r["gvr_vs_radix"])
-        n_correct += int(r["correct_pick"])
         print(
             f"{case.name:>26} {case.num_rows:>5} {case.num_long:>6} "
-            f"{r['lb_us']:>8.2f} {r['no_us']:>8.2f} {r['oracle_us']:>8.2f} {r['radix_us']:>9.2f} "
-            f"{r['oracle_speedup']:>10.2f}x {'Y' if r['correct_pick'] else 'N':>3} "
-            f"{r['gvr_vs_radix']:>9.2f}x"
+            f"{r['lb_us']:>8.2f} {r['no_us']:>8.2f} {r['radix_us']:>9.2f} "
+            f"{r['lb_speedup']:>8.2f}x {r['gvr_vs_radix']:>9.2f}x"
         )
 
     print("-" * len(header))
     if lb_speedups:
         total = len(lb_speedups)
         print(
-            "  [1] GVR LB heuristic — geomean speedup vs GVR-noLB baseline (higher better):"
-        )
-        print(
-            f"        always-LB : {geomean(lb_speedups):.3f}x   heuristic : {geomean(auto_speedups):.3f}x "
-            f"  (picked faster path {n_correct}/{total})"
+            f"  [1] GVR LB geomean speedup vs GVR-noLB: {geomean(lb_speedups):.3f}x"
         )
         g_gr = geomean(gvr_vs_radix)
         worst = min(gvr_vs_radix)
         gvr_wins = sum(1 for x in gvr_vs_radix if x > 1.0)
         print(
-            f"  [2] gvr-auto vs radix : geomean {g_gr:.2f}x, GVR faster in {gvr_wins}/{total} "
+            f"  [2] best-GVR vs radix: geomean {g_gr:.2f}x, GVR faster in {gvr_wins}/{total} "
             f"(min {worst:.2f}x)"
         )
-    print("=" * 116)
+    print("=" * 100)
 
 
 def _sweep_one(case, top_k, dtype, device, args):
@@ -496,7 +471,7 @@ def main():
     device = torch.device("cuda")
     major, minor = get_compute_capability(device)
     cc = major * 10 + minor
-    if not flashinfer.top_k_decode.is_backend_supported("gvr", cc):
+    if not flashinfer.top_k_varlen.is_backend_supported("gvr", cc):
         raise SystemExit(
             f"GVR backend not supported on sm_{cc} (needs Blackwell sm_100+ and CuTe DSL)."
         )
