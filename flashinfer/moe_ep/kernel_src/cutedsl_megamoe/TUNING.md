@@ -282,6 +282,16 @@ Support statement: **>= 4.5.2 at full performance** (4.5.2 via the MR!27
 WAR; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
 (4.5.0 fails at `cute.compile`, 4.5.1 unmeasured — the shim warns).
 
+The 4.7.0.dev internal drop (`nvidia-cutlass-dsl-internal`
+`0.3.0+20260721052439.f58f4a5`) also measures fast: nvfp4
+427.0/614.2/1907.7 µs @1024/2048/8192 (`sweep_20260722_142421_fi_mega.csv`)
+— compiles and runs cleanly. Note internal wheels report their own version
+scheme (`cutlass.__version__ == "0.3.0"`, dist name
+`nvidia-cutlass-dsl-internal`), so on internal drops the ==4.5.2 WAR gate
+is always OFF and the shim's <4.5.2 warning silently skips (dist lookup
+misses) — both are the right behavior as long as internal drops carry the
+4.5.3+ codegen fix, which this one does.
+
 ## The knob system (`shim/tuner.py`, `shim/autotune.py`)
 
 - `tuner.py` mirrors the kernel team's `tester/solvers/inference_solver.py`
