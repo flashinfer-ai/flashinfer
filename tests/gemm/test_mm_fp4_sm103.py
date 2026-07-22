@@ -5,7 +5,13 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import SfLayout, autotune, mm_fp4, nvfp4_quantize
+from flashinfer.autotuner import AutoTuner
 from flashinfer.utils import get_compute_capability
+
+
+# The 63 SM103 tactics contain 36 generic K128/K256 entries followed by 27
+# native K768 entries. The optimization under test applies to the latter.
+_NATIVE_K768_TACTICS = range(36, 63)
 
 
 def _skip_if_not_sm103() -> None:
@@ -20,9 +26,9 @@ def test_mm_fp4_sm103_cutlass_epilogue() -> None:
 
     _skip_if_not_sm103()
 
-    # K=1536 keeps the native K768 tactics eligible during public autotuning
-    # while keeping the end-to-end API test compact.
-    m, n, k = 512, 768, 1536
+    # This compact shape selected native K768 tactic 51 in 20/20 independent
+    # public-API autotuning runs across four B300 GPUs. No tactic is forced.
+    m, n, k = 512, 6144, 6144
     torch.manual_seed(103768)
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
@@ -37,6 +43,9 @@ def test_mm_fp4_sm103_cutlass_epilogue() -> None:
     )
     base_alpha = torch.reciprocal(a_global_sf * b_global_sf).float()
     reference = torch.mm(a, b.T).float()
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    selected_tactic_checked = False
 
     for out_dtype in (torch.bfloat16, torch.float16):
         unit_alpha_norm = None
@@ -48,7 +57,9 @@ def test_mm_fp4_sm103_cutlass_epilogue() -> None:
             assert output.data_ptr() % 32 == 0
             assert output.stride(0) * output.element_size() % 32 == 0
 
-            with autotune(True):
+            # A single exact bucket makes the cache entry for this invocation
+            # unambiguous and avoids profiling unrelated M buckets in CI.
+            with autotune(True, tuning_buckets=(m,)):
                 result = mm_fp4(
                     a_fp4,
                     b_fp4.T,
@@ -62,6 +73,25 @@ def test_mm_fp4_sm103_cutlass_epilogue() -> None:
                     backend="cutlass",
                     use_nvfp4=True,
                 )
+
+            if not selected_tactic_checked:
+                matching_entries = [
+                    (key, runner_id, tactic)
+                    for key, (runner_id, tactic, _) in tuner.profiling_cache.items()
+                    if key.custom_op == "fp4_gemm" and key.nearest_profile[0][0] == m
+                ]
+                assert len(matching_entries) == 1, (
+                    "expected one fp4_gemm autotuner entry for the exact M bucket, "
+                    f"got {matching_entries}"
+                )
+                key, runner_id, tactic = matching_entries[0]
+                assert key.runner_class_name == "CutlassFp4GemmRunner"
+                assert runner_id == 0
+                assert tactic in _NATIVE_K768_TACTICS, (
+                    f"autotuner selected generic tactic {tactic}; expected a native "
+                    "SM103 K768 tactic"
+                )
+                selected_tactic_checked = True
 
             assert result.data_ptr() == output.data_ptr()
             assert torch.isfinite(output).all(), (
