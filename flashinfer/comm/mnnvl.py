@@ -524,10 +524,11 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
             )
         )
-        if (
+        is_posix_fd = (
             allocation_prop.requestedHandleTypes
-            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        ):
+            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        )
+        if not is_posix_fd:
             all_handles_data = comm.allgather(exported_fabric_handle.data)
         else:
             # POSIX-FD single-node path (x86 Blackwell/Hopper, no NVLink fabric
@@ -539,6 +540,13 @@ class MnnvlMemory:  # type: ignore[no-redef]
             exchanger = PosixFDHandleExchanger(comm, comm_rank, comm_size)
             try:
                 all_handles_data = exchanger.allgather(exported_fabric_handle)
+            except OSError as e:
+                raise RuntimeError(
+                    "MNNVL POSIX-FD handle exchange failed. This path requires all "
+                    "ranks to run on one node and share a network namespace (the "
+                    "handles are passed over an abstract-namespace AF_UNIX socket). "
+                    f"Original error: {e!r}"
+                ) from e
             finally:
                 exchanger.close()
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
@@ -575,6 +583,20 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 )
 
             checkCudaErrors(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
+
+            if is_posix_fd:
+                # SCM_RIGHTS installed a local dup of each peer's fd, and the CUDA
+                # import above holds its own reference to the allocation, so close
+                # the fd now (also the ring's iteration-0 self-dup for
+                # i == comm_rank). Leaving them open leaks fds and pins the
+                # physical allocation until process exit (cuMemRelease only frees
+                # once all shareable handles are closed).
+                os.close(remote_handle_data)
+
+        if is_posix_fd:
+            # The exported fd was dup'd into the kernel at sendmsg time; drop the
+            # local reference so this rank's allocation isn't self-pinned.
+            os.close(exported_fabric_handle)
 
         ptr = MnnvlMemory.current_start_address + MnnvlMemory.current_mem_offset
         stride = MnnvlMemory.current_rank_stride
@@ -725,6 +747,11 @@ class IpcSocket:
         Returns:
             int: Received file descriptor
         """
+        # Bound the wait: the sender issues its send microseconds after a shared
+        # barrier, so a peer that never sends (died / wrong namespace) would
+        # otherwise hang recv_fd forever. A generous timeout only fires on a
+        # genuine failure and surfaces it as socket.timeout instead of a deadlock.
+        self.sock.settimeout(120)
         # Receive message with ancillary data
         # Maximum size for ancillary data containing one fd
         fds = array.array("i")

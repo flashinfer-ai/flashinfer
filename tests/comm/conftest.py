@@ -29,51 +29,19 @@ def pytest_sessionfinish(session, exitstatus):
 Shared test utilities for comm tests.
 """
 
-import ctypes
-import os
-
 from flashinfer.comm.mnnvl import MnnvlMemory
 
 
-def _check_pidfd_permissions() -> bool:
-    """Check if pidfd_getfd syscall is available and permitted.
-
-    This is required for MNNVL in containers - the SYS_PTRACE capability
-    must be available for cross-process file descriptor sharing.
-    """
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        syscall = libc.syscall
-        SYS_pidfd_open = 434
-        SYS_pidfd_getfd = 438
-
-        # Try to open our own process and get our own fd
-        my_pid = os.getpid()
-        pidfd = syscall(SYS_pidfd_open, my_pid, 0)
-        if pidfd < 0:
-            return False
-
-        # Try pidfd_getfd on stdin (fd=0) - this tests the permission
-        # We don't actually need the result, just checking if it's permitted
-        test_fd = syscall(SYS_pidfd_getfd, pidfd, 0, 0)
-        os.close(pidfd)
-
-        if test_fd < 0:
-            err = ctypes.get_errno()
-            if err == 1:  # EPERM - permission denied (container issue)
-                return False
-            # Other errors (like EBADF) are OK - permission check passed
-        else:
-            os.close(test_fd)
-
-        return True
-    except Exception:
-        return False
-
-
 def mnnvl_available() -> bool:
-    """Check if MNNVL is fully available (hardware + container permissions)."""
-    return MnnvlMemory.supports_mnnvl() and _check_pidfd_permissions()
+    """Check if MNNVL is available on this host (all-NVLink-up hardware).
+
+    The POSIX-FD handle exchange no longer needs CAP_SYS_PTRACE / pidfd_getfd
+    (it uses SCM_RIGHTS over an abstract-namespace socket), so a container
+    capability probe is intentionally not part of this gate -- MNNVL tests must
+    run in default-capability containers, the exact scenario the exchange fix
+    enables.
+    """
+    return MnnvlMemory.supports_mnnvl()
 
 
 def pytest_addoption(parser):
