@@ -979,6 +979,7 @@ __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
     uint8_t* scaleOutput, float* perTokenScaleOutput) {
   static constexpr int SF_VEC_SIZE = 16;
   static constexpr float E2M1_MAX_VALUE = 6.f;
+  static constexpr float E2M1_MAX_VALUE_INV = 1.f / 6.f;
   static_assert(SCALES_PER_LOAD == 4 || SCALES_PER_LOAD == 8, "SCALES_PER_LOAD must be 4, or 8");
   using ScaleVec = std::array<float, SCALES_PER_LOAD>;
   int rowIdx = blockIdx.x;
@@ -1034,6 +1035,7 @@ __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
   }
   __syncthreads();
   perTokenScale = perTokenScaleSmem;
+  float const perTokenScaleInv = reciprocal_approximate_ftz(perTokenScale);
 
   int64_t sfOutputRowBase;
   if constexpr (SF_LAYOUT_OUT == QuantizationSFLayout::LINEAR) {
@@ -1071,15 +1073,13 @@ __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           uint32_t vecIdx = scaleVecIdx * SCALES_PER_LOAD + i + j;
-          float localAmax;
+          float dequantScale;
           if constexpr (CACHE_SCALE_IN_SMEM) {
-            localAmax = scaleSmem[vecIdx];
+            dequantScale = scaleSmem[vecIdx] * E2M1_MAX_VALUE_INV;
           } else {
-            localAmax = scales[i + j] * E2M1_MAX_VALUE;
+            dequantScale = scales[i + j];
           }
-          float localScale =
-              localAmax == 0.f ? 0.f : E2M1_MAX_VALUE * reciprocal_approximate_ftz(localAmax);
-          float fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
+          float fp32Scale = dequantScale == 0.f ? 0 : dequantScale * perTokenScaleInv;
           packedOutput |= static_cast<uint32_t>(__nv_fp8_e4m3(fp32Scale).__x) << (j * 8);
         }
         uint32_t vecIdx = scaleVecIdx * SCALES_PER_LOAD + i;
@@ -1094,30 +1094,26 @@ __global__ void scaleOnlyQuantAndPerTokenScaleKernel(
 #pragma unroll
       for (int i = 0; i < SCALES_PER_LOAD; ++i) {
         uint32_t vecIdx = scaleVecIdx * SCALES_PER_LOAD + i;
-        float localAmax;
+        float dequantScale;
         if constexpr (CACHE_SCALE_IN_SMEM) {
-          localAmax = scaleSmem[vecIdx];
+          dequantScale = scaleSmem[vecIdx] * E2M1_MAX_VALUE_INV;
         } else {
-          localAmax = scales[i] * E2M1_MAX_VALUE;
+          dequantScale = scales[i];
         }
-        float localScale =
-            localAmax == 0.f ? 0.f : E2M1_MAX_VALUE * reciprocal_approximate_ftz(localAmax);
-        float fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
+        float fp32Scale = dequantScale == 0.f ? 0 : dequantScale * perTokenScaleInv;
         scaleOutput[getSfOutputOffset(vecIdx)] = __nv_fp8_e4m3(fp32Scale).__x;
       }
     }
   }
   for (uint32_t vecIdx = num_scale_vecs_per_row * SCALES_PER_LOAD + threadIdx.x;
        vecIdx < num_sf_vecs_per_row; vecIdx += blockDim.x) {
-    float localAmax;
+    float dequantScale;
     if constexpr (CACHE_SCALE_IN_SMEM) {
-      localAmax = scaleSmem[vecIdx];
+      dequantScale = scaleSmem[vecIdx] * E2M1_MAX_VALUE_INV;
     } else {
-      localAmax = rowScaleInput[vecIdx] * E2M1_MAX_VALUE;
+      dequantScale = rowScaleInput[vecIdx];
     }
-    float localScale =
-        localAmax == 0.f ? 0.f : E2M1_MAX_VALUE * reciprocal_approximate_ftz(localAmax);
-    float fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
+    float fp32Scale = dequantScale == 0.f ? 0 : dequantScale * perTokenScaleInv;
     scaleOutput[getSfOutputOffset(vecIdx)] = __nv_fp8_e4m3(fp32Scale).__x;
   }
 }
@@ -1188,6 +1184,7 @@ __global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void scaleOnlyQuantAndPerToke
   if (laneIdx == 0) {
     perTokenScaleOutput[rowIdx] = perTokenScale;
   }
+  float const perTokenScaleInv = reciprocal_approximate_ftz(perTokenScale);
 
   int64_t sfOutputRowBase;
   if constexpr (SF_LAYOUT_OUT == QuantizationSFLayout::LINEAR) {
@@ -1212,10 +1209,8 @@ __global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void scaleOnlyQuantAndPerToke
       uint32_t packedOutput = 0;
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        float const localAmax = values[i][groupIdx + j] * E2M1_MAX_VALUE;
-        float const localScale =
-            localAmax == 0.f ? 0.f : E2M1_MAX_VALUE * reciprocal_approximate_ftz(localAmax);
-        float const fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
+        float const dequantScale = values[i][groupIdx + j];
+        float const fp32Scale = dequantScale == 0.f ? 0 : dequantScale * perTokenScaleInv;
         packedOutput |= static_cast<uint32_t>(__nv_fp8_e4m3(fp32Scale).__x) << (j * 8);
       }
       uint32_t const vecIdx = scaleVecIdx * SCALES_PER_LOAD + groupIdx;
