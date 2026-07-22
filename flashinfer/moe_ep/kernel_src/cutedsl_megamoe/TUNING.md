@@ -210,9 +210,40 @@ Takeaways:
   ~512-1024 tok/rank out past 2048 (nvfp4 *loses* at 1024, 0.80-0.83x),
   and the 8192 win shrinks from ~1.6-1.8x to 1.19-1.24x.
 
-Conclusion: treat **4.6.1 as a performance floor**, not just a
+Conclusion (2026-07-15): treat **4.6.1 as a performance floor**, not just a
 compile-compatibility floor — 4.5.2 is functional but leaves ~1.3-1.5x of
 nvfp4 kernel performance on the table.
+**Superseded for nvfp4 on 2026-07-22 by the MR!27 mainloop WAR — see the
+follow-up below.**
+
+### Follow-up 2026-07-22: MR!27 mainloop WAR recovers nvfp4 on 4.5.2
+
+`cutedsl_megamoe` MR!27 (ported in the `4_5_2-perf-fix` branch, single file
+`src/moe_nvfp4_swapab/kernel_fc12.py`) peels the last k-tile out of the
+MMA-consumer mainloop when `cutlass.__version__ == 4.5.2` exactly
+(`cutlass.const_expr`-gated, so 4.6.1+ traces are unchanged). Rerun of the
+same sweep recipe with 4.5.2 pinned (CSVs
+`moe_ep_benchmark/results/sweep_20260722_1125*/1126*/1129*_fi_mega.csv`;
+e2e_pipelined p50 µs, ratio vs same-run dg):
+
+| tok/rank | dg     | nvfp4 bf16     | +combine_nvfp4     |
+|---------:|-------:|---------------:|-------------------:|
+| 8        | 214.0  | 222.5 (0.96x)  | 227.3 (0.94x)      |
+| 512      | 341.4  | 359.3 (0.95x)  | **327.7 (1.04x)**  |
+| 1024     | 469.0  | 428.0 (1.10x)  | **371.7 (1.26x)**  |
+| 2048     | 834.0  | 609.3 (1.37x)  | **533.0 (1.56x)**  |
+| 4096     | 1576.3 | 996.9 (1.58x)  | **885.8 (1.78x)**  |
+| 8192     | 3018.2 | 1859.7 (1.62x) | **1738.7 (1.74x)** |
+
+This matches the 4.6.1 reference table above within run noise at every
+point (e.g. nvfp4 bf16 428.0 vs 428.5 @1024, 609.3 vs 625.6 @2048, 1859.7
+vs 1923.5 @8192), i.e. the 34-54% regression is fully recovered and the
+dg-crossover / large-token win shape is restored. Correctness: the full
+`tests/moe_ep/run_tests.sh all` suite passed under pinned 4.5.2 (all 8
+sections, 2026-07-22, job 2427254). Caveats: the WAR covers only the nvfp4
+swap-AB fc12 kernel — mxfp8 mega on 4.5.2 remains unmeasured — and 4.5.0
+still fails at `cute.compile`, so >=4.6.1 stays the recommended runtime;
+4.5.2 is now an acceptable fallback for nvfp4.
 
 ## The knob system (`shim/tuner.py`, `shim/autotune.py`)
 
