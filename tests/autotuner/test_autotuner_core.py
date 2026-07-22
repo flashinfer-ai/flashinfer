@@ -1045,9 +1045,10 @@ def test_skip_ops_restored_after_context():
 def _build_num_tokens_tuning_config(mapper):
     """Build a TuningConfig that buckets dim 0 of input 0 using *mapper*.
 
-    Two configs built with the same mapper normalize to one nearest-profile key.
-    Distinct mapper objects (for example fresh lambdas) remain distinct because
-    the mapper controls the profile result.
+    Two configs built with the *same* ``mapper`` object are equal and hash-equal
+    (see ``DynamicTensorSpec.__hash__``/``__eq__``), so they collapse to a single
+    ``_find_nearest_profile`` lru_cache key.  Built with distinct ``mapper``
+    objects (e.g. fresh lambdas) they are distinct keys.
     """
     return TuningConfig(
         dynamic_tensor_specs=(
@@ -1062,7 +1063,17 @@ def _build_num_tokens_tuning_config(mapper):
 
 
 def test_find_nearest_profile_cache_dedups_equivalent_configs():
-    """Equivalent rebuilt configs share the normalized profile-cache key."""
+    """Regression test for the _find_nearest_profile lru_cache key.
+
+    ``_find_nearest_profile`` normalizes ``TuningConfig`` to a key containing
+    only fields that affect profile selection. In particular, mapper identity
+    remains significant while tensor initializers are excluded.
+
+    This test holds the input shape FIXED and rebuilds an equivalent config on
+    every iteration, then asserts the cache does NOT grow.  Contrast with
+    ``test_find_nearest_profile_cache_grows_with_fresh_callable`` below, which
+    shows the growth when the profile mapper itself changes on every call.
+    """
     AutoTuner._find_nearest_profile_cached.cache_clear()
 
     shapes = ((1024, 128),)
@@ -1088,7 +1099,8 @@ def test_find_nearest_profile_cache_dedups_equivalent_configs():
     assert cache_growth == 0, (
         f"Cache grew by {cache_growth} entries across {N} calls with equivalent "
         "configs for a fixed shape. Equivalent TuningConfigs must collapse to a "
-        "single normalized cache key."
+        "single cache key — a per-call lambda/closure for map_to_tuning_buckets "
+        "reintroduces the unbounded-growth leak."
     )
 
 
