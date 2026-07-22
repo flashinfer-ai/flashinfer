@@ -125,6 +125,16 @@ This is the actual point of the exercise. Checks, each cheap and scriptable:
      "built artifact changed across `build()`", which is what the harness
      now does; raw `build()` invocations are reported separately as the
      warm-start overhead metric (`jit_build_calls`).
+- **2026-07-21** — Phase 1 validated on B200 (computelab, CI cu130 image):
+  - Cold cache: Qwen3-0.6B smoke run 1 compiled 4 modules (batch_prefill,
+    rope, page, silu_and_mul; 57.8 s), run 2 compiled **0** (6.4 s) —
+    cross-process cache reuse confirmed; greedy outputs identical; zero
+    steady-state builds. `smoke_test.py` exit 0.
+  - Qwen3-8B (36 layers): coherent batch-3 completions, ~316 tok/s decode
+    (uninstrumented loop, not a benchmark), zero compiles — same kernel URIs
+    as 0.6B (head_dim 128, BF16).
+  - Note: decode with `use_tensor_cores=True` shares the prefill module, so
+    the dense BF16 path needs only 4 JIT modules end to end.
 
 ## Roadmap
 
