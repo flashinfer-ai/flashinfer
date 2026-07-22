@@ -4130,7 +4130,7 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
 
       moe::dev::routing::routingDeepSeek::Data data;
       data.mDtypeOutput =
-          topk_weights.value().dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+          metadata[kExpertWeights].dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
       data.mDtypeBias = mRoutingBiasDtype;
       data.mDtypeInput = btg::Dtype::Fp32;
       data.mUsePdl = false;

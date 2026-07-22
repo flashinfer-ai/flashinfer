@@ -185,7 +185,12 @@ def candidate_tile_sizes(
 def normalize_tactic(execution: DAExecution, tactic: Any) -> Any:
     """Reject a stale tactic whose tile is not valid for this runner profile."""
 
-    if tactic == -1 or not hasattr(tactic, "__getitem__") or len(tactic) == 0:
+    if (
+        not execution.config.enabled
+        or tactic == -1
+        or not hasattr(tactic, "__getitem__")
+        or len(tactic) == 0
+    ):
         return tactic
     valid_tiles = candidate_tile_sizes(execution, execution.invocation.num_tokens)
     return tactic if int(tactic[0]) in valid_tiles else -1

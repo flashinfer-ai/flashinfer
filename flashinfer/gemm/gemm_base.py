@@ -53,6 +53,11 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
+from .gemm_mm_fp4_cute_dsl import (
+    _compile_block_scaled_gemm,
+    _mm_fp4_cache_key,
+    precompile_mm_fp4_tactics,
+)
 from .kernels.utils import (
     _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
     _SM100_MMA_TILER_MN_CANDIDATES,
@@ -60,6 +65,7 @@ from .kernels.utils import (
     _select_sm100_mm_fp4_cute_dsl_tactic,
 )
 from ..utils import (
+    get_device_index,
     get_device_sm_count,
     get_native_fp4_dtype,
     is_sm100a_supported,
@@ -126,11 +132,6 @@ _CUBLASLT_MAX_ALGOS = 100
 
 # Error messages
 CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120/SM121 with cuDNN backend version < 9.14.0."
-
-_TORCH_TO_CUTLASS_DTYPE_ATTR = {
-    torch.bfloat16: "BFloat16",
-    torch.float16: "Float16",
-}
 
 
 def _match_sm_version(device: torch.device, sm_version: list[str]):
@@ -4683,113 +4684,6 @@ def _get_sm100_block_scaled_tactics(
     return valid_tactics
 
 
-def _compile_block_scaled_gemm(
-    cache,
-    cache_key,
-    make_gemm_kernel,
-    ab_cutlass_dtype,
-    sf_dtype,
-    c_cutlass_dtype,
-    ab_assumed_align,
-    cluster_shape_mn,
-    swap_ab,
-    sf_m,
-    sf_n,
-    sf_k,
-    batch_size,
-    cluster_shape_k=1,
-):
-    """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
-
-    ``make_gemm_kernel`` is a zero-arg callable that returns a kernel instance
-    (Sm100 or Sm103).  It is only invoked on a cache miss.
-
-    TVM-FFI compilation pattern:
-      - A, B, C, alpha: make_fake_compact_tensor -> torch tensors
-        passed directly at runtime via TVM-FFI C-level dlpack
-      - SF tensors: make_ptr (complex 6D BlockScaledBasicChunk
-        layout can't be expressed as torch tensor) -> data_ptr() at runtime
-      - Stream: make_fake_stream -> automatic env stream at runtime
-
-    For FP4 runners, ``ab_cutlass_dtype`` is ``Uint8`` because FP4 data is
-    stored as uint8 in torch (2 FP4 values per byte); the kernel wrapper
-    recasts from Uint8 to Float4E2M1FN internally.
-    """
-    if cache_key in cache:
-        return cache[cache_key]
-
-    import cutlass
-    import cutlass.cute as cute
-
-    from cutlass.cute.runtime import make_ptr
-    from flashinfer.cute_dsl.utils import get_max_active_clusters
-
-    gemm = make_gemm_kernel()
-
-    sym_m = cute.sym_int()
-    sym_k = cute.sym_int()
-    sym_n = cute.sym_int()
-
-    a_fake = cute.runtime.make_fake_compact_tensor(
-        ab_cutlass_dtype,
-        (sym_m, sym_k),
-        stride_order=(1, 0),
-        assumed_align=ab_assumed_align,
-    )
-    b_fake = cute.runtime.make_fake_compact_tensor(
-        ab_cutlass_dtype,
-        (sym_n, sym_k),
-        stride_order=(1, 0),
-        assumed_align=ab_assumed_align,
-    )
-    if swap_ab:
-        c_fake = cute.runtime.make_fake_compact_tensor(
-            c_cutlass_dtype,
-            (sym_n, sym_m),
-            stride_order=(0, 1),
-            assumed_align=16,
-        )
-    else:
-        c_fake = cute.runtime.make_fake_compact_tensor(
-            c_cutlass_dtype,
-            (sym_m, sym_n),
-            stride_order=(1, 0),
-            assumed_align=16,
-        )
-
-    a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
-    b_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
-    alpha_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (1,), assumed_align=4
-    )
-
-    launch_cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1] * cluster_shape_k
-    max_active_clusters = get_max_active_clusters(launch_cluster_size)
-    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-
-    compiled_gemm = cute.compile(
-        gemm.wrapper,
-        a_fake,
-        b_fake,
-        c_fake,
-        sf_m,
-        sf_n,
-        sf_k,
-        batch_size,
-        a_sf_ptr,
-        b_sf_ptr,
-        alpha_fake,
-        max_active_clusters,
-        stream_fake,
-        swap_ab,
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
-
-    result = (compiled_gemm, max_active_clusters)
-    cache[cache_key] = result
-    return result
-
-
 _CUTE_DSL_ALPHA_ONE_CACHE: dict = {}
 
 
@@ -4846,13 +4740,14 @@ def _cute_dsl_gemm_mxfp8_runner(
             "Supported: torch.bfloat16, torch.float16."
         )
 
-    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
-    if cutlass_dtype_attr is None:
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+
+    if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
             f"cute_dsl mm_mxfp8 does not support output dtype {out_dtype}. "
             "Supported: torch.bfloat16, torch.float16."
         )
-    c_cutlass_dtype = getattr(cutlass, cutlass_dtype_attr)
+    c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
     _ = sm_major, sm_minor
 
     class CuteDSLMxfp8GemmRunner(TunableRunner):
@@ -5918,15 +5813,14 @@ def _cute_dsl_gemm_fp4_runner(
     #     except ImportError:
     #         pass
 
-    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
-    c_cutlass_dtype = (
-        getattr(cutlass, cutlass_dtype_attr) if cutlass_dtype_attr is not None else None
-    )
-    if c_cutlass_dtype is None:
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+
+    if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
             f"cute_dsl backend does not support output dtype {out_dtype}. "
             f"Supported: torch.bfloat16, torch.float16."
         )
+    c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
 
     class CuteDSLFp4GemmRunner(TunableRunner):
         """TunableRunner for CuTe DSL block-scaled FP4 dense GEMM.
@@ -6078,6 +5972,26 @@ def _cute_dsl_gemm_fp4_runner(
             sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
             batch_size = 1
 
+            if do_preparation:
+                try:
+                    precompile_mm_fp4_tactics(
+                        self.get_valid_tactics(inputs, None),
+                        m,
+                        n,
+                        real_k,
+                        use_nvfp4,
+                        enable_pdl,
+                        out_dtype,
+                        _CUTE_DSL_MM_FP4_KERNEL_CACHE,
+                        a.device,
+                    )
+                except Exception as e:  # noqa: BLE001 -- serial fallback is intentional
+                    logger.warning(
+                        f"[mm_fp4 cute-dsl] tactic precompilation failed "
+                        f"({type(e).__name__}: {e}); tactics will compile "
+                        f"serially during profiling."
+                    )
+
             if tactic is None or tactic == -1:
                 # Use analytical heuristic to pick the best tactic based on
                 # tile and wave quantization efficiency.
@@ -6112,17 +6026,7 @@ def _cute_dsl_gemm_fp4_runner(
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            cache_key = (
-                sf_vec_size,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                swap_ab,
-                use_prefetch,
-                kernel_type,
-                use_tma_store,
-                enable_pdl,
-                out_dtype,
-            )
+            cache_key = _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype)
 
             if kernel_type == "sm103" and Sm103Kernel is not None:
                 make_kernel = lambda: Sm103Kernel(
@@ -6155,6 +6059,8 @@ def _cute_dsl_gemm_fp4_runner(
                 sf_n=sf_n,
                 sf_k=sf_k,
                 batch_size=batch_size,
+                cache_module_name="mm_fp4",
+                device_index=get_device_index(a.device),
             )
 
             alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
@@ -6205,15 +6111,14 @@ def _b12x_gemm_fp4_runner(
         _select_default_dense_gemm_plan,
     )
 
-    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
-    c_cutlass_dtype = (
-        getattr(cutlass, cutlass_dtype_attr) if cutlass_dtype_attr is not None else None
-    )
-    if c_cutlass_dtype is None:
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+
+    if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
             f"b12x backend does not support output dtype {out_dtype}. "
             f"Supported: torch.bfloat16, torch.float16."
         )
+    c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
 
     def _default_dense_plan(m, n, real_k, device):
         return _select_default_dense_gemm_plan(

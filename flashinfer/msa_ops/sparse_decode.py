@@ -213,8 +213,18 @@ def msa_sparse_decode_attention(
     seqlen_q : int
         Uniform query length per request (e.g. 1, or >1 for speculative
         decoding).
+    page_table : torch.Tensor, optional
+        Page-table mapping for paged KV layout.
+    seqused_k : torch.Tensor, optional
+        Per-sequence valid KV-token counts for paged KV layout.
+    cu_seqlens_k : torch.Tensor, optional
+        ``(batch_size + 1,)`` int32 cumulative KV lengths for ragged KV layout.
     causal : bool
         Right-aligned causal masking (default True for decode).
+    softmax_scale : float, optional
+        Overrides the default attention scaling factor.
+    return_softmax_lse : bool
+        If ``True``, also return per-query log-sum-exp values.
     k_scale, v_scale : torch.Tensor, optional
         NVFP4 only: e4m3 block scales as uint8 bytes in the swizzled 128x4
         layout produced by :func:`flashinfer.nvfp4_quantize` (one scale per
@@ -224,6 +234,10 @@ def msa_sparse_decode_attention(
     k_global_scale, v_global_scale : float, optional
         NVFP4 global dequant scales; folded into the softmax scale and the
         output scale respectively, so the kernel applies only block scales.
+    q_offset : int or torch.Tensor, optional
+        Optional query-position offset used by causal alignment.
+    partial_dtype : torch.dtype, optional
+        Accumulator / partial-result dtype override for supported kernels.
     force_fused : bool, optional
         Override the adaptive split-K decision. By default each token's selected
         list is split into chunks (one CTA per chunk online-softmaxes its blocks

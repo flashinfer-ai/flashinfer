@@ -1843,7 +1843,7 @@ def test_fp4_logits_da_graph_replays_packed_metadata(monkeypatch, precision):
         )
         da_context = config_key[1]
         tactics_by_tile = {}
-        for cache_key, (_, tactic, _) in tuner.profiling_cache.items():
+        for cache_key, (tactic, _) in tuner.profiling_cache.items():
             op_name = (
                 cache_key.custom_op if hasattr(cache_key, "custom_op") else cache_key[0]
             )
@@ -2430,7 +2430,7 @@ def _clear_da_test_state(tuner: AutoTuner) -> None:
 
 def _collect_profile_latencies(tuner: AutoTuner) -> dict[int, dict[int, float]]:
     out: dict[int, dict[int, float]] = {}
-    for cache_key, (_runner_id, tactic, _profile) in tuner.profiling_cache.items():
+    for cache_key, (tactic, _profile) in tuner.profiling_cache.items():
         if hasattr(cache_key, "custom_op"):
             op_name = cache_key.custom_op
             runner_name = cache_key.runner_class_name
@@ -2936,7 +2936,7 @@ class _BaselineLookupContext:
 
 def _baseline_lookup_tuner(entries):
     class _Tuner:
-        profiling_cache = {key: (0, tactic, None) for key, tactic, _ in entries}
+        profiling_cache = {key: (tactic, None) for key, tactic, _ in entries}
         profiling_time_cache = {key: latency for key, _, latency in entries}
 
     return _Tuner()

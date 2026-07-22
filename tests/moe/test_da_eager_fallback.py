@@ -84,6 +84,13 @@ def test_da_eager_lookup_does_not_start_hidden_tuning():
     assert tuner.calls[0][2].default_value_buckets is None
 
 
+def test_noda_tactic_bypasses_da_normalization():
+    execution = SimpleNamespace(config=SimpleNamespace(enabled=False))
+    tactic = [4096, 0]
+
+    assert da_core.normalize_tactic(execution, tactic) is tactic
+
+
 def test_verbose_eager_da_warns_without_graph_capture(monkeypatch, capsys):
     execution = SimpleNamespace(
         config=SimpleNamespace(enabled=True, verbose=True),

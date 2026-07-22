@@ -158,3 +158,76 @@ def test_nvfp4_kernel_name_is_symbol_safe():
     for cfg in (None, NVFP44Over6Config(err_mode="MSE")):
         name = _nvfp4_kernel_name(**{**NVFP4_NAME_BASELINE, "nvfp4_4over6_config": cfg})
         assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+# ---------------------------------------------------------------------------
+# mm_fp4 (flashinfer/gemm/gemm_mm_fp4_cute_dsl.py) cache adopter
+# ---------------------------------------------------------------------------
+
+import torch  # noqa: E402
+
+from flashinfer.gemm.gemm_mm_fp4_cute_dsl import (  # noqa: E402
+    _blockscaled_kernel_disk_name,
+    _mm_fp4_cache_key,
+)
+
+# A baseline argument set and, for each argument, a distinct alternative.
+MM_FP4_NAME_BASELINE = {
+    "sf_vec_size": 16,
+    "mma_tiler_mn": (256, 128),
+    "cluster_shape_mn": (2, 1),
+    "swap_ab": False,
+    "use_prefetch": False,
+    "kernel_type": "sm100",
+    "use_tma_store": None,
+    "enable_pdl": False,
+    "out_dtype": torch.bfloat16,
+    "batch_size": 1,
+    "max_active_clusters": 74,
+}
+MM_FP4_NAME_PERTURBED = {
+    "sf_vec_size": 32,
+    "mma_tiler_mn": (128, 256),  # transpose of baseline: catches mixed-up axes
+    "cluster_shape_mn": (1, 2),
+    "swap_ab": True,
+    "use_prefetch": True,
+    "kernel_type": "sm103",
+    "use_tma_store": True,
+    "enable_pdl": True,
+    "out_dtype": torch.float16,
+    "batch_size": 2,
+    "max_active_clusters": 148,
+}
+
+
+def _mm_fp4_name(**kwargs):
+    tactic = (
+        kwargs["mma_tiler_mn"],
+        kwargs["cluster_shape_mn"],
+        kwargs["swap_ab"],
+        kwargs["use_prefetch"],
+        kwargs["kernel_type"],
+        kwargs["use_tma_store"],
+    )
+    cache_key = _mm_fp4_cache_key(
+        kwargs["sf_vec_size"], tactic, kwargs["enable_pdl"], kwargs["out_dtype"]
+    )
+    return _blockscaled_kernel_disk_name(
+        cache_key, kwargs["batch_size"], kwargs["max_active_clusters"]
+    )
+
+
+@pytest.mark.parametrize("param", sorted(MM_FP4_NAME_BASELINE))
+def test_mm_fp4_kernel_name_varies_with_every_argument(param):
+    """Changing any single codegen argument must change the kernel name, and
+    names must be symbol-safe as produced (see the nvfp4 twins above)."""
+    baseline_name = _mm_fp4_name(**MM_FP4_NAME_BASELINE)
+    kwargs = dict(MM_FP4_NAME_BASELINE)
+    kwargs[param] = MM_FP4_NAME_PERTURBED[param]
+    perturbed_name = _mm_fp4_name(**kwargs)
+    assert perturbed_name != baseline_name, (
+        f"_blockscaled_kernel_disk_name ignores argument {param!r}: two "
+        "different kernel specializations would collide on one cache artifact."
+    )
+    for name in (baseline_name, perturbed_name):
+        assert re.fullmatch(r"[0-9A-Za-z_]+", name), name

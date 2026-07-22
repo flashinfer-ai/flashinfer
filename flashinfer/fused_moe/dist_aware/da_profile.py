@@ -830,7 +830,7 @@ def cached_profile_tactics(
 
     latencies: Dict[Tuple[int, int], Dict[int, float]] = {}
     tuner = AutoTuner.get()
-    for cache_key, (_runner_id, tactic, _profile) in tuner.profiling_cache.items():
+    for cache_key, (tactic, _profile) in tuner.profiling_cache.items():
         op_name, runner_name, _runner_hash, profile_key = _profiling_cache_key_parts(
             cache_key
         )
@@ -935,7 +935,7 @@ def populate_per_tile_tactics_from_autotune(
     }
 
     per_bucket_tile_best: Dict[int, Dict[int, Tuple[int, float]]] = {}
-    for cache_key, (_runner_id, tactic, _profile) in tuner.profiling_cache.items():
+    for cache_key, (tactic, _profile) in tuner.profiling_cache.items():
         stats["total"] += 1
         op_name, runner_name, cached_hash, profile_key = _profiling_cache_key_parts(
             cache_key
@@ -1031,11 +1031,7 @@ def best_static_tactic_from_profiles(
 
     best_exact: Optional[Tuple[Tuple[int, int], float]] = None
     best_compatible: Optional[Tuple[Tuple[int, int], float]] = None
-    for profile_cache_key, (
-        _runner_id,
-        tactic,
-        _profile,
-    ) in tuner.profiling_cache.items():
+    for profile_cache_key, (tactic, _profile) in tuner.profiling_cache.items():
         op_name, cached_runner_name, cached_runner_hash, profile_key = (
             _profiling_cache_key_parts(profile_cache_key)
         )
@@ -1510,7 +1506,7 @@ def auto_profile_knn_exemplars(
 
     cached_latencies: Dict[Tuple[int, int], Dict[int, float]] = {}
     tuner = AutoTuner.get()
-    for cache_key, (_runner_id, tactic, _profile) in tuner.profiling_cache.items():
+    for cache_key, (tactic, _profile) in tuner.profiling_cache.items():
         op_name, runner_name, cached_hash, profile_key = _profiling_cache_key_parts(
             cache_key
         )
