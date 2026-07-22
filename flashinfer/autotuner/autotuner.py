@@ -1494,26 +1494,40 @@ class AutoTuner:
     def _winner_cache(self) -> dict:
         """In-memory winner-cache partition for the active MEASUREMENT identity.
 
-        Winners selected under one measurement policy must not short-circuit
-        tuning (or serving) under another: a graph-timed winner is not an
-        eager winner.  The partition follows the policy's manifest fields —
-        the same fields that isolate the on-disk environment — while disk
-        *targeting* separately follows the store stack.  With no
-        non-default policy active this is the plain v1 ``profiling_cache``
-        (byte-identical legacy behavior, and what v1 ``save_configs``
-        serializes).
+        Winners must only be served under the identity they were tuned for
+        (a graph-timed winner is not an eager winner; root A's winners are
+        not root B's):
+
+        - a targeted (context) or ambient store -> partition by that
+          store's ``(root, env_hash)`` — the measurement policy is already
+          part of the env hash;
+        - no store but an explicit MeasurementPolicy -> partition by the
+          policy's manifest fields;
+        - otherwise (pure v1 flows) -> the plain v1 ``profiling_cache``
+          (byte-identical legacy behavior, and what v1 ``save_configs``
+          serializes).
+
+        Bare serving thus reads the AMBIENT store's partition — never a
+        stale winner tuned under a different identity that happens to sit
+        in legacy memory — and switching ``cache_root`` repopulates instead
+        of silently reusing the old root's winners.
         """
-        policy = self._effective_measure_policy
-        fields = (
-            tuple(sorted(policy.manifest_fields().items()))
-            if policy is not None
-            else ()
-        )
-        if not fields:
-            return self.profiling_cache
-        part = self._winner_partitions.get(fields)
+        store = self._active_managed_store
+        if store is not None:
+            key: tuple = (str(store.root), store.env_hash)
+        else:
+            policy = self._effective_measure_policy
+            fields = (
+                tuple(sorted(policy.manifest_fields().items()))
+                if policy is not None
+                else ()
+            )
+            if not fields:
+                return self.profiling_cache
+            key = ("__policy__", *fields)
+        part = self._winner_partitions.get(key)
         if part is None:
-            part = self._winner_partitions[fields] = {}
+            part = self._winner_partitions[key] = {}
         return part
 
     def _get_skip_ops_stack(self) -> list[frozenset[str]]:
@@ -1647,6 +1661,12 @@ class AutoTuner:
                 runner_keys.append((r_id, cache_key))
                 if cache_key in winners:
                     tactic, stored_profile = winners[cache_key]
+                    if not self._tactic_still_valid(
+                        r, inputs, tactic, custom_op, "memory"
+                    ):
+                        # Fall through: another runner, a disk source, or
+                        # (in tuning mode) a re-profile may still serve.
+                        continue
                     return True, r_id, tactic, stored_profile
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...))
@@ -1931,10 +1951,13 @@ class AutoTuner:
                     for param in inspect.signature(r.forward).parameters.values()
                 }
 
-            # Regression guard (autotune_v2 contexts): the default path
-            # (runners[0], tactic=-1) always races as a candidate, so a
-            # tuned-and-persisted selection can structurally never lose to
-            # not tuning (the slower-than-default class of #3537/#3622).
+            # Default-candidate coverage (autotune_v2 contexts): the default
+            # path (runners[0], tactic=-1) always races as a candidate, so a
+            # tuned-and-persisted selection cannot lose to not tuning AT THE
+            # PROBE inputs.  It is not a full regression guard: if the
+            # synthetic probe misrepresents serving (routing distribution /
+            # EP-sharded M, the #3622/#3537 class), the comparison itself is
+            # off — representative probe construction is op-level work.
             # Scoped to v2 so plain autotune() selection is byte-identical.
             race_default = bool(self._get_store_stack())
 

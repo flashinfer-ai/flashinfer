@@ -280,9 +280,10 @@ def test_persist_false_disables_disk(cache_root, monkeypatch):
 
 
 def test_v2_disk_entries_cannot_leak_into_v1_file(cache_root, monkeypatch, tmp_path):
-    """No mixing by construction: an entry served from the v2 store lives
-    only inside the backend's memo, so a later v1 save_configs can never
-    write it into the user's v1 JSON file."""
+    """No mixing by construction: winners tuned inside a v2 context belong
+    to the v2 identity (its store partition + its store on disk), so a
+    nested v1 save_configs can never write them — or any v2-store entry —
+    into the user's v1 JSON file."""
     _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})  # _OP -> v2 disk
 
     # Fresh "process": _OP is served from the v2 store, then a nested v1
@@ -301,8 +302,14 @@ def test_v2_disk_entries_cannot_leak_into_v1_file(cache_root, monkeypatch, tmp_p
                 other_op, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
             )
     keys = [k for k in json.loads(v1_path.read_text()) if not k.startswith("_")]
-    assert any(other_op in k for k in keys)  # v1 saved its own tuning result
+    # The nested tuning ran under the v2 context's identity (its policy
+    # governed the measurement), so its winner persists in the v2 store,
+    # not the v1 file.
+    assert not any(other_op in k for k in keys)
     assert not any(_OP in k for k in keys)  # v2-store entry never leaked in
+    assert any(
+        other_op in json.loads(e.read_text())["key"] for e in _entry_files(cache_root)
+    )
 
 
 def test_serving_after_context_exit_reuses_entries(cache_root, monkeypatch):
@@ -776,3 +783,82 @@ def test_invalid_cached_tactic_is_a_loud_miss(cache_root, monkeypatch):
             _OP, [DummyRunnerRejecting()], _CONFIG, [torch.zeros(8, 16)]
         )
     assert len(calls) > 0
+
+
+def _policy_dependent_profile(monkeypatch):
+    """Fake profiler where the eager-measured winner differs from default."""
+    calls = []
+
+    def fake_profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        policy = self._effective_measure_policy
+        mode = policy.execution_mode if policy is not None else "auto"
+        calls.append((mode, tactic))
+        times = {-1: 5.0, 0: 1.0, 1: 2.0, 2: 3.0}
+        if mode == "eager":
+            times = {-1: 5.0, 0: 2.0, 1: 1.0, 2: 3.0}
+        return times[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    return calls
+
+
+def test_bare_serving_after_policy_context_uses_ambient_identity(
+    cache_root, monkeypatch
+):
+    """P1 (codex round 3): after an eager-policy context exits, bare serving
+    must serve the ambient (eager) identity's winner — never a winner tuned
+    under a different identity that sits in legacy memory."""
+    _policy_dependent_profile(monkeypatch)
+    inputs = [torch.zeros(8, 16)]
+    with autotune_v2():
+        _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    assert tactic == 0  # default-identity winner
+
+    with autotune_v2(measure=MeasurementPolicy(execution_mode="eager")):
+        _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    assert tactic == 1  # eager-identity winner
+
+    # Bare call: ambient store is the eager one -> must serve 1, not 0.
+    _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    assert tactic == 1
+
+
+def test_cache_root_switch_repopulates(cache_root, monkeypatch, tmp_path):
+    """P1 (codex round 3): switching cache_root must not silently reuse the
+    old root's in-memory winners — the new root gets populated."""
+    _install_fake_profile(monkeypatch, times={-1: 5.0, 0: 3.0, 1: 1.0, 2: 2.0})
+    inputs = [torch.zeros(8, 16)]
+    root_b = tmp_path / "root_b"
+    with autotune_v2():
+        AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    assert len(_entry_files(cache_root)) == 1
+
+    with autotune_v2(cache_root=root_b):
+        _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    assert tactic == 1
+    assert len(list(root_b.glob("v2/*/entries/*.json"))) == 1  # B populated
+
+
+class DummyRunnerFlippable(DummyRunner):
+    def __init__(self, valid_tactics=(0, 1, 2)):
+        super().__init__(valid_tactics)
+        self.reject = False
+
+    def validate_tactic(self, inputs, tactic):
+        return not self.reject
+
+
+def test_in_memory_winner_is_revalidated_same_process(cache_root, monkeypatch):
+    """P1 (codex round 3): a winner tuned earlier in THIS process is also
+    revalidated — a runtime shape the runner now rejects becomes a loud
+    fallback, not a blind replay (#3566 without a restart)."""
+    _install_fake_profile(monkeypatch, times={-1: 5.0, 0: 3.0, 1: 1.0, 2: 2.0})
+    runner = DummyRunnerFlippable()
+    inputs = [torch.zeros(8, 16)]
+    with autotune_v2():
+        _, tactic = AutoTuner.get().choose_one(_OP, [runner], _CONFIG, inputs)
+    assert tactic == 1
+
+    runner.reject = True  # e.g. a runtime shape this plan cannot serve
+    _, tactic = AutoTuner.get().choose_one(_OP, [runner], _CONFIG, inputs)
+    assert tactic == -1  # memory AND disk hits rejected -> clean fallback
