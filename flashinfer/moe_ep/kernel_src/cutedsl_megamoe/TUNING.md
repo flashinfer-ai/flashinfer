@@ -271,6 +271,17 @@ headline pair were re-measured on 4.5.2 and adopted as the current
 reference numbers — see "Microbenchmark results (2026-07-22)" and the
 end-to-end section above.
 
+The two published versions between 4.5.2 and 4.6.1 were also measured
+(dg + nvfp4 @1024/2048/8192, `sweep_20260722_132849/133055_fi_mega.csv`):
+**4.5.3 (424.4/613.3/1933.3 µs) and 4.6.0 (427.0/614.1/1922.0 µs) both
+match the fast reference** — the codegen regression existed only in
+4.5.2 and was fixed upstream in 4.5.3, so the WAR's exact `== 4.5.2` gate
+is correct and every published version >= 4.5.2 runs at full performance.
+
+Support statement: **>= 4.5.2 at full performance** (4.5.2 via the MR!27
+WAR; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
+(4.5.0 fails at `cute.compile`, 4.5.1 unmeasured — the shim warns).
+
 ## The knob system (`shim/tuner.py`, `shim/autotune.py`)
 
 - `tuner.py` mirrors the kernel team's `tester/solvers/inference_solver.py`
