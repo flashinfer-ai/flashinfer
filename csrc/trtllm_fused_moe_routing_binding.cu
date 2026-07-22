@@ -37,8 +37,10 @@ using tvm::ffi::TensorView;
  *
  *   routing_logits              : [num_tokens, num_experts] float32 or bfloat16
  *   routing_bias                : [num_experts] float32 or bfloat16 (optional)
- *   topk_packed                 : [num_tokens, top_k + num_fused_shared_experts] int32 (output)
- *                                 PackedScoreIdx layout: (idx << 16) | bf16 score bits
+ *   topk_packed                 : [num_tokens, top_k + num_fused_shared_experts] int32 (scratch)
+ *                                 PackedScoreIdx pipeline scratch, layout (score << 16) | idx;
+ *                                 contents are an internal intermediate, NOT the final selection
+ *                                 (expert ids are reconstructed from the permutation in Python)
  *   topk_weights                : [num_tokens, top_k + num_fused_shared_experts] bfloat16 (output)
  *   expert_count_histogram      : [>= max(2 * total_num_experts, 512)] int32 (scratch/output)
  *   total_num_padded_tokens     : [1] int32 (output)
@@ -113,6 +115,8 @@ void trtllm_gen_routing(TensorView routing_logits, Optional<TensorView> routing_
     TVM_FFI_ICHECK(t.numel() >= min_numel)
         << name << " must have at least " << min_numel << " elements, got " << t.numel();
   };
+  // topk_packed is required pipeline scratch even though its contents are not
+  // surfaced (RoutingKernel.h: "required if the number of tokens is large").
   check_i32_output(topk_packed, "topk_packed", num_tokens * total_experts_per_token);
   check_i32_output(expert_count_histogram, "expert_count_histogram", histogram_size);
   check_i32_output(total_num_padded_tokens, "total_num_padded_tokens", 1);

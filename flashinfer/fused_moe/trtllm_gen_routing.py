@@ -70,13 +70,16 @@ class TrtllmGenRoutingResult(NamedTuple):
     remaining fields are the permutation/bookkeeping tensors the fused MoE
     kernels consume; entries beyond the actual padded count (see
     ``total_num_padded_tokens``) are undefined.
+
+    In from-logits mode the routing kernels never emit expert ids directly —
+    expert identity lives in the permuted layout. ``topk_ids`` is therefore
+    reconstructed on the torch side: permuted slot ``p`` belongs to CTA tile
+    ``p // tile_tokens_dim``, and ``cta_idx_xy_to_batch_idx`` maps each CTA
+    tile to its expert.
     """
 
-    topk_ids: torch.Tensor  # [num_tokens, top_k + nfse] int32
+    topk_ids: torch.Tensor  # [num_tokens, top_k + nfse] int32, -1 for inactive slots
     topk_weights: torch.Tensor  # [num_tokens, top_k + nfse] bfloat16
-    topk_packed: (
-        torch.Tensor
-    )  # [num_tokens, top_k + nfse] int32, (id << 16) | bf16 bits
     total_num_padded_tokens: torch.Tensor  # [1] int32
     expanded_idx_to_permuted_idx: torch.Tensor  # [num_tokens, top_k + nfse] int32
     permuted_idx_to_token_idx: torch.Tensor  # [max_num_padded_tokens] int32
@@ -259,8 +262,8 @@ def trtllm_gen_routing(
     Returns
     -------
     TrtllmGenRoutingResult
-        Named tuple with expert selection (``topk_ids``, ``topk_weights``,
-        ``topk_packed``) and permutation/bookkeeping tensors
+        Named tuple with expert selection (``topk_ids``, ``topk_weights``)
+        and permutation/bookkeeping tensors
         (``total_num_padded_tokens``, ``expanded_idx_to_permuted_idx``,
         ``permuted_idx_to_token_idx``, ``cta_idx_xy_to_batch_idx``,
         ``cta_idx_xy_to_mn_limit``, ``num_non_exiting_ctas``).
@@ -269,6 +272,11 @@ def trtllm_gen_routing(
     -----
     ``topk_weights`` is always ``bfloat16``: the routing dispatcher hard-codes
     its output dtype regardless of the logits dtype.
+
+    ``topk_ids`` is reconstructed from the permutation (the kernels emit no
+    direct id output in from-logits mode): permuted slot ``p`` lies in CTA
+    tile ``p // tile_tokens_dim``, whose expert is
+    ``cta_idx_xy_to_batch_idx[p // tile_tokens_dim] + local_expert_offset``.
     """
     device = routing_logits.device
     num_tokens, num_experts = routing_logits.shape
@@ -326,14 +334,22 @@ def trtllm_gen_routing(
         enable_pdl,
     )
 
-    # PackedScoreIdx<bf16> layout: low 16 bits = bf16 score, high 16 bits =
-    # int16 expert id; arithmetic >> 16 sign-extends the id.
-    topk_ids = topk_packed >> 16
+    # Reconstruct expert ids from the permuted layout: slot p -> CTA tile
+    # p // tile_tokens_dim -> expert. cta_idx_xy_to_batch_idx holds the
+    # *local* expert index of each CTA tile. Slots with e2p < 0 (experts
+    # outside the local shard) get id -1.
+    e2p = expanded_idx_to_permuted_idx.long()
+    active = e2p >= 0
+    experts_of_cta = cta_idx_xy_to_batch_idx.long() + local_expert_offset
+    topk_ids = torch.where(
+        active,
+        experts_of_cta[e2p.clamp(min=0) // tile_tokens_dim],
+        torch.full_like(e2p, -1),
+    ).to(torch.int32)
 
     return TrtllmGenRoutingResult(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
-        topk_packed=topk_packed,
         total_num_padded_tokens=total_num_padded_tokens,
         expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
         permuted_idx_to_token_idx=permuted_idx_to_token_idx,
