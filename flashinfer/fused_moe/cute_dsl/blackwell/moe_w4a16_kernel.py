@@ -1701,6 +1701,11 @@ class Sm100W4A16GroupedGemmKernel:
                             gated_tTR_tAcc_mn,
                             gated_tTR_rAcc,
                         )
+                        if gated_subtile_idx == gated_subtile_cnt - 1:
+                            cute.arch.fence_view_async_tmem_load()
+                            with cute.arch.elect_one():
+                                acc_pipeline.consumer_release(acc_consumer_state)
+                            acc_consumer_state.advance()
                         num_prev_subtiles += 1
                         c_buffer = num_prev_subtiles % self.num_c_stage
                         gated_identity_mn = gated_tTR_identity_base[
@@ -1814,6 +1819,11 @@ class Sm100W4A16GroupedGemmKernel:
                     # Load accumulator from tensor memory buffer to register
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+                    if subtile_idx == subtile_cnt - 1:
+                        cute.arch.fence_view_async_tmem_load()
+                        with cute.arch.elect_one():
+                            acc_pipeline.consumer_release(acc_consumer_state)
+                        acc_consumer_state.advance()
 
                     if cutlass.const_expr(self.fuse_activation):
                         alpha_f32 = cutlass.Float32(alpha_val)
@@ -1975,10 +1985,6 @@ class Sm100W4A16GroupedGemmKernel:
                             cute.flatten(tTR_gC[(None, None, None, subtile_idx)]),
                             pred=cute.flatten(tCpC),
                         )
-                # Async arrive accumulator buffer empty
-                with cute.arch.elect_one():
-                    acc_pipeline.consumer_release(acc_consumer_state)
-                acc_consumer_state.advance()
                 # Advance to next tile
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
