@@ -143,11 +143,18 @@ This is the actual point of the exercise. Checks, each cheap and scriptable:
 
 ## Roadmap
 
-- **Phase 1 (this change):** dense single-GPU example (Qwen3 0.6B–32B,
+- **Phase 1 (done):** dense single-GPU example (Qwen3 0.6B–32B,
   Llama-family), paged-KV prefill/decode, sampling, smoke harness; validate
   on B200.
-- **Phase 2:** MoE variant (Qwen3-30B-A3B) exercising `fused_moe`; FP8/FP4
-  weight-quantized linear via the shared `flashinfer_modules.py` backends.
+- **Phase 2 (in progress):** `qwen3_moe` support through
+  `fused_moe.cutlass_fused_moe` (BF16 SwiGLU experts, external
+  softmax→top-k→renorm routing mirroring the HF reference), plus
+  `reference_check.py`: tiny random-weight dense/MoE checkpoints built with
+  `transformers`, our last-token prefill logits asserted against
+  transformers eager within a relative-L2 tolerance. The tiny MoE exercises
+  the identical kernel path as Qwen3-30B-A3B, so no large download is needed
+  for functional verification. Remaining: FP8/FP4 weight-quantized linear
+  backends.
 - **Phase 3:** tensor-parallel (2–4 GPU) variant exercising
   `flashinfer.comm` all-reduce; unlocks the 70B–235B tier.
 - **Phase 4:** wire the smoke harness into CI (it's designed to be a
