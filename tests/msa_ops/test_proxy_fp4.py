@@ -58,11 +58,12 @@ def _dequant_128x4(xq, sf_flat, mul, rows, d=128):
     return vals * sc.repeat_interleave(16, dim=1) * mul
 
 
-def _ref_proxy_fp4(q_deq, k_deq, seqlen_q, seqlen_k, group_size, causal):
+def _ref_proxy_fp4(q_deq, k_deq, seqlen_q, seqlen_k, group_size, causal, q_off=None):
     """Block-max proxy on pre-dequantized bf16 Q/K, single sequence -> [Hq, nb, Sq]."""
     Hq = q_deq.shape[1]
     nb = (seqlen_k + BLK_KV - 1) // BLK_KV
-    q_off = seqlen_k - seqlen_q  # right-aligned causal
+    if q_off is None:
+        q_off = seqlen_k - seqlen_q  # right-aligned causal
     out = torch.full((Hq, nb, seqlen_q), -float("inf"), dtype=torch.float32)
     for h in range(Hq):
         kv = h // group_size
@@ -78,19 +79,19 @@ def _ref_proxy_fp4(q_deq, k_deq, seqlen_q, seqlen_k, group_size, causal):
 
 
 def _dequant_qk(q_fp4, q_scale, inv_q, k_fp4, k_scale, inv_k):
-    """Dequant packed Q/K to bf16; both global scales fold into Q, as in the kernel."""
+    """Dequant packed Q/K; both global scales fold into Q, as in the kernel.
+
+    Kept in float32: the kernel's fp4 x scale products never round through
+    bf16, and a bf16-rounded reference misses tolerance on boundary blocks
+    whose causal limit leaves a single near-cancelling dot product."""
     Sq, Hq, _ = q_fp4.shape
     Sk, Hkv, _ = k_fp4.shape
-    q_deq = (
-        _dequant_128x4(q_fp4.reshape(-1, 64), q_scale, inv_q * inv_k, Sq * Hq)
-        .reshape(Sq, Hq, 128)
-        .to(torch.bfloat16)
-    )
-    k_deq = (
-        _dequant_128x4(k_fp4.reshape(-1, 64), k_scale, 1.0, Sk * Hkv)
-        .reshape(Sk, Hkv, 128)
-        .to(torch.bfloat16)
-    )
+    q_deq = _dequant_128x4(
+        q_fp4.reshape(-1, 64), q_scale, inv_q * inv_k, Sq * Hq
+    ).reshape(Sq, Hq, 128)
+    k_deq = _dequant_128x4(
+        k_fp4.reshape(-1, 64), k_scale, 1.0, Sk * Hkv
+    ).reshape(Sk, Hkv, 128)
     return q_deq, k_deq
 
 
@@ -257,8 +258,11 @@ def test_proxy_fp4_paged():
     assert rel < 5e-2, f"paged max rel err {rel}"
 
 
-@pytest.mark.parametrize("B,seqlen_q", [(1, 8), (2, 5), (3, 1)])
-def test_proxy_fp4_decode_packed(B, seqlen_q):
+@pytest.mark.parametrize(
+    "B,seqlen_q,explicit_qoff",
+    [(1, 8, False), (2, 5, False), (3, 1, False), (2, 5, True)],
+)
+def test_proxy_fp4_decode_packed(B, seqlen_q, explicit_qoff):
     """group_size 16, q_len <= 8 dispatches the packed fp4 tensor-core kernel."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score_fp4
@@ -280,6 +284,12 @@ def test_proxy_fp4_decode_packed(B, seqlen_q):
     q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
     k_fp4, k_scale, inv_k = _quantize_qk_to_nvfp4(k)
 
+    qoff = None
+    if explicit_qoff:
+        # Positions strictly inside each sequence so the causal limit bites.
+        qoff = torch.tensor(
+            [seqlen_k // 2 + 37 * b for b in range(B)], dtype=torch.int32, device=dev
+        )
     out = msa_proxy_score_fp4(
         q_fp4,
         k_fp4,
@@ -290,6 +300,7 @@ def test_proxy_fp4_decode_packed(B, seqlen_q):
         cu_q,
         cu_k,
         causal=True,
+        q_offset=qoff,
     )
     torch.cuda.synchronize()
     assert out.shape == (Hq, nb, total_q)
@@ -302,7 +313,15 @@ def test_proxy_fp4_decode_packed(B, seqlen_q):
     for b in range(B):
         qsl = slice(b * seqlen_q, (b + 1) * seqlen_q)
         ksl = slice(b * seqlen_k, (b + 1) * seqlen_k)
-        ref = _ref_proxy_fp4(q_deq[qsl], k_deq[ksl], seqlen_q, seqlen_k, 16, True)
+        ref = _ref_proxy_fp4(
+            q_deq[qsl],
+            k_deq[ksl],
+            seqlen_q,
+            seqlen_k,
+            16,
+            True,
+            q_off=int(qoff[b]) if qoff is not None else None,
+        )
         sub = got[:, :, qsl]
         finite = torch.isfinite(ref)
         assert (torch.isfinite(sub) == finite).all(), f"mask mismatch b={b}"

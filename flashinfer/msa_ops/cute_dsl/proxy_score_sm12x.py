@@ -454,6 +454,7 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
         kv_fp8: bool = False,
         qhead_per_kv: int = 4,
         pack_q_len: int = 16,
+        qoff_default: bool = False,
     ):
         super().__init__(
             head_dim=head_dim,
@@ -473,6 +474,8 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
         # factorization compiles to its own kernel.
         self._qhead_per_kv = qhead_per_kv
         self._pack_q_len = pack_q_len
+        # True: right-aligned decode; the causal offset is computed in-kernel.
+        self._qoff_default = qoff_default
 
     @cute.jit
     def __call__(
@@ -544,6 +547,12 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
         k_start = mCuK[batch_idx]
         seqlen_k = mCuK[batch_idx + 1] - k_start
         num_kv_blocks = cute.ceil_div(seqlen_k, self._n_block_size)
+        q_off = cutlass.Int32(0)
+        if cutlass.const_expr(self._is_causal):
+            if cutlass.const_expr(self._qoff_default):
+                q_off = seqlen_k - seqlen_q
+            else:
+                q_off = mQOffset[batch_idx]
 
         sQ_layout = self._make_sq_layout()
         sK_layout = self._make_sk_layout()
@@ -737,9 +746,7 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                     row = tScS_mn[r, 0][0]
                     token = row % self._pack_q_len
                     if cutlass.const_expr(self._is_causal):
-                        col_limit = cutlass.min(
-                            token + mQOffset[batch_idx] + 1, seqlen_k
-                        )
+                        col_limit = cutlass.min(token + q_off + 1, seqlen_k)
                     else:
                         col_limit = seqlen_k
                     for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
