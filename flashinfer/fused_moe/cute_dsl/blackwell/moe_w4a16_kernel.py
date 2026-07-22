@@ -129,10 +129,9 @@ class Sm100W4A16GroupedGemmKernel:
         # Set specialized warp ids
         self.epilog_warp_id = (0, 1, 2, 3)
         self.mma_warp_id = 4
-        self.tma_warp_id = 5
-        self.scale_tma_warp_id = 6
-        # Schedule warp assigns routed-row tiles to experts.
-        self.schedule_warp_id = 7
+        self.schedule_warp_id = 5
+        self.weight_tma_warp_id = 6
+        self.activation_tma_warp_id = 7
         self.transform_warp_id = (
             8,
             9,
@@ -149,8 +148,9 @@ class Sm100W4A16GroupedGemmKernel:
             max(
                 (
                     self.mma_warp_id,
-                    self.tma_warp_id,
-                    self.scale_tma_warp_id,
+                    self.schedule_warp_id,
+                    self.weight_tma_warp_id,
+                    self.activation_tma_warp_id,
                     *self.epilog_warp_id,
                     *self.transform_warp_id,
                 )
@@ -729,8 +729,7 @@ class Sm100W4A16GroupedGemmKernel:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # Initialize load2transform pipeline, which tracks the dependencies between TMA's loading
-        # of A and B, and the transformation of A and MMA's consumption
+        # Initialize load2transform pipeline for the weight operand.
         transform_thread_idx = (
             tidx - 32 * self.transform_warp_id[0]
             if tidx >= 32 * self.transform_warp_id[0]
@@ -1060,19 +1059,16 @@ class Sm100W4A16GroupedGemmKernel:
             cute.append(acc_shape, self.num_acc_stage)
         )
 
-        # Cluster wait before TMEM alloc and ensure pipelines are ready
+        # Cluster wait before TMEM alloc and ensure pipelines are ready.
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
-
-        griddepcontrol_wait()
 
         # TMEM allocation
         tmem.allocate(self.num_tmem_alloc_cols)
         tmem.wait_for_alloc()
 
-        # Schedule warp
+        # Tile scheduling is independent of the preceding grid.
         if warp_idx == self.schedule_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_schedule_warp)
-            # Persistent tile scheduling loop
             tile_sched = utils.StaticPersistentRuntimeTileScheduler.create(
                 tile_sched_params,
                 (bidx, bidy, bidz),
@@ -1102,20 +1098,21 @@ class Sm100W4A16GroupedGemmKernel:
                 not_last_tile = work_tile.is_valid_tile and (
                     route_tile_idx < num_non_exiting_tiles_value
                 )
+                route_start = cutlass.Int32(-1)
+                group_idx = cutlass.Int32(group_count)
+                distance_to_boundary = cutlass.Int32(-1)
+                if not_last_tile:
+                    route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
+                    group_idx = tile_idx_to_expert_idx[route_tile_idx]
+                    distance_to_boundary = (
+                        tile_idx_to_mn_limit[route_tile_idx] - route_start
+                    )
                 # Store tile info into shared memory buffer
                 with cute.arch.elect_one():
                     cur_sTile_info[0] = cta_tile_coord_m
-                    if not_last_tile:
-                        route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
-                        cur_sTile_info[1] = route_start
-                        cur_sTile_info[2] = tile_idx_to_expert_idx[route_tile_idx]
-                        cur_sTile_info[3] = (
-                            tile_idx_to_mn_limit[route_tile_idx] - route_start
-                        )
-                    else:
-                        cur_sTile_info[1] = -1
-                        cur_sTile_info[2] = group_count
-                        cur_sTile_info[3] = -1
+                    cur_sTile_info[1] = route_start
+                    cur_sTile_info[2] = group_idx
+                    cur_sTile_info[3] = distance_to_boundary
                 # Fence and barrier to ensure tile info store has finished
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -1124,16 +1121,81 @@ class Sm100W4A16GroupedGemmKernel:
                 self.sched_sync_barrier.arrive_and_wait()
                 # Commit tile info pipeline
                 tile_info_pipeline.producer_commit(tile_info_producer_state)
-                # Advance to next tile
                 tile_info_producer_state.advance()
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+
             tile_info_pipeline.producer_tail(tile_info_producer_state)
 
-        # Specialized TMA load warp for A/B tensor
-        if warp_idx == self.tma_warp_id:
+        # The activation TMA warp is the only role that waits on the preceding grid.
+        if warp_idx == self.activation_tma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_tma_warps)
-            # Persistent tile scheduling loop
+            if cutlass.const_expr(self.enable_pdl):
+                griddepcontrol_wait()
+
+            tile_info_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
+            )
+            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
+                group_count, sTile_info[(None, tile_info_consumer_state.index)]
+            )
+            cute.arch.fence_proxy(
+                "async.shared",
+                space="cta",
+            )
+            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            tile_info_consumer_state.advance()
+            b_load2mma_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_load2trans_stage
+            )
+
+            while work_tile.is_valid_tile:
+                coord_n_offset = (
+                    (work_tile.coord_n, 0)
+                    if cutlass.const_expr(
+                        self.b_major_mode == tcgen05.OperandMajorMode.MN
+                    )
+                    else (0, work_tile.coord_n)
+                )
+                tBgB_slice = cute.make_tensor(
+                    (
+                        tBgB.iterator[0] + coord_n_offset[0],
+                        coord_n_offset[1] + tBgB.iterator[1],
+                    ),
+                    cute.slice_(tBgB.layout, (None, 0, None, 0)),
+                )
+
+                b_load2mma_producer_state.reset_count()
+                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    b_load2mma_pipeline.producer_acquire(b_load2mma_producer_state)
+                    cute.copy(
+                        tma_atom_b,
+                        tBgB_slice[(None, b_load2mma_producer_state.count)],
+                        tBsB[(None, b_load2mma_producer_state.index)],
+                        tma_bar_ptr=b_load2mma_pipeline.producer_get_barrier(
+                            b_load2mma_producer_state
+                        ),
+                        mcast_mask=b_full_mcast_mask,
+                    )
+                    b_load2mma_pipeline.producer_commit(b_load2mma_producer_state)
+                    b_load2mma_producer_state.advance()
+
+                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
+                    group_count, sTile_info[(None, tile_info_consumer_state.index)]
+                )
+                cute.arch.fence_proxy(
+                    "async.shared",
+                    space="cta",
+                )
+                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
+            b_load2mma_pipeline.producer_tail(b_load2mma_producer_state)
+
+        # Static weight and scale loads can run before the activation is ready.
+        if warp_idx == self.weight_tma_warp_id:
+            cute.arch.setmaxregister_decrease(self.num_regs_tma_warps)
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
@@ -1150,8 +1212,12 @@ class Sm100W4A16GroupedGemmKernel:
             a_load2trans_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_load2trans_stage
             )
-            b_load2mma_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_load2trans_stage
+            scale_load2trans_producer_state = (
+                pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_scale_load2trans_stage
+                )
+                if self.scale_mode is TransformMode.ConvertScale
+                else None
             )
 
             while work_tile.is_valid_tile:
@@ -1163,105 +1229,7 @@ class Sm100W4A16GroupedGemmKernel:
                         work_tile.group_idx,
                     )
                 ]
-                # Select the routed-row tile assigned by the scheduler.
-                coord_n_offset = (
-                    (work_tile.coord_n, 0)
-                    if cutlass.const_expr(
-                        self.b_major_mode == tcgen05.OperandMajorMode.MN
-                    )
-                    else (0, work_tile.coord_n)
-                )
-                tBgB_slice = cute.make_tensor(
-                    (
-                        tBgB.iterator[0] + coord_n_offset[0],
-                        coord_n_offset[1] + tBgB.iterator[1],
-                    ),
-                    cute.slice_(tBgB.layout, (None, 0, None, 0)),
-                )
-
-                a_load2trans_producer_state.reset_count()
-                peek_load2trans_empty_status = cutlass.Boolean(1)
-                if a_load2trans_producer_state.count < k_tile_cnt:
-                    peek_load2trans_empty_status = (
-                        a_load2trans_pipeline.producer_try_acquire(
-                            a_load2trans_producer_state
-                        )
-                    )
-                b_load2mma_producer_state.reset_count()
-                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    a_load2trans_pipeline.producer_acquire(
-                        a_load2trans_producer_state, peek_load2trans_empty_status
-                    )
-                    b_load2mma_pipeline.producer_acquire(b_load2mma_producer_state)
-                    # TMA load A/B
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_slice[(None, a_load2trans_producer_state.count)],
-                        tAsA[(None, a_load2trans_producer_state.index)],
-                        tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
-                            a_load2trans_producer_state
-                        ),
-                        mcast_mask=a_full_mcast_mask,
-                    )
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_slice[(None, b_load2mma_producer_state.count)],
-                        tBsB[(None, b_load2mma_producer_state.index)],
-                        tma_bar_ptr=b_load2mma_pipeline.producer_get_barrier(
-                            b_load2mma_producer_state
-                        ),
-                        mcast_mask=b_full_mcast_mask,
-                    )
-                    a_load2trans_pipeline.producer_commit(a_load2trans_producer_state)
-                    b_load2mma_pipeline.producer_commit(b_load2mma_producer_state)
-                    a_load2trans_producer_state.advance()
-                    b_load2mma_producer_state.advance()
-                    if a_load2trans_producer_state.count < k_tile_cnt:
-                        peek_load2trans_empty_status = (
-                            a_load2trans_pipeline.producer_try_acquire(
-                                a_load2trans_producer_state
-                            )
-                        )
-                # Advance to next tile
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
-                    group_count, sTile_info[(None, tile_info_consumer_state.index)]
-                )
-                cute.arch.fence_proxy(
-                    "async.shared",
-                    space="cta",
-                )
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
-                tile_info_consumer_state.advance()
-            # Wait A/B buffer empty
-            a_load2trans_pipeline.producer_tail(a_load2trans_producer_state)
-            b_load2mma_pipeline.producer_tail(b_load2mma_producer_state)
-
-        # Specialized TMA load for scale tensor
-        if warp_idx == self.scale_tma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_tma_warps)
-            if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-                # Persistent tile scheduling loop
-                tile_info_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
-                )
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
-                    group_count, sTile_info[(None, tile_info_consumer_state.index)]
-                )
-                cute.arch.fence_proxy(
-                    "async.shared",
-                    space="cta",
-                )
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
-                tile_info_consumer_state.advance()
-                scale_load2trans_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.num_scale_load2trans_stage
-                )
-                scale_k_tile_cnt = k_tile_cnt
-
-                while work_tile.is_valid_tile:
-                    # ((atom_v, rest_v), RestK)
+                if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
                     tSgS_slice = tSgS[
                         (
                             None,
@@ -1280,20 +1248,54 @@ class Sm100W4A16GroupedGemmKernel:
                         ),
                     )
 
+                a_load2trans_producer_state.reset_count()
+                peek_load2trans_empty_status = cutlass.Boolean(1)
+                if a_load2trans_producer_state.count < k_tile_cnt:
+                    peek_load2trans_empty_status = (
+                        a_load2trans_pipeline.producer_try_acquire(
+                            a_load2trans_producer_state
+                        )
+                    )
+                if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
                     scale_load2trans_producer_state.reset_count()
                     peek_scale_load2trans_empty_status = cutlass.Boolean(1)
-                    if scale_load2trans_producer_state.count < scale_k_tile_cnt:
+                    if scale_load2trans_producer_state.count < k_tile_cnt:
                         peek_scale_load2trans_empty_status = (
                             scale_load2trans_pipeline.producer_try_acquire(
                                 scale_load2trans_producer_state
                             )
                         )
-                    for _k_tile in cutlass.range(0, scale_k_tile_cnt, 1, unroll=1):
+
+                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    a_load2trans_pipeline.producer_acquire(
+                        a_load2trans_producer_state,
+                        peek_load2trans_empty_status,
+                    )
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_slice[(None, a_load2trans_producer_state.count)],
+                        tAsA[(None, a_load2trans_producer_state.index)],
+                        tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
+                            a_load2trans_producer_state
+                        ),
+                        mcast_mask=a_full_mcast_mask,
+                    )
+                    a_load2trans_pipeline.producer_commit(a_load2trans_producer_state)
+                    a_load2trans_producer_state.advance()
+                    if a_load2trans_producer_state.count < k_tile_cnt:
+                        peek_load2trans_empty_status = (
+                            a_load2trans_pipeline.producer_try_acquire(
+                                a_load2trans_producer_state
+                            )
+                        )
+
+                    if cutlass.const_expr(
+                        self.scale_mode == TransformMode.ConvertScale
+                    ):
                         scale_load2trans_pipeline.producer_acquire(
                             scale_load2trans_producer_state,
                             peek_scale_load2trans_empty_status,
                         )
-                        # TMA load scale
                         cute.copy(
                             tma_atom_s,
                             tSgS_slice_filtered[
@@ -1308,24 +1310,29 @@ class Sm100W4A16GroupedGemmKernel:
 
                         scale_load2trans_producer_state.advance()
                         peek_scale_load2trans_empty_status = cutlass.Boolean(1)
-                        if scale_load2trans_producer_state.count < scale_k_tile_cnt:
+                        if scale_load2trans_producer_state.count < k_tile_cnt:
                             peek_scale_load2trans_empty_status = (
                                 scale_load2trans_pipeline.producer_try_acquire(
                                     scale_load2trans_producer_state
                                 )
                             )
-                    # Advance to next tile
-                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                    work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
-                        group_count, sTile_info[(None, tile_info_consumer_state.index)]
-                    )
-                    cute.arch.fence_proxy(
-                        "async.shared",
-                        space="cta",
-                    )
-                    tile_info_pipeline.consumer_release(tile_info_consumer_state)
-                    tile_info_consumer_state.advance()
-                # Wait scale buffer empty
+
+                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
+                    group_count, sTile_info[(None, tile_info_consumer_state.index)]
+                )
+                cute.arch.fence_proxy(
+                    "async.shared",
+                    space="cta",
+                )
+                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
+
+            if cutlass.const_expr(self.enable_pdl and self.fuse_activation):
+                with cute.arch.elect_one():
+                    griddepcontrol_launch_dependents()
+            a_load2trans_pipeline.producer_tail(a_load2trans_producer_state)
+            if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
                 scale_load2trans_pipeline.producer_tail(scale_load2trans_producer_state)
 
         # Specialized transform warps
@@ -2275,7 +2282,10 @@ class Sm100W4A16GroupedGemmKernel:
             if cutlass.const_expr(not self.use_fused_finalize):
                 c_pipeline.producer_tail()
 
-        griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.enable_pdl and not self.fuse_activation):
+            if warp_idx == self.mma_warp_id:
+                with cute.arch.elect_one():
+                    griddepcontrol_launch_dependents()
 
     @staticmethod
     def _compute_stages_and_tmem_cols(
