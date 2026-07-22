@@ -66,6 +66,7 @@ from .utils import (
 
 _NVFP4_SCALE_GRANULARITY_M = 1
 _NVFP4_SCALE_GRANULARITY_K = 16
+_TMA_CACHE_HINT_EVICT_FIRST = 0x12F0000000000000
 _TMA_CACHE_HINT_EVICT_LAST = 0x14F0000000000000
 
 
@@ -1156,6 +1157,7 @@ class Sm100W4A16GroupedGemmKernel:
                             a_load2trans_producer_state
                         ),
                         mcast_mask=a_full_mcast_mask,
+                        cache_policy=cutlass.Int64(_TMA_CACHE_HINT_EVICT_FIRST),
                     )
                     a_load2trans_pipeline.producer_commit(a_load2trans_producer_state)
                     a_load2trans_producer_state.advance()
