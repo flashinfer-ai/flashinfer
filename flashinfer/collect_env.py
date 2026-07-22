@@ -134,7 +134,9 @@ def _installed_distributions():
     for dist in importlib.metadata.distributions():
         name = (dist.metadata.get("Name") or "").strip()
         if name:
-            dists[name.lower()] = dist.version
+            # Same canonicalization as _check_pin, so metadata names like
+            # flashinfer_python / sgl_kernel resolve.
+            dists[re.sub(r"[-_.]+", "-", name).lower()] = dist.version
     return dists
 
 
@@ -444,7 +446,7 @@ def _describe_lib_dir(family, dirpath, paths, dists):
     tags = []
     versions = set()
     for p in paths:
-        m = re.search(r"\.so\.(\d+(?:\.\d+)+)$", p)
+        m = re.search(r"\.so\.(\d+(?:\.\d+)*)$", p)
         if m:
             versions.add(m.group(1))
     if versions:
@@ -539,10 +541,16 @@ def _get_relevant_packages():
 
 
 def _get_env_vars():
+    # Reports are pasted into public issues; redact anything credential-like
+    # (the broad prefixes can match e.g. NVIDIA_API_KEY).
+    secret_markers = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
     info = {}
     for k in sorted(os.environ):
         if k.startswith(_ENV_PREFIXES) or k in _ENV_EXACT:
-            info[k] = os.environ[k]
+            if any(m in k.upper() for m in secret_markers):
+                info[k] = "<redacted>"
+            else:
+                info[k] = os.environ[k]
     return info or {"(none set)": ""}
 
 

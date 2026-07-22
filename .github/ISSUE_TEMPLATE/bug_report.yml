@@ -25,15 +25,8 @@ body:
         The report includes which cuDNN/cuBLAS/CUDA libraries are *actually
         loaded* vs merely installed — this resolves most "works on my machine"
         divergence, so please don't trim it.
-      value: |
-        <details>
-        <summary>Output of python -m flashinfer.collect_env</summary>
-
-        ```text
-        PASTE OUTPUT HERE
-        ```
-
-        </details>
+      render: text
+      placeholder: Paste the full output of `python -m flashinfer.collect_env` here.
     validations:
       required: true
   - type: textarea
@@ -51,14 +44,23 @@ body:
         Smallest self-contained script that reproduces the issue — a short
         standalone Python script is far more actionable than a full
         `vllm serve ...` invocation. Include exact shapes/dtypes and the
-        backend selected (fa2/fa3/cudnn/trtllm/cutlass/...). If the failure
-        involves JIT compilation, re-run with `FLASHINFER_JIT_VERBOSE=1` and
-        attach the log.
+        backend selected (fa2/fa3/cudnn/trtllm/cutlass/...).
       render: python
     validations:
       required: true
   - type: textarea
+    id: logs
+    attributes:
+      label: Error messages / logs
+      description: >
+        Stack trace, error output, or logs. If the failure involves JIT
+        compilation, re-run with `FLASHINFER_JIT_VERBOSE=1` and include that
+        log.
+      render: text
+    validations:
+      required: false
+  - type: textarea
     id: extra
     attributes:
       label: Additional context
-      description: Stack traces, logs, related issues, workarounds you tried.
+      description: Related issues, workarounds you tried, anything else useful.
