@@ -1126,6 +1126,13 @@ class TestCuteDslMoeW4A16:
                 ((256, 256), (2, 1)),
                 id="route128-mixed",
             ),
+            pytest.param(
+                ActivationType.Swiglu,
+                192,
+                ((256, 128), (2, 1)),
+                ((256, 128), (2, 1)),
+                id="route192",
+            ),
         ],
     )
     def test_route_tile_numerical_accuracy(
