@@ -110,6 +110,21 @@ This is the actual point of the exercise. Checks, each cheap and scriptable:
 - **2026-07-21** — doc created; upstream main synced (`b7cd951d`). Phase 1
   in progress: dense Qwen3/Llama single-GPU example + smoke harness, to be
   validated on a computelab B200.
+- **2026-07-21** — first B200 deployment (Qwen3-0.6B) surfaced two findings
+  on day one, validating the approach:
+  1. *Environment class:* a source checkout without the (new) `3rdparty/cccl`
+     submodule fails every attention JIT compile — the JIT include path puts
+     the vendored CCCL first and `fastdiv.cuh` now needs
+     `cuda::fast_mod_div`, so an empty `3rdparty/cccl` silently falls back to
+     the CUDA toolkit's older libcudacxx and nvcc errors out. Anyone
+     updating an existing checkout across that upstream change hits this.
+  2. *Harness calibration:* `JitSpecNvcc.try_load()` returns `None` for
+     JIT-path modules *by design* (artifact freshness is delegated to
+     ninja's dependency scan), so `build()` runs in every fresh process and
+     ninja no-ops on a warm cache. "Recompile" must therefore be measured as
+     "built artifact changed across `build()`", which is what the harness
+     now does; raw `build()` invocations are reported separately as the
+     warm-start overhead metric (`jit_build_calls`).
 
 ## Roadmap
 

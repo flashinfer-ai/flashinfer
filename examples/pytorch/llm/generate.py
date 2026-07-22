@@ -9,8 +9,11 @@ Besides generating text, this script emits machine-readable ``[smoke] key=value`
 lines consumed by ``smoke_test.py``:
 
 - ``jit_builds_total`` — number of FlashInfer JIT modules actually *compiled*
-  in this process (``JitSpec.build()`` calls, which happen only on a JIT cache
-  miss). On a warm cache this must be 0.
+  in this process (the built artifact changed during ``JitSpec.build()``).
+  On a warm cache this must be 0.
+- ``jit_build_calls`` — informational: ``build()`` invocations, i.e. ninja
+  dependency scans. By design this equals the number of JIT modules used
+  even on a warm cache (``try_load`` defers freshness to ninja).
 - ``jit_builds_steady`` — compilations triggered after the first decode step
   (must always be 0: steady-state decoding must not recompile anything).
 - ``tokens_<i>`` — generated token ids per request, for determinism checks.
@@ -38,11 +41,18 @@ DEFAULT_PROMPTS = [
 
 
 def install_jit_build_counter() -> Dict:
-    """Count actual JIT compilations (cache misses) in this process.
+    """Count actual JIT compilations (not mere cache probes) in this process.
 
-    ``JitSpec.build_and_load()`` calls ``build()`` only after ``try_load()``
-    misses (see flashinfer/jit/core.py), so wrapping the concrete subclasses'
-    ``build`` gives an exact "module was recompiled" counter.
+    Nuance discovered on first deployment of this harness:
+    ``JitSpecNvcc.try_load()`` intentionally returns ``None`` for JIT-path
+    modules — artifact freshness is owned by ninja's dependency scan — so
+    ``build()`` runs in *every* process and ninja no-ops when the cached
+    ``.so`` is up to date (see flashinfer/jit/core.py). Counting ``build()``
+    calls therefore counts ninja invocations, not recompiles. A module was
+    actually (re)compiled iff its built artifact changed across the
+    ``build()`` call, so that is what ``count``/``names`` track;
+    ``build_calls`` keeps the raw invocation count as an informational
+    warm-start metric.
     """
     import flashinfer.jit.core as jit_core
 
@@ -50,7 +60,14 @@ def install_jit_build_counter() -> Dict:
     with contextlib.suppress(Exception):
         import flashinfer.jit.cute_dsl_core  # noqa: F401
 
-    counter: Dict = {"count": 0, "names": []}
+    counter: Dict = {"count": 0, "names": [], "build_calls": 0}
+
+    def _artifact_stamp(spec):
+        try:
+            lib = spec.get_library_path()
+            return lib.stat().st_mtime_ns if lib.exists() else None
+        except Exception:
+            return None
 
     def _wrap(cls):
         orig = cls.__dict__.get("build")
@@ -58,9 +75,13 @@ def install_jit_build_counter() -> Dict:
             return
 
         def build(self, *args, _orig=orig, **kwargs):
-            counter["count"] += 1
-            counter["names"].append(self.name)
-            return _orig(self, *args, **kwargs)
+            counter["build_calls"] += 1
+            before = _artifact_stamp(self)
+            result = _orig(self, *args, **kwargs)
+            if _artifact_stamp(self) != before:
+                counter["count"] += 1
+                counter["names"].append(self.name)
+            return result
 
         cls.build = build
 
@@ -348,6 +369,7 @@ def main():
 
     print(f"[smoke] jit_builds_total={jit_counter['count']}")
     print(f"[smoke] jit_builds_names={','.join(jit_counter['names'])}")
+    print(f"[smoke] jit_build_calls={jit_counter['build_calls']}")
     print(f"[smoke] jit_builds_steady={result['jit_builds_steady']}")
     for i, out_ids in enumerate(result["outputs"]):
         print(f"[smoke] tokens_{i}={','.join(map(str, out_ids))}")

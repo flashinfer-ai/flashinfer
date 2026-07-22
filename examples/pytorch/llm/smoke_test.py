@@ -4,8 +4,9 @@ Runs ``generate.py`` in two fresh subprocesses and verifies integration-level
 invariants that kernel unit tests cannot see:
 
 1. **JIT cache works across processes** — the second run must compile zero
-   modules (``jit_builds_total == 0``). If this fails, the on-disk kernel
-   cache is broken and every user process pays full recompilation.
+   modules (``jit_builds_total == 0``, measured as "built artifact changed";
+   ninja dependency scans still run by design). If this fails, the on-disk
+   kernel cache is broken and every user process pays full recompilation.
 2. **No steady-state recompiles** — decode steps after the first must never
    trigger a JIT build (``jit_builds_steady == 0``), in both runs.
 3. **Greedy determinism** — both runs must produce identical token ids.
@@ -59,6 +60,7 @@ def run_generate(args: argparse.Namespace, label: str) -> Dict:
     smoke["tokens"] = tokens
     print(
         f"{label}: {elapsed:.1f}s, jit_builds_total={smoke.get('jit_builds_total')}, "
+        f"jit_build_calls={smoke.get('jit_build_calls')}, "
         f"jit_builds_steady={smoke.get('jit_builds_steady')}, "
         f"{len(tokens)} completions"
     )
