@@ -64,13 +64,15 @@ from .utils import (
 )
 
 
+_NVFP4_SCALE_GRANULARITY_M = 1
+_NVFP4_SCALE_GRANULARITY_K = 16
+
+
 class Sm100W4A16GroupedGemmKernel:
     """Warp-specialized grouped GEMM for the W4A16 MoE pipeline."""
 
     def __init__(
         self,
-        scale_granularity_m: int,
-        scale_granularity_k: int,
         acc_dtype: type[cutlass.Numeric],
         use_2cta_instrs: bool,
         mma_tiler_mnk: tuple[int, int, int],
@@ -83,20 +85,7 @@ class Sm100W4A16GroupedGemmKernel:
         use_fused_finalize: bool,
         enable_pdl: bool,
     ):
-        """
-        Initializes the mixed-input GEMM kernel with a specified configuration.
-        """
-        # Scale granularity defines how many elements share the same scale factor
-        # along the M and K modes.
-        self.scale_granularity_m = scale_granularity_m
-        self.scale_granularity_k = scale_granularity_k
-        # Set transform mode
-        if cutlass.const_expr(
-            self.scale_granularity_m == 0 and self.scale_granularity_k == 0
-        ):
-            self.scale_mode = TransformMode.ConvertOnly
-        else:
-            self.scale_mode = TransformMode.ConvertScale
+        """Initialize the W4A16 grouped GEMM configuration."""
         self.group_count = group_count
         self.acc_dtype = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -163,7 +152,6 @@ class Sm100W4A16GroupedGemmKernel:
             1, 32 * len(self.epilog_warp_id)
         )
         self.tmem_ptr_sync_barrier = pipeline.NamedBarrier(2, self.threads_per_cta)
-        self.cta_sync_barrier = pipeline.NamedBarrier(4, self.threads_per_cta)
         self.sched_sync_barrier = pipeline.NamedBarrier(5, 32)
 
         self.smem_buffer_align_bytes = 1024
@@ -212,11 +200,6 @@ class Sm100W4A16GroupedGemmKernel:
             self.cta_tile_shape_mnk[1],
             self.cta_tile_shape_mnk[2],
         )
-        self.cluster_tile_shape_mnk = (
-            self.cluster_shape_mn[0] * self.cta_tile_shape_mnk[0],
-            self.cluster_shape_mn[1] * self.cta_tile_shape_mnk[1],
-            self.cta_tile_shape_mnk[2],
-        )
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma.thr_id.shape,),
@@ -259,14 +242,9 @@ class Sm100W4A16GroupedGemmKernel:
             self.c_dtype,
             self.c_layout,
             self.transform_a_source,
-            self.scale_granularity_m,
-            self.scale_granularity_k,
             self.smem_buffer_align_bytes,
-            self.scale_mode,
             self.use_fused_finalize,
-            self.gated,
         )
-        self.num_c_store_stage = self.num_c_stage
 
         # Align TMEM columns for allocation
         # TMEM allocation requires power-of-2 column alignment
@@ -281,7 +259,7 @@ class Sm100W4A16GroupedGemmKernel:
             self.c_dtype,
             self.c_layout,
             self.epi_tile,
-            self.num_c_store_stage,
+            self.num_c_stage,
         )
         # Get smem layout for A, transformed A, and B
         (
@@ -297,65 +275,31 @@ class Sm100W4A16GroupedGemmKernel:
             self.num_trans2mma_stage,
         )
         # Get smem layout for scale tensor
-        self.smem_layout_scale_per_stage = None
-        self.smem_layout_scale = None
-        self.smem_layout_scale_tma = None
-        if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-            scale_tile_shape = (
-                self.cta_tile_shape_mnk[0],
-                self.mma_tiler[2],
-            )
-            # The transform and TMA partitions use different logical views of
-            # the same block-scaled shared-memory storage.
-            scale_smem_layout = blockscaled_utils.make_smem_layout_sf(
-                scale_tile_shape,
-                self.scale_granularity_k,
-                self.num_scale_load2trans_stage,
-            )
-            scale_smem_layout_per_stage = cute.slice_(
-                scale_smem_layout, (None, None, 0)
-            )
-            trivial_swizzle = cute.make_swizzle(0, 4, 3)
-            self.smem_layout_scale_per_stage = cute.make_composed_layout(
-                trivial_swizzle, 0, scale_smem_layout_per_stage
-            )
-            self.smem_layout_scale = cute.make_composed_layout(
-                trivial_swizzle, 0, scale_smem_layout
-            )
-            self.smem_layout_scale_tma = blockscaled_utils.make_smem_layout_sfa(
-                tiled_mma,
-                self.mma_tiler,
-                self.scale_granularity_k,
-                self.num_scale_load2trans_stage,
-            )
-
-    def _validate_inputs(
-        self,
-        a: cute.Tensor,
-        a_scale: Optional[cute.Tensor],
-        b: cute.Tensor,
-        c: cute.Tensor,
-    ) -> None:
-        """
-        Validates input tensors and their properties.
-
-        :param a: Input tensor A.
-        :type a: cute.Tensor
-        :param a_scale: Scale tensor for tensor A (None for ConvertOnly mode).
-        :type a_scale: Optional[cute.Tensor]
-        :param b: Input tensor B.
-        :type b: cute.Tensor
-        :param c: Output tensor C.
-        :type c: cute.Tensor
-        :raises ValueError: If inputs don't meet kernel requirements.
-        """
-        # Validate scale tensor major mode
-        if cutlass.const_expr(
-            self.scale_mode == TransformMode.ConvertScale
-            and utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
-            != tcgen05.OperandMajorMode.K
-        ):
-            raise ValueError("scale_major_mode must be K-major")
+        scale_tile_shape = (
+            self.cta_tile_shape_mnk[0],
+            self.mma_tiler[2],
+        )
+        # The transform and TMA partitions use different logical views of the
+        # same block-scaled shared-memory storage.
+        scale_smem_layout = blockscaled_utils.make_smem_layout_sf(
+            scale_tile_shape,
+            _NVFP4_SCALE_GRANULARITY_K,
+            self.num_scale_load2trans_stage,
+        )
+        scale_smem_layout_per_stage = cute.slice_(scale_smem_layout, (None, None, 0))
+        trivial_swizzle = cute.make_swizzle(0, 4, 3)
+        self.smem_layout_scale_per_stage = cute.make_composed_layout(
+            trivial_swizzle, 0, scale_smem_layout_per_stage
+        )
+        self.smem_layout_scale = cute.make_composed_layout(
+            trivial_swizzle, 0, scale_smem_layout
+        )
+        self.smem_layout_scale_tma = blockscaled_utils.make_smem_layout_sfa(
+            tiled_mma,
+            self.mma_tiler,
+            _NVFP4_SCALE_GRANULARITY_K,
+            self.num_scale_load2trans_stage,
+        )
 
     @cute.jit
     def wrapper(
@@ -386,7 +330,7 @@ class Sm100W4A16GroupedGemmKernel:
         weight_sf = cute.make_tensor(
             weight_sf_ptr,
             blockscaled_utils.tile_atom_to_shape_SF(
-                weights.shape, self.scale_granularity_k
+                weights.shape, _NVFP4_SCALE_GRANULARITY_K
             ),
         )
         activations = cute.make_tensor(
@@ -448,7 +392,7 @@ class Sm100W4A16GroupedGemmKernel:
     def __call__(
         self,
         a: cute.Tensor,
-        a_scale: Optional[cute.Tensor],  # None for ConvertOnly mode
+        a_scale: cute.Tensor,
         b: cute.Tensor,
         tile_idx_to_expert_idx: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
@@ -463,24 +407,20 @@ class Sm100W4A16GroupedGemmKernel:
     ):
         """Configure and launch the grouped GEMM."""
         self.a_dtype: type[cutlass.Numeric] = a.element_type
-        self.a_scale_dtype: type[cutlass.Numeric] = (
-            a_scale.element_type
-            if self.scale_mode is TransformMode.ConvertScale
-            else None
-        )
+        self.a_scale_dtype: type[cutlass.Numeric] = a_scale.element_type
         self.b_dtype: type[cutlass.Numeric] = b.element_type
         self.c_dtype: type[cutlass.Numeric] = c.element_type
-        self.final_scale_dtype: Optional[type[cutlass.Numeric]] = (
-            token_final_scales.element_type if self.use_fused_finalize else None
-        )
         self.mma_dtype = self.b_dtype
 
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
         self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        # Validate inputs
-        self._validate_inputs(a, a_scale, b, c)
+        if cutlass.const_expr(
+            utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
+            != cute.nvgpu.OperandMajorMode.K
+        ):
+            raise ValueError("scale_major_mode must be K-major")
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
@@ -501,7 +441,6 @@ class Sm100W4A16GroupedGemmKernel:
         b_op = mixed_input_utils.get_tma_atom_kind(
             self.is_b_mcast, self.use_2cta_instrs, True
         )
-        a_scale_op = a_op
         # Deduce TMA copy atom and TMA tensor for A, scale, and B
         smem_layout_a_per_stage = cute.slice_(self.smem_layout_a, (None, None, None, 0))
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
@@ -516,20 +455,18 @@ class Sm100W4A16GroupedGemmKernel:
             ),
         )
 
-        tma_atom_scale, tma_tensor_scale = None, None
-        if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-            scale_smem_layout_for_tma = cute.slice_(
-                self.smem_layout_scale_tma, (None, None, None, 0)
-            )
-            tma_atom_scale, tma_tensor_scale = cute.nvgpu.make_tiled_tma_atom_A(
-                a_scale_op,
-                a_scale,
-                scale_smem_layout_for_tma,
-                self.mma_tiler,
-                tiled_mma,
-                self.cluster_layout_vmnk.shape,
-                internal_type=cutlass.Int16,
-            )
+        scale_smem_layout_for_tma = cute.slice_(
+            self.smem_layout_scale_tma, (None, None, None, 0)
+        )
+        tma_atom_scale, tma_tensor_scale = cute.nvgpu.make_tiled_tma_atom_A(
+            a_op,
+            a_scale,
+            scale_smem_layout_for_tma,
+            self.mma_tiler,
+            tiled_mma,
+            self.cluster_layout_vmnk.shape,
+            internal_type=cutlass.Int16,
+        )
 
         smem_layout_b_per_stage = cute.slice_(self.smem_layout_b, (None, None, None, 0))
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
@@ -547,10 +484,8 @@ class Sm100W4A16GroupedGemmKernel:
         # Calculate copy size for tensor A, B, and scale
         a_copy_size = cute.size_in_bytes(self.a_dtype, smem_layout_a_per_stage)
         b_copy_size = cute.size_in_bytes(self.b_dtype, smem_layout_b_per_stage)
-        a_scale_copy_size = (
-            cute.size_in_bytes(self.a_scale_dtype, self.smem_layout_scale_per_stage)
-            if self.scale_mode is TransformMode.ConvertScale
-            else 0
+        a_scale_copy_size = cute.size_in_bytes(
+            self.a_scale_dtype, self.smem_layout_scale_per_stage
         )
 
         self.num_tma_load_bytes_a = a_copy_size
@@ -658,8 +593,8 @@ class Sm100W4A16GroupedGemmKernel:
         tiled_mma: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
-        tma_atom_s: Optional[cute.CopyAtom],
-        mS_mkl: Optional[cute.Tensor],
+        tma_atom_s: cute.CopyAtom,
+        mS_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
@@ -683,9 +618,7 @@ class Sm100W4A16GroupedGemmKernel:
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
     ):
-        """
-        GPU device kernel performing the Persistent Mixed-Input Grouped GEMM computation.
-        """
+        """Run the persistent W4A16 grouped GEMM."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -693,17 +626,10 @@ class Sm100W4A16GroupedGemmKernel:
         if warp_idx == self.epilog_warp_id[0]:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
-            if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-                cpasync.prefetch_descriptor(tma_atom_s)
+            cpasync.prefetch_descriptor(tma_atom_s)
             cpasync.prefetch_descriptor(tma_atom_c)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
-        bidx, bidy, bidz = cute.arch.block_idx()
-        # Compute how many k_tiles share the same scale
-        num_k_tiles_per_scale = max(
-            1, self.scale_granularity_k // self.cta_tile_shape_mnk[2]
-        )
-
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
@@ -712,8 +638,6 @@ class Sm100W4A16GroupedGemmKernel:
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
             cta_rank_in_cluster
         )
-        tidx, _, _ = cute.arch.thread_idx()
-
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
@@ -737,30 +661,21 @@ class Sm100W4A16GroupedGemmKernel:
             mcast_mode_mn=(1, 0),  # multicast for A will only happen on the M-mode
             defer_sync=True,
         )
-        # Initialize scale_load2trans pipeline, which tracks the dependencies between TMA's loading
-        # of scale, and the transformation of A
-        scale_load2trans_pipeline = None
-        if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-            num_producers_a_scale = self.num_mcast_ctas_a
-            scale_load2trans_pipeline = pipeline.PipelineTmaAsync.create(
-                barrier_storage=storage.a_scale_load2trans_full_mbar_ptr.data_ptr(),
-                num_stages=self.num_scale_load2trans_stage,
-                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-                consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread,
-                    num_producers_a_scale
-                    * len(self.transform_warp_id)
-                    * num_k_tiles_per_scale,
-                ),
-                tx_count=self.num_tma_load_bytes_scale,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                tidx=transform_thread_idx,
-                mcast_mode_mn=(
-                    1,
-                    0,
-                ),  # multicast for scale_a will only happen on the M-mode
-                defer_sync=True,
-            )
+        # Track scale TMA loads consumed by the weight-transform warps.
+        scale_load2trans_pipeline = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.a_scale_load2trans_full_mbar_ptr.data_ptr(),
+            num_stages=self.num_scale_load2trans_stage,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.num_mcast_ctas_a * len(self.transform_warp_id),
+            ),
+            tx_count=self.num_tma_load_bytes_scale,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            tidx=transform_thread_idx,
+            mcast_mode_mn=(1, 0),
+            defer_sync=True,
+        )
         # Initialize transform2mma pipeline, which tracks the dependencies between the transformation
         # of A and MMA's consumption of transformed A
         cta_v_size = cute.size(cluster_layout_vmnk, mode=[0])
@@ -803,13 +718,8 @@ class Sm100W4A16GroupedGemmKernel:
         )
         # Initialize tile info pipeline, which tracks the dependencies between
         # tile scheduling warp and other warps
-        # Skip scheduler warp and TMA scale load warp when scale_mode is ConvertOnly
-        # when computing consumer thread count
-        num_tile_info_pipeline_consumer_threads = (
-            self.threads_per_cta
-            - 32
-            - (32 if self.scale_mode is TransformMode.ConvertOnly else 0)
-        )
+        # Every warp except the scheduler consumes routed-tile metadata.
+        num_tile_info_pipeline_consumer_threads = self.threads_per_cta - 32
         tile_info_pipeline = pipeline.PipelineAsync.create(
             barrier_storage=storage.tile_info_full_mbar_ptr.data_ptr(),
             num_stages=self.num_tile_info_stage,
@@ -860,21 +770,13 @@ class Sm100W4A16GroupedGemmKernel:
             byte_alignment=self.smem_buffer_align_bytes,
             swizzle=a_smem_layout.inner,
         )
-        sS_input = (
-            smem.allocate_tensor(
-                element_type=self.a_scale_dtype,
-                layout=scale_smem_layout.outer,
-                byte_alignment=self.smem_buffer_align_bytes,
-                swizzle=scale_smem_layout.inner,
-            )
-            if self.scale_mode is TransformMode.ConvertScale
-            else None
+        sS_input = smem.allocate_tensor(
+            element_type=self.a_scale_dtype,
+            layout=scale_smem_layout.outer,
+            byte_alignment=self.smem_buffer_align_bytes,
+            swizzle=scale_smem_layout.inner,
         )
-        sS_tma = (
-            cute.make_tensor(sS_input.iterator, scale_tma_smem_layout)
-            if self.scale_mode is TransformMode.ConvertScale
-            else None
-        )
+        sS_tma = cute.make_tensor(sS_input.iterator, scale_tma_smem_layout)
         sA_transform_input = sA_input
         sS_transform_input = sS_input
         if cutlass.const_expr(self.gated):
@@ -937,12 +839,10 @@ class Sm100W4A16GroupedGemmKernel:
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
         )
         # (bM, bK, loopM, loopK, loopL)
-        gS_mkl = (
-            cute.local_tile(
-                mS_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
-            )
-            if self.scale_mode is TransformMode.ConvertScale
-            else None
+        gS_mkl = cute.local_tile(
+            mS_mkl,
+            cute.slice_(self.mma_tiler, (None, 0, None)),
+            (None, None, None),
         )
         # (bN, bK, loopN, loopK, loopL)
         gB_nkl = cute.local_tile(
@@ -966,11 +866,7 @@ class Sm100W4A16GroupedGemmKernel:
         # (MMA, MMA_M, MMA_K, loopM, loopK, loopL)
         tCgA = thr_mma.partition_A(gA_mkl)
         # (MMA, MMA_M, MMA_K, loopM, loopK, loopL)
-        tCgS = (
-            thr_mma.partition_A(gS_mkl)
-            if self.scale_mode is TransformMode.ConvertScale
-            else None
-        )
+        tCgS = thr_mma.partition_A(gS_mkl)
         # (MMA, MMA_N, MMA_K, loopN, loopK, loopL)
         tCgB = thr_mma.partition_B(gB_nkl)
         # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
@@ -978,12 +874,8 @@ class Sm100W4A16GroupedGemmKernel:
         tCgC_simt = thr_mma.partition_C(gC_mnl_simt)
 
         # Setup copy atom to load A from shared memory for further transformation
-        copy_atom_a_input = (
-            cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), self.a_dtype, num_bits_per_copy=32
-            )
-            if self.scale_mode is TransformMode.ConvertScale
-            else None
+        copy_atom_a_input = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.a_dtype, num_bits_per_copy=32
         )
         a_smem_shape = tiled_mma.partition_shape_A(
             cute.dice(self.mma_tiler, (1, None, 1))
@@ -1012,22 +904,18 @@ class Sm100W4A16GroupedGemmKernel:
             cute.group_modes(tCgA, 0, 3),
         )
 
-        tCsS = None
-        tSsS = None
-        tSgS = None
-        if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-            thr_mma_leader_cta = tiled_mma.get_slice(0)
-            # (MMA, MMA_M, MMA_K, STAGE)
-            tCsS = thr_mma_leader_cta.partition_A(sS_transform_input)
-            tSsS, tSgS = cpasync.tma_partition(
-                tma_atom_s,
-                block_in_cluster_coord_vmnk[2],
-                a_cta_layout,
-                cute.group_modes(sS_tma, 0, 3),
-                cute.group_modes(tCgS, 0, 3),
-            )
-            tSsS = cute.filter_zeros(tSsS)
-            tSgS = cute.filter_zeros(tSgS)
+        thr_mma_leader_cta = tiled_mma.get_slice(0)
+        # (MMA, MMA_M, MMA_K, STAGE)
+        tCsS = thr_mma_leader_cta.partition_A(sS_transform_input)
+        tSsS, tSgS = cpasync.tma_partition(
+            tma_atom_s,
+            block_in_cluster_coord_vmnk[2],
+            a_cta_layout,
+            cute.group_modes(sS_tma, 0, 3),
+            cute.group_modes(tCgS, 0, 3),
+        )
+        tSsS = cute.filter_zeros(tSsS)
+        tSgS = cute.filter_zeros(tSgS)
 
         # TMA load B partition_S/D
         b_cta_layout = cute.make_layout(
@@ -1145,7 +1033,7 @@ class Sm100W4A16GroupedGemmKernel:
                 coord_n_offset = (
                     (work_tile.coord_n, 0)
                     if cutlass.const_expr(
-                        self.b_major_mode == tcgen05.OperandMajorMode.MN
+                        self.b_major_mode == cute.nvgpu.OperandMajorMode.MN
                     )
                     else (0, work_tile.coord_n)
                 )
@@ -1203,12 +1091,8 @@ class Sm100W4A16GroupedGemmKernel:
             a_load2trans_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_load2trans_stage
             )
-            scale_load2trans_producer_state = (
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.num_scale_load2trans_stage
-                )
-                if self.scale_mode is TransformMode.ConvertScale
-                else None
+            scale_load2trans_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_scale_load2trans_stage
             )
             if cutlass.const_expr(self.enable_pdl and self.fuse_activation):
                 with cute.arch.elect_one():
@@ -1222,24 +1106,23 @@ class Sm100W4A16GroupedGemmKernel:
                         work_tile.group_idx,
                     )
                 ]
-                if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-                    tSgS_slice = tSgS[
-                        (
-                            None,
-                            work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
-                            None,
-                            work_tile.group_idx,
-                        )
-                    ]
-                    # Filter zeros in rest mode
-                    rest_filtered = cute.filter_zeros(tSgS_slice[(0, None)].layout)
-                    tSgS_slice_filtered = cute.make_tensor(
-                        tSgS_slice.iterator,
-                        cute.make_layout(
-                            (tSgS_slice.layout[0].shape, rest_filtered.shape),
-                            stride=(tSgS_slice.layout[0].stride, rest_filtered.stride),
-                        ),
+                tSgS_slice = tSgS[
+                    (
+                        None,
+                        work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
+                        None,
+                        work_tile.group_idx,
                     )
+                ]
+                # Filter zeros in rest mode
+                rest_filtered = cute.filter_zeros(tSgS_slice[(0, None)].layout)
+                tSgS_slice_filtered = cute.make_tensor(
+                    tSgS_slice.iterator,
+                    cute.make_layout(
+                        (tSgS_slice.layout[0].shape, rest_filtered.shape),
+                        stride=(tSgS_slice.layout[0].stride, rest_filtered.stride),
+                    ),
+                )
 
                 a_load2trans_producer_state.reset_count()
                 peek_load2trans_empty_status = cutlass.Boolean(1)
@@ -1249,15 +1132,14 @@ class Sm100W4A16GroupedGemmKernel:
                             a_load2trans_producer_state
                         )
                     )
-                if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-                    scale_load2trans_producer_state.reset_count()
-                    peek_scale_load2trans_empty_status = cutlass.Boolean(1)
-                    if scale_load2trans_producer_state.count < k_tile_cnt:
-                        peek_scale_load2trans_empty_status = (
-                            scale_load2trans_pipeline.producer_try_acquire(
-                                scale_load2trans_producer_state
-                            )
+                scale_load2trans_producer_state.reset_count()
+                peek_scale_load2trans_empty_status = cutlass.Boolean(1)
+                if scale_load2trans_producer_state.count < k_tile_cnt:
+                    peek_scale_load2trans_empty_status = (
+                        scale_load2trans_pipeline.producer_try_acquire(
+                            scale_load2trans_producer_state
                         )
+                    )
 
                 for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     a_load2trans_pipeline.producer_acquire(
@@ -1282,33 +1164,30 @@ class Sm100W4A16GroupedGemmKernel:
                             )
                         )
 
-                    if cutlass.const_expr(
-                        self.scale_mode == TransformMode.ConvertScale
-                    ):
-                        scale_load2trans_pipeline.producer_acquire(
-                            scale_load2trans_producer_state,
-                            peek_scale_load2trans_empty_status,
-                        )
-                        cute.copy(
-                            tma_atom_s,
-                            tSgS_slice_filtered[
-                                (None, scale_load2trans_producer_state.count)
-                            ],
-                            tSsS[(None, scale_load2trans_producer_state.index)],
-                            tma_bar_ptr=scale_load2trans_pipeline.producer_get_barrier(
-                                scale_load2trans_producer_state
-                            ),
-                            mcast_mask=s_full_mcast_mask,
-                        )
+                    scale_load2trans_pipeline.producer_acquire(
+                        scale_load2trans_producer_state,
+                        peek_scale_load2trans_empty_status,
+                    )
+                    cute.copy(
+                        tma_atom_s,
+                        tSgS_slice_filtered[
+                            (None, scale_load2trans_producer_state.count)
+                        ],
+                        tSsS[(None, scale_load2trans_producer_state.index)],
+                        tma_bar_ptr=scale_load2trans_pipeline.producer_get_barrier(
+                            scale_load2trans_producer_state
+                        ),
+                        mcast_mask=s_full_mcast_mask,
+                    )
 
-                        scale_load2trans_producer_state.advance()
-                        peek_scale_load2trans_empty_status = cutlass.Boolean(1)
-                        if scale_load2trans_producer_state.count < k_tile_cnt:
-                            peek_scale_load2trans_empty_status = (
-                                scale_load2trans_pipeline.producer_try_acquire(
-                                    scale_load2trans_producer_state
-                                )
+                    scale_load2trans_producer_state.advance()
+                    peek_scale_load2trans_empty_status = cutlass.Boolean(1)
+                    if scale_load2trans_producer_state.count < k_tile_cnt:
+                        peek_scale_load2trans_empty_status = (
+                            scale_load2trans_pipeline.producer_try_acquire(
+                                scale_load2trans_producer_state
                             )
+                        )
 
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
@@ -1322,8 +1201,7 @@ class Sm100W4A16GroupedGemmKernel:
                 tile_info_consumer_state.advance()
 
             a_load2trans_pipeline.producer_tail(a_load2trans_producer_state)
-            if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-                scale_load2trans_pipeline.producer_tail(scale_load2trans_producer_state)
+            scale_load2trans_pipeline.producer_tail(scale_load2trans_producer_state)
 
         # Specialized transform warps
         if warp_idx >= self.transform_warp_id[0]:
@@ -1333,7 +1211,6 @@ class Sm100W4A16GroupedGemmKernel:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
-            tCrA = None
             if cutlass.const_expr(
                 self.transform_a_source == tcgen05.OperandSource.TMEM
             ):
@@ -1351,7 +1228,7 @@ class Sm100W4A16GroupedGemmKernel:
             src_copy_a, dst_copy_a, tAsA_input, tAsA_transform = (
                 mixed_input_utils.transform_partition(
                     self.transform_a_source,
-                    self.scale_mode,
+                    TransformMode.ConvertScale,
                     copy_atom_a_input,
                     copy_atom_a_transform,
                     sA_transform_input,
@@ -1371,32 +1248,27 @@ class Sm100W4A16GroupedGemmKernel:
                 tAsA_input[(None, None, None, None, 0)].shape, self.mma_dtype
             )
             # Partition scale tensor
-            smem_thr_copy_S = None
-            tSsS_trans = None
-            tSrS_copy = None
-            tSrS = None
-            if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-                smem_thr_copy_S = src_copy_a.get_slice(transform_local_tidx)
-                tSsS_trans = smem_thr_copy_S.partition_S(tCsS)
-                scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (0,)
-                tSsS_layout_per_stage = tSsS_trans[scale_stage_coord].layout
-                tSrS_copy = cute.make_rmem_tensor(
-                    cute.filter_zeros(tSsS_layout_per_stage).shape,
-                    self.a_scale_dtype,
-                )
-                tSrS = cute.make_tensor(
-                    tSrS_copy.iterator,
-                    cute.make_layout(
-                        tSsS_layout_per_stage.shape,
-                        stride=tSrS_copy.layout.stride,
-                    ),
-                )
-                assert cute.size(tSrS, mode=[0]) == cute.size(tArA, mode=[0]), (
-                    "tSrS and tArA have different leading dimension"
-                )
-                assert cute.size(tSrS) == cute.size(tArA), (
-                    "tSrS and tArA have different shape"
-                )
+            smem_thr_copy_S = src_copy_a.get_slice(transform_local_tidx)
+            tSsS_trans = smem_thr_copy_S.partition_S(tCsS)
+            scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (0,)
+            tSsS_layout_per_stage = tSsS_trans[scale_stage_coord].layout
+            tSrS_copy = cute.make_rmem_tensor(
+                cute.filter_zeros(tSsS_layout_per_stage).shape,
+                self.a_scale_dtype,
+            )
+            tSrS = cute.make_tensor(
+                tSrS_copy.iterator,
+                cute.make_layout(
+                    tSsS_layout_per_stage.shape,
+                    stride=tSrS_copy.layout.stride,
+                ),
+            )
+            assert cute.size(tSrS, mode=[0]) == cute.size(tArA, mode=[0]), (
+                "tSrS and tArA have different leading dimension"
+            )
+            assert cute.size(tSrS) == cute.size(tArA), (
+                "tSrS and tArA have different shape"
+            )
             # Deduce a sub-tile size and tile tensors
             transform_tiler_size = min(
                 cute.size(cute.coalesce(tAsA_input.layout), mode=[0]), 128
@@ -1404,16 +1276,8 @@ class Sm100W4A16GroupedGemmKernel:
             transform_tiler = cute.make_layout(transform_tiler_size)
             tArA_load = cute.flat_divide(tArA, transform_tiler)
             tArA_load = cute.group_modes(tArA_load, 1, cute.rank(tArA_load))
-            tSrS_load = (
-                cute.flat_divide(tSrS, transform_tiler)
-                if self.scale_mode is TransformMode.ConvertScale
-                else None
-            )
-            tSrS_load = (
-                cute.group_modes(tSrS_load, 1, cute.rank(tSrS_load))
-                if self.scale_mode is TransformMode.ConvertScale
-                else None
-            )
+            tSrS_load = cute.flat_divide(tSrS, transform_tiler)
+            tSrS_load = cute.group_modes(tSrS_load, 1, cute.rank(tSrS_load))
             tArA_transform_store = cute.flat_divide(tArA_transform, transform_tiler)
             tArA_transform_store = cute.group_modes(
                 tArA_transform_store, 1, cute.rank(tArA_transform_store)
@@ -1436,13 +1300,9 @@ class Sm100W4A16GroupedGemmKernel:
                 pipeline.PipelineUserType.Consumer,
                 self.num_load2trans_stage,
             )
-            scale_load2trans_consumer_state = (
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    self.num_scale_load2trans_stage,
-                )
-                if self.scale_mode is TransformMode.ConvertScale
-                else None
+            scale_load2trans_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer,
+                self.num_scale_load2trans_stage,
             )
             trans2mma_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
@@ -1458,13 +1318,12 @@ class Sm100W4A16GroupedGemmKernel:
                         )
                     )
                 peek_scale_load2trans_full_status = cutlass.Boolean(1)
-                if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-                    scale_load2trans_consumer_state.reset_count()
-                    peek_scale_load2trans_full_status = (
-                        scale_load2trans_pipeline.consumer_try_wait(
-                            scale_load2trans_consumer_state
-                        )
+                scale_load2trans_consumer_state.reset_count()
+                peek_scale_load2trans_full_status = (
+                    scale_load2trans_pipeline.consumer_try_wait(
+                        scale_load2trans_consumer_state
                     )
+                )
                 trans2mma_producer_state.reset_count()
                 peek_trans2mma_empty_status = cutlass.Boolean(1)
                 if trans2mma_producer_state.count < k_tile_cnt:
@@ -1474,7 +1333,7 @@ class Sm100W4A16GroupedGemmKernel:
                         )
                     )
 
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     a_load2trans_pipeline.consumer_wait(
                         a_load2trans_consumer_state, peek_load2trans_full_status
                     )
@@ -1487,35 +1346,26 @@ class Sm100W4A16GroupedGemmKernel:
                     tAsA_input_slice = cute.group_modes(
                         tAsA_input_slice, 1, cute.rank(tAsA_input_slice)
                     )
-                    if cutlass.const_expr(
-                        self.scale_mode == TransformMode.ConvertScale
-                    ):
-                        scale_load2trans_pipeline.consumer_wait(
-                            scale_load2trans_consumer_state,
-                            peek_scale_load2trans_full_status,
-                        )
+                    scale_load2trans_pipeline.consumer_wait(
+                        scale_load2trans_consumer_state,
+                        peek_scale_load2trans_full_status,
+                    )
                     trans2mma_pipeline.producer_acquire(
                         trans2mma_producer_state, peek_trans2mma_empty_status
                     )
-                    # load scale tensor when needed
-                    if cutlass.const_expr(
-                        self.scale_mode == TransformMode.ConvertScale
-                    ):
-                        if k_tile % num_k_tiles_per_scale == 0:
-                            scale_stage_coord = (None,) * (
-                                cute.rank(tSsS_trans) - 1
-                            ) + (scale_load2trans_consumer_state.index,)
-                            tSsS_slice = tSsS_trans[scale_stage_coord]
-                            tSsS_slice_filtered = cute.make_tensor(
-                                tSsS_slice.iterator,
-                                cute.filter_zeros(tSsS_slice.layout),
-                            )
-                            cute.autovec_copy(tSsS_slice_filtered, tSrS_copy)
-                        cur_scale_load2trans_consumer_state = (
-                            scale_load2trans_consumer_state.clone()
-                        )
-                        if (k_tile + 1) % num_k_tiles_per_scale == 0:
-                            scale_load2trans_consumer_state.advance()
+                    scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (
+                        scale_load2trans_consumer_state.index,
+                    )
+                    tSsS_slice = tSsS_trans[scale_stage_coord]
+                    tSsS_slice_filtered = cute.make_tensor(
+                        tSsS_slice.iterator,
+                        cute.filter_zeros(tSsS_slice.layout),
+                    )
+                    cute.autovec_copy(tSsS_slice_filtered, tSrS_copy)
+                    cur_scale_load2trans_consumer_state = (
+                        scale_load2trans_consumer_state.clone()
+                    )
+                    scale_load2trans_consumer_state.advance()
 
                     cur_a_load2trans_consumer_state = (
                         a_load2trans_consumer_state.clone()
@@ -1536,33 +1386,21 @@ class Sm100W4A16GroupedGemmKernel:
                                         a_load2trans_consumer_state
                                     )
                                 )
-                                if cutlass.const_expr(
-                                    self.scale_mode == TransformMode.ConvertScale
-                                ):
-                                    peek_scale_load2trans_full_status = (
-                                        scale_load2trans_pipeline.consumer_try_wait(
-                                            scale_load2trans_consumer_state
-                                        )
+                                peek_scale_load2trans_full_status = (
+                                    scale_load2trans_pipeline.consumer_try_wait(
+                                        scale_load2trans_consumer_state
                                     )
-                        if cutlass.const_expr(
-                            self.scale_mode == TransformMode.ConvertScale
-                        ):
-                            packed_fragment = cute.recast_tensor(
-                                tArA_load[(None, idx)], cutlass.Uint8
-                            ).load()
-                            scale_fragment = cute.recast_tensor(
-                                tSrS_load[(None, (None, idx))], cutlass.Uint8
-                            ).load()
-                            tensor_transformed = decode_nvfp4_fragment_to_bf16(
-                                packed_fragment,
-                                scale_fragment,
-                            )
-                        else:
-                            tensor_transformed = mixed_input_utils.cvt_tensor_a(
-                                tArA_load[(None, idx)],
-                                self.mma_dtype,
-                                False,
-                            )
+                                )
+                        packed_fragment = cute.recast_tensor(
+                            tArA_load[(None, idx)], cutlass.Uint8
+                        ).load()
+                        scale_fragment = cute.recast_tensor(
+                            tSrS_load[(None, (None, idx))], cutlass.Uint8
+                        ).load()
+                        tensor_transformed = decode_nvfp4_fragment_to_bf16(
+                            packed_fragment,
+                            scale_fragment,
+                        )
                         tArA_transform_store[(None, idx)].store(tensor_transformed)
                     # Store transformed A to tensor memory or shared memory
                     mixed_input_utils.store_transformed_a(
@@ -1581,12 +1419,9 @@ class Sm100W4A16GroupedGemmKernel:
                             "async.shared",
                             space="cta",
                         )
-                    if cutlass.const_expr(
-                        self.scale_mode == TransformMode.ConvertScale
-                    ):
-                        scale_load2trans_pipeline.consumer_release(
-                            cur_scale_load2trans_consumer_state
-                        )
+                    scale_load2trans_pipeline.consumer_release(
+                        cur_scale_load2trans_consumer_state
+                    )
 
                     a_load2trans_pipeline.consumer_release(
                         cur_a_load2trans_consumer_state
@@ -1620,7 +1455,6 @@ class Sm100W4A16GroupedGemmKernel:
             # Get the pointer to the TMEM buffer
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tCrA = None
             if cutlass.const_expr(
                 self.transform_a_source == tcgen05.OperandSource.TMEM
             ):
@@ -1846,7 +1680,7 @@ class Sm100W4A16GroupedGemmKernel:
                 32 * len(self.epilog_warp_id),
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
-                num_stages=self.num_c_store_stage,
+                num_stages=self.num_c_stage,
                 producer_group=c_producer_group,
             )
 
@@ -1939,7 +1773,7 @@ class Sm100W4A16GroupedGemmKernel:
                             gated_tTR_rAcc,
                         )
                         num_prev_subtiles += 1
-                        c_buffer = num_prev_subtiles % self.num_c_store_stage
+                        c_buffer = num_prev_subtiles % self.num_c_stage
                         gated_identity_mn = gated_tTR_identity_base[
                             (None, None, None, 0, gated_subtile_idx)
                         ]
@@ -2251,12 +2085,8 @@ class Sm100W4A16GroupedGemmKernel:
         c_dtype: type[cutlass.Numeric],
         c_layout: utils.LayoutEnum,
         transform_a_source: tcgen05.OperandSource,
-        scale_granularity_m: int,
-        scale_granularity_k: int,
         smem_buffer_align_bytes: int,
-        scale_mode: TransformMode,
         use_fused_finalize: bool,
-        gated: bool,
     ) -> tuple[int, int, int, int, int, int, int, int]:
         """
         Compute pipeline stages and TMEM column allocation configurations.
@@ -2283,14 +2113,8 @@ class Sm100W4A16GroupedGemmKernel:
         :type c_layout: utils.LayoutEnum
         :param transform_a_source: The source of the transformed A tensor.
         :type transform_a_source: tcgen05.OperandSource
-        :param scale_granularity_m: The granularity of the scale tensor along the M mode.
-        :type scale_granularity_m: int
-        :param scale_granularity_k: The granularity of the scale tensor along the K mode.
-        :type scale_granularity_k: int
         :param smem_buffer_align_bytes: The alignment of the shared memory buffer.
         :type smem_buffer_align_bytes: int
-        :param scale_mode: The transform mode.
-        :type scale_mode: TransformMode
         :param use_fused_finalize: Whether the epilogue atomically reduces route
             outputs into token rows.
         :type use_fused_finalize: bool
@@ -2340,8 +2164,7 @@ class Sm100W4A16GroupedGemmKernel:
             + bytes_per_pipeline_stage * num_tile_info_stage
         )
 
-        c_store_stage_count = 1 if use_fused_finalize else 2
-        c_stage_count = c_store_stage_count
+        c_stage_count = 1 if use_fused_finalize else 2
         c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(
             c_dtype,
             c_layout,
@@ -2360,21 +2183,17 @@ class Sm100W4A16GroupedGemmKernel:
         )
 
         smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        if scale_mode == TransformMode.ConvertOnly:
-            scale_load2trans_stage_count = 0
-            a_scale_bytes_per_stage = 0
-        else:
-            # Ensure we have 4 buffers for scale tiles needed for 1 CTA tile
-            a_scale_k_mode = max(cta_tile_shape_mnk[2] // scale_granularity_k, 1)
-            a_scale_m_mode = max(cta_tile_shape_mnk[0] // scale_granularity_m, 1)
-            scale_load2trans_stage_count = 4
-            a_scale_bytes_per_stage = cute.round_up(
-                cute.size_in_bytes(
-                    tiled_mma.op.a_dtype,
-                    cute.make_layout((a_scale_m_mode, a_scale_k_mode)),
-                ),
-                smem_buffer_align_bytes,
-            )
+        # Four stages cover the NVFP4 scale tiles consumed by one CTA tile.
+        a_scale_k_mode = max(cta_tile_shape_mnk[2] // _NVFP4_SCALE_GRANULARITY_K, 1)
+        a_scale_m_mode = max(cta_tile_shape_mnk[0] // _NVFP4_SCALE_GRANULARITY_M, 1)
+        scale_load2trans_stage_count = 4
+        a_scale_bytes_per_stage = cute.round_up(
+            cute.size_in_bytes(
+                tiled_mma.op.a_dtype,
+                cute.make_layout((a_scale_m_mode, a_scale_k_mode)),
+            ),
+            smem_buffer_align_bytes,
+        )
         a_scale_bytes = (
             a_scale_bytes_per_stage + bytes_per_pipeline_stage
         ) * scale_load2trans_stage_count
@@ -2515,8 +2334,6 @@ class Sm100W4A16GroupedGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
-        scale_granularity_m: int,
-        scale_granularity_k: int,
         mma_tiler: tuple[int, int, int],
         cluster_shape_mn: tuple[int, int],
         use_2cta_instrs: bool,
@@ -2524,7 +2341,7 @@ class Sm100W4A16GroupedGemmKernel:
         """
         Check if the kernel can be implemented for the given tensor shapes and data types.
         """
-        m, n, k, l = mnkl
+        m, n, k, _ = mnkl
 
         if not mixed_input_utils.is_valid_mma_tiler_and_cluster_shape(
             mma_tiler, cluster_shape_mn, use_2cta_instrs
@@ -2533,10 +2350,8 @@ class Sm100W4A16GroupedGemmKernel:
         # Unlike the generic mixed-input kernel, W4A16 consumes multiple
         # 16-value NVFP4 scale blocks within each MMA K tile.
         if (
-            scale_granularity_m != 1
-            or scale_granularity_k != 16
-            or k % scale_granularity_k != 0
-            or mma_tiler[2] % scale_granularity_k != 0
+            k % _NVFP4_SCALE_GRANULARITY_K != 0
+            or mma_tiler[2] % _NVFP4_SCALE_GRANULARITY_K != 0
         ):
             return False
         if not mixed_input_utils.is_valid_tensor_alignment(
@@ -2553,8 +2368,8 @@ class Sm100W4A16GroupedGemmKernel:
             mma_tiler,
             use_2cta_instrs,
             cluster_shape_mn,
-            scale_granularity_m,
-            scale_granularity_k,
+            _NVFP4_SCALE_GRANULARITY_M,
+            _NVFP4_SCALE_GRANULARITY_K,
         ):
             return False
         return True

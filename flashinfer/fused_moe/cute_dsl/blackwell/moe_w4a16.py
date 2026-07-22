@@ -150,8 +150,6 @@ def _get_compiled_kernel(
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
         kernel = Sm100W4A16GroupedGemmKernel(
-            scale_granularity_m=1,
-            scale_granularity_k=16,
             acc_dtype=cutlass.Float32,
             use_2cta_instrs=use_2cta_instrs,
             mma_tiler_mnk=(mma_tiler_m, route_tile, mma_tiler_k),
