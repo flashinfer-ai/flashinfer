@@ -1,8 +1,7 @@
 name: 🐛 Bug Report
 description: >
-  Report something broken, wrong, or slower than it used to be — correctness
-  issues, crashes, build/install failures, or performance regressions. For new
-  capabilities or speedups, use 🚀 Kernel / Feature Request instead.
+  Report something broken, wrong, or slower than before — a correctness bug,
+  crash, or perf regression. For new capabilities, use 🚀 Kernel / Feature Request.
 labels: ["bug"]
 body:
   - type: checkboxes
