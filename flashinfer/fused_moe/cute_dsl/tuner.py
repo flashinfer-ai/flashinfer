@@ -481,8 +481,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         else:
             final_scale_dtype = cutlass.Float16
 
-        valid_tactics = []
-        for tactic in ALL_MOE_TACTICS:
+        def _tactic_ok(tactic):
             tile_size, gemm1_tactic, gemm2_tactic = tactic
             gemm1_mma_tiler_mn = gemm1_tactic[0]
             gemm1_cluster_shape_mn = gemm1_tactic[1]
@@ -528,21 +527,39 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 )
             )
 
-            if gemm1_ok and gemm2_ok:
-                valid_tactics.append(tactic)
+            return gemm1_ok and gemm2_ok
+
+        valid_tactics = [t for t in ALL_MOE_TACTICS if _tactic_ok(t)]
 
         if not valid_tactics:
-            logger.warning(
-                "No valid tactics found for problem dims "
-                "(tokens=%d, hidden=%d, intermediate=%d, experts=%d, top_k=%d). "
-                "Falling back to default tactic.",
-                num_tokens,
-                hidden_size,
-                intermediate_size,
-                num_local_experts,
-                self.top_k,
-            )
-            valid_tactics = [DEFAULT_MOE_TACTIC]
+            # gh #3957: never fall back to an UNVALIDATED tactic. The
+            # can_implement guards exist because the kernels' unpredicated
+            # epilogue stores overrun partial/padded N tiles; a fallback that
+            # bypasses them re-opens the same silent device-memory corruption.
+            if _tactic_ok(DEFAULT_MOE_TACTIC):
+                logger.warning(
+                    "No valid tactics found for problem dims "
+                    "(tokens=%d, hidden=%d, intermediate=%d, experts=%d, top_k=%d). "
+                    "Falling back to default tactic.",
+                    num_tokens,
+                    hidden_size,
+                    intermediate_size,
+                    num_local_experts,
+                    self.top_k,
+                )
+                valid_tactics = [DEFAULT_MOE_TACTIC]
+            else:
+                logger.warning(
+                    "cute_dsl MoE refuses problem dims "
+                    "(tokens=%d, hidden=%d, intermediate=%d, experts=%d, top_k=%d): "
+                    "no tactic (incl. default) passes can_implement (gh #3957).",
+                    num_tokens,
+                    hidden_size,
+                    intermediate_size,
+                    num_local_experts,
+                    self.top_k,
+                )
+                return []
 
         return valid_tactics
 
