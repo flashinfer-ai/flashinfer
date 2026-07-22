@@ -23,8 +23,12 @@ def _check_dsl_perf_floor() -> None:
 
     The MegaMoE kernels compile 34-54% slower on nvidia-cutlass-dsl 4.5.x
     (measured 2026-07-15, TUNING.md "CuTe-DSL runtime sensitivity"; vllm_e2e
-    RUNS.md run 14). Results are CORRECT on 4.5.x — only slower — so this
-    warns instead of raising. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.
+    RUNS.md run 14). Exception: on exactly 4.5.2 the nvfp4 swap-AB kernels
+    carry the MR!27 mainloop WAR (kernel_fc12.py) and measure at 4.6.1 parity
+    (TUNING.md follow-up 2026-07-22), so 4.5.2 gets a softer note covering
+    the still-unmeasured mxfp8 path. Results are CORRECT on 4.5.x — only
+    slower — so this warns instead of raising. Silence with
+    FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.
     """
     import os as _os
 
@@ -42,15 +46,27 @@ def _check_dsl_perf_floor() -> None:
     if parts and parts < (4, 6, 1):
         import warnings as _warnings
 
-        _warnings.warn(
-            f"nvidia-cutlass-dsl {ver} detected: the CuTeDSL MegaMoE kernels "
-            "compile 34-54% slower on <4.6.1 (perf floor; results stay "
-            "correct). Install nvidia-cutlass-dsl[cu13]>=4.6.1 — see "
-            "kernel_src/cutedsl_megamoe/TUNING.md 'CuTe-DSL runtime "
-            "sensitivity'. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.",
-            UserWarning,
-            stacklevel=2,
-        )
+        if parts == (4, 5, 2):
+            _warnings.warn(
+                f"nvidia-cutlass-dsl {ver} detected: nvfp4 MegaMoE kernels "
+                "run at >=4.6.1 parity here via the MR!27 4.5.2 mainloop WAR, "
+                "but the mxfp8 path is unmeasured on 4.5.2 — "
+                ">=4.6.1 remains recommended. See "
+                "kernel_src/cutedsl_megamoe/TUNING.md 'CuTe-DSL runtime "
+                "sensitivity'. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            _warnings.warn(
+                f"nvidia-cutlass-dsl {ver} detected: the CuTeDSL MegaMoE kernels "
+                "compile 34-54% slower on <4.6.1 (perf floor; results stay "
+                "correct). Install nvidia-cutlass-dsl[cu13]>=4.6.1 — see "
+                "kernel_src/cutedsl_megamoe/TUNING.md 'CuTe-DSL runtime "
+                "sensitivity'. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 _check_dsl_perf_floor()
