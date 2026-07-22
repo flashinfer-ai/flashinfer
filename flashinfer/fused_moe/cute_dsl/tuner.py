@@ -322,63 +322,92 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     # `gemm/gemm_base.py`).
                     gen_tuning_buckets=get_hybrid_num_tokens_buckets,
                     map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
-                    tensor_initializers=[
-                        # 0: x — FP4 quantized input (uint8 packed). Seeded
-                        # for cross-process determinism of autotune picks
-                        # (matches trt-llm's seed=515 convention).
-                        lambda shapes, dtype, device: torch.randint(
-                            0,
-                            256,
+                ),
+            ),
+            # Per-input initializer closures, keyed by input index. Indices
+            # match input_idx above: 11 is per_token_scale when per-token
+            # activation is enabled (else moe_output), 12 is moe_output.
+            tensor_initializers=(
+                # 0: x — FP4 quantized input (uint8 packed). Seeded
+                # for cross-process determinism of autotune picks
+                # (matches trt-llm's seed=515 convention).
+                (
+                    0,
+                    lambda shapes, dtype, device: torch.randint(
+                        0,
+                        256,
+                        shapes,
+                        dtype=torch.uint8,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                # 1: x_sf — FP8 scale factors (uint8). Seeded.
+                (
+                    1,
+                    lambda shapes, dtype, device: torch.randint(
+                        1,
+                        128,
+                        shapes,
+                        dtype=torch.uint8,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                # 2: token_selected_experts — output is overwritten
+                # by inputs_pre_hook (CuteDslMoEInputsHelper), but
+                # seed the initializer too in case the hook is ever
+                # disabled.
+                (
+                    2,
+                    lambda shapes, dtype, device: torch.randint(
+                        0,
+                        max(num_experts, 1),
+                        shapes,
+                        dtype=torch.int32,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                # 3: token_final_scales — softmax-normalized. Seeded.
+                (
+                    3,
+                    lambda shapes, dtype, device: torch.softmax(
+                        torch.randn(
                             shapes,
-                            dtype=torch.uint8,
                             device=device,
                             generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 1: x_sf — FP8 scale factors (uint8). Seeded.
-                        lambda shapes, dtype, device: torch.randint(
-                            1,
-                            128,
-                            shapes,
-                            dtype=torch.uint8,
-                            device=device,
-                            generator=torch.Generator(device=device).manual_seed(515),
-                        ),
-                        # 2: token_selected_experts — output is overwritten
-                        # by inputs_pre_hook (CuteDslMoEInputsHelper), but
-                        # seed the initializer too in case the hook is ever
-                        # disabled.
-                        lambda shapes, dtype, device: torch.randint(
-                            0,
-                            max(num_experts, 1),
-                            shapes,
-                            dtype=torch.int32,
-                            device=device,
-                            generator=torch.Generator(device=device).manual_seed(515),
-                        ),
-                        # 3: token_final_scales — softmax-normalized. Seeded.
-                        lambda shapes, dtype, device: torch.softmax(
-                            torch.randn(
-                                shapes,
-                                device=device,
-                                generator=torch.Generator(device=device).manual_seed(
-                                    515
-                                ),
+                        dim=-1,
+                    ).to(torch.float32),
+                ),
+                *(
+                    [
+                        # 11: per_token_scale — ones.
+                        (
+                            11,
+                            lambda shapes, dtype, device: torch.ones(
+                                shapes, dtype=torch.float32, device=device
                             ),
-                            dim=-1,
-                        ).to(torch.float32),
-                        *(
-                            [
-                                lambda shapes, dtype, device: torch.ones(
-                                    shapes, dtype=torch.float32, device=device
-                                )
-                            ]
-                            if use_per_token_activation
-                            else []
                         ),
-                        lambda shapes, dtype, device: torch.empty(
-                            shapes, dtype=dtype, device=device
+                        # 12: moe_output — empty.
+                        (
+                            12,
+                            lambda shapes, dtype, device: torch.empty(
+                                shapes, dtype=dtype, device=device
+                            ),
                         ),
-                    ],
+                    ]
+                    if use_per_token_activation
+                    else [
+                        # 11: moe_output — empty.
+                        (
+                            11,
+                            lambda shapes, dtype, device: torch.empty(
+                                shapes, dtype=dtype, device=device
+                            ),
+                        )
+                    ]
                 ),
             ),
             inputs_pre_hook=self._inputs_helper.inputs_pre_hook,

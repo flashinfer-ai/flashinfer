@@ -1505,7 +1505,7 @@ def get_trtllm_moe_sm100_module():
                 return MoeRunnerInputs._DYNAMIC_DIM[name]
 
             dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
-            initializers = [init for _, _, init in sorted_inputs]
+            tensor_initializers = tuple((idx, init) for idx, _, init in sorted_inputs)
 
             return TuningConfig(
                 dynamic_tensor_specs=(
@@ -1514,9 +1514,9 @@ def get_trtllm_moe_sm100_module():
                         dim_idx,
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
                         make_hybrid_bucket_mapper(tune_max_num_tokens),
-                        initializers,
                     ),
                 ),
+                tensor_initializers=tensor_initializers,
                 **kwargs,
             )
 

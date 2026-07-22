@@ -2158,11 +2158,11 @@ def _mla_decode_tuning_config(
 ) -> TuningConfig:
     """One TuningConfig (and one pair of initializer closures) per key.
 
-    Memoized because ``AutoTuner._find_nearest_profile`` lru-caches on
-    ``(shapes, tuning_config)``: a fresh config per dispatcher call shares
-    its hash with all previous ones (``DynamicTensorSpec.__hash__`` skips
-    ``tensor_initializers``) but never compares equal (closures compare by
-    identity), so would result in a leak.
+    Memoized so equivalent dispatcher calls reuse a single config object (and
+    its initializer closures) instead of rebuilding them every call. The
+    initializer closures no longer participate in ``AutoTuner``'s nearest-profile
+    cache key (it keys only on the dynamic-tensor specs and constraints), so this
+    memoization is a host-overhead optimization rather than a leak guard.
 
     The DynamicTensorSpec sweeps batch dim across all four ``inputs`` tensors
     (query, block_tables, seq_lens, out). ``block_tables`` is initialized via
@@ -2189,9 +2189,9 @@ def _mla_decode_tuning_config(
                 dim_idx=(0, 0, 0, 0),
                 gen_tuning_buckets=buckets,
                 map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
-                tensor_initializers=(None, init_block_tables, init_seq_lens, None),
             ),
         ),
+        tensor_initializers=((1, init_block_tables), (2, init_seq_lens)),
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )

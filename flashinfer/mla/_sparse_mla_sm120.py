@@ -949,14 +949,14 @@ def _decode_dsv4_tuning_config() -> TuningConfig:
                 dim_idx=(0, 0, 0, 0, 0),
                 gen_tuning_buckets=_decode_dsv4_num_token_buckets,
                 map_to_tuning_buckets=_decode_dsv4_map_to_token_bucket,
-                tensor_initializers=[
-                    _decode_dsv4_init_q,
-                    _decode_dsv4_init_indices,
-                    _decode_dsv4_init_topk_length,
-                    _decode_dsv4_init_indices,
-                    _decode_dsv4_init_topk_length,
-                ],
             ),
+        ),
+        tensor_initializers=(
+            (0, _decode_dsv4_init_q),
+            (1, _decode_dsv4_init_indices),
+            (6, _decode_dsv4_init_topk_length),
+            (8, _decode_dsv4_init_indices),
+            (9, _decode_dsv4_init_topk_length),
         ),
         inputs_pre_hook=_decode_dsv4_inputs_pre_hook,
         # Constrain T (dim 0) of all output/scratch tensors to q's T so the
@@ -981,12 +981,12 @@ def _decode_dsv3_2_tuning_config() -> TuningConfig:
                 dim_idx=(0, 0, 0),
                 gen_tuning_buckets=_decode_dsv4_num_token_buckets,
                 map_to_tuning_buckets=_decode_dsv4_map_to_token_bucket,
-                tensor_initializers=[
-                    _decode_dsv4_init_q,
-                    _decode_dsv4_init_indices,
-                    _decode_dsv4_init_topk_length,
-                ],
             ),
+        ),
+        tensor_initializers=(
+            (0, _decode_dsv4_init_q),
+            (1, _decode_dsv4_init_indices),
+            (6, _decode_dsv4_init_topk_length),
         ),
         inputs_pre_hook=_decode_dsv4_inputs_pre_hook,
         # Constrain T (dim 0) of all output/scratch tensors to q's T so the
