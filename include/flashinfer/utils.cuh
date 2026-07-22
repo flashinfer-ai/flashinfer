@@ -152,6 +152,9 @@
   } else if (group_size == 4) {                              \
     constexpr size_t GROUP_SIZE = 4;                         \
     __VA_ARGS__                                              \
+  } else if (group_size == 6) {                              \
+    constexpr size_t GROUP_SIZE = 6;                         \
+    __VA_ARGS__                                              \
   } else if (group_size == 8) {                              \
     constexpr size_t GROUP_SIZE = 8;                         \
     __VA_ARGS__                                              \
@@ -386,12 +389,26 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
   std::cout << std::endl;
 }
 
-inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
+inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim,
+                                     uint32_t head_dim_qk = 0, uint32_t kv_dtype_bytes = 2) {
+  // head_dim is the VO dim at the batch-prefill call sites; head_dim_qk (when
+  // nonzero) lets asymmetric (QK != VO) configurations report the dim that
+  // actually drives shared-memory cost. kv_dtype_bytes is sizeof(DTypeKV) when
+  // the caller knows it; the default 2 is the conservative worst case.
+  const uint32_t qk = head_dim_qk ? head_dim_qk : head_dim;
   if (head_dim >= 512) {
+    // True VO-split (VO >= 512): the split halves o_frag register pressure, so
+    // CTA_TILE_Q=32 is feasible for long-q; CTA16 for decode / short-q.
     if (avg_packed_qo_len <= 32) {
       return 16;  // decode / short-q (incl. speculative decode): lean CTA16
     }
     return 32;  // Long-q prefill use CTA_TILE_Q=32
+  }
+  if (qk >= 512) {
+    // Asymmetric large-QK but VO <= 256: VO-split does NOT engage (NUM_MMA_D_VO
+    // == 16), so o_frag is sized by the full NUM_MMA_D_VO_TILE=16. CTA_TILE_Q>16
+    // (NUM_MMA_Q>=2) overflows the 256-register o_frag wall -> only CTA16 is valid.
+    return 16;
   }
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     return 128;
@@ -403,7 +420,46 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
         // avg_packed_qo_len <= 64
         return 64;
       } else {
-        // avg_packed_qo_len <= 16
+        // avg_packed_qo_len <= 16: prefer the 1x4 warp layout (cta_tile_q=16),
+        // but only if one NUM_MMA_KV step fits shared memory. The estimate
+        // mirrors the kernel dispatcher's minimum requirement -- one Q tile
+        // (assumed 2-byte Q) plus a single NUM_MMA_KV step of K+V in the 1x4
+        // layout (16 rows x 4 KV warps x kv_dtype_bytes) -- checked against
+        // cudaDevAttrMaxSharedMemoryPerBlockOptin, the same limit the
+        // dispatcher's "even the smallest KV tile exceeds shared memory" guard
+        // bounds max_smem_per_threadblock with. It is an approximation: FP4
+        // scale-factor bytes and FP8 repack staging are not counted (both are
+        // zero or small at CTA_TILE_Q=16).
+        // This fallback is reachable today: neither plan() nor the JIT path
+        // validates head dims, so within this branch (vo <= 256 -- vo in
+        // (256, 512) fails the NUM_MMA_D_VO tiling static_assert and vo >= 512
+        // / qk >= 512 return above) head_dim_qk may be any multiple of 16 up
+        // to 496 under pos_encoding_mode NONE. E.g. (qk, vo) = (448, 256) at
+        // 2-byte KV needs 16*448*2 + (448+256)*16*4*2 = 104448 bytes, which
+        // exceeds the 101376-byte opt-in limit of 99KB parts (SM86/89/120/121)
+        // -- the probe fires and the cta_tile_q=64 fallback (4x1 layout, 4x
+        // smaller KV step, like the Turing branch below) keeps the
+        // configuration dispatchable instead of failing outright. The
+        // kv_dtype_bytes accuracy likewise changes tile selection for such
+        // configurations: at (448, 256) the true 1-byte cost is
+        // 16*448*2 + (448+256)*16*4*1 = 59392 bytes, so callers that supply
+        // kv_dtype_bytes=1 get cta_tile_q=16 where the 2-byte assumption
+        // returned 64. Both behaviors are pinned by
+        // test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256 in
+        // tests/attention/test_batch_prefill_kernels.py. Callers that cannot
+        // supply kv_dtype_bytes keep the conservative 2-byte default, which
+        // overestimates 1-byte (FP8/FP4) KV by 2x and can demote a working
+        // configuration to cta_tile_q=64 (a performance change, not a
+        // correctness one).
+        int dev_id = 0, max_smem_per_block_optin = 0;
+        cudaGetDevice(&dev_id);
+        cudaDeviceGetAttribute(&max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               dev_id);
+        const uint32_t q_tile_smem = 16 * qk * 2;
+        const uint32_t kv_step_smem_1x4 = (qk + head_dim) * 16 * 4 * kv_dtype_bytes;
+        if (q_tile_smem + kv_step_smem_1x4 > (uint32_t)max_smem_per_block_optin) {
+          return 64;
+        }
         return 16;
       }
     } else {

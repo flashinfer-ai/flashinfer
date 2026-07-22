@@ -35,6 +35,15 @@ def skip_if_head_dim_unsupported(head_dim: int):
         pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
 
 
+def skip_if_nvfp4_asymmetric_unsupported(head_dim_qk: int):
+    skip_if_head_dim_unsupported(head_dim_qk)
+    if get_compute_capability(torch.device("cuda:0"))[0] < 10:
+        pytest.skip(
+            "asymmetric NVFP4 KV prefill uses the NVFP4 KV quantization kernel, "
+            "which requires SM100 or newer"
+        )
+
+
 @pytest.fixture(
     autouse=not has_flashinfer_jit_cache(),
     scope="module",
@@ -1528,6 +1537,446 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_strided_scale_views(kv_layout):
             v_scale=v_global_scale.item(),
             kv_cache_sf=(bad_k_sf, bad_v_sf),
         )
+
+
+@pytest.mark.parametrize("head_dim_qk,head_dim_vo", [(512, 256), (256, 128)])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("num_kv_heads", [2, 8])
+@pytest.mark.parametrize("causal", [True])
+def test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric(
+    head_dim_qk,
+    head_dim_vo,
+    page_size,
+    num_kv_heads,
+    causal,
+):
+    """Asymmetric (head_dim_qk != head_dim_vo) NVFP4 paged prefill correctness.
+
+    K pages are ``[.., head_dim_qk // 2]`` and V pages ``[.., head_dim_vo // 2]``,
+    so the separately allocated K and V pools (and their scale-factor tensors)
+    have genuinely different stride families — the layout an asymmetric NVFP4
+    KV cache hands the FA2 paged prefill entry point.
+
+    bf16 K/V are quantized with the in-tree NVFP4 KV quantization kernel and
+    the FA2 output is checked against a float32 reference attention computed on
+    ``nvfp4_kv_dequantize_paged`` output: kernel and reference consume the exact
+    same quantized bytes, so the reference is a dequantization oracle rather
+    than a requantized approximation.
+    """
+    skip_if_nvfp4_asymmetric_unsupported(head_dim_qk)
+
+    kv_layout = "NHD"
+    torch.manual_seed(42)
+    batch_size = 2
+    kv_len = 99
+    qo_len = 33
+    num_qo_heads = 2 * num_kv_heads
+    q_dtype = torch.bfloat16
+
+    # --- query ---
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim_qk, device="cuda:0", dtype=q_dtype
+    )
+    q_indptr_cpu = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+
+    # --- paged KV metadata ---
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr_cpu = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32) * num_pages_per_seq
+    )
+    kv_indices_cpu = torch.arange(0, total_num_pages, dtype=torch.int32)
+    kv_last_page_len_cpu = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    )
+
+    # --- bf16 source K/V, quantized via the in-tree NVFP4 KV quantization
+    # kernel (the helper tests/utils/test_fp4_kv_quantization.py exercises).
+    # It quantizes row-wise over the last dim, so asymmetric K/V widths
+    # quantize naturally. ---
+    k_bf16 = torch.randn(
+        total_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim_qk,
+        device="cuda:0",
+        dtype=q_dtype,
+    )
+    v_bf16 = torch.randn(
+        total_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim_vo,
+        device="cuda:0",
+        dtype=q_dtype,
+    )
+    # global_scale=1.0 avoids FP8 E4M3 block-scale underflow (see
+    # test_nvfp4_kv_roundtrip).
+    k_global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda:0")
+    v_global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda:0")
+    k_packed, k_sf = flashinfer.nvfp4_kv_quantize(
+        k_bf16.reshape(-1, head_dim_qk), k_global_scale
+    )
+    v_packed, v_sf = flashinfer.nvfp4_kv_quantize(
+        v_bf16.reshape(-1, head_dim_vo), v_global_scale
+    )
+    k_packed = k_packed.reshape(
+        total_num_pages, page_size, num_kv_heads, head_dim_qk // 2
+    )
+    k_sf = k_sf.reshape(total_num_pages, page_size, num_kv_heads, head_dim_qk // 16)
+    v_packed = v_packed.reshape(
+        total_num_pages, page_size, num_kv_heads, head_dim_vo // 2
+    )
+    v_sf = v_sf.reshape(total_num_pages, page_size, num_kv_heads, head_dim_vo // 16)
+
+    # The whole point: every consumer reachable from this entry point must
+    # support (or explicitly reject) unequal K/V strides.
+    assert k_packed.stride() != v_packed.stride()
+    assert k_sf.stride() != v_sf.stride()
+
+    # --- run BatchPrefillWithPagedKVCacheWrapper (FA2 NVFP4 paged path) ---
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+    wrapper.plan(
+        q_indptr_cpu.to("cuda:0"),
+        kv_indptr_cpu.to("cuda:0"),
+        kv_indices_cpu.to("cuda:0"),
+        kv_last_page_len_cpu.to("cuda:0"),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        page_size,
+        head_dim_vo=head_dim_vo,
+        causal=causal,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=0.0,
+        kv_data_type=torch.uint8,
+        q_data_type=q_dtype,
+    )
+    o = wrapper.run(
+        q,
+        (k_packed, v_packed),
+        k_scale=k_global_scale.item(),
+        v_scale=v_global_scale.item(),
+        kv_cache_sf=(k_sf, v_sf),
+    )
+    assert o.shape == (batch_size * qo_len, num_qo_heads, head_dim_vo)
+    assert torch.isfinite(o).all()
+
+    # --- dequantization oracle: #3748's paged NVFP4 dequant kernel ---
+    block_tables = (
+        kv_indices_cpu.to("cuda:0").reshape(batch_size, num_pages_per_seq).contiguous()
+    )
+    seq_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device="cuda:0")
+    k_dq = torch.zeros(
+        batch_size, kv_len, num_kv_heads, head_dim_qk, dtype=q_dtype, device="cuda:0"
+    )
+    v_dq = torch.zeros(
+        batch_size, kv_len, num_kv_heads, head_dim_vo, dtype=q_dtype, device="cuda:0"
+    )
+    flashinfer.nvfp4_kv_dequantize_paged(
+        (k_packed, v_packed),
+        (k_sf.view(torch.float8_e4m3fn), v_sf.view(torch.float8_e4m3fn)),
+        block_tables,
+        seq_lens,
+        k_global_scale,
+        v_global_scale,
+        k_dq,
+        v_dq,
+        kv_layout=kv_layout,
+    )
+
+    # --- float32 reference attention on the dequantized K/V ---
+    group_size = num_qo_heads // num_kv_heads
+    sm_scale = head_dim_qk**-0.5
+    for i in range(batch_size):
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()  # [qo, Hq, dqk]
+        ki = k_dq[i].float().repeat_interleave(group_size, dim=1)  # [kv, Hq, dqk]
+        vi = v_dq[i].float().repeat_interleave(group_size, dim=1)  # [kv, Hq, dvo]
+
+        logits = torch.einsum("qhd,khd->hqk", qi, ki) * sm_scale
+        if causal:
+            qpos = torch.arange(qo_len, device="cuda:0").unsqueeze(1)
+            kpos = torch.arange(kv_len, device="cuda:0").unsqueeze(0)
+            allowed = kpos <= qpos + (kv_len - qo_len)
+            logits = logits.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+        o_ref_i = torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), vi)
+        o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()
+
+        # NVFP4 is 4-bit; use relaxed tolerance
+        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-1, atol=1e-1)
+
+
+_PLAN_INFO_CTA_TILE_Q_IDX = 3  # PrefillPlanInfo::ToVector layout (scheduler.cuh)
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
+def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256(kv_dtype):
+    """Pin the FA2DetermineCtaTileQ shared-memory probe at unvalidated head
+    dims: neither ``plan()`` nor the JIT path validates head dims, so under
+    ``pos_encoding_mode="NONE"`` a config like (qk, vo) = (448, 256) reaches
+    the probe's short-q branch today.
+
+    At 2-byte KV the 1x4-layout cost is 16*448*2 + (448+256)*16*4*2 = 104448
+    bytes: on 99KB-opt-in parts (SM86/89/120/121) the probe must fire and fall
+    back to CTA_TILE_Q=64 -- which keeps the config dispatchable where the
+    CTA16 dispatch would exceed the per-block limit -- while on larger-smem
+    parts (e.g. SM90) CTA16 is kept. At 1-byte KV the true cost is 59392
+    bytes, so the probe selects CTA16 everywhere, pinning that the
+    kv_dtype_bytes accuracy changes tile selection at such dims (the previous
+    2-byte assumption forced CTA64 on 99KB parts).
+
+    The expected tile is computed from the device's actual per-block opt-in
+    limit, so the assertion is exact on every architecture. The 2-byte case
+    then runs the kernel against an exact float32 reference. The 1-byte case
+    stops at the plan-level assertion: the FA2 1-byte KV producers require
+    head_dim to be a multiple of 128 elements (the 128-bit-per-lane load loop
+    steps NUM_MMA_D by 8, and the k128B swizzle needs an 8-aligned upcast
+    stride), a pre-existing constraint -- so no currently-runnable 1-byte
+    config reaches the flipped CTA64->CTA16 region, and the pin locks the
+    documented planner behavior for when one does.
+    """
+    head_dim_qk = 448
+    head_dim_vo = 256
+    skip_if_head_dim_unsupported(head_dim_qk)
+    props = torch.cuda.get_device_properties(0)
+    optin = getattr(props, "shared_memory_per_block_optin", None)
+    if optin is None:
+        pytest.skip("torch does not expose shared_memory_per_block_optin")
+
+    torch.manual_seed(42)
+    batch_size = 2
+    qo_len = 8  # group_size 1 below -> avg_packed_qo_len = 8 <= 16: probe branch
+    kv_len = 65
+    page_size = 16
+    num_kv_heads = 2
+    num_qo_heads = 2
+
+    # Mirror FA2DetermineCtaTileQ's accounting exactly (utils.cuh).
+    kv_dtype_bytes = 1 if kv_dtype == torch.float8_e4m3fn else 2
+    q_tile_smem = 16 * head_dim_qk * 2
+    kv_step_smem_1x4 = (head_dim_qk + head_dim_vo) * 16 * 4 * kv_dtype_bytes
+    expected_cta_tile_q = 64 if q_tile_smem + kv_step_smem_1x4 > optin else 16
+
+    q_indptr_cpu = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr_cpu = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32) * num_pages_per_seq
+    )
+    kv_indices_cpu = torch.arange(0, total_num_pages, dtype=torch.int32)
+    kv_last_page_len_cpu = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper.plan(
+        q_indptr_cpu.to("cuda:0"),
+        kv_indptr_cpu.to("cuda:0"),
+        kv_indices_cpu.to("cuda:0"),
+        kv_last_page_len_cpu.to("cuda:0"),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        page_size,
+        head_dim_vo=head_dim_vo,
+        causal=False,
+        pos_encoding_mode="NONE",
+        q_data_type=torch.float16,
+        kv_data_type=kv_dtype,
+    )
+    assert wrapper._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == expected_cta_tile_q
+
+    if kv_dtype != torch.float16:
+        # Plan-level pin only; see docstring for why (448, 256) is not
+        # runnable at 1-byte KV today.
+        return
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim_qk,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    k = torch.randn(
+        total_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim_qk,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    v = torch.randn(
+        total_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim_vo,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    o = wrapper.run(q, (k, v))
+    assert o.shape == (batch_size * qo_len, num_qo_heads, head_dim_vo)
+
+    # Exact float32 reference over the same logical KV.
+    sm_scale = head_dim_qk**-0.5
+    for i in range(batch_size):
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()
+        ki = (
+            k[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
+            .reshape(-1, num_kv_heads, head_dim_qk)[:kv_len]
+            .float()
+        )
+        vi = (
+            v[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
+            .reshape(-1, num_kv_heads, head_dim_vo)[:kv_len]
+            .float()
+        )
+        logits = torch.einsum("qhd,khd->hqk", qi, ki) * sm_scale
+        o_ref_i = torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), vi)
+        o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()
+        torch.testing.assert_close(o_i, o_ref_i, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("qo_len", [17, 65])
+def test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides(kv_layout, qo_len):
+    """Execute the shared-KV-smem on-the-fly producer's V routing with
+    genuinely unequal K/V stride families.
+
+    ``page_produce_kv_on_the_fly`` runs only under
+    ``KernelTraits::USE_KV_SHARED_SMEM`` (USE_VO_SPLIT, not FP4,
+    HEAD_DIM_QK == HEAD_DIM_VO, 2-byte KV or CTA_TILE_Q > 16), which the
+    asymmetric NVFP4 test cannot reach. At (qk, vo) = (512, 512) with fp16 KV
+    it holds for both CTA tiles the planner can pick (static reasoning from
+    prefill.cuh): head_dim >= 512 gives CTA_TILE_Q=16 for
+    avg_packed_qo_len <= 32 (NUM_WARPS_KV=4; NUM_MMA_D_VO=32 % 4 == 0) and
+    CTA_TILE_Q=32 above (kLargeHeadWarpSplit: NUM_WARPS_KV=2; 32 % 2 == 0), so
+    USE_VO_SPLIT -- and with fp16's HEAD_DIM_QK == HEAD_DIM_VO,
+    USE_KV_SHARED_SMEM -- is true either way. The qo_len parametrization
+    covers both tiles.
+
+    K and V pools are views of differently padded parent tensors (identical
+    logical shapes, unequal stride families -- the decode negative test's
+    construction), so ``get_paged_kv_offset_for_logical_row<produce_v=true>``
+    must route V rows through the V strides: addressing V with K's stride
+    family (the routing bug this pins) reads V rows at wrong offsets and
+    fails the exact float32 reference check. SM80+, so it runs on the
+    standard CI runners.
+    """
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+
+    torch.manual_seed(42)
+    batch_size = 2
+    kv_len = 97
+    page_size = 16
+    num_kv_heads = 2
+    num_qo_heads = 2  # group_size 1: avg_packed_qo_len == qo_len
+    causal = True
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    q_indptr_cpu = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr_cpu = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32) * num_pages_per_seq
+    )
+    kv_indices_cpu = torch.arange(0, total_num_pages, dtype=torch.int32)
+    kv_last_page_len_cpu = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    )
+
+    def padded_pool(num_padding_heads):
+        """A [pages, ..., num_kv_heads, ...] view of a parent padded along the
+        heads dim: logical shape identical across pools, strides governed by
+        the parent's padding. The parent is fully random so misaddressed reads
+        yield wrong values rather than zeros."""
+        if kv_layout == "NHD":
+            parent = torch.randn(
+                total_num_pages,
+                page_size,
+                num_kv_heads + num_padding_heads,
+                head_dim,
+                device="cuda:0",
+                dtype=torch.float16,
+            )
+            return parent[:, :, :num_kv_heads, :]
+        parent = torch.randn(
+            total_num_pages,
+            num_kv_heads + num_padding_heads,
+            page_size,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float16,
+        )
+        return parent[:, :num_kv_heads, :, :]
+
+    k = padded_pool(1)
+    v = padded_pool(3)
+    assert k.shape == v.shape
+    assert not k.is_contiguous() and not v.is_contiguous()
+    # The point of the test: genuinely different stride families.
+    assert k.stride() != v.stride()
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, backend="fa2"
+    )
+    wrapper.plan(
+        q_indptr_cpu.to("cuda:0"),
+        kv_indptr_cpu.to("cuda:0"),
+        kv_indices_cpu.to("cuda:0"),
+        kv_last_page_len_cpu.to("cuda:0"),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+        pos_encoding_mode="NONE",
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    o = wrapper.run(q, (k, v))
+    assert o.shape == (batch_size * qo_len, num_qo_heads, head_dim)
+
+    # Exact float32 reference on the logical (view) K/V values.
+    sm_scale = head_dim**-0.5
+    perm = (0, 1, 2, 3) if kv_layout == "NHD" else (0, 2, 1, 3)
+    for i in range(batch_size):
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()
+        ki = (
+            k[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
+            .permute(*perm)
+            .reshape(-1, num_kv_heads, head_dim)[:kv_len]
+            .float()
+        )
+        vi = (
+            v[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
+            .permute(*perm)
+            .reshape(-1, num_kv_heads, head_dim)[:kv_len]
+            .float()
+        )
+        logits = torch.einsum("qhd,khd->hqk", qi, ki) * sm_scale
+        if causal:
+            qpos = torch.arange(qo_len, device="cuda:0").unsqueeze(1)
+            kpos = torch.arange(kv_len, device="cuda:0").unsqueeze(0)
+            allowed = kpos <= qpos + (kv_len - qo_len)
+            logits = logits.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+        o_ref_i = torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), vi)
+        o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()
+        torch.testing.assert_close(o_i, o_ref_i, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
