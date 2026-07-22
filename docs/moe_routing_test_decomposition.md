@@ -104,16 +104,15 @@ Each step lands as its own commit. `[ ]` → `[x]` as they complete.
     intermediate sizes (~7.9k → ~3.5k raw; roughly halves the passing
     volume). Kept: DSv3, nemotron_3_super, both fused_shared variants
     (shared-expert fusion isn't covered standalone yet).
-  - [ ] Per-(method × launcher) from-logits smoke grid for the methods whose
-    dense coverage lives in the renormalize shard files.
-  - [ ] **Open decision**: fate of the three `routing_renormalize_*` shard
-    files (1,398 passing cases, was 123 min pre-split; really a catch-all for
-    ungrouped routing per `var/moe-routing-test-audit.md` on the NFS repo —
-    which independently proposed a ~62% decoupled-matrix cut, CI caps
-    2h/file, 4h/run). Options: (a) shrink the shared `RENORMALIZE_*`
-    constants to one method + smoke grid, (b) retire the shard files and
-    fold survivors into `test_trtllm_gen_fused_moe.py`. Leaning (a) as the
-    minimal reviewable step.
+  - [x] Renormalize shard files (decision: shrink in place, no file reorg):
+    `RENORMALIZE_ROUTING_CONFIGS` now keeps only the Renormalize configs
+    (Qwen3_MOE, Qwen3_next, 2048-expert stress) — the method GPT-OSS / Qwen
+    route with; DeepSeek's method has its own dense test. Dropped
+    Default / SigmoidRenorm / MiniMax2 configs (~64% of the shard files'
+    1,398 passing cases per the prior audit): routing math moves to the
+    standalone routing test, from-logits launcher plumbing keeps smoke
+    coverage via `test_routing_dtype_flexibility` (4 methods × dtypes).
+    No new smoke grid needed.
 - [ ] **Step 5** — validate the reduced fused matrix on B200; record
   before/after collected-case counts and wall-clock here.
 - [ ] **Step 6 (Phase 4)** — follow-ups: fuzz suite visibility in CI, doc

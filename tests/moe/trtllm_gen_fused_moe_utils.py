@@ -3136,93 +3136,15 @@ RENORMALIZE_ROUTING_CONFIGS = [
         },
         id="RoutingRenormalize_large_experts",
     ),
-    pytest.param(
-        {
-            "num_experts": 128,
-            "top_k": 8,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.Default,
-            "compatible_moe_impls": [
-                FP8PerTensorMoe,
-                FP8BlockScaleMoe,
-                FP4Moe,
-                BF16Moe,
-                MxInt4BlockScaleMoe,
-            ],
-            "compatible_intermediate_size": [384, 768, 1024],
-            "enable_autotune": False,
-        },
-        id="Default_128e_top8",
-    ),
-    pytest.param(
-        {
-            "num_experts": 128,
-            "top_k": 8,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.SigmoidRenorm,
-            "compatible_moe_impls": [
-                FP8PerTensorMoe,
-                FP8BlockScaleMoe,
-                FP4Moe,
-                BF16Moe,
-                MxInt4BlockScaleMoe,
-            ],
-            "compatible_intermediate_size": [384, 768, 1024],
-            "enable_autotune": False,
-        },
-        id="SigmoidRenorm_128e_top8",
-    ),
-    pytest.param(
-        {
-            "num_experts": 256,
-            "top_k": 6,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": True,
-            "routing_method_type": RoutingMethodType.MiniMax2,
-            "compatible_moe_impls": [
-                FP8PerTensorMoe,
-                FP8BlockScaleMoe,
-                FP4Moe,
-                BF16Moe,
-                MxInt4BlockScaleMoe,
-            ],
-            "compatible_intermediate_size": [384, 768, 1024],
-            "enable_autotune": False,
-        },
-        id="MiniMax2_256e_top6_no_scale",
-    ),
-    # MiniMax2 with routed_scaling != None. The no_scale variant above uses routed_scaling=None
-    # (the kernel's scale multiply is a no-op there), so this is the only case exercising
-    # routing_reference_minimax2's `raw_weights * routed_scaling_factor` branch. routed_scaling is
-    # routing-math only and quant-independent, so it's pinned to a single quant + intermediate size
-    # (3 tests instead of the full quant x layout x shape sweep) — a routing-only smoke.
-    pytest.param(
-        {
-            "num_experts": 256,
-            "top_k": 6,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": 3.0,
-            "has_routing_bias": True,
-            "routing_method_type": RoutingMethodType.MiniMax2,
-            "compatible_moe_impls": [BF16Moe],
-            "compatible_intermediate_size": [1024],
-            "enable_autotune": False,
-        },
-        id="MiniMax2_256e_top6_scale3",
-    ),
+    # Dropped from the dense grid: Default_128e_top8, SigmoidRenorm_128e_top8,
+    # MiniMax2_256e_top6_no_scale, MiniMax2_256e_top6_scale3. These files keep
+    # only Renormalize — the method production models (GPT-OSS, Qwen3,
+    # Qwen3-Next, Mixtral) route with. Routing math for Default / SigmoidRenorm
+    # / MiniMax2 (incl. routed_scaling and bias handling) is covered densely by
+    # tests/moe/test_trtllm_gen_routing.py against the same host oracles, and
+    # their from-logits launcher plumbing keeps smoke coverage via
+    # test_trtllm_gen_fused_moe.py::test_routing_dtype_flexibility. See
+    # docs/moe_routing_test_decomposition.md.
 ]
 
 RENORMALIZE_WEIGHT_PROCESSING = [
