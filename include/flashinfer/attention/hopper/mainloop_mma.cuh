@@ -11,14 +11,14 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
-#include "../../utils.cuh"
 
+#include "../../utils.cuh"
 #include "variants.cuh"
 
 namespace flashinfer {
 
-template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXTEND, bool MULTIITEMSCORING,
-          typename WarpScheduler, typename AttentionVariant, typename Params,
+template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXTEND,
+          bool MULTIITEMSCORING, typename WarpScheduler, typename AttentionVariant, typename Params,
           typename MainloopPipeline, typename PipelineState, typename SharedStorage,
           typename FrgTensorO, typename AttentionUpdater>
 CUTLASS_DEVICE void mma_f16(
@@ -27,9 +27,9 @@ CUTLASS_DEVICE void mma_f16(
     FrgTensorO& tOrO, AttentionUpdater& attention_updater, int kv_tile_idx_count,
     int swa_begin_kv_tile_idx, int swa_end_kv_tile_idx, int thread_idx, int work_idx,
     int q_tile_idx, SharedStorage& shared_storage, const int32_t qo_len, const int32_t kv_len,
-    const int32_t qo_head_idx, const int32_t kv_head_idx, const int32_t batch_idx, const uint32_t prefix_len,
-    uint16_t* token_pos_in_items, const int num_kv_tiles_outside_items_window = 0,
-    const int num_kv_tiles_prefix = 0) {
+    const int32_t qo_head_idx, const int32_t kv_head_idx, const int32_t batch_idx,
+    const uint32_t prefix_len, uint16_t* token_pos_in_items,
+    const int num_kv_tiles_outside_items_window = 0, const int num_kv_tiles_prefix = 0) {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using IdType = typename Ktraits::IdType;
@@ -97,7 +97,7 @@ CUTLASS_DEVICE void mma_f16(
     return qo_idx + kv_len - qo_len - mainloop_params.window_left;
   };
 
-    // ════════════════════════════════════════════════════════════════════════════════════
+  // ════════════════════════════════════════════════════════════════════════════════════
   // Block Extend Mask Helper
   // ════════════════════════════════════════════════════════════════════════════════════
   //   mask[q, k] = (q_global / B) >= (kv_global / B)
@@ -129,7 +129,8 @@ CUTLASS_DEVICE void mma_f16(
       if (offset_ptr != nullptr) {
         kv_block_extend_offset = offset_ptr[batch_idx];
       }
-    } else if constexpr (has_kv_block_extend_offset_v<decltype(mainloop_params.additional_params)>) {
+    } else if constexpr (has_kv_block_extend_offset_v<
+                             decltype(mainloop_params.additional_params)>) {
       kv_block_extend_offset = mainloop_params.additional_params.kv_block_extend_offset;
     }
   }
@@ -230,8 +231,9 @@ CUTLASS_DEVICE void mma_f16(
   Tensor tOrP = make_tensor(convert_type<DTypeKV>(tSrS).data(),
                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout()));
 
-  constexpr int n_masking_steps = MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
-                                                   : ((CAUSAL || BLOCK_EXTEND) ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
+  constexpr int n_masking_steps =
+      MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
+                       : ((CAUSAL || BLOCK_EXTEND) ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
   // masking loops
   // ziangl@nvidia.com: for multi item scoring, we use this loop only to mask along the diagonal
 #pragma unroll
