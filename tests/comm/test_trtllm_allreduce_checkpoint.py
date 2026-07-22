@@ -1,4 +1,6 @@
 import socket
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -139,6 +141,12 @@ def _run_worker(
 def test_graph_replay_after_symmetric_memory_remap(
     num_tokens: int, use_oneshot: bool
 ) -> None:
+    # mp.spawn starts fresh interpreters that need to re-import this module;
+    # ensure the repo root is on sys.path so 'tests.comm' is findable.
+    repo_root = str(Path(__file__).resolve().parents[2])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     mp.spawn(
         _run_worker,
         args=(2, _free_port(), num_tokens, use_oneshot),
