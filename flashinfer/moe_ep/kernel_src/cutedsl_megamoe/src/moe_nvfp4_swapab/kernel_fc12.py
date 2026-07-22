@@ -8,6 +8,9 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from packaging.version import Version
+
+cute_dsl_version = Version(cutlass.__version__)
 
 try:
     from cutlass.cute import iket  # type: ignore
@@ -2210,11 +2213,18 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    cutedsl_452_ver_war = cute_dsl_version == Version("4.5.2")
+                    k_tile_loop_cnt = k_tile_cnt
+                    if cutlass.const_expr(cutedsl_452_ver_war):
+                        k_tile_loop_cnt = k_tile_loop_cnt - 1
+
+                    for k_tile in cutlass.range(0, k_tile_loop_cnt, 1, unroll=1):
                         handle = ab_consumer.wait_and_advance(peek_ab_full_status)
-                        peek_ab_full_status = cutlass.Boolean(1)
-                        if k_tile + 1 < k_tile_cnt:
+                        if cutlass.const_expr(cutedsl_452_ver_war):
                             peek_ab_full_status = ab_consumer.try_wait()
+                        else:
+                            if k_tile + 1 < k_tile_loop_cnt:
+                                peek_ab_full_status = ab_consumer.try_wait()
 
                         s2t_stage_coord = (None, None, None, None, handle.index)
                         cute.copy(
@@ -2237,6 +2247,35 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             sfa_tensor=tCtSFA,
                             sfb_tensor=tCtSFB_mma,
                             k_tile_idx=k_tile,
+                            valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
+                            mma_tiler_mnk=self.mma_tiler_mnk,
+                        )
+                        handle.release()
+
+                    if cutlass.const_expr(cutedsl_452_ver_war):
+                        # Last loop unroll
+                        handle = ab_consumer.wait_and_advance(peek_ab_full_status)
+
+                        s2t_stage_coord = (None, None, None, None, handle.index)
+                        cute.copy(
+                            tiled_copy_s2t_sfa,
+                            tCsSFA_compact_s2t[s2t_stage_coord],
+                            tCtSFA_compact_s2t,
+                        )
+                        cute.copy(
+                            tiled_copy_s2t_sfb,
+                            tCsSFB_compact_s2t[s2t_stage_coord],
+                            tCtSFB_compact_s2t,
+                        )
+
+                        tile_crd = (None, None, None, handle.index)
+                        dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
+                            acc_tensor=tCtAcc,
+                            a_frag_tile=tCrA[tile_crd],
+                            b_frag_tile=tCrB[tile_crd],
+                            sfa_tensor=tCtSFA,
+                            sfb_tensor=tCtSFB_mma,
+                            k_tile_idx=k_tile_cnt - 1,
                             valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
                             mma_tiler_mnk=self.mma_tiler_mnk,
                         )
