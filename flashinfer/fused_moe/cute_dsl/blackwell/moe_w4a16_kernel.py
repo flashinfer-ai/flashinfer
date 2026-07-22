@@ -2185,10 +2185,11 @@ class Sm100W4A16GroupedGemmKernel:
         )
 
         smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        # Four stages cover the NVFP4 scale tiles consumed by one CTA tile.
+        # Keep additional scale tiles in flight to overlap their TMA latency
+        # with weight conversion.
         a_scale_k_mode = max(cta_tile_shape_mnk[2] // _NVFP4_SCALE_GRANULARITY_K, 1)
         a_scale_m_mode = max(cta_tile_shape_mnk[0] // _NVFP4_SCALE_GRANULARITY_M, 1)
-        scale_load2trans_stage_count = 4
+        scale_load2trans_stage_count = 6
         a_scale_bytes_per_stage = cute.round_up(
             cute.size_in_bytes(
                 tiled_mma.op.a_dtype,
