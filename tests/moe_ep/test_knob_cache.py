@@ -182,6 +182,11 @@ def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path):
 
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
+    from flashinfer.utils import get_compute_capability
+
+    cap = get_compute_capability(torch.device("cuda"))
+    if cap[0] != 10:
+        pytest.skip(f"needs sm_100/sm_103; got sm_{cap[0]}{cap[1]}")
 
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,

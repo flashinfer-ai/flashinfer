@@ -9,7 +9,7 @@ the eager reference bit-exactly (default non-ikr config is deterministic).
 Launched via torchrun (any even world size >= 2; runs at world size 2+):
     torchrun --nproc_per_node=2 -m pytest \\
         tests/moe_ep/test_mega_cuda_graph_multirank.py -v \\
-        -m "gpu_4 and arch_blackwell"
+        -m "gpu_2 and arch_blackwell"
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from .test_moe_ep_nvfp4_cutedsl_mega_multirank import (
 _REPLAYS = 4
 
 
-@pytest.mark.gpu_4
+@pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
 def test_nvfp4_mega_two_rank_graph_replay_lockstep():
     pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
