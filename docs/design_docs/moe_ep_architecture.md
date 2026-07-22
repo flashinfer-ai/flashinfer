@@ -4,7 +4,7 @@
 > [moe_ep runbook](./moe_ep_runbook.md).
 > For the CuTeDSL mega backends' tuning surface, measured performance, and
 > benchmark methodology, see
-> [kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+> [kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
 
 Expert-Parallel MoE with two execution modes:
 
@@ -24,13 +24,16 @@ moe_ep/
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,…}
-  kernel_src/cutedsl_megamoe/  ← CuTeDSL kernel src (kernel team) + FI shim
+  kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by nvfp4_cutedsl / mxfp8_cutedsl backends
     shim/                      ← thin adapters over src/ (_paths, comm, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
     SKILL.md                   ← how to resync src/ when kernel team drops a new version
     TUNING.md                  ← tuning surface, measured perf, benchmark methodology
     ACKNOWLEDGEMENT.md         ← kernel authors
+  kernel_src/sm90/pull_style_cutedsl_megakernel/  ← Hopper pull-style FP8 kernel src + FI shim
+    src/                       ← VERBATIM drop, fork of the sm100 kernel repo (common, src, moe_nvfp4_swapab, moe_hopper_fp8)
+    shim/, __init__.py, SKILL.md  ← same layering; process-exclusive with the sm100 tree (module names collide)
   modes/{split_layer,mega_layer,config}.py
 ```
 
