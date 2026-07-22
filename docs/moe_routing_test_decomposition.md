@@ -113,8 +113,8 @@ Each step lands as its own commit. `[ ]` → `[x]` as they complete.
     standalone routing test, from-logits launcher plumbing keeps smoke
     coverage via `test_routing_dtype_flexibility` (4 methods × dtypes).
     No new smoke grid needed.
-- [ ] **Step 5** — validate the reduced fused matrix on B200; record
-  before/after collected-case counts and wall-clock here.
+- [x] **Step 5** — reduced fused matrices validated on B200 (umb-b200-240,
+  two allocations; see results log). All stages green, zero failures.
 - [ ] **Step 6 (Phase 4)** — follow-ups: fuzz suite visibility in CI, doc
   cleanup, upstream PR.
 
@@ -130,11 +130,11 @@ Each step lands as its own commit. `[ ]` → `[x]` as they complete.
 
   | file | collected before | collected after | validated on B200 |
   |---|---|---|---|
-  | `test_trtllm_gen_routed_fused_moe.py` | 3,568 | **706** (−80%) | 706 passed, 13m56s incl. cold JIT |
-  | `test_trtllm_gen_fused_moe.py` | 10,040 | **4,424** (−56%) | `-k deepseekv3_routing` slice passed (exit 0) |
-  | renormalize shards (bf16/fp8/fp4) | 1,008 / 1,512 / 1,512 | shrink pending re-measure (configs 7→3) | rerun pending (first attempt raced a stale worktree pull) |
-  | `test_trtllm_gen_routing.py` (new) | — | 651 | 555/555 at af314b4e; +96 model-shape dsv3 cases added later, rerun pending |
+  | `test_trtllm_gen_routed_fused_moe.py` | 3,568 | **706** (−80%) | 706 passed / 0 failed, 13m56s incl. cold JIT |
+  | `test_trtllm_gen_fused_moe.py` | 10,040 | **4,424** (−56%) | deepseekv3 slice: 69 executed / 3,387 runtime-skipped / 0 failed, 22m23s |
+  | renormalize shards (bf16/fp8/fp4) | 4,032 total | **1,728** (−57%) | 201 executed / 1,527 skipped / 0 failed, 1h32m for all three sequentially incl. cold JIT + autotune (pre-shrink: 1,398 executed, 123 min per the June audit) |
+  | `test_trtllm_gen_routing.py` (new) | — | 651 | 627 passed / 24 skipped / 0 failed, 11m incl. cold routing-module JIT (~16 s warm); incl. new model shapes up to 512 experts / top_k 22 |
 
-  Note: collected ≠ executed (runtime `skip_checks` trims further); wall-clock
-  is the honest currency — routed file went from "SOLO-class, hours" to ~14 min
-  cold.
+  Executed-volume cut on the shards: 1,398 → 201 (−86%). Note: collected ≠
+  executed (runtime `skip_checks` trims further); wall-clock is the honest
+  currency — the routed SOLO file went from hours-class to ~14 min cold.
