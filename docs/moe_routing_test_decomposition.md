@@ -93,13 +93,27 @@ Each step lands as its own commit. `[ ]` → `[x]` as they complete.
     input-only and `mPtrTopKPacked` is pipeline scratch (confirmed by GPU
     probe). `topk_ids` is now reconstructed from the permutation:
     `cta_idx_xy_to_batch_idx[slot // tile_tokens_dim]` (f3a280a1).
-- [ ] **Step 4 (Phase 3)** — collapse routing axis in fused tests.
-  - `test_trtllm_gen_routed_fused_moe.py`: routing_method 3→1 on the flagship
-    test (3,456 → ~600).
-  - `test_trtllm_gen_fused_moe.py::test_deepseekv3_routing`: 7 → 2 routing
-    configs (variety moves to the routing-only test).
-  - New small per-(method × launcher) from-logits smoke grid (~50–100 cases).
-  - Decide fate of the three `routing_renormalize_*` shard files.
+- [~] **Step 4 (Phase 3)** — collapse routing axis in fused tests
+  (code done, fused-suite GPU validation pending; see Step 5).
+  - [x] `test_trtllm_gen_routed_fused_moe.py`: dense grid pinned to
+    Renormalize/packed (3,456 → 576 raw) + new 18-case
+    `..._format_parity` smoke over method[3] × format[2] × quant[3].
+  - [x] `test_trtllm_gen_fused_moe.py::test_deepseekv3_routing`: dropped
+    kimi_k2 / DSLite / GLM4_MoE configs (routing-shape variety moved to the
+    standalone routing test, incl. nemotron 512/22) and pruned orphaned
+    intermediate sizes (~7.9k → ~3.5k raw; roughly halves the passing
+    volume). Kept: DSv3, nemotron_3_super, both fused_shared variants
+    (shared-expert fusion isn't covered standalone yet).
+  - [ ] Per-(method × launcher) from-logits smoke grid for the methods whose
+    dense coverage lives in the renormalize shard files.
+  - [ ] **Open decision**: fate of the three `routing_renormalize_*` shard
+    files (1,398 passing cases, was 123 min pre-split; really a catch-all for
+    ungrouped routing per `var/moe-routing-test-audit.md` on the NFS repo —
+    which independently proposed a ~62% decoupled-matrix cut, CI caps
+    2h/file, 4h/run). Options: (a) shrink the shared `RENORMALIZE_*`
+    constants to one method + smoke grid, (b) retire the shard files and
+    fold survivors into `test_trtllm_gen_fused_moe.py`. Leaning (a) as the
+    minimal reviewable step.
 - [ ] **Step 5** — validate the reduced fused matrix on B200; record
   before/after collected-case counts and wall-clock here.
 - [ ] **Step 6 (Phase 4)** — follow-ups: fuzz suite visibility in CI, doc

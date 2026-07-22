@@ -166,7 +166,9 @@ def test_sigmoid_routing(
 # Test: DeepSeekV3 routing
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [2688, 2048, 1024, 768, 512, 384])
+# 768/384 belonged to the removed DSLite config; keep only sizes some
+# remaining routing_config lists as compatible.
+@pytest.mark.parametrize("intermediate_size", [2688, 2048, 1024, 512])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -206,26 +208,12 @@ def test_sigmoid_routing(
             },
             id="nemotron_3_super",
         ),
-        pytest.param(
-            {
-                "num_experts": 384,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": 1,
-                "top_k_groups": 1,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
-                "compatible_intermediate_size": [1024, 2048],
-                "compatible_activation_types": [
-                    ActivationType.Swiglu,
-                    ActivationType.Geglu,
-                ],
-                "enable_autotune": True,
-            },
-            id="kimi_k2",
-        ),
+        # Routing-shape variety (kimi_k2 384/8, DSLite 72/6, GLM4_MoE 160/8 —
+        # all n_groups=1) moved to tests/moe/test_trtllm_gen_routing.py::
+        # test_deepseekv3_routing; multiplying those configs against the full
+        # quant x layout x activation grid added no GEMM coverage beyond the
+        # DSv3 and nemotron_3_super representatives kept here. See
+        # docs/moe_routing_test_decomposition.md.
         pytest.param(
             {
                 "num_experts": 256,
@@ -286,46 +274,6 @@ def test_sigmoid_routing(
                 "enable_autotune": False,
             },
             id="DSv3_fused_shared_2",
-        ),
-        pytest.param(
-            {
-                "num_experts": 72,
-                "top_k": 6,
-                "padding": 8,
-                "n_groups": 1,
-                "top_k_groups": 1,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
-                "compatible_intermediate_size": [384, 768],
-                "compatible_activation_types": [
-                    ActivationType.Swiglu,
-                    ActivationType.Geglu,
-                ],
-                "enable_autotune": False,
-            },
-            id="DSLite",
-        ),
-        pytest.param(
-            {
-                "num_experts": 160,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": 1,
-                "top_k_groups": 1,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe, BF16Moe],
-                "compatible_intermediate_size": [512, 1024, 1536],
-                "compatible_activation_types": [
-                    ActivationType.Swiglu,
-                    ActivationType.Geglu,
-                ],
-                "enable_autotune": False,
-            },
-            id="GLM4_MoE",
         ),
     ],
 )
