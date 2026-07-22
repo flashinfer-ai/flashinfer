@@ -26,6 +26,7 @@ from torch.nn import functional as F
 import flashinfer.fused_moe as fused_moe
 from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import (
+    get_compute_capability,
     is_sm90a_supported,
     is_sm100a_supported,
     is_sm12x_supported,
@@ -3562,9 +3563,19 @@ def test_workspace_exact_size_accepted_with_packed_weights():
 # ---------------------------------------------------------------------------
 # Workspace buffer tests (issue #3364, Option A)
 # ---------------------------------------------------------------------------
-_WS_SM100_SKIP = pytest.mark.skipif(
-    not is_sm100a_supported(torch.device("cuda")),
-    reason="workspace_buffer tests require SM100",
+_WS_CUTLASS_MOE_SUPPORTED_ARCHES = {
+    (8, 9),
+    (9, 0),
+    (10, 0),
+    (10, 3),
+    (11, 0),
+    (12, 0),
+    (12, 1),
+}
+_WS_CUTLASS_MOE_SKIP = pytest.mark.skipif(
+    get_compute_capability(torch.device("cuda"))
+    not in _WS_CUTLASS_MOE_SUPPORTED_ARCHES,
+    reason="CUTLASS fused MoE is not supported on this architecture",
 )
 
 _WS_CFG = dict(
@@ -3626,14 +3637,14 @@ def _ws_size(num_tokens, cfg=_WS_CFG, *, ep_size=1, ep_rank=0, device=None):
     )
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_size_positive_and_monotonic():
     sizes = [_ws_size(n) for n in [256, 1024, 4096, 8192]]
     assert all(s > 0 for s in sizes)
     assert all(sizes[i] <= sizes[i + 1] for i in range(len(sizes) - 1))
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_buffered_matches_unbuffered():
     inputs = _make_ws_inputs(256)
     out_unbuf = _call_ws(*inputs)[0]
@@ -3642,14 +3653,14 @@ def test_workspace_buffered_matches_unbuffered():
     torch.testing.assert_close(out_unbuf, out_buf, rtol=0, atol=0)
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_exact_size_accepted():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(_ws_size(256), dtype=torch.uint8, device="cuda")
     _call_ws(*inputs, workspace_buffer=ws)  # must not raise
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_exact_size_accepted_with_ep():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(
@@ -3660,7 +3671,7 @@ def test_workspace_exact_size_accepted_with_ep():
     _call_ws(*inputs, workspace_buffer=ws, ep_size=2, ep_rank=0)
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_undersized_rejected():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(1, dtype=torch.uint8, device="cuda")
@@ -3668,7 +3679,7 @@ def test_workspace_undersized_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_wrong_dtype_rejected():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(_ws_size(256), dtype=torch.float32, device="cuda")
@@ -3676,7 +3687,7 @@ def test_workspace_wrong_dtype_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_cpu_tensor_rejected():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(_ws_size(256), dtype=torch.uint8, device="cpu")
@@ -3684,7 +3695,7 @@ def test_workspace_cpu_tensor_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2,
     reason="workspace device-guard test requires two CUDA devices",
@@ -3705,7 +3716,7 @@ def test_workspace_device_tracks_input_not_current_device():
             _call_ws(*inputs, workspace_buffer=wrong_device_ws)
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_wrong_ndim_rejected():
     inputs = _make_ws_inputs(256)
     n = _ws_size(256)
@@ -3714,7 +3725,7 @@ def test_workspace_wrong_ndim_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_noncontiguous_rejected():
     inputs = _make_ws_inputs(64)
     n = _ws_size(64)
@@ -3725,7 +3736,7 @@ def test_workspace_noncontiguous_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_size_rejects_nonpositive_dims():
     from flashinfer.fused_moe.core import cutlass_fused_moe_workspace_size
 
@@ -3755,7 +3766,7 @@ def test_workspace_size_rejects_nonpositive_dims():
         )
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_no_alloc_during_buffered_call():
     inputs = _make_ws_inputs(512)
     ws = torch.empty(_ws_size(512), dtype=torch.uint8, device="cuda")
@@ -3776,7 +3787,7 @@ def test_workspace_no_alloc_during_buffered_call():
     )
 
 
-@_WS_SM100_SKIP
+@_WS_CUTLASS_MOE_SKIP
 def test_workspace_cuda_graph_capture_replay():
     num_tokens = 128
     inputs = _make_ws_inputs(num_tokens)
