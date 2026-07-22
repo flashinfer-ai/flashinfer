@@ -199,7 +199,9 @@ _F16 = frozenset({torch.float16, torch.bfloat16})
 CAPABILITIES: Dict[str, BackendCapability] = {
     "fa2": BackendCapability(
         name="fa2",
-        cc_majors=frozenset({8, 9, 10, 11, 12}),
+        # cc 11 (Thor/sm_110) intentionally undeclared: no hardware in the
+        # verification pool (capability-honesty rule)
+        cc_majors=frozenset({8, 9, 10, 12}),
         q_dtypes=_F16,
         head_dims=frozenset({(64, 64), (128, 128), (256, 256)}),
         page_sizes=None,
@@ -227,7 +229,7 @@ CAPABILITIES: Dict[str, BackendCapability] = {
     ),
     "cudnn": BackendCapability(
         name="cudnn",
-        cc_majors=frozenset({8, 9, 10, 11, 12}),
+        cc_majors=frozenset({8, 9, 10, 12}),
         q_dtypes=_F16,
         head_dims=frozenset({(128, 128), (192, 128)}),
         page_sizes=None,
@@ -270,7 +272,6 @@ _HEURISTIC_ORDER = {
     10: ("trtllm-gen", "cudnn", "fa2"),
     9: ("fa3", "fa2", "cudnn"),
     8: ("fa2", "cudnn"),
-    11: ("fa2", "cudnn"),
     12: ("fa2", "cudnn"),
 }
 
@@ -383,6 +384,7 @@ def resolve_paged_prefill(
             f"kv_input_form must be 'block_tables' or 'page_indices', got "
             f"{kv_input_form!r}"
         )
+    _expect_window_left(window_left)
     _expect_page_size(page_size, kv_input_form)
 
     order = _HEURISTIC_ORDER.get(cc_major, ())
@@ -450,6 +452,16 @@ def resolve_paged_prefill(
 def _expect(cond: bool, msg: str) -> None:
     if not cond:
         raise ValueError(msg)
+
+
+def _expect_window_left(window_left: int) -> None:
+    # trtllm's launcher special-cases exactly -1 (unlimited); other negatives
+    # become a force-enabled negative window there while fa/cudnn read them
+    # as unlimited — backend-divergent, so reject anything below -1 loudly.
+    _expect(
+        isinstance(window_left, int) and window_left >= -1,
+        f"window_left must be >= -1 (-1 = unlimited), got {window_left!r}",
+    )
 
 
 def _expect_page_size(page_size: int, kv_input_form: str) -> None:
@@ -569,6 +581,7 @@ class UnifiedPagedPrefill:
             "or kv_page_indices (flat CSR page ids, sglang-style)",
         )
         kv_input_form = "block_tables" if block_tables is not None else "page_indices"
+        _expect_window_left(window_left)
 
         self._validate_structure(
             qo_indptr,
@@ -1005,10 +1018,14 @@ def _derive(
 
     - dense given → flat indices by capacity scatter (a boolean masked-select
       would sync to size its result; scatter does not);
-    - flat indices given → dense (when a candidate needs it) by a clamped
-      gather of width ceil(max_kv_len / page_size); rows' tails beyond each
-      request's page count hold clamped garbage that no kernel reads (they
-      bound by kv_seq_lens).
+    - flat indices given → dense (when a candidate needs it) by a gather of
+      width ceil(max_kv_len / page_size), with each row's tail CLAMPED TO THE
+      REQUEST'S OWN LAST PAGE.  The per-row clamp is load-bearing: cuDNN
+      gathers K/V pages by table width before masking, so a tail that
+      pointed into the over-allocated (possibly uninitialized) region of
+      kv_page_indices produced NaN outputs / out-of-pool reads (found
+      empirically by the NaN-page probe; see the fuzzer's
+      csr_overallocated_nan_tail mutation).
     """
     dev = kv_seq_lens.device
     zero = torch.zeros(1, dtype=torch.int32, device=dev)
@@ -1040,7 +1057,14 @@ def _derive(
         width = (max_kv_len + page_size - 1) // page_size  # host int, no sync
         col = torch.arange(width, device=dev, dtype=torch.int64)
         src = kv_page_indptr[:-1].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
-        src = src.clamp_(max=int(kv_page_indices.shape[0]) - 1)
+        # clamp each row's tail to the request's OWN last live page (kv_len
+        # >= 1 is validated, so every row owns at least one).  Load-bearing:
+        # cuDNN gathers K/V pages by table width before masking, so a tail
+        # pointing into a neighbouring request or the over-allocated
+        # (possibly uninitialized) region of kv_page_indices produced NaN
+        # outputs / out-of-pool reads (fuzzer: csr_overallocated_nan_tail).
+        row_last = kv_page_indptr[1:].to(torch.int64).unsqueeze(1) - 1
+        src = torch.minimum(src, row_last)
         dense = (
             kv_page_indices.to(torch.int64)
             .gather(0, src.reshape(-1))
@@ -1148,6 +1172,7 @@ class _CudnnAdapter:
         from ..cudnn import cudnn_batch_prefill_with_kv_cache
 
         m, d = self._m, self._d
+        assert m["block_tables"] is not None  # needs_dense contract
         b = m["batch_size"]
         native_lse = self._native_lse
         out_t, lse_t = cudnn_batch_prefill_with_kv_cache(
@@ -1203,6 +1228,7 @@ class _TrtllmGenAdapter:
         from ..prefill import trtllm_batch_context_with_kv_cache
 
         m, d = self._m, self._d
+        assert m["block_tables"] is not None  # needs_dense contract
         result = trtllm_batch_context_with_kv_cache(
             q,
             (k_cache, v_cache),

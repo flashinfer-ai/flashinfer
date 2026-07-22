@@ -253,6 +253,33 @@ def m_q_noncontig(p):
     return p
 
 
+def m_csr_overallocated_nan_tail(p):
+    # Regression for the CSR->dense per-row clamp: an over-allocated
+    # kv_page_indices whose tail points at a NaN-filled pool page must not
+    # leak into any output (cuDNN gathers K/V pages by dense-table width).
+    p = _clone(p)
+    p["input_form"] = "page_indices"
+    pool = p["k_cache"].shape[0]
+    live = p["kv_page_indices"]
+    # pick a pool page NOT referenced by any request (make_problem keeps >= 8
+    # slack pages, but which ids are unused depends on the permutation)
+    live_set = set(live.cpu().tolist())
+    nan_page = next(i for i in range(pool) if i not in live_set)
+    p["k_cache"] = p["k_cache"].clone()
+    p["v_cache"] = p["v_cache"].clone()
+    p["k_cache"][nan_page] = float("nan")
+    p["v_cache"][nan_page] = float("nan")
+    tail = torch.full((256,), nan_page, dtype=torch.int32, device=live.device)
+    p["kv_page_indices"] = torch.cat([live, tail])
+    return p
+
+
+def m_window_left_below_minus_one(p):
+    p = _clone(p)
+    p["_window_left_override"] = -2
+    return p
+
+
 def m_both_paging_forms(p):
     # passing dense AND flat indices together is a second-truth hazard and
     # must be rejected (exactly-one contract)
@@ -286,6 +313,8 @@ MUTATIONS = [
     ("block_tables_negative", False, m_block_tables_negative),
     ("both_paging_forms", False, m_both_paging_forms),
     ("csr_indices_too_short", False, m_csr_indices_too_short),
+    ("csr_overallocated_nan_tail", True, m_csr_overallocated_nan_tail),
+    ("window_left_below_minus_one", False, m_window_left_below_minus_one),
 ]
 
 # documented trusted inputs: expected to fail reject-or-correct today
@@ -379,6 +408,7 @@ def test_fuzz_reject_or_correct(backend, mutation):
         if not _backend_runnable(p, backend, cfg["causal"]):
             continue
         mutated = mutate(p)
+        wl = mutated.get("_window_left_override", -1)
         repro = f"backend={backend} seed={seed} mutation={name} cfg={cfg}"
         if comparable:
             # ground truth is still the TRUE problem `p`; hand the oracle the
@@ -390,11 +420,13 @@ def test_fuzz_reject_or_correct(backend, mutation):
                 if mutation != "q_noncontig"
                 else mutated["kv_seq_lens_cpu"]
             )
-            outcome, _ = _run_and_check(merged, backend, cfg["causal"], repro)
+            outcome, _ = _run_and_check(
+                merged, backend, cfg["causal"], repro, window_left=wl
+            )
             assert outcome in ("rejected", "correct")
         else:
             try:
-                run_unified(mutated, backend, causal=cfg["causal"])
+                run_unified(mutated, backend, causal=cfg["causal"], window_left=wl)
             except CLEAN as e:
                 assert str(e), f"empty error message [{repro}]"
             except RuntimeError as e:

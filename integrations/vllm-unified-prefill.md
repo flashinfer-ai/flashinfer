@@ -9,8 +9,13 @@ with decode and wait for the decode follow-up).
 
 ```python
 # FlashInferMetadataBuilder.__init__ (near the q_data_type decisions, ~:672)
-+from flashinfer.attention.unified import resolve_paged_prefill
++from flashinfer.attention.unified import (
++    UnifiedPagedPrefill, resolve_paged_prefill,
++)
 +
++# NOTE: the Resolution config-key includes window_left and causal, so a
++# model with sliding window resolves its own variant; engines with mixed
++# variants hold one Resolution per (window, causal) pair.
 +self._prefill_resolution = resolve_paged_prefill(
 +    device=self.device,
 +    num_qo_heads=self.num_qo_heads,
@@ -20,8 +25,12 @@ with decode and wait for the decode follow-up).
 +    page_size=self.page_size,
 +    kv_layout=get_kv_cache_layout(),   # "HND" on SM100, "NHD" elsewhere
 +    causal=True,
-+    need_lse=self.use_dcp,             # DCP consumes LSE
++    window_left=self.window_left,      # uniform per batch, as today
++    need_lse=False,                    # DCP stays on the current path (below)
 +)
++# constructed ONCE here (it owns 128 MB workspace; per-build construction
++# would re-allocate every scheduler step)
++self._prefill_attn = UnifiedPagedPrefill(self.device)
 ```
 
 Deletes on the prefill side: the `prefill_use_trtllm` predicate
@@ -35,8 +44,7 @@ replaces.  `resolve()` also reports exclusion reasons, replacing the logged
 ```python
 # in build(), prefill branch (replacing TRTLLMPrefill :1175-1207 AND the
 # FIPrefill CSR construction :1208-1269 for the prefill slice)
-+prefill_attn = UnifiedPagedPrefill(self.device)
-+prefill_attn.plan(
++self._prefill_attn.plan(
 +    qo_indptr=qo_indptr[prefill_start:] - qo_indptr[prefill_start],
 +    kv_seq_lens=seq_lens[prefill_start:],
 +    block_tables=block_table_tensor[prefill_start:],
@@ -49,9 +57,9 @@ replaces.  `resolve()` also reports exclusion reasons, replacing the logged
 +    q_dtype=self.q_data_type_prefill,
 +    kv_layout=get_kv_cache_layout(),
 +    causal=causal,
-+    window_left=self.window_left,            # uniform per batch, as today
++    window_left=self.window_left,
 +    sm_scale=self.sm_scale,
-+    return_lse=self.use_dcp,
++    return_lse=False,
 +    qo_indptr_cpu=qo_indptr_prefill_cpu,     # mirrors vLLM already owns
 +    kv_seq_lens_cpu=seq_lens_cpu[prefill_start:],
 +    backend=self._prefill_resolution,
@@ -60,9 +68,17 @@ replaces.  `resolve()` also reports exclusion reasons, replacing the logged
 
 Deletes: `_compute_flashinfer_kv_metadata` for the prefill slice (the
 numpy-indptr + Triton `_copy_page_indices_kernel` CSR expansion, `:902-940`),
-the trtllm `cum_seq_lens_kv` GPU cumsum (`:1180-1194`), the per-build
-`q_data_type` mutation (`:1036-1038` — dtype is pinned by the resolution),
-and both prefill dataclasses' metadata duplication.
+the trtllm `cum_seq_lens_kv` GPU cumsum (`:1180-1194`), and both prefill
+dataclasses' metadata duplication.  The per-build `q_data_type` mutation
+(`:1036-1038`) **stays**: it un-quantizes q for the FI-native *decode* path
+too, so it can only go with the decode follow-up.
+
+Friction (carried in the real PR): unified's unconditional value validation
+consumes the host mirrors, so the all-trtllm async-mode path that today
+skips `seq_lens_cpu` retrieval (`needs_seq_lens_cpu` guard, `:1058-1064`)
+would pay that retrieval again — or production relaxes validation to
+maxes-only for mirror-free plans (proposal §3.1 allows it; the POC chose
+strictness).
 
 ## 3. forward(): one run replaces the trtllm/FI fork
 
@@ -74,15 +90,19 @@ and both prefill dataclasses' metadata duplication.
 +)
 ```
 
-LSE is base-2 packed `(tokens, h)` fp32 from every backend, so the DCP
-merge path needs no per-backend shim — and the "Trtllm does not support
-returning LSE" DCP fork (`vllm/utils/flashinfer.py:431-437`) becomes
-unnecessary *for prefill* (it was already stale: trtllm prefill exposes LSE).
-
 ## What stays (v1 scoping, honest)
 
 - decode routing + `use_trtllm_attention` (shared with decode),
 - the artifactory HTTP probe (backs decode gates),
+- **DCP**: under DCP, build() rewrites `seq_lens_cpu` to DCP-local lengths
+  while the GPU `seq_lens` stays global (`:1072-1091`) — unified's
+  mirror-consistency contract needs a device-side local-lens step first.
+  (The LSE contract makes the eventual migration attractive: base-2 packed
+  `(tokens, h)` fp32 from every backend, and the "Trtllm does not support
+  returning LSE" fork at `vllm/utils/flashinfer.py:431-437` is already
+  stale for prefill.)
+- models with `logits_soft_cap` or attention sinks (absent capability axes
+  in the POC — production should add them as *rejectable* axes),
 - cascade (fa2 MultiLevelCascade hardwired),
 - fp8-Q / fp8-KV / nvfp4 paths (outside the POC dtype envelope),
-- spec-decode reorder policy.
+- spec-decode reorder policy, and the shared `q_data_type` mutation.
