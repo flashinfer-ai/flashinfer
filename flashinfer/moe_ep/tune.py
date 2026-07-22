@@ -179,6 +179,7 @@ def _tune_one(
         mxfp8_candidates,
         nvfp4_candidates,
     )
+    from .kernel_src.cutedsl_megamoe.shim.nvfp4 import COMBINE_FORMAT_NAMES
 
     is_nvfp4 = args.dtype == "nvfp4"
     live_tokens = args.live_tokens if args.live_tokens is not None else max_tokens
@@ -200,11 +201,7 @@ def _tune_one(
                 seed=args.seed,
             )
             candidates = nvfp4_candidates(
-                combine_format={
-                    "bf16": "bf16",
-                    "nvfp4": "16e2m1xbf16",
-                    "mxfp8": "32e4m3xe8m0",
-                }[args.combine_dtype],
+                combine_format=COMBINE_FORMAT_NAMES[args.combine_dtype],
                 allow_in_kernel_fc2_reduce=args.allow_nondeterministic,
             )
             tune = autotune_nvfp4_mega_moe
