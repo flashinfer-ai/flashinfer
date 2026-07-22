@@ -532,34 +532,23 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         valid_tactics = [t for t in ALL_MOE_TACTICS if _tactic_ok(t)]
 
         if not valid_tactics:
-            # gh #3957: never fall back to an UNVALIDATED tactic. The
-            # can_implement guards exist because the kernels' unpredicated
-            # epilogue stores overrun partial/padded N tiles; a fallback that
-            # bypasses them re-opens the same silent device-memory corruption.
-            if _tactic_ok(DEFAULT_MOE_TACTIC):
-                logger.warning(
-                    "No valid tactics found for problem dims "
-                    "(tokens=%d, hidden=%d, intermediate=%d, experts=%d, top_k=%d). "
-                    "Falling back to default tactic.",
-                    num_tokens,
-                    hidden_size,
-                    intermediate_size,
-                    num_local_experts,
-                    self.top_k,
-                )
-                valid_tactics = [DEFAULT_MOE_TACTIC]
-            else:
-                logger.warning(
-                    "cute_dsl MoE refuses problem dims "
-                    "(tokens=%d, hidden=%d, intermediate=%d, experts=%d, top_k=%d): "
-                    "no tactic (incl. default) passes can_implement (gh #3957).",
-                    num_tokens,
-                    hidden_size,
-                    intermediate_size,
-                    num_local_experts,
-                    self.top_k,
-                )
-                return []
+            # DEFAULT_MOE_TACTIC is a member of ALL_MOE_TACTICS, so an empty
+            # list means even the default fails can_implement -- do not fall
+            # back to it unvalidated (gh #3957). This early refusal is
+            # diagnostics/defense-in-depth: the kernel wrappers re-validate
+            # can_implement at launch and raise, so an unvalidated tactic
+            # cannot reach the device -- but refusing here avoids pointless
+            # profiling of a tactic that can only throw, and says why.
+            logger.warning(
+                "cute_dsl MoE refuses problem dims "
+                "(tokens=%d, hidden=%d, intermediate=%d, experts=%d, top_k=%d): "
+                "no tactic (incl. default) passes can_implement (gh #3957).",
+                num_tokens,
+                hidden_size,
+                intermediate_size,
+                num_local_experts,
+                self.top_k,
+            )
 
         return valid_tactics
 
