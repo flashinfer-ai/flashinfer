@@ -240,10 +240,16 @@ point (e.g. nvfp4 bf16 428.0 vs 428.5 @1024, 609.3 vs 625.6 @2048, 1859.7
 vs 1923.5 @8192), i.e. the 34-54% regression is fully recovered and the
 dg-crossover / large-token win shape is restored. Correctness: the full
 `tests/moe_ep/run_tests.sh all` suite passed under pinned 4.5.2 (all 8
-sections, 2026-07-22, job 2427254). Caveats: the WAR covers only the nvfp4
-swap-AB fc12 kernel — mxfp8 mega on 4.5.2 remains unmeasured — and 4.5.0
-still fails at `cute.compile`, so >=4.6.1 stays the recommended runtime;
-4.5.2 is now an acceptable fallback for nvfp4.
+sections, 2026-07-22, job 2427254).
+
+mxfp8 needs no WAR: a same-day 4.5.2 sweep
+(`sweep_20260722_114210_fi_mega.csv`) matches the 4.6.1 mxfp8 reference
+within noise at every point (373.7/604.1/750.4/1007.2/1714.7/3215.3 µs at
+8..8192 vs 385.8/634.9/749.6/1006.6/1742.8/3122.2) — the 4.5.2 codegen
+regression was specific to the nvfp4 swap-AB fc12 mainloop. With both
+dtypes at parity and the suite green, 4.5.2 is a fully acceptable runtime
+for this drop; 4.5.0 still fails at `cute.compile`, so <4.5.2 remains
+unsupported in practice.
 
 ## The knob system (`shim/tuner.py`, `shim/autotune.py`)
 
