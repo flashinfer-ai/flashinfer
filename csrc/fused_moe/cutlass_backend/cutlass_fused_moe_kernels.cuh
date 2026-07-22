@@ -4680,6 +4680,8 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   bool is_fp8_act_quant = mDType == nvinfer1::DataType::kFP8;
   bool is_fp8_w_quant = mWType == nvinfer1::DataType::kFP8;
   bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();
+  // NVFP4 uses the same six quant workspaces as wfp4afp8 (issue #4003).
+  bool const is_native_wfp4afp4_family = isNativeWfp4Afp4Family();
   // This predicate identifies the SM90 FP8 activation x packed-MXFP4 storage
   // family.  Sm90Wfp4Afp8ScaleMode selects Humming/pre-MMA vs future post-MMA
   // semantics; do not infer the semantic path from dtype/layout alone.
@@ -4716,10 +4718,13 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   size_t const fp8_mxfp4_token_scale_size = num_expanded_tokens * sizeof(float);
   size_t quant_5_size = 0;
   size_t quant_6_size = 0;
-  if (is_native_wfp4afp8_family) {
+  if (is_native_wfp4afp8_family || is_native_wfp4afp4_family) {
     quant_1_size = sizeof(float);
-    quant_2_size = getOffsetWeightSF(num_experts_per_node, inter_size, hidden_size, mScalingType) *
-                   sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
+    // fc1 scale factors span fc1_out_size rows (2x inter_size when gated),
+    // matching the gemm1_n the profiler consumes them with.
+    quant_2_size =
+        getOffsetWeightSF(num_experts_per_node, fc1_out_size, hidden_size, mScalingType) *
+        sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
     quant_3_size = num_experts_per_node * sizeof(float);
     quant_4_size = sizeof(float);
     quant_5_size = getOffsetWeightSF(num_experts_per_node, hidden_size, inter_size, mScalingType) *
@@ -5028,8 +5033,7 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
         static_cast<float const*>(quant_3), static_cast<float const*>(quant_4),
         static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_5),
         static_cast<float const*>(quant_6));
-  } else if ((mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
-             (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64)) {
+  } else if (isNativeWfp4Afp4Family()) {
     // nvllm still uses int64 because torch doesn't have fp4 yet.
     TLLM_CHECK(quant_1 && quant_2 && quant_3 && quant_4 && quant_5 && quant_6);
     mQuantParams = QuantParams::FP4(

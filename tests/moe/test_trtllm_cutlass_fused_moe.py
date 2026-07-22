@@ -713,6 +713,8 @@ def test_moe_fp8(
     ids=["swiglu", "swiglustep", "relu2"],
 )
 @pytest.mark.parametrize("use_4over6", [False, True])
+# use_autotune=True is regression coverage for issue #4003 (NVFP4 autotune crash).
+@pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
@@ -728,6 +730,7 @@ def test_moe_nvfp4(
     quantized_input,
     activation_type,
     use_4over6,
+    use_autotune,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -818,19 +821,20 @@ def test_moe_nvfp4(
     input_sf = None
     if quantized_input:
         hidden_states, input_sf = fp4_quantize(x, a1_gs)
-    _ = fused_moe.cutlass_fused_moe(
-        hidden_states,
-        selected_experts.to(torch.int),
-        routing_weights,
-        w1_q.contiguous().view(torch.long),
-        w2_q.contiguous().view(torch.long),
-        otype,
-        quant_scales=quant_scales,
-        input_sf=input_sf,
-        output=flash_output,
-        activation_type=activation_type,
-        swiglu_limit=swiglu_limit,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            hidden_states,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w1_q.contiguous().view(torch.long),
+            w2_q.contiguous().view(torch.long),
+            otype,
+            quant_scales=quant_scales,
+            input_sf=input_sf,
+            output=flash_output,
+            activation_type=activation_type,
+            swiglu_limit=swiglu_limit,
+        )
 
     # Ref check
     a_fp4, a_scale_interleaved = fp4_quantize(x, a1_gs)
