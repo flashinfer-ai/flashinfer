@@ -29,6 +29,13 @@ test_large_batch              — stress: large batch × long rows
 test_repeated_calls           — same inputs twice → same top-K set
 test_no_pre_idx_fallback      — pre_idx=None always goes to radix path
 test_lb_config_validation     — GvrTopKLBConfig bad args raise at construction
+test_lb_decision_from_counts  — pure-host LB decision boundary (graph-safe)
+test_count_long_rows          — device long-row count (both compress_ratios)
+test_load_balance_modes       — explicit True/False GVR paths correct
+test_load_balance_auto_num_long_rows_hint  — host-hint 'auto' path correct
+test_load_balance_auto_requires_num_long_rows  — 'auto' w/o hint raises
+test_gvr_row_width_alignment  — GVR rejects non-vec-aligned N
+test_radix_row_width_no_alignment_constraint  — radix accepts any N
 """
 
 import pytest
@@ -411,3 +418,162 @@ def test_lb_config_validation():
         GvrTopKLBConfig(cluster_size=0)
     with pytest.raises(ValueError, match="num_threads"):
         GvrTopKLBConfig(num_threads=256)
+
+
+# ---------------------------------------------------------------------------
+# test_should_load_balance — heuristic decision boundary
+# ---------------------------------------------------------------------------
+
+
+def test_lb_decision_from_counts():
+    """Pure-host LB decision: LB iff long rows present but a minority (<= half).
+
+    Takes plain ints, so it does no device I/O (CUDA-graph safe). Boundary is
+    ``0 < n_long <= num_rows // 2``.
+    """
+    from flashinfer.topk_blackwell import _lb_decision_from_counts
+
+    assert not _lb_decision_from_counts(0, 128)  # no long rows
+    assert _lb_decision_from_counts(1, 128)  # 1 long (minority)
+    assert _lb_decision_from_counts(8, 128)  # few long
+    assert _lb_decision_from_counts(64, 128)  # exactly half
+    assert not _lb_decision_from_counts(65, 128)  # majority
+    assert not _lb_decision_from_counts(128, 128)  # all long
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def test_count_long_rows():
+    """_count_long_rows counts rows with scan-len strictly above long_threshold."""
+    from flashinfer.topk_blackwell import _count_long_rows
+
+    LT = 64 * 1024
+
+    def lens(n_long, long_len, n_short, short_len):
+        return torch.tensor(
+            [long_len] * n_long + [short_len] * n_short,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+    # compress_ratio == 1 (DSv3.2): compare raw seq_lens against long_threshold.
+    assert _count_long_rows(lens(0, 131072, 128, 2048), 1, LT) == 0
+    assert _count_long_rows(lens(8, 131072, 120, 2048), 1, LT) == 8
+    # Boundary: "long" is strictly greater-than, so seq_len == threshold is short.
+    assert _count_long_rows(lens(8, LT, 120, 2048), 1, LT) == 0
+
+    # compress_ratio == 4 (DSv4): scan-len = seq_len / 4, so a row is "long" iff
+    # seq_len > long_threshold * 4 (= 256K).
+    assert _count_long_rows(lens(8, 524288, 120, 8192), 4, LT) == 8  # 512K/4=128K
+    assert _count_long_rows(lens(8, 262144, 120, 8192), 4, LT) == 0  # 256K/4=64K not >
+
+
+# ---------------------------------------------------------------------------
+# test_load_balance_modes — auto / True / False all correct
+# ---------------------------------------------------------------------------
+
+
+def _make_ragged_gvr_inputs(top_k, dtype=torch.bfloat16):
+    """4 long rows (> 64K threshold) + 12 short rows: a ragged batch."""
+    N = 128 * 1024
+    seq_len_list = [N] * 4 + [2048] * 12
+    batch_size = len(seq_len_list)
+    torch.manual_seed(7)
+    logits = (torch.randn(batch_size, N, dtype=torch.float32, device="cuda") * 2.0).to(dtype)
+    seq_lens = torch.tensor(seq_len_list, dtype=torch.int32, device="cuda")
+    logits_f32 = logits.to(torch.float32)
+    pre_idx = torch.zeros(batch_size, top_k, dtype=torch.int32, device="cuda")
+    for r in range(batch_size):
+        pre_idx[r, 0] = int(logits_f32[r, : seq_len_list[r]].argmax().item())
+    pre_idx[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
+    return logits, seq_lens, pre_idx
+
+
+@requires_blackwell
+@pytest.mark.parametrize("load_balance", [True, False])
+def test_load_balance_modes(load_balance):
+    """Explicit load_balance=True/False both produce correct GVR top-K.
+
+    ``True``/``False`` force the two kernel variants directly on a ragged batch.
+    (``"auto"`` is covered by test_load_balance_auto_num_long_rows_hint.)
+    """
+    top_k = 512
+    logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
+    indices = flashinfer.top_k_decode(
+        logits, seq_lens, top_k, pre_idx=pre_idx,
+        backend="gvr", load_balance=load_balance,
+    )
+    torch.cuda.synchronize()
+    assert indices.shape == (seq_lens.shape[0], top_k)
+    _check_correct(indices, logits, seq_lens, top_k)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("num_long_rows", [4, 0])
+def test_load_balance_auto_num_long_rows_hint(num_long_rows):
+    """load_balance='auto' with a host-side num_long_rows hint stays correct.
+
+    The hint drives a pure-host LB/non-LB decision (CUDA-graph safe). The batch is
+    fixed (4 long + 12 short); num_long_rows only steers the choice, and BOTH
+    kernel paths must produce correct top-K on the same inputs.
+    """
+    top_k = 512
+    logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
+    indices = flashinfer.top_k_decode(
+        logits, seq_lens, top_k, pre_idx=pre_idx,
+        backend="gvr", load_balance="auto", num_long_rows=num_long_rows,
+    )
+    torch.cuda.synchronize()
+    assert indices.shape == (seq_lens.shape[0], top_k)
+    _check_correct(indices, logits, seq_lens, top_k)
+
+
+@requires_blackwell
+def test_load_balance_auto_requires_num_long_rows():
+    """load_balance='auto' without num_long_rows raises ValueError (no device sync)."""
+    top_k = 512
+    logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
+    with pytest.raises(ValueError, match="num_long_rows"):
+        flashinfer.top_k_decode(
+            logits, seq_lens, top_k, pre_idx=pre_idx,
+            backend="gvr", load_balance="auto",
+        )
+
+
+# ---------------------------------------------------------------------------
+# test_gvr_row_width_alignment — GVR N must be vec-aligned; radix is unconstrained
+# ---------------------------------------------------------------------------
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "dtype,align", [(torch.bfloat16, 8), (torch.float16, 8), (torch.float32, 4)]
+)
+def test_gvr_row_width_alignment(dtype, align):
+    """GVR raises ValueError when N is not a multiple of 16//itemsize.
+
+    GVR uses 128-bit vectorized loads, so each row (and thus N*itemsize) must be
+    16-byte aligned. A misaligned N would otherwise fault with a cryptic CUDA
+    'misaligned address' error; the API validates it up front instead.
+    """
+    top_k, batch_size = 512, 4
+    N_bad = 4096 + 1  # not a multiple of 4 or 8 for any supported dtype
+    logits = torch.randn(batch_size, N_bad, dtype=dtype, device="cuda")
+    seq_lens = torch.full((batch_size,), N_bad, dtype=torch.int32, device="cuda")
+    pre_idx = torch.zeros(batch_size, top_k, dtype=torch.int32, device="cuda")
+    pre_idx[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
+
+    with pytest.raises(ValueError, match=f"multiple of {align}"):
+        flashinfer.top_k_decode(
+            logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr", load_balance=False
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def test_radix_row_width_no_alignment_constraint():
+    """Radix backend accepts any N (no vectorized-load alignment requirement)."""
+    top_k, batch_size, N_bad = 512, 4, 4097
+    logits = torch.randn(batch_size, N_bad, dtype=torch.bfloat16, device="cuda")
+    seq_lens = torch.full((batch_size,), N_bad, dtype=torch.int32, device="cuda")
+    indices = flashinfer.top_k_decode(logits, seq_lens, top_k, backend="radix")
+    torch.cuda.synchronize()
+    assert indices.shape == (batch_size, top_k)

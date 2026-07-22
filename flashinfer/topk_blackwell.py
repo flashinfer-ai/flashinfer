@@ -70,8 +70,8 @@ _BLACKWELL_PLUS_CCS = [100, 103, 110, 120, 121]
 def _radix_top_k_decode_check(
     logits, seq_lens, top_k, pre_idx=None, compress_ratio=1,
     next_n=1, return_values=False, out_indices=None, out_values=None,
-    backend="auto", load_balance=True,
-):
+    backend="auto", load_balance=True, num_long_rows=None,
+):  # noqa: extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers."""
     return True
 
@@ -80,8 +80,8 @@ def _radix_top_k_decode_check(
 def _gvr_top_k_decode_check(
     logits, seq_lens, top_k, pre_idx=None, compress_ratio=1,
     next_n=1, return_values=False, out_indices=None, out_values=None,
-    backend="auto", load_balance=True,
-):
+    backend="auto", load_balance=True, num_long_rows=None,
+):  # noqa: extra kwargs mirror the public signature; unused by the check
     """GVR LB: requires Blackwell hardware, CuTe DSL, and a pre_idx hint."""
     return is_cute_dsl_available() and pre_idx is not None
 
@@ -100,17 +100,22 @@ if is_cute_dsl_available():
 
 
 @functools.cache
-def _compile_lb_prepare(
-    num_threads: int, batch_size: int, long_threshold: int, compress_ratio: int
-):
+def _compile_lb_prepare(num_threads: int, long_threshold: int, compress_ratio: int):
+    # batch_size (the seq_lens length) is DYNAMIC: it is passed as a runtime scalar
+    # (cutlass.Int32(batch_size)) and only bounds the classifier's per-thread guard
+    # (tidx < batch_size); it is never a const_expr / SMEM size / static unroll, and
+    # the grid is fixed (1,1,1). So seq_lens is compiled with a symbolic length and
+    # one kernel serves every batch size. num_threads stays static (it sizes the
+    # order_row buffer and the block-prefix-sum SMEM); counters is constant (2,).
     prep = GvrTopKLBPrepareKernel(
         long_threshold=long_threshold,
         compress_ratio=compress_ratio,
         num_threads=num_threads,
     )
+    sym_batch = cute.sym_int()
     return cute.compile(
         prep,
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (batch_size,), stride_order=(0,)),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_batch,), stride_order=(0,)),
         cute.runtime.make_fake_compact_tensor(cutlass.Int32, (num_threads,), stride_order=(0,)),
         cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,)),
         cutlass.Int32(0),
@@ -121,9 +126,16 @@ def _compile_lb_prepare(
 
 @functools.cache
 def _compile_lb(
-    cute_dtype, top_k, next_n, num_rows, N, compress_ratio,
+    cute_dtype, top_k, next_n, compress_ratio,
     max_batch_size, num_threads, cluster_size, return_output_values,
 ):
+    # num_rows and N are DYNAMIC (symbolic) — see _compile_gvr. The LB kernel's
+    # grid is fixed at max_batch_size * next_n * cluster_size (surplus clusters
+    # early-exit via counters), so num_rows never touches the launch config, and
+    # N is a per-row runtime bound. Only max_batch_size stays static (it sizes the
+    # grid and the order_row buffer). One compiled kernel serves every batch size
+    # and sequence length for a given (dtype, top_k, next_n, compress_ratio,
+    # max_batch_size, num_threads, cluster_size, return_output_values).
     kernel = GvrTopKLBKernel(
         dtype=cute_dtype,
         top_k=top_k,
@@ -134,14 +146,16 @@ def _compile_lb(
         cluster_size=cluster_size,
         max_batch_size=max_batch_size,
     )
-    n_groups = num_rows // next_n
+    sym_groups = cute.sym_int()  # request count (= num_rows // next_n)
+    sym_n = cute.sym_int()  # per-row logits width
+    sym_rows = sym_groups * next_n
     return cute.compile(
         kernel,
-        cute.runtime.make_fake_compact_tensor(cute_dtype, (num_rows, N), stride_order=(1, 0), assumed_align=16),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (n_groups, top_k), stride_order=(1, 0), assumed_align=16),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (n_groups,), stride_order=(0,)),
-        cute.runtime.make_fake_compact_tensor(cute_dtype, (num_rows, top_k), stride_order=(1, 0), assumed_align=16) if return_output_values else None,
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (num_rows, top_k), stride_order=(1, 0), assumed_align=16),
+        cute.runtime.make_fake_compact_tensor(cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_groups, top_k), stride_order=(1, 0), assumed_align=16),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_groups,), stride_order=(0,)),
+        cute.runtime.make_fake_compact_tensor(cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16) if return_output_values else None,
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16),
         cute.runtime.make_fake_compact_tensor(cutlass.Int32, (max_batch_size,), stride_order=(0,)),
         cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,)),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -151,9 +165,18 @@ def _compile_lb(
 
 @functools.cache
 def _compile_gvr(
-    cute_dtype, top_k, next_n, num_rows, N, compress_ratio,
+    cute_dtype, top_k, next_n, compress_ratio,
     num_threads, return_output_values,
 ):
+    # num_rows and N (per-row width) are DYNAMIC dimensions: the kernel reads
+    # them from the tensor shapes at runtime (num_rows = input.shape[0] drives the
+    # grid in __call__; N is derived per-row from seq_lens) and never uses them in
+    # a const_expr / SMEM sizing / static unroll. So they are compiled symbolically
+    # via cute.sym_int() — one compiled kernel serves every batch size and
+    # sequence length, matching the FlashInfer CuTe-DSL convention (cf.
+    # rmsnorm_fp4quant._get_compiled_kernel). Only true specializations (dtype,
+    # top_k, next_n, compress_ratio, num_threads, return_output_values) key the
+    # cache. sym_groups is the request axis; num_rows = sym_groups * next_n.
     kernel = GvrTopKKernel(
         dtype=cute_dtype,
         top_k=top_k,
@@ -163,14 +186,16 @@ def _compile_gvr(
         return_output_values=return_output_values,
         cluster_size=1,
     )
-    n_groups = num_rows // next_n
+    sym_groups = cute.sym_int()  # request count (= num_rows // next_n)
+    sym_n = cute.sym_int()  # per-row logits width
+    sym_rows = sym_groups * next_n
     return cute.compile(
         kernel,
-        cute.runtime.make_fake_compact_tensor(cute_dtype, (num_rows, N), stride_order=(1, 0), assumed_align=16),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (n_groups, top_k), stride_order=(1, 0), assumed_align=16),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (n_groups,), stride_order=(0,)),
-        cute.runtime.make_fake_compact_tensor(cute_dtype, (num_rows, top_k), stride_order=(1, 0), assumed_align=16) if return_output_values else None,
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (num_rows, top_k), stride_order=(1, 0), assumed_align=16),
+        cute.runtime.make_fake_compact_tensor(cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_groups, top_k), stride_order=(1, 0), assumed_align=16),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_groups,), stride_order=(0,)),
+        cute.runtime.make_fake_compact_tensor(cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16) if return_output_values else None,
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16),
         None,  # order_row unused when seqlen_sorted=False
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -203,14 +228,13 @@ def _run_gvr(
     """Run GVR LB prepare + decode in one call (mirrors topk_clusters_exact)."""
     cute_dtype = torch_to_cutlass_dtype(logits.dtype)
     num_rows = logits.shape[0]
-    N = logits.shape[1]
     batch_size = seq_lens.shape[0]
     max_batch_size = _lb_max_batch_size(batch_size)
     lb_cfg = GvrTopKLBConfig(max_batch_size=max_batch_size)
 
     order_row = torch.empty(max_batch_size, dtype=torch.int32, device=logits.device)
     counters = torch.zeros(2, dtype=torch.int32, device=logits.device)
-    _compile_lb_prepare(max_batch_size, batch_size, lb_cfg.long_threshold, compress_ratio)(
+    _compile_lb_prepare(max_batch_size, lb_cfg.long_threshold, compress_ratio)(
         seq_lens, order_row, counters, cutlass.Int32(batch_size)
     )
 
@@ -220,7 +244,7 @@ def _run_gvr(
         out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
 
     _compile_lb(
-        cute_dtype, top_k, next_n, num_rows, N, compress_ratio,
+        cute_dtype, top_k, next_n, compress_ratio,
         max_batch_size, lb_cfg.num_threads, lb_cfg.cluster_size, return_output_values,
     )(
         logits, pre_idx, seq_lens,
@@ -244,7 +268,6 @@ def _run_gvr_no_lb(
     """Run GVR without load-balancing: one CTA per row, no prepare kernel."""
     cute_dtype = torch_to_cutlass_dtype(logits.dtype)
     num_rows = logits.shape[0]
-    N = logits.shape[1]
 
     if out_indices is None:
         out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=logits.device)
@@ -253,7 +276,7 @@ def _run_gvr_no_lb(
 
     lb_cfg = GvrTopKLBConfig()
     _compile_gvr(
-        cute_dtype, top_k, next_n, num_rows, N, compress_ratio,
+        cute_dtype, top_k, next_n, compress_ratio,
         lb_cfg.num_threads, return_output_values,
     )(
         logits, pre_idx, seq_lens,
@@ -261,6 +284,54 @@ def _run_gvr_no_lb(
         out_indices, None,
     )
     return (out_values if return_output_values else None), out_indices
+
+
+def _lb_decision_from_counts(n_long: int, num_rows: int) -> bool:
+    """Pure-host LB decision: is the two-kernel LB path worth its overhead?
+
+    Load-balancing splits *long* rows (scan-length > ``long_threshold``) across a
+    CTA cluster to shorten the single-wave tail, and packs short rows one-per-CTA.
+    It pays off only when the batch is a *mix* of long and non-long rows:
+
+      * No long rows                -> LB adds a prepare kernel + cluster sync for
+                                       no tail to cut  => non-LB is faster.
+      * All (or a majority of) rows  -> every row already saturates an SM; there
+        are long                      are no short rows to pack and the cluster
+                                       split just adds DSMEM-sync overhead
+                                       => non-LB is faster.
+      * A minority (<= half) of rows -> the long rows form a tail that LB cuts
+        are long                       ~cluster_size-fold while short rows finish
+                                       cheaply  => LB is faster.
+
+    LB is selected iff ``0 < n_long <= num_rows // 2``. Boundary tuned on B200: LB
+    wins up to ~50% long-fraction, loses by ~62% (see ``benchmarks/bench_gvr_lb.py``).
+
+    This function takes plain Python ints, so it does no device I/O and is
+    **CUDA-graph safe** — the branch resolves at trace time. Callers who know their
+    batch's long-row count (they usually track context lengths on the host anyway)
+    should pass it via ``top_k_decode(..., num_long_rows=...)``.
+    """
+    return 0 < n_long <= num_rows // 2
+
+
+def _count_long_rows(
+    seq_lens: torch.Tensor, compress_ratio: int, long_threshold: int
+) -> int:
+    """Count rows whose scan length exceeds ``long_threshold`` (device reduction).
+
+    Compared in scan-length space (``seq_lens / compress_ratio``), matching the GVR
+    prepare kernel. Threshold-scaling avoids the elementwise divide when
+    ``compress_ratio == 1`` (the common DSv3.2 case).
+
+    Convenience helper for callers who want to derive the ``num_long_rows`` hint
+    for ``top_k_decode(load_balance="auto", ...)`` from a device ``seq_lens``
+    tensor. The ``.item()`` read forces a device->host sync (~a few us) and is
+    **NOT CUDA-graph safe**, so ``top_k_decode`` never calls it internally — under
+    graph capture, compute ``num_long_rows`` on the host from data you already
+    track, or use an explicit ``load_balance=True/False``.
+    """
+    threshold = long_threshold if compress_ratio == 1 else long_threshold * compress_ratio
+    return int((seq_lens > threshold).sum().item())
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +410,8 @@ def top_k_decode(
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
     backend: Literal["radix", "gvr", "auto"] = "auto",
-    load_balance: bool = True,
+    load_balance: Union[bool, Literal["auto"]] = True,
+    num_long_rows: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
 
@@ -357,6 +429,11 @@ def top_k_decode(
     logits : torch.Tensor
         2-D float tensor of shape ``(num_rows, max_seq_len)``.
         Supported dtypes: ``float32``, ``bfloat16``, ``float16``.
+        For the ``"gvr"`` backend the row width ``max_seq_len`` must be a
+        multiple of ``16 // itemsize`` (8 for fp16/bf16, 4 for fp32) so each
+        row is 16-byte aligned for GVR's 128-bit vectorized loads; a
+        ``ValueError`` is raised otherwise.  The ``"radix"`` backend has no
+        such constraint.
     seq_lens : torch.Tensor
         1-D ``int32`` tensor of shape ``(num_rows // next_n,)`` with the
         effective KV-cache length per request.  Logits at or beyond
@@ -393,13 +470,35 @@ def top_k_decode(
                       ``pre_idx``).
         ``"radix"`` — Masked radix top-K (all GPUs, no ``pre_idx`` needed).
         ``"auto"``  — GVR when requirements are met, else radix.
-    load_balance : bool, optional
-        When ``True`` (default) the GVR backend runs the two-kernel LB path
-        (``GvrTopKLBPrepareKernel`` + ``GvrTopKLBKernel``): a prepare kernel
-        first classifies requests into long/short buckets, then the main
-        kernel dispatches them accordingly.  When ``False``, the simpler
-        single-kernel path (``GvrTopKKernel``) is used: one CTA per row with
-        no prepare step.  Ignored by the radix backend.
+    load_balance : bool or ``"auto"``, optional
+        Selects the GVR kernel path (ignored by the radix backend).  Default
+        ``True``.
+
+        ``True`` (default) — two-kernel LB path (``GvrTopKLBPrepareKernel`` +
+                     ``GvrTopKLBKernel``): a prepare kernel classifies requests
+                     into long/short buckets, then the main kernel splits each
+                     long row across a CTA cluster and packs short rows.  Best
+                     for the ragged decode batches GVR targets.
+        ``False``  — single-kernel path (``GvrTopKKernel``): one CTA per row,
+                     no prepare step.  Faster when the batch has no length
+                     variance (all rows short, or all long).
+        ``"auto"`` — pick per call with the heuristic: use LB only when the batch
+                     is a *mix* of long and non-long rows (long rows form a
+                     minority tail worth splitting; see :func:`_lb_decision_from_counts`).
+                     **Requires** ``num_long_rows`` — the decision is made purely
+                     on the host from that count, with no device read.  Omitting
+                     it raises ``ValueError`` (deriving the count from ``seq_lens``
+                     would need a device->host sync that is not CUDA-graph safe).
+
+        All three settings are CUDA-graph safe (no host branch on device data).
+    num_long_rows : int, optional
+        Host-side hint: the number of rows whose scan length
+        (``seq_lens / compress_ratio``) exceeds the GVR ``long_threshold`` (64K).
+        **Required** when ``load_balance="auto"`` (ignored otherwise).  The LB
+        decision is a pure-host branch on this count, keeping ``"auto"`` CUDA-graph
+        safe and sync-free.  Callers typically already track context lengths on the
+        host; :func:`_count_long_rows` can derive it from ``seq_lens`` in eager mode
+        (at the cost of a device sync) if needed.
 
     Returns
     -------
@@ -452,7 +551,39 @@ def top_k_decode(
         backend = top_k_decode.suitable_auto_backends[0]
 
     if backend == "gvr":
-        if load_balance:
+        # GVR scans each row with 128-bit vectorized loads (vec_align = 16 bytes),
+        # so every row must start at a 16-byte boundary. Row r begins at byte
+        # r * N * itemsize, hence N * itemsize must be a multiple of 16 -- i.e. N
+        # must be a multiple of 16 // itemsize (8 for fp16/bf16, 4 for fp32).
+        # Otherwise the kernel issues a misaligned LDG and the launch faults with a
+        # cryptic CUDA "misaligned address" error, so validate it up front.
+        N = logits.shape[1]
+        elem_align = 16 // logits.element_size()
+        if N % elem_align != 0:
+            raise ValueError(
+                f"GVR backend requires the logits row width (N={N}) to be a "
+                f"multiple of {elem_align} for {logits.dtype} (128-bit aligned "
+                f"vectorized loads). Pad the logits buffer's last dimension up to a "
+                f"multiple of {elem_align}, or use backend='radix' (no alignment "
+                f"constraint)."
+            )
+        if load_balance == "auto":
+            # "auto" requires the host-side long-row count. Deriving it from
+            # seq_lens would need a device->host sync (.item()), which is not
+            # CUDA-graph safe and adds latency, so it is disallowed: callers must
+            # supply num_long_rows (pure-host, graph-safe) or pick a path
+            # explicitly with load_balance=True/False.
+            if num_long_rows is None:
+                raise ValueError(
+                    "load_balance='auto' requires num_long_rows (the count of rows "
+                    "whose scan length exceeds the GVR long_threshold). Computing it "
+                    "from seq_lens needs a device->host sync that is not CUDA-graph "
+                    "safe. Pass num_long_rows, or set load_balance=True/False."
+                )
+            use_lb = _lb_decision_from_counts(int(num_long_rows), seq_lens.shape[0])
+        else:
+            use_lb = bool(load_balance)
+        if use_lb:
             out_v, out_i = _run_gvr(
                 logits, pre_idx, seq_lens, top_k, next_n, compress_ratio,
                 return_values, out_indices, out_values,
