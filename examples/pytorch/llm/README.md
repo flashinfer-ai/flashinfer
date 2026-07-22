@@ -1,13 +1,20 @@
 # FlashInfer LLM Example (Llama / Qwen dense)
 
 A self-contained, plain-PyTorch LLM decoder built from FlashInfer's
-serving-path ops. This is **reference and verification code, not a serving
-engine**: it exists so FlashInfer's public APIs can be exercised end to end —
-paged KV cache, batched prefill/decode attention, RoPE, RMSNorm, SwiGLU
-activation, and sampling — with nothing but `flashinfer`, `torch`, and a
-Hugging Face checkpoint. Integration-level regressions (a broken JIT cache,
-per-step recompiles, silent backend fallbacks) show up here even when every
-kernel unit test passes. Background and roadmap:
+serving-path ops.
+
+**Scope.** Serving models independently is explicitly *not* a goal of this
+example — production inference belongs to the serving frameworks that build
+on FlashInfer. What *is* the goal, and what we consider paramount for the
+library's robustness, is being able to **close the loop independently**: a
+functional end-to-end verification path that exercises FlashInfer's public
+APIs the way a serving stack composes them — paged KV cache, batched
+prefill/decode attention, RoPE, RMSNorm, SwiGLU activation, and sampling —
+with nothing but `flashinfer`, `torch`, and a Hugging Face checkpoint.
+Integration-level regressions (a broken JIT cache, per-step recompiles,
+silent backend fallbacks) show up here even when every kernel unit test
+passes, and can be reproduced and bisected inside this repo without any
+external framework in the dependency chain. Background and roadmap:
 [`docs/design_docs/e2e_pytorch_llm_examples.md`](../../../docs/design_docs/e2e_pytorch_llm_examples.md).
 
 ## FlashInfer APIs exercised
