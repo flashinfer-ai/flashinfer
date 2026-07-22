@@ -41,17 +41,24 @@ here an admitted config is a machine-checked config, so under-claiming is the
 only honest default.
 
 Prototype simplifications (documented, not hidden):
-- ``kv_layout="HND"`` only (pages, H, page_size, D).  plan(kv_layout=...)
-  exists and rejects anything else loudly; NHD wiring is mechanical.
 - dtypes: fp16/bf16 only.  fp8/nvfp4 are capability axes, out of scope here.
-- ``window_left`` / sliding window is not plumbed (all three backends can do
-  it; it is a capability axis in the proposal).
-- page_size >= 8 required: page_size=1 token-CSR serving (sglang default) is
-  CSR-canonical per proposal §3.1 and needs the CSR input form, which this
-  prototype does not carry.
 - Heuristic order is a static per-arch placeholder, to be seeded from the
   benchmark suite (proposal §5.2).  Autotune hook (§5.4) is not wired.
-- Each adapter allocates its own workspace lazily (production: share).
+- CUDA-graph capture mode (pinned metadata buffers, replay-safe re-plan) is
+  not wired; run() is capture-shaped (no allocs with out=/lse=, no syncs)
+  but the plan-under-capture story is follow-up work.
+- ``sinks`` / custom masks / soft-cap are absent capability axes.
+
+Paging metadata comes in exactly one of two forms (never both):
+- dense ``block_tables (b, max_pages)`` — vLLM-native; page_size >= 8
+  (denser would blow the table up; token-CSR engines use the other form);
+- flat ``kv_page_indices`` — sglang-style token/CSR-native, any page_size
+  >= 1.  The page-unit indptr and last-page lengths are NOT accepted: they
+  are derivable from ``kv_seq_lens`` + ``page_size``, and accepting them
+  would create a second truth (see the #3921 mask-divergence class).
+  Backends that need the dense table (cudnn, trtllm-gen) get it derived by
+  a zero-sync gather when page_size >= 8, and are capability-excluded below
+  that.
 - Trusted inputs (documented, not validated): host mirrors must match the
   device tensors; ``block_tables`` VALUES (page ids) must be in-pool —
   checking them costs a device-side pass the hot path cannot pay; a debug
@@ -104,7 +111,11 @@ class BackendCapability:
     kv_layouts: frozenset
     supports_lse: bool
     supports_noncausal: bool
+    supports_window: bool
     requires_contiguous_q: bool
+    # True if the backend consumes the dense block table (derivation from the
+    # flat-indices input form is forbidden below page_size 8 — table blowup)
+    needs_dense: bool = False
     # native LSE format, normalized by the adapter:
     #   "base2_tokens_h"  — already the contract
     #   "ln_padded_bsh"   — natural-log (b, max_q, h); adapter gathers + folds
@@ -121,6 +132,8 @@ class BackendCapability:
         kv_layout: str,
         causal: bool,
         need_lse: bool,
+        window_left: int,
+        kv_input_form: str,
     ) -> Optional[str]:
         """Return None if runnable, else the exclusion reason (for explain())."""
         if cc_major not in self.cc_majors:
@@ -137,6 +150,18 @@ class BackendCapability:
             return "non-causal attention not supported"
         if need_lse and not self.supports_lse:
             return "LSE output not supported"
+        if window_left >= 0 and not self.supports_window:
+            return "sliding window (window_left >= 0) not supported"
+        if (
+            self.needs_dense
+            and kv_input_form == "page_indices"
+            and page_size < _MIN_DENSE_PAGE_SIZE
+        ):
+            return (
+                "needs a dense block table, and deriving one from flat page "
+                f"indices at page_size {page_size} < {_MIN_DENSE_PAGE_SIZE} "
+                "would blow up to (batch, max_context) — CSR-native backends only"
+            )
         return None
 
 
@@ -176,22 +201,28 @@ CAPABILITIES: Dict[str, BackendCapability] = {
         name="fa2",
         cc_majors=frozenset({8, 9, 10, 11, 12}),
         q_dtypes=_F16,
-        head_dims=frozenset({(128, 128)}),
+        head_dims=frozenset({(64, 64), (128, 128), (256, 256)}),
         page_sizes=None,
-        kv_layouts=frozenset({"HND"}),
+        kv_layouts=frozenset({"HND", "NHD"}),
         supports_lse=True,
         supports_noncausal=True,
+        supports_window=True,
         requires_contiguous_q=False,
     ),
     "fa3": BackendCapability(
         name="fa3",
         cc_majors=frozenset({9}),
         q_dtypes=_F16,
-        head_dims=frozenset({(128, 128)}),
+        # (192,128) is NOT declared: the paged fa kernels require
+        # k_page_stride == v_page_stride, which separately-allocated
+        # K(192)/V(128) pools violate (needs a stride-matched allocation
+        # contract; cudnn covers (192,128) without one).
+        head_dims=frozenset({(64, 64), (128, 128), (256, 256)}),
         page_sizes=None,
-        kv_layouts=frozenset({"HND"}),
+        kv_layouts=frozenset({"HND", "NHD"}),
         supports_lse=True,
         supports_noncausal=True,
+        supports_window=True,
         requires_contiguous_q=False,
     ),
     "cudnn": BackendCapability(
@@ -203,7 +234,9 @@ CAPABILITIES: Dict[str, BackendCapability] = {
         kv_layouts=frozenset({"HND"}),
         supports_lse=True,
         supports_noncausal=True,  # bottom_right mask off + padding mask: verified H100
+        supports_window=False,  # no sliding window in the cuDNN SDPA graph path
         requires_contiguous_q=True,  # token-unit offsets assume packed THD
+        needs_dense=True,
         lse_native="ln_padded_bsh",
     ),
     "trtllm-gen": BackendCapability(
@@ -214,11 +247,13 @@ CAPABILITIES: Dict[str, BackendCapability] = {
         # 128+ pages are supported by the kernel with GQA (repo tests cover
         # up to 1024) — kept out until this suite exercises them.
         page_sizes=frozenset({16, 32, 64}),
-        kv_layouts=frozenset({"HND"}),
+        kv_layouts=frozenset({"HND", "NHD"}),
         supports_lse=True,
         # vLLM routes non-causal away from trtllm; unverified here, so False.
         supports_noncausal=False,
+        supports_window=True,
         requires_contiguous_q=True,  # TMA: last dim stride 1; keep strict here
+        needs_dense=True,
     ),
 }
 
@@ -239,9 +274,11 @@ _HEURISTIC_ORDER = {
     12: ("fa2", "cudnn"),
 }
 
-# page_size=1 token-CSR serving is CSR-canonical (proposal §3.1); the dense
-# block_tables form this prototype carries would blow up to (b, max_context).
-_MIN_PAGE_SIZE = 8
+# Below this page size a dense (b, max_pages) block table degenerates toward
+# (b, max_context): the dense INPUT form requires page_size >= this floor, and
+# dense DERIVATION from the flat-indices form is refused below it (backends
+# that need the dense table are capability-excluded instead).
+_MIN_DENSE_PAGE_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -284,6 +321,8 @@ def _resolve_config_key(
     kv_layout,
     causal,
     need_lse,
+    window_left,
+    kv_input_form,
 ) -> Tuple:
     return (
         num_qo_heads,
@@ -295,6 +334,8 @@ def _resolve_config_key(
         kv_layout,
         causal,
         need_lse,
+        window_left,
+        kv_input_form,
     )
 
 
@@ -311,6 +352,8 @@ def resolve_paged_prefill(
     kv_layout: str = "HND",
     causal: bool = True,
     need_lse: bool = False,
+    window_left: int = -1,
+    kv_input_form: str = "block_tables",
     backend: str = "auto",
 ) -> Resolution:
     """Static backend resolution — no wrapper, no tensors.
@@ -335,14 +378,12 @@ def resolve_paged_prefill(
             f"num_qo_heads ({num_qo_heads}) must be divisible by "
             f"num_kv_heads ({num_kv_heads}) for GQA/MQA"
         )
-    if page_size < _MIN_PAGE_SIZE:
+    if kv_input_form not in ("block_tables", "page_indices"):
         raise ValueError(
-            f"page_size {page_size} < {_MIN_PAGE_SIZE}: token-granular paging "
-            "(page_size=1) is CSR-canonical and needs the CSR input form, "
-            "which this prototype does not carry — use "
-            "BatchPrefillWithPagedKVCacheWrapper directly, or page_size >= "
-            f"{_MIN_PAGE_SIZE}"
+            f"kv_input_form must be 'block_tables' or 'page_indices', got "
+            f"{kv_input_form!r}"
         )
+    _expect_page_size(page_size, kv_input_form)
 
     order = _HEURISTIC_ORDER.get(cc_major, ())
     if backend != "auto":
@@ -368,6 +409,8 @@ def resolve_paged_prefill(
             kv_layout=kv_layout,
             causal=causal,
             need_lse=need_lse,
+            window_left=window_left,
+            kv_input_form=kv_input_form,
         )
         if reason is None:
             reason = _PROBES[name]()
@@ -393,6 +436,8 @@ def resolve_paged_prefill(
             kv_layout,
             causal,
             need_lse,
+            window_left,
+            kv_input_form,
         ),
     )
 
@@ -405,6 +450,21 @@ def resolve_paged_prefill(
 def _expect(cond: bool, msg: str) -> None:
     if not cond:
         raise ValueError(msg)
+
+
+def _expect_page_size(page_size: int, kv_input_form: str) -> None:
+    _expect(
+        isinstance(page_size, int) and page_size >= 1,
+        f"page_size must be a positive host int, got {page_size!r}",
+    )
+    if kv_input_form == "block_tables":
+        _expect(
+            page_size >= _MIN_DENSE_PAGE_SIZE,
+            f"page_size {page_size} < {_MIN_DENSE_PAGE_SIZE} with the dense "
+            "block_tables form: a dense table at token-granular page sizes "
+            "degenerates to (batch, max_context) — pass the flat "
+            "kv_page_indices form instead (any page_size >= 1)",
+        )
 
 
 class UnifiedPagedPrefill:
@@ -430,8 +490,20 @@ class UnifiedPagedPrefill:
         if dev.type == "cuda" and dev.index is None:
             dev = torch.device("cuda", torch.cuda.current_device())
         self.device = dev
-        self._adapters: Dict[str, Any] = {}
+        self._adapters: Dict[Any, Any] = {}
+        self._workspace: Optional[torch.Tensor] = None
         self._planned = False
+
+    def _shared_workspace(self) -> torch.Tensor:
+        # One scratch workspace shared by the fa/cudnn adapters (they never
+        # run concurrently within one instance).  trtllm-gen keeps a private
+        # zero-initialized buffer: its kernels rely on counter semantics that
+        # a scribbled-on shared buffer would violate.
+        if self._workspace is None:
+            self._workspace = torch.empty(
+                128 * 1024 * 1024, dtype=torch.uint8, device=self.device
+            )
+        return self._workspace
 
     # ------------------------------ plan ------------------------------
 
@@ -440,7 +512,8 @@ class UnifiedPagedPrefill:
         *,
         qo_indptr: torch.Tensor,
         kv_seq_lens: torch.Tensor,
-        block_tables: torch.Tensor,
+        block_tables: Optional[torch.Tensor] = None,
+        kv_page_indices: Optional[torch.Tensor] = None,
         page_size: int,
         max_q_len: int,
         max_kv_len: int,
@@ -452,6 +525,7 @@ class UnifiedPagedPrefill:
         kv_dtype: Optional[torch.dtype] = None,
         kv_layout: str = "HND",
         causal: bool = True,
+        window_left: int = -1,
         sm_scale: Optional[float] = None,
         return_lse: bool = False,
         qo_indptr_cpu: Optional[torch.Tensor] = None,
@@ -466,8 +540,14 @@ class UnifiedPagedPrefill:
           (``qo_indptr[0] == 0``; build with ``cumsum(..., dtype=torch.int32)``)
         - ``kv_seq_lens``: ``(b,)`` per-request valid KV lengths >= 1
           (masking truth; causal requires ``q_len_i <= kv_len_i``)
-        - ``block_tables``: ``(b, max_pages_per_seq)`` dense page table
+        - paging: EXACTLY ONE of ``block_tables`` ``(b, max_pages_per_seq)``
+          dense (page_size >= 8) or ``kv_page_indices`` flat CSR page-id list
+          (any page_size >= 1; page-unit indptr / last-page lengths are
+          derived from ``kv_seq_lens`` — a second copy would be a second
+          truth)
         - ``page_size, max_q_len, max_kv_len``: host ints, REQUIRED
+        - ``window_left``: sliding-window size (-1 = unlimited); backends
+          without window support are capability-excluded
         - ``qo_indptr_cpu`` / ``kv_seq_lens_cpu``: optional host mirrors —
           with them plan() is zero-sync (validation and fa2/fa3 scheduling
           read the mirrors the engine already owns); without them plan()
@@ -480,14 +560,25 @@ class UnifiedPagedPrefill:
         head_dim_vo = head_dim_vo if head_dim_vo is not None else head_dim_qk
         kv_dtype = kv_dtype if kv_dtype is not None else q_dtype
         _expect(
-            kv_layout == "HND",
-            f"kv_layout {kv_layout!r} is not wired in this prototype — only "
-            '"HND" (pages, num_kv_heads, page_size, head_dim); permute NHD '
-            "caches with .permute(0, 2, 1, 3).contiguous()",
+            kv_layout in ("HND", "NHD"),
+            f"kv_layout must be 'HND' or 'NHD', got {kv_layout!r}",
         )
+        _expect(
+            (block_tables is None) != (kv_page_indices is None),
+            "pass EXACTLY ONE paging form: block_tables (dense, vLLM-style) "
+            "or kv_page_indices (flat CSR page ids, sglang-style)",
+        )
+        kv_input_form = "block_tables" if block_tables is not None else "page_indices"
 
         self._validate_structure(
-            qo_indptr, kv_seq_lens, block_tables, page_size, max_q_len, max_kv_len
+            qo_indptr,
+            kv_seq_lens,
+            block_tables,
+            kv_page_indices,
+            page_size,
+            max_q_len,
+            max_kv_len,
+            kv_input_form,
         )
         # Value-level validation is unconditional — it is what makes the
         # reject-or-correct property hold.  Zero-sync iff the caller hands us
@@ -501,6 +592,7 @@ class UnifiedPagedPrefill:
             qo_indptr,
             kv_seq_lens,
             block_tables,
+            kv_page_indices,
             page_size,
             max_q_len,
             max_kv_len,
@@ -522,6 +614,8 @@ class UnifiedPagedPrefill:
                 kv_layout,
                 causal,
                 return_lse,
+                window_left,
+                kv_input_form,
             )
             _expect(
                 backend.config == want,
@@ -542,6 +636,8 @@ class UnifiedPagedPrefill:
                 kv_layout=kv_layout,
                 causal=causal,
                 need_lse=return_lse,
+                window_left=window_left,
+                kv_input_form=kv_input_form,
                 backend=backend,
             )
         # Plan-time choice within the pinned set (level 2).  The prototype
@@ -554,7 +650,6 @@ class UnifiedPagedPrefill:
         self._meta = dict(
             qo_indptr=qo_indptr,
             kv_seq_lens=kv_seq_lens,
-            block_tables=block_tables,
             page_size=page_size,
             max_q_len=max_q_len,
             max_kv_len=max_kv_len,
@@ -565,32 +660,61 @@ class UnifiedPagedPrefill:
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
             causal=causal,
+            window_left=window_left,
+            kv_layout=kv_layout,
             sm_scale=sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk),
             return_lse=return_lse,
             batch_size=b,
             qo_indptr_cpu=qo_indptr_cpu,
             kv_seq_lens_cpu=kv_seq_lens_cpu,
         )
-        self._derived = _derive(qo_indptr, kv_seq_lens, block_tables, page_size)
+        self._derived = _derive(
+            qo_indptr,
+            kv_seq_lens,
+            block_tables,
+            kv_page_indices,
+            page_size,
+            max_kv_len,
+            needs_dense=any(CAPABILITIES[n].needs_dense for n in (self._backend,)),
+        )
+        # both paging forms live in meta post-derivation (None where truly absent)
+        self._meta["block_tables"] = (
+            block_tables if block_tables is not None else self._derived.block_tables
+        )
 
-        adapter = self._adapters.get(self._backend)
+        key = (self._backend, kv_layout)
+        adapter = self._adapters.get(key)
         if adapter is None:
-            adapter = _ADAPTERS[self._backend](self.device)
-            self._adapters[self._backend] = adapter
+            adapter = _ADAPTERS[self._backend](
+                self.device, kv_layout, self._shared_workspace()
+            )
+            self._adapters[key] = adapter
         adapter.plan(self._meta, self._derived)
         self._adapter = adapter
         self._planned = True
         return self
 
     def _validate_structure(
-        self, qo_indptr, kv_seq_lens, block_tables, page_size, max_q_len, max_kv_len
+        self,
+        qo_indptr,
+        kv_seq_lens,
+        block_tables,
+        kv_page_indices,
+        page_size,
+        max_q_len,
+        max_kv_len,
+        kv_input_form,
     ) -> None:
         """Closed-set structural validation. Cheap (host-only, shape-derived)."""
-        for name, t, dim in (
+        checks = [
             ("qo_indptr", qo_indptr, 1),
             ("kv_seq_lens", kv_seq_lens, 1),
-            ("block_tables", block_tables, 2),
-        ):
+        ]
+        if block_tables is not None:
+            checks.append(("block_tables", block_tables, 2))
+        if kv_page_indices is not None:
+            checks.append(("kv_page_indices", kv_page_indices, 1))
+        for name, t, dim in checks:
             _expect(isinstance(t, torch.Tensor), f"{name} must be a torch.Tensor")
             _expect(
                 t.is_cuda and t.device == self.device,
@@ -613,35 +737,34 @@ class UnifiedPagedPrefill:
             f"{tuple(qo_indptr.shape)} — it is a token-unit prefix sum "
             "(qo_indptr[0] = 0)",
         )
-        _expect(
-            block_tables.shape[0] == b,
-            f"block_tables must have shape (batch_size, max_pages) with "
-            f"batch_size={b}, got {tuple(block_tables.shape)}",
-        )
-        _expect(
-            isinstance(page_size, int) and page_size >= _MIN_PAGE_SIZE,
-            f"page_size must be a host int >= {_MIN_PAGE_SIZE}, got "
-            f"{page_size!r} (page_size=1 token-CSR is outside this prototype; "
-            "see module docstring)",
-        )
+        if block_tables is not None:
+            _expect(
+                block_tables.shape[0] == b,
+                f"block_tables must have shape (batch_size, max_pages) with "
+                f"batch_size={b}, got {tuple(block_tables.shape)}",
+            )
+        _expect_page_size(page_size, kv_input_form)
         for nm, v in (("max_q_len", max_q_len), ("max_kv_len", max_kv_len)):
             _expect(
                 isinstance(v, int) and v >= 1,
                 f"{nm} must be a positive host int (required; it kills the "
                 f"hidden device sync), got {v!r}",
             )
-        capacity = block_tables.shape[1] * page_size
-        _expect(
-            max_kv_len <= capacity,
-            f"max_kv_len ({max_kv_len}) exceeds block_tables capacity "
-            f"({block_tables.shape[1]} pages x page_size {page_size} = {capacity})",
-        )
+        if block_tables is not None:
+            capacity = block_tables.shape[1] * page_size
+            _expect(
+                max_kv_len <= capacity,
+                f"max_kv_len ({max_kv_len}) exceeds block_tables capacity "
+                f"({block_tables.shape[1]} pages x page_size {page_size} = "
+                f"{capacity})",
+            )
 
     def _validate_values(
         self,
         qo_indptr,
         kv_seq_lens,
         block_tables,
+        kv_page_indices,
         page_size,
         max_q_len,
         max_kv_len,
@@ -703,14 +826,24 @@ class UnifiedPagedPrefill:
             f"max_kv_len ({max_kv_len}) is smaller than the actual longest "
             f"KV ({int(kv_seq_lens_cpu.max())})",
         )
-        capacity = block_tables.shape[1] * page_size
-        if not bool((kv_seq_lens_cpu <= capacity).all()):
-            bad = int((kv_seq_lens_cpu > capacity).nonzero()[0])
-            raise ValueError(
-                f"kv_seq_lens[{bad}] = {int(kv_seq_lens_cpu[bad])} exceeds "
-                f"block_tables capacity ({block_tables.shape[1]} pages x "
-                f"page_size {page_size} = {capacity}) — widen block_tables or "
-                "fix the length"
+        if block_tables is not None:
+            capacity = block_tables.shape[1] * page_size
+            if not bool((kv_seq_lens_cpu <= capacity).all()):
+                bad = int((kv_seq_lens_cpu > capacity).nonzero()[0])
+                raise ValueError(
+                    f"kv_seq_lens[{bad}] = {int(kv_seq_lens_cpu[bad])} exceeds "
+                    f"block_tables capacity ({block_tables.shape[1]} pages x "
+                    f"page_size {page_size} = {capacity}) — widen block_tables "
+                    "or fix the length"
+                )
+        else:
+            total_pages = int(torch.sum((kv_seq_lens_cpu + page_size - 1) // page_size))
+            _expect(
+                kv_page_indices.shape[0] >= total_pages,
+                f"kv_page_indices has {kv_page_indices.shape[0]} entries but "
+                f"kv_seq_lens require {total_pages} pages at page_size "
+                f"{page_size} — the flat page-id list must cover "
+                "sum(ceil(kv_len/page_size)) entries in request order",
             )
 
     # ------------------------------ run -------------------------------
@@ -746,24 +879,37 @@ class UnifiedPagedPrefill:
             "(pages, num_kv_heads, page_size, head_dim) [HND]",
         )
         k_cache, v_cache = kv_cache
+        layout = m["kv_layout"]
+        h_pos, ps_pos = (1, 2) if layout == "HND" else (2, 1)
+        shape_word = (
+            "(pages, H, page_size, D)"
+            if layout == "HND"
+            else "(pages, page_size, H, D)"
+        )
         for name, t, dim_ in (
             ("k_cache", k_cache, m["head_dim_qk"]),
             ("v_cache", v_cache, m["head_dim_vo"]),
         ):
-            _expect(t.dim() == 4, f"{name} must be 4-D paged (pages, H, page_size, D)")
-            nhd_hint = (
-                " — this looks like an NHD-layout cache; this API takes HND "
-                "(pages, H, page_size, D): permute(0, 2, 1, 3).contiguous()"
-                if t.shape[1] == m["page_size"] and t.shape[2] == m["num_kv_heads"]
+            _expect(t.dim() == 4, f"{name} must be 4-D paged {shape_word} [{layout}]")
+            swapped_hint = (
+                f" — dims 1/2 look transposed: the plan declared kv_layout="
+                f"{layout!r} {shape_word}; permute(0, 2, 1, 3).contiguous() or "
+                "re-plan with the other kv_layout"
+                if (
+                    t.shape[ps_pos] == m["num_kv_heads"]
+                    and t.shape[h_pos] == m["page_size"]
+                    and m["num_kv_heads"] != m["page_size"]
+                )
                 else ""
             )
             _expect(
-                t.shape[1] == m["num_kv_heads"]
-                and t.shape[2] == m["page_size"]
+                t.shape[h_pos] == m["num_kv_heads"]
+                and t.shape[ps_pos] == m["page_size"]
                 and t.shape[3] == dim_,
                 f"{name} shape {tuple(t.shape)} does not match plan "
-                f"(H={m['num_kv_heads']}, page_size={m['page_size']}, D={dim_})"
-                f"{nhd_hint}",
+                f"(kv_layout={layout}, H={m['num_kv_heads']}, "
+                f"page_size={m['page_size']}, D={dim_})"
+                f"{swapped_hint}",
             )
             _expect(
                 t.dtype == m["kv_dtype"],
@@ -834,19 +980,35 @@ class _Derived:
     q_seq_lens: torch.Tensor  # (b,)  device — diff(qo_indptr)
     cum_kv_seq_lens: torch.Tensor  # (b+1,) device — for trtllm / cuDNN cu_seq_len_kv
     kv_page_indptr: torch.Tensor  # (b+1,) device CSR page-unit indptr
-    kv_page_indices: torch.Tensor  # (b*width,) device flat page ids (CSR-compacted
-    # prefix up to kv_page_indptr[-1]; tail is untouched scratch never read by
-    # kernels, which bound reads by the indptr)
+    kv_page_indices: torch.Tensor  # flat page ids (CSR-compacted prefix up to
+    # kv_page_indptr[-1]; any tail is untouched scratch never read by kernels,
+    # which bound reads by the indptr)
+    block_tables: Optional[torch.Tensor]  # (b, width) dense — given or derived;
+    # None only when no candidate backend needs the dense form
 
 
-def _derive(qo_indptr, kv_seq_lens, block_tables, page_size) -> _Derived:
+def _derive(
+    qo_indptr,
+    kv_seq_lens,
+    block_tables,
+    kv_page_indices,
+    page_size,
+    max_kv_len,
+    *,
+    needs_dense: bool,
+) -> _Derived:
     """Canonical → derived forms.  Pure device ops, zero sync.
 
     In production this is one fused kernel (proposal §3.2); torch ops keep the
     prototype readable.  All output shapes are static functions of the input
-    shapes — in particular the CSR indices buffer is capacity-allocated at
-    ``b * width`` and filled by scatter (a boolean masked-select would sync
-    to size its result; scatter does not).
+    shapes and host ints:
+
+    - dense given → flat indices by capacity scatter (a boolean masked-select
+      would sync to size its result; scatter does not);
+    - flat indices given → dense (when a candidate needs it) by a clamped
+      gather of width ceil(max_kv_len / page_size); rows' tails beyond each
+      request's page count hold clamped garbage that no kernel reads (they
+      bound by kv_seq_lens).
     """
     dev = kv_seq_lens.device
     zero = torch.zeros(1, dtype=torch.int32, device=dev)
@@ -854,20 +1016,38 @@ def _derive(qo_indptr, kv_seq_lens, block_tables, page_size) -> _Derived:
     cum_kv = torch.cat([zero, torch.cumsum(kv_seq_lens, 0, dtype=torch.int32)])
     pages = (kv_seq_lens + page_size - 1) // page_size  # (b,)
     kv_page_indptr = torch.cat([zero, torch.cumsum(pages, 0, dtype=torch.int32)])
-    b, width = block_tables.shape
-    capacity = b * width
-    col = torch.arange(width, device=dev, dtype=torch.int32)
-    valid = col.unsqueeze(0) < pages.unsqueeze(1)  # (b, width)
-    # compact destination of each (row, col) lane; invalid lanes all target a
-    # dummy tail slot (duplicate scatter writes there are benign — never read)
-    dst = kv_page_indptr[:-1].unsqueeze(1).to(torch.int64) + col.unsqueeze(0).to(
-        torch.int64
-    )
-    dst = torch.where(valid, dst, torch.full_like(dst, capacity))
-    buf = torch.empty(capacity + 1, dtype=torch.int32, device=dev)
-    buf.scatter_(0, dst.reshape(-1), block_tables.reshape(-1))
-    kv_page_indices = buf[:capacity]
-    return _Derived(q_seq_lens, cum_kv, kv_page_indptr, kv_page_indices)
+    b = kv_seq_lens.shape[0]
+
+    if block_tables is not None:
+        width = block_tables.shape[1]
+        capacity = b * width
+        col = torch.arange(width, device=dev, dtype=torch.int32)
+        valid = col.unsqueeze(0) < pages.unsqueeze(1)  # (b, width)
+        # compact destination of each (row, col) lane; invalid lanes all
+        # target a dummy tail slot (duplicate writes there are benign)
+        dst = kv_page_indptr[:-1].unsqueeze(1).to(torch.int64) + col.unsqueeze(0).to(
+            torch.int64
+        )
+        dst = torch.where(valid, dst, torch.full_like(dst, capacity))
+        buf = torch.empty(capacity + 1, dtype=torch.int32, device=dev)
+        buf.scatter_(0, dst.reshape(-1), block_tables.reshape(-1))
+        return _Derived(
+            q_seq_lens, cum_kv, kv_page_indptr, buf[:capacity], block_tables
+        )
+
+    dense = None
+    if needs_dense:
+        width = (max_kv_len + page_size - 1) // page_size  # host int, no sync
+        col = torch.arange(width, device=dev, dtype=torch.int64)
+        src = kv_page_indptr[:-1].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
+        src = src.clamp_(max=int(kv_page_indices.shape[0]) - 1)
+        dense = (
+            kv_page_indices.to(torch.int64)
+            .gather(0, src.reshape(-1))
+            .reshape(b, width)
+            .to(torch.int32)
+        )
+    return _Derived(q_seq_lens, cum_kv, kv_page_indptr, kv_page_indices, dense)
 
 
 # --------------------------------------------------------------------------
@@ -883,15 +1063,12 @@ class _FaAdapter:
     (computed from the mirrors the contract layer guarantees — zero-sync).
     """
 
-    def __init__(self, device, backend: str = "fa2"):
+    def __init__(self, device, kv_layout, workspace, backend: str = "fa2"):
         from ..prefill import BatchPrefillWithPagedKVCacheWrapper
 
         self._backend = backend
-        self._workspace = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=device
-        )
         self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            self._workspace, "HND", backend=backend
+            workspace, kv_layout, backend=backend
         )
 
     def plan(self, m: dict, d: _Derived) -> None:
@@ -917,6 +1094,7 @@ class _FaAdapter:
             page,
             head_dim_vo=m["head_dim_vo"],
             causal=m["causal"],
+            window_left=m["window_left"],
             sm_scale=m["sm_scale"],
             q_data_type=m["q_dtype"],
             kv_data_type=m["kv_dtype"],
@@ -939,10 +1117,9 @@ class _CudnnAdapter:
     outlier (fragmentation survey A4) dies here, invisibly to callers.
     """
 
-    def __init__(self, device):
-        self._workspace = torch.empty(
-            128 * 1024 * 1024, dtype=torch.int8, device=device
-        )
+    def __init__(self, device, kv_layout, workspace):
+        assert kv_layout == "HND"  # capability-gated upstream
+        self._workspace = workspace.view(torch.int8)
 
     def plan(self, m: dict, d: _Derived) -> None:
         self._m, self._d = m, d
@@ -1011,10 +1188,13 @@ class _TrtllmGenAdapter:
     zero-initialized (kernel counter semantics).
     """
 
-    def __init__(self, device):
+    def __init__(self, device, kv_layout, workspace):
+        # deliberately NOT the shared workspace: trtllm-gen kernels rely on
+        # zero-initialized counter semantics
         self._workspace = torch.zeros(
             128 * 1024 * 1024, dtype=torch.uint8, device=device
         )
+        self._kv_layout = kv_layout
 
     def plan(self, m: dict, d: _Derived) -> None:
         self._m, self._d = m, d
@@ -1036,7 +1216,8 @@ class _TrtllmGenAdapter:
             m["batch_size"],
             m["qo_indptr"],
             d.cum_kv_seq_lens,
-            kv_layout="HND",
+            window_left=m["window_left"],
+            kv_layout=self._kv_layout,
             causal=m["causal"],
             out=out,
             lse=lse,
@@ -1049,8 +1230,8 @@ class _TrtllmGenAdapter:
 
 
 _ADAPTERS = {
-    "fa2": lambda dev: _FaAdapter(dev, "fa2"),
-    "fa3": lambda dev: _FaAdapter(dev, "fa3"),
+    "fa2": lambda dev, layout, ws: _FaAdapter(dev, layout, ws, "fa2"),
+    "fa3": lambda dev, layout, ws: _FaAdapter(dev, layout, ws, "fa3"),
     "cudnn": _CudnnAdapter,
     "trtllm-gen": _TrtllmGenAdapter,
 }

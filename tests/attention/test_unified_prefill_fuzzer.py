@@ -60,14 +60,21 @@ CLEAN = (ValueError, NotImplementedError, TypeError)
 
 
 def _sample_config(rng: random.Random):
+    input_form = rng.choice(["block_tables", "block_tables", "page_indices"])
     return dict(
         batch_size=rng.randint(1, 8),
         max_q=rng.choice([1, 8, 33, 64]),
         max_kv=rng.choice([64, 130, 300, 512]),
         heads=rng.choice([(8, 8), (8, 2), (8, 1), (4, 4)]),
-        page_size=rng.choice([16, 32, 64]),
+        # page_size=1 only via the flat-indices form (dense input rejects it)
+        page_size=rng.choice(
+            [16, 32, 64] + ([1] if input_form == "page_indices" else [])
+        ),
         causal=True,
-        dtype=torch.bfloat16,
+        dtype=rng.choice([torch.bfloat16, torch.bfloat16, torch.float16]),
+        kv_layout=rng.choice(["HND", "HND", "NHD"]),
+        window_left=rng.choice([-1, -1, -1, 16]),
+        input_form=input_form,
     )
 
 
@@ -82,10 +89,12 @@ def _build(seed, cfg):
         head_dim_qk=128,
         page_size=cfg["page_size"],
         dtype=cfg["dtype"],
+        kv_layout=cfg["kv_layout"],
+        input_form=cfg["input_form"],
     )
 
 
-def _backend_runnable(p, backend, causal):
+def _backend_runnable(p, backend, causal, window_left=-1):
     try:
         resolve_paged_prefill(
             device=torch.device(p["device"]),
@@ -94,8 +103,15 @@ def _backend_runnable(p, backend, causal):
             head_dim_qk=p["head_dim_qk"],
             q_dtype=p["dtype"],
             page_size=p["page_size"],
+            kv_layout=p.get("kv_layout", "HND"),
             causal=causal,
             need_lse=True,
+            window_left=window_left,
+            kv_input_form=(
+                "page_indices"
+                if p.get("input_form") == "page_indices"
+                else "block_tables"
+            ),
             backend=backend,
         )
         return True
@@ -237,6 +253,21 @@ def m_q_noncontig(p):
     return p
 
 
+def m_both_paging_forms(p):
+    # passing dense AND flat indices together is a second-truth hazard and
+    # must be rejected (exactly-one contract)
+    p = _clone(p)
+    p["input_form"] = "both"
+    return p
+
+
+def m_csr_indices_too_short(p):
+    p = _clone(p)
+    p["input_form"] = "page_indices"
+    p["kv_page_indices"] = p["kv_page_indices"][:-2]
+    return p
+
+
 MUTATIONS = [
     ("max_q_underclaim", True, m_max_q_underclaim),
     ("max_kv_underclaim", True, m_max_kv_underclaim),
@@ -253,16 +284,18 @@ MUTATIONS = [
     ("out_wrong_dtype", False, m_out_wrong_dtype),
     ("lse_wrong_dtype", False, m_lse_wrong_dtype),
     ("block_tables_negative", False, m_block_tables_negative),
+    ("both_paging_forms", False, m_both_paging_forms),
+    ("csr_indices_too_short", False, m_csr_indices_too_short),
 ]
 
 # documented trusted inputs: expected to fail reject-or-correct today
 KNOWN_GAP_MUTATIONS = {"block_tables_negative"}
 
 
-def _run_and_check(p, backend, causal, repro):
+def _run_and_check(p, backend, causal, repro, window_left=-1):
     """Run one call and enforce reject-or-correct against the TRUE oracle."""
     try:
-        _, out, lse = run_unified(p, backend, causal=causal)
+        _, out, lse = run_unified(p, backend, causal=causal, window_left=window_left)
     except CLEAN as e:
         assert str(e), f"empty error message is not a clean rejection [{repro}]"
         return "rejected", str(e)
@@ -272,9 +305,12 @@ def _run_and_check(p, backend, causal, repro):
         p["v_cache"],
         p["qo_indptr_cpu"],
         p["kv_seq_lens_cpu"],
-        p["block_tables"],
+        p["block_tables"] if p.get("input_form") != "page_indices" else None,
         p["page_size"],
         causal,
+        window_left=window_left,
+        kv_layout=p.get("kv_layout", "HND"),
+        kv_page_indices=p.get("kv_page_indices"),
     )
     torch.testing.assert_close(
         out.float(),
@@ -301,10 +337,12 @@ def test_fuzz_valid_configs(backend):
         rng = random.Random(seed)
         cfg = _sample_config(rng)
         p = _build(seed, cfg)
-        if not _backend_runnable(p, backend, cfg["causal"]):
+        if not _backend_runnable(p, backend, cfg["causal"], cfg["window_left"]):
             continue
         repro = f"backend={backend} seed={seed} cfg={cfg}"
-        outcome, _ = _run_and_check(p, backend, cfg["causal"], repro)
+        outcome, _ = _run_and_check(
+            p, backend, cfg["causal"], repro, window_left=cfg["window_left"]
+        )
         assert outcome == "correct", (
             f"valid config was rejected — capability matrix admits a config "
             f"the backend cannot run [{repro}]"
@@ -331,6 +369,12 @@ def test_fuzz_reject_or_correct(backend, mutation):
         rng = random.Random(seed)
         cfg = _sample_config(rng)
         cfg["batch_size"] = max(cfg["batch_size"], 3)
+        cfg["kv_layout"], cfg["input_form"], cfg["window_left"] = (
+            "HND",
+            "block_tables",
+            -1,
+        )
+        cfg["page_size"] = max(cfg["page_size"], 16)
         p = _build(seed, cfg)
         if not _backend_runnable(p, backend, cfg["causal"]):
             continue

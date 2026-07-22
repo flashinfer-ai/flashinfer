@@ -42,6 +42,8 @@ def make_problem(
     dtype,
     device="cuda:0",
     uniform_q1=False,
+    kv_layout="HND",
+    input_form="block_tables",
 ):
     """Random valid paged-prefill problem with scattered (non-identity) page ids."""
     head_dim_vo = head_dim_vo or head_dim_qk
@@ -73,12 +75,20 @@ def make_problem(
 
     total_q = int(qo_indptr_cpu[-1])
     q = torch.randn(total_q, num_qo_heads, head_dim_qk, dtype=dtype, device=device)
-    k_cache = torch.randn(
-        pool_pages, num_kv_heads, page_size, head_dim_qk, dtype=dtype, device=device
-    )
-    v_cache = torch.randn(
-        pool_pages, num_kv_heads, page_size, head_dim_vo, dtype=dtype, device=device
-    )
+    if kv_layout == "HND":
+        k_shape = (pool_pages, num_kv_heads, page_size, head_dim_qk)
+        v_shape = (pool_pages, num_kv_heads, page_size, head_dim_vo)
+    else:  # NHD
+        k_shape = (pool_pages, page_size, num_kv_heads, head_dim_qk)
+        v_shape = (pool_pages, page_size, num_kv_heads, head_dim_vo)
+    k_cache = torch.randn(*k_shape, dtype=dtype, device=device)
+    v_cache = torch.randn(*v_shape, dtype=dtype, device=device)
+
+    # flat CSR page-id list: request-ordered concatenation of each row's
+    # live prefix (same info as the dense table)
+    kv_page_indices_cpu = torch.cat(
+        [block_tables_cpu[i, : int(pages_per_seq[i])] for i in range(batch_size)]
+    ).to(torch.int32)
 
     return dict(
         q=q,
@@ -89,6 +99,9 @@ def make_problem(
         kv_seq_lens=kv_lens.to(device),
         kv_seq_lens_cpu=kv_lens,
         block_tables=block_tables_cpu.to(device),
+        kv_page_indices=kv_page_indices_cpu.to(device),
+        kv_layout=kv_layout,
+        input_form=input_form,
         page_size=page_size,
         max_q_len=int(q_lens.max()),
         max_kv_len=int(kv_lens.max()),
@@ -102,13 +115,24 @@ def make_problem(
 
 
 def run_unified(
-    p, backend, *, causal=True, return_lse=True, with_mirrors=True, sm_scale=None
+    p,
+    backend,
+    *,
+    causal=True,
+    return_lse=True,
+    with_mirrors=True,
+    sm_scale=None,
+    window_left=-1,
 ):
     attn = UnifiedPagedPrefill(torch.device(p["device"]))
+    form = p.get("input_form", "block_tables")
     attn.plan(
         qo_indptr=p["qo_indptr"],
         kv_seq_lens=p["kv_seq_lens"],
-        block_tables=p["block_tables"],
+        block_tables=(p["block_tables"] if form in ("block_tables", "both") else None),
+        kv_page_indices=(
+            p["kv_page_indices"] if form in ("page_indices", "both") else None
+        ),
         page_size=p["page_size"],
         max_q_len=p["max_q_len"],
         max_kv_len=p["max_kv_len"],
@@ -117,7 +141,9 @@ def run_unified(
         head_dim_qk=p["head_dim_qk"],
         head_dim_vo=p["head_dim_vo"],
         q_dtype=p["dtype"],
+        kv_layout=p.get("kv_layout", "HND"),
         causal=causal,
+        window_left=window_left,
         return_lse=return_lse,
         qo_indptr_cpu=p["qo_indptr_cpu"] if with_mirrors else None,
         kv_seq_lens_cpu=p["kv_seq_lens_cpu"] if with_mirrors else None,
@@ -133,7 +159,7 @@ def run_unified(
     return attn, out, lse
 
 
-def _resolve_or_skip(p, backend, *, causal=True, need_lse=True):
+def _resolve_or_skip(p, backend, *, causal=True, need_lse=True, window_left=-1):
     try:
         return resolve_paged_prefill(
             device=torch.device(p["device"]),
@@ -143,26 +169,36 @@ def _resolve_or_skip(p, backend, *, causal=True, need_lse=True):
             head_dim_vo=p["head_dim_vo"],
             q_dtype=p["dtype"],
             page_size=p["page_size"],
+            kv_layout=p.get("kv_layout", "HND"),
             causal=causal,
             need_lse=need_lse,
+            window_left=window_left,
+            kv_input_form=(
+                "page_indices"
+                if p.get("input_form") == "page_indices"
+                else "block_tables"
+            ),
             backend=backend,
         )
     except ValueError as e:
         pytest.skip(f"backend {backend} not runnable here: {e}")
 
 
-def check(p, backend, *, causal=True):
-    _resolve_or_skip(p, backend, causal=causal)
-    _, out, lse = run_unified(p, backend, causal=causal)
+def check(p, backend, *, causal=True, window_left=-1):
+    _resolve_or_skip(p, backend, causal=causal, window_left=window_left)
+    _, out, lse = run_unified(p, backend, causal=causal, window_left=window_left)
     ref_out, ref_lse = reference_paged_prefill(
         p["q"],
         p["k_cache"],
         p["v_cache"],
         p["qo_indptr_cpu"],
         p["kv_seq_lens_cpu"],
-        p["block_tables"],
+        p["block_tables"] if p.get("input_form") != "page_indices" else None,
         p["page_size"],
         causal,
+        window_left=window_left,
+        kv_layout=p.get("kv_layout", "HND"),
+        kv_page_indices=p.get("kv_page_indices"),
     )
     torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
     # Output contract: LSE base-2, packed (tokens, h), fp32 — for everyone.
@@ -469,7 +505,25 @@ def test_derive_is_sync_free():
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        d = _derive(p["qo_indptr"], p["kv_seq_lens"], p["block_tables"], p["page_size"])
+        d = _derive(
+            p["qo_indptr"],
+            p["kv_seq_lens"],
+            p["block_tables"],
+            None,
+            p["page_size"],
+            p["max_kv_len"],
+            needs_dense=False,
+        )
+        # reverse direction: flat indices -> dense, also zero-sync
+        d2 = _derive(
+            p["qo_indptr"],
+            p["kv_seq_lens"],
+            None,
+            p["kv_page_indices"],
+            p["page_size"],
+            p["max_kv_len"],
+            needs_dense=True,
+        )
     finally:
         torch.cuda.set_sync_debug_mode("default")
     # correctness of the scatter-compaction vs a host-side reference
@@ -482,3 +536,134 @@ def test_derive_is_sync_free():
     )
     total_pages = int(pages.sum())
     assert torch.equal(d.kv_page_indices.cpu()[:total_pages], expected)
+    # CSR->dense round trip: live prefix of each derived dense row matches
+    dense = d2.block_tables.cpu()
+    for i in range(p["kv_seq_lens_cpu"].shape[0]):
+        n = int(pages[i])
+        assert torch.equal(dense[i, :n], p["block_tables"].cpu()[i, :n])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("window_left", [0, 16, 127])
+def test_unified_prefill_sliding_window(backend, window_left):
+    """window_left plumbed through every windowed backend; cudnn is
+    capability-excluded (skip via resolve)."""
+    p = make_problem(
+        seed=37,
+        batch_size=4,
+        max_q=48,
+        max_kv=384,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    check(p, backend, window_left=window_left)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_unified_prefill_nhd_layout(backend):
+    p = make_problem(
+        seed=41,
+        batch_size=4,
+        max_q=32,
+        max_kv=256,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+        kv_layout="NHD",
+    )
+    check(p, backend)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("page_size", [1, 16])
+def test_unified_prefill_csr_page_indices(backend, page_size):
+    """The flat kv_page_indices form (sglang-style); page_size=1 token-CSR is
+    in-envelope here, with dense-needing backends capability-excluded."""
+    p = make_problem(
+        seed=43,
+        batch_size=4,
+        max_q=32,
+        max_kv=192,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=page_size,
+        dtype=torch.bfloat16,
+        input_form="page_indices",
+    )
+    check(p, backend)
+
+
+def test_unified_prefill_csr_dense_equivalence():
+    """Dense and flat-indices forms of the same problem are bitwise identical
+    per backend (the derivation is exact, not approximate)."""
+    common = dict(
+        seed=47,
+        batch_size=4,
+        max_q=32,
+        max_kv=192,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    p_dense = make_problem(**common)
+    # SAME tensors, different input form (make_problem's randn draws from the
+    # global CUDA RNG, so a second call would build a different problem)
+    p_csr = dict(p_dense, input_form="page_indices")
+    for backend in ["fa2", "cudnn", "trtllm-gen"]:
+        try:
+            _resolve_or_skip(p_dense, backend)
+        except Exception:
+            continue
+        _, out_a, lse_a = run_unified(p_dense, backend)
+        _, out_b, lse_b = run_unified(p_csr, backend)
+        assert torch.equal(out_a, out_b), backend
+        assert torch.equal(lse_a, lse_b), backend
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn"])
+def test_unified_prefill_fp16(backend):
+    p = make_problem(
+        seed=53,
+        batch_size=3,
+        max_q=32,
+        max_kv=192,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.float16,
+    )
+    check(p, backend)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@pytest.mark.parametrize("head_dim", [64, 256])
+def test_unified_prefill_wide_head_dims(backend, head_dim):
+    p = make_problem(
+        seed=59,
+        batch_size=3,
+        max_q=24,
+        max_kv=160,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=head_dim,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    check(p, backend)
+
+
+# NOTE: fa2/fa3 paged (192,128) is NOT declared: the paged kernel requires
+# k_page_stride == v_page_stride ("K and V must have same page stride for
+# sparse attention", batch_prefill_sm90.cu:235), which separately-allocated
+# K(D=192)/V(D=128) pools violate.  It is reachable only with a
+# stride-matched allocation contract — a capability axis with an allocation
+# precondition, out of prototype scope.  cudnn handles (192,128) fine.
