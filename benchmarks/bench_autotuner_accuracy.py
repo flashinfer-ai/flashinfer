@@ -11,16 +11,20 @@ several seeds and score:
 - regret:   (t_oracle(chosen) - t_oracle(best)) / t_oracle(best)
 - top-1:    chosen == oracle best
 - flips:    number of distinct winners across seeds (measurement noise)
-- oracle disagreement: do the events-oracle and cupti-oracle name the same
-  best candidate?  (the two timers measure different things: steady-state
-  throughput vs isolated-call span)
+- oracle disagreement: do the eager-oracle and cupti-oracle name the same
+  best candidate?  (the two measure different deployments: host-included
+  eager rate vs host-excluded kernel span)
 
 Decode focus: small-M shapes are where CUDA-event timing is noisiest.
 
-CAVEAT: the events oracle at repeat=101 overflows the 5 ms delay-kernel
-budget, so it measures the eager sustained rate — it is NOT a scaled-up v1
-measurement (v1 at repeat=10 is blind to host-bound cost).  Deployment
-oracles (eager wall-clock, CUDA-graph replay) are the next refinement.
+Drift protection: the oracle sweep is INTERLEAVED — every round measures
+all candidates back-to-back (rotating the start offset per round), so
+thermal/clock drift hits candidates evenly instead of manufacturing
+phantom regret between phase-separated measurements.  The per-round SM
+clock is recorded (pynvml) so drift is visible in the report.  Oracles:
+``cupti`` (host-excluded span) and ``eager`` (execution_mode="eager":
+host-included, no delay kernel) — both explicit policies, no reliance on
+delay-budget overflow.
 
 Usage (pick an SM100 GPU via CUDA_VISIBLE_DEVICES):
     CUDA_VISIBLE_DEVICES=1 CUDA_HOME=... python benchmarks/bench_autotuner_accuracy.py
@@ -79,6 +83,57 @@ def capture_choose_one_call(make_call):
     return next(iter(captured.items()))
 
 
+def sm_clock_mhz():
+    """Current SM clock in MHz via pynvml, or None if unavailable."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        idx = torch.cuda.current_device()
+        # CUDA_VISIBLE_DEVICES remapping: resolve via PCI bus id.
+        bus = torch.cuda.get_device_properties(idx).pci_bus_id
+        handle = pynvml.nvmlDeviceGetHandleByPciBusId(
+            f"00000000:{bus:02X}:00.0".encode()
+        )
+        return pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)
+    except Exception:
+        return None
+
+
+def interleaved_oracle(tuner, candidates, inputs, config, kwargs, rounds, repeat):
+    """Measure every candidate under BOTH oracle policies, interleaved.
+
+    Each round visits all candidates back-to-back (start offset rotates),
+    measuring the cupti and eager oracles adjacently so both see the same
+    thermal state.  Returns (oracle_cupti, oracle_eager, clocks_mhz) where
+    each oracle maps (r_id, tactic) -> median-over-rounds ms.
+    """
+    cupti_pol = MeasurementPolicy(_timer="cupti")
+    eager_pol = MeasurementPolicy(execution_mode="eager")
+    per_c = {(r_id, t): [] for r_id, _, t in candidates}
+    per_e = {(r_id, t): [] for r_id, _, t in candidates}
+    clocks = []
+    for rnd in range(rounds):
+        clocks.append(sm_clock_mhz())
+        order = (
+            candidates[rnd % len(candidates) :] + candidates[: rnd % len(candidates)]
+        )
+        for r_id, r, t in order:
+            per_c[(r_id, t)].append(
+                measure_candidate(
+                    tuner, r, inputs, t, config, kwargs, cupti_pol, repeat
+                )
+            )
+            per_e[(r_id, t)].append(
+                measure_candidate(
+                    tuner, r, inputs, t, config, kwargs, eager_pol, repeat
+                )
+            )
+    oracle_c = {k: statistics.median(v) for k, v in per_c.items()}
+    oracle_e = {k: statistics.median(v) for k, v in per_e.items()}
+    return oracle_c, oracle_e, clocks
+
+
 def measure_candidate(tuner, runner, inputs, tactic, config, kwargs, policy, repeat):
     """One tuner-style measurement; returns ms or inf on failure."""
     saved_repeat = tuner.repeat
@@ -105,7 +160,8 @@ def main():
         "--m-list", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 1024]
     )
     parser.add_argument("--seeds", type=int, default=3)
-    parser.add_argument("--oracle-repeat", type=int, default=101)
+    parser.add_argument("--oracle-rounds", type=int, default=5)
+    parser.add_argument("--oracle-repeat", type=int, default=21)
     parser.add_argument("--tuner-repeat", type=int, default=10)
     parser.add_argument("--out", type=str, default="autotuner_accuracy.json")
     args = parser.parse_args()
@@ -149,27 +205,20 @@ def main():
             candidates.extend((r_id, r, t) for t in tactics)
         print(f"\nM={m}: op={op}, {len(runners)} runners, {len(candidates)} candidates")
 
-        # Oracles: high-repetition, both timers.
-        oracle = {}
-        oracle_events = {}
-        for r_id, r, t in candidates:
-            oracle[(r_id, t)] = measure_candidate(
-                tuner,
-                r,
-                inputs,
-                t,
-                config,
-                kwargs,
-                MeasurementPolicy(_timer="cupti"),
-                args.oracle_repeat,
-            )
-            oracle_events[(r_id, t)] = measure_candidate(
-                tuner, r, inputs, t, config, kwargs, None, args.oracle_repeat
-            )
+        # Oracles: interleaved rounds, both deployment policies.
+        oracle, oracle_eager, clocks = interleaved_oracle(
+            tuner,
+            candidates,
+            inputs,
+            config,
+            kwargs,
+            args.oracle_rounds,
+            args.oracle_repeat,
+        )
         best_key = min(oracle, key=oracle.get)
         best_ms = oracle[best_key]
-        best_events_key = min(oracle_events, key=oracle_events.get)
-        best_events_ms = oracle_events[best_events_key]
+        best_eager_key = min(oracle_eager, key=oracle_eager.get)
+        best_eager_ms = oracle_eager[best_eager_key]
         valid = sum(1 for v in oracle.values() if v != float("inf"))
 
         def name(key):
@@ -181,21 +230,23 @@ def main():
             "m": m,
             "candidates": len(candidates),
             "valid": valid,
+            "sm_clocks_mhz": clocks,
             "oracle_best": name(best_key),
             "oracle_best_ms": best_ms,
             "oracle_top3": [(name(k), oracle[k]) for k in top3],
-            "oracle_events_best": name(best_events_key),
-            "oracles_agree": best_key == best_events_key,
+            "oracle_eager_best": name(best_eager_key),
+            "oracles_agree": best_key == best_eager_key,
             "policies": {},
         }
         print(
+            f"  clocks(MHz)={clocks}\n"
             f"  oracle(cupti):  best={name(best_key)} {best_ms * 1e3:.1f}us  "
             f"top3={[f'{name(k)} {oracle[k] * 1e3:.1f}us' for k in top3]}"
         )
         print(
-            f"  oracle(events): best={name(best_events_key)} "
-            f"{best_events_ms * 1e3:.1f}us"
-            f"{'' if best_key == best_events_key else '  << ORACLES DISAGREE'}"
+            f"  oracle(eager):  best={name(best_eager_key)} "
+            f"{best_eager_ms * 1e3:.1f}us"
+            f"{'' if best_key == best_eager_key else '  << ORACLES DISAGREE (expected when host-bound)'}"
         )
 
         # Tuner simulations at production settings.  Regret is scored
@@ -221,16 +272,14 @@ def main():
                 pick = min(times, key=times.get)
                 chosen.append(pick)
                 regrets_c.append((oracle[pick] - best_ms) / best_ms)
-                regrets_e.append(
-                    (oracle_events[pick] - best_events_ms) / best_events_ms
-                )
+                regrets_e.append((oracle_eager[pick] - best_eager_ms) / best_eager_ms)
             top1 = sum(1 for c in chosen if c == best_key)
             shape_row["policies"][pname] = {
                 "top1_vs_cupti_oracle": f"{top1}/{args.seeds}",
                 "regret_cupti_med": statistics.median(regrets_c),
                 "regret_cupti_max": max(regrets_c),
-                "regret_events_med": statistics.median(regrets_e),
-                "regret_events_max": max(regrets_e),
+                "regret_eager_med": statistics.median(regrets_e),
+                "regret_eager_max": max(regrets_e),
                 "distinct_winners": len(set(chosen)),
                 "winners": [name(c) for c in chosen],
             }
@@ -238,7 +287,7 @@ def main():
                 f"  {pname:10s} "
                 f"regret(cupti) med={statistics.median(regrets_c) * 100:.2f}% "
                 f"max={max(regrets_c) * 100:.2f}% | "
-                f"regret(events) med={statistics.median(regrets_e) * 100:.2f}% "
+                f"regret(eager) med={statistics.median(regrets_e) * 100:.2f}% "
                 f"max={max(regrets_e) * 100:.2f}% | "
                 f"flips={len(set(chosen))} winners={[name(c) for c in chosen]}"
             )
