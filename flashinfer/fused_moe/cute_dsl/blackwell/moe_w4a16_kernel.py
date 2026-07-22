@@ -2085,8 +2085,8 @@ class Sm100W4A16GroupedGemmKernel:
         )
 
         bytes_per_pipeline_stage = 16
-        # By default, we use 2 stages for tile info
-        num_tile_info_stage = 2
+        # Keep one routed tile ready while consumers process the other stages.
+        num_tile_info_stage = 3
         tile_info_bytes = (
             cute.size_in_bytes(cute.Int32, cute.make_layout((4, num_tile_info_stage)))
             + bytes_per_pipeline_stage * num_tile_info_stage
