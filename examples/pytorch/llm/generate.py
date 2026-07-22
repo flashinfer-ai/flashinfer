@@ -323,15 +323,22 @@ def main():
         prompt_token_ids = []
         for p in prompts:
             messages = [{"role": "user", "content": p}]
+            # Render to text, then tokenize explicitly: apply_chat_template's
+            # tokenized return type varies across transformers versions.
             try:
-                ids = tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, enable_thinking=False
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    enable_thinking=False,
                 )
             except TypeError:  # template without enable_thinking support
-                ids = tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True
+                text = tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False
                 )
-            prompt_token_ids.append(list(ids))
+            prompt_token_ids.append(
+                tokenizer(text, add_special_tokens=False)["input_ids"]
+            )
         eos_extra = tokenizer.eos_token_id
         if eos_extra is not None and eos_extra not in model.config.eos_token_ids:
             model.config.eos_token_ids.append(eos_extra)
