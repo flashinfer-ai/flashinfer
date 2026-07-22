@@ -83,7 +83,7 @@ def _entry_files(cache_root):
 def test_tuning_publishes_one_entry_per_op(cache_root, monkeypatch):
     _, tactic, calls = _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     assert tactic == 1
-    assert len(calls) == 3  # all tactics profiled exactly once
+    assert sorted(t for t in calls if t != -1) == [0, 1, 2]  # each tactic profiled once
 
     entries = _entry_files(cache_root)
     assert len(entries) == 1
@@ -153,7 +153,7 @@ def test_corrupt_entry_is_a_miss_and_retuned(cache_root, monkeypatch):
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
     assert tactic == 1
-    assert len(calls) == 3
+    assert sorted(t for t in calls if t != -1) == [0, 1, 2]
     entry = json.loads(entry_file.read_text())
     assert entry["tactic"] == 1
 
@@ -417,7 +417,11 @@ def test_measure_policy_isolates_store_identity(cache_root, monkeypatch):
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
     assert tactic == 1
-    assert len(calls) == 3  # default-policy entry was NOT visible here
+    assert sorted(t for t in calls if t != -1) == [
+        0,
+        1,
+        2,
+    ]  # default-policy entry was NOT visible here
     assert len(list(cache_root.glob("v2/*"))) == 2  # two env dirs coexist
     assert len(_entry_files(cache_root)) == 2
 
@@ -594,7 +598,11 @@ def test_persistent_false_context_never_touches_disk(cache_root, monkeypatch):
         _, tactic = AutoTuner.get().choose_one(
             other_op, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
-    assert tactic == 1 and len(calls) == 3  # tuned (ambient disk hit forbidden too)
+    assert tactic == 1 and sorted(t for t in calls if t != -1) == [
+        0,
+        1,
+        2,
+    ]  # tuned (ambient disk hit forbidden too)
 
     after = {p: p.read_bytes() for p in _entry_files(cache_root)}
     assert after == before  # no new entries, no rewrites
@@ -624,3 +632,147 @@ def test_nested_contexts_publish_to_their_own_store(cache_root, monkeypatch):
     manifest = json.loads((entries[0].parent.parent / "manifest.json").read_text())
     # Published under the outer (default-policy) identity: no eager marker.
     assert "measure_execution_mode" not in manifest
+
+
+def test_default_path_races_and_can_win(cache_root, monkeypatch):
+    """Regression guard: (runners[0], -1) always races in v2 contexts, so a
+    persisted selection can never be slower than not tuning (#3537/#3622)."""
+    calls = _install_fake_profile(monkeypatch, times={-1: 0.5, 0: 1.0, 1: 2.0, 2: 3.0})
+    with autotune_v2():
+        _, tactic = AutoTuner.get().choose_one(
+            _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+        )
+    assert tactic == -1  # the default beat every tuned tactic
+    assert -1 in calls  # and it was actually measured
+    (entry,) = _entry_files(cache_root)
+    assert json.loads(entry.read_text())["tactic"] == -1
+
+    # Fresh process: the persisted -1 replays with zero profiling.
+    _fresh_process()
+    calls = _install_fake_profile(monkeypatch, times={-1: 0.5, 0: 1.0})
+    with autotune_v2(enable_tuning=False):
+        _, tactic = AutoTuner.get().choose_one(
+            _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+        )
+    assert tactic == -1 and calls == []
+
+
+def test_v1_selection_does_not_race_default(monkeypatch):
+    """Plain autotune() selection stays byte-identical: no -1 candidate."""
+    calls = _install_fake_profile(monkeypatch, times={-1: 0.5, 0: 1.0, 1: 2.0, 2: 3.0})
+    reset_autotuner()
+    with autotune(True):
+        _, tactic = AutoTuner.get().choose_one(
+            _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+        )
+    assert -1 not in calls
+    assert tactic == 0
+    reset_autotuner()
+
+
+def test_reload_converges_ranks_on_store_state(cache_root, monkeypatch):
+    """autotune_v2_reload(): after tuning, dropping in-memory winners makes
+    this rank serve the store's canonical entry (simulating another rank's
+    later publish winning last-write-wins)."""
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})  # local winner: 1
+    (entry_file,) = _entry_files(cache_root)
+    entry = json.loads(entry_file.read_text())
+    entry["tactic"] = 2  # another rank's publish landed last
+    entry_file.write_text(json.dumps(entry))
+
+    calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    _, tactic = AutoTuner.get().choose_one(
+        _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+    )
+    assert tactic == 1  # still the locally-measured winner (memoized)
+
+    autotune_v2_reload()
+    _, tactic = AutoTuner.get().choose_one(
+        _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+    )
+    assert tactic == 2  # converged on the store's canonical entry
+    assert calls == []  # reload never re-profiles
+
+
+class DummyRunnerB(DummyRunner):
+    pass
+
+
+def test_runner_reorder_replays_correct_runner(cache_root, monkeypatch):
+    """Persisted entries key on the runner class, so reordering the runner
+    list across processes replays the winner on the RIGHT runner."""
+    times = {0: 2.0, 1: 1.0, 2: 3.0}
+    _install_fake_profile(monkeypatch, times)
+    inputs = [torch.zeros(8, 16)]
+    with autotune_v2():
+        runner, tactic = AutoTuner.get().choose_one(
+            _OP, [DummyRunner((0,)), DummyRunnerB((0, 1, 2))], _CONFIG, inputs
+        )
+    assert isinstance(runner, DummyRunnerB) and tactic == 1
+
+    _fresh_process()
+    calls = _install_fake_profile(monkeypatch, times)
+    with autotune_v2(enable_tuning=False):
+        runner, tactic = AutoTuner.get().choose_one(
+            _OP, [DummyRunnerB((0, 1, 2)), DummyRunner((0,))], _CONFIG, inputs
+        )
+    assert isinstance(runner, DummyRunnerB) and tactic == 1
+    assert calls == []
+
+
+class DummyRunnerWithExtras(DummyRunner):
+    def __init__(self, extras, valid_tactics=(0, 1, 2)):
+        super().__init__(valid_tactics)
+        self._extras = extras
+
+    def get_cache_key_extras(self, inputs):
+        return self._extras
+
+
+def test_extras_distinguish_entries(cache_root, monkeypatch):
+    """Runner extras are part of the persisted key: same class, different
+    extras -> distinct entries (the vllm#43119 key-completeness class)."""
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    inputs = [torch.zeros(8, 16)]
+    with autotune_v2():
+        AutoTuner.get().choose_one(
+            _OP, [DummyRunnerWithExtras(("layout_a",))], _CONFIG, inputs
+        )
+        AutoTuner.get().choose_one(
+            _OP, [DummyRunnerWithExtras(("layout_b",))], _CONFIG, inputs
+        )
+    entries = _entry_files(cache_root)
+    assert len(entries) == 2
+    keys = {json.loads(e.read_text())["key"] for e in entries}
+    assert any("layout_a" in k for k in keys) and any("layout_b" in k for k in keys)
+
+
+class DummyRunnerRejecting(DummyRunner):
+    def validate_tactic(self, inputs, tactic):
+        return False
+
+
+def test_invalid_cached_tactic_is_a_loud_miss(cache_root, monkeypatch):
+    """Runner-contract revalidation: a stored tactic the runner rejects is a
+    cache miss (retune or fallback), never a blind replay (#3566 class)."""
+    _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+
+    _fresh_process()
+    calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2(enable_tuning=False):
+        _, tactic = AutoTuner.get().choose_one(
+            _OP, [DummyRunnerRejecting()], _CONFIG, [torch.zeros(8, 16)]
+        )
+    assert tactic == -1  # loud fallback, not the invalid stored tactic
+    assert calls == []
+
+    # With tuning enabled the op is re-profiled instead.
+    _fresh_process()
+    calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2():
+        _, tactic = AutoTuner.get().choose_one(
+            _OP, [DummyRunnerRejecting()], _CONFIG, [torch.zeros(8, 16)]
+        )
+    assert len(calls) > 0
