@@ -21,13 +21,15 @@ bootstrap_paths()
 def _check_dsl_perf_floor() -> None:
     """Warn once if the installed CuTe-DSL predates the 4.5.2 perf floor.
 
-    4.5.2 and >=4.6.1 both measure at full parity (TUNING.md "CuTe-DSL
-    runtime sensitivity" + 2026-07-22 follow-up): nvfp4 via the MR!27
-    mainloop WAR in kernel_fc12.py (const_expr-gated on ==4.5.2), mxfp8
-    needs no WAR. Older 4.5.x is 34-54% slower on nvfp4 (measured
-    2026-07-15) and 4.5.0 fails outright at cute.compile. Results are
-    CORRECT wherever compilation succeeds — only slower — so this warns
-    instead of raising. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.
+    Every published version >=4.5.2 measures at full parity (TUNING.md
+    "CuTe-DSL runtime sensitivity" + 2026-07-22 follow-up): 4.5.2 via the
+    MR!27 mainloop WAR in kernel_fc12.py (const_expr-gated on ==4.5.2 —
+    the codegen regression existed only in 4.5.2, fixed upstream in
+    4.5.3), 4.5.3/4.6.0/4.6.1 verified natively fast; mxfp8 never
+    regressed. Below 4.5.2: 4.5.0 fails outright at cute.compile, 4.5.1
+    unmeasured/presumed slow. Results are CORRECT wherever compilation
+    succeeds — only slower — so this warns instead of raising. Silence
+    with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.
     """
     import os as _os
 
