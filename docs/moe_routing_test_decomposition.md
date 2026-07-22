@@ -123,3 +123,18 @@ Each step lands as its own commit. `[ ]` → `[x]` as they complete.
 (append measurements / decisions as steps complete)
 
 - 2026-07-21: audit + plan (see PR description / this doc). Branch created.
+- 2026-07-21 evening: standalone routing suite green on B200
+  (555/555, 15.9 s post-compile).
+- 2026-07-21 night — fused validation on B200 (umb-b200-240) + collected-count
+  accounting (baseline `ce29c1a5` vs branch, `pytest --collect-only`):
+
+  | file | collected before | collected after | validated on B200 |
+  |---|---|---|---|
+  | `test_trtllm_gen_routed_fused_moe.py` | 3,568 | **706** (−80%) | 706 passed, 13m56s incl. cold JIT |
+  | `test_trtllm_gen_fused_moe.py` | 10,040 | **4,424** (−56%) | `-k deepseekv3_routing` slice passed (exit 0) |
+  | renormalize shards (bf16/fp8/fp4) | 1,008 / 1,512 / 1,512 | shrink pending re-measure (configs 7→3) | rerun pending (first attempt raced a stale worktree pull) |
+  | `test_trtllm_gen_routing.py` (new) | — | 651 | 555/555 at af314b4e; +96 model-shape dsv3 cases added later, rerun pending |
+
+  Note: collected ≠ executed (runtime `skip_checks` trims further); wall-clock
+  is the honest currency — routed file went from "SOLO-class, hours" to ~14 min
+  cold.
