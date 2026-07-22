@@ -9,14 +9,14 @@ launches via :class:`MegaMoENvfp4Frontend`.
 Single-rank (no NVSHMEM)::
 
     MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 python -u \\
-        -m flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim \\
+        -m flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim \\
         --num_tokens_per_rank 128 --num_topk 4 --num_total_experts 32 \\
         --hidden 2048 --intermediate 1024
 
 Multi-rank::
 
     PYTHONUNBUFFERED=1 torchrun --standalone --nproc_per_node=4 \\
-        -m flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim \\
+        -m flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim \\
         --num_tokens_per_rank 256 --num_topk 4 --num_total_experts 32 \\
         --hidden 2048 --intermediate 1024 --route_distribution balanced
 """

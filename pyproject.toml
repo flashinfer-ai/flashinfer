@@ -107,7 +107,8 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers/",
-  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/",
+  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
+  "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "build/",
 ]
 
@@ -121,7 +122,8 @@ extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers",
-  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src",
 ]
 force-exclude = true
 

@@ -33,7 +33,7 @@ def stage_mega_moe_inputs(
     """
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # package import also bootstraps sys.path for the kernel packages.
-    from .....kernel_src.cutedsl_megamoe import (
+    from .....kernel_src.sm100.cutedsl_megamoe import (
         Nvfp4BlockSize,
         ceil_div,
         fused_quant_stage,
@@ -144,7 +144,7 @@ def validate_nvfp4_forward_inputs(
         raise MoEEpConfigError("topk_weights and topk_ids must have the same shape")
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
+    from .....kernel_src.sm100.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     if scales.ndim != 2 or scales.shape[0] != num_tokens:

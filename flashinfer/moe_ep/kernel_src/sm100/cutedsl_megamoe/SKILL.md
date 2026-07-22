@@ -3,7 +3,7 @@
 ## Layout
 
 ```
-kernel_src/cutedsl_megamoe/
+kernel_src/sm100/cutedsl_megamoe/
 ├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
 │   ├── common/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, …)
@@ -45,8 +45,9 @@ Layer isolation (enforce on every drop — grep before/after):
 - FI backends (`backends/mega/kernel/{nvfp4,mxfp8}_cutedsl/`) import kernel
   helpers/constants/launch entry points **only** from the package `__init__`,
   never from `src/` directly.
-- `modes/` talk to backends only; `core/` touches the kernel drop solely via
-  `core/runtime/bootstrap.py` → package `bootstrap_paths` (from `shim/_paths.py`).
+- `modes/` talk to backends only; `core/` never imports the kernel drop (its
+  only reference is a `sys.modules` lookup in `core/kernel/base.py` for
+  fused-stage memo eviction — a no-op when this shim was never loaded).
 - The cutedsl tests verify **only** through the package public API (constants +
   the MXFP8 torch reference are re-exported by `kernel_helpers.py`).
 
@@ -61,9 +62,9 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 1. **Replace `src/` verbatim** with the drop's four kernel packages — no injected
    files, no edits (the drop is a full repo; copy only these four dirs):
    ```bash
-   rm -rf flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab}
+   rm -rf flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab}
    cp -r <new_drop>/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab} \
-       flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/
+       flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/
    ```
    Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
    `.git`, `pyproject.toml`, `dispatch_test.py`, `README.md`).
@@ -105,8 +106,7 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    |---|---|
    | `from common.megamoe_constants import Nvfp4BlockSize, Mxfp8BlockSize` | `src/common/megamoe_constants.py` |
    | `from common.host_utils import kind_data_dtype, mxfp8_quantize_per_block_32` | `src/common/host_utils.py` |
-   | `from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype, ceil_div, round_up, to_blocked, nvfp4_quantize_per_block_16` | `src/moe_nvfp4_swapab/runner_common.py` |
-   | `from moe_nvfp4_swapab.mega_runner import _stack_byte_reinterpretable_tensors` (lazy) | `src/moe_nvfp4_swapab/mega_runner.py` |
+   | `from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype, ceil_div, round_up, to_blocked, nvfp4_quantize_per_block_16, _stack_byte_reinterpretable_tensors` | `src/moe_nvfp4_swapab/runner_common.py` |
    | `from moe_mxfp8_glu.mega_runner import _make_fp8_tensor, _make_e8m0_scale_tensor` (lazy) | `src/moe_mxfp8_glu/mega_runner.py` |
    | `from moe_mxfp8_glu.mega_reference_mxfp8 import compute_megamoe_reference_mxfp8` (lazy) | `src/moe_mxfp8_glu/mega_reference_mxfp8.py` |
 
@@ -126,5 +126,7 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
   is `__init__.py`; keep it stable across kernel drops.
 - `backends/mega/kernel/nvfp4_cutedsl/` and `mxfp8_cutedsl/` — those are the FI backend
   wrappers; they import from the package (`__init__.py`) but are not part of this drop.
-- `core/runtime/bootstrap.py` — imports `bootstrap_paths` from the package
-  (`shim/_paths.py`); only change if that public name moves.
+- `core/runtime/bootstrap.py` — initializes NVSHMEM without touching this
+  package (each tree's shim bootstraps its own `src/` paths at import; core
+  must never import a specific kernel tree, or it would trip the sm90/sm100
+  process-exclusivity guard for the other tree's sessions).

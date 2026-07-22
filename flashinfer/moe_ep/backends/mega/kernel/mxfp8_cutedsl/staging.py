@@ -17,7 +17,7 @@ def _use_fused_stage() -> bool:
 def _mxfp8_data_dtype(kind: str) -> torch.dtype:
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # package import also bootstraps sys.path for the kernel packages.
-    from .....kernel_src.cutedsl_megamoe import kind_data_dtype
+    from .....kernel_src.sm100.cutedsl_megamoe import kind_data_dtype
 
     return kind_data_dtype(kind)
 
@@ -40,7 +40,7 @@ def stage_mega_moe_inputs(
     falls back to the original torch-composed staging below.
     """
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import (
+    from .....kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         ceil_div,
         fused_quant_stage,
@@ -123,7 +123,7 @@ def validate_mxfp8_forward_inputs(
         return
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import (
+    from .....kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         Mxfp8ScaleDtype,
         ceil_div,

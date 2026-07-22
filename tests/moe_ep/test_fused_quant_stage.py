@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_blackwell():
@@ -57,7 +57,7 @@ def _make_buffers(quant_type: str, capacity: int, hidden: int, topk: int):
     # reset the tail-fill memo for this (possibly reused) address so the
     # fused path treats the dirty buffer as fully live.
     topk_idx = torch.full((capacity, topk), 7, dtype=torch.int64, device="cuda")
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import note_staged_tokens
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
     note_staged_tokens(topk_idx, capacity)
     topk_weights = torch.zeros(capacity, topk, dtype=torch.float32, device="cuda")

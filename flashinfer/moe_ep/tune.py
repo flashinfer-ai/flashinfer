@@ -2,7 +2,7 @@
 
 Runs the collective autotune sweep OUTSIDE any serving engine and persists
 the winners in the knob cache (see
-``kernel_src/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
+``kernel_src/sm100/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
 that constructs the mega layer with ``knobs=None`` (the default) resolves the
 recorded winner with a pure dict lookup — no compiles, no collectives, no
 timing on the hot path.
@@ -169,17 +169,17 @@ def _tune_one(
 ) -> dict:
     import json
 
-    from .kernel_src.cutedsl_megamoe import (
+    from .kernel_src.sm100.cutedsl_megamoe import (
         autotune_mxfp8_mega_moe,
         autotune_nvfp4_mega_moe,
         create_dummy_mxfp8_inputs,
         create_dummy_nvfp4_inputs,
     )
-    from .kernel_src.cutedsl_megamoe.shim.autotune import (
+    from .kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
         mxfp8_candidates,
         nvfp4_candidates,
     )
-    from .kernel_src.cutedsl_megamoe.shim.nvfp4 import COMBINE_FORMAT_NAMES
+    from .kernel_src.sm100.cutedsl_megamoe.shim.nvfp4 import COMBINE_FORMAT_NAMES
 
     is_nvfp4 = args.dtype == "nvfp4"
     live_tokens = args.live_tokens if args.live_tokens is not None else max_tokens
@@ -227,7 +227,7 @@ def _tune_one(
         if args.sweep == "schedule":
             import json as _json
 
-            from .kernel_src.cutedsl_megamoe import resolve_knobs
+            from .kernel_src.sm100.cutedsl_megamoe import resolve_knobs
 
             if args.base_knobs:
                 base = _json.loads(args.base_knobs)
@@ -301,8 +301,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     import torch
 
-    from .kernel_src.cutedsl_megamoe import finalize_dist, init_dist
-    from .kernel_src.cutedsl_megamoe.shim.knob_cache import _cache_path
+    from .kernel_src.sm100.cutedsl_megamoe import finalize_dist, init_dist
+    from .kernel_src.sm100.cutedsl_megamoe.shim.knob_cache import _cache_path
 
     rank, world_size = init_dist()
     try:
