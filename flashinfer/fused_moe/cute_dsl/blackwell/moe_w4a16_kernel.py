@@ -1321,8 +1321,14 @@ class Sm100W4A16GroupedGemmKernel:
                         packed_fragment = cute.recast_tensor(
                             tArA_load[(None, idx)], cutlass.Uint8
                         ).load()
+                        scale_slice = tSrS_load[(None, (None, idx))]
+                        # Load each block scale once instead of its broadcast view.
+                        scale_slice_compact = cute.make_tensor(
+                            scale_slice.iterator,
+                            cute.filter_zeros(scale_slice.layout),
+                        )
                         scale_fragment = cute.recast_tensor(
-                            tSrS_load[(None, (None, idx))], cutlass.Uint8
+                            scale_slice_compact, cutlass.Uint8
                         ).load()
                         tensor_transformed = decode_nvfp4_fragment_to_bf16(
                             packed_fragment,
