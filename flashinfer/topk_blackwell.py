@@ -38,7 +38,7 @@ import cutlass.cute as cute
 import torch
 
 from .api_logging import flashinfer_api
-from .cute_dsl.top_k.config import GvrTopKLBConfig
+from .cute_dsl.top_k.config import GvrTopKConfig, GvrTopKLBConfig
 from .cute_dsl.utils import (
     is_cute_dsl_available,
     torch_to_cutlass_dtype,
@@ -48,6 +48,7 @@ from .utils import (
     _get_cache_buf,
     backend_requirement,
     get_compute_capability,
+    get_device_sm_count,
     supported_compute_capability,
 )
 
@@ -128,14 +129,21 @@ def _compile_lb_prepare(num_threads: int, long_threshold: int, compress_ratio: i
 def _compile_lb(
     cute_dtype, top_k, next_n, compress_ratio,
     max_batch_size, num_threads, cluster_size, return_output_values,
+    # Launch-config knobs chosen by GvrTopKConfig.auto() per shape. Defaults
+    # preserve the pre-auto() LB behavior (GvrTopKLBKernel's defaults, which
+    # DIFFER from _compile_gvr: 256-bit loads ON, phase3-unroll OFF).
+    min_blocks_per_mp=3,
+    use_256bit_load=True,
+    enable_unroll_4=True,
+    enable_phase3_unroll=False,
+    enable_warp_parallel_reduce=False,
 ):
     # num_rows and N are DYNAMIC (symbolic) — see _compile_gvr. The LB kernel's
     # grid is fixed at max_batch_size * next_n * cluster_size (surplus clusters
     # early-exit via counters), so num_rows never touches the launch config, and
     # N is a per-row runtime bound. Only max_batch_size stays static (it sizes the
-    # grid and the order_row buffer). One compiled kernel serves every batch size
-    # and sequence length for a given (dtype, top_k, next_n, compress_ratio,
-    # max_batch_size, num_threads, cluster_size, return_output_values).
+    # grid and the order_row buffer). The cache keys on those specializations plus
+    # the launch-config knobs; shapes stay symbolic within each.
     kernel = GvrTopKLBKernel(
         dtype=cute_dtype,
         top_k=top_k,
@@ -145,6 +153,11 @@ def _compile_lb(
         return_output_values=return_output_values,
         cluster_size=cluster_size,
         max_batch_size=max_batch_size,
+        min_blocks_per_mp=min_blocks_per_mp,
+        use_256bit_load=use_256bit_load,
+        enable_unroll_4=enable_unroll_4,
+        enable_phase3_unroll=enable_phase3_unroll,
+        enable_warp_parallel_reduce=enable_warp_parallel_reduce,
     )
     sym_groups = cute.sym_int()  # request count (= num_rows // next_n)
     sym_n = cute.sym_int()  # per-row logits width
@@ -167,6 +180,14 @@ def _compile_lb(
 def _compile_gvr(
     cute_dtype, top_k, next_n, compress_ratio,
     num_threads, return_output_values,
+    # Launch-config knobs chosen by GvrTopKConfig.auto() per shape. Each is a
+    # compile-time specialization keying the JIT cache; defaults preserve the
+    # pre-auto() behavior (GvrTopKKernel's defaults at num_threads=512).
+    min_blocks_per_mp=3,
+    use_256bit_load=False,
+    enable_unroll_4=True,
+    enable_phase3_unroll=True,
+    enable_warp_parallel_reduce=False,
 ):
     # num_rows and N (per-row width) are DYNAMIC dimensions: the kernel reads
     # them from the tensor shapes at runtime (num_rows = input.shape[0] drives the
@@ -174,9 +195,10 @@ def _compile_gvr(
     # a const_expr / SMEM sizing / static unroll. So they are compiled symbolically
     # via cute.sym_int() — one compiled kernel serves every batch size and
     # sequence length, matching the FlashInfer CuTe-DSL convention (cf.
-    # rmsnorm_fp4quant._get_compiled_kernel). Only true specializations (dtype,
-    # top_k, next_n, compress_ratio, num_threads, return_output_values) key the
-    # cache. sym_groups is the request axis; num_rows = sym_groups * next_n.
+    # rmsnorm_fp4quant._get_compiled_kernel). The cache keys on the true
+    # specializations (dtype, top_k, next_n, compress_ratio, return_output_values)
+    # plus the launch-config knobs; shapes stay symbolic within each.
+    # sym_groups is the request axis; num_rows = sym_groups * next_n.
     kernel = GvrTopKKernel(
         dtype=cute_dtype,
         top_k=top_k,
@@ -185,6 +207,12 @@ def _compile_gvr(
         compress_ratio=compress_ratio,
         return_output_values=return_output_values,
         cluster_size=1,
+        min_blocks_per_mp=min_blocks_per_mp,
+        use_256bit_load=use_256bit_load,
+        enable_unroll_4=enable_unroll_4,
+        enable_phase3_unroll=enable_phase3_unroll,
+        enable_warp_parallel_reduce=enable_warp_parallel_reduce,
+        use_constant_hint=False,
     )
     sym_groups = cute.sym_int()  # request count (= num_rows // next_n)
     sym_n = cute.sym_int()  # per-row logits width
@@ -212,6 +240,46 @@ def _lb_max_batch_size(batch_size: int) -> int:
         if batch_size <= cap:
             return cap
     raise ValueError(f"batch_size {batch_size} exceeds maximum supported 1024")
+
+
+def _n_is_256bit_aligned(torch_dtype, N: int) -> bool:
+    """256-bit vectorized loads need 32-byte-aligned rows: N * itemsize % 32 == 0.
+    (The up-front N check only guarantees 16-byte / 128-bit alignment.)
+    """
+    itemsize = torch.tensor([], dtype=torch_dtype).element_size()
+    return (N % (32 // itemsize)) == 0
+
+
+def _auto_gvr_knobs(logits, is_lb):
+    """Launch-config knobs from the shape-aware analytical heuristic
+    GvrTopKConfig.auto(). These knobs (num_threads / min_blocks_per_mp /
+    vec-width / unrolls) are memory-pipeline/occupancy parameters whose optimum
+    is determined by the tensor shape, so an analytical rule picks them well —
+    no runtime profiling needed. Returns (num_threads, knob_kwargs).
+
+    256-bit is force-disabled unless N is 32-byte aligned: the kernel issues a
+    32B-aligned LDG when use_256bit_load=True, which faults on a 16B-but-not-32B-
+    aligned row. auto() only enables 256-bit for fp32/large-N, but the LB path's
+    historical default is 256-bit-on for any dtype, so gate it here regardless.
+    """
+    N = logits.shape[1]
+    num_rows = logits.shape[0]
+    cfg = GvrTopKConfig.auto(
+        logits.dtype, N, num_rows, get_device_sm_count(logits.device)
+    )
+    use_256 = cfg.use_256bit_load
+    if is_lb:
+        # LB historically prefers 256-bit; enable it when the row is 32B-aligned.
+        use_256 = True
+    if not _n_is_256bit_aligned(logits.dtype, N):
+        use_256 = False
+    return cfg.num_threads_per_block, dict(
+        min_blocks_per_mp=cfg.min_blocks_per_mp,
+        use_256bit_load=use_256,
+        enable_unroll_4=cfg.enable_unroll_4,
+        enable_phase3_unroll=cfg.enable_phase3_unroll,
+        enable_warp_parallel_reduce=cfg.enable_warp_parallel_reduce,
+    )
 
 
 def _run_gvr(
@@ -243,9 +311,12 @@ def _run_gvr(
     if return_output_values and out_values is None:
         out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
 
+    # Shape-aware launch config from GvrTopKConfig.auto().
+    num_threads, knobs = _auto_gvr_knobs(logits, is_lb=True)
     _compile_lb(
         cute_dtype, top_k, next_n, compress_ratio,
-        max_batch_size, lb_cfg.num_threads, lb_cfg.cluster_size, return_output_values,
+        max_batch_size, num_threads, lb_cfg.cluster_size, return_output_values,
+        **knobs,
     )(
         logits, pre_idx, seq_lens,
         out_values if return_output_values else None,
@@ -274,10 +345,12 @@ def _run_gvr_no_lb(
     if return_output_values and out_values is None:
         out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
 
-    lb_cfg = GvrTopKLBConfig()
+    # Shape-aware launch config from GvrTopKConfig.auto().
+    num_threads, knobs = _auto_gvr_knobs(logits, is_lb=False)
     _compile_gvr(
         cute_dtype, top_k, next_n, compress_ratio,
-        lb_cfg.num_threads, return_output_values,
+        num_threads, return_output_values,
+        **knobs,
     )(
         logits, pre_idx, seq_lens,
         out_values if return_output_values else None,
