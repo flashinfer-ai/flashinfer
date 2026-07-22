@@ -60,6 +60,26 @@ def test_factory_returns_prequantized_with_both_scales():
         assert pack.w13_scale is s13 and pack.w2_scale is s2
 
 
+def test_factory_tolerates_explicit_none_scales():
+    # Regression: type_call re-runs the variant's __init__ with the caller's
+    # ORIGINAL arguments, so explicit-None scales (positional or kwargs) used
+    # to TypeError out of UnquantizedMoEWeights' generated __init__.
+    w13, w2 = _bf16_tensors()
+    for pack in (
+        MoEWeightPack(w13, w2, None, None),
+        MoEWeightPack(w13=w13, w2=w2, w13_scale=None, w2_scale=None),
+    ):
+        assert type(pack) is UnquantizedMoEWeights
+        assert pack.w13 is w13 and pack.w2 is w2
+        assert pack.w13_scale is None and pack.w2_scale is None
+
+
+def test_direct_unquantized_rejects_real_scales():
+    w13, w2, s13, s2 = _packed_tensors()
+    with pytest.raises(TypeError, match="no scale planes"):
+        UnquantizedMoEWeights(w13=w13, w2=w2, w13_scale=s13, w2_scale=s2)
+
+
 def test_mixed_scale_state_raises():
     w13, w2, s13, s2 = _packed_tensors()
     with pytest.raises(ValueError, match="BOTH scale planes"):
@@ -114,7 +134,7 @@ def test_nvfp4_preprocess_dispatches_prequantized_shapes():
         preprocess_mega_weights,
     )
 
-    w13, w2, s13, s2 = _packed_tensors()
+    w13, w2, _, s2 = _packed_tensors()
     bad_s13 = torch.zeros(E, 2 * INTER, HIDDEN // 32, dtype=torch.float8_e4m3fn)
     with pytest.raises(ValueError, match="w13_scale must have shape"):
         preprocess_mega_weights(

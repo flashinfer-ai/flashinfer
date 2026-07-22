@@ -85,9 +85,11 @@ class MoEWeightPack:
         )
 
     # No __init__ here: after __new__ returns a variant, CPython re-runs the
-    # VARIANT's dataclass __init__ with the original arguments (type_call uses
-    # type(obj).__init__). The signatures match by construction, so the
-    # variant's fields are simply re-set to the same values.
+    # VARIANT's __init__ with the original arguments (type_call uses
+    # type(obj).__init__). PrequantizedMoEWeights' dataclass signature matches
+    # by construction (fields re-set to the same values); UnquantizedMoEWeights
+    # needs a hand-written __init__ to tolerate the caller's explicit-None
+    # scales (see below).
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,25 @@ class UnquantizedMoEWeights(MoEWeightPack):
     # mypy flags instance->class overrides; the shadowing is the point here.
     w13_scale: ClassVar[None] = None  # type: ignore[misc]
     w2_scale: ClassVar[None] = None  # type: ignore[misc]
+
+    def __init__(
+        self,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        w13_scale: None = None,
+        w2_scale: None = None,
+    ) -> None:
+        # Hand-written (dataclass skips codegen when __init__ exists): the
+        # factory's re-init passes the caller's ORIGINAL arguments, so
+        # ``MoEWeightPack(w13, w2, None, None)`` / the kwargs form re-enter
+        # here with explicit None scales — accept those, reject real scales.
+        if w13_scale is not None or w2_scale is not None:
+            raise TypeError(
+                "UnquantizedMoEWeights takes no scale planes; construct "
+                "PrequantizedMoEWeights (or MoEWeightPack with both scales)."
+            )
+        object.__setattr__(self, "w13", w13)
+        object.__setattr__(self, "w2", w2)
 
 
 @dataclass(frozen=True)
