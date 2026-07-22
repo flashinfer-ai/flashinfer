@@ -1886,6 +1886,9 @@ def gen_trtllm_gen_fmha_module():
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
             jit_env.FLASHINFER_CSRC_DIR / "fmhaReduction.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_sage_quant.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/common/sageQuant.cu",
         ],
         # link "include" sub-directory in cache
         extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
