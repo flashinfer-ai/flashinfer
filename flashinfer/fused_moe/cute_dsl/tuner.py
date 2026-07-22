@@ -809,8 +809,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 a_major="k",
                 b_major="k",
                 c_major="m",
-                scale_granularity_m=1,
-                scale_granularity_k=16,
                 mma_tiler=(mma_tiler_m, route_tile, mma_tiler_k),
                 cluster_shape_mn=cluster_shape_mn,
                 use_2cta_instrs=mma_tiler_m == 256,
