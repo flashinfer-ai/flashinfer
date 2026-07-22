@@ -135,6 +135,11 @@ This is the actual point of the exercise. Checks, each cheap and scriptable:
     as 0.6B (head_dim 128, BF16).
   - Note: decode with `use_tensor_cores=True` shares the prefill module, so
     the dense BF16 path needs only 4 JIT modules end to end.
+- **2026-07-21** — `--chat` mode validated on B200 (Qwen3-8B, greedy,
+  96 tokens): correct answers to factual questions, EOS stop confirmed,
+  ~404 tok/s batch-3 decode. One portability fix: transformers v5 changed
+  `apply_chat_template`'s tokenized return type, so the example now renders
+  the template to text and tokenizes explicitly.
 
 ## Roadmap
 
