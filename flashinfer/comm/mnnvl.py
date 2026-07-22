@@ -530,41 +530,17 @@ class MnnvlMemory:  # type: ignore[no-redef]
         ):
             all_handles_data = comm.allgather(exported_fabric_handle.data)
         else:
-            all_handles_data = comm.allgather(exported_fabric_handle)
-            all_pids = comm.allgather(os.getpid())
-            libc = ctypes.CDLL(None, use_errno=True)
-            syscall = libc.syscall
-            SYS_pidfd_open = 434
-            SYS_pidfd_getfd = 438
-            pidfds = []
-            for pid in all_pids:
-                pidfd = syscall(SYS_pidfd_open, pid, 0)
-                if pidfd < 0:
-                    err = ctypes.get_errno()
-                    raise RuntimeError(
-                        f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                    )
-                pidfds.append(pidfd)
-
-            remote_fds = []
-            for pidfd, fd in zip(pidfds, all_handles_data, strict=True):
-                remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                if remote_fd < 0:
-                    err = ctypes.get_errno()
-                    error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
-                    if err == 1:  # EPERM
-                        error_msg += (
-                            " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
-                            "to your docker run command."
-                        )
-                    else:
-                        error_msg += (
-                            " This may be due to kernel version (requires Linux 5.6+)."
-                        )
-                    raise RuntimeError(error_msg)
-                remote_fds.append(remote_fd)
-
-            all_handles_data = remote_fds
+            # POSIX-FD single-node path (x86 Blackwell/Hopper, no NVLink fabric
+            # cluster): exchange the CUDA VMM file descriptors via SCM_RIGHTS over
+            # a Unix socket, reusing PosixFDHandleExchanger -- the same mechanism
+            # SymmDeviceMemory already uses. This avoids pidfd_getfd, which needs
+            # PTRACE_MODE_ATTACH (CAP_SYS_PTRACE + a permissive yama ptrace_scope)
+            # and fails with EPERM inside a default-capability container.
+            exchanger = PosixFDHandleExchanger(comm, comm_rank, comm_size)
+            try:
+                all_handles_data = exchanger.allgather(exported_fabric_handle)
+            finally:
+                exchanger.close()
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
