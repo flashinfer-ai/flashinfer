@@ -1,22 +1,9 @@
-import os
+import socket
 
 import pytest
 import torch
 import torch.distributed as dist
-
-from tests.test_helpers.comm import init_torch_distributed_from_mpi, setup_mpi_and_cuda
-
-
-def _distributed_world_size() -> int:
-    """Return world size from launcher env vars without importing mpi4py."""
-    for key in ("SLURM_NTASKS", "WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MPI_LOCALNRANKS"):
-        val = os.environ.get(key)
-        if val is not None:
-            try:
-                return int(val)
-            except ValueError:
-                pass
-    return 1
+import torch.multiprocessing as mp
 
 
 def test_protocol_restore_resets_inference_flags(monkeypatch) -> None:
@@ -70,30 +57,27 @@ def test_checkpoint_lifecycle_rejects_torch_symmetric_memory_backing() -> None:
             workspace.checkpoint_restore(None)
 
 
-@pytest.mark.parametrize("num_tokens,use_oneshot", [(1, True), (4, False)])
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or (torch.cuda.device_count() < 2 and _distributed_world_size() < 2),
-    reason="checkpointable TRT-LLM all-reduce requires 2+ GPUs or 2+ distributed ranks",
-)
-def test_graph_replay_after_symmetric_memory_remap(
-    num_tokens: int, use_oneshot: bool
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _run_worker(
+    rank: int, world_size: int, port: int, num_tokens: int, use_oneshot: bool
 ) -> None:
-    import flashinfer.comm as comm
-    from flashinfer.comm.mnnvl import TorchDistBackend
-
-    rank, world_size, _ = setup_mpi_and_cuda()
-    init_torch_distributed_from_mpi()
-
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-    # allreduce sum of (rank+1) across all ranks: 1+2+...+world_size
-    expected_first = world_size * (world_size + 1) // 2
-    # after input_.fill_(rank+2): sum of (rank+2) across all ranks
-    expected_second = world_size * (world_size + 1) // 2 + world_size
-
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
     workspace = None
     try:
+        import flashinfer.comm as comm
+        from flashinfer.comm.mnnvl import TorchDistBackend
+
         workspace = comm.create_allreduce_fusion_workspace(
             backend="trtllm",
             world_size=world_size,
@@ -104,7 +88,7 @@ def test_graph_replay_after_symmetric_memory_remap(
             comm_backend=TorchDistBackend(),
         )
         input_ = torch.full(
-            (num_tokens, 4096), rank + 1, dtype=torch.bfloat16, device=device
+            (num_tokens, 4096), rank + 1, dtype=torch.bfloat16, device="cuda"
         )
         output = torch.empty_like(input_)
 
@@ -119,7 +103,7 @@ def test_graph_replay_after_symmetric_memory_remap(
 
         all_reduce()
         torch.cuda.synchronize()
-        torch.testing.assert_close(output, torch.full_like(output, expected_first))
+        torch.testing.assert_close(output, torch.full_like(output, 3))
 
         graph = torch.cuda.CUDAGraph()
         dist.barrier()
@@ -140,7 +124,24 @@ def test_graph_replay_after_symmetric_memory_remap(
         input_.fill_(rank + 2)
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(output, torch.full_like(output, expected_second))
+        torch.testing.assert_close(output, torch.full_like(output, 5))
     finally:
         if workspace is not None:
             workspace.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("num_tokens,use_oneshot", [(1, True), (4, False)])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="checkpointable TRT-LLM all-reduce requires two CUDA devices",
+)
+def test_graph_replay_after_symmetric_memory_remap(
+    num_tokens: int, use_oneshot: bool
+) -> None:
+    mp.spawn(
+        _run_worker,
+        args=(2, _free_port(), num_tokens, use_oneshot),
+        nprocs=2,
+        join=True,
+    )
