@@ -1139,7 +1139,7 @@ def test_find_nearest_profile_cache_dedups_equivalent_configs():
     """Regression test for the _find_nearest_profile lru_cache key.
 
     ``_find_nearest_profile`` normalizes ``TuningConfig`` to a key containing
-    only fields that affect profile selection. In particular, mapper identity
+    only fields that affect profile selection. In particular, mapper equality
     remains significant while tensor initializers are excluded.
 
     This test holds the input shape FIXED and rebuilds an equivalent config on
@@ -1222,6 +1222,36 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
         f"Python allocations grew by {allocated_bytes / 1024:.1f} KB "
         f"({allocated_bytes / N:.0f} B/call)."
     )
+
+
+def test_find_nearest_profile_cache_dedups_recreated_bound_method():
+    """Equivalent bound-method objects should use their native equality."""
+
+    class BucketMapper:
+        def map(self, value):
+            return last_positive_power_of_2(value)
+
+    mapper = BucketMapper()
+    assert mapper.map is not mapper.map
+    assert mapper.map == mapper.map
+
+    AutoTuner._find_nearest_profile.cache_clear()
+    shapes = ((1024, 128),)
+    AutoTuner._find_nearest_profile(shapes, _build_num_tokens_tuning_config(mapper.map))
+    cache_before = AutoTuner._find_nearest_profile.cache_info()
+
+    N = 1_000
+    for _ in range(N):
+        AutoTuner._find_nearest_profile(
+            shapes, _build_num_tokens_tuning_config(mapper.map)
+        )
+
+    cache_after = AutoTuner._find_nearest_profile.cache_info()
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    assert cache_after.currsize == cache_before.currsize
+    assert cache_after.misses == cache_before.misses
+    assert cache_after.hits - cache_before.hits == N
 
 
 def _build_moe_style_tuning_config(topk_ids_initializer):

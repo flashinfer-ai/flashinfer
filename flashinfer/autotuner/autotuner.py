@@ -13,7 +13,6 @@ import weakref
 import tqdm
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from types import FunctionType
 from typing import (
     Any,
     Callable,
@@ -536,6 +535,17 @@ _NearestProfileDynamicSpec: TypeAlias = tuple[
 ]
 
 
+def _get_mapper_key(
+    mapper: Callable[[int], int],
+) -> Callable[[int], int] | _CallableIdentity:
+    """Use native callable equality when possible, otherwise use identity."""
+    try:
+        hash(mapper)
+    except TypeError:
+        return _CallableIdentity(mapper)
+    return mapper
+
+
 class _NearestProfileKey:
     """Immutable nearest-profile key with a precomputed hash."""
 
@@ -575,9 +585,7 @@ def _get_nearest_profile_key(tuning_config: TuningConfig) -> _NearestProfileKey:
                 (
                     spec.input_idx,
                     spec.dim_idx,
-                    spec.map_to_tuning_buckets
-                    if isinstance(spec.map_to_tuning_buckets, FunctionType)
-                    else _CallableIdentity(spec.map_to_tuning_buckets),
+                    _get_mapper_key(spec.map_to_tuning_buckets),
                 )
                 for spec in tuning_config.dynamic_tensor_specs
             ),
