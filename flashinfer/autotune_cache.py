@@ -311,6 +311,38 @@ def _attach_managed_cache(tuner, cache_root, manifest: Dict[str, str]):
         return store
 
 
+def autotune_v2_reload() -> None:
+    """Rank-consistency finalize step: drop in-process winners so later
+    lookups re-read the (shared) managed store.
+
+    Homogeneous ranks tuning concurrently into one store may each hold a
+    locally-measured winner in memory that differs from the store's final
+    (last valid publish wins) entry.  Calling this on every rank AFTER a
+    barrier that follows tuning makes all ranks serve byte-identical
+    tactics — the divergence class behind NCCL symmetric-memory deadlocks
+    (issue #3186; composes with ``set_autotune_process_group``, which fixes
+    the in-session window).
+
+    Only meaningful when tuning published to a store: winners that were
+    never published (e.g. ``persistent_cache=False`` segments) fall back to
+    heuristics after the reload.
+    """
+    from .autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    with tuner._lock:
+        tuner.profiling_cache.clear()
+        tuner._winner_partitions.clear()
+        tuner._managed_decoded.clear()
+        store = tuner._managed_cache
+        if store is not None:
+            store.clear_memo()
+    logger.info(
+        "[Autotuner]: autotune_v2_reload(): in-memory winners dropped; "
+        "lookups now re-read the managed store."
+    )
+
+
 @contextlib.contextmanager
 def autotune_v2(
     enable_tuning: bool = True,

@@ -1314,6 +1314,9 @@ class AutoTuner:
         self._winner_partitions: dict[tuple, dict] = {}
         # Track which file config keys have been logged (to avoid per-call spam)
         self._logged_file_hits: set[tuple[str, str]] = set()
+        # (op, runner, source) triples whose cached tactic failed
+        # revalidation, so the warning fires once, not per call.
+        self._logged_invalid_tactic: set[tuple[str, str, str]] = set()
         # Cache-metadata mismatch severities ("hard"/"soft") already logged at
         # WARNING; repeats for further cache files are logged at DEBUG (a
         # deployment can touch dozens of cache files per process).
@@ -1435,6 +1438,36 @@ class AutoTuner:
         )
         self._measure_config_cache.setdefault(tuning_config, {})[cache_key] = new_config
         return new_config
+
+    def _tactic_still_valid(
+        self, runner: TunableRunner, inputs, tactic: Any, custom_op: str, source: str
+    ) -> bool:
+        """Runner-contract revalidation of a cached (on-disk) tactic.
+
+        Runners may expose an optional cheap check
+        ``validate_tactic(inputs, tactic) -> bool`` (the CUTLASS
+        ``isValidConfig`` pattern).  A tactic that fails it is treated as a
+        loud cache miss instead of becoming a silent different kernel or an
+        execute-time crash (the "plan rejected at execute, server dead"
+        class).  Runners without the method are trusted as before.
+        """
+        validate = getattr(runner, "validate_tactic", None)
+        if validate is None:
+            return True
+        try:
+            ok = bool(validate(inputs, tactic))
+        except Exception:
+            ok = False
+        if not ok:
+            key = (custom_op, runner.__class__.__name__, source)
+            if key not in self._logged_invalid_tactic:
+                self._logged_invalid_tactic.add(key)
+                logger.warning(
+                    f"[Autotuner]: cached tactic {tactic!r} for {custom_op} "
+                    f"(runner={runner.__class__.__name__}, source={source}) "
+                    f"failed revalidation; treating as a cache miss."
+                )
+        return ok
 
     def _get_store_stack(self) -> list[Any]:
         """Return the per-thread context-store stack, creating it on first access."""
@@ -1623,6 +1656,10 @@ class AutoTuner:
                     runner_name, tactic = self._file_configs[file_key]
                     if runner_name != runners[r_id].__class__.__name__:
                         continue
+                    if not self._tactic_still_valid(
+                        runners[r_id], inputs, tactic, custom_op, "config file"
+                    ):
+                        continue
                     log_key = (custom_op, runner_name)
                     if log_key not in self._logged_file_hits:
                         self._logged_file_hits.add(log_key)
@@ -1652,6 +1689,10 @@ class AutoTuner:
                         continue
                     runner_name, tactic = hit
                     if runner_name != runners[r_id].__class__.__name__:
+                        continue
+                    if not self._tactic_still_valid(
+                        runners[r_id], inputs, tactic, custom_op, "managed cache"
+                    ):
                         continue
                     log_key = (custom_op, runner_name)
                     if log_key not in self._logged_file_hits:
@@ -1890,6 +1931,13 @@ class AutoTuner:
                     for param in inspect.signature(r.forward).parameters.values()
                 }
 
+            # Regression guard (autotune_v2 contexts): the default path
+            # (runners[0], tactic=-1) always races as a candidate, so a
+            # tuned-and-persisted selection can structurally never lose to
+            # not tuning (the slower-than-default class of #3537/#3622).
+            # Scoped to v2 so plain autotune() selection is byte-identical.
+            race_default = bool(self._get_store_stack())
+
             pbar = None
             for _step, p in enumerate(profiles):
                 try:
@@ -1944,6 +1992,8 @@ class AutoTuner:
                             valid_tactics = self._blocklist.filter(
                                 custom_op, r, valid_tactics
                             )
+                            if r_id == 0 and race_default and -1 not in valid_tactics:
+                                valid_tactics = [-1, *valid_tactics]
                             runner_arg_names = runner_arg_names_map[r]
                             if (
                                 "do_preparation" in runner_arg_names
