@@ -2211,5 +2211,431 @@ class TestOutputBothSFLayouts:
         )
 
 
+@cute_dsl_available
+@blackwell_required
+class TestYNormOutput:
+    """Optional normed-output (``y_out``).
+
+    When ``y_out`` is provided the kernel additionally stores the bf16/fp16
+    RMSNorm result (before quantization) so a single launch can feed both an
+    FP4 GEMM and a norm-precision consumer (e.g. an MoE router). The FP4
+    payload and scale-factor outputs must be unaffected by the extra store.
+    """
+
+    @pytest.mark.parametrize("batch_size", [1, 64])
+    @pytest.mark.parametrize("hidden_size", [256, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_y_out_matches_reference(self, batch_size, hidden_size, dtype):
+        """``y_out`` equals the reference RMSNorm(x+r)*weight in input dtype."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Reference computed before the in-place residual update.
+        ref_norm = llama_rms_norm(x + r, weight, eps=eps)
+
+        y_out = torch.empty(batch_size, hidden_size, device="cuda", dtype=dtype)
+        add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            y_out=y_out,
+        )
+
+        # Same rounding path as the reference (fp32 compute -> input dtype),
+        # so the stored norm should match within a couple of ULPs.
+        torch.testing.assert_close(
+            y_out.float(), ref_norm.float(), rtol=1e-2, atol=1e-2
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 64])
+    @pytest.mark.parametrize("hidden_size", [256, 2048])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_quant_outputs_unaffected_by_y_out(self, batch_size, hidden_size, dtype):
+        """FP4 payload and block scales are byte-identical with/without ``y_out``.
+
+        Uses the unswizzled (linear) scale-factor layout so the comparison is
+        padding-free and exact; the swizzled path with ``y_out`` is covered by
+        ``test_y_out_with_both_sf_layouts``.
+        """
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        global_scale = compute_global_scale(x, r, weight, eps=eps)
+
+        # Baseline (no y_out).
+        r_base = r.clone()
+        y_fp4_base = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
+        )
+        sf_base = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        add_rmsnorm_fp4quant(
+            x,
+            r_base,
+            weight,
+            y_fp4_base,
+            sf_base,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+        )
+
+        # With y_out (fresh clones — residual is updated in place).
+        r_y = r.clone()
+        y_fp4_y = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
+        )
+        sf_y = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        y_out = torch.empty(batch_size, hidden_size, device="cuda", dtype=dtype)
+        add_rmsnorm_fp4quant(
+            x,
+            r_y,
+            weight,
+            y_fp4_y,
+            sf_y,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+            y_out=y_out,
+        )
+
+        assert torch.equal(y_fp4_base.view(torch.uint8), y_fp4_y.view(torch.uint8)), (
+            "FP4 payload must be byte-identical with and without y_out"
+        )
+        assert torch.equal(sf_base.view(torch.uint8), sf_y.view(torch.uint8)), (
+            "Block scales must be byte-identical with and without y_out"
+        )
+        # Residual in-place update is also unaffected.
+        assert torch.equal(r_base, r_y)
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 2048])
+    def test_y_out_with_both_sf_layouts(self, batch_size, hidden_size):
+        """``y_out`` composes with ``output_both_sf_layouts=True``."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.bfloat16
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        ref_norm = llama_rms_norm(x + r, weight, eps=eps)
+
+        y_out = torch.empty(batch_size, hidden_size, device="cuda", dtype=dtype)
+        result = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            output_both_sf_layouts=True,
+            y_out=y_out,
+        )
+
+        # Tuple arity is still 3 (y_out is written in place, not returned).
+        assert len(result) == 3
+        torch.testing.assert_close(
+            y_out.float(), ref_norm.float(), rtol=1e-2, atol=1e-2
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 4])
+    @pytest.mark.parametrize("seq_len", [37])
+    @pytest.mark.parametrize("hidden_size", [256, 2048])
+    def test_y_out_3d(self, batch_size, seq_len, hidden_size):
+        """``y_out`` works with 3D (batch, seq, hidden) inputs."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.bfloat16
+
+        x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        ref_norm = llama_rms_norm(x + r, weight, eps=eps)
+
+        y_out = torch.empty(
+            batch_size, seq_len, hidden_size, device="cuda", dtype=dtype
+        )
+        add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            y_out=y_out,
+        )
+
+        torch.testing.assert_close(
+            y_out.float(), ref_norm.float(), rtol=1e-2, atol=1e-2
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 64])
+    @pytest.mark.parametrize("hidden_size", [2048])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_y_out_is_not_global_scaled(self, batch_size, hidden_size, dtype):
+        """``y_out`` is the un-scaled RMSNorm, independent of ``global_scale``.
+
+        ``global_scale`` only affects the FP4 block-scale mapping, not the
+        normed value a router/shared-gate consumes. Guards against a future
+        change that stores the quant-scaled value into ``y_out``. Also checks
+        the FP4 payload still matches the baseline (no ``y_out``).
+        """
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        # A deliberately non-unit global scale.
+        global_scale = compute_global_scale(x, r, weight, eps=eps)
+        assert global_scale.item() != 1.0
+
+        ref_norm = llama_rms_norm(x + r, weight, eps=eps)
+
+        # Baseline FP4 (no y_out).
+        r_base = r.clone()
+        y_fp4_base = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
+        )
+        sf_base = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        add_rmsnorm_fp4quant(
+            x,
+            r_base,
+            weight,
+            y_fp4_base,
+            sf_base,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+        )
+
+        # With y_out.
+        r_y = r.clone()
+        y_fp4_y = torch.empty_like(y_fp4_base)
+        sf_y = torch.empty_like(sf_base)
+        y_out = torch.empty(batch_size, hidden_size, device="cuda", dtype=dtype)
+        add_rmsnorm_fp4quant(
+            x,
+            r_y,
+            weight,
+            y_fp4_y,
+            sf_y,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+            y_out=y_out,
+        )
+
+        # y_out is the plain RMSNorm (NOT multiplied by global_scale).
+        torch.testing.assert_close(
+            y_out.float(), ref_norm.float(), rtol=1e-2, atol=1e-2
+        )
+        # FP4 payload unaffected by the extra y_out store.
+        assert torch.equal(y_fp4_base.view(torch.uint8), y_fp4_y.view(torch.uint8))
+
+    @pytest.mark.parametrize("batch_size", [1, 64])
+    @pytest.mark.parametrize("hidden_size", [2048])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_y_out_mxfp4_block32(self, batch_size, hidden_size, dtype):
+        """``y_out`` under MXFP4 (block_size=32, UE8M0), which the kernel
+        handles with a distinct dual-chunk store path."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 32  # MXFP4
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        ref_norm = llama_rms_norm(x + r, weight, eps=eps)
+
+        # Baseline (no y_out).
+        r_base = r.clone()
+        y_fp4_base = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
+        )
+        sf_base = torch.empty(
+            batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
+        )
+        add_rmsnorm_fp4quant(
+            x,
+            r_base,
+            weight,
+            y_fp4_base,
+            sf_base,
+            eps=eps,
+            block_size=block_size,
+            scale_format="ue8m0",
+        )
+
+        # With y_out.
+        r_y = r.clone()
+        y_fp4_y = torch.empty_like(y_fp4_base)
+        sf_y = torch.empty_like(sf_base)
+        y_out = torch.empty(batch_size, hidden_size, device="cuda", dtype=dtype)
+        add_rmsnorm_fp4quant(
+            x,
+            r_y,
+            weight,
+            y_fp4_y,
+            sf_y,
+            eps=eps,
+            block_size=block_size,
+            scale_format="ue8m0",
+            y_out=y_out,
+        )
+
+        torch.testing.assert_close(
+            y_out.float(), ref_norm.float(), rtol=1e-2, atol=1e-2
+        )
+        assert torch.equal(y_fp4_base.view(torch.uint8), y_fp4_y.view(torch.uint8)), (
+            "MXFP4 FP4 payload must be byte-identical with and without y_out"
+        )
+        assert torch.equal(sf_base, sf_y), (
+            "MXFP4 block scales must be byte-identical with and without y_out"
+        )
+
+    def test_y_out_wrong_shape_same_numel_raises(self):
+        """A ``y_out`` with the right element count but wrong shape is rejected.
+
+        Regression guard for the shape check (was ``numel``-only): a router /
+        shared-gate consumer would misread a mis-shaped buffer.
+        """
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        batch_size, hidden_size = 16, 512
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.bfloat16
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        # Same numel (16*512) but transposed shape.
+        y_out_bad = torch.empty(hidden_size, batch_size, device="cuda", dtype=dtype)
+        assert y_out_bad.numel() == batch_size * hidden_size
+
+        with pytest.raises(AssertionError):
+            add_rmsnorm_fp4quant(
+                x, r, weight, eps=eps, block_size=block_size, y_out=y_out_bad
+            )
+
+    def test_trace_refused_for_optional_output_variants(self):
+        """``fi_trace`` refuses (returns ``{}``) when the optional output
+        variants are active, since the trace template models only the core
+        FP4-quantize signature; the plain call still traces normally."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        batch_size, hidden_size = 16, 512
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.bfloat16
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        y_out = torch.empty(batch_size, hidden_size, device="cuda", dtype=dtype)
+
+        fi_trace = getattr(add_rmsnorm_fp4quant, "fi_trace", None)
+        if fi_trace is None:
+            pytest.skip("fi_trace not attached (trace tooling unavailable)")
+
+        # Core signature traces normally (non-empty definition).
+        core = fi_trace(
+            input=x, residual=r.clone(), weight=weight, eps=eps, block_size=block_size
+        )
+        assert core and "inputs" in core
+
+        # y_out active -> refused.
+        assert (
+            fi_trace(
+                input=x,
+                residual=r.clone(),
+                weight=weight,
+                eps=eps,
+                block_size=block_size,
+                y_out=y_out,
+            )
+            == {}
+        )
+
+        # output_both_sf_layouts active -> refused.
+        assert (
+            fi_trace(
+                input=x,
+                residual=r.clone(),
+                weight=weight,
+                eps=eps,
+                block_size=block_size,
+                output_both_sf_layouts=True,
+            )
+            == {}
+        )
+
+    def test_y_out_dtype_mismatch_raises(self):
+        """``y_out`` with a dtype different from the input is rejected."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        batch_size, hidden_size = 16, 512
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.bfloat16
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        y_out = torch.empty(batch_size, hidden_size, device="cuda", dtype=torch.float16)
+
+        with pytest.raises(AssertionError):
+            add_rmsnorm_fp4quant(
+                x, r, weight, eps=eps, block_size=block_size, y_out=y_out
+            )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

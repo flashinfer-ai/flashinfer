@@ -1,4 +1,4 @@
-"""Unified MoE runner adapters for the autotuned pre-routed NVFP4 path.
+"""Unified MoE runner adapters for the autotuned pre-routed path.
 
 Copyright (c) 2026 by FlashInfer team.
 
@@ -19,18 +19,23 @@ into the backend's native calling convention.  Both MVP runners are thin
 adapters over an existing, canonical inner runner (CuteDSL's
 ``CuteDslFusedMoENvfp4Runner`` and trtllm-gen's ``core.MoERunner``) so the
 fragile backend-specific kernel-launch code lives in exactly one place.
-
-MVP scope: NVFP4 only, two backends (CuteDSL, TRTLLM routed).
 """
 
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, ClassVar, List
 
 import torch
 
-from ..autotuner import TunableRunner
-from .api import MoEActivationPack, MoEConfig, MoEWeightPack, RoutingInputMode
+from ..autotuner import TunableRunner, TuningConfig
+from .api import (
+    ActivationType,
+    MoEActivationPack,
+    MoEConfig,
+    MoEWeightPack,
+    QuantVariant,
+    RoutingInputMode,
+)
 
 
 def _validate_pack_devices(act: MoEActivationPack, runner: str) -> None:
@@ -136,23 +141,50 @@ def _validate_logits_inputs(
             )
 
 
+class MoERunner(TunableRunner):
+    """Base class for unified MoE backend runners."""
+
+    backend_key: ClassVar[str] = ""
+    supported_routing_modes: tuple[RoutingInputMode, ...] = ()
+    supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
+
+    config: MoEConfig
+
+    def check_support(self) -> None:
+        """Raise if the initialized runner cannot execute its configuration."""
+        variant = self.config.quant.variant
+        if variant not in self.supported_quant_variants:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support QuantVariant.{variant.name}."
+            )
+
+
 # ---------------------------------------------------------------------------
 # CuteDSL NVFP4 runner — delegates to the existing CuteDslFusedMoENvfp4Runner
 # ---------------------------------------------------------------------------
 
 
-class CuteDslNvfp4Runner(TunableRunner):
+class CuteDslNvfp4Runner(MoERunner):
     """Wraps CuteDslFusedMoENvfp4Runner, translating Pack inputs into its
     List[Tensor] convention."""
 
     backend_key = "cute_dsl_nvfp4"
     # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = (QuantVariant.NVFP4,)
+
+    def check_support(self) -> None:
+        super().check_support()
+        if self.config.activation.type is not ActivationType.Swiglu:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu activation."
+            )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from .cute_dsl.fused_moe import _cute_dsl_fused_moe_nvfp4_impl
         from .cute_dsl.tuner import CuteDslFusedMoENvfp4Runner
 
+        self.config = config
         experts = config.experts
         routing = config.routing
         num_local_experts = experts.local_num_experts or routing.num_experts
@@ -242,7 +274,7 @@ class CuteDslNvfp4Runner(TunableRunner):
 # ---------------------------------------------------------------------------
 
 
-class TrtllmFp4RoutedRunner(TunableRunner):
+class TrtllmFp4RoutedRunner(MoERunner):
     """NVFP4 adapter over the canonical trtllm-gen ``MoERunner``.
 
     Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
@@ -273,6 +305,14 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
+    supported_quant_variants = (QuantVariant.NVFP4,)
+
+    def check_support(self) -> None:
+        super().check_support()
+        if self.config.activation.type is not ActivationType.Swiglu:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu activation."
+            )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
@@ -508,7 +548,7 @@ class TrtllmFp4RoutedRunner(TunableRunner):
 # ---------------------------------------------------------------------------
 
 
-class TrtllmBf16RoutedRunner(TunableRunner):
+class TrtllmBf16RoutedRunner(MoERunner):
     """Pre-routed BF16 adapter over the canonical trtllm-gen ``MoERunner``.
 
     Mirrors :class:`TrtllmFp4RoutedRunner` but with ``Bfloat16`` activation +
@@ -526,6 +566,14 @@ class TrtllmBf16RoutedRunner(TunableRunner):
     backend_key = "trtllm_bf16_routed"
     # The bf16 kernel supports FromLogits too; wiring it here is a follow-up.
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = (QuantVariant.BF16,)
+
+    def check_support(self) -> None:
+        super().check_support()
+        if self.config.activation.type is not ActivationType.Swiglu:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu activation."
+            )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
@@ -686,3 +734,241 @@ class TrtllmBf16RoutedRunner(TunableRunner):
 
     def __hash__(self):
         return hash(("trtllm_bf16_routed",))
+
+
+# ---------------------------------------------------------------------------
+# SM12x b12x runners — fixed tactic, existing wrapper delegation
+# ---------------------------------------------------------------------------
+
+
+class _B12xRunner(MoERunner):
+    """Shared unified adapter over ``B12xMoEWrapper``."""
+
+    backend_key: ClassVar[str] = ""
+    required_weight_keys: ClassVar[tuple[str, ...]] = ()
+
+    def check_support(self) -> None:
+        super().check_support()
+
+        from ..cute_dsl import is_cute_dsl_available
+        from ..jit.cpp_ext import get_cuda_version
+        from ..utils import get_compute_capability
+
+        if get_cuda_version().major < 13:
+            raise ValueError("b12x unified MoE requires CUDA 13 or later.")
+        if not is_cute_dsl_available():
+            raise RuntimeError("b12x unified MoE requires the CuTe DSL package.")
+        major, minor = get_compute_capability(self.device)
+        if (major, minor) not in ((12, 0), (12, 1)):
+            raise RuntimeError(
+                f"b12x unified MoE requires SM120 or SM121, got SM{major}{minor}."
+            )
+
+        experts = self.config.experts
+        local_num_experts = experts.local_num_experts or self.config.routing.num_experts
+        if experts.local_expert_offset != 0 or (
+            local_num_experts != self.config.routing.num_experts
+        ):
+            raise NotImplementedError(
+                "b12x unified MoE does not support expert parallelism."
+            )
+        if not self.config.execution.do_finalize:
+            raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        from .utils import get_b12x_activation_name
+
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.activation = get_b12x_activation_name(config.activation.type)
+        self.tuning_config = TuningConfig()
+        self._prepared_weights: dict[str, torch.Tensor] | None = None
+        self._inner: Any = None
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        return [-1]
+
+    def _get_quant_mode_name(self) -> str:
+        if len(self.supported_quant_variants) != 1:
+            raise ValueError(
+                f"{type(self).__name__} must support exactly one quant variant."
+            )
+        quant_variant = self.supported_quant_variants[0]
+        if quant_variant is QuantVariant.NVFP4:
+            return "nvfp4"
+        if quant_variant is QuantVariant.W4A16:
+            return "w4a16"
+        raise ValueError(f"Unsupported b12x quant variant: {quant_variant!r}.")
+
+    def _validate_prepared_weights(
+        self, prepared_weights: dict[str, torch.Tensor]
+    ) -> None:
+        missing = [
+            key for key in self.required_weight_keys if key not in prepared_weights
+        ]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        if any(
+            not isinstance(prepared_weights[key], torch.Tensor)
+            for key in self.required_weight_keys
+        ):
+            raise TypeError(f"{self.backend_key} prepared weights must be tensors.")
+
+    def _ensure_inner(self, hidden_size: int, num_tokens: int) -> None:
+        if (
+            self._inner is not None
+            and hidden_size == self._inner.hidden_size
+            and num_tokens <= self._inner.max_num_tokens
+        ):
+            return
+        from .cute_dsl import B12xMoEWrapper
+
+        self._inner = B12xMoEWrapper(
+            num_experts=self.config.routing.num_experts,
+            top_k=self.config.routing.top_k,
+            hidden_size=hidden_size,
+            intermediate_size=self.config.experts.intermediate_size,
+            use_cuda_graph=True,
+            max_num_tokens=max(1, num_tokens),
+            device=self.device,
+            activation=self.activation,
+            quant_mode=self._get_quant_mode_name(),
+            source_format="modelopt",
+        )
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        v = weights.get_view(self.backend_key)
+        self._validate_prepared_weights(v)
+        first_weight = v[self.required_weight_keys[0]]
+        if first_weight.shape[0] != self.config.routing.num_experts:
+            raise ValueError(
+                f"{self.backend_key} prepared {first_weight.shape[0]} "
+                f"experts, expected {self.config.routing.num_experts}."
+            )
+
+        hidden_states = act.hidden_states_q
+        if hidden_states.dtype != torch.bfloat16:
+            raise TypeError(
+                f"{self.backend_key} requires BF16 hidden_states, "
+                f"got {hidden_states.dtype}."
+            )
+        if hidden_states.device != self.device:
+            raise ValueError(
+                f"hidden_states is on {hidden_states.device}, expected {self.device}."
+            )
+        if hidden_states.ndim != 2:
+            raise ValueError(
+                "b12x hidden_states must have shape [num_tokens, hidden_size]."
+            )
+        prepared_hidden_size = int(v["w1_weight"].shape[2]) * 2
+        prepared_intermediate_size = int(v["w2_weight"].shape[2]) * 2
+        expected_w1_rows = prepared_intermediate_size * (
+            2 if self.config.activation.is_gated else 1
+        )
+        if v["w1_weight"].shape[1] != expected_w1_rows:
+            raise ValueError(
+                f"{self.backend_key} prepared weights are incompatible with "
+                f"activation {self.config.activation.type!r}."
+            )
+        if prepared_intermediate_size != self.config.experts.intermediate_size:
+            raise ValueError(
+                f"{self.backend_key} prepared intermediate size "
+                f"{prepared_intermediate_size} does not match config "
+                f"{self.config.experts.intermediate_size}."
+            )
+        if hidden_states.shape[1] != prepared_hidden_size:
+            raise ValueError(
+                f"hidden size {hidden_states.shape[1]} does not match prepared "
+                f"weights ({prepared_hidden_size})."
+            )
+        _validate_prerouted_inputs(
+            act,
+            hidden_states.shape[0],
+            self.config.routing.top_k,
+            type(self).__name__,
+        )
+        if act.topk_weights.dtype != torch.float32:
+            raise TypeError("b12x topk_weights must use torch.float32.")
+        self._prepared_weights = v
+        self._ensure_inner(hidden_states.shape[1], hidden_states.shape[0])
+        return [hidden_states, act.topk_ids, act.topk_weights]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if tactic != -1:
+            raise ValueError(f"{self.backend_key} supports only tactic -1.")
+        if self._prepared_weights is None:
+            raise RuntimeError("pack_inputs must be called before b12x forward.")
+        if self._inner is None:
+            raise RuntimeError("pack_inputs must initialize the b12x wrapper.")
+        if len(inputs) != 3:
+            raise ValueError("b12x runner expects [hidden, expert_ids, weights].")
+        return self._inner.run(
+            x=inputs[0],
+            w1_weight=self._prepared_weights["w1_weight"],
+            w1_weight_sf=self._prepared_weights["w1_weight_sf"],
+            w1_alpha=self._prepared_weights["w1_alpha"],
+            fc2_input_scale=self._prepared_weights.get("fc2_input_scale"),
+            w2_weight=self._prepared_weights["w2_weight"],
+            w2_weight_sf=self._prepared_weights["w2_weight_sf"],
+            w2_alpha=self._prepared_weights["w2_alpha"],
+            token_selected_experts=inputs[1],
+            token_final_scales=inputs[2],
+        )
+
+    def __hash__(self):
+        return hash((self.backend_key, self.config))
+
+
+class B12xNvfp4Runner(_B12xRunner):
+    """Unified SM120/SM121 adapter for b12x NVFP4/W4A4 MoE."""
+
+    backend_key = "b12x_nvfp4"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = (QuantVariant.NVFP4,)
+    required_weight_keys = (
+        "w1_weight",
+        "w1_weight_sf",
+        "w1_alpha",
+        "w2_weight",
+        "w2_weight_sf",
+        "w2_alpha",
+        "fc2_input_scale",
+    )
+
+
+class B12xW4A16Runner(_B12xRunner):
+    """Unified SM120/SM121 adapter for b12x W4A16 MoE."""
+
+    backend_key = "b12x_w4a16"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = (QuantVariant.W4A16,)
+    required_weight_keys = (
+        "w1_weight",
+        "w1_weight_sf",
+        "w1_alpha",
+        "w2_weight",
+        "w2_weight_sf",
+        "w2_alpha",
+    )
+
+    def check_support(self) -> None:
+        super().check_support()
+        if self.config.activation.type not in (
+            ActivationType.Swiglu,
+            ActivationType.Relu2,
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu or Relu2 activation."
+            )

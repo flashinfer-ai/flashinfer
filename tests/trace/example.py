@@ -19,6 +19,7 @@ fused_add_rmsnorm_quant_h7168.json
 gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
+recurrent_kda_q8_v16_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
@@ -67,6 +68,7 @@ rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
+silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -104,6 +106,7 @@ import flashinfer.norm
 import flashinfer.sampling
 import flashinfer.gemm
 import flashinfer.gdn_decode
+import flashinfer.kda_decode
 import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
@@ -236,6 +239,7 @@ from flashinfer.quantization.fp4_quantization import (
     nvfp4_kv_dequantize_paged,
     mxfp4_quantize,
     nvfp4_quantize,
+    silu_and_mul_nvfp4_quantize,
 )
 from flashinfer.quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
@@ -254,6 +258,13 @@ with contextlib.suppress(Exception):
     mxfp4_quantize(quant_input_bf16)
 with contextlib.suppress(Exception):
     mxfp8_quantize(quant_input_bf16)
+# Match silu_and_mul_h16384 with a gated [M, 2K] input and packed [M, K/2] output.
+with contextlib.suppress(Exception):
+    silu_and_mul_nvfp4_quantize(
+        torch.randn(quant_M, 2 * 8192, dtype=torch.bfloat16, device=device),
+        quant_global_sf,
+        sf_vec_size=16,
+    )
 
 # Paged NVFP4 KV dequantization helper: NHD and HND cache layouts.
 with contextlib.suppress(Exception):
@@ -638,6 +649,30 @@ dt_bias_m = torch.zeros(HV, dtype=torch.float32, device=device)
 b_m = torch.zeros(B, T_mtp, HV, dtype=torch.bfloat16, device=device)
 flashinfer.gdn_decode.gated_delta_rule_mtp(
     q_m, k_m, v_m, init_state, init_idx, A_log_m, a_m, dt_bias_m, b_m
+)
+
+# ── recurrent KDA decode with separate committed state ───────────────────────
+rk_B, rk_H, rk_HV, rk_D = 4, 8, 16, 128
+rk_q = torch.randn(rk_B, 1, rk_H, rk_D, dtype=torch.bfloat16, device=device)
+rk_k = torch.randn_like(rk_q)
+rk_v = torch.randn(rk_B, 1, rk_HV, rk_D, dtype=torch.bfloat16, device=device)
+rk_g = torch.randn_like(rk_v)
+rk_beta = torch.randn(rk_B, 1, rk_HV, dtype=torch.bfloat16, device=device)
+rk_state = torch.zeros(rk_B, rk_HV, rk_D, rk_D, dtype=torch.bfloat16, device=device)
+rk_source = torch.randn(
+    rk_B + 2, rk_HV, rk_D, rk_D, dtype=torch.bfloat16, device=device
+)
+rk_source_indices = torch.arange(rk_B, dtype=torch.int32, device=device)
+flashinfer.kda_decode.recurrent_kda(
+    rk_q,
+    rk_k,
+    rk_v,
+    rk_g,
+    rk_beta,
+    initial_state=rk_state,
+    initial_state_source=rk_source,
+    initial_state_indices=rk_source_indices,
+    beta_is_logit=True,
 )
 
 # ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────
