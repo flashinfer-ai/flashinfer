@@ -152,6 +152,17 @@ This is the actual point of the exercise. Checks, each cheap and scriptable:
   checkpoints (all real HF models tested) were unaffected. Also measured:
   the `fused_moe_100` module is by far the heaviest JIT unit (267 objects,
   ~1 h cold compile at 30-way parallelism on the shared node).
+- **2026-07-22** — Phase 3 TEP validated on 2× B200 (umbriel-b200-040):
+  `torchrun --nproc_per_node=2 reference_check.py` matches the single-GPU
+  transformers reference at identical quality (dense rel-L2 0.0077–0.0089,
+  MoE 0.0080–0.0383, top-1 agreement everywhere) — TP attention sharding,
+  EP expert dispatch (`ep_size/ep_rank` + global routing), and both
+  allreduce points are numerically correct. `health_check.py` passes in
+  both modes with `jit_builds_cold=0` — the NFS-mounted JIT cache
+  (ops note below) served a fresh container on a different node with zero
+  recompiles. Tiny-model TEP throughput is (expectedly) below single-GPU
+  (decode 1601 vs 1847 tok/s) since allreduce latency dominates at toy
+  sizes; real-model TEP numbers are a phase-4 measurement.
 
 ## Roadmap
 
