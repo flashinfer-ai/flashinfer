@@ -46,7 +46,7 @@ def _check_dsl_perf_floor() -> None:
             f"nvidia-cutlass-dsl {ver} detected: the CuTeDSL MegaMoE kernels "
             "compile 34-54% slower on <4.6.1 (perf floor; results stay "
             "correct). Install nvidia-cutlass-dsl[cu13]>=4.6.1 — see "
-            "kernel_src/cutedsl_megamoe/TUNING.md 'CuTe-DSL runtime "
+            "kernel_src/sm100/cutedsl_megamoe/TUNING.md 'CuTe-DSL runtime "
             "sensitivity'. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.",
             UserWarning,
             stacklevel=2,

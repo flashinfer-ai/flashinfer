@@ -28,7 +28,7 @@ _REPLAYS = 4
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
 def test_nvfp4_mega_two_rank_graph_replay_lockstep():
-    pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+    pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 2:

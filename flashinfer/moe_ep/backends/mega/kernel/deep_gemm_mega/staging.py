@@ -39,7 +39,7 @@ def stage_mega_moe_inputs(
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import (
+    from .....kernel_src.sm100.cutedsl_megamoe import (
         fused_quant_stage,
         fused_quant_stage_supported,
     )

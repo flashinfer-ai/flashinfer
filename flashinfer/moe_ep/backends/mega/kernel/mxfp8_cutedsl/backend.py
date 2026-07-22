@@ -114,7 +114,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from .....kernel_src.cutedsl_megamoe import (
+        from .....kernel_src.sm100.cutedsl_megamoe import (
             get_symm_buffer_for_mxfp8_mega_moe,
         )
 
@@ -175,7 +175,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             )
         else:
             # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-            from .....kernel_src.cutedsl_megamoe import (
+            from .....kernel_src.sm100.cutedsl_megamoe import (
                 Mxfp8BlockSize,
                 ceil_div,
                 round_up,
@@ -202,7 +202,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             capacity = workspace.x.shape[0]
             if num_tokens < capacity:
                 workspace.topk_idx[num_tokens:capacity].fill_(-1)
-            from .....kernel_src.cutedsl_megamoe import note_staged_tokens
+            from .....kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
             note_staged_tokens(workspace.topk_idx, num_tokens)
 
@@ -213,7 +213,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from .....kernel_src.cutedsl_megamoe import mxfp8_mega_moe, staged_tokens
+        from .....kernel_src.sm100.cutedsl_megamoe import mxfp8_mega_moe, staged_tokens
 
         if output is not None:
             num_tokens = output.shape[0]
@@ -235,7 +235,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
             # so the candidate sweep stays in lockstep (see shim/autotune.py).
-            from .....kernel_src.cutedsl_megamoe import autotune_mxfp8_mega_moe
+            from .....kernel_src.sm100.cutedsl_megamoe import autotune_mxfp8_mega_moe
 
             autotune_mxfp8_mega_moe(
                 output,

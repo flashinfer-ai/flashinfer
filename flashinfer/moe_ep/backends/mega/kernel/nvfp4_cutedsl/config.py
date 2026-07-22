@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class Nvfp4CutedslMegaMoeConfig:
-    """Kernel params for ``kernel_src.cutedsl_megamoe.nvfp4_mega_moe``.
+    """Kernel params for ``kernel_src.sm100.cutedsl_megamoe.nvfp4_mega_moe``.
 
     Expert weights must be NVFP4 at kernel launch; supply bf16 ``MoEWeightPack``
     and enable ``MegaConfig.preprocess_weights`` (default), or pass pre-quantized
@@ -39,7 +39,7 @@ class Nvfp4CutedslMegaMoeConfig:
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None
-    # Kernel tuning knobs (see kernel_src.cutedsl_megamoe.shim.tuner); overrides
+    # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(num_max_tokens).
     # "auto" -> online autotune at the first forward: collectively time the

@@ -235,7 +235,7 @@ class MegaKernelBackend(ABC):
             import sys
 
             quant_stage = sys.modules.get(
-                "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
+                "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
             )
             topk_idx = getattr(workspace, "topk_idx", None)
             if quant_stage is not None and topk_idx is not None:
