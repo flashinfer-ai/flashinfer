@@ -188,6 +188,9 @@ def _get_cute_dsl_bf16_fp4_gemm(
         acc_dtype=cutlass.Float32,
         tile_shape_mnk=tile_shape_mnk,
         atom_layout=atom_layout,
+        # At occupancy 3 the SMEM budget per CTA only fits 2 ab stages next
+        # to the default 4-stage epilogue; a 2-stage epilogue keeps 3.
+        epi_stage=2 if occupancy >= 3 else 4,
         pipeline_depth=pipeline_depth,
         use_fp16_mma=use_fp16_mma,
         enable_pdl=enable_pdl,
@@ -407,6 +410,22 @@ def _bf16_fp4_cute_dsl_tactic_configs(
         add(base_tile_m, base_atom, 1, 1, occ=2)
         add(base_tile_m, base_atom, 0, 1, occ=2)
 
+    # occupancy=2 x split-K: grids too small to fill two CTAs per SM on their
+    # own (the down-proj class, ~1 tile per SM) get there by splitting K, so
+    # both halves of a tile's K loop co-reside on one SM.  get_valid_tactics'
+    # makespan gate decides per device whether the pieces actually fit.
+    if tile_k == 128 and n // 64 <= 256:
+        k_tiles = k // tile_k
+        for splits in (2, 4, 8):
+            if splits <= k_tiles:
+                add(base_tile_m, base_atom, 1, 1, splits=splits, occ=2)
+
+    # occupancy=3: 9 resident warps per SM, matching Marlin's warp-level load
+    # parallelism.  Needs a 2-stage epilogue to keep 3 ab stages in the SMEM
+    # budget (paired in _get_cute_dsl_bf16_fp4_gemm).
+    if tile_k == 128 and n // 64 >= 128:
+        add(base_tile_m, base_atom, 1, 1, occ=3)
+
     return configs
 
 
@@ -460,8 +479,11 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     return True
                 tile_m, tile_n, _ = cfg[0]
                 tiles = (-(-m_opt // tile_m)) * (-(-n // tile_n))
+                # occupancy multiplies the co-resident CTA slots per SM, so
+                # occ2 x split-K fits 2x the pieces in one wave.
+                slots = sm_count * cfg[6]
                 base_waves = -(-tiles // sm_count)
-                split_waves = (-(-tiles * splits // sm_count)) / splits
+                split_waves = (-(-tiles * splits // slots)) / splits
                 return split_waves <= 0.75 * base_waves
 
             return [i for i, cfg in enumerate(configs) if split_reduces_makespan(cfg)]
