@@ -108,6 +108,19 @@ exclude = [
 ]
 
 
+[tool.ruff]
+# The GVR top-k kernels are CuTe-DSL device code ported verbatim from
+# TensorRT-LLM. Exclude them from ruff (both lint and format) so the port stays
+# byte-faithful to upstream and future syncs stay clean -- reflowing or
+# "simplifying" DSL code can also change traced semantics (e.g. SIM109's
+# `x in (a, b)` yields a Python bool, not the DSL Boolean predicate that
+# `x == a or x == b` produces).
+extend-exclude = [
+  "flashinfer/cute_dsl/top_k/gvr_topk_decode.py",
+  "flashinfer/cute_dsl/top_k/gvr_topk_decode_lb.py",
+  "flashinfer/cute_dsl/top_k/block_scan.py",
+]
+
 [tool.ruff.lint]
 select = [
   # pycodestyle

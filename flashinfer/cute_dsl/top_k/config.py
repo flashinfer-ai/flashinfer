@@ -22,8 +22,7 @@ auto-selection based on hardware and problem shape.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 
 @dataclass
@@ -115,7 +114,9 @@ class GvrTopKConfig:
             n_thresh_t = 131072
         else:
             n_thresh_t = 65536
-        num_threads_per_block = 1024 if (num_rows <= num_sms and N >= n_thresh_t) else 512
+        num_threads_per_block = (
+            1024 if (num_rows <= num_sms and n_thresh_t <= N) else 512
+        )
 
         use_256bit_load = dtype == torch.float32 and N >= 16384
         enable_warp_parallel_reduce = num_threads_per_block == 1024
@@ -179,9 +180,10 @@ class GvrTopKLBConfig:
     num_threads: int = 512
 
     def __post_init__(self):
-        if not (64 <= self.max_batch_size <= 1024) or (
-            self.max_batch_size & (self.max_batch_size - 1)
-        ) != 0:
+        if (
+            not (64 <= self.max_batch_size <= 1024)
+            or (self.max_batch_size & (self.max_batch_size - 1)) != 0
+        ):
             raise ValueError(
                 f"max_batch_size must be a power of 2 in [64, 1024]; got {self.max_batch_size}"
             )
@@ -190,6 +192,4 @@ class GvrTopKLBConfig:
                 f"cluster_size must be in [1, 16]; got {self.cluster_size}"
             )
         if self.num_threads not in (512, 1024):
-            raise ValueError(
-                f"num_threads must be 512 or 1024; got {self.num_threads}"
-            )
+            raise ValueError(f"num_threads must be 512 or 1024; got {self.num_threads}")
