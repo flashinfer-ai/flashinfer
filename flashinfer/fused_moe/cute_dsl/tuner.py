@@ -639,7 +639,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         )
 
 
-_W4A16_ROUTE_TILES = (32, 64, 128)
+_W4A16_ROUTE_TILES = (8, 16, 32, 64, 128)
 _W4A16_K_TILES = (64, 128, 256)
 # Grouped expert scheduling requires cluster N=1 when multiple routed rows
 # target the same expert.
@@ -664,6 +664,8 @@ W4A16_MOE_TACTICS = tuple(
     for route_tile, (gemm1_tactic, gemm2_tactic) in itertools.product(
         _W4A16_ROUTE_TILES, _W4A16_GEMM_TACTIC_PAIRS
     )
+    # Two-CTA MMA requires at least 16 routed rows.
+    if route_tile >= 16 or (gemm1_tactic[0][0] == 128 and gemm2_tactic[0][0] == 128)
 )
 
 
