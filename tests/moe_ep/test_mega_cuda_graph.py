@@ -29,14 +29,16 @@ pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 def _require_blackwell():
     import torch
 
+    from flashinfer.utils import get_compute_capability
+
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
-    cap = torch.cuda.get_device_capability()
+    cap = get_compute_capability(torch.device("cuda"))
     if cap[0] != 10:
         pytest.skip(f"cutedsl mega kernels need sm_100/sm_103; got sm_{cap[0]}{cap[1]}")
 
 
-def _single_rank_layer(backend_name: str):
+def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int = 1024):
     """MoEEpMegaLayer on one rank (MEGA_NO_DIST) with bf16 staging."""
     import torch
 
@@ -50,8 +52,6 @@ def _single_rank_layer(backend_name: str):
         Nvfp4CutedslMegaMoeConfig,
     )
 
-    hidden = 2048
-    intermediate = 1024
     num_experts = 4
     topk = 4
     max_tokens = 64
@@ -134,13 +134,25 @@ def _random_batch(problem: dict, *, seed: int, num_tokens: int = 32):
 
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("backend_name", ["nvfp4", "mxfp8"])
-def test_mega_layer_graph_capture_replay_matches_eager(monkeypatch, backend_name):
+@pytest.mark.parametrize(
+    "hidden,intermediate",
+    [
+        (2048, 1024),
+        # %64-but-not-%128: the relaxed cutedsl bound. nvfp4 keeps the fused
+        # stage (%64 gate); mxfp8 falls back to torch staging (%128 gate) —
+        # both must stay capturable and bit-exact.
+        (1600, 832),
+    ],
+)
+def test_mega_layer_graph_capture_replay_matches_eager(
+    monkeypatch, backend_name, hidden, intermediate
+):
     import torch
 
     _require_blackwell()
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    layer, problem = _single_rank_layer(backend_name)
+    layer, problem = _single_rank_layer(backend_name, hidden, intermediate)
     try:
         t = _random_batch(problem, seed=3)
 

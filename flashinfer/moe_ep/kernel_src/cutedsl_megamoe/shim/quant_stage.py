@@ -39,6 +39,9 @@ class _CompiledStager:
     launch_kwargs: Optional[dict] = None
 
 
+# Explicit dict rather than functools.cache: a miss must run the
+# ensure_not_capturing guard (a hit must not), and the entry is a mutable
+# launch-args cache, not a pure function value.
 _STAGERS: dict[tuple, _CompiledStager] = {}
 
 # topk_idx_out.data_ptr() -> num_tokens staged by the last fused call into
@@ -72,6 +75,18 @@ def note_staged_tokens(topk_idx_out: torch.Tensor, num_tokens: int) -> None:
 def staged_tokens(topk_idx_out: torch.Tensor) -> Optional[int]:
     """Live-token count of the last staging into this buffer, if known."""
     return _LAST_STAGED_N.get(topk_idx_out.data_ptr())
+
+
+def forget_staged_tokens(topk_idx_out: torch.Tensor) -> None:
+    """Evict a buffer from the staging memos at workspace teardown.
+
+    The symmetric heap (and the caching allocator) reuse freed addresses, so
+    a later workspace can land on this pointer and would otherwise inherit a
+    stale live-count or graph-captured mark from the destroyed buffer.
+    """
+    ptr = topk_idx_out.data_ptr()
+    _LAST_STAGED_N.pop(ptr, None)
+    _GRAPH_CAPTURED_BUFFERS.discard(ptr)
 
 
 def fused_quant_stage_supported(
