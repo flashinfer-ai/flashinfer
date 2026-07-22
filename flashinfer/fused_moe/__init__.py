@@ -43,6 +43,7 @@ from .runners import (  # noqa: F401
     CuteDslNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
+    TrtllmFp8PerTensorRunner,
 )
 
 # Legacy flat-argument APIs (unchanged, not deprecated)

@@ -16,8 +16,6 @@ limitations under the License.
 
 Builds one runner per compatible backend, picks the cross-backend winner
 by measuring each runner's best tactic, then dispatches to the winner.
-
-MVP scope: NVFP4 only, pre-routed path, two backends.
 """
 
 from __future__ import annotations
@@ -39,6 +37,7 @@ from .api import (
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
 )
 from .runners import (
     B12xNvfp4Runner,
@@ -47,6 +46,7 @@ from .runners import (
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
+    TrtllmFp8PerTensorRunner,
 )
 from .utils import map_to_hybrid_bucket
 
@@ -59,6 +59,7 @@ _RunnerT = Union[
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
+    TrtllmFp8PerTensorRunner,
     B12xNvfp4Runner,
     B12xW4A16Runner,
 ]
@@ -69,6 +70,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
+    TrtllmFp8PerTensorConfig: TrtllmFp8PerTensorRunner,
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
 }

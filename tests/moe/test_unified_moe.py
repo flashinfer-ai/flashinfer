@@ -271,6 +271,10 @@ class TestBackendOptions:
         assert len(valid) == 3
         assert not TrtllmFp8BlockConfig.supported(110)
         assert not TrtllmFp8BlockConfig.supported(120)
+        assert TrtllmFp8PerTensorConfig.supported(100)
+        assert TrtllmFp8PerTensorConfig.supported(103)
+        assert not TrtllmFp8PerTensorConfig.supported(90)
+        assert not TrtllmFp8PerTensorConfig.supported(120)
 
     def test_iteration(self):
         opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
