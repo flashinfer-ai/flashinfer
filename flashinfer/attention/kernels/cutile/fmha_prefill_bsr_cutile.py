@@ -936,18 +936,20 @@ def _prefill_attention_ragged_body(
             k_pe = ct.reshape(k_pe_tile, (BLOCK_N, BLOCK_R))
             qk = ct.mma(q_pe, ct.transpose(k_pe), acc=qk)
 
-        # Mask KV columns past the valid range. The final BLOCK_N tile is
-        # PAD_ZERO-loaded, so padded columns have qk == 0 and would otherwise add
-        # exp2(-m_ij) mass to the softmax denominator (their V rows are zero, so
-        # only the denominator is corrupted). No-op when off_band_hi is a multiple
-        # of BLOCK_N. (Kept unconditional: the ragged KV is PAD_ZERO-loaded, so
-        # this drops padded columns from the softmax denominator — a different
-        # mechanism from the paged page-0 case; gating it broke ragged tests.)
-        offs_n = curr_n + offs_n_base
-        boundary_mask = ct.reshape((offs_n < off_band_hi), (1, BLOCK_N))
-        qk = ct.where(
-            boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
-        )
+        # Mask KV columns past the valid range. Only the FINAL off-band block can
+        # straddle off_band_hi: for iter_idx < off_band_iters-1, curr_n+BLOCK_N =
+        # (iter_idx+1)*BLOCK_N <= (off_band_iters-1)*BLOCK_N < off_band_hi, so every
+        # column is in range and the mask is a proven no-op. Peeling it to the last
+        # iteration drops a where + a -1e6 tile materialization from the hot loop
+        # (the padded-column-in-denominator hazard only exists on that last tile).
+        if iter_idx == off_band_iters - 1:
+            offs_n = curr_n + offs_n_base
+            boundary_mask = ct.reshape((offs_n < off_band_hi), (1, BLOCK_N))
+            qk = ct.where(
+                boundary_mask,
+                qk,
+                ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32),
+            )
 
         qk_max = ct.max(qk, axis=1, keepdims=False)
         m_ij = ct.maximum(m_i, (qk_max * qk_scale))
