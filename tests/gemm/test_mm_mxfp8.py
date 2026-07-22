@@ -103,6 +103,8 @@ def _run_mm_mxfp8(
     if backend == "cutlass":
         if is_sf_swizzled_layout and use_8x4_sf_layout_for_a:
             pytest.skip("cutlass doesn't support 8x4 swizzle layout")
+        if not is_sf_swizzled_layout:
+            pytest.skip("cutlass requires sf_swizzled_layouts")
     if backend == "cute-dsl" and not is_sf_swizzled_layout:
         pytest.skip(
             "cute-dsl mm_mxfp8 currently supports only swizzled 1D scale layout."
