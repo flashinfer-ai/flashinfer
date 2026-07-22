@@ -2067,9 +2067,7 @@ class Sm100W4A16GroupedGemmKernel:
         sm100_tmem_columns = cute.arch.get_max_tmem_alloc_cols("sm_100")
         accumulator_stage_count = sm100_tmem_columns // num_tmem_acc_col_per_stage
         if transform_a_source == tcgen05.OperandSource.TMEM:
-            if num_tmem_acc_col_per_stage < 128:
-                accumulator_stage_count = 3
-            elif num_tmem_acc_col_per_stage < 256:
+            if num_tmem_acc_col_per_stage < 256:
                 accumulator_stage_count = 2
             else:
                 accumulator_stage_count = 1
