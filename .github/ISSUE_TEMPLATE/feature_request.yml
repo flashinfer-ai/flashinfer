@@ -56,11 +56,12 @@ body:
       description: Select every confirmed target.
       multiple: true
       options:
-        - SM80 / SM86 (A100, A30, RTX 30-series)
+        - SM80 / SM86 / SM87 (A100, A30, RTX 30-series, Jetson Orin)
         - SM89 (L4, L40S, RTX 40-series)
         - SM90 (H100, H200, H20)
         - SM100 (B200, GB200)
         - SM103 (B300, GB300)
+        - SM110 (Jetson AGX Thor, DRIVE AGX Thor)
         - SM120 (RTX PRO 6000, RTX 50-series)
         - SM121 (GB10 — DGX Spark, RTX Spark)
         - Future architecture
