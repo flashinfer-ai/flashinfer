@@ -332,10 +332,10 @@ class TestTacticEnumeration:
 
         assert len(W4A16_MOE_TACTICS) == len(set(W4A16_MOE_TACTICS))
         assert DEFAULT_W4A16_MOE_TACTIC in W4A16_MOE_TACTICS
-        assert len(W4A16_MOE_TACTICS) == 36
+        assert len(W4A16_MOE_TACTICS) == 54
 
         route_tiles = {tactic[0] for tactic in W4A16_MOE_TACTICS}
-        assert route_tiles == {32, 64, 128}
+        assert route_tiles == {8, 16, 32, 64, 128}
 
         shared_gemm_tactics = {
             ((mma_m, mma_k), cluster_shape)
@@ -353,12 +353,19 @@ class TestTacticEnumeration:
             (((128, mma_k), (2, 1)), ((256, mma_k), (2, 1))) for mma_k in (64, 128, 256)
         )
         for route_tile in route_tiles:
+            expected_route_gemm_pairs = expected_gemm_pairs
+            if route_tile == 8:
+                expected_route_gemm_pairs = {
+                    pair
+                    for pair in expected_gemm_pairs
+                    if pair[0][0][0] == 128 and pair[1][0][0] == 128
+                }
             route_tactics = [
                 (gemm1_tactic, gemm2_tactic)
                 for route, gemm1_tactic, gemm2_tactic in W4A16_MOE_TACTICS
                 if route == route_tile
             ]
-            assert set(route_tactics) == expected_gemm_pairs
+            assert set(route_tactics) == expected_route_gemm_pairs
 
 
 # =============================================================================
@@ -1091,6 +1098,13 @@ class TestCuteDslMoeW4A16:
     @pytest.mark.parametrize(
         "activation_type,route_tile,gemm1_tactic,gemm2_tactic",
         [
+            pytest.param(
+                ActivationType.Swiglu,
+                8,
+                ((128, 256), (2, 1)),
+                ((128, 256), (2, 1)),
+                id="route8-1cta",
+            ),
             pytest.param(
                 ActivationType.Swiglu,
                 32,
