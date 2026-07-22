@@ -80,6 +80,10 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
   if (expert_bias.has_value()) {
     CHECK_INPUT(expert_bias.value());
     CHECK_INPUT_TYPE(expert_bias.value(), dl_float32);
+    TVM_FFI_ICHECK(expert_bias.value().ndim() == 1 &&
+                   expert_bias.value().size(0) == Dims::NUM_EXPERTS)
+        << "expert_bias must be 1-D with NUM_EXPERTS (=" << Dims::NUM_EXPERTS
+        << ") elements; the routing kernel reads all NUM_EXPERTS entries.";
     expert_bias_ptr = static_cast<const float*>(expert_bias.value().data_ptr());
   }
 
