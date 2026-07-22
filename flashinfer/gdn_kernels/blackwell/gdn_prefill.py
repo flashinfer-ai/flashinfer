@@ -26,7 +26,8 @@ State layout: ``[N, H, V, K]``.
 """
 
 import functools
-from typing import Optional
+import os
+from typing import Any, Optional
 
 import torch
 
@@ -38,6 +39,9 @@ from cutlass.cute.runtime import from_dlpack
 from flashinfer.cute_dsl.utils import get_num_sm
 
 from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
+from .gated_delta_net_chunked_sm90_pipeline import (
+    GatedDeltaNetChunkedSm90PipelineKernel,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +61,8 @@ def _get_compiled_cache(
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
+    pipeline_variant: str,
+    order_state_groups: bool,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -138,6 +144,17 @@ def chunk_gated_delta_rule_sm100(
     store_final_state = output_state is not None
     enable_checkpoints = checkpoint_every_n_tokens > 0
     io_dtype = _cutlass_io_dtype(q.dtype)
+    pipeline_variant = os.environ.get("FLASHINFER_GDN_SM100_PIPELINE", "native")
+    kernel_cls: Any
+    if pipeline_variant == "native":
+        kernel_cls = GatedDeltaNetChunkedKernel
+    elif pipeline_variant == "sm90":
+        kernel_cls = GatedDeltaNetChunkedSm90PipelineKernel
+    else:
+        raise ValueError(
+            "FLASHINFER_GDN_SM100_PIPELINE must be 'native' or 'sm90', "
+            f"got {pipeline_variant!r}"
+        )
 
     # Auto-detect state dtype from initial_state, default to float32
     if initial_state is not None:
@@ -151,6 +168,11 @@ def chunk_gated_delta_rule_sm100(
     _initial_state = initial_state if use_initial_state else None
     B = cu_seqlens.size(0) - 1
     _output_state = output_state if store_final_state else None
+    num_sm = get_num_sm(q.device)
+    num_work_tiles = B * (HQ if is_GQA else HV)
+    # The ordered State groups help when every CTA owns exactly one recurrent
+    # work tile. Sparse or multi-wave grids retain the original barrier-free body.
+    order_state_groups = pipeline_variant == "sm90" and num_work_tiles == num_sm
 
     cache = _get_compiled_cache(
         str(q.dtype),
@@ -161,14 +183,15 @@ def chunk_gated_delta_rule_sm100(
         use_initial_state,
         store_final_state,
         enable_checkpoints,
+        pipeline_variant,
+        order_state_groups,
     )
 
     if "compiled" not in cache:
         # --- First call: compile the kernel ---
-        num_sm = get_num_sm(q.device)
         max_active_clusters = num_sm
 
-        gdn = GatedDeltaNetChunkedKernel(
+        kernel_kwargs = dict(
             io_dtype=io_dtype,
             acc_dtype=cutlass.Float32,
             state_dtype=state_dtype,
@@ -184,6 +207,9 @@ def chunk_gated_delta_rule_sm100(
             enable_checkpoints=enable_checkpoints,
             is_persistent=True,
         )
+        if pipeline_variant == "sm90":
+            kernel_kwargs["order_state_groups"] = order_state_groups
+        gdn = kernel_cls(**kernel_kwargs)
 
         # Convert PyTorch tensors to CuTe tensors for compilation.
         # Token dimension (dim 0) must be dynamic to handle varying seq lengths.
@@ -239,9 +265,7 @@ def chunk_gated_delta_rule_sm100(
                 cu_checkpoints, assumed_align=4
             ).mark_layout_dynamic()
 
-        workspace_size = GatedDeltaNetChunkedKernel.get_workspace_size(
-            num_sm, B, HQ, HV, True
-        )
+        workspace_size = kernel_cls.get_workspace_size(num_sm, B, HQ, HV, True)
         workspace = torch.empty(workspace_size, dtype=torch.int8, device=q.device)
         workspace_cute = from_dlpack(workspace, assumed_align=16)
 
@@ -269,14 +293,14 @@ def chunk_gated_delta_rule_sm100(
 
         cache["compiled"] = compiled
         cache["num_sm"] = num_sm
+        cache["kernel_cls"] = kernel_cls
 
     # --- Execute ---
     compiled = cache["compiled"]
     num_sm = cache["num_sm"]
+    kernel_cls = cache["kernel_cls"]
 
-    workspace_size = GatedDeltaNetChunkedKernel.get_workspace_size(
-        num_sm, B, HQ, HV, True
-    )
+    workspace_size = kernel_cls.get_workspace_size(num_sm, B, HQ, HV, True)
     ws_key = f"workspace_{q.device.index}"
     if ws_key not in cache or cache[ws_key].size(0) < workspace_size:
         cache[ws_key] = torch.empty(workspace_size, dtype=torch.int8, device=q.device)
