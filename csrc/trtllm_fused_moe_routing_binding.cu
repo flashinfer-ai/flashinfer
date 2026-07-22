@@ -22,8 +22,8 @@
 namespace flashinfer::trtllm_gen_routing {
 
 namespace btg = batchedGemm::trtllm::gen;
-using tensorrt_llm::kernels::trtllmgen_moe::RoutingMethodType;
 namespace Routing = tensorrt_llm::kernels::trtllmgen_moe::Routing;
+using RoutingMethodType = Routing::RoutingMethodType;
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
 
