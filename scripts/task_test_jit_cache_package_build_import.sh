@@ -183,6 +183,12 @@ fi
 echo "  - MAX_JOBS: ${MAX_JOBS}"
 echo "  - NVCC_THREADS: ${FLASHINFER_NVCC_THREADS}"
 
+# Resolved TVM-FFI version before the build (traceability for the pre-release
+# verification in PR #2599; the override is applied by setup_test_env.sh).
+echo ""
+echo "Checking TVM-FFI version before build..."
+python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+
 echo ""
 echo "========================================"
 echo "Installing flashinfer package"
@@ -233,6 +239,12 @@ echo "✓ Flashinfer-jit-cache wheel installed successfully"
 cd ..
 
 # Verify installation
+# Resolved TVM-FFI version once more, after the jit-cache wheel install, in case
+# it pulled a different build (traceability for PR #2599's pre-release check).
+echo ""
+echo "Checking TVM-FFI version before verification tests..."
+python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+
 echo ""
 echo "========================================"
 echo "Running verification tests"
