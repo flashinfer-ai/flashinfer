@@ -546,3 +546,81 @@ def test_reattach_clears_decoded_memo(cache_root, monkeypatch):
         )
     assert tactic == -1  # store B (eager env) is empty: miss, not A's winner
     assert calls == []  # enable_tuning=False: no profiling either
+
+
+def test_policy_switch_reprofiles_in_process(cache_root, monkeypatch):
+    """P1 (codex review): winners tuned under one measurement policy must not
+    short-circuit tuning under another in the same process — the in-memory
+    winner cache is partitioned by measurement identity, not just the disk."""
+    calls = []
+
+    def fake_profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        policy = self._effective_measure_policy
+        mode = policy.execution_mode if policy is not None else "auto"
+        calls.append((mode, tactic))
+        # Under eager measurement tactic 1 wins; otherwise tactic 0 wins.
+        times = {0: 1.0, 1: 2.0, 2: 3.0}
+        if mode == "eager":
+            times = {0: 2.0, 1: 1.0, 2: 3.0}
+        return times[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    inputs = [torch.zeros(8, 16)]
+
+    with autotune_v2():
+        _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    assert tactic == 0
+
+    with autotune_v2(measure=MeasurementPolicy(execution_mode="eager")):
+        _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    assert tactic == 1  # re-profiled under eager, not served tactic 0 from memory
+    assert ("eager", 0) in calls  # eager tuning really ran
+
+    # Both identities published to their own env dirs.
+    entries = _entry_files(cache_root)
+    assert len(entries) == 2
+    assert len({e.parent.parent.name for e in entries}) == 2
+
+
+def test_persistent_false_context_never_touches_disk(cache_root, monkeypatch):
+    """P1 (codex review): persistent_cache=False forbids disk for the context
+    even when an ambient store was attached earlier in the process."""
+    _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})  # attaches ambient
+    before = {p: p.read_bytes() for p in _entry_files(cache_root)}
+
+    calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    other_op = _OP + "::inmem"
+    with autotune_v2(persistent_cache=False):
+        _, tactic = AutoTuner.get().choose_one(
+            other_op, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+        )
+    assert tactic == 1 and len(calls) == 3  # tuned (ambient disk hit forbidden too)
+
+    after = {p: p.read_bytes() for p in _entry_files(cache_root)}
+    assert after == before  # no new entries, no rewrites
+
+    # The ambient store still serves outside the context.
+    tuner = AutoTuner.get()
+    assert tuner._managed_cache is not None
+    _, tactic = tuner.choose_one(_OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)])
+    assert tactic == 1
+
+
+def test_nested_contexts_publish_to_their_own_store(cache_root, monkeypatch):
+    """P1 (codex review): after an inner context with a different identity
+    exits, the outer context's publishes go to the OUTER store, not the
+    inner one's manifest."""
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    inner_pol = MeasurementPolicy(execution_mode="eager")
+    with autotune_v2():
+        with autotune_v2(measure=inner_pol):
+            pass  # inner attaches its own env, then exits
+        _, tactic = AutoTuner.get().choose_one(
+            _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+        )
+    assert tactic == 1
+    entries = _entry_files(cache_root)
+    assert len(entries) == 1
+    manifest = json.loads((entries[0].parent.parent / "manifest.json").read_text())
+    # Published under the outer (default-policy) identity: no eager marker.
+    assert "measure_execution_mode" not in manifest

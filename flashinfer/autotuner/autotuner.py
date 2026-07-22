@@ -1123,11 +1123,18 @@ def _cupti_measure_spans(run_iteration: Callable[[], None], repeat: int) -> list
         cupti.ActivityKind.CONCURRENT_KERNEL,
     )
     iter_windows: list[tuple[int, int]] = []
+    enabled: list[Any] = []
     try:
         for kind in kinds:
             cupti.activity_enable(kind)
+            enabled.append(kind)
         cupti.activity_register_callbacks(buffer_requested, buffer_completed)
     except Exception as e:
+        # Partial-init failure: disable whatever was enabled so no tracing
+        # overhead leaks into the rest of the process.
+        for kind in enabled:
+            with contextlib.suppress(Exception):
+                cupti.activity_disable(kind)
         raise _CuptiInfraError(str(e)) from e
     try:
         for _ in range(repeat):
@@ -1138,9 +1145,14 @@ def _cupti_measure_spans(run_iteration: Callable[[], None], repeat: int) -> list
             torch.cuda.synchronize()
             iter_windows.append((t0, t1))
     finally:
-        cupti.activity_flush_all(0)
-        for kind in kinds:
-            cupti.activity_disable(kind)
+        # Disable must run even if flush raises (and vice versa must not
+        # mask the original measurement exception).
+        try:
+            cupti.activity_flush_all(0)
+        finally:
+            for kind in enabled:
+                with contextlib.suppress(Exception):
+                    cupti.activity_disable(kind)
 
     launches.sort()
     launch_starts = [entry[0] for entry in launches]
@@ -1217,6 +1229,10 @@ class _MeasureLocal(threading.local):
     stack: list[Any]
 
 
+class _StoreLocal(threading.local):
+    stack: list[Any]
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT-LLM operations.
 
@@ -1275,13 +1291,27 @@ class AutoTuner:
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: dict[str, tuple[str, Any]] = {}
-        # Managed store attached by autotune_v2 (ManagedAutotuneCache); stays
-        # attached for the process, like load_configs.  Disjoint from
-        # _file_configs by design: v1 save_configs must never observe v2
-        # entries.  Protected by _lock.
+        # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache):
+        # serves context-free lookups for the remainder of the process, like
+        # load_configs.  Disjoint from _file_configs by design: v1
+        # save_configs must never observe v2 entries.  Protected by _lock.
+        # (Inside an autotune_v2 context the per-thread store STACK overrides
+        # this — see _active_managed_store.)
         self._managed_cache: Any | None = None
+        # Per-thread stack of context-scoped stores.  Top of stack = the
+        # store the innermost autotune_v2 context reads/publishes (None =
+        # that context forbids disk I/O); empty stack falls back to the
+        # ambient store above.
+        self._store_local: _StoreLocal = _StoreLocal()
         # Managed hits decoded from JSON once, then served from memory.
-        self._managed_decoded: dict[str, tuple[str, Any]] = {}
+        # Keyed by (root, env_hash, file_key): entries decoded from one
+        # store identity are never served under another's.
+        self._managed_decoded: dict[tuple[str, str, str], tuple[str, Any]] = {}
+        # In-memory winner-cache partitions keyed by store/policy identity;
+        # the default (v1) partition is `profiling_cache` itself.  Winners
+        # tuned under one measurement identity must not short-circuit
+        # tuning under another (they may legitimately differ).
+        self._winner_partitions: dict[tuple, dict] = {}
         # Track which file config keys have been logged (to avoid per-call spam)
         self._logged_file_hits: set[tuple[str, str]] = set()
         # Cache-metadata mismatch severities ("hard"/"soft") already logged at
@@ -1406,6 +1436,53 @@ class AutoTuner:
         self._measure_config_cache.setdefault(tuning_config, {})[cache_key] = new_config
         return new_config
 
+    def _get_store_stack(self) -> list[Any]:
+        """Return the per-thread context-store stack, creating it on first access."""
+        local = self._store_local
+        if not hasattr(local, "stack"):
+            local.stack = []
+        return local.stack
+
+    @property
+    def _active_managed_store(self):
+        """The store lookups/publishes target right now.
+
+        Inside an autotune_v2 context this is that context's store (``None``
+        when the context was entered with ``persistent_cache=False`` — disk
+        is forbidden even if an ambient store is attached).  Outside any
+        context it is the ambient attached store, so serving keeps working
+        after warmup exits.
+        """
+        stack = getattr(self._store_local, "stack", None)
+        if stack:
+            return stack[-1]
+        return self._managed_cache
+
+    def _winner_cache(self) -> dict:
+        """In-memory winner-cache partition for the active MEASUREMENT identity.
+
+        Winners selected under one measurement policy must not short-circuit
+        tuning (or serving) under another: a graph-timed winner is not an
+        eager winner.  The partition follows the policy's manifest fields —
+        the same fields that isolate the on-disk environment — while disk
+        *targeting* separately follows the store stack.  With no
+        non-default policy active this is the plain v1 ``profiling_cache``
+        (byte-identical legacy behavior, and what v1 ``save_configs``
+        serializes).
+        """
+        policy = self._effective_measure_policy
+        fields = (
+            tuple(sorted(policy.manifest_fields().items()))
+            if policy is not None
+            else ()
+        )
+        if not fields:
+            return self.profiling_cache
+        part = self._winner_partitions.get(fields)
+        if part is None:
+            part = self._winner_partitions[fields] = {}
+        return part
+
     def _get_skip_ops_stack(self) -> list[frozenset[str]]:
         """Return the per-thread skip_ops stack, creating it on first access."""
         local = self._skip_ops_local
@@ -1519,10 +1596,12 @@ class AutoTuner:
             synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
-            # 1. In-memory cache (from live tuning). Keys are built lazily so
-            #    the common warm path (hit here) pays for exactly one key per
-            #    runner visited; a full miss leaves runner_keys complete for
-            #    the passes below.
+            # 1. In-memory cache (from live tuning), partitioned by the
+            #    active measurement identity — see _winner_cache.  Keys are
+            #    built lazily so the common warm path (hit here) pays for
+            #    exactly one key per runner visited; a full miss leaves
+            #    runner_keys complete for the passes below.
+            winners = self._winner_cache()
             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
             for r_id, r in enumerate(runners):
                 cache_key = AutoTuner._get_cache_key(
@@ -1533,8 +1612,8 @@ class AutoTuner:
                     r.get_cache_key_extras(inputs) if inputs is not None else (),
                 )
                 runner_keys.append((r_id, cache_key))
-                if cache_key in self.profiling_cache:
-                    tactic, stored_profile = self.profiling_cache[cache_key]
+                if cache_key in winners:
+                    tactic, stored_profile = winners[cache_key]
                     return True, r_id, tactic, stored_profile
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...))
@@ -1553,18 +1632,22 @@ class AutoTuner:
                         )
                     return True, r_id, tactic, None
 
-            # 2.5 Managed v2 per-entry store (active once autotune_v2 has
-            #     attached it); decoded hits are memoized so the hot path
+            # 2.5 Managed v2 per-entry store (the active context's store, or
+            #     the ambient attached store outside any context); decoded
+            #     hits are memoized per store identity so the hot path
             #     re-reads neither the filesystem nor JSON.
-            if self._managed_cache is not None:
+            managed_store = self._active_managed_store
+            if managed_store is not None:
+                store_id = (str(managed_store.root), managed_store.env_hash)
                 for r_id, cache_key in runner_keys:
                     file_key = cache_key.file_key
-                    hit = self._managed_decoded.get(file_key)
+                    memo_key = (*store_id, file_key)
+                    hit = self._managed_decoded.get(memo_key)
                     if hit is None:
-                        entry = self._managed_cache.lookup(file_key)
+                        entry = managed_store.lookup(file_key)
                         if entry is not None:
                             hit = (entry[0], _json_to_tactic(entry[1]))
-                            self._managed_decoded[file_key] = hit
+                            self._managed_decoded[memo_key] = hit
                     if hit is None:
                         continue
                     runner_name, tactic = hit
@@ -1762,7 +1845,7 @@ class AutoTuner:
                     # keys are ``str((custom_op, runner_class_name, profile))``,
                     # so we filter by ``custom_op`` on each.
                     op_has_profiling = any(
-                        k.custom_op == custom_op for k in self.profiling_cache
+                        k.custom_op == custom_op for k in self._winner_cache()
                     )
                     file_key_op_prefix = f"({repr(custom_op)}, "
                     op_has_file = any(
@@ -1959,12 +2042,13 @@ class AutoTuner:
                                 tuning_config,
                                 runners[runner_id].get_cache_key_extras(tensors),
                             )
-                            self.profiling_cache[cache_key] = (tactic, p)
+                            self._winner_cache()[cache_key] = (tactic, p)
                             self._dirty = True
                             self._dirty_seq += 1
-                            if self._managed_cache is not None:
+                            publish_store = self._active_managed_store
+                            if publish_store is not None:
                                 # Eager atomic publish; best-effort, never raises.
-                                self._managed_cache.publish(
+                                publish_store.publish(
                                     cache_key.file_key,
                                     cache_key.runner_class_name,
                                     _tactic_to_json(tactic),
@@ -2045,10 +2129,6 @@ class AutoTuner:
         # both the routing decision and pure_profile's delay-kernel skip
         # see the same policy.
         measure_policy = self._effective_measure_policy
-
-        input_tensor_batches = self._prepare_input_tensors_with_batches(
-            inputs, tuning_config
-        )
 
         stream = torch.cuda.current_stream()
         avg_time = float("inf")
@@ -2176,6 +2256,13 @@ class AutoTuner:
                         f"profiler for faithful measurements."
                     )
             if not use_cupti:
+                # Rotating input batches (up to ~3x L2 of clones under
+                # cold_l2) are only used by the event path; allocating them
+                # before the routing decision would double the transient
+                # footprint alongside the CUPTI path's own flush buffer.
+                input_tensor_batches = self._prepare_input_tensors_with_batches(
+                    inputs, tuning_config
+                )
                 with _profile_measurement_scope():
                     # warm up, no timing
                     for _ in range(self.warmup):
@@ -2816,6 +2903,7 @@ class AutoTuner:
             self._logged_cache_miss_oor.clear()
             self._dirty = False
             self._dirty_seq = 0
+            self._winner_partitions.clear()
             self._managed_decoded.clear()
             if self._managed_cache is not None:
                 # Forget memoized lookups so cleared keys re-probe disk.
