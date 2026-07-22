@@ -315,6 +315,36 @@ def quant_dequant_fp4_per_token_reference(
     return dequantized.float(), per_token_scale.to(tensor.device)
 
 
+def _dequantize_nvfp4_moe_weight(
+    weight: torch.Tensor,
+    weight_sf: torch.Tensor,
+    rows: int,
+    cols: int,
+) -> torch.Tensor:
+    from flashinfer.cute_dsl.utils import convert_sf_from_mma_layout
+    from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
+
+    num_experts = weight.shape[0]
+    swizzled_sf = convert_sf_from_mma_layout(
+        weight_sf,
+        m=rows,
+        k=cols,
+        num_groups=num_experts,
+        sf_vec_size=16,
+    )
+    dequantized = e2m1_and_ufp8sf_scale_to_float(
+        weight.reshape(num_experts * rows, cols // 2).cpu(),
+        swizzled_sf.cpu().reshape(-1),
+        torch.ones(1, dtype=torch.float32),
+        sf_vec_size=16,
+        ufp8_type=1,
+        is_sf_swizzled_layout=True,
+    )
+    return dequantized.to(device=weight.device, dtype=torch.bfloat16).reshape(
+        num_experts, rows, cols
+    )
+
+
 def compute_reference_moe_fp4(
     hidden_states: torch.Tensor,
     gemm1_weights: torch.Tensor,
@@ -337,6 +367,9 @@ def compute_reference_moe_fp4(
     swiglu_limit: float | None = None,
     gemm1_alpha: torch.Tensor | None = None,
     gemm2_alpha: torch.Tensor | None = None,
+    quant_mode: str = "w4a4",
+    gemm1_weight_sf: torch.Tensor | None = None,
+    gemm2_weight_sf: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute reference MoE output using PyTorch operations on GPU.
 
@@ -364,6 +397,9 @@ def compute_reference_moe_fp4(
         swiglu_limit: SwiGLU clamp limit.
         gemm1_alpha: GEMM1 per-expert scalar scales [num_local_experts]
         gemm2_alpha: GEMM2 per-expert scalar scales [num_local_experts]
+        quant_mode: Weight/activation contract, ``"w4a4"`` or ``"w4a16"``.
+        gemm1_weight_sf: W4A16 GEMM1 E4M3 block scales in MMA layout.
+        gemm2_weight_sf: W4A16 GEMM2 E4M3 block scales in MMA layout.
 
     Returns:
         Output tensor [num_tokens, hidden_size]
@@ -391,6 +427,35 @@ def compute_reference_moe_fp4(
 
     if num_local_experts is None:
         num_local_experts = num_experts
+
+    if quant_mode == "w4a16":
+        if gemm1_weight_sf is None or gemm2_weight_sf is None:
+            raise ValueError("W4A16 reference requires GEMM1 and GEMM2 weight scales")
+        # Decode only E2M1 x E4M3 to BF16. The FP32 per-expert scales stay in
+        # gemm1_alpha/gemm2_alpha and are applied to the FP32 accumulators below.
+        w1_rows = intermediate_size * (2 if gated else 1)
+        gemm1_weights = _dequantize_nvfp4_moe_weight(
+            gemm1_weights, gemm1_weight_sf, w1_rows, hidden_size
+        )
+        if gated:
+            group_size = 64
+            num_groups = intermediate_size // group_size
+            gemm1_weights = (
+                gemm1_weights.view(
+                    num_local_experts, num_groups, 2, group_size, hidden_size
+                )
+                .transpose(1, 2)
+                .contiguous()
+                .view(num_local_experts, w1_rows, hidden_size)
+            )
+        gemm2_weights = _dequantize_nvfp4_moe_weight(
+            gemm2_weights,
+            gemm2_weight_sf,
+            hidden_size,
+            intermediate_size,
+        )
+    elif quant_mode != "w4a4":
+        raise ValueError(f"Unsupported reference quant_mode {quant_mode!r}")
 
     device = hidden_states.device
 
