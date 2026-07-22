@@ -469,9 +469,13 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             self.epi_smem_layout_staged,
             tile_sched_params,
         ).launch(
+            # No cluster dims: an explicit cluster launch (even 1x1x1) is
+            # scheduled by the cluster work distributor, whose co-residency
+            # cap sits below the block-occupancy limit on SM12x (measured:
+            # 2 clusters/SM where 3 CTAs fit) and would silently defeat
+            # occupancy > 2 tactics.
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
-            cluster=[1, 1, 1],
             stream=stream,
             use_pdl=self.enable_pdl,
         )
@@ -494,7 +498,6 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         self.kernel_partial_reduce(partial, c).launch(
             grid=[reduce_grid, 1, 1],
             block=[self.reduce_threads_per_cta, 1, 1],
-            cluster=[1, 1, 1],
             stream=stream,
             use_pdl=self.enable_pdl,
         )
