@@ -80,13 +80,20 @@ class FuzzLedger:
     def find(self, cfg, backend: Optional[str] = None) -> Optional[Finding]:
         """Best entry matching this config (and backend, if scoped).
 
+        Scope contract: a backend-scoped entry matches ONLY when queried with
+        that exact backend — with ``backend=None`` (a config-level query,
+        before backends are even enumerated) scoped entries do NOT match, so
+        a backend-scoped quarantine never takes out the other, healthy
+        backends of the same config. Query per backend to apply scoped
+        entries (see ``skip_backend`` / the fuzzer's runner loop).
+
         Quarantine entries take priority over tolerated-wrong-answer entries
         regardless of declaration order: if any matching entry says "never
         launch", that is the safety contract that must win.
         """
         best: Optional[Finding] = None
         for f in self.findings:
-            if f.backend is not None and backend is not None and f.backend != backend:
+            if f.backend is not None and f.backend != backend:
                 continue
             if f.match(cfg):
                 if f.quarantine:
@@ -95,8 +102,24 @@ class FuzzLedger:
                     best = f
         return best
 
+    def skip_backend(self, cfg, backend: str) -> Optional[Finding]:
+        """Backend-scoped quarantine check for a per-runner loop.
+
+        Returns the quarantine Finding if this (config, backend) must not
+        launch, else None. Unlike :meth:`xfail_if_quarantined` (which xfails
+        the whole test and is meant for GLOBAL entries), the caller should
+        skip just this backend and keep testing the others.
+        """
+        f = self.find(cfg, backend=backend)
+        return f if (f is not None and f.quarantine) else None
+
     def xfail_if_quarantined(self, cfg, backend: Optional[str] = None) -> None:
-        """Call at the top of a fuzz case, BEFORE any kernel launch."""
+        """Call at the top of a fuzz case, BEFORE any kernel launch.
+
+        With ``backend=None`` this applies GLOBAL (unscoped) quarantine
+        entries only — backend-scoped entries are applied per-runner via
+        :meth:`skip_backend`.
+        """
         f = self.find(cfg, backend)
         if f is not None and f.quarantine:
             pytest.xfail(f"[{self.op}] quarantined (never run): {f.reason}")

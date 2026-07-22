@@ -1362,6 +1362,11 @@ def test_unified_moe_fuzz(cfg):
 
     n_ran = 0
     for runner in layer.runners:
+        # Backend-scoped crash quarantine: skip ONLY this runner (never launch
+        # it), keep testing the other backends of the same config. Global
+        # quarantines already xfailed the whole test at the top.
+        if LEDGER.skip_backend(cfg, runner.backend_key):
+            continue
         try:
             out = run(runner)
         except Exception as e:
