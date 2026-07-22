@@ -1170,10 +1170,13 @@ def _run_parallel_mode(
                 f"\nMode: real {mode.upper()}{world_size}, "
                 "timing=max rank CUDA events, cache=cold L2"
             )
-            print(
-                "global tokens | W4A4 + activation quant (ms) | "
-                "W4A16 (ms) | W4A16 / W4A4"
-            )
+            if selected_variant is None:
+                print(
+                    "global tokens | W4A4 + activation quant (ms) | "
+                    "W4A16 (ms) | W4A16 / W4A4"
+                )
+            else:
+                print(f"global tokens | {selected_variant.upper()} (ms)")
 
     max_tokens_per_rank_budget = None
     if mode == "ep":
@@ -1233,12 +1236,15 @@ def _run_parallel_mode(
             gc.collect()
             torch.cuda.empty_cache()
 
-        if rank == 0 and row:
+        if rank == 0 and len(row) == 2:
             ratio = row["w4a16"] / row["w4a4"]
             print(
                 f"{num_tokens:>13} | {row['w4a4']:>28.3f} | "
                 f"{row['w4a16']:>10.3f} | {ratio:>13.3f}x"
             )
+        elif rank == 0 and row:
+            value = row[selected_variant]
+            print(f"{num_tokens:>13} | {value:>11.3f}")
 
 
 def _run_distributed_benchmark(args, token_counts):
