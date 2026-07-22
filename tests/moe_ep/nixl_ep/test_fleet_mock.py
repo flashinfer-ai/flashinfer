@@ -71,6 +71,8 @@ def fake_buffer_cls():
         def update_memory_buffers(
             self, num_ranks, num_experts_per_rank, num_rdma_bytes
         ):
+            self.num_ranks = num_ranks
+            self.num_experts_per_rank = num_experts_per_rank
             self.calls.append(
                 (
                     "update_memory_buffers",
@@ -89,14 +91,28 @@ def fake_buffer_cls():
         def low_latency_dispatch(self, x, topk_idx, max_tokens, num_experts, **kw):
             import torch
 
+            kw = dict(kw, stream=torch.cuda.current_stream().cuda_stream)
             self.calls.append(("dispatch", max_tokens, num_experts, kw))
-            # Return (recv_x, recv_count, handle, event, hook).
+            # Return (recv_x, recv_count, handle, event, hook) with the real
+            # LL EXPERT_MAJOR recv shape [num_local, max_tokens * ranks, hidden].
+            num_local = self.num_experts_per_rank
             recv_x = torch.empty(
-                num_experts, max_tokens, x.size(1), dtype=x.dtype, device=x.device
+                num_local,
+                max_tokens * self.num_ranks,
+                x.size(1),
+                dtype=x.dtype,
+                device=x.device,
             )
-            recv_count = torch.tensor(
-                [max_tokens // num_experts] * num_experts, device=x.device
-            )
+            if kw.get("use_fp8"):
+                scales = torch.empty(
+                    num_local,
+                    max_tokens * self.num_ranks,
+                    x.size(1) // 128,
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+                recv_x = (recv_x.to(torch.float8_e4m3fn), scales)
+            recv_count = torch.zeros(num_local, dtype=torch.int32, device=x.device)
             handle = ("dummy_handle",)
             event = mock.Mock(current_stream_wait=mock.Mock())
             hook = mock.Mock()
@@ -239,5 +255,166 @@ def test_update_topology_diffs_ranks(patched_loader, fake_buffer_cls):
         (c for c in buf.calls if c[0] == "connect_ranks" and c[1] == [4, 5]), None
     )
     assert added is not None, f"expected connect_ranks([4, 5]) in {buf.calls}"
+
+    fake_buffer_cls.instances.clear()
+
+
+def _make_fleet(create_fleet, BootstrapConfig, FleetParams, knobs=(), **bs_kw):
+    bs_kw.setdefault("tcp_store", mock.Mock())
+    bootstrap = BootstrapConfig(world_size=4, rank=0, **bs_kw)
+    params = FleetParams(
+        num_experts=8,
+        max_tokens_per_rank=64,
+        token_hidden_size=4096,
+    )
+    return create_fleet(bootstrap, params, knobs, backend="nixl_ep")
+
+
+def test_dispatch_surfaces_counts_and_num_tokens(patched_loader, fake_buffer_cls):
+    import torch
+
+    _skip_unless_ep_capable()
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        DispatchInputParams,
+        FleetParams,
+        HandleParams,
+        create_fleet,
+    )
+
+    fleet = _make_fleet(create_fleet, BootstrapConfig, FleetParams)
+    topk = torch.zeros(64, 4, dtype=torch.int64, device="cuda")
+    h = fleet.create_handle(HandleParams(topk_ids=topk))
+    x = torch.randn(64, 4096, dtype=torch.bfloat16, device="cuda")
+    out = h.dispatch(DispatchInputParams(x=[x]))
+
+    # The library's recv counts must be surfaced, not discarded.
+    assert out.expert_counts is not None
+    assert out.expert_counts.shape == (2,)  # 8 experts / 4 ranks
+    assert out.expert_scales is None  # bf16 dispatch
+    # num_tokens is the per-expert row count of the recv buffer
+    # (max_tokens_per_rank * ranks — same semantics as nccl_ep LL).
+    assert out.get_num_tokens() == 64 * 4
+    assert out.get_num_tokens() == out.expert_tensors.size(1)
+
+    fake_buffer_cls.instances.clear()
+
+
+def test_dispatch_fp8_surfaces_scales(patched_loader, fake_buffer_cls):
+    import torch
+
+    _skip_unless_ep_capable()
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        DispatchInputParams,
+        FleetAlgoKnobQuantization,
+        FleetParams,
+        HandleParams,
+        QuantType,
+        create_fleet,
+    )
+
+    fleet = _make_fleet(
+        create_fleet,
+        BootstrapConfig,
+        FleetParams,
+        knobs=[FleetAlgoKnobQuantization(quants=frozenset({QuantType.FP8E4M3}))],
+    )
+    topk = torch.zeros(64, 4, dtype=torch.int64, device="cuda")
+    h = fleet.create_handle(HandleParams(topk_ids=topk))
+    x = torch.randn(64, 4096, dtype=torch.bfloat16, device="cuda")
+    out = h.dispatch(DispatchInputParams(x=[x]))
+
+    # use_fp8 reached the library, and the (data, scales) pair is surfaced.
+    disp = next(c for c in fake_buffer_cls.instances[-1].calls if c[0] == "dispatch")
+    assert disp[3]["use_fp8"] is True
+    assert out.expert_tensors.dtype == torch.float8_e4m3fn
+    assert out.expert_scales is not None
+    assert out.expert_scales.dtype == torch.float32
+
+    fake_buffer_cls.instances.clear()
+
+
+def test_user_stream_knob_redirects_dispatch(patched_loader, fake_buffer_cls):
+    import torch
+
+    _skip_unless_ep_capable()
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        DispatchInputParams,
+        FleetParams,
+        HandleAlgoKnobUserStream,
+        HandleParams,
+        create_fleet,
+    )
+
+    fleet = _make_fleet(create_fleet, BootstrapConfig, FleetParams)
+    topk = torch.zeros(64, 4, dtype=torch.int64, device="cuda")
+    side_stream = torch.cuda.Stream()
+    h = fleet.create_handle(
+        HandleParams(topk_ids=topk),
+        algo_knobs=[HandleAlgoKnobUserStream(stream=side_stream.cuda_stream)],
+    )
+    x = torch.randn(64, 4096, dtype=torch.bfloat16, device="cuda")
+    _ = h.dispatch(DispatchInputParams(x=[x]))
+
+    disp = next(c for c in fake_buffer_cls.instances[-1].calls if c[0] == "dispatch")
+    assert disp[3]["stream"] == side_stream.cuda_stream
+
+    fake_buffer_cls.instances.clear()
+
+
+def test_store_derived_from_default_group(patched_loader, fake_buffer_cls, tmp_path):
+    import torch.distributed as dist
+
+    _skip_unless_ep_capable()
+
+    from flashinfer.moe_ep import BootstrapConfig, FleetParams, create_fleet
+
+    if dist.is_initialized():
+        pytest.skip("needs an uninitialized torch.distributed")
+    dist.init_process_group(
+        "gloo",
+        store=dist.FileStore(str(tmp_path / "store"), 1),
+        rank=0,
+        world_size=1,
+    )
+    try:
+        bootstrap = BootstrapConfig(world_size=1, rank=0)
+        params = FleetParams(
+            num_experts=8,
+            max_tokens_per_rank=64,
+            token_hidden_size=4096,
+        )
+        _ = create_fleet(bootstrap, params, [], backend="nixl_ep")
+        buf = fake_buffer_cls.instances[-1]
+        # No tcp_store passed: the fleet derives a namespaced PrefixStore
+        # from the default store instead of erroring out.
+        assert isinstance(buf.tcp_store_group, dist.PrefixStore)
+    finally:
+        dist.destroy_process_group()
+        fake_buffer_cls.instances.clear()
+
+
+def test_missing_store_raises_without_dist(patched_loader, fake_buffer_cls):
+    import torch.distributed as dist
+
+    _skip_unless_ep_capable()
+
+    from flashinfer.moe_ep import BootstrapConfig, FleetParams, create_fleet
+
+    if dist.is_initialized():
+        pytest.skip("needs an uninitialized torch.distributed")
+    bootstrap = BootstrapConfig(world_size=4, rank=0)
+    params = FleetParams(
+        num_experts=8,
+        max_tokens_per_rank=64,
+        token_hidden_size=4096,
+    )
+    with pytest.raises(ValueError, match="rendezvous store"):
+        create_fleet(bootstrap, params, [], backend="nixl_ep")
 
     fake_buffer_cls.instances.clear()
