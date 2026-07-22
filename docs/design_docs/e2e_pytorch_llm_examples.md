@@ -140,6 +140,18 @@ This is the actual point of the exercise. Checks, each cheap and scriptable:
   ~404 tok/s batch-3 decode. One portability fix: transformers v5 changed
   `apply_chat_template`'s tokenized return type, so the example now renders
   the template to text and tokenizes explicitly.
+- **2026-07-22** — Phase 2 (MoE) validated on B200. `reference_check.py`
+  results vs transformers eager (bf16, tolerance 0.05 rel-L2):
+  dense 0.008–0.010, MoE 0.007–0.039, top-1 agreement at every length;
+  tiny-MoE decode loop deterministic. The check caught a real bug on its
+  first run: transformers v5 moved rope config into nested
+  `rope_parameters` (and renamed the expert count to `num_local_experts`),
+  so the old flat-schema read silently used rope_theta=1e4 for v5-saved
+  checkpoints — a with-length-growing logits divergence (0.16→0.64) that
+  the HF-bf16-vs-fp32 baseline (~0.007, flat) proved was ours. Older
+  checkpoints (all real HF models tested) were unaffected. Also measured:
+  the `fused_moe_100` module is by far the heaviest JIT unit (267 objects,
+  ~1 h cold compile at 30-way parallelism on the shared node).
 
 ## Roadmap
 
