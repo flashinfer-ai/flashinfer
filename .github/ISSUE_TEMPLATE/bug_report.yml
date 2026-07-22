@@ -1,0 +1,66 @@
+name: 🐛 Bug Report
+description: >
+  Report something broken, wrong, or slower than it used to be — correctness
+  issues, crashes, build/install failures, or performance regressions. For new
+  capabilities or speedups, use 🚀 Kernel / Feature Request instead.
+labels: ["bug"]
+body:
+  - type: checkboxes
+    id: presubmit
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have searched existing issues and did not find a solution or an existing report.
+          required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >
+        Run `python -m flashinfer.collect_env` (or `flashinfer collect-env`)
+        in the exact environment (same venv/container) where the bug
+        reproduces and paste the full output below. If `import flashinfer` itself is broken, download the
+        standalone script and run it with plain Python:
+        `curl -OL https://raw.githubusercontent.com/flashinfer-ai/flashinfer/main/flashinfer/collect_env.py && python collect_env.py`.
+        The report includes which cuDNN/cuBLAS/CUDA libraries are *actually
+        loaded* vs merely installed — this resolves most "works on my machine"
+        divergence, so please don't trim it.
+      render: text
+      placeholder: Paste the full output of `python -m flashinfer.collect_env` here.
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug description
+      description: What happened, and what did you expect to happen instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: >
+        Smallest self-contained script that reproduces the issue — a short
+        standalone Python script is far more actionable than a full
+        `vllm serve ...` invocation. Include exact shapes/dtypes and the
+        backend selected (fa2/fa3/cudnn/trtllm/cutlass/...).
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error messages / logs
+      description: >
+        Stack trace, error output, or logs. If the failure involves JIT
+        compilation, re-run with `FLASHINFER_JIT_VERBOSE=1` and include that
+        log.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Related issues, workarounds you tried, anything else useful.

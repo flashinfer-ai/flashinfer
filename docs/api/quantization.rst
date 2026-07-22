@@ -42,6 +42,7 @@ layout helpers used by the FP4 GEMM/MoE pipelines.
     block_scale_interleave
     e2m1_and_ufp8sf_scale_to_float
     scaled_fp4_grouped_quantize
+    silu_and_mul_nvfp4_quantize
     shuffle_matrix_a
     shuffle_matrix_sf_a
 

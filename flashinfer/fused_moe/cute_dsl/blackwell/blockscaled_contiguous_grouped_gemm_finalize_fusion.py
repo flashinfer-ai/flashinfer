@@ -39,6 +39,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .utils import (
+    blk_copy,
     blk_reduce_bf16,
     blk_reduce_fp16,
     blk_reduce_fp32,
@@ -362,6 +363,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         raster_along_m: bool = False,
         enable_pdl: bool = True,
         use_a_per_token_scale: bool = False,
+        use_fused_finalize: bool = True,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -384,6 +386,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.sf_vec_size = sf_vec_size
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
+        self.use_fused_finalize = use_fused_finalize
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -1963,11 +1966,15 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     is_valid_row = cutlass.Int32(permuted_row < tile_info[4])
                     gather_tok = token_idx * is_valid_row
                     token_scale = token_final_scales[(gather_tok, topk_idx)]
+                    output_idx = token_idx
+                    if cutlass.const_expr(not self.use_fused_finalize):
+                        token_scale = self.final_scale_dtype(1.0)
+                        output_idx = safe_idx
                     if cutlass.const_expr(self.use_a_per_token_scale):
                         token_scale = cutlass.Float32(token_scale) * cutlass.Float32(
                             a_per_token_scale[permuted_row]
                         )
-                    sMetaTokenIdx[(r, meta_stage)] = token_idx
+                    sMetaTokenIdx[(r, meta_stage)] = output_idx
                     sMetaScale[(r, meta_stage)] = alpha_val * token_scale
                 cute.arch.fence_proxy("async.shared", space="cta")
                 meta_pipeline.producer_commit(meta_producer_state)
@@ -2137,7 +2144,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 if is_partial_tile:
                     self.epilog_sync_barrier.arrive_and_wait()
 
-                # Whole-row async bulk reduce (smem -> global scatter-add).
+                # Write expanded rows directly or atomically reduce into token rows.
                 reduce_row = epi_tidx
                 if is_partial_tile:
                     reduce_row = (epi_tidx % self.threads_per_warp) * len(
@@ -2153,7 +2160,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     scatter_out_offset = cute.domain_offset(
                         (reduce_token_idx, coord_n, 0), out
                     )
-                    if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
+                    if cutlass.const_expr(not self.use_fused_finalize):
+                        blk_copy(
+                            scatter_out_offset,
+                            sC[reduce_row, None, 0],
+                            cutlass.Int32(self.copy_size),
+                        )
+                    elif cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
                         blk_reduce_bf16(
                             scatter_out_offset,
                             sC[reduce_row, None, 0],
@@ -2793,8 +2806,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
             ),
         )
+        output_rows = num_tokens
+        if cutlass.const_expr(not self.use_fused_finalize):
+            output_rows = num_tokens * top_k
         c = cute.make_tensor(
-            c_ptr, layout=cute.make_ordered_layout((num_tokens, n, 1), order=(1, 0, 2))
+            c_ptr, layout=cute.make_ordered_layout((output_rows, n, 1), order=(1, 0, 2))
         )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
 

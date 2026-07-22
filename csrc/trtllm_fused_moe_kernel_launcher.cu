@@ -20,7 +20,11 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <set>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -261,7 +265,6 @@ class FusedMoeLauncher {
   btg::Dtype mRoutingLogitsDtype{btg::Dtype::Bfloat16};
   bool norm_topk_prob{true};
   ActivationType activation_type{ActivationType::Swiglu};
-  btg::Dtype mDtypeScore{btg::Dtype::Bfloat16};
 
   // Optional routing replay output: [num_tokens, top_k] int16 tensor
   Optional<TensorView> routing_replay_out;
@@ -490,15 +493,6 @@ class FusedMoeLauncher {
     workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
     workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
     workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
-
-    // Set dtype of score based on actual routing_logits dtype
-    if (routing_logits.has_value()) {
-      if (routing_logits.value().dtype() == dl_float32) {
-        mDtypeScore = btg::Dtype::Fp32;
-      } else {
-        mDtypeScore = btg::Dtype::Bfloat16;
-      }
-    }
   }
 
   void check_moe_common() const {
@@ -516,7 +510,8 @@ class FusedMoeLauncher {
   Tensor workspace_fc2;
   Tensor output;
   int64_t moe_tactic{-1};
-  std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> moe_runner;
+  // Non-owning; points into the thread-local runner cache in prepare_moe_common().
+  tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner* moe_runner{nullptr};
 
   void prepare_moe_common(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
@@ -532,19 +527,56 @@ class FusedMoeLauncher {
     // gemm1 bias, use the weights-only Runner constructor to match the original kernel
     // path and numerics. DSFp8 + biasMn routes through the unified constructor below
     // (which accepts gemm1_bias_type).
-    if (this->mDtypeAct == btg::Dtype::E4m3 && this->mDtypeWeights == btg::Dtype::E4m3 &&
-        args->mUseDeepSeekFp8 && args->gemm1_bias_type == batchedGemm::gemm::BiasType::None) {
-      moe_runner = std::make_unique<RunnerType>(this->mDtypeWeights, args->mUseDeepSeekFp8,
-                                                (int32_t)tile_tokens_dim, this->use_shuffled_weight,
-                                                this->weight_layout, usePerTokenScalingGemm1,
-                                                usePerTokenScalingGemm2, false, false);
-    } else {
-      moe_runner = std::make_unique<RunnerType>(
-          this->mDtypeAct, this->mDtypeWeights, this->mDtypeGemm1Output.value_or(this->mDtypeAct),
-          args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim, this->activation_type,
-          this->use_shuffled_weight, this->weight_layout, args->gemm1_bias_type,
-          usePerTokenScalingGemm1, usePerTokenScalingGemm2);
+    bool const useWeightsOnlyConstructor =
+        this->mDtypeAct == btg::Dtype::E4m3 && this->mDtypeWeights == btg::Dtype::E4m3 &&
+        args->mUseDeepSeekFp8 && args->gemm1_bias_type == batchedGemm::gemm::BiasType::None;
+    bool constexpr usePerChannelScalingGemm1 = false;
+    bool constexpr usePerChannelScalingGemm2 = false;
+
+    // A Runner contains only constructor-derived kernel metadata and config indices. Reuse it on
+    // the same host thread instead of rebuilding and filtering the global config table per call.
+    std::tuple const runnerKey{static_cast<int64_t>(this->mDtypeAct),
+                               static_cast<int64_t>(this->mDtypeWeights),
+                               args->mUseDeepSeekFp8,
+                               static_cast<int32_t>(tile_tokens_dim),
+                               static_cast<int64_t>(this->activation_type),
+                               this->use_shuffled_weight,
+                               static_cast<int64_t>(this->weight_layout),
+                               static_cast<int64_t>(args->gemm1_bias_type),
+                               usePerTokenScalingGemm1,
+                               usePerTokenScalingGemm2,
+                               usePerChannelScalingGemm1,
+                               usePerChannelScalingGemm2,
+                               useWeightsOnlyConstructor,
+                               std::get<0>(device_version),
+                               std::get<1>(device_version),
+                               hidden_states.device().device_id};
+    using RunnerCacheKey = std::remove_const_t<decltype(runnerKey)>;
+    static thread_local std::map<RunnerCacheKey, RunnerType> runnerCache;
+
+    auto runnerIt = runnerCache.find(runnerKey);
+    if (runnerIt == runnerCache.end()) {
+      if (useWeightsOnlyConstructor) {
+        runnerIt =
+            runnerCache
+                .try_emplace(runnerKey, this->mDtypeWeights, args->mUseDeepSeekFp8,
+                             static_cast<int32_t>(tile_tokens_dim), this->use_shuffled_weight,
+                             this->weight_layout, usePerTokenScalingGemm1, usePerTokenScalingGemm2,
+                             usePerChannelScalingGemm1, usePerChannelScalingGemm2)
+                .first;
+      } else {
+        runnerIt = runnerCache
+                       .try_emplace(runnerKey, this->mDtypeAct, this->mDtypeWeights,
+                                    this->mDtypeGemm1Output.value_or(this->mDtypeAct),
+                                    args->mUseDeepSeekFp8, static_cast<int32_t>(tile_tokens_dim),
+                                    this->activation_type, this->use_shuffled_weight,
+                                    this->weight_layout, args->gemm1_bias_type,
+                                    usePerTokenScalingGemm1, usePerTokenScalingGemm2,
+                                    usePerChannelScalingGemm1, usePerChannelScalingGemm2)
+                       .first;
+      }
     }
+    moe_runner = &runnerIt->second;
 
     int32_t const effectiveTopK = args->top_k + args->num_fused_shared_experts;
     int32_t const effectiveLocalExperts = args->local_num_experts + args->num_fused_shared_experts;
@@ -554,13 +586,10 @@ class FusedMoeLauncher {
                                                           args->intermediate_size,
                                                           effectiveLocalExperts, args->num_tokens);
     }
-    auto valid_cfgs =
-        moe_runner->getValidConfigIndices(effectiveTopK, args->hidden_size, args->intermediate_size,
-                                          effectiveLocalExperts, args->num_tokens);
-    auto valid_it = std::find(valid_cfgs.begin(), valid_cfgs.end(), moe_tactic);
-    FLASHINFER_CHECK(valid_it != valid_cfgs.end(), "Invalid MoE tactic ", moe_tactic,
-                     " for tile_N=", tile_tokens_dim, ". Number of valid tactics for this tile is ",
-                     valid_cfgs.size(),
+    FLASHINFER_CHECK(moe_runner->isValidConfigIndex(moe_tactic, effectiveTopK, args->hidden_size,
+                                                    args->intermediate_size, effectiveLocalExperts,
+                                                    args->num_tokens),
+                     "Invalid MoE tactic ", moe_tactic, " for tile_N=", tile_tokens_dim,
                      ". This often indicates a stale or mismatched autotuner cache entry.");
     this->moe_tactic = moe_tactic;
 
@@ -599,6 +628,7 @@ class FusedMoeLauncher {
   virtual Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
                             bool use_routing_scales_on_input = false,
                             bool use_deep_seek_fp8 = false, bool return_activation_output = false) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
     prepare_routing();
 
@@ -787,9 +817,12 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     if (has_precomputed_weights) {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
     } else {
-      auto ew_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
+      // Allocate the routing-output buffer as bf16 to match the kernel's output
+      // (mDtypeOutput is always Bfloat16 in trtllm_fused_moe_runner.cu, never the
+      // logits dtype); a fp32 alloc would mislabel bf16 data when this buffer is
+      // surfaced to the caller verbatim on do_finalize=false. See #3595.
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, ew_dtype, hidden_states.device());
+          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
   }
@@ -954,9 +987,12 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     mRoutingLogitsDtype =
         routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
-    auto expert_weights_dtype = mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
+    // Allocate the routing-output buffer as bf16 to match the kernel's output
+    // (always Bfloat16, never the logits dtype); a fp32 alloc would mislabel bf16
+    // data when this buffer is surfaced to the caller verbatim on
+    // do_finalize=false. See #3595.
     expert_weights =
-        alloc_tensor({args->num_tokens, args->top_k}, expert_weights_dtype, hidden_states.device());
+        alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
 
     workspace.expert_weights = expert_weights.data_ptr();
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
@@ -1255,9 +1291,12 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
     bool has_precomputed_weights = expert_weights.ndim() == 2 && expert_weights.size(0) > 0;
     if (!has_precomputed_weights) {
-      auto ew_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
-      FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, totalExpertsPerToken}, ew_dtype, hidden_states.device());
+      // Allocate the routing-output buffer as bf16 to match the kernel's output
+      // (always Bfloat16, never the logits dtype); a fp32 alloc would mislabel
+      // bf16 data when this buffer is surfaced to the caller verbatim on
+      // do_finalize=false. See #3595.
+      FusedMoeLauncher::expert_weights = alloc_tensor({args->num_tokens, totalExpertsPerToken},
+                                                      dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     } else {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
@@ -1432,6 +1471,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
                     bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
                     bool return_activation_output = false) override {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
     prepare_routing();
 
@@ -1627,9 +1667,12 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
     if (has_precomputed_weights) {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
     } else {
-      auto ew_dtype = mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
+      // Allocate the routing-output buffer as bf16 to match the kernel's output
+      // (always Bfloat16, never the logits dtype); a fp32 alloc would mislabel
+      // bf16 data when this buffer is surfaced to the caller verbatim on
+      // do_finalize=false. See #3595.
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, ew_dtype, hidden_states.device());
+          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
   }
@@ -1796,6 +1839,13 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   void check_routing() const override {
     // First call base class common routing checks
     FusedMoeLauncher::check_routing_common();
+
+    if (routing_input_mode_ == RoutingInputMode::UnpackedPrecomputed) {
+      TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32)
+          << "topk_ids must be int32 for unpacked precomputed routing.";
+      TVM_FFI_ICHECK(topk_weights.dtype() == dl_bfloat16 || topk_weights.dtype() == dl_float32)
+          << "topk_weights must be bfloat16 or float32 for unpacked precomputed routing.";
+    }
   }
 
   void prepare_routing() override {
@@ -1841,6 +1891,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         routing_logits.has_value() ? routing_logits.value().dtype() : dl_bfloat16;
     mRoutingLogitsDtype =
         routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+
+    if (routing_input_mode_ == RoutingInputMode::UnpackedPrecomputed) {
+      args->mDtypeExpW =
+          topk_weights.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+    }
   }
 
   void check_moe() const override {
@@ -2008,6 +2063,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
                     bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
                     bool return_activation_output = false) override {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     TVM_FFI_ICHECK(!return_activation_output)
         << "return_activation_output is not supported for FP4 block-scale MoE";
     check_routing();

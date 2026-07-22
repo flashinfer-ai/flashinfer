@@ -28,7 +28,7 @@ einops
 nccl4py>=0.3.1
 ninja
 numpy
-nvidia-cudnn-frontend>=1.13.0
+nvidia-cudnn-frontend>=1.25.0
 nvidia-cutlass-dsl>=4.5.0
 nvidia-ml-py
 packaging>=24.2

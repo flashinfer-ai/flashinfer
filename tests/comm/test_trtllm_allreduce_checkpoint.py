@@ -1,9 +1,38 @@
 import socket
+import sys
+from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+
+def test_protocol_restore_resets_inference_flags(monkeypatch) -> None:
+    from flashinfer.comm.allreduce import MNNVLAllReduceFusionWorkspace
+    from flashinfer.comm.workspace_base import AllReduceFusionWorkspace
+
+    workspace = object.__new__(MNNVLAllReduceFusionWorkspace)
+    AllReduceFusionWorkspace.__init__(workspace, world_size=1, rank=0)
+    workspace.handle = type(
+        "Handle",
+        (),
+        {"lamport_initialize": lambda self, rank, dtype: None},
+    )()
+    workspace.buffer_size_bytes = 1024
+    with torch.inference_mode():
+        workspace.buffer_flags = torch.ones(9, dtype=torch.uint32)
+    workspace._destroyed = True
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    assert torch.is_inference(workspace.buffer_flags)
+    assert not torch.is_inference_mode_enabled()
+    workspace._initialize_protocol()
+    assert not torch.is_inference_mode_enabled()
+    assert torch.equal(
+        workspace.buffer_flags,
+        torch.tensor([0, 2, 1024, 0, 0, 0, 0, 0, 0], dtype=torch.uint32),
+    )
 
 
 def test_checkpoint_lifecycle_rejects_torch_symmetric_memory_backing() -> None:
@@ -112,6 +141,12 @@ def _run_worker(
 def test_graph_replay_after_symmetric_memory_remap(
     num_tokens: int, use_oneshot: bool
 ) -> None:
+    # mp.spawn starts fresh interpreters that need to re-import this module;
+    # ensure the repo root is on sys.path so 'tests.comm' is findable.
+    repo_root = str(Path(__file__).resolve().parents[2])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     mp.spawn(
         _run_worker,
         args=(2, _free_port(), num_tokens, use_oneshot),

@@ -26,7 +26,7 @@ from .api_logging import flashinfer_api
 from .trace.templates.attention import (
     gqa_paged_decode_trace,
     single_decode_with_kv_cache_trace,
-    trtllm_batch_decode_trace,
+    trtllm_batch_decode_trace_dispatch,
     xqa_batch_decode_trace,
 )
 
@@ -2841,6 +2841,7 @@ class TrtllmGenDecodeModule:
             lse,
             lse_stride_tokens,
             lse_stride_heads,
+            False,  # enable_block_sparse_attention
         )
         return out
 
@@ -3000,7 +3001,7 @@ def get_trtllm_gen_decode_module(*args):
     )
 
 
-@flashinfer_api(trace=trtllm_batch_decode_trace)
+@flashinfer_api(trace=trtllm_batch_decode_trace_dispatch)
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -3031,6 +3032,7 @@ def trtllm_batch_decode_with_kv_cache(
     return_lse: bool = False,
     bmm1_scale_log2: Optional[torch.Tensor] = None,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    enable_block_sparse_attention: bool = False,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -3060,9 +3062,17 @@ def trtllm_batch_decode_with_kv_cache(
         When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
         When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
         where dim 1 distinguishes K (0) and V (1) page indices.
+        When ``enable_block_sparse_attention`` is True: shape
+        ``[num_kv_heads, batch_size, max_num_pages_per_seq]`` (contiguous), where each row holds
+        the page indices *selected* for that (kv head, sequence) pair, packed densely at the
+        front of the row in ascending original order; the remaining entries are ignored.
 
     seq_lens : torch.Tensor
-        A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
+        A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
+        When ``enable_block_sparse_attention`` is True: shape ``[num_kv_heads, batch_size]``
+        (contiguous), holding the number of *surviving* kv tokens per (kv head, sequence) pair
+        after dropping the non-selected pages. Since selected pages are packed in ascending
+        order, only the final selected page of a row may be partially filled.
 
     max_seq_len : int
         max sequence length for kv_cache
@@ -3184,6 +3194,16 @@ def trtllm_batch_decode_with_kv_cache(
         ``torch.zeros``); the kernel self-resets the counters at the end of each
         launch, so it does not need to be re-zeroed between calls.
 
+    enable_block_sparse_attention : bool = False
+        Whether to use block-sparse attention with different sparse KV pages per KV head.
+        Only supported by the ``trtllm-gen`` backend. When True, ``block_tables`` and
+        ``seq_lens`` are extended with a leading ``num_kv_heads`` dimension (see their
+        docs above); each KV head only attends to the pages listed in its own row.
+        ``max_seq_len`` should be the maximum surviving kv length across all
+        (kv head, sequence) pairs (the dense maximum is a safe upper bound).
+        Not compatible with sliding window (``window_left != -1``),
+        ``skip_softmax_threshold_scale_factor``, or ``uses_shared_paged_kv_idx=False``.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -3241,6 +3261,23 @@ def trtllm_batch_decode_with_kv_cache(
 
     if backend != "trtllm-gen" and bmm1_scale_log2 is not None:
         raise ValueError("bmm1_scale_log2 is only supported by the trtllm-gen backend")
+
+    if enable_block_sparse_attention:
+        if backend != "trtllm-gen":
+            raise ValueError(
+                "enable_block_sparse_attention is only supported by the trtllm-gen "
+                f"backend, got backend={backend!r}"
+            )
+        if window_left != -1:
+            raise ValueError(
+                "block-sparse attention does not support sliding window "
+                "(window_left must be -1)"
+            )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "block-sparse attention does not support "
+                "skip_softmax_threshold_scale_factor"
+            )
 
     if backend == "xqa":
         # xqa backend doesn't support nvfp4 output
@@ -3391,7 +3428,26 @@ def trtllm_batch_decode_with_kv_cache(
             assert max_q_len is not None
             batch_size = cum_seq_lens_q.size(0) - 1
 
-        _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
+        num_kv_heads = k_cache.size(-3)
+        _check_block_tables_shape(
+            block_tables,
+            uses_shared_paged_kv_idx,
+            block_sparse=enable_block_sparse_attention,
+            num_kv_heads=num_kv_heads,
+            batch_size=batch_size,
+        )
+        if enable_block_sparse_attention:
+            if seq_lens.shape != (num_kv_heads, batch_size):
+                raise ValueError(
+                    "block-sparse attention expects seq_lens of shape "
+                    f"[num_kv_heads, batch_size] = [{num_kv_heads}, {batch_size}], "
+                    f"got {tuple(seq_lens.shape)}"
+                )
+            if not seq_lens.is_contiguous() or not block_tables.is_contiguous():
+                raise ValueError(
+                    "block-sparse attention requires contiguous seq_lens and "
+                    "block_tables tensors"
+                )
 
         num_qo_heads = query.size(1)
         multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
@@ -3446,6 +3502,7 @@ def trtllm_batch_decode_with_kv_cache(
             lse,
             lse_stride_tokens,
             lse_stride_heads,
+            enable_block_sparse_attention,
         )
 
         result_out = (
