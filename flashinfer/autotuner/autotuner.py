@@ -20,10 +20,14 @@ from typing import (
     Iterable,
     Optional,
     Sequence,
+    TYPE_CHECKING,
     TypeAlias,
 )
 
 import torch
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
 
 from flashinfer.tllm_utils import delay_kernel
 from flashinfer.utils import (
@@ -648,7 +652,7 @@ def autotune(
     tuning_buckets: tuple[int, ...] | None = None,
     round_up: bool | None = None,
     skip_ops: str | set[str] | None = None,
-    distributed_process_group: Any | None = None,
+    distributed_process_group: "Optional[ProcessGroup]" = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -1128,10 +1132,12 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         # Relative speed-up an explicit tactic must beat the op's built-in
         # heuristic-default (tactic=-1) by before the autotuner switches away
-        # from that default.  This guarantees the tuned choice is *never slower
-        # than default* (the autotuner keeps the default unless a tactic is
-        # genuinely faster) and removes run-to-run / cross-rank flapping among
-        # near-tied tactics.  Override via FLASHINFER_AUTOTUNE_SWITCH_MARGIN
+        # from that default.  This strongly biases toward the default -- it is
+        # kept unless a tactic profiled meaningfully faster -- which empirically
+        # makes the tuned choice very unlikely to be slower than default and
+        # damps run-to-run / cross-rank flapping among near-tied tactics (it is
+        # not a hard guarantee; selection is based on noisy measurements).
+        # Override via FLASHINFER_AUTOTUNE_SWITCH_MARGIN
         # (e.g. "0.0" to restore pure fastest-wins behavior).
         self.switch_margin = max(
             0.0, float(os.environ.get("FLASHINFER_AUTOTUNE_SWITCH_MARGIN", "0.03"))
@@ -1655,9 +1661,10 @@ class AutoTuner:
                         # on the fallback runner (runners[0]) up-front and use it
                         # as the baseline.  An explicit tactic is only adopted when
                         # it beats this baseline by ``switch_margin`` (decision made
-                        # after the loop) -- this guarantees the tuned choice is
-                        # *never slower than default* and removes run-to-run /
-                        # cross-rank flapping among near-tied tactics.
+                        # after the loop) -- this strongly biases toward default so
+                        # the tuned choice is empirically very unlikely to be slower
+                        # than default, and damps run-to-run / cross-rank flapping
+                        # among near-tied tactics.
                         default_time = float("inf")
                         _default_runner = runners[0]
                         if "do_preparation" in runner_arg_names_map[_default_runner]:
@@ -1869,7 +1876,9 @@ class AutoTuner:
         )
 
     def _maybe_sync_distributed_cache(
-        self, process_group: Any = None, local_had_exception: bool = False
+        self,
+        process_group: "Optional[ProcessGroup]" = None,
+        local_had_exception: bool = False,
     ) -> None:
         """Align the profiling cache across EP/TP ranks.
 
