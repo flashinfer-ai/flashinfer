@@ -214,7 +214,7 @@ def record_knobs(
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
             raise
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         warnings.warn(
             f"[moe_ep-knob-cache] could not write {path!r}: {exc}",
             RuntimeWarning,
