@@ -159,8 +159,19 @@ def _load_state_dict(ckpt_dir: Path) -> Dict[str, torch.Tensor]:
 
 
 class DecoderLayerWeights:
+    """Per-layer weights, sharded at load time when tp_size > 1 (TEP style:
+    attention heads and dense-FFN intermediate are tensor-parallel; MoE
+    experts are expert-parallel across the same ranks)."""
+
     def __init__(
-        self, sd: Dict[str, torch.Tensor], i: int, device, dtype, config: "ModelConfig"
+        self,
+        sd: Dict[str, torch.Tensor],
+        i: int,
+        device,
+        dtype,
+        config: "ModelConfig",
+        tp_size: int = 1,
+        tp_rank: int = 0,
     ):
         p = f"model.layers.{i}."
 
@@ -172,25 +183,36 @@ class DecoderLayerWeights:
                 return None
             return sd[key].to(device=device, dtype=dtype)
 
+        def shard(t: Optional[torch.Tensor], dim: int) -> Optional[torch.Tensor]:
+            if t is None or tp_size == 1:
+                return t
+            return t.chunk(tp_size, dim=dim)[tp_rank].contiguous()
+
         self.input_layernorm = get("input_layernorm.weight")
         self.post_attention_layernorm = get("post_attention_layernorm.weight")
-        self.q_proj = get("self_attn.q_proj.weight")
-        self.k_proj = get("self_attn.k_proj.weight")
-        self.v_proj = get("self_attn.v_proj.weight")
-        self.o_proj = get("self_attn.o_proj.weight")
+        # Column-parallel QKV (head-contiguous rows), row-parallel o_proj.
+        self.q_proj = shard(get("self_attn.q_proj.weight"), 0)
+        self.k_proj = shard(get("self_attn.k_proj.weight"), 0)
+        self.v_proj = shard(get("self_attn.v_proj.weight"), 0)
+        self.o_proj = shard(get("self_attn.o_proj.weight"), 1)
         # Qwen2-family checkpoints carry QKV bias; Llama/Qwen3 do not.
-        self.q_bias = get("self_attn.q_proj.bias", required=False)
-        self.k_bias = get("self_attn.k_proj.bias", required=False)
-        self.v_bias = get("self_attn.v_proj.bias", required=False)
-        # Qwen3 per-head q/k RMSNorm over head_dim.
+        self.q_bias = shard(get("self_attn.q_proj.bias", required=False), 0)
+        self.k_bias = shard(get("self_attn.k_proj.bias", required=False), 0)
+        self.v_bias = shard(get("self_attn.v_proj.bias", required=False), 0)
+        # Qwen3 per-head q/k RMSNorm over head_dim: replicated (shape [head_dim]).
         self.q_norm = get("self_attn.q_norm.weight", required=False)
         self.k_norm = get("self_attn.k_norm.weight", required=False)
         self.is_sparse = config.is_sparse_layer(i)
         if self.is_sparse:
             self.gate_proj = self.up_proj = self.down_proj = None
-            self.moe_gate = get("mlp.gate.weight")  # router, [num_experts, hidden]
+            # Router is replicated; every rank computes the global routing.
+            self.moe_gate = get("mlp.gate.weight")  # [num_experts, hidden]
+            # Expert-parallel: this rank holds experts
+            # [tp_rank * E/tp, (tp_rank+1) * E/tp).
+            experts_per_rank = config.num_experts // tp_size
+            expert_start = tp_rank * experts_per_rank
             w31, w2 = [], []
-            for j in range(config.num_experts):
+            for j in range(expert_start, expert_start + experts_per_rank):
                 ep = f"{p}mlp.experts.{j}."
                 gate = sd[ep + "gate_proj.weight"].to(device=device, dtype=dtype)
                 up = sd[ep + "up_proj.weight"].to(device=device, dtype=dtype)
@@ -200,13 +222,14 @@ class DecoderLayerWeights:
                 # silu(x @ w1.T) * (x @ w3.T) internally.
                 w31.append(torch.cat([up, gate], dim=0))
                 w2.append(down)
-            self.moe_w31 = torch.stack(w31).contiguous()  # [E, 2*I, H]
-            self.moe_w2 = torch.stack(w2).contiguous()  # [E, H, I]
+            self.moe_w31 = torch.stack(w31).contiguous()  # [E_local, 2*I, H]
+            self.moe_w2 = torch.stack(w2).contiguous()  # [E_local, H, I]
         else:
             self.moe_gate = self.moe_w31 = self.moe_w2 = None
-            self.gate_proj = get("mlp.gate_proj.weight")
-            self.up_proj = get("mlp.up_proj.weight")
-            self.down_proj = get("mlp.down_proj.weight")
+            # Column-parallel gate/up, row-parallel down.
+            self.gate_proj = shard(get("mlp.gate_proj.weight"), 0)
+            self.up_proj = shard(get("mlp.up_proj.weight"), 0)
+            self.down_proj = shard(get("mlp.down_proj.weight"), 1)
 
 
 class FlashInferLLM:
@@ -223,10 +246,25 @@ class FlashInferLLM:
         state_dict: Dict[str, torch.Tensor],
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
+        tp_size: int = 1,
+        tp_rank: int = 0,
     ):
         self.config = config
         self.device = device
         self.dtype = dtype
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        if tp_size > 1:
+            if config.num_attention_heads % tp_size:
+                raise ValueError("num_attention_heads must divide by tp_size")
+            if config.num_key_value_heads % tp_size:
+                raise ValueError("num_key_value_heads must divide by tp_size")
+            if config.intermediate_size % tp_size:
+                raise ValueError("intermediate_size must divide by tp_size")
+            if config.is_moe and config.num_experts % tp_size:
+                raise ValueError("num_experts must divide by tp_size (TP=EP)")
+        self.num_local_qo_heads = config.num_attention_heads // tp_size
+        self.num_local_kv_heads = config.num_key_value_heads // tp_size
         self.embed_tokens = state_dict["model.embed_tokens.weight"].to(
             device=device, dtype=dtype
         )
@@ -236,9 +274,15 @@ class FlashInferLLM:
         else:
             self.lm_head = state_dict["lm_head.weight"].to(device=device, dtype=dtype)
         self.layers = [
-            DecoderLayerWeights(state_dict, i, device, dtype, config)
+            DecoderLayerWeights(state_dict, i, device, dtype, config, tp_size, tp_rank)
             for i in range(config.num_hidden_layers)
         ]
+
+    def _maybe_all_reduce(self, t: torch.Tensor) -> torch.Tensor:
+        """Sum partial results across the TP=EP group (no-op when tp_size==1)."""
+        if self.tp_size > 1:
+            torch.distributed.all_reduce(t)
+        return t
 
     @classmethod
     def from_pretrained(
@@ -246,12 +290,16 @@ class FlashInferLLM:
         model_id_or_path: str,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
+        tp_size: int = 1,
+        tp_rank: int = 0,
     ) -> "FlashInferLLM":
         ckpt_dir = resolve_checkpoint_dir(model_id_or_path)
         with open(ckpt_dir / "config.json") as f:
             config = ModelConfig.from_hf_config(json.load(f))
+        # Every rank reads the full state dict and slices its shard — fine
+        # for verification-scale models; a real loader would shard reads.
         state_dict = _load_state_dict(ckpt_dir)
-        return cls(config, state_dict, device, dtype)
+        return cls(config, state_dict, device, dtype, tp_size, tp_rank)
 
     def _apply_rope(self, q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor):
         cfg = self.config
@@ -292,8 +340,8 @@ class FlashInferLLM:
         cfg = self.config
         nnz = input_ids.shape[0]
         num_q, num_kv, hd = (
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
+            self.num_local_qo_heads,
+            self.num_local_kv_heads,
             cfg.head_dim,
         )
         x = torch.nn.functional.embedding(input_ids, self.embed_tokens)
@@ -326,6 +374,7 @@ class FlashInferLLM:
             )
             attn = attn_wrapper.run(q, kv_cache.layer_view(i))
             attn = torch.nn.functional.linear(attn.reshape(nnz, num_q * hd), w.o_proj)
+            self._maybe_all_reduce(attn)
             flashinfer.fused_add_rmsnorm(
                 attn, residual, w.post_attention_layernorm, cfg.rms_norm_eps
             )
@@ -341,6 +390,8 @@ class FlashInferLLM:
                     routing_weights = routing_weights / routing_weights.sum(
                         dim=-1, keepdim=True
                     )
+                # Expert-parallel: global routing on every rank, local expert
+                # slice here; partial outputs are summed across ranks.
                 x = flashinfer.fused_moe.cutlass_fused_moe(
                     attn,
                     selected_experts.to(torch.int),
@@ -349,7 +400,10 @@ class FlashInferLLM:
                     w.moe_w2,
                     self.dtype,
                     quant_scales=None,
+                    ep_size=self.tp_size,
+                    ep_rank=self.tp_rank,
                 )[0]
+                self._maybe_all_reduce(x)
             else:
                 gate_up = torch.cat(
                     [
@@ -361,6 +415,7 @@ class FlashInferLLM:
                 x = torch.nn.functional.linear(
                     flashinfer.silu_and_mul(gate_up), w.down_proj
                 )
+                self._maybe_all_reduce(x)
         # Final residual add + norm, only then project the rows we sample from.
         flashinfer.fused_add_rmsnorm(x, residual, self.final_norm, cfg.rms_norm_eps)
         hidden = x[last_token_rows]
@@ -382,6 +437,7 @@ class PagedKVCache:
         page_size: int,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
+        num_kv_heads: Optional[int] = None,  # local count under TP
     ):
         self.page_size = page_size
         self.device = device
@@ -390,7 +446,7 @@ class PagedKVCache:
             max_pages,
             2,
             page_size,
-            config.num_key_value_heads,
+            num_kv_heads or config.num_key_value_heads,
             config.head_dim,
             device=device,
             dtype=dtype,

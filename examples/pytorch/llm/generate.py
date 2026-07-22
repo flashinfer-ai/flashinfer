@@ -24,6 +24,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import math
+import os
+import sys
 import time
 from typing import Dict, List, Optional
 
@@ -38,6 +40,20 @@ DEFAULT_PROMPTS = [
     "The three primary colors are",
     "To bake bread you need flour, water,",
 ]
+
+
+def maybe_init_distributed() -> tuple:
+    """Initialize NCCL for torchrun launches (TEP: TP=EP over all ranks).
+
+    Returns (world_size, rank). Single-process runs return (1, 0) untouched.
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size == 1:
+        return 1, 0
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    torch.distributed.init_process_group(backend="nccl")
+    return world_size, torch.distributed.get_rank()
 
 
 def install_jit_build_counter() -> Dict:
@@ -146,7 +162,14 @@ class GenerationEngine:
             math.ceil((len(p) + max_new_tokens) / self.page_size)
             for p in prompt_token_ids
         )
-        kv = PagedKVCache(cfg, max_pages, self.page_size, device, self.model.dtype)
+        kv = PagedKVCache(
+            cfg,
+            max_pages,
+            self.page_size,
+            device,
+            self.model.dtype,
+            num_kv_heads=self.model.num_local_kv_heads,
+        )
         for ids in prompt_token_ids:
             req = kv.add_request()
             kv.extend(req, len(ids))
@@ -176,8 +199,8 @@ class GenerationEngine:
             kv_indptr,
             kv_indices,
             kv_last_page_len,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
+            model.num_local_qo_heads,
+            model.num_local_kv_heads,
             cfg.head_dim,
             self.page_size,
             causal=True,
@@ -220,8 +243,8 @@ class GenerationEngine:
         batch = len(prompt_token_ids)
         page_size = self.page_size
         num_q, num_kv, hd = (
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
+            model.num_local_qo_heads,
+            model.num_local_kv_heads,
             cfg.head_dim,
         )
         generator = None
@@ -329,17 +352,24 @@ def main():
     args = parser.parse_args()
 
     jit_counter = install_jit_build_counter()
-    device = torch.device("cuda")
+    world_size, rank = maybe_init_distributed()
+    if rank != 0:  # keep stdout single-writer; stderr stays visible
+        sys.stdout = open(os.devnull, "w")  # noqa: SIM115 — process-lifetime sink
+    device = torch.device("cuda", torch.cuda.current_device())
     ckpt_dir = resolve_checkpoint_dir(args.model_id)
 
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dir))
     t0 = time.perf_counter()
-    model = FlashInferLLM.from_pretrained(str(ckpt_dir), device)
+    model = FlashInferLLM.from_pretrained(
+        str(ckpt_dir), device, tp_size=world_size, tp_rank=rank
+    )
+    tp_note = f", tep tp=ep={world_size}" if world_size > 1 else ""
     print(
         f"Loaded {args.model_id} ({model.config.model_type}, "
-        f"{model.config.num_hidden_layers} layers) in {time.perf_counter() - t0:.1f}s"
+        f"{model.config.num_hidden_layers} layers{tp_note}) "
+        f"in {time.perf_counter() - t0:.1f}s"
     )
 
     prompts = args.prompt or DEFAULT_PROMPTS
@@ -404,6 +434,8 @@ def main():
     print(f"[smoke] jit_builds_steady={result['jit_builds_steady']}")
     for i, out_ids in enumerate(result["outputs"]):
         print(f"[smoke] tokens_{i}={','.join(map(str, out_ids))}")
+    if world_size > 1:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
