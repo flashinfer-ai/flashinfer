@@ -357,6 +357,8 @@ static inline ActType activationTypeToGatedActType(ActivationType actType) {
       return ActType::SwiGlu;
     case ActivationType::Geglu:
       return ActType::GeGlu;
+    case ActivationType::Situ:
+      return ActType::SiTuGlu;
     default:
       FLASHINFER_CHECK(false, "Unsupported gated activation type ",
                        serializeActivationType(actType), " of enum ",

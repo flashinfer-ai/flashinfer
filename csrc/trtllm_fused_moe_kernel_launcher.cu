@@ -1866,10 +1866,17 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
  public:
   static constexpr std::array<int32_t, 4> mBaseSupportedTileNums = {8, 16, 32, 64};
 
-  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act) {
+  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act, btg::Dtype dtype_weights) {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
+      // Keep tactic enumeration aligned with the public BMM artifact.
+      bool const supports_tile_n_192 =
+          (dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
+          (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3);
+      if (supports_tile_n_192) {
+        tiles.push_back(192);
+      }
       tiles.push_back(256);
     }
     return tiles;
@@ -2207,7 +2214,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                                                bool use_per_token_scaling) {
     Array<Array<int64_t>> valid_configs;
 
-    std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act);
+    std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
 
@@ -2761,7 +2768,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   }
 
   // Determine supported tile sizes
-  std::vector<int32_t> mSupportedTileN = FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct);
+  std::vector<int32_t> mSupportedTileN =
+      FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights);
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size

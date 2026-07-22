@@ -20,6 +20,10 @@ import torch
 from flashinfer.utils import get_compute_capability
 
 from flashinfer.fused_moe import fill_w_ptr
+from flashinfer.fused_moe.core import (
+    _prepare_fp4_block_scale_gemm1_activation_params,
+)
+from flashinfer.tllm_enums import DtypeTrtllmGen
 from tests.moe.trtllm_gen_fused_moe_utils import (
     ActivationType,
     BF16Moe,
@@ -36,6 +40,7 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     pack_topk_for_routed_moe,
     routing_reference_renormalize,
     run_moe_test,
+    situ_activation_reference,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_fp8_block_scale_moe,
@@ -2277,3 +2282,284 @@ def test_fp4_block_scale_deepseekv3_unfinalized_weight_dtype(cache_permute_indic
         routing_logits_dtype=torch.float32,
         verify_unfinalized_weight_dtype=True,
     )
+
+
+def test_situ_reference_default_and_branch_order():
+    x0 = torch.tensor([[-3.0, 0.5, 2.0]], dtype=torch.float32)
+    x1 = torch.tensor([[0.25, -2.0, 4.0]], dtype=torch.float32)
+
+    actual = situ_activation_reference(x0, x1)
+    expected = torch.tanh(x0) * torch.tanh(x1) * torch.sigmoid(x1)
+    branch_swapped = torch.tanh(x1) * torch.tanh(x0) * torch.sigmoid(x0)
+
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, branch_swapped)
+
+
+@pytest.mark.parametrize(
+    "alpha_value,beta_value,clamp_value",
+    [
+        pytest.param(4.0, 25.0, None, id="Alpha4Beta25"),
+        pytest.param(1.7, 1.0, 7.0, id="Alpha1p7Beta1Clamp7"),
+    ],
+)
+def test_situ_reference_asymmetric_alpha_beta_and_clamp(
+    alpha_value, beta_value, clamp_value
+):
+    x0 = torch.tensor([[-9.0, 2.0, 8.0]], dtype=torch.float32)
+    x1 = torch.tensor([[6.0, -4.0, 1.0]], dtype=torch.float32)
+    alpha = torch.tensor(alpha_value)
+    beta = torch.tensor(beta_value)
+    limit = None if clamp_value is None else torch.tensor(clamp_value)
+
+    actual = situ_activation_reference(
+        x0, x1, alpha=alpha, beta=beta, clamp_limit=limit
+    )
+    if limit is None:
+        x0_bounded = x0
+        x1_bounded = x1
+    else:
+        x0_bounded = torch.clamp(x0, min=-limit, max=limit)
+        x1_bounded = torch.clamp(x1, max=limit)
+    expected = (
+        beta
+        * torch.tanh(x0_bounded / beta)
+        * alpha
+        * torch.tanh(x1_bounded / alpha)
+        * torch.sigmoid(x1_bounded)
+    )
+    swapped_parameters = (
+        alpha
+        * torch.tanh(x0_bounded / alpha)
+        * beta
+        * torch.tanh(x1_bounded / beta)
+        * torch.sigmoid(x1_bounded)
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, swapped_parameters)
+
+
+def test_situ_activation_defaults_materialize_per_expert_ones() -> None:
+    alpha, beta, clamp = _prepare_fp4_block_scale_gemm1_activation_params(
+        ActivationType.Situ.value, None, None, None, 3, torch.device("cpu")
+    )
+
+    torch.testing.assert_close(alpha, torch.ones(3, dtype=torch.float32))
+    torch.testing.assert_close(beta, torch.ones(3, dtype=torch.float32))
+    assert clamp is None
+
+
+@pytest.mark.parametrize(
+    ("alpha_value", "beta_value", "clamp_value"),
+    [
+        pytest.param(4.0, 25.0, None, id="alpha4_beta25"),
+        pytest.param(1.7, 1.0, 7.0, id="alpha1p7_beta1_clamp7"),
+    ],
+)
+def test_situ_activation_accepts_requested_parameters(
+    alpha_value: float, beta_value: float, clamp_value: float | None
+) -> None:
+    alpha = torch.full((2,), alpha_value, dtype=torch.float32)
+    beta = torch.full((2,), beta_value, dtype=torch.float32)
+    clamp = (
+        None
+        if clamp_value is None
+        else torch.full((2,), clamp_value, dtype=torch.float32)
+    )
+
+    actual = _prepare_fp4_block_scale_gemm1_activation_params(
+        ActivationType.Situ.value, alpha, beta, clamp, 2, torch.device("cpu")
+    )
+
+    assert actual[0] is alpha
+    assert actual[1] is beta
+    assert actual[2] is clamp
+
+
+@pytest.mark.parametrize(
+    ("parameter", "values"),
+    [
+        ("gemm1_alpha", [0.0, 1.0]),
+        ("gemm1_alpha", [-1.0, 1.0]),
+        ("gemm1_alpha", [float("nan"), 1.0]),
+        ("gemm1_beta", [0.0, 1.0]),
+        ("gemm1_beta", [float("inf"), 1.0]),
+        ("gemm1_clamp_limit", [-1.0, 1.0]),
+        ("gemm1_clamp_limit", [float("nan"), 1.0]),
+    ],
+)
+def test_situ_activation_rejects_nonpositive_or_nonfinite_parameters(
+    parameter: str, values: list[float]
+) -> None:
+    params = {
+        "gemm1_alpha": torch.ones(2, dtype=torch.float32),
+        "gemm1_beta": torch.ones(2, dtype=torch.float32),
+        "gemm1_clamp_limit": None,
+    }
+    params[parameter] = torch.tensor(values, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=parameter):
+        _prepare_fp4_block_scale_gemm1_activation_params(
+            ActivationType.Situ.value,
+            params["gemm1_alpha"],
+            params["gemm1_beta"],
+            params["gemm1_clamp_limit"],
+            2,
+            torch.device("cpu"),
+        )
+
+
+def test_situ_activation_rejects_wrong_shape_and_dtype() -> None:
+    with pytest.raises(ValueError, match="Invalid shape of gemm1_alpha"):
+        _prepare_fp4_block_scale_gemm1_activation_params(
+            ActivationType.Situ.value,
+            torch.ones(1),
+            None,
+            None,
+            2,
+            torch.device("cpu"),
+        )
+    with pytest.raises(ValueError, match="Invalid dtype of gemm1_beta"):
+        _prepare_fp4_block_scale_gemm1_activation_params(
+            ActivationType.Situ.value,
+            None,
+            torch.ones(2, dtype=torch.float64),
+            None,
+            2,
+            torch.device("cpu"),
+        )
+
+
+def test_non_situ_activation_parameter_behavior_is_unchanged() -> None:
+    assert _prepare_fp4_block_scale_gemm1_activation_params(
+        ActivationType.Swiglu.value, None, None, None, 2, torch.device("cpu")
+    ) == (None, None, None)
+
+
+SITU_TEST_CASES = (
+    pytest.param(None, None, None, id="Situ_Defaults"),
+    pytest.param(4.0, 25.0, None, id="Situ_Alpha4Beta25"),
+    pytest.param(1.7, 1.0, 7.0, id="Situ_Alpha1p7Beta1Clamp7"),
+)
+
+
+def _run_fp4_situ_test(
+    quant_mode, alpha_value, beta_value, clamp_value, cache_permute_indices
+):
+    num_experts = 8
+
+    def per_expert(value):
+        return (
+            None
+            if value is None
+            else torch.full((num_experts,), value, device="cuda", dtype=torch.float32)
+        )
+
+    run_moe_test(
+        num_tokens=32,
+        hidden_size=1024,
+        intermediate_size=512,
+        moe_impl=FP4Moe(quant_mode=quant_mode),
+        routing_config={
+            "num_experts": num_experts,
+            "top_k": 2,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [512],
+            "compatible_activation_types": [ActivationType.Situ],
+            "enable_autotune": True,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe],
+        },
+        activation_type=ActivationType.Situ,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        gemm1_alpha=per_expert(alpha_value),
+        gemm1_beta=per_expert(beta_value),
+        gemm1_clamp_limit=per_expert(clamp_value),
+    )
+
+
+@pytest.mark.parametrize("alpha_value,beta_value,clamp_value", SITU_TEST_CASES)
+def test_mxfp4_mxfp8_moe_situ(
+    alpha_value, beta_value, clamp_value, cache_permute_indices
+):
+    _run_fp4_situ_test(
+        QuantMode.FP4_MXFP4_MXFP8,
+        alpha_value,
+        beta_value,
+        clamp_value,
+        cache_permute_indices,
+    )
+
+
+@pytest.mark.parametrize("alpha_value,beta_value,clamp_value", SITU_TEST_CASES)
+def test_nvfp4_moe_situ(alpha_value, beta_value, clamp_value, cache_permute_indices):
+    _run_fp4_situ_test(
+        QuantMode.FP4_NVFP4_NVFP4,
+        alpha_value,
+        beta_value,
+        clamp_value,
+        cache_permute_indices,
+    )
+
+
+def _get_situ_tactic_tile_ns(dtype_act, dtype_weights):
+    from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
+
+    raw_moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    tactics = raw_moe_op.trtllm_get_valid_moe_configs(
+        dtype_act,
+        dtype_weights,
+        Fp8QuantizationType.NoneFp8,
+        2,
+        1024,
+        512,
+        8,
+        ActivationType.Situ.value,
+        True,
+        WeightLayout.MajorK.value,
+        False,
+        512,
+        False,
+    )
+    return {int(tactic[0]) for tactic in tactics}
+
+
+def test_mxfp4_mxfp8_autotuner_includes_tile_n_192():
+    tile_ns = _get_situ_tactic_tile_ns(DtypeTrtllmGen.MxE4m3, DtypeTrtllmGen.MxE2m1)
+    assert 192 in tile_ns
+
+
+def test_nvfp4_autotuner_includes_tile_n_192():
+    tile_ns = _get_situ_tactic_tile_ns(DtypeTrtllmGen.E2m1, DtypeTrtllmGen.E2m1)
+    assert 192 in tile_ns
+
+
+@pytest.mark.parametrize(
+    ("dtype_act", "dtype_weights"),
+    [
+        pytest.param(
+            DtypeTrtllmGen.E2m1,
+            DtypeTrtllmGen.MxE2m1,
+            id="mxfp4_weights_nvfp4_activations",
+        ),
+        pytest.param(
+            DtypeTrtllmGen.MxE4m3,
+            DtypeTrtllmGen.E2m1,
+            id="nvfp4_weights_mxfp8_activations",
+        ),
+    ],
+)
+def test_unsupported_fp4_dtype_pairs_exclude_tile_n_192(dtype_act, dtype_weights):
+    tile_ns = _get_situ_tactic_tile_ns(dtype_act, dtype_weights)
+    assert 192 not in tile_ns

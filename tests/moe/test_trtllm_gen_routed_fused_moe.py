@@ -64,6 +64,10 @@ def _run_trtllm_gen_routed_fused_moe_case(
     routing_method_type: RoutingMethodType,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
     routing_format: Literal["packed", "unpacked", "unpacked_fp32"],
+    activation_type: ActivationType = ActivationType.Swiglu,
+    gemm1_alpha: torch.Tensor | None = None,
+    gemm1_beta: torch.Tensor | None = None,
+    gemm1_clamp_limit: torch.Tensor | None = None,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -166,9 +170,9 @@ def _run_trtllm_gen_routed_fused_moe_case(
         w13,
         w13_scale,
         None,  # w13_bias
-        None,  # gemm1_alpha
-        None,  # gemm1_beta
-        None,  # gemm1_clamp_limit
+        gemm1_alpha,  # gemm1_alpha
+        gemm1_beta,  # gemm1_beta
+        gemm1_clamp_limit,  # gemm1_clamp_limit
         w2,
         w2_scale,
         None,  # w2_bias
@@ -186,7 +190,7 @@ def _run_trtllm_gen_routed_fused_moe_case(
         routing_method_type.value,
         True,  # do_finalize
         enable_pdl,
-        ActivationType.Swiglu.value,  # act_type
+        activation_type.value,  # act_type
         None,
     )[0].to(torch.float)
 
@@ -229,9 +233,9 @@ def _run_trtllm_gen_routed_fused_moe_case(
         w13,
         w13_scale,
         None,  # w13_bias
-        None,  # gemm1_alpha
-        None,  # gemm1_beta
-        None,  # gemm1_clamp_limit
+        gemm1_alpha,  # gemm1_alpha
+        gemm1_beta,  # gemm1_beta
+        gemm1_clamp_limit,  # gemm1_clamp_limit
         w2,
         w2_scale,
         None,  # w2_bias
@@ -249,7 +253,7 @@ def _run_trtllm_gen_routed_fused_moe_case(
         routing_method_type.value,
         True,  # do_finalize
         enable_pdl,
-        ActivationType.Swiglu.value,  # act_type
+        activation_type.value,  # act_type
         None,
     )[0].to(torch.float)
 
@@ -1414,4 +1418,40 @@ def test_fp8_block_scale_moe_routing_replay_custom_routing(
     assert (routing_replay_out[num_tokens:] == -1).all(), (
         f"Kernel wrote beyond active token rows "
         f"(kernel={kernel_tier}, routing={routing_method_type.name})"
+    )
+
+
+@pytest.mark.parametrize(
+    "alpha_value,beta_value,clamp_value",
+    [
+        pytest.param(4.0, 25.0, None, id="Situ_Alpha4Beta25"),
+        pytest.param(1.7, 1.0, 7.0, id="Situ_Alpha1p7Beta1Clamp7"),
+    ],
+)
+def test_situ_mxfp4_mxfp8_logits_match_pre_routed(alpha_value, beta_value, clamp_value):
+    num_experts = 8
+    device = torch.device("cuda:0")
+    _run_trtllm_gen_routed_fused_moe_case(
+        num_tokens=32,
+        hidden_size=1024,
+        intermediate_size=512,
+        top_k=2,
+        num_experts=num_experts,
+        routing_method_type=RoutingMethodType.Renormalize,
+        quant_mode="MxFP4xMxFP8",
+        routing_format="unpacked",
+        activation_type=ActivationType.Situ,
+        gemm1_alpha=torch.full(
+            (num_experts,), alpha_value, device=device, dtype=torch.float32
+        ),
+        gemm1_beta=torch.full(
+            (num_experts,), beta_value, device=device, dtype=torch.float32
+        ),
+        gemm1_clamp_limit=(
+            None
+            if clamp_value is None
+            else torch.full(
+                (num_experts,), clamp_value, device=device, dtype=torch.float32
+            )
+        ),
     )

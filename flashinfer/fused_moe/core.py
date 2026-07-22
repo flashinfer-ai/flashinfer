@@ -3178,6 +3178,46 @@ def _validate_bf16_gemm1_activation_params(
             )
 
 
+def _prepare_fp4_block_scale_gemm1_activation_params(
+    activation_type: int,
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    local_num_experts: int,
+    device: torch.device,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if int(activation_type) != int(ActivationType.Situ):
+        return gemm1_alpha, gemm1_beta, gemm1_clamp_limit
+
+    def validate_positive_finite(name: str, tensor: torch.Tensor) -> None:
+        check_shape_dtype_device(
+            tensor, (local_num_experts,), torch.float32, device, name
+        )
+        # The warmup call validates values before CUDA graph capture. Avoid
+        # synchronizing a device tensor while the graph is being recorded.
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise ValueError(f"{name} must contain only finite values for SiTU.")
+        if not bool((tensor > 0).all().item()):
+            raise ValueError(f"{name} must contain only positive values for SiTU.")
+
+    if gemm1_alpha is None:
+        gemm1_alpha = torch.ones(local_num_experts, dtype=torch.float32, device=device)
+    else:
+        validate_positive_finite("gemm1_alpha", gemm1_alpha)
+
+    if gemm1_beta is None:
+        gemm1_beta = torch.ones(local_num_experts, dtype=torch.float32, device=device)
+    else:
+        validate_positive_finite("gemm1_beta", gemm1_beta)
+
+    if gemm1_clamp_limit is not None:
+        validate_positive_finite("gemm1_clamp_limit", gemm1_clamp_limit)
+
+    return gemm1_alpha, gemm1_beta, gemm1_clamp_limit
+
+
 def _validate_routing_replay_out(
     routing_replay_out: Optional[torch.Tensor], top_k: int
 ) -> None:
@@ -4418,10 +4458,17 @@ def trtllm_fp4_block_scale_moe(
         ``[num_experts, 2 * intermediate_size]`` FC1 bias, ``float32``.
     gemm1_alpha : Optional[torch.Tensor]
         ``[num_experts]`` swiglu alpha, ``float32``.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``alpha=1``.
+
     gemm1_beta : Optional[torch.Tensor]
         ``[num_experts]`` swiglu beta, ``float32``.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``beta=1``.
     gemm1_clamp_limit : Optional[torch.Tensor]
         ``[num_experts]`` swiglu clamp limit, ``float32``.
+        For SiTU a provided limit is per-local-expert, finite, and positive;
+        it clamps ``x0`` to ``[-limit, limit]`` and ``x1`` from above.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size, intermediate_size]`` packed FP4 FC2
         weights, dtype ``uint8``.
@@ -4480,6 +4527,7 @@ def trtllm_fp4_block_scale_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2; ``7`` Identity.
+        ``10`` SiTU uses ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, ``float32``.
     output : Optional[torch.Tensor]
@@ -4507,6 +4555,16 @@ def trtllm_fp4_block_scale_moe(
         path and fp32 ``DeepSeekV3`` logits.
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
+    gemm1_alpha, gemm1_beta, gemm1_clamp_limit = (
+        _prepare_fp4_block_scale_gemm1_activation_params(
+            activation_type,
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
+            local_num_experts,
+            hidden_states.device,
+        )
+    )
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         RoutingInputMode.FromLogits,
         routing_logits,
@@ -4618,10 +4676,17 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[num_experts, 2 * intermediate_size]`` FC1 bias, float32.
     gemm1_alpha : Optional[torch.Tensor]
         ``[num_experts]`` swiglu alpha, float32.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``alpha=1``.
+
     gemm1_beta : Optional[torch.Tensor]
         ``[num_experts]`` swiglu beta, float32.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``beta=1``.
     gemm1_clamp_limit : Optional[torch.Tensor]
         ``[num_experts]`` swiglu clamp limit, float32.
+        For SiTU a provided limit is per-local-expert, finite, and positive;
+        it clamps ``x0`` to ``[-limit, limit]`` and ``x1`` from above.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size, intermediate_size]`` packed FP4 FC2
         weights, ``uint8``.
@@ -4679,6 +4744,7 @@ def trtllm_fp4_block_scale_routed_moe(
         Whether to enable Programmatic Dependent Launch.
     activation_type : int
         Activation type (default ``3`` — Swiglu).
+        ``10`` SiTU uses ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, float32.
     output : Optional[torch.Tensor]
@@ -4692,6 +4758,16 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[output]`` when ``do_finalize`` is ``True``, otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
+    gemm1_alpha, gemm1_beta, gemm1_clamp_limit = (
+        _prepare_fp4_block_scale_gemm1_activation_params(
+            activation_type,
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
+            local_num_experts,
+            hidden_states.device,
+        )
+    )
     # Determine routing mode based on input format
     if isinstance(topk_ids, tuple):
         # Unpacked format: (topk_ids, topk_weights)
