@@ -70,7 +70,12 @@ from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 
 from .mapping import Mapping
 
-from .mnnvl import CommBackend, SymmDeviceMemory
+from .mnnvl import (
+    CommBackend,
+    SymmDeviceMemory,
+    all_ranks_support_mnnvl,
+    is_multicast_supported,
+)
 
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
@@ -274,22 +279,6 @@ def _trtllm_workspace_check(
     return world_size <= 16
 
 
-def _mnnvl_workspace_check(
-    backend: str,
-    world_size: int,
-    rank: int,
-    max_token_num: int,
-    hidden_dim: int,
-    dtype: torch.dtype,
-) -> bool:
-    """
-    Check if mnnvl backend CAN be used for workspace creation.
-
-    """
-
-    return True
-
-
 # ============================================================================
 # HEURISTIC - Performance-based backend selection
 # ============================================================================
@@ -461,13 +450,9 @@ def create_allreduce_fusion_workspace(
             dtype=dtype,
         ):
             suitable_backends.append("trtllm")
-        if _mnnvl_workspace_check(
-            backend=backend,
-            world_size=world_size,
-            rank=rank,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            dtype=dtype,
+        local_mnnvl_supported = is_multicast_supported(torch.cuda.current_device())
+        if all_ranks_support_mnnvl(
+            local_mnnvl_supported, world_size, comm_backend, group
         ):
             suitable_backends.append("mnnvl")
 
