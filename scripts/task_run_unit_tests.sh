@@ -130,6 +130,13 @@ main() {
     # Find test files (unique to unit tests - auto-discovery)
     find_test_files
 
+    # Print the resolved TVM-FFI version right before tests (traceability for
+    # the pre-release verification in PR #2599; the override itself is applied
+    # by setup_test_env.sh sourced above in main()).
+    echo "Checking TVM-FFI version before tests..."
+    python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+    echo ""
+
     # Execute tests or dry run
     if [ "$DRY_RUN" == "true" ]; then
         execute_dry_run "$TEST_FILES"
