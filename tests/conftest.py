@@ -163,6 +163,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")
     config.addinivalue_line("markers", "arch_blackwell: requires sm_100 or sm_103")
+    config.addinivalue_line("markers", "arch_hopper: requires sm_90 (Hopper)")
     config.addinivalue_line(
         "markers",
         "long_running: front-load this test file at the start of the parallel CI queue",
@@ -211,6 +212,10 @@ def pytest_collection_modifyitems(config, items):
                 )
         if "arch_blackwell" in item.keywords and cc < (10, 0):
             item.add_marker(pytest.mark.skip(reason="needs sm_100+"))
+        # Exactly sm_90: the SM90 mega kernels are Hopper-only (Blackwell
+        # hosts use the sm_100 tree's kernels instead).
+        if "arch_hopper" in item.keywords and cc != (9, 0):
+            item.add_marker(pytest.mark.skip(reason="needs sm_90 (Hopper)"))
 
 
 def is_cuda_oom_error_str(e: str) -> bool:
