@@ -274,12 +274,16 @@ class ManagedAutotuneCache:
         )
 
 
-def _attach_managed_cache(tuner, cache_root, manifest: Dict[str, str]) -> None:
-    """Attach (idempotently) the managed store for this process.
+def _attach_managed_cache(tuner, cache_root, manifest: Dict[str, str]):
+    """Attach (idempotently) the ambient managed store for this process and
+    return the store object.
 
-    The store outlives the context — frameworks serve outside any context,
-    so lookups must keep working after warmup exits.  Same root + manifest
-    reuses the existing store and its memos; a change replaces it.
+    The ambient store outlives the context — frameworks serve outside any
+    context, so lookups must keep working after warmup exits.  Same root +
+    manifest reuses the existing store and its memos; a change replaces it.
+    (Contexts additionally push their store onto the tuner's per-thread
+    store stack, so nested contexts with different identities never publish
+    into each other's namespace.)
     """
     resolved = (
         pathlib.Path(cache_root) if cache_root is not None else get_default_cache_root()
@@ -290,7 +294,7 @@ def _attach_managed_cache(tuner, cache_root, manifest: Dict[str, str]) -> None:
         current = tuner._managed_cache
         if current is not None:
             if current.root == resolved and current.manifest == candidate:
-                return
+                return current
             logger.info(
                 f"[Autotuner]: Re-attaching managed autotune cache at "
                 f"{resolved} (was {current.root}, env {current.env_hash})."
@@ -304,6 +308,7 @@ def _attach_managed_cache(tuner, cache_root, manifest: Dict[str, str]) -> None:
         logger.info(
             f"[Autotuner]: Managed autotune cache attached for this process: {store!r}"
         )
+        return store
 
 
 @contextlib.contextmanager
@@ -407,13 +412,23 @@ def autotune_v2(
             if measure is not None:
                 # The policy is part of the environment identity.
                 manifest.update(measure.manifest_fields())
-            _attach_managed_cache(tuner, cache_root, manifest)
-        elif tuner._managed_cache is not None:
-            logger.warning(
-                "[Autotuner]: autotune_v2(persistent_cache=False), but a "
-                "managed store attached earlier in this process remains "
-                "active; detach is not supported yet."
-            )
+            store = _attach_managed_cache(tuner, cache_root, manifest)
+        else:
+            # Disk forbidden for this context: lookups and publishes are
+            # disabled even if an ambient store was attached earlier (the
+            # ambient store remains for serving after this context exits).
+            store = None
+            if tuner._managed_cache is not None:
+                logger.info(
+                    "[Autotuner]: autotune_v2(persistent_cache=False): disk "
+                    "access disabled inside this context; the previously "
+                    "attached store remains active for serving outside it."
+                )
+        # The store stack scopes lookup/publish to THIS context: a nested
+        # context with a different identity (policy/root) never publishes
+        # into the outer context's namespace, and persistent_cache=False
+        # truly means no disk I/O for the duration.
+        tuner._get_store_stack().append(store)
         if measure is not None:
             tuner._get_measure_stack().append(measure)
         try:
@@ -421,3 +436,4 @@ def autotune_v2(
         finally:
             if measure is not None:
                 tuner._get_measure_stack().pop()
+            tuner._get_store_stack().pop()
