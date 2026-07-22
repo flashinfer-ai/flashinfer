@@ -18,7 +18,7 @@ limitations under the License.
 
 Public API
 ----------
-:func:`top_k_decode` — selects top-K per row of decode-step logits.
+:func:`top_k_varlen` — selects top-K per row of decode-step logits.
 
 Backend choices
 ---------------
@@ -28,17 +28,18 @@ Backend choices
 ``"radix"`` — masked-radix fallback; masks logits to ``seq_lens`` then
               calls the existing FlashInfer radix top-K.  Runs on any GPU.
 ``"auto"``  — picks GVR when all its requirements are met, falls back to
-              radix otherwise.
+              radix otherwise (default).
 """
 
 import functools
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.topk import top_k_varlen_trace
 from .cute_dsl.top_k.config import GvrTopKConfig, GvrTopKLBConfig
 from .cute_dsl.utils import (
     is_cute_dsl_available,
@@ -68,7 +69,7 @@ _BLACKWELL_PLUS_CCS = [100, 103, 110, 120, 121]
 
 
 @supported_compute_capability(_ALL_CCS)
-def _radix_top_k_decode_check(
+def _radix_top_k_varlen_check(
     logits,
     seq_lens,
     top_k,
@@ -80,14 +81,13 @@ def _radix_top_k_decode_check(
     out_values=None,
     backend="auto",
     load_balance=True,
-    num_long_rows=None,
 ):  # extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers."""
     return True
 
 
 @supported_compute_capability(_BLACKWELL_PLUS_CCS)
-def _gvr_top_k_decode_check(
+def _gvr_top_k_varlen_check(
     logits,
     seq_lens,
     top_k,
@@ -99,13 +99,12 @@ def _gvr_top_k_decode_check(
     out_values=None,
     backend="auto",
     load_balance=True,
-    num_long_rows=None,
 ):  # extra kwargs mirror the public signature; unused by the check
     """GVR LB: requires Blackwell hardware, CuTe DSL, and a pre_idx hint."""
     return is_cute_dsl_available() and pre_idx is not None
 
 
-def _top_k_decode_heuristic(suitable_backends, **kwargs):
+def _top_k_varlen_heuristic(suitable_backends, **kwargs):
     """Prefer GVR over radix when both are available."""
     return [b for b in ("gvr", "radix") if b in suitable_backends]
 
@@ -442,56 +441,6 @@ def _run_gvr_no_lb(
     return (out_values if return_output_values else None), out_indices
 
 
-def _lb_decision_from_counts(n_long: int, num_rows: int) -> bool:
-    """Pure-host LB decision: is the two-kernel LB path worth its overhead?
-
-    Load-balancing splits *long* rows (scan-length > ``long_threshold``) across a
-    CTA cluster to shorten the single-wave tail, and packs short rows one-per-CTA.
-    It pays off only when the batch is a *mix* of long and non-long rows:
-
-      * No long rows                -> LB adds a prepare kernel + cluster sync for
-                                       no tail to cut  => non-LB is faster.
-      * All (or a majority of) rows  -> every row already saturates an SM; there
-        are long                      are no short rows to pack and the cluster
-                                       split just adds DSMEM-sync overhead
-                                       => non-LB is faster.
-      * A minority (<= half) of rows -> the long rows form a tail that LB cuts
-        are long                       ~cluster_size-fold while short rows finish
-                                       cheaply  => LB is faster.
-
-    LB is selected iff ``0 < n_long <= num_rows // 2``. Boundary tuned on B200: LB
-    wins up to ~50% long-fraction, loses by ~62% (see ``benchmarks/bench_gvr_lb.py``).
-
-    This function takes plain Python ints, so it does no device I/O and is
-    **CUDA-graph safe** — the branch resolves at trace time. Callers who know their
-    batch's long-row count (they usually track context lengths on the host anyway)
-    should pass it via ``top_k_decode(..., num_long_rows=...)``.
-    """
-    return 0 < n_long <= num_rows // 2
-
-
-def _count_long_rows(
-    seq_lens: torch.Tensor, compress_ratio: int, long_threshold: int
-) -> int:
-    """Count rows whose scan length exceeds ``long_threshold`` (device reduction).
-
-    Compared in scan-length space (``seq_lens / compress_ratio``), matching the GVR
-    prepare kernel. Threshold-scaling avoids the elementwise divide when
-    ``compress_ratio == 1`` (the common DSv3.2 case).
-
-    Convenience helper for callers who want to derive the ``num_long_rows`` hint
-    for ``top_k_decode(load_balance="auto", ...)`` from a device ``seq_lens``
-    tensor. The ``.item()`` read forces a device->host sync (~a few us) and is
-    **NOT CUDA-graph safe**, so ``top_k_decode`` never calls it internally — under
-    graph capture, compute ``num_long_rows`` on the host from data you already
-    track, or use an explicit ``load_balance=True/False``.
-    """
-    threshold = (
-        long_threshold if compress_ratio == 1 else long_threshold * compress_ratio
-    )
-    return int((seq_lens > threshold).sum().item())
-
-
 # ---------------------------------------------------------------------------
 # Internal: radix backend implementation
 # ---------------------------------------------------------------------------
@@ -553,19 +502,19 @@ def _run_radix(
 
 
 # ---------------------------------------------------------------------------
-# Public API: top_k_decode
+# Public API: top_k_varlen
 # ---------------------------------------------------------------------------
 
 
 @backend_requirement(
     {
-        "radix": _radix_top_k_decode_check,
-        "gvr": _gvr_top_k_decode_check,
+        "radix": _radix_top_k_varlen_check,
+        "gvr": _gvr_top_k_varlen_check,
     },
-    heuristic_func=_top_k_decode_heuristic,
+    heuristic_func=_top_k_varlen_heuristic,
 )
-@flashinfer_api
-def top_k_decode(
+@flashinfer_api(trace=top_k_varlen_trace)
+def top_k_varlen(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
     top_k: int,
@@ -576,9 +525,8 @@ def top_k_decode(
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
     backend: Literal["radix", "gvr", "auto"] = "auto",
-    load_balance: Union[bool, Literal["auto"]] = True,
-    num_long_rows: Optional[int] = None,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    load_balance: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
     r"""Top-K selection over batched decode-step logits.
 
     Selects the top-``top_k`` elements from each row of ``logits``,
@@ -636,7 +584,7 @@ def top_k_decode(
                       ``pre_idx``).
         ``"radix"`` — Masked radix top-K (all GPUs, no ``pre_idx`` needed).
         ``"auto"``  — GVR when requirements are met, else radix.
-    load_balance : bool or ``"auto"``, optional
+    load_balance : bool, optional
         Selects the GVR kernel path (ignored by the radix backend).  Default
         ``True``.
 
@@ -648,23 +596,8 @@ def top_k_decode(
         ``False``  — single-kernel path (``GvrTopKKernel``): one CTA per row,
                      no prepare step.  Faster when the batch has no length
                      variance (all rows short, or all long).
-        ``"auto"`` — pick per call with the heuristic: use LB only when the batch
-                     is a *mix* of long and non-long rows (long rows form a
-                     minority tail worth splitting; see :func:`_lb_decision_from_counts`).
-                     **Requires** ``num_long_rows`` — the decision is made purely
-                     on the host from that count, with no device read.  Omitting
-                     it raises ``ValueError`` (deriving the count from ``seq_lens``
-                     would need a device->host sync that is not CUDA-graph safe).
 
-        All three settings are CUDA-graph safe (no host branch on device data).
-    num_long_rows : int, optional
-        Host-side hint: the number of rows whose scan length
-        (``seq_lens / compress_ratio``) exceeds the GVR ``long_threshold`` (64K).
-        **Required** when ``load_balance="auto"`` (ignored otherwise).  The LB
-        decision is a pure-host branch on this count, keeping ``"auto"`` CUDA-graph
-        safe and sync-free.  Callers typically already track context lengths on the
-        host; :func:`_count_long_rows` can derive it from ``seq_lens`` in eager mode
-        (at the cost of a device sync) if needed.
+        Both settings are CUDA-graph safe (no host branch on device data).
 
     Returns
     -------
@@ -689,7 +622,7 @@ def top_k_decode(
     >>> # Each request has a different KV-cache length in [top_k+1, N_max-1].
     >>> logits = torch.randn(B, N_max, dtype=torch.bfloat16, device="cuda")
     >>> seq_lens_t = torch.randint(top_k + 1, N_max, (B,), dtype=torch.int32, device="cuda")
-    >>> indices_t = flashinfer.top_k_decode(logits, seq_lens_t, top_k, backend="radix")
+    >>> indices_t = flashinfer.top_k_varlen(logits, seq_lens_t, top_k, backend="radix")
     >>> # Reference check: every selected value must be >= the K-th largest.
     >>> for i in range(B):
     ...     s = seq_lens_t[i].item()
@@ -700,7 +633,7 @@ def top_k_decode(
     >>> logits_t1 = torch.randn(B, N_max, dtype=torch.bfloat16, device="cuda")
     >>> seq_lens_t1 = seq_lens_t + 1
     >>> # Pass indices_t as pre_idx; GVR uses it to warm-start the threshold search.
-    >>> indices_t1 = flashinfer.top_k_decode(logits_t1, seq_lens_t1, top_k, pre_idx=indices_t)
+    >>> indices_t1 = flashinfer.top_k_varlen(logits_t1, seq_lens_t1, top_k, pre_idx=indices_t)
     >>> for i in range(B):
     ...     s = seq_lens_t1[i].item()
     ...     kth = torch.topk(logits_t1[i, :s].float(), top_k).values[-1]
@@ -714,7 +647,7 @@ def top_k_decode(
     assert seq_lens.is_cuda and seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
 
     if backend == "auto":
-        backend = top_k_decode.suitable_auto_backends[0]
+        backend = top_k_varlen.suitable_auto_backends[0]
 
     if backend == "gvr":
         # GVR scans each row with 128-bit vectorized loads (vec_align = 16 bytes),
@@ -733,22 +666,7 @@ def top_k_decode(
                 f"multiple of {elem_align}, or use backend='radix' (no alignment "
                 f"constraint)."
             )
-        if load_balance == "auto":
-            # "auto" requires the host-side long-row count. Deriving it from
-            # seq_lens would need a device->host sync (.item()), which is not
-            # CUDA-graph safe and adds latency, so it is disallowed: callers must
-            # supply num_long_rows (pure-host, graph-safe) or pick a path
-            # explicitly with load_balance=True/False.
-            if num_long_rows is None:
-                raise ValueError(
-                    "load_balance='auto' requires num_long_rows (the count of rows "
-                    "whose scan length exceeds the GVR long_threshold). Computing it "
-                    "from seq_lens needs a device->host sync that is not CUDA-graph "
-                    "safe. Pass num_long_rows, or set load_balance=True/False."
-                )
-            use_lb = _lb_decision_from_counts(int(num_long_rows), seq_lens.shape[0])
-        else:
-            use_lb = bool(load_balance)
+        use_lb = bool(load_balance)
         if use_lb:
             out_v, out_i = _run_gvr(
                 logits,

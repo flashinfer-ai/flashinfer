@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Correctness tests for flashinfer.top_k_decode.
+"""Correctness tests for flashinfer.top_k_varlen.
 
 On Blackwell (sm_100+) with ``pre_idx`` supplied the GVR fast path runs.
 On other hardware the radix fallback is used; most tests still execute.
@@ -30,11 +30,7 @@ test_large_batch              — stress: large batch × long rows
 test_repeated_calls           — same inputs twice → same top-K set
 test_no_pre_idx_fallback      — pre_idx=None always goes to radix path
 test_lb_config_validation     — GvrTopKLBConfig bad args raise at construction
-test_lb_decision_from_counts  — pure-host LB decision boundary (graph-safe)
-test_count_long_rows          — device long-row count (both compress_ratios)
-test_load_balance_modes       — explicit True/False GVR paths correct
-test_load_balance_auto_num_long_rows_hint  — host-hint 'auto' path correct
-test_load_balance_auto_requires_num_long_rows  — 'auto' w/o hint raises
+test_load_balance_modes       — True/False GVR paths correct
 test_gvr_row_width_alignment  — GVR rejects non-vec-aligned N
 test_radix_row_width_no_alignment_constraint  — radix accepts any N
 test_auto_gvr_knobs_256bit_alignment_gate  — 256-bit gated on 32B N alignment
@@ -69,7 +65,7 @@ def _gvr_hw_supported() -> bool:
     major, minor = get_compute_capability(torch.device("cuda"))
     cc = major * 10 + minor
     return (
-        flashinfer.top_k_decode.is_backend_supported("gvr", cc)
+        flashinfer.top_k_varlen.is_backend_supported("gvr", cc)
         and is_cute_dsl_available()
     )
 
@@ -145,7 +141,7 @@ def _check_correct(indices, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
 @pytest.mark.parametrize("N", [4096, 32768])
 @pytest.mark.parametrize("batch_size", [1, 32])
 def test_basic_decode(dtype, top_k, N, batch_size):
-    """top_k_decode with pre_idx: works on Blackwell (GVR) and any GPU (radix)."""
+    """top_k_varlen with pre_idx: works on Blackwell (GVR) and any GPU (radix)."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
     if top_k > N:
@@ -154,7 +150,7 @@ def test_basic_decode(dtype, top_k, N, batch_size):
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=42)
     pre_idx_arg = pre_idx if _IS_BLACKWELL else None
 
-    indices = flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
+    indices = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
     torch.cuda.synchronize()
 
     assert indices.shape == (batch_size, top_k)
@@ -176,7 +172,7 @@ def test_return_values(dtype, top_k):
     N, batch_size = 8192, 4
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=13)
 
-    indices, values = flashinfer.top_k_decode(
+    indices, values = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, return_values=True
     )
     torch.cuda.synchronize()
@@ -209,7 +205,7 @@ def test_next_n(dtype, top_k, batch_size):
         num_rows, N, top_k, dtype, seed=7, next_n=next_n
     )
 
-    indices = flashinfer.top_k_decode(
+    indices = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, next_n=next_n
     )
     torch.cuda.synchronize()
@@ -232,7 +228,7 @@ def test_compress_ratio(dtype, top_k):
         batch_size, N, top_k, dtype, seed=55, compress_ratio=compress_ratio
     )
 
-    indices = flashinfer.top_k_decode(
+    indices = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, compress_ratio=compress_ratio
     )
     torch.cuda.synchronize()
@@ -253,7 +249,7 @@ def test_preallocated_outputs():
     out_i = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
     out_v = torch.empty(batch_size, top_k, dtype=dtype, device="cuda")
 
-    ret_i, ret_v = flashinfer.top_k_decode(
+    ret_i, ret_v = flashinfer.top_k_varlen(
         logits,
         seq_lens,
         top_k,
@@ -280,7 +276,7 @@ def test_large_batch():
     dtype, top_k, N, batch_size = torch.bfloat16, 1024, 65536, 128
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=9)
 
-    indices = flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=pre_idx)
+    indices = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx)
     torch.cuda.synchronize()
 
     _check_correct(indices, logits, seq_lens, top_k)
@@ -298,9 +294,9 @@ def test_repeated_calls():
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=3)
     pre_idx_arg = pre_idx if _IS_BLACKWELL else None
 
-    idx1 = flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
+    idx1 = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
     torch.cuda.synchronize()
-    idx2 = flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
+    idx2 = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
     torch.cuda.synchronize()
 
     for row in range(batch_size):
@@ -320,7 +316,7 @@ def test_no_pre_idx_fallback():
     dtype, top_k, N, batch_size = torch.bfloat16, 512, 4096, 4
     logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=77)
 
-    indices = flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=None)
+    indices = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=None)
     torch.cuda.synchronize()
 
     assert indices.shape == (batch_size, top_k)
@@ -340,7 +336,7 @@ def test_radix_return_values(dtype, top_k):
     N, batch_size = 8192, 4
     logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=13)
 
-    indices, values = flashinfer.top_k_decode(
+    indices, values = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=None, return_values=True, backend="radix"
     )
     torch.cuda.synchronize()
@@ -366,7 +362,7 @@ def test_radix_next_n(dtype, top_k, batch_size):
     num_rows = batch_size * next_n
     logits, _, seq_lens = _make_inputs(num_rows, N, top_k, dtype, seed=7, next_n=next_n)
 
-    indices = flashinfer.top_k_decode(
+    indices = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=None, next_n=next_n, backend="radix"
     )
     torch.cuda.synchronize()
@@ -384,7 +380,7 @@ def test_radix_compress_ratio(dtype, top_k):
         batch_size, N, top_k, dtype, seed=55, compress_ratio=compress_ratio
     )
 
-    indices = flashinfer.top_k_decode(
+    indices = flashinfer.top_k_varlen(
         logits,
         seq_lens,
         top_k,
@@ -405,7 +401,7 @@ def test_radix_preallocated_outputs():
     out_i = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
     out_v = torch.empty(batch_size, top_k, dtype=dtype, device="cuda")
 
-    ret_i, ret_v = flashinfer.top_k_decode(
+    ret_i, ret_v = flashinfer.top_k_varlen(
         logits,
         seq_lens,
         top_k,
@@ -442,54 +438,7 @@ def test_lb_config_validation():
 
 
 # ---------------------------------------------------------------------------
-# test_should_load_balance — heuristic decision boundary
-# ---------------------------------------------------------------------------
-
-
-def test_lb_decision_from_counts():
-    """Pure-host LB decision: LB iff long rows present but a minority (<= half).
-
-    Takes plain ints, so it does no device I/O (CUDA-graph safe). Boundary is
-    ``0 < n_long <= num_rows // 2``.
-    """
-    from flashinfer.topk_blackwell import _lb_decision_from_counts
-
-    assert not _lb_decision_from_counts(0, 128)  # no long rows
-    assert _lb_decision_from_counts(1, 128)  # 1 long (minority)
-    assert _lb_decision_from_counts(8, 128)  # few long
-    assert _lb_decision_from_counts(64, 128)  # exactly half
-    assert not _lb_decision_from_counts(65, 128)  # majority
-    assert not _lb_decision_from_counts(128, 128)  # all long
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-def test_count_long_rows():
-    """_count_long_rows counts rows with scan-len strictly above long_threshold."""
-    from flashinfer.topk_blackwell import _count_long_rows
-
-    LT = 64 * 1024
-
-    def lens(n_long, long_len, n_short, short_len):
-        return torch.tensor(
-            [long_len] * n_long + [short_len] * n_short,
-            dtype=torch.int32,
-            device="cuda",
-        )
-
-    # compress_ratio == 1 (DSv3.2): compare raw seq_lens against long_threshold.
-    assert _count_long_rows(lens(0, 131072, 128, 2048), 1, LT) == 0
-    assert _count_long_rows(lens(8, 131072, 120, 2048), 1, LT) == 8
-    # Boundary: "long" is strictly greater-than, so seq_len == threshold is short.
-    assert _count_long_rows(lens(8, LT, 120, 2048), 1, LT) == 0
-
-    # compress_ratio == 4 (DSv4): scan-len = seq_len / 4, so a row is "long" iff
-    # seq_len > long_threshold * 4 (= 256K).
-    assert _count_long_rows(lens(8, 524288, 120, 8192), 4, LT) == 8  # 512K/4=128K
-    assert _count_long_rows(lens(8, 262144, 120, 8192), 4, LT) == 0  # 256K/4=64K not >
-
-
-# ---------------------------------------------------------------------------
-# test_load_balance_modes — auto / True / False all correct
+# test_load_balance_modes — True / False correct
 # ---------------------------------------------------------------------------
 
 
@@ -514,14 +463,10 @@ def _make_ragged_gvr_inputs(top_k, dtype=torch.bfloat16):
 @requires_blackwell
 @pytest.mark.parametrize("load_balance", [True, False])
 def test_load_balance_modes(load_balance):
-    """Explicit load_balance=True/False both produce correct GVR top-K.
-
-    ``True``/``False`` force the two kernel variants directly on a ragged batch.
-    (``"auto"`` is covered by test_load_balance_auto_num_long_rows_hint.)
-    """
+    """load_balance=True/False both produce correct GVR top-K on a ragged batch."""
     top_k = 512
     logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
-    indices = flashinfer.top_k_decode(
+    indices = flashinfer.top_k_varlen(
         logits,
         seq_lens,
         top_k,
@@ -532,47 +477,6 @@ def test_load_balance_modes(load_balance):
     torch.cuda.synchronize()
     assert indices.shape == (seq_lens.shape[0], top_k)
     _check_correct(indices, logits, seq_lens, top_k)
-
-
-@requires_blackwell
-@pytest.mark.parametrize("num_long_rows", [4, 0])
-def test_load_balance_auto_num_long_rows_hint(num_long_rows):
-    """load_balance='auto' with a host-side num_long_rows hint stays correct.
-
-    The hint drives a pure-host LB/non-LB decision (CUDA-graph safe). The batch is
-    fixed (4 long + 12 short); num_long_rows only steers the choice, and BOTH
-    kernel paths must produce correct top-K on the same inputs.
-    """
-    top_k = 512
-    logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
-    indices = flashinfer.top_k_decode(
-        logits,
-        seq_lens,
-        top_k,
-        pre_idx=pre_idx,
-        backend="gvr",
-        load_balance="auto",
-        num_long_rows=num_long_rows,
-    )
-    torch.cuda.synchronize()
-    assert indices.shape == (seq_lens.shape[0], top_k)
-    _check_correct(indices, logits, seq_lens, top_k)
-
-
-@requires_blackwell
-def test_load_balance_auto_requires_num_long_rows():
-    """load_balance='auto' without num_long_rows raises ValueError (no device sync)."""
-    top_k = 512
-    logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
-    with pytest.raises(ValueError, match="num_long_rows"):
-        flashinfer.top_k_decode(
-            logits,
-            seq_lens,
-            top_k,
-            pre_idx=pre_idx,
-            backend="gvr",
-            load_balance="auto",
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +503,7 @@ def test_gvr_row_width_alignment(dtype, align):
     pre_idx[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
 
     with pytest.raises(ValueError, match=f"multiple of {align}"):
-        flashinfer.top_k_decode(
+        flashinfer.top_k_varlen(
             logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr", load_balance=False
         )
 
@@ -610,7 +514,7 @@ def test_radix_row_width_no_alignment_constraint():
     top_k, batch_size, N_bad = 512, 4, 4097
     logits = torch.randn(batch_size, N_bad, dtype=torch.bfloat16, device="cuda")
     seq_lens = torch.full((batch_size,), N_bad, dtype=torch.int32, device="cuda")
-    indices = flashinfer.top_k_decode(logits, seq_lens, top_k, backend="radix")
+    indices = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix")
     torch.cuda.synchronize()
     assert indices.shape == (batch_size, top_k)
 
@@ -627,7 +531,7 @@ def test_auto_gvr_knobs_256bit_alignment_gate():
     only guarantees 16B. The gate keeps a 256-bit kernel from being selected for a
     16B-but-not-32B-aligned N (which would fault). No GPU needed beyond dtype size.
     """
-    from flashinfer.topk_blackwell import _n_is_256bit_aligned
+    from flashinfer.topk_varlen import _n_is_256bit_aligned
 
     # bf16 itemsize 2 -> 256-bit needs N % 16 == 0.
     assert _n_is_256bit_aligned(torch.bfloat16, 4096)
@@ -660,7 +564,7 @@ def test_lb_256bit_misaligned_no_crash():
         pre_idx[r, 0] = int(lf[r, : int(seq_lens[r])].argmax().item())
     pre_idx[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
 
-    indices = flashinfer.top_k_decode(
+    indices = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr", load_balance=True
     )
     torch.cuda.synchronize()  # would surface a misaligned-address fault
@@ -671,7 +575,7 @@ def test_lb_256bit_misaligned_no_crash():
 def test_auto_gvr_knobs_shape_aware():
     """auto() picks a shape-appropriate config: large-N fp32 small-batch -> 1024
     threads + 256-bit + low min_blocks (vs the frozen 512/mb3 old default)."""
-    from flashinfer.topk_blackwell import _auto_gvr_knobs
+    from flashinfer.topk_varlen import _auto_gvr_knobs
 
     logits = torch.randn(8, 131072, dtype=torch.float32, device="cuda")
     num_threads, knobs = _auto_gvr_knobs(logits, is_lb=False)

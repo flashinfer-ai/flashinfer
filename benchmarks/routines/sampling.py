@@ -72,8 +72,8 @@ def run_sampling_test(args):
         return testTopKPageTableTransform(args)
     elif args.routine == "top_k_ragged_transform":
         return testTopKRaggedTransform(args)
-    elif args.routine == "top_k_decode":
-        return testTopKDecode(args)
+    elif args.routine == "top_k_varlen":
+        return testTopKVarlen(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -184,7 +184,7 @@ def parse_sampling_args(line, parser):
         nargs="+",
         default=["cuda"],
         choices=["cuda", "radix", "gvr"],
-        help="Kernel backends to test. Default: cuda. Use 'radix'/'gvr' for top_k_decode.",
+        help="Kernel backends to test. Default: cuda. Use 'radix'/'gvr' for top_k_varlen.",
     )
 
     args = parser.parse_args(line)
@@ -1897,8 +1897,8 @@ def testTopKPageTableTransform(args):
     return res
 
 
-def testTopKDecode(args):
-    """Test top_k_decode with two runners: 'radix' (masked fallback) and 'gvr' (Blackwell GVR LB).
+def testTopKVarlen(args):
+    """Test top_k_varlen with two runners: 'radix' (masked fallback) and 'gvr' (Blackwell GVR LB).
 
     Runners
     -------
@@ -1911,7 +1911,7 @@ def testTopKDecode(args):
     to logits masked to ``seq_lens``.
     """
     if args.verbose >= 1:
-        print("[INFO] Running testTopKDecode")
+        print("[INFO] Running testTopKVarlen")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
@@ -1951,9 +1951,9 @@ def testTopKDecode(args):
 
     def run_backend(backend, logits):
         if backend == "radix":
-            return flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=None)
+            return flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=None)
         elif backend == "gvr":
-            return flashinfer.top_k_decode(logits, seq_lens, top_k, pre_idx=pre_idx)
+            return flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx)
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
