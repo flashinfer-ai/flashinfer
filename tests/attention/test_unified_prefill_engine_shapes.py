@@ -9,16 +9,21 @@ than an idealized version, so any impedance mismatch between the unified
 contract and what an engine can cheaply supply shows up here as a failure
 or a documented friction note.
 
-Friction log (kept current — this docstring is part of the deliverable):
-- vLLM: none structural.  The trtllm-path metadata (dense block table + GPU
-  seq_lens + host maxes + CPU mirrors) maps 1:1; the rebased prefill slice
-  of a mixed batch works as-is; zero-sync plan holds with the mirrors vLLM
-  already carries.
-- sglang: none structural for the paged half.  page_size=1 token-CSR maps to
-  the flat ``kv_page_indices`` form including the +256 over-allocated tail
-  (validation requires len >= required, not ==); the preallocated
-  ``(max_bs+1,)`` indptr buffer slice works as-is.  The radix-extend
-  ragged+paged cascade is out of v1 scope (needs the ragged follow-up).
+Friction log (kept current — this docstring is part of the deliverable;
+the full audited list lives in integrations/README.md):
+- vLLM: metadata maps 1:1 (dense table + GPU seq_lens + host maxes + CPU
+  mirrors; rebased mixed-batch slice; preallocated out).  Carried friction:
+  the all-trtllm async mode skips seq_lens_cpu retrieval today and would
+  pay it under unified's unconditional validation; DCP rewrites the CPU
+  lens to DCP-local while GPU stays global (mirror contract) — DCP stays
+  on the current path in v1.
+- sglang: page_size=1 token-CSR maps to the flat ``kv_page_indices`` form
+  including the +256 over-allocated tail; preallocated indptr buffer
+  slices work as-is.  Carried friction: no host copy of paged_kernel_lens
+  exists at the plan site today (the diff adds a copy-forward of a
+  scheduler-owned host array).  The radix-extend cascade (causal=False
+  over prefix lens, zero-length rows for no-prefix requests) is outside
+  the v1 envelope entirely.
 """
 
 import pytest

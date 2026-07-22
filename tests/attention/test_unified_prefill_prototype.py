@@ -331,7 +331,8 @@ def test_resolve_is_static_and_explains():
 
 
 @pytest.mark.parametrize("backend", ["cudnn", "fa2"])
-def test_unified_prefill_headdim_192_128(backend):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_unified_prefill_headdim_192_128(backend, dtype):
     """(192,128) head dims — capability-honesty: declared rows are tested."""
     if backend == "fa2":
         pytest.skip("fa2 (192,128) not declared in the prototype capability set")
@@ -345,7 +346,7 @@ def test_unified_prefill_headdim_192_128(backend):
         head_dim_qk=192,
         head_dim_vo=128,
         page_size=16,
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     check(p, backend)
 
@@ -628,7 +629,7 @@ def test_unified_prefill_csr_dense_equivalence():
         assert torch.equal(lse_a, lse_b), backend
 
 
-@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn"])
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen"])
 def test_unified_prefill_fp16(backend):
     p = make_problem(
         seed=53,
@@ -646,7 +647,8 @@ def test_unified_prefill_fp16(backend):
 
 @pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @pytest.mark.parametrize("head_dim", [64, 256])
-def test_unified_prefill_wide_head_dims(backend, head_dim):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_unified_prefill_wide_head_dims(backend, head_dim, dtype):
     p = make_problem(
         seed=59,
         batch_size=3,
@@ -656,7 +658,7 @@ def test_unified_prefill_wide_head_dims(backend, head_dim):
         num_kv_heads=2,
         head_dim_qk=head_dim,
         page_size=16,
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     check(p, backend)
 
