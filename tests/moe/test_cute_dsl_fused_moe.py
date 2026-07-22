@@ -78,6 +78,66 @@ sm100_required = pytest.mark.skipif(
 )
 
 
+_MOE_QUANT_MODES = ("w4a4", "w4a16")
+
+
+_MOE_QUANT_MODE_CASES = (
+    pytest.param("w4a4", False, id="w4a4-per-tensor"),
+    pytest.param("w4a4", True, id="w4a4-per-token"),
+    pytest.param("w4a16", False, id="w4a16"),
+)
+
+
+def _prepare_moe_quant_mode_inputs(
+    tensors: dict,
+    quant_mode: str,
+) -> tuple[dict, dict]:
+    """Select API and reference inputs for a shared MoE test case."""
+    if quant_mode == "w4a16":
+        return (
+            {
+                "x": tensors["x_bf16"],
+                "x_sf": None,
+                "fc2_input_scale": None,
+                "per_token_scale": None,
+            },
+            {
+                "hidden_states": tensors["x_bf16"],
+                "gemm1_weights": tensors["w1_weight"],
+                "gemm2_weights": tensors["w2_weight"],
+                "gemm1_weight_sf": tensors["w1_weight_sf"],
+                "gemm2_weight_sf": tensors["w2_weight_sf"],
+                "gemm1_alpha": tensors["w1_alpha"],
+                "gemm2_alpha": tensors["w2_alpha"],
+                "fc2_input_scale": None,
+                "use_per_token_activation": False,
+                "quant_mode": "w4a16",
+            },
+        )
+    if quant_mode == "w4a4":
+        return (
+            {
+                "x": tensors["x"],
+                "x_sf": tensors["x_sf"],
+                "fc2_input_scale": tensors["fc2_input_scale"],
+                "per_token_scale": tensors["x_per_token_scale"],
+            },
+            {
+                "hidden_states": tensors["x_ref"].float(),
+                "gemm1_weights": tensors["w1_weight_bf16"].float(),
+                "gemm2_weights": tensors["w2_weight_bf16"].float(),
+                "gemm1_weight_sf": None,
+                "gemm2_weight_sf": None,
+                "gemm1_alpha": tensors["w1_alpha"],
+                "gemm2_alpha": tensors["w2_alpha"],
+                "fc2_input_scale": tensors["fc2_input_scale"],
+                "use_per_token_activation": tensors["x_per_token_scale"] is not None,
+                "quant_mode": "w4a4",
+            },
+        )
+    raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
+
+
 # =============================================================================
 # Test Class: GEMM input validation
 # =============================================================================
@@ -976,150 +1036,15 @@ class TestAutotunerBucketConfig:
 
 
 # =============================================================================
-# Test Class: BF16 activations with online NVFP4 weight dequantization
+# Test Class: W4A16-specific contracts
 # =============================================================================
 
 
 @cute_dsl_available
 @sm100_required
-class TestCuteDslMoeBf16Activation:
-    @pytest.mark.parametrize("ep_size,ep_rank", [(1, 0), (8, 4)])
+class TestCuteDslMoeW4A16:
     @pytest.mark.parametrize("use_wrapper", [False, True])
-    @pytest.mark.parametrize("enable_pdl", [False, True])
-    @pytest.mark.parametrize("use_fused_finalize", [False, True])
-    def test_numerical_accuracy(
-        self,
-        use_wrapper: bool,
-        enable_pdl: bool,
-        use_fused_finalize: bool,
-        ep_size: int,
-        ep_rank: int,
-    ):
-        from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
-
-        num_tokens, hidden_size, intermediate_size = 129, 256, 512
-        num_experts, top_k = 256, 2
-        num_local_experts = num_experts // ep_size
-        local_expert_offset = ep_rank * num_local_experts
-        tensors = create_moe_tensors(
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            top_k=top_k,
-        )
-        if ep_size == 1:
-            # Give two experts one full fallback route tile and one boundary
-            # tile each, and exercise route-to-token reduction.
-            tensors["token_selected_experts"][:] = torch.arange(
-                top_k, device=tensors["token_selected_experts"].device
-            )
-
-        kwargs = {
-            "x": tensors["x_bf16"],
-            "x_sf": None,
-            "token_selected_experts": tensors["token_selected_experts"],
-            "token_final_scales": tensors["token_final_scales"],
-            "w1_weight": tensors["w1_weight"],
-            "w1_weight_sf": tensors["w1_weight_sf"],
-            "w1_alpha": tensors["w1_alpha"],
-            "fc2_input_scale": None,
-            "w2_weight": tensors["w2_weight"],
-            "w2_weight_sf": tensors["w2_weight_sf"],
-            "w2_alpha": tensors["w2_alpha"],
-        }
-        if use_wrapper:
-            moe = CuteDslMoEWrapper(
-                num_experts=num_experts,
-                top_k=top_k,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                num_local_experts=num_local_experts,
-                local_expert_offset=local_expert_offset,
-                use_cuda_graph=False,
-                enable_pdl=enable_pdl,
-                use_fused_finalize=use_fused_finalize,
-                quant_mode="w4a16",
-            )
-            result = moe.run(**kwargs)
-        else:
-            result = cute_dsl_fused_moe_nvfp4(
-                **kwargs,
-                num_experts=num_experts,
-                top_k=top_k,
-                num_local_experts=num_local_experts,
-                local_expert_offset=local_expert_offset,
-                enable_pdl=enable_pdl,
-                use_fused_finalize=use_fused_finalize,
-                quant_mode="w4a16",
-            )
-
-        ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"],
-            gemm1_weights=tensors["w1_weight_bf16"],
-            gemm2_weights=tensors["w2_weight_bf16"],
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_local_experts=num_local_experts,
-            local_expert_offset=local_expert_offset,
-        )
-
-        assert result.shape == (num_tokens, hidden_size)
-        assert result.dtype == torch.bfloat16
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
-
-        # Weight scales are serving-owned tensors and may be updated in place.
-        # Reuse the same allocation to ensure W4A16 reads the current contents.
-        tensors["w1_weight_sf"].zero_()
-        if use_wrapper:
-            updated = moe.run(**kwargs)
-        else:
-            updated = cute_dsl_fused_moe_nvfp4(
-                **kwargs,
-                num_experts=num_experts,
-                top_k=top_k,
-                num_local_experts=num_local_experts,
-                local_expert_offset=local_expert_offset,
-                enable_pdl=enable_pdl,
-                use_fused_finalize=use_fused_finalize,
-                quant_mode="w4a16",
-            )
-        torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
-
-    @pytest.mark.parametrize(
-        "activation_type,activation_kwargs",
-        [
-            pytest.param(ActivationType.Swiglu, {}, id="swiglu"),
-            pytest.param(
-                ActivationType.Swiglu,
-                {
-                    "swiglu_alpha": 1.702,
-                    "swiglu_beta": 1.0,
-                    "swiglu_limit": 7.0,
-                },
-                id="swiglu-oai",
-            ),
-            pytest.param(ActivationType.Relu2, {}, id="relu2"),
-        ],
-    )
-    @pytest.mark.parametrize("use_wrapper", [False, True])
-    def test_activation_dispatch(
-        self,
-        activation_type: ActivationType,
-        activation_kwargs: dict,
-        use_wrapper: bool,
-    ):
+    def test_weight_scale_update(self, use_wrapper: bool):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 17, 256, 512
@@ -1131,9 +1056,7 @@ class TestCuteDslMoeBf16Activation:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
-            gated=activation_type.is_gated,
         )
-
         kwargs = {
             "x": tensors["x_bf16"],
             "x_sf": None,
@@ -1154,45 +1077,28 @@ class TestCuteDslMoeBf16Activation:
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 use_cuda_graph=False,
-                enable_pdl=False,
-                use_fused_finalize=False,
-                activation_type=activation_type,
                 quant_mode="w4a16",
-                **activation_kwargs,
             )
-            result = moe.run(**kwargs)
         else:
-            result = cute_dsl_fused_moe_nvfp4(
+            moe = None
+
+        def run():
+            if moe is not None:
+                return moe.run(**kwargs)
+            return cute_dsl_fused_moe_nvfp4(
                 **kwargs,
                 num_experts=num_experts,
                 top_k=top_k,
-                activation_type=activation_type,
-                use_fused_finalize=False,
-                enable_pdl=False,
                 quant_mode="w4a16",
-                **activation_kwargs,
             )
-        ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"],
-            gemm1_weights=tensors["w1_weight_bf16"],
-            gemm2_weights=tensors["w2_weight_bf16"],
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            activation_type=activation_type,
-            **activation_kwargs,
-        )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
+        # Weight scales are serving-owned tensors and may be updated in place.
+        # Reuse the same allocation to ensure W4A16 reads the current contents.
+        result = run()
+        assert torch.count_nonzero(result).item() > 0
+        tensors["w1_weight_sf"].zero_()
+        updated = run()
+        torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
 
     @pytest.mark.parametrize(
         "activation_type,route_tile,gemm1_tactic,gemm2_tactic",
@@ -1244,6 +1150,7 @@ class TestCuteDslMoeBf16Activation:
         tensors["token_selected_experts"][:] = torch.arange(
             top_k, device=tensors["token_selected_experts"].device
         )
+        _, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a16")
         tactic = (route_tile, gemm1_tactic, gemm2_tactic)
 
         result = _moe_core_impl(
@@ -1268,11 +1175,6 @@ class TestCuteDslMoeBf16Activation:
             activation_type=activation_type,
         )
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"],
-            gemm1_weights=tensors["w1_weight_bf16"],
-            gemm2_weights=tensors["w2_weight_bf16"],
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -1281,114 +1183,13 @@ class TestCuteDslMoeBf16Activation:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation_type=activation_type,
+            **reference_inputs,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
-
-    def test_autotune_cuda_graph(self):
-        from flashinfer import autotune
-        from flashinfer import CuteDslMoEWrapper
-
-        num_tokens, hidden_size, intermediate_size = 128, 256, 512
-        num_experts, top_k = 256, 2
-        tensors = create_moe_tensors(
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            num_local_experts=num_experts,
-            top_k=top_k,
-        )
-        route_idx = torch.arange(
-            num_tokens * top_k,
-            device=tensors["token_selected_experts"].device,
-            dtype=torch.int32,
-        )
-        tensors["token_selected_experts"].copy_(
-            route_idx.reshape(num_tokens, top_k) % num_experts
-        )
-        kwargs = {
-            "x": tensors["x_bf16"],
-            "x_sf": None,
-            "token_selected_experts": tensors["token_selected_experts"],
-            "token_final_scales": tensors["token_final_scales"],
-            "w1_weight": tensors["w1_weight"],
-            "w1_weight_sf": tensors["w1_weight_sf"],
-            "w1_alpha": tensors["w1_alpha"],
-            "fc2_input_scale": None,
-            "w2_weight": tensors["w2_weight"],
-            "w2_weight_sf": tensors["w2_weight_sf"],
-            "w2_alpha": tensors["w2_alpha"],
-        }
-        moe = CuteDslMoEWrapper(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            use_cuda_graph=True,
-            use_fused_finalize=False,
-            quant_mode="w4a16",
-        )
-
-        # Profile eagerly so graph capture only performs a cache lookup and
-        # launches the already-selected tactic.
-        with autotune(True):
-            eager_output = moe.run(**kwargs)
-        torch.cuda.synchronize()
-        ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"],
-            gemm1_weights=tensors["w1_weight_bf16"],
-            gemm2_weights=tensors["w2_weight_bf16"],
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-        )
-        passed, percent_within, atol = check_accuracy(eager_output, ref_output)
-        assert passed, (
-            f"Eager accuracy: {percent_within * 100:.2f}% "
-            f"within tolerance (atol={atol:.4f})"
-        )
-
-        for _ in range(3):
-            moe.run(**kwargs)
-        torch.cuda.synchronize()
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            graph_output = moe.run(**kwargs)
-
-        tensors["x_bf16"].normal_().div_(10)
-        ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"],
-            gemm1_weights=tensors["w1_weight_bf16"],
-            gemm2_weights=tensors["w2_weight_bf16"],
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-        )
-        for _ in range(3):
-            graph.replay()
-            torch.cuda.synchronize()
-            passed, percent_within, atol = check_accuracy(graph_output, ref_output)
-            assert passed, (
-                f"CUDA graph accuracy: {percent_within * 100:.2f}% "
-                f"within tolerance (atol={atol:.4f})"
-            )
 
 
 # =============================================================================
@@ -1406,7 +1207,9 @@ class TestCuteDslFusedMoeFunctional:
     @pytest.mark.parametrize(
         "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
     )
-    @pytest.mark.parametrize("use_per_token_activation", [False, True])
+    @pytest.mark.parametrize(
+        "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
+    )
     @pytest.mark.parametrize("top_k", [1, 2, 8])
     @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
     @pytest.mark.parametrize("num_experts", [256, 384])
@@ -1421,6 +1224,7 @@ class TestCuteDslFusedMoeFunctional:
         hidden_size: int,
         intermediate_size: int,
         num_experts: int,
+        quant_mode: str,
         use_per_token_activation: bool,
     ):
         """Accuracy test for functional API across configurations."""
@@ -1431,14 +1235,16 @@ class TestCuteDslFusedMoeFunctional:
             hidden_size,
             intermediate_size,
             num_experts,
+            quant_mode,
             use_per_token_activation,
             use_fused_finalize=True,
         )
 
     @pytest.mark.parametrize(
-        "activation_type,num_tokens,top_k,hidden_size,intermediate_size,num_experts,use_per_token_activation",
+        "quant_mode,activation_type,num_tokens,top_k,hidden_size,intermediate_size,num_experts,use_per_token_activation",
         [
             pytest.param(
+                "w4a4",
                 ActivationType.Swiglu,
                 128,
                 1,
@@ -1449,6 +1255,7 @@ class TestCuteDslFusedMoeFunctional:
                 id="swiglu-per-tensor",
             ),
             pytest.param(
+                "w4a4",
                 ActivationType.Relu2,
                 515,
                 8,
@@ -1458,10 +1265,33 @@ class TestCuteDslFusedMoeFunctional:
                 True,
                 id="relu2-per-token",
             ),
+            pytest.param(
+                "w4a16",
+                ActivationType.Swiglu,
+                128,
+                1,
+                256,
+                512,
+                256,
+                False,
+                id="w4a16-swiglu",
+            ),
+            pytest.param(
+                "w4a16",
+                ActivationType.Relu2,
+                515,
+                8,
+                1024,
+                2048,
+                384,
+                False,
+                id="w4a16-relu2",
+            ),
         ],
     )
     def test_deterministic_finalize_numerical_accuracy(
         self,
+        quant_mode: str,
         activation_type: ActivationType,
         num_tokens: int,
         top_k: int,
@@ -1477,6 +1307,7 @@ class TestCuteDslFusedMoeFunctional:
             hidden_size,
             intermediate_size,
             num_experts,
+            quant_mode,
             use_per_token_activation,
             use_fused_finalize=False,
         )
@@ -1489,6 +1320,7 @@ class TestCuteDslFusedMoeFunctional:
         hidden_size: int,
         intermediate_size: int,
         num_experts: int,
+        quant_mode: str,
         use_per_token_activation: bool,
         use_fused_finalize: bool,
     ):
@@ -1507,16 +1339,16 @@ class TestCuteDslFusedMoeFunctional:
             gated=gated,
             use_per_token_activation=use_per_token_activation,
         )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, quant_mode
+        )
 
         result = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
-            x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=tensors["fc2_input_scale"],
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
@@ -1525,7 +1357,8 @@ class TestCuteDslFusedMoeFunctional:
             num_local_experts=num_local_experts,
             activation_type=activation_type,
             use_fused_finalize=use_fused_finalize,
-            per_token_scale=tensors["x_per_token_scale"],
+            quant_mode=quant_mode,
+            **api_inputs,
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1534,21 +1367,15 @@ class TestCuteDslFusedMoeFunctional:
         assert not torch.isinf(result).any()
 
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_ref"].float().cuda(),
-            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
-            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
-            num_experts=num_local_experts,
+            num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            fc2_input_scale=tensors["fc2_input_scale"],
             activation_type=activation_type,
-            use_per_token_activation=use_per_token_activation,
+            **reference_inputs,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -1556,7 +1383,8 @@ class TestCuteDslFusedMoeFunctional:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
-    def test_with_autotune(self):
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_with_autotune(self, quant_mode: str):
         """Test functional API with autotune context."""
         from flashinfer import autotune
         from flashinfer import cute_dsl_fused_moe_nvfp4
@@ -1572,17 +1400,15 @@ class TestCuteDslFusedMoeFunctional:
             num_local_experts=num_experts,
             top_k=top_k,
         )
+        api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, quant_mode)
 
         with autotune(True):
             result = cute_dsl_fused_moe_nvfp4(
-                x=tensors["x"],
-                x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
                 w1_weight=tensors["w1_weight"],
                 w1_weight_sf=tensors["w1_weight_sf"],
                 w1_alpha=tensors["w1_alpha"],
-                fc2_input_scale=tensors["fc2_input_scale"],
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
@@ -1592,12 +1418,15 @@ class TestCuteDslFusedMoeFunctional:
                 swiglu_alpha=1.702,
                 swiglu_beta=1.0,
                 swiglu_limit=7.0,
+                quant_mode=quant_mode,
+                **api_inputs,
             )
 
         assert result.shape == (num_tokens, hidden_size)
         assert not torch.isnan(result).any()
 
-    def test_swiglu_oai_accuracy(self):
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_swiglu_oai_accuracy(self, quant_mode: str):
         """Accuracy test for the OAI SwiGLU epilogue variant."""
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
@@ -1612,16 +1441,16 @@ class TestCuteDslFusedMoeFunctional:
             num_local_experts=num_experts,
             top_k=top_k,
         )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, quant_mode
+        )
 
         result = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
-            x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=tensors["fc2_input_scale"],
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
@@ -1631,14 +1460,11 @@ class TestCuteDslFusedMoeFunctional:
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
+            quant_mode=quant_mode,
+            **api_inputs,
         )
 
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"].float().cuda(),
-            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
-            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -1646,11 +1472,11 @@ class TestCuteDslFusedMoeFunctional:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            fc2_input_scale=tensors["fc2_input_scale"],
             activation_type=ActivationType.Swiglu,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
+            **reference_inputs,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -1673,7 +1499,9 @@ class TestCuteDslMoEWrapper:
 
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
-    @pytest.mark.parametrize("use_per_token_activation", [False, True])
+    @pytest.mark.parametrize(
+        "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
+    )
     @pytest.mark.parametrize("top_k", [2, 8])
     @pytest.mark.parametrize("num_experts", [256, 384])
     def test_wrapper_accuracy(
@@ -1682,6 +1510,7 @@ class TestCuteDslMoEWrapper:
         top_k: int,
         num_experts: int,
         use_fused_finalize: bool,
+        quant_mode: str,
         use_per_token_activation: bool,
     ):
         """Accuracy test for wrapper API."""
@@ -1698,6 +1527,9 @@ class TestCuteDslMoEWrapper:
             top_k=top_k,
             use_per_token_activation=use_per_token_activation,
         )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, quant_mode
+        )
 
         # Create wrapper WITHOUT CUDA graph
         moe = CuteDslMoEWrapper(
@@ -1707,21 +1539,19 @@ class TestCuteDslMoEWrapper:
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
             use_fused_finalize=use_fused_finalize,
+            quant_mode=quant_mode,
         )
 
         result = moe.run(
-            x=tensors["x"],
-            x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=tensors["fc2_input_scale"],
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
-            per_token_scale=tensors["x_per_token_scale"],
+            **api_inputs,
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1729,11 +1559,6 @@ class TestCuteDslMoEWrapper:
         assert not torch.isinf(result).any()
 
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_ref"].float().cuda(),
-            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
-            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -1741,8 +1566,7 @@ class TestCuteDslMoEWrapper:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            fc2_input_scale=tensors["fc2_input_scale"],
-            use_per_token_activation=use_per_token_activation,
+            **reference_inputs,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -1750,7 +1574,8 @@ class TestCuteDslMoEWrapper:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
-    def test_wrapper_swiglu_oai_accuracy(self):
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_wrapper_swiglu_oai_accuracy(self, quant_mode: str):
         """Accuracy test for wrapper API with OAI SwiGLU."""
         from flashinfer import CuteDslMoEWrapper
 
@@ -1765,6 +1590,9 @@ class TestCuteDslMoEWrapper:
             num_local_experts=num_experts,
             top_k=top_k,
         )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, quant_mode
+        )
 
         moe = CuteDslMoEWrapper(
             num_experts=num_experts,
@@ -1776,28 +1604,22 @@ class TestCuteDslMoEWrapper:
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
+            quant_mode=quant_mode,
         )
 
         result = moe.run(
-            x=tensors["x"],
-            x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=tensors["fc2_input_scale"],
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            **api_inputs,
         )
 
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"].float().cuda(),
-            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
-            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -1805,11 +1627,11 @@ class TestCuteDslMoEWrapper:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            fc2_input_scale=tensors["fc2_input_scale"],
             activation_type=ActivationType.Swiglu,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
+            **reference_inputs,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -1818,13 +1640,16 @@ class TestCuteDslMoEWrapper:
         )
 
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
-    @pytest.mark.parametrize("use_per_token_activation", [False, True])
+    @pytest.mark.parametrize(
+        "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
+    )
     @pytest.mark.parametrize("num_tokens", [64, 128, 256])
     @pytest.mark.parametrize("num_experts", [256, 384])
     def test_wrapper_cuda_graph(
         self,
         num_tokens: int,
         num_experts: int,
+        quant_mode: str,
         use_per_token_activation: bool,
         use_fused_finalize: bool,
     ):
@@ -1843,6 +1668,9 @@ class TestCuteDslMoEWrapper:
             top_k=top_k,
             use_per_token_activation=use_per_token_activation,
         )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, quant_mode
+        )
 
         # Create wrapper WITH CUDA graph
         moe = CuteDslMoEWrapper(
@@ -1857,23 +1685,21 @@ class TestCuteDslMoEWrapper:
             swiglu_beta=1.0,
             swiglu_limit=7.0,
             use_fused_finalize=use_fused_finalize,
+            quant_mode=quant_mode,
         )
 
         # Warmup
         for _ in range(3):
             moe.run(
-                x=tensors["x"],
-                x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
                 w1_weight=tensors["w1_weight"],
                 w1_weight_sf=tensors["w1_weight_sf"],
                 w1_alpha=tensors["w1_alpha"],
-                fc2_input_scale=tensors["fc2_input_scale"],
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
-                per_token_scale=tensors["x_per_token_scale"],
+                **api_inputs,
             )
         torch.cuda.synchronize()
 
@@ -1881,18 +1707,15 @@ class TestCuteDslMoEWrapper:
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             output = moe.run(
-                x=tensors["x"],
-                x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
                 w1_weight=tensors["w1_weight"],
                 w1_weight_sf=tensors["w1_weight_sf"],
                 w1_alpha=tensors["w1_alpha"],
-                fc2_input_scale=tensors["fc2_input_scale"],
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
-                per_token_scale=tensors["x_per_token_scale"],
+                **api_inputs,
             )
         torch.cuda.synchronize()
 
@@ -1925,11 +1748,6 @@ class TestCuteDslMoEWrapper:
 
         # Verify accuracy
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"].float().cuda(),
-            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
-            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -1937,12 +1755,11 @@ class TestCuteDslMoEWrapper:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            fc2_input_scale=tensors["fc2_input_scale"],
             activation_type=ActivationType.Swiglu,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
-            use_per_token_activation=use_per_token_activation,
+            **reference_inputs,
         )
 
         passed, percent_within, atol = check_accuracy(results[0], ref_output)
@@ -1953,7 +1770,10 @@ class TestCuteDslMoEWrapper:
     @pytest.mark.parametrize(
         "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
     )
-    def test_wrapper_with_autotune(self, activation_type: ActivationType):
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_wrapper_with_autotune(
+        self, activation_type: ActivationType, quant_mode: str
+    ):
         """Test wrapper API with autotune context."""
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
@@ -1971,6 +1791,9 @@ class TestCuteDslMoEWrapper:
             top_k=top_k,
             gated=gated,
         )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, quant_mode
+        )
 
         moe = CuteDslMoEWrapper(
             num_experts=num_experts,
@@ -1979,32 +1802,26 @@ class TestCuteDslMoEWrapper:
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
             activation_type=activation_type,
+            quant_mode=quant_mode,
         )
 
         with autotune(True):
             result = moe.run(
-                x=tensors["x"],
-                x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
                 w1_weight=tensors["w1_weight"],
                 w1_weight_sf=tensors["w1_weight_sf"],
                 w1_alpha=tensors["w1_alpha"],
-                fc2_input_scale=tensors["fc2_input_scale"],
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
+                **api_inputs,
             )
 
         assert result.shape == (num_tokens, hidden_size)
         assert not torch.isnan(result).any()
 
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"].float().cuda(),
-            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
-            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2012,8 +1829,8 @@ class TestCuteDslMoEWrapper:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            fc2_input_scale=tensors["fc2_input_scale"],
             activation_type=activation_type,
+            **reference_inputs,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -2021,7 +1838,8 @@ class TestCuteDslMoEWrapper:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
-    def test_cuda_graph_wrapper_lifetime_before_autotune(self):
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_cuda_graph_wrapper_lifetime_before_autotune(self, quant_mode: str):
         """Dropped CUDA graph wrappers should not wait for cyclic GC."""
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
@@ -2031,18 +1849,17 @@ class TestCuteDslMoEWrapper:
         target_num_tokens = 256
 
         def run_wrapper(moe, tensors):
+            api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, quant_mode)
             return moe.run(
-                x=tensors["x"],
-                x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
                 w1_weight=tensors["w1_weight"],
                 w1_weight_sf=tensors["w1_weight_sf"],
                 w1_alpha=tensors["w1_alpha"],
-                fc2_input_scale=tensors["fc2_input_scale"],
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
+                **api_inputs,
             )
 
         def warmup_and_drop_cuda_graph_wrapper():
@@ -2061,6 +1878,7 @@ class TestCuteDslMoEWrapper:
                 intermediate_size=intermediate_size,
                 use_cuda_graph=True,
                 max_num_tokens=64,
+                quant_mode=quant_mode,
             )
             ref = weakref.ref(moe)
             finalized = []
@@ -2096,6 +1914,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
+            quant_mode=quant_mode,
         )
 
         with autotune(True):
@@ -2105,7 +1924,8 @@ class TestCuteDslMoEWrapper:
         assert result.shape == (target_num_tokens, hidden_size)
         assert not torch.isnan(result).any()
 
-    def test_cuda_graph_wrapper_lifetime_after_autotune(self):
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_cuda_graph_wrapper_lifetime_after_autotune(self, quant_mode: str):
         """Dropped CUDA graph wrappers should not wait for cyclic GC,
         even after autotune profiling has populated the autotuner cache."""
         from flashinfer import autotune
@@ -2116,18 +1936,17 @@ class TestCuteDslMoEWrapper:
         num_experts, top_k = 256, 2
 
         def run_wrapper(moe, tensors):
+            api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, quant_mode)
             return moe.run(
-                x=tensors["x"],
-                x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
                 w1_weight=tensors["w1_weight"],
                 w1_weight_sf=tensors["w1_weight_sf"],
                 w1_alpha=tensors["w1_alpha"],
-                fc2_input_scale=tensors["fc2_input_scale"],
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
+                **api_inputs,
             )
 
         def autotune_and_drop_cuda_graph_wrapper():
@@ -2146,6 +1965,7 @@ class TestCuteDslMoEWrapper:
                 intermediate_size=intermediate_size,
                 use_cuda_graph=True,
                 max_num_tokens=64,
+                quant_mode=quant_mode,
             )
             ref = weakref.ref(moe)
             finalized = []
@@ -2166,9 +1986,13 @@ class TestCuteDslMoEWrapper:
             # Confirm profiling actually ran for this custom op. Cache keys
             # are ProfilingCacheKey instances; see AutoTuner._get_cache_key
             # in flashinfer/autotuner/autotuner.py.
+            expected_custom_op = (
+                "CuteDslMoEWrapper::run::W4A16::Swiglu"
+                if quant_mode == "w4a16"
+                else "CuteDslMoEWrapper::run::Swiglu"
+            )
             assert any(
-                k.custom_op == "CuteDslMoEWrapper::run::Swiglu"
-                for k in autotuner.profiling_cache
+                k.custom_op == expected_custom_op for k in autotuner.profiling_cache
             ), "autotune(True) did not populate a CuteDslMoEWrapper::run cache entry"
             return ref, finalized
 
@@ -2195,7 +2019,8 @@ class TestApiConsistency:
 
     pytestmark = _requires_dsl_arch
 
-    def test_functional_vs_wrapper_output(self):
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_functional_vs_wrapper_output(self, quant_mode: str):
         """Verify functional and wrapper APIs produce the same output."""
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
 
@@ -2210,23 +2035,22 @@ class TestApiConsistency:
             num_local_experts=num_experts,
             top_k=top_k,
         )
+        api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, quant_mode)
 
         # Functional API
         result_functional = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
-            x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=tensors["fc2_input_scale"],
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
             num_experts=num_experts,
             top_k=top_k,
-            quant_mode="nvfp4",
+            quant_mode=quant_mode,
+            **api_inputs,
         )
 
         # Wrapper API
@@ -2236,21 +2060,19 @@ class TestApiConsistency:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
-            quant_mode="nvfp4",
+            quant_mode=quant_mode,
         )
 
         result_wrapper = moe.run(
-            x=tensors["x"],
-            x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=tensors["fc2_input_scale"],
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            **api_inputs,
         )
 
         # Both should produce valid outputs
@@ -2280,7 +2102,8 @@ class TestExpertParallelism:
 
     @pytest.mark.parametrize("ep_size", [1, 8, 32])
     @pytest.mark.parametrize("ep_rank", [0, -1])  # -1 means last rank
-    def test_wrapper_with_ep(self, ep_size: int, ep_rank: int):
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_wrapper_with_ep(self, ep_size: int, ep_rank: int, quant_mode: str):
         """Test wrapper API with expert parallelism and numerical accuracy.
 
         Tests different EP ranks to ensure local_expert_offset handling is correct.
@@ -2305,6 +2128,9 @@ class TestExpertParallelism:
             num_local_experts=num_local_experts,
             top_k=top_k,
         )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, quant_mode
+        )
 
         # Keep original routing - the kernel should handle filtering
         # based on local_expert_offset and num_local_experts
@@ -2317,20 +2143,19 @@ class TestExpertParallelism:
             intermediate_size=intermediate_size,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            quant_mode=quant_mode,
         )
 
         result = moe.run(
-            x=tensors["x"],
-            x_sf=tensors["x_sf"],
             token_selected_experts=token_selected_experts,
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=tensors["fc2_input_scale"],
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            **api_inputs,
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -2339,11 +2164,6 @@ class TestExpertParallelism:
 
         # Numerical accuracy verification against reference
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"].float().cuda(),
-            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
-            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=token_selected_experts,
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2351,9 +2171,9 @@ class TestExpertParallelism:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            fc2_input_scale=tensors["fc2_input_scale"],
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            **reference_inputs,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -2363,11 +2183,14 @@ class TestExpertParallelism:
         )
 
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
-    @pytest.mark.parametrize("use_per_token_activation", [False, True])
+    @pytest.mark.parametrize(
+        "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
+    )
     @pytest.mark.parametrize("ep_size", [8])
     def test_functional_with_ep(
         self,
         ep_size: int,
+        quant_mode: str,
         use_per_token_activation: bool,
         use_fused_finalize: bool,
     ):
@@ -2391,16 +2214,16 @@ class TestExpertParallelism:
             top_k=top_k,
             use_per_token_activation=use_per_token_activation,
         )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, quant_mode
+        )
 
         result = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
-            x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=tensors["fc2_input_scale"],
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
@@ -2409,7 +2232,8 @@ class TestExpertParallelism:
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
             use_fused_finalize=use_fused_finalize,
-            per_token_scale=tensors["x_per_token_scale"],
+            quant_mode=quant_mode,
+            **api_inputs,
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -2418,11 +2242,6 @@ class TestExpertParallelism:
 
         # Numerical accuracy verification
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_ref"].float().cuda(),
-            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
-            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-            gemm1_alpha=tensors["w1_alpha"],
-            gemm2_alpha=tensors["w2_alpha"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2430,10 +2249,9 @@ class TestExpertParallelism:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            fc2_input_scale=tensors["fc2_input_scale"],
-            use_per_token_activation=use_per_token_activation,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            **reference_inputs,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
