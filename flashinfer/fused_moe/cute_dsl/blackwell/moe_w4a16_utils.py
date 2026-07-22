@@ -176,7 +176,7 @@ def decode_nvfp4_fragment_to_bf16(
     fragment_size = packed_byte_count * 2
     scale_count = fragment_size // 16
     assert fragment_size in (64, 128)
-    assert cute.size(scale_fragment.shape) == fragment_size
+    assert cute.size(scale_fragment.shape) == scale_count
 
     packed_values = [
         vector.extract(
@@ -184,12 +184,14 @@ def decode_nvfp4_fragment_to_bf16(
         )
         for idx in range(packed_byte_count)
     ]
-    # The transform partition broadcasts each block scale over its 16 FP4 lanes.
-    scale_values = [
-        vector.extract(
-            scale_fragment.ir_value(loc=loc, ip=ip), [], [idx * 16], loc=loc, ip=ip
-        )
-        for idx in range(scale_count)
+    # Keep four E4M3 scale bytes packed until each NVFP4 block is decoded.
+    scale_words_type = ir.VectorType.get([scale_count // 4], Uint32.mlir_type, loc=loc)
+    scale_words_vector = llvm.bitcast(
+        scale_words_type, scale_fragment.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
+    )
+    scale_words = [
+        vector.extract(scale_words_vector, [], [idx], loc=loc, ip=ip)
+        for idx in range(scale_count // 4)
     ]
     output_type = ir.VectorType.get([fragment_size], BFloat16.mlir_type, loc=loc)
     output_values: list[ir.Value] = []
@@ -211,8 +213,9 @@ def decode_nvfp4_fragment_to_bf16(
             vector.extract(packed_words_vector, [], [idx], loc=loc, ip=ip)
             for idx in range(2)
         ]
-        scale_e4m3 = scale_values[scale_idx]
-        scale_bits = Uint32(llvm.zext(Uint32.mlir_type, scale_e4m3, loc=loc, ip=ip))
+        scale_bits = Uint32(scale_words[scale_idx // 4])
+        if scale_idx % 4:
+            scale_bits = scale_bits >> Uint32((scale_idx % 4) * 8)
         output_values.extend(
             value.ir_value(loc=loc, ip=ip)
             for value in e2m1x16_e4m3_to_bf16x16(
