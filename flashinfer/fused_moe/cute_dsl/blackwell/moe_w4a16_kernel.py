@@ -883,10 +883,11 @@ class Sm100W4A16GroupedGemmKernel:
             else None
         )
         # Fused finalize reuses the first C stage as a linear
-        # [route, hidden] tile for descriptor-free bulk reduction.
+        # [route, hidden] tile for descriptor-free bulk reduction. The bulk
+        # reduction consumes raw contiguous bytes, so drop sC's pointer swizzle.
         sFinalize = (
             cute.make_tensor(
-                sC.iterator,
+                cute.recast_ptr(sC.iterator),
                 cute.make_layout(
                     (self.epi_tile_n, self.cta_tile_shape_mnk[0]),
                     stride=(self.cta_tile_shape_mnk[0], 1),
