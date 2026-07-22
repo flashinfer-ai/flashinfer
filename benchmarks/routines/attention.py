@@ -121,6 +121,7 @@ def parse_attention_args(line, parser):
             "trtllm-fmha-v2",
             "trtllm-gen-native",  # Deprecated, will be removed in future
             "cute-dsl",
+            "cutile",
         ],
         help="Kernel backends to test. Default: fa2. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
@@ -438,6 +439,33 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         print("[INFO] auto backend is disabled for speculative decode. Skipping.")
         backends.remove("auto")
 
+    if "cutile" in backends:
+        # cuTile decode kernel constraints (flashinfer/decode.py run() + kernel):
+        #   NHD layout only (handled below), q_len_per_req == 1 (no spec decode),
+        #   power-of-2 head dims, bf16 KV (no FP8 / NVFP4 KV).
+        remove_cutile = False
+        if speculative_decode:
+            print("[INFO] cuTile decode requires q_len_per_req==1. Skipping.")
+            remove_cutile = True
+        if (head_dim_qk & (head_dim_qk - 1)) != 0 or (
+            head_dim_vo & (head_dim_vo - 1)
+        ) != 0:
+            print("[INFO] cuTile decode requires power-of-2 head dims. Skipping.")
+            remove_cutile = True
+        if (
+            is_nvfp4_kv
+            or q_dtype
+            in [
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ]
+            or kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+        ):
+            print("[INFO] cuTile decode does not support FP8/NVFP4 KV. Skipping.")
+            remove_cutile = True
+        if remove_cutile:
+            backends.remove("cutile")
+
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
     outputs = {}
@@ -522,6 +550,13 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             1,
         ),
     )
+
+    # cuTile decode needs an NHD paged KV cache: same logical values as the HND
+    # cache above, permuted to (total_num_pages, 2, page_size, num_kv_heads, dim)
+    # and made contiguous. Identical values => refcheck vs fa2 stays valid.
+    kv_cache_nhd = None
+    if "cutile" in backends:
+        kv_cache_nhd = kv_cache.permute(0, 1, 3, 2, 4).contiguous()
 
     # Now initialize the page tables
     block_tables = torch.tensor(
@@ -627,6 +662,31 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 block_tables=block_tables,
             )
             resolved_backends[backend] = backend_wrappers[backend]._backend
+        elif backend == "cutile":
+            # cuTile decode requires NHD layout; no tensor-core flag.
+            backend_wrappers[backend] = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                workspace_buffer,
+                "NHD",
+                use_cuda_graph=is_cuda_graph_compatible,
+                use_tensor_cores=False,
+                paged_kv_indptr_buffer=kv_indptr,
+                paged_kv_indices_buffer=kv_indices,
+                paged_kv_last_page_len_buffer=kv_last_page_len,
+                backend="cutile",
+            )
+            backend_wrappers[backend].plan(
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                page_size,
+                q_data_type=q_dtype,
+                data_type=kv_dtype,
+                block_tables=block_tables,
+            )
+            resolved_backends[backend] = backend_wrappers[backend]._backend
         else:
             resolved_backends[backend] = backend
 
@@ -713,6 +773,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 enable_pdl=args.enable_pdl,
                 multi_ctas_kv_counter_buffer=gqa_multi_ctas_kv_counter_buffer,
             )
+        elif backend == "cutile":
+            # cuTile decode: NHD paged KV cache; scale is folded internally.
+            return backend_wrappers[backend].run(q, kv_cache_nhd)
         else:
             print(f"[ERROR] Backend {backend} not supported")
             return None
@@ -1013,6 +1076,28 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         print("[ERROR] Layer not supported. Exiting.")
         return res
 
+    if "cutile" in backends:
+        # cuTile paged-prefill kernel constraints (fmha_prefill_bsr_cutile):
+        #   NHD paged KV (built below), power-of-2 head dims, bf16/fp16 KV,
+        #   page_size >= 16 (prefill autotune min BLOCK_N).
+        remove_cutile = False
+        if (head_dim_qk & (head_dim_qk - 1)) != 0 or (
+            head_dim_vo & (head_dim_vo - 1)
+        ) != 0:
+            print("[INFO] cuTile prefill requires power-of-2 head dims. Skipping.")
+            remove_cutile = True
+        if page_size < 16:
+            print("[INFO] cuTile prefill requires page_size >= 16. Skipping.")
+            remove_cutile = True
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
+            print("[INFO] cuTile prefill does not support FP8 KV. Skipping.")
+            remove_cutile = True
+        if remove_cutile:
+            backends.remove("cutile")
+
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
     outputs = {}
@@ -1103,6 +1188,12 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         dtype=torch.int,
         device=device,
     )
+
+    # cuTile paged-prefill needs NHD KV: permute HND (.,2,H_kv,page,dim) ->
+    # (.,2,page,H_kv,dim), contiguous; identical values => refcheck vs fa2 valid.
+    kv_cache_nhd_prefill = None
+    if "cutile" in backends:
+        kv_cache_nhd_prefill = kv_cache.permute(0, 1, 3, 2, 4).contiguous()
 
     actual_seq_lens_q_device = actual_seq_lens_q.to(device)
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
@@ -1404,6 +1495,33 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 mask_mode="causal" if causal else "padding",
                 out_dtype=o_data_type,
             )
+        elif backend == "cutile":
+            # Direct paged cuTile prefill kernel (no wrapper in prefill.py yet).
+            # NHD paged KV; softmax scale is folded into k_scale (kernel does
+            # qk_scale = k_scale * INV_LOG_2), mirroring sparse.py's caller.
+            from flashinfer.attention.kernels.cutile.fmha_prefill_bsr_cutile import (
+                prefill_attention_kv_paged_cutile,
+            )
+
+            out_ct = torch.empty(
+                q.shape[0], num_qo_heads, head_dim_vo, dtype=q.dtype, device=q.device
+            )
+            result, _ = prefill_attention_kv_paged_cutile(
+                q=q,
+                k_cache=kv_cache_nhd_prefill[:, 0],
+                v_cache=kv_cache_nhd_prefill[:, 1],
+                actual_seq_lens_q=actual_seq_lens_q_device.flatten().to(torch.int32),
+                actual_seq_lens_kv=actual_seq_lens_kv_device.flatten().to(torch.int32),
+                actual_seq_offset=qo_indptr,
+                block_tables=block_tables.to(torch.int32),
+                k_scale=scale,
+                v_scale=1.0,
+                num_batch=batch_size,
+                max_seq_len=s_qo,
+                is_causal=causal,
+                outputs=out_ct,
+            )
+            return result
         else:
             print(f"[ERROR] Backend {backend} not supported")
             return None

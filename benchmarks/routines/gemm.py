@@ -446,7 +446,7 @@ def testGroupGemmFp8NtGroupwise(args):
         )
 
     ## Parse input arguments
-    backends = ["cutlass"]  # Cutlass is currently the only supported backend
+    backends = args.backends
     m = args.m
     n = args.n
     k = args.k
@@ -513,6 +513,19 @@ def testGroupGemmFp8NtGroupwise(args):
                 scale_major_mode=scale_major_mode,
                 out_dtype=out_dtype,
                 mma_sm=mma_sm,
+            )
+        elif backend in ["trtllm", "cutile"]:
+            # trtllm / cuTile backends select their own tiling; mma_sm is a
+            # cutlass-only knob so it is not forwarded here.
+            return flashinfer.gemm.group_gemm_fp8_nt_groupwise(
+                a=a_fp8,
+                b=b_fp8,
+                a_scale=a_scale,
+                b_scale=b_scale,
+                m_indptr=m_indptr,
+                scale_major_mode=scale_major_mode,
+                out_dtype=out_dtype,
+                backend=backend,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -2569,7 +2582,7 @@ def testBmmBf16(args):
         return res
 
     def run_backend(backend, A, B, out_dtype):
-        if backend in ["cudnn", "cutlass", "auto"]:
+        if backend in ["cudnn", "cutlass", "cutile", "tgv", "auto"]:
             return flashinfer.bmm_bf16(
                 A=A,
                 B=B,
