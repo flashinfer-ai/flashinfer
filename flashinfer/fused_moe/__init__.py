@@ -42,6 +42,7 @@ from .runners import (  # noqa: F401
     B12xW4A16Runner,
     CuteDslNvfp4Runner,
     TrtllmFp4RoutedRunner,
+    TrtllmFp8BlockRunner,
 )
 
 # Legacy flat-argument APIs (unchanged, not deprecated)
@@ -138,6 +139,7 @@ __all__ = [
     "MoELayer",
     "MoEWeightPack",
     "TrtllmFp4RoutedRunner",
+    "TrtllmFp8BlockRunner",
     "QuantConfig",
     "QuantVariant",
     "RoutingConfig",

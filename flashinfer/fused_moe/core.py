@@ -1363,9 +1363,16 @@ def get_trtllm_moe_sm100_module():
             expert_weights = moe_inputs.expert_weights
             topk_weights = expert_weights
             hidden_states = moe_inputs.hidden_states
+            # The generic helper identifies TRTLLM dtypes whose ABI normally
+            # consumes an auxiliary scale tensor (FP4 and MX formats). Plain
+            # E4m3 returns false, but DeepSeek block-FP8 is an exception: it
+            # requires the real per-1x128-block scales from the activation pack.
             hidden_states_scale = (
                 moe_inputs.hidden_states_scale
-                if trtllm_gen_dtype_has_scale(self.dtype_act)
+                if (
+                    trtllm_gen_dtype_has_scale(self.dtype_act)
+                    or self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+                )
                 else None
             )
 
@@ -1452,30 +1459,13 @@ def get_trtllm_moe_sm100_module():
                     or self.fp8_quantization_type == Fp8QuantizationType.MxFp8
                 ):
                     # FP8 block scale
-                    current_num_tokens = hidden_states.shape[0]
-                    current_hidden_size = hidden_states.shape[1]
-                    if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-                        current_hidden_states_scale = torch.full(
-                            (current_hidden_size // 128, current_num_tokens),
-                            2.0,
-                            dtype=torch.float,
-                            device=hidden_states.device,
-                        )
-                    elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
-                        current_hidden_states_scale = hidden_states_scale
-
-                    else:
-                        raise ValueError(
-                            f"Unsupported FP8 quantization type: {self.fp8_quantization_type}"
-                        )
-
                     moe_op.trtllm_fp8_block_scale_moe(
                         routing_logits,
                         topk_ids,
                         topk_weights,
                         kwargs["routing_bias"],
                         hidden_states,
-                        current_hidden_states_scale,
+                        hidden_states_scale,
                         kwargs["gemm1_weights"],
                         kwargs["gemm1_weights_scale"],
                         moe_inputs.gemm1_lora_delta,
