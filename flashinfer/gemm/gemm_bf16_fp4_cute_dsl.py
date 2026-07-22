@@ -188,9 +188,6 @@ def _get_cute_dsl_bf16_fp4_gemm(
         acc_dtype=cutlass.Float32,
         tile_shape_mnk=tile_shape_mnk,
         atom_layout=atom_layout,
-        # At occupancy 3 the SMEM budget per CTA only fits 2 ab stages next
-        # to the default 4-stage epilogue; a 2-stage epilogue keeps 3.
-        epi_stage=2 if occupancy >= 3 else 4,
         pipeline_depth=pipeline_depth,
         use_fp16_mma=use_fp16_mma,
         enable_pdl=enable_pdl,
@@ -420,11 +417,9 @@ def _bf16_fp4_cute_dsl_tactic_configs(
             if splits <= k_tiles:
                 add(base_tile_m, base_atom, 1, 1, splits=splits, occ=2)
 
-    # occupancy=3: 9 resident warps per SM, matching Marlin's warp-level load
-    # parallelism.  Needs a 2-stage epilogue to keep 3 ab stages in the SMEM
-    # budget (paired in _get_cute_dsl_bf16_fp4_gemm).
-    if tile_k == 128 and n // 64 >= 128:
-        add(base_tile_m, base_atom, 1, 1, occ=3)
+    # occupancy=3 was measured and rejected (prod 5080, 2026-07-22): achieved
+    # occupancy stays ~11% and dram% falls -- the third CTA never converts to
+    # resident-warp gain.  Two CTAs per SM is this lever's ceiling.
 
     return configs
 
