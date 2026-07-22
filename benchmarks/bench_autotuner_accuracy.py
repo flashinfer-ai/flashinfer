@@ -1,8 +1,9 @@
 """Autotuner accuracy harness (skeleton) — quantify how well the tuner's
 winner matches an oracle, per measurement policy.
 
-Methodology (see FLASHINFER_AUTOTUNE_CACHE_PROPOSAL.md, "Quantifying tuner
-accuracy"): for each shape of a real op (bmm_fp8, backend="auto"), enumerate
+Methodology (see RFC https://github.com/flashinfer-ai/flashinfer/issues/3920,
+"Accuracy quantification"): for each shape of a real op (bmm_fp8,
+backend="auto"), enumerate
 every (runner, tactic) candidate the autotuner would consider, measure each
 exhaustively with a high-repetition oracle, then simulate tuner selections
 under each measurement policy at production settings (repeat=10) across
@@ -175,6 +176,7 @@ def main():
     policies = {
         "v1_events": None,
         "v2_cupti": MeasurementPolicy(_timer="cupti"),
+        "v2_eager": MeasurementPolicy(execution_mode="eager"),
     }
     report = {"gpu": props.name, "n": args.n, "k": args.k, "shapes": []}
 
