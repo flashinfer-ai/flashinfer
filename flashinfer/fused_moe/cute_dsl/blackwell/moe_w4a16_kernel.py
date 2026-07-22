@@ -43,6 +43,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.mixed_input_helpers as mixed_input_utils
 from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -308,19 +309,33 @@ class Sm100W4A16GroupedGemmKernel:
         # Get smem layout for scale tensor
         self.smem_layout_scale_per_stage = None
         self.smem_layout_scale = None
+        self.smem_layout_scale_tma = None
         if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-            # Get scale tile shape and smem layout for scale tensor
-            (
-                self.scale_tile_shape,
-                self.smem_layout_scale_per_stage,
-                self.smem_layout_scale,
-            ) = mixed_input_utils.get_smem_layout_scale(
-                self.mma_tiler,
-                self.use_2cta_instrs,
-                self.scale_granularity_m,
+            scale_tile_shape = (
+                self.cta_tile_shape_mnk[0],
+                self.mma_tiler[2],
+            )
+            # The transform and TMA partitions use different logical views of
+            # the same block-scaled shared-memory storage.
+            scale_smem_layout = blockscaled_utils.make_smem_layout_sf(
+                scale_tile_shape,
                 self.scale_granularity_k,
-                self.scale_major_mode,
-                self.a_scale_dtype,
+                self.num_scale_load2trans_stage,
+            )
+            scale_smem_layout_per_stage = cute.slice_(
+                scale_smem_layout, (None, None, 0)
+            )
+            trivial_swizzle = cute.make_swizzle(0, 4, 3)
+            self.smem_layout_scale_per_stage = cute.make_composed_layout(
+                trivial_swizzle, 0, scale_smem_layout_per_stage
+            )
+            self.smem_layout_scale = cute.make_composed_layout(
+                trivial_swizzle, 0, scale_smem_layout
+            )
+            self.smem_layout_scale_tma = blockscaled_utils.make_smem_layout_sfa(
+                tiled_mma,
+                self.mma_tiler,
+                self.scale_granularity_k,
                 self.num_scale_load2trans_stage,
             )
 
@@ -348,9 +363,9 @@ class Sm100W4A16GroupedGemmKernel:
         if cutlass.const_expr(
             self.scale_mode == TransformMode.ConvertScale
             and utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
-            != tcgen05.OperandMajorMode.MN
+            != tcgen05.OperandMajorMode.K
         ):
-            raise ValueError("scale_major_mode must be M-major")
+            raise ValueError("scale_major_mode must be K-major")
 
     @cute.jit
     def wrapper(
@@ -374,14 +389,15 @@ class Sm100W4A16GroupedGemmKernel:
         stream: cuda.CUstream,
     ):
         """Build logical tensors over FlashInfer's packed NVFP4 storage."""
-        scale_k = k // self.scale_granularity_k
         weights = cute.make_tensor(
             weight_ptr,
             cute.make_ordered_layout((m, k, self.group_count), order=(1, 0, 2)),
         )
         weight_sf = cute.make_tensor(
             weight_sf_ptr,
-            cute.make_ordered_layout((m, scale_k, self.group_count), order=(0, 1, 2)),
+            blockscaled_utils.tile_atom_to_shape_SF(
+                weights.shape, self.scale_granularity_k
+            ),
         )
         activations = cute.make_tensor(
             activation_ptr,
@@ -470,34 +486,8 @@ class Sm100W4A16GroupedGemmKernel:
         self.mma_dtype = self.b_dtype
 
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.scale_major_mode = (
-            utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
-            if self.scale_mode is TransformMode.ConvertScale
-            else None
-        )
         self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
-        if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-            # The public NVFP4 contract stores scales in the 6D MMA layout
-            # M(32x4xrest_m)xK(4xrest_k)xL. Preserve that physical layout so
-            # in-place scale updates are visible without a host-side copy.
-            m, k, group_count = a.shape
-            scale_k = cute.ceil_div(k, self.scale_granularity_k)
-            m_tiles = cute.ceil_div(m, 128)
-            k_tiles = cute.ceil_div(scale_k, 4)
-            tile_elements = 32 * 4 * 4
-            self.gmem_layout_scale = cute.make_layout(
-                (
-                    (self.scale_granularity_m, (32, 4, m_tiles)),
-                    (self.scale_granularity_k, (4, k_tiles)),
-                    group_count,
-                ),
-                stride=(
-                    (0, (16, 4, k_tiles * tile_elements)),
-                    (0, (1, tile_elements)),
-                    m_tiles * k_tiles * tile_elements,
-                ),
-            )
 
         # Validate inputs
         self._validate_inputs(a, a_scale, b, c)
@@ -538,28 +528,17 @@ class Sm100W4A16GroupedGemmKernel:
 
         tma_atom_scale, tma_tensor_scale = None, None
         if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
-            # Partition smem layout for scale tensor to make it compatible with TMA atom
-            smem_layout_for_tma_atom = cute.get(
-                tiled_mma._thrfrg_A(self.smem_layout_scale_per_stage.outer), mode=[1]
-            )
-            # ((MMA_M, MMA_K), REST_M, REST_K)
-            smem_layout_for_tma_atom = cute.dice(
-                smem_layout_for_tma_atom,
-                (1, (1,) * cute.rank(self.smem_layout_scale_per_stage.outer)),
+            scale_smem_layout_for_tma = cute.slice_(
+                self.smem_layout_scale_tma, (None, None, None, 0)
             )
             tma_atom_scale, tma_tensor_scale = cute.nvgpu.make_tiled_tma_atom_A(
                 a_scale_op,
-                cute.make_tensor(a_scale.iterator, self.gmem_layout_scale),
-                smem_layout_for_tma_atom,
-                # (SCALE_M, 1, SCALE_K)
-                (self.scale_tile_shape[0], 1, self.scale_tile_shape[1]),
+                a_scale,
+                scale_smem_layout_for_tma,
+                self.mma_tiler,
                 tiled_mma,
                 self.cluster_layout_vmnk.shape,
-                internal_type=(
-                    cutlass.TFloat32
-                    if a_scale.element_type is cutlass.Float32
-                    else None
-                ),
+                internal_type=cutlass.Int16,
             )
 
         smem_layout_b_per_stage = cute.slice_(self.smem_layout_b, (None, None, None, 0))
@@ -666,6 +645,7 @@ class Sm100W4A16GroupedGemmKernel:
             self.cluster_layout_vmnk,
             self.smem_layout_a,
             self.smem_layout_scale,
+            self.smem_layout_scale_tma,
             self.smem_layout_a_transform,
             self.smem_layout_b,
             self.c_smem_layout_staged,
@@ -707,6 +687,7 @@ class Sm100W4A16GroupedGemmKernel:
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout: cute.ComposedLayout,
         scale_smem_layout: cute.ComposedLayout,
+        scale_tma_smem_layout: cute.Layout,
         a_smem_layout_transform: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
         c_smem_layout_staged: cute.ComposedLayout,
@@ -912,6 +893,11 @@ class Sm100W4A16GroupedGemmKernel:
             if self.scale_mode is TransformMode.ConvertScale
             else None
         )
+        sS_tma = (
+            cute.make_tensor(sS_input.iterator, scale_tma_smem_layout)
+            if self.scale_mode is TransformMode.ConvertScale
+            else None
+        )
         sB_input = smem.allocate_tensor(
             element_type=self.b_dtype,
             layout=b_smem_layout.outer,
@@ -1042,15 +1028,15 @@ class Sm100W4A16GroupedGemmKernel:
             thr_mma_leader_cta = tiled_mma.get_slice(0)
             # (MMA, MMA_M, MMA_K, STAGE)
             tCsS = thr_mma_leader_cta.partition_A(sS_input)
-            # ((atom_v, rest_v), STAGE)
-            # ((atom_v, rest_v), loopM, loopK, loopL)
-            tSsS, tSgS = mixed_input_utils.scale_tma_partition(
-                tCsS,
-                tCgS,
+            tSsS, tSgS = cpasync.tma_partition(
                 tma_atom_s,
-                block_in_cluster_coord_vmnk,
+                block_in_cluster_coord_vmnk[2],
                 a_cta_layout,
+                cute.group_modes(sS_tma, 0, 3),
+                cute.group_modes(tCgS, 0, 3),
             )
+            tSsS = cute.filter_zeros(tSsS)
+            tSgS = cute.filter_zeros(tSgS)
 
         # TMA load B partition_S/D
         b_cta_layout = cute.make_layout(
@@ -1395,7 +1381,8 @@ class Sm100W4A16GroupedGemmKernel:
             if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
                 smem_thr_copy_S = src_copy_a.get_slice(transform_local_tidx)
                 tSsS_trans = smem_thr_copy_S.partition_S(tCsS)
-                tSsS_layout_per_stage = tSsS_trans[(None, None, None, None, 0)].layout
+                scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (0,)
+                tSsS_layout_per_stage = tSsS_trans[scale_stage_coord].layout
                 tSrS_copy = cute.make_rmem_tensor(
                     cute.filter_zeros(tSsS_layout_per_stage).shape,
                     self.a_scale_dtype,
@@ -1518,15 +1505,10 @@ class Sm100W4A16GroupedGemmKernel:
                         self.scale_mode == TransformMode.ConvertScale
                     ):
                         if k_tile % num_k_tiles_per_scale == 0:
-                            tSsS_slice = tSsS_trans[
-                                (
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    scale_load2trans_consumer_state.index,
-                                )
-                            ]
+                            scale_stage_coord = (None,) * (
+                                cute.rank(tSsS_trans) - 1
+                            ) + (scale_load2trans_consumer_state.index,)
+                            tSsS_slice = tSsS_trans[scale_stage_coord]
                             tSsS_slice_filtered = cute.make_tensor(
                                 tSsS_slice.iterator,
                                 cute.filter_zeros(tSsS_slice.layout),

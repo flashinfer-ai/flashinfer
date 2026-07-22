@@ -176,6 +176,7 @@ def decode_nvfp4_fragment_to_bf16(
     fragment_size = packed_byte_count * 2
     scale_count = fragment_size // 16
     assert fragment_size in (64, 128)
+    assert cute.size(scale_fragment.shape) == fragment_size
 
     packed_values = [
         vector.extract(
@@ -183,9 +184,10 @@ def decode_nvfp4_fragment_to_bf16(
         )
         for idx in range(packed_byte_count)
     ]
+    # The transform partition broadcasts each block scale over its 16 FP4 lanes.
     scale_values = [
         vector.extract(
-            scale_fragment.ir_value(loc=loc, ip=ip), [], [idx], loc=loc, ip=ip
+            scale_fragment.ir_value(loc=loc, ip=ip), [], [idx * 16], loc=loc, ip=ip
         )
         for idx in range(scale_count)
     ]
