@@ -1799,8 +1799,8 @@ def nvfp4_quantize_cute_dsl(
             global_scale.float().reshape(1).contiguous().to(input.device)
         )
     else:
-        global_scale_tensor = torch.tensor(
-            [float(global_scale)], dtype=torch.float32, device=input.device
+        global_scale_tensor = torch.full(
+            (1,), float(global_scale), dtype=torch.float32, device=input.device
         )
 
     num_sm = get_num_sm(input.device)
@@ -2032,8 +2032,8 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
             global_scale.float().reshape(1).contiguous().to(input.device)
         )
     else:
-        global_scale_tensor = torch.tensor(
-            [float(global_scale)], dtype=torch.float32, device=input.device
+        global_scale_tensor = torch.full(
+            (1,), float(global_scale), dtype=torch.float32, device=input.device
         )
 
     num_sm = get_num_sm(input.device)
@@ -2202,8 +2202,8 @@ def nvfp4_quantize_per_token_cute_dsl(
             global_scale_inv.float().reshape(1).contiguous().to(input.device)
         )
     else:
-        global_scale_inv_tensor = torch.tensor(
-            [float(global_scale_inv)], dtype=torch.float32, device=input.device
+        global_scale_inv_tensor = torch.full(
+            (1,), float(global_scale_inv), dtype=torch.float32, device=input.device
         )
 
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
