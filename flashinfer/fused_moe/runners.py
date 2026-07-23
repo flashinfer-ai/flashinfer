@@ -57,7 +57,12 @@ def _validate_pack_devices(act: MoEActivationPack, runner: str) -> None:
 
 
 def _validate_prerouted_inputs(
-    act: MoEActivationPack, num_tokens: int, top_k: int, runner: str
+    act: MoEActivationPack,
+    num_tokens: int,
+    top_k: int,
+    runner: str,
+    *,
+    expected_weights_dtype: torch.dtype | None = None,
 ) -> None:
     """Runner-boundary validation for pre-routed packs.
 
@@ -92,7 +97,21 @@ def _validate_prerouted_inputs(
         # tensor here is read as int32 bytes — silent garbage routing.
         raise TypeError(
             f"{runner}: topk_ids must be torch.int32, got {act.topk_ids.dtype} "
-            "(torch.topk returns int64 — cast before packing)."
+            "(torch.topk returns int64 — cast before constructing the pack)."
+        )
+    if (
+        expected_weights_dtype is not None
+        and act.topk_weights.dtype != expected_weights_dtype
+    ):
+        raise TypeError(
+            f"{runner}: topk_weights must be {expected_weights_dtype}, "
+            f"got {act.topk_weights.dtype}."
+        )
+    if expected_weights_dtype is not None and (
+        not act.topk_ids.is_contiguous() or not act.topk_weights.is_contiguous()
+    ):
+        raise ValueError(
+            f"{runner}: unpacked topk_ids/topk_weights must be contiguous."
         )
 
 
@@ -291,6 +310,9 @@ class TrtllmFp4RoutedRunner(MoERunner):
       ``topk_ids`` / ``topk_weights`` and the runner packs them into int32 top-k ids
       ``(GLOBAL expert_id << 16) | bf16(weight)`` (the kernel maps global ids to the
       local shard via the separately passed ``local_expert_offset``).
+    * **unpacked pre-routed** (``RoutingInputMode.UnpackedPrecomputed``): the
+      pack carries plain int32 ids plus BF16 weights, which are forwarded as
+      separate kernel inputs without packed-id construction.
     * **in-kernel** (``RoutingInputMode.FromLogits``): the pack carries
       ``routing_logits`` (+ optional ``routing_bias``); the kernel computes the top-k
       selection per ``RoutingConfig.method`` and writes ``topk_ids`` / ``topk_weights``
@@ -303,6 +325,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
     backend_key = "trtllm_fp4_routed"
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = (QuantVariant.NVFP4,)
@@ -407,7 +430,8 @@ class TrtllmFp4RoutedRunner(MoERunner):
 
         Routing mode is read from ``act.routing_input_mode``: ``FromLogits`` drives
         in-kernel routing from ``act.routing_logits``; ``PackedPrecomputed`` packs the
-        pre-routed ``act.topk_ids`` / ``act.topk_weights``.
+        pre-routed ``act.topk_ids`` / ``act.topk_weights``; and
+        ``UnpackedPrecomputed`` forwards int32 ids plus BF16 weights directly.
 
         The local-shard offset comes from ``ExpertConfig.local_expert_offset``
         on the config this runner was built with.  ``topk_ids`` carries
@@ -480,11 +504,26 @@ class TrtllmFp4RoutedRunner(MoERunner):
             expert_weights = act.topk_weights.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
+        elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
+            # Mode 3: both routing tensors are caller-owned kernel inputs. Keep
+            # global ids intact; the launcher applies local_expert_offset.
+            _validate_prerouted_inputs(
+                act,
+                num_tokens,
+                routing.top_k,
+                "TrtllmFp4RoutedRunner",
+                expected_weights_dtype=torch.bfloat16,
+            )
+            routing_logits = None
+            routing_bias = None
+            topk_ids = act.topk_ids
+            expert_weights = act.topk_weights
         else:
             raise NotImplementedError(
                 f"TrtllmFp4RoutedRunner does not support "
                 f"routing_input_mode={routing_input_mode!r} "
-                "(only FromLogits and PackedPrecomputed are wired)."
+                "(only FromLogits, PackedPrecomputed, and "
+                "UnpackedPrecomputed are wired)."
             )
 
         moe_inputs = MoeRunnerInputs(
