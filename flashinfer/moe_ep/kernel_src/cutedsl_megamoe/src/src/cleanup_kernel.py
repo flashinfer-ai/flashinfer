@@ -134,9 +134,9 @@ def cleanup_kernel(
                 grid_sync_counter[i] = Uint32(0)
     else:
         # SMs 1..num_sms-1 split l1_arrival_count clearing. The
-        slot_per_sm: cutlass.Constexpr[int] = (num_max_task_tiles + num_sms - 2) // (
-            num_sms - 1
-        )
+        slot_per_sm: cutlass.Constexpr[int] = (
+            num_max_task_tiles + num_sms - 2
+        ) // (num_sms - 1)
         my_start = (sm_idx - Int32(1)) * Int32(slot_per_sm)
         my_end_unclamped = my_start + Int32(slot_per_sm)
         end_limit = Int32(num_max_task_tiles)

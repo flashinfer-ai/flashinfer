@@ -5,10 +5,7 @@
 # dialect, so fall back to no-op markers when the import is unavailable.
 try:
     from cutlass.cute.experimental import iket  # Latest tot DKG.
-except (
-    ImportError,
-    NotImplementedError,
-):  # pragma: no cover -- fallback for wheels without cute.iket
+except (ImportError, NotImplementedError):  # pragma: no cover -- fallback for wheels without cute.iket
     # ``cute.experimental`` raises NotImplementedError (NOT ImportError) on
     # CUDA toolkits < 13.1, so the public-release / CTK-12.9 CI wheels land
     # here; catch both so the no-op shim below actually takes over instead
@@ -17,7 +14,6 @@ except (
         from cutlass.cute import iket  # type: ignore
     except (ImportError, NotImplementedError):
         print("!!!! Iket is not enabled !!!!")
-
         class _IketShim:
             """No-op IKET shim used when the dialect is not available."""
 

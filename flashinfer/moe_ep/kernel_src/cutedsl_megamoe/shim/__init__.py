@@ -63,6 +63,15 @@ from .mxfp8 import (
     mxfp8_mega_launch_thunk,
     mxfp8_mega_moe,
 )
+from .bf16 import (
+    MegaMoEBf16Config,
+    MegaMoEBf16Frontend,
+    MegaMoEBf16Inputs,
+    MegaMoEBf16SymmBuffer,
+    bf16_mega_launch_thunk,
+    bf16_mega_moe,
+    get_symm_buffer_for_bf16_mega_moe,
+)
 
 # Kernel tuning knobs (tactic enumeration + config application).
 from . import tuner
@@ -75,7 +84,9 @@ from .tuner import (
 
 # Online (warmup-time) collective knob autotuning.
 from .autotune import (
+    autotune_bf16_mega_moe,
     autotune_knobs,
+    bf16_candidates,
     autotune_mxfp8_mega_moe,
     autotune_nvfp4_mega_moe,
 )
@@ -121,14 +132,24 @@ __all__ = [
     "get_symm_buffer_for_mxfp8_mega_moe",
     "mxfp8_mega_launch_thunk",
     "mxfp8_mega_moe",
+    # bf16
+    "MegaMoEBf16Config",
+    "MegaMoEBf16Frontend",
+    "MegaMoEBf16Inputs",
+    "MegaMoEBf16SymmBuffer",
+    "bf16_mega_launch_thunk",
+    "bf16_mega_moe",
+    "get_symm_buffer_for_bf16_mega_moe",
     # tuner
     "tuner",
     "CORRECTNESS_KNOBS",
     "PERF_KNOBS",
+    "bf16_candidates",
     "iter_candidates",
     "with_knobs",
     # autotune
     "autotune_knobs",
+    "autotune_bf16_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
 ]

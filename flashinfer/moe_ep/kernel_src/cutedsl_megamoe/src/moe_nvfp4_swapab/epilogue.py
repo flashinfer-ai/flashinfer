@@ -8,11 +8,10 @@ store components.
 """
 
 import dataclasses
-from typing import Any, Optional, Tuple, Type, Union
+from typing import Any, List, Literal, Optional, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute
-
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
@@ -223,8 +222,6 @@ def _cp_async_bulk_s2g(
         loc=loc,
         ip=ip,
     )
-
-
 @dsl_user_op
 def _cp_reduce_async_bulk_add_noftz_bf16_s2g(
     dst_gmem,
@@ -462,24 +459,19 @@ class _TmemTranspose16x32Core:
         )
 
         self._atom_ld16x64 = cute.make_copy_atom(
-            tcgen05.Ld16x64bOp(tcgen05.Repetition.x16),
-            self._io_dtype,
+            tcgen05.Ld16x64bOp(tcgen05.Repetition.x16), self._io_dtype,
         )
         self._atom_st16x128 = cute.make_copy_atom(
-            tcgen05.St16x128bOp(tcgen05.Repetition.x8),
-            self._io_dtype,
+            tcgen05.St16x128bOp(tcgen05.Repetition.x8), self._io_dtype,
         )
         self._atom_st32x32 = cute.make_copy_atom(
-            tcgen05.St32x32bOp(tcgen05.Repetition.x16),
-            self._io_dtype,
+            tcgen05.St32x32bOp(tcgen05.Repetition.x16), self._io_dtype,
         )
         self._atom_ld16x256 = cute.make_copy_atom(
-            tcgen05.Ld16x256bOp(tcgen05.Repetition.x2),
-            self._io_dtype,
+            tcgen05.Ld16x256bOp(tcgen05.Repetition.x2), self._io_dtype,
         )
         self._atom_ld16x128 = cute.make_copy_atom(
-            tcgen05.Ld16x128bOp(tcgen05.Repetition.x4),
-            self._io_dtype,
+            tcgen05.Ld16x128bOp(tcgen05.Repetition.x4), self._io_dtype,
         )
 
         self._src_regs = cute.make_rmem_tensor((16,), self._io_dtype)
@@ -608,22 +600,18 @@ class TmemTranspose16x32(_TmemTranspose16x32Core):
     InputContract = Contract(
         domain=_domain,
         codomain=_codomain,
-        mapping=FunctionMapping(
-            lambda lane_idx, elem_idx: {
-                "token_idx": elem_idx * 2 + ((lane_idx // 2) % 2),
-                "intermediate_output_idx": (lane_idx % 2) * 8 + lane_idx // 4,
-            }
-        ),
+        mapping=FunctionMapping(lambda lane_idx, elem_idx: {
+            "token_idx": elem_idx * 2 + ((lane_idx // 2) % 2),
+            "intermediate_output_idx": (lane_idx % 2) * 8 + lane_idx // 4,
+        }),
     )
     OutputContract = Contract(
         domain=_domain,
         codomain=_codomain,
-        mapping=FunctionMapping(
-            lambda lane_idx, elem_idx: {
-                "token_idx": lane_idx,
-                "intermediate_output_idx": elem_idx,
-            }
-        ),
+        mapping=FunctionMapping(lambda lane_idx, elem_idx: {
+            "token_idx": lane_idx,
+            "intermediate_output_idx": elem_idx,
+        }),
     )
 
 
@@ -641,22 +629,18 @@ class TmemTranspose16x32Packed(_TmemTranspose16x32Core):
     InputContract = Contract(
         domain=_domain,
         codomain=_codomain,
-        mapping=FunctionMapping(
-            lambda lane_idx, elem_idx: {
-                "token_idx": elem_idx * 2 + ((lane_idx // 2) % 2),
-                "hidden_pair_idx": (lane_idx % 2) * 8 + lane_idx // 4,
-            }
-        ),
+        mapping=FunctionMapping(lambda lane_idx, elem_idx: {
+            "token_idx": elem_idx * 2 + ((lane_idx // 2) % 2),
+            "hidden_pair_idx": (lane_idx % 2) * 8 + lane_idx // 4,
+        }),
     )
     OutputContract = Contract(
         domain=_domain,
         codomain=_codomain,
-        mapping=FunctionMapping(
-            lambda lane_idx, elem_idx: {
-                "token_idx": lane_idx,
-                "hidden_pair_idx": elem_idx,
-            }
-        ),
+        mapping=FunctionMapping(lambda lane_idx, elem_idx: {
+            "token_idx": lane_idx,
+            "hidden_pair_idx": elem_idx,
+        }),
     )
 
 
@@ -686,9 +670,7 @@ class TmemTranspose32x32Inplace:
                 "skip-R1.Load or do R1.Load)."
             )
         self.top = TmemTranspose16x32(tmem_ptr, Region.Top, reg_tensor=reg_tensor_top)
-        self.bot = TmemTranspose16x32(
-            tmem_ptr, Region.Bottom, reg_tensor=reg_tensor_bot
-        )
+        self.bot = TmemTranspose16x32(tmem_ptr, Region.Bottom, reg_tensor=reg_tensor_bot)
 
 
 # =============================================================================
@@ -818,12 +800,10 @@ class PostSwigluHalf:
     InputContract = Contract(
         domain=_domain,
         codomain=_codomain,
-        mapping=FunctionMapping(
-            lambda lane_idx, elem_idx: {
-                "token_idx": lane_idx,
-                "intermediate_output_idx": elem_idx,
-            }
-        ),
+        mapping=FunctionMapping(lambda lane_idx, elem_idx: {
+            "token_idx": lane_idx,
+            "intermediate_output_idx": elem_idx,
+        }),
     )
 
     _Nvfp4RcpLimit = 1.0 / 6.0  # 1 / max abs of Float4E2M1FN (= 6.0)
@@ -870,7 +850,9 @@ class PostSwigluHalf:
             swiglu.tensor, norm_const, preloaded_topk_weight
         )
 
-    def _gen_sfc_quantize(self, swiglu_rmem: cute.Tensor, norm_const, topk_weight):
+    def _gen_sfc_quantize(
+        self, swiglu_rmem: cute.Tensor, norm_const, topk_weight
+    ):
         """Compute SFC + pre-quantized scaled fp32 regs in RMEM."""
         sfc_reg = cute.make_rmem_tensor((1,), cutlass.Float8E4M3FN)
         weighted_regs = cute.make_rmem_tensor((16,), cutlass.Float32)
@@ -899,7 +881,9 @@ class PostSwigluHalf:
 
         acc_scale = norm_const * cute.arch.rcp_approx(sfc_fp32_rt)
         acc_scale = cute.arch.fmin(acc_scale, cutlass.Float32(self._Fp32Max))
-        mask = cute.arch.fmin(sfc_fp32_rt * cutlass.Float32(1e30), cutlass.Float32(1.0))
+        mask = cute.arch.fmin(
+            sfc_fp32_rt * cutlass.Float32(1e30), cutlass.Float32(1.0)
+        )
         acc_scale = acc_scale * mask
 
         acc_scale_pair = (acc_scale, acc_scale)
@@ -941,28 +925,18 @@ class PostSwigluHalf:
         if cutlass.const_expr(
             isinstance(self._intermediate_downproj, int)
             and self._intermediate_downproj
-            % self._cga_cluster_tile_intermediate_downproj
-            == 0
+            % self._cga_cluster_tile_intermediate_downproj == 0
         ):
-            self._gSFC[self._token_idx, self._intermediate_downproj_idx, 0] = (
-                self._sfc_reg[0]
-            )
+            self._gSFC[
+                self._token_idx, self._intermediate_downproj_idx, 0
+            ] = self._sfc_reg[0]
             return
 
         # Runtime predicate.  Works for both the unaligned-static and the
         # dynamic-shape paths; subtile size assumption (1 fp8 / warp /
         # subtile) is unchanged from the previous implementation.
         if self._intermediate_downproj_idx < self._intermediate_downproj:
-            cute.copy(
-                cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), cutlass.Uint8, num_bits_per_copy=8
-                ),
-                self._sfc_reg,
-                cute.composition(
-                    self._gSFC[self._token_idx, self._intermediate_downproj_idx, None],
-                    self._sfc_reg.shape,
-                ),
-            )
+            cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Uint8, num_bits_per_copy=8), self._sfc_reg, cute.composition(self._gSFC[self._token_idx, self._intermediate_downproj_idx, None], self._sfc_reg.shape))
 
     def r2s(self, subtile_idx) -> None:
         """RMEM -> SMEM: per-thread STS.64 of 16 fp4 to ``sC[subtile_idx]``."""
@@ -1015,12 +989,10 @@ class Fc2AccLoadAndPack:
     OutputContract = Contract(
         domain=_domain,
         codomain=_codomain,
-        mapping=FunctionMapping(
-            lambda lane_idx, elem_idx: {
-                "token_idx": elem_idx * 2 + ((lane_idx // 2) % 2),
-                "hidden_pair_idx": (lane_idx % 2) * 8 + lane_idx // 4,
-            }
-        ),
+        mapping=FunctionMapping(lambda lane_idx, elem_idx: {
+            "token_idx": elem_idx * 2 + ((lane_idx // 2) % 2),
+            "hidden_pair_idx": (lane_idx % 2) * 8 + lane_idx // 4,
+        }),
     )
 
     _io_dtype = cutlass.Float32  # 32-bit slot dtype for downstream atoms
@@ -1148,12 +1120,10 @@ class TransposeStgReturnTokenContract(Fc2ReturnTokenContract):
         contract = Contract(
             domain=domain,
             codomain=codomain,
-            mapping=FunctionMapping(
-                lambda epi_tidx, token_iter: {
-                    "token_idx_within_cta_token_tile": token_iter * 32
-                    + (epi_tidx % 32),
-                }
-            ),
+            mapping=FunctionMapping(lambda epi_tidx, token_iter: {
+                "token_idx_within_cta_token_tile":
+                    token_iter * 32 + (epi_tidx % 32),
+            }),
         )
         object.__setattr__(self, "num_token_iters", self.cta_token_count // 32)
         object.__setattr__(self, "contract", contract)
@@ -1190,15 +1160,13 @@ class TransposeRedgReturnTokenContract(Fc2ReturnTokenContract):
         contract = Contract(
             domain=domain,
             codomain=codomain,
-            mapping=FunctionMapping(
-                lambda epi_tidx, token_iter: {
-                    "token_idx_within_cta_token_tile": (token_iter // 8)
-                    * EpilogueTokenTile
+            mapping=FunctionMapping(lambda epi_tidx, token_iter: {
+                "token_idx_within_cta_token_tile":
+                    (token_iter // 8) * EpilogueTokenTile
                     + ((token_iter % 8) // 4) * 32
                     + ((epi_tidx % 32) // 4)
                     + ((token_iter % 4) * 8),
-                }
-            ),
+            }),
         )
         object.__setattr__(self, "num_token_iters", num_iters)
         object.__setattr__(self, "contract", contract)
@@ -1237,14 +1205,13 @@ class BulkReturnTokenContract(Fc2ReturnTokenContract):
         contract = Contract(
             domain=domain,
             codomain=codomain,
-            mapping=FunctionMapping(
-                lambda epi_tidx, token_iter: {
-                    "token_idx_within_cta_token_tile": token_iter * 128
+            mapping=FunctionMapping(lambda epi_tidx, token_iter: {
+                "token_idx_within_cta_token_tile":
+                    token_iter * 128
                     + ((epi_tidx % 32) // 8) * 32
                     + (epi_tidx // 32) * 8
                     + (epi_tidx % 8),
-                }
-            ),
+            }),
         )
         object.__setattr__(self, "num_token_iters", num_iters)
         object.__setattr__(self, "contract", contract)
@@ -1316,8 +1283,7 @@ class Fc2ReturnTile:
 
         for token_iter in cutlass.range_constexpr(token_count):
             token_offset = self.token_contract.token_idx_within_cta_tile(
-                epi_tidx,
-                cutlass.Int32(token_iter),
+                epi_tidx, cutlass.Int32(token_iter),
             )
             pool_token = self.cta_token_tile_start + token_offset
             pool_tokens[token_iter] = pool_token
@@ -1357,8 +1323,7 @@ class Fc2ReturnTile:
             return prefetch.row(token_iter), prefetch.is_valid(token_iter)
 
         token_offset = self.token_contract.token_idx_within_cta_tile(
-            epi_tidx,
-            token_iter,
+            epi_tidx, token_iter,
         )
         pool_token = self.cta_token_tile_start + token_offset
         valid = pool_token < self.valid_token_row_end
@@ -1371,7 +1336,8 @@ class Fc2ReturnTile:
         if valid:
             md = TokenSrcMetadata.load(
                 self.metadata.iterator.toint()
-                + cutlass.Int64(pool_token) * cutlass.Int64(TokenSrcMetadata.nbytes)
+                + cutlass.Int64(pool_token)
+                * cutlass.Int64(TokenSrcMetadata.nbytes)
             )
             dst_rank = md.src_rank
             dst_token = md.src_token
@@ -1379,8 +1345,7 @@ class Fc2ReturnTile:
                 topk = md.src_topk
         local_row = cute.slice_(self.tensor, (dst_token, topk, None))
         peer_iter = self.peer_rank_ptr_mapper.ptr_map_to_rank(
-            local_row.iterator,
-            dst_rank,
+            local_row.iterator, dst_rank,
         )
         return cute.make_tensor(peer_iter, local_row.layout), valid
 
@@ -1404,8 +1369,7 @@ class Fc2ReturnTilePrefetch:
     def row(self, token_iter) -> cute.Tensor:
         if cutlass.const_expr(self.tile.metadata is None):
             return cute.slice_(
-                self.tile.tensor,
-                (self.pool_tokens[token_iter], 0, None),
+                self.tile.tensor, (self.pool_tokens[token_iter], 0, None),
             )
 
         local_row = cute.slice_(
@@ -1502,12 +1466,10 @@ class Fc2UnpackPermuteStg:
     InputContract = Contract(
         domain=_domain,
         codomain=_codomain,
-        mapping=FunctionMapping(
-            lambda lane_idx, elem_idx: {
-                "token_idx": lane_idx,
-                "hidden_pair_idx": elem_idx,
-            }
-        ),
+        mapping=FunctionMapping(lambda lane_idx, elem_idx: {
+            "token_idx": lane_idx,
+            "hidden_pair_idx": elem_idx,
+        }),
     )
 
     # REDG-path per-LDTM RMEM contract: the (lane_idx, elem_idx) ->
@@ -1516,16 +1478,20 @@ class Fc2UnpackPermuteStg:
     # off a 16-lane x 16-col TMEM slab.  See the class docstring for
     # the pair semantics + coalescing invariant.
     _redg_per_ldtm_domain = Space(("lane_idx", "elem_idx"), (32, 8))
-    _redg_per_ldtm_codomain = Space(("tmem_lane_in_ldtm", "tmem_col"), (16, 16))
+    _redg_per_ldtm_codomain = Space(
+        ("tmem_lane_in_ldtm", "tmem_col"), (16, 16)
+    )
     _RedgPerLdtmContract = Contract(
         domain=_redg_per_ldtm_domain,
         codomain=_redg_per_ldtm_codomain,
-        mapping=FunctionMapping(
-            lambda lane_idx, elem_idx: {
-                "tmem_lane_in_ldtm": (lane_idx // 4) + 8 * ((elem_idx // 2) % 2),
-                "tmem_col": (lane_idx % 4) * 2 + (elem_idx % 2) + 8 * (elem_idx // 4),
-            }
-        ),
+        mapping=FunctionMapping(lambda lane_idx, elem_idx: {
+            "tmem_lane_in_ldtm":
+                (lane_idx // 4) + 8 * ((elem_idx // 2) % 2),
+            "tmem_col":
+                (lane_idx % 4) * 2
+                + (elem_idx % 2)
+                + 8 * (elem_idx // 4),
+        }),
     )
 
     # Per-warp hidden tile width (warp w handles hidden [w*32, w*32+32)).
@@ -1533,10 +1499,10 @@ class Fc2UnpackPermuteStg:
     # Bits per STG.256 store.
     _StgBitsPerCopy = 256
     # REDG-path layout constants.
-    _RedgLdtmIterCount = 2  # 2 x Ld16x256b(Repetition.x2)
-    _RedgRegPerLdtm = 8  # reg/thread per LDTM call
-    _RedgRegPairsPerLdtm = 4  # = _RedgRegPerLdtm / 2
-    _RedgBf16PerPair = 4  # 8 B pair = 2 bf16x2 = 4 bf16
+    _RedgLdtmIterCount = 2          # 2 x Ld16x256b(Repetition.x2)
+    _RedgRegPerLdtm = 8             # reg/thread per LDTM call
+    _RedgRegPairsPerLdtm = 4        # = _RedgRegPerLdtm / 2
+    _RedgBf16PerPair = 4            # 8 B pair = 2 bf16x2 = 4 bf16
 
     def __init__(
         self,
@@ -1622,7 +1588,7 @@ class Fc2UnpackPermuteStg:
         # -- Step 3: unpack + permute back to natural hidden order ---------
         natural = cute.make_rmem_tensor((32,), self._fc2_output_dtype)
         for h in range(16):
-            natural[h] = packed_bf16[2 * h]  # lo lane = hidden h
+            natural[h]      = packed_bf16[2 * h]      # lo lane = hidden h
             natural[h + 16] = packed_bf16[2 * h + 1]  # hi lane = hidden h+16
 
         # -- Step 4: cache for stg() ---------------------------------------
@@ -1679,7 +1645,9 @@ class Fc2UnpackPermuteStg:
                     cute.make_layout((((16,), 1),), stride=(((1,), 0),)),
                 )
 
-                hidden_base = self._tile_hidden_base + warp_hidden_base + stg_idx * 16
+                hidden_base = (
+                    self._tile_hidden_base + warp_hidden_base + stg_idx * 16
+                )
 
                 gOut_thread_row = cute.local_tile(
                     token_row_1d,
@@ -1750,14 +1718,15 @@ class Fc2UnpackPermuteStg:
         redg_iter_in_subtile = self._token_iter % cutlass.Int32(8)
         half_idx = redg_iter_in_subtile // cutlass.Int32(4)
         scratch_iter = tmem_subtile_scratch.iterator + cute.assume(
-            32 * half_idx,
-            divby=32,
+            32 * half_idx, divby=32,
         )
         # Per-LDTM source views: each is 16 lanes x 16 cols, addressing
         # rows 0..15 (iter 0) and rows 16..31 (iter 1) of the slab.
         # The 16-lane offset in TMEM cell units = 16 *
         # ``_TmemTranspose16x32Core._TmemRowStride``.
-        ldtm_half_lane_off = 16 * _TmemTranspose16x32Core._TmemRowStride
+        ldtm_half_lane_off = (
+            16 * _TmemTranspose16x32Core._TmemRowStride
+        )
         self._redg_ldtm_src_views = (
             cute.make_tensor(
                 scratch_iter,
@@ -1773,7 +1742,7 @@ class Fc2UnpackPermuteStg:
         packed_bf16 = cute.recast_tensor(packed.tensor, self._fc2_output_dtype)
         natural = cute.make_rmem_tensor((32,), self._fc2_output_dtype)
         for h in range(16):
-            natural[h] = packed_bf16[2 * h]
+            natural[h]      = packed_bf16[2 * h]
             natural[h + 16] = packed_bf16[2 * h + 1]
         natural_fp32 = cute.recast_tensor(natural, cutlass.Float32)
 
@@ -1877,16 +1846,15 @@ class Fc2UnpackPermuteStg:
         # Per-pair low-end hidden offset within the warp's 32-hidden
         # segment, in bf16 element units.
         per_pair_hidden_in_warp_lo = (
-            lane_quad * cutlass.Int32(4),  # pair 0
-            lane_quad * cutlass.Int32(4),  # pair 1
+            lane_quad * cutlass.Int32(4),                     # pair 0
+            lane_quad * cutlass.Int32(4),                     # pair 1
             lane_quad * cutlass.Int32(4) + cutlass.Int32(16),  # pair 2
             lane_quad * cutlass.Int32(4) + cutlass.Int32(16),  # pair 3
         )
 
         for ldtm_iter in cutlass.range_constexpr(self._RedgLdtmIterCount):
             regs = cute.make_rmem_tensor(
-                (self._RedgRegPerLdtm,),
-                cutlass.Float32,
+                (self._RedgRegPerLdtm,), cutlass.Float32,
             )
             cute.copy(
                 ldtm_atom,
@@ -1907,7 +1875,9 @@ class Fc2UnpackPermuteStg:
             # payload, see ``_red_add_relaxed_sys_v2_bf16x2`` docstring.
 
             for pair_idx in cutlass.range_constexpr(self._RedgRegPairsPerLdtm):
-                token_slot = pair_to_token_slot[pair_idx] + (2 if ldtm_iter == 1 else 0)
+                token_slot = pair_to_token_slot[pair_idx] + (
+                    2 if ldtm_iter == 1 else 0
+                )
                 token_row_1d = self._redg_token_rows_1d[token_slot]
                 token_valid = self._redg_token_valid[token_slot]
                 hidden_in_warp_lo = per_pair_hidden_in_warp_lo[pair_idx]
@@ -1933,15 +1903,11 @@ class Fc2UnpackPermuteStg:
                     if cutlass.const_expr(self._needs_hidden_predicate):
                         if hidden_base < self._valid_hidden:
                             _red_add_relaxed_sys_v2_bf16x2(
-                                addr,
-                                val0,
-                                val1,
+                                addr, val0, val1,
                             )
                     else:
                         _red_add_relaxed_sys_v2_bf16x2(
-                            addr,
-                            val0,
-                            val1,
+                            addr, val0, val1,
                         )
 
     # ------------------------------------------------------------------
@@ -2065,8 +2031,8 @@ class SwapABSwigluFp4Epilogue:
         # ``intermediate_downproj`` is an integer multiple of it the
         # predicate is statically True and elided.
         self._cga_cluster_tile_intermediate_downproj: int = (
-            self._cta_tile_m // 2
-        ) * cluster_shape_mn[0]
+            (self._cta_tile_m // 2) * cluster_shape_mn[0]
+        )
         if static_expert_shape is not None:
             intermediate_downproj = static_expert_shape[1] // 2
             if intermediate_downproj % sf_vec_size != 0:
@@ -2311,10 +2277,10 @@ class SwapABSwigluFp4Epilogue:
         # ── fc1 (Linear1 phase) outputs ──────────────────────────────────
         # NVFP4 packed output staged through SMEM and dispatched by TMA
         # bulk store.
-        smem_fc1_output_buffer: cute.Tensor,  # sC SMEM (subtile_cnt slots)
-        tma_atom_fc1_output: cute.CopyAtom,  # TMA store atom for fc1 NVFP4 out
-        gmem_fc1_output: cute.Tensor,  # GMEM target for the TMA store
-        gmem_fc1_output_sf: cute.Tensor,  # GMEM fp8 SFC, written by per-thread STG
+        smem_fc1_output_buffer: cute.Tensor,        # sC SMEM (subtile_cnt slots)
+        tma_atom_fc1_output: cute.CopyAtom,          # TMA store atom for fc1 NVFP4 out
+        gmem_fc1_output: cute.Tensor,                # GMEM target for the TMA store
+        gmem_fc1_output_sf: cute.Tensor,             # GMEM fp8 SFC, written by per-thread STG
         # ── topk weights (applied before fc1-output NVFP4 quantize) ─────
         gmem_topk_scores: cute.Tensor,
         # ── fc2 (Linear2 phase) output ───────────────────────────────────
@@ -2391,7 +2357,9 @@ class SwapABSwigluFp4Epilogue:
                 cute.arch.fence_acq_rel_gpu()
                 for _b in cutlass.range_constexpr(0, _batch, 1):
                     if cutlass.Int32(_b) < _pend_n:
-                        _red_add_relaxed_gpu_s32_addr(_pend_addr[_b], cutlass.Int32(1))
+                        _red_add_relaxed_gpu_s32_addr(
+                            _pend_addr[_b], cutlass.Int32(1)
+                        )
             return cutlass.Int32(0)
 
         work_tile_info = sched_consumer.consume_work()
@@ -2433,7 +2401,8 @@ class SwapABSwigluFp4Epilogue:
 
             cur_was_linear1 = work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
             cur_fc1_counter_slot = (
-                work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+                work_tile_info.cumulative_token_block_count
+                + work_tile_info.tile_n_idx
             )
             # Only valid fc1 N-tiles signal the buffer ready. ``tile_m_idx`` in swap_ab is the
             # ``intermediate_downproj_tile_idx``.
@@ -2532,20 +2501,14 @@ class SwapABSwigluFp4Epilogue:
     ) -> None:
         """Linear1 task-tile body."""
         real_fc1_output, _ = sched_ext.get_gmem_tensor(
-            "c",
-            gmem_fc1_output,
-            work_tile_info,
+            "c", gmem_fc1_output, work_tile_info,
         )
         real_fc1_output_sf, _ = sched_ext.get_gmem_tensor(
-            "sfc",
-            gmem_fc1_output_sf,
-            work_tile_info,
+            "sfc", gmem_fc1_output_sf, work_tile_info,
         )
         # Shifted topk view; downstream indexing is expert-local.
         real_topk_scores, _ = sched_ext.get_gmem_tensor(
-            "topk",
-            gmem_topk_scores,
-            work_tile_info,
+            "topk", gmem_topk_scores, work_tile_info,
         )
 
         iket.range_push("fc1_epi_wait")
@@ -2559,7 +2522,8 @@ class SwapABSwigluFp4Epilogue:
             )
         else:
             acc_stage_col_offset = (
-                cutlass.Int32(acc_consumer_state.index) * self._cta_tile_n
+                cutlass.Int32(acc_consumer_state.index)
+                * self._cta_tile_n
             )
 
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
@@ -2578,15 +2542,11 @@ class SwapABSwigluFp4Epilogue:
             ) % cutlass.Int32(subtile_cnt)
 
             tmem_subtile_first = self._subtile_local_tmem_tensor(
-                tmem_acc_tensor,
-                subtile_idx_first,
-                warp_idx,
+                tmem_acc_tensor, subtile_idx_first, warp_idx,
                 acc_stage_col_offset,
             )
             tmem_subtile_second = self._subtile_local_tmem_tensor(
-                tmem_acc_tensor,
-                subtile_idx_second,
-                warp_idx,
+                tmem_acc_tensor, subtile_idx_second, warp_idx,
                 acc_stage_col_offset,
             )
 
@@ -2637,9 +2597,7 @@ class SwapABSwigluFp4Epilogue:
                 self._run_fc1_subtile(
                     subtile_idx=subtile_idx,
                     tmem_subtile_tensor=self._subtile_local_tmem_tensor(
-                        tmem_acc_tensor,
-                        subtile_idx,
-                        warp_idx,
+                        tmem_acc_tensor, subtile_idx, warp_idx,
                         acc_stage_col_offset,
                     ),
                     real_fc1_output=real_fc1_output,
@@ -2695,7 +2653,9 @@ class SwapABSwigluFp4Epilogue:
         """
         metadata_u32 = None
         peer_rank_ptr_mapper = None
-        if cutlass.const_expr(token_comm_args is None or self._token_back_by_dispatch):
+        if cutlass.const_expr(
+            token_comm_args is None or self._token_back_by_dispatch
+        ):
             if cutlass.const_expr(self._reduce_topk_in_kernel):
                 raise ValueError(
                     "in_kernel_fc2_reduce requires token_comm metadata + a "
@@ -2705,8 +2665,7 @@ class SwapABSwigluFp4Epilogue:
                 )
         else:
             metadata_u32 = cute.recast_tensor(
-                token_comm_args.token_src_metadata,
-                cutlass.Uint32,
+                token_comm_args.token_src_metadata, cutlass.Uint32,
             )
             peer_rank_ptr_mapper = token_comm_args.peer_rank_ptr_mapper
 
@@ -2754,7 +2713,8 @@ class SwapABSwigluFp4Epilogue:
             )
         else:
             acc_stage_col_offset = (
-                cutlass.Int32(acc_consumer_state.index) * self._cta_tile_n
+                cutlass.Int32(acc_consumer_state.index)
+                * self._cta_tile_n
             )
 
         if cutlass.const_expr(self._fc2_use_bulk):
@@ -2787,15 +2747,11 @@ class SwapABSwigluFp4Epilogue:
             ) % cutlass.Int32(subtile_cnt)
 
             tmem_subtile_first = self._subtile_local_tmem_tensor(
-                tmem_acc_tensor,
-                subtile_idx_first,
-                warp_idx,
+                tmem_acc_tensor, subtile_idx_first, warp_idx,
                 acc_stage_col_offset,
             )
             tmem_subtile_second = self._subtile_local_tmem_tensor(
-                tmem_acc_tensor,
-                subtile_idx_second,
-                warp_idx,
+                tmem_acc_tensor, subtile_idx_second, warp_idx,
                 acc_stage_col_offset,
             )
 
@@ -2838,9 +2794,7 @@ class SwapABSwigluFp4Epilogue:
                 self._run_fc2_subtile(
                     subtile_idx=subtile_idx,
                     tmem_subtile_tensor=self._subtile_local_tmem_tensor(
-                        tmem_acc_tensor,
-                        subtile_idx,
-                        warp_idx,
+                        tmem_acc_tensor, subtile_idx, warp_idx,
                         acc_stage_col_offset,
                     ),
                     return_prefetch=return_prefetch,
@@ -2895,16 +2849,15 @@ class SwapABSwigluFp4Epilogue:
             else:
                 subtile_idx = cutlass.Int32(i)
 
-            release_after_ldtm = cutlass.const_expr(
-                self._overlapping_accum
-            ) and i == cutlass.Int32(0)
+            release_after_ldtm = (
+                cutlass.const_expr(self._overlapping_accum)
+                and i == cutlass.Int32(0)
+            )
             if subtile_idx * cutlass.Int32(64) < valid_tokens:
                 self._run_fc2_bulk_subtile(
                     subtile_idx=subtile_idx,
                     tmem_subtile_tensor=self._subtile_local_tmem_tensor(
-                        tmem_acc_tensor,
-                        subtile_idx,
-                        warp_idx,
+                        tmem_acc_tensor, subtile_idx, warp_idx,
                         acc_stage_col_offset,
                     ),
                     scratch=scratch,
@@ -2927,6 +2880,7 @@ class SwapABSwigluFp4Epilogue:
             acc_pipeline.consumer_release(acc_consumer_state)
 
     # -- Per-subtile dispatch -------------------------------------------------
+
 
     @cute.jit
     def _run_fc1_subtile(
@@ -3016,7 +2970,7 @@ class SwapABSwigluFp4Epilogue:
         )
 
         # Resolve ``intermediate_downproj`` for the PostSwigluHalf SFC
-        # predicate.
+        # predicate. 
         if cutlass.const_expr(self._intermediate_downproj is not None):
             intermediate_downproj_value = self._intermediate_downproj
         else:
@@ -3067,13 +3021,11 @@ class SwapABSwigluFp4Epilogue:
                 TmemTranspose16x32._tmem_layout(16, 32),
             )
             cute.copy(
-                atom_ld16x64,
-                tmem_gate_view,
+                atom_ld16x64, tmem_gate_view,
                 TmemTranspose16x32._rmem_copy_view(f_gate_tensor, 16),
             )
             cute.copy(
-                atom_ld16x64,
-                tmem_up_view,
+                atom_ld16x64, tmem_up_view,
                 TmemTranspose16x32._rmem_copy_view(f_up_tensor, 16),
             )
         else:
@@ -3081,12 +3033,10 @@ class SwapABSwigluFp4Epilogue:
             f_up_tensor = preload_acc[1]
 
         f_gate = TensorWithContract(
-            tensor=f_gate_tensor,
-            contract=TmemTranspose16x32.InputContract,
+            tensor=f_gate_tensor, contract=TmemTranspose16x32.InputContract,
         )
         f_up = TensorWithContract(
-            tensor=f_up_tensor,
-            contract=TmemTranspose16x32.InputContract,
+            tensor=f_up_tensor, contract=TmemTranspose16x32.InputContract,
         )
 
         # -- SwiGLU fold first half (0..8 now; 8..16 dispersed below) --------
@@ -3106,8 +3056,7 @@ class SwapABSwigluFp4Epilogue:
 
         if cutlass.const_expr(preload_acc is None):
             second_t = TmemTranspose32x32Inplace(tmem_second_ptr)
-            second_t.bot.r1_load()
-            second_t.top.r1_load()
+            second_t.bot.r1_load();   second_t.top.r1_load()
         else:
             second_t = TmemTranspose32x32Inplace(
                 tmem_second_ptr,
@@ -3122,15 +3071,11 @@ class SwapABSwigluFp4Epilogue:
             )
             # skip-R1.Load: r1_load is a no-op inside _TmemTranspose16x32Core,
             # so we don't call it here.
-        second_t.bot.r1_perm()
-        second_t.top.r1_perm()
-        second_t.bot.r1_store()
-        second_t.top.r1_store()
+        second_t.bot.r1_perm();   second_t.top.r1_perm()
+        second_t.bot.r1_store();  second_t.top.r1_store()
 
-        second_t.bot.r2_load()
-        second_t.top.r2_load()
-        second_t.top.r2_store()
-        second_t.bot.r2_store()
+        second_t.bot.r2_load();   second_t.top.r2_load()
+        second_t.top.r2_store();  second_t.bot.r2_store()
 
         second_t.top.r3_load_top()
         second_t.top.r3_load_bot()
@@ -3320,9 +3265,10 @@ class SwapABSwigluFp4Epilogue:
     ) -> None:
         """Issue one 32-token x 128-hidden scratch tile via UBLKCP/UBLKREDG."""
         pair_idx = subtile_idx // cutlass.Int32(2)
-        issue_group = (subtile_idx % cutlass.Int32(2)) * cutlass.Int32(
-            2
-        ) + cutlass.Int32(token_group_idx)
+        issue_group = (
+            (subtile_idx % cutlass.Int32(2)) * cutlass.Int32(2)
+            + cutlass.Int32(token_group_idx)
+        )
         lane_idx = tidx % 32
         lane_group = lane_idx // cutlass.Int32(8)
         lane_in_group = lane_idx % cutlass.Int32(8)
@@ -3425,11 +3371,7 @@ class SwapABSwigluFp4Epilogue:
 
         # token 0..31 of this 64-token subtile
         self._store_fc2_bulk_token_group_to_smem(
-            raw_acc,
-            scratch,
-            token_group_idx=0,
-            warp_idx=warp_idx,
-            tidx=tidx,
+            raw_acc, scratch, token_group_idx=0, warp_idx=warp_idx, tidx=tidx,
         )
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_warp()
@@ -3452,11 +3394,7 @@ class SwapABSwigluFp4Epilogue:
         cute.arch.sync_warp()
         task_tile_bar.arrive_and_wait()
         self._store_fc2_bulk_token_group_to_smem(
-            raw_acc,
-            scratch,
-            token_group_idx=1,
-            warp_idx=warp_idx,
-            tidx=tidx,
+            raw_acc, scratch, token_group_idx=1, warp_idx=warp_idx, tidx=tidx,
         )
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_warp()
