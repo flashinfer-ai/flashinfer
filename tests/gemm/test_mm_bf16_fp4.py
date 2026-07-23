@@ -302,6 +302,8 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
     sf_u8 = sf_p.view(torch.uint8).contiguous()
     alpha_l = _prepare_bf16_fp4_alpha(alpha_p, device)
     for tactic, cfg in enumerate(_bf16_fp4_cute_dsl_tactic_configs(n, k)):
+        if cfg[7] == "gemv" and m != 1:
+            continue
         outs = []
         for _ in range(2):
             out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
