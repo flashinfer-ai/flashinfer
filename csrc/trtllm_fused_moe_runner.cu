@@ -712,7 +712,19 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     // Setup finalize data
     finalizeData.mDtypeElt = args.mDtypeOut;
     finalizeData.mDtypeExpW = args.mDtypeExpW;
-    finalizeData.mUsePdl = enablePdl;
+    // Disable PDL for the finalize kernel. The trt-llm MoE pipeline runs
+    // routing -> GEMM1 -> (quant) -> GEMM2 -> finalize on one stream. With
+    // PDL, the dependency chain signals after the routing kernel
+    // (cudaTriggerProgrammaticLaunchCompletion), but GEMM2 runs between
+    // routing and finalize. finalizeKernelVecLoad's cudaGridDependencySynchronize()
+    // therefore sees the routing signal and starts while GEMM2 is still writing
+    // gemm2_output. The finalize kernel reads gemm2_output via ld.global.v4.f32,
+    // which on sm_100+ lowers to a bulk async load waited on with ACQBULK. Since
+    // GEMM2 has not finished writing, ACQBULK parks forever (observed: all 225K
+    // threads stuck at the same ACQBULK PC). Setting mUsePdl = false makes
+    // finalize use normal stream ordering, so it waits for GEMM2 to complete.
+    // This only affects the finalize kernel; GEMM1/GEMM2 keep their own PDL.
+    finalizeData.mUsePdl = false;
     finalizeData.mUseDeepSeekFp8 = false;
     finalizeData.inPtr = workspace.gemm2_output;
     finalizeData.outPtr = args.output;
