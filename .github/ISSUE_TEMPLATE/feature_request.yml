@@ -1,0 +1,187 @@
+name: 🚀 Kernel / Feature Request
+description: >
+  Request a kernel, hardware enablement, framework integration, API, or
+  performance improvement. For something broken, wrong, or slower than it
+  used to be, use 🐛 Bug Report instead.
+title: "[Feature]: "
+labels: ["feature request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping us understand the request and its impact. Please use
+        public, non-confidential information. **Only the first four fields are
+        required** — the optional fields below them help the team scope and
+        prioritize faster, so fill in what you can.
+
+  - type: checkboxes
+    id: presubmit
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have searched existing issues and this request has not been filed yet.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: >
+        Describe the problem and what is blocked or inefficient today. If you
+        have a trace/profile or a minimal script that demonstrates it, link or
+        attach it here.
+      placeholder: |
+        Today, users cannot...
+        The current behavior is...
+    validations:
+      required: true
+
+  - type: textarea
+    id: requested-outcome
+    attributes:
+      label: Requested outcome
+      description: >
+        Describe the capability or behavior you want. Focus on the outcome
+        rather than prescribing an implementation.
+      placeholder: |
+        Add support for...
+        The public API or framework should be able to...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Target hardware
+      description: Select every confirmed target.
+      multiple: true
+      options:
+        - SM80 / SM86 / SM87 (A100, A30, RTX 30-series, Jetson Orin)
+        - SM89 (L4, L40S, RTX 40-series)
+        - SM90 (H100, H200, H20)
+        - SM100 (B200, GB200)
+        - SM103 (B300, GB300)
+        - SM110 (Jetson AGX Thor, DRIVE AGX Thor)
+        - SM120 (RTX PRO 6000, RTX 50-series)
+        - SM121 (GB10 — DGX Spark, RTX Spark)
+        - Future architecture
+        - Hardware-independent
+        - Other or unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: inference-engine
+    attributes:
+      label: Inference engine
+      description: Select every engine or integration path this applies to.
+      multiple: true
+      options:
+        - vLLM
+        - SGLang
+        - TRT-LLM
+        - PyTorch native
+        - Custom / other
+        - Not applicable
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        **Everything below is optional** — the more you fill in, the faster the
+        team can act on the request.
+
+  - type: input
+    id: models
+    attributes:
+      label: Affected model or model family
+      description: >
+        Exact checkpoint or family with a public link, if the request is
+        model-driven.
+      placeholder: "Example: Qwen3.5-397B-A17B-NVFP4 - https://huggingface.co/..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload and configuration
+      description: >
+        The single most useful section for kernel/performance requests — enough
+        detail to identify the operator path and representative shapes. For the
+        environment line, paste the output of `python -m flashinfer.collect_env`.
+      value: |
+        - Data type and quantization:
+        - Batch size or request concurrency:
+        - Sequence lengths or token counts:
+        - Parallelism: TP / EP / DP / PP / disaggregated
+        - Relevant shapes: heads, head dimension, hidden size, experts, top-k, page size, or other
+        - Environment: output of `python -m flashinfer.collect_env`
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround
+      description: >
+        The workaround, fallback, or alternative currently used and its
+        limitations.
+      placeholder: "Example: We currently use Marlin, but it is slower for these shapes and requires an extra repack."
+    validations:
+      required: false
+
+  - type: dropdown
+    id: impact-type
+    attributes:
+      label: Impact
+      description: Select all outcomes that apply.
+      multiple: true
+      options:
+        - Missing model or hardware support
+        - Production deployment blocker
+        - Correctness or numerical-quality risk
+        - Crash, hang, or reliability risk
+        - Throughput
+        - Latency
+        - Memory capacity or bandwidth
+        - Startup, compilation, or autotuning time
+        - API usability or integration complexity
+        - Testing, maintainability, or documentation
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: >
+        How maintainers can verify completion — measurable thresholds for
+        performance requests, correctness tests for new functionality.
+      placeholder: |
+        - Passes ... correctness tests across ... shapes and dtypes.
+        - Achieves at least ... with no more than ... regression elsewhere.
+    validations:
+      required: false
+
+  - type: textarea
+    id: scope-and-dependencies
+    attributes:
+      label: Related work, dependencies, or suggested scope
+      description: >
+        Related issues/PRs, upstream dependencies, prerequisite kernels/APIs,
+        or an implementation outline.
+    validations:
+      required: false
+
+  - type: input
+    id: timing
+    attributes:
+      label: Timing or release need
+      description: A concrete external milestone or required release, only if one exists.
+      placeholder: "Example: Needed for v0.7.x or public launch on 2026-10-15"
+    validations:
+      required: false

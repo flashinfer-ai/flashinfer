@@ -437,6 +437,8 @@ class TrtllmFp4RoutedRunner(MoERunner):
         routing_input_mode = act.routing_input_mode
         if routing_input_mode == RoutingInputMode.FromLogits:
             # In-kernel routing: topk_ids/expert_weights are OUTPUT buffers the kernel fills.
+            # Unlike the FP8 launcher, FP4 receives routing_input_mode explicitly;
+            # non-empty output buffers therefore do not select precomputed routing.
             # We allocate them here (mirroring trtllm_fp4_block_scale_moe_op, core.py ~2268)
             # because MoERunner.forward calls the raw op directly, bypassing the buffer-allocating
             # wrapper. Weight dtype mirrors logits dtype (core.py:2253).
@@ -541,6 +543,303 @@ class TrtllmFp4RoutedRunner(MoERunner):
 
     def __hash__(self):
         return hash(("trtllm_fp4_routed",))
+
+
+# ---------------------------------------------------------------------------
+# TRTLLM block-FP8 runner — DeepSeek FP8 and MXFP8
+# ---------------------------------------------------------------------------
+
+
+class TrtllmFp8BlockRunner(MoERunner):
+    """Block-FP8 adapter over the canonical trtllm-gen ``MoERunner``.
+
+    DeepSeek FP8 and MXFP8 share the kernel family but not scale contracts:
+    DeepSeek uses FP32 128-element/128x128 block scales, while MXFP8 uses
+    linear UE8M0 scales over 32-element K blocks.
+    """
+
+    backend_key = "trtllm_fp8_block"
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.FromLogits,
+    )
+    supported_quant_variants = (
+        QuantVariant.DeepSeekFp8,
+        QuantVariant.MxFp8,
+    )
+
+    def check_support(self) -> None:
+        super().check_support()
+        if self.config.activation.type is not ActivationType.Swiglu:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu activation."
+            )
+        if not self.config.execution.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only do_finalize=True."
+            )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+        from ..utils import device_support_pdl
+        from .api import QuantVariant
+        from .core import get_trtllm_moe_sm100_module
+
+        if config.quant.variant is QuantVariant.MxFp8:
+            dtype = DtypeTrtllmGen.MxE4m3
+            fp8_type = Fp8QuantizationType.MxFp8
+        else:
+            # Use a harmless default while construction precedes check_support().
+            # Unsupported variants are rejected before the runner is registered.
+            dtype = DtypeTrtllmGen.E4m3
+            fp8_type = Fp8QuantizationType.DeepSeekFp8
+
+        self.config = config
+        self.device = device
+        self._module = get_trtllm_moe_sm100_module()
+        self._variant = config.quant.variant
+        self._dtype_act = dtype
+        self._dtype_weights = dtype
+        self._fp8_quantization_type = fp8_type
+        self._use_shuffled_weight = config.quant.variant is QuantVariant.MxFp8
+
+        routing = config.routing
+        experts = config.experts
+        execution = config.execution
+        self._num_local_experts = experts.local_num_experts or routing.num_experts
+        self._local_expert_offset = experts.local_expert_offset
+        self._intermediate_size = experts.intermediate_size
+        self._activation_type = int(config.activation.type)
+        self._tune_max_num_tokens = execution.tune_max_num_tokens
+
+        enable_pdl = execution.enable_pdl
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(device)
+        self._enable_pdl = enable_pdl
+
+        self._inner: Any = None
+        self._static_kwargs: dict = {}
+        self.tuning_config: Any = None
+
+    def _ensure_inner(self, hidden_size: int) -> None:
+        if self._inner is not None:
+            return
+        from ..tllm_enums import WeightLayout
+
+        self._inner = self._module.MoERunner(
+            top_k=self.config.routing.top_k,
+            num_local_experts=self._num_local_experts,
+            dtype_act=self._dtype_act,
+            dtype_weights=self._dtype_weights,
+            fp8_quantization_type=self._fp8_quantization_type,
+            hidden_size=hidden_size,
+            intermediate_size=self._intermediate_size,
+            activation_type=self._activation_type,
+            use_shuffled_weight=self._use_shuffled_weight,
+            weight_layout=int(WeightLayout.MajorK),
+            use_per_token_scaling=False,
+            num_experts=self.config.routing.num_experts,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self, inputs: List[torch.Tensor], profile: Any
+    ) -> List[Any]:
+        return self._inner.get_valid_tactics(inputs, profile)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._inner.forward(
+            inputs,
+            tactic=tactic,
+            do_preparation=do_preparation,
+            **self._static_kwargs,
+        )
+        return inputs[0]
+
+    def _validate_fp8_tensors(
+        self,
+        act: MoEActivationPack,
+        view: dict,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        from .api import QuantVariant
+
+        if act.hidden_states_q.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "TrtllmFp8BlockRunner requires float8_e4m3fn hidden_states_q, "
+                f"got {act.hidden_states_q.dtype}."
+            )
+        scale = act.hidden_states_scale
+        if scale is None:
+            raise ValueError("TrtllmFp8BlockRunner requires hidden_states_scale.")
+        num_tokens = act.hidden_states_q.shape[0]
+        if self._variant is QuantVariant.DeepSeekFp8:
+            expected_scale = (hidden_size // 128, num_tokens)
+            if scale.dtype != torch.float32 or tuple(scale.shape) != expected_scale:
+                raise ValueError(
+                    "DeepSeekFp8 hidden_states_scale must be float32 with shape "
+                    f"{expected_scale}, got {scale.dtype} {tuple(scale.shape)}."
+                )
+            expected_w1_scale = (
+                self._num_local_experts,
+                2 * self._intermediate_size // 128,
+                hidden_size // 128,
+            )
+            expected_w2_scale = (
+                self._num_local_experts,
+                hidden_size // 128,
+                self._intermediate_size // 128,
+            )
+            scale_dtype = torch.float32
+        else:
+            expected_scale = (num_tokens, hidden_size // 32)
+            if scale.dtype != torch.uint8 or tuple(scale.shape) != expected_scale:
+                raise ValueError(
+                    "MxFp8 hidden_states_scale must be uint8 UE8M0 with shape "
+                    f"{expected_scale}, got {scale.dtype} {tuple(scale.shape)}."
+                )
+            expected_w1_scale = (
+                self._num_local_experts,
+                2 * self._intermediate_size,
+                hidden_size // 32,
+            )
+            expected_w2_scale = (
+                self._num_local_experts,
+                hidden_size,
+                self._intermediate_size // 32,
+            )
+            scale_dtype = torch.uint8
+
+        expected_weights = {
+            "gemm1_weights": (
+                self._num_local_experts,
+                2 * self._intermediate_size,
+                hidden_size,
+            ),
+            "gemm2_weights": (
+                self._num_local_experts,
+                hidden_size,
+                self._intermediate_size,
+            ),
+        }
+        for name, expected in expected_weights.items():
+            tensor = view[name]
+            if tensor.dtype != torch.float8_e4m3fn or tuple(tensor.shape) != expected:
+                raise ValueError(
+                    f"{name} must be float8_e4m3fn with shape {expected}, got "
+                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                )
+        for name, expected in (
+            ("gemm1_weights_scale", expected_w1_scale),
+            ("gemm2_weights_scale", expected_w2_scale),
+        ):
+            tensor = view[name]
+            if tensor.dtype != scale_dtype or tuple(tensor.shape) != expected:
+                raise ValueError(
+                    f"{name} must be {scale_dtype} with shape {expected}, got "
+                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                )
+        return scale
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        from ..tllm_enums import WeightLayout
+        from .core import MoeRunnerInputs, RoutingInputMode
+
+        view = weights.get_view(self.backend_key)
+        routing = self.config.routing
+        num_tokens, hidden_size = act.hidden_states_q.shape
+        hidden_states_scale = self._validate_fp8_tensors(act, view, hidden_size)
+
+        output = act.hidden_states_q.new_empty(
+            (num_tokens, hidden_size), dtype=torch.bfloat16
+        )
+        routing_input_mode = act.routing_input_mode
+        if routing_input_mode == RoutingInputMode.FromLogits:
+            _validate_logits_inputs(
+                act, num_tokens, routing.num_experts, "TrtllmFp8BlockRunner"
+            )
+            routing_logits = act.routing_logits
+            routing_bias = act.routing_bias
+            # FP8 infers the routing mode from the expert-index tensor: a
+            # non-empty 2D tensor means PackedPrecomputed and suppresses
+            # routing_logits. Empty placeholders select FromLogits, matching
+            # the canonical trtllm_fp8_block_scale_moe wrapper.
+            topk_ids = act.hidden_states_q.new_empty((0,), dtype=torch.int32)
+            expert_weights = act.hidden_states_q.new_empty((0,), dtype=torch.bfloat16)
+        elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
+            _validate_prerouted_inputs(
+                act, num_tokens, routing.top_k, "TrtllmFp8BlockRunner"
+            )
+            routing_logits = None
+            routing_bias = None
+            weight_bits = (
+                act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+            )
+            topk_ids = (act.topk_ids << 16) | (weight_bits & 0xFFFF)
+            expert_weights = act.topk_weights.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+        else:
+            raise NotImplementedError(
+                "TrtllmFp8BlockRunner supports only FromLogits and "
+                "PackedPrecomputed routing."
+            )
+
+        moe_inputs = MoeRunnerInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=act.hidden_states_q,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+        self._static_kwargs = dict(
+            routing_input_mode=routing_input_mode,
+            routing_bias=routing_bias,
+            gemm1_weights=view["gemm1_weights"],
+            gemm1_weights_scale=view["gemm1_weights_scale"],
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=view["gemm2_weights"],
+            gemm2_weights_scale=view["gemm2_weights_scale"],
+            num_experts=routing.num_experts,
+            num_fused_shared_experts=0,
+            n_group=routing.n_group,
+            topk_group=routing.topk_group,
+            local_expert_offset=self._local_expert_offset,
+            routed_scaling_factor=routing.routed_scaling_factor,
+            routing_method_type=int(routing.method),
+            use_shuffled_weight=self._use_shuffled_weight,
+            weight_layout=int(WeightLayout.MajorK),
+            do_finalize=True,
+            enable_pdl=self._enable_pdl,
+            # Matches the legacy block-FP8 FromLogits wrapper. Pre-routed
+            # execution ignores this flag because weights are already final.
+            norm_topk_prob=True,
+            routing_replay_out=None,
+        )
+
+        self._ensure_inner(hidden_size)
+        self.tuning_config = self._inner._make_tuning_config(
+            moe_inputs,
+            tune_max_num_tokens=self._tune_max_num_tokens,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+        return moe_inputs.to_list()
+
+    def __hash__(self):
+        return hash(("trtllm_fp8_block", self._variant))
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,11 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <set>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -504,7 +508,8 @@ class FusedMoeLauncher {
   Tensor workspace_fc2;
   Tensor output;
   int64_t moe_tactic{-1};
-  std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> moe_runner;
+  // Non-owning; points into the thread-local runner cache in prepare_moe_common().
+  tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner* moe_runner{nullptr};
 
   void prepare_moe_common(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
@@ -520,18 +525,55 @@ class FusedMoeLauncher {
     // gemm1 bias, use the weights-only Runner constructor to match the original kernel
     // path and numerics. DSFp8 + biasMn routes through the unified constructor below
     // (which accepts gemm1_bias_type).
-    if (this->mDtypeAct == btg::Dtype::E4m3 && this->mDtypeWeights == btg::Dtype::E4m3 &&
-        args->mUseDeepSeekFp8 && args->gemm1_bias_type == batchedGemm::gemm::BiasType::None) {
-      moe_runner = std::make_unique<RunnerType>(this->mDtypeWeights, args->mUseDeepSeekFp8,
-                                                (int32_t)tile_tokens_dim, this->use_shuffled_weight,
-                                                this->weight_layout, usePerTokenScalingGemm1,
-                                                usePerTokenScalingGemm2, false, false);
-    } else {
-      moe_runner = std::make_unique<RunnerType>(
-          this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
-          this->activation_type, this->use_shuffled_weight, this->weight_layout,
-          args->gemm1_bias_type, usePerTokenScalingGemm1, usePerTokenScalingGemm2);
+    bool const useWeightsOnlyConstructor =
+        this->mDtypeAct == btg::Dtype::E4m3 && this->mDtypeWeights == btg::Dtype::E4m3 &&
+        args->mUseDeepSeekFp8 && args->gemm1_bias_type == batchedGemm::gemm::BiasType::None;
+    bool constexpr usePerChannelScalingGemm1 = false;
+    bool constexpr usePerChannelScalingGemm2 = false;
+
+    // A Runner contains only constructor-derived kernel metadata and config indices. Reuse it on
+    // the same host thread instead of rebuilding and filtering the global config table per call.
+    std::tuple const runnerKey{static_cast<int64_t>(this->mDtypeAct),
+                               static_cast<int64_t>(this->mDtypeWeights),
+                               args->mUseDeepSeekFp8,
+                               static_cast<int32_t>(tile_tokens_dim),
+                               static_cast<int64_t>(this->activation_type),
+                               this->use_shuffled_weight,
+                               static_cast<int64_t>(this->weight_layout),
+                               static_cast<int64_t>(args->gemm1_bias_type),
+                               usePerTokenScalingGemm1,
+                               usePerTokenScalingGemm2,
+                               usePerChannelScalingGemm1,
+                               usePerChannelScalingGemm2,
+                               useWeightsOnlyConstructor,
+                               std::get<0>(device_version),
+                               std::get<1>(device_version),
+                               hidden_states.device().device_id};
+    using RunnerCacheKey = std::remove_const_t<decltype(runnerKey)>;
+    static thread_local std::map<RunnerCacheKey, RunnerType> runnerCache;
+
+    auto runnerIt = runnerCache.find(runnerKey);
+    if (runnerIt == runnerCache.end()) {
+      if (useWeightsOnlyConstructor) {
+        runnerIt =
+            runnerCache
+                .try_emplace(runnerKey, this->mDtypeWeights, args->mUseDeepSeekFp8,
+                             static_cast<int32_t>(tile_tokens_dim), this->use_shuffled_weight,
+                             this->weight_layout, usePerTokenScalingGemm1, usePerTokenScalingGemm2,
+                             usePerChannelScalingGemm1, usePerChannelScalingGemm2)
+                .first;
+      } else {
+        runnerIt =
+            runnerCache
+                .try_emplace(runnerKey, this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8,
+                             static_cast<int32_t>(tile_tokens_dim), this->activation_type,
+                             this->use_shuffled_weight, this->weight_layout, args->gemm1_bias_type,
+                             usePerTokenScalingGemm1, usePerTokenScalingGemm2,
+                             usePerChannelScalingGemm1, usePerChannelScalingGemm2)
+                .first;
+      }
     }
+    moe_runner = &runnerIt->second;
 
     int32_t const effectiveTopK = args->top_k + args->num_fused_shared_experts;
     int32_t const effectiveLocalExperts = args->local_num_experts + args->num_fused_shared_experts;
@@ -541,13 +583,10 @@ class FusedMoeLauncher {
                                                           args->intermediate_size,
                                                           effectiveLocalExperts, args->num_tokens);
     }
-    auto valid_cfgs =
-        moe_runner->getValidConfigIndices(effectiveTopK, args->hidden_size, args->intermediate_size,
-                                          effectiveLocalExperts, args->num_tokens);
-    auto valid_it = std::find(valid_cfgs.begin(), valid_cfgs.end(), moe_tactic);
-    FLASHINFER_CHECK(valid_it != valid_cfgs.end(), "Invalid MoE tactic ", moe_tactic,
-                     " for tile_N=", tile_tokens_dim, ". Number of valid tactics for this tile is ",
-                     valid_cfgs.size(),
+    FLASHINFER_CHECK(moe_runner->isValidConfigIndex(moe_tactic, effectiveTopK, args->hidden_size,
+                                                    args->intermediate_size, effectiveLocalExperts,
+                                                    args->num_tokens),
+                     "Invalid MoE tactic ", moe_tactic, " for tile_N=", tile_tokens_dim,
                      ". This often indicates a stale or mismatched autotuner cache entry.");
     this->moe_tactic = moe_tactic;
 
@@ -586,6 +625,7 @@ class FusedMoeLauncher {
   virtual Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
                             bool use_routing_scales_on_input = false,
                             bool use_deep_seek_fp8 = false, bool return_activation_output = false) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
     prepare_routing();
 
@@ -1428,6 +1468,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
                     bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
                     bool return_activation_output = false) override {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
     prepare_routing();
 
@@ -2002,6 +2043,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
                     bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
                     bool return_activation_output = false) override {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     TVM_FFI_ICHECK(!return_activation_output)
         << "return_activation_output is not supported for FP4 block-scale MoE";
     check_routing();

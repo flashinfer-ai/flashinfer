@@ -11,6 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
+
+# Multiprocessing workers (spawn/forkserver) in this directory re-import their
+# test module by dotted path (e.g. ``tests.comm.test_comm_backend``) to unpickle
+# their target, which needs the repo root on ``sys.path``. This repo runs pytest
+# with ``--import-mode=importlib`` (pytest.ini), which does not add it, and plain
+# ``pytest`` (unlike ``python -m pytest``) doesn't put CWD there either -- so the
+# workers fail with ``ModuleNotFoundError: No module named 'tests'``. Put the repo
+# root on the parent's path here; spawn/forkserver capture the parent's sys.path
+# and restore it in the child before unpickling.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import pytest
 import torch.distributed as dist
 
@@ -29,51 +44,16 @@ def pytest_sessionfinish(session, exitstatus):
 Shared test utilities for comm tests.
 """
 
-import ctypes
-import os
-
 from flashinfer.comm.mnnvl import MnnvlMemory
 
 
-def _check_pidfd_permissions() -> bool:
-    """Check if pidfd_getfd syscall is available and permitted.
-
-    This is required for MNNVL in containers - the SYS_PTRACE capability
-    must be available for cross-process file descriptor sharing.
-    """
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        syscall = libc.syscall
-        SYS_pidfd_open = 434
-        SYS_pidfd_getfd = 438
-
-        # Try to open our own process and get our own fd
-        my_pid = os.getpid()
-        pidfd = syscall(SYS_pidfd_open, my_pid, 0)
-        if pidfd < 0:
-            return False
-
-        # Try pidfd_getfd on stdin (fd=0) - this tests the permission
-        # We don't actually need the result, just checking if it's permitted
-        test_fd = syscall(SYS_pidfd_getfd, pidfd, 0, 0)
-        os.close(pidfd)
-
-        if test_fd < 0:
-            err = ctypes.get_errno()
-            if err == 1:  # EPERM - permission denied (container issue)
-                return False
-            # Other errors (like EBADF) are OK - permission check passed
-        else:
-            os.close(test_fd)
-
-        return True
-    except Exception:
-        return False
-
-
 def mnnvl_available() -> bool:
-    """Check if MNNVL is fully available (hardware + container permissions)."""
-    return MnnvlMemory.supports_mnnvl() and _check_pidfd_permissions()
+    """Check if MNNVL memory is available (all NVLink links up).
+
+    Handle exchange uses either FABRIC handles or POSIX fds over SCM_RIGHTS
+    sockets, so no extra container capability (e.g. SYS_PTRACE) is required.
+    """
+    return MnnvlMemory.supports_mnnvl()
 
 
 def pytest_addoption(parser):

@@ -196,6 +196,12 @@ class DispatchOutput:
     (the received tokens are front-packed) while the transport buffer stays sized to
     the static ``max_recv_tokens_per_rank`` budget (nccl-ep v0.1 does not resize the
     buffer itself). ``None`` → the consumer must fall back to the full static buffer.
+
+    ``expert_scales`` carries the per-block dequantization scales when the
+    transport quantized the tokens in-flight (``FleetAlgoKnobQuantization``
+    with an FP8 type on nixl_ep — the library returns ``(fp8_data, scales)``
+    and both are surfaced). ``None`` when dispatch was not quantized or the
+    backend does not produce scales.
     """
 
     expert_tensors: "torch.Tensor"
@@ -204,6 +210,7 @@ class DispatchOutput:
     recv_topk_weights: Optional["torch.Tensor"] = None
     expert_counts: Optional["torch.Tensor"] = None
     recv_total_counter: Optional["torch.Tensor"] = None
+    expert_scales: Optional["torch.Tensor"] = None
 
     def get_num_tokens(self) -> int:
         """Resolve ``num_tokens`` to an int, evaluating a deferred thunk if present."""

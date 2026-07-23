@@ -14,6 +14,7 @@ design's Fleet / Handle split by:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 from typing import TYPE_CHECKING, Sequence
 
 from ..... import _require_built
@@ -39,17 +40,24 @@ if TYPE_CHECKING:
 
 
 def _load_nixl_ep():
-    """Import the vendored ``nixl_ep`` Python module + load the .so."""
-    try:
-        from . import _load_nixl_ep_cpp  # noqa: F401
-    except ImportError as e:
+    """Import the vendored ``nixl_ep`` Python module (staged by the build).
+
+    The base NIXL libs are ctypes-preloaded (RTLD_GLOBAL) so the extension
+    resolves its symbols; the extension itself is then loaded exactly once,
+    as the package submodule (buffer.py does ``from . import nixl_ep_cpp``)
+    — NOT dlopen'd separately, which would double-load its static state.
+    """
+    from . import _libs_dir, _preload_libnixl
+
+    if not list(_libs_dir.glob("nixl_ep_cpp*.so")):
         raise MoEEpNotBuiltError(
             "nixl_ep loaders not staged; rebuild with `pip install -e .` "
             "(BUILD_NIXL_EP=1 makes missing build deps a hard error)"
-        ) from e
-    _load_nixl_ep_cpp()
+        )
+    _preload_libnixl()
     try:
-        # The vendored module is staged under _vendored/ by build_backend._build_nixl_ep.
+        # The vendored package is staged under _vendored/nixl_ep/ by
+        # build_backend._build_nixl_ep, with nixl_ep_cpp*.so inside it.
         import os
         import sys
 
@@ -66,6 +74,68 @@ def _load_nixl_ep():
     return nixl_ep
 
 
+# Per-GROUP generation counters namespacing derived rendezvous stores, keyed
+# by the group's sorted global-rank tuple. Fleet creation is collective over
+# the EP group, so each group's counter agrees across its ranks; re-created
+# fleets then never reuse a prior fleet's keys. A single process-wide counter
+# would diverge when a process belongs to several EP subgroups and creates
+# their fleets in a different interleaving than its peers.
+_STORE_GENS: dict = {}
+
+
+def _resolve_store(bootstrap: "BootstrapConfig"):
+    """Return the rendezvous store the NIXL ``Buffer`` bootstraps over.
+
+    Resolution order (the NIXL analogue of nccl_ep's ``_resolve_comm``):
+
+    1. ``bootstrap.tcp_store`` set — use it as-is (previous behavior).
+    2. otherwise — derive a ``PrefixStore`` from torch.distributed's default
+       store, so hosts that pass only ``process_group`` (e.g. vLLM's EP group,
+       the same ``BootstrapConfig`` shape the nccl_ep backend consumes) work
+       without constructing a second TCPStore on a sibling port. The prefix is
+       namespaced by the EP group's global ranks plus that group's generation
+       counter so disjoint EP subgroups and re-created fleets never collide on
+       store keys.
+    """
+    if bootstrap.tcp_store is not None:
+        return bootstrap.tcp_store
+
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        raise ValueError(
+            "NixlEpFleet needs a rendezvous store: set bootstrap.tcp_store "
+            "(a torch.distributed.TCPStore), or initialize torch.distributed "
+            "so one can be derived from the default store."
+        )
+
+    from .....core.bootstrap_utils import bootstrap_comm_group
+
+    # torch exposes no public accessor for the default store;
+    # _get_default_store has been stable across torch 2.x but is private, so
+    # fail with the explicit-tcp_store escape hatch rather than a raw
+    # AttributeError if it ever moves.
+    try:
+        base_store = dist.distributed_c10d._get_default_store()
+    except (AttributeError, RuntimeError) as e:
+        raise ValueError(
+            "Could not derive a rendezvous store from torch.distributed's "
+            "default store; set bootstrap.tcp_store (a "
+            "torch.distributed.TCPStore) explicitly."
+        ) from e
+
+    ranks = tuple(sorted(dist.get_process_group_ranks(bootstrap_comm_group(bootstrap))))
+    gen = _STORE_GENS.get(ranks, 0)
+    _STORE_GENS[ranks] = gen + 1
+    # Encode the FULL group identity: a min×len-style prefix collides for
+    # overlapping groups like (0,1,2,3) vs (0,2,4,6). Digest the rank tuple
+    # (not hash(), which is per-process randomized) to keep the prefix
+    # bounded for large groups while staying identical across ranks.
+    group_id = hashlib.sha1("-".join(map(str, ranks)).encode()).hexdigest()[:12]
+    prefix = f"flashinfer/moe_ep/nixl_ep/{group_id}/{gen}"
+    return dist.PrefixStore(prefix, base_store)
+
+
 class NixlEpFleet(Fleet):
     """Owns a ``nixl_ep.Buffer`` for one rank."""
 
@@ -79,12 +149,7 @@ class NixlEpFleet(Fleet):
         _require_built("nixl_ep")
         validate_arch_for_backend("nixl_ep")
         validate_bootstrap_world_size(bootstrap)
-
-        if bootstrap.tcp_store is None:
-            raise ValueError(
-                "NixlEpFleet requires bootstrap.tcp_store to be set; "
-                "construct a torch.distributed.TCPStore and pass it in."
-            )
+        store = _resolve_store(bootstrap)
 
         self._params = params
         self._fleet_knobs = _index_knobs(algo_knobs)
@@ -101,6 +166,7 @@ class NixlEpFleet(Fleet):
         self._capacity = cap
 
         nixl_ep = _load_nixl_ep()
+        self._nixl_ep = nixl_ep  # handles read topk_idx_t off it
         # num_rdma_bytes — size the per-rank RDMA buffer via the upstream hint.
         num_rdma_bytes = nixl_ep.Buffer.get_rdma_size_hint(
             params.max_tokens_per_rank,
@@ -111,7 +177,7 @@ class NixlEpFleet(Fleet):
         self._buffer = nixl_ep.Buffer(
             rank=bootstrap.rank,
             low_latency_mode=True,  # MVP: LL only
-            tcp_store_group=bootstrap.tcp_store,
+            tcp_store_group=store,
         )
         num_experts_per_rank = params.num_experts // cap
         self._buffer.update_memory_buffers(cap, num_experts_per_rank, num_rdma_bytes)
@@ -138,6 +204,11 @@ class NixlEpFleet(Fleet):
     @property
     def params(self) -> FleetParams:
         return self._params
+
+    @property
+    def capacity(self) -> int:
+        """Rank capacity the Buffer was sized to (≥ current world_size)."""
+        return self._capacity
 
     # @flashinfer_api  # disabled per PR #3453 review
     def create_handle(self, params, algo_knobs: Sequence[AlgoKnob] = ()) -> "Handle":
