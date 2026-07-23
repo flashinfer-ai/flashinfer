@@ -900,9 +900,11 @@ class MixedCommHandler:
         for ptr in self.mc_ptr_dict.values():
             if ptr is not None:
                 checkCudaErrors(cuda.cuMemAddressFree(ptr, self.vm_workspace_bytes))
-        for ptr in self.uc_ptr_list:
-            checkCudaErrors(cuda.cuMemAddressFree(ptr, self.vm_workspace_bytes))
-        checkCudaErrors(cuda.cuMemFree(self.uc_buffer_dict["raw"]))
+        if self.uc_ptr_list is not None:
+            for ptr in self.uc_ptr_list:
+                checkCudaErrors(cuda.cuMemAddressFree(ptr, self.vm_workspace_bytes))
+        if self.uc_buffer_dict["raw"]:
+            checkCudaErrors(cuda.cuMemFree(self.uc_buffer_dict["raw"]))
 
     def init_virtual_memory(self):
         """Initialize CUDA virtual memory for intra-node communication.
