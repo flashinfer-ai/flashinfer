@@ -128,12 +128,10 @@ class Sm100W4A16GroupedGemmKernel:
         self.num_transform_warpgroups = 2
         self.transform_warp_id = tuple(range(8, 8 + 4 * self.num_transform_warpgroups))
         self.num_transform_warps = len(self.transform_warp_id)
-        # Define expected register count for different warps
+        # Keep the role-control warpgroup on one absolute register target.
+        # Transform warps retain the 128-register launch default.
         self.num_regs_epilogue_warps = 176
-        self.num_regs_mma_warp = 96
-        self.num_regs_tma_warps = 80
-        self.num_regs_transform_warps = 120
-        self.num_regs_schedule_warp = 64
+        self.num_regs_generic_warps = 80
         self.threads_per_cta = 32 * (
             max(
                 (
@@ -1185,7 +1183,7 @@ class Sm100W4A16GroupedGemmKernel:
 
         # Tile scheduling is independent of the preceding grid.
         if warp_idx == self.schedule_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_schedule_warp)
+            cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
             tile_info_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_tile_info_stage
             )
@@ -1308,7 +1306,7 @@ class Sm100W4A16GroupedGemmKernel:
 
         # The activation TMA warp is the only role that waits on the preceding grid.
         if warp_idx == self.activation_tma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_tma_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
@@ -1374,7 +1372,7 @@ class Sm100W4A16GroupedGemmKernel:
 
         # Static weight and scale loads can run before the activation is ready.
         if warp_idx == self.weight_tma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_tma_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
@@ -1477,7 +1475,6 @@ class Sm100W4A16GroupedGemmKernel:
 
         # Specialized transform warps
         if warp_idx >= self.transform_warp_id[0]:
-            cute.arch.setmaxregister_decrease(self.num_regs_transform_warps)
             transform_group_idx = (warp_idx - self.transform_warp_id[0]) // 4
             transform_local_tidx = tidx - 32 * (
                 self.transform_warp_id[0] + transform_group_idx * 4
@@ -1569,7 +1566,7 @@ class Sm100W4A16GroupedGemmKernel:
 
         # Specialized MMA warp
         if warp_idx == self.mma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_mma_warp)
+            cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
             # Get the pointer to the TMEM buffer
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
