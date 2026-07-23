@@ -131,6 +131,14 @@ class Sm100W4A16GroupedGemmKernel:
             10,
             11,
         )
+        # The x4 TMEM store exposes two disjoint K128 ownership groups only for
+        # this one-CTA SwiGLU topology. Other tactics retain the x8 transform.
+        self.split_transform_across_warpgroups = (
+            self.gated and self.mma_tiler[0] == 128 and self.mma_tiler[2] == 256
+        )
+        self.num_transform_warps = len(self.transform_warp_id) + (
+            len(self.epilog_warp_id) if self.split_transform_across_warpgroups else 0
+        )
         # Define expected register count for different warps
         self.num_regs_epilogue_warps = 176
         self.num_regs_mma_warp = 96
@@ -304,6 +312,232 @@ class Sm100W4A16GroupedGemmKernel:
             _NVFP4_SCALE_GRANULARITY_K,
             self.num_load2trans_stage,
         )
+
+    @cute.jit
+    def _setup_transform_partitions(
+        self,
+        tiled_mma: cute.TiledMma,
+        copy_atom_a_input: cute.CopyAtom,
+        copy_atom_a_transform: cute.CopyAtom,
+        sA_transform_input: cute.Tensor,
+        a_smem_layout_transform: cute.ComposedLayout,
+        sA_transform: cute.Tensor,
+        tCsS: cute.Tensor,
+        accumulators: cute.Tensor,
+        transform_tidx: cutlass.Int32,
+        transform_group_idx: cutlass.Int32,
+    ):
+        if cutlass.const_expr(self.transform_a_source == tcgen05.OperandSource.TMEM):
+            tmem_ptr_transform = cute.recast_ptr(
+                accumulators.iterator + self.num_acc_tmem_cols,
+                dtype=self.mma_dtype,
+            )
+            transform_destination = cute.make_tensor(
+                tmem_ptr_transform,
+                tiled_mma.make_fragment_A(a_smem_layout_transform.outer).layout,
+            )
+        else:
+            transform_destination = sA_transform
+
+        src_copy_a, dst_copy_a, tAsA_input, tAsA_transform = (
+            mixed_input_utils.transform_partition(
+                self.transform_a_source,
+                TransformMode.ConvertScale,
+                copy_atom_a_input,
+                copy_atom_a_transform,
+                sA_transform_input,
+                transform_destination,
+                transform_tidx,
+            )
+        )
+        if cutlass.const_expr(self.split_transform_across_warpgroups):
+            tAsA_input = tAsA_input[(None, transform_group_idx, None, None, None)]
+            tAsA_transform = tAsA_transform[
+                (None, transform_group_idx, None, None, None)
+            ]
+
+        a_stage_coord = (None,) * (cute.rank(tAsA_input) - 1) + (0,)
+        tArA = cute.make_rmem_tensor(
+            tAsA_input[a_stage_coord].shape,
+            tAsA_input.element_type,
+        )
+        tArA_transform = cute.make_rmem_tensor(
+            tAsA_input[a_stage_coord].shape,
+            self.mma_dtype,
+        )
+
+        smem_thr_copy_S = src_copy_a.get_slice(transform_tidx)
+        tSsS_trans = smem_thr_copy_S.partition_S(tCsS)
+        if cutlass.const_expr(self.split_transform_across_warpgroups):
+            tSsS_trans = tSsS_trans[(None, transform_group_idx, None, None, None)]
+        scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (0,)
+        tSsS_layout_per_stage = tSsS_trans[scale_stage_coord].layout
+        tSrS_copy = cute.make_rmem_tensor(
+            cute.filter_zeros(tSsS_layout_per_stage).shape,
+            self.a_scale_dtype,
+        )
+        tSrS = cute.make_tensor(
+            tSrS_copy.iterator,
+            cute.make_layout(
+                tSsS_layout_per_stage.shape,
+                stride=tSrS_copy.layout.stride,
+            ),
+        )
+        assert cute.size(tSrS, mode=[0]) == cute.size(tArA, mode=[0]), (
+            "tSrS and tArA have different leading dimension"
+        )
+        assert cute.size(tSrS) == cute.size(tArA), "tSrS and tArA have different shape"
+
+        if cutlass.const_expr(self.split_transform_across_warpgroups):
+            transform_tiler_size = 128
+        else:
+            transform_tiler_size = min(
+                cute.size(cute.coalesce(tAsA_input.layout), mode=[0]), 128
+            )
+        transform_tiler = cute.make_layout(transform_tiler_size)
+        tArA_load = cute.flat_divide(tArA, transform_tiler)
+        tArA_load = cute.group_modes(tArA_load, 1, cute.rank(tArA_load))
+        tSrS_load = cute.flat_divide(tSrS, transform_tiler)
+        tSrS_load = cute.group_modes(tSrS_load, 1, cute.rank(tSrS_load))
+        tArA_transform_store = cute.flat_divide(tArA_transform, transform_tiler)
+        tArA_transform_store = cute.group_modes(
+            tArA_transform_store,
+            1,
+            cute.rank(tArA_transform_store),
+        )
+        return (
+            dst_copy_a,
+            tAsA_input,
+            tAsA_transform,
+            tSsS_trans,
+            tSrS_copy,
+            tSrS_load,
+            tArA_load,
+            tArA_transform,
+            tArA_transform_store,
+            transform_tiler,
+        )
+
+    @cute.jit
+    def _transform_tile(
+        self,
+        a_load2trans_pipeline: pipeline.PipelineTmaAsync,
+        trans2mma_pipeline: pipeline.PipelineAsyncUmma,
+        a_load2trans_consumer_state: pipeline.PipelineState,
+        trans2mma_producer_state: pipeline.PipelineState,
+        dst_copy_a: cute.CopyAtom,
+        tAsA_input: cute.Tensor,
+        tAsA_transform: cute.Tensor,
+        tSsS_trans: cute.Tensor,
+        tSrS_copy: cute.Tensor,
+        tSrS_load: cute.Tensor,
+        tArA_load: cute.Tensor,
+        tArA_transform: cute.Tensor,
+        tArA_transform_store: cute.Tensor,
+        transform_tiler: cute.Layout,
+        transform_group_idx: cutlass.Int32,
+        k_tile_cnt: cutlass.Int32,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+        a_load2trans_consumer_state.reset_count()
+        peek_load2trans_full_status = cutlass.Boolean(1)
+        if a_load2trans_consumer_state.count < k_tile_cnt:
+            peek_load2trans_full_status = a_load2trans_pipeline.consumer_try_wait(
+                a_load2trans_consumer_state
+            )
+        trans2mma_producer_state.reset_count()
+        peek_trans2mma_empty_status = cutlass.Boolean(1)
+        if trans2mma_producer_state.count < k_tile_cnt:
+            peek_trans2mma_empty_status = trans2mma_pipeline.producer_try_acquire(
+                trans2mma_producer_state
+            )
+
+        for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+            a_load2trans_pipeline.consumer_wait(
+                a_load2trans_consumer_state,
+                peek_load2trans_full_status,
+            )
+            a_stage_coord = (None,) * (cute.rank(tAsA_input) - 1) + (
+                a_load2trans_consumer_state.index,
+            )
+            tAsA_input_slice = tAsA_input[a_stage_coord]
+            tAsA_input_slice = cute.flat_divide(tAsA_input_slice, transform_tiler)
+            tAsA_input_slice = cute.group_modes(
+                tAsA_input_slice,
+                1,
+                cute.rank(tAsA_input_slice),
+            )
+            trans2mma_pipeline.producer_acquire(
+                trans2mma_producer_state,
+                peek_trans2mma_empty_status,
+            )
+            scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (
+                a_load2trans_consumer_state.index,
+            )
+            tSsS_slice = tSsS_trans[scale_stage_coord]
+            tSsS_slice_filtered = cute.make_tensor(
+                tSsS_slice.iterator,
+                cute.filter_zeros(tSsS_slice.layout),
+            )
+            cute.autovec_copy(tSsS_slice_filtered, tSrS_copy)
+            cur_a_load2trans_consumer_state = a_load2trans_consumer_state.clone()
+            for idx in cutlass.range_constexpr(cute.size(tArA_load, mode=[1])):
+                cute.autovec_copy(
+                    tAsA_input_slice[(None, idx)],
+                    tArA_load[(None, idx)],
+                )
+                if cutlass.const_expr(idx == cute.size(tArA_load, mode=[1]) - 1):
+                    a_load2trans_consumer_state.advance()
+                    if a_load2trans_consumer_state.count < k_tile_cnt:
+                        peek_load2trans_full_status = (
+                            a_load2trans_pipeline.consumer_try_wait(
+                                a_load2trans_consumer_state
+                            )
+                        )
+                packed_fragment = cute.recast_tensor(
+                    tArA_load[(None, idx)], cutlass.Uint8
+                ).load()
+                if cutlass.const_expr(self.split_transform_across_warpgroups):
+                    scale_slice_compact = cute.flat_divide(
+                        tSrS_copy, cute.make_layout(8)
+                    )[(None, transform_group_idx)]
+                else:
+                    scale_slice = tSrS_load[(None, (None, idx))]
+                    scale_slice_compact = cute.make_tensor(
+                        scale_slice.iterator,
+                        cute.filter_zeros(scale_slice.layout),
+                    )
+                scale_fragment = cute.recast_tensor(
+                    scale_slice_compact, cutlass.Uint8
+                ).load()
+                tensor_transformed = decode_nvfp4_fragment_to_bf16(
+                    packed_fragment,
+                    scale_fragment,
+                )
+                tArA_transform_store[(None, idx)].store(tensor_transformed)
+
+            a_transform_stage_coord = (None,) * (cute.rank(tAsA_transform) - 1) + (
+                trans2mma_producer_state.index,
+            )
+            mixed_input_utils.store_transformed_a(
+                tArA_transform,
+                tAsA_transform[a_transform_stage_coord],
+                dst_copy_a,
+            )
+            if cutlass.const_expr(
+                self.transform_a_source == tcgen05.OperandSource.TMEM
+            ):
+                cute.arch.fence_view_async_tmem_store()
+            else:
+                cute.arch.fence_proxy("async.shared", space="cta")
+            a_load2trans_pipeline.consumer_release(cur_a_load2trans_consumer_state)
+            trans2mma_pipeline.producer_commit(trans2mma_producer_state)
+            trans2mma_producer_state.advance()
+            if trans2mma_producer_state.count < k_tile_cnt:
+                peek_trans2mma_empty_status = trans2mma_pipeline.producer_try_acquire(
+                    trans2mma_producer_state
+                )
+
+        return a_load2trans_consumer_state, trans2mma_producer_state
 
     @cute.jit
     def wrapper(
@@ -657,7 +891,7 @@ class Sm100W4A16GroupedGemmKernel:
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                self.num_mcast_ctas_a * len(self.transform_warp_id),
+                self.num_mcast_ctas_a * self.num_transform_warps,
             ),
             tx_count=self.num_tma_load_bytes_a_scale,
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -673,7 +907,7 @@ class Sm100W4A16GroupedGemmKernel:
             num_stages=self.num_trans2mma_stage,
             producer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                32 * len(self.transform_warp_id) * cta_v_size,
+                32 * self.num_transform_warps * cta_v_size,
             ),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -891,6 +1125,14 @@ class Sm100W4A16GroupedGemmKernel:
             a_smem_shape,
             self.a_dtype,
         )
+        if cutlass.const_expr(self.split_transform_across_warpgroups):
+            copy_atom_a_transform = cute.make_copy_atom(
+                tcgen05.St32x32bOp(
+                    tcgen05.Repetition(4),
+                    tcgen05.Unpack.NONE,
+                ),
+                self.mma_dtype,
+            )
 
         # Partition global/shared tensor for TMA load A/B
         # TMA load A partition_S/D
@@ -1244,81 +1486,36 @@ class Sm100W4A16GroupedGemmKernel:
         # Specialized transform warps
         if warp_idx >= self.transform_warp_id[0]:
             cute.arch.setmaxregister_increase(self.num_regs_transform_warps)
+            transform_group_idx = cutlass.Int32(
+                1 if self.split_transform_across_warpgroups else 0
+            )
             transform_local_tidx = tidx - 32 * self.transform_warp_id[0]
             # Get the pointer to the TMEM buffer
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
-            if cutlass.const_expr(
-                self.transform_a_source == tcgen05.OperandSource.TMEM
-            ):
-                tmem_ptr_transform = cute.recast_ptr(
-                    accumulators.iterator + self.num_acc_tmem_cols, dtype=self.mma_dtype
-                )
-                tCrA = cute.make_tensor(
-                    tmem_ptr_transform,
-                    tiled_mma.make_fragment_A(a_smem_layout_transform.outer).layout,
-                )
-            else:
-                tCrA = tiled_mma.make_fragment_A(sA_transform)
-            # Partition tensors for transform input and output and set up the copy atom
-            # used for loading and storing transformed A tensor
-            src_copy_a, dst_copy_a, tAsA_input, tAsA_transform = (
-                mixed_input_utils.transform_partition(
-                    self.transform_a_source,
-                    TransformMode.ConvertScale,
-                    copy_atom_a_input,
-                    copy_atom_a_transform,
-                    sA_transform_input,
-                    (
-                        tCrA
-                        if self.transform_a_source == tcgen05.OperandSource.TMEM
-                        else sA_transform
-                    ),
-                    transform_local_tidx,
-                )
-            )
-            # make fragment for input A and transformed A
-            tArA = cute.make_rmem_tensor(
-                tAsA_input[(None, None, None, None, 0)].shape, tAsA_input.element_type
-            )
-            tArA_transform = cute.make_rmem_tensor(
-                tAsA_input[(None, None, None, None, 0)].shape, self.mma_dtype
-            )
-            # Partition scale tensor
-            smem_thr_copy_S = src_copy_a.get_slice(transform_local_tidx)
-            tSsS_trans = smem_thr_copy_S.partition_S(tCsS)
-            scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (0,)
-            tSsS_layout_per_stage = tSsS_trans[scale_stage_coord].layout
-            tSrS_copy = cute.make_rmem_tensor(
-                cute.filter_zeros(tSsS_layout_per_stage).shape,
-                self.a_scale_dtype,
-            )
-            tSrS = cute.make_tensor(
-                tSrS_copy.iterator,
-                cute.make_layout(
-                    tSsS_layout_per_stage.shape,
-                    stride=tSrS_copy.layout.stride,
-                ),
-            )
-            assert cute.size(tSrS, mode=[0]) == cute.size(tArA, mode=[0]), (
-                "tSrS and tArA have different leading dimension"
-            )
-            assert cute.size(tSrS) == cute.size(tArA), (
-                "tSrS and tArA have different shape"
-            )
-            # Deduce a sub-tile size and tile tensors
-            transform_tiler_size = min(
-                cute.size(cute.coalesce(tAsA_input.layout), mode=[0]), 128
-            )
-            transform_tiler = cute.make_layout(transform_tiler_size)
-            tArA_load = cute.flat_divide(tArA, transform_tiler)
-            tArA_load = cute.group_modes(tArA_load, 1, cute.rank(tArA_load))
-            tSrS_load = cute.flat_divide(tSrS, transform_tiler)
-            tSrS_load = cute.group_modes(tSrS_load, 1, cute.rank(tSrS_load))
-            tArA_transform_store = cute.flat_divide(tArA_transform, transform_tiler)
-            tArA_transform_store = cute.group_modes(
-                tArA_transform_store, 1, cute.rank(tArA_transform_store)
+            (
+                dst_copy_a,
+                tAsA_input,
+                tAsA_transform,
+                tSsS_trans,
+                tSrS_copy,
+                tSrS_load,
+                tArA_load,
+                tArA_transform,
+                tArA_transform_store,
+                transform_tiler,
+            ) = self._setup_transform_partitions(
+                tiled_mma,
+                copy_atom_a_input,
+                copy_atom_a_transform,
+                sA_transform_input,
+                a_smem_layout_transform,
+                sA_transform,
+                tCsS,
+                accumulators,
+                transform_local_tidx,
+                transform_group_idx,
             )
 
             tile_info_consumer_state = pipeline.make_pipeline_state(
@@ -1343,113 +1540,27 @@ class Sm100W4A16GroupedGemmKernel:
                 self.num_trans2mma_stage,
             )
             while work_tile.is_valid_tile:
-                a_load2trans_consumer_state.reset_count()
-                peek_load2trans_full_status = cutlass.Boolean(1)
-                if a_load2trans_consumer_state.count < k_tile_cnt:
-                    peek_load2trans_full_status = (
-                        a_load2trans_pipeline.consumer_try_wait(
-                            a_load2trans_consumer_state
-                        )
-                    )
-                trans2mma_producer_state.reset_count()
-                peek_trans2mma_empty_status = cutlass.Boolean(1)
-                if trans2mma_producer_state.count < k_tile_cnt:
-                    peek_trans2mma_empty_status = (
-                        trans2mma_pipeline.producer_try_acquire(
-                            trans2mma_producer_state
-                        )
-                    )
-
-                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    a_load2trans_pipeline.consumer_wait(
-                        a_load2trans_consumer_state, peek_load2trans_full_status
-                    )
-                    tAsA_input_slice = tAsA_input[
-                        (None, None, None, None, a_load2trans_consumer_state.index)
-                    ]
-                    tAsA_input_slice = cute.flat_divide(
-                        tAsA_input_slice, transform_tiler
-                    )
-                    tAsA_input_slice = cute.group_modes(
-                        tAsA_input_slice, 1, cute.rank(tAsA_input_slice)
-                    )
-                    trans2mma_pipeline.producer_acquire(
-                        trans2mma_producer_state, peek_trans2mma_empty_status
-                    )
-                    scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (
-                        a_load2trans_consumer_state.index,
-                    )
-                    tSsS_slice = tSsS_trans[scale_stage_coord]
-                    tSsS_slice_filtered = cute.make_tensor(
-                        tSsS_slice.iterator,
-                        cute.filter_zeros(tSsS_slice.layout),
-                    )
-                    cute.autovec_copy(tSsS_slice_filtered, tSrS_copy)
-                    cur_a_load2trans_consumer_state = (
-                        a_load2trans_consumer_state.clone()
-                    )
-                    for idx in cutlass.range_constexpr(cute.size(tArA_load, mode=[1])):
-                        # Load A from shared memory
-                        cute.autovec_copy(
-                            tAsA_input_slice[(None, idx)],
-                            tArA_load[(None, idx)],
-                        )
-                        if cutlass.const_expr(
-                            idx == cute.size(tArA_load, mode=[1]) - 1
-                        ):
-                            a_load2trans_consumer_state.advance()
-                            if a_load2trans_consumer_state.count < k_tile_cnt:
-                                peek_load2trans_full_status = (
-                                    a_load2trans_pipeline.consumer_try_wait(
-                                        a_load2trans_consumer_state
-                                    )
-                                )
-                        packed_fragment = cute.recast_tensor(
-                            tArA_load[(None, idx)], cutlass.Uint8
-                        ).load()
-                        scale_slice = tSrS_load[(None, (None, idx))]
-                        # Load each block scale once instead of its broadcast view.
-                        scale_slice_compact = cute.make_tensor(
-                            scale_slice.iterator,
-                            cute.filter_zeros(scale_slice.layout),
-                        )
-                        scale_fragment = cute.recast_tensor(
-                            scale_slice_compact, cutlass.Uint8
-                        ).load()
-                        tensor_transformed = decode_nvfp4_fragment_to_bf16(
-                            packed_fragment,
-                            scale_fragment,
-                        )
-                        tArA_transform_store[(None, idx)].store(tensor_transformed)
-                    # Store transformed A to tensor memory or shared memory
-                    mixed_input_utils.store_transformed_a(
-                        tArA_transform,
-                        tAsA_transform[
-                            (None, None, None, None, trans2mma_producer_state.index)
-                        ],
-                        dst_copy_a,
-                    )
-                    if cutlass.const_expr(
-                        self.transform_a_source == tcgen05.OperandSource.TMEM
-                    ):
-                        cute.arch.fence_view_async_tmem_store()
-                    else:
-                        cute.arch.fence_proxy(
-                            "async.shared",
-                            space="cta",
-                        )
-                    a_load2trans_pipeline.consumer_release(
-                        cur_a_load2trans_consumer_state
-                    )
-                    # Signal the completion of transformation
-                    trans2mma_pipeline.producer_commit(trans2mma_producer_state)
-                    trans2mma_producer_state.advance()
-                    if trans2mma_producer_state.count < k_tile_cnt:
-                        peek_trans2mma_empty_status = (
-                            trans2mma_pipeline.producer_try_acquire(
-                                trans2mma_producer_state
-                            )
-                        )
+                (
+                    a_load2trans_consumer_state,
+                    trans2mma_producer_state,
+                ) = self._transform_tile(
+                    a_load2trans_pipeline,
+                    trans2mma_pipeline,
+                    a_load2trans_consumer_state,
+                    trans2mma_producer_state,
+                    dst_copy_a,
+                    tAsA_input,
+                    tAsA_transform,
+                    tSsS_trans,
+                    tSrS_copy,
+                    tSrS_load,
+                    tArA_load,
+                    tArA_transform,
+                    tArA_transform_store,
+                    transform_tiler,
+                    transform_group_idx,
+                    k_tile_cnt,
+                )
                 # Advance to next tile
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
@@ -1589,6 +1700,39 @@ class Sm100W4A16GroupedGemmKernel:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             tCtAcc_base = accumulators
+            if cutlass.const_expr(self.split_transform_across_warpgroups):
+                transform_group_idx = cutlass.Int32(0)
+                (
+                    epi_dst_copy_a,
+                    epi_tAsA_input,
+                    epi_tAsA_transform,
+                    epi_tSsS_trans,
+                    epi_tSrS_copy,
+                    epi_tSrS_load,
+                    epi_tArA_load,
+                    epi_tArA_transform,
+                    epi_tArA_transform_store,
+                    epi_transform_tiler,
+                ) = self._setup_transform_partitions(
+                    tiled_mma,
+                    copy_atom_a_input,
+                    copy_atom_a_transform,
+                    sA_transform_input,
+                    a_smem_layout_transform,
+                    sA_transform,
+                    tCsS,
+                    accumulators,
+                    epi_tidx,
+                    transform_group_idx,
+                )
+                epi_a_load2trans_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer,
+                    self.num_load2trans_stage,
+                )
+                epi_trans2mma_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer,
+                    self.num_trans2mma_stage,
+                )
             # Partition for epilogue
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
                 mixed_input_utils.epilog_tmem_copy_and_partition(
@@ -1715,6 +1859,29 @@ class Sm100W4A16GroupedGemmKernel:
             tile_info_consumer_state.advance()
             num_prev_subtiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.split_transform_across_warpgroups):
+                    (
+                        epi_a_load2trans_consumer_state,
+                        epi_trans2mma_producer_state,
+                    ) = self._transform_tile(
+                        a_load2trans_pipeline,
+                        trans2mma_pipeline,
+                        epi_a_load2trans_consumer_state,
+                        epi_trans2mma_producer_state,
+                        epi_dst_copy_a,
+                        epi_tAsA_input,
+                        epi_tAsA_transform,
+                        epi_tSsS_trans,
+                        epi_tSrS_copy,
+                        epi_tSrS_load,
+                        epi_tArA_load,
+                        epi_tArA_transform,
+                        epi_tArA_transform_store,
+                        epi_transform_tiler,
+                        transform_group_idx,
+                        k_tile_cnt,
+                    )
+
                 alpha_val = alpha[work_tile.group_idx]
                 if cutlass.const_expr(self.gated):
                     bSG_gC = bSG_gC_partitioned[(None, work_tile.cta_coord_m, None, 0)]
@@ -2083,6 +2250,8 @@ class Sm100W4A16GroupedGemmKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
+            if cutlass.const_expr(self.split_transform_across_warpgroups):
+                trans2mma_pipeline.producer_tail(epi_trans2mma_producer_state)
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
