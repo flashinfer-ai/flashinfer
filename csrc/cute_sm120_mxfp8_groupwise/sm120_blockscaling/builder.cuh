@@ -95,7 +95,7 @@ struct SM120BlockScalingBuilder {
       TileM_ >= 64;
   static constexpr bool kUnionSmem = !kUseTmaStore && !kUseStagedR2G;
   static constexpr int AB_Stages = Stages_;
-  static constexpr uint32_t LoadRegisterRequirement = kUseStagedR2G ? 80 : 40;
+  static constexpr uint32_t LoadRegisterRequirement = kUseStagedR2G ? 88 : 40;
   static constexpr uint32_t MmaRegisterRequirement = kUseStagedR2G ? 208 : 232;
 
   static constexpr int kTileM = TileM_;

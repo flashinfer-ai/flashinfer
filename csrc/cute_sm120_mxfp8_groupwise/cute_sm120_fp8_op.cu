@@ -22,7 +22,8 @@
 void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_scale,
                                      TensorView b_scale, TensorView m_indptr, TensorView out,
                                      std::string scale_major_mode, int64_t scale_granularity_m,
-                                     int64_t scale_granularity_n, int64_t scale_granularity_k) {
+                                     int64_t scale_granularity_n, int64_t scale_granularity_k,
+                                     int64_t is_gated) {
   TVM_FFI_ICHECK(scale_major_mode == "MN")
       << "Only scale_major_mode=\"MN\" is supported; got \"" << scale_major_mode << "\"";
 
@@ -62,13 +63,24 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
   int n = static_cast<int>(b.size(1));
   int k = static_cast<int>(b.size(2));
 
+  // Gated (fused SwiGLU) mode: b packs gate+up along N (b.size(1) == 2 * out_n); the kernel
+  // fuses SiLU(gate)*up so output N is halved. b_scale still spans the full b.size(1) weight
+  // dimension (SFB is over b.size(1)), so only out / runner shape_n use out_n.
+  bool gated = is_gated != 0;
+  if (gated) {
+    TVM_FFI_ICHECK_EQ(n % 2, 0)
+        << "gated (fused SwiGLU) moe requires even b.size(1) (gate+up); got " << n;
+  }
+  int out_n = gated ? n / 2 : n;
+
   TVM_FFI_ICHECK_GT(num_experts, 0) << "num_experts must be positive; got " << num_experts;
   TVM_FFI_ICHECK_EQ(a.size(1), k) << "a.size(1) (" << a.size(1) << ") must match b.size(2) (" << k
                                   << ")";
   TVM_FFI_ICHECK_EQ(out.size(0), total_rows)
       << "out.size(0) (" << out.size(0) << ") must match a.size(0) (" << total_rows << ")";
-  TVM_FFI_ICHECK_EQ(out.size(1), n)
-      << "out.size(1) (" << out.size(1) << ") must match b.size(1) (" << n << ")";
+  TVM_FFI_ICHECK_EQ(out.size(1), out_n)
+      << "out.size(1) (" << out.size(1) << ") must match output N (" << out_n
+      << (gated ? "; = b.size(1)/2 for gated" : "; = b.size(1)") << ")";
   TVM_FFI_ICHECK_EQ(m_indptr.size(0), num_experts + 1)
       << "m_indptr.size(0) (" << m_indptr.size(0) << ") must be num_experts + 1 ("
       << (num_experts + 1) << ")";
@@ -76,7 +88,7 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
   TVM_FFI_ICHECK_GT(k, 0) << "k must be positive; got k=" << k;
   TVM_FFI_ICHECK_GT(n, 0) << "n must be positive; got n=" << n;
   TVM_FFI_ICHECK_EQ(k % 16, 0) << "k must be multiple of 16; got k=" << k;
-  TVM_FFI_ICHECK_EQ(n % 16, 0) << "n must be multiple of 16; got n=" << n;
+  TVM_FFI_ICHECK_EQ(out_n % 16, 0) << "output N must be multiple of 16; got " << out_n;
 
   auto ceil_div = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
   auto compute_padded_offset = [](int64_t offset, int64_t problem_idx) {
@@ -110,7 +122,7 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
   runner.moe_gemm_fp8_nt_groupwise(
       out.data_ptr(), static_cast<void const*>(a.data_ptr()),
       static_cast<void const*>(b.data_ptr()), static_cast<int32_t const*>(m_indptr.data_ptr()),
-      num_experts, total_rows, n, k, stream, static_cast<float const*>(a_scale.data_ptr()),
+      num_experts, total_rows, out_n, k, stream, static_cast<float const*>(a_scale.data_ptr()),
       static_cast<float const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_m),
-      static_cast<int>(scale_granularity_n), static_cast<int>(scale_granularity_k));
+      static_cast<int>(scale_granularity_n), static_cast<int>(scale_granularity_k), gated);
 }
