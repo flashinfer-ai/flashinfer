@@ -20,20 +20,15 @@
 
 // TEMP_FP8_OFFSET regression anchor: the down-activation TMA descriptor
 // addresses `spec->temp_fp8` as `scratchpad_ptr + TEMP_FP8_OFFSET`, so that
-// constant must equal `offsetof(MoEGemmSpec<Dims>, temp_fp8)`.  New fields
-// MUST be appended after temp_fp8 or this fires (docs/design_docs/monomoe_kernel.md §4).
-static_assert(offsetof(monomoe::MoEGemmSpec<monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>,
-                       temp_fp8) ==
-                  monomoe::MoEGemmSpec<
-                      monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>::TEMP_FP8_OFFSET,
-              "TEMP_FP8_OFFSET must match offsetof(MoEGemmSpec<Dims>, temp_fp8) for "
-              "Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA. Do not insert fields "
-              "before temp_fp8; grid_barrier / partial_barrier belong at the tail of "
-              "MoEGemmSpec<Dims>.");
+// constant must equal `offsetof(MoEGemmSpec<Dims>, temp_fp8)`.  The check is
+// emitted once per instantiated config (a generated per-config static_assert
+// in monomoe_binding.cu, since the layout is Dims-dependent), so it lives
+// there rather than being hard-coded to one shape here
+// (docs/design_docs/monomoe_kernel.md §4).
 
 /**
- * @brief Host launcher for `moe_kernel_topk`, parameterized on the compile-time
- * @p Dims shape variant with runtime top_k / scoring_func / renormalize.
+ * @brief Host launcher for `moe_kernel_topk<Dims>`, with runtime top_k /
+ * scoring_func / renormalize / expert_bias / routed_scaling_factor.
  *
  * Design doc: docs/design_docs/monomoe_kernel.md (section numbers below).
  * Checks the co-residency invariant (§3), zero-inits the scratchpad on first
@@ -46,7 +41,8 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
                            TensorView expert_weights_up, TensorView expert_scales_up,
                            TensorView expert_weights_down, TensorView expert_scales_down,
                            TensorView activations_out, TensorView scratchpad, int64_t top_k,
-                           int64_t scoring_func, bool renormalize) {
+                           int64_t scoring_func, bool renormalize,
+                           ffi::Optional<TensorView> expert_bias, double routed_scaling_factor) {
   CHECK_INPUT(activations_in);
   CHECK_INPUT(router_logits);
   CHECK_INPUT(expert_weights_up);
@@ -78,12 +74,26 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
   auto* activations_out_ptr = static_cast<R_element*>(activations_out.data_ptr());
   char* scratchpad_ptr = reinterpret_cast<char*>(scratchpad.data_ptr());
 
+  // Optional per-expert selection bias (float32 [NUM_EXPERTS]); nullptr =>
+  // raw-logit ranking.
+  const float* expert_bias_ptr = nullptr;
+  if (expert_bias.has_value()) {
+    CHECK_INPUT(expert_bias.value());
+    CHECK_INPUT_TYPE(expert_bias.value(), dl_float32);
+    TVM_FFI_ICHECK(expert_bias.value().ndim() == 1 &&
+                   expert_bias.value().size(0) == Dims::NUM_EXPERTS)
+        << "expert_bias must be 1-D with NUM_EXPERTS (=" << Dims::NUM_EXPERTS
+        << ") elements; the routing kernel reads all NUM_EXPERTS entries.";
+    expert_bias_ptr = static_cast<const float*>(expert_bias.value().data_ptr());
+  }
+
   const uint32_t num_tokens = activations_in.size(0);
   const size_t shmem_size = get_moe_shmem_size<Dims>();
   const size_t scratchpad_size =
       static_cast<size_t>(scratchpad.numel()) * get_element_size(scratchpad);
   const uint32_t top_k_u32 = static_cast<uint32_t>(top_k);
   const ScoringFunc sf = static_cast<ScoringFunc>(scoring_func);
+  const float routed_scaling_factor_f = static_cast<float>(routed_scaling_factor);
 
   // TMA descriptors (docs/design_docs/monomoe_kernel.md §5).  Non-TMA variants leave these
   // zero-initialized; the kernel params are always present but only the
@@ -94,14 +104,23 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
   CUtensorMap activations_desc{};
   CUtensorMap down_weights_desc{};
   CUtensorMap down_activations_desc{};
-  if constexpr (use_tma_v<Dims>) {
+  if constexpr (use_tma<Dims>::value) {
     up_weights_desc = create_up_weight_tma_desc(
         reinterpret_cast<const void*>(expert_weights_up_ptr), Dims::NUM_EXPERTS, Dims::N, Dims::K);
+    // Row extent = the REAL token count, not Dims::BS: the TMA engine
+    // bounds-checks against globalDim and zero-fills out-of-bounds box rows,
+    // so for M < BS the routing-window load reads exactly M rows and
+    // hardware-zeros the phantom rows.  Under CUDA graphs the descriptor is
+    // captured per graph (one graph per batch size), so the baked-in M
+    // always matches replays.
     activations_desc = create_activations_tma_desc(
-        reinterpret_cast<const void*>(activations_in_ptr), Dims::BS, Dims::HIDDEN_STATES);
-    down_weights_desc = create_down_weight_tma_desc(
-        reinterpret_cast<const void*>(expert_weights_down_ptr), Dims::NUM_EXPERTS,
-        Dims::HIDDEN_STATES, Dims::N, /*row_box=*/MoECoreDims<Dims>::DOWN_COL_TILE);
+        reinterpret_cast<const void*>(activations_in_ptr), num_tokens, Dims::HIDDEN_STATES);
+    // row_box pinned to 128: DOWN_COL_TILE can exceed the 256-row TMA boxDim
+    // cap (e.g. 384), so the kernel issues one 128-row TMA per M-atom.
+    down_weights_desc =
+        create_down_weight_tma_desc(reinterpret_cast<const void*>(expert_weights_down_ptr),
+                                    Dims::NUM_EXPERTS, Dims::HIDDEN_STATES, Dims::N,
+                                    /*row_box=*/128u);
     // Down-activation descriptor reads `spec->temp_fp8` inside the
     // scratchpad: base + compile-time offset (docs/design_docs/monomoe_kernel.md §4).
     const void* temp_fp8_ptr =
@@ -113,19 +132,19 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
   const cudaStream_t stream = get_stream(activations_in.device());
   CUDA_CHECK(cudaFuncSetAttribute(moe_kernel_topk<Dims>,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
-  // Co-residency invariant (docs/design_docs/monomoe_kernel.md §3): the barrier spin only avoids
-  // deadlock if GRID_SIZE <= SM count.  Single cheap query off the hot path.
+  // Co-residency invariant (design doc §3): the sentinel/flag handoffs spin
+  // on values other blocks publish, so every block must be scheduled for the
+  // kernel's full lifetime — GRID_SIZE <= SM count.
   int sm_count = 0;
   cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
                          activations_in.device().device_id);
   TVM_FFI_ICHECK(Dims::KernelConfig::GRID_SIZE <= static_cast<uint32_t>(sm_count))
       << "monomoe requires GRID_SIZE (=" << Dims::KernelConfig::GRID_SIZE
-      << ") <= SM count (=" << sm_count << ") for software grid barrier co-residency invariant.";
-  // First-use scratchpad zero-init (docs/design_docs/monomoe_kernel.md §4): the barrier counters
-  // must start at 0; the ping-pong reset is self-maintaining thereafter.
-  // Key the guard on buffer identity (ptr, size, device) — a process-wide
-  // one-shot flag would leave a second distinct scratchpad with
-  // uninitialized counters and deadlock the spin.
+      << ") <= SM count (=" << sm_count << ") for the co-residency invariant.";
+  // First-use scratchpad zero-init (design doc §4): establishes the 0.0f
+  // scale sentinel, launch_flip = 0, and down_ready = 0.  All are
+  // self-maintaining afterwards (parity double-buffer refills).  Keyed on
+  // buffer identity so each distinct scratchpad is initialized exactly once.
   {
     static const void* _zeroed_ptr = nullptr;
     static size_t _zeroed_size = 0;
@@ -140,20 +159,24 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
     }
   }
 
+  // Standard launch: cross-block ordering comes from the in-kernel
+  // sentinel/flag handoffs (design doc §2), which is what lets the kernel be
+  // captured into a CUDA Graph.
   moe_kernel_topk<Dims><<<dim3(Dims::KernelConfig::GRID_SIZE, 1, 1),
                           dim3(Dims::KernelConfig::BLOCK_SIZE, 1, 1), shmem_size, stream>>>(
       activations_in_ptr, num_tokens, router_logits_ptr, expert_weights_up_ptr,
       expert_scales_up_ptr, expert_weights_down_ptr, expert_scales_down_ptr, activations_out_ptr,
-      scratchpad_ptr, scratchpad_size, shmem_size, top_k_u32, sf, renormalize, up_weights_desc,
-      activations_desc, down_weights_desc, down_activations_desc);
+      scratchpad_ptr, scratchpad_size, shmem_size, top_k_u32, sf, renormalize, expert_bias_ptr,
+      routed_scaling_factor_f, up_weights_desc, activations_desc, down_weights_desc,
+      down_activations_desc);
   CUDA_CHECK(cudaGetLastError());
 }
 
-// Explicit instantiation for the only BS8 variant (TMA + WGMMA +
-// SWIZZLE_128B); materializes the launcher symbol that monomoe_binding.cu
-// exports through TVM-FFI.
-template void monomoe_topk_launcher<monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>(
+// Explicit instantiation of the launcher for the single hard-specialized
+// shape (E=256, N=512, K=2048, block-wise FP8, BS8).  This is byte-identical
+// to the pre-tuning shipped kernel (formerly config 0).
+template void monomoe_topk_launcher<::monomoe::Dims_BS8_E256_N512_K2048_BlockFP8_WGMMA_TMA>(
     TensorView activations_in, TensorView router_logits, TensorView expert_weights_up,
     TensorView expert_scales_up, TensorView expert_weights_down, TensorView expert_scales_down,
     TensorView activations_out, TensorView scratchpad, int64_t top_k, int64_t scoring_func,
-    bool renormalize);
+    bool renormalize, ffi::Optional<TensorView> expert_bias, double routed_scaling_factor);
