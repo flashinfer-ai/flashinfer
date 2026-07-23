@@ -30,15 +30,12 @@ from flashinfer.tllm_enums import (
 
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_w4a16_permute import moe_permute_bf16_pdl
-from .moe_w4a16_unpermute import moe_unpermute_bf16_pdl
 
 
 W4A16GemmTactic = Tuple[Tuple[int, int], Tuple[int, int]]
 W4A16MoeTactic = Tuple[int, W4A16GemmTactic, W4A16GemmTactic]
 
 _MIN_GEMM1_M_CLUSTERS_FOR_PERMUTE_OVERLAP = 8
-_SPARSE_UNPERMUTE_NUM_WARPS = 16
-_DENSE_UNPERMUTE_NUM_WARPS = 32
 
 # Fixed correctness fallback used when no tuned tactic is available. Runtime
 # performance selection belongs to CuteDslFusedMoEW4A16Runner.
@@ -516,34 +513,15 @@ def launch_w4a16_moe(
         tactic=gemm2_tactic,
     )
     if not use_fused_finalize:
-        if enable_pdl:
-            # Sparse EP partitions favor a smaller CTA that can coexist with
-            # GEMM2; denser reductions use all 32 warps for memory throughput.
-            sparse_ep_partition = top_k * num_local_experts <= num_experts
-            unpermute_num_warps = (
-                _SPARSE_UNPERMUTE_NUM_WARPS
-                if sparse_ep_partition
-                else _DENSE_UNPERMUTE_NUM_WARPS
-            )
-            moe_unpermute_bf16_pdl(
-                permuted_input=gemm2_output,
-                output=moe_output,
-                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                topk_scales=token_final_scales,
-                num_tokens=int(x.size(0)),
-                top_k=top_k,
-                num_warps=unpermute_num_warps,
-            )
-        else:
-            moe_unpermute(
-                permuted_input=gemm2_output,
-                output=moe_output,
-                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                topk_scales=token_final_scales,
-                num_tokens=int(x.size(0)),
-                top_k=top_k,
-                enable_pdl=False,
-            )
+        moe_unpermute(
+            permuted_input=gemm2_output,
+            output=moe_output,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            topk_scales=token_final_scales,
+            num_tokens=int(x.size(0)),
+            top_k=top_k,
+            enable_pdl=enable_pdl,
+        )
     return moe_output
 
 
