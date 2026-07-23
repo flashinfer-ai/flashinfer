@@ -2720,3 +2720,108 @@ if __name__ == "__main__":
     test_compare_with_sglang_style_prefill_mode(8, 4096, 256)
 
     print("\nAll tests passed!")
+
+
+@pytest.mark.parametrize("algo", ["auto", "filtered", "multi_cta"])
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("is_sorted", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_rows_with_insufficient_finite_entries(
+    set_topk_algo, algo, deterministic, is_sorted, dtype
+):
+    """Contract for rows holding fewer than k entries greater than -inf.
+
+    See the "Rows with fewer than k finite entries" section of the top_k
+    docstring: all finite entries are returned, the deficit slots hold
+    (-inf, valid distinct in-range index), values always match a gather of
+    the input at the returned indices, and sorted=True front-packs the
+    finite entries.
+    """
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("FilteredTopK not supported on this device")
+    if dtype == torch.bfloat16:
+        _require_sm80_for_bf16()
+    set_topk_algo(algo)
+
+    k, vocab_size = 128, 8192
+    n_finite_cases = [0, 1, k // 2, k - 1, k]
+    device = "cuda"
+
+    torch.manual_seed(42)
+    logits = torch.full(
+        (len(n_finite_cases), vocab_size), float("-inf"), device=device, dtype=dtype
+    )
+    planted = []
+    for i, n_finite in enumerate(n_finite_cases):
+        pos = torch.randperm(vocab_size, device=device)[:n_finite]
+        logits[i, pos] = (
+            torch.rand(n_finite, device=device, dtype=torch.float32).to(dtype) + 1.0
+        )
+        planted.append(set(pos.tolist()))
+
+    values, indices = flashinfer.top_k(
+        logits, k, sorted=is_sorted, deterministic=deterministic
+    )
+
+    assert values.shape == (len(n_finite_cases), k)
+    assert indices.shape == (len(n_finite_cases), k)
+
+    # values must be a gather of the input at the returned indices (all slots)
+    assert ((indices >= 0) & (indices < vocab_size)).all()
+    gathered = torch.gather(logits, dim=-1, index=indices)
+    assert torch.equal(values, gathered)
+
+    for i, n_finite in enumerate(n_finite_cases):
+        row_values = values[i]
+        row_indices = indices[i]
+        finite_mask = torch.isfinite(row_values.float())
+
+        # every finite entry is selected, none invented
+        assert int(finite_mask.sum()) == n_finite
+        assert set(row_indices[finite_mask].tolist()) == planted[i]
+
+        # deficit slots hold -inf at distinct valid positions
+        assert (row_values[~finite_mask].float() == float("-inf")).all()
+        assert len(set(row_indices.tolist())) == k
+
+        if is_sorted:
+            row_f32 = row_values.float()
+            assert (row_f32[:-1] >= row_f32[1:]).all()
+            # descending order implies the finite entries are front-packed
+            assert finite_mask[:n_finite].all()
+
+
+@pytest.mark.parametrize(
+    "tie_break",
+    [flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE],
+)
+def test_top_k_inf_padding_follows_tie_break(tie_break):
+    """With tie_break, the -inf padding slots follow the boundary tie-break
+    rule: smallest (SMALL) / largest (LARGE) indices among the -inf
+    positions."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Tie-break modes require filtered top-k support on this device")
+
+    k, vocab_size, n_finite = 128, 8192, 64
+    device = "cuda"
+
+    torch.manual_seed(42)
+    logits = torch.full(
+        (1, vocab_size), float("-inf"), device=device, dtype=torch.float32
+    )
+    pos = torch.randperm(vocab_size, device=device)[:n_finite]
+    logits[0, pos] = torch.rand(n_finite, device=device) + 1.0
+
+    values, indices = flashinfer.top_k(logits, k, tie_break=tie_break)
+
+    finite_positions = set(pos.tolist())
+    inf_positions = sorted(set(range(vocab_size)) - finite_positions)
+    deficit = sorted(set(indices[0].tolist()) - finite_positions)
+    if tie_break == flashinfer.TopKTieBreak.SMALL:
+        assert deficit == inf_positions[: k - n_finite]
+    else:
+        assert deficit == sorted(inf_positions[-(k - n_finite) :])
+    assert (
+        torch.gather(logits, -1, indices)[0][values[0] == float("-inf")]
+        == float("-inf")
+    ).all()
