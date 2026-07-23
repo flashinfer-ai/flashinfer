@@ -35,7 +35,11 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_routed_moe,
     WeightLayout,
 )
-from flashinfer.fused_moe.core import Fp8QuantizationType, MoEInputs
+from flashinfer.fused_moe.core import (
+    Fp8QuantizationType,
+    MoEInputs,
+    get_trtllm_moe_sm100_module,
+)
 from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 from flashinfer.tllm_enums import DtypeTrtllmGen
 from flashinfer.utils import (
@@ -331,6 +335,56 @@ def _enumerate_valid_tactics(
             False,  # has_gemm1_lora_delta
         )
     )
+
+
+@pytest.mark.parametrize(
+    "dtype_act,dtype_weights,expect_tactics",
+    [
+        (DtypeTrtllmGen.E2m1, DtypeTrtllmGen.E2m1, True),
+        (DtypeTrtllmGen.Bfloat16, DtypeTrtllmGen.Bfloat16, False),
+    ],
+)
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+def test_sm100_tiny_m_autotune_guard_is_dtype_scoped(
+    dtype_act: DtypeTrtllmGen,
+    dtype_weights: DtypeTrtllmGen,
+    expect_tactics: bool,
+    num_tokens: int,
+):
+    device = torch.device("cuda:0")
+    if get_compute_capability(device)[0] != 10:
+        pytest.skip("Only works on SM100 / SM103.")
+
+    top_k = 22
+    num_local_experts = 128
+    module = get_trtllm_moe_sm100_module()
+    runner = module.MoERunner(
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        dtype_act=dtype_act,
+        dtype_weights=dtype_weights,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=2048,
+        intermediate_size=5120,
+        activation_type=ActivationType.Swiglu.value,
+        use_shuffled_weight=True,
+        weight_layout=WeightLayout.MajorK,
+        num_experts=512,
+    )
+    # Tactic enumeration only needs the token count and device from hidden_states.
+    inputs = MoEInputs(
+        output=None,
+        routing_logits=None,
+        topk_ids=None,
+        expert_weights=None,
+        hidden_states=torch.empty(num_tokens, 1, device=device),
+        hidden_states_scale=None,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+
+    tactics = runner.get_valid_tactics(inputs.to_list(), None)
+    assert bool(tactics) == expect_tactics
 
 
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
