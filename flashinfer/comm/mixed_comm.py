@@ -48,6 +48,7 @@ from ..cuda_utils import checkCudaErrors
 from ..jit.comm import gen_mixed_comm_module
 from ..testing.utils import bench_gpu_time
 from ..utils import backend_requirement, supported_compute_capability
+from .mnnvl import CommBackend, TorchDistBackend
 
 
 @functools.cache
@@ -578,6 +579,7 @@ class MixedCommHandler:
         self.vm_handle_type = (
             cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
         )
+        self._vm_mapped = False
         self.vm_workspace_bytes = None
         self.uc_handle_list = None
         self.uc_ptr_list = None
@@ -639,7 +641,7 @@ class MixedCommHandler:
             valid_mode_list.append(MixedCommMode.AUTOTUNE)
         return valid_mode_list
 
-    def init_virtual_memory(self):
+    def _create_and_map_vmm_handles(self, comm_backend):
         """Initialize CUDA virtual memory for intra-node communication.
 
         Allocates unicast and multicast memory handles, exchanges them between
@@ -693,7 +695,7 @@ class MixedCommHandler:
                     cuda.cuMemImportFromShareableHandle(uc_fd_recv, self.vm_handle_type)
                 )
                 os.close(uc_fd_recv)
-                torch.distributed.barrier(group=self.local_comm_group)
+                comm_backend.barrier()
             os.close(uc_fd_send)
             return uc_handle_list
 
@@ -719,11 +721,14 @@ class MixedCommHandler:
             checkCudaErrors(cuda.cuMulticastAddDevice(mc_handle, self.device.index))
             return mc_handle
 
-        def map_handle(handle, access_desc, vm_granularity):
+        def map_handle(handle, access_desc, vm_granularity, ptr=None):
             """Reserve virtual address space and map a memory handle into it."""
-            ptr = checkCudaErrors(
-                cuda.cuMemAddressReserve(self.vm_workspace_bytes, vm_granularity, 0, 0)
-            )
+            if ptr is None:
+                ptr = checkCudaErrors(
+                    cuda.cuMemAddressReserve(
+                        self.vm_workspace_bytes, vm_granularity, 0, 0
+                    )
+                )
             checkCudaErrors(cuda.cuMemMap(ptr, self.vm_workspace_bytes, 0, handle, 0))
             checkCudaErrors(
                 cuda.cuMemSetAccess(ptr, self.vm_workspace_bytes, [access_desc], 1)
@@ -748,16 +753,12 @@ class MixedCommHandler:
             os.chmod(socket_folder_list[0], 0o700)
         else:
             socket_folder_list = [None]
-        torch.distributed.broadcast_object_list(
-            socket_folder_list,
-            src=self.para_info.inter_rank * self.para_info.local_size,
-            group=self.local_comm_group,
-        )
+        socket_folder_list[0] = comm_backend.bcast(socket_folder_list[0], root=0)
         socket_folder = socket_folder_list[0]
         socket_path = get_socket_path(self.para_info.local_rank)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         sock.bind(socket_path)
-        torch.distributed.barrier(group=self.local_comm_group)
+        comm_backend.barrier()
 
         # Create multicast and unicast handles
         uc_prop = cuda.CUmemAllocationProp()
@@ -782,11 +783,14 @@ class MixedCommHandler:
             )
         )
         vm_granularity = math.lcm(mc_granularity, uc_granularity)
-        self.vm_workspace_bytes = _round_up(
-            self.vm_buffer_bytes_all + self.buffer_info_bytes, vm_granularity
-        )
-        self.uc_handle_list = create_and_allgather_uc_handle(sock, uc_prop)
-        mc_prop.size = self.vm_workspace_bytes
+        if self.vm_workspace_bytes is None:
+            self.vm_workspace_bytes = _round_up(
+                self.vm_buffer_bytes_all + self.buffer_info_bytes, vm_granularity
+            )
+        vm_workspace_bytes = self.vm_workspace_bytes
+        uc_handle_list = create_and_allgather_uc_handle(sock, uc_prop)
+        self.uc_handle_list = uc_handle_list
+        mc_prop.size = vm_workspace_bytes
         if self.para_info.local_rank == 0:
             mc_prop.numDevices = self.para_info.local_size
             self.mc_handle_dict["full"] = create_and_send_mc_handle(
@@ -794,7 +798,7 @@ class MixedCommHandler:
             )
         else:
             self.mc_handle_dict["full"] = recv_and_create_mc_handle(sock)
-        torch.distributed.barrier(group=self.local_comm_group)
+        comm_backend.barrier()
         if self.para_info.use_local_tp:
             if self.para_info.local_tp_rank == 0:
                 mc_prop.numDevices = self.para_info.local_tp_size
@@ -803,11 +807,11 @@ class MixedCommHandler:
                 )
             else:
                 self.mc_handle_dict["tp"] = recv_and_create_mc_handle(sock)
-            torch.distributed.barrier(group=self.local_comm_group)
-        torch.distributed.barrier(group=self.local_comm_group)
+            comm_backend.barrier()
+        comm_backend.barrier()
         sock.close()
         os.unlink(socket_path)
-        torch.distributed.barrier(group=self.local_comm_group)
+        comm_backend.barrier()
         if self.para_info.local_rank == 0:
             os.rmdir(socket_folder)
 
@@ -817,42 +821,144 @@ class MixedCommHandler:
         access_desc.location.id = self.device.index
         access_desc.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         access_desc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-        self.uc_ptr_list = [
-            map_handle(val, access_desc, vm_granularity) for val in self.uc_handle_list
-        ]
-        ptr_list = [int(val) for val in self.uc_ptr_list]
-        uc_buffer_list = []
-        local_tp_rank = self.para_info.local_tp_rank
-        local_dp_rank = self.para_info.local_dp_rank
-        local_tp_size = self.para_info.local_tp_size
-        local_dp_size = self.para_info.local_dp_size
-        for i in range(local_dp_size):
-            peer_local_dp_rank = (local_dp_rank + i + 1) % local_dp_size
-            for j in range(local_tp_size):
-                peer_local_tp_rank = (local_tp_rank + j + 1) % local_tp_size
-                uc_buffer_list.append(
-                    ptr_list[peer_local_tp_rank + peer_local_dp_rank * local_tp_size]
-                )
-        self.uc_buffer_dict = create_gpu_array(uc_buffer_list)
+        if self.uc_ptr_list is None:
+            uc_ptr_list = [
+                map_handle(val, access_desc, vm_granularity) for val in uc_handle_list
+            ]
+            self.uc_ptr_list = uc_ptr_list
+        else:
+            uc_ptr_list = self.uc_ptr_list
+            for handle, ptr in zip(uc_handle_list, uc_ptr_list, strict=True):
+                map_handle(handle, access_desc, vm_granularity, ptr)
+        ptr_list = [int(val) for val in uc_ptr_list]
+        if not self.uc_buffer_dict["raw"]:
+            uc_buffer_list = []
+            local_tp_rank = self.para_info.local_tp_rank
+            local_dp_rank = self.para_info.local_dp_rank
+            local_tp_size = self.para_info.local_tp_size
+            local_dp_size = self.para_info.local_dp_size
+            for i in range(local_dp_size):
+                peer_local_dp_rank = (local_dp_rank + i + 1) % local_dp_size
+                for j in range(local_tp_size):
+                    peer_local_tp_rank = (local_tp_rank + j + 1) % local_tp_size
+                    uc_buffer_list.append(
+                        ptr_list[
+                            peer_local_tp_rank + peer_local_dp_rank * local_tp_size
+                        ]
+                    )
+            self.uc_buffer_dict = create_gpu_array(uc_buffer_list)
         ptr = ptr_list[self.para_info.local_rank]
         self.mem_buffer = ctypes.c_void_p(ptr)
+        self._initialize_vmm_protocol()
+        uc_handle_self = uc_handle_list[self.para_info.local_rank]
+        for key, val in self.mc_handle_dict.items():
+            if val is None:
+                continue
+            checkCudaErrors(
+                cuda.cuMulticastBindMem(
+                    val, 0, uc_handle_self, 0, vm_workspace_bytes, 0
+                )
+            )
+            self.mc_ptr_dict[key] = map_handle(
+                val, access_desc, vm_granularity, self.mc_ptr_dict[key]
+            )
+            self.mc_buffer_dict[key] = ctypes.c_void_p(int(self.mc_ptr_dict[key]))
+
+    def _initialize_vmm_protocol(self):
+        """Reset the virtual-memory communication protocol."""
+        ptr = int(self.uc_ptr_list[self.para_info.local_rank])
         checkCudaErrors(
             cuda.cuMemsetD16(ptr, self.neg_zero_uint16, self.vm_buffer_bytes_all // 2)
         )
         checkCudaErrors(
             cuda.cuMemsetD8(ptr + self.vm_buffer_bytes_all, 0, self.buffer_info_bytes)
         )
-        uc_handle_self = self.uc_handle_list[self.para_info.local_rank]
+
+    def _unmap_and_release_vmm_handles(self):
+        """Unmap and release physical VMM backing while retaining addresses."""
         for key, val in self.mc_handle_dict.items():
             if val is None:
                 continue
             checkCudaErrors(
-                cuda.cuMulticastBindMem(
-                    val, 0, uc_handle_self, 0, self.vm_workspace_bytes, 0
+                cuda.cuMulticastUnbind(
+                    val, self.device.index, 0, self.vm_workspace_bytes
                 )
             )
-            self.mc_ptr_dict[key] = map_handle(val, access_desc, vm_granularity)
-            self.mc_buffer_dict[key] = ctypes.c_void_p(int(self.mc_ptr_dict[key]))
+            checkCudaErrors(
+                cuda.cuMemUnmap(self.mc_ptr_dict[key], self.vm_workspace_bytes)
+            )
+            checkCudaErrors(cuda.cuMemRelease(val))
+            self.mc_handle_dict[key] = None
+        for handle, ptr in zip(self.uc_handle_list, self.uc_ptr_list, strict=True):
+            checkCudaErrors(cuda.cuMemUnmap(ptr, self.vm_workspace_bytes))
+            checkCudaErrors(cuda.cuMemRelease(handle))
+        self.uc_handle_list = None
+        self._vm_mapped = False
+
+    def _free_vmm_addresses(self):
+        """Free permanent VMM addresses and the GPU peer-pointer table."""
+        for ptr in self.mc_ptr_dict.values():
+            if ptr is not None:
+                checkCudaErrors(cuda.cuMemAddressFree(ptr, self.vm_workspace_bytes))
+        for ptr in self.uc_ptr_list:
+            checkCudaErrors(cuda.cuMemAddressFree(ptr, self.vm_workspace_bytes))
+        checkCudaErrors(cuda.cuMemFree(self.uc_buffer_dict["raw"]))
+
+    def init_virtual_memory(self):
+        """Initialize CUDA virtual memory for intra-node communication.
+
+        Allocates unicast and multicast memory handles, exchanges them between
+        local ranks via Unix domain sockets, and maps them into the GPU virtual
+        address space so that all ranks on a node can directly read/write each
+        other's buffers.
+        """
+        comm_backend = TorchDistBackend(self.local_comm_group)
+        self._create_and_map_vmm_handles(comm_backend)
+        self._vmm_comm_backend = comm_backend
+        self._vm_mapped = True
+
+    def _validate_vmm_comm_backend(self, comm_backend: CommBackend):
+        """Validate the local checkpoint rendezvous backend."""
+        if comm_backend.Get_rank() != self.para_info.local_rank:
+            raise ValueError(
+                "MixedComm checkpoint backend rank does not match local rank"
+            )
+        if comm_backend.Get_size() != self.para_info.local_size:
+            raise ValueError(
+                "MixedComm checkpoint backend size does not match local size"
+            )
+
+    @flashinfer_api
+    def checkpoint_prepare(self):
+        """Release physical VMM backing while retaining graph-visible addresses."""
+        if self.para_info.use_inter:
+            raise NotImplementedError(
+                "MixedComm checkpointing does not yet support multi-node handlers"
+            )
+        if not self._vm_mapped:
+            return
+        torch.cuda.synchronize()
+        assert self._vmm_comm_backend is not None
+        self._vmm_comm_backend.barrier()
+        self._unmap_and_release_vmm_handles()
+        self._vmm_comm_backend.barrier()
+        self._vmm_comm_backend = None
+
+    @flashinfer_api
+    def checkpoint_restore(self, comm_backend: CommBackend):
+        """Restore physical VMM backing at retained graph-visible addresses."""
+        if self.para_info.use_inter:
+            raise NotImplementedError(
+                "MixedComm checkpointing does not yet support multi-node handlers"
+            )
+        if self._vm_mapped:
+            return
+        self._validate_vmm_comm_backend(comm_backend)
+        self._create_and_map_vmm_handles(comm_backend)
+        torch.cuda.synchronize()
+        comm_backend.barrier()
+        self._vmm_comm_backend = comm_backend
+        self._vm_mapped = True
 
     def init_nvshmem(self):
         """Initialize nvshmem for inter-node communication.
@@ -919,28 +1025,19 @@ class MixedCommHandler:
         and destroys process groups. Must be called at most once.
         """
 
-        def unmap_handle(ptr, handle):
-            """Unmap, release, and free a virtual memory handle and its address range."""
-            checkCudaErrors(cuda.cuMemUnmap(ptr, self.vm_workspace_bytes))
-            checkCudaErrors(cuda.cuMemRelease(handle))
-            checkCudaErrors(cuda.cuMemAddressFree(ptr, self.vm_workspace_bytes))
-
         assert self.is_running, "Should not call shutdown() more than once."
         self.is_running = False
         torch.cuda.synchronize()
-        torch.distributed.barrier()
+        if self.para_info.use_inter:
+            torch.distributed.barrier()
+        elif self._vm_mapped:
+            assert self._vmm_comm_backend is not None
+            self._vmm_comm_backend.barrier()
 
-        for key, val in self.mc_handle_dict.items():
-            if val is not None:
-                checkCudaErrors(
-                    cuda.cuMulticastUnbind(
-                        val, self.device.index, 0, self.vm_workspace_bytes
-                    )
-                )
-                unmap_handle(self.mc_ptr_dict[key], val)
-        for handle, ptr in zip(self.uc_handle_list, self.uc_ptr_list, strict=True):
-            unmap_handle(ptr, handle)
-        checkCudaErrors(cuda.cuMemFree(self.uc_buffer_dict["raw"]))
+        if self._vm_mapped:
+            self._unmap_and_release_vmm_handles()
+            self._vmm_comm_backend = None
+        self._free_vmm_addresses()
 
         if self.para_info.use_inter:
             del self.ns_workspace
