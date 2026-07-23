@@ -122,7 +122,7 @@ void trtllm_paged_attention_launcher(
     bool uses_shared_paged_kv_idx, bool enable_block_sparse_attention, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, int64_t k_sf_stride_heads, int64_t k_sf_stride_batch,
     int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads, cudaStream_t stream) {
+    int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -134,6 +134,17 @@ void trtllm_paged_attention_launcher(
   auto fmha_runner =
       TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, kv_data_type, o_data_type);
   TllmGenFmhaRunnerParams runner_params{};
+  TVM_FFI_ICHECK(bf16q_fp8kv_transform_mode >= 0 && bf16q_fp8kv_transform_mode <= 2)
+      << "bf16q_fp8kv_transform_mode must be 0, 1, or 2";
+  auto const transform_mode = static_cast<Bf16QFp8KvTransformMode>(bf16q_fp8kv_transform_mode);
+  if (transform_mode != Bf16QFp8KvTransformMode::Full) {
+    TVM_FFI_ICHECK(
+        mode == TllmPagedAttentionMode::ForGen && q_data_type == Data_type::DATA_TYPE_BF16 &&
+        kv_data_type == Data_type::DATA_TYPE_E4M3 && o_data_type == Data_type::DATA_TYPE_BF16)
+        << "bf16q_fp8kv_transform_mode is only supported for BF16 query, FP8 E4M3 KV, "
+           "BF16 output decode";
+  }
+  runner_params.mBf16QFp8KvTransformMode = transform_mode;
 
   // Common params
   runner_params.qPtr = query;
@@ -341,7 +352,8 @@ void trtllm_paged_attention_decode(
     Optional<TensorView> cum_seq_lens_q, Optional<TensorView> key_block_scales,
     Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor,
     Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads, bool enable_block_sparse_attention) {
+    int64_t lse_stride_heads, bool enable_block_sparse_attention,
+    int64_t bf16q_fp8kv_transform_mode) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -492,7 +504,7 @@ void trtllm_paged_attention_decode(
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       enable_block_sparse_attention, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
       k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, /*is_causal=*/true,
-      lse_stride_tokens, lse_stride_heads, stream);
+      lse_stride_tokens, lse_stride_heads, bf16q_fp8kv_transform_mode, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -632,7 +644,7 @@ void trtllm_paged_attention_context(
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       /*enable_block_sparse_attention=*/false, sm_count, enable_pdl, workspace_size,
       k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, is_causal,
-      lse_stride_tokens, lse_stride_heads, stream);
+      lse_stride_tokens, lse_stride_heads, /*bf16q_fp8kv_transform_mode=*/0, stream);
 }
 
 void trtllm_ragged_attention_launcher(
@@ -980,7 +992,7 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       enable_pdl, workspace_size,
       /*k_sf_stride_heads=*/0, /*k_sf_stride_batch=*/0, /*v_sf_stride_heads=*/0,
       /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
-      /*lse_stride_heads=*/0, stream);
+      /*lse_stride_heads=*/0, /*bf16q_fp8kv_transform_mode=*/0, stream);
 }
 
 namespace trtllm_cubin_loader {

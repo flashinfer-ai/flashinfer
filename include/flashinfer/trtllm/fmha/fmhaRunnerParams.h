@@ -153,6 +153,12 @@ enum class TrtllmGenSparseMlaType {
   DynamicTokenSparse = 2,
 };
 
+enum class Bf16QFp8KvTransformMode {
+  Full = 0,
+  KOnly,
+  SeparateKv,
+};
+
 inline bool isSparseMla(TrtllmGenSparseMlaType sparseMlaType) {
   return sparseMlaType != TrtllmGenSparseMlaType::None;
 }
@@ -340,6 +346,8 @@ struct TllmGenFmhaRunnerParams {
   int mSparseMlaTopK;
   // Whether DSv4 sparse MLA should read tile 0 from slidingWindowKvPoolPtr.
   bool mHasSlidingWindowKvPool;
+  // Transform mode for BF16 query + FP8 KV generation kernels.
+  Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
   // Whether the indices for K & V pages are shared as unified index.
   // true -> vLLM/FlashInfer; false -> TRT-LLM.
   bool mUsesSharedPagedKvIdx;
@@ -420,6 +428,10 @@ struct TllmGenSelectKernelParams {
   int mTileSizeKv;
   // Use 2 CTA MMA or not.
   bool mUses2CtaMma;
+  // Whether the selected generation kernel groups tokensQ and headsQ into one CTA.
+  bool mGroupsTokensHeadsQ;
+  // Transform mode for BF16 query + FP8 KV generation kernels.
+  Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
 
   // The constructor.
   TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -439,5 +451,7 @@ struct TllmGenSelectKernelParams {
         mTileScheduler(params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
-        mUses2CtaMma(false) {};
+        mUses2CtaMma(false),
+        mGroupsTokensHeadsQ(false),
+        mBf16QFp8KvTransformMode(params.mBf16QFp8KvTransformMode) {};
 };
