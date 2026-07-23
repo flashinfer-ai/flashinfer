@@ -83,6 +83,7 @@ PROBLEM_SIZES = [
     (4, 256, 512),
     (16, 256, 256),
     # mid: typical decode at a few model widths
+    (1, 512, 2048),  # small-n decode: the fallback's static split-K region
     (1, 1024, 1024),
     (4, 1024, 1024),
     (16, 1024, 1024),
@@ -268,6 +269,86 @@ def test_backend_out_dtype_override(backend):
         out_dtype=torch.float16,
     )
     assert out.dtype == torch.float16
+
+
+@pytest.mark.parametrize("m,n,k", [(1, 2048, 7168), (16, 10304, 2688)])
+def test_cute_dsl_every_tactic_matches_reference(m, n, k):
+    """Every enumerated cute-dsl tactic matches the reference and is
+    run-to-run deterministic.
+
+    The autotuner only exercises the winning tactic, so non-default configs
+    need direct coverage.  Shapes cover even and uneven K splits plus
+    padded M rows.
+    """
+    _skip_if_backend_unavailable("cute-dsl")
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _bf16_fp4_cute_dsl_tactic_configs,
+        _cute_dsl_bf16_fp4_runner,
+        _prepare_bf16_fp4_alpha,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl"
+    )
+
+    weight_fp32 = _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
+    ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
+
+    runner = _cute_dsl_bf16_fp4_runner(enable_pdl=True)
+    sf_u8 = sf_p.view(torch.uint8).contiguous()
+    alpha_l = _prepare_bf16_fp4_alpha(alpha_p, device)
+    for tactic, cfg in enumerate(_bf16_fp4_cute_dsl_tactic_configs(n, k)):
+        outs = []
+        for _ in range(2):
+            out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+            runner.forward(
+                [a, b_p, sf_u8, alpha_l, torch.bfloat16, out, 16], tactic=tactic
+            )
+            outs.append(out)
+        torch.cuda.synchronize()
+        _assert_close_to_reference(outs[0], ref, f"cute-dsl tactic {tactic} {cfg}")
+        assert torch.equal(outs[0], outs[1]), (
+            f"tactic {tactic} {cfg} is not deterministic across runs"
+        )
+
+
+def test_cute_dsl_fallback_k_splits_selector():
+    """Pin the no-autotune fallback's static split-K rule.
+
+    Expected picks mirror the autotuner's choices on 48/84/188-SM parts.
+    """
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _select_bf16_fp4_k_splits,
+        _select_bf16_fp4_tile_shape,
+    )
+
+    def pick(m, n, k, sm_count):
+        tile, _ = _select_bf16_fp4_tile_shape(m, n, k)
+        return _select_bf16_fp4_k_splits(m, n, k, tile, sm_count)
+
+    # Strong underfill: the chosen split scales with the SM count.
+    assert pick(1, 512, 2048, 48) == 4
+    assert pick(1, 512, 2048, 84) == 8
+    assert pick(1, 512, 4096, 188) == 8
+    assert pick(1, 1024, 4096, 48) == 2
+    assert pick(1, 1024, 4096, 84) == 4
+    # The pick never exceeds the K-tile count.
+    assert pick(1, 512, 512, 188) == 4
+    assert pick(1, 128, 128, 188) == 1
+    # Grids that already fill the GPU do not split.
+    assert pick(1, 2048, 2048, 48) == 1
+    assert pick(1, 2048, 4096, 84) == 1
+    assert pick(1, 4096, 512, 48) == 1
+    assert pick(1, 14336, 4096, 188) == 1
+    # tile_k=64 shapes split on their (32, 64, 64) base tile.
+    assert pick(1, 512, 2112, 84) == 8
+    # m > 16 picks larger tiles, which the tactic space never pairs with splits.
+    assert pick(64, 512, 2048, 84) == 1
+    assert pick(512, 512, 2048, 84) == 1
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)

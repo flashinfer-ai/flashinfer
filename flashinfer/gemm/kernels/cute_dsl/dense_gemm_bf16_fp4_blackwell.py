@@ -161,6 +161,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         enable_pdl: bool = True,
         tile_swizzle: int = 1,
         raster_along_m: bool = True,
+        k_splits: int = 1,
     ):
         """bf16 x fp4 kernel.
 
@@ -188,6 +189,10 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         self.tile_swizzle = int(tile_swizzle)
         self.raster_along_m = bool(raster_along_m)
         self.enable_pdl = bool(enable_pdl)
+        self.k_splits = int(k_splits)
+        if self.k_splits < 1:
+            raise ValueError(f"k_splits must be >= 1 (got {k_splits})")
+        self.reduce_threads_per_cta = 256
         # Optional override for the epilogue tile shape.
         self.epi_tile_override = (
             tuple(epi_tile_override) if epi_tile_override is not None else None
@@ -328,6 +333,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         b_packed: cute.Tensor,
         b_sf: cute.Tensor,
         c: cute.Tensor,
+        partial: cute.Tensor,
         alpha: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
@@ -401,6 +407,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             max_active_clusters,
             self.tile_swizzle,
             self.raster_along_m,
+            self.k_splits,
         )
 
         @cute.struct
@@ -444,6 +451,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             tma_tensor_b_sf,
             tma_atom_c,
             tma_tensor_c,
+            partial,
             alpha,
             self.tiled_mma,
             self.cta_layout_mnk,
@@ -460,6 +468,56 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             stream=stream,
             use_pdl=self.enable_pdl,
         )
+        if cutlass.const_expr(self.k_splits > 1):
+            self._launch_partial_reduce(c, partial, stream)
+        return
+
+    @cute.jit
+    def _launch_partial_reduce(
+        self,
+        c: cute.Tensor,
+        partial: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        """Launch the split-K reduce, PDL-chained behind the GEMM grid."""
+        total = cute.size(c, mode=[0]) * cute.size(c, mode=[1])
+        reduce_grid = (total + Int32(self.reduce_threads_per_cta) - Int32(1)) // Int32(
+            self.reduce_threads_per_cta
+        )
+        self.kernel_partial_reduce(partial, c).launch(
+            grid=[reduce_grid, 1, 1],
+            block=[self.reduce_threads_per_cta, 1, 1],
+            cluster=[1, 1, 1],
+            stream=stream,
+            use_pdl=self.enable_pdl,
+        )
+
+    @cute.kernel
+    def kernel_partial_reduce(
+        self,
+        mPartial: cute.Tensor,
+        mC_mnl: cute.Tensor,
+    ):
+        """Sum the fp32 partials into C, one element per thread, in fixed
+        split order for determinism."""
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        cute.arch.griddepcontrol_wait()
+
+        m_actual = cute.size(mC_mnl, mode=[0])
+        n_actual = cute.size(mC_mnl, mode=[1])
+        total = m_actual * n_actual
+        mC_flat = cute.make_tensor(mC_mnl.iterator, cute.make_layout(total))
+
+        idx = Int32(bidx) * Int32(self.reduce_threads_per_cta) + tidx
+        if idx < total:
+            acc_sum = Float32(0.0)
+            for s in cutlass.range_constexpr(self.k_splits):
+                acc_sum = acc_sum + Float32(mPartial[Int32(s) * total + idx])
+            mC_flat[idx] = acc_sum.to(self.c_dtype)
+
+        cute.arch.griddepcontrol_launch_dependents()
         return
 
     @cute.kernel
@@ -473,6 +531,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         mB_sf_kn: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
+        # fp32 split-K partials of shape (k_splits * m, n); an unused
+        # dummy when k_splits == 1.
+        mPartial: cute.Tensor,
         mAlpha: cute.Tensor,
         tiled_mma: cute.TiledMma,
         cta_layout_mnk: cute.Layout,
@@ -689,15 +750,33 @@ class BlackwellDenseGemmBf16Fp4Kernel:
 
             alpha_val = Float32(mAlpha[Int32(0)])
 
+            if cutlass.const_expr(self.k_splits > 1):
+                cC = cute.make_identity_tensor(
+                    cute.slice_(self.tile_shape_mnk, (None, None, 0))
+                )
+                tCcC = thr_mma.partition_C(cC)
+
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
-                gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
+                # Host enforces k_splits <= k_tiles, so every split owns
+                # >= 1 K-tile and the pipeline never waits on a stage the
+                # producer won't fill.
+                if cutlass.const_expr(self.k_splits > 1):
+                    tile_l, split_idx, k_start, k_len = self._split_work_krange(
+                        tile_coord_mnl[2], k_tile_cnt
+                    )
+                else:
+                    tile_l = tile_coord_mnl[2]
+                    k_len = k_tile_cnt
+                gC_mnl_slice = gC_mnl[
+                    (None, None, tile_coord_mnl[0], tile_coord_mnl[1], tile_l)
+                ]
                 accumulators.fill(0.0)
 
                 mainloop_consumer_state.reset_count()
 
                 peek_ab_full_status = cutlass.Boolean(1)
-                if mainloop_consumer_state.count < k_tile_cnt:
+                if mainloop_consumer_state.count < k_len:
                     peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
                         mainloop_consumer_state
                     )
@@ -728,7 +807,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                         0,
                     )
 
-                for _k_tile in cutlass.range(0, k_tile_cnt - 1, 1, unroll=1):
+                for _k_tile in cutlass.range(0, k_len - 1, 1, unroll=1):
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                         k_block_next = (
                             0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
@@ -898,135 +977,149 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                             accumulators,
                         )
 
-                # Epilogue: accumulator -> smem -> gmem via R2S (StMatrix.x4)
-                # + TMA bulk store.
-                copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
-                    self.c_layout,
-                    elem_ty_d=self.c_dtype,
-                    elem_ty_acc=self.acc_dtype,
-                )
+                if cutlass.const_expr(self.k_splits > 1):
+                    # Store alpha * acc as fp32 partials straight from
+                    # registers; staging through the output-dtype smem
+                    # buffer would round each split early.
+                    m_actual = cute.size(mC_mnl, mode=[0])
+                    n_actual = cute.size(mC_mnl, mode=[1])
+                    cta_m_offset = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
+                    cta_n_offset = tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
+                    for i in cutlass.range_constexpr(cute.size(accumulators)):
+                        r = cta_m_offset + Int32(tCcC[i][0])
+                        if r < m_actual:
+                            c = cta_n_offset + Int32(tCcC[i][1])
+                            mPartial[(split_idx * m_actual + r) * n_actual + c] = (
+                                alpha_val * accumulators[i]
+                            )
 
-                copy_atom_C = cute.make_copy_atom(
-                    cute.nvgpu.warp.StMatrix8x8x16bOp(
-                        self.c_layout.is_m_major_c(),
-                        4,
-                    ),
-                    self.c_dtype,
-                )
+                else:
+                    copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
+                        self.c_layout,
+                        elem_ty_d=self.c_dtype,
+                        elem_ty_acc=self.acc_dtype,
+                    )
 
-                tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+                    copy_atom_C = cute.make_copy_atom(
+                        cute.nvgpu.warp.StMatrix8x8x16bOp(
+                            self.c_layout.is_m_major_c(),
+                            4,
+                        ),
+                        self.c_dtype,
+                    )
 
-                tiled_copy_r2s = cute.make_tiled_copy_S(
-                    copy_atom_r2s,
-                    tiled_copy_C_Atom,
-                )
+                    tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(
+                        copy_atom_C, tiled_mma
+                    )
 
-                thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-                tRS_sD = thr_copy_r2s.partition_D(sC)
-                tRS_rAcc = tiled_copy_r2s.retile(accumulators)
+                    tiled_copy_r2s = cute.make_tiled_copy_S(
+                        copy_atom_r2s,
+                        tiled_copy_C_Atom,
+                    )
 
-                rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
-                tRS_rD_layout = cute.make_layout(rD_shape[:3])
-                tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
+                    thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+                    tRS_sD = thr_copy_r2s.partition_D(sC)
+                    tRS_rAcc = tiled_copy_r2s.retile(accumulators)
 
-                sepi_for_tma_partition = cute.group_modes(sC, 0, 2)
-                tcgc_for_tma_partition = cute.zipped_divide(gC_mnl_slice, self.epi_tile)
+                    rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
+                    tRS_rD_layout = cute.make_layout(rD_shape[:3])
+                    tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
 
-                bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_c,
-                    0,
-                    cute.make_layout(1),
-                    sepi_for_tma_partition,
-                    tcgc_for_tma_partition,
-                )
+                    sepi_for_tma_partition = cute.group_modes(sC, 0, 2)
+                    tcgc_for_tma_partition = cute.zipped_divide(
+                        gC_mnl_slice, self.epi_tile
+                    )
 
-                # Epilogue: iterate (epi_m, epi_n) explicitly
-                # and use (mma_m, mma_n) mode indexing into tRS_rAcc so
-                # the loop works for any epi_tile_m / epi_tile_n.  Also
-                # supports OOB-iteration skipping when m_actual < tile_M.
-                epi_rest_m = cute.size(tcgc_for_tma_partition, mode=[1, 0])
-                epi_rest_n = cute.size(tcgc_for_tma_partition, mode=[1, 1])
-                epi_tile_m = self.epi_tile[0]
-                epi_tile_n = self.epi_tile[1]
-                # mma_tile_{m,n} = per-mma-atom (M,N) size.  tRS_rAcc has
-                # shape (atom_v, mma_m, mma_n); modes 1, 2 give the atom
-                # counts in M, N.
-                mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
-                mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rAcc, mode=[2])
-                MmaMPerEpiM = epi_tile_m // mma_tile_m
-                MmaNPerEpiN = epi_tile_n // mma_tile_n
+                    bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
+                        tma_atom_c,
+                        0,
+                        cute.make_layout(1),
+                        sepi_for_tma_partition,
+                        tcgc_for_tma_partition,
+                    )
 
-                tma_store_producer_group = pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread,
-                    self.num_mma_warps * self.num_threads_per_warp,
-                )
-                tma_store_pipeline = pipeline.PipelineTmaStore.create(
-                    num_stages=self.epi_stage,
-                    producer_group=tma_store_producer_group,
-                )
+                    # Iterate (epi_m, epi_n) explicitly, indexing tRS_rAcc
+                    # by (mma_m, mma_n) modes, so the loop works for any
+                    # epi_tile shape.
+                    epi_rest_m = cute.size(tcgc_for_tma_partition, mode=[1, 0])
+                    epi_rest_n = cute.size(tcgc_for_tma_partition, mode=[1, 1])
+                    epi_tile_m = self.epi_tile[0]
+                    epi_tile_n = self.epi_tile[1]
+                    # tRS_rAcc holds one fragment per MMA-atom tile, so
+                    # dividing the CTA tile by its (mma_m, mma_n) mode
+                    # extents gives the per-atom tile size.
+                    mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
+                    mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rAcc, mode=[2])
+                    MmaMPerEpiM = epi_tile_m // mma_tile_m
+                    MmaNPerEpiN = epi_tile_n // mma_tile_n
 
-                # Skip OOB epilogue iterations when actual M < tile_M.
-                m_actual = cute.size(mC_mnl, mode=[0])
-                cta_m_offset = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
+                    tma_store_producer_group = pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread,
+                        self.num_mma_warps * self.num_threads_per_warp,
+                    )
+                    tma_store_pipeline = pipeline.PipelineTmaStore.create(
+                        num_stages=self.epi_stage,
+                        producer_group=tma_store_producer_group,
+                    )
 
-                # kept_count cycles in lockstep with the TMA-store pipeline.
-                # epi_buffer = kept_count % num_stages stays in sync with
-                # producer_commit/acquire calls, regardless of how many
-                # iterations are skipped.
-                kept_count = 0
-                for epi_n in cutlass.range_constexpr(epi_rest_n):
-                    for epi_m in cutlass.range_constexpr(epi_rest_m):
-                        epi_m_global_start = cta_m_offset + Int32(epi_m * epi_tile_m)
-                        if epi_m_global_start < m_actual:
-                            # Copy this epi-tile's slice of acc -> tRS_rD
-                            # using b12x-style (mma_m, mma_n) indexing.
-                            for mma_n_in_epi in cutlass.range_constexpr(MmaNPerEpiN):
-                                for mma_m_in_epi in cutlass.range_constexpr(
-                                    MmaMPerEpiM
+                    m_actual = cute.size(mC_mnl, mode=[0])
+                    cta_m_offset = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
+
+                    # Skipped iterations must not advance the TMA-store
+                    # pipeline, so the stage index comes from kept_count,
+                    # not the loop indices.
+                    kept_count = 0
+                    for epi_n in cutlass.range_constexpr(epi_rest_n):
+                        for epi_m in cutlass.range_constexpr(epi_rest_m):
+                            epi_m_global_start = cta_m_offset + Int32(
+                                epi_m * epi_tile_m
+                            )
+                            if epi_m_global_start < m_actual:
+                                for mma_n_in_epi in cutlass.range_constexpr(
+                                    MmaNPerEpiN
                                 ):
-                                    mma_n = epi_n * MmaNPerEpiN + mma_n_in_epi
-                                    mma_m = epi_m * MmaMPerEpiM + mma_m_in_epi
-                                    tRS_rD_slice = tRS_rD[
-                                        (None, mma_m_in_epi, mma_n_in_epi)
-                                    ]
-                                    tRS_rAcc_slice = tRS_rAcc[(None, mma_m, mma_n)]
-                                    for elem_idx in cutlass.range_constexpr(
-                                        cute.size(tRS_rD_slice)
+                                    for mma_m_in_epi in cutlass.range_constexpr(
+                                        MmaMPerEpiM
                                     ):
-                                        tRS_rD_slice[elem_idx] = tRS_rAcc_slice[
-                                            elem_idx
+                                        mma_n = epi_n * MmaNPerEpiN + mma_n_in_epi
+                                        mma_m = epi_m * MmaMPerEpiM + mma_m_in_epi
+                                        tRS_rD_slice = tRS_rD[
+                                            (None, mma_m_in_epi, mma_n_in_epi)
                                         ]
+                                        tRS_rAcc_slice = tRS_rAcc[(None, mma_m, mma_n)]
+                                        for elem_idx in cutlass.range_constexpr(
+                                            cute.size(tRS_rD_slice)
+                                        ):
+                                            tRS_rD_slice[elem_idx] = tRS_rAcc_slice[
+                                                elem_idx
+                                            ]
 
-                            tRS_rD_out = cute.make_rmem_tensor(
-                                tRS_rD_layout.shape, self.c_dtype
-                            )
-                            # Apply the global alpha here, once, on the
-                            # fp32 accumulator (hoisted out of the
-                            # per-K-block dequant): one rounding instead
-                            # of folding alpha into every B scale.
-                            acc_vec = tRS_rD.load()
-                            tRS_rD_out.store((alpha_val * acc_vec).to(self.c_dtype))
-
-                            epi_buffer = kept_count % cute.size(tRS_sD, mode=[3])
-                            cute.copy(
-                                tiled_copy_r2s,
-                                tRS_rD_out,
-                                tRS_sD[(None, None, None, epi_buffer)],
-                            )
-                            cute.arch.fence_proxy("async.shared", space="cta")
-                            self.epilog_sync_barrier.arrive_and_wait()
-
-                            if warp_idx == 0:
-                                cute.copy(
-                                    tma_atom_c,
-                                    bSG_sD[(None, epi_buffer)],
-                                    bSG_gD[(None, (epi_m, epi_n))],
+                                tRS_rD_out = cute.make_rmem_tensor(
+                                    tRS_rD_layout.shape, self.c_dtype
                                 )
-                                tma_store_pipeline.producer_commit()
-                                tma_store_pipeline.producer_acquire()
-                            kept_count = kept_count + 1
+                                acc_vec = tRS_rD.load()
+                                tRS_rD_out.store((alpha_val * acc_vec).to(self.c_dtype))
 
-                tma_store_pipeline.producer_tail()
+                                epi_buffer = kept_count % cute.size(tRS_sD, mode=[3])
+                                cute.copy(
+                                    tiled_copy_r2s,
+                                    tRS_rD_out,
+                                    tRS_sD[(None, None, None, epi_buffer)],
+                                )
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                self.epilog_sync_barrier.arrive_and_wait()
+
+                                if warp_idx == 0:
+                                    cute.copy(
+                                        tma_atom_c,
+                                        bSG_sD[(None, epi_buffer)],
+                                        bSG_gD[(None, (epi_m, epi_n))],
+                                    )
+                                    tma_store_pipeline.producer_commit()
+                                    tma_store_pipeline.producer_acquire()
+                                kept_count = kept_count + 1
+
+                    tma_store_pipeline.producer_tail()
 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
@@ -1036,19 +1129,25 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
-                tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
-                tBpacked_g_kn = tBpacked_g[
-                    (None, None, tile_coord_mnl[1], tile_coord_mnl[2])
-                ]
-                tBsf_g_kn = tBsf_g[(None, None, tile_coord_mnl[1], tile_coord_mnl[2])]
+                if cutlass.const_expr(self.k_splits > 1):
+                    tile_l, split_idx, k_start, k_len = self._split_work_krange(
+                        tile_coord_mnl[2], k_tile_cnt
+                    )
+                else:
+                    tile_l = tile_coord_mnl[2]
+                    k_start = Int32(0)
+                    k_len = k_tile_cnt
+                tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_l)]
+                tBpacked_g_kn = tBpacked_g[(None, None, tile_coord_mnl[1], tile_l)]
+                tBsf_g_kn = tBsf_g[(None, None, tile_coord_mnl[1], tile_l)]
                 mainloop_producer_state.reset_count()
-                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for _k_tile in cutlass.range(0, k_len, 1, unroll=1):
                     mainloop_pipeline.producer_acquire(mainloop_producer_state)
                     barrier_ptr = mainloop_pipeline.producer_get_barrier(
                         mainloop_producer_state
                     )
 
-                    tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
+                    tAgA_k = tAgA_mkl[(None, k_start + mainloop_producer_state.count)]
                     tAsA_pipe = tAsA[(None, mainloop_producer_state.index)]
                     cute.copy(
                         tma_atom_a,
@@ -1058,7 +1157,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                         mcast_mask=a_mcast_mask,
                     )
 
-                    tBpacked_g_k = tBpacked_g_kn[(None, mainloop_producer_state.count)]
+                    tBpacked_g_k = tBpacked_g_kn[
+                        (None, k_start + mainloop_producer_state.count)
+                    ]
                     tBpacked_s_pipe = tBpacked_s[(None, mainloop_producer_state.index)]
                     cute.copy(
                         tma_atom_b_packed,
@@ -1068,7 +1169,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                         mcast_mask=b_mcast_mask,
                     )
 
-                    tBsf_g_k = tBsf_g_kn[(None, mainloop_producer_state.count)]
+                    tBsf_g_k = tBsf_g_kn[
+                        (None, k_start + mainloop_producer_state.count)
+                    ]
                     tBsf_s_pipe = tBsf_s[(None, mainloop_producer_state.index)]
                     cute.copy(
                         tma_atom_b_sf,
@@ -1215,10 +1318,18 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         max_active_clusters: cutlass.Constexpr,
         tile_swizzle: cutlass.Constexpr = 1,
         raster_along_m: cutlass.Constexpr = True,
+        k_splits: cutlass.Constexpr = 1,
     ):
         c_shape = cute.slice_(tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
+        # Split-K reuses the scheduler's otherwise size-1 batch (L) mode.
+        if cutlass.const_expr(k_splits > 1):
+            num_ctas_mnl = (
+                num_ctas_mnl[0],
+                num_ctas_mnl[1],
+                num_ctas_mnl[2] * k_splits,
+            )
         cluster_shape_mnl = (1, 1, 1)
         tile_sched_params = utils.PersistentTileSchedulerParams(
             num_ctas_mnl,
@@ -1267,6 +1378,18 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             num_multicast=mcast_dim,
         )
         return tma_atom, tma_tensor
+
+    @cute.jit
+    def _split_work_krange(self, tile_coord_l, k_tile_cnt):
+        """Compute the balanced K-tile range of one split.
+
+        Producer and consumer branches both call this so their ranges agree.
+        """
+        split_idx = Int32(tile_coord_l) % Int32(self.k_splits)
+        tile_l = Int32(tile_coord_l) // Int32(self.k_splits)
+        k_start = split_idx * k_tile_cnt // Int32(self.k_splits)
+        k_stop = (split_idx + Int32(1)) * k_tile_cnt // Int32(self.k_splits)
+        return tile_l, split_idx, k_start, k_stop - k_start
 
     @cute.jit
     def _cvt_a_bf16_to_fp16_one_k_block(
@@ -1412,6 +1535,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         mB_packed: cute.Tensor,
         mB_sf: cute.Tensor,
         mC: cute.Tensor,
+        mPartial: cute.Tensor,
         mAlpha: cute.Tensor,
         l: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -1424,11 +1548,15 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             mB_packed: (k // 16, n * 2) int32 -- packed FP4.
             mB_sf:     (k // 16, n) uint8 -- FP8-E4M3 per-group scales.
             mC:        (m, n) output tensor C, bf16 or fp16.
+            mPartial:  (k_splits * m * n,) fp32 split-K partials; a small
+                       unused dummy when k_splits == 1.
             mAlpha:    (1,) fp32 global scale.
             l: batch dimension (Constexpr); typically 1.
             max_active_clusters: Constexpr from get_max_active_clusters(1).
             current_stream: CUDA stream (TVM-FFI fake stream).
         """
+        if cutlass.const_expr(self.k_splits > 1 and l != 1):
+            raise ValueError("k_splits > 1 requires l == 1")
         m = cute.size(mA, mode=[0])
         k = cute.size(mA, mode=[1])
         n = cute.size(mC, mode=[1])
@@ -1458,6 +1586,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             b_packed_tensor,
             b_sf_tensor,
             c_tensor,
+            mPartial,
             mAlpha,
             max_active_clusters,
             current_stream,
