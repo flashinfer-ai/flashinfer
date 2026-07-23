@@ -9,6 +9,7 @@ import torch
 import flashinfer
 from flashinfer import autotune
 from flashinfer.autotuner import AutoTuner
+from flashinfer.mla._batch_mla import _functional as batch_mla_core
 from flashinfer.utils import (
     get_compute_capability,
     get_device_sm_count,
@@ -124,3 +125,88 @@ def test_autotune_dispatcher_runs_with_auto_backend_and_caller_counter():
     assert out.shape == (query.shape[0], 1, _NUM_HEADS, _KV_LORA_RANK)
     assert out.isfinite().all()
     assert torch.count_nonzero(caller_counter_buffer).item() == 0
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected_candidates"),
+    (("trtllm-gen", ("trtllm-gen",)), ("auto", ("trtllm-gen", "cute-dsl"))),
+)
+def test_explicit_and_auto_candidate_names_and_order_remain_stable(
+    monkeypatch, backend, expected_candidates
+):
+    seen = {}
+
+    class FakeRunner:
+        def __init__(self, name, **kwargs):
+            self.name = name
+
+        def __call__(self, *, inputs, tactic):
+            seen["final_call"] = (self.name, inputs, tactic)
+
+    class FakeAutoTuner:
+        @classmethod
+        def get(cls):
+            return cls()
+
+        def choose_one(self, op_name, runners, tuning_config, inputs):
+            seen["choose"] = (
+                op_name,
+                tuple(runner.name for runner in runners),
+                tuning_config,
+            )
+            return runners[0], -1
+
+    monkeypatch.setattr(
+        batch_mla_core,
+        "TrtllmGenMlaDecodeRunner",
+        lambda **kwargs: FakeRunner("trtllm-gen", **kwargs),
+    )
+    monkeypatch.setattr(
+        batch_mla_core,
+        "CuteDslMlaDecodeRunner",
+        lambda **kwargs: FakeRunner("cute-dsl", **kwargs),
+    )
+    monkeypatch.setattr(batch_mla_core, "AutoTuner", FakeAutoTuner)
+    monkeypatch.setattr(batch_mla_core, "device_support_pdl", lambda device: False)
+    monkeypatch.setattr(batch_mla_core, "get_device_sm_count", lambda device: 120)
+    monkeypatch.setattr(
+        batch_mla_core,
+        "_check_trtllm_gen_mla_shape",
+        lambda query, kv_cache, *args, **kwargs: kv_cache,
+    )
+    monkeypatch.setattr(
+        batch_mla_core,
+        "_cute_dsl_incompatibility_reason",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        batch_mla_core,
+        "_build_mla_decode_tuning_config",
+        lambda **kwargs: seen.setdefault(
+            "tuning_runner_names", tuple(kwargs["runner_names"])
+        ),
+    )
+
+    query = torch.empty((2, 1, 128, 576), dtype=torch.bfloat16)
+    out = torch.empty((2, 1, 128, 512), dtype=torch.bfloat16)
+    result = batch_mla_core._run_mla_decode_trtllm_gen_or_cute_dsl_impl(
+        query=query,
+        kv_cache=torch.empty((4, 1, 64, 576), dtype=torch.bfloat16),
+        workspace_buffer=torch.empty(16, dtype=torch.uint8),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        max_seq_len=64,
+        out=out,
+        backend=backend,
+    )
+
+    assert result is out
+    assert seen["tuning_runner_names"] == expected_candidates
+    assert seen["choose"][:2] == (
+        "trtllm_batch_decode_mla",
+        expected_candidates,
+    )
+    assert seen["final_call"][0] == expected_candidates[0]

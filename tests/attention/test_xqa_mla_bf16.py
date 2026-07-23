@@ -35,7 +35,7 @@ def test_xqa_mla_batch_decode_bf16(
 ):
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip(
-            "XQA MLA BF16 requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)."
+            "XQA MLA BF16 requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)."
         )
     # Redundant check against the raw compute capability, kept symmetric
     # with the existing FP8 test so the skip reason is unambiguous.

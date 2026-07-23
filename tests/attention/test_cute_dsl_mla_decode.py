@@ -1763,3 +1763,219 @@ def test_mla_decode_trtllm_gen_rejects_block_size_128():
     args = _mla_decode_block_size_128_inputs()
     with pytest.raises(ValueError, match=r"trtllm-gen requires block_size"):
         trtllm_batch_decode_with_kv_cache_mla(**args, backend="trtllm-gen")
+
+
+def _batch_mla_wrapper_cute_dsl_case(metadata_form, cute_dsl_impl):
+    skip_if_unsupported()
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    batch_size, num_heads = 2, 128
+    kv_lora_rank, qk_rope_head_dim, page_size = 512, 64, 64
+    query = torch.randn(
+        batch_size,
+        1,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=torch.float16,
+        device=device,
+    )
+    kv_cache = torch.randn(
+        4,
+        page_size,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=torch.float16,
+        device=device,
+    )
+    block_tables = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([64, 96], dtype=torch.int32, device=device)
+    cum_seq_lens_q = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    wrapper_workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    functional_workspace = torch.empty_like(wrapper_workspace)
+    use_sinks = cute_dsl_impl == "modular"
+    sinks = (
+        torch.randn(num_heads, dtype=torch.float32, device=device)
+        if use_sinks
+        else None
+    )
+    return_lse = cute_dsl_impl == "monolithic"
+    bmm1_scale, bmm2_scale = 0.2, 1.25
+
+    wrapper = BatchMLAPagedAttentionWrapper(wrapper_workspace, backend="cute-dsl")
+    common_plan = dict(
+        num_heads=num_heads,
+        head_dim_ckv=kv_lora_rank,
+        head_dim_kpe=qk_rope_head_dim,
+        page_size=page_size,
+        causal=False,
+        sm_scale=0.125,
+        q_data_type=query.dtype,
+        kv_data_type=kv_cache.dtype,
+        is_var_seq=True,
+        cute_dsl_impl=cute_dsl_impl,
+        use_sinks=use_sinks,
+    )
+    if metadata_form == "dense":
+        wrapper.plan(
+            cum_seq_lens_q=cum_seq_lens_q,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_q_len=1,
+            **common_plan,
+        )
+    else:
+        wrapper.plan(
+            cum_seq_lens_q,
+            torch.tensor([0, 1, 3], dtype=torch.int32, device=device),
+            torch.tensor([0, 2, 3], dtype=torch.int32, device=device),
+            seq_lens,
+            **common_plan,
+        )
+
+    wrapper_out = torch.empty(
+        (batch_size, num_heads, kv_lora_rank),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    wrapper_lse = torch.empty(
+        (batch_size, num_heads), dtype=torch.float32, device=device
+    )
+    return dict(
+        wrapper=wrapper,
+        query=query,
+        kv_cache=kv_cache,
+        functional_workspace=functional_workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        sinks=sinks,
+        return_lse=return_lse,
+        cute_dsl_impl=cute_dsl_impl,
+        wrapper_out=wrapper_out,
+        wrapper_lse=wrapper_lse,
+    )
+
+
+def _run_batch_mla_wrapper_cute_dsl_case(case):
+    rank = case["kv_lora_rank"]
+    query = case["query"]
+    kv_cache = case["kv_cache"]
+    return case["wrapper"].run(
+        query[..., :rank].flatten(0, 1),
+        query[..., rank:].flatten(0, 1),
+        kv_cache[..., :rank],
+        kv_cache[..., rank:],
+        out=case["wrapper_out"],
+        lse=case["wrapper_lse"] if case["return_lse"] else None,
+        return_lse=case["return_lse"],
+        sinks=case["sinks"],
+        bmm1_scale=case["bmm1_scale"],
+        bmm2_scale=case["bmm2_scale"],
+    )
+
+
+def _functional_batch_mla_cute_dsl_result(case):
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    query = case["query"]
+    rank = case["kv_lora_rank"]
+    return trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=case["kv_cache"],
+        workspace_buffer=case["functional_workspace"],
+        qk_nope_head_dim=128,
+        kv_lora_rank=rank,
+        qk_rope_head_dim=case["qk_rope_head_dim"],
+        block_tables=case["block_tables"],
+        seq_lens=case["seq_lens"],
+        max_seq_len=96,
+        bmm1_scale=case["bmm1_scale"],
+        bmm2_scale=case["bmm2_scale"],
+        out=torch.empty(
+            (query.size(0), 1, query.size(2), rank),
+            dtype=torch.bfloat16,
+            device=query.device,
+        ),
+        sinks=None if case["sinks"] is None else [case["sinks"]],
+        backend="cute-dsl",
+        is_var_seq=True,
+        return_lse=case["return_lse"],
+        cute_dsl_impl=case["cute_dsl_impl"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("metadata_form", "cute_dsl_impl"),
+    (("dense", "monolithic"), ("csr", "modular")),
+)
+def test_batch_mla_wrapper_cute_dsl_matches_functional_api(
+    metadata_form, cute_dsl_impl
+):
+    case = _batch_mla_wrapper_cute_dsl_case(metadata_form, cute_dsl_impl)
+    functional = _functional_batch_mla_cute_dsl_result(case)
+    wrapped = _run_batch_mla_wrapper_cute_dsl_case(case)
+
+    return_lse = case["return_lse"]
+    functional_out = functional[0] if return_lse else functional
+    wrapped_out = wrapped[0] if return_lse else wrapped
+    torch.testing.assert_close(
+        wrapped_out,
+        functional_out.flatten(0, 1),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    if return_lse:
+        torch.testing.assert_close(wrapped[1], functional[1], atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("cute_dsl_impl", ("monolithic", "modular"))
+def test_batch_mla_wrapper_cute_dsl_reuses_planned_artifact(cute_dsl_impl):
+    case = _batch_mla_wrapper_cute_dsl_case("dense", cute_dsl_impl)
+
+    from flashinfer.cute_dsl.attention import mla_dispatch
+
+    if cute_dsl_impl == "monolithic":
+        from flashinfer.cute_dsl.attention.monolithic import mla_decode as impl
+
+        compile_helper = "_get_compiled_mla_kernel"
+    else:
+        from flashinfer.cute_dsl.attention.wrappers import batch_mla as impl
+
+        compile_helper = "_compile_mla_kernel"
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            mla_dispatch,
+            "_resolve_impl",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("run selected a CuTe implementation")
+            ),
+        )
+        monkeypatch.setattr(
+            impl,
+            compile_helper,
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("run loaded or compiled a CuTe kernel")
+            ),
+        )
+        _run_batch_mla_wrapper_cute_dsl_case(case)
+
+
+def test_batch_mla_wrapper_cute_dsl_cuda_graph_replays():
+    case = _batch_mla_wrapper_cute_dsl_case("dense", "monolithic")
+    functional = _functional_batch_mla_cute_dsl_result(case)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_result = _run_batch_mla_wrapper_cute_dsl_case(case)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        graph_result[0], functional[0].flatten(0, 1), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(graph_result[1], functional[1], atol=1e-3, rtol=1e-3)

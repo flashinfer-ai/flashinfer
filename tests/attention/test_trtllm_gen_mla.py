@@ -1,7 +1,8 @@
+import random
+
 import pytest
 import torch
 import torch.nn.functional as F
-import random
 
 import flashinfer
 from flashinfer.mla import (

@@ -39,6 +39,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
 )
 from flashinfer.utils import is_sm12x_supported
 
+
 pytestmark = pytest.mark.skipif(
     not is_sm12x_supported(torch.device("cuda")),
     reason="Sparse-MLA SM120 requires SM12x.",

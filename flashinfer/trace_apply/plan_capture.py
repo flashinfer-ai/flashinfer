@@ -44,6 +44,16 @@ class StatefulAdapter:
     self_attrs: dict[str, str] = field(default_factory=dict)
 
 
+_MLA_STATEFUL_ADAPTER = StatefulAdapter(
+    plan_attr="plan",
+    plan_inputs={
+        "kv_indptr": "kv_indptr",
+        "kv_indices": "kv_indices",
+        "sm_scale": "sm_scale",
+    },
+)
+
+
 # Keyed by fi_api (module.qualname of the wrapper's run method).
 STATEFUL_ADAPTERS: dict[str, StatefulAdapter] = {
     "flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run": StatefulAdapter(
@@ -76,13 +86,9 @@ STATEFUL_ADAPTERS: dict[str, StatefulAdapter] = {
             "sm_scale": "sm_scale",
         },
     ),
-    "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run": StatefulAdapter(
-        plan_attr="plan",
-        plan_inputs={
-            "kv_indptr": "kv_indptr",
-            "kv_indices": "kv_indices",
-            "sm_scale": "sm_scale",
-        },
+    "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run": _MLA_STATEFUL_ADAPTER,
+    "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run": (
+        _MLA_STATEFUL_ADAPTER
     ),
 }
 

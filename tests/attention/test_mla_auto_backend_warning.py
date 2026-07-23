@@ -15,42 +15,182 @@ import pytest
 import torch
 
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
+from flashinfer.mla._batch_mla import _wrapper as batch_mla_core
+from flashinfer.mla._batch_mla._backends import cutlass_backend
+from flashinfer.mla._batch_mla._backends import fa2_backend
+from flashinfer.mla._batch_mla._backends import fa3_backend
 
 
 WARN_TAG = "not Blackwell-native"
+
+
+class _NoopBackend:
+    def __init__(self, before_metadata_commit):
+        self._before_metadata_commit = before_metadata_commit
+
+    def plan(self, **kwargs):
+        if self._before_metadata_commit is not None:
+            self._before_metadata_commit()
+
+
+class _NoopFa2Backend(_NoopBackend, fa2_backend._BatchMLAPagedAttentionFa2Backend):
+    def __init__(self, *args):
+        _NoopBackend.__init__(self, args[-1])
+
+
+class _NoopFa3Backend(_NoopBackend, fa3_backend._BatchMLAPagedAttentionFa3Backend):
+    def __init__(self, *args):
+        _NoopBackend.__init__(self, args[-1])
+
+
+class _NoopCutlassBackend(
+    _NoopBackend, cutlass_backend._BatchMLAPagedAttentionCutlassBackend
+):
+    def __init__(self, *args):
+        _NoopBackend.__init__(self, None)
+
+
+_ORIGINAL_PLAN_FROM_WRAPPER = {
+    "fa2": fa2_backend._BatchMLAPagedAttentionFa2Backend.__dict__[
+        "plan_from_wrapper"
+    ].__func__,
+    "fa3": fa3_backend._BatchMLAPagedAttentionFa3Backend.__dict__[
+        "plan_from_wrapper"
+    ].__func__,
+    "cutlass": cutlass_backend._BatchMLAPagedAttentionCutlassBackend.__dict__[
+        "plan_from_wrapper"
+    ].__func__,
+}
+
+
+def _patch_plan_from_wrapper_owner(monkeypatch, backend_name, owner):
+    backend_type = batch_mla_core._WRAPPER_BACKEND_TYPES[backend_name]
+    plan_from_wrapper = _ORIGINAL_PLAN_FROM_WRAPPER[backend_name]
+
+    def dispatch(cls, args):
+        assert cls is backend_type
+        return plan_from_wrapper(owner, args)
+
+    monkeypatch.setattr(
+        backend_type,
+        "plan_from_wrapper",
+        classmethod(dispatch),
+    )
 
 
 def _fresh_state():
     BatchMLAPagedAttentionWrapper._blackwell_auto_fallback_warned = False
 
 
-def _make(buf, backend):
+def _make(buf, backend, monkeypatch):
+    monkeypatch.setattr(batch_mla_core, "determine_mla_backend", lambda device: "fa2")
+    _patch_plan_from_wrapper_owner(monkeypatch, "fa2", _NoopFa2Backend)
+    _patch_plan_from_wrapper_owner(monkeypatch, "fa3", _NoopFa3Backend)
+    _patch_plan_from_wrapper_owner(monkeypatch, "cutlass", _NoopCutlassBackend)
+
+    qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device=buf.device)
+    kv_indptr = torch.tensor([0, 1], dtype=torch.int32, device=buf.device)
+    kv_indices = torch.tensor([0], dtype=torch.int32, device=buf.device)
+    kv_len_arr = torch.tensor([1], dtype=torch.int32, device=buf.device)
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        BatchMLAPagedAttentionWrapper(buf, backend=backend)
+        wrapper = BatchMLAPagedAttentionWrapper(buf, backend=backend)
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            num_heads=1,
+            head_dim_ckv=512,
+            head_dim_kpe=64,
+            page_size=1,
+            causal=False,
+            sm_scale=1.0,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
         return [str(x.message) for x in w if WARN_TAG in str(x.message)]
 
 
 @pytest.fixture
 def buf():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
     _fresh_state()
-    return torch.empty(8 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    return torch.empty(8, dtype=torch.int8)
 
 
-@patch("flashinfer.mla._core.get_compute_capability", return_value=(10, 0))
-def test_auto_warns_once_on_blackwell(_cc, buf):
-    assert len(_make(buf, "auto")) == 1
-    assert len(_make(buf, "auto")) == 0  # one-time
+@patch(
+    "flashinfer.mla._batch_mla._wrapper.get_compute_capability", return_value=(10, 0)
+)
+def test_auto_warns_once_on_blackwell(_cc, buf, monkeypatch):
+    assert len(_make(buf, "auto", monkeypatch)) == 1
+    assert len(_make(buf, "auto", monkeypatch)) == 0  # one-time
 
 
-@patch("flashinfer.mla._core.get_compute_capability", return_value=(10, 0))
-def test_explicit_backend_does_not_warn(_cc, buf):
-    assert _make(buf, "fa2") == []
-    assert _make(buf, "cutlass") == []
+@patch(
+    "flashinfer.mla._batch_mla._wrapper.get_compute_capability", return_value=(10, 0)
+)
+def test_explicit_backend_does_not_warn(_cc, buf, monkeypatch):
+    assert _make(buf, "fa2", monkeypatch) == []
+    assert _make(buf, "cutlass", monkeypatch) == []
 
 
-@patch("flashinfer.mla._core.get_compute_capability", return_value=(9, 0))
-def test_no_warn_on_hopper(_cc, buf):
-    assert _make(buf, "auto") == []
+@patch("flashinfer.mla._batch_mla._wrapper.get_compute_capability", return_value=(9, 0))
+def test_no_warn_on_hopper(_cc, buf, monkeypatch):
+    assert _make(buf, "auto", monkeypatch) == []
+
+
+def test_warning_as_error_stops_before_fa_commit_and_preserves_plan(buf, monkeypatch):
+    events = []
+    backends = []
+
+    class CommitRecordingBackend(fa2_backend._BatchMLAPagedAttentionFa2Backend):
+        def __init__(self, *args):
+            self.committed = False
+            backends.append(self)
+
+        def plan(self, **kwargs):
+            events.append("planned")
+            self.committed = True
+            events.append("committed")
+
+    monkeypatch.setattr(batch_mla_core, "determine_mla_backend", lambda device: "fa2")
+    _patch_plan_from_wrapper_owner(monkeypatch, "fa2", CommitRecordingBackend)
+    monkeypatch.setattr(
+        batch_mla_core,
+        "get_compute_capability",
+        lambda device: (9, 0) if not backends else (10, 0),
+    )
+    plan_args = dict(
+        qo_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        kv_indices=torch.tensor([0], dtype=torch.int32),
+        kv_len_arr=torch.tensor([1], dtype=torch.int32),
+        num_heads=1,
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        page_size=1,
+        causal=False,
+        sm_scale=1.0,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    wrapper = BatchMLAPagedAttentionWrapper(buf, backend="auto")
+    wrapper.plan(**plan_args)
+    original_state = (
+        wrapper._backend_impl,
+        wrapper._selected_backend,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        with pytest.raises(UserWarning, match=WARN_TAG):
+            wrapper.plan(**plan_args)
+
+    assert events == ["planned", "committed"]
+    assert backends[0].committed
+    assert len(backends) == 1
+    assert (
+        wrapper._backend_impl,
+        wrapper._selected_backend,
+    ) == original_state
+    assert BatchMLAPagedAttentionWrapper._blackwell_auto_fallback_warned
