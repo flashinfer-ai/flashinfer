@@ -2669,7 +2669,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     kv_lora_rank : int
         Latent KV rank. TRTLLM-GEN and SM120/SM121 sparse v32/GLM use ``512``.
     qk_rope_head_dim : int
-        RoPE head dimension. Sparse MLA paths use ``64``.
+        RoPE head dimension. Sparse MLA paths use ``64``; the native
+        no-RoPE TRTLLM-GEN path (``kv_lora_rank=512``) uses ``0``.
     block_tables : torch.Tensor
         Page table for dense MLA backends when ``sparse_mla_top_k == 0``. For
         SM100/SM103 TRTLLM-GEN sparse MLA it is the usual paged block table.

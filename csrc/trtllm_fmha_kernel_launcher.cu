@@ -443,6 +443,7 @@ void trtllm_paged_attention_decode(
         << "sparse_mla_top_k_lens must be on the same device as query";
     TVM_FFI_ICHECK_EQ(top_k_lens.device().device_id, query.device().device_id)
         << "sparse_mla_top_k_lens must be on the same device as query";
+    TVM_FFI_ICHECK(top_k_lens.IsContiguous()) << "sparse_mla_top_k_lens must be contiguous";
     sparse_mla_top_k_lens_ptr = static_cast<int*>(top_k_lens.data_ptr());
   }
   auto maybe_bmm1_scale_value = bmm1_scale.as<double>();
