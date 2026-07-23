@@ -11,8 +11,16 @@
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
 
+// Dedicated Block Extend dispatch — compiles only MaskMode::kBlockExtend.
 #define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, ...) \
-  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { using AttentionVariant = {{ variant_name }}; __VA_ARGS__(); })
+  { \
+    if (mask_mode != MaskMode::kBlockExtend) { \
+      FLASHINFER_ERROR("Block-extend JIT module only supports kBlockExtend"); \
+    } \
+    constexpr MaskMode MASK_MODE = MaskMode::kBlockExtend; \
+    using AttentionVariant = {{ variant_name }}; \
+    __VA_ARGS__(); \
+  }
 
 using namespace flashinfer;
 
@@ -62,6 +70,14 @@ struct Params {
   int window_left;
 
   bool causal;
+
+  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
+    return qo_len;
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+    return kv_len;
+  }
 };
 
 {{ variant_decl }}

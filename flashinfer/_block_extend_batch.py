@@ -1,6 +1,5 @@
 """Private JIT wiring for native Block Extend batch prefill."""
 
-import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -71,7 +70,11 @@ def _get_uri(
     idtype_uri = {torch.int32: "i32", torch.int64: "i64"}
     if head_dim_qk not in (64, 128) or head_dim_vo not in (64, 128):
         raise ValueError("block_extend only supports head dimensions 64 and 128")
-    if dtype_q not in dtype_uri or dtype_kv not in dtype_uri or dtype_o not in dtype_uri:
+    if (
+        dtype_q not in dtype_uri
+        or dtype_kv not in dtype_uri
+        or dtype_o not in dtype_uri
+    ):
         raise ValueError("block_extend only supports fp16 and bf16")
     if idtype not in idtype_uri:
         raise ValueError("block_extend only supports int32 and int64 indptr")

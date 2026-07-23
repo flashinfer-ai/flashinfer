@@ -33,7 +33,8 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool BLOCK_EXTEND = false, bool MULTIITEMSCORING = false>
+template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool BLOCK_EXTEND = false,
+          bool MULTIITEMSCORING = false>
 struct SparseCollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;

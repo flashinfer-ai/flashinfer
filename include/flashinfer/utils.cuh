@@ -548,9 +548,9 @@ __device__ __forceinline__ uint32_t dim4_offset(const uint32_t& dim_c, const uin
 // Block Extend related type traits (defined once here to avoid ODR violations)
 DEFINE_HAS_MEMBER(dllm_block_size)
 DEFINE_HAS_MEMBER(q_block_extend_offset)
-DEFINE_HAS_MEMBER(maybe_q_block_extend_offset)  // per-batch q_offset pointer for FA3 BatchPrefill
-DEFINE_HAS_MEMBER(kv_block_extend_offset)       // kv_offset for Cascade Current Chunk
-DEFINE_HAS_MEMBER(maybe_kv_block_extend_offset) // per-batch kv_offset pointer for FA3 BatchPrefill
+DEFINE_HAS_MEMBER(maybe_q_block_extend_offset)   // per-batch q_offset pointer for FA3 BatchPrefill
+DEFINE_HAS_MEMBER(kv_block_extend_offset)        // kv_offset for Cascade Current Chunk
+DEFINE_HAS_MEMBER(maybe_kv_block_extend_offset)  // per-batch kv_offset pointer for FA3 BatchPrefill
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_UTILS_CUH_
