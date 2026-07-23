@@ -332,7 +332,7 @@ class TestTacticEnumeration:
 
         assert len(W4A16_MOE_TACTICS) == len(set(W4A16_MOE_TACTICS))
         assert DEFAULT_W4A16_MOE_TACTIC in W4A16_MOE_TACTICS
-        assert len(W4A16_MOE_TACTICS) == 66
+        assert len(W4A16_MOE_TACTICS) == 63
 
         route_tiles = {tactic[0] for tactic in W4A16_MOE_TACTICS}
         assert route_tiles == {8, 16, 32, 64, 128, 192}
@@ -359,6 +359,10 @@ class TestTacticEnumeration:
                     pair
                     for pair in expected_gemm_pairs
                     if pair[0][0][0] == 128 and pair[1][0][0] == 128
+                }
+            elif route_tile == 192:
+                expected_route_gemm_pairs = {
+                    pair for pair in expected_gemm_pairs if pair[0][0] != (128, 256)
                 }
             route_tactics = [
                 (gemm1_tactic, gemm2_tactic)
@@ -961,6 +965,9 @@ class TestCuteDslMoeW4A16:
     @pytest.mark.parametrize("use_wrapper", [False, True])
     def test_weight_scale_update(self, use_wrapper: bool):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
+        from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
+            DEFAULT_W4A16_MOE_TACTIC,
+        )
 
         num_tokens, hidden_size, intermediate_size = 17, 256, 512
         num_experts, top_k = 8, 2
@@ -999,7 +1006,7 @@ class TestCuteDslMoeW4A16:
 
         def run():
             if moe is not None:
-                return moe.run(**kwargs)
+                return moe.run(**kwargs, tactic=DEFAULT_W4A16_MOE_TACTIC)
             return cute_dsl_fused_moe_nvfp4(
                 **kwargs,
                 num_experts=num_experts,

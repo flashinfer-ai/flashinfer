@@ -119,7 +119,6 @@ class Sm100W4A16GroupedGemmKernel:
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
-        # Set specialized warp ids
         self.epilog_warp_id = (0, 1, 2, 3)
         self.mma_warp_id = 4
         self.schedule_warp_id = 5
@@ -146,7 +145,6 @@ class Sm100W4A16GroupedGemmKernel:
             + 1
         )
 
-        # Set barrier id for cta sync, epilogue sync, and tmem ptr sync
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             1, 32 * len(self.epilog_warp_id)
         )
@@ -156,22 +154,7 @@ class Sm100W4A16GroupedGemmKernel:
         self.smem_buffer_align_bytes = 1024
 
     def _setup_attributes(self):
-        """Set up configurations that are dependent on GEMM inputs
-
-        This method configures various attributes based on the input tensor properties
-        (data types, leading dimensions) and kernel settings:
-        - Deduce where the transformed A tensor is stored
-        - Configuring tiled MMA
-        - Computing MMA/cluster/tile shapes
-        - Computing cluster layout
-        - Computing multicast CTAs for A/B
-        - Computing epilogue sub-tile
-        - Setting up A/scale/B/C stage counts in shared memory
-        - Setting up transformed A stage count in shared memory or tensor memory
-        - Computing A/transformed A/scale/B/C memory layout
-        - Computing tensor memory allocation columns
-        """
-        # Deduce where the transformed A tensor is stored, shared memory(SMEM) or tensor memory(TMEM)
+        """Derive static MMA, pipeline, and storage layouts from operand types."""
         self.transform_a_source = mixed_input_utils.get_transform_a_source(
             self.a_major_mode
         )
@@ -221,7 +204,6 @@ class Sm100W4A16GroupedGemmKernel:
         )
         self.epi_tile_n = cute.size(self.epi_tile[1])
 
-        # Compute tensor memory(TMEM) columns and stages for each pipeline
         (
             self.num_load2trans_stage,
             self.num_trans2mma_stage,
@@ -245,22 +227,18 @@ class Sm100W4A16GroupedGemmKernel:
             self.use_clc_scheduler,
         )
 
-        # Align TMEM columns for allocation
-        # TMEM allocation requires power-of-2 column alignment
-        # and must meet minimum allocation requirements
+        # TMEM allocation requires power-of-two column alignment.
         self.num_tmem_alloc_cols = cute.round_up(
             self.num_acc_tmem_cols + self.num_a_tmem_cols,
             cute.arch.get_min_tmem_alloc_cols("sm_100"),
         )
         self.num_tmem_alloc_cols = 2 ** (ceil(log2(self.num_tmem_alloc_cols)))
-        # Get smem layout for C tensor
         self.c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.c_dtype,
             self.c_layout,
             self.epi_tile,
             self.num_c_stage,
         )
-        # Get smem layout for A, transformed A, and B
         (
             self.smem_layout_a,
             self.smem_layout_a_transform,
@@ -273,7 +251,6 @@ class Sm100W4A16GroupedGemmKernel:
             self.num_load2trans_stage,
             self.num_trans2mma_stage,
         )
-        # Get smem layout for scale tensor
         scale_tile_shape = (
             self.cta_tile_shape_mnk[0],
             self.mma_tiler[2],
@@ -441,7 +418,6 @@ class Sm100W4A16GroupedGemmKernel:
         tArA_transform: cute.Tensor,
         tArA_transform_store: cute.Tensor,
         transform_tiler: cute.Layout,
-        transform_group_idx: cutlass.Int32,
         k_tile_cnt: cutlass.Int32,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
         a_load2trans_consumer_state.reset_count()
@@ -661,7 +637,6 @@ class Sm100W4A16GroupedGemmKernel:
         ):
             raise ValueError("scale_major_mode must be K-major")
 
-        # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
 
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -673,14 +648,12 @@ class Sm100W4A16GroupedGemmKernel:
             self.mma_tiler[:2],
             self.transform_a_source,
         )
-        # Set up gmem copy atoms for A, scale, and B
         a_op = mixed_input_utils.get_tma_atom_kind(
             self.is_a_mcast, self.use_2cta_instrs, False
         )
         b_op = mixed_input_utils.get_tma_atom_kind(
             self.is_b_mcast, self.use_2cta_instrs, True
         )
-        # Deduce TMA copy atom and TMA tensor for A, scale, and B
         smem_layout_a_per_stage = cute.slice_(self.smem_layout_a, (None, None, None, 0))
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
             a_op,
@@ -720,7 +693,6 @@ class Sm100W4A16GroupedGemmKernel:
             ),
         )
 
-        # Calculate copy size for tensor A, B, and scale
         a_copy_size = cute.size_in_bytes(self.a_dtype, smem_layout_a_per_stage)
         b_copy_size = cute.size_in_bytes(self.b_dtype, smem_layout_b_per_stage)
         a_scale_copy_size = cute.size_in_bytes(
@@ -782,7 +754,6 @@ class Sm100W4A16GroupedGemmKernel:
 
         self.shared_storage = SharedStorage
 
-        # Launch kernel
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -819,9 +790,7 @@ class Sm100W4A16GroupedGemmKernel:
             stream=stream,
             use_pdl=self.enable_pdl,
         )
-        return
 
-    # GPU device kernel
     @cute.kernel
     def kernel(
         self,
@@ -1547,7 +1516,6 @@ class Sm100W4A16GroupedGemmKernel:
                     tArA_transform,
                     tArA_transform_store,
                     transform_tiler,
-                    transform_group_idx,
                     k_tile_cnt,
                 )
                 # Advance to next tile
@@ -2210,50 +2178,7 @@ class Sm100W4A16GroupedGemmKernel:
         use_fused_finalize: bool,
         use_clc_scheduler: bool,
     ) -> tuple[int, int, int, int, int, int, int]:
-        """
-        Compute pipeline stages and TMEM column allocation configurations.
-
-        This method calculates the number of pipeline stages for different operations
-        (tile_info, load2trans, trans2mma, accumulator, etc.) and determines TMEM column allocation
-        based on available memory resources and tile configuration.
-
-        :param tiled_mma: The tiled MMA object defining the core computation.
-        :type tiled_mma: cute.TiledMma
-        :param mma_tiler_mnk: The shape (M, N, K) of the MMA tiler.
-        :type mma_tiler_mnk: tuple[int, int, int]
-        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
-        :type cta_tile_shape_mnk: tuple[int, int, int]
-        :param epi_tile: The epilogue tile shape.
-        :type epi_tile: cute.Tile
-        :param a_dtype: Data type of operand A.
-        :type a_dtype: type[cutlass.Numeric]
-        :param b_dtype: Data type of operand B.
-        :type b_dtype: type[cutlass.Numeric]
-        :param c_dtype: Data type of operand C.
-        :type c_dtype: type[cutlass.Numeric]
-        :param c_layout: Layout enum of operand C.
-        :type c_layout: utils.LayoutEnum
-        :param transform_a_source: The source of the transformed A tensor.
-        :type transform_a_source: tcgen05.OperandSource
-        :param smem_buffer_align_bytes: The alignment of the shared memory buffer.
-        :type smem_buffer_align_bytes: int
-        :param use_fused_finalize: Whether the epilogue atomically reduces route
-            outputs into token rows.
-        :type use_fused_finalize: bool
-        :param use_clc_scheduler: Whether routed tiles use CLC dynamic scheduling.
-        :type use_clc_scheduler: bool
-
-        :return: A tuple containing the number of stages for:
-                 (load2trans, transform2mma, accumulator, c, tile_info, tmem_acc_cols, tmem_a_cols)
-        :rtype: tuple[int, int, int, int, int, int, int]
-        - num_load2trans_stage: Stages for A/scale load-to-transform and B load-to-MMA pipelines
-        - num_trans2mma_stage: Stages for transform-to-MMA pipeline
-        - num_acc_stage: Stages for accumulator-to-epilogue pipeline
-        - num_c_stage: Stages for epilogue-to-output C pipeline
-        - num_tile_info_stage: Stages for buffers storing tile info
-        - num_acc_tmem_cols: TMEM columns for accumulator
-        - num_a_tmem_cols: TMEM columns for transformed A tensor
-        """
+        """Fit the load, transform, accumulator, and epilogue pipelines."""
         # Compute tmem columns required for accumulator
         acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
         tCtAcc_stage1 = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
@@ -2431,9 +2356,7 @@ class Sm100W4A16GroupedGemmKernel:
         ],
         tuple[int, int, int],
     ]:
-        """
-        Use persistent tile scheduler to compute the grid size for the output tensor C.
-        """
+        """Build the persistent scheduler and launch grid."""
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
@@ -2467,9 +2390,7 @@ class Sm100W4A16GroupedGemmKernel:
         cluster_shape_mn: tuple[int, int],
         use_2cta_instrs: bool,
     ) -> bool:
-        """
-        Check if the kernel can be implemented for the given tensor shapes and data types.
-        """
+        """Return whether the requested layout and tile shape are supported."""
         m, n, k, _ = mnkl
 
         if not mixed_input_utils.is_valid_mma_tiler_and_cluster_shape(

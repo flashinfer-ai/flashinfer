@@ -952,7 +952,7 @@ def run_benchmark(
         )
         for row, histogram_record in rows_and_histograms:
             _print_row(row, histogram_record)
-        _print_footer(ep_config, num_local, use_per_token_activation)
+        _print_footer(use_per_token_activation)
 
     return results
 
@@ -1241,7 +1241,7 @@ def _print_row(results, histogram_record):
         )
 
 
-def _print_footer(ep_config, num_local, use_per_token_activation):
+def _print_footer(use_per_token_activation):
     """Print benchmark footer."""
     table_width = 120 if use_per_token_activation else 159
     print("-" * table_width)

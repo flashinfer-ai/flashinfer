@@ -86,6 +86,7 @@ from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
 from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
     blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4,
 )
+from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .tuner import (
     ALL_MOE_TACTICS,
     CuteDslFusedMoENvfp4Runner,
@@ -267,8 +268,6 @@ def _moe_core_impl(
                 f"moe_output must have shape {(num_tokens, hidden_size)}, "
                 f"got {tuple(moe_output.shape)}"
             )
-
-        from .blackwell.moe_w4a16 import launch_w4a16_moe
 
         return launch_w4a16_moe(
             x=x,
@@ -487,8 +486,7 @@ class CuteDslMoEWrapper:
         top_k: Number of experts per token.
         hidden_size: Hidden dimension size.
         intermediate_size: Intermediate dimension size.
-        use_cuda_graph: Whether the wrapper holds persistent stream/event
-            resources for CUDA graph capture.
+        use_cuda_graph: Whether the wrapper is configured for CUDA graph use.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
         quant_mode: Selected W4A4 or W4A16 compute mode.
@@ -555,9 +553,9 @@ class CuteDslMoEWrapper:
         intermediate_size : int
             Intermediate dimension size after the GEMM1 activation.
         use_cuda_graph : bool
-            Create persistent CUDA stream/events for async-memset overlap.
-            Required for CUDA graph capture, since streams and events must be
-            created outside graph capture.  Defaults to ``False``.
+            Create persistent CUDA stream/events for W4A4 async-memset
+            overlap. W4A16 is CUDA-graph safe without those resources.
+            Defaults to ``False``.
         max_num_tokens : Optional[int]
             Deprecated; accepted for backwards compatibility but ignored.
         num_local_experts : Optional[int]
@@ -623,25 +621,15 @@ class CuteDslMoEWrapper:
         self._main_event: Optional[torch.cuda.Event] = None
         self._memset_event: Optional[torch.cuda.Event] = None
 
-        wrapper_ref = weakref.ref(self)
-
-        def _forward_with_tactic_weak(*args, **kwargs):
-            wrapper = wrapper_ref()
-            if wrapper is None:
-                raise RuntimeError(
-                    "CuteDslMoEWrapper was destroyed before runner invocation"
-                )
-            return wrapper._forward_with_tactic(*args, **kwargs)
-
-        # Create auto-tuner runner. Use a weak trampoline instead of a bound
-        # method so the runner cannot keep CUDA graph resources alive after the
-        # wrapper drops out of scope.
+        # W4A4 needs the wrapper-owned CUDA graph resources, so its runners use
+        # a weak trampoline. W4A16 owns its workspaces in the runner and calls
+        # the shared module implementation directly.
         self._runner: Optional[CuteDslFusedMoENvfp4Runner] = None
         self._per_token_runner: Optional[CuteDslFusedMoENvfp4Runner] = None
         self._w4a16_runner: Optional[CuteDslFusedMoEW4A16Runner] = None
         if quant_mode == "w4a16":
             self._w4a16_runner = CuteDslFusedMoEW4A16Runner(
-                forward_impl=_forward_with_tactic_weak,
+                forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
                 num_experts=num_experts,
                 top_k=top_k,
                 num_local_experts=self.num_local_experts,
@@ -655,6 +643,16 @@ class CuteDslMoEWrapper:
                 swiglu_limit=swiglu_limit,
             )
         else:
+            wrapper_ref = weakref.ref(self)
+
+            def _forward_with_tactic_weak(*args, **kwargs):
+                wrapper = wrapper_ref()
+                if wrapper is None:
+                    raise RuntimeError(
+                        "CuteDslMoEWrapper was destroyed before runner invocation"
+                    )
+                return wrapper._forward_with_tactic(*args, **kwargs)
+
             self._runner = CuteDslFusedMoENvfp4Runner(
                 forward_impl=_forward_with_tactic_weak,
                 num_experts=num_experts,
@@ -685,7 +683,7 @@ class CuteDslMoEWrapper:
                 swiglu_limit=swiglu_limit,
                 use_per_token_activation=True,
             )
-        if use_cuda_graph:
+        if use_cuda_graph and quant_mode != "w4a16":
             self._aux_stream = torch.cuda.Stream(device=self.device)
             self._main_event = torch.cuda.Event()
             self._memset_event = torch.cuda.Event()
@@ -819,7 +817,7 @@ class CuteDslMoEWrapper:
             Per-expert global scale for GEMM2.
         tactic : Optional[Tuple]
             Tactic tuple, or ``None`` for auto-selection via the runtime
-            tuner. Explicit tactics are not supported for W4A16.
+            tuner.
         per_token_scale : Optional[torch.Tensor]
             Optional W4A4 per-token input row scale for GEMM1.
 
@@ -837,8 +835,6 @@ class CuteDslMoEWrapper:
         )
 
         if self.quant_mode == "w4a16":
-            if tactic is not None:
-                raise ValueError("tactic is not supported for quant_mode='w4a16'")
             if per_token_scale is not None:
                 raise ValueError(
                     "per_token_scale is not supported by quant_mode='w4a16'"
@@ -859,6 +855,8 @@ class CuteDslMoEWrapper:
                 w2_alpha,
                 moe_output,
             ]
+            if tactic is not None:
+                return self._w4a16_runner(inputs, tactic=tactic)
             _, best_tactic = AutoTuner.get().choose_one(
                 f"CuteDslMoEWrapper::run::W4A16::{self.activation_type.name}",
                 [self._w4a16_runner],
