@@ -183,6 +183,46 @@ def benchmark_config(config_name, num_tokens, provider, enable_pdl=False):
             if mode_ncu and run_idx == 20:
                 torch.cuda.cudart().cudaProfilerStop()
 
+    elif provider == "cutile":
+        # Migrated cuTile backend (PR #4019). cuTile rope_quantize_fp8 supports
+        # only MLA-style 2D key + is_neox=False; GQA/MHA raise NotImplementedError.
+        q_rope = q_in[..., :rope_dim]
+        q_nope = q_in[..., rope_dim:]
+        k_rope = k_in[..., :rope_dim]
+        k_nope = k_in[..., rope_dim:]
+
+        q_rope_out = torch.empty_like(q_rope, dtype=quant_dtype)
+        q_nope_out = torch.empty_like(q_nope, dtype=quant_dtype)
+        k_rope_out = torch.empty_like(k_rope, dtype=quant_dtype)
+        k_nope_out = torch.empty_like(k_nope, dtype=quant_dtype)
+
+        def execute():
+            nonlocal run_idx
+            run_idx += 1
+
+            if mode_ncu and run_idx == 20:
+                torch.cuda.cudart().cudaProfilerStart()
+
+            flashinfer.rope.rope_quantize_fp8(
+                q_rope=q_rope,
+                k_rope=k_rope,
+                q_nope=q_nope,
+                k_nope=k_nope,
+                cos_sin_cache=rope_ref.cos_sin_cache,
+                pos_ids=pos_ids,
+                is_neox=False,
+                q_rope_out=q_rope_out,
+                k_rope_out=k_rope_out,
+                q_nope_out=q_nope_out,
+                k_nope_out=k_nope_out,
+                quant_scale_q=1.0,
+                quant_scale_kv=1.0,
+                backend="cutile",
+            )
+
+            if mode_ncu and run_idx == 20:
+                torch.cuda.cudart().cudaProfilerStop()
+
     elif provider == "torch":
         # Create compiled version for better performance
         @torch.compile
@@ -233,9 +273,9 @@ def benchmark_config(config_name, num_tokens, provider, enable_pdl=False):
         x_names=["num_tokens"],
         x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
         line_arg="provider",
-        line_vals=["flashinfer", "torch"],
-        line_names=["FlashInfer", "PyTorch Compiled"],
-        styles=[("blue", "-"), ("blue", "--")],
+        line_vals=["flashinfer", "cutile", "torch"],
+        line_names=["FlashInfer (native CUDA)", "cuTile", "PyTorch Compiled"],
+        styles=[("blue", "-"), ("orange", "-"), ("blue", "--")],
         ylabel="Latency (ms)",
         plot_name="mla-rope-benchmark",
         args={},
