@@ -672,8 +672,12 @@ class MoEActivationPack:
 
     * ``PackedPrecomputed`` (default) — **pre-routed**: the caller computes expert
       selection on the host and passes ``topk_ids`` + ``topk_weights``.
-      (``UnpackedPrecomputed`` exists at the kernel enum level but is not currently
-      supported by the unified runners.)
+      The TRTLLM runners normally combine both fields into one packed ``int32``
+      tensor before launch.
+    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: currently
+      supported by the TRTLLM FP4 runner. The caller supplies ``int32`` ids and
+      BF16 or FP32 weights directly, avoiding packed-id construction. The
+      launcher consumes the weights in their native dtype.
     * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
@@ -694,7 +698,9 @@ class MoEActivationPack:
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
-    topk_weights: Optional[Tensor] = None  # [M, top_k] float32 (routing weights)
+    # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
+    # float32 for TRTLLM FP4 UnpackedPrecomputed.
+    topk_weights: Optional[Tensor] = None
     # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
     # call site fails loudly instead of silently binding a tensor to the mode.
     routing_input_mode: RoutingInputMode = field(
@@ -741,8 +747,54 @@ class MoEActivationPack:
                     f"topk_ids must be torch.int32 (got {self.topk_ids.dtype}); "
                     "torch.topk returns int64 — cast before constructing the pack."
                 )
-        # UnpackedPrecomputed: no unified runner supports it; runners raise
-        # NotImplementedError, so no field contract is enforced here.
+        elif mode == RoutingInputMode.UnpackedPrecomputed:
+            if self.topk_ids is None or self.topk_weights is None:
+                raise ValueError(
+                    "routing_input_mode=UnpackedPrecomputed requires "
+                    "topk_ids + topk_weights."
+                )
+            if self.routing_logits is not None or self.routing_bias is not None:
+                raise ValueError(
+                    "routing_logits/routing_bias are only consumed by "
+                    "in-kernel (FromLogits) routing."
+                )
+            if self.topk_ids.dtype != torch.int32:
+                raise TypeError(
+                    f"topk_ids must be torch.int32 (got {self.topk_ids.dtype}); "
+                    "torch.topk returns int64 — cast before constructing the pack."
+                )
+            if self.topk_weights.dtype not in (torch.bfloat16, torch.float32):
+                raise TypeError(
+                    "UnpackedPrecomputed topk_weights must be torch.bfloat16 "
+                    "or torch.float32 "
+                    f"(got {self.topk_weights.dtype})."
+                )
+            expected = (self.hidden_states_q.shape[0],)
+            if self.topk_ids.ndim != 2 or self.topk_weights.ndim != 2:
+                raise ValueError(
+                    "UnpackedPrecomputed topk_ids/topk_weights must both be 2-D "
+                    f"[num_tokens, top_k], got {tuple(self.topk_ids.shape)} and "
+                    f"{tuple(self.topk_weights.shape)}."
+                )
+            if (
+                self.topk_ids.shape != self.topk_weights.shape
+                or self.topk_ids.shape[:1] != expected
+            ):
+                raise ValueError(
+                    "UnpackedPrecomputed topk_ids/topk_weights must have matching "
+                    f"[num_tokens, top_k] shapes, got {tuple(self.topk_ids.shape)} "
+                    f"and {tuple(self.topk_weights.shape)} for "
+                    f"num_tokens={expected[0]}."
+                )
+            if (
+                not self.topk_ids.is_contiguous()
+                or not self.topk_weights.is_contiguous()
+            ):
+                raise ValueError(
+                    "UnpackedPrecomputed topk_ids/topk_weights must be contiguous."
+                )
+        else:
+            raise ValueError(f"Unsupported routing_input_mode={mode!r}.")
 
         # All routing tensors must live with the activations; a stray CPU
         # tensor otherwise surfaces as a cryptic launch/ICHECK failure.

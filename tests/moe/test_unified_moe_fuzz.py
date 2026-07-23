@@ -63,19 +63,22 @@ reused for a different shape is caught (the #2933-adjacent class).
 deviating backend is caught by #2 directly, and #2 also names which backend -- so a cross-backend
 comparison adds no pass/fail power, only redundancy. See the design discussion.)
 
-Routing coverage (both modes, axes ``routing_method`` x ``routing_input_mode`` x ``logits_dtype``):
+Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` x ``logits_dtype``):
   * **pre-routed** (RoutingInputMode.PackedPrecomputed): the host computes the top-k per method and
     feeds packed indices -- the original path.
+  * **unpacked pre-routed** (RoutingInputMode.UnpackedPrecomputed): TRTLLM FP4 receives separate
+    int32 ids + BF16 or FP32 weights without packed-id construction.
   * **in-kernel** (RoutingInputMode.FromLogits): the kernel routes from raw logits per
     RoutingConfig.method -- reaches the bug cluster the pre-routed harness structurally can't:
     DeepSeekV3 group-topk + bias (#2575), all-negative logits (#2822), fp32 router logits (#2796),
     bias-method weight leakage (#2485/#2907). The SAME ``_route`` oracle (ported verbatim from the
     kernel-validated references in ``tests/moe/test_trtllm_gen_fused_moe.py``) is the authority for
-    both modes, so a kernel that routes wrong is caught by check #2. In-kernel routing is single-GPU
-    (non-EP) here; EP + in-kernel routing semantics are a separate validation.
+    every mode, so a kernel that routes wrong is caught by check #2. In-kernel routing is
+    single-GPU (non-EP) here; EP + in-kernel routing semantics are a separate validation.
 
-Coverage today: NVFP4 (CuteDSL pre-routed + TRTLLM-FP4 pre-routed/in-kernel) on SM100 -- the only
-wired MVP runners (CuteDSL is pre-routed-only; FromLogits restricts to the trtllm backend).
+Coverage today: NVFP4 (CuteDSL pre-routed + TRTLLM-FP4 packed/unpacked pre-routed/in-kernel) on
+SM100 -- CuteDSL is pre-routed-only, while FromLogits and UnpackedPrecomputed restrict to the
+TRTLLM FP4 backend.
 
 OPT-IN: this suite is gated behind FLASHINFER_UMOE_FUZZ (see the pytestmark below) and is
 SKIPPED unless that env var is set -- waived in CI pending root-cause of a
@@ -626,7 +629,7 @@ _TOPK = [1, 2, 4, 6, 8]  # 6 non-pow2
 _TOKENS = [1, 2, 3, 7, 17, 64, 127, 129, 256, 1024, 2048, 4095, 4096, 4097]
 # Routing-logits *distribution* skew (orthogonal to the routing METHOD below). "all_negative"
 # (#2822 all-negative-logit mis-selection) and "all_to_one" only bite the in-kernel router; the
-# pre-routed host topk handles them trivially, but exercising both modes is free coverage.
+# pre-routed host topk handles them trivially, but exercising all modes is free coverage.
 _ROUTE = ["uniform", "uniform", "hot1", "imbalanced", "all_negative", "all_to_one"]
 
 # Routing METHOD axis (RoutingMethodType). Pre-routed mode computes the host weights per method
@@ -655,6 +658,11 @@ _FROMLOGITS_BACKENDS = {
     cfg_cls
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
     if RoutingInputMode.FromLogits in runner_cls.supported_routing_modes
+}
+_UNPACKED_BACKENDS = {
+    cfg_cls
+    for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
+    if RoutingInputMode.UnpackedPrecomputed in runner_cls.supported_routing_modes
 }
 
 # Methods whose routing uses an additive bias (selection only -- weights stay unbiased). DeepSeekV3
@@ -687,10 +695,10 @@ class Cfg:
     # Routing axes (defaults keep the original pre-routed RenormalizeNaive behavior so the
     # positional _CURATED literals below are unaffected).
     routing_method: RoutingMethodType = RoutingMethodType.RenormalizeNaive
-    routing_input_mode: str = (
-        "prerouted"  # "prerouted" (PackedPrecomputed) | "fromlogits"
-    )
+    # "prerouted" (PackedPrecomputed) | "unpacked" | "fromlogits"
+    routing_input_mode: str = "prerouted"
     logits_dtype: str = "bf16"  # "bf16" | "fp32" (#2796 fp32-router-logits class)
+    unpacked_weights_dtype: str = "bf16"  # "bf16" | "fp32"; unpacked mode only
     n_group: int = 0  # DeepSeekV3 group count (0 -> None)
     topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
     routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
@@ -708,13 +716,22 @@ class Cfg:
         return self.routing_input_mode == "fromlogits"
 
     @property
+    def is_unpacked(self):
+        return self.routing_input_mode == "unpacked"
+
+    @property
     def label(self):
         ep = f"L{self.n_local}o{self.expert_offset}_" if self.is_ep else ""
-        mode = "FL_" if self.is_fromlogits else ""
+        mode = "FL_" if self.is_fromlogits else "UP_" if self.is_unpacked else ""
         ld = "fp32_" if self.logits_dtype == "fp32" else ""
+        uwd = (
+            "wfp32_"
+            if self.is_unpacked and self.unpacked_weights_dtype == "fp32"
+            else ""
+        )
         grp = f"g{self.n_group}x{self.topk_group}_" if self.n_group else ""
         return (
-            f"{self.variant}_{mode}{self.routing_method.name}_{ld}{self.route}_"
+            f"{self.variant}_{mode}{self.routing_method.name}_{ld}{uwd}{self.route}_"
             f"e{self.num_experts}_{ep}{grp}k{self.top_k}_"
             f"t{self.num_tokens}_h{self.hidden}_i{self.intermediate}_s{self.seed}"
         )
@@ -727,7 +744,9 @@ def _gen(seed):
     # routing semantics (does the kernel route over global logits then filter to local?) are a
     # separate validation, and EP collectives are out of scope for this single-GPU harness.
     # DeepSeekV3 group routing scores over the full expert set, so keep it non-EP too.
-    fromlogits = rng.random() < 0.5
+    mode_roll = rng.random()
+    fromlogits = mode_roll < 0.5
+    unpacked = 0.5 <= mode_roll < 0.65
     force_non_ep = fromlogits or method == RoutingMethodType.DeepSeekV3
     # Resample shape until the weights of the FINAL config fit the budget (modest per-test
     # GPU footprint). Routing mode is chosen BEFORE this loop on purpose: non-EP-forced
@@ -773,15 +792,21 @@ def _gen(seed):
         num_experts=ne,
         top_k=top_k,
         # FromLogits can use only variants with an in-kernel-routing runner.
-        variant=rng.choice(_FROMLOGITS_VARIANT_IDS)
-        if fromlogits
-        else rng.choice(_VARIANT_IDS),
+        variant=(
+            rng.choice(_FROMLOGITS_VARIANT_IDS)
+            if fromlogits
+            else "nvfp4"
+            if unpacked
+            else rng.choice(_VARIANT_IDS)
+        ),
         route=rng.choice(_ROUTE),
         seed=seed,
         local_experts=local,
         expert_offset=offset,
         routing_method=method,
-        routing_input_mode="fromlogits" if fromlogits else "prerouted",
+        routing_input_mode=(
+            "fromlogits" if fromlogits else "unpacked" if unpacked else "prerouted"
+        ),
         logits_dtype="fp32"
         if rng.random() < 0.25
         else "bf16",  # #2796 fp32-logits axis
@@ -905,6 +930,33 @@ _CURATED = [
         routing_method=RoutingMethodType.Default,
         routing_input_mode="fromlogits",
     ),  # seed % 4 == 0 deliberately exercises production autotuning for MXFP8
+    Cfg(
+        64,
+        512,
+        512,
+        128,
+        4,
+        "nvfp4",
+        "imbalanced",
+        900_020,
+        local_experts=32,
+        expert_offset=32,
+        routing_input_mode="unpacked",
+    ),  # Unpacked BF16 weights + nonzero EP offset; seed % 4 == 0 autotunes
+    Cfg(
+        64,
+        512,
+        512,
+        128,
+        4,
+        "nvfp4",
+        "imbalanced",
+        900_024,
+        local_experts=32,
+        expert_offset=32,
+        routing_input_mode="unpacked",
+        unpacked_weights_dtype="fp32",
+    ),  # Unpacked FP32 weights + nonzero EP offset; seed % 4 == 0 autotunes
 ]
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _curated_by_seed = {c.seed: c for c in _CURATED}
@@ -1164,15 +1216,40 @@ def test_unified_moe_fuzz(cfg):
         # In-kernel routing restricts to FromLogits-capable backends (CuteDSL is pre-routed-only,
         # so it cannot serve a logits-only pack and would compare apples to oranges).
         wired_backends = [B for B in wired_backends if B in _FROMLOGITS_BACKENDS]
+    elif cfg.is_unpacked:
+        # Exact TRTLLM Mode 3 is currently wired only through the FP4 runner.
+        # Backends that accept separate tensors through their own ABI are not
+        # implementations of RoutingInputMode.UnpackedPrecomputed.
+        wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
     if not wired_backends:
-        mode = "in-kernel-routing " if cfg.is_fromlogits else ""
+        mode = (
+            "in-kernel-routing "
+            if cfg.is_fromlogits
+            else "unpacked-precomputed "
+            if cfg.is_unpacked
+            else ""
+        )
         pytest.skip(f"no wired {mode}backend for {cfg.variant} on SM{sm}")
 
     x, w1, w2, selected_experts, final_scales, logits, routing_bias = _master(
         cfg, handler
     )
+    unpacked_weights_dtype = (
+        torch.float32 if cfg.unpacked_weights_dtype == "fp32" else torch.bfloat16
+    )
+    reference_scales = (
+        final_scales.to(unpacked_weights_dtype).float()
+        if cfg.is_unpacked
+        else final_scales
+    )
     ref = handler.reference(
-        x, w1, w2, selected_experts, final_scales, cfg.intermediate, cfg.expert_offset
+        x,
+        w1,
+        w2,
+        selected_experts,
+        reference_scales,
+        cfg.intermediate,
+        cfg.expert_offset,
     )
     atol = handler.atol_frac * ref.abs().max().item() + 1e-3
     rtol = handler.rtol
@@ -1185,6 +1262,14 @@ def test_unified_moe_fuzz(cfg):
         act_pack = handler.make_act_pack_logits(x, logits, routing_bias)
     else:
         act_pack = handler.make_act_pack(x, selected_experts, final_scales)
+        if cfg.is_unpacked:
+            act_pack = MoEActivationPack(
+                hidden_states_q=act_pack.hidden_states_q,
+                hidden_states_scale=act_pack.hidden_states_scale,
+                topk_ids=selected_experts,
+                topk_weights=final_scales.to(unpacked_weights_dtype),
+                routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+            )
     weight_pack = MoEWeightPack()
     for BackendCfg in wired_backends:
         prepare_kwargs = dict(
