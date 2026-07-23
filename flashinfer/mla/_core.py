@@ -116,7 +116,18 @@ smaller_mla_dimensions = MLAHeadDimensions(
     kv_lora_rank=256,
 )
 
-supported_mla_head_dimensions = [deepseek_mla_dimensions, smaller_mla_dimensions]
+nope_mla_dimensions = MLAHeadDimensions(
+    qk_nope_head_dim=256,
+    qk_rope_head_dim=0,
+    v_head_dim=256,
+    kv_lora_rank=512,
+)
+
+supported_mla_head_dimensions = [
+    deepseek_mla_dimensions,
+    smaller_mla_dimensions,
+    nope_mla_dimensions,
+]
 
 
 @dataclass(frozen=True)
@@ -667,7 +678,13 @@ def _check_trtllm_gen_mla_shape(
         kv_lora_rank == smaller_mla_dimensions.kv_lora_rank
         and qk_rope_head_dim == smaller_mla_dimensions.qk_rope_head_dim
     )
-    if not (is_deepseek_dimensions or is_smaller_mla_dimensions):
+    is_nope_mla_dimensions = (
+        kv_lora_rank == nope_mla_dimensions.kv_lora_rank
+        and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
+    )
+    if not (
+        is_deepseek_dimensions or is_smaller_mla_dimensions or is_nope_mla_dimensions
+    ):
         raise ValueError(
             f"Unsupported MLA dimensions, got kv_lora_rank={kv_lora_rank} and qk_rope_head_dim={qk_rope_head_dim}, supported dimensions are: {supported_mla_head_dimensions}"
         )
@@ -2155,6 +2172,8 @@ def _mla_decode_tuning_config(
     buckets: tuple[int, ...],
     num_pages: int,
     profile_seq_len: int,
+    has_sparse_mla_top_k_lens: bool,
+    sparse_top_k_width: int,
 ) -> TuningConfig:
     """One TuningConfig (and one pair of initializer closures) per key.
 
@@ -2164,8 +2183,9 @@ def _mla_decode_tuning_config(
     ``tensor_initializers``) but never compares equal (closures compare by
     identity), so would result in a leak.
 
-    The DynamicTensorSpec sweeps batch dim across all four ``inputs`` tensors
-    (query, block_tables, seq_lens, out). ``block_tables`` is initialized via
+    The DynamicTensorSpec sweeps batch dim across the four base ``inputs``
+    tensors (query, block_tables, seq_lens, out), plus the optional dynamic
+    sparse top-k lengths tensor. ``block_tables`` is initialized via
     ``random_(0, num_pages)`` which wraps mod kv_cache size — safe for autotune
     profiling because MLA decode reads kv_cache and never writes it, so aliased
     page reads give correct timing measurements. ``seq_lens`` is filled
@@ -2182,14 +2202,26 @@ def _mla_decode_tuning_config(
         tensor.fill_(profile_seq_len)
         return tensor
 
+    def init_sparse_top_k_lens(shapes, dtype, device):
+        tensor = torch.empty(shapes, dtype=dtype, device=device)
+        tensor.fill_(sparse_top_k_width)
+        return tensor
+
+    input_idx = (0, 1, 2, 3, 4) if has_sparse_mla_top_k_lens else (0, 1, 2, 3)
+    tensor_initializers = (
+        (None, init_block_tables, init_seq_lens, None, init_sparse_top_k_lens)
+        if has_sparse_mla_top_k_lens
+        else (None, init_block_tables, init_seq_lens, None)
+    )
+
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0, 1, 2, 3),
-                dim_idx=(0, 0, 0, 0),
+                input_idx=input_idx,
+                dim_idx=tuple(0 for _ in input_idx),
                 gen_tuning_buckets=buckets,
                 map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
-                tensor_initializers=(None, init_block_tables, init_seq_lens, None),
+                tensor_initializers=tensor_initializers,
             ),
         ),
         use_cuda_graph=True,
@@ -2207,6 +2239,7 @@ def _build_mla_decode_tuning_config(
     kv_lora_rank: int,
     max_seq_len: int,
     device: torch.device,
+    has_sparse_mla_top_k_lens: bool = False,
 ) -> TuningConfig:
     """Reduce call args to the memoization key of ``_mla_decode_tuning_config``.
 
@@ -2232,7 +2265,13 @@ def _build_mla_decode_tuning_config(
         device,
     )
 
-    return _mla_decode_tuning_config(buckets, num_pages, profile_seq_len)
+    return _mla_decode_tuning_config(
+        buckets,
+        num_pages,
+        profile_seq_len,
+        has_sparse_mla_top_k_lens,
+        block_tables.shape[-1],
+    )
 
 
 class TrtllmGenMlaDecodeRunner(TunableRunner):
@@ -2310,7 +2349,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         return [-1]
 
     def get_cache_key_extras(self, inputs):
-        q, _, _, out = inputs
+        q, _, _, out = inputs[:4]
         sinks_key = (
             None
             if self.sinks is None
@@ -2338,6 +2377,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             sinks_key,
             self.skip_softmax_threshold_scale_factor,
             self.return_lse,
+            len(inputs) == 5,
         )
 
     def forward(
@@ -2348,7 +2388,8 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        query, block_tables, seq_lens, out = inputs
+        query, block_tables, seq_lens, out = inputs[:4]
+        sparse_mla_top_k_lens = inputs[4] if len(inputs) == 5 else None
         batch_size = query.size(0)
         max_q_len = query.size(1)
         num_qo_heads = query.size(2)
@@ -2423,6 +2464,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
+            sparse_mla_top_k_lens,
         )
         return out
 
@@ -2595,6 +2637,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
 
@@ -2756,6 +2799,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
         for each concurrently executing CUDA stream or graph. Autotune profiling
         uses runner-owned internal storage; the caller buffer is used only for the
         final request.
+    sparse_mla_top_k_lens : Optional[torch.Tensor] = None
+        Flattened active sparse top-k lengths, one INT32 value per query token.
+        Required by the native ``kv_lora_rank=512, qk_rope_head_dim=0``
+        TRTLLM-GEN kernel. Sparse indices must be packed before any ``-1``
+        padding. Zero-length rows are unsupported; padded query rows should
+        contain one valid dummy index and use length 1.
 
     Note
     ----
@@ -2804,6 +2853,36 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
     if max_q_len is not None and cum_seq_lens_q is None:
         raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
+
+    is_nope_mla = (
+        kv_lora_rank == nope_mla_dimensions.kv_lora_rank
+        and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
+    )
+    if is_nope_mla and sparse_mla_top_k <= 0:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
+        )
+    if is_nope_mla and sparse_mla_top_k_lens is None:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
+        )
+    if sparse_mla_top_k_lens is not None:
+        if not is_nope_mla:
+            raise ValueError(
+                "sparse_mla_top_k_lens is currently only supported by the "
+                "native qk_rope_head_dim=0 TRTLLM-GEN MLA path"
+            )
+        expected_num_query_tokens = (
+            query.size(0) * query.size(1) if query.ndim == 4 else query.size(0)
+        )
+        check_shape_dtype_device(
+            sparse_mla_top_k_lens,
+            (expected_num_query_tokens,),
+            torch.int32,
+            query.device,
+            "sparse_mla_top_k_lens",
+        )
+        sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
 
     if backend == "auto":
         cc = get_compute_capability(query.device)
@@ -3043,6 +3122,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             0,  # lse_stride_tokens
             0,  # lse_stride_heads
             False,  # enable_block_sparse_attention
+            sparse_mla_top_k_lens,
         )
         return out
 
@@ -3217,8 +3297,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
         kv_lora_rank=kv_lora_rank,
         max_seq_len=max_seq_len,
         device=query.device,
+        has_sparse_mla_top_k_lens=sparse_mla_top_k_lens is not None,
     )
     inputs = [query, block_tables, seq_lens, out]
+    if sparse_mla_top_k_lens is not None:
+        inputs.append(sparse_mla_top_k_lens)
     runner, tactic = AutoTuner.get().choose_one(
         "trtllm_batch_decode_mla",
         runners,

@@ -2627,6 +2627,9 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
             abbrev="topk",
             description="Number of top-k pages selected per query token.",
         ),
+        "num_query_tokens": Var(
+            description="Flattened number of query tokens with active top-k lengths."
+        ),
         "workspace_size": Var(description="Workspace buffer length in bytes."),
     },
     inputs={
@@ -2659,6 +2662,12 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
         "sparse_mla_top_k": Scalar(
             "int32",
             description="Number of top-k pages selected per query token; >0 selects this template.",
+        ),
+        "sparse_mla_top_k_lens": Tensor(
+            ["num_query_tokens"],
+            dtype="int32",
+            optional=True,
+            description="Active sparse top-k length for each flattened query token.",
         ),
         "bmm1_scale": Scalar(
             "float32",

@@ -2842,6 +2842,7 @@ class TrtllmGenDecodeModule:
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
+            None,  # sparse_mla_top_k_lens
         )
         return out
 
@@ -3503,6 +3504,7 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_tokens,
             lse_stride_heads,
             enable_block_sparse_attention,
+            None,  # sparse_mla_top_k_lens
         )
 
         result_out = (
