@@ -123,11 +123,6 @@ def _cosine(a, b):
     ).item()
 
 
-# (E, N, K) test shapes.  e256_n512_k2048: has a BS16 companion;
-# e64_n512_k2048: BS8-only, cheap.
-SHAPES = [(256, 512, 2048), (64, 512, 2048)]
-
-
 def _make_weights(dev, E, N, K, scale=0.1, seed=42):
     """Quantized block-FP8 up/down weights (fp8 tensors + scales) for a shape."""
     g = torch.Generator(device=dev).manual_seed(seed)

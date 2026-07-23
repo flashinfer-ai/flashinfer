@@ -113,8 +113,8 @@ Within one block, two things run concurrently:
   `topk_ids_flat` / `topk_weights_flat`.  Then `sync_calc_threads()`
   (a 256-thread `bar.sync`) joins the 8 warps.
 - **Warp 8 lane 0 — routing-window TMA**: arms `bar_rwin` once with the
-  full tile's byte count, then issues `K_BLOCKS_TOTAL = K/128` bulk TMAs
-  (16 / 24 / 48), one 8-token × 128-K bf16 box each, filling
+  full tile's byte count, then issues `K_BLOCKS_TOTAL = K/128 = 16` bulk
+  TMAs, one 8-token × 128-K bf16 box each, filling
   `bf16_in_full`.  Warp 8 lanes 1–31 and warps 9–11 are idle in Phase 1.
 
 ### Phase 2 — routing tables ∥ quantization (all GRID_SIZE blocks, replicated)
@@ -129,7 +129,7 @@ Warp split within each block:
 - **Warps 1–11 (11 warps, 352 threads) — `routing_phase_quantize`**: each
   thread first waits on `bar_rwin` (the Phase-1 TMA completion), then the
   11 warps split the `BS × K_BLOCKS_TOTAL` (token, 128-K-block) pairs
-  (128 / 192 / 384 pairs) stride-11 by warp.  Each pair = one warp call to
+  (128 pairs) stride-11 by warp.  Each pair = one warp call to
   `moe_streaming_quantize_k128`: 32 lanes × 4 bf16 values, warp-reduce
   max, fp8 quantize into `fp8_act_full`, one scale into `act_scale`.
   Note this uses calc warps 1–7 too — the Phase-1 role split does not
@@ -154,12 +154,12 @@ Block assignment: `up_group = blockIdx.x / UP_GRID`,
   Phase 2, ascending id, length `expert_count ≤ min(E, BS·top_k)`) as
   `e = g, g + UP_GROUPS, g + 2·UP_GROUPS, ...`.  Each group therefore
   visits ≤ `ceil(expert_count / UP_GROUPS)` experts — with BS=8, top_k=8
-  at most 64 are active, so ≤ 4 per group at UP_GROUPS=16 and ≤ 1 at
-  UP_GROUPS=64.  A group whose index exceeds `expert_count` skips Phase 3
-  entirely and waits at the site-#2 barrier.
+  at most 64 are active, so ≤ 4 per group at UP_GROUPS=16.  A group whose
+  index exceeds `expert_count` skips Phase 3 entirely and waits at the
+  site-#2 barrier.
 - **Per expert, warp duties**:
-    - warps 0–7 (WG0 + WG1): the K-loop — `K_TILES_UP = K/KUP` iterations
-    (8 / 12 / 24), each
+    - warps 0–7 (WG0 + WG1): the K-loop — `K_TILES_UP = K/KUP = 8`
+    iterations, each
     waiting `bar_w[s % SLOTS]` then chaining 4 WGMMAs per 128-K substep
     per M-atom, with scale-apply at every 128-K boundary.  WG0 computes
     SHM weight rows [0..63] of each atom, WG1 rows [64..127].  At the
@@ -199,18 +199,17 @@ The same 128 blocks re-map: `down_group = blockIdx.x / DOWN_GRID`,
 `down_block_idx = blockIdx.x % DOWN_GRID`,
 `base_col = down_block_idx · DOWN_COL_TILE`.
 
-- **Blocks per expert**: `DOWN_GRID = K/DCT` blocks (8 / 8 / 16) jointly
-  cover one expert's `K` output columns; each block owns `DCT` columns
-  (256 / 384 / 384) = `DOWN_COL_HALVES = DCT/128` (2 / 3 / 3) sequential
+- **Blocks per expert**: `DOWN_GRID = K/DCT = 8` blocks jointly
+  cover one expert's `K` output columns; each block owns `DCT = 256`
+  columns = `DOWN_COL_HALVES = DCT/128 = 2` sequential
   128-col WGMMA passes per K-step.
-- **Experts in parallel**: `DOWN_GROUPS = GRID_SIZE/DOWN_GRID` groups
-  (16 / 16 / 8).
+- **Experts in parallel**: `DOWN_GROUPS = GRID_SIZE/DOWN_GRID = 16` groups.
 - **Expert loop**: `e = down_group, down_group + DOWN_GROUPS, ...` over
   the same active-expert list.  Note the up and down loops visit experts
   in a different interleaving; correctness needs only that Phase 3
   finished the expert before Phase 4 reads it, which site #2 guarantees.
 - **Per expert, warp duties**:
-    - warps 0–7: K-loop of `K_TILES_DOWN = N/KDN` iterations (2 / 8 / 2),
+    - warps 0–7: K-loop of `K_TILES_DOWN = N/KDN = 2` iterations,
     each
     waiting `bar_w[s&1]` + `bar_a[s&1]` (weight + activation double
     buffers) then running the lo/hi WGMMA chains per substep per
@@ -227,9 +226,9 @@ The same 128 blocks re-map: `down_group = blockIdx.x / DOWN_GRID`,
     - warps 8–11 (128 PF threads): the **deferred accumulate of the
     previous expert** — `out_accum[tok][col] += down_out[col][rank]`,
     the (tok, col) plane sliced across the first `K_TILES_DOWN − 1`
-    iterations (7 slices at K_TILES_DOWN=8; a single slice at s=0 for
-    the 2-step configs).  The last visited expert's accumulate runs
-    after the loop with all 12 warps.
+    iterations (a single slice at s=0, since `K_TILES_DOWN = 2`).  The
+    last visited expert's accumulate runs after the loop with all 12
+    warps.
 - After the expert loop: every block `atomicAdd`s its
   `out_accum[BS][DOWN_COL_TILE]` slice into the global
   `down_partial_out[BS][K]` (so each output cell receives
@@ -247,11 +246,11 @@ wait).
 
 ### Phase 5 — writeback (first DOWN_GRID blocks only)
 
-Only blocks with `blockIdx.x < DOWN_GRID` (8 / 8 / 16) write: all 384
+Only blocks with `blockIdx.x < DOWN_GRID` (8) write: all 384
 threads of each stream-cast the block's own `DCT`-column stripe of
 `down_partial_out` from fp32 to bf16 in `activations_out`, and zero-fill
 the padding tokens `[batch_size, BS)`.  The remaining
-`GRID_SIZE − DOWN_GRID` blocks (120 / 120 / 112) exit after the site-#3
+`GRID_SIZE − DOWN_GRID` blocks (120) exit after the site-#3
 barrier.
 
 ## Grid carve
@@ -352,8 +351,9 @@ expert:
   the one the next expert's s=0 wait reads).  Parity state is hoisted out of
   the expert loop and never reset.
 - When `routed_count == 0` for an expert, no activation TMA is armed; the
-  WGMMA computes on garbage that the rank-filtered accumulate never reads
-  (fp8 e4m3 has no NaN encoding, so garbage can't fault).
+  WGMMA computes on garbage, but the rank-filtered accumulate never reads or
+  accumulates those results (every token's `rank` is `0xFF` for an unrouted
+  expert), so the garbage cannot reach the output.
 - Epilogue: accumulators → `down_out[DCT][8]` in SHM.  The
   `out_accum[tok][col] += down_out[col][rank]` accumulate for the *previous*
   expert runs deferred on prefetch warps, sliced across the first
@@ -425,8 +425,11 @@ Other notable fields:
 
 ## Global scratchpad (`MoEGemmSpec`)
 
-Persistent GM workspace, one per process (allocated by the caller, ≥
-`get_moe_max_scratchpad_size()`), zeroed once on first launch:
+Persistent GM workspace, one per process, zeroed once on first launch.
+`mono_moe` allocates it automatically when the `scratchpad` argument is
+omitted; callers that want to reuse a buffer across launches allocate one
+explicitly with `alloc_scratchpad()`, sized by `get_scratchpad_size_bytes()`
+(the `monomoe_scratchpad_size` binding, i.e. `sizeof(MoEGemmSpec<Dims>)`):
 
 - `temp_fp8[TEMP_ROWS][N]` + `temp_act_scale[TEMP_ROWS][N/DOWN_ACT_BLOCK]` —
   Phase 3 → Phase 4 handoff, expert-sorted rows.
@@ -434,7 +437,7 @@ Persistent GM workspace, one per process (allocated by the caller, ≥
   as `scratchpad + TEMP_FP8_OFFSET` when building the down-activation TMA
   descriptor, so no field may ever be inserted before `temp_fp8`; new fields
   (handoff flags) go at the tail.  A `static_assert` in
-  `monomoe_wrapper.cuh` enforces this.
+  `monomoe_binding.cu` enforces this.
 - `down_partial_out[BS][K]` fp32 — Phase 4 atomicAdd target.
 - sentinel-handoff tail state: `temp_act_scale_alt` (the second scale
   buffer), `launch_flip[GRID_SIZE]` (per-block private launch counters →
