@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
-from .....weights import MoEWeightPack
+from .....weights import MoEWeightPack, PrequantizedMoEWeights
 
 if TYPE_CHECKING:
     import torch
@@ -42,13 +42,13 @@ def _quantize_expert_weights(
     import torch
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import nvfp4_quantize_per_block_16
+    from .....kernel_src.sm100.cutedsl_megamoe import nvfp4_quantize_per_block_16
 
     return nvfp4_quantize_per_block_16(weight_k_major.to(torch.float32), norm_const)
 
 
 def _swizzle_expert_scales(raw_sf: "torch.Tensor") -> "torch.Tensor":
-    from .....kernel_src.cutedsl_megamoe import to_blocked
+    from .....kernel_src.sm100.cutedsl_megamoe import to_blocked
 
     return to_blocked(raw_sf)
 
@@ -112,7 +112,7 @@ def preprocess_mega_weights(
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # shim exposes this cutlass-pulling helper lazily via the package boundary.
-    from .....kernel_src.cutedsl_megamoe import _stack_byte_reinterpretable_tensors
+    from .....kernel_src.sm100.cutedsl_megamoe import _stack_byte_reinterpretable_tensors
 
     # Reject conflicting clamp aliases; the clamp itself is a kernel-side
     # nonlinearity parameter and must NOT scale the weight quantization.
@@ -135,7 +135,7 @@ def preprocess_mega_weights(
     packed_w13_shape = (num_experts, fc1_out, hidden_size // 2)
     packed_w2_shape = (num_experts, hidden_size, intermediate_size // 2)
 
-    if weights.w13_scale is not None and weights.w2_scale is not None:
+    if isinstance(weights, PrequantizedMoEWeights):
         if (
             weights.w13.shape == packed_w13_shape
             and weights.w2.shape == packed_w2_shape
@@ -247,7 +247,7 @@ def _nvfp4_swizzled_flat_sf_size(rows: int, cols: int) -> int:
     import torch
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import to_blocked
+    from .....kernel_src.sm100.cutedsl_megamoe import to_blocked
 
     plain = torch.zeros(rows, cols, dtype=torch.float32)
     return to_blocked(plain).numel()
@@ -292,7 +292,7 @@ def validate_transformed_mega_weights(
     weight_dtype = _nvfp4_kernel_weight_dtype()
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
+    from .....kernel_src.sm100.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
 
     hidden_sf_cols = ceil_div(hidden_size, Nvfp4BlockSize)
     intermediate_sf_cols = ceil_div(intermediate_size, Nvfp4BlockSize)

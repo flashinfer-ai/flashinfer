@@ -22,7 +22,7 @@ import pytest
 # cutedsl_megamoe shim public API (including the torch reference it re-exports);
 # it never imports the src/ kernel packages directly, so a new src/ drop can't
 # silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -190,7 +190,7 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     # Verify only against the cutedsl_megamoe shim boundary: pull constants and
     # reference tensor-makers from the package public API, never from the src/
     # kernel packages directly (so a new src/ drop can't silently break tests).
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         Mxfp8ScaleDtype,
         _make_e8m0_scale_tensor,
@@ -288,7 +288,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
             f"mxfp8_mega_moe requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
         )
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
@@ -302,7 +302,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
 
     # The MXFP8 torch reference is consumed via the shim boundary, not the src/
     # package directly, so tests verify against a stable public surface.
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         compute_megamoe_reference_mxfp8,
     )
 

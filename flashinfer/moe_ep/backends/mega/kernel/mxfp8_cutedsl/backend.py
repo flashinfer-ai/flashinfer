@@ -48,6 +48,18 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
+        if self._autotune_pending:
+            import warnings
+
+            warnings.warn(
+                "knobs='auto' runs a COLLECTIVE multi-minute compile+timing "
+                "sweep at the first forward — never use it inside a serving "
+                "engine. Tune offline instead (python -m flashinfer.moe_ep.tune"
+                "); winners persist in the knob cache and knobs=None then "
+                "resolves them with a pure lookup.",
+                UserWarning,
+                stacklevel=3,
+            )
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -67,6 +79,9 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             bootstrap.world_size,
             intermediate_size=self._kernel_config.intermediate_size,
             top_k=self._kernel_config.top_k,
+            # cutedsl tiles are tail-safe (ceil-div + predicated epilogue);
+            # the binding bound is TMA row alignment, not the dg SF word.
+            alignment=64,
         )
 
     def preprocess_weights(
@@ -99,7 +114,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from .....kernel_src.cutedsl_megamoe import (
+        from .....kernel_src.sm100.cutedsl_megamoe import (
             get_symm_buffer_for_mxfp8_mega_moe,
         )
 
@@ -160,7 +175,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             )
         else:
             # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-            from .....kernel_src.cutedsl_megamoe import (
+            from .....kernel_src.sm100.cutedsl_megamoe import (
                 Mxfp8BlockSize,
                 ceil_div,
                 round_up,
@@ -187,46 +202,93 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             capacity = workspace.x.shape[0]
             if num_tokens < capacity:
                 workspace.topk_idx[num_tokens:capacity].fill_(-1)
+            from .....kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+
+            note_staged_tokens(workspace.topk_idx, num_tokens)
 
     def compute(
         self,
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
         *,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from .....kernel_src.cutedsl_megamoe import mxfp8_mega_moe
+        from .....kernel_src.sm100.cutedsl_megamoe import mxfp8_mega_moe, staged_tokens
+
+        if output is not None:
+            num_tokens = output.shape[0]
+        else:
+            if self._autotune_pending:
+                raise ValueError(
+                    "compute(output=None) is incompatible with knobs='auto' "
+                    "(the autotune sweep needs a caller output buffer)"
+                )
+            staged = staged_tokens(workspace.topk_idx)
+            if staged is None:
+                raise ValueError(
+                    "compute(output=None) requires stage_inputs() to have "
+                    "staged this workspace first"
+                )
+            num_tokens = staged
 
         kcfg = self._kernel_config
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
             # so the candidate sweep stays in lockstep (see shim/autotune.py).
-            from .....kernel_src.cutedsl_megamoe import autotune_mxfp8_mega_moe
+            from .....kernel_src.sm100.cutedsl_megamoe import autotune_mxfp8_mega_moe
 
             autotune_mxfp8_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],
                 workspace,
-                num_tokens=output.shape[0],
+                num_tokens=num_tokens,
                 gate_up_clamp=_resolve_gate_up_clamp(kcfg),
                 activation_clamp=kcfg.activation_clamp,
             )
             # Cleared only on success: if the collective tune raises, a retried
             # compute() re-attempts it (all ranks fail together, so lockstep holds).
             self._autotune_pending = False
-        mxfp8_mega_moe(
+        view = mxfp8_mega_moe(
             output,
             transformed_weights[0],
             transformed_weights[1],
             workspace,
-            num_tokens=output.shape[0],
+            num_tokens=num_tokens,
             gate_up_clamp=_resolve_gate_up_clamp(kcfg),
             activation_clamp=kcfg.activation_clamp,
             fast_math=kcfg.fast_math,
         )
-        return output
+        # output=None -> zero-copy: the kernel's reduced result stays in the
+        # workspace and the caller consumes the [:n] view under stream
+        # ordering (valid until the next launch on this session's buffers).
+        return output if output is not None else view
 
-    def destroy(self, workspace: Any) -> None:
-        if workspace is not None:
-            workspace.destroy()
+    def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        k = self._kernel_config
+        if k.knobs == "auto":
+            # Autotune retunes (and recompiles) the workspace's shared
+            # frontend at first compute; give each session its own buffer.
+            return None
+        import torch
+
+        from .....core.kernel.workspace_pool import knobs_pool_key
+
+        fp = fleet_params
+        return (
+            "mxfp8_cutedsl",
+            torch.cuda.current_device(),
+            self.ep_rank,
+            self.ep_world_size,
+            id(self._ep_comm_group),
+            fp.num_experts,
+            fp.max_tokens_per_rank,
+            k.top_k,
+            fp.token_hidden_size,
+            k.intermediate_size,
+            k.kind,
+            _resolve_gate_up_clamp(k),
+            k.in_kernel_fc2_reduce,
+            k.token_back_by_dispatch,
+            knobs_pool_key(k.knobs),
+        )

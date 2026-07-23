@@ -44,6 +44,10 @@ from .backends.mega.kernel.nvfp4_cutedsl import (
     Nvfp4CutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm90_pull_fp8 import (
+    Sm90PullFp8MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
+)
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -98,7 +102,12 @@ from .modes import (
     run_split_kernel,
 )
 from .tensors import MoEEpTensors
-from .weights import MoEWeightPack, dummy_moe_weights
+from .weights import (
+    MoEWeightPack,
+    PrequantizedMoEWeights,
+    UnquantizedMoEWeights,
+    dummy_moe_weights,
+)
 
 __all__ = [
     "AlgoKnob",
@@ -135,12 +144,15 @@ __all__ = [
     "MoEEpSplitLayer",
     "MoEEpTensors",
     "MoEWeightPack",
+    "PrequantizedMoEWeights",
+    "UnquantizedMoEWeights",
     "Mxfp8CutedslMegaMoeConfig",
     "NCCLEPConfig",
     "NcclEpConfig",
     "Nvfp4CutedslMegaMoeConfig",
     "NvepConfig",
     "QuantType",
+    "Sm90PullFp8MegaMoeConfig",
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",
@@ -159,6 +171,7 @@ __all__ = [
     "preprocess_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
+    "preprocess_sm90_pull_fp8_mega_weights",
     "run_split_kernel",
     "validate_arch_for_backend",
     "validate_bootstrap_process_group_ready",

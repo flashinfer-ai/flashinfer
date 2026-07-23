@@ -229,6 +229,25 @@ def validate_mega_arch() -> None:
         )
 
 
+def validate_mega_arch_sm90() -> None:
+    """Arch gate for the SM90 (Hopper) mega kernels.
+
+    The Hopper FP8 CuTeDSL mega kernel is compiled for sm_90 exactly (WGMMA
+    warp specialization; the fork is 1-CTA-only and does not target Blackwell
+    — Blackwell hosts use the sm_100 tree's kernels instead).
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    cc = _device_capability()
+    if cc != (9, 0):
+        raise MoEEpArchError(
+            f"sm90_pull_fp8 mega kernel requires sm_90 (Hopper); host has "
+            f"sm_{cc[0]}{cc[1]}"
+        )
+
+
 def validate_fleet_weights(
     weights: MoEWeightPack, params: FleetParams, world_size: int
 ) -> None:
@@ -278,7 +297,14 @@ def validate_mega_fleet_params(
     *,
     intermediate_size: int,
     top_k: int,
+    alignment: int = 128,
 ) -> None:
+    # ``alignment`` is backend-specific: deep_gemm's wire format stores scale
+    # factors 4-per-int32 word (hidden/128 columns, static-asserted host and
+    # device side), so it needs 128. The cutedsl kernels tile with ceil-div +
+    # TMA zero-fill and predicated epilogue tails; their true bound is the
+    # 16B TMA row alignment and SF-word packing, i.e. 64 (verified 2026-07-21
+    # against gpt-oss-120b geometry, hidden=inter=2880).
     if world_size <= 0:
         raise MoEEpConfigError(f"world_size must be positive, got {world_size}")
     if params.num_experts % world_size != 0:
@@ -286,13 +312,14 @@ def validate_mega_fleet_params(
             f"num_experts ({params.num_experts}) must be divisible by "
             f"world_size ({world_size})"
         )
-    if params.token_hidden_size % 128 != 0:
+    if params.token_hidden_size % alignment != 0:
         raise MoEEpConfigError(
-            f"token_hidden_size ({params.token_hidden_size}) must be a multiple of 128"
+            f"token_hidden_size ({params.token_hidden_size}) must be a "
+            f"multiple of {alignment}"
         )
-    if intermediate_size % 128 != 0:
+    if intermediate_size % alignment != 0:
         raise MoEEpConfigError(
-            f"intermediate_size ({intermediate_size}) must be a multiple of 128"
+            f"intermediate_size ({intermediate_size}) must be a multiple of {alignment}"
         )
     if top_k <= 0:
         raise MoEEpConfigError(f"top_k must be positive, got {top_k}")

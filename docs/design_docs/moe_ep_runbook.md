@@ -144,17 +144,54 @@ Notes:
 - NIXL-EP coverage today is smoke + multirank + mocked unit tests only; the
   correctness/mega targets are NCCL-EP-only.
 
+### SM90 mega token sweep
+
+Hopper-only (`sm90_pull_fp8`) correctness targets run in their own pytest
+process (the SM90/SM100 kernel trees are mutually exclusive per process):
+`bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
+`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
+
+The perf microbenchmark reproduces the kernel drop's Hopper P03 multirank
+token sweep (`moe_hopper_fp8/run_token_sweep_benchmark.py`, DSV4 geometry:
+topk 6, 384 experts EP4, hidden 7168, intermediate 3072 post-SwiGLU, tokens
+per rank 512..32768) through the FI `MoEEpLayer` mega path, on 4×H100:
+
+```bash
+torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py
+```
+
+Rank 0 prints one `BENCH_CSV` row per (scale_mode, layout, tokens) point;
+each row names the matching drop reference CSV
+(`moe_hopper_fp8/benchmark_data/20260720/...`) so comparison is one grep
+away. The `compute_*_us` columns map to the drop's per-rank
+`mega_us + topk_us`; `e2e_*_us` adds FI staging/validation/output-copy.
+Axes: `--scale-mode {per_tensor,blockwise,both}`, `--swap-ab`/`--no-swap-ab`
+(default both layouts at the shim default tiles: non-swap M64 N128, swap-AB
+M256 N32), `--mma-tiler M,N`, `--tokens`, `--kind`. See the module docstring
+for the full timing/mapping notes. Measured results, comparison caveats,
+and the reproduce recipe live in
+[`kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md).
+
 ---
 
 ## Adding a new mega-kernel backend
 
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
-under `flashinfer/moe_ep/backends/mega/kernel/<name>/`. The kernel sources
-themselves live under
-`flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/` and are exposed
-through the `kernel_src/cutedsl_megamoe/` public API (e.g. `mxfp8_mega_moe`,
-`get_symm_buffer_for_mxfp8_mega_moe`). Use the existing `mxfp8_cutedsl` backend
-as the reference template.
+under `flashinfer/moe_ep/backends/mega/kernel/<name>/`. Kernel-team drops are
+vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
+
+- `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
+- `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
+  (a fork of the same kernel repo; a push-style tree will be added later)
+
+Each tree exposes its kernels through its own package public API (e.g. the
+sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
+trees duplicate the shared kernel-repo runtime (`common`, `src`, …) at their
+own drop revision and are **process-exclusive** — the top-level kernel module
+names collide, so each tree's `shim/_paths.py` refuses to bootstrap when the
+sibling tree's modules are already imported (a process runs on one
+architecture anyway). Use the existing `mxfp8_cutedsl` backend as the
+reference template.
 
 ### 1. Kernel + frontend (the "backend config" it links to)
 
@@ -209,12 +246,13 @@ def <name>_mega_moe(
 caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
-Add both functions under
-`kernel_src/cutedsl_megamoe/shim/` (alongside `nvfp4.py` / `mxfp8.py`) and
-re-export them from the package `__init__.py` (or point at your own kernel
-module). Raw kernel sources live under `kernel_src/cutedsl_megamoe/src/` — see
-`kernel_src/cutedsl_megamoe/SKILL.md` for how to update that directory when the
-kernel team ships a new drop. The kernel-specific tuning knobs
+Add both functions under the owning tree's `shim/` — e.g.
+`kernel_src/sm100/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
+`nvfp4.py` / `mxfp8.py`), `kernel_src/sm90/pull_style_cutedsl_megakernel/shim/`
+for Hopper — and re-export them from that package's `__init__.py` (or point at
+your own kernel module). Raw kernel sources live under the tree's `src/` — see
+the tree's `SKILL.md` for how to update that directory when the kernel team
+ships a new drop. The kernel-specific tuning knobs
 (intermediate size, top_k, clamps, dtype `kind`, fast-math, reduce/dispatch
 flags) live on the **config** dataclass in step 2 and are threaded through to
 these two calls by the backend in step 4 — so an SM90/SM120 kernel that needs

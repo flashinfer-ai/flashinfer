@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .....core.validation.common import MoEEpConfigError
+
+
+def _use_fused_stage() -> bool:
+    # Bisection escape hatch back to the multi-kernel torch staging path.
+    return os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
 
 
 def stage_mega_moe_inputs(
@@ -18,12 +25,20 @@ def stage_mega_moe_inputs(
     *,
     norm_const: float = 1.0,
 ) -> None:
-    """bf16 ``hidden_states`` → NVFP4 activation + fp8 block scales."""
+    """bf16 ``hidden_states`` → NVFP4 activation + fp8 block scales.
+
+    Default path is the fused single-launch ``DataPreprocess`` staging kernel
+    (quant + routing repack in one launch); ``FLASHINFER_MEGA_FUSED_STAGE=0``
+    falls back to the original torch-composed staging below.
+    """
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # package import also bootstraps sys.path for the kernel packages.
-    from .....kernel_src.cutedsl_megamoe import (
+    from .....kernel_src.sm100.cutedsl_megamoe import (
         Nvfp4BlockSize,
         ceil_div,
+        fused_quant_stage,
+        fused_quant_stage_supported,
+        note_staged_tokens,
         nvfp4_quantize_per_block_16,
         round_up,
     )
@@ -31,10 +46,26 @@ def stage_mega_moe_inputs(
     num_tokens, hidden = hidden_states.shape
     if num_tokens == 0:
         return
-    if hidden % 128 != 0:
-        raise ValueError("hidden_size must be a multiple of 128.")
+    if hidden % 64 != 0:
+        raise ValueError("hidden_size must be a multiple of 64.")
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
+
+    if _use_fused_stage() and fused_quant_stage_supported(
+        hidden_states, quant_type="nvfp4"
+    ):
+        fused_quant_stage(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            x_nvfp4,
+            x_sf,
+            topk_idx_out,
+            topk_weights_out,
+            quant_type="nvfp4",
+            norm_const=norm_const,
+        )
+        return
 
     activation_fp32 = hidden_states.to(torch.float32)
     q, sf = nvfp4_quantize_per_block_16(activation_fp32, norm_const)
@@ -56,6 +87,7 @@ def stage_mega_moe_inputs(
     capacity = x_nvfp4.shape[0]
     if num_tokens < capacity:
         topk_idx_out[num_tokens:capacity].fill_(-1)
+    note_staged_tokens(topk_idx_out, num_tokens)
 
 
 def validate_nvfp4_forward_inputs(
@@ -112,7 +144,7 @@ def validate_nvfp4_forward_inputs(
         raise MoEEpConfigError("topk_weights and topk_ids must have the same shape")
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
+    from .....kernel_src.sm100.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     if scales.ndim != 2 or scales.shape[0] != num_tokens:
