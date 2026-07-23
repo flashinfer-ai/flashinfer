@@ -393,6 +393,7 @@ def compute_reference_moe_fp4(
         num_local_experts = num_experts
 
     device = hidden_states.device
+
     hidden_states = hidden_states.float()
     gemm1_weights = gemm1_weights.float()
     gemm2_weights = gemm2_weights.float()

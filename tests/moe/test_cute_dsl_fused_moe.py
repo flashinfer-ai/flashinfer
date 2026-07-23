@@ -332,10 +332,10 @@ class TestTacticEnumeration:
 
         assert len(W4A16_MOE_TACTICS) == len(set(W4A16_MOE_TACTICS))
         assert DEFAULT_W4A16_MOE_TACTIC in W4A16_MOE_TACTICS
-        assert len(W4A16_MOE_TACTICS) == 54
+        assert len(W4A16_MOE_TACTICS) == 66
 
         route_tiles = {tactic[0] for tactic in W4A16_MOE_TACTICS}
-        assert route_tiles == {8, 16, 32, 64, 128}
+        assert route_tiles == {8, 16, 32, 64, 128, 192}
 
         shared_gemm_tactics = {
             ((mma_m, mma_k), cluster_shape)

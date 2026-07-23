@@ -188,16 +188,16 @@ def _moe_core_impl(
     4. Routing-weight reduction in deterministic mode
 
     Args:
-        x: Input tensor, NVFP4 quantized or BF16 when ``x_sf`` is ``None``.
-        x_sf: Scale factors for an NVFP4 input, or ``None`` for BF16 input.
+        x: Packed NVFP4 input for W4A4 or BF16 input for W4A16.
+        x_sf: Scale factors for W4A4; must be ``None`` for W4A16.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
         w1_weight: GEMM1 weights (gate + up fused for gated activations, or a
             single projection for non-gated activations).
         w1_weight_sf: Scale factors for w1_weight.
         w1_alpha: Per-expert global scale for GEMM1.
-        fc2_input_scale: Global scale for GEMM2 input quantization. Ignored
-            when ``x_sf`` is ``None`` because GEMM1 output stays in BF16.
+        fc2_input_scale: Global scale for W4A4 GEMM2 input quantization; must
+            be ``None`` for W4A16.
         w2_weight: GEMM2 weights (down projection).
         w2_weight_sf: Scale factors for w2_weight.
         w2_alpha: Per-expert global scale for GEMM2.
@@ -248,7 +248,29 @@ def _moe_core_impl(
             raise ValueError("fc2_input_scale must be None when quant_mode='w4a16'")
         if per_token_scale is not None:
             raise ValueError("per_token_scale is not supported by quant_mode='w4a16'")
-        return _moe_bf16_activation_impl(
+        if output_dtype != torch.bfloat16:
+            raise ValueError("quant_mode='w4a16' only supports BF16 output")
+        num_tokens = int(token_selected_experts.size(0))
+        hidden_size = int(w2_weight.size(1))
+        if tuple(x.shape) != (num_tokens, hidden_size):
+            raise ValueError(
+                "x must have shape "
+                f"{(num_tokens, hidden_size)} for quant_mode='w4a16', "
+                f"got {tuple(x.shape)}"
+            )
+        if moe_output is None:
+            moe_output = torch.empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16, device=x.device
+            )
+        elif tuple(moe_output.shape) != (num_tokens, hidden_size):
+            raise ValueError(
+                f"moe_output must have shape {(num_tokens, hidden_size)}, "
+                f"got {tuple(moe_output.shape)}"
+            )
+
+        from .blackwell.moe_w4a16 import launch_w4a16_moe
+
+        return launch_w4a16_moe(
             x=x,
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
@@ -262,10 +284,9 @@ def _moe_core_impl(
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
             moe_output=moe_output,
-            output_dtype=output_dtype,
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
-            activation=activation,
+            activation_type=activation,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -444,77 +465,6 @@ def _moe_core_impl(
         )
 
     return moe_output[:num_tokens]
-
-
-def _moe_bf16_activation_impl(
-    x: torch.Tensor,
-    token_selected_experts: torch.Tensor,
-    token_final_scales: torch.Tensor,
-    w1_weight: torch.Tensor,
-    w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
-    num_experts: int,
-    num_local_experts: int,
-    local_expert_offset: int,
-    moe_output: Optional[torch.Tensor],
-    output_dtype: torch.dtype,
-    use_fused_finalize: bool,
-    enable_pdl: bool,
-    activation: ActivationType,
-    swiglu_alpha: float,
-    swiglu_beta: float,
-    swiglu_limit: float,
-    tactic: Optional[Tuple],
-    workspace_cache: Optional[Dict[Tuple, Any]],
-) -> torch.Tensor:
-    """Run the BF16-activation, online-NVFP4-weight-dequantization path."""
-    if output_dtype != torch.bfloat16:
-        raise ValueError("the BF16 activation path only supports BF16 output")
-    num_tokens = int(token_selected_experts.size(0))
-    hidden_size = int(w2_weight.size(1))
-    if tuple(x.shape) != (num_tokens, hidden_size):
-        raise ValueError(
-            "x must have shape "
-            f"{(num_tokens, hidden_size)} for quant_mode='w4a16', got {tuple(x.shape)}"
-        )
-    if moe_output is None:
-        moe_output = torch.empty(
-            (num_tokens, hidden_size), dtype=torch.bfloat16, device=x.device
-        )
-    elif tuple(moe_output.shape) != (num_tokens, hidden_size):
-        raise ValueError(
-            f"moe_output must have shape {(num_tokens, hidden_size)}, "
-            f"got {tuple(moe_output.shape)}"
-        )
-
-    from .blackwell.moe_w4a16 import launch_w4a16_moe
-
-    return launch_w4a16_moe(
-        x=x,
-        token_selected_experts=token_selected_experts,
-        token_final_scales=token_final_scales,
-        w1_weight=w1_weight,
-        w1_weight_sf=w1_weight_sf,
-        w1_alpha=w1_alpha,
-        w2_weight=w2_weight,
-        w2_weight_sf=w2_weight_sf,
-        w2_alpha=w2_alpha,
-        num_experts=num_experts,
-        num_local_experts=num_local_experts,
-        local_expert_offset=local_expert_offset,
-        moe_output=moe_output,
-        use_fused_finalize=use_fused_finalize,
-        enable_pdl=enable_pdl,
-        activation_type=activation,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        swiglu_limit=swiglu_limit,
-        tactic=tactic,
-        workspace_cache=workspace_cache,
-    )
 
 
 # =============================================================================
