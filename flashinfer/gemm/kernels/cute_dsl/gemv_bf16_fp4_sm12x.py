@@ -13,13 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Prototype streaming W4A16 GEMV for SM12x: bf16 activations x NVFP4 weights at
-tiny M.  Weights stream GMEM -> registers with no SMEM staging and no tensor
-cores (each weight byte is used exactly once, so staging is pure overhead);
-one output row per warp, 32 dim-parallel lanes, warp-shuffle reduction.  The
-schedule mirrors MsaProxyScoreDecodeStreamSm12x, whose pack_q measurements
-bound where this shape stops paying: expect wins at M <= 4, parity-at-best by
-M ~ 8 as the FMA phase starts scaling with M while the loads do not.
+Streaming W4A16 GEMV for SM12x: bf16 activation row x NVFP4 weights at m=1.
+
+The MMA kernel's design point (SMEM pipeline feeding tensor cores) is wrong
+for m=1: the problem is DRAM-bound and the tensor-core math is nearly free,
+so pipeline depth buys nothing while its SMEM cost caps resident warps.
+This kernel inverts the trade — weights stream GMEM -> registers with no
+SMEM and no tensor cores, and latency is hidden by warp count alone
+(~48 resident warps/SM).  Measured on prod 5080 it reaches the same DRAM
+utilization band as Marlin (93-96%) where the MMA path tops out lower.
 """
 
 from typing import Tuple
@@ -31,24 +33,12 @@ from cutlass import Float32, Int32, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ....fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_fp4_helpers import (
-    SF_VEC_SIZE,
-    packed_dequant_e2m1x4_to_bfloat2x2,
-)
-
-# The register dequant emits raw-bit bf16 = true_value * 2^-126 (no bias
-# multiply), and the E4M3 scale-byte bit-place decode below emits
-# true_scale * 2^-120.  Folding both ratios into one constant (2^246) is not
-# f32-representable, so each is unfolded separately per scale block.
-_TWO_POW_126 = 2.0**126
-_TWO_POW_120 = 2.0**120
+from ....cute_dsl.fp4_common import fp4_decode_4bytes
 
 
 @dsl_user_op
-def _bf16x2_to_f32x2(
-    packed: Uint32, *, loc=None, ip=None
-) -> Tuple[Float32, Float32]:
-    """Widen one packed bf16x2 register into two f32 values exactly."""
+def _f16x2_to_f32x2(packed: Uint32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """Widen one packed f16x2 register into two f32 values exactly."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [Uint32(packed).ir_value(loc=loc, ip=ip)],
@@ -56,8 +46,8 @@ def _bf16x2_to_f32x2(
         {
             .reg .b16 lo, hi;
             mov.b32 {lo, hi}, $2;
-            cvt.f32.bf16 $0, lo;
-            cvt.f32.bf16 $1, hi;
+            cvt.f32.f16 $0, lo;
+            cvt.f32.f16 $1, hi;
         }
         """,
         "=f,=f,r",
@@ -73,12 +63,21 @@ def _bf16x2_to_f32x2(
 
 
 @dsl_user_op
-def _u32_bitcast_f32(bits: Uint32, *, loc=None, ip=None) -> Float32:
+def _s0e5m3_to_f32(byte: Uint32, *, loc=None, ip=None) -> Float32:
+    """Decode one S0E5M3 scale byte to f32 (exact): ``f16(byte << 7)``."""
     return Float32(
         llvm.inline_asm(
             T.f32(),
-            [Uint32(bits).ir_value(loc=loc, ip=ip)],
-            "mov.b32 $0, $1;",
+            [Uint32(byte).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b32 t;
+                .reg .b16 h;
+                shl.b32 t, $1, 7;
+                cvt.u16.u32 h, t;
+                cvt.f32.f16 $0, h;
+            }
+            """,
             "=f,r",
             has_side_effects=False,
             is_align_stack=False,
@@ -90,60 +89,74 @@ def _u32_bitcast_f32(bits: Uint32, *, loc=None, ip=None) -> Float32:
 
 
 class GemvBf16Fp4Sm12x:
-    """Streaming bf16 x nvfp4 GEMV, one output row per warp.
+    """Streaming bf16 x nvfp4 GEMV over the cute-DSL backend's prepared
+    tensors: the tile-packed ``(K/16, N*2)`` int32 weight and the S0E5M3
+    ``(K/16, N)`` scales — the same operands the MMA kernel takes, so the
+    two dispatch freely per call.
 
-    Consumes the *canonical* nvfp4 weight layout directly -- ``(N, K/2)``
-    uint8 viewed as ``(N, K/8)`` int32 (two codes per byte, low nibble =
-    even K) plus linear ``(N, K/16)`` E4M3 scale bytes -- so unlike the
-    MMA kernel no weight repack pass is needed.
+    Each warp owns one 64-wide N tile and streams its (16K x 64N) packed
+    tiles along K: 4 int32 per lane per tile is one contiguous 16B load,
+    so the warp consumes each 512B tile fully coalesced.  The pack's MMA
+    thread mapping then pins per lane which (k, n) each byte holds: lane
+    ``l`` covers n = base + {0,16,32,48} (base drawn from l) over half the
+    tile's K, and its xor-1 partner lane covers the other half, so four
+    f32 partials per lane plus one butterfly step complete each dot
+    product.  fp4 codes and scales decode with single hardware ops
+    (``cvt.f16x2.e2m1x2``, f16 bit-place) and accumulate in f32.
 
-    Per iteration a lane owns 32 consecutive K codes (one 16B load, two
-    scale blocks); the warp's 32 lanes cover 1024 K.  Dequant reuses the
-    e2m1 bit-place primitive from the SM12x MoE W4A16 kernel and the dot
-    products accumulate in f32, so the only bf16 rounding on the B side is
-    the exact e2m1 magnitude set -- slightly *tighter* than the MMA
-    kernel's bf16 operand path.
-
-    Constraints (prototype): K % 1024 == 0, M in [1, 4] (compile-time; Q
-    and the accumulators live in registers per lane -- the same footprint
-    argument as the MSA stream kernel's group_size cap), non-negative
-    scales (guaranteed by nvfp4 quantization; the shipped MMA kernel's
-    S0E5M3 reformat already bakes in the same assumption).
+    ``splits`` shards K across grid.y for grid fill (a 64-wide-tile grid
+    alone underfills large GPUs); split partials reuse the MMA kernel's
+    fp32-workspace + fixed-order reduce scheme, so results stay
+    deterministic.  m == 1 only: at m >= 2 the serial FMA chain scales
+    with m while the loads don't, and the MMA path wins (measured).
     """
 
-    _NUM_WARPS = 8  # one output row per warp -> 8 rows per CTA
-    _I32_PER_LANE = 4  # one 16B weight load = 4 int32 = 32 fp4 codes
-    _CODES_PER_I32 = 8  # fp4 codes per packed int32
-    # Scale blocks touched per lane per iteration (2) and int32s covered by
-    # one scale block (2).
-    _SF_PER_LANE = _I32_PER_LANE * _CODES_PER_I32 // SF_VEC_SIZE
-    _I32_PER_SF = SF_VEC_SIZE // _CODES_PER_I32
+    _NUM_WARPS = 8  # one 64-wide N tile per warp
+    _TILE_N = 64  # fixed by the weight pack (_CUTE_DSL_PACK_TILE_N)
+    _TILE_K = 16  # fixed by the weight pack; also the scale-block size
+    _I32_PER_LANE = 4  # 128 int32 per packed tile / 32 lanes
 
-    def __init__(self, m: int):
-        if not 1 <= m <= 4:
-            raise ValueError("m must be in [1, 4]")
-        self._m = m
+    def __init__(self, splits: int = 1, enable_pdl: bool = True):
+        if splits < 1:
+            raise ValueError("splits must be >= 1")
+        self._splits = splits
+        self._enable_pdl = enable_pdl
         self._num_threads = self._NUM_WARPS * 32
-        # K codes consumed per warp per iteration (= 1024).
-        self._k_per_iter = 32 * self._I32_PER_LANE * self._CODES_PER_I32
+        self._reduce_threads = 128
 
     @cute.jit
     def __call__(
         self,
-        mA: cute.Tensor,  # (M, K) bf16
-        mB: cute.Tensor,  # (N, K/8) int32: canonical packed fp4
-        mSF: cute.Tensor,  # (N, K/16) uint8 E4M3 per-block scales, linear
-        mC: cute.Tensor,  # (M, N) bf16
+        mA: cute.Tensor,  # (M, K) bf16, row 0 used
+        mB: cute.Tensor,  # (K/16, N*2) int32 tile-packed weight
+        mSF: cute.Tensor,  # (K/16, N) uint8 S0E5M3 scales
+        mC: cute.Tensor,  # (M, N)
+        mPartial: cute.Tensor,  # (splits * N,) f32, dummy when splits == 1
         mAlpha: cute.Tensor,  # (1,) f32
-        n: cutlass.Int32,
-        num_iters: cutlass.Int32,  # K // self._k_per_iter (= K // 1024)
         stream: cuda.CUstream,
     ):
-        self.kernel(mA, mB, mSF, mC, mAlpha, n, num_iters).launch(
-            grid=((n + self._NUM_WARPS - 1) // self._NUM_WARPS, 1, 1),
+        n_tiles = cute.size(mSF, mode=[1]) // self._TILE_N
+        self.kernel(mA, mB, mSF, mC, mPartial, mAlpha).launch(
+            grid=(
+                (n_tiles + self._NUM_WARPS - 1) // self._NUM_WARPS,
+                self._splits,
+                1,
+            ),
             block=[self._num_threads, 1, 1],
             stream=stream,
+            use_pdl=self._enable_pdl,
         )
+        if cutlass.const_expr(self._splits > 1):
+            total = cute.size(mC, mode=[0]) * cute.size(mC, mode=[1])
+            reduce_grid = (total + Int32(self._reduce_threads) - Int32(1)) // Int32(
+                self._reduce_threads
+            )
+            self.kernel_partial_reduce(mPartial, mC).launch(
+                grid=[reduce_grid, 1, 1],
+                block=[self._reduce_threads, 1, 1],
+                stream=stream,
+                use_pdl=self._enable_pdl,
+            )
 
     @cute.kernel
     def kernel(
@@ -152,101 +165,111 @@ class GemvBf16Fp4Sm12x:
         mB: cute.Tensor,
         mSF: cute.Tensor,
         mC: cute.Tensor,
+        mPartial: cute.Tensor,
         mAlpha: cute.Tensor,
-        n: cutlass.Int32,
-        num_iters: cutlass.Int32,
     ):
         lane = cute.arch.lane_idx()
         warp = cute.arch.warp_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        row = bidx * self._NUM_WARPS + warp
-        M = self._m
+        bidx, split, _ = cute.arch.block_idx()
+        nt = bidx * self._NUM_WARPS + warp
 
-        # No SMEM and no CTA-wide sync anywhere below, so a tail warp with no
-        # row can retire early without deadlocking its CTA.
-        if row < n:
-            alpha = mAlpha[0]
-            mB_row = mB[row, None]
-            mSF_row = mSF[row, None]
+        n = cute.size(mSF, mode=[1])
+        n_tiles = n // self._TILE_N
+        k_tiles = cute.size(mB, mode=[0])
 
-            acc = cute.make_rmem_tensor((M,), Float32)
-            acc.fill(0.0)
-            wfrag = cute.make_rmem_tensor(
-                cute.make_layout(self._I32_PER_LANE), Int32
+        cute.arch.griddepcontrol_wait()
+
+        # No SMEM and no CTA-wide sync, so a tail warp with no tile can
+        # retire early without deadlocking its CTA.
+        if nt < n_tiles:
+            kt_per_split = (k_tiles + Int32(self._splits) - Int32(1)) // Int32(
+                self._splits
             )
+            kt0 = split * kt_per_split
+            kt1 = cutlass.min(kt0 + kt_per_split, k_tiles)
+
+            # Lane-fixed slice of the pack mapping (see the class docstring):
+            # this lane's 16B load holds codes for n = base_n + {0,16,32,48}
+            # at k_half in 2*(lane%2) + {0,1,4,5}.
+            base_n = (lane // 16) * 8 + (lane % 16) // 2
+
+            acc = cute.make_rmem_tensor((4,), Float32)
+            acc.fill(0.0)
+            wfrag = cute.make_rmem_tensor(cute.make_layout(self._I32_PER_LANE), Int32)
             afrags = [
-                [
-                    cute.make_rmem_tensor(
-                        cute.make_layout(self._CODES_PER_I32), mA.element_type
-                    )
-                    for _ in range(self._I32_PER_LANE)
-                ]
-                for _ in range(M)
+                cute.make_rmem_tensor(cute.make_layout(4), mA.element_type)
+                for _ in range(2)
             ]
 
-            for it in cutlass.range(num_iters):
-                base_i32 = it * (32 * self._I32_PER_LANE) + lane * self._I32_PER_LANE
-
-                # Issue every load of the iteration before any consumption;
-                # cross-iteration overlap comes from warp parallelism (this
-                # shape runs tens of warps per SM), not a SMEM pipeline.
+            for kt in cutlass.range(kt0, kt1, 1):
                 w_chunk = cute.local_tile(
-                    mB_row, (self._I32_PER_LANE,), (it * 32 + lane,)
+                    mB[kt, None], (self._I32_PER_LANE,), (nt * 32 + lane,)
                 )
                 cute.autovec_copy(w_chunk, wfrag)
-                for g in cutlass.range_constexpr(M):
-                    for j in cutlass.range_constexpr(self._I32_PER_LANE):
-                        a_chunk = cute.local_tile(
-                            mA[g, None], (self._CODES_PER_I32,), (base_i32 + j,)
+                # Each lane loads only its own 8 A values: k in
+                # 2*trh0 + {0..3} and 2*trh0 + {8..11} of the tile.  The
+                # lane parity lives in the address so the fragment indices
+                # below stay compile-time.
+                for h in cutlass.range_constexpr(2):
+                    a_chunk = cute.local_tile(
+                        mA[0, None], (4,), (kt * 4 + 2 * h + (lane % 2),)
+                    )
+                    cute.autovec_copy(a_chunk, afrags[h])
+                af = [[Float32(afrags[h][i]) for i in range(4)] for h in range(2)]
+
+                dot = [Float32(0.0) for _ in range(4)]
+                for j in cutlass.range_constexpr(self._I32_PER_LANE):
+                    b0, b1, b2, b3 = fp4_decode_4bytes(Uint32(wfrag[j]))
+                    for b, reg in enumerate((b0, b1, b2, b3)):
+                        p = 2 * (j & 1) + (b >> 1)
+                        lo, hi = _f16x2_to_f32x2(reg)
+                        dot[p] = (
+                            dot[p]
+                            + lo * af[b & 1][2 * (j >> 1)]
+                            + hi * af[b & 1][2 * (j >> 1) + 1]
                         )
-                        cute.autovec_copy(a_chunk, afrags[g][j])
-                sblk = it * (32 * self._SF_PER_LANE) + lane * self._SF_PER_LANE
 
-                for h in cutlass.range_constexpr(self._SF_PER_LANE):
-                    # E4M3 bit-place decode: exp+mant land in the f32 fields
-                    # at ratio 2^-120 (sign dropped: nvfp4 scales are
-                    # non-negative).
-                    sb = Uint32(mSF_row[sblk + h])
-                    s_true = _u32_bitcast_f32((sb & 0x7F) << 20) * _TWO_POW_120
-                    dot = [Float32(0.0) for _ in range(M)]
-                    for j in cutlass.range_constexpr(self._I32_PER_SF):
-                        wu = Uint32(wfrag[h * self._I32_PER_SF + j])
-                        # Nibble order per int32 (little-endian codes k0..k7):
-                        # the primitive returns (shifted, unshifted) pairs, so
-                        # dequant(w) yields (k2,k6),(k3,k7) and dequant(w<<8)
-                        # yields (k0,k4),(k1,k5).  The dot is order-invariant,
-                        # so index A to match instead of shuffling W.
-                        p26, p37 = packed_dequant_e2m1x4_to_bfloat2x2(wu)
-                        p04, p15 = packed_dequant_e2m1x4_to_bfloat2x2(wu << 8)
-                        f3, f7 = _bf16x2_to_f32x2(p37)
-                        f2, f6 = _bf16x2_to_f32x2(p26)
-                        f1, f5 = _bf16x2_to_f32x2(p15)
-                        f0, f4 = _bf16x2_to_f32x2(p04)
-                        fs = (f0, f1, f2, f3, f4, f5, f6, f7)
-                        for g in cutlass.range_constexpr(M):
-                            af = afrags[g][h * self._I32_PER_SF + j]
-                            dot[g] = (
-                                dot[g]
-                                + fs[0] * Float32(af[0])
-                                + fs[1] * Float32(af[1])
-                                + fs[2] * Float32(af[2])
-                                + fs[3] * Float32(af[3])
-                                + fs[4] * Float32(af[4])
-                                + fs[5] * Float32(af[5])
-                                + fs[6] * Float32(af[6])
-                                + fs[7] * Float32(af[7])
-                            )
-                    # Unfold the two power-of-two ratios separately (their
-                    # product is not f32-representable).  dot's raw terms sit
-                    # near 2^-126 where f32 subnormals lose a few mantissa
-                    # bits, but only on terms ~2^-22 below the block dot --
-                    # far under the e2m1 quantization noise.
-                    for g in cutlass.range_constexpr(M):
-                        acc[g] = acc[g] + (dot[g] * _TWO_POW_126) * s_true
+                for p in cutlass.range_constexpr(4):
+                    sb = Uint32(mSF[kt, nt * self._TILE_N + base_n + 16 * p])
+                    acc[p] = acc[p] + dot[p] * _s0e5m3_to_f32(sb)
 
-            for g in cutlass.range_constexpr(M):
-                r = acc[g]
-                for s in cutlass.range_constexpr(5):  # log2(32-lane warp)
-                    r = r + cute.arch.shuffle_sync_bfly(r, 1 << s)
-                if lane == 0:
-                    mC[g, row] = mC.element_type(r * alpha)
+            # xor-1 partners cover complementary k_half sets of the same
+            # four n's; one butterfly completes each dot product.
+            for p in cutlass.range_constexpr(4):
+                acc[p] = acc[p] + cute.arch.shuffle_sync_bfly(acc[p], 1)
+
+            alpha = mAlpha[0]
+            if lane % 2 == 0:
+                for p in cutlass.range_constexpr(4):
+                    n_idx = nt * self._TILE_N + lane // 2 + 16 * p
+                    if cutlass.const_expr(self._splits == 1):
+                        mC[0, n_idx] = mC.element_type(acc[p] * alpha)
+                    else:
+                        mPartial[split * n + n_idx] = acc[p] * alpha
+
+        cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.kernel
+    def kernel_partial_reduce(
+        self,
+        mPartial: cute.Tensor,
+        mC_mn: cute.Tensor,
+    ):
+        """Sum the fp32 partials into C, one element per thread, in fixed
+        split order for determinism (same scheme as the MMA kernel)."""
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        cute.arch.griddepcontrol_wait()
+
+        total = cute.size(mC_mn, mode=[0]) * cute.size(mC_mn, mode=[1])
+        mC_flat = cute.make_tensor(mC_mn.iterator, cute.make_layout(total))
+
+        idx = Int32(bidx) * Int32(self._reduce_threads) + tidx
+        if idx < total:
+            acc_sum = Float32(0.0)
+            for s in cutlass.range_constexpr(self._splits):
+                acc_sum = acc_sum + Float32(mPartial[Int32(s) * total + idx])
+            mC_flat[idx] = mC_flat.element_type(acc_sum)
+
+        cute.arch.griddepcontrol_launch_dependents()
