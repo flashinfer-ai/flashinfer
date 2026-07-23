@@ -387,7 +387,7 @@ class TllmGenFmhaKernel {
 
   inline bool useDynamicNumTokensPerPage(RunnerParams const& params) const {
     return isPagedKv(params.mQkvLayout) && !isSparseMla(params.mSparseMlaType) &&
-           params.mNumHeadsQPerKv > 1 && params.mHeadDimQk == params.mHeadDimV &&
+           params.mHeadDimQk == params.mHeadDimV &&
            params.mNumTokensPerPage >= kDynamicNumTokensPerPageThreshold;
   }
 
