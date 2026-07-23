@@ -28,6 +28,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
+
+from .cute_compile_utils import cute_compile, device_compute_capability
 import cuda.bindings.driver as cuda
 
 # ============================================================================
@@ -896,6 +898,8 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
 
 @functools.cache
 def _get_compiled_decode_kernel(
+    cc_major: int,
+    cc_minor: int,
     T: int,
     H: int,
     HV: int,
@@ -960,7 +964,10 @@ def run_pretranspose_decode(
         stride0, stride1, stride2, stride3 = tuple(int(x) for x in h0_source.stride())
     else:
         pool_size = stride0 = stride1 = stride2 = stride3 = 0
+    cc = device_compute_capability(q.device)
     cache_key = (
+        cc[0],
+        cc[1],
         T,
         H,
         HV,
@@ -1028,7 +1035,7 @@ def run_pretranspose_decode(
         run_func = run_gdn_decode_kernel_small_batch_pretranspose
 
         # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
+        compiled = cute_compile(
             run_func,
             h0_source_tensor,
             A_log_tensor,
@@ -1055,6 +1062,7 @@ def run_pretranspose_decode(
             use_pool_indexing=use_pool_indexing,
             is_varlen=False,
             stream=stream,
+            device=q.device,
             options="--enable-tvm-ffi",
         )
         cache["compiled"] = compiled

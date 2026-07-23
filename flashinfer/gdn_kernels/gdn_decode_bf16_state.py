@@ -47,6 +47,8 @@ import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from .cute_compile_utils import cute_compile, device_compute_capability
+
 
 def _mark_batch_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
     # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
@@ -3129,8 +3131,10 @@ def gated_delta_rule_mtp_wide_vec(
     else:
         pool_size_key = pool_size
         pool_slot_stride = tuple(int(s) for s in initial_state_source.stride())
+    cc = device_compute_capability(q.device)
     cache_key = (
         "v3_mtp_bf16_tiled_dynB",
+        cc,
         T_val,
         H_val,
         HV_val,
@@ -3203,7 +3207,7 @@ def gated_delta_rule_mtp_wide_vec(
         )
 
         _compiled_kernels_wide_vec[cache_key] = {
-            "compiled": cute.compile(
+            "compiled": cute_compile(
                 _run_wide_vec,
                 h_,
                 inter_,
@@ -3239,6 +3243,7 @@ def gated_delta_rule_mtp_wide_vec(
                 per_token_pool_scatter,
                 per_token_pool_scatter_flat,
                 stream,
+                device=q.device,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
             # Per-B default tensors (B-dependent shapes; can't be shared
@@ -3408,8 +3413,10 @@ def gated_delta_rule_t1_wide_vec(
     else:
         pool_size_key = pool_size
         pool_slot_stride = tuple(int(s) for s in initial_state_source.stride())
+    cc = device_compute_capability(q.device)
     cache_key = (
         "v3_mtp_bf16_tiled_dynB",
+        cc,
         T_val,
         H_val,
         HV_val,
@@ -3464,7 +3471,7 @@ def gated_delta_rule_t1_wide_vec(
         h0_out_idx_ = h0_idx_
 
         _compiled_kernels_wide_vec[cache_key] = {
-            "compiled": cute.compile(
+            "compiled": cute_compile(
                 _run_wide_vec_t1,
                 h_,
                 inter_,
@@ -3493,6 +3500,7 @@ def gated_delta_rule_t1_wide_vec(
                 use_packed_fma,
                 same_pool,
                 stream,
+                device=q.device,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
             # Per-B default tensors (B-dependent shapes — see batch-dynamic
@@ -3773,8 +3781,10 @@ def gated_delta_rule_mtp(
     else:
         pool_size_key = pool_size
         pool_slot_stride = tuple(int(s) for s in initial_state_source.stride())
+    cc = device_compute_capability(q.device)
     cache_key = (
         "mtp_bf16_dynB",
+        cc,
         T,
         H,
         HV,
@@ -3847,7 +3857,7 @@ def gated_delta_rule_mtp(
         )
 
         _compiled_kernels_mtp[cache_key] = {
-            "compiled": cute.compile(
+            "compiled": cute_compile(
                 run_gdn_decode_bf16state_mtp_ilp4,
                 h_,
                 inter_,
@@ -3882,6 +3892,7 @@ def gated_delta_rule_mtp(
                 per_token_pool_scatter,
                 per_token_pool_scatter_flat,
                 stream,
+                device=q.device,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
             # Per-B default tensors (B-dependent shapes — see batch-dynamic

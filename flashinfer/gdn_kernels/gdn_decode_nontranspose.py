@@ -29,6 +29,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from .cute_compile_utils import cute_compile, device_compute_capability
+
 # ============================================================================
 # Constants for NONTRANSPOSE version ([pool, HV, K, V])
 # ============================================================================
@@ -677,6 +679,8 @@ def run_gdn_decode_kernel_big_batch_nontranspose(
 
 @functools.cache
 def _get_compiled_decode_kernel_nontranspose(
+    cc_major: int,
+    cc_minor: int,
     use_small_batch: bool,
     T: int,
     H: int,
@@ -722,7 +726,20 @@ def run_nontranspose_decode(
         use_qk_l2norm: Whether to apply L2 normalization.
     """
     use_small_batch = B < SMALL_BATCH_THRESHOLD_NT
-    cache_key = (use_small_batch, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
+    cc = device_compute_capability(q.device)
+    cache_key = (
+        cc[0],
+        cc[1],
+        use_small_batch,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        q.dtype,
+        scale,
+        use_qk_l2norm,
+    )
     cache = _get_compiled_decode_kernel_nontranspose(*cache_key)
 
     aux_map = cache.setdefault("aux", {})
@@ -763,7 +780,7 @@ def run_nontranspose_decode(
         ).mark_layout_dynamic()
 
         # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
+        compiled = cute_compile(
             run_func,
             cu_seqlens_tensor,
             q_tensor,
@@ -787,6 +804,7 @@ def run_nontranspose_decode(
             use_initial_state=True,
             use_qk_l2norm=use_qk_l2norm,
             stream=stream,
+            device=q.device,
             options="--enable-tvm-ffi",
         )
         cache["compiled"] = compiled
