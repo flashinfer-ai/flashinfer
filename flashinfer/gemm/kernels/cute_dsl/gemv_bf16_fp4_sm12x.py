@@ -32,6 +32,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from ....fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_fp4_helpers import (
+    SF_VEC_SIZE,
     packed_dequant_e2m1x4_to_bfloat2x2,
 )
 
@@ -112,14 +113,19 @@ class GemvBf16Fp4Sm12x:
 
     _NUM_WARPS = 8  # one output row per warp -> 8 rows per CTA
     _I32_PER_LANE = 4  # one 16B weight load = 4 int32 = 32 fp4 codes
+    _CODES_PER_I32 = 8  # fp4 codes per packed int32
+    # Scale blocks touched per lane per iteration (2) and int32s covered by
+    # one scale block (2).
+    _SF_PER_LANE = _I32_PER_LANE * _CODES_PER_I32 // SF_VEC_SIZE
+    _I32_PER_SF = SF_VEC_SIZE // _CODES_PER_I32
 
     def __init__(self, m: int):
         if not 1 <= m <= 4:
             raise ValueError("m must be in [1, 4]")
         self._m = m
         self._num_threads = self._NUM_WARPS * 32
-        # K codes consumed per warp per iteration.
-        self._k_per_iter = 32 * self._I32_PER_LANE * 8
+        # K codes consumed per warp per iteration (= 1024).
+        self._k_per_iter = 32 * self._I32_PER_LANE * self._CODES_PER_I32
 
     @cute.jit
     def __call__(
@@ -130,7 +136,7 @@ class GemvBf16Fp4Sm12x:
         mC: cute.Tensor,  # (M, N) bf16
         mAlpha: cute.Tensor,  # (1,) f32
         n: cutlass.Int32,
-        num_iters: cutlass.Int32,  # K // 1024
+        num_iters: cutlass.Int32,  # K // self._k_per_iter (= K // 1024)
         stream: cuda.CUstream,
     ):
         self.kernel(mA, mB, mSF, mC, mAlpha, n, num_iters).launch(
@@ -165,11 +171,15 @@ class GemvBf16Fp4Sm12x:
 
             acc = cute.make_rmem_tensor((M,), Float32)
             acc.fill(0.0)
-            wfrag = cute.make_rmem_tensor(cute.make_layout(4), Int32)
+            wfrag = cute.make_rmem_tensor(
+                cute.make_layout(self._I32_PER_LANE), Int32
+            )
             afrags = [
                 [
-                    cute.make_rmem_tensor(cute.make_layout(8), mA.element_type)
-                    for _ in range(4)
+                    cute.make_rmem_tensor(
+                        cute.make_layout(self._CODES_PER_I32), mA.element_type
+                    )
+                    for _ in range(self._I32_PER_LANE)
                 ]
                 for _ in range(M)
             ]
@@ -180,23 +190,27 @@ class GemvBf16Fp4Sm12x:
                 # Issue every load of the iteration before any consumption;
                 # cross-iteration overlap comes from warp parallelism (this
                 # shape runs tens of warps per SM), not a SMEM pipeline.
-                w_chunk = cute.local_tile(mB_row, (4,), (it * 32 + lane,))
+                w_chunk = cute.local_tile(
+                    mB_row, (self._I32_PER_LANE,), (it * 32 + lane,)
+                )
                 cute.autovec_copy(w_chunk, wfrag)
                 for g in cutlass.range_constexpr(M):
-                    for j in cutlass.range_constexpr(4):
-                        a_chunk = cute.local_tile(mA[g, None], (8,), (base_i32 + j,))
+                    for j in cutlass.range_constexpr(self._I32_PER_LANE):
+                        a_chunk = cute.local_tile(
+                            mA[g, None], (self._CODES_PER_I32,), (base_i32 + j,)
+                        )
                         cute.autovec_copy(a_chunk, afrags[g][j])
-                sblk = it * 64 + lane * 2
+                sblk = it * (32 * self._SF_PER_LANE) + lane * self._SF_PER_LANE
 
-                for h in cutlass.range_constexpr(2):  # two scale blocks / lane
+                for h in cutlass.range_constexpr(self._SF_PER_LANE):
                     # E4M3 bit-place decode: exp+mant land in the f32 fields
                     # at ratio 2^-120 (sign dropped: nvfp4 scales are
                     # non-negative).
                     sb = Uint32(mSF_row[sblk + h])
                     s_true = _u32_bitcast_f32((sb & 0x7F) << 20) * _TWO_POW_120
                     dot = [Float32(0.0) for _ in range(M)]
-                    for j in cutlass.range_constexpr(2):
-                        wu = Uint32(wfrag[h * 2 + j])
+                    for j in cutlass.range_constexpr(self._I32_PER_SF):
+                        wu = Uint32(wfrag[h * self._I32_PER_SF + j])
                         # Nibble order per int32 (little-endian codes k0..k7):
                         # the primitive returns (shifted, unshifted) pairs, so
                         # dequant(w) yields (k2,k6),(k3,k7) and dequant(w<<8)
@@ -210,7 +224,7 @@ class GemvBf16Fp4Sm12x:
                         f0, f4 = _bf16x2_to_f32x2(p04)
                         fs = (f0, f1, f2, f3, f4, f5, f6, f7)
                         for g in cutlass.range_constexpr(M):
-                            af = afrags[g][h * 2 + j]
+                            af = afrags[g][h * self._I32_PER_SF + j]
                             dot[g] = (
                                 dot[g]
                                 + fs[0] * Float32(af[0])
@@ -232,7 +246,7 @@ class GemvBf16Fp4Sm12x:
 
             for g in cutlass.range_constexpr(M):
                 r = acc[g]
-                for s in cutlass.range_constexpr(5):
+                for s in cutlass.range_constexpr(5):  # log2(32-lane warp)
                     r = r + cute.arch.shuffle_sync_bfly(r, 1 << s)
                 if lane == 0:
                     mC[g, row] = mC.element_type(r * alpha)
