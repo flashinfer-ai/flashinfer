@@ -17,16 +17,10 @@ import ctypes
 import logging
 import os
 import socket
-import array
-import random
 
-import contextlib
-
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-import platform
 import sys
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 import pynvml
 
 logger = logging.getLogger(__name__)
@@ -50,6 +44,17 @@ except ImportError:
 from ..cuda_utils import checkCudaErrors
 from .dlpack_utils import create_dlpack_capsule, pack_strided_memory
 from .mapping import Mapping
+
+from .abstractions import CommBackend
+from .comm_backend import (  # noqa: F401
+    MPIBackend,
+    MpiComm,
+    TorchDistBackend,
+)
+from .fd_exchange import broadcast_fd, exchange_fds
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
 
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
@@ -170,181 +175,6 @@ def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> Optional[int]:
     return int(device_ptr)
 
 
-class CommBackend(ABC):
-    """Abstract communication backend interface"""
-
-    @abstractmethod
-    def Get_rank(self) -> int: ...
-
-    @abstractmethod
-    def Get_size(self) -> int: ...
-
-    @abstractmethod
-    def allgather(self, data: int) -> List[int]: ...
-
-    @abstractmethod
-    def bcast(self, data: Any, root: int) -> Any: ...
-
-    @abstractmethod
-    def barrier(self) -> None: ...
-
-    @abstractmethod
-    def Split(self, color: int, key: int) -> "CommBackend": ...
-
-
-if TYPE_CHECKING:
-    from mpi4py import MPI  # noqa: F401
-
-
-def lazy_import_mpi():
-    """Lazy import for mpi4py"""
-    try:
-        from mpi4py import MPI
-
-        return MPI
-    except ImportError as err:
-        raise ImportError("mpi4py is not installed") from err  # type: ignore[no-redef]
-
-
-class MpiComm:  # type: ignore[no-redef]
-    _comm: Any = None
-    _MPI: Any = None
-
-    @classmethod
-    def _get_mpi(cls):
-        if cls._MPI is None:
-            cls._MPI = lazy_import_mpi()
-            cls._comm = cls._MPI.COMM_WORLD
-        return cls._MPI
-
-    @classmethod
-    def set_mpi_comm(cls, new_comm: Any):
-        cls._get_mpi()
-        # Optional: add type checking here
-        cls._comm = new_comm
-
-    def __getattr__(self, name):
-        if self._comm is None:
-            self._get_mpi()
-        return getattr(self._comm, name)
-
-
-class MPIBackend(CommBackend):
-    def __init__(self):
-        self._mpicomm = MpiComm()
-
-    def Get_rank(self) -> int:
-        return self._mpicomm.Get_rank()
-
-    def Get_size(self) -> int:
-        return self._mpicomm.Get_size()
-
-    def allgather(self, data: int) -> List[int]:
-        return self._mpicomm.allgather(data)
-
-    def bcast(self, data: Any, root: int) -> Any:
-        return self._mpicomm.bcast(data, root)
-
-    def barrier(self):
-        self._mpicomm.Barrier()
-
-    def Split(self, color: int, key: int) -> CommBackend:
-        self._mpicomm = self._mpicomm.Split(color, key)
-        return MPIBackend()  # Returns new adapter
-
-
-class TorchDistBackend(CommBackend):
-    """Communication backend using torch.distributed"""
-
-    def __init__(self, group: Optional[Any] = None):
-        """
-        Initialize TorchDistBackend.
-
-        Args:
-            group: Optional process group. If None, uses the default process group.
-        """
-        import torch.distributed as dist
-
-        if not dist.is_initialized():
-            raise RuntimeError(
-                "torch.distributed is not initialized. "
-                "Please call torch.distributed.init_process_group() first."
-            )
-        self._group = group
-        self._dist = dist
-
-    def Get_rank(self) -> int:
-        return self._dist.get_rank(self._group)
-
-    def Get_size(self) -> int:
-        return self._dist.get_world_size(self._group)
-
-    def allgather(self, data: Any) -> List[Any]:
-        """All-gather arbitrary Python objects across all ranks."""
-        output_list = [None] * self.Get_size()
-        self._dist.all_gather_object(output_list, data, group=self._group)
-        return output_list
-
-    def bcast(self, data: Any, root: int) -> Any:
-        """Broadcast a Python object from root to all ranks.
-
-        Args:
-            data: object to broadcast (only used on the root rank).
-            root: group-local rank of the sender (consistent with MPI).
-        """
-        object_list = [data]
-        global_root = (
-            self._dist.get_global_rank(self._group, root)
-            if self._group is not None
-            else root
-        )
-        self._dist.broadcast_object_list(
-            object_list, src=global_root, group=self._group
-        )
-        return object_list[0]
-
-    def barrier(self) -> None:
-        self._dist.barrier(group=self._group)
-
-    def Split(self, color: int, key: int) -> "TorchDistBackend":
-        """
-        Split the communicator into sub-groups based on color.
-
-        All processes with the same color will be in the same new group.
-        The key determines the rank ordering within the new group.
-
-        Args:
-            color: Processes with the same color are placed in the same group
-            key: Determines rank ordering within the new group (lower key = lower rank)
-
-        Returns:
-            New TorchDistBackend with the split process group
-        """
-        # Gather (color, key, global_rank) from all processes
-        global_rank = self.Get_rank()
-
-        all_info = self.allgather((color, key, global_rank))
-
-        # Group ranks by color, sort by key within each group
-        color_groups: Dict[int, List[tuple]] = {}
-        for c, k, r in all_info:
-            if c not in color_groups:
-                color_groups[c] = []
-            color_groups[c].append((k, r))
-
-        # Sort each group by key to determine rank ordering
-        for c in color_groups:
-            color_groups[c].sort(key=lambda x: x[0])
-
-        # Find my new group's ranks (in sorted order by key)
-        my_group_ranks = [r for _, r in color_groups[color]]
-
-        # Create new process group with the ranks in my color group
-        new_group = self._dist.new_group(ranks=my_group_ranks)
-
-        return TorchDistBackend(group=new_group)
-
-
 @dataclass
 class MnnvlConfig:
     """Configuration for MNNVL memory management"""
@@ -446,6 +276,39 @@ class MnnvlMemory:  # type: ignore[no-redef]
         MnnvlMemory.comm = comm
         return comm
 
+    _fabric_supported: bool | None = None
+
+    @staticmethod
+    def _probe_fabric_supported(dev_id: int) -> bool:
+        """Return True if this rank's GPU supports FABRIC handles and is part of a fabric cluster."""
+        try:
+            return is_mnnvl_fabric_supported(dev_id)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _resolve_fabric_support(comm: CommBackend, dev_id: int) -> bool:
+        """AND-reduce per-rank FABRIC support and cache the result.
+
+        All ranks must take the same handle-exchange path or the collective deadlocks.
+        """
+        if MnnvlMemory._fabric_supported is not None:
+            return MnnvlMemory._fabric_supported
+
+        local_supported = MnnvlMemory._probe_fabric_supported(dev_id)
+        agreed = all_ranks_agree(comm, local_supported)
+
+        if agreed != local_supported:
+            logger.warning(
+                "[MnnvlMemory] FABRIC support probe disagrees across ranks "
+                f"(local={local_supported}); falling back to "
+                f"{'FABRIC' if agreed else 'POSIX fd'} on all ranks to keep the "
+                "handle-exchange path consistent."
+            )
+
+        MnnvlMemory._fabric_supported = agreed
+        return agreed
+
     @staticmethod
     def get_allocation_prop(dev_id: int):
         location = cuda.CUmemLocation()
@@ -453,11 +316,15 @@ class MnnvlMemory:  # type: ignore[no-redef]
         location.id = dev_id
         allocation_prop = cuda.CUmemAllocationProp()
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        # TODO: We differentiate FABRIC for GB200 (aarch64) and POSIX_FILE_DESCRIPTOR for B200 (x86_64).
-        # May need to find a better way to handle this.
-        arch = platform.machine().lower()
-        is_on_aarch64 = "aarch64" in arch
-        if is_on_aarch64:
+        allocation_prop.location = location
+
+        use_fabric = (
+            MnnvlMemory._fabric_supported
+            if MnnvlMemory._fabric_supported is not None
+            else MnnvlMemory._probe_fabric_supported(dev_id)
+        )
+
+        if use_fabric:
             allocation_prop.requestedHandleTypes = (
                 cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
             )
@@ -465,7 +332,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
             allocation_prop.requestedHandleTypes = (
                 cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
             )
-        allocation_prop.location = location
         return allocation_prop
 
     @staticmethod
@@ -511,54 +377,28 @@ class MnnvlMemory:  # type: ignore[no-redef]
             allocation_prop.requestedHandleTypes
             == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
         ):
-            all_handles_data = comm.allgather(exported_fabric_handle.data)
+            # tuple (FABRIC) here, list[int] (POSIX fds) below -- widen to Sequence.
+            all_handles_data: Sequence[Any] = comm.allgather(
+                exported_fabric_handle.data
+            )
         else:
+            # The exchange returns our own exported_fd (not a dup) at our rank's
+            # slot; the mapping loop's finally closes it along with received fds.
             exported_fd = int(exported_fabric_handle)
-            pidfds = []
-            remote_fds = []
             try:
-                all_handles_data = comm.allgather(exported_fd)
-                all_pids = comm.allgather(os.getpid())
-                libc = ctypes.CDLL(None, use_errno=True)
-                syscall = libc.syscall
-                SYS_pidfd_open = 434
-                SYS_pidfd_getfd = 438
-
-                for pid in all_pids:
-                    pidfd = syscall(SYS_pidfd_open, pid, 0)
-                    if pidfd < 0:
-                        err = ctypes.get_errno()
-                        raise RuntimeError(
-                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                        )
-                    pidfds.append(pidfd)
-
-                for pidfd, fd in zip(pidfds, all_handles_data, strict=True):
-                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                    if remote_fd < 0:
-                        err = ctypes.get_errno()
-                        error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
-                        if err == 1:  # EPERM
-                            error_msg += (
-                                " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
-                                "to your docker run command."
-                            )
-                        else:
-                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
-                        raise RuntimeError(error_msg)
-                    remote_fds.append(remote_fd)
-
-                # Every rank must duplicate every exported FD before its owner closes it.
-                comm.barrier()
-                all_handles_data = remote_fds
+                local_host = socket.gethostname()
+                all_hosts = comm.allgather(local_host)
+                if len(set(all_hosts)) != 1:
+                    raise RuntimeError(
+                        "[MnnvlMemory] POSIX fd exchange via SCM_RIGHTS requires all "
+                        "ranks to share the same host, but got differing hostnames: "
+                        f"{all_hosts}. Multi-node MNNVL requires a fabric-capable GPU "
+                        "setup (CU_MEM_HANDLE_TYPE_FABRIC)."
+                    )
+                all_handles_data = exchange_fds(comm, exported_fd)
             except BaseException:
-                for remote_fd in remote_fds:
-                    os.close(remote_fd)
-                raise
-            finally:
-                for pidfd in pidfds:
-                    os.close(pidfd)
                 os.close(exported_fd)
+                raise
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
@@ -639,6 +479,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
         assert all(x == size for x in all_rank_allocate_sizes), (
             "Not all rank allocating same size."
         )
+        MnnvlMemory._resolve_fabric_support(comm, dev_id)
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
@@ -722,7 +563,9 @@ class MnnvlMemory:  # type: ignore[no-redef]
                     is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
                     if is_active:
                         active_links += 1
-            except pynvml.NVMLError_NotSupported:
+            except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):
+                # Link indices beyond the device's link count raise
+                # InvalidArgument on some platforms (e.g. B200).
                 continue
         return (
             active_links == available_links and available_links > 0
@@ -738,207 +581,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
         # May need better support check.
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
         return support_nvlink_and_all_up
-
-
-# The helper class for passing the FD handle over the socket.
-class IpcSocket:
-    """Unix Domain Socket for IPC file descriptor passing"""
-
-    def __init__(self, rank: int, op_id: int, use_abstract=True):
-        """
-        Initialize IPC socket
-
-        Args:
-            rank: Process rank
-            op_id: Unique operation ID (hash)
-            use_abstract: Use Linux abstract socket namespace
-        """
-        self.rank = rank
-        self.op_id = op_id
-        self.use_abstract = use_abstract
-
-        # Create Unix domain socket (DGRAM for compatibility with C code)
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-
-        # Create unique socket name
-        socket_name = f"/tmp/mcastmem-socket-{rank}-{op_id:x}"
-
-        if use_abstract:
-            # Linux abstract socket: prepend null byte
-            self.socket_path = "\0" + socket_name
-        else:
-            self.socket_path = socket_name
-            # Remove existing socket file if it exists
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(socket_name)
-
-        # Bind socket
-        self.sock.bind(self.socket_path)
-
-    def send_fd(self, fd: int, dest_rank: int, dest_op_id: Optional[int] = None):
-        """
-        Send a file descriptor to another process
-
-        Args:
-            fd: File descriptor to send
-            dest_rank: Destination process rank
-            dest_op_id: Destination operation ID
-        """
-        # Construct destination socket path
-        dest_op_id = dest_op_id or self.op_id
-        dest_socket_name = f"/tmp/mcastmem-socket-{dest_rank}-{dest_op_id:x}"
-
-        if self.use_abstract:
-            dest_path = "\0" + dest_socket_name
-        else:
-            dest_path = dest_socket_name
-
-        # Prepare message with file descriptor
-        # Send dummy byte as data (required)
-        dummy_data = b"\x00"
-
-        # Pack file descriptor in ancillary data (SCM_RIGHTS)
-        fds = array.array("i", [fd])
-        ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds.tobytes())]
-
-        # Send message with file descriptor
-        self.sock.sendmsg([dummy_data], ancillary, 0, dest_path)
-
-    def recv_fd(self):
-        """
-        Receive a file descriptor from another process
-
-        Returns:
-            int: Received file descriptor
-        """
-        # Receive message with ancillary data
-        # Maximum size for ancillary data containing one fd
-        fds = array.array("i")
-        msg, ancdata, flags, addr = self.sock.recvmsg(
-            1,
-            socket.CMSG_SPACE(
-                fds.itemsize
-            ),  # Buffer size for dummy data  # Ancillary data size
-        )
-
-        # Extract file descriptor from ancillary data
-        for cmsg_level, cmsg_type, cmsg_data in ancdata:
-            if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
-                fds = array.array("i")
-                fds.frombytes(
-                    cmsg_data[: len(cmsg_data) - (len(cmsg_data) % fds.itemsize)]
-                )
-                return fds[0]
-
-        raise RuntimeError("No file descriptor received")
-
-    def close(self):
-        """Close the socket"""
-        self.sock.close()
-        if not self.use_abstract and self.socket_path:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(self.socket_path)
-
-
-class HandleExchanger(ABC):
-    """Abstract interface for exchanging CUDA shareable handles across ranks."""
-
-    def __init__(self, comm_backend: "CommBackend", group_rank: int, group_size: int):
-        self.comm = comm_backend
-        self.rank = group_rank
-        self.size = group_size
-
-    @property
-    @abstractmethod
-    def handle_type(self) -> cuda.CUmemAllocationHandleType:
-        """The CUDA handle type this exchanger works with."""
-        ...
-
-    @abstractmethod
-    def allgather(self, local_handle) -> List:
-        """All-gather shareable handles from all ranks."""
-        ...
-
-    @abstractmethod
-    def broadcast(self, handle, root: int):
-        """Broadcast a handle from root to all ranks."""
-        ...
-
-    @abstractmethod
-    def cleanup(self, handle) -> None: ...
-
-    @abstractmethod
-    def close(self) -> None: ...
-
-
-class FabricHandleExchanger(HandleExchanger):
-    """Handle exchange using CUDA Fabric handles via MPI/collective backend."""
-
-    @property
-    def handle_type(self) -> cuda.CUmemAllocationHandleType:
-        return cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-
-    def allgather(self, local_handle) -> List:
-        return self.comm.allgather(local_handle.data)
-
-    def broadcast(self, handle, root: int):
-        return self.comm.bcast(handle.data if handle else None, root=root)
-
-    def cleanup(self, handle) -> None:
-        pass  # No cleanup needed for Fabric handles.
-
-    def close(self) -> None:
-        pass  # No close needed for Fabric handles.
-
-
-class PosixFDHandleExchanger(HandleExchanger):
-    """Handle exchange using POSIX file descriptors via IPC sockets."""
-
-    def __init__(self, comm_backend: "CommBackend", group_rank: int, group_size: int):
-        super().__init__(comm_backend, group_rank, group_size)
-        self._socket = self._init_ipc_socket()
-
-    def _init_ipc_socket(self) -> IpcSocket:
-        if self.rank == 0:
-            opId = random.Random().randint(0, 2**64 - 1)
-        else:
-            opId = None
-        opId = self.comm.bcast(opId, root=0)
-        return IpcSocket(self.rank, opId)
-
-    @property
-    def handle_type(self) -> cuda.CUmemAllocationHandleType:
-        return cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-
-    def allgather(self, local_handle) -> List:
-        result = [None] * self.size
-        for i in range(self.size):
-            self.comm.barrier()
-            self._socket.send_fd(local_handle, (self.rank + i) % self.size)
-            src = (self.rank + self.size - i) % self.size
-            result[src] = self._socket.recv_fd()
-        return result
-
-    def broadcast(self, handle, root: int):
-        if self.rank == root:
-            for p in range(1, self.size):
-                self.comm.barrier()
-                self._socket.send_fd(handle, p)
-            return handle
-        else:
-            # Ordered receive to avoid race condition
-            for _ in range(self.rank):
-                self.comm.barrier()
-            result = self._socket.recv_fd()
-            for _ in range(self.size - self.rank - 1):
-                self.comm.barrier()
-            return result
-
-    def cleanup(self, handle) -> None:
-        os.close(handle)
-
-    def close(self) -> None:
-        self._socket.close()
 
 
 def is_mnnvl_fabric_supported(device_idx: int) -> bool:
@@ -963,6 +605,124 @@ def is_mnnvl_fabric_supported(device_idx: int) -> bool:
         )
     finally:
         pynvml.nvmlShutdown()
+
+
+def is_multicast_supported(device_idx: int) -> bool:
+    """Return True if the device supports NVLink multicast (cuMulticastCreate; SM90+ NVLink)."""
+    try:
+        multicast_supported = checkCudaErrors(
+            cuda.cuDeviceGetAttribute(
+                cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED,
+                device_idx,
+            )
+        )
+        return multicast_supported != 0
+    except Exception:
+        return False
+
+
+def all_ranks_agree(comm: CommBackend, local: bool) -> bool:
+    """AND-reduce a per-rank boolean over the group (True iff every rank is True)."""
+    return all(comm.allgather(local))
+
+
+def all_ranks_support_mnnvl(
+    local_supported: bool,
+    world_size: int,
+    comm_backend: CommBackend | None = None,
+    group: "ProcessGroup | None" = None,
+) -> bool:
+    """Return True only if every rank supports MNNVL.
+
+    All ranks must build the same workspace type or the collective rendezvous
+    deadlocks, so we AND-reduce the per-rank probe. Must be called on every rank
+    unconditionally.
+    """
+    if world_size <= 1:
+        return local_supported
+
+    comm = comm_backend
+    if comm is None:
+        import torch.distributed as dist
+
+        comm = TorchDistBackend(group=group) if dist.is_initialized() else MPIBackend()
+
+    comm_size = comm.Get_size()
+    if comm_size != world_size:
+        logger.warning(
+            "[MNNVL] capability-vote comm size %d != world_size %d; disabling "
+            "MNNVL auto-selection. Pass a comm_backend/group scoped to the "
+            "workspace ranks to enable it.",
+            comm_size,
+            world_size,
+        )
+        return False
+
+    return all_ranks_agree(comm, local_supported)
+
+
+@dataclass(frozen=True)
+class HandleExchanger:
+    """Exchanges CUDA shareable memory handles across ranks.
+
+    ``handle_type`` is the tag that selects the transport: FABRIC handles ride
+    the ``CommBackend`` object collectives; POSIX file descriptors ride AF_UNIX
+    SCM_RIGHTS sockets (see :mod:`.fd_exchange`).
+    """
+
+    comm: CommBackend
+    rank: int
+    size: int
+    handle_type: "cuda.CUmemAllocationHandleType"
+
+
+def make_handle_exchanger(
+    comm: CommBackend, rank: int, size: int, dev_id: int
+) -> HandleExchanger:
+    """Pick FABRIC vs POSIX-fd handles based on the device's fabric support."""
+    if is_mnnvl_fabric_supported(dev_id):
+        handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    else:
+        handle_type = (
+            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        )
+    return HandleExchanger(comm=comm, rank=rank, size=size, handle_type=handle_type)
+
+
+def _handle_is_fabric(ex: HandleExchanger) -> bool:
+    return ex.handle_type == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+
+
+def handle_allgather(ex: HandleExchanger, local_handle) -> Sequence[Any]:
+    """All-gather shareable handles from every rank (indexed by rank).
+
+    Returns a tuple for FABRIC handles and a list for POSIX fds; callers only
+    index and iterate. For POSIX fds the returned sequence owns real
+    descriptors (``entry[own_rank]`` is the caller's own fd); close each
+    returned fd exactly once (see :func:`.fd_exchange.exchange_fds`).
+    """
+    if _handle_is_fabric(ex):
+        return ex.comm.allgather(local_handle.data)
+    return exchange_fds(ex.comm, int(local_handle))
+
+
+def handle_broadcast(ex: HandleExchanger, handle, root: int):
+    """Broadcast one shareable handle from ``root`` to every rank."""
+    if _handle_is_fabric(ex):
+        return ex.comm.bcast(handle.data if handle else None, root=root)
+    return broadcast_fd(ex.comm, int(handle) if handle is not None else None, root)
+
+
+def handle_cleanup(ex: HandleExchanger, handle) -> None:
+    """Release a shareable handle: FABRIC needs none; a POSIX fd is closed."""
+    if not _handle_is_fabric(ex) and handle is not None:
+        os.close(int(handle))
+
+
+def handle_close(ex: HandleExchanger | None) -> None:
+    """Release transport resources. Sockets are self-managed per exchange, so
+    this is a no-op kept for symmetry with the previous interface."""
+    return None
 
 
 # TODO: This class follows similar logic with MnnvlMemory, but the latter use single instance mode to manage the memory allocation.
@@ -1023,17 +783,10 @@ class SymmDeviceMemory:
         self.SIGNAL_PAD_SIZE = SIGNAL_PAD_SIZE
 
         # Check if device supports multicasting
-        if self._enable_multicast:
-            multicast_supported = checkCudaErrors(
-                cuda.cuDeviceGetAttribute(
-                    cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED,
-                    device_idx,
-                )
+        if self._enable_multicast and not is_multicast_supported(device_idx):
+            raise RuntimeError(
+                "[SymmDeviceMemory] Device does not support multicasting."
             )
-            if multicast_supported == 0:
-                raise RuntimeError(
-                    "[SymmDeviceMemory] Device does not support multicasting."
-                )
 
         # Calculate signal pad offset with alignment (matching C++ exactly)
         self.signal_pad_offset = round_up(buf_size, self.SIGNAL_PAD_ALIGNMENT)
@@ -1064,7 +817,7 @@ class SymmDeviceMemory:
         """Destructor - cleanup allocated memory"""
 
         if hasattr(self, "_exchanger") and self._exchanger is not None:
-            self._exchanger.close()
+            handle_close(self._exchanger)
 
         # Skip cleanup during Python finalization to avoid segfaults
         # Especially cause the CUDA context could be destroyed at this point.
@@ -1179,14 +932,9 @@ class SymmDeviceMemory:
     def _create_and_map_handles(self, comm: CommBackend) -> None:
         """Create physical backing and map it at the reserved addresses."""
         # Create handle exchanger
-        if is_mnnvl_fabric_supported(self.device_idx):
-            self._exchanger = FabricHandleExchanger(
-                comm, self.group_rank, self.group_size
-            )
-        else:
-            self._exchanger = PosixFDHandleExchanger(
-                comm, self.group_rank, self.group_size
-            )
+        self._exchanger = make_handle_exchanger(
+            comm, self.group_rank, self.group_size, self.device_idx
+        )
 
         self._verify_cuda_context()
 
@@ -1226,7 +974,7 @@ class SymmDeviceMemory:
         for handle in self.uc_handles:
             checkCudaErrors(cuda.cuMemRelease(handle))
 
-        self._exchanger.close()
+        handle_close(self._exchanger)
         self.uc_handles = [0] * self.group_size
         self._exchanger = None
         self._mapped = False
@@ -1307,8 +1055,12 @@ class SymmDeviceMemory:
             )
         )
 
-        # All-gather shareable handles
-        all_shareable_uc_handles = self._exchanger.allgather(local_shareable_uc_handle)
+        # All-gather shareable handles. For POSIX fds, entry[group_rank] is our
+        # own local_shareable_uc_handle (not a dup), so the cleanup loop below
+        # closes it exactly once — no separate cleanup of local_shareable_uc_handle.
+        all_shareable_uc_handles = handle_allgather(
+            self._exchanger, local_shareable_uc_handle
+        )
         cuda.cuCtxSynchronize()
 
         # Import remote handles
@@ -1320,8 +1072,7 @@ class SymmDeviceMemory:
                         self._exchanger.handle_type,
                     )
                 )
-            self._exchanger.cleanup(all_shareable_uc_handles[p])
-        self._exchanger.cleanup(local_shareable_uc_handle)
+            handle_cleanup(self._exchanger, all_shareable_uc_handles[p])
 
         # Reserve address space for UC pointers
         if not self.uc_ptrs:
@@ -1366,7 +1117,9 @@ class SymmDeviceMemory:
             shareable_mc_handle = None
 
         # Broadcast multicast handle from rank 0
-        shareable_mc_handle = self._exchanger.broadcast(shareable_mc_handle, root=0)
+        shareable_mc_handle = handle_broadcast(
+            self._exchanger, shareable_mc_handle, root=0
+        )
         cuda.cuCtxSynchronize()
 
         # Import multicast handle for non-root ranks
@@ -1377,7 +1130,7 @@ class SymmDeviceMemory:
                     self._exchanger.handle_type,
                 )
             )
-        self._exchanger.cleanup(shareable_mc_handle)
+        handle_cleanup(self._exchanger, shareable_mc_handle)
 
         # Add device to multicast
         checkCudaErrors(cuda.cuMulticastAddDevice(self.mc_handle, self.device_idx))

@@ -38,6 +38,7 @@ from .api import (
     MoEWeightPack,
     TrtllmBf16Config,
     TrtllmFp4Config,
+    TrtllmFp8BlockConfig,
 )
 from .runners import (
     B12xNvfp4Runner,
@@ -45,6 +46,7 @@ from .runners import (
     CuteDslNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
+    TrtllmFp8BlockRunner,
 )
 from .utils import map_to_hybrid_bucket
 
@@ -56,6 +58,7 @@ _RunnerT = Union[
     CuteDslNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
+    TrtllmFp8BlockRunner,
     B12xNvfp4Runner,
     B12xW4A16Runner,
 ]
@@ -65,6 +68,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
+    TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
 }

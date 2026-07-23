@@ -47,6 +47,7 @@ from ..utils import get_compute_capability
 # Module-level permute-index cache.  Permute indices depend only on weight
 # dims, so the cache is safe to reuse across shapes and calls.
 _TRTLLM_PERMUTE_CACHE: dict = {}
+_TRTLLM_FP8_PERMUTE_CACHE: dict = {}
 
 
 # The E8M0 range clamp and residual-scale factorization are adapted from
@@ -536,6 +537,196 @@ def prepare_trtllm_fp4_weights(
         "output1_scale_gate_scalar": ones,
         "output2_scale_scalar": ones,
     }
+
+
+def _deepseek_fp8_quantize_activations(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[M, K]`` BF16 per 1x128 block.
+
+    TRTLLM's DeepSeek path consumes scales transposed as ``[K // 128, M]``.
+    """
+    block = 128
+    m, k = x.shape
+    blocks = x.float().reshape(m, k // block, block)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    scales = (blocks.abs().amax(dim=-1, keepdim=True) / fp8_max).clamp(min=1e-12)
+    quantized = (blocks / scales).clamp(-fp8_max, fp8_max)
+    return (
+        quantized.reshape(m, k).to(torch.float8_e4m3fn),
+        scales.squeeze(-1).transpose(0, 1).contiguous(),
+    )
+
+
+def _deepseek_fp8_quantize_weights(
+    weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[E, N, K]`` BF16 per 128x128 block."""
+    block = 128
+    e, n, k = weights.shape
+    blocks = (
+        weights.float()
+        .reshape(e, n // block, block, k // block, block)
+        .permute(0, 1, 3, 2, 4)
+    )
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    scales = (blocks.abs().amax(dim=(-1, -2), keepdim=True) / fp8_max).clamp(min=1e-12)
+    quantized = (blocks / scales).clamp(-fp8_max, fp8_max)
+    quantized = quantized.permute(0, 1, 3, 2, 4).reshape(e, n, k)
+    return quantized.to(torch.float8_e4m3fn), scales[..., 0, 0].contiguous()
+
+
+def _validate_trtllm_fp8_block_inputs(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> None:
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise ValueError(
+            "prepare_trtllm_fp8_block_weights expects BF16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+
+
+def prepare_trtllm_fp8_block_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    variant,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Prepare canonical BF16 expert weights for TRTLLM block-FP8 MoE.
+
+    DeepSeek FP8 uses E4M3 payloads with FP32 128x128 block scales. MXFP8
+    uses E4M3 payloads with linear UE8M0 scales over 32-element K blocks.
+    Both native views remain in ``MajorK`` layout; the unified runner records
+    the exact variant and passes the corresponding kernel enum.
+    """
+    from .api import QuantVariant
+
+    if variant not in (QuantVariant.DeepSeekFp8, QuantVariant.MxFp8):
+        raise ValueError(
+            "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
+            f"got {variant!r}."
+        )
+    _validate_trtllm_fp8_block_inputs(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    if device is None:
+        device = w1_bf16.device
+    w1_bf16 = w1_bf16.to(device).contiguous()
+    w2_bf16 = w2_bf16.to(device).contiguous()
+
+    if variant is QuantVariant.DeepSeekFp8:
+        for name, dim in (
+            ("hidden_size", hidden_size),
+            ("intermediate_size", intermediate_size),
+            ("2 * intermediate_size", 2 * intermediate_size),
+        ):
+            if dim % 128 != 0:
+                raise ValueError(f"DeepSeek FP8 requires {name} divisible by 128.")
+        w1_q, w1_sf = _deepseek_fp8_quantize_weights(w1_bf16)
+        w2_q, w2_sf = _deepseek_fp8_quantize_weights(w2_bf16)
+    else:
+        if hidden_size % 32 != 0 or intermediate_size % 32 != 0:
+            raise ValueError(
+                "MXFP8 requires hidden_size and intermediate_size divisible by 32."
+            )
+        from ..quantization.fp8_quantization import mxfp8_quantize
+        from .core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
+        w1_q, w1_sf, w2_q, w2_sf = [], [], [], []
+        for expert in range(num_local_experts):
+            q, sf = mxfp8_quantize(w1_bf16[expert], is_sf_swizzled_layout=False)
+            sf = sf.view(torch.uint8).reshape(2 * intermediate_size, hidden_size // 32)
+            permute = _maybe_get_cached_w3_w1_permute_indices(
+                _TRTLLM_FP8_PERMUTE_CACHE,
+                q.view(torch.uint8),
+                128,
+                is_gated_act_gemm=True,
+            )
+            permute_sf = _maybe_get_cached_w3_w1_permute_indices(
+                _TRTLLM_FP8_PERMUTE_CACHE,
+                sf,
+                128,
+                num_elts_per_sf=32,
+                is_gated_act_gemm=True,
+            )
+            w1_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
+            w1_sf.append(sf[permute_sf.to(device)])
+
+            q, sf = mxfp8_quantize(w2_bf16[expert], is_sf_swizzled_layout=False)
+            sf = sf.view(torch.uint8).reshape(hidden_size, intermediate_size // 32)
+            permute = get_w2_permute_indices_with_cache(
+                _TRTLLM_FP8_PERMUTE_CACHE, q.view(torch.uint8), 128
+            )
+            permute_sf = get_w2_permute_indices_with_cache(
+                _TRTLLM_FP8_PERMUTE_CACHE,
+                sf,
+                128,
+                num_elts_per_sf=32,
+            )
+            w2_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
+            w2_sf.append(sf[permute_sf.to(device)])
+        w1_q, w1_sf = torch.stack(w1_q), torch.stack(w1_sf)
+        w2_q, w2_sf = torch.stack(w2_q), torch.stack(w2_sf)
+
+    return {
+        "gemm1_weights": w1_q,
+        "gemm1_weights_scale": w1_sf,
+        "gemm2_weights": w2_q,
+        "gemm2_weights_scale": w2_sf,
+    }
+
+
+def prepare_trtllm_fp8_block_activations(
+    hidden_states_bf16: torch.Tensor,
+    *,
+    variant,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[M, H]`` BF16 activations for TRTLLM block-FP8 MoE."""
+    from .api import QuantVariant
+
+    if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
+        raise ValueError(
+            "prepare_trtllm_fp8_block_activations expects a 2D BF16 tensor, "
+            f"got shape={tuple(hidden_states_bf16.shape)}, "
+            f"dtype={hidden_states_bf16.dtype}."
+        )
+    hidden_states_bf16 = hidden_states_bf16.contiguous()
+    if variant is QuantVariant.DeepSeekFp8:
+        if hidden_states_bf16.shape[1] % 128 != 0:
+            raise ValueError("DeepSeek FP8 hidden_size must be divisible by 128.")
+        return _deepseek_fp8_quantize_activations(hidden_states_bf16)
+    if variant is QuantVariant.MxFp8:
+        from ..quantization.fp8_quantization import mxfp8_quantize
+
+        q, sf = mxfp8_quantize(hidden_states_bf16, is_sf_swizzled_layout=False)
+        return q, sf.view(torch.uint8).reshape(hidden_states_bf16.shape[0], -1)
+    raise ValueError(
+        "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
+        f"got {variant!r}."
+    )
 
 
 def prepare_trtllm_bf16_weights(
