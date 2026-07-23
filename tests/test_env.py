@@ -35,7 +35,7 @@ def _load_env_module():
 
     stubs["flashinfer.compilation_context"].CompilationContext = _Stub
 
-    saved = {k: sys.modules.get(k) for k in stubs}
+    saved = {k: sys.modules.get(k) for k in (*stubs, "flashinfer.jit.env")}
     sys.modules.update(stubs)
     try:
         spec = importlib.util.spec_from_file_location(
