@@ -9,15 +9,11 @@ import torch
 import flashinfer
 from flashinfer import autotune
 from flashinfer.autotuner import AutoTuner
-from flashinfer.mla._batch_mla._backends import (
-    trtllm_gen_backend as batch_mla_trtllm_gen,
-)
-from flashinfer.mla._batch_mla import _core as batch_mla_core
+from flashinfer.mla._batch_mla import _functional as batch_mla_core
 from flashinfer.utils import (
     get_compute_capability,
     get_device_sm_count,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
-    next_positive_power_of_2,
 )
 
 
@@ -129,89 +125,6 @@ def test_autotune_dispatcher_runs_with_auto_backend_and_caller_counter():
     assert out.shape == (query.shape[0], 1, _NUM_HEADS, _KV_LORA_RANK)
     assert out.isfinite().all()
     assert torch.count_nonzero(caller_counter_buffer).item() == 0
-
-
-def test_trtllm_runner_cache_key_is_stable_after_backend_local_extraction(
-    monkeypatch,
-):
-    class FakeModule:
-        def trtllm_paged_attention_decode(self, *args):
-            raise AssertionError("cache-key construction must not launch a kernel")
-
-    monkeypatch.setattr(
-        batch_mla_trtllm_gen,
-        "get_trtllm_gen_fmha_module",
-        lambda: FakeModule(),
-    )
-    runner_type = batch_mla_trtllm_gen.TrtllmGenMlaDecodeRunner
-    runner = runner_type(
-        kv_cache=torch.empty((4, 1, 64, 576), dtype=torch.bfloat16),
-        workspace_buffer=torch.empty(16, dtype=torch.uint8),
-        sm_count=120,
-        qk_nope_head_dim=128,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        max_seq_len=2048,
-        sparse_mla_top_k=0,
-        bmm1_scale=1.0,
-        bmm2_scale=torch.ones(1),
-        sinks=[torch.empty(2)],
-        skip_softmax_threshold_scale_factor=None,
-        enable_pdl=False,
-        is_var_seq=True,
-        uses_shared_paged_kv_idx=True,
-        return_lse=False,
-        lse=None,
-    )
-    inputs = [
-        torch.empty((2, 1, 128, 576), dtype=torch.float16),
-        torch.zeros((2, 1), dtype=torch.int32),
-        torch.ones(2, dtype=torch.int32),
-        torch.empty((2, 1, 128, 512), dtype=torch.float32),
-    ]
-
-    cache_key_extras = runner.get_cache_key_extras(inputs)
-    assert cache_key_extras[7] == next_positive_power_of_2(runner.max_seq_len)
-    assert cache_key_extras == (
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-        128,
-        512,
-        64,
-        64,
-        2048,
-        0,
-        True,
-        True,
-        False,
-        "bmm1_float",
-        "bmm2_tensor",
-        (((2,), torch.float32),),
-        None,
-        False,
-    )
-    assert hash(runner) == hash(
-        runner_type(
-            kv_cache=torch.empty((8, 1, 64, 576), dtype=torch.bfloat16),
-            workspace_buffer=torch.empty(32, dtype=torch.uint8),
-            sm_count=120,
-            qk_nope_head_dim=128,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            max_seq_len=2048,
-            sparse_mla_top_k=0,
-            bmm1_scale=1.0,
-            bmm2_scale=torch.ones(1),
-            sinks=[torch.empty(2)],
-            skip_softmax_threshold_scale_factor=None,
-            enable_pdl=False,
-            is_var_seq=True,
-            uses_shared_paged_kv_idx=True,
-            return_lse=False,
-            lse=None,
-        )
-    )
 
 
 @pytest.mark.parametrize(

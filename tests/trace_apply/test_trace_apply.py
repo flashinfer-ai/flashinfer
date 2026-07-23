@@ -207,7 +207,7 @@ def test_mla_stateful_adapter_preserves_old_and_new_module_paths():
 
     legacy = adapter_for("flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run")
     current = adapter_for(
-        "flashinfer.mla._batch_mla._core.BatchMLAPagedAttentionWrapper.run"
+        "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run"
     )
 
     assert legacy is current

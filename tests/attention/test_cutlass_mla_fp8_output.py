@@ -15,6 +15,9 @@ import torch
 from tests.test_helpers.test_helpers import clear_cuda_cache
 
 import flashinfer
+from flashinfer.mla._batch_mla._backends.fa2_backend import (
+    _BatchMLAPagedAttentionFa2Backend,
+)
 from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 
 
@@ -237,7 +240,9 @@ def test_cutlass_mla_fp8_output_scale_rejected_by_non_cutlass_backend():
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa2")
     wrapper._selected_backend = "fa2"
-    wrapper._backend_impl = object()
+    backend = object.__new__(_BatchMLAPagedAttentionFa2Backend)
+    backend._generated_fa_workspace = wrapper._generated_fa_workspace
+    wrapper._backend_impl = backend
     out = torch.empty(1, 128, 512, dtype=torch.float8_e4m3fn, device=device)
 
     with pytest.raises(ValueError, match="o_scale is only supported with the cutlass"):

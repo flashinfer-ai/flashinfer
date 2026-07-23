@@ -10,7 +10,7 @@ You may obtain a copy of the License at
 
 import functools
 import math
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -20,6 +20,7 @@ from flashinfer.jit import gen_trtllm_gen_fmha_module, setup_cubin_loader
 from flashinfer.utils import (
     _check_block_tables_shape,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
+    _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     check_shape_dtype_device,
     device_support_pdl,
     get_device_sm_count,
@@ -28,6 +29,11 @@ from flashinfer.utils import (
     next_positive_power_of_2,
 )
 
+from .._planning import (
+    _audit_plan_from_wrapper_arguments,
+    _MLAPlanArguments,
+    _MLAWrapperPlanResult,
+)
 from ._layout import _concat_adjacent_views_or_cat
 
 
@@ -85,6 +91,10 @@ def _check_trtllm_gen_mla_shape(
     qk_rope_head_dim: int,
     page_size: int,
     block_tables: torch.Tensor,
+    sparse_mla_top_k: int = 0,
+    uses_shared_paged_kv_idx: bool = True,
+    batch_size: Optional[int] = None,
+    max_q_len: Optional[int] = None,
 ) -> torch.Tensor:
     if query.ndim not in (3, 4):
         raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
@@ -102,7 +112,10 @@ def _check_trtllm_gen_mla_shape(
             f"kv_lora_rank={kv_lora_rank} and qk_rope_head_dim={qk_rope_head_dim}."
         )
 
-    batch_size = query.shape[0] if query.ndim == 4 else block_tables.shape[0]
+    if query.ndim == 4:
+        batch_size = query.shape[0]
+    elif batch_size is None or max_q_len is None:
+        raise ValueError("batch_size and max_q_len are required when query.ndim == 3")
     qk_head_dim = query.shape[-1]
     expected_qk_head_dim = kv_lora_rank + qk_rope_head_dim
     if qk_head_dim != expected_qk_head_dim or kv_cache.shape[3] != expected_qk_head_dim:
@@ -111,7 +124,20 @@ def _check_trtllm_gen_mla_shape(
             f"got {qk_head_dim} and {kv_cache.shape[3]}."
         )
 
-    _check_block_tables_shape(block_tables, True)
+    if sparse_mla_top_k > 0:
+        expected_shape = (
+            (query.size(0), sparse_mla_top_k)
+            if query.ndim == 3
+            else (batch_size, query.size(1), sparse_mla_top_k)
+        )
+        if tuple(block_tables.shape) != expected_shape:
+            raise ValueError(
+                f"Expected block_tables.shape == {expected_shape}, got "
+                f"{tuple(block_tables.shape)}"
+            )
+        return kv_cache
+
+    _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
     if block_tables.shape[0] != batch_size:
         raise ValueError(
             "Expected block_tables.shape[0] to match query batch size, got "
@@ -257,9 +283,6 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         return_lse: bool,
         lse: Optional[torch.Tensor],
     ):
-        self._launcher = _TrtllmGenMlaDecodeLauncher(
-            get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-        )
         self.kv_cache = kv_cache
         self.workspace_buffer = workspace_buffer
         self.sm_count = sm_count
@@ -278,6 +301,48 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
         self.return_lse = return_lse
         self.lse = lse
+
+    def _plan_backend(
+        self,
+        *,
+        query: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cum_seq_lens_q: torch.Tensor,
+        max_q_len: int,
+        has_ragged_query: bool,
+    ) -> "_BatchMLAPagedAttentionTrtllmGenBackend":
+        sinks = self.sinks
+        if isinstance(sinks, (list, tuple)):
+            if len(sinks) != 1:
+                raise ValueError("trtllm-gen MLA expects sinks to contain one tensor")
+            sinks = sinks[0]
+        backend = _BatchMLAPagedAttentionTrtllmGenBackend(self.workspace_buffer)
+        backend.plan(
+            cum_seq_lens_q=cum_seq_lens_q,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_q_len=max_q_len,
+            max_seq_len=self.max_seq_len,
+            num_heads=query.size(-2),
+            head_dim_ckv=self.kv_lora_rank,
+            head_dim_kpe=self.qk_rope_head_dim,
+            page_size=self.page_size,
+            causal=False,
+            sm_scale=1.0 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim),
+            q_data_type=query.dtype,
+            kv_data_type=self.kv_cache.dtype,
+            use_profiler=False,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            enable_pdl=self.enable_pdl,
+            is_var_seq=self.is_var_seq,
+            use_sinks=sinks is not None,
+            sparse_mla_top_k=self.sparse_mla_top_k,
+            uses_shared_paged_kv_idx=self.uses_shared_paged_kv_idx,
+            has_ragged_query=has_ragged_query,
+            allow_fp8=True,
+        )
+        return backend
 
     def __hash__(self):
         return hash(type(self))
@@ -328,27 +393,26 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Launch a non-autotuned variable-query request."""
-        self._launcher.run(
-            out=out,
+        backend = self._plan_backend(
             query=query,
-            key_cache=self.kv_cache,
-            value_cache=self.kv_cache,
-            workspace_buffer=self.workspace_buffer,
             block_tables=block_tables,
             seq_lens=seq_lens,
+            cum_seq_lens_q=cum_seq_lens_q,
             max_q_len=max_q_len,
-            max_seq_len=self.max_seq_len,
+            has_ragged_query=True,
+        )
+        backend.run(
+            q_nope=query[..., : self.kv_lora_rank],
+            q_pe=query[..., self.kv_lora_rank :],
+            ckv_cache=self.kv_cache.squeeze(1)[..., : self.kv_lora_rank],
+            kpe_cache=self.kv_cache.squeeze(1)[..., self.kv_lora_rank :],
+            out=out,
+            sinks=(
+                self.sinks[0] if isinstance(self.sinks, (list, tuple)) else self.sinks
+            ),
+            skip_softmax_threshold_scale_factor=self.skip_softmax_threshold_scale_factor,
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
-            batch_size=cum_seq_lens_q.size(0) - 1,
-            num_qo_heads=query.size(1),
-            sparse_mla_top_k=self.sparse_mla_top_k,
-            sm_count=self.sm_count,
-            enable_pdl=self.enable_pdl,
-            sinks=self.sinks,
-            cum_seq_lens_q=cum_seq_lens_q,
-            skip_softmax_threshold_scale_factor=self.skip_softmax_threshold_scale_factor,
-            uses_shared_paged_kv_idx=self.uses_shared_paged_kv_idx,
             multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
         return out
@@ -365,7 +429,9 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         batch_size = query.size(0)
         max_q_len = query.size(1)
         num_qo_heads = query.size(2)
-        query_flat = query.flatten(0, 1)
+        cum_seq_lens_q = torch.arange(
+            batch_size + 1, device=query.device, dtype=torch.int32
+        ).mul_(max_q_len)
 
         if self.return_lse:
             lse_shape = (batch_size * max_q_len, num_qo_heads)
@@ -373,36 +439,31 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
                 lse = self.lse
             else:
                 lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
-            lse_stride_tokens = lse.stride(0)
-            lse_stride_heads = lse.stride(1)
         else:
             lse = None
-            lse_stride_tokens = 0
-            lse_stride_heads = 0
 
-        self._launcher.run(
-            out=out,
-            query=query_flat,
-            key_cache=self.kv_cache,
-            value_cache=self.kv_cache,
-            workspace_buffer=self.workspace_buffer,
+        backend = self._plan_backend(
+            query=query,
             block_tables=block_tables,
             seq_lens=seq_lens,
+            cum_seq_lens_q=cum_seq_lens_q,
             max_q_len=max_q_len,
-            max_seq_len=self.max_seq_len,
+            has_ragged_query=False,
+        )
+        backend.run(
+            q_nope=query[..., : self.kv_lora_rank].flatten(0, 1),
+            q_pe=query[..., self.kv_lora_rank :].flatten(0, 1),
+            ckv_cache=self.kv_cache.squeeze(1)[..., : self.kv_lora_rank],
+            kpe_cache=self.kv_cache.squeeze(1)[..., self.kv_lora_rank :],
+            out=out.flatten(0, 1),
+            lse=lse,
+            return_lse=self.return_lse,
+            sinks=(
+                self.sinks[0] if isinstance(self.sinks, (list, tuple)) else self.sinks
+            ),
+            skip_softmax_threshold_scale_factor=self.skip_softmax_threshold_scale_factor,
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
-            batch_size=batch_size,
-            num_qo_heads=num_qo_heads,
-            sparse_mla_top_k=self.sparse_mla_top_k,
-            sm_count=self.sm_count,
-            enable_pdl=self.enable_pdl,
-            sinks=self.sinks,
-            skip_softmax_threshold_scale_factor=self.skip_softmax_threshold_scale_factor,
-            uses_shared_paged_kv_idx=self.uses_shared_paged_kv_idx,
-            lse=lse,
-            lse_stride_tokens=lse_stride_tokens,
-            lse_stride_heads=lse_stride_heads,
             multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
         return out
@@ -413,6 +474,50 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         self._backend = "trtllm-gen"
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+
+    @classmethod
+    @_audit_plan_from_wrapper_arguments
+    def plan_from_wrapper(cls, args: _MLAPlanArguments) -> _MLAWrapperPlanResult:
+        cute_dsl_impl = args.cute_dsl_impl
+        if cute_dsl_impl != "auto":
+            raise ValueError(
+                "cute_dsl_impl is not supported by the trtllm-gen backend."
+            )
+        if (
+            not isinstance(args.page_size, int)
+            or isinstance(args.page_size, bool)
+            or args.page_size <= 0
+        ):
+            raise ValueError(
+                f"page_size must be a positive int, got {args.page_size!r}."
+            )
+        if args.page_size > 128 or 128 % args.page_size != 0:
+            raise ValueError(
+                "trtllm-gen dense metadata requires page_size to divide 128, "
+                f"got {args.page_size}."
+            )
+        dense = args.native_dense
+        backend = cls(args._float_workspace_buffer)
+        backend.plan(
+            cum_seq_lens_q=dense.cum_seq_lens_q,
+            block_tables=dense.block_tables,
+            seq_lens=dense.seq_lens,
+            max_q_len=dense.max_q_len,
+            num_heads=args.num_heads,
+            head_dim_ckv=args.head_dim_ckv,
+            head_dim_kpe=args.head_dim_kpe,
+            page_size=args.page_size,
+            causal=args.causal,
+            sm_scale=args.sm_scale,
+            q_data_type=args.q_data_type,
+            kv_data_type=args.kv_data_type,
+            use_profiler=args.use_profiler,
+            qk_nope_head_dim=args.qk_nope_head_dim,
+            enable_pdl=args.enable_pdl,
+            is_var_seq=args.is_var_seq,
+            use_sinks=args.use_sinks,
+        )
+        return _MLAWrapperPlanResult(backend_impl=backend)
 
     def plan(
         self,
@@ -431,9 +536,14 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         kv_data_type: torch.dtype,
         use_profiler: bool,
         qk_nope_head_dim: Optional[int],
+        max_seq_len: Optional[int] = None,
         enable_pdl: Optional[bool] = None,
         is_var_seq: Optional[bool] = None,
         use_sinks: bool = False,
+        sparse_mla_top_k: int = 0,
+        uses_shared_paged_kv_idx: bool = True,
+        has_ragged_query: bool = False,
+        allow_fp8: bool = False,
     ) -> None:
         for name, tensor in (
             ("cum_seq_lens_q", cum_seq_lens_q),
@@ -469,10 +579,15 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
             raise _BackendPlanUnsupportedError(
                 "qk_nope_head_dim is required with trtllm-gen backend."
             )
-        if q_data_type != torch.bfloat16 or kv_data_type != torch.bfloat16:
+        supported_dtypes = (torch.bfloat16, torch.float8_e4m3fn)
+        if (
+            q_data_type != kv_data_type
+            or q_data_type not in supported_dtypes
+            or (not allow_fp8 and q_data_type != torch.bfloat16)
+        ):
             raise _BackendPlanUnsupportedError(
-                "trtllm-gen BatchMLAPagedAttentionWrapper backend initially "
-                "supports only bfloat16 query and KV tensors, got "
+                "trtllm-gen backend requires matching bfloat16 query and KV "
+                "tensors (functional lowering additionally supports float8), got "
                 f"{q_data_type=} and {kv_data_type=}."
             )
 
@@ -519,16 +634,36 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
                 "trtllm-gen backend expects seq_lens.shape[0] == batch_size, "
                 f"got {seq_lens.numel()} and {batch_size}."
             )
-        if block_tables.ndim != 2 or block_tables.shape[0] != batch_size:
+        if sparse_mla_top_k < 0:
             raise _BackendPlanUnsupportedError(
-                "trtllm-gen backend expects rank-2 block_tables with batch "
-                f"dimension {batch_size}, got {tuple(block_tables.shape)}."
+                f"trtllm-gen backend expects non-negative sparse_mla_top_k, got {sparse_mla_top_k}."
             )
+        if sparse_mla_top_k > 0:
+            expected_shape = (
+                (total_q, sparse_mla_top_k)
+                if has_ragged_query
+                else (batch_size, q_len, sparse_mla_top_k)
+            )
+            if tuple(block_tables.shape) != expected_shape:
+                raise _BackendPlanUnsupportedError(
+                    "trtllm-gen backend expects sparse block_tables shape "
+                    f"{expected_shape}, got {tuple(block_tables.shape)}."
+                )
+        else:
+            try:
+                _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
+            except ValueError as error:
+                raise _BackendPlanUnsupportedError(str(error)) from error
+            if block_tables.shape[0] != batch_size:
+                raise _BackendPlanUnsupportedError(
+                    "trtllm-gen backend expects block_tables batch dimension "
+                    f"{batch_size}, got {tuple(block_tables.shape)}."
+                )
         if page_size not in (32, 64):
             raise _BackendPlanUnsupportedError(
                 f"trtllm-gen backend requires page_size in (32, 64), got {page_size}."
             )
-        if block_tables.shape[1] == 0:
+        if block_tables.shape[-1] == 0:
             raise _BackendPlanUnsupportedError(
                 "trtllm-gen backend expects block_tables width to be positive."
             )
@@ -545,6 +680,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         self._batch_size = batch_size
         self._q_len = q_len
         self._is_var_seq = resolved_is_var_seq
+        self._has_ragged_query = has_ragged_query
         self._use_sinks = use_sinks
         self._max_q_len = max_q_len
         self._total_q = total_q
@@ -555,9 +691,17 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         # seq_lens is graph-mutable launch metadata.  Keep the scalar launch
         # bound at the page-table capacity so in-place length growth remains
         # valid without changing captured arguments.
-        self._max_seq_len = int(block_tables.shape[1] * page_size)
+        self._max_seq_len = (
+            int(block_tables.shape[-1] * page_size)
+            if max_seq_len is None
+            else max_seq_len
+        )
         self._bmm1_scale = float(sm_scale)
         self._bmm2_scale = 1.0
+        self._q_data_type = q_data_type
+        self._kv_data_type = kv_data_type
+        self._sparse_mla_top_k = sparse_mla_top_k
+        self._uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
         self._enable_pdl = (
             device_support_pdl(self.device) if enable_pdl is None else enable_pdl
         )
@@ -574,6 +718,67 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         launcher._counter_is_preplanned = True
         self._launcher = launcher
 
+    def run_from_wrapper(
+        self,
+        *,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+        out: Optional[torch.Tensor],
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
+        profiler_buffer: Optional[torch.Tensor],
+        kv_len: Optional[torch.Tensor],
+        page_table: Optional[torch.Tensor],
+        return_lse_base_on_e: bool,
+        o_scale: Optional[float],
+        ckv_scale: Optional[float],
+        kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor],
+        skip_softmax_threshold_scale_factor: Optional[float],
+        bmm1_scale: Optional[Union[float, torch.Tensor]],
+        bmm2_scale: Optional[Union[float, torch.Tensor]],
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if profiler_buffer is not None:
+            raise ValueError(
+                "profiler_buffer is not supported with trtllm-gen backend."
+            )
+        if kv_len is not None:
+            raise ValueError(
+                "kv_len is not supported with trtllm-gen backend; KV lengths "
+                "are captured from seq_lens at plan time."
+            )
+        if page_table is not None:
+            raise ValueError(
+                "page_table is not supported with trtllm-gen backend; "
+                "block_tables are captured at plan time."
+            )
+        if return_lse_base_on_e:
+            raise ValueError(
+                "return_lse_base_on_e is not supported with trtllm-gen backend."
+            )
+        if o_scale is not None:
+            raise ValueError("o_scale is not supported with trtllm-gen backend.")
+        if ckv_scale is not None or kpe_scale is not None:
+            raise ValueError(
+                "ckv_scale / kpe_scale are only supported with the fa3 backend "
+                "and FP8 kv_data_type."
+            )
+        return self.run(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            ckv_cache=ckv_cache,
+            kpe_cache=kpe_cache,
+            out=out,
+            lse=lse,
+            return_lse=return_lse,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+        )
+
     def run(
         self,
         *,
@@ -588,6 +793,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[float | torch.Tensor] = None,
         bmm2_scale: Optional[float | torch.Tensor] = None,
+        multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if not hasattr(self, "_launcher"):
             raise RuntimeError(
@@ -607,11 +813,6 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
                 torch.float32,
                 self.device,
                 "sinks",
-            )
-        if self._is_var_seq and (return_lse or lse is not None):
-            raise ValueError(
-                "trtllm-gen backend does not support LSE with variable-query "
-                "scheduling."
             )
         if skip_softmax_threshold_scale_factor is not None and (
             return_lse or lse is not None
@@ -646,28 +847,28 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         check_shape_dtype_device(
             q_nope,
             (self._total_q, self._num_heads, self._kv_lora_rank),
-            torch.bfloat16,
+            self._q_data_type,
             self.device,
             "q_nope",
         )
         check_shape_dtype_device(
             q_pe,
             (self._total_q, self._num_heads, self._qk_rope_head_dim),
-            torch.bfloat16,
+            self._q_data_type,
             self.device,
             "q_pe",
         )
         check_shape_dtype_device(
             ckv_cache,
             (ckv_cache.shape[0], self._page_size, self._kv_lora_rank),
-            torch.bfloat16,
+            self._kv_data_type,
             self.device,
             "ckv_cache",
         )
         check_shape_dtype_device(
             kpe_cache,
             (ckv_cache.shape[0], self._page_size, self._qk_rope_head_dim),
-            torch.bfloat16,
+            self._kv_data_type,
             self.device,
             "kpe_cache",
         )
@@ -682,7 +883,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
                 raise ValueError("out must be contiguous for trtllm-gen backend.")
 
         query = _concat_adjacent_views_or_cat(q_nope, q_pe)
-        if not self._is_var_seq:
+        if not self._has_ragged_query:
             query = query.reshape(
                 self._batch_size,
                 self._q_len,
@@ -697,11 +898,15 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
             qk_rope_head_dim=self._qk_rope_head_dim,
             page_size=self._page_size,
             block_tables=self._block_tables,
+            sparse_mla_top_k=self._sparse_mla_top_k,
+            uses_shared_paged_kv_idx=self._uses_shared_paged_kv_idx,
+            batch_size=self._batch_size,
+            max_q_len=self._max_q_len,
         )
-        query_flat = query if self._is_var_seq else query.flatten(0, 1)
+        query_flat = query if self._has_ragged_query else query.flatten(0, 1)
         out_view = (
             out
-            if self._is_var_seq
+            if self._has_ragged_query
             else out.reshape(
                 self._batch_size, self._q_len, self._num_heads, self._kv_lora_rank
             )
@@ -723,6 +928,16 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
             )
         lse_stride_tokens = 0 if lse is None else lse.stride(0)
         lse_stride_heads = 0 if lse is None else lse.stride(1)
+        if multi_ctas_kv_counter_buffer is not None:
+            multi_ctas_kv_counter_buffer = (
+                _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+                    multi_ctas_kv_counter_buffer,
+                    self._batch_size,
+                    self._num_heads,
+                    self._sm_count,
+                    self.device,
+                )
+            )
 
         self._launcher.run(
             out=out_view,
@@ -738,14 +953,16 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
             bmm2_scale=resolved_bmm2_scale,
             batch_size=self._batch_size,
             num_qo_heads=self._num_heads,
-            sparse_mla_top_k=0,
+            sparse_mla_top_k=self._sparse_mla_top_k,
             sm_count=self._sm_count,
             enable_pdl=self._enable_pdl,
             sinks=sinks,
-            cum_seq_lens_q=(self._cum_seq_lens_q if self._is_var_seq else None),
+            cum_seq_lens_q=(self._cum_seq_lens_q if self._has_ragged_query else None),
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             lse=lse,
             lse_stride_tokens=lse_stride_tokens,
             lse_stride_heads=lse_stride_heads,
+            uses_shared_paged_kv_idx=self._uses_shared_paged_kv_idx,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
         return (out, lse) if return_lse else out
