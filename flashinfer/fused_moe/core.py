@@ -1529,7 +1529,17 @@ def get_trtllm_moe_sm100_module():
             num_tokens = moe_inputs.hidden_states.shape[0]
 
             major, _ = get_compute_capability(moe_inputs.hidden_states.device)
-            if major == 10 and num_tokens * self.top_k < 2 * self.num_local_experts:
+            # Native NVFP4 tactics are valid at tiny M. Retain the guard
+            # conservatively for other dtypes, including the affected BF16 path.
+            is_nvfp4 = (
+                self.dtype_act == DtypeTrtllmGen.E2m1
+                and self.dtype_weights == DtypeTrtllmGen.E2m1
+            )
+            if (
+                major == 10
+                and not is_nvfp4
+                and num_tokens * self.top_k < 2 * self.num_local_experts
+            ):
                 return []
 
             has_gemm1_lora_delta = moe_inputs.gemm1_lora_delta is not None
