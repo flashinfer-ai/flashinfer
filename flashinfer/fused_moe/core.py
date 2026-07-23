@@ -79,6 +79,12 @@ from ..utils import (
     register_custom_op,
     register_fake_op,
 )
+
+# These helpers moved to prepare.py; keep aliases here for backward compatibility.
+from .prepare import (
+    interleave_moe_scales_for_sm90_mixed_gemm as interleave_moe_scales_for_sm90_mixed_gemm,
+    interleave_moe_weights_for_sm90_mixed_gemm as interleave_moe_weights_for_sm90_mixed_gemm,
+)
 from .utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
@@ -561,7 +567,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
     @register_custom_op(
         "flashinfer::cutlass_fused_moe",
-        mutates_args=(""),
+        mutates_args=("output", "workspace_buffer"),
     )
     def cutlass_fused_moe(
         output: torch.Tensor,
@@ -597,6 +603,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_fused_finalize: bool = True,
         use_wfp4afp8_humming: bool = False,
         profile_ids: Optional[List[int]] = None,
+        workspace_buffer: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -721,6 +728,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             [gemm_tactic_1, gemm_tactic_2],
             enable_pdl,
             activation_type,
+            workspace_buffer,
         )
 
         return (
@@ -769,6 +777,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_fused_finalize: bool = True,
         use_wfp4afp8_humming: bool = False,
         profile_ids: Optional[List[int]] = None,
+        workspace_buffer: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -787,9 +796,72 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         else:
             return [input.new_empty([seq_len, hidden_size], dtype=output_dtype)]
 
+    def _cutlass_fused_moe_workspace_size(
+        max_num_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts_total: int,
+        top_k: int,
+        *,
+        x_dtype: torch.dtype,
+        weight_dtype: torch.dtype,
+        output_dtype: torch.dtype = torch.bfloat16,
+        activation_type: ActivationType = ActivationType.Swiglu,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        ep_size: int = 1,
+        ep_rank: int = 0,
+        min_latency_mode: bool = False,
+        use_deepseek_fp8_block_scale: bool = False,
+        use_w4_group_scaling: bool = False,
+        use_mxfp8_act_scaling: bool = False,
+        use_fused_finalize: bool = True,
+        use_packed_weights: bool = False,
+        use_wfp4afp8_humming: bool = False,
+    ) -> int:
+        enable_pdl = device_support_pdl(torch.device("cuda"))
+        moe_runner = MoERunner(
+            x_dtype=x_dtype,
+            weight_dtype=weight_dtype,
+            output_dtype=output_dtype,
+            top_k=top_k,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=1,
+            cluster_rank=0,
+            enable_alltoall=False,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            min_latency_mode=min_latency_mode,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            use_packed_weights=use_packed_weights,
+            use_fused_finalize=use_fused_finalize,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
+        )
+        return int(
+            moe_runner.fused_moe_runner.get_workspace_size(
+                max_num_tokens,
+                hidden_size,
+                intermediate_size,
+                num_experts_total,
+                top_k,
+                tp_size,
+                tp_rank,
+                ep_size,
+                ep_rank,
+                min_latency_mode,
+                activation_type,
+            )
+        )
+
     # Register the module
     return SimpleNamespace(
         cutlass_fused_moe=cutlass_fused_moe,
+        cutlass_fused_moe_workspace_size=_cutlass_fused_moe_workspace_size,
         interleave_moe_weights_for_sm90_mixed_gemm=(
             module.interleave_moe_weights_for_sm90_mixed_gemm
         ),
@@ -832,6 +904,7 @@ def cutlass_fused_moe(
     swizzled_input_sf: bool = True,
     use_fused_finalize: bool = True,
     profile_ids: Optional[List[int]] = None,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -969,6 +1042,28 @@ def cutlass_fused_moe(
         Optional ``[gemm1_profile, gemm2_profile]`` override. Both values are absolute indices in
         the runner's combined tactic list; ``-1`` keeps the default tactic for that GEMM.
 
+    workspace_buffer : Optional[torch.Tensor]
+        Pre-allocated scratch buffer reused across calls to eliminate per-call workspace
+        allocation (which can reach 10-20 GiB at large batch size). If ``None`` (default),
+        the workspace is allocated and freed on every call. To opt in:
+
+        1. Query the required size once at model-load time::
+
+               ws_bytes = cutlass_fused_moe_workspace_size(
+                   max_num_tokens, hidden_size, intermediate_size,
+                   num_experts_total, top_k, x_dtype=..., weight_dtype=...,
+                   use_fused_finalize=<same as here>, device=input.device)
+               workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=input.device)
+
+        2. Pass ``workspace_buffer=workspace`` on every forward call.
+
+        The buffer must be a 1-D ``torch.uint8`` or ``torch.int8`` tensor on the same
+        CUDA device as the input, with at least ``ws_bytes`` bytes and 128-byte-aligned
+        data pointer (``torch.empty`` on CUDA satisfies all of these). Allocate one buffer
+        per CUDA stream context; overlapping micro-batches on separate streams each need
+        their own buffer. A buffer sized for the maximum token count is valid for all
+        smaller counts on the same call.
+
     Returns
     -------
     out: torch.Tensor
@@ -988,7 +1083,7 @@ def cutlass_fused_moe(
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
     """
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = get_compute_capability(input.device)
     device_arch = f"{major * 10 + minor}"
 
     if use_wfp4afp8_humming and device_arch != "90":
@@ -1025,41 +1120,169 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
-    return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
-        output,
-        input,
-        token_selected_experts,
-        token_final_scales,
-        fc1_expert_weights,
-        fc1_expert_biases,
-        fc2_expert_weights,
-        fc2_expert_biases,
-        output_dtype,
-        quant_scales,
-        input_sf,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
-        swizzled_input_sf,
-        tp_size,
-        tp_rank,
-        ep_size,
-        ep_rank,
-        cluster_size,
-        cluster_rank,
-        use_packed_weights=use_packed_weights,
-        enable_alltoall=enable_alltoall,
-        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-        use_w4_group_scaling=use_w4_group_scaling,
-        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        min_latency_mode=min_latency_mode,
-        tune_max_num_tokens=tune_max_num_tokens,
-        enable_pdl=enable_pdl,
-        activation_type=activation_type,
-        use_fused_finalize=use_fused_finalize,
-        use_wfp4afp8_humming=use_wfp4afp8_humming,
-        profile_ids=profile_ids,
-    )
+    # Module loading and runner construction inspect the current CUDA device.
+    # Keep the Python-side context aligned with the input; the C++ runner also
+    # installs its own guard for execution and workspace allocation.
+    with torch.cuda.device(input.device):
+        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
+            output,
+            input,
+            token_selected_experts,
+            token_final_scales,
+            fc1_expert_weights,
+            fc1_expert_biases,
+            fc2_expert_weights,
+            fc2_expert_biases,
+            output_dtype,
+            quant_scales,
+            input_sf,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            swizzled_input_sf,
+            tp_size,
+            tp_rank,
+            ep_size,
+            ep_rank,
+            cluster_size,
+            cluster_rank,
+            use_packed_weights=use_packed_weights,
+            enable_alltoall=enable_alltoall,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            min_latency_mode=min_latency_mode,
+            tune_max_num_tokens=tune_max_num_tokens,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            use_fused_finalize=use_fused_finalize,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
+            profile_ids=profile_ids,
+            workspace_buffer=workspace_buffer,
+        )
+
+
+def cutlass_fused_moe_workspace_size(
+    max_num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts_total: int,
+    top_k: int,
+    *,
+    x_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    output_dtype: torch.dtype = torch.bfloat16,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    min_latency_mode: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    use_fused_finalize: bool = True,
+    use_packed_weights: bool = False,
+    use_wfp4afp8_humming: bool = False,
+    device: Optional[torch.device] = None,
+) -> int:
+    """Return the workspace buffer size in bytes required by :func:`cutlass_fused_moe`.
+
+    Allocate the returned number of bytes once at model-load time (as a 1-D
+    ``torch.uint8`` tensor) and pass the buffer as ``workspace_buffer=`` on
+    every :func:`cutlass_fused_moe` call to eliminate the per-call
+    multi-GiB scratch allocation.
+
+    Parameters
+    ----------
+    max_num_tokens : int
+        Maximum ``input.shape[0]`` that will be seen at runtime.  The buffer
+        is monotonically sized by this value, so a buffer allocated for the
+        maximum shape is valid for all smaller shapes on the same call.
+    hidden_size : int
+        Logical hidden dimension.
+    intermediate_size : int
+        Logical, unpacked intermediate dimension. For packed weights this is
+        ``fc2_expert_weights.shape[2]`` multiplied by the format's packing
+        factor, not the packed storage dimension itself.
+    num_experts_total : int
+        Global expert count across all EP ranks. This must equal
+        ``fc2_expert_weights.shape[0] * ep_size``.
+    top_k : int
+        Number of selected experts per token.
+    x_dtype, weight_dtype : torch.dtype
+        Input and weight dtypes, used to select the kernel runner.
+    output_dtype : torch.dtype, optional
+        Output dtype (default: ``torch.bfloat16``).
+    device : torch.device, optional
+        CUDA device on which the workspace will be used. Defaults to the
+        current CUDA device.
+
+    Note
+    ----
+    Allocate one workspace buffer per CUDA stream context.  Overlapping
+    micro-batches on separate streams each need their own buffer.
+    """
+    if max_num_tokens <= 0:
+        raise ValueError(f"max_num_tokens must be positive, got {max_num_tokens}")
+    if hidden_size <= 0:
+        raise ValueError(f"hidden_size must be positive, got {hidden_size}")
+    if intermediate_size <= 0:
+        raise ValueError(f"intermediate_size must be positive, got {intermediate_size}")
+    if num_experts_total <= 0:
+        raise ValueError(f"num_experts_total must be positive, got {num_experts_total}")
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    if ep_size <= 0:
+        raise ValueError(f"ep_size must be positive, got {ep_size}")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
+    if not 0 <= ep_rank < ep_size:
+        raise ValueError(f"ep_rank must be in [0, {ep_size}), got {ep_rank}")
+    if num_experts_total % ep_size != 0:
+        raise ValueError(
+            f"num_experts_total ({num_experts_total}) must be divisible by "
+            f"ep_size ({ep_size})"
+        )
+
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError(f"device must be a CUDA device, got {device}")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+
+    with torch.cuda.device(device):
+        major, minor = get_compute_capability(device)
+        device_arch = f"{major * 10 + minor}"
+        return get_cutlass_fused_moe_module(
+            device_arch
+        ).cutlass_fused_moe_workspace_size(
+            max_num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts_total,
+            top_k,
+            x_dtype=x_dtype,
+            weight_dtype=weight_dtype,
+            output_dtype=output_dtype,
+            activation_type=activation_type,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            min_latency_mode=min_latency_mode,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            use_fused_finalize=use_fused_finalize,
+            use_packed_weights=use_packed_weights,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
+        )
 
 
 # trtllmgen-moe-fp8
@@ -1357,9 +1580,16 @@ def get_trtllm_moe_sm100_module():
             expert_weights = moe_inputs.expert_weights
             topk_weights = expert_weights
             hidden_states = moe_inputs.hidden_states
+            # The generic helper identifies TRTLLM dtypes whose ABI normally
+            # consumes an auxiliary scale tensor (FP4 and MX formats). Plain
+            # E4m3 returns false, but DeepSeek block-FP8 is an exception: it
+            # requires the real per-1x128-block scales from the activation pack.
             hidden_states_scale = (
                 moe_inputs.hidden_states_scale
-                if trtllm_gen_dtype_has_scale(self.dtype_act)
+                if (
+                    trtllm_gen_dtype_has_scale(self.dtype_act)
+                    or self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+                )
                 else None
             )
 
@@ -1446,30 +1676,13 @@ def get_trtllm_moe_sm100_module():
                     or self.fp8_quantization_type == Fp8QuantizationType.MxFp8
                 ):
                     # FP8 block scale
-                    current_num_tokens = hidden_states.shape[0]
-                    current_hidden_size = hidden_states.shape[1]
-                    if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-                        current_hidden_states_scale = torch.full(
-                            (current_hidden_size // 128, current_num_tokens),
-                            2.0,
-                            dtype=torch.float,
-                            device=hidden_states.device,
-                        )
-                    elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
-                        current_hidden_states_scale = hidden_states_scale
-
-                    else:
-                        raise ValueError(
-                            f"Unsupported FP8 quantization type: {self.fp8_quantization_type}"
-                        )
-
                     moe_op.trtllm_fp8_block_scale_moe(
                         routing_logits,
                         topk_ids,
                         topk_weights,
                         kwargs["routing_bias"],
                         hidden_states,
-                        current_hidden_states_scale,
+                        hidden_states_scale,
                         kwargs["gemm1_weights"],
                         kwargs["gemm1_weights_scale"],
                         moe_inputs.gemm1_lora_delta,
@@ -2327,13 +2540,8 @@ def get_trtllm_moe_sm100_module():
             assert topk_weights is not None, (
                 "topk_weights must be provided for UnpackedPrecomputed mode"
             )
-            # The finalize kernel reads the expert weights as args.mDtypeExpW,
-            # which is bfloat16 for this op (see runner.h: expert_weights is
-            # "[num_tokens, top_k] in bfloat16 = mDtypeExpW"). A user-provided
-            # fp32 buffer would be reinterpreted as bf16, so reject it up front.
-            assert topk_weights.dtype == torch.bfloat16, (
-                "topk_weights must be bfloat16 for UnpackedPrecomputed mode, got "
-                f"{topk_weights.dtype}"
+            assert topk_weights.dtype in (torch.bfloat16, torch.float32), (
+                f"topk_weights must be bfloat16 or float32, got {topk_weights.dtype}."
             )
         else:
             # For Mode 1 (FromLogits) and Mode 2 (PackedPrecomputed), allocate OUTPUT buffers
@@ -4045,7 +4253,9 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[seq_len, top_k]`` in packed format ``(expert_id << 16) | weight`` or
         a tuple ``(ids, weights)`` where ``ids`` is int32 of shape
         ``[seq_len, top_k]`` (plain expert indices) and ``weights`` is
-        ``bfloat16`` of the same shape (routing weights).
+        ``bfloat16`` or ``float32`` of the same shape (routing weights). The
+        weights are consumed at their native dtype (no cast), so passing the
+        ``float32`` weights emitted by typical routers is copy-free.
     routing_bias : Optional[torch.Tensor]
         ``[num_experts]`` routing bias.  May be ``None``.
     hidden_states : torch.Tensor

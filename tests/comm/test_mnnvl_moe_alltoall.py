@@ -626,9 +626,7 @@ def moe_a2a_dispatch_test_impl(distribution, top_k, use_lora=False):
     try:
         MnnvlMemory.initialize()
         if not mnnvl_available():
-            pytest.skip(
-                "MNNVL not supported on this system or container lacks SYS_PTRACE capability"
-            )
+            pytest.skip("MNNVL not supported on this system")
     except Exception:
         pytest.skip("MNNVL not supported on this system")
 
@@ -746,9 +744,7 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k, use_lora=False):
     try:
         MnnvlMemory.initialize()
         if not mnnvl_available():
-            pytest.skip(
-                "MNNVL not supported on this system or container lacks SYS_PTRACE capability"
-            )
+            pytest.skip("MNNVL not supported on this system")
     except Exception:
         pytest.skip("MNNVL not supported on this system")
 

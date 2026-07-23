@@ -4,7 +4,7 @@ Tests for DiT (Diffusion Transformer) oriented ragged attention kernels.
 Covers three variants:
 1. Q/K/V all FP8 E4M3 (standard case)
 2. Q/K in BF16, V in FP8 E4M3 (DiT: BMM1 in BF16, BMM2 in FP8)
-3. Q/K in INT8, V in FP8 E4M3, with SageAttention scaling factors
+3. BF16 Q/K/V quantized on GPU to SageAttention INT8/FP8, then run by attention
 
 All tests run on SM100/SM103 only (Blackwell).
 """
@@ -34,36 +34,6 @@ def _to_float8(x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn):
     scale = finfo.max / amax * 0.1
     x_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
     return x_sat.to(dtype), scale.float().reciprocal()
-
-
-def _to_int8_blocked(x: torch.Tensor, block_size: int):
-    """
-    Quantize float tensor to INT8 with per-block scaling.
-
-    x: [tokens, heads, head_dim]
-    block_size: number of elements per block along tokens
-
-    Returns:
-        x_q: INT8 tensor same shape as x
-        sfs: float32 per-block scales [heads * (tokens // block_size)]
-              (inverse scales / dequant scales)
-    """
-    tokens, heads, head_dim = x.shape
-    assert tokens % block_size == 0
-    num_blocks = tokens // block_size
-    x_blocks = x.reshape(num_blocks, block_size, heads, head_dim)
-    amax = (
-        x_blocks.abs()
-        .amax(dim=-1, keepdim=True)
-        .amax(dim=1, keepdim=True)
-        .clamp(min=1e-12)
-    )
-    scale = 127.0 / amax  # per-block quantization scale
-    x_sat = (x_blocks * scale).round().clamp(-128, 127)
-    x_q = x_sat.reshape(tokens, heads, head_dim).to(torch.int8)
-    # inv_scale (dequant scale): 1/scale = amax / 127
-    inv_scale = (amax / 127.0).reshape(num_blocks, heads).T.flatten().contiguous()
-    return x_q, inv_scale
 
 
 def _ragged_reference_bf16(
@@ -299,7 +269,7 @@ def test_trtllm_ragged_dit_qk_bf16_v_fp8(
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Q/K in INT8, V in FP8 E4M3, with SageAttention block scaling
+# Test 3: Q/K quantized to INT8, V to FP8 E4M3, with SageAttention block scaling
 # ---------------------------------------------------------------------------
 
 
@@ -314,7 +284,7 @@ def test_trtllm_ragged_dit_qk_bf16_v_fp8(
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("sage_blk_q", [1])
 @pytest.mark.parametrize("sage_blk_k", [4, 16])
-def test_trtllm_ragged_dit_sage_qk_int8_v_fp8(
+def test_trtllm_ragged_dit_sage_qdq(
     causal: bool,
     batch_size: int,
     s_qo: int,
@@ -332,31 +302,44 @@ def test_trtllm_ragged_dit_sage_qk_int8_v_fp8(
     total_q = int(q_lens.sum())
     total_kv = int(kv_lens.sum())
 
-    q_f = torch.randn(total_q, num_heads, head_dim, device=device)
-    k_f = torch.randn(total_kv, num_heads, head_dim, device=device)
-    v_f = torch.randn(total_kv, num_heads, head_dim, device=device)
+    q = torch.randn(total_q, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(total_kv, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(total_kv, num_heads, head_dim, device=device, dtype=torch.bfloat16)
 
-    # Per-block INT8 quantization for Q and K
-    q_int8, q_sfs = _to_int8_blocked(q_f.cpu(), sage_blk_q)
-    k_int8, k_sfs = _to_int8_blocked(k_f.cpu(), sage_blk_k)
-    q_int8 = q_int8.to(device)
-    k_int8 = k_int8.to(device)
-    q_sfs = q_sfs.to(device)
-    k_sfs = k_sfs.to(device)
+    q_int8, k_int8, v_fp8, q_sfs, k_sfs, v_sfs = (
+        flashinfer.trtllm_sage_attention_quantize(
+            q,
+            k,
+            v,
+            q_block_size=sage_blk_q,
+            k_block_size=sage_blk_k,
+            qk_quant_dtype=torch.int8,
+        )
+    )
+
+    assert q_sfs.shape == (
+        num_heads,
+        (total_q + sage_blk_q - 1) // sage_blk_q,
+    )
+    assert k_sfs.shape == (
+        num_heads,
+        (total_kv + sage_blk_k - 1) // sage_blk_k,
+    )
+    assert v_sfs.shape == (num_heads, head_dim)
+    assert torch.isfinite(q_sfs).all()
+    assert torch.isfinite(k_sfs).all()
+    assert torch.isfinite(v_sfs).all()
 
     sage_blk_v = 1
-    v_fp8, v_inv_scale = _to_float8(v_f)
-    v_sfs = torch.ones((num_heads * head_dim), device=device)
 
     # For SageAttention, bmm1_scale encodes 1/sqrt(head_dim) only;
     # per-block Q/K dequant is handled via sage_attn_sfs_q/k
     scale = 1.0 / math.sqrt(head_dim)
-    # INT8 range is [-127,127] so per-block inv_scale is amax/127;
-    # the effective per-block scale that the kernel uses is
-    # sfs_q[i] * sfs_k[j] * (1/sqrt(head_dim)), but bmm1_scale here is 1.0
-    # because the kernel multiplies by sfs_q * sfs_k internally.
+    # Per-block Q/K dequantization is handled inside the attention kernel, so
+    # bmm1_scale only contains the usual attention normalization.
     bmm1_scale = 1.0 / math.sqrt(head_dim)
-    bmm2_scale = float(v_inv_scale)
+    # All dequantization scales are supplied through SageAttention scale tensors.
+    bmm2_scale = 1.0
 
     qo_indptr = torch.cat(
         [torch.zeros(1, dtype=torch.int32, device=device), q_lens.cumsum(0).int()]
@@ -393,9 +376,9 @@ def test_trtllm_ragged_dit_sage_qk_int8_v_fp8(
     assert out_trtllm.dtype == torch.bfloat16
 
     out_ref = _ragged_reference_bf16(
-        q_f,
-        k_f,
-        v_f,
+        q,
+        k,
+        v,
         q_lens,
         kv_lens,
         scale,
