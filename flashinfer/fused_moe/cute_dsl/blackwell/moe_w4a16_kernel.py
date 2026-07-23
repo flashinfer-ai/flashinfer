@@ -339,12 +339,29 @@ class Sm100W4A16GroupedGemmKernel:
                 transform_tidx,
             )
         )
-        tAsA_input = cute.logical_divide(tAsA_input, (None, None, None, 2, None))[
-            (None, None, None, (transform_group_idx, None), None)
+        blocks_per_transform_group = (
+            cute.size(tAsA_input, mode=[3]) // self.num_transform_warpgroups
+        )
+        transform_group_tiler = (
+            None,
+            None,
+            None,
+            blocks_per_transform_group,
+            None,
+        )
+        transform_group_coord = (
+            None,
+            None,
+            None,
+            (None, transform_group_idx),
+            None,
+        )
+        tAsA_input = cute.logical_divide(tAsA_input, transform_group_tiler)[
+            transform_group_coord
         ]
-        tAsA_transform = cute.logical_divide(
-            tAsA_transform, (None, None, None, 2, None)
-        )[(None, None, None, (transform_group_idx, None), None)]
+        tAsA_transform = cute.logical_divide(tAsA_transform, transform_group_tiler)[
+            transform_group_coord
+        ]
 
         a_stage_coord = (None,) * (cute.rank(tAsA_input) - 1) + (0,)
         tArA = cute.make_rmem_tensor(
@@ -358,8 +375,8 @@ class Sm100W4A16GroupedGemmKernel:
 
         smem_thr_copy_S = src_copy_a.get_slice(transform_tidx)
         tSsS_trans = smem_thr_copy_S.partition_S(tCsS)
-        tSsS_trans = cute.logical_divide(tSsS_trans, (None, None, None, 2, None))[
-            (None, None, None, (transform_group_idx, None), None)
+        tSsS_trans = cute.logical_divide(tSsS_trans, transform_group_tiler)[
+            transform_group_coord
         ]
         scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (0,)
         tSsS_layout_per_stage = tSsS_trans[scale_stage_coord].layout
@@ -385,7 +402,10 @@ class Sm100W4A16GroupedGemmKernel:
         transform_tiler = cute.make_layout(transform_tiler_size)
         tArA_load = cute.flat_divide(tArA, transform_tiler)
         tArA_load = cute.group_modes(tArA_load, 1, cute.rank(tArA_load))
-        tSrS_load = cute.flat_divide(tSrS, transform_tiler)
+        scale_tiler = cute.make_layout(
+            transform_tiler_size // _NVFP4_SCALE_GRANULARITY_K
+        )
+        tSrS_load = cute.flat_divide(tSrS_copy, scale_tiler)
         tSrS_load = cute.group_modes(tSrS_load, 1, cute.rank(tSrS_load))
         tArA_transform_store = cute.flat_divide(tArA_transform, transform_tiler)
         tArA_transform_store = cute.group_modes(
