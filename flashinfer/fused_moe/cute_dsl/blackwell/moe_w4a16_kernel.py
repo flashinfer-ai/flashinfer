@@ -86,6 +86,7 @@ class Sm100W4A16GroupedGemmKernel:
         swiglu_limit: float,
         use_fused_finalize: bool,
         enable_pdl: bool,
+        use_clc_scheduler: bool,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
         self.group_count = group_count
@@ -102,7 +103,7 @@ class Sm100W4A16GroupedGemmKernel:
                 f"unsupported W4A16 epilogue activation: {activation_type}"
             )
         self.fuse_activation = activation_type is not None
-        self.use_clc_scheduler = self.fuse_activation
+        self.use_clc_scheduler = use_clc_scheduler
         self.gated = activation_type == ActivationType.Swiglu.value
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta

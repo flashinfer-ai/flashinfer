@@ -128,6 +128,7 @@ def _get_compiled_kernel(
     swiglu_limit: float,
     use_fused_finalize: bool,
     enable_pdl: bool,
+    use_clc_scheduler: bool,
     route_tile: int,
     mma_tiler_mk: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
@@ -142,6 +143,7 @@ def _get_compiled_kernel(
         swiglu_limit,
         use_fused_finalize,
         enable_pdl,
+        use_clc_scheduler,
         mma_tiler_m,
         mma_tiler_k,
         route_tile,
@@ -163,6 +165,7 @@ def _get_compiled_kernel(
             swiglu_limit=swiglu_limit,
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
+            use_clc_scheduler=use_clc_scheduler,
         )
         compiled = cute.compile(
             kernel.wrapper,
@@ -216,6 +219,16 @@ def _run_grouped_gemm(
     mma_tiler_mk, cluster_shape_mn = tactic
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
+    cta_group_size = 2 if mma_tiler_mk[0] == 256 else 1
+    cta_tile_m = mma_tiler_mk[0] // cta_group_size
+    num_ctas_m = (m + cta_tile_m - 1) // cta_tile_m
+    num_ctas_n = (n + route_tile - 1) // route_tile
+    num_problem_clusters = (
+        (num_ctas_m + cluster_shape_mn[0] - 1) // cluster_shape_mn[0]
+    ) * ((num_ctas_n + cluster_shape_mn[1] - 1) // cluster_shape_mn[1])
+    use_clc_scheduler = (
+        activation_type is not None and num_problem_clusters > max_active_clusters
     )
     weight_ptr = make_ptr(
         cutlass.Float4E2M1FN,
@@ -312,6 +325,7 @@ def _run_grouped_gemm(
         swiglu_limit,
         use_fused_finalize,
         enable_pdl,
+        use_clc_scheduler,
         route_tile,
         mma_tiler_mk,
         cluster_shape_mn,
