@@ -103,7 +103,9 @@ def _test_mm_fp4(
                 skip_check=False,
             )
 
-        cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
+        cos_sim = F.cosine_similarity(
+            reference.float().reshape(-1), res.float().reshape(-1), dim=0
+        )
         assert cos_sim > 0.97
     except LibraryError as e:
         # TODO: Remove this check once cuDNN backend version is updated to 9.14.0
