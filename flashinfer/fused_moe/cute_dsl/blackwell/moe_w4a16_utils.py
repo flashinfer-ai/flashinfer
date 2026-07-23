@@ -171,36 +171,78 @@ def decode_nvfp4_fragment_to_bf16(
     loc=None,
     ip=None,
 ) -> cute.TensorSSA:
-    """Decode one transform thread's 16-value NVFP4 block to BF16."""
+    """Decode one NVFP4 transform fragment to BF16."""
     packed_byte_count = cute.size(packed_fragment.shape)
     fragment_size = packed_byte_count * 2
-    assert fragment_size == 16
-    assert cute.size(scale_fragment.shape) == 1
+    scale_count = fragment_size // 16
+    assert fragment_size in (32, 64, 128)
+    assert cute.size(scale_fragment.shape) == scale_count
 
-    packed_word_type = ir.VectorType.get([2], Uint32.mlir_type, loc=loc)
-    packed_word_vector = llvm.bitcast(
-        packed_word_type, packed_fragment.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
+    packed_words_type = ir.VectorType.get(
+        [packed_byte_count // 4], Uint32.mlir_type, loc=loc
+    )
+    packed_words_vector = llvm.bitcast(
+        packed_words_type,
+        packed_fragment.ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
     )
     packed_words = [
-        vector.extract(packed_word_vector, [], [idx], loc=loc, ip=ip)
-        for idx in range(2)
+        vector.extract(packed_words_vector, [], [idx], loc=loc, ip=ip)
+        for idx in range(packed_byte_count // 4)
     ]
-    scale_byte = vector.extract(
-        scale_fragment.ir_value(loc=loc, ip=ip), [], [0], loc=loc, ip=ip
-    )
-    scale_bits = llvm.zext(Uint32.mlir_type, scale_byte, loc=loc, ip=ip)
-    output_values = [
-        value.ir_value(loc=loc, ip=ip)
-        for value in e2m1x16_e4m3_to_bf16x16(
-            Uint32(packed_words[0]),
-            Uint32(packed_words[1]),
-            Uint32(scale_bits),
+    if scale_count == 2:
+        scale_bytes = [
+            vector.extract(
+                scale_fragment.ir_value(loc=loc, ip=ip),
+                [],
+                [idx],
+                loc=loc,
+                ip=ip,
+            )
+            for idx in range(scale_count)
+        ]
+    else:
+        scale_words_type = ir.VectorType.get(
+            [scale_count // 4], Uint32.mlir_type, loc=loc
+        )
+        scale_words_vector = llvm.bitcast(
+            scale_words_type,
+            scale_fragment.ir_value(loc=loc, ip=ip),
             loc=loc,
             ip=ip,
         )
-    ]
-
+        scale_words = [
+            vector.extract(scale_words_vector, [], [idx], loc=loc, ip=ip)
+            for idx in range(scale_count // 4)
+        ]
     output_type = ir.VectorType.get([fragment_size], BFloat16.mlir_type, loc=loc)
+    output_values: list[ir.Value] = []
+    for scale_idx in range(scale_count):
+        if scale_count == 2:
+            scale_bits = Uint32(
+                llvm.zext(
+                    Uint32.mlir_type,
+                    scale_bytes[scale_idx],
+                    loc=loc,
+                    ip=ip,
+                )
+            )
+        else:
+            scale_bits = Uint32(scale_words[scale_idx // 4])
+            if scale_idx % 4:
+                scale_bits = scale_bits >> Uint32((scale_idx % 4) * 8)
+        output_values.extend(
+            value.ir_value(loc=loc, ip=ip)
+            for value in e2m1x16_e4m3_to_bf16x16(
+                Uint32(packed_words[2 * scale_idx]),
+                Uint32(packed_words[2 * scale_idx + 1]),
+                scale_bits,
+                loc=loc,
+                ip=ip,
+            )
+        )
+
     output = vector.from_elements(output_type, output_values, loc=loc, ip=ip)
     return cute.TensorSSA(output, (fragment_size,), cutlass.BFloat16)
 
