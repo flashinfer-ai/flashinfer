@@ -9,6 +9,7 @@ from flashinfer.grouped_mm.core import (
     _check_grouped_mm_fp8,
     _check_grouped_mm_mxfp8,
 )
+from flashinfer.grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION
 from flashinfer.utils import get_compute_capability
 
 try:
@@ -25,14 +26,24 @@ except (ImportError, OSError):
     CUDNN_BACKEND_VERSION = 0
     CUDNN_HAS_MOE_API = False
 
+# Both marks gate on the same runtime constant the cuDNN backend itself enforces
+# (flashinfer.grouped_mm.cudnn._CUDNN_MOE_MIN_VERSION) instead of a hardcoded
+# literal, so a future bump of that constant can't silently desync the test skip
+# from the runtime check again (#4064: a prior hardcoded 91800 here diverged from
+# the constant after #3797 raised it to 92100, so grouped_mm_bf16/fp8 tests ran
+# instead of skipping on cuDNN 9.19-9.20 and hit the runtime RuntimeError).
 requires_cudnn_moe = pytest.mark.skipif(
-    not CUDNN_AVAILABLE or CUDNN_BACKEND_VERSION < 91800 or not CUDNN_HAS_MOE_API,
-    reason="cuDNN MOE requires backend >= 9.18.0 and a frontend exposing moe_grouped_matmul_mode",
+    not CUDNN_AVAILABLE
+    or CUDNN_BACKEND_VERSION < _CUDNN_MOE_MIN_VERSION
+    or not CUDNN_HAS_MOE_API,
+    reason=f"cuDNN MOE requires backend >= {_CUDNN_MOE_MIN_VERSION} and a frontend exposing moe_grouped_matmul_mode",
 )
 
 requires_cudnn_moe_block_scale = pytest.mark.skipif(
-    not CUDNN_AVAILABLE or CUDNN_BACKEND_VERSION < 92100 or not CUDNN_HAS_MOE_API,
-    reason="cuDNN MOE block-scale requires backend >= 9.21.0 and a frontend exposing moe_grouped_matmul_mode",
+    not CUDNN_AVAILABLE
+    or CUDNN_BACKEND_VERSION < _CUDNN_MOE_MIN_VERSION
+    or not CUDNN_HAS_MOE_API,
+    reason=f"cuDNN MOE block-scale requires backend >= {_CUDNN_MOE_MIN_VERSION} and a frontend exposing moe_grouped_matmul_mode",
 )
 
 
