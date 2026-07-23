@@ -260,6 +260,8 @@ struct KernelParams
 };
 
 void run(Data& data, void* stream);
+void runMultiTileCluster(Data* data, int32_t numTiles, void* stream);
+int32_t maxTokensMultiTileCluster(int32_t numExperts);
 
 }  // namespace routingDeepSeek
 

@@ -146,7 +146,9 @@ class Runner {
            batchedGemm::trtllm::gen::Dtype dtypeBias, bool useRoutingScalesOnInput,
            bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
            batchedGemm::trtllm::gen::Dtype dtypeLogits, bool normTopkProb = true,
-           int16_t* routing_replay_out = nullptr, bool enable_pdl = true);
+           int16_t* routing_replay_out = nullptr, bool enable_pdl = true,
+           batchedGemm::trtllm::gen::Dtype dtypeExpertWeights =
+               batchedGemm::trtllm::gen::Dtype::Bfloat16);
 
  private:
   friend class MoE::Runner;
@@ -451,6 +453,8 @@ class Runner {
                                                    int32_t intermediateSize,
                                                    int32_t numLocalExperts,
                                                    int32_t numTokens) const;
+
+  [[nodiscard]] MoEConfig getConfigComponents(int64_t configIndex) const;
 
  private:
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, bool const enablePdl,

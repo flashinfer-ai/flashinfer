@@ -196,9 +196,6 @@ def trtllm_gen_dtype_has_scale(dtype: DtypeTrtllmGen) -> bool:
 def deduce_trtllm_gen_tensor_dtype(
     x: torch.Tensor, scale: Optional[torch.Tensor]
 ) -> DtypeTrtllmGen:
-    x_numel = x.numel()
-    if x.dtype == torch.uint8:  # FIXME(siyuan): use torch.float4_e2m1x2 after torch 2.8
-        x_numel *= 2
     if x.dtype == torch.bfloat16:
         dtype = DtypeTrtllmGen.Bfloat16
     elif x.dtype == torch.float8_e4m3fn:
@@ -207,10 +204,53 @@ def deduce_trtllm_gen_tensor_dtype(
         x.dtype == torch.uint8
     ):  # FIXME(siyuan): use torch.float4_e2m1x2 after torch 2.8
         assert scale is not None, "Scale tensor must be provided for float4x2 input"
-        if scale.numel() == x_numel // 16:
-            dtype = DtypeTrtllmGen.E2m1
-        else:
-            dtype = DtypeTrtllmGen.MxE2m1
+        if x.ndim < 2:
+            raise ValueError("Packed FP4 inputs must have at least two dimensions.")
+
+        logical_rows = x.shape[-2]
+        logical_cols = x.shape[-1] * 2
+        matrix_count = 1
+        for dim in x.shape[:-2]:
+            matrix_count *= dim
+
+        # Prefer an exact linear scale shape before comparing padded storage
+        # sizes. For short matrices, NVFP4 vec16 linear scales can have the
+        # same numel as MXFP4 vec32 scales padded to the interleaved 128x4
+        # layout, but their logical last dimensions remain unambiguous.
+        for vec_size, dtype in (
+            (16, DtypeTrtllmGen.E2m1),
+            (32, DtypeTrtllmGen.MxE2m1),
+        ):
+            if logical_cols % vec_size:
+                continue
+            expected_shape = (*x.shape[:-1], logical_cols // vec_size)
+            if tuple(scale.shape) == expected_shape:
+                return dtype
+
+        matching_vec_sizes = []
+        for vec_size in (16, 32):
+            if logical_cols % vec_size:
+                continue
+            scale_cols = logical_cols // vec_size
+            linear_numel = matrix_count * logical_rows * scale_cols
+            interleaved_numel = (
+                matrix_count
+                * ((logical_rows + 127) // 128)
+                * 128
+                * ((scale_cols + 3) // 4)
+                * 4
+            )
+            if scale.numel() in (linear_numel, interleaved_numel):
+                matching_vec_sizes.append(vec_size)
+
+        if not matching_vec_sizes:
+            raise ValueError(
+                "Scale tensor shape is incompatible with the packed FP4 tensor's "
+                "logical dimensions."
+            )
+        dtype = (
+            DtypeTrtllmGen.E2m1 if matching_vec_sizes == [16] else DtypeTrtllmGen.MxE2m1
+        )
     else:
         raise ValueError("Unsupported trtllm-gen input tensor.")
     return dtype

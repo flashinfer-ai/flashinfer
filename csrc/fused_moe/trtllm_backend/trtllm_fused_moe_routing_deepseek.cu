@@ -32,6 +32,7 @@
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
+#include "flashinfer/trtllm/fused_moe/da_heuristic_constants.cuh"
 
 namespace moe::dev::routing {
 
@@ -423,6 +424,108 @@ __global__ void routingIndicesClusterKernel(KernelParams params) {
 }
 #endif
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams, int MaxTiles = flashinfer::da_heuristic::kMaxTiles>
+struct MultiTileKernelArgs {
+  KernelParams params[MaxTiles];
+  int32_t numTiles;
+};
+
+template <typename KernelParams>
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+__global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
+    __launch_bounds__(KernelParams::MaxNumExperts)
+        routingIndicesMultiTileClusterKernel(MultiTileKernelArgs<KernelParams> args) {
+  using OutputT = typename KernelParams::OutputT;
+
+  int32_t const tileIdx = blockIdx.x / NumBlocksPerCluster;
+  if (tileIdx >= args.numTiles) {
+    return;
+  }
+
+  KernelParams params = args.params[tileIdx];
+  int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+  int32_t const clusterBlockRank = blockIdx.x - tileIdx * NumBlocksPerCluster;
+
+  if (params.mUsePdl) {
+    cudaGridDependencySynchronize();
+  }
+  routingPermutation<KernelParams, OutputT, KernelParams::MaxNumExperts,
+                     KernelParams::MaxNumExperts / WarpSize, KernelParams::MaxNumTopExperts,
+                     /*LoadExpertIdxFromGlobal=*/true>(params, nullptr, warpIdx, clusterBlockRank);
+}
+#else
+__global__ void routingIndicesMultiTileClusterKernel(MultiTileKernelArgs<KernelParams>) {
+  assert(false && "routingIndicesMultiTileClusterKernel is only supported on SM90+ architectures");
+}
+#endif
+
+template <typename KernelParams>
+static void launchMultiTileClusterKernel(Data* data, int32_t numTiles, int32_t numBlocks,
+                                         int32_t numThreads, int32_t smemSize, void* stream) {
+  MultiTileKernelArgs<KernelParams> args{};
+  args.numTiles = numTiles;
+  for (int32_t i = 0; i < numTiles; ++i) {
+    args.params[i] = KernelParams::setKernelParams(data[i]);
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = numBlocks;
+  config.blockDim = numThreads;
+  config.dynamicSmemBytes = smemSize;
+  config.stream = reinterpret_cast<cudaStream_t>(stream);
+
+  cudaLaunchAttribute attributes[2] = {};
+  attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attributes[0].val.programmaticStreamSerializationAllowed = int(data[0].mUsePdl);
+  attributes[1].id = cudaLaunchAttributeCooperative;
+  attributes[1].val.cooperative = 0;
+  config.attrs = attributes;
+  config.numAttrs = 2;
+
+  auto kernelTyped = routingIndicesMultiTileClusterKernel<KernelParams>;
+  if (smemSize > 48 * 1024) {
+    CHECK_CUDA_ERROR(
+        cudaFuncSetAttribute(kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));
+  }
+  CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, kernelTyped, args));
+}
+
+static void launchRoutingDeepSeekMultiTileCluster(Data* data, int32_t numTiles, int32_t numBlocks,
+                                                  int32_t numThreads, int32_t smemSize,
+                                                  void* stream) {
+  // This path is used by FlashInfer's overlapped DA graph for DeepSeek-V3 with
+  // already-computed top-k IDs. Keep the instantiation narrow to avoid a large
+  // JIT compile-time footprint for model combinations the Python guard does not expose.
+  FLASHINFER_CHECK(data[0].mNumExperts <= NumDeepseekExperts,
+                   "multi-tile DeepSeek routing currently supports numExperts <= ",
+                   NumDeepseekExperts, ", got ", data[0].mNumExperts);
+  FLASHINFER_CHECK(data[0].mTopK <= NumTop8Experts,
+                   "multi-tile DeepSeek routing currently supports topK <= ", NumTop8Experts,
+                   ", got ", data[0].mTopK);
+  FLASHINFER_CHECK(data[0].mDtypeInput == tg::Dtype::Fp32 &&
+                       data[0].mDtypeBias == tg::Dtype::Bfloat16 &&
+                       data[0].mDtypeOutput == tg::Dtype::Bfloat16,
+                   "multi-tile DeepSeek routing currently supports "
+                   "score=fp32, bias=bf16, expert_weight=bf16 only");
+  FLASHINFER_CHECK(data[0].mNumExpertGroups > 1,
+                   "multi-tile DeepSeek routing currently requires grouped routing");
+  FLASHINFER_CHECK(data[0].mPaddingLog2 > 0,
+                   "multi-tile DeepSeek routing currently requires power-of-two tile sizes");
+  FLASHINFER_CHECK(!data[0].mUsePdl,
+                   "multi-tile DeepSeek routing currently captures as a normal graph node");
+
+  if (data[0].mNumExperts <= topk::MaxNumExpertsUnit) {
+    using Params =
+        KernelParams<float, __nv_bfloat16, topk::MaxNumExpertsUnit, NumTop8Experts, true>;
+    launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+  } else {
+    using Params = KernelParams<float, __nv_bfloat16, NumDeepseekExperts, NumTop8Experts, true>;
+    launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+  }
+}
+
 static void launchClusterKernel(Data& data, int numThreadsHist, void* stream) {
   LAUNCH_ROUTING_DEEPSEEK(data,
                           /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster,
@@ -616,6 +719,56 @@ void run(Data& data, void* stream) {
       }
     }
   }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+int32_t maxTokensMultiTileCluster(int32_t numExperts) {
+  return NumBlocksPerCluster * getMaxNumExperts(numExperts);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void runMultiTileCluster(Data* data, int32_t numTiles, void* stream) {
+  FLASHINFER_CHECK(data != nullptr, "runMultiTileCluster requires non-null data");
+  FLASHINFER_CHECK(numTiles > 0 && numTiles <= flashinfer::da_heuristic::kMaxTiles,
+                   "numTiles must be in [1, ", flashinfer::da_heuristic::kMaxTiles, "], got ",
+                   numTiles);
+
+  Data const& first = data[0];
+  int32_t const maxTokens = maxTokensMultiTileCluster(first.mNumExperts);
+  FLASHINFER_CHECK(first.mNumTokens <= maxTokens, "runMultiTileCluster supports up to ", maxTokens,
+                   " tokens (NumBlocksPerCluster * MaxNumExperts), got ", first.mNumTokens);
+  FLASHINFER_CHECK(first.mPtrTopKPacked != nullptr || first.mPtrTopKIds != nullptr,
+                   "runMultiTileCluster requires precomputed top-k ids");
+  FLASHINFER_CHECK(first.mPtrPermutedIdxSize != nullptr,
+                   "runMultiTileCluster requires routing metadata output buffers");
+
+  for (int32_t i = 1; i < numTiles; ++i) {
+    FLASHINFER_CHECK(data[i].mNumTokens == first.mNumTokens,
+                     "all multi-tile routing entries must have the same num_tokens");
+    FLASHINFER_CHECK(data[i].mNumExperts == first.mNumExperts,
+                     "all multi-tile routing entries must have the same num_experts");
+    FLASHINFER_CHECK(data[i].mTopK == first.mTopK,
+                     "all multi-tile routing entries must have the same top_k");
+    FLASHINFER_CHECK(data[i].mNumExpertGroups == first.mNumExpertGroups,
+                     "all multi-tile routing entries must have the same num_expert_groups");
+    FLASHINFER_CHECK(data[i].mNumLimitedGroups == first.mNumLimitedGroups,
+                     "all multi-tile routing entries must have the same num_limited_groups");
+    FLASHINFER_CHECK(data[i].mLocalExpertsStartIdx == first.mLocalExpertsStartIdx,
+                     "all multi-tile routing entries must have the same local expert offset");
+    FLASHINFER_CHECK(data[i].mLocalExpertsStrideLog2 == first.mLocalExpertsStrideLog2,
+                     "all multi-tile routing entries must have the same local expert stride");
+    FLASHINFER_CHECK(data[i].mNumLocalExperts == first.mNumLocalExperts,
+                     "all multi-tile routing entries must have the same local expert count");
+    FLASHINFER_CHECK((data[i].mPaddingLog2 > 0) == (first.mPaddingLog2 > 0),
+                     "all multi-tile routing entries must agree on pow2 tile mode");
+  }
+
+  int32_t const numThreadsHist = getMaxNumExperts(first.mNumExperts);
+  int32_t const numBlocks = NumBlocksPerCluster * numTiles;
+  launchRoutingDeepSeekMultiTileCluster(data, numTiles, numBlocks, numThreadsHist,
+                                        /*smemSize=*/0, stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

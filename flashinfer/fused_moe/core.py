@@ -18,8 +18,7 @@ import functools
 import math
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, Union
-
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 
 from ..api_logging import flashinfer_api
@@ -90,6 +89,7 @@ from .utils import (
     make_hybrid_bucket_mapper,
     make_random_topk_ids,
 )
+from .dist_aware import da_capture, da_core, da_state
 
 
 # RoutingInputMode (the FusedMoE launcher's routing-input ABI enum) lives in
@@ -120,6 +120,11 @@ def _moe_topk_ids_init(num_experts: int):
         return (expert_ids << 16) | expert_weights
 
     return _init
+
+
+# Backward-compatible core aliases; implementation and state live in DA modules.
+get_da_fast_path_stats = da_capture.fast_path_stats
+reset_da_fast_path_stats = da_capture.reset_fast_path_stats
 
 
 @functools.cache
@@ -1402,12 +1407,14 @@ def _unpack_trtllm_moe_output(
 def get_trtllm_moe_sm100_module():
     module = gen_trtllm_gen_fused_moe_sm100_module()
     moe_op = module.build_and_load()
-    setup_cubin_loader(str(module.get_library_path()))
+    module_library_path = str(module.get_library_path())
+    setup_cubin_loader(module_library_path)
 
     class MoERunner(TunableRunner):
         # Cache valid tactics to reduce the overhead of re-querying the kernel.
         # TODO(siyuan): directly cache the runners
         valid_tactics_dict = dict()
+        factorized_tactics_dict = dict()
 
         def __init__(
             self,
@@ -1425,6 +1432,7 @@ def get_trtllm_moe_sm100_module():
             use_per_token_scaling: bool = False,
             num_experts: Optional[int] = None,
             num_fused_shared_experts: int = 0,
+            factorized_da_enabled: bool = False,
         ):
             self.num_local_experts = num_local_experts
             self.top_k = top_k
@@ -1445,6 +1453,30 @@ def get_trtllm_moe_sm100_module():
             self.use_per_token_scaling = use_per_token_scaling
             self.num_experts = (
                 num_experts if num_experts is not None else num_local_experts
+            )
+            self.factorized_da_enabled = factorized_da_enabled
+
+        def _tactics_instance_key(
+            self, moe_inputs: "MoEInputs", profile: OptimizationProfile
+        ) -> tuple:
+            num_tokens = int(
+                profile.get_opt_shapes()[MoEInputs.idx("hidden_states")][0]
+            )
+            nfse = self.num_fused_shared_experts
+            return (
+                self.dtype_act,
+                self.dtype_weights,
+                self.fp8_quantization_type,
+                self.top_k + nfse,
+                self.hidden_size,
+                self.intermediate_size,
+                self.num_local_experts + nfse,
+                self.activation_type,
+                self.use_shuffled_weight,
+                self.weight_layout,
+                self.use_per_token_scaling,
+                num_tokens,
+                moe_inputs.gemm1_lora_delta is not None,
             )
 
         def _make_tuning_config(
@@ -1506,6 +1538,7 @@ def get_trtllm_moe_sm100_module():
 
             dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
             initializers = [init for _, _, init in sorted_inputs]
+            value_specs = tuple(kwargs.pop("value_specs", ()))
 
             return TuningConfig(
                 dynamic_tensor_specs=(
@@ -1515,6 +1548,7 @@ def get_trtllm_moe_sm100_module():
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
                         make_hybrid_bucket_mapper(tune_max_num_tokens),
                         initializers,
+                        value_specs=value_specs,
                     ),
                 ),
                 **kwargs,
@@ -1526,35 +1560,17 @@ def get_trtllm_moe_sm100_module():
             profile: OptimizationProfile,
         ) -> List[int]:
             moe_inputs = MoeRunnerInputs.from_list(inputs)
-            num_tokens = moe_inputs.hidden_states.shape[0]
-
-            major, _ = get_compute_capability(moe_inputs.hidden_states.device)
-            if major == 10 and num_tokens * self.top_k < 2 * self.num_local_experts:
-                return []
-
-            has_gemm1_lora_delta = moe_inputs.gemm1_lora_delta is not None
-
-            # Enumerate valid tactics for the fused (routed + shared) expert
-            # dimensions so they match what prepare_moe() validates against at
-            # runtime (effectiveTopK / effectiveLocalExperts). nfse defaults to 0,
-            # so non-shared-expert paths are unaffected. Including nfse in the key
-            # also prevents cache collisions across different shared-expert counts.
-            nfse = self.num_fused_shared_experts
-            instance_key = (
-                self.dtype_act,
-                self.dtype_weights,
-                self.fp8_quantization_type,
-                self.top_k + nfse,
-                self.hidden_size,
-                self.intermediate_size,
-                self.num_local_experts + nfse,
-                self.activation_type,
-                self.use_shuffled_weight,
-                self.weight_layout,
-                self.use_per_token_scaling,
-                num_tokens,
-                has_gemm1_lora_delta,
+            num_tokens = int(
+                profile.get_opt_shapes()[MoeRunnerInputs.idx("hidden_states")][0]
             )
+            major, _ = get_compute_capability(moe_inputs.hidden_states.device)
+            if (
+                num_tokens * (self.top_k + self.num_fused_shared_experts)
+                < 2 * (self.num_local_experts + self.num_fused_shared_experts)
+                and major == 10
+            ):
+                return []
+            instance_key = self._tactics_instance_key(moe_inputs, profile)
             if instance_key not in MoERunner.valid_tactics_dict:
                 try:
                     valid_tactics = moe_op.trtllm_get_valid_moe_configs(*instance_key)
@@ -1564,7 +1580,108 @@ def get_trtllm_moe_sm100_module():
                     )
                     return []
                 MoERunner.valid_tactics_dict[instance_key] = valid_tactics
+            if (
+                profile.value_buckets
+                and int(profile.value_buckets[0])
+                != da_core.DEFAULT_PROFILE_VALUE_BUCKET
+            ):
+                target_tile = int(profile.value_buckets[0])
+                return [
+                    tactic
+                    for tactic in MoERunner.valid_tactics_dict[instance_key]
+                    if len(tactic) > 0 and int(tactic[0]) == target_tile
+                ]
             return MoERunner.valid_tactics_dict[instance_key]
+
+        def get_tactic_groups(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> Optional[List[List[Any]]]:
+            if (
+                not self.factorized_da_enabled
+                or not profile.value_buckets
+                or int(profile.value_buckets[0]) == da_core.DEFAULT_PROFILE_VALUE_BUCKET
+            ):
+                return None
+
+            moe_inputs = MoEInputs.from_list(inputs)
+            instance_key = self._tactics_instance_key(moe_inputs, profile)
+            if instance_key not in MoERunner.factorized_tactics_dict:
+                try:
+                    rows = moe_op.trtllm_get_valid_moe_factorized_configs(*instance_key)
+                    normalized_rows = tuple(
+                        tuple(int(value) for value in row) for row in rows
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "[Autotuner]: Failed to get factorized TRT-LLM MoE "
+                        f"tactics for {instance_key}: {e}"
+                    )
+                    return None
+                MoERunner.factorized_tactics_dict[instance_key] = normalized_rows
+
+            target_tile = int(profile.value_buckets[0])
+            all_rows = MoERunner.factorized_tactics_dict[instance_key]
+            if any(len(row) != 5 or row[4] not in (0, 1) for row in all_rows):
+                logger.debug(
+                    "[Autotuner]: Invalid factorized TRT-LLM MoE metadata for "
+                    f"{instance_key}"
+                )
+                return None
+            rows = [row for row in all_rows if row[0] == target_tile]
+            default_rows = [row for row in rows if row[4] == 1]
+            if len(default_rows) != 1:
+                logger.debug(
+                    "[Autotuner]: Expected one default factorized tactic for "
+                    f"tile {target_tile}, found {len(default_rows)}"
+                )
+                return None
+
+            default_fc1, default_fc2 = default_rows[0][2:4]
+            combined_configs = {(row[0], row[1]) for row in rows}
+            component_configs = {(row[0], row[2], row[3]) for row in rows}
+            if len(combined_configs) != len(rows) or len(component_configs) != len(
+                rows
+            ):
+                logger.debug(
+                    "[Autotuner]: Non-bijective factorized TRT-LLM MoE metadata "
+                    f"for tile {target_tile}"
+                )
+                return None
+            fc1_group = [[row[0], row[1]] for row in rows if row[3] == default_fc2]
+            fc2_group = [[row[0], row[1]] for row in rows if row[2] == default_fc1]
+            if not fc1_group or not fc2_group:
+                return None
+            return [fc1_group, fc2_group]
+
+        def compose_tactics(
+            self,
+            group_winners: List[Any],
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> Any:
+            if len(group_winners) != 2:
+                raise ValueError(
+                    "TRT-LLM factorized MoE tuning requires FC1 and FC2 winners"
+                )
+            moe_inputs = MoEInputs.from_list(inputs)
+            instance_key = self._tactics_instance_key(moe_inputs, profile)
+            rows = MoERunner.factorized_tactics_dict[instance_key]
+            by_combined = {(row[0], row[1]): row for row in rows}
+            fc1_tile, fc1_combined = group_winners[0]
+            fc2_tile, fc2_combined = group_winners[1]
+            fc1_winner = (int(fc1_tile), int(fc1_combined))
+            fc2_winner = (int(fc2_tile), int(fc2_combined))
+            if fc1_winner[0] != fc2_winner[0]:
+                raise ValueError("FC1 and FC2 winners must use the same tile size")
+
+            fc1_config = by_combined[fc1_winner][2]
+            fc2_config = by_combined[fc2_winner][3]
+            by_components = {(row[0], row[2], row[3]): row[1] for row in rows}
+            tile = fc1_winner[0]
+            combined_config = by_components[(tile, fc1_config, fc2_config)]
+            return [tile, combined_config]
 
         def forward(
             self,
@@ -1866,6 +1983,8 @@ def get_trtllm_moe_sm100_module():
 
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
+        # DA-MoE: resolve configuration once for this invocation.
+        da_config = da_core.create_config()
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
@@ -1901,6 +2020,7 @@ def get_trtllm_moe_sm100_module():
 
         dtype_act = DtypeTrtllmGen.Bfloat16
         dtype_weights = DtypeTrtllmGen.Bfloat16
+        custom_op = "flashinfer::trtllm_bf16_moe"
 
         moe_runner = MoERunner(
             top_k=top_k,
@@ -1914,6 +2034,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=use_shuffled_weight,
             activation_type=activation_type,
             num_experts=num_experts,
+            factorized_da_enabled=da_config.factorized_autotune,
         )
 
         moe_inputs = MoeRunnerInputs(
@@ -1926,18 +2047,101 @@ def get_trtllm_moe_sm100_module():
             gemm1_lora_delta=gemm1_lora_delta,
             per_token_scale=None,
         )
+        # DA-MoE: key profile and tactic state by this runner and device.
+        da_context = da_state.make_context_from_runner(
+            custom_op,
+            moe_runner,
+            device=hidden_states.device,
+            num_experts=num_experts,
+            local_expert_offset=local_expert_offset,
+            has_gemm1_lora_delta=gemm1_lora_delta is not None,
+        )
+
+        # DA-MoE: build call-specific state for profiling and metadata replay.
+        def _make_bf16_da_execution(
+            da_topk_ids: Optional[torch.Tensor],
+            da_expert_weights: Optional[torch.Tensor],
+        ) -> da_core.DAExecution:
+            return da_core.create_execution(
+                da_core.create_backend(get_trtllm_moe_sm100_module),
+                da_core.DAInvocation(
+                    da_context=da_context,
+                    runner=moe_runner,
+                    tuning_inputs=moe_inputs.to_list(),
+                    input_indices=da_core.DAInputIndices(
+                        routing_logits=MoEInputs.idx("routing_logits"),
+                        topk_ids=MoEInputs.idx("topk_ids"),
+                        hidden_states=MoEInputs.idx("hidden_states"),
+                    ),
+                    hidden_states=hidden_states,
+                    hidden_states_scale=None,
+                    routing_logits=routing_logits,
+                    topk_ids=da_topk_ids,
+                    expert_weights=da_expert_weights,
+                    routing_bias=routing_bias,
+                    gemm1_weights=gemm1_weights,
+                    gemm1_weights_scale=None,
+                    gemm1_bias=None,
+                    gemm1_alpha=None,
+                    gemm1_beta=None,
+                    gemm1_clamp_limit=None,
+                    gemm2_weights=gemm2_weights,
+                    gemm2_weights_scale=None,
+                    gemm2_bias=None,
+                    output1_scale_scalar=None,
+                    output1_scale_gate_scalar=None,
+                    output2_scale_scalar=None,
+                    output=output,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    n_group=n_group,
+                    topk_group=topk_group,
+                    intermediate_size=intermediate_size,
+                    local_expert_offset=local_expert_offset,
+                    num_local_experts=local_num_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    routing_method_type=routing_method_type,
+                    activation_type=activation_type,
+                    num_tokens=num_tokens,
+                    tune_max_num_tokens=tune_max_num_tokens,
+                    dtype_act=dtype_act,
+                    norm_topk_prob=norm_topk_prob,
+                    use_routing_scales_on_input=False,
+                    routing_input_mode=(
+                        int(RoutingInputMode.FromLogits)
+                        if routing_logits is not None
+                        else int(RoutingInputMode.PackedPrecomputed)
+                    ),
+                    internal_routing_mode=int(RoutingInputMode.PackedPrecomputed),
+                    enable_pdl=bool(enable_pdl),
+                ),
+                da_config,
+            )
+
+        # DA-MoE: attach value-profile specs only when distribution-aware tuning is enabled.
+        da_tuning_execution = _make_bf16_da_execution(topk_ids, expert_weights)
+        _da_tuning_config_kwargs: Dict[str, Any] = {}
+        _da_value_specs_active = False
+        if da_config.enabled:
+            _da_tuning_config_kwargs, _da_value_specs_active = (
+                da_core.tuning_config_kwargs(da_tuning_execution, tuner)
+            )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
+            **_da_tuning_config_kwargs,
         )
 
-        _, tactic = tuner.choose_one(
-            "flashinfer::trtllm_bf16_moe",
-            [moe_runner],
-            tuning_config,
-            moe_inputs.to_list(),
+        _, tactic = da_core.choose_one(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tuning_config=tuning_config,
+            inputs=moe_inputs.to_list(),
+            da_value_specs_active=_da_value_specs_active,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm2_weights=gemm2_weights,
@@ -1957,6 +2161,79 @@ def get_trtllm_moe_sm100_module():
             enable_pdl=enable_pdl,
             activation_type=activation_type,
         )
+        # DA-MoE: apply profiled tactics and publish fresh tuning results.
+        tactic = da_core.resolve_static_fallback(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tactic=tactic,
+        )
+        da_core.publish_tactics_from_autotune(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            da_value_specs_active=_da_value_specs_active,
+        )
+        if _da_value_specs_active and tuner.is_tuning_mode:
+            da_core.maybe_prepare_bundle(da_tuning_execution, tuner)
+        tactic = da_core.normalize_tactic(da_tuning_execution, tactic)
+
+        # DA-MoE: replay routing metadata on graph capture when tactics are ready.
+        if (
+            da_state.is_dist_aware_autotune(da_config)
+            and do_finalize
+            and gemm1_lora_delta is None
+        ):
+            da_topk_ids = topk_ids
+            da_expert_weights = expert_weights
+            if (
+                routing_logits is not None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                da_topk_ids = torch.empty(
+                    num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+                )
+                da_expert_weights = torch.empty(
+                    num_tokens,
+                    top_k,
+                    dtype=routing_logits.dtype,
+                    device=hidden_states.device,
+                )
+            elif routing_logits is not None:
+                da_topk_ids = None
+                da_expert_weights = None
+
+            def _run_bf16_from_routing_metadata(
+                routing_metadata: da_capture.RoutingMetadataBundle,
+                tactic: Sequence[int],
+            ) -> None:
+                get_trtllm_moe_sm100_module().trtllm_bf16_moe_from_routing_metadata(
+                    routing_metadata.public_metadata(),
+                    hidden_states,
+                    gemm1_weights,
+                    gemm2_weights,
+                    int(num_experts),
+                    int(top_k),
+                    int(intermediate_size),
+                    int(local_expert_offset),
+                    int(local_num_experts),
+                    bool(use_shuffled_weight),
+                    int(weight_layout),
+                    list(tactic),
+                    do_finalize=True,
+                    enable_pdl=bool(enable_pdl) if enable_pdl is not None else False,
+                    activation_type=int(activation_type),
+                    output=output,
+                )
+
+            da_execution = _make_bf16_da_execution(da_topk_ids, da_expert_weights)
+            fast_result = da_core.try_capture_dispatch(
+                da_execution, _run_bf16_from_routing_metadata
+            )
+            if fast_result is not None:
+                return fast_result
 
         # Call the C++ function with the selected tactic
         intermediate_output = moe_op.trtllm_bf16_moe(
@@ -2034,6 +2311,74 @@ def get_trtllm_moe_sm100_module():
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
     @register_custom_op(
+        "flashinfer::trtllm_bf16_moe_from_routing_metadata",
+        mutates_args=(),
+    )
+    def trtllm_bf16_moe_from_routing_metadata_op(
+        routing_metadata: List[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        use_shuffled_weight: bool,
+        weight_layout: int,
+        config_index: List[int],
+        do_finalize: bool = True,
+        enable_pdl: Optional[bool] = None,
+        activation_type: int = ActivationType.Swiglu.value,
+        output: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
+        output = _prepare_routing_metadata_output(hidden_states, output)
+        intermediate_output = moe_op.trtllm_bf16_moe_run_from_routing_metadata(
+            routing_metadata,
+            hidden_states,
+            gemm1_weights,
+            gemm2_weights,
+            num_experts,
+            top_k,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            use_shuffled_weight,
+            weight_layout,
+            do_finalize,
+            enable_pdl,
+            output,
+            config_index,
+            activation_type,
+        )
+        return _unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
+
+    @register_fake_op("flashinfer::trtllm_bf16_moe_from_routing_metadata")
+    def _fake_trtllm_bf16_moe_from_routing_metadata(
+        routing_metadata: List[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        use_shuffled_weight: bool,
+        weight_layout: int,
+        config_index: List[int],
+        do_finalize: bool = True,
+        enable_pdl: Optional[bool] = None,
+        activation_type: int = ActivationType.Swiglu.value,
+        output: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        _ = routing_metadata
+        _ = config_index
+        return _fake_routing_metadata_output(hidden_states, output)
+
+    @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_moe",
         mutates_args=("routing_replay_out",),
     )
@@ -2068,6 +2413,8 @@ def get_trtllm_moe_sm100_module():
             enable_pdl = device_support_pdl(hidden_states.device)
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
+        # DA-MoE: resolve configuration once for this invocation.
+        da_config = da_core.create_config()
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
@@ -2093,6 +2440,7 @@ def get_trtllm_moe_sm100_module():
 
         dtype_act = DtypeTrtllmGen.E4m3  # FP8 activation
         dtype_weights = DtypeTrtllmGen.E4m3  # FP8 weights
+        custom_op = "flashinfer::trtllm_fp8_per_tensor_scale_moe"
 
         moe_runner = MoERunner(
             top_k=top_k,
@@ -2106,6 +2454,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=True,
             activation_type=activation_type,
             num_experts=num_experts,
+            factorized_da_enabled=da_config.factorized_autotune,
         )
 
         moe_inputs = MoeRunnerInputs(
@@ -2118,18 +2467,93 @@ def get_trtllm_moe_sm100_module():
             gemm1_lora_delta=None,
             per_token_scale=None,
         )
+        # DA-MoE: key profile and tactic state by this runner and device.
+        da_context = da_state.make_context_from_runner(
+            custom_op,
+            moe_runner,
+            device=hidden_states.device,
+            num_experts=num_experts,
+            local_expert_offset=local_expert_offset,
+        )
+
+        # DA-MoE: build call-specific state for profiling and metadata replay.
+        def _make_fp8_per_tensor_da_execution() -> da_core.DAExecution:
+            return da_core.create_execution(
+                da_core.create_backend(get_trtllm_moe_sm100_module),
+                da_core.DAInvocation(
+                    da_context=da_context,
+                    runner=moe_runner,
+                    tuning_inputs=moe_inputs.to_list(),
+                    input_indices=da_core.DAInputIndices(
+                        routing_logits=MoEInputs.idx("routing_logits"),
+                        topk_ids=MoEInputs.idx("topk_ids"),
+                        hidden_states=MoEInputs.idx("hidden_states"),
+                    ),
+                    hidden_states=hidden_states,
+                    hidden_states_scale=None,
+                    routing_logits=routing_logits,
+                    topk_ids=topk_ids,
+                    expert_weights=topk_weights,
+                    routing_bias=routing_bias,
+                    gemm1_weights=gemm1_weights,
+                    gemm1_weights_scale=None,
+                    gemm1_bias=None,
+                    gemm1_alpha=None,
+                    gemm1_beta=None,
+                    gemm1_clamp_limit=None,
+                    gemm2_weights=gemm2_weights,
+                    gemm2_weights_scale=None,
+                    gemm2_bias=None,
+                    output1_scale_scalar=output1_scales_scalar,
+                    output1_scale_gate_scalar=output1_scales_gate_scalar,
+                    output2_scale_scalar=output2_scales_scalar,
+                    output=output,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    n_group=n_group,
+                    topk_group=topk_group,
+                    intermediate_size=intermediate_size,
+                    local_expert_offset=local_expert_offset,
+                    num_local_experts=local_num_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    routing_method_type=routing_method_type,
+                    activation_type=activation_type,
+                    num_tokens=num_tokens,
+                    tune_max_num_tokens=tune_max_num_tokens,
+                    dtype_act=dtype_act,
+                    norm_topk_prob=norm_topk_prob,
+                    use_routing_scales_on_input=use_routing_scales_on_input,
+                    routing_input_mode=int(RoutingInputMode.FromLogits),
+                    internal_routing_mode=int(RoutingInputMode.PackedPrecomputed),
+                    enable_pdl=bool(enable_pdl),
+                ),
+                da_config,
+            )
+
+        # DA-MoE: attach value-profile specs only when distribution-aware tuning is enabled.
+        da_tuning_execution = _make_fp8_per_tensor_da_execution()
+        _da_tuning_config_kwargs: Dict[str, Any] = {}
+        _da_value_specs_active = False
+        if da_config.enabled:
+            _da_tuning_config_kwargs, _da_value_specs_active = (
+                da_core.tuning_config_kwargs(da_tuning_execution, tuner)
+            )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
+            **_da_tuning_config_kwargs,
         )
 
-        _, tactic = tuner.choose_one(
-            "flashinfer::trtllm_fp8_per_tensor_scale_moe",
-            [moe_runner],
-            tuning_config,
-            moe_inputs.to_list(),
+        _, tactic = da_core.choose_one(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tuning_config=tuning_config,
+            inputs=moe_inputs.to_list(),
+            da_value_specs_active=_da_value_specs_active,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             output1_scales_scalar=output1_scales_scalar,
@@ -2148,6 +2572,60 @@ def get_trtllm_moe_sm100_module():
             enable_pdl=enable_pdl,
             activation_type=activation_type,
         )
+        # DA-MoE: apply profiled tactics and publish fresh tuning results.
+        tactic = da_core.resolve_static_fallback(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tactic=tactic,
+        )
+        da_core.publish_tactics_from_autotune(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            da_value_specs_active=_da_value_specs_active,
+        )
+        if _da_value_specs_active and tuner.is_tuning_mode:
+            da_core.maybe_prepare_bundle(da_tuning_execution, tuner)
+        tactic = da_core.normalize_tactic(da_tuning_execution, tactic)
+
+        # DA-MoE: replay routing metadata on graph capture when tactics are ready.
+        if da_state.is_dist_aware_autotune(da_config) and do_finalize:
+
+            def _run_fp8_per_tensor_from_routing_metadata(
+                routing_metadata: da_capture.RoutingMetadataBundle,
+                tactic: Sequence[int],
+            ) -> None:
+                get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe_from_routing_metadata(
+                    routing_metadata.public_metadata(),
+                    hidden_states,
+                    gemm1_weights,
+                    output1_scales_scalar,
+                    output1_scales_gate_scalar,
+                    gemm2_weights,
+                    output2_scales_scalar,
+                    int(num_experts),
+                    int(top_k),
+                    int(intermediate_size),
+                    int(local_expert_offset),
+                    int(local_num_experts),
+                    bool(use_routing_scales_on_input),
+                    list(tactic),
+                    do_finalize=True,
+                    enable_pdl=bool(enable_pdl) if enable_pdl is not None else False,
+                    activation_type=int(activation_type),
+                    output=output,
+                )
+
+            da_execution = _make_fp8_per_tensor_da_execution()
+            fast_result = da_core.try_capture_dispatch(
+                da_execution, _run_fp8_per_tensor_from_routing_metadata
+            )
+            if fast_result is not None:
+                return fast_result
+
         # Call the C++ function
         intermediate_output = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
@@ -2220,6 +2698,90 @@ def get_trtllm_moe_sm100_module():
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
     @register_custom_op(
+        "flashinfer::trtllm_fp8_per_tensor_scale_moe_from_routing_metadata",
+        mutates_args=(),
+    )
+    def trtllm_fp8_per_tensor_scale_moe_from_routing_metadata_op(
+        routing_metadata: List[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        output1_scales_scalar: torch.Tensor,
+        output1_scales_gate_scalar: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        output2_scales_scalar: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        use_routing_scales_on_input: bool,
+        config_index: List[int],
+        do_finalize: bool = True,
+        enable_pdl: Optional[bool] = None,
+        activation_type: int = ActivationType.Swiglu.value,
+        output: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
+        output = _prepare_routing_metadata_output(hidden_states, output)
+        intermediate_output = (
+            moe_op.trtllm_fp8_per_tensor_scale_moe_run_from_routing_metadata(
+                routing_metadata,
+                hidden_states,
+                gemm1_weights,
+                output1_scales_scalar,
+                output1_scales_gate_scalar,
+                gemm2_weights,
+                output2_scales_scalar,
+                num_experts,
+                top_k,
+                intermediate_size,
+                local_expert_offset,
+                local_num_experts,
+                use_routing_scales_on_input,
+                do_finalize,
+                enable_pdl,
+                output,
+                config_index,
+                activation_type,
+            )
+        )
+        if do_finalize:
+            return [output]
+        return [
+            torch.from_dlpack(intermediate_output[0]),
+            torch.from_dlpack(intermediate_output[1]),
+            torch.from_dlpack(intermediate_output[2]),
+        ]
+
+    @register_fake_op(
+        "flashinfer::trtllm_fp8_per_tensor_scale_moe_from_routing_metadata"
+    )
+    def _fake_trtllm_fp8_per_tensor_scale_moe_from_routing_metadata(
+        routing_metadata: List[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        output1_scales_scalar: torch.Tensor,
+        output1_scales_gate_scalar: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        output2_scales_scalar: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        use_routing_scales_on_input: bool,
+        config_index: List[int],
+        do_finalize: bool = True,
+        enable_pdl: Optional[bool] = None,
+        activation_type: int = ActivationType.Swiglu.value,
+        output: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        _ = routing_metadata
+        _ = config_index
+        return _fake_routing_metadata_output(hidden_states, output)
+
+    @register_custom_op(
         "flashinfer::trtllm_fp8_block_scale_moe",
         mutates_args=("routing_replay_out",),
     )
@@ -2274,6 +2836,8 @@ def get_trtllm_moe_sm100_module():
 
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
+        # DA-MoE: resolve configuration once for this invocation.
+        da_config = da_core.create_config()
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
@@ -2325,6 +2889,14 @@ def get_trtllm_moe_sm100_module():
             gemm1_beta,
             gemm1_clamp_limit,
         )
+        custom_op = "flashinfer::trtllm_fp8_block_scale_moe"
+        if (
+            gemm1_lora_delta is not None
+            and fp8_quantization_type != Fp8QuantizationType.MxFp8
+        ):
+            raise NotImplementedError(
+                "LoRA delta is only supported for MxFp8 block-scale MoE."
+            )
 
         moe_runner = MoERunner(
             top_k=top_k,
@@ -2339,6 +2911,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=use_shuffled_weight,
             num_experts=num_experts,
             num_fused_shared_experts=num_fused_shared_experts,
+            factorized_da_enabled=da_config.factorized_autotune,
         )
 
         moe_inputs = MoeRunnerInputs(
@@ -2351,18 +2924,101 @@ def get_trtllm_moe_sm100_module():
             gemm1_lora_delta=gemm1_lora_delta,
             per_token_scale=None,
         )
+        # DA-MoE: key profile and tactic state by this runner and device.
+        da_context = da_state.make_context_from_runner(
+            custom_op,
+            moe_runner,
+            device=hidden_states.device,
+            num_experts=num_experts,
+            local_expert_offset=local_expert_offset,
+            has_gemm1_lora_delta=gemm1_lora_delta is not None,
+        )
+
+        # DA-MoE: build call-specific state for profiling and metadata replay.
+        def _make_fp8_block_da_execution(
+            da_topk_ids: Optional[torch.Tensor],
+            da_expert_weights: Optional[torch.Tensor],
+        ) -> da_core.DAExecution:
+            return da_core.create_execution(
+                da_core.create_backend(get_trtllm_moe_sm100_module),
+                da_core.DAInvocation(
+                    da_context=da_context,
+                    runner=moe_runner,
+                    tuning_inputs=moe_inputs.to_list(),
+                    input_indices=da_core.DAInputIndices(
+                        routing_logits=MoEInputs.idx("routing_logits"),
+                        topk_ids=MoEInputs.idx("topk_ids"),
+                        hidden_states=MoEInputs.idx("hidden_states"),
+                    ),
+                    hidden_states=hidden_states,
+                    hidden_states_scale=hidden_states_scale,
+                    routing_logits=routing_logits,
+                    topk_ids=da_topk_ids,
+                    expert_weights=da_expert_weights,
+                    routing_bias=routing_bias,
+                    gemm1_weights=gemm1_weights,
+                    gemm1_weights_scale=gemm1_weights_scale,
+                    gemm1_bias=None,
+                    gemm1_alpha=None,
+                    gemm1_beta=None,
+                    gemm1_clamp_limit=None,
+                    gemm2_weights=gemm2_weights,
+                    gemm2_weights_scale=gemm2_weights_scale,
+                    gemm2_bias=None,
+                    output1_scale_scalar=None,
+                    output1_scale_gate_scalar=None,
+                    output2_scale_scalar=None,
+                    output=output,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    n_group=n_group,
+                    topk_group=topk_group,
+                    intermediate_size=intermediate_size,
+                    local_expert_offset=local_expert_offset,
+                    num_local_experts=local_num_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    routing_method_type=routing_method_type,
+                    activation_type=activation_type,
+                    num_tokens=num_tokens,
+                    tune_max_num_tokens=tune_max_num_tokens,
+                    dtype_act=dtype_act,
+                    norm_topk_prob=norm_topk_prob,
+                    use_routing_scales_on_input=False,
+                    routing_input_mode=(
+                        int(RoutingInputMode.FromLogits)
+                        if routing_logits is not None
+                        else int(RoutingInputMode.PackedPrecomputed)
+                    ),
+                    internal_routing_mode=int(RoutingInputMode.PackedPrecomputed),
+                    enable_pdl=bool(enable_pdl),
+                ),
+                da_config,
+            )
+
+        # DA-MoE: attach value-profile specs only when distribution-aware tuning is enabled.
+        da_tuning_execution = _make_fp8_block_da_execution(topk_ids, expert_weights)
+        _da_tuning_config_kwargs: Dict[str, Any] = {}
+        _da_value_specs_active = False
+        if da_config.enabled:
+            _da_tuning_config_kwargs, _da_value_specs_active = (
+                da_core.tuning_config_kwargs(da_tuning_execution, tuner)
+            )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
+            **_da_tuning_config_kwargs,
         )
 
-        _, tactic = tuner.choose_one(
-            "flashinfer::trtllm_fp8_block_scale_moe",
-            [moe_runner],
-            tuning_config,
-            moe_inputs.to_list(),
+        _, tactic = da_core.choose_one(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tuning_config=tuning_config,
+            inputs=moe_inputs.to_list(),
+            da_value_specs_active=_da_value_specs_active,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_weights_scale=gemm1_weights_scale,
@@ -2384,6 +3040,83 @@ def get_trtllm_moe_sm100_module():
             enable_pdl=enable_pdl,
             num_fused_shared_experts=num_fused_shared_experts,
         )
+        # DA-MoE: apply profiled tactics and publish fresh tuning results.
+        tactic = da_core.resolve_static_fallback(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tactic=tactic,
+        )
+        da_core.publish_tactics_from_autotune(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            da_value_specs_active=_da_value_specs_active,
+        )
+        if _da_value_specs_active and tuner.is_tuning_mode:
+            da_core.maybe_prepare_bundle(da_tuning_execution, tuner)
+        tactic = da_core.normalize_tactic(da_tuning_execution, tactic)
+
+        # DA-MoE: replay routing metadata on graph capture when tactics are ready.
+        if (
+            da_state.is_dist_aware_autotune(da_config)
+            and do_finalize
+            and gemm1_lora_delta is None
+        ):
+            da_topk_ids = topk_ids
+            da_expert_weights = expert_weights
+            if (
+                routing_logits is not None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                da_topk_ids = torch.empty(
+                    num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+                )
+                da_expert_weights = torch.empty(
+                    num_tokens,
+                    top_k,
+                    dtype=routing_logits.dtype,
+                    device=hidden_states.device,
+                )
+            elif routing_logits is not None:
+                da_topk_ids = None
+                da_expert_weights = None
+
+            def _run_fp8_block_from_routing_metadata(
+                routing_metadata: da_capture.RoutingMetadataBundle,
+                tactic: Sequence[int],
+            ) -> None:
+                get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe_from_routing_metadata(
+                    routing_metadata.public_metadata(),
+                    hidden_states,
+                    hidden_states_scale,
+                    gemm1_weights,
+                    gemm1_weights_scale,
+                    gemm2_weights,
+                    gemm2_weights_scale,
+                    int(num_experts),
+                    int(top_k),
+                    int(intermediate_size),
+                    int(local_expert_offset),
+                    int(local_num_experts),
+                    bool(use_shuffled_weight),
+                    int(weight_layout),
+                    list(tactic),
+                    fp8_quantization_type,
+                    do_finalize=True,
+                    enable_pdl=bool(enable_pdl) if enable_pdl is not None else False,
+                    activation_type=int(activation_type),
+                    output=output,
+                )
+
+            da_execution = _make_fp8_block_da_execution(da_topk_ids, da_expert_weights)
+            fast_result = da_core.try_capture_dispatch(
+                da_execution, _run_fp8_block_from_routing_metadata
+            )
+            if fast_result is not None:
+                return fast_result
         _nfse = num_fused_shared_experts if num_fused_shared_experts is not None else 0
         # Call the C++ function for block scale MoE
         intermediate_output = moe_op.trtllm_fp8_block_scale_moe(
@@ -2470,6 +3203,88 @@ def get_trtllm_moe_sm100_module():
         hidden_size = hidden_states.shape[1]
         # TODO: This is not correct for gemm1_lora_delta or do_finalize=False
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+
+    @register_custom_op(
+        "flashinfer::trtllm_fp8_block_scale_moe_from_routing_metadata",
+        mutates_args=(),
+    )
+    def trtllm_fp8_block_scale_moe_from_routing_metadata_op(
+        routing_metadata: List[torch.Tensor],
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        use_shuffled_weight: bool,
+        weight_layout: int,
+        config_index: List[int],
+        fp8_quantization_type: Fp8QuantizationType,
+        do_finalize: bool = True,
+        enable_pdl: Optional[bool] = None,
+        activation_type: int = ActivationType.Swiglu.value,
+        output: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
+        output = _prepare_routing_metadata_output(hidden_states, output)
+        intermediate_output = (
+            moe_op.trtllm_fp8_block_scale_moe_run_from_routing_metadata(
+                routing_metadata,
+                hidden_states,
+                hidden_states_scale,
+                gemm1_weights,
+                gemm1_weights_scale,
+                gemm2_weights,
+                gemm2_weights_scale,
+                num_experts,
+                top_k,
+                intermediate_size,
+                local_expert_offset,
+                local_num_experts,
+                use_shuffled_weight,
+                weight_layout,
+                do_finalize,
+                enable_pdl,
+                output,
+                config_index,
+                fp8_quantization_type,
+                activation_type,
+            )
+        )
+        return _unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
+
+    @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe_from_routing_metadata")
+    def _fake_trtllm_fp8_block_scale_moe_from_routing_metadata(
+        routing_metadata: List[torch.Tensor],
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        use_shuffled_weight: bool,
+        weight_layout: int,
+        config_index: List[int],
+        fp8_quantization_type: Fp8QuantizationType,
+        do_finalize: bool = True,
+        enable_pdl: Optional[bool] = None,
+        activation_type: int = ActivationType.Swiglu.value,
+        output: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        _ = routing_metadata
+        _ = config_index
+        return _fake_routing_metadata_output(hidden_states, output)
 
     @register_custom_op(
         "flashinfer::trtllm_fp4_block_scale_moe",
@@ -2571,10 +3386,32 @@ def get_trtllm_moe_sm100_module():
             )
 
         tuner = AutoTuner.get()
+        # DA-MoE: resolve configuration once for this invocation.
+        da_config = da_core.create_config()
         dtype_act = deduce_trtllm_gen_tensor_dtype(hidden_states, hidden_states_scale)
         dtype_weights = deduce_trtllm_gen_tensor_dtype(
             gemm1_weights, gemm1_weights_scale
         )
+        custom_op = "flashinfer::trtllm_fp4_block_scale_moe"
+        # DA-MoE: key profile and tactic state by this invocation.
+        da_context = da_state.make_context(
+            custom_op,
+            device=hidden_states.device,
+            dtype_act=dtype_act,
+            dtype_weights=dtype_weights,
+            quantization_type=Fp8QuantizationType.NoneFp8,
+            top_k=top_k,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=activation_type,
+            weight_layout=WeightLayout.MajorK,
+            use_shuffled_weight=True,
+            use_per_token_scaling=per_token_scale is not None,
+        )
+
         moe_runner = MoERunner(
             top_k=top_k,
             num_local_experts=num_local_experts,
@@ -2588,6 +3425,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=True,
             use_per_token_scaling=per_token_scale is not None,
             num_experts=num_experts,
+            factorized_da_enabled=da_config.factorized_autotune,
         )
         moe_inputs = MoeRunnerInputs(
             output=output,
@@ -2599,18 +3437,181 @@ def get_trtllm_moe_sm100_module():
             gemm1_lora_delta=None,
             per_token_scale=per_token_scale,
         )
+
+        # DA-MoE: build call-specific state for profiling and metadata replay.
+        def _make_fp4_da_execution() -> da_core.DAExecution:
+            return da_core.create_execution(
+                da_core.create_backend(get_trtllm_moe_sm100_module),
+                da_core.DAInvocation(
+                    da_context=da_context,
+                    runner=moe_runner,
+                    tuning_inputs=moe_inputs.to_list(),
+                    input_indices=da_core.DAInputIndices(
+                        routing_logits=MoEInputs.idx("routing_logits"),
+                        topk_ids=MoEInputs.idx("topk_ids"),
+                        hidden_states=MoEInputs.idx("hidden_states"),
+                    ),
+                    hidden_states=hidden_states,
+                    hidden_states_scale=hidden_states_scale,
+                    routing_logits=routing_logits,
+                    topk_ids=topk_ids,
+                    expert_weights=topk_weights,
+                    routing_bias=routing_bias,
+                    gemm1_weights=gemm1_weights,
+                    gemm1_weights_scale=gemm1_weights_scale,
+                    gemm1_bias=gemm1_bias,
+                    gemm1_alpha=gemm1_alpha,
+                    gemm1_beta=gemm1_beta,
+                    gemm1_clamp_limit=gemm1_clamp_limit,
+                    gemm2_weights=gemm2_weights,
+                    gemm2_weights_scale=gemm2_weights_scale,
+                    gemm2_bias=gemm2_bias,
+                    output1_scale_scalar=output1_scale_scalar,
+                    output1_scale_gate_scalar=output1_scale_gate_scalar,
+                    output2_scale_scalar=output2_scale_scalar,
+                    output=output,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    n_group=n_group,
+                    topk_group=topk_group,
+                    intermediate_size=intermediate_size,
+                    local_expert_offset=local_expert_offset,
+                    num_local_experts=num_local_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    routing_method_type=routing_method_type,
+                    activation_type=activation_type,
+                    num_tokens=num_tokens,
+                    tune_max_num_tokens=tune_max_num_tokens,
+                    dtype_act=dtype_act,
+                    norm_topk_prob=norm_topk_prob,
+                    use_routing_scales_on_input=False,
+                    routing_input_mode=int(routing_input_mode),
+                    internal_routing_mode=(
+                        int(RoutingInputMode.UnpackedPrecomputed)
+                        if int(routing_input_mode)
+                        == int(RoutingInputMode.UnpackedPrecomputed)
+                        else int(RoutingInputMode.PackedPrecomputed)
+                    ),
+                    enable_pdl=bool(enable_pdl),
+                ),
+                da_config,
+            )
+
+        # DA-MoE: preload bundle tactics before capture-aware dispatch.
+        da_execution = _make_fp4_da_execution()
+        da_core.maybe_prepare_bundle(da_execution, tuner)
+
+        # DA-MoE: replay prepared routing metadata and tactic bodies during graph capture.
+        if da_state.is_dist_aware_autotune(da_config) and do_finalize:
+
+            def _run_fp4_from_routing_metadata(
+                routing_metadata: da_capture.RoutingMetadataBundle,
+                tactic: Sequence[int],
+            ) -> None:
+                if per_token_scale is None:
+                    moe_op.trtllm_fp4_block_scale_moe_run_from_routing_metadata(
+                        routing_metadata.public_metadata(),
+                        hidden_states,
+                        hidden_states_scale,
+                        gemm1_weights,
+                        gemm1_weights_scale,
+                        gemm1_bias,
+                        gemm1_alpha,
+                        gemm1_beta,
+                        gemm1_clamp_limit,
+                        gemm2_weights,
+                        gemm2_weights_scale,
+                        gemm2_bias,
+                        output1_scale_scalar,
+                        output1_scale_gate_scalar,
+                        output2_scale_scalar,
+                        int(num_experts),
+                        int(top_k),
+                        int(intermediate_size),
+                        int(local_expert_offset),
+                        int(num_local_experts),
+                        True,
+                        bool(enable_pdl) if enable_pdl is not None else False,
+                        int(activation_type),
+                        output,
+                        list(tactic),
+                    )
+                else:
+                    moe_op.trtllm_fp4_block_scale_moe_run_from_routing_metadata_with_per_token_scale(
+                        routing_metadata.public_metadata(),
+                        hidden_states,
+                        hidden_states_scale,
+                        gemm1_weights,
+                        gemm1_weights_scale,
+                        gemm1_bias,
+                        gemm1_alpha,
+                        gemm1_beta,
+                        gemm1_clamp_limit,
+                        gemm2_weights,
+                        gemm2_weights_scale,
+                        gemm2_bias,
+                        output1_scale_scalar,
+                        output1_scale_gate_scalar,
+                        output2_scale_scalar,
+                        per_token_scale,
+                        int(num_experts),
+                        int(top_k),
+                        int(intermediate_size),
+                        int(local_expert_offset),
+                        int(num_local_experts),
+                        True,
+                        bool(enable_pdl) if enable_pdl is not None else False,
+                        int(activation_type),
+                        output,
+                        list(tactic),
+                    )
+
+            fast_result = da_core.try_capture_dispatch(
+                da_execution,
+                _run_fp4_from_routing_metadata,
+            )
+            if fast_result is not None:
+                return fast_result
+
+        # DA-MoE: attach value-profile specs only when distribution-aware tuning is enabled.
+        _da_tuning_config_kwargs: Dict[str, Any] = {}
+        _da_value_specs_active = False
+        if da_config.enabled:
+            _da_tuning_config_kwargs, _da_value_specs_active = (
+                da_core.tuning_config_kwargs(
+                    da_execution,
+                    tuner,
+                    pack_topk_ids=(
+                        int(routing_input_mode)
+                        != int(RoutingInputMode.UnpackedPrecomputed)
+                    ),
+                )
+            )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             use_cold_l2_cache=True,
             use_cuda_graph=True,
+            **_da_tuning_config_kwargs,
         )
+        if da_config.verbose and tuner.is_tuning_mode:
+            _tensor_value_specs = _da_tuning_config_kwargs.get("value_specs", ())
+            print(
+                f"[DA tuning_config] op={custom_op} "
+                f"value_specs_active={_da_value_specs_active} "
+                f"value_specs set={bool(_tensor_value_specs)} "
+                f"num_value_specs={len(_tensor_value_specs)}",
+                flush=True,
+            )
 
-        _, tactic = tuner.choose_one(
-            "flashinfer::trtllm_fp4_block_scale_moe",
-            [moe_runner],
-            tuning_config,
-            moe_inputs.to_list(),
+        _, tactic = da_core.choose_one(
+            da_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tuning_config=tuning_config,
+            inputs=moe_inputs.to_list(),
+            da_value_specs_active=_da_value_specs_active,
             routing_input_mode=routing_input_mode,
             num_experts=num_experts,
             routing_bias=routing_bias,
@@ -2636,6 +3637,27 @@ def get_trtllm_moe_sm100_module():
             do_finalize=do_finalize,
             activation_type=activation_type,
         )
+        # DA-MoE: apply profiled tactics and publish fresh tuning results.
+        tactic = da_core.resolve_static_fallback(
+            da_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tactic=tactic,
+        )
+        # Populate DAKNNv2 per-tile tactics only while the AutoTuner is in
+        # tuning mode. Once tuning finishes the profiling cache is frozen.
+        da_core.publish_tactics_from_autotune(
+            da_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            da_value_specs_active=_da_value_specs_active,
+        )
+        if _da_value_specs_active and tuner.is_tuning_mode:
+            da_core.maybe_prepare_bundle(da_execution, tuner)
+
+        tactic = da_core.normalize_tactic(da_execution, tactic)
 
         # Call the C++ function for block scale MoE
         intermediate_output = moe_op.trtllm_fp4_block_scale_moe(
@@ -2731,6 +3753,383 @@ def get_trtllm_moe_sm100_module():
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
     @register_custom_op(
+        "flashinfer::trtllm_moe_allocate_routing_metadata_from_logits",
+        mutates_args=["packed_topk_ids"],
+    )
+    def trtllm_moe_allocate_routing_metadata_from_logits_op(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        tile_tokens_dim: int,
+        norm_topk_prob: bool,
+        use_routing_scales_on_input: bool,
+        packed_topk_ids: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        metadata = moe_op.trtllm_moe_allocate_routing_metadata_from_logits(
+            routing_logits,
+            routing_bias,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            tile_tokens_dim,
+            norm_topk_prob,
+            use_routing_scales_on_input,
+            packed_topk_ids,
+        )
+        return [torch.from_dlpack(tensor) for tensor in metadata]
+
+    @register_fake_op("flashinfer::trtllm_moe_allocate_routing_metadata_from_logits")
+    def _fake_trtllm_moe_allocate_routing_metadata_from_logits(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        tile_tokens_dim: int,
+        norm_topk_prob: bool,
+        use_routing_scales_on_input: bool,
+        packed_topk_ids: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        _ = routing_logits
+        _ = norm_topk_prob
+        _ = use_routing_scales_on_input
+        return _fake_trtllm_moe_allocate_routing_metadata(
+            packed_topk_ids,
+            routing_bias,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            tile_tokens_dim,
+            int(RoutingInputMode.PackedPrecomputed),
+            None,
+        )
+
+    @register_custom_op(
+        "flashinfer::trtllm_deepseek_moe_compute_routing_packed_only",
+        mutates_args=["packed_topk_ids", "expert_weights_bf16"],
+    )
+    def trtllm_deepseek_moe_compute_routing_packed_only_op(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        packed_topk_ids: torch.Tensor,
+        expert_weights_bf16: torch.Tensor,
+    ) -> None:
+        moe_op.trtllm_deepseek_moe_compute_routing_packed_only(
+            routing_logits,
+            routing_bias,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            packed_topk_ids,
+            expert_weights_bf16,
+        )
+
+    @register_fake_op("flashinfer::trtllm_deepseek_moe_compute_routing_packed_only")
+    def _fake_trtllm_deepseek_moe_compute_routing_packed_only(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        packed_topk_ids: torch.Tensor,
+        expert_weights_bf16: torch.Tensor,
+    ) -> None:
+        return None
+
+    @register_custom_op(
+        "flashinfer::trtllm_moe_allocate_routing_metadata",
+        mutates_args=(),
+    )
+    def trtllm_moe_allocate_routing_metadata_op(
+        topk_ids: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        tile_tokens_dim: int,
+        routing_input_mode: int,
+        topk_weights: Optional[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
+        assert topk_ids.ndim == 2, "topk_ids must be a 2D tensor."
+        assert topk_ids.shape[1] == top_k, "topk_ids.shape[1] must match top_k."
+        metadata = moe_op.trtllm_moe_allocate_routing_metadata(
+            topk_ids,
+            routing_bias,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            tile_tokens_dim,
+            routing_input_mode,
+            topk_weights,
+        )
+        return [torch.from_dlpack(tensor) for tensor in metadata]
+
+    @register_fake_op("flashinfer::trtllm_moe_allocate_routing_metadata")
+    def _fake_trtllm_moe_allocate_routing_metadata(
+        topk_ids: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        tile_tokens_dim: int,
+        routing_input_mode: int,
+        topk_weights: Optional[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        num_tokens = topk_ids.shape[0]
+        expanded_tokens = num_tokens * top_k
+        num_filled_experts = min(num_experts, expanded_tokens)
+        remaining_tokens = max(expanded_tokens - num_filled_experts, 0)
+        max_num_ctas = num_filled_experts + remaining_tokens // tile_tokens_dim
+        max_num_padded_tokens = max_num_ctas * tile_tokens_dim
+        histogram_size = max(num_experts * 2, 256 * 2)
+        return [
+            topk_ids.new_empty((1,)),
+            topk_ids.new_empty((expanded_tokens,)),
+            topk_ids.new_empty((max_num_padded_tokens,)),
+            torch.empty(
+                (num_tokens, top_k),
+                dtype=(
+                    topk_weights.dtype
+                    if int(routing_input_mode)
+                    == int(RoutingInputMode.UnpackedPrecomputed)
+                    and topk_weights is not None
+                    else torch.bfloat16
+                ),
+                device=topk_ids.device,
+            ),
+            topk_ids.new_empty((histogram_size,)),
+            topk_ids.new_empty((num_experts,)),
+            topk_ids.new_empty((max_num_ctas,)),
+            topk_ids.new_empty((max_num_ctas,)),
+            topk_ids.new_empty((1,)),
+        ]
+
+    @register_custom_op(
+        "flashinfer::trtllm_moe_allocate_routing_metadata_multi_tile",
+        mutates_args=(),
+    )
+    def trtllm_moe_allocate_routing_metadata_multi_tile_op(
+        topk_ids: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        tile_tokens_dims: List[int],
+        routing_input_mode: int,
+        topk_weights: Optional[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
+        assert topk_ids.ndim == 2, "topk_ids must be a 2D tensor."
+        assert topk_ids.shape[1] == top_k, "topk_ids.shape[1] must match top_k."
+        metadata = moe_op.trtllm_moe_allocate_routing_metadata_multi_tile(
+            topk_ids,
+            routing_bias,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            tile_tokens_dims,
+            routing_input_mode,
+            topk_weights,
+        )
+        flat = [torch.from_dlpack(tensor) for tensor in metadata]
+        if (
+            int(routing_input_mode) == int(RoutingInputMode.UnpackedPrecomputed)
+            and topk_weights is not None
+        ):
+            for expert_weights_idx in range(3, len(flat), 9):
+                flat[expert_weights_idx] = topk_weights
+        return flat
+
+    @register_fake_op("flashinfer::trtllm_moe_allocate_routing_metadata_multi_tile")
+    def _fake_trtllm_moe_allocate_routing_metadata_multi_tile(
+        topk_ids: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        tile_tokens_dims: List[int],
+        routing_input_mode: int,
+        topk_weights: Optional[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        flat: List[torch.Tensor] = []
+        for tile_tokens_dim in tile_tokens_dims:
+            metadata = _fake_trtllm_moe_allocate_routing_metadata(
+                topk_ids,
+                routing_bias,
+                num_experts,
+                top_k,
+                n_group,
+                topk_group,
+                local_expert_offset,
+                local_num_experts,
+                routed_scaling_factor,
+                routing_method_type,
+                int(tile_tokens_dim),
+                routing_input_mode,
+                topk_weights,
+            )
+            if (
+                int(routing_input_mode) == int(RoutingInputMode.UnpackedPrecomputed)
+                and topk_weights is not None
+            ):
+                metadata[3] = topk_weights
+            flat.extend(metadata)
+        return flat
+
+    # DA-MoE: group the flat per-tile metadata returned by the multi-tile FFI.
+    def _prepare_routing_metadata_multi_tile(
+        topk_ids: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        tile_tokens_dims: Sequence[int],
+        routing_input_mode: int = int(RoutingInputMode.PackedPrecomputed),
+        topk_weights: Optional[torch.Tensor] = None,
+    ) -> List[List[torch.Tensor]]:
+        """Build routing metadata for every candidate capture tile."""
+        flat = trtllm_moe_allocate_routing_metadata_multi_tile_op(
+            topk_ids,
+            routing_bias,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            list(tile_tokens_dims),
+            routing_input_mode,
+            topk_weights,
+        )
+        return [list(flat[i : i + 9]) for i in range(0, len(flat), 9)]
+
+    def _prepare_routing_metadata_output(
+        hidden_states: torch.Tensor,
+        output: Optional[torch.Tensor],
+        *,
+        allow_narrow: bool = False,
+    ) -> torch.Tensor:
+        hidden_size = hidden_states.shape[1]
+        if hidden_states.dtype == torch.uint8:
+            hidden_size *= 2
+        expected_shape = (hidden_states.shape[0], hidden_size)
+        if output is None:
+            return torch.empty(
+                expected_shape,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+        check_shape_dtype_device(
+            output,
+            None if allow_narrow else expected_shape,
+            torch.bfloat16,
+            hidden_states.device,
+            "output",
+        )
+        if allow_narrow:
+            assert output.shape[0] == expected_shape[0], (
+                f"output.shape[0]={output.shape[0]} must be equal to {expected_shape[0]}"
+            )
+            assert output.shape[1] <= expected_shape[1], (
+                f"output.shape[1]={output.shape[1]} must be less than or equal to "
+                f"{expected_shape[1]}"
+            )
+        return output
+
+    def _fake_routing_metadata_output(
+        hidden_states: torch.Tensor,
+        output: Optional[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        hidden_size = hidden_states.shape[1]
+        if hidden_states.dtype == torch.uint8:
+            hidden_size *= 2
+        if output is not None:
+            hidden_size = output.shape[1]
+        return [
+            hidden_states.new_empty(
+                [hidden_states.shape[0], hidden_size], dtype=torch.bfloat16
+            )
+        ]
+
+    @register_custom_op(
         "flashinfer::trtllm_mxint4_block_scale_moe",
         mutates_args=("routing_replay_out",),
     )
@@ -2796,8 +4195,11 @@ def get_trtllm_moe_sm100_module():
             )
 
         tuner = AutoTuner.get()
+        # DA-MoE: resolve configuration once for this invocation.
+        da_config = da_core.create_config()
         dtype_act = DtypeTrtllmGen.Bfloat16
         dtype_weights = DtypeTrtllmGen.MxInt4
+        custom_op = "flashinfer::trtllm_mxint4_block_scale_moe"
         moe_runner = MoERunner(
             top_k=top_k,
             num_local_experts=num_local_experts,
@@ -2810,6 +4212,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.BlockMajorK,
             use_shuffled_weight=True,
             num_experts=num_experts,
+            factorized_da_enabled=da_config.factorized_autotune,
         )
 
         moe_inputs = MoeRunnerInputs(
@@ -2822,18 +4225,101 @@ def get_trtllm_moe_sm100_module():
             gemm1_lora_delta=gemm1_lora_delta,
             per_token_scale=None,
         )
+        # DA-MoE: key profile and tactic state by this runner and device.
+        da_context = da_state.make_context_from_runner(
+            custom_op,
+            moe_runner,
+            device=hidden_states.device,
+            num_experts=num_experts,
+            local_expert_offset=local_expert_offset,
+            has_gemm1_lora_delta=gemm1_lora_delta is not None,
+        )
+
+        # DA-MoE: build call-specific state for profiling and metadata replay.
+        def _make_mxint4_da_execution(
+            da_topk_ids: Optional[torch.Tensor],
+            da_expert_weights: Optional[torch.Tensor],
+        ) -> da_core.DAExecution:
+            return da_core.create_execution(
+                da_core.create_backend(get_trtllm_moe_sm100_module),
+                da_core.DAInvocation(
+                    da_context=da_context,
+                    runner=moe_runner,
+                    tuning_inputs=moe_inputs.to_list(),
+                    input_indices=da_core.DAInputIndices(
+                        routing_logits=MoEInputs.idx("routing_logits"),
+                        topk_ids=MoEInputs.idx("topk_ids"),
+                        hidden_states=MoEInputs.idx("hidden_states"),
+                    ),
+                    hidden_states=hidden_states,
+                    hidden_states_scale=None,
+                    routing_logits=routing_logits,
+                    topk_ids=da_topk_ids,
+                    expert_weights=da_expert_weights,
+                    routing_bias=routing_bias,
+                    gemm1_weights=gemm1_weights,
+                    gemm1_weights_scale=gemm1_weights_scale,
+                    gemm1_bias=None,
+                    gemm1_alpha=gemm1_alpha,
+                    gemm1_beta=gemm1_beta,
+                    gemm1_clamp_limit=gemm1_clamp_limit,
+                    gemm2_weights=gemm2_weights,
+                    gemm2_weights_scale=gemm2_weights_scale,
+                    gemm2_bias=None,
+                    output1_scale_scalar=None,
+                    output1_scale_gate_scalar=None,
+                    output2_scale_scalar=None,
+                    output=output,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    n_group=n_group,
+                    topk_group=topk_group,
+                    intermediate_size=intermediate_size,
+                    local_expert_offset=local_expert_offset,
+                    num_local_experts=num_local_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    routing_method_type=routing_method_type,
+                    activation_type=int(ActivationType.Swiglu),
+                    num_tokens=num_tokens,
+                    tune_max_num_tokens=tune_max_num_tokens,
+                    dtype_act=dtype_act,
+                    norm_topk_prob=norm_topk_prob,
+                    use_routing_scales_on_input=False,
+                    routing_input_mode=(
+                        int(RoutingInputMode.FromLogits)
+                        if routing_logits is not None
+                        else int(RoutingInputMode.PackedPrecomputed)
+                    ),
+                    internal_routing_mode=int(RoutingInputMode.PackedPrecomputed),
+                    enable_pdl=bool(enable_pdl),
+                ),
+                da_config,
+            )
+
+        # DA-MoE: attach value-profile specs only when distribution-aware tuning is enabled.
+        da_tuning_execution = _make_mxint4_da_execution(topk_ids, expert_weights)
+        _da_tuning_config_kwargs: Dict[str, Any] = {}
+        _da_value_specs_active = False
+        if da_config.enabled:
+            _da_tuning_config_kwargs, _da_value_specs_active = (
+                da_core.tuning_config_kwargs(da_tuning_execution, tuner)
+            )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
+            **_da_tuning_config_kwargs,
         )
 
-        _, tactic = tuner.choose_one(
-            "flashinfer::trtllm_mxint4_block_scale_moe",
-            [moe_runner],
-            tuning_config,
-            moe_inputs.to_list(),
+        _, tactic = da_core.choose_one(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tuning_config=tuning_config,
+            inputs=moe_inputs.to_list(),
+            da_value_specs_active=_da_value_specs_active,
             num_experts=num_experts,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
@@ -2851,6 +4337,81 @@ def get_trtllm_moe_sm100_module():
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
         )
+        # DA-MoE: apply profiled tactics and publish fresh tuning results.
+        tactic = da_core.resolve_static_fallback(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            tactic=tactic,
+        )
+        da_core.publish_tactics_from_autotune(
+            da_tuning_execution,
+            tuner,
+            custom_op=custom_op,
+            runner=moe_runner,
+            da_value_specs_active=_da_value_specs_active,
+        )
+        if _da_value_specs_active and tuner.is_tuning_mode:
+            da_core.maybe_prepare_bundle(da_tuning_execution, tuner)
+        tactic = da_core.normalize_tactic(da_tuning_execution, tactic)
+
+        # DA-MoE: replay routing metadata on graph capture when tactics are ready.
+        if (
+            da_state.is_dist_aware_autotune(da_config)
+            and do_finalize
+            and gemm1_lora_delta is None
+        ):
+            da_topk_ids = topk_ids
+            da_expert_weights = expert_weights
+            if (
+                routing_logits is not None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                da_topk_ids = torch.empty(
+                    num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+                )
+                da_expert_weights = torch.empty(
+                    num_tokens,
+                    top_k,
+                    dtype=routing_logits.dtype,
+                    device=hidden_states.device,
+                )
+            elif routing_logits is not None:
+                da_topk_ids = None
+                da_expert_weights = None
+
+            def _run_mxint4_from_routing_metadata(
+                routing_metadata: da_capture.RoutingMetadataBundle,
+                tactic: Sequence[int],
+            ) -> None:
+                get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe_from_routing_metadata(
+                    routing_metadata.public_metadata(),
+                    hidden_states,
+                    gemm1_weights,
+                    gemm1_weights_scale,
+                    gemm1_alpha,
+                    gemm1_beta,
+                    gemm1_clamp_limit,
+                    gemm2_weights,
+                    gemm2_weights_scale,
+                    int(num_experts),
+                    int(top_k),
+                    int(intermediate_size),
+                    int(local_expert_offset),
+                    int(num_local_experts),
+                    list(tactic),
+                    do_finalize=True,
+                    enable_pdl=bool(enable_pdl) if enable_pdl is not None else False,
+                    output=output,
+                )
+
+            da_execution = _make_mxint4_da_execution(da_topk_ids, da_expert_weights)
+            fast_result = da_core.try_capture_dispatch(
+                da_execution, _run_mxint4_from_routing_metadata
+            )
+            if fast_result is not None:
+                return fast_result
 
         # Call the C++ function for block scale MoE
         intermediate_output = moe_op.trtllm_mxint4_block_scale_moe(
@@ -2925,18 +4486,125 @@ def get_trtllm_moe_sm100_module():
 
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
-    return SimpleNamespace(
+    @register_custom_op(
+        "flashinfer::trtllm_mxint4_block_scale_moe_from_routing_metadata",
+        mutates_args=(),
+    )
+    def trtllm_mxint4_block_scale_moe_from_routing_metadata_op(
+        routing_metadata: List[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm1_alpha: Optional[torch.Tensor],
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor],
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        config_index: List[int],
+        do_finalize: bool = True,
+        enable_pdl: Optional[bool] = None,
+        output: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
+        output = _prepare_routing_metadata_output(hidden_states, output)
+        intermediate_output = (
+            moe_op.trtllm_mxint4_block_scale_moe_run_from_routing_metadata(
+                routing_metadata,
+                hidden_states,
+                gemm1_weights,
+                gemm1_weights_scale,
+                gemm1_alpha,
+                gemm1_beta,
+                gemm1_clamp_limit,
+                gemm2_weights,
+                gemm2_weights_scale,
+                num_experts,
+                top_k,
+                intermediate_size,
+                local_expert_offset,
+                local_num_experts,
+                do_finalize,
+                enable_pdl,
+                output,
+                config_index,
+            )
+        )
+        return _unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
+
+    @register_fake_op("flashinfer::trtllm_mxint4_block_scale_moe_from_routing_metadata")
+    def _fake_trtllm_mxint4_block_scale_moe_from_routing_metadata(
+        routing_metadata: List[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm1_alpha: Optional[torch.Tensor],
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor],
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        config_index: List[int],
+        do_finalize: bool = True,
+        enable_pdl: Optional[bool] = None,
+        output: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        _ = routing_metadata
+        _ = config_index
+        return _fake_routing_metadata_output(hidden_states, output)
+
+    ns = SimpleNamespace(
         trtllm_bf16_moe=trtllm_bf16_moe_op,
         trtllm_fp8_per_tensor_scale_moe=trtllm_fp8_per_tensor_scale_moe_op,
         trtllm_fp8_block_scale_moe=trtllm_fp8_block_scale_moe_op,
         trtllm_fp4_block_scale_moe=trtllm_fp4_block_scale_moe_op,
+        trtllm_moe_allocate_routing_metadata_from_logits=(
+            trtllm_moe_allocate_routing_metadata_from_logits_op
+        ),
+        trtllm_deepseek_moe_compute_routing_packed_only=(
+            trtllm_deepseek_moe_compute_routing_packed_only_op
+        ),
+        trtllm_moe_allocate_routing_metadata=(trtllm_moe_allocate_routing_metadata_op),
+        trtllm_moe_allocate_routing_metadata_multi_tile=(
+            trtllm_moe_allocate_routing_metadata_multi_tile_op
+        ),
+        prepare_routing_metadata_multi_tile=_prepare_routing_metadata_multi_tile,
+        trtllm_bf16_moe_from_routing_metadata=(
+            trtllm_bf16_moe_from_routing_metadata_op
+        ),
+        trtllm_fp8_per_tensor_scale_moe_from_routing_metadata=(
+            trtllm_fp8_per_tensor_scale_moe_from_routing_metadata_op
+        ),
+        trtllm_fp8_block_scale_moe_from_routing_metadata=(
+            trtllm_fp8_block_scale_moe_from_routing_metadata_op
+        ),
+        trtllm_mxint4_block_scale_moe_from_routing_metadata=(
+            trtllm_mxint4_block_scale_moe_from_routing_metadata_op
+        ),
         trtllm_mxint4_block_scale_moe=trtllm_mxint4_block_scale_moe_op,
         # Canonical tactic-aware TunableRunner (closes over the raw moe_op and
         # trtllm_get_valid_moe_configs).  Exposed so the unified MoE API's
         # TrtllmFp4RoutedRunner can delegate to it instead of re-deriving the
         # raw op's positional call.
         MoERunner=MoERunner,
+        # Raw TVM-FFI module handle for capture-safe low-level callers that
+        # need to bypass the torch custom-op wrappers (e.g. the single-graph
+        # DA path in flashinfer/fused_moe/da_single_graph.py).
+        ffi_moe_op=moe_op,
     )
+
+    # Bundle loading is deferred to the first compatible DA execution.
+    # transaction, avoiding re-entry into this cached module factory.
+    return ns
 
 
 def _validate_bf16_gemm1_activation_params(
@@ -3010,6 +4678,91 @@ def _validate_fp8_block_scale_gemm1_activation_params(
             "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported "
             "for ActivationType.Swiglu."
         )
+
+
+@flashinfer_api
+def trtllm_moe_allocate_routing_metadata(
+    topk_ids: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    tile_tokens_dim: int,
+    routing_input_mode: int = int(RoutingInputMode.PackedPrecomputed),
+    topk_weights: Optional[torch.Tensor] = None,
+) -> List[torch.Tensor]:
+    """Allocate TRT-LLM MoE routing metadata for one candidate tile.
+
+    ``topk_ids`` may contain packed TRT-LLM assignments or raw expert IDs when
+    ``routing_input_mode`` is ``UnpackedPrecomputed``. Unpacked routing also
+    requires the caller's separate BF16 ``topk_weights`` tensor. The returned
+    list is intentionally opaque;
+    pass the matching list to the corresponding routing-metadata MoE runner.
+    """
+    return get_trtllm_moe_sm100_module().trtllm_moe_allocate_routing_metadata(
+        topk_ids,
+        routing_bias,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        tile_tokens_dim,
+        routing_input_mode,
+        topk_weights,
+    )
+
+
+@flashinfer_api
+def trtllm_moe_allocate_routing_metadata_multi_tile(
+    topk_ids: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    tile_tokens_dims: Sequence[int],
+    routing_input_mode: int = int(RoutingInputMode.PackedPrecomputed),
+    topk_weights: Optional[torch.Tensor] = None,
+) -> List[List[torch.Tensor]]:
+    """Allocate TRT-LLM MoE routing metadata for all candidate tiles."""
+    flat = (
+        get_trtllm_moe_sm100_module().trtllm_moe_allocate_routing_metadata_multi_tile(
+            topk_ids,
+            routing_bias,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            list(tile_tokens_dims),
+            routing_input_mode,
+            topk_weights,
+        )
+    )
+    grouped = [list(flat[i : i + 9]) for i in range(0, len(flat), 9)]
+    if (
+        int(routing_input_mode) == int(RoutingInputMode.UnpackedPrecomputed)
+        and topk_weights is not None
+    ):
+        for metadata in grouped:
+            metadata[3] = topk_weights
+    return grouped
 
 
 @flashinfer_api(trace=trtllm_bf16_moe_trace)

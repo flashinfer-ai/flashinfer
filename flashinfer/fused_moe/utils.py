@@ -4,8 +4,9 @@ import logging
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from flashinfer.utils import ceil_div, next_positive_power_of_2, round_up
@@ -289,6 +290,481 @@ def map_to_hybrid_bucket_uncapped(x: int) -> int:
     if x <= _PHASE3_END:
         return _ceil_to_step(x, _PHASE3_STEP)
     return next_positive_power_of_2(x)
+
+
+def round_to_nearest_bucket(
+    x: int, buckets: Sequence[int], round_map: bool = False
+) -> int:
+    """Map *x* to the nearest bucket using floor or ceil semantics.
+
+    Args:
+        x: The value to map.
+        buckets: Bucket values in **ascending** order.  Must not be empty.
+        round_map: Rounding direction.
+
+            * ``False`` (default) -- **floor**: return the largest bucket
+              that is ``<= x``.  If *x* is smaller than every bucket, the
+              smallest bucket is returned (clamped).
+            * ``True`` -- **ceil**: return the smallest bucket that is
+              ``>= x``.  If *x* is larger than every bucket, the largest
+              bucket is returned (clamped).
+
+    Returns:
+        The matched bucket value.  Always one of the elements in *buckets*.
+
+    Examples::
+
+        >>> round_to_nearest_bucket(350, [100, 200, 500, 1000])
+        200
+        >>> round_to_nearest_bucket(350, [100, 200, 500, 1000], round_map=True)
+        500
+        >>> round_to_nearest_bucket(2000, [100, 200, 500, 1000], round_map=True)
+        1000
+    """
+    if len(buckets) == 0:
+        raise ValueError("buckets must be non-empty")
+    if round_map:
+        for b in buckets:
+            if b >= x:
+                return b
+        return buckets[-1]
+    else:
+        for b in reversed(buckets):
+            if b <= x:
+                return b
+        return buckets[0]
+
+
+def make_bucket_mapper(buckets: Tuple[int, ...], round_map: bool = False):
+    """Create a mapper function for :class:`DynamicTensorSpec.map_to_tuning_buckets`.
+
+    The returned callable maps any integer *x* to the nearest value in
+    *buckets*, using floor or ceil semantics controlled by *round_map*.
+    Duplicates in *buckets* are removed and values are sorted internally.
+
+    Args:
+        buckets: The set of allowed bucket values.
+        round_map: If ``False`` (default) the mapper rounds **down** (floor);
+            if ``True`` it rounds **up** (ceil).  In both cases the result is
+            clamped to the bucket range -- see
+            :func:`round_to_nearest_bucket` for details.
+
+    Returns:
+        A ``Callable[[int], int]`` suitable for passing as
+        ``map_to_tuning_buckets`` to :class:`DynamicTensorSpec`.
+
+    Examples::
+
+        >>> mapper = make_bucket_mapper((100, 200, 500, 1000), round_map=False)
+        >>> mapper(350)
+        200
+        >>> mapper_up = make_bucket_mapper((100, 200, 500, 1000), round_map=True)
+        >>> mapper_up(350)
+        500
+    """
+    if len(buckets) == 0:
+        raise ValueError("buckets must be non-empty")
+    sorted_buckets = tuple(sorted(set(buckets)))
+
+    def _mapper(x: int) -> int:
+        return round_to_nearest_bucket(x, sorted_buckets, round_map)
+
+    return _mapper
+
+
+_EFF_EXPERTS_STREAM: Optional["torch.cuda.Stream"] = None
+
+
+def _get_eff_experts_stream() -> "torch.cuda.Stream":
+    """Lazily create a dedicated CUDA stream for effective-experts computation.
+
+    Using a separate stream avoids blocking the main stream's pending work
+    (routing kernels, previous MoE iteration) when we need to copy data
+    from GPU to CPU.
+    """
+    global _EFF_EXPERTS_STREAM
+    if _EFF_EXPERTS_STREAM is None:
+        _EFF_EXPERTS_STREAM = torch.cuda.Stream()
+    return _EFF_EXPERTS_STREAM
+
+
+def _copy_flat_tensor_to_cpu_numpy(flat: "torch.Tensor") -> np.ndarray:
+    """Copy a 1D tensor to CPU with minimal default-stream blocking."""
+    if flat.is_cuda:
+        stream = _get_eff_experts_stream()
+        event = torch.cuda.Event()
+        event.record()
+        stream.wait_event(event)
+        with torch.cuda.stream(stream):
+            flat_cpu = flat.to("cpu")
+        stream.synchronize()
+    else:
+        flat_cpu = flat
+    return flat_cpu.numpy().astype(np.int64, copy=False)
+
+
+def _local_expert_counts_from_ids(
+    expert_ids: np.ndarray,
+    num_local_experts: int,
+    local_expert_offset: int,
+) -> np.ndarray:
+    if expert_ids.size == 0:
+        return np.zeros(num_local_experts, dtype=np.int64)
+
+    local_end = local_expert_offset + num_local_experts
+    local_mask = (expert_ids >= local_expert_offset) & (expert_ids < local_end)
+    local_ids = expert_ids[local_mask] - local_expert_offset
+    if local_ids.size == 0:
+        return np.zeros(num_local_experts, dtype=np.int64)
+    return np.bincount(
+        local_ids.astype(np.int64, copy=False),
+        minlength=num_local_experts,
+    )[:num_local_experts].astype(np.int64, copy=False)
+
+
+def compute_local_expert_counts_from_plain_ids(
+    token_selected_experts: "torch.Tensor",
+    num_local_experts: int,
+    local_expert_offset: int = 0,
+) -> np.ndarray:
+    """Count local assignments from plain global expert-id tensors."""
+    flat = token_selected_experts.reshape(-1)
+    expert_ids = _copy_flat_tensor_to_cpu_numpy(flat)
+    return _local_expert_counts_from_ids(
+        expert_ids,
+        num_local_experts,
+        local_expert_offset,
+    )
+
+
+_EXP_FLOOR_FRAC = 0.1
+_EXP_SEARCH_ITERS = 50
+_EXP_LAMBDA_RANGE = (0.0, 20.0)
+_DIRICHLET_SEARCH_ITERS = 80
+_DIRICHLET_ALPHA_RANGE = (1e-6, 1e6)
+DADistributionSpec = Tuple[str, str, Any]
+
+
+def _clamp_effective_experts(target_eff: float, n_experts: int) -> float:
+    return min(max(float(target_eff), 1.0), float(n_experts))
+
+
+def _inverse_simpson_effective_experts(probs: np.ndarray) -> float:
+    return float(1.0 / (probs**2).sum())
+
+
+def _solve_monotonic_parameter(
+    target: float,
+    lo: float,
+    hi: float,
+    value_fn: Callable[[float], float],
+    *,
+    increasing: bool,
+    iters: int,
+) -> float:
+    """Binary-search a scalar parameter for a monotonic metric."""
+
+    for _ in range(iters):
+        mid = (lo + hi) / 2.0
+        value = value_fn(mid)
+        if (value < target and increasing) or (value > target and not increasing):
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def _apply_uniform_floor(probs: np.ndarray) -> np.ndarray:
+    f = _EXP_FLOOR_FRAC
+    n_experts = probs.size
+    probs = (1.0 - f) * probs + f / n_experts
+    probs /= probs.sum()
+    return probs
+
+
+def _exp_floor_probs(lam: float, n_experts: int) -> np.ndarray:
+    """P(i) ∝ (1 - f) * exp(-λi) + f/n.
+
+    Adds a uniform floor to exponential decay, better matching real MoE
+    routing distributions which have heavier tails than pure exponential
+    (validated on DeepSeek-V3 MMLU across 58 layers, EP=1 and EP=4).
+    """
+    idx = np.arange(n_experts, dtype=np.float64)
+    p_exp = np.exp(-lam * idx)
+    p_exp /= p_exp.sum()
+    return _apply_uniform_floor(p_exp)
+
+
+def _exp_decay_eff_experts(lam: float, n_experts: int) -> float:
+    """Compute effective_experts for exp+floor distribution."""
+    probs = _exp_floor_probs(lam, n_experts)
+    return _inverse_simpson_effective_experts(probs)
+
+
+def _exp_lambda_for_target_eff(target_eff: float, n_experts: int) -> float:
+    """Find λ for exp+floor probabilities at a target effective-experts value."""
+
+    target_eff = _clamp_effective_experts(target_eff, n_experts)
+    return _solve_monotonic_parameter(
+        target_eff,
+        *_EXP_LAMBDA_RANGE,
+        lambda lam: _exp_decay_eff_experts(lam, n_experts),
+        increasing=False,
+        iters=_EXP_SEARCH_ITERS,
+    )
+
+
+def _exp_floor_probs_for_target_eff(target_eff: float, n_experts: int) -> np.ndarray:
+    return _exp_floor_probs(
+        _exp_lambda_for_target_eff(target_eff, n_experts),
+        n_experts,
+    )
+
+
+def _symmetric_dirichlet_expected_eff_experts(alpha: float, n_experts: int) -> float:
+    """Approximate effective experts for Dirichlet([alpha] * n).
+
+    Uses 1 / E[sum_i p_i^2], where E[sum_i p_i^2] =
+    (alpha + 1) / (n * alpha + 1), then applies the same uniform floor used by
+    exp+floor distributions. This is monotonic and stable for choosing the one
+    free Dirichlet concentration parameter.
+    """
+    alpha = float(alpha)
+    n = float(n_experts)
+    dirichlet_second_moment = (alpha + 1.0) / (n * alpha + 1.0)
+    f = _EXP_FLOOR_FRAC
+    floored_second_moment = (1.0 - f) ** 2 * dirichlet_second_moment
+    floored_second_moment += (2.0 * f - f**2) / n
+    return float(1.0 / floored_second_moment)
+
+
+def _symmetric_dirichlet_alpha_for_target_eff(
+    target_eff: float,
+    n_experts: int,
+) -> float:
+    """Binary-search alpha in [1e-6, 1e6] for a target effective-experts value."""
+    target_eff = _clamp_effective_experts(target_eff, n_experts)
+    return _solve_monotonic_parameter(
+        target_eff,
+        *_DIRICHLET_ALPHA_RANGE,
+        lambda alpha: _symmetric_dirichlet_expected_eff_experts(alpha, n_experts),
+        increasing=True,
+        iters=_DIRICHLET_SEARCH_ITERS,
+    )
+
+
+def _symmetric_dirichlet_probs_for_target_eff(
+    target_eff: float,
+    n_experts: int,
+) -> np.ndarray:
+    alpha = _symmetric_dirichlet_alpha_for_target_eff(target_eff, n_experts)
+    rng = np.random.default_rng(42)
+    probs = rng.dirichlet(np.full(n_experts, alpha, dtype=np.float64))
+    probs = np.clip(probs, np.finfo(np.float64).tiny, None)
+    probs /= probs.sum()
+    probs = _apply_uniform_floor(probs)
+    return np.sort(probs)[::-1]
+
+
+def da_distribution_target_effective_experts(
+    distribution: DADistributionSpec,
+    num_local_experts: int,
+) -> float:
+    _, kind, param = distribution
+    if kind == "uniform":
+        return float(num_local_experts)
+    if kind == "single":
+        return 1.0
+    if kind in ("sparse_eff", "sparse_factor"):
+        return _sparse_active_eff(kind, param, num_local_experts)[1]
+    if kind in ("exp_factor", "ddist_factor"):
+        return max(1.0, float(num_local_experts) / float(param))
+    raise ValueError(f"Unknown DA distribution kind: {kind!r}")
+
+
+def _sparse_factor_active_eff(
+    param: Tuple[float, float],
+    num_local_experts: int,
+) -> Tuple[int, float]:
+    """Convert sparse factor notation into active/effective expert counts."""
+
+    active_factor, eff_factor = param
+    n = int(num_local_experts)
+    active = min(max(1, int(np.floor(float(n) / float(active_factor) + 0.5))), n)
+    target_eff = min(max(1.0, float(n) / float(eff_factor)), float(active))
+    return active, target_eff
+
+
+def _sparse_active_eff(
+    kind: str,
+    param: Any,
+    num_local_experts: int,
+) -> Tuple[int, float]:
+    if kind == "sparse_factor":
+        return _sparse_factor_active_eff(param, num_local_experts)
+    if kind != "sparse_eff":
+        raise ValueError(f"Unknown sparse distribution kind: {kind!r}")
+
+    active_raw, eff_raw = param
+    active = min(max(1, int(active_raw)), int(num_local_experts))
+    target_eff = min(max(1.0, float(eff_raw)), float(active))
+    return active, target_eff
+
+
+def _sparse_probs(kind: str, param: Any, num_local_experts: int) -> np.ndarray:
+    active, target_eff = _sparse_active_eff(kind, param, num_local_experts)
+    probs = np.zeros(int(num_local_experts), dtype=np.float64)
+    probs[:active] = _symmetric_dirichlet_probs_for_target_eff(target_eff, active)
+    return probs
+
+
+def _shuffle_probs(probs: np.ndarray, seed: int = 42) -> np.ndarray:
+    """Deterministically shuffle probability mass across expert ids."""
+
+    rng = np.random.default_rng(seed)
+    shuffled = np.zeros_like(probs)
+    shuffled[rng.permutation(probs.size)] = probs
+    return shuffled
+
+
+def _sample_expert_assignments_from_probs(
+    probs: np.ndarray,
+    original_tensor: "torch.Tensor",
+    top_k: int,
+    local_expert_offset: int = 0,
+) -> "torch.Tensor":
+    num_tokens = int(original_tensor.shape[0])
+    dtype = original_tensor.dtype
+    probs_t = torch.from_numpy(probs).float().to(device=original_tensor.device)
+    support = int(np.count_nonzero(probs > 0.0))
+
+    if top_k <= support:
+        indices = torch.multinomial(
+            probs_t.expand(num_tokens, -1),
+            top_k,
+            replacement=False,
+        )
+    else:
+        indices = torch.multinomial(
+            probs_t,
+            num_tokens * top_k,
+            replacement=True,
+        ).reshape(num_tokens, top_k)
+    return indices.to(dtype=dtype) + int(local_expert_offset)
+
+
+def generate_skewed_expert_assignments(
+    target_eff_experts: float,
+    original_tensor: "torch.Tensor",
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+    local_expert_offset: int = 0,
+) -> "torch.Tensor":
+    """Generate expert assignments with exp+floor distribution.
+
+    Uses P(expert_i) ∝ (1-f)*exp(-λi) + f/N and binary-searches on λ to hit
+    target_eff_experts. The uniform floor better matches real routing tails
+    than pure exponential (validated on DeepSeek-V3 MMLU).
+
+    Used during autotuner profiling only (not inference).
+    """
+    del num_experts
+
+    target_eff_experts = float(target_eff_experts)
+    if target_eff_experts >= float(num_local_experts):
+        probs = np.full(num_local_experts, 1.0 / float(num_local_experts))
+    else:
+        probs = _shuffle_probs(
+            _exp_floor_probs_for_target_eff(target_eff_experts, num_local_experts)
+        )
+    return _sample_expert_assignments_from_probs(
+        probs,
+        original_tensor,
+        top_k,
+        local_expert_offset,
+    )
+
+
+def generate_dirichlet_expert_assignments(
+    distribution: DADistributionSpec,
+    original_tensor: "torch.Tensor",
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+    local_expert_offset: int = 0,
+) -> "torch.Tensor":
+    """Generate expert ids from a symmetric Dirichlet probability law."""
+
+    del num_experts
+    probs = _shuffle_probs(
+        _symmetric_dirichlet_probs_for_target_eff(
+            da_distribution_target_effective_experts(distribution, num_local_experts),
+            num_local_experts,
+        )
+    )
+    return _sample_expert_assignments_from_probs(
+        probs,
+        original_tensor,
+        top_k,
+        local_expert_offset,
+    )
+
+
+def generate_da_distribution_assignments(
+    distribution: DADistributionSpec,
+    original_tensor: "torch.Tensor",
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+    local_expert_offset: int = 0,
+) -> "torch.Tensor":
+    """Generate expert ids for one DA synthetic distribution."""
+
+    label, kind, param = distribution
+    del label
+    if kind == "uniform":
+        return generate_skewed_expert_assignments(
+            float(num_local_experts),
+            original_tensor,
+            num_local_experts,
+            num_experts,
+            top_k,
+            local_expert_offset,
+        )
+    if kind == "single":
+        return torch.full(
+            (original_tensor.shape[0], top_k),
+            int(local_expert_offset),
+            dtype=original_tensor.dtype,
+            device=original_tensor.device,
+        )
+    if kind == "exp_factor":
+        return generate_skewed_expert_assignments(
+            da_distribution_target_effective_experts(distribution, num_local_experts),
+            original_tensor,
+            num_local_experts,
+            num_experts,
+            top_k,
+            local_expert_offset,
+        )
+    if kind == "ddist_factor":
+        return generate_dirichlet_expert_assignments(
+            distribution,
+            original_tensor,
+            num_local_experts,
+            num_experts,
+            top_k,
+            local_expert_offset,
+        )
+    if kind in ("sparse_eff", "sparse_factor"):
+        return _sample_expert_assignments_from_probs(
+            _sparse_probs(kind, param, num_local_experts),
+            original_tensor,
+            top_k,
+            local_expert_offset,
+        )
+    raise ValueError(f"Unknown DA distribution kind: {kind!r}")
 
 
 def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):

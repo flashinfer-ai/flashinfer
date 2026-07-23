@@ -58,6 +58,8 @@ from .core import (
     gen_trtllm_gen_fused_moe_sm100_module,
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_moe,
+    trtllm_moe_allocate_routing_metadata,
+    trtllm_moe_allocate_routing_metadata_multi_tile,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
@@ -66,6 +68,11 @@ from .core import (
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
     trtllm_mxint4_block_scale_routed_moe,
+)
+
+from .dist_aware.da_capture import (
+    fast_path_stats as get_da_fast_path_stats,
+    reset_fast_path_stats as reset_da_fast_path_stats,
 )
 
 from .prepare import (
@@ -165,10 +172,14 @@ __all__ = [
     "gen_cutlass_fused_moe_sm100_module",
     "gen_cutlass_fused_moe_sm90_module",
     "gen_trtllm_gen_fused_moe_sm100_module",
+    "get_da_fast_path_stats",
+    "reset_da_fast_path_stats",
     "reorder_rows_for_gated_act_gemm",
     "trtllm_bf16_moe",
     "trtllm_bf16_routed_moe",
     "trtllm_fp4_block_scale_moe",
+    "trtllm_moe_allocate_routing_metadata",
+    "trtllm_moe_allocate_routing_metadata_multi_tile",
     "trtllm_fp4_block_scale_routed_moe",
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_block_scale_routed_moe",

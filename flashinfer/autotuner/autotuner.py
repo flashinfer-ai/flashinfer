@@ -6,8 +6,10 @@ import inspect
 import itertools
 import json
 import os
+import statistics
 import tempfile
 import threading
+import time
 import weakref
 
 import tqdm
@@ -16,10 +18,15 @@ from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
+    Dict,
     Iterable,
+    List,
     Optional,
     Sequence,
+    Set,
     TypeAlias,
+    Tuple,
+    Union,
 )
 
 import torch
@@ -42,6 +49,44 @@ from flashinfer.autotuner.initializers import (
 # such as when new kernels or configs are added. In such cases, the tuning configs
 # should also be updated. Currently, this process is manual, but it should be automated in the future.
 _nvfp4_cutlass_version = "0.1"
+
+
+# Re-read at every call (not at import) so harnesses that toggle this env
+# var mid-process see the change.
+def _is_value_aware_autotune() -> bool:
+    return os.environ.get("FLASHINFER_DIST_AWARE_AUTOTUNE", "0") == "1"
+
+
+_AUTOTUNE_DUMP_PATH = os.environ.get("FLASHINFER_AUTOTUNE_DUMP", "")
+
+
+def _is_autotune_verbose_progress() -> bool:
+    return os.environ.get("FLASHINFER_AUTOTUNE_VERBOSE_PROGRESS", "0") == "1"
+
+
+def _is_autotune_nvtx_enabled() -> bool:
+    """Return whether value-aware profiling should emit Nsight annotations."""
+    return os.environ.get("FLASHINFER_AUTOTUNE_NVTX", "0") == "1"
+
+
+@contextlib.contextmanager
+def _autotune_nvtx_range(message: str):
+    """Emit an opt-in host NVTX range around autotuner control work."""
+    if _is_autotune_nvtx_enabled():
+        torch.cuda.nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        if _is_autotune_nvtx_enabled():
+            torch.cuda.nvtx.range_pop()
+
+
+def _stable_hash_key(obj: Any) -> Any:
+    try:
+        hash(obj)
+        return obj
+    except TypeError:
+        return id(obj)
 
 
 def _tactic_to_json(tactic: Any) -> Any:
@@ -397,7 +442,10 @@ def get_config_path(is_module: bool):
 @dataclass(slots=True)
 class DynamicTensorSpec:
     """
-    A specification for a dynamic tensor dimension.
+    A specification for dynamic tensor profiling.
+
+    This describes both shape buckets and, optionally, representative value
+    buckets for tensors whose content distribution affects kernel performance.
     Args:
         input_idx: A tuple of the indices of the input tensors.
         dim_idx: A tuple of the indices of the dimensions to tune.
@@ -406,6 +454,8 @@ class DynamicTensorSpec:
         gen_tuning_buckets: A tuple of values to try or a function generating values.
         map_to_tuning_buckets: A function to map dimensions to valid values during inference.
         tensor_initializers: A list of functions to initialize the tensors.
+        value_specs: Optional value-bucket profiling rules attached to this
+            dynamic tensor spec.
     """
 
     input_idx: tuple[int, ...]
@@ -415,6 +465,7 @@ class DynamicTensorSpec:
     tensor_initializers: Sequence[TensorInitializer] | None = field(
         default_factory=lambda: None
     )
+    value_specs: Tuple["DynamicValueSpec", ...] = ()
 
     def __post_init__(self):
         # Set default tensor_initializers if not provided
@@ -422,6 +473,7 @@ class DynamicTensorSpec:
             self.tensor_initializers = [
                 autotuner_initializer_rand_scaled for _ in range(len(self.input_idx))
             ]
+        self.value_specs = tuple(self.value_specs or ())
 
     def __hash__(self) -> int:
         # FIXME: currently not hashing tensor_initializers
@@ -434,6 +486,7 @@ class DynamicTensorSpec:
                 if isinstance(self.gen_tuning_buckets, tuple)
                 else id(self.gen_tuning_buckets),
                 id(self.map_to_tuning_buckets),
+                self.value_specs,
             )
         )
 
@@ -451,6 +504,81 @@ class ConstraintSpec:
     input_idx: int
     dim_idx: int
     infer_shape: Callable
+
+
+class ValueSampleStager(ABC):
+    """Stage non-isomorphic value samples into captured graph inputs."""
+
+    @abstractmethod
+    def prepare(
+        self,
+        input_batches: List[List[Optional[torch.Tensor]]],
+        input_idx: int,
+    ) -> Any:
+        """Allocate persistent staging state before graph capture."""
+
+    @abstractmethod
+    def stage(
+        self,
+        source: torch.Tensor,
+        input_batches: List[List[Optional[torch.Tensor]]],
+        input_idx: int,
+        state: Any,
+    ) -> Tuple[int, int]:
+        """Stage one sample and return ``(copies, host_to_device_copies)``."""
+
+
+@dataclass(slots=True)
+class DynamicValueSpec:
+    """Specification for value-bucket profiling within a DynamicTensorSpec.
+
+    This varies the content/distribution of a profiled tensor while reusing the
+    shape buckets and tensor initializers owned by the parent DynamicTensorSpec.
+
+    Args:
+        input_idx: Index of the input tensor whose values matter.
+        gen_value_buckets: Bucket IDs to profile during tuning (tuple, a zero-argument
+            callable, or a callable that accepts the generated OptimizationProfile).
+        map_to_value_bucket: Maps actual runtime inputs to a bucket ID at inference time.
+            Must be cheap (~microseconds). It may accept either:
+            - ``tensor``; or
+            - ``tensor, inputs, kwargs`` for methods that need light call context.
+        tensor_value_generator: Generates representative tensor values for a given
+            bucket during profiling. It may accept either:
+            - ``bucket_id, profiled_tensor``; or
+            - ``bucket_id, profiled_tensor, original_tensor``; or
+            - ``bucket_id, profiled_tensor, original_tensor, inputs``.
+        sample_value_generator: Optional generator used for every outer value
+            realization. It follows the ``tensor_value_generator`` calling
+            convention, with an optional fifth ``sample_index`` argument, and
+            may return staging data with a different shape.
+        sample_value_stager: Optional object that stages a sample generator's
+            result into the captured graph inputs.
+    """
+
+    input_idx: int
+    gen_value_buckets: Union[Tuple[int, ...], Callable]
+    map_to_value_bucket: Callable
+    tensor_value_generator: Callable
+    sample_value_generator: Optional[Callable] = None
+    sample_value_stager: Optional[ValueSampleStager] = None
+
+    def __hash__(self):
+        return hash(
+            (
+                self.input_idx,
+                self.gen_value_buckets
+                if isinstance(self.gen_value_buckets, tuple)
+                else _stable_hash_key(self.gen_value_buckets),
+                _stable_hash_key(self.map_to_value_bucket),
+                _stable_hash_key(self.tensor_value_generator),
+                _stable_hash_key(self.sample_value_generator),
+                _stable_hash_key(self.sample_value_stager),
+            )
+        )
+
+    def __eq__(self, other):
+        return isinstance(other, DynamicValueSpec) and hash(self) == hash(other)
 
 
 @dataclass(kw_only=True, unsafe_hash=True)
@@ -495,12 +623,21 @@ class TuningConfig:
             This flag is to create circular buffer of input tensors to avoid L2 cache hits to simulate cold L2 cache.
             Notice that not all tuning processes can benefit from this feature.
         use_cuda_graph (bool): Whether to use CUDA graph for the tuning process.
+        value_sample_count: Optional callback that receives the complete value-bucket
+            tuple and the default outer sample count. It may reduce the number of
+            generated value realizations for deterministic buckets.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: tuple[ConstraintSpec, ...] = ()
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = False
+    value_sample_count: Optional[Callable[[Tuple[Any, ...], int], int]] = None
+    # Optional explicit value-bucket tuple representing the unmodified/default
+    # input profile.  Its winner is also published under the ordinary
+    # shape-only cache key, allowing one value-aware sweep to serve eager and
+    # value-aware execution without conflating the two cache contracts.
+    default_value_buckets: Optional[Tuple[Any, ...]] = None
     # Optional callback invoked once per profile bucket, after dynamic
     # tensors are synthesized but before the per-tactic profile loop.
     # Receives the full list of tensors and returns a (possibly modified)
@@ -540,9 +677,10 @@ class OptimizationProfile:
 
     shapes: list[list[Dim]]
     tensor_initializers: list[TensorInitializer | None]
+    value_buckets: Tuple = ()
 
     def get_hash_key(self):
-        return self.get_opt_shapes()
+        return (self.get_opt_shapes(), self.value_buckets)
 
     def get_opt_shapes(self) -> tuple[tuple[int, ...], ...]:
         """Only the opt shapes are considered as hash key"""
@@ -593,6 +731,26 @@ class TunableRunner(ABC):
         per-tensor content).
         """
         return ()
+
+    def get_tactic_groups(
+        self, inputs: List[torch.Tensor], profile: OptimizationProfile
+    ) -> Optional[List[List[Any]]]:
+        """Return independently tunable tactic groups, or ``None`` for exhaustive search.
+
+        Each group is profiled independently. The tuner passes the fastest tactic
+        from every group to :meth:`compose_tactics` and profiles the composed tactic
+        once before caching it.
+        """
+        return None
+
+    def compose_tactics(
+        self,
+        group_winners: List[Any],
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> Any:
+        """Compose independently selected group winners into an executable tactic."""
+        raise NotImplementedError
 
     def __call__(self, inputs, **kwargs):
         return self.forward(inputs, **kwargs)
@@ -826,7 +984,10 @@ def autotune(
             tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
             autotune_enabled = tune_mode and not old_mode
         if autotune_enabled:
-            logger.info("[Autotuner]: Autotuning process starts ...")
+            value_status = "enabled" if _is_value_aware_autotune() else "disabled"
+            logger.info(
+                f"[Autotuner]: Autotuning process starts (value-aware: {value_status}) ..."
+            )
     except BaseException:
         if pushed:
             override_stack.pop()
@@ -849,6 +1010,12 @@ def autotune(
             skip_ops_stack.pop()
 
         if autotune_enabled:
+            for cb in tuner._post_autotune_callbacks:
+                try:
+                    cb()
+                except Exception as e:
+                    logger.warning(f"[Autotuner] post-autotune callback failed: {e}")
+            tuner._post_autotune_callbacks.clear()
             logger.info("[Autotuner]: Autotuning process ends")
 
         # Save configs on exit when tuning with a cache path, but only if
@@ -972,6 +1139,346 @@ class ProfilingCacheKey:
         )
 
 
+class _ValueAwareInputArena:
+    """Reuse cold-L2 lane storage across value-aware token-shape profiles.
+
+    Each lane owns distinct tensor storage, preserving the cold-L2 rotation.
+    Dynamic profile tensors are allocated once at their maximum shape and
+    narrower profiles bind views into the same lane-local storage.
+
+    Example:
+        arena = _ValueAwareInputArena.create(tuner, profiles, inputs, config)
+        for input_batch in arena.batches_for(profile):
+            measure(input_batch)
+    """
+
+    def __init__(
+        self,
+        input_batches: List[List[Optional[torch.Tensor]]],
+        dynamic_input_indices: Set[int],
+    ) -> None:
+        self.input_batches = input_batches
+        self.dynamic_input_indices = dynamic_input_indices
+        self._arena_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for batch in input_batches
+            for tensor in batch
+            if isinstance(tensor, torch.Tensor)
+        )
+
+    @classmethod
+    def create(
+        cls,
+        tuner: "AutoTuner",
+        profiles: List[OptimizationProfile],
+        inputs: List[Optional[torch.Tensor]],
+        tuning_config: Optional[TuningConfig] = None,
+        *,
+        lane_count: Optional[int] = None,
+    ) -> "_ValueAwareInputArena":
+        """Allocate maximum-shape storage and return reusable cold-L2 lanes."""
+        if not profiles:
+            raise ValueError("value-aware input arena requires at least one profile")
+
+        dynamic_input_indices = {
+            input_idx
+            for input_idx in range(len(inputs))
+            if any(
+                any(isinstance(dim, DynamicDim) for dim in profile.shapes[input_idx])
+                for profile in profiles
+            )
+        }
+        if not dynamic_input_indices:
+            raise ValueError("value-aware input arena requires dynamic tensor inputs")
+
+        max_shapes = [
+            tuple(
+                max(
+                    profile.get_opt_shapes()[input_idx][dim_idx] for profile in profiles
+                )
+                for dim_idx in range(len(profiles[0].shapes[input_idx]))
+            )
+            for input_idx in range(len(inputs))
+        ]
+        max_inputs: List[Optional[torch.Tensor]] = []
+        default_initializer = lambda shapes, dtype, device: (
+            torch.rand(shapes, device=device) * 10 - 5
+        ).to(dtype)
+        for input_idx, input_tensor in enumerate(inputs):
+            if input_tensor is None:
+                max_inputs.append(None)
+            elif input_idx not in dynamic_input_indices:
+                max_inputs.append(input_tensor)
+            else:
+                initializer = (
+                    profiles[0].tensor_initializers[input_idx] or default_initializer
+                )
+                max_inputs.append(
+                    tuner._create_tensor_like(
+                        input_tensor,
+                        [StaticDim(size) for size in max_shapes[input_idx]],
+                        initializer,
+                    )
+                )
+
+        if lane_count is None:
+            max_buffer_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in max_inputs
+                if isinstance(tensor, torch.Tensor)
+            )
+            lane_count = tuner._get_cold_l2_buffer_count(
+                max_buffer_bytes,
+                True if tuning_config is None else tuning_config.use_cold_l2_cache,
+            )
+
+        input_batches = [max_inputs]
+        for _ in range(lane_count - 1):
+            input_batches.append(
+                [
+                    tensor.clone() if isinstance(tensor, torch.Tensor) else tensor
+                    for tensor in max_inputs
+                ]
+            )
+        return cls(input_batches, dynamic_input_indices)
+
+    @staticmethod
+    def _view_for_shape(tensor: torch.Tensor, shape: Tuple[int, ...]) -> torch.Tensor:
+        if tuple(tensor.shape) == shape:
+            return tensor
+        if tensor.ndim != len(shape) or any(
+            size > tensor.shape[dim] for dim, size in enumerate(shape)
+        ):
+            raise ValueError(
+                f"arena tensor shape {tuple(tensor.shape)} cannot serve profile shape {shape}"
+            )
+        return tensor[tuple(slice(0, size) for size in shape)]
+
+    def batches_for(
+        self, profile: OptimizationProfile
+    ) -> List[List[Optional[torch.Tensor]]]:
+        """Return profile-shaped views of every cold-L2 lane."""
+        profile_shapes = profile.get_opt_shapes()
+        return [
+            [
+                (
+                    self._view_for_shape(tensor, profile_shapes[input_idx])
+                    if input_idx in self.dynamic_input_indices
+                    and isinstance(tensor, torch.Tensor)
+                    else tensor
+                )
+                for input_idx, tensor in enumerate(batch)
+            ]
+            for batch in self.input_batches
+        ]
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Describe arena ownership for per-candidate profiling records."""
+        return {
+            "input_arena_reused": True,
+            "cold_l2_lane_count": len(self.input_batches),
+            "cold_l2_arena_bytes": self._arena_bytes,
+            "mutable_route_h2d_copies": 0,
+            "arena_fallback_reason": "",
+        }
+
+
+class _GraphProfileSession:
+    """Own one CUDA graph and stable input storage for a tactic's value samples."""
+
+    def __init__(
+        self,
+        tuner: "AutoTuner",
+        runner: TunableRunner,
+        tactic: Any,
+        tuning_config: TuningConfig,
+        input_batches: List[List[torch.Tensor]],
+        mutable_input_indices: Tuple[int, ...],
+        graph: torch.cuda.CUDAGraph,
+        graph_pool: object,
+        start: Union[torch.cuda.Event, torch.Tensor],
+        end: Union[torch.cuda.Event, torch.Tensor],
+        stream: torch.cuda.Stream,
+        setup_host_time_s: float,
+        arena_diagnostics: Optional[Dict[str, Any]] = None,
+        value_stagers: Optional[Dict[int, ValueSampleStager]] = None,
+        value_stager_states: Optional[Dict[int, Any]] = None,
+        **kwargs,
+    ) -> None:
+        self.tuner = tuner
+        self.runner = runner
+        self.tactic = tactic
+        self.tuning_config = tuning_config
+        self.input_batches = input_batches
+        self.mutable_input_indices = tuple(dict.fromkeys(mutable_input_indices))
+        self.graph = graph
+        self.graph_pool = graph_pool
+        self.start = start
+        self.end = end
+        self.stream = stream
+        self.setup_host_time_s = setup_host_time_s
+        self.kwargs = kwargs
+        self.replay_count = 0
+        self.staging_copy_count = 0
+        self.arena_diagnostics = arena_diagnostics or {
+            "input_arena_reused": False,
+            "cold_l2_lane_count": len(input_batches),
+            "cold_l2_arena_bytes": 0,
+            "mutable_route_h2d_copies": 0,
+            "arena_fallback_reason": "",
+        }
+        self.value_stagers = value_stagers or {}
+        self.value_stager_states = value_stager_states or {}
+        self.mutable_route_h2d_copy_count = 0
+
+    @classmethod
+    def capture(
+        cls,
+        tuner: "AutoTuner",
+        runner: TunableRunner,
+        inputs: List[torch.Tensor],
+        initial_value_inputs: List[torch.Tensor],
+        tactic: Any,
+        tuning_config: TuningConfig,
+        mutable_input_indices: Tuple[int, ...],
+        input_batches: Optional[List[List[Optional[torch.Tensor]]]] = None,
+        arena_diagnostics: Optional[Dict[str, Any]] = None,
+        value_stagers: Optional[Dict[int, ValueSampleStager]] = None,
+        **kwargs,
+    ) -> "_GraphProfileSession":
+        """Allocate, warm up, and capture one tactic-local graph session."""
+        setup_start = time.perf_counter()
+        if input_batches is None:
+            input_batches = tuner._prepare_input_tensors_with_batches(
+                inputs, tuning_config
+            )
+        value_stager_states = {
+            input_idx: stager.prepare(input_batches, input_idx)
+            for input_idx, stager in (value_stagers or {}).items()
+        }
+        stream = torch.cuda.current_stream()
+        graph_pool = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        if tuner._use_global_timer:
+            start = torch.empty(1, dtype=torch.int64, device="cuda")
+            end = torch.empty(1, dtype=torch.int64, device="cuda")
+        else:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+        session = cls(
+            tuner,
+            runner,
+            tactic,
+            tuning_config,
+            input_batches,
+            mutable_input_indices,
+            graph,
+            graph_pool,
+            start,
+            end,
+            stream,
+            0.0,
+            arena_diagnostics,
+            value_stagers,
+            value_stager_states,
+            **kwargs,
+        )
+
+        with _profile_measurement_scope(), torch.cuda.stream(stream):
+            with _autotune_nvtx_range("graph-session:stage-initial"):
+                session._stage_values(initial_value_inputs)
+            with _autotune_nvtx_range(f"graph-session:warmup, calls={tuner.warmup}"):
+                for _ in range(tuner.warmup):
+                    runner(input_batches[-1], tactic=tactic, **kwargs)
+            stream.synchronize()
+            with (
+                _autotune_nvtx_range(
+                    f"graph-session:capture, replays-per-graph={tuner.repeat}"
+                ),
+                torch.cuda.graph(graph, pool=graph_pool),
+            ):
+                session._run_kernels()
+            stream.synchronize()
+
+        session.setup_host_time_s = time.perf_counter() - setup_start
+        return session
+
+    def _stage_values(self, value_inputs: List[torch.Tensor]) -> None:
+        """Copy mutable value-spec tensors into every stable cold-L2 batch."""
+        for input_idx in self.mutable_input_indices:
+            source = value_inputs[input_idx]
+            if not isinstance(source, torch.Tensor):
+                continue
+            stager = self.value_stagers.get(input_idx)
+            if stager is not None:
+                copies, h2d_copies = stager.stage(
+                    source,
+                    self.input_batches,
+                    input_idx,
+                    self.value_stager_states[input_idx],
+                )
+                self.staging_copy_count += copies
+                self.mutable_route_h2d_copy_count += h2d_copies
+                continue
+            for batch in self.input_batches:
+                destination = batch[input_idx]
+                if not isinstance(destination, torch.Tensor):
+                    raise TypeError(
+                        f"value input {input_idx} is not a tensor in a graph profile batch"
+                    )
+                destination.copy_(source)
+                self.staging_copy_count += 1
+
+    def _run_kernels(self) -> None:
+        for repeat_idx in range(self.tuner.repeat):
+            self.runner(
+                self.input_batches[repeat_idx % len(self.input_batches)],
+                tactic=self.tactic,
+                **self.kwargs,
+            )
+
+    def measure(self, value_inputs: List[torch.Tensor]) -> float:
+        """Stage one realization before timing and replay the captured graph."""
+        with _profile_measurement_scope(), torch.cuda.stream(self.stream):
+            with _autotune_nvtx_range("graph-session:stage-sample"):
+                self._stage_values(value_inputs)
+            with _autotune_nvtx_range(
+                f"graph-session:thermal-cooldown, us={self.tuner._CUDA_GRAPH_DELAY_MICRO_SECS}"
+            ):
+                delay_kernel(self.tuner._CUDA_GRAPH_DELAY_MICRO_SECS)
+            with _autotune_nvtx_range("graph-session:graph-replay"):
+                if self.tuner._use_global_timer:
+                    self.tuner._record_global_timer(self.start)
+                else:
+                    self.start.record()
+                self.graph.replay()
+                if self.tuner._use_global_timer:
+                    self.tuner._record_global_timer(self.end)
+                else:
+                    self.end.record()
+            self.stream.synchronize()
+        self.replay_count += 1
+        if self.tuner._use_global_timer:
+            elapsed_ms = (self.end.item() - self.start.item()) / 1e6
+        else:
+            elapsed_ms = self.start.elapsed_time(self.end)
+        return elapsed_ms / self.tuner.repeat
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Return optional dump fields without retaining the session past a tactic."""
+        diagnostics = {
+            "value_sample_count": self.replay_count,
+            "graph_captures": 1,
+            "graph_replays": self.replay_count,
+            "staging_copies": self.staging_copy_count,
+            "staging_before_timing": True,
+            "graph_setup_host_time_ms": self.setup_host_time_s * 1000.0,
+            **self.arena_diagnostics,
+        }
+        diagnostics["mutable_route_h2d_copies"] = self.mutable_route_h2d_copy_count
+        return diagnostics
+
+
 @dataclass
 class AutoTunerStatistics:
     """Statistics collected by the AutoTuner.
@@ -1088,14 +1595,29 @@ class AutoTuner:
     def __init__(
         self, warmup: int = 3, repeat: int = 10, stream_delay_micro_secs: int = 5000
     ):
+        # Allow env-var override so frameworks (e.g. vLLM) can do a fast
+        # verification-only autotune without code changes. FLASHINFER_AUTOTUNE_WARMUP=1
+        # FLASHINFER_AUTOTUNE_REPEAT=1 makes profiling roughly 6x faster at the
+        # cost of noisier measurements.
+        warmup = int(os.environ.get("FLASHINFER_AUTOTUNE_WARMUP", warmup))
+        repeat = int(os.environ.get("FLASHINFER_AUTOTUNE_REPEAT", repeat))
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache: dict[
             ProfilingCacheKey, tuple[Any, OptimizationProfile | None]
         ] = {}
+        self.profiling_time_cache: dict[ProfilingCacheKey, float] = {}
+        # Retain every measured tactic, not only the winner. Post-selection
+        # policies can compare fixed tactics on identical value profiles
+        # without launching a second profiling sweep.
+        self.profiling_tactic_time_cache: dict[
+            tuple[ProfilingCacheKey, Any], float
+        ] = {}
+        self.last_selection: Optional[dict[str, Any]] = None
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
+        self._post_autotune_callbacks: list = []
 
         # Reentrant lock protecting all mutable state on this instance.
         # RLock is used because choose_one() calls search_cache() internally.
@@ -1105,6 +1627,7 @@ class AutoTuner:
         self.stats = AutoTunerStatistics()
 
         self.profiling_debug = True
+        self._profiling_records: List[Dict[str, Any]] = []
 
         # Offline tactics blocklist (loaded via env var or explicit call).
         # Lazy import to avoid circular dependency (tactics_blocklist
@@ -1182,6 +1705,48 @@ class AutoTuner:
             self._record_global_timer = None
 
         logger.debug(f"[Autotuner] use_global_timer: {self._use_global_timer}")
+
+    def _dump_profiling_records(self, custom_op: str):
+        """Dump collected profiling records to CSV when FLASHINFER_AUTOTUNE_DUMP is set."""
+        if not _AUTOTUNE_DUMP_PATH or not self._profiling_records:
+            return
+        import csv
+
+        path = _AUTOTUNE_DUMP_PATH
+        file_exists = os.path.exists(path)
+        fieldnames = [
+            "op",
+            "runner",
+            "num_tokens",
+            "value_buckets",
+            "tactic",
+            "time_ms",
+            "value_time_min_ms",
+            "value_time_median_ms",
+            "value_time_max_ms",
+            "selection_stage",
+            "is_best",
+            "value_sample_count",
+            "graph_captures",
+            "graph_replays",
+            "staging_copies",
+            "staging_before_timing",
+            "graph_setup_host_time_ms",
+            "input_arena_reused",
+            "cold_l2_lane_count",
+            "cold_l2_arena_bytes",
+            "mutable_route_h2d_copies",
+            "arena_fallback_reason",
+        ]
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(self._profiling_records)
+        logger.info(
+            f"[Autotuner]: Dumped {len(self._profiling_records)} profiling records to {path}"
+        )
+        self._profiling_records.clear()
 
     def _get_override_stack(self) -> OverrideStack:
         """Return the per-thread override stack, creating it on first access."""
@@ -1270,6 +1835,7 @@ class AutoTuner:
         runners: list[TunableRunner],
         input_shapes: tuple[tuple[int, ...], ...],
         tuning_config: TuningConfig,
+        value_buckets: Tuple = (),
         inputs: list[torch.Tensor] | None = None,
     ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search for cached profiling results matching the current configuration.
@@ -1285,6 +1851,7 @@ class AutoTuner:
             runners (List[TunableRunner]): List of candidate implementations to profile
             input_shapes (Tuple[torch.Size]): Shapes of the input tensors
             tuning_config (TuningConfig): Tuning configuration
+            value_buckets: Tuple of value bucket IDs for value-aware tuning
             inputs (Optional[List[torch.Tensor]]): Raw input tensors, used to compute
                 per-runner cache key extras via get_cache_key_extras().
 
@@ -1315,6 +1882,7 @@ class AutoTuner:
                     input_shapes,
                     tuning_config,
                     r.get_cache_key_extras(inputs) if inputs is not None else (),
+                    value_buckets=value_buckets,
                 )
                 runner_keys.append((r_id, cache_key))
                 if cache_key in self.profiling_cache:
@@ -1401,6 +1969,7 @@ class AutoTuner:
                     gen_tuning_buckets=new_gen,
                     map_to_tuning_buckets=new_map,
                     tensor_initializers=spec.tensor_initializers,
+                    value_specs=spec.value_specs,
                 )
             )
 
@@ -1409,6 +1978,8 @@ class AutoTuner:
             constraint_specs=tuning_config.constraint_specs,
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
+            value_sample_count=tuning_config.value_sample_count,
+            default_value_buckets=tuning_config.default_value_buckets,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
@@ -1472,10 +2043,42 @@ class AutoTuner:
 
             input_shapes = tuple(self._get_input_sizes(inputs))
 
+            def _serialize_tactic(tactic: Any) -> Any:
+                if isinstance(tactic, tuple):
+                    return tuple(
+                        int(x) if isinstance(x, (int, float)) else x for x in tactic
+                    )
+                if isinstance(tactic, list):
+                    return tuple(
+                        int(x) if isinstance(x, (int, float)) else x for x in tactic
+                    )
+                return tactic
+
+            def _tactic_key(tactic: Any) -> Any:
+                return _json_to_tactic(_tactic_to_json(tactic))
+
+            value_specs = AutoTuner._get_value_specs(tuning_config)
+            if (
+                _is_value_aware_autotune()
+                and value_specs
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                value_buckets = tuple(
+                    self._map_dynamic_value_bucket(spec, inputs, kwargs)
+                    for spec in value_specs
+                )
+            else:
+                value_buckets = ()
+
             # Early return if it's not tuning, use cache found one or fallback one
             if not self.is_tuning_mode:
-                is_cache_hit, runner_id, tactic, _ = self.search_cache(
-                    custom_op, runners, input_shapes, tuning_config, inputs=inputs
+                is_cache_hit, runner_id, tactic, stored_profile = self.search_cache(
+                    custom_op,
+                    runners,
+                    input_shapes,
+                    tuning_config,
+                    value_buckets=value_buckets,
+                    inputs=inputs,
                 )
                 runner = runners[runner_id]
                 # TODO: check the stored runner and tactic can implement this shape here
@@ -1488,7 +2091,7 @@ class AutoTuner:
                         f"[AutoTuner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
                     )
                     logger.debug(
-                        f"[AutoTuner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs))}"
+                        f"[AutoTuner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs), value_buckets=value_buckets)}"
                     )
 
                     # If the user has loaded an autotune cache (via
@@ -1523,7 +2126,7 @@ class AutoTuner:
                     if has_tune_data:
                         try:
                             signature = self._find_nearest_profile(
-                                input_shapes, tuning_config
+                                input_shapes, tuning_config, value_buckets
                             )
                         except Exception:
                             signature = tuple(tuple(s) for s in input_shapes)
@@ -1539,6 +2142,18 @@ class AutoTuner:
                                 f"max_num_tokens during the next tuning "
                                 f"pass to avoid this perf cliff."
                             )
+                self.last_selection = {
+                    "custom_op": custom_op,
+                    "input_shapes": tuple(
+                        tuple(int(v) for v in shape) for shape in input_shapes
+                    ),
+                    "value_buckets": tuple(value_buckets),
+                    "runner_id": int(runner_id),
+                    "runner_name": runner.__class__.__name__,
+                    "tactic": _serialize_tactic(tactic),
+                    "is_cache_hit": bool(is_cache_hit),
+                    "is_tuning_mode": False,
+                }
                 return runner, tactic
 
             assert len(runners) > 0, "At least one runner is required"
@@ -1549,6 +2164,16 @@ class AutoTuner:
             profiles = self._generate_optimization_profiles(tuning_config, inputs)
             # Record the total configs to try
             self.stats.tuned_op_total_configs[custom_op] = len(profiles)
+
+            input_arena = None
+            input_arena_attempted = False
+            arena_fallback_reason = ""
+            use_value_aware_arena = (
+                _is_value_aware_autotune()
+                and tuning_config.use_cuda_graph
+                and bool(value_specs)
+                and tuning_config.inputs_pre_hook is None
+            )
 
             # Pre-compute runner arg names to avoid calling inspect.signature in the loop
             runner_arg_names_map = {}
@@ -1584,16 +2209,93 @@ class AutoTuner:
                         runners,
                         p.get_opt_shapes(),
                         tuning_config,
+                        value_buckets=p.value_buckets,
                         inputs=inputs,
                     )
                     if not is_cache_hit:
-                        # Synthesize inputs only on the profiling path.
-                        tensors = self._prepare_input_tensors(p, inputs)
+                        profile_batches = None
+                        if use_value_aware_arena:
+                            if not input_arena_attempted:
+                                input_arena_attempted = True
+                                try:
+                                    input_arena = _ValueAwareInputArena.create(
+                                        self, profiles, inputs, tuning_config
+                                    )
+                                except torch.cuda.OutOfMemoryError:
+                                    torch.cuda.empty_cache()
+                                    arena_fallback_reason = "out_of_memory"
+                                except (TypeError, ValueError) as error:
+                                    arena_fallback_reason = type(error).__name__
+                            if input_arena is not None:
+                                profile_batches = input_arena.batches_for(p)
+                                tensors = profile_batches[0]
+                                self._apply_value_specs(
+                                    p, tensors, inputs, tuning_config
+                                )
+                            else:
+                                tensors = self._prepare_input_tensors(
+                                    p, inputs, tuning_config
+                                )
+                        else:
+                            # Synthesize inputs only on the profiling path.
+                            tensors = self._prepare_input_tensors(
+                                p, inputs, tuning_config
+                            )
                         # Apply the optional inputs_pre_hook to inject a
                         # deterministic / realistic distribution before
                         # the per-tactic profile loop.
                         if tuning_config.inputs_pre_hook is not None:
                             tensors = list(tuning_config.inputs_pre_hook(tensors))
+                        value_input_sets = None
+                        if (
+                            _is_value_aware_autotune()
+                            and p.value_buckets
+                            and value_specs
+                        ):
+                            value_input_sets = []
+                            for sample_index in range(
+                                self._value_sample_count(p, tuning_config)
+                            ):
+                                value_tensors = list(tensors)
+                                for spec, bucket_id in zip(
+                                    value_specs,
+                                    p.value_buckets,
+                                    strict=True,
+                                ):
+                                    generator = (
+                                        spec.sample_value_generator
+                                        or spec.tensor_value_generator
+                                    )
+                                    num_params = len(
+                                        inspect.signature(generator).parameters
+                                    )
+                                    if num_params >= 5:
+                                        value_tensors[spec.input_idx] = generator(
+                                            bucket_id,
+                                            tensors[spec.input_idx],
+                                            inputs[spec.input_idx],
+                                            inputs,
+                                            sample_index,
+                                        )
+                                    elif num_params >= 4:
+                                        value_tensors[spec.input_idx] = generator(
+                                            bucket_id,
+                                            tensors[spec.input_idx],
+                                            inputs[spec.input_idx],
+                                            inputs,
+                                        )
+                                    elif num_params >= 3:
+                                        value_tensors[spec.input_idx] = generator(
+                                            bucket_id,
+                                            tensors[spec.input_idx],
+                                            inputs[spec.input_idx],
+                                        )
+                                    else:
+                                        value_tensors[spec.input_idx] = generator(
+                                            bucket_id,
+                                            tensors[spec.input_idx],
+                                        )
+                                value_input_sets.append(value_tensors)
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
@@ -1605,10 +2307,82 @@ class AutoTuner:
                         min_time = float("inf")
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
+                        profile_records: List[Dict[str, Any]] = []
+                        opt_shapes = p.get_opt_shapes()
+                        num_tokens = (
+                            opt_shapes[0][0] if opt_shapes and opt_shapes[0] else "?"
+                        )
                         skipped_count = 0
                         for r_id, r in enumerate(runners):
                             # TODO: use FakeTensor here.
-                            valid_tactics = r.get_valid_tactics(tensors, p)
+                            tactic_groups = r.get_tactic_groups(tensors, p)
+                            candidate_stages: Dict[Any, List[str]] = {}
+                            if tactic_groups is None:
+                                # Exhaustive runners profile every valid tactic directly.
+                                valid_tactics = r.get_valid_tactics(tensors, p)
+                            else:
+                                # Factorized runners deduplicate overlapping group candidates.
+                                valid_tactics = []
+                                seen_tactics = set()
+                                for group_id, group in enumerate(tactic_groups):
+                                    for candidate in group:
+                                        candidate_key = _tactic_key(candidate)
+                                        candidate_stages.setdefault(
+                                            candidate_key, []
+                                        ).append(f"group_{group_id}")
+                                        if candidate_key not in seen_tactics:
+                                            seen_tactics.add(candidate_key)
+                                            valid_tactics.append(candidate)
+                            runner_profile_cache_key = AutoTuner._get_cache_key(
+                                custom_op,
+                                r,
+                                p.get_opt_shapes(),
+                                tuning_config,
+                                r.get_cache_key_extras(tensors),
+                                value_buckets=p.value_buckets,
+                            )
+                            # The explicit default-profile winner is the fixed
+                            # NoDA fallback.  Factorized value profiles would
+                            # not necessarily measure that exact composed
+                            # tactic, so include it as a measurement-only
+                            # candidate for the matching tile.  It is not part
+                            # of either factorized group and therefore cannot
+                            # change their winners or the composed DA tactic.
+                            if (
+                                tactic_groups is not None
+                                and tuning_config.default_value_buckets is not None
+                                and p.value_buckets
+                                != tuning_config.default_value_buckets
+                                and p.value_buckets
+                            ):
+                                shape_cache_key = AutoTuner._get_cache_key(
+                                    custom_op,
+                                    r,
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    r.get_cache_key_extras(tensors),
+                                )
+                                default_entry = self.profiling_cache.get(
+                                    shape_cache_key
+                                )
+                                if default_entry is not None:
+                                    default_tactic, _ = default_entry
+                                    try:
+                                        matches_profile_tile = int(
+                                            default_tactic[0]
+                                        ) == int(p.value_buckets[0])
+                                    except (IndexError, TypeError, ValueError):
+                                        matches_profile_tile = False
+                                    default_key = _tactic_key(default_tactic)
+                                    if (
+                                        matches_profile_tile
+                                        and default_key not in seen_tactics
+                                    ):
+                                        seen_tactics.add(default_key)
+                                        valid_tactics.append(default_tactic)
+                                        candidate_stages.setdefault(
+                                            default_key, []
+                                        ).append("default_profile_baseline")
                             valid_tactics = self._blocklist.filter(
                                 custom_op, r, valid_tactics
                             )
@@ -1618,11 +2392,81 @@ class AutoTuner:
                                 and len(valid_tactics) > 0
                             ):
                                 r(tensors, tactic=-1, do_preparation=True, **kwargs)
-                            for tac in valid_tactics:
+
+                            def profile_tactic(tac, selection_stage):
+                                nonlocal skipped_count
+                                session_diagnostics = None
+                                value_time_min_ms = None
+                                value_time_median_ms = None
+                                value_time_max_ms = None
                                 try:
-                                    time_measured = self._profile_single_kernel(
-                                        r, tensors, tac, tuning_config, **kwargs
-                                    )
+                                    if value_input_sets is not None:
+                                        if tuning_config.use_cuda_graph:
+                                            with _autotune_nvtx_range(
+                                                "profile-tactic:"
+                                                f"op={custom_op}, tokens={num_tokens}, "
+                                                f"value-buckets={p.value_buckets}, "
+                                                f"runner={r_id}, tactic={tac}"
+                                            ):
+                                                session = _GraphProfileSession.capture(
+                                                    self,
+                                                    r,
+                                                    tensors,
+                                                    value_input_sets[0],
+                                                    tac,
+                                                    tuning_config,
+                                                    tuple(
+                                                        spec.input_idx
+                                                        for spec in value_specs
+                                                    ),
+                                                    input_batches=profile_batches,
+                                                    arena_diagnostics=(
+                                                        input_arena.diagnostics()
+                                                        if input_arena is not None
+                                                        else {
+                                                            "input_arena_reused": False,
+                                                            "cold_l2_lane_count": 0,
+                                                            "cold_l2_arena_bytes": 0,
+                                                            "mutable_route_h2d_copies": 0,
+                                                            "arena_fallback_reason": arena_fallback_reason,
+                                                        }
+                                                    ),
+                                                    value_stagers={
+                                                        spec.input_idx: spec.sample_value_stager
+                                                        for spec in value_specs
+                                                        if spec.sample_value_stager
+                                                        is not None
+                                                    },
+                                                    **kwargs,
+                                                )
+                                            value_times = [
+                                                session.measure(value_tensors)
+                                                for value_tensors in value_input_sets
+                                            ]
+                                            session_diagnostics = session.diagnostics()
+                                        else:
+                                            value_times = [
+                                                self._profile_single_kernel(
+                                                    r,
+                                                    value_tensors,
+                                                    tac,
+                                                    tuning_config,
+                                                    **kwargs,
+                                                )
+                                                for value_tensors in value_input_sets
+                                            ]
+                                            session_diagnostics = None
+                                        value_time_min_ms = min(value_times)
+                                        value_time_median_ms = statistics.median(
+                                            value_times
+                                        )
+                                        value_time_max_ms = max(value_times)
+                                        time_measured = value_time_median_ms
+                                    else:
+                                        time_measured = self._profile_single_kernel(
+                                            r, tensors, tac, tuning_config, **kwargs
+                                        )
+                                        session_diagnostics = None
                                 except torch.cuda.OutOfMemoryError:
                                     # Distributed autotuning: the per-tactic
                                     # all-reduce must run the same number of
@@ -1685,15 +2529,117 @@ class AutoTuner:
                                             p.get_opt_shapes(),
                                             tuning_config,
                                             r.get_cache_key_extras(tensors),
+                                            value_buckets=p.value_buckets,
                                         )
                                     )
 
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
-                                if time_measured < min_time:
-                                    min_time = time_measured
-                                    runner_id, tactic = r_id, tac
+                                if _AUTOTUNE_DUMP_PATH:
+                                    profile_records.append(
+                                        {
+                                            "op": custom_op,
+                                            "runner": r.__class__.__name__,
+                                            "num_tokens": num_tokens,
+                                            "value_buckets": p.value_buckets
+                                            if p.value_buckets
+                                            else "",
+                                            "tactic": _serialize_tactic(tac),
+                                            "time_ms": time_measured,
+                                            "value_time_min_ms": value_time_min_ms,
+                                            "value_time_median_ms": value_time_median_ms,
+                                            "value_time_max_ms": value_time_max_ms,
+                                            "selection_stage": selection_stage,
+                                            "is_best": False,
+                                            **(session_diagnostics or {}),
+                                        }
+                                    )
+                                tactic_time_key = (
+                                    runner_profile_cache_key,
+                                    _tactic_key(tac),
+                                )
+                                previous_time = self.profiling_tactic_time_cache.get(
+                                    tactic_time_key, float("inf")
+                                )
+                                if time_measured < previous_time:
+                                    self.profiling_tactic_time_cache[
+                                        tactic_time_key
+                                    ] = time_measured
+                                return time_measured
+
+                            measured_tactics = {}
+                            # Profile every unique exhaustive or grouped candidate once.
+                            for tac in valid_tactics:
+                                if tactic_groups is None:
+                                    time_measured = profile_tactic(tac, "exhaustive")
+                                    if time_measured < min_time:
+                                        min_time = time_measured
+                                        runner_id, tactic = r_id, tac
+                                    continue
+
+                                tactic_key = _tactic_key(tac)
+                                time_measured = profile_tactic(
+                                    tac, "+".join(candidate_stages[tactic_key])
+                                )
+                                measured_tactics[tactic_key] = (time_measured, tac)
+
+                            # Resolve factorized groups only after all shared candidates run.
+                            if tactic_groups is not None:
+                                factorized_selection_succeeded = False
+                                group_winners: List[Any] = []
+                                # Pick the fastest candidate from each anchored component sweep.
+                                for group in tactic_groups:
+                                    measured_group = [
+                                        measured_tactics[_tactic_key(candidate)]
+                                        for candidate in group
+                                        if _tactic_key(candidate) in measured_tactics
+                                        and measured_tactics[_tactic_key(candidate)][0]
+                                        < float("inf")
+                                    ]
+                                    if not measured_group:
+                                        group_winners = []
+                                        break
+                                    group_winners.append(
+                                        min(
+                                            measured_group, key=lambda result: result[0]
+                                        )[1]
+                                    )
+                                # Compose the component winners and measure the executable tactic.
+                                if group_winners:
+                                    try:
+                                        composed_tactic = r.compose_tactics(
+                                            group_winners, tensors, p
+                                        )
+                                        composed_time = profile_tactic(
+                                            composed_tactic, "composed"
+                                        )
+                                        if composed_time < min_time:
+                                            min_time = composed_time
+                                            runner_id, tactic = r_id, composed_tactic
+                                        factorized_selection_succeeded = (
+                                            composed_time < float("inf")
+                                        )
+                                    except Exception as e:
+                                        skipped_count += 1
+                                        logger.debug(
+                                            "[Autotuner]: Failed to compose factorized "
+                                            f"tactics for {r}: {e}"
+                                        )
+
+                                # Fall back to the complete search if composition cannot succeed.
+                                if not factorized_selection_succeeded:
+                                    logger.debug(
+                                        "[Autotuner]: Factorized tactic selection failed for "
+                                        f"{r}; falling back to exhaustive tactics"
+                                    )
+                                    for tac in r.get_valid_tactics(tensors, p):
+                                        time_measured = profile_tactic(
+                                            tac, "exhaustive_fallback"
+                                        )
+                                        if time_measured < min_time:
+                                            min_time = time_measured
+                                            runner_id, tactic = r_id, tac
 
                         if skipped_count > 0:
                             logger.info(
@@ -1702,6 +2648,16 @@ class AutoTuner:
                             )
 
                         if runner_id is not None:
+                            if _AUTOTUNE_DUMP_PATH and profile_records:
+                                for rec in reversed(profile_records):
+                                    if (
+                                        rec["tactic"] == _serialize_tactic(tactic)
+                                        and rec["runner"]
+                                        == runners[runner_id].__class__.__name__
+                                    ):
+                                        rec["is_best"] = True
+                                        break
+                                self._profiling_records.extend(profile_records)
                             # At least one valid (runner, tactic) pair is found
                             cache_key = AutoTuner._get_cache_key(
                                 custom_op,
@@ -1709,8 +2665,29 @@ class AutoTuner:
                                 p.get_opt_shapes(),
                                 tuning_config,
                                 runners[runner_id].get_cache_key_extras(tensors),
+                                value_buckets=p.value_buckets,
                             )
                             self.profiling_cache[cache_key] = (tactic, p)
+                            self.profiling_time_cache[cache_key] = min_time
+                            if (
+                                tuning_config.default_value_buckets is not None
+                                and p.value_buckets
+                                == tuning_config.default_value_buckets
+                            ):
+                                default_profile = copy.deepcopy(p)
+                                default_profile.value_buckets = ()
+                                shape_cache_key = AutoTuner._get_cache_key(
+                                    custom_op,
+                                    runners[runner_id],
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    runners[runner_id].get_cache_key_extras(tensors),
+                                )
+                                self.profiling_cache[shape_cache_key] = (
+                                    tactic,
+                                    default_profile,
+                                )
+                                self.profiling_time_cache[shape_cache_key] = min_time
                             self._dirty = True
                             self._dirty_seq += 1
                             self.stats.tuned_op_successful_configs[custom_op] = (
@@ -1737,10 +2714,68 @@ class AutoTuner:
             # Get the best runner and tactic from cache
             # If no valid tactic is found, the fallback runner and tactic will be used
             _, runner_id, tactic, _ = self.search_cache(
-                custom_op, runners, input_shapes, tuning_config, inputs=inputs
+                custom_op,
+                runners,
+                input_shapes,
+                tuning_config,
+                value_buckets=value_buckets,
+                inputs=inputs,
             )
 
+            self._dump_profiling_records(custom_op)
+            self.last_selection = {
+                "custom_op": custom_op,
+                "input_shapes": tuple(
+                    tuple(int(v) for v in shape) for shape in input_shapes
+                ),
+                "value_buckets": tuple(value_buckets),
+                "runner_id": int(runner_id),
+                "runner_name": runners[runner_id].__class__.__name__,
+                "tactic": _serialize_tactic(tactic),
+                "is_cache_hit": True,
+                "is_tuning_mode": True,
+            }
             return runners[runner_id], tactic
+
+    @staticmethod
+    def _get_value_specs(
+        tuning_config: TuningConfig,
+    ) -> Tuple[DynamicValueSpec, ...]:
+        specs: List[DynamicValueSpec] = []
+        for tensor_spec in tuning_config.dynamic_tensor_specs:
+            specs.extend(tensor_spec.value_specs)
+        return tuple(specs)
+
+    def _value_sample_count(
+        self,
+        profile: OptimizationProfile,
+        tuning_config: TuningConfig,
+    ) -> int:
+        """Return the outer value-realization count for one profile."""
+        callback = tuning_config.value_sample_count
+        count = (
+            self.repeat
+            if callback is None
+            else callback(profile.value_buckets, self.repeat)
+        )
+        if not isinstance(count, int) or count <= 0:
+            raise ValueError(
+                "value_sample_count must return a positive int, "
+                f"got {count!r} for value_buckets={profile.value_buckets!r}"
+            )
+        return count
+
+    @staticmethod
+    def _map_dynamic_value_bucket(
+        spec: DynamicValueSpec,
+        inputs: List[torch.Tensor],
+        kwargs: Dict[str, Any],
+    ) -> int:
+        tensor = inputs[spec.input_idx]
+        num_params = len(inspect.signature(spec.map_to_value_bucket).parameters)
+        if num_params >= 3:
+            return spec.map_to_value_bucket(tensor, inputs, kwargs)
+        return spec.map_to_value_bucket(tensor)
 
     def _get_input_sizes(self, inputs: list[Any]) -> tuple[tuple[int, ...], ...]:
         """Return ``torch.Size`` for each input, using ``(0,)`` for non-Tensor values."""
@@ -2015,13 +3050,65 @@ class AutoTuner:
                 )
             generated_profiles.append(p)
             logger.debug(f"[Autotuner]: generated profile: {p}")
+
+        # If value-aware autotuning is enabled and there are value specs, do a
+        # cartesian product with value buckets.
+        value_specs = self._get_value_specs(tuning_config)
+        if _is_value_aware_autotune() and value_specs:
+            expanded_profiles = []
+            for profile in generated_profiles:
+                if tuning_config.default_value_buckets is not None:
+                    if len(tuning_config.default_value_buckets) != len(value_specs):
+                        raise ValueError(
+                            "default_value_buckets must provide one marker for "
+                            "each DynamicValueSpec"
+                        )
+                    default_profile = copy.deepcopy(profile)
+                    default_profile.value_buckets = tuple(
+                        tuning_config.default_value_buckets
+                    )
+                    expanded_profiles.append(default_profile)
+                value_bucket_lists = []
+                has_empty_value_spec = False
+                for value_spec in value_specs:
+                    generator = value_spec.gen_value_buckets
+                    if callable(generator) and not isinstance(generator, tuple):
+                        try:
+                            inspect.signature(generator).bind(profile)
+                        except (TypeError, ValueError):
+                            buckets = generator()
+                        else:
+                            buckets = generator(profile)
+                    else:
+                        buckets = generator
+                    buckets = tuple(buckets)
+                    if not buckets:
+                        has_empty_value_spec = True
+                        break
+                    value_bucket_lists.append(buckets)
+
+                if has_empty_value_spec or not value_bucket_lists:
+                    expanded_profiles.append(profile)
+                    continue
+
+                for value_buckets in itertools.product(*value_bucket_lists):
+                    p = copy.deepcopy(profile)
+                    p.value_buckets = tuple(value_buckets)
+                    expanded_profiles.append(p)
+                    logger.debug(
+                        f"[Autotuner]: generated profile with value_buckets={p.value_buckets}: {p}"
+                    )
+            generated_profiles = expanded_profiles
         return generated_profiles
 
     @classmethod
     @functools.lru_cache(maxsize=16384)
     def _find_nearest_profile(
-        cls, shapes: tuple[tuple[int, ...], ...], tuning_config: TuningConfig
-    ) -> tuple[tuple[int, ...], ...]:
+        cls,
+        shapes: tuple[tuple[int, ...], ...],
+        tuning_config: TuningConfig,
+        value_buckets: Tuple = (),
+    ) -> Tuple:
         """Find the nearest optimization profile for given inputs
         User can define their own nearest profile generation method to reduce the host overhead.
 
@@ -2047,7 +3134,10 @@ class AutoTuner:
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
         for constraint_spec in tuning_config.constraint_specs:
             base_profile[constraint_spec.input_idx][constraint_spec.dim_idx] = -1
-        return tuple(tuple(shape) for shape in base_profile)
+        profile = tuple(tuple(shape) for shape in base_profile)
+        if value_buckets:
+            return (profile, value_buckets)
+        return profile
 
     @classmethod
     def _get_cache_key(
@@ -2057,12 +3147,15 @@ class AutoTuner:
         input_shapes: tuple[tuple[int, ...], ...],
         tuning_config: TuningConfig,
         extras: tuple[Any, ...] = (),
+        value_buckets: Tuple = (),
     ) -> ProfilingCacheKey:
         return ProfilingCacheKey(
             custom_op=custom_op,
             runner_class_name=runner.__class__.__name__,
             runner_hash=hash(runner),
-            nearest_profile=cls._find_nearest_profile(input_shapes, tuning_config),
+            nearest_profile=cls._find_nearest_profile(
+                input_shapes, tuning_config, value_buckets
+            ),
             extras=extras,
         )
 
@@ -2091,7 +3184,10 @@ class AutoTuner:
         return initializer(shapes, dtype, device)
 
     def _prepare_input_tensors(
-        self, profile: OptimizationProfile, inputs: list[torch.Tensor | None]
+        self,
+        profile: OptimizationProfile,
+        inputs: list[torch.Tensor | None],
+        tuning_config: Optional[TuningConfig] = None,
     ) -> list[torch.Tensor | None]:
         """Create tensors matching *profile* shapes; reuse static inputs as-is."""
         default_initializer = autotuner_initializer_rand_scaled
@@ -2110,7 +3206,49 @@ class AutoTuner:
                 tensors.append(tensor)
             else:
                 tensors.append(inputs[i])
+        self._apply_value_specs(profile, tensors, inputs, tuning_config)
         return tensors
+
+    @staticmethod
+    def _apply_value_specs(
+        profile: OptimizationProfile,
+        tensors: List[Optional[torch.Tensor]],
+        inputs: List[Optional[torch.Tensor]],
+        tuning_config: Optional[TuningConfig],
+    ) -> None:
+        """Apply value generators in place after profile storage is available."""
+        # Apply value generators for value-aware profiling.
+        if (
+            _is_value_aware_autotune()
+            and tuning_config is not None
+            and profile.value_buckets
+        ):
+            value_specs = AutoTuner._get_value_specs(tuning_config)
+            if len(value_specs) != len(profile.value_buckets):
+                raise ValueError(
+                    "value profile/spec mismatch: "
+                    f"profile={profile.value_buckets!r}, num_specs={len(value_specs)}"
+                )
+            for spec, bucket_id in zip(value_specs, profile.value_buckets, strict=True):
+                generator = spec.tensor_value_generator
+                num_params = len(inspect.signature(generator).parameters)
+                if num_params >= 4:
+                    tensors[spec.input_idx] = generator(
+                        bucket_id,
+                        tensors[spec.input_idx],
+                        inputs[spec.input_idx],
+                        inputs,
+                    )
+                elif num_params >= 3:
+                    tensors[spec.input_idx] = generator(
+                        bucket_id,
+                        tensors[spec.input_idx],
+                        inputs[spec.input_idx],
+                    )
+                else:
+                    tensors[spec.input_idx] = generator(
+                        bucket_id, tensors[spec.input_idx]
+                    )
 
     def save_configs(self, path: str) -> None:
         """Save the current profiling cache to a JSON file.
@@ -2406,23 +3544,21 @@ class AutoTuner:
         tuning_config: TuningConfig,
     ) -> list[list[Any]]:
         """Create multiple input copies to flush the L2 cache between profiling iterations."""
-        if not tuning_config.use_cold_l2_cache:
-            return [inputs]
-
         one_buffer_bytes = sum(
             input.numel() * input.element_size()
             if isinstance(input, torch.Tensor)
             else 0
             for input in inputs
         )
-        if one_buffer_bytes <= 0:
-            logger.debug(
-                "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
-            )
+        num_buffers = self._get_cold_l2_buffer_count(
+            one_buffer_bytes, tuning_config.use_cold_l2_cache
+        )
+        if num_buffers == 1:
+            if one_buffer_bytes <= 0:
+                logger.debug(
+                    "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
+                )
             return [inputs]
-
-        num_buffers = self._get_l2_cache_size_in_bytes() * 3 // one_buffer_bytes + 1
-        num_buffers = min(num_buffers, self.repeat + 1)
 
         inputs_list = [inputs]
         for _ in range(num_buffers - 1):
@@ -2435,10 +3571,25 @@ class AutoTuner:
         )
         return inputs_list
 
+    def _get_cold_l2_buffer_count(
+        self, one_buffer_bytes: int, use_cold_l2_cache: bool
+    ) -> int:
+        """Return the existing cold-L2 lane count without allocating tensors."""
+        if not use_cold_l2_cache or one_buffer_bytes <= 0:
+            return 1
+        return min(
+            self._get_l2_cache_size_in_bytes() * 3 // one_buffer_bytes + 1,
+            self.repeat + 1,
+        )
+
     def clear_cache(self) -> None:
         """Clear the profiling cache and user-loaded file configs."""
         with self._lock:
             self.profiling_cache.clear()
+            self.profiling_time_cache.clear()
+            self.profiling_tactic_time_cache.clear()
+            self.last_selection = None
+            self._profiling_records.clear()
             self._file_configs.clear()
             self._logged_file_hits.clear()
             self._logged_cache_miss_oor.clear()
