@@ -187,8 +187,83 @@ if state_ty is cutlass.Float16:
 else:
     _CVT_ST2_FROM_F32 = "cvt.rn.bf16x2.f32"
     _MMA_H_F32 = "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
-# A-fragment bf16x2 -> f16x2 in-register conversion for the mixed-mode H
-# GEMM (bf16 -> f32 via exact 16-bit shift, f32 -> f16 exact in range).
+# _H_A_CVT_ASM (H-GEMM A-fragment bf16->f16 conversion) is defined BELOW,
+# after _PACK_MIXED: in the combined state+cache-fp16 mode the packed tile is
+# stored fp16 at norm time, so the H GEMM's A operand is already fp16 and no
+# conversion is needed (the block becomes empty).
+# Ring-cache (u/k) element type: defaults to the IO dtype. Set
+# GDN_UCACHE_RING_DTYPE=fp16 with bf16 IO for the upstream-Triton-parity
+# mode (the TRT-LLM PR #16464 / vLLM rule: fp16 rings under bf16
+# activations). The rings hold L2-normed keys and bounded corrections —
+# small dynamic range — so fp16's 10 mantissa bits beat bf16's 7 at
+# identical bandwidth (both 2 B: perf-neutral by construction). Dtype
+# journey in the mixed mode, one rounding at each store:
+#   u: f32 MMA accumulators -> cvt.rn.f16x2.f32 at the OutStage ring rows
+#      (output rows stay IO dtype); ring appends copy the f16 bytes raw.
+#   k: normed bf16 (the MMA operand) -> f16 repack at the append STG
+#      (exact for in-range values; magnitudes <= 1).
+#   g: fp32 always.
+# Consumers: the u tile is consumed RAW f16 — the history contraction and
+# the fold issue .f16.f16 MMAs with their A operands (w-scaled transposed
+# scores / w-scaled u) staged f16. The khist tile is converted f16 -> bf16
+# in place before the (bf16) scores GEMM, and the flush fold's STS-back
+# repacks it f16 (exact in range), so the fold preserves the u values'
+# fp16 fidelity while k stays at bf16 quantum (same as the bf16 mode).
+_RING_ENV = os.environ.get("GDN_UCACHE_RING_DTYPE", "").strip().lower()
+if _RING_ENV in ("", _IO_ENV):
+    ring_ty = io
+    RING_TORCH = IO_TORCH
+    _RING_MIXED = False
+    _CVT_RG2_FROM_F32 = _CVT_H2_FROM_F32
+    _CVT_F32_FROM_RG = _CVT_F32_FROM_H
+    _MMA_RING_F32 = _MMA_M16N8K16_HH_F32
+elif _RING_ENV in ("fp16", "float16", "half") and io is cutlass.BFloat16:
+    ring_ty = cutlass.Float16
+    RING_TORCH = torch.float16
+    _RING_MIXED = True
+    _CVT_RG2_FROM_F32 = "cvt.rn.f16x2.f32"
+    _CVT_F32_FROM_RG = "cvt.f32.f16"
+    _MMA_RING_F32 = "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+else:
+    raise ValueError(
+        f"GDN_UCACHE_RING_DTYPE={_RING_ENV!r} with IO={_IO_ENV!r} unsupported: "
+        "ring dtype must equal the IO dtype, or be 'fp16' with bf16 IO."
+    )
+# ----- packed [k|q] tile element type ("pack_ty") -----
+# In the COMBINED state+cache-fp16 mode BOTH GEMM partners of the packed tile
+# are fp16 (the H GEMM's state operand and the scores GEMM's khist operand),
+# so the normalized packed tile is stored fp16 DIRECTLY at norm time (fp32 ->
+# f16, replacing fp32 -> bf16). This (a) gives the k-cache TRUE fp16 precision
+# — normed k no longer round-trips through bf16 — and (b) eliminates the
+# per-fragment bf16->f16 conversions in BOTH GEMMs (the ~2-3% overhead), since
+# the Grams / H GEMM / scores GEMM all read fp16 natively. Enabled ONLY when
+# both knobs are fp16; single-knob and default paths keep pack_ty == io (bf16,
+# byte-identical to before).
+_PACK_MIXED = _ST_MIXED and _RING_MIXED
+if _PACK_MIXED:
+    pack_ty = cutlass.Float16
+    _CVT_PK2_FROM_F32 = "cvt.rn.f16x2.f32"
+    _CVT_F32_FROM_PK = "cvt.f32.f16"
+    _MMA_PACK = "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+else:
+    pack_ty = io
+    _CVT_PK2_FROM_F32 = _CVT_H2_FROM_F32
+    _CVT_F32_FROM_PK = _CVT_F32_FROM_H
+    _MMA_PACK = _MMA_M16N8K16_HH_F32
+# scores-GEMM B-fragment bf16->f16 conversion: needed ONLY when the ring is
+# fp16 but the packed tile is still bf16 (cache-fp16-ONLY mode). In combined
+# mode the packed tile is already fp16 -> empty.
+_RING_B_CVT_ASM = (
+    " shl.b32 _wl, _b0, 16; and.b32 _wh, _b0, 0xFFFF0000;"
+    " mov.b32 _fl, _wl; mov.b32 _fh, _wh; cvt.rn.f16x2.f32 _b0, _fh, _fl;"
+    " shl.b32 _wl, _b1, 16; and.b32 _wh, _b1, 0xFFFF0000;"
+    " mov.b32 _fl, _wl; mov.b32 _fh, _wh; cvt.rn.f16x2.f32 _b1, _fh, _fl;"
+    if (_RING_MIXED and not _PACK_MIXED)
+    else ""
+)
+# H-GEMM A-fragment bf16->f16 conversion: needed ONLY when the state is fp16
+# but the packed tile is still bf16 (state-fp16-ONLY mode). In combined mode
+# the packed tile is already fp16 -> empty.
 _H_A_CVT_ASM = (
     "{ .reg .b32 _wl, _wh; .reg .f32 _fl, _fh;"
     " shl.b32 _wl, _a0, 16; and.b32 _wh, _a0, 0xFFFF0000;"
@@ -199,7 +274,7 @@ _H_A_CVT_ASM = (
     " mov.b32 _fl, _wl; mov.b32 _fh, _wh; cvt.rn.f16x2.f32 _a2, _fh, _fl;"
     " shl.b32 _wl, _a3, 16; and.b32 _wh, _a3, 0xFFFF0000;"
     " mov.b32 _fl, _wl; mov.b32 _fh, _wh; cvt.rn.f16x2.f32 _a3, _fh, _fl; }"
-    if _ST_MIXED
+    if (_ST_MIXED and not _PACK_MIXED)
     else ""
 )
 f32 = cutlass.Float32
@@ -622,6 +697,115 @@ def _sts_st2_f32(smem_addr_i32, lo_f32, hi_f32):
     return Int32(r)
 
 
+def _sts_rg2_f32(smem_addr_i32, lo_f32, hi_f32):
+    """RING-dtype variant of ``_sts_bf16x2_f32``: packs a U f32 pair to the
+    ring element type before the 4-byte SMEM store. Used ONLY for the
+    OutStage ring rows [8:8+t) (the ring appends then copy bytes raw).
+    Compiles identically to the IO variant when the ring dtype is the IO
+    dtype (same mnemonic)."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [smem_addr_i32.ir_value(), lo_f32.ir_value(), hi_f32.ir_value()],
+        "{ .reg .b32 _v;"
+        f" {_CVT_RG2_FROM_F32} _v, $3, $2;"
+        " st.shared.b32 [$1], _v;"
+        " mov.u32 $0, 0; }",
+        "=r,r,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
+def _mul_rg2_f32(packed_i32, scalar):
+    """RING-dtype variant of ``_mul_bf16x2_f32`` (the fold's w-scale over
+    the u stage). Identical to the IO variant when ring dtype == IO."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [packed_i32.ir_value(), scalar.ir_value()],
+        "{ .reg .b16 _lo, _hi; .reg .f32 _flo, _fhi;"
+        " mov.b32 {_lo, _hi}, $1;"
+        f" {_CVT_F32_FROM_RG} _flo, _lo;"
+        f" {_CVT_F32_FROM_RG} _fhi, _hi;"
+        " mul.f32 _flo, _flo, $2;"
+        " mul.f32 _fhi, _fhi, $2;"
+        f" {_CVT_RG2_FROM_F32} $0, _fhi, _flo; }}",
+        "=r,r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
+def _mul_packstore_f32(packed_bf16_i32, scalar):
+    """Norm store: unpack a bf16 pair (the RAW loaded q/k), multiply by the
+    fp32 inverse-norm, repack to the PACK dtype. In the combined
+    state+cache-fp16 mode pack is fp16, so this rounds fp32->f16 DIRECTLY —
+    the packed tile (and the k-cache snapshot taken from it) carry true fp16
+    precision, and every packed-tile GEMM reads fp16 with no per-fragment
+    conversion. Identical to ``_mul_bf16x2_f32`` when pack_ty == io (bf16)."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [packed_bf16_i32.ir_value(), scalar.ir_value()],
+        "{ .reg .b16 _lo, _hi; .reg .f32 _flo, _fhi;"
+        " mov.b32 {_lo, _hi}, $1;"
+        f" {_CVT_F32_FROM_H} _flo, _lo;"
+        f" {_CVT_F32_FROM_H} _fhi, _hi;"
+        " mul.f32 _flo, _flo, $2;"
+        " mul.f32 _fhi, _fhi, $2;"
+        f" {_CVT_PK2_FROM_F32} $0, _fhi, _flo; }}",
+        "=r,r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
+def _mul_pack_f32(packed_pk_i32, scalar):
+    """bdec row-scale over the (already pack-dtype) packed A-tile: unpack
+    pack, multiply by e^{G_P}, repack pack. Identical to ``_mul_bf16x2_f32``
+    when pack_ty == io (bf16)."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [packed_pk_i32.ir_value(), scalar.ir_value()],
+        "{ .reg .b16 _lo, _hi; .reg .f32 _flo, _fhi;"
+        " mov.b32 {_lo, _hi}, $1;"
+        f" {_CVT_F32_FROM_PK} _flo, _lo;"
+        f" {_CVT_F32_FROM_PK} _fhi, _hi;"
+        " mul.f32 _flo, _flo, $2;"
+        " mul.f32 _fhi, _fhi, $2;"
+        f" {_CVT_PK2_FROM_F32} $0, _fhi, _flo; }}",
+        "=r,r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
+def _repack_io2_to_rg2(packed_i32):
+    """Unpack an IO-dtype pair, repack as a RING-dtype pair (bf16 -> fp16 in
+    the mixed mode — exact for in-range values: normed-k magnitudes <= 1).
+    Used at the k-ring append STGs and the fold's khist STS-back."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [packed_i32.ir_value()],
+        "{ .reg .b16 _lo, _hi; .reg .f32 _flo, _fhi;"
+        " mov.b32 {_lo, _hi}, $1;"
+        f" {_CVT_F32_FROM_H} _flo, _lo;"
+        f" {_CVT_F32_FROM_H} _fhi, _hi;"
+        f" {_CVT_RG2_FROM_F32} $0, _fhi, _flo; }}",
+        "=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
 def _lds_v4_b32(smem_addr_i32):
     """LDS.128: 16 B (8 bf16) from SMEM. Address must be 16-B aligned."""
     r = llvm.inline_asm(
@@ -696,7 +880,9 @@ def _fused_ab_1mma(a_addr, b_addr, c0, c1, c2, c3):
 
 
 def _fused_ab_4mma_serial_brow(a_base, b_base, c0, c1, c2, c3):
-    """KKT/QKT pattern — 4 sequential (ldmatrix_A + ldmatrix_B + MMA) at K-stride 32B."""
+    """KKT/QKT Grams — 4 sequential (ldmatrix_A + ldmatrix_B + MMA) at
+    K-stride 32B. Both operands are the packed tile, so the MMA is in the
+    PACK dtype (fp16 in the combined state+cache-fp16 mode, bf16 otherwise)."""
     r = llvm.inline_asm(
         llvm.StructType.get_literal([mlir_T.f32()] * 4),
         [
@@ -710,19 +896,19 @@ def _fused_ab_4mma_serial_brow(a_base, b_base, c0, c1, c2, c3):
         "{ .reg .b32 _a<4>, _b<2>;"
         " ldmatrix.sync.aligned.x4.m8n8.shared.b16 {_a0,_a1,_a2,_a3}, [$8];"
         " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$9];"
-        f" {_MMA_M16N8K16_HH_F32}"
+        f" {_MMA_PACK}"
         "   {$0,$1,$2,$3}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$0,$1,$2,$3};"
         " ldmatrix.sync.aligned.x4.m8n8.shared.b16 {_a0,_a1,_a2,_a3}, [$8+32];"
         " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$9+32];"
-        f" {_MMA_M16N8K16_HH_F32}"
+        f" {_MMA_PACK}"
         "   {$0,$1,$2,$3}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$0,$1,$2,$3};"
         " ldmatrix.sync.aligned.x4.m8n8.shared.b16 {_a0,_a1,_a2,_a3}, [$8+64];"
         " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$9+64];"
-        f" {_MMA_M16N8K16_HH_F32}"
+        f" {_MMA_PACK}"
         "   {$0,$1,$2,$3}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$0,$1,$2,$3};"
         " ldmatrix.sync.aligned.x4.m8n8.shared.b16 {_a0,_a1,_a2,_a3}, [$8+96];"
         " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$9+96];"
-        f" {_MMA_M16N8K16_HH_F32}"
+        f" {_MMA_PACK}"
         "   {$0,$1,$2,$3}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$0,$1,$2,$3}; }",
         "=f,=f,=f,=f,0,1,2,3,r,r",
         has_side_effects=True,
@@ -762,6 +948,98 @@ def _qtv_4mma(a0, a1, a2, a3, b_base):
         "   {$8,$9,$10,$11}, {$32,$33,$34,$35}, {_b0,_b1}, {$8,$9,$10,$11};"
         " ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {_b0,_b1}, [$36+48];"
         f" {_MMA_M16N8K16_HH_F32}"
+        "   {$12,$13,$14,$15}, {$32,$33,$34,$35}, {_b0,_b1}, {$12,$13,$14,$15}; }",
+        "=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,"
+        "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,"
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Float32(llvm.extractvalue(mlir_T.f32(), r, [i])) for i in range(16)
+    )
+
+
+def _fused_ab_4mma_serial_brow_rgb(a_base, b_base, c0, c1, c2, c3):
+    """Mixed-ring variant of ``_fused_ab_4mma_serial_brow`` for the SCORES
+    GEMM only: A (the khist ring tile) is consumed RAW in the ring dtype;
+    the two B fragments (the packed q/k tile, IO dtype) are converted to
+    the ring dtype IN REGISTERS after each ldmatrix (exact in range), and
+    the MMA issues in the ring dtype. In the default mode the cvt block is
+    empty and this is byte-for-byte the plain helper."""
+    r = llvm.inline_asm(
+        llvm.StructType.get_literal([mlir_T.f32()] * 4),
+        [
+            c0.ir_value(),
+            c1.ir_value(),
+            c2.ir_value(),
+            c3.ir_value(),
+            a_base.ir_value(),
+            b_base.ir_value(),
+        ],
+        "{ .reg .b32 _a<4>, _b<2>, _wl, _wh; .reg .f32 _fl, _fh;"
+        " ldmatrix.sync.aligned.x4.m8n8.shared.b16 {_a0,_a1,_a2,_a3}, [$8];"
+        " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$9];"
+        f"{_RING_B_CVT_ASM}"
+        f" {_MMA_RING_F32}"
+        "   {$0,$1,$2,$3}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$0,$1,$2,$3};"
+        " ldmatrix.sync.aligned.x4.m8n8.shared.b16 {_a0,_a1,_a2,_a3}, [$8+32];"
+        " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$9+32];"
+        f"{_RING_B_CVT_ASM}"
+        f" {_MMA_RING_F32}"
+        "   {$0,$1,$2,$3}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$0,$1,$2,$3};"
+        " ldmatrix.sync.aligned.x4.m8n8.shared.b16 {_a0,_a1,_a2,_a3}, [$8+64];"
+        " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$9+64];"
+        f"{_RING_B_CVT_ASM}"
+        f" {_MMA_RING_F32}"
+        "   {$0,$1,$2,$3}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$0,$1,$2,$3};"
+        " ldmatrix.sync.aligned.x4.m8n8.shared.b16 {_a0,_a1,_a2,_a3}, [$8+96];"
+        " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$9+96];"
+        f"{_RING_B_CVT_ASM}"
+        f" {_MMA_RING_F32}"
+        "   {$0,$1,$2,$3}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$0,$1,$2,$3}; }",
+        "=f,=f,=f,=f,0,1,2,3,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(mlir_T.f32(), r, [0])),
+        cutlass.Float32(llvm.extractvalue(mlir_T.f32(), r, [1])),
+        cutlass.Float32(llvm.extractvalue(mlir_T.f32(), r, [2])),
+        cutlass.Float32(llvm.extractvalue(mlir_T.f32(), r, [3])),
+    )
+
+
+def _qtv_4mma_rg(a0, a1, a2, a3, b_base):
+    """RING-dtype variant of ``_qtv_4mma`` — used ONLY where a ring tile is
+    an MMA operand (the history contraction: A = w-scaled scores staged in
+    the ring dtype, B = the u tile raw; the fold: A = w-scaled u, B = the
+    khist STS-back). Identical to ``_qtv_4mma`` when ring dtype == IO."""
+    zero = cutlass.Float32(0.0)
+    r = llvm.inline_asm(
+        llvm.StructType.get_literal([mlir_T.f32()] * 16),
+        [zero.ir_value()] * 16
+        + [
+            a0.ir_value(),
+            a1.ir_value(),
+            a2.ir_value(),
+            a3.ir_value(),
+            b_base.ir_value(),
+        ],
+        "{ .reg .b32 _b<2>;"
+        " ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {_b0,_b1}, [$36];"
+        f" {_MMA_RING_F32}"
+        "   {$0,$1,$2,$3}, {$32,$33,$34,$35}, {_b0,_b1}, {$0,$1,$2,$3};"
+        " ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {_b0,_b1}, [$36+16];"
+        f" {_MMA_RING_F32}"
+        "   {$4,$5,$6,$7}, {$32,$33,$34,$35}, {_b0,_b1}, {$4,$5,$6,$7};"
+        " ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {_b0,_b1}, [$36+32];"
+        f" {_MMA_RING_F32}"
+        "   {$8,$9,$10,$11}, {$32,$33,$34,$35}, {_b0,_b1}, {$8,$9,$10,$11};"
+        " ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {_b0,_b1}, [$36+48];"
+        f" {_MMA_RING_F32}"
         "   {$12,$13,$14,$15}, {$32,$33,$34,$35}, {_b0,_b1}, {$12,$13,$14,$15}; }",
         "=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,"
         "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,"
@@ -1205,8 +1483,15 @@ class GdnDecodeUCacheFlushKernel:
             # w-scaled TRANSPOSED scores tile [W_RING, BF_PAD] bf16 — the
             # A-operand of the MMA history contraction
             # (sWScores[r_packed, j] = w_j * khist_j . packed_r).
+            # (ring-fp16) typed with the RING dtype: tenant #1 (the w-scaled
+            # transposed scores) is the ring-dtype contraction's A operand.
+            # Tenant #2 (QT, an IO-dtype operand of the y GEMM) writes its
+            # bytes through raw _sts pair-stores below, bypassing the tensor
+            # element type — ldmatrix reads are untyped, so each tenant's
+            # MMA sees the bytes its own staging wrote. ring_ty == io in the
+            # default mode (identical layout either way: both 2 B).
             wscores_bf: cute.struct.Align[
-                cute.struct.MemRange[io, W_RING * BF_PAD], 128
+                cute.struct.MemRange[ring_ty, W_RING * BF_PAD], 128
             ]
             # G-ring scratch: [0:16]=G_j, [16:32]=w_j, [32]=bdec.
             ghist_fp32: cute.struct.Align[cute.struct.MemRange[f32, 48], 128]
@@ -1434,7 +1719,10 @@ class GdnDecodeUCacheFlushKernel:
                 inv_norm = _rsqrt_approx_f32(partial + f32(EPS))
                 if norm_row < Int32(self._t_input):
                     for c in cutlass.range_constexpr(16):
-                        _sK_i32.iterator[_norm_off_i32 + 4 * c] = _mul_bf16x2_f32(
+                        # (pack) store the normalized k in the PACK dtype
+                        # (fp16 in combined mode -> true fp16 k-cache + no
+                        # per-fragment GEMM conversion; bf16 otherwise).
+                        _sK_i32.iterator[_norm_off_i32 + 4 * c] = _mul_packstore_f32(
                             _sK_i32.iterator[_norm_off_i32 + 4 * c], inv_norm
                         )
             if warp_id == Int32(2):
@@ -1456,7 +1744,8 @@ class GdnDecodeUCacheFlushKernel:
                 inv_norm = inv_norm * scale
                 if norm_row < Int32(self._t_input):
                     for c in cutlass.range_constexpr(16):
-                        _qn_val = _mul_bf16x2_f32(
+                        # (pack) normalized q in the PACK dtype (see K-norm).
+                        _qn_val = _mul_packstore_f32(
                             _sQ_i32.iterator[_norm_off_i32 + 4 * c], inv_norm
                         )
                         _sQ_i32.iterator[_norm_off_i32 + 4 * c] = _qn_val
@@ -1574,6 +1863,22 @@ class GdnDecodeUCacheFlushKernel:
         _kv0, _kv1, _kv2, _kv3 = _lds_v4_b32(
             _sK_base_async + _kc_row * Int32(K_PADDED * 2) + _kc_pos * Int32(16)
         )
+        # (ring-fp16) cache-fp16-ONLY mode: the packed tile is bf16, so repack
+        # each bf16 pair to fp16 at the STG boundary (exact in range — normed
+        # |k| <= 1). In the COMBINED mode the packed tile (hence this
+        # snapshot) is ALREADY fp16 — true fp32->fp16 precision from the norm
+        # pass — so the bytes go raw to the fp16 cache (no bf16 round-trip).
+        # Compile-time no-op in the default mode.
+        if const_expr(_RING_MIXED and not _PACK_MIXED):
+            _kr0 = _repack_io2_to_rg2(_kv0)
+            _kr1 = _repack_io2_to_rg2(_kv1)
+            _kr2 = _repack_io2_to_rg2(_kv2)
+            _kr3 = _repack_io2_to_rg2(_kv3)
+        else:
+            _kr0 = _kv0
+            _kr1 = _kv1
+            _kr2 = _kv2
+            _kr3 = _kv3
         if (pid_hv % (HV // H)) == 0:
             if P_hist < flush_min:
                 _kc_wr_off = P_hist * K_DIM
@@ -1581,10 +1886,10 @@ class GdnDecodeUCacheFlushKernel:
                     _st_global_v4_b32(
                         _gKC_base_st + _kc_pool_e64 * 2,
                         _kc_wr_off + _kc_row * K_DIM + _kc_pos * Int32(8),
-                        _kv0,
-                        _kv1,
-                        _kv2,
-                        _kv3,
+                        _kr0,
+                        _kr1,
+                        _kr2,
+                        _kr3,
                     )
 
         # KKT (warps 0-1) || QKT (warps 2-3) — direct acc → SMEM writes.
@@ -1774,6 +2079,11 @@ class GdnDecodeUCacheFlushKernel:
                 # deep in the block inverse at this point.
                 _cp_async_wait_group_0()
                 _bar_sync_1_64()
+                # (ring-fp16) the khist tile stays RAW in the ring dtype:
+                # the scores GEMM below converts the PACKED tile's B
+                # fragments in registers instead (exact in range) — no SMEM
+                # convert pass, no extra barrier, and the flush snapshot
+                # naturally captures ring-dtype bytes for the fold.
                 acc.fill(f32(0.0))
                 _sc_col_off = (warp_id - Int32(2)) * Int32(8)
                 for _sc_g in cutlass.range_constexpr(K_DIM // 16 // 4):
@@ -1790,7 +2100,7 @@ class GdnDecodeUCacheFlushKernel:
                         acc.iterator[1],
                         acc.iterator[2],
                         acc.iterator[3],
-                    ) = _fused_ab_4mma_serial_brow(
+                    ) = _fused_ab_4mma_serial_brow_rgb(
                         _sc_a,
                         _sc_b,
                         acc.iterator[0],
@@ -1807,18 +2117,22 @@ class GdnDecodeUCacheFlushKernel:
                 # MMA contribute exact zeros.
                 _sc_w_lo = sGhist.iterator[W_RING + _sc_r0]
                 _sc_w_hi = sGhist.iterator[W_RING + _sc_r0 + 8]
+                # (ring-fp16) staged in the RING dtype: the contraction MMA
+                # pairs this A operand with the raw u tile (B), so both
+                # sides carry the ring element type. `.to(ring_ty)` == the
+                # old `.to(io)` in the default mode.
                 sWScores.iterator[(_sc_col_off + _sc_c0) * BF_PAD + _sc_r0] = (
                     acc.iterator[0] * _sc_w_lo
-                ).to(io)
+                ).to(ring_ty)
                 sWScores.iterator[(_sc_col_off + _sc_c0 + 1) * BF_PAD + _sc_r0] = (
                     acc.iterator[1] * _sc_w_lo
-                ).to(io)
+                ).to(ring_ty)
                 sWScores.iterator[(_sc_col_off + _sc_c0) * BF_PAD + _sc_r0 + 8] = (
                     acc.iterator[2] * _sc_w_hi
-                ).to(io)
+                ).to(ring_ty)
                 sWScores.iterator[(_sc_col_off + _sc_c0 + 1) * BF_PAD + _sc_r0 + 8] = (
                     acc.iterator[3] * _sc_w_hi
-                ).to(io)
+                ).to(ring_ty)
             # === T≤8 PATH: only T00 (warp 0) is real work; T11 = diag(β1) ===
             if warp_id == Int32(0):
                 if lane_id < Int32(8):
@@ -2074,7 +2388,10 @@ class GdnDecodeUCacheFlushKernel:
                     if _bs_rr < Int32(self._t_input)
                     else Int32(8 - self._t_input) + _bs_rr
                 )
-                _sK_i32.iterator[_bs_row * _kpad_i32 + _bs_col] = _mul_bf16x2_f32(
+                # (pack) the packed A-tile is pack_ty here (fp16 in combined
+                # mode) — scale in that dtype so the H GEMM stays conversion-
+                # free. Identical to _mul_bf16x2_f32 when pack_ty == bf16.
+                _sK_i32.iterator[_bs_row * _kpad_i32 + _bs_col] = _mul_pack_f32(
                     _sK_i32.iterator[_bs_row * _kpad_i32 + _bs_col], _bdec
                 )
 
@@ -2232,7 +2549,7 @@ class GdnDecodeUCacheFlushKernel:
                 + _ldm_row * Int32(V_PADDED * 2)
                 + warp_id * Int32(64)
             )
-            _hcr = _qtv_4mma(_hc_a0, _hc_a1, _hc_a2, _hc_a3, _hc_b_base)
+            _hcr = _qtv_4mma_rg(_hc_a0, _hc_a1, _hc_a2, _hc_a3, _hc_b_base)
             wh_acc_0.iterator[0] = wh_acc_0.iterator[0] + _hcr[0]
             wh_acc_0.iterator[1] = wh_acc_0.iterator[1] + _hcr[1]
             wh_acc_0.iterator[2] = wh_acc_0.iterator[2] + _hcr[2]
@@ -2310,17 +2627,25 @@ class GdnDecodeUCacheFlushKernel:
             )
             _qt_r0 = lane_id // 4
             _qt_c0 = (lane_id & 3) * 2
-            sWScores.iterator[_qt_r0 * BF_PAD + _qt_col_off + _qt_c0] = acc.iterator[
-                0
-            ].to(io)
-            sWScores.iterator[_qt_r0 * BF_PAD + _qt_col_off + _qt_c0 + 1] = (
-                acc.iterator[1].to(io)
+            # (ring-fp16) QT is an IO-dtype MMA operand (y GEMM, paired with
+            # R in sV): store its bytes RAW via the IO pack helper rather
+            # than typed iterator assignment — the buffer's element type is
+            # the RING dtype (tenant #1), and a typed store would silently
+            # convert QT's bf16 values to fp16 bit patterns that the bf16 y
+            # GEMM would then misread. c0 is even, so each pair store is
+            # 4-B aligned. Identical codegen in the default mode.
+            _qt_sw_base = sWScores.iterator.toint()
+            _sts_bf16x2_f32(
+                _qt_sw_base
+                + (_qt_r0 * BF_PAD + _qt_col_off + _qt_c0) * 2,
+                acc.iterator[0],
+                acc.iterator[1],
             )
-            sWScores.iterator[(_qt_r0 + 8) * BF_PAD + _qt_col_off + _qt_c0] = (
-                acc.iterator[2].to(io)
-            )
-            sWScores.iterator[(_qt_r0 + 8) * BF_PAD + _qt_col_off + _qt_c0 + 1] = (
-                acc.iterator[3].to(io)
+            _sts_bf16x2_f32(
+                _qt_sw_base
+                + ((_qt_r0 + 8) * BF_PAD + _qt_col_off + _qt_c0) * 2,
+                acc.iterator[2],
+                acc.iterator[3],
             )
 
         # Wait for second half to land before H GEMM half-1.
@@ -2537,7 +2862,9 @@ class GdnDecodeUCacheFlushKernel:
         if _y_r0 < Int32(self._t_input):
             for _ug in cutlass.range_constexpr(4):
                 _uu_col = (warp_id * Int32(4) + Int32(_ug)) * Int32(8) + _y_c0
-                _sts_bf16x2_f32(
+                # (ring-fp16) U packs f32 -> RING dtype here — the single
+                # rounding on the u path (the ring appends copy raw bytes).
+                _sts_rg2_f32(
                     _sOutStage_base + ((8 + _y_r0) * V_PADDED + _uu_col) * 2,
                     _ur[_ug * 4],
                     _ur[_ug * 4 + 1],
@@ -2643,6 +2970,9 @@ class GdnDecodeUCacheFlushKernel:
             _kh_sts = (tidx // Int32(8)) * Int32(K_PADDED // 2) + (
                 tidx % Int32(8)
             ) * Int32(8)
+            # (ring-fp16) the snapshot holds RAW ring-dtype bytes (the tile
+            # is never converted in SMEM), so plain stores are correct in
+            # every mode — the fold MMA consumes the ring dtype directly.
             _sQ_i32.iterator[_kh_sts + 0] = _khs0
             _sQ_i32.iterator[_kh_sts + 1] = _khs1
             _sQ_i32.iterator[_kh_sts + 2] = _khs2
@@ -2672,7 +3002,7 @@ class GdnDecodeUCacheFlushKernel:
                 _ws_c = _ws_g % Int32(V_PADDED // 2)
                 if _ws_r < Int32(W_RING):
                     _w_row = sGhist.iterator[W_RING + _ws_r]
-                    _sK_i32.iterator[_ws_r * _kpad_i32 + _ws_c] = _mul_bf16x2_f32(
+                    _sK_i32.iterator[_ws_r * _kpad_i32 + _ws_c] = _mul_rg2_f32(
                         _sK_i32.iterator[_ws_r * _kpad_i32 + _ws_c], _w_row
                     )
             # --- 5) fold: HALF-1 FIRST from the RESIDENT sH (OutStage
@@ -2731,7 +3061,7 @@ class GdnDecodeUCacheFlushKernel:
                             + _fs * Int32(32)
                             + _fa_colb
                         )
-                        _frr = _qtv_4mma(
+                        _frr = _qtv_4mma_rg(
                             _fa0,
                             _fa1,
                             _fa2,
@@ -2800,10 +3130,10 @@ class GdnDecodeUCacheFlushKernel:
                     _st_global_v4_b32(
                         _gKC_base_st + _kc_pool_e64 * 2,
                         _kc_rd_base + _kc_row * K_DIM + _kc_pos * Int32(8),
-                        _kv0,
-                        _kv1,
-                        _kv2,
-                        _kv3,
+                        _kr0,
+                        _kr1,
+                        _kr2,
+                        _kr3,
                     )
 
 
@@ -3047,16 +3377,18 @@ def gated_delta_rule_mtp_ucache_flush(
     ), "gated_delta_rule_mtp_ucache: k_cache/u_cache/g_cache/hist_len are required."
     _pool = h0.shape[0]
     _pools_contig = _inner_dense(h0, "initial_state_source")
-    assert k_cache.dtype == IO_TORCH, (
-        f"k_cache must be {IO_TORCH} (module IO dtype); got {k_cache.dtype}."
+    assert k_cache.dtype == RING_TORCH, (
+        f"k_cache must be {RING_TORCH} (module RING dtype, see "
+        f"GDN_UCACHE_RING_DTYPE); got {k_cache.dtype}."
     )
     _pools_contig &= _inner_dense(k_cache, "k_cache")
     assert tuple(k_cache.shape) == (_pool, HK, 16, K_dim), (
         f"k_cache must be [pool={_pool}, H={HK}, 16, K={K_dim}]; got {tuple(k_cache.shape)}"
     )
-    assert u_cache.dtype == IO_TORCH, (
-        f"u_cache must be {IO_TORCH} (module IO dtype; f32 rings remain a "
-        f"documented extension point); got {u_cache.dtype}."
+    assert u_cache.dtype == RING_TORCH, (
+        f"u_cache must be {RING_TORCH} (module RING dtype, see "
+        f"GDN_UCACHE_RING_DTYPE; f32 rings remain a documented extension "
+        f"point); got {u_cache.dtype}."
     )
     _pools_contig &= _inner_dense(u_cache, "u_cache")
     assert tuple(u_cache.shape) == (_pool, HV, 16, V_dim)
@@ -3223,6 +3555,7 @@ def gated_delta_rule_mtp_ucache_flush(
         "ucache-flush-v2",
         str(IO_TORCH),
         str(ST_TORCH),
+        str(RING_TORCH),
         str(device),
         mbp,
         t_disc,

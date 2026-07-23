@@ -82,10 +82,14 @@ _FLUSH_PATH = str(
 _MODULE_CACHE: dict = {}
 
 ARMS = {
-    #  name        io env    state env  io dtype        state dtype
-    "bf16": (None, None, torch.bfloat16, torch.bfloat16),
-    "fp16_state": (None, "fp16", torch.bfloat16, torch.float16),
-    "fp16_io": ("fp16", None, torch.float16, torch.float16),
+    #  name        io env  state env ring env io dtype     state dtype    ring dtype
+    "bf16": (None, None, None, torch.bfloat16, torch.bfloat16, torch.bfloat16),
+    "fp16_state": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
+    "fp16_io": ("fp16", None, None, torch.float16, torch.float16, torch.float16),
+    "ring_fp16": (None, None, "fp16", torch.bfloat16, torch.bfloat16, torch.float16),
+    # bf16 inputs, BOTH state pool AND u/k rings fp16 (state+ring combined)
+    "fp16_state_cache": (None, "fp16", "fp16",
+                         torch.bfloat16, torch.float16, torch.float16),
 }
 
 
@@ -101,13 +105,16 @@ def _load_flush(arm: str):
     """Load one module copy per dtype arm (dtype is chosen at import time)."""
     if arm in _MODULE_CACHE:
         return _MODULE_CACHE[arm]
-    io_env, state_env, _, _ = ARMS[arm]
+    io_env, state_env, ring_env, _, _, _ = ARMS[arm]
     old = {k: os.environ.pop(k, None)
-           for k in ("GDN_UCACHE_IO_DTYPE", "GDN_UCACHE_STATE_DTYPE")}
+           for k in ("GDN_UCACHE_IO_DTYPE", "GDN_UCACHE_STATE_DTYPE",
+                     "GDN_UCACHE_RING_DTYPE")}
     if io_env:
         os.environ["GDN_UCACHE_IO_DTYPE"] = io_env
     if state_env:
         os.environ["GDN_UCACHE_STATE_DTYPE"] = state_env
+    if ring_env:
+        os.environ["GDN_UCACHE_RING_DTYPE"] = ring_env
     try:
         spec = importlib.util.spec_from_file_location(f"uc_flush_{arm}", _FLUSH_PATH)
         mod = importlib.util.module_from_spec(spec)
@@ -161,7 +168,8 @@ def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
 # ---------------------------------------------------------------------------
 # Case builder: consistent inputs + rings for B requests.
 # ---------------------------------------------------------------------------
-def _make_case(B, hist_lens, io_dtype, state_dtype, seed):
+def _make_case(B, hist_lens, io_dtype, state_dtype, seed, ring_dtype=None):
+    ring_dtype = ring_dtype or io_dtype
     g = torch.Generator(device=DEV).manual_seed(seed)
 
     def rn(*s, sc=1.0):
@@ -173,8 +181,8 @@ def _make_case(B, hist_lens, io_dtype, state_dtype, seed):
              + torch.rand(HV, generator=g, device=DEV) * 0.3).to(io_dtype)
     dt_bias = rn(HV, sc=0.5)
     pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(state_dtype)
-    kc = torch.zeros(B, H, W, K, dtype=io_dtype, device=DEV)
-    uc = torch.zeros(B, HV, W, V, dtype=io_dtype, device=DEV)
+    kc = torch.zeros(B, H, W, K, dtype=ring_dtype, device=DEV)
+    uc = torch.zeros(B, HV, W, V, dtype=ring_dtype, device=DEV)
     gc = torch.zeros(B, HV, W, dtype=torch.float32, device=DEV)
     hl = torch.tensor(hist_lens, dtype=torch.int32, device=DEV)
     for r in range(B):
@@ -182,8 +190,8 @@ def _make_case(B, hist_lens, io_dtype, state_dtype, seed):
         if P == 0:
             continue
         kh = torch.randn(H, P, K, generator=g, device=DEV)
-        kc[r, :, :P] = F.normalize(kh, dim=-1).to(io_dtype)
-        uc[r, :, :P] = (torch.randn(HV, P, V, generator=g, device=DEV) * 0.3).to(io_dtype)
+        kc[r, :, :P] = F.normalize(kh, dim=-1).to(ring_dtype)
+        uc[r, :, :P] = (torch.randn(HV, P, V, generator=g, device=DEV) * 0.3).to(ring_dtype)
         la = -(torch.rand(HV, P, generator=g, device=DEV) * 0.3 + 0.003)
         gc[r, :, :P] = torch.cumsum(la, dim=-1)
     idx = torch.arange(B, dtype=torch.int32, device=DEV)
@@ -204,10 +212,11 @@ STATE_TOL = 2e-2  # committed state accumulates P outer products first
 def test_output_matches_fp32_reference(arm, history):
     _skip_if_not_sm90_or_later()
     mod = _load_flush(arm)
-    _, _, io_dtype, state_dtype = ARMS[arm]
+    _, _, _, io_dtype, state_dtype, ring_dtype = ARMS[arm]
     B = 4
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, idx = _make_case(
-        B, HISTORIES[history], io_dtype, state_dtype, seed=1234)
+        B, HISTORIES[history], io_dtype, state_dtype, seed=1234,
+        ring_dtype=ring_dtype)
     pool_before = pool.clone()  # fold rows mutate the pool; ref needs the old state
 
     y = mod.gated_delta_rule_mtp_ucache_flush(
@@ -230,10 +239,11 @@ def test_folded_state_matches_fp32_reference(arm):
     checkpoint back to the pool. Compare that committed state to the oracle."""
     _skip_if_not_sm90_or_later()
     mod = _load_flush(arm)
-    _, _, io_dtype, state_dtype = ARMS[arm]
+    _, _, _, io_dtype, state_dtype, ring_dtype = ARMS[arm]
     B = 4
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, idx = _make_case(
-        B, [13, 13, 13, 13], io_dtype, state_dtype, seed=99)
+        B, [13, 13, 13, 13], io_dtype, state_dtype, seed=99,
+        ring_dtype=ring_dtype)
     pool_before = pool.clone()
 
     mod.gated_delta_rule_mtp_ucache_flush(
@@ -258,12 +268,13 @@ def test_fp16_state_commits_more_precisely_than_bf16():
     errs = {}
     for arm in ("bf16", "fp16_state"):
         mod = _load_flush(arm)
-        _, _, io_dtype, state_dtype = ARMS[arm]
+        _, _, _, io_dtype, state_dtype, ring_dtype = ARMS[arm]
         tot = 0.0
         for seed in (7, 8, 9, 10):
             B = 4
             q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, idx = _make_case(
-                B, [13] * B, io_dtype, state_dtype, seed=seed)
+                B, [13] * B, io_dtype, state_dtype, seed=seed,
+                ring_dtype=ring_dtype)
             pool_before = pool.clone()
             mod.gated_delta_rule_mtp_ucache_flush(
                 A_log, a, dt_bias, q=q, k=k, v=v, b=b,
