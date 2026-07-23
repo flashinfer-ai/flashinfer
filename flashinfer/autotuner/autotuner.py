@@ -20,7 +20,6 @@ from typing import (
     Optional,
     Sequence,
     TypeAlias,
-    cast,
 )
 
 import torch
@@ -395,7 +394,7 @@ def get_config_path(is_module: bool):
         )
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, unsafe_hash=True)
 class DynamicTensorSpec:
     """
     A specification for a dynamic tensor dimension.
@@ -406,37 +405,12 @@ class DynamicTensorSpec:
             For every tensor mapped to the input_idx, their dimension mapped to the dim_idx must be the same.
         gen_tuning_buckets: A tuple of values to try or a function generating values.
         map_to_tuning_buckets: A function to map dimensions to valid values during inference.
-        tensor_initializers: A list of functions to initialize the tensors.
     """
 
     input_idx: tuple[int, ...]
     dim_idx: tuple[int, ...]
     gen_tuning_buckets: tuple[int, ...] | Callable[[int], Iterable[int]]
     map_to_tuning_buckets: Callable[[int], int]
-    tensor_initializers: Sequence[TensorInitializer] | None = field(
-        default_factory=lambda: None
-    )
-
-    def __post_init__(self):
-        # Set default tensor_initializers if not provided
-        if self.tensor_initializers is None:
-            self.tensor_initializers = [
-                autotuner_initializer_rand_scaled for _ in range(len(self.input_idx))
-            ]
-
-    def __hash__(self) -> int:
-        # FIXME: currently not hashing tensor_initializers
-        return hash(
-            (
-                self.input_idx,
-                self.dim_idx,
-                # For gen_tuning_buckets, only hash if it's a tuple, otherwise hash its id
-                self.gen_tuning_buckets
-                if isinstance(self.gen_tuning_buckets, tuple)
-                else id(self.gen_tuning_buckets),
-                id(self.map_to_tuning_buckets),
-            )
-        )
 
 
 @dataclass(slots=True, unsafe_hash=True)
@@ -496,10 +470,23 @@ class TuningConfig:
             This flag is to create circular buffer of input tensors to avoid L2 cache hits to simulate cold L2 cache.
             Notice that not all tuning processes can benefit from this feature.
         use_cuda_graph (bool): Whether to use CUDA graph for the tuning process.
+        tensor_initializers (Tuple[Tuple[int, TensorInitializer]]): Per-input-index
+            initializer closures used to synthesize profiling tensors. Each entry
+            pairs an input tensor index with the closure that fills that input.
+            Indices not listed fall back to a random-scaled default initializer.
+
+            Example:
+                >>> config = TuningConfig(
+                ...     tensor_initializers=(
+                ...         (0, autotuner_initializer_randn),
+                ...         (1, autotuner_initializer_ones),
+                ...     )
+                ... )
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: tuple[ConstraintSpec, ...] = ()
+    tensor_initializers: tuple[tuple[int, TensorInitializer], ...] = ()
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = False
     # Optional callback invoked once per profile bucket, after dynamic
@@ -509,99 +496,6 @@ class TuningConfig:
     # for inputs whose default tensor_initializer would be random
     # (e.g. token_selected_experts in MoE workloads).
     inputs_pre_hook: Callable | None = None
-    _nearest_profile_key: Any = field(
-        default=None, init=False, repr=False, compare=False, hash=False
-    )
-
-
-class _CallableIdentity:
-    """Hash and compare a callable by identity while retaining the object."""
-
-    __slots__ = ("callable", "identity")
-
-    def __init__(self, callable_: Callable[[int], int]):
-        self.callable = callable_
-        self.identity = id(callable_)
-
-    def __hash__(self) -> int:
-        return self.identity
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, _CallableIdentity) and self.callable is other.callable
-
-
-_NearestProfileDynamicSpec: TypeAlias = tuple[
-    tuple[int, ...], tuple[int, ...], Callable[[int], int] | _CallableIdentity
-]
-
-
-def _get_mapper_key(
-    mapper: Callable[[int], int],
-) -> Callable[[int], int] | _CallableIdentity:
-    """Use native callable equality when possible, otherwise use identity."""
-    try:
-        hash(mapper)
-    except TypeError:
-        return _CallableIdentity(mapper)
-    return mapper
-
-
-class _NearestProfileKey:
-    """Immutable nearest-profile key with a precomputed hash."""
-
-    __slots__ = ("dynamic_specs", "constraint_dims", "_hash")
-
-    def __init__(
-        self,
-        dynamic_specs: tuple[_NearestProfileDynamicSpec, ...],
-        constraint_dims: tuple[tuple[int, int], ...],
-    ):
-        self.dynamic_specs = dynamic_specs
-        self.constraint_dims = constraint_dims
-        self._hash = hash((dynamic_specs, constraint_dims))
-
-    def __hash__(self) -> int:
-        return self._hash
-
-    def __eq__(self, other: object) -> bool:
-        return (
-            isinstance(other, _NearestProfileKey)
-            and self.dynamic_specs == other.dynamic_specs
-            and self.constraint_dims == other.constraint_dims
-        )
-
-
-def _get_nearest_profile_key(tuning_config: TuningConfig) -> _NearestProfileKey:
-    """Extract only fields that affect nearest-profile selection.
-
-    Tensor initializers and the rest of ``TuningConfig`` are intentionally
-    excluded.  Each ``TuningConfig`` memoizes its key, including retained mapper
-    callables, so the warm path avoids rebuilding or recursively hashing it.
-    """
-    key = tuning_config._nearest_profile_key
-    if key is None:
-        key = _NearestProfileKey(
-            tuple(
-                (
-                    spec.input_idx,
-                    spec.dim_idx,
-                    _get_mapper_key(spec.map_to_tuning_buckets),
-                )
-                for spec in tuning_config.dynamic_tensor_specs
-            ),
-            tuple(
-                (spec.input_idx, spec.dim_idx)
-                for spec in tuning_config.constraint_specs
-            ),
-        )
-        tuning_config._nearest_profile_key = key
-    return key
-
-
-def _forward_cache_api(wrapper: Callable[..., Any], cached: Callable[..., Any]) -> None:
-    """Expose cache controls on a wrapper that delegates to an LRU cache."""
-    for attribute in ("cache_info", "cache_clear"):
-        setattr(wrapper, attribute, getattr(cached, attribute))
 
 
 @dataclass(frozen=True)
@@ -641,14 +535,6 @@ class OptimizationProfile:
     def get_opt_shapes(self) -> tuple[tuple[int, ...], ...]:
         """Only the opt shapes are considered as hash key"""
         return tuple(tuple(_get_opt(d) for d in t) for t in self.shapes)
-
-
-# TODO: can/shall we use the torch builtin FakeTensor class?
-@dataclass
-class FakeTensor:
-    dtype: torch.dtype
-    device: torch.device
-    shape: list[Dim]
 
 
 class TunableRunner(ABC):
@@ -1240,10 +1126,10 @@ class AutoTuner:
         # Per-thread stack of frozenset[str] for skip_ops overrides.
         self._skip_ops_local: _SkipOpsLocal = _SkipOpsLocal()
         # Cache overridden TuningConfig objects to keep stable object identity
-        # for _find_nearest_profile's LRU cache.
+        # for the nearest-profile LRU cache.
         # Two-level: WeakKeyDictionary[TuningConfig, Dict[(buckets, round_up), TuningConfig]]
-        # keyed by identity so configs differing only in tensor_initializers
-        # (whose __hash__ is the same) don't collide.
+        # keyed by identity so configs that share a hash but carry distinct
+        # closures (e.g. gen/map buckets, tensor_initializers) don't collide.
         self._override_config_cache: weakref.WeakKeyDictionary[
             TuningConfig, dict[tuple[tuple[int, ...] | None, bool], TuningConfig]
         ] = weakref.WeakKeyDictionary()
@@ -1448,7 +1334,7 @@ class AutoTuner:
         """Return a TuningConfig with overridden buckets/rounding if overrides are active.
 
         The result is cached so the same logical override produces the same
-        object, keeping ``_find_nearest_profile``'s LRU cache effective.
+        object, keeping the nearest-profile LRU cache effective.
         """
         buckets = self._override_tuning_buckets
         round_up_flag = self._override_round_up
@@ -1494,13 +1380,13 @@ class AutoTuner:
                     dim_idx=spec.dim_idx,
                     gen_tuning_buckets=new_gen,
                     map_to_tuning_buckets=new_map,
-                    tensor_initializers=spec.tensor_initializers,
                 )
             )
 
         new_config = TuningConfig(
             dynamic_tensor_specs=tuple(new_specs),
             constraint_specs=tuning_config.constraint_specs,
+            tensor_initializers=tuning_config.tensor_initializers,
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
@@ -1701,7 +1587,6 @@ class AutoTuner:
                         runner_id, tactic = None, None
                         skipped_count = 0
                         for r_id, r in enumerate(runners):
-                            # TODO: use FakeTensor here.
                             valid_tactics = r.get_valid_tactics(tensors, p)
                             valid_tactics = self._blocklist.filter(
                                 custom_op, r, valid_tactics
@@ -2042,6 +1927,9 @@ class AutoTuner:
             [None] * len(inputs),
         )
 
+        for idx, initializer in tuning_config.tensor_initializers:
+            base_profile.tensor_initializers[idx] = initializer
+
         generated_profiles: list[OptimizationProfile] = []
 
         dynamic_dims: list[tuple[Any, ...]] = []
@@ -2055,12 +1943,6 @@ class AutoTuner:
             assert len(spec.input_idx) == len(spec.dim_idx), (
                 f"The number of input indices and dimension indices must be the same, got {len(spec.input_idx)} and {len(spec.dim_idx)}"
             )
-            assert spec.tensor_initializers is not None
-            assert len(spec.tensor_initializers) == len(spec.input_idx), (
-                f"The number of tensor initializers and input indices must be the same, got {len(spec.tensor_initializers)} and {len(spec.input_idx)}"
-            )
-            for i, idx in enumerate(spec.input_idx):
-                base_profile.tensor_initializers[idx] = spec.tensor_initializers[i]
 
             if callable(spec.gen_tuning_buckets):
                 opt_shapes = spec.gen_tuning_buckets(
@@ -2128,7 +2010,9 @@ class AutoTuner:
                 - profile: Tuple of input tensor shapes
         """
         return cls._find_nearest_profile_cached(
-            shapes, _get_nearest_profile_key(tuning_config)
+            shapes,
+            tuning_config.dynamic_tensor_specs,
+            tuning_config.constraint_specs,
         )
 
     @classmethod
@@ -2136,32 +2020,29 @@ class AutoTuner:
     def _find_nearest_profile_cached(
         cls,
         shapes: tuple[tuple[int, ...], ...],
-        profile_key: _NearestProfileKey,
+        dynamic_tensor_specs: tuple[DynamicTensorSpec, ...],
+        constraint_specs: tuple[ConstraintSpec, ...],
     ) -> tuple[tuple[int, ...], ...]:
-        """Cached nearest-profile lookup keyed only by lookup-relevant fields."""
+        """Bucket-match ``shapes`` against the specs and constraints.
+
+        The cache key excludes ``tensor_initializers`` because they do not affect
+        profile selection. Equivalent configurations therefore share entries as
+        long as their dynamic-spec callables are stable and hash-equivalent.
+        """
         base_profile = list(list(shape) for shape in shapes)
 
-        for dynamic_input_idx, dynamic_dim_idx, mapper in profile_key.dynamic_specs:
-            mapper_callable = (
-                mapper.callable if isinstance(mapper, _CallableIdentity) else mapper
-            )
-            mapped_val = mapper_callable(
-                base_profile[dynamic_input_idx[0]][dynamic_dim_idx[0]]
+        for spec in dynamic_tensor_specs:
+            mapped_val = spec.map_to_tuning_buckets(
+                base_profile[spec.input_idx[0]][spec.dim_idx[0]]
             )
             # Apply the same mapped bucket to all linked dimensions in this spec.
-            for input_i, dim_i in zip(dynamic_input_idx, dynamic_dim_idx, strict=True):
+            for input_i, dim_i in zip(spec.input_idx, spec.dim_idx, strict=True):
                 base_profile[input_i][dim_i] = mapped_val
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
-        for constraint_input_idx, constraint_dim_idx in profile_key.constraint_dims:
-            base_profile[constraint_input_idx][constraint_dim_idx] = -1
+        for constraint_spec in constraint_specs:
+            base_profile[constraint_spec.input_idx][constraint_spec.dim_idx] = -1
         return tuple(tuple(shape) for shape in base_profile)
-
-    # Preserve the cache-management API on the existing entry point.
-    _forward_cache_api(
-        cast(classmethod, _find_nearest_profile).__func__,
-        cast(classmethod, _find_nearest_profile_cached).__func__,
-    )
 
     @classmethod
     def _get_cache_key(

@@ -17,6 +17,10 @@ from flashinfer.mla._core import (
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
+from flashinfer.mla._sparse_mla_sm120 import (
+    _decode_dsv3_2_tuning_config,
+    _decode_dsv4_tuning_config,
+)
 from flashinfer.tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
 from flashinfer.autotuner import (
     AutoTuner,
@@ -444,6 +448,40 @@ def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
     assert prepared[1] is inputs[1]
 
 
+def test_tuning_config_tensor_initializers_apply_by_input_index():
+    """Top-level initializers apply by index while unspecified inputs use defaults."""
+
+    def fill_sevens(shapes, dtype, device):
+        return torch.full(shapes, 7, dtype=dtype, device=device)
+
+    tuner = reset_autotuner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 2),
+                dim_idx=(0, 0),
+                gen_tuning_buckets=(8,),
+                map_to_tuning_buckets=lambda _: 8,
+            ),
+        ),
+        tensor_initializers=((2, fill_sevens),),
+    )
+    inputs = [
+        torch.empty((4, 2), dtype=torch.float32),
+        torch.empty((3, 3), dtype=torch.float32),
+        torch.empty((4, 1), dtype=torch.float32),
+    ]
+
+    (profile,) = tuner._generate_optimization_profiles(config, inputs)
+    assert profile.tensor_initializers == [None, None, fill_sevens]
+
+    prepared = tuner._prepare_input_tensors(profile, inputs)
+    assert tuple(prepared[0].shape) == (8, 2)
+    assert prepared[1] is inputs[1]
+    assert tuple(prepared[2].shape) == (8, 1)
+    assert torch.all(prepared[2] == 7)
+
+
 class TileTacticDummyRunner(TunableRunner):
     def __init__(self, supported_tiles: tuple[int, ...], num_tactics_per_tile: int = 2):
         self.supported_tiles = supported_tiles
@@ -717,6 +755,31 @@ def test_autotune_context_custom_buckets(monkeypatch):
     # original power-of-2 points.
     unique_shapes = sorted(set(profiled_shapes))
     assert unique_shapes == [100, 200, 500]
+
+
+def test_tuning_overrides_preserve_tensor_initializers():
+    """Bucket overrides must retain the per-input initializer mapping."""
+
+    def initializer(shapes, dtype, device):
+        return torch.zeros(shapes, dtype=dtype, device=device)
+
+    tuner = reset_autotuner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(128, 256),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+        tensor_initializers=((0, initializer),),
+    )
+
+    with autotune(tune_mode=False, tuning_buckets=(100, 200)):
+        overridden = tuner._apply_tuning_overrides(config)
+
+    assert overridden.tensor_initializers == config.tensor_initializers
 
 
 def test_autotune_context_round_up(monkeypatch):
@@ -1136,18 +1199,18 @@ def _build_num_tokens_tuning_config(mapper):
 
 
 def test_find_nearest_profile_cache_dedups_equivalent_configs():
-    """Regression test for the _find_nearest_profile lru_cache key.
+    """Regression test for the nearest-profile LRU cache key.
 
-    ``_find_nearest_profile`` normalizes ``TuningConfig`` to a key containing
-    only fields that affect profile selection. In particular, mapper equality
-    remains significant while tensor initializers are excluded.
+    The cached helper is keyed only on fields that affect profile selection.
+    In particular, mapper equality remains significant while tensor
+    initializers are excluded.
 
     This test holds the input shape FIXED and rebuilds an equivalent config on
     every iteration, then asserts the cache does NOT grow.  Contrast with
     ``test_find_nearest_profile_cache_grows_with_fresh_callable`` below, which
     shows the growth when the profile mapper itself changes on every call.
     """
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     shapes = ((1024, 128),)
 
@@ -1155,7 +1218,7 @@ def test_find_nearest_profile_cache_dedups_equivalent_configs():
     AutoTuner._find_nearest_profile(
         shapes, _build_num_tokens_tuning_config(last_positive_power_of_2)
     )
-    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+    cache_before = AutoTuner._find_nearest_profile_cached.cache_info().currsize
 
     # Rebuild an *equivalent* config on every call, same shape every time.
     # With a stable callable these all map to one cache key -> no growth.
@@ -1164,8 +1227,10 @@ def test_find_nearest_profile_cache_dedups_equivalent_configs():
         config = _build_num_tokens_tuning_config(last_positive_power_of_2)
         AutoTuner._find_nearest_profile(shapes, config)
 
-    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
-    AutoTuner._find_nearest_profile.cache_clear()
+    cache_growth = (
+        AutoTuner._find_nearest_profile_cached.cache_info().currsize - cache_before
+    )
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     assert cache_growth == 0, (
         f"Cache grew by {cache_growth} entries across {N} calls with equivalent "
@@ -1185,7 +1250,7 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     though the shape and bucketing logic are identical, so the cache grows by
     exactly N — the original memory leak.
     """
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     shapes = ((1024, 128),)
 
@@ -1193,7 +1258,7 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     AutoTuner._find_nearest_profile(
         shapes, _build_num_tokens_tuning_config(lambda x: last_positive_power_of_2(x))
     )
-    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+    cache_before = AutoTuner._find_nearest_profile_cached.cache_info().currsize
 
     tracemalloc.start()
     snapshot_before = tracemalloc.take_snapshot()
@@ -1207,10 +1272,12 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     snapshot_after = tracemalloc.take_snapshot()
     tracemalloc.stop()
 
-    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+    cache_growth = (
+        AutoTuner._find_nearest_profile_cached.cache_info().currsize - cache_before
+    )
     stats = snapshot_after.compare_to(snapshot_before, "lineno")
     allocated_bytes = sum(s.size_diff for s in stats if s.size_diff > 0)
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     assert cache_growth == N, (
         f"Expected {N} new cache entries (one per fresh callable), got {cache_growth}."
@@ -1235,10 +1302,10 @@ def test_find_nearest_profile_cache_dedups_recreated_bound_method():
     assert mapper.map is not mapper.map
     assert mapper.map == mapper.map
 
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
     shapes = ((1024, 128),)
     AutoTuner._find_nearest_profile(shapes, _build_num_tokens_tuning_config(mapper.map))
-    cache_before = AutoTuner._find_nearest_profile.cache_info()
+    cache_before = AutoTuner._find_nearest_profile_cached.cache_info()
 
     N = 1_000
     for _ in range(N):
@@ -1246,8 +1313,8 @@ def test_find_nearest_profile_cache_dedups_recreated_bound_method():
             shapes, _build_num_tokens_tuning_config(mapper.map)
         )
 
-    cache_after = AutoTuner._find_nearest_profile.cache_info()
-    AutoTuner._find_nearest_profile.cache_clear()
+    cache_after = AutoTuner._find_nearest_profile_cached.cache_info()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     assert cache_after.currsize == cache_before.currsize
     assert cache_after.misses == cache_before.misses
@@ -1265,11 +1332,11 @@ def _build_moe_style_tuning_config(topk_ids_initializer):
                 dim_idx=(0, 0),
                 gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192, 1),
                 map_to_tuning_buckets=make_hybrid_bucket_mapper(8192),
-                tensor_initializers=[
-                    autotuner_initializer_randn,
-                    topk_ids_initializer,
-                ],
             ),
+        ),
+        tensor_initializers=(
+            (0, autotuner_initializer_randn),
+            (1, topk_ids_initializer),
         ),
     )
 
@@ -1281,21 +1348,23 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     # The factory must return the identical object for the same expert count.
     assert _moe_topk_ids_init(128) is _moe_topk_ids_init(128)
 
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
     shapes = ((1024, 4096), (1024, 8))
 
     AutoTuner._find_nearest_profile(
         shapes, _build_moe_style_tuning_config(_moe_topk_ids_init(128))
     )
-    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+    cache_before = AutoTuner._find_nearest_profile_cached.cache_info().currsize
 
     N = 1_000
     for _ in range(N):
         config = _build_moe_style_tuning_config(_moe_topk_ids_init(128))
         AutoTuner._find_nearest_profile(shapes, config)
 
-    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
-    AutoTuner._find_nearest_profile.cache_clear()
+    cache_growth = (
+        AutoTuner._find_nearest_profile_cached.cache_info().currsize - cache_before
+    )
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     assert cache_growth == 0, (
         f"Cache grew by {cache_growth} entries across {N} rebuilds of an "
@@ -1346,17 +1415,15 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
         config_a = runner._make_tuning_config(moe_inputs)
         config_b = runner._make_tuning_config(moe_inputs)
 
-        spec_a = config_a.dynamic_tensor_specs[0]
-        spec_b = config_b.dynamic_tensor_specs[0]
         topk_idx = MoeRunnerInputs.idx("topk_ids")
-        init_a = spec_a.tensor_initializers[spec_a.input_idx.index(topk_idx)]
-        init_b = spec_b.tensor_initializers[spec_b.input_idx.index(topk_idx)]
+        init_a = dict(config_a.tensor_initializers)[topk_idx]
+        init_b = dict(config_b.tensor_initializers)[topk_idx]
 
         assert init_a is init_b, (
             "_make_tuning_config returned a different topk_ids initializer object "
-            "on each call. It must reuse _moe_topk_ids_init(num_experts) so that "
-            "rebuilt TuningConfigs collapse to the same _find_nearest_profile "
-            "lru_cache key — a per-call closure reintroduces the memory leak."
+            "on each call. It must reuse _moe_topk_ids_init(num_experts) so an "
+            "equivalent config reuses one initializer object instead of allocating "
+            "a fresh closure on every call."
         )
     finally:
         fn.cache_clear()
@@ -1364,7 +1431,7 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
 
 def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatch):
     """Initializers do not affect profile selection or its cache key."""
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
     shapes = ((1024, 4096), (1024, 8))
 
     def make_fresh_closure():
@@ -1375,11 +1442,10 @@ def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatc
 
     ref_config = _build_moe_style_tuning_config(make_fresh_closure())
     other_config = _build_moe_style_tuning_config(make_fresh_closure())
-    assert hash(ref_config) == hash(other_config), "hashes should match"
     assert ref_config != other_config, "equality should fail on fresh closures"
 
     AutoTuner._find_nearest_profile(shapes, ref_config)
-    cache_before = AutoTuner._find_nearest_profile.cache_info()
+    cache_before = AutoTuner._find_nearest_profile_cached.cache_info()
 
     original_eq = TuningConfig.__eq__
     eq_calls = 0
@@ -1396,8 +1462,8 @@ def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatc
         config = _build_moe_style_tuning_config(make_fresh_closure())
         AutoTuner._find_nearest_profile(shapes, config)
 
-    cache_after = AutoTuner._find_nearest_profile.cache_info()
-    AutoTuner._find_nearest_profile.cache_clear()
+    cache_after = AutoTuner._find_nearest_profile_cached.cache_info()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     assert cache_after.currsize == cache_before.currsize
     assert cache_after.misses == cache_before.misses
@@ -1428,11 +1494,9 @@ def _call_build_mla_decode_tuning_config():
 def test_mla_decode_tuning_config_is_memoized():
     """Equivalent MLA-decode dispatcher calls must reuse one TuningConfig object.
 
-    A fresh config per call embeds two fresh initializer closures; those hash
-    identically to but never compare equal with previous ones, so each call
-    would leak one _find_nearest_profile cache entry and lookups would scan the
-    whole collision chain (observed as GC gen-2 pause growth and decaying
-    decode throughput in serving).
+    Memoizing on (buckets, num_pages, profile_seq_len) keeps a single config
+    object and its initializer closures alive across dispatcher calls, avoiding
+    a per-call rebuild on the decode hot path.
     """
     _mla_decode_tuning_config.cache_clear()
     try:
@@ -1442,26 +1506,39 @@ def test_mla_decode_tuning_config_is_memoized():
         assert config_a is config_b, (
             "_build_mla_decode_tuning_config returned a different TuningConfig "
             "object for equivalent arguments. It must memoize on "
-            "(buckets, num_pages, profile_seq_len) so rebuilt configs collapse to "
-            "the same _find_nearest_profile lru_cache key — a per-call config "
-            "reintroduces the memory leak."
+            "(buckets, num_pages, profile_seq_len) so equivalent dispatcher calls "
+            "reuse one config object instead of rebuilding it each call."
         )
+        assert set(dict(config_a.tensor_initializers)) == {1, 2}
     finally:
         _mla_decode_tuning_config.cache_clear()
+
+
+def test_sparse_mla_tuning_config_initializer_indices():
+    """Sparse MLA configs retain each initializer's original input index."""
+
+    assert set(dict(_decode_dsv4_tuning_config().tensor_initializers)) == {
+        0,
+        1,
+        6,
+        8,
+        9,
+    }
+    assert set(dict(_decode_dsv3_2_tuning_config().tensor_initializers)) == {0, 1, 6}
 
 
 def test_find_nearest_profile_cache_dedups_mla_decode_config():
     """Regression test: rebuilt MLA-decode configs must collapse to a single
     _find_nearest_profile cache entry.
     """
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
     _mla_decode_tuning_config.cache_clear()
     try:
         # [query, block_tables, seq_lens, out] as passed by the MLA dispatcher.
         shapes = ((8, 4, 128, 576), (8, 64), (8,), (8, 4, 128, 512))
 
         AutoTuner._find_nearest_profile(shapes, _call_build_mla_decode_tuning_config())
-        cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+        cache_before = AutoTuner._find_nearest_profile_cached.cache_info().currsize
 
         N = 1_000
         for _ in range(N):
@@ -1470,7 +1547,7 @@ def test_find_nearest_profile_cache_dedups_mla_decode_config():
             )
 
         cache_growth = (
-            AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+            AutoTuner._find_nearest_profile_cached.cache_info().currsize - cache_before
         )
 
         assert cache_growth == 0, (
@@ -1478,5 +1555,5 @@ def test_find_nearest_profile_cache_dedups_mla_decode_config():
             "equivalent MLA-decode tuning config with a fixed shape."
         )
     finally:
-        AutoTuner._find_nearest_profile.cache_clear()
+        AutoTuner._find_nearest_profile_cached.cache_clear()
         _mla_decode_tuning_config.cache_clear()
