@@ -7,10 +7,14 @@ Current features:
 sequential compilation of kernels that can occupy 95% of the test's wall time.
 """
 
+import contextlib
+import logging
 import os
 
 import pytest
 import torch
+
+logger = logging.getLogger(__name__)
 
 _XQA_FILE = "test_trtllm_gen_attention_decode_xqa.py"
 
@@ -64,8 +68,9 @@ def pytest_collection_modifyitems(session, config, items):
             continue
         try:
             spec = gen_xqa_module(**kwargs)
-        except Exception:
-            continue  # unsupported config the test would also skip
+        except ValueError as e:
+            logger.debug("xqa-prebuild: skipping unsupported config %s: %s", kwargs, e)
+            continue
         specs[spec.name] = spec
 
     specs = list(specs.values())
@@ -78,25 +83,50 @@ def pytest_collection_modifyitems(session, config, items):
             f"[xqa-prebuild] compiling {len(specs)} XQA kernels in parallel..."
         )
 
-    # One ninja graph, built in parallel; skip_prebuilt reuses anything already AOT'd.
-    build_jit_specs(specs, verbose=False)
+    # Any failure here (e.g. compilation failure) must not abort collection
+    # for the whole suite. Fall back to the normal per-test first-touch JIT path,
+    # where a genuinely broken kernel surfaces as its own test failure instead.
+    try:
+        # One ninja graph, built in parallel; skip_prebuilt reuses anything already AOT'd.
+        build_jit_specs(specs, verbose=False)
 
-    # Stage each freshly-built .so into the AOT path so build_and_load loads it
-    # directly (no per-module ninja dependency scan at test time).
-    staged = 0
-    for s in specs:
-        src = s.jit_library_path
-        dst = s.aot_path
-        if dst.exists() or not src.exists():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.link(src, dst)  # hardlink: instant, same filesystem
-        except OSError:
-            import shutil
+        # Stage each freshly-built .so into the AOT path so build_and_load loads it
+        # directly (no per-module ninja dependency scan at test time).
+        staged = 0
+        for s in specs:
+            src = s.jit_library_path
+            dst = s.aot_path
+            if dst.exists() or not src.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(src, dst)  # hardlink: atomic + instant, same filesystem
+            except FileExistsError:
+                continue  # another worker staged it first; nothing to do
+            except OSError:
+                # Cross-filesystem (or link unsupported): copy to a temp file in
+                # the destination dir, then atomically rename into place so a
+                # concurrent worker never observes a partially written .so.
+                import shutil
+                import tempfile
 
-            shutil.copy2(src, dst)
-        staged += 1
+                fd, tmp = tempfile.mkstemp(dir=str(dst.parent), suffix=".tmp")
+                os.close(fd)
+                try:
+                    shutil.copy2(src, tmp)
+                    os.replace(tmp, dst)  # atomic on the same filesystem
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+                    continue
+            staged += 1
+    except Exception as e:
+        if reporter:
+            reporter.write_line(
+                f"[xqa-prebuild] prebuild failed ({e!r}); falling back to "
+                "per-test JIT compilation."
+            )
+        return
 
     if reporter:
         reporter.write_line(
