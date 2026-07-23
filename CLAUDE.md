@@ -563,6 +563,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
+| `FLASHINFER_ALLOW_UNSAFE_GRAPH_CAPTURE` | unset | `flashinfer/utils.py` | Non-zero / non-empty value disables the `RuntimeError` raised when a wrapper's `run()` is captured into a CUDA graph although the wrapper was constructed with `use_cuda_graph=False`. Escape hatch only — a graph captured in this mode replays against stale plan buffers and can silently produce wrong output. |
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120.py` | Override the disk path for MLA AutoTuner cache files. Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
