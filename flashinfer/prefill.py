@@ -448,7 +448,7 @@ def get_single_prefill_module(backend, *args):
 
 
 @functools.cache
-def get_batch_prefill_module(backend, *args):
+def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
@@ -457,8 +457,10 @@ def get_batch_prefill_module(backend, *args):
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
-        uri = get_batch_prefill_uri(backend, *args)
-        module = gen_batch_prefill_module(backend, *args).build_and_load()
+        uri = get_batch_prefill_uri(backend, *args, dtype_k=dtype_k, dtype_v=dtype_v)
+        module = gen_batch_prefill_module(
+            backend, *args, dtype_k=dtype_k, dtype_v=dtype_v
+        ).build_and_load()
         plan_func = module.plan
         workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run

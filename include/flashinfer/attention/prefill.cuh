@@ -25,6 +25,8 @@
 #endif
 #include <cuda_runtime.h>
 
+#include <type_traits>
+
 #include "../cp_async.cuh"
 #include "../fastdiv.cuh"
 #ifdef FP16_QK_REDUCTION_SUPPORTED
@@ -2462,6 +2464,13 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                                cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  // Asymmetric K/V plumbing: the prefill kernel body still assumes a single
+  // KV element type for shared-memory layout, swizzle mode selection, and
+  // FP8 dequantization. Guard until the kernel body splits DTypeK/DTypeV;
+  // asymmetric K/V is currently supported by the decode kernels only.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
+                "SinglePrefillWithKVCacheDispatched does not yet support "
+                "asymmetric K/V dtypes; only decode kernels do");
   using DTypeO = typename Params::DTypeO;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
@@ -4069,6 +4078,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
                                                     cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  // Asymmetric K/V plumbing; see SinglePrefillWithKVCacheDispatched above.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
+                "BatchPrefillWithRaggedKVCacheDispatched does not yet support "
+                "asymmetric K/V dtypes; only decode kernels do");
   using DTypeO = typename Params::DTypeO;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
@@ -4271,6 +4284,10 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                                                    cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  // Asymmetric K/V plumbing; see SinglePrefillWithKVCacheDispatched above.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
+                "BatchPrefillWithPagedKVCacheDispatched does not yet support "
+                "asymmetric K/V dtypes; only decode kernels do");
   using DTypeO = typename Params::DTypeO;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
