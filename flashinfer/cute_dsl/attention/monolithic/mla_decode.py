@@ -158,8 +158,19 @@ def _check_can_implement(
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
 ) -> None:
     """Check if the kernel supports the given configuration (cached)."""
+    if not isinstance(enable_dcp, bool):
+        raise TypeError(f"enable_dcp must be a bool, got {type(enable_dcp).__name__}")
+    if not isinstance(cp_world, int) or isinstance(cp_world, bool) or cp_world <= 0:
+        raise ValueError(f"cp_world must be a positive integer, got {cp_world!r}")
+    if not enable_dcp and cp_world != 1:
+        raise ValueError(
+            f"cp_world={cp_world} requires enable_dcp=True; disabled DCP uses cp_world=1"
+        )
+
     mma_qk_tiler_mn = (128, 128)
     mma_pv_tiler_mn = (128, 256)
 
@@ -214,13 +225,15 @@ def _get_compiled_mla_kernel(
     skip_correction_threshold: float = 0.0,
     is_workspace_size_zero: bool = False,
     enable_pdl: bool = False,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
     Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
     page_table, o, lse, workspace, split_kv_scalar, cache_seqs,
-    cum_seq_lens_q, block_split_kvs, softmax_scale_scalar,
-    output_scale_scalar).
+    cum_seq_lens_q, causal_seqlens_kv_global, cp_rank_scalar,
+    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
@@ -259,6 +272,8 @@ def _get_compiled_mla_kernel(
         seq_len_q=seq_len_q,
         reducer_d_tiles=reducer_d_tiles,
         reducer_max_splits=reducer_max_splits,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -383,6 +398,19 @@ def _get_compiled_mla_kernel(
         )
     else:
         cum_seq_lens_q_fake = None
+
+    # DCP's causal boundary is global while cache_seqs remains the physical
+    # rank-local length used for paging and split-K traversal. Keep the tensor
+    # absent from the disabled specialization so no load or pointer argument
+    # reaches its generated device code.
+    if enable_dcp:
+        causal_seqlens_kv_global_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_batch,),
+            assumed_align=4,
+        )
+    else:
+        causal_seqlens_kv_global_fake = None
     # block_split_kvs: [batch_size] — int32 (only needed for is_var_split_kv=True)
     if is_var_split_kv:
         block_split_kvs_fake = cute.runtime.make_fake_compact_tensor(
@@ -408,6 +436,8 @@ def _get_compiled_mla_kernel(
         Int32(1),  # split_kv placeholder
         cache_seqs_fake,
         cum_seq_lens_q_fake,
+        causal_seqlens_kv_global_fake,
+        Int32(0),  # cp_rank placeholder (runtime-uniform, not a JIT key)
         block_split_kvs_fake,
         Float32(1.0),  # softmax_scale placeholder
         Float32(1.0),  # output_scale placeholder
@@ -438,6 +468,10 @@ def cute_dsl_mla_decode(
     return_lse: bool = False,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -514,6 +548,17 @@ def cute_dsl_mla_decode(
         synchronization and makes the call CUDA-graph-capturable. It must be
         at least the largest request query length; the compiled kernel is
         specialized to this capacity.
+    enable_dcp : bool
+        Enable static cyclic decode context-parallel masking. DCP returns a
+        rank-local attention state and therefore requires ``return_lse=True``.
+    cp_world : int
+        Compile-time context-parallel world size. The local cache owns global
+        token positions ``cp_world * local_k + cp_rank``.
+    cp_rank : int
+        Runtime-uniform context-parallel rank.
+    causal_seqlens_kv_global : Optional[torch.Tensor]
+        Contiguous CUDA int32 tensor ``[B]`` containing the global exclusive
+        causal bound for the newest query token. Required when DCP is enabled.
     Returns
     -------
     torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
@@ -530,6 +575,8 @@ def cute_dsl_mla_decode(
     )
     is_var_q = cum_seq_lens_q is not None
     if is_var_q:
+        if query.ndim != 3:
+            raise ValueError("query must have shape [total_q, num_heads, head_dim_qk]")
         total_q, H, D_qk = query.shape
         B = cum_seq_lens_q.numel() - 1
         if max_q_len is None:
@@ -540,9 +587,75 @@ def cute_dsl_mla_decode(
         q_len = max_q_len
         cum_seq_lens_q = cum_seq_lens_q.contiguous()
     else:
+        if query.ndim != 4:
+            raise ValueError(
+                "query must have shape "
+                "[batch_size, q_len_per_request, num_heads, head_dim_qk]"
+            )
         B, q_len, H, D_qk = query.shape
         total_q = B * q_len
     assert D_qk == kv_lora_rank + qk_rope_head_dim
+
+    if not isinstance(enable_dcp, bool):
+        raise TypeError(f"enable_dcp must be a bool, got {type(enable_dcp).__name__}")
+    if not isinstance(cp_world, int) or isinstance(cp_world, bool) or cp_world <= 0:
+        raise ValueError(f"cp_world must be a positive integer, got {cp_world!r}")
+    if not isinstance(cp_rank, int) or isinstance(cp_rank, bool):
+        raise TypeError(f"cp_rank must be an integer, got {type(cp_rank).__name__}")
+
+    if enable_dcp:
+        if is_var_q:
+            raise ValueError("DCP does not support cum_seq_lens_q / max_q_len")
+        if not 0 <= cp_rank < cp_world:
+            raise ValueError(
+                f"cp_rank must satisfy 0 <= cp_rank < cp_world, got "
+                f"cp_rank={cp_rank}, cp_world={cp_world}"
+            )
+        if not return_lse:
+            raise ValueError(
+                "enable_dcp=True requires return_lse=True so rank-local states "
+                "can be merged with their LSE values"
+            )
+        if causal_seqlens_kv_global is None:
+            raise ValueError(
+                "causal_seqlens_kv_global is required when enable_dcp=True"
+            )
+        if not isinstance(causal_seqlens_kv_global, torch.Tensor):
+            raise TypeError(
+                "causal_seqlens_kv_global must be a torch.Tensor, got "
+                f"{type(causal_seqlens_kv_global).__name__}"
+            )
+        if causal_seqlens_kv_global.dtype != torch.int32:
+            raise ValueError(
+                "causal_seqlens_kv_global must have dtype torch.int32, got "
+                f"{causal_seqlens_kv_global.dtype}"
+            )
+        if not causal_seqlens_kv_global.is_cuda:
+            raise ValueError("causal_seqlens_kv_global must be a CUDA tensor")
+        if causal_seqlens_kv_global.device != query.device:
+            raise ValueError(
+                "causal_seqlens_kv_global must be on the query device "
+                f"{query.device}, got {causal_seqlens_kv_global.device}"
+            )
+        if tuple(causal_seqlens_kv_global.shape) != (B,):
+            raise ValueError(
+                f"causal_seqlens_kv_global must have shape ({B},), got "
+                f"{tuple(causal_seqlens_kv_global.shape)}"
+            )
+        if not causal_seqlens_kv_global.is_contiguous():
+            raise ValueError("causal_seqlens_kv_global must be contiguous")
+    else:
+        nondefault = []
+        if cp_world != 1:
+            nondefault.append(f"cp_world={cp_world}")
+        if cp_rank != 0:
+            nondefault.append(f"cp_rank={cp_rank}")
+        if causal_seqlens_kv_global is not None:
+            nondefault.append("causal_seqlens_kv_global")
+        if nondefault:
+            raise ValueError(
+                "DCP arguments require enable_dcp=True; got " + ", ".join(nondefault)
+            )
 
     # Each request's Q descriptor flattens (query_token, head) into one affine
     # row mode. Adjacent tokens must therefore follow all H head rows.
@@ -700,6 +813,8 @@ def cute_dsl_mla_decode(
         is_persistent=is_persistent,
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
     )
 
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
@@ -724,6 +839,8 @@ def cute_dsl_mla_decode(
         skip_correction_threshold=skip_correction_threshold,
         is_workspace_size_zero=is_workspace_size_zero,
         enable_pdl=enable_pdl,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
     )
 
     # Call the kernel
@@ -739,6 +856,8 @@ def cute_dsl_mla_decode(
         Int32(split_kv),
         cache_seqs,
         cum_seq_lens_q,
+        causal_seqlens_kv_global,
+        Int32(cp_rank),
         block_split_kvs,
         Float32(softmax_scale),
         Float32(output_scale),
