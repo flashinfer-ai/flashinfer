@@ -87,7 +87,7 @@ STATEFUL_ADAPTERS: dict[str, StatefulAdapter] = {
         },
     ),
     "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run": _MLA_STATEFUL_ADAPTER,
-    "flashinfer.mla._batch_mla._core.BatchMLAPagedAttentionWrapper.run": (
+    "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run": (
         _MLA_STATEFUL_ADAPTER
     ),
 }

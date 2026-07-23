@@ -74,9 +74,7 @@ mla_paged_decode_trace = _mla_paged_decode_trace
 xqa_batch_decode_mla_trace = _xqa_batch_decode_mla_trace
 MaskMode = _MaskMode
 determine_mla_backend = _determine_mla_backend
-get_trtllm_gen_multi_ctas_kv_counter_bytes = (
-    _get_trtllm_gen_multi_ctas_kv_counter_bytes
-)
+get_trtllm_gen_multi_ctas_kv_counter_bytes = _get_trtllm_gen_multi_ctas_kv_counter_bytes
 xqa_mla = _xqa_mla
 
 
@@ -466,8 +464,6 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     if return_lse:
         return out, user_lse if user_lse is not None else out_lse
     return out
-
-
 
 
 def _normalize_dsv4_sparse_mla_kv_cache(
@@ -1138,29 +1134,22 @@ def trtllm_batch_decode_sparse_mla_dsv4(
 _trtllm_batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
 
 
-# These aliases preserve root `_core` lookups for implementations owned by Batch MLA.
-from ._batch_mla._core import (
-    BatchMLAPagedAttentionWrapper as _BatchMLAPagedAttentionWrapper,
-    CuteDslMlaDecodeRunner as _CuteDslMlaDecodeRunner,
-    TrtllmGenMlaDecodeRunner as _TrtllmGenMlaDecodeRunner,
+# Re-export internal Batch MLA implementations through the package façade.
+from ._batch_mla._functional import (
+    CuteDslMlaDecodeRunner as CuteDslMlaDecodeRunner,
+    TrtllmGenMlaDecodeRunner as TrtllmGenMlaDecodeRunner,
     _run_mla_decode_cute_dsl,
     _run_mla_decode_trtllm_gen,
     _run_mla_decode_trtllm_gen_or_cute_dsl_impl,
     _run_mla_decode_xqa,
-    get_batch_mla_module as _get_batch_mla_module,
-    get_mla_module as _get_mla_module,
-    get_trtllm_gen_fmha_module as _get_trtllm_gen_fmha_module,
-    xqa_batch_decode_with_kv_cache_mla as _xqa_batch_decode_with_kv_cache_mla,
+    get_batch_mla_module as get_batch_mla_module,
+    get_mla_module as get_mla_module,
+    get_trtllm_gen_fmha_module as get_trtllm_gen_fmha_module,
+    xqa_batch_decode_with_kv_cache_mla as xqa_batch_decode_with_kv_cache_mla,
 )
-
-
-BatchMLAPagedAttentionWrapper = _BatchMLAPagedAttentionWrapper
-CuteDslMlaDecodeRunner = _CuteDslMlaDecodeRunner
-TrtllmGenMlaDecodeRunner = _TrtllmGenMlaDecodeRunner
-get_batch_mla_module = _get_batch_mla_module
-get_mla_module = _get_mla_module
-get_trtllm_gen_fmha_module = _get_trtllm_gen_fmha_module
-xqa_batch_decode_with_kv_cache_mla = _xqa_batch_decode_with_kv_cache_mla
+from ._batch_mla._wrapper import (
+    BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper,
+)
 
 
 def _run_mla_decode_sparse(
@@ -1198,8 +1187,7 @@ def _run_mla_decode_sparse(
         )
     if multi_ctas_kv_counter_buffer is not None:
         raise ValueError(
-            "multi_ctas_kv_counter_buffer is only supported by the "
-            "trtllm-gen backend"
+            "multi_ctas_kv_counter_buffer is only supported by the trtllm-gen backend"
         )
     del (
         max_seq_len,

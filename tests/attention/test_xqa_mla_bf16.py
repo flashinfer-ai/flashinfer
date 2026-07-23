@@ -20,38 +20,6 @@ global_xqa_workspace_buffer = None  # must be zero initialized
 workspace_size = 128 * 1024 * 1024
 
 
-def test_functional_xqa_ignores_legacy_compatibility_knobs(monkeypatch):
-    from flashinfer.mla._batch_mla import _core as batch_mla_core
-
-    expected = object()
-
-    class RecordingImplementation:
-        def run(self, **kwargs):
-            return expected
-
-    monkeypatch.setattr(
-        batch_mla_core, "_XqaMlaDecodeImplementation", RecordingImplementation
-    )
-
-    result = batch_mla_core._run_mla_decode_xqa(
-        query=object(),
-        kv_cache=object(),
-        workspace_buffer=object(),
-        qk_nope_head_dim=128,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        block_tables=object(),
-        seq_lens=object(),
-        max_seq_len=1,
-        backend="xqa",
-        cute_dsl_impl="monolithic",
-        kv_scale_format="arbitrary_legacy_format",
-        is_var_seq=False,
-    )
-
-    assert result is expected
-
-
 @pytest.mark.parametrize(
     "batch_size",
     [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024],

@@ -9,16 +9,21 @@ You may obtain a copy of the License at
 """
 
 import math
-from typing import Callable, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
 from flashinfer._backend import _BackendPlanUnsupportedError
 from flashinfer.utils import get_compute_capability
 
+from .._planning import (
+    _audit_plan_from_wrapper_arguments,
+    _MLAGeneratedFaWorkspace,
+    _MLAPlanArguments,
+    _MLAWrapperPlanResult,
+)
 from ._fa_common import (
     _BatchMLAGeneratedFaMechanics,
-    _BatchMLAGeneratedFaWorkspace,
     get_batch_mla_module,
 )
 
@@ -31,13 +36,12 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
-        generated_fa_workspace: _BatchMLAGeneratedFaWorkspace,
+        generated_fa_workspace: _MLAGeneratedFaWorkspace,
         use_cuda_graph: bool,
         qo_indptr: Optional[torch.Tensor],
         kv_indptr: Optional[torch.Tensor],
         kv_indices: Optional[torch.Tensor],
         kv_len_arr: Optional[torch.Tensor],
-        before_metadata_commit: Optional[Callable[[], None]],
     ) -> None:
         self._backend = "fa3"
         super().__init__(
@@ -48,8 +52,57 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
             kv_indptr,
             kv_indices,
             kv_len_arr,
-            before_metadata_commit,
         )
+
+    @classmethod
+    @_audit_plan_from_wrapper_arguments
+    def plan_from_wrapper(cls, args: _MLAPlanArguments) -> _MLAWrapperPlanResult:
+        args._generated_fa_workspace.raise_if_invalid()
+        enable_pdl = args.enable_pdl
+        is_var_seq = args.is_var_seq
+        cute_dsl_impl = args.cute_dsl_impl
+        use_sinks = args.use_sinks
+        qk_nope_head_dim = args.qk_nope_head_dim
+        if enable_pdl:
+            raise ValueError("enable_pdl is not supported by the fa3 wrapper backend.")
+        if is_var_seq is not None:
+            raise ValueError("is_var_seq is not supported by the fa3 wrapper backend.")
+        if cute_dsl_impl != "auto":
+            raise ValueError(
+                "cute_dsl_impl is not supported by the fa3 wrapper backend."
+            )
+        if use_sinks:
+            raise ValueError("use_sinks is not supported by the fa3 wrapper backend.")
+        if qk_nope_head_dim is not None:
+            raise ValueError(
+                "qk_nope_head_dim is only supported with trtllm-gen backend."
+            )
+        csr = args.csr
+        backend = cls(
+            args._float_workspace_buffer,
+            args._generated_fa_workspace,
+            args._use_cuda_graph,
+            args._qo_indptr_buf,
+            args._kv_indptr_buf,
+            args._kv_indices_buf,
+            args._kv_len_arr_buf,
+        )
+        backend.plan(
+            qo_indptr=csr.qo_indptr,
+            kv_indptr=csr.kv_indptr,
+            kv_indices=csr.kv_indices,
+            kv_len_arr=csr.kv_len_arr,
+            num_heads=args.num_heads,
+            head_dim_ckv=args.head_dim_ckv,
+            head_dim_kpe=args.head_dim_kpe,
+            page_size=args.page_size,
+            causal=args.causal,
+            sm_scale=args.sm_scale,
+            q_data_type=args.q_data_type,
+            kv_data_type=args.kv_data_type,
+            use_profiler=args.use_profiler,
+        )
+        return _MLAWrapperPlanResult(backend_impl=backend)
 
     def plan(
         self,
@@ -176,4 +229,60 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
             return_lse_base_on_e=return_lse_base_on_e,
             ckv_scale=ckv_scale_f,
             kpe_scale=kpe_scale_f,
+        )
+
+    def run_from_wrapper(
+        self,
+        *,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+        out: Optional[torch.Tensor],
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
+        profiler_buffer: Optional[torch.Tensor],
+        kv_len: Optional[torch.Tensor],
+        page_table: Optional[torch.Tensor],
+        return_lse_base_on_e: bool,
+        o_scale: Optional[float],
+        ckv_scale: Optional[float],
+        kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor],
+        skip_softmax_threshold_scale_factor: Optional[float],
+        bmm1_scale: Optional[Union[float, torch.Tensor]],
+        bmm2_scale: Optional[Union[float, torch.Tensor]],
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        self._generated_fa_workspace.raise_if_invalid()
+        if sinks is not None:
+            raise ValueError("sinks are not supported by the fa3 wrapper backend.")
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "skip_softmax_threshold_scale_factor is not supported by the "
+                "fa3 wrapper backend."
+            )
+        if bmm1_scale is not None:
+            raise ValueError("bmm1_scale is not supported by the fa3 wrapper backend.")
+        if bmm2_scale is not None:
+            raise ValueError("bmm2_scale is not supported by the fa3 wrapper backend.")
+        if kv_len is not None:
+            raise ValueError("kv_len is only supported with cutlass backend.")
+        if page_table is not None:
+            raise ValueError("page_table is only supported with cutlass backend.")
+        if o_scale is not None:
+            raise ValueError(
+                "o_scale is only supported with the cutlass backend for now."
+            )
+        return self.run(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            ckv_cache=ckv_cache,
+            kpe_cache=kpe_cache,
+            out=out,
+            lse=lse,
+            return_lse=return_lse,
+            profiler_buffer=profiler_buffer,
+            return_lse_base_on_e=return_lse_base_on_e,
+            ckv_scale=ckv_scale,
+            kpe_scale=kpe_scale,
         )

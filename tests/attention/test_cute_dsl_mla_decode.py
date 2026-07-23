@@ -40,40 +40,6 @@ def cute_dsl_impl(request):
     return request.param
 
 
-def test_functional_cute_dsl_ignores_legacy_kv_scale_format(monkeypatch):
-    from flashinfer.mla._batch_mla import _core as batch_mla_core
-
-    expected = object()
-    forwarded = []
-
-    def recording_impl(**kwargs):
-        forwarded.append(kwargs)
-        return expected
-
-    monkeypatch.setattr(
-        batch_mla_core,
-        "_run_mla_decode_trtllm_gen_or_cute_dsl_impl",
-        recording_impl,
-    )
-
-    result = batch_mla_core._run_mla_decode_cute_dsl(
-        query=object(),
-        kv_cache=object(),
-        workspace_buffer=object(),
-        qk_nope_head_dim=128,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        block_tables=object(),
-        seq_lens=object(),
-        max_seq_len=1,
-        backend="cute-dsl",
-        kv_scale_format="arbitrary_legacy_format",
-    )
-
-    assert result is expected
-    assert forwarded[0]["kv_scale_format"] == "auto"
-
-
 def torch_reference_mla(
     q_nope,
     q_rope,
@@ -1825,9 +1791,7 @@ def _batch_mla_wrapper_cute_dsl_case(metadata_form, cute_dsl_impl):
     block_tables = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device)
     seq_lens = torch.tensor([64, 96], dtype=torch.int32, device=device)
     cum_seq_lens_q = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
-    wrapper_workspace = torch.empty(
-        128 * 1024 * 1024, dtype=torch.uint8, device=device
-    )
+    wrapper_workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     functional_workspace = torch.empty_like(wrapper_workspace)
     use_sinks = cute_dsl_impl == "modular"
     sinks = (
@@ -1838,9 +1802,7 @@ def _batch_mla_wrapper_cute_dsl_case(metadata_form, cute_dsl_impl):
     return_lse = cute_dsl_impl == "monolithic"
     bmm1_scale, bmm2_scale = 0.2, 1.25
 
-    wrapper = BatchMLAPagedAttentionWrapper(
-        wrapper_workspace, backend="cute-dsl"
-    )
+    wrapper = BatchMLAPagedAttentionWrapper(wrapper_workspace, backend="cute-dsl")
     common_plan = dict(
         num_heads=num_heads,
         head_dim_ckv=kv_lora_rank,

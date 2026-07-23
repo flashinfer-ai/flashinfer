@@ -25,6 +25,7 @@ import torch
 from flashinfer.jit import gen_batch_mla_module
 
 from ....utils import MaskMode, check_shape_dtype_device
+from .._planning import _MLAGeneratedFaWorkspace
 
 
 @functools.cache
@@ -96,7 +97,9 @@ class _BatchMLAGeneratedFaWorkspace:
     ) -> torch.Tensor:
         """Commit a successfully planned staging buffer and return its run buffer."""
         if planned_buffer is not self._staging_int_workspace_buffer:
-            raise ValueError("generated FA plan did not use the current staging buffer.")
+            raise ValueError(
+                "generated FA plan did not use the current staging buffer."
+            )
 
         if self._live_int_workspace_buffer is None:
             self._live_int_workspace_buffer = planned_buffer
@@ -115,13 +118,12 @@ class _BatchMLAGeneratedFaMechanics:
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
-        generated_fa_workspace: _BatchMLAGeneratedFaWorkspace,
+        generated_fa_workspace: _MLAGeneratedFaWorkspace,
         use_cuda_graph: bool,
         qo_indptr: Optional[torch.Tensor],
         kv_indptr: Optional[torch.Tensor],
         kv_indices: Optional[torch.Tensor],
         kv_len_arr: Optional[torch.Tensor],
-        before_metadata_commit: Optional[Callable[[], None]],
     ) -> None:
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -136,7 +138,6 @@ class _BatchMLAGeneratedFaMechanics:
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
         self._kv_len_arr_buf = kv_len_arr
-        self._before_metadata_commit = before_metadata_commit
 
     def _validate_metadata_tensor(self, name: str, tensor: torch.Tensor) -> None:
         if not isinstance(tensor, torch.Tensor):
@@ -255,16 +256,14 @@ class _BatchMLAGeneratedFaMechanics:
     def _metadata_copy_is_exact_alias(
         cls, destination: torch.Tensor, source: torch.Tensor
     ) -> bool:
-        return cls._metadata_byte_range(destination) == cls._metadata_byte_range(
-            source
-        )
+        return cls._metadata_byte_range(destination) == cls._metadata_byte_range(source)
 
     @classmethod
     def _preflight_cuda_graph_metadata_copies(
         cls,
         pairs: Tuple[Tuple[str, torch.Tensor, torch.Tensor], ...],
     ) -> None:
-        regions = []
+        regions: list[Tuple[int, str, str, torch.Tensor, Tuple[int, int]]] = []
         for pair_index, (name, destination, source) in enumerate(pairs):
             regions.extend(
                 (
@@ -374,7 +373,7 @@ class _BatchMLAGeneratedFaMechanics:
             kv_len_arr=kv_len_arr,
         )
 
-        metadata_pairs = ()
+        metadata_pairs: Tuple[Tuple[str, torch.Tensor, torch.Tensor], ...] = ()
         if self._use_cuda_graph:
             metadata_pairs = self._metadata_copy_pairs(
                 qo_indptr=qo_indptr,
@@ -409,9 +408,6 @@ class _BatchMLAGeneratedFaMechanics:
             head_dim_ckv,  # head_dim_o
             causal,
         )
-
-        if self._before_metadata_commit is not None:
-            self._before_metadata_commit()
 
         int_workspace_buffer = self._commit_generated_fa_plan(
             planning_int_workspace_buffer,

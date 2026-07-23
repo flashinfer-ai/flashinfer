@@ -11,16 +11,16 @@ You may obtain a copy of the License at
 import functools
 import logging
 import math
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 
 from flashinfer._backend import _BackendPlanUnsupportedError
 from flashinfer.jit.mla import gen_mla_module
 from .._planning import (
-    _CSRPlanMetadata,
-    _DensePlanMetadata,
-    _max_q_len,
+    _audit_plan_from_wrapper_arguments,
+    _MLAPlanArguments,
+    _MLAWrapperPlanResult,
 )
 from flashinfer.utils import check_shape_dtype_device, get_compute_capability
 
@@ -86,45 +86,6 @@ def _validate_cutlass_metadata(
         )
 
 
-def _validate_cutlass_plan_metadata(
-    kv_len: torch.Tensor,
-    page_table: torch.Tensor,
-    *,
-    csr: _CSRPlanMetadata,
-    page_size: int,
-    device: torch.device,
-) -> _DensePlanMetadata:
-    """Validate legacy CUTLASS metadata and its logical equivalence to CSR."""
-    batch_size = csr.qo_indptr.numel() - 1
-    _validate_cutlass_metadata(
-        kv_len,
-        page_table,
-        batch_size=batch_size,
-        page_size=page_size,
-        device=device,
-    )
-    if not torch.equal(kv_len, csr.kv_len_arr):
-        raise ValueError("CUTLASS kv_len must equal CSR kv_len_arr.")
-
-    kv_indptr_host = csr.kv_indptr.to(device="cpu", dtype=torch.int64)
-    for row in range(batch_size):
-        start = int(kv_indptr_host[row].item())
-        end = int(kv_indptr_host[row + 1].item())
-        if not torch.equal(
-            page_table[row, : end - start], csr.kv_indices[start:end]
-        ):
-            raise ValueError(
-                "CUTLASS live page_table entries must equal CSR page lists."
-            )
-
-    return _DensePlanMetadata(
-        cum_seq_lens_q=csr.qo_indptr,
-        block_tables=page_table,
-        seq_lens=kv_len,
-        max_q_len=_max_q_len(csr.qo_indptr),
-    )
-
-
 def _is_same_tensor_view(actual: torch.Tensor, planned: torch.Tensor) -> bool:
     return (
         actual.shape == planned.shape
@@ -183,6 +144,66 @@ class _BatchMLAPagedAttentionCutlassBackend:
         self._backend = "cutlass"
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+
+    @classmethod
+    @_audit_plan_from_wrapper_arguments
+    def plan_from_wrapper(cls, args: _MLAPlanArguments) -> _MLAWrapperPlanResult:
+        enable_pdl = args.enable_pdl
+        is_var_seq = args.is_var_seq
+        cute_dsl_impl = args.cute_dsl_impl
+        use_sinks = args.use_sinks
+        qk_nope_head_dim = args.qk_nope_head_dim
+        if enable_pdl:
+            raise ValueError(
+                "enable_pdl is not supported by the cutlass wrapper backend."
+            )
+        if is_var_seq is not None:
+            raise ValueError(
+                "is_var_seq is not supported by the cutlass wrapper backend."
+            )
+        if cute_dsl_impl != "auto":
+            raise ValueError(
+                "cute_dsl_impl is not supported by the cutlass wrapper backend."
+            )
+        if use_sinks:
+            raise ValueError(
+                "use_sinks is not supported by the cutlass wrapper backend."
+            )
+        if qk_nope_head_dim is not None:
+            raise ValueError(
+                "qk_nope_head_dim is only supported with trtllm-gen backend."
+            )
+        if (
+            not isinstance(args.page_size, int)
+            or isinstance(args.page_size, bool)
+            or args.page_size <= 0
+        ):
+            raise ValueError(
+                f"page_size must be a positive int, got {args.page_size!r}."
+            )
+        if args.page_size > 128 or 128 % args.page_size != 0:
+            raise ValueError(
+                "cutlass dense metadata requires page_size to divide 128, "
+                f"got {args.page_size}."
+            )
+        dense = args.dense(table_width_alignment=128 // args.page_size)
+        batch_size = dense.cum_seq_lens_q.shape[0] - 1
+        backend = cls(args._float_workspace_buffer)
+        backend.plan(
+            num_heads=args.num_heads,
+            head_dim_ckv=args.head_dim_ckv,
+            head_dim_kpe=args.head_dim_kpe,
+            page_size=args.page_size,
+            causal=args.causal,
+            sm_scale=args.sm_scale,
+            q_data_type=args.q_data_type,
+            kv_data_type=args.kv_data_type,
+            use_profiler=args.use_profiler,
+            batch_size=batch_size,
+            kv_len=dense.seq_lens,
+            page_table=dense.block_tables,
+        )
+        return _MLAWrapperPlanResult(backend_impl=backend)
 
     def plan(
         self,
@@ -307,6 +328,159 @@ class _BatchMLAPagedAttentionCutlassBackend:
             "page_table metadata."
         )
         return kv_len, page_table
+
+    @staticmethod
+    def _validate_wrapper_run_options(
+        *,
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
+        profiler_buffer: Optional[torch.Tensor],
+        return_lse_base_on_e: bool,
+        ckv_scale: Optional[float],
+        kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor],
+        skip_softmax_threshold_scale_factor: Optional[float],
+        bmm1_scale: Optional[Union[float, torch.Tensor]],
+        bmm2_scale: Optional[Union[float, torch.Tensor]],
+    ) -> None:
+        if sinks is not None:
+            raise ValueError("sinks are not supported by the cutlass wrapper backend.")
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "skip_softmax_threshold_scale_factor is not supported by the "
+                "cutlass wrapper backend."
+            )
+        if bmm1_scale is not None:
+            raise ValueError(
+                "bmm1_scale is not supported by the cutlass wrapper backend."
+            )
+        if bmm2_scale is not None:
+            raise ValueError(
+                "bmm2_scale is not supported by the cutlass wrapper backend."
+            )
+        if return_lse:
+            raise ValueError("return_lse is not supported with cutlass backend.")
+        if lse is not None:
+            raise ValueError("lse is not supported with cutlass backend.")
+        if profiler_buffer is not None:
+            raise ValueError("profiler_buffer is not supported with cutlass backend.")
+        if return_lse_base_on_e:
+            raise ValueError(
+                "return_lse_base_on_e is not supported with cutlass backend."
+            )
+        if ckv_scale is not None or kpe_scale is not None:
+            raise ValueError(
+                "ckv_scale / kpe_scale are only supported with the fa3 backend "
+                "and FP8 kv_data_type."
+            )
+
+    def run_from_wrapper(
+        self,
+        *,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+        out: Optional[torch.Tensor],
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
+        profiler_buffer: Optional[torch.Tensor],
+        kv_len: Optional[torch.Tensor],
+        page_table: Optional[torch.Tensor],
+        return_lse_base_on_e: bool,
+        o_scale: Optional[float],
+        ckv_scale: Optional[float],
+        kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor],
+        skip_softmax_threshold_scale_factor: Optional[float],
+        bmm1_scale: Optional[Union[float, torch.Tensor]],
+        bmm2_scale: Optional[Union[float, torch.Tensor]],
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        self._validate_wrapper_run_options(
+            lse=lse,
+            return_lse=return_lse,
+            profiler_buffer=profiler_buffer,
+            return_lse_base_on_e=return_lse_base_on_e,
+            ckv_scale=ckv_scale,
+            kpe_scale=kpe_scale,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+        )
+        return self.run(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            ckv_cache=ckv_cache,
+            kpe_cache=kpe_cache,
+            out=out,
+            kv_len=kv_len,
+            page_table=page_table,
+            o_scale=o_scale,
+        )
+
+    @classmethod
+    def run_unplanned_from_wrapper(
+        cls,
+        float_workspace_buffer: torch.Tensor,
+        *,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+        out: Optional[torch.Tensor],
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
+        profiler_buffer: Optional[torch.Tensor],
+        kv_len: Optional[torch.Tensor],
+        page_table: Optional[torch.Tensor],
+        return_lse_base_on_e: bool,
+        o_scale: Optional[float],
+        ckv_scale: Optional[float],
+        kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor],
+        skip_softmax_threshold_scale_factor: Optional[float],
+        bmm1_scale: Optional[Union[float, torch.Tensor]],
+        bmm2_scale: Optional[Union[float, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Run the deprecated explicit-CUTLASS compatibility path without plan()."""
+        cls._validate_wrapper_run_options(
+            lse=lse,
+            return_lse=return_lse,
+            profiler_buffer=profiler_buffer,
+            return_lse_base_on_e=return_lse_base_on_e,
+            ckv_scale=ckv_scale,
+            kpe_scale=kpe_scale,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+        )
+        backend = cls(float_workspace_buffer)
+        backend.plan(
+            num_heads=q_nope.shape[1],
+            head_dim_ckv=q_nope.shape[2],
+            head_dim_kpe=q_pe.shape[2],
+            page_size=ckv_cache.shape[1],
+            causal=False,
+            sm_scale=1.0 / math.sqrt(128 + q_pe.shape[2]),
+            q_data_type=q_nope.dtype,
+            kv_data_type=ckv_cache.dtype,
+            use_profiler=False,
+            batch_size=q_nope.shape[0],
+            kv_len=None,
+            page_table=None,
+        )
+        return backend.run(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            ckv_cache=ckv_cache,
+            kpe_cache=kpe_cache,
+            out=out,
+            kv_len=kv_len,
+            page_table=page_table,
+            o_scale=o_scale,
+        )
 
     def run(
         self,
