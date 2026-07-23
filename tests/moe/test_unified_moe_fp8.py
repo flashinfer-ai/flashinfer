@@ -712,4 +712,5 @@ def test_fp8_per_tensor_cuda_graph_replay():
     with torch.cuda.graph(graph):
         runner.forward(inputs)
     graph.replay()
+    torch.cuda.synchronize()
     _assert_per_tensor_fp8_close(inputs[0], ref)
