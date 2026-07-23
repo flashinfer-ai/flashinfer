@@ -313,44 +313,49 @@ class MaskedScheduler:
         ]
         accum_tile_m = self._accum_tile_m
         batch_idx = self._current_batch_idx
+        num_batches = self.params.masked_m.shape[0]
 
-        while (
-            (
-                accum_tile_m
-                + cute.ceil_div(
-                    self.params.masked_m[batch_idx],
-                    self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
-                )
-            )
-            * num_tiles_n
-            <= current_work_linear_idx
-            and batch_idx < self.params.masked_m.shape[0]
-        ):
-            if cutlass.const_expr(
-                (dsm_pending_packed is not None)
-                and (self.params.dst_signals is not None)
-            ):
-                dsm_pending_packed = with_byte(
-                    dsm_pending_packed,
-                    index=batch_idx,
-                    value=dsm_counter + (num_c_stage - 1),
-                )
-
-            accum_tile_m += cute.ceil_div(
+        # NOTE: `masked_m[batch_idx]` must only be read under a control-flow
+        # guard that `batch_idx` is in bounds. A combined condition like
+        # `masked_m[batch_idx] ... and batch_idx < num_batches` is NOT safe:
+        # dynamic `and` in the DSL may evaluate both operands (no Python
+        # short-circuit), so `masked_m[num_batches]` could be read
+        # out-of-bounds once all batches are consumed, causing illegal
+        # memory access (CUDA error 700).
+        keep_running = batch_idx < num_batches
+        while keep_running:
+            num_tiles_m_cur = cute.ceil_div(
                 self.params.masked_m[batch_idx],
                 self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
             )
-            batch_idx += Int32(1)
+            if (accum_tile_m + num_tiles_m_cur) * num_tiles_n <= (
+                current_work_linear_idx
+            ):
+                if cutlass.const_expr(
+                    (dsm_pending_packed is not None)
+                    and (self.params.dst_signals is not None)
+                ):
+                    dsm_pending_packed = with_byte(
+                        dsm_pending_packed,
+                        index=batch_idx,
+                        value=dsm_counter + (num_c_stage - 1),
+                    )
+
+                accum_tile_m += num_tiles_m_cur
+                batch_idx += Int32(1)
+                keep_running = batch_idx < num_batches
+            else:
+                keep_running = cutlass.Boolean(False)
 
         self._accum_tile_m = accum_tile_m
         self._current_batch_idx = batch_idx
 
-        is_valid = self._current_batch_idx < self.params.masked_m.shape[0]
+        is_valid = batch_idx < num_batches
         if is_valid:
             is_valid = (
-                self._accum_tile_m
+                accum_tile_m
                 + cute.ceil_div(
-                    self.params.masked_m[self._current_batch_idx],
+                    self.params.masked_m[batch_idx],
                     self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
                 )
             ) * num_tiles_n > current_work_linear_idx
@@ -361,14 +366,14 @@ class MaskedScheduler:
         if cutlass.const_expr(is_swap_ab):
             cur_cluster_coord = (
                 current_work_linear_idx % num_tiles_n,
-                current_work_linear_idx // num_tiles_n - self._accum_tile_m,
-                self._current_batch_idx,
+                current_work_linear_idx // num_tiles_n - accum_tile_m,
+                batch_idx,
             )
         else:
             cur_cluster_coord = (
-                current_work_linear_idx // num_tiles_n - self._accum_tile_m,
+                current_work_linear_idx // num_tiles_n - accum_tile_m,
                 current_work_linear_idx % num_tiles_n,
-                self._current_batch_idx,
+                batch_idx,
             )
 
         # cur_tile_coord is a tuple of i32 values
