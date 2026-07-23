@@ -339,8 +339,12 @@ class Sm100W4A16GroupedGemmKernel:
                 transform_tidx,
             )
         )
-        tAsA_input = tAsA_input[(None, transform_group_idx, None, None, None)]
-        tAsA_transform = tAsA_transform[(None, transform_group_idx, None, None, None)]
+        tAsA_input = cute.logical_divide(tAsA_input, (None, None, None, 2, None))[
+            (None, None, None, (transform_group_idx, None), None)
+        ]
+        tAsA_transform = cute.logical_divide(
+            tAsA_transform, (None, None, None, 2, None)
+        )[(None, None, None, (transform_group_idx, None), None)]
 
         a_stage_coord = (None,) * (cute.rank(tAsA_input) - 1) + (0,)
         tArA = cute.make_rmem_tensor(
@@ -354,7 +358,9 @@ class Sm100W4A16GroupedGemmKernel:
 
         smem_thr_copy_S = src_copy_a.get_slice(transform_tidx)
         tSsS_trans = smem_thr_copy_S.partition_S(tCsS)
-        tSsS_trans = tSsS_trans[(None, transform_group_idx, None, None, None)]
+        tSsS_trans = cute.logical_divide(tSsS_trans, (None, None, None, 2, None))[
+            (None, None, None, (transform_group_idx, None), None)
+        ]
         scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (0,)
         tSsS_layout_per_stage = tSsS_trans[scale_stage_coord].layout
         tSrS_copy = cute.make_rmem_tensor(
@@ -1091,10 +1097,10 @@ class Sm100W4A16GroupedGemmKernel:
         copy_atom_a_input = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), self.a_dtype, num_bits_per_copy=32
         )
-        # Split each transformed tile across two four-warp TMEM store groups.
+        # Split complete NVFP4 blocks between two transform warpgroups.
         copy_atom_a_transform = cute.make_copy_atom(
             tcgen05.St32x32bOp(
-                tcgen05.Repetition(4),
+                tcgen05.Repetition(8),
                 tcgen05.Unpack.NONE,
             ),
             self.mma_dtype,
