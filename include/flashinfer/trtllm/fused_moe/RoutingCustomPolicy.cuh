@@ -386,8 +386,12 @@ struct SumNormalizePostprocess {
   }
 };
 
-/// ScaledSumNormalize: recovers un-biased sigmoid scores by subtracting per-expert bias from the
-/// selection scores (sigmoid + bias), then normalizes by sum and applies routeScale.
+/// ScaledSumNormalize: normalizes un-biased sigmoid scores by sum and applies
+/// routeScale. SigmoidBias selection uses sigmoid(raw) + bias as the top-K key,
+/// but final weights must use sigmoid(raw). Warp-per-token routing recomputes
+/// selected sigmoid(raw) from raw logits to avoid cancellation when a tiny
+/// sigmoid is rounded away by a large bias; block-per-token routing reads the
+/// same un-biased sigmoid from smemAux.
 /// Used by DeepSeek-style routing: final_weight = sigmoid(raw) * routeScale / (sum + epsilon).
 /// DeepSeek uses epsilon=0 (no guard); MiniMax2 uses epsilon=1e-20 to prevent division by zero.
 struct ScaledSumNormalizePostprocess {
@@ -428,6 +432,28 @@ struct ScaledSumNormalizePostprocess {
                                    : 0.f;
     float sigmoidScore =
         laneIdx < topK ? (static_cast<float>(warpTopKScore[laneIdx]) - biasVal) : 0.f;
+    float sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    if (laneIdx < topK) {
+      warpTopKScore[laneIdx] =
+          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+    }
+  }
+
+  /// Warp-per-token variant with access to the original raw scores. SigmoidBias
+  /// selection uses sigmoid(raw) + bias as the topK key, but final weights must
+  /// be normalized from the un-biased sigmoid(raw). Recomputing sigmoid(raw)
+  /// avoids lossy recovery when a tiny sigmoid is rounded away by a large bias.
+  template <typename DataType, typename InputType, int K, typename ParamsT>
+  __forceinline__ __device__ static void applyWithScores(
+      cg::thread_block_tile<WarpSize> const& warp, DataType (&warpTopKScore)[K],
+      int32_t const (&warpTopKExpertIdx)[K], int32_t laneIdx, int32_t topK,
+      InputType const* ptrScores, ParamsT const& params) {
+    float sigmoidScore = 0.f;
+    if (laneIdx < topK) {
+      int32_t const expertIdx = warpTopKExpertIdx[laneIdx];
+      sigmoidScore = sigmoid_accurate(static_cast<float>(ptrScores[expertIdx]));
+    }
+
     float sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
     if (laneIdx < topK) {
       warpTopKScore[laneIdx] =
@@ -566,8 +592,14 @@ struct TopKExpertSelect {
     topk::reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, score, idx, minScore, topK);
 
     // Apply postprocess (e.g. renormalize, softmax over top-K, scaled renormalize, ...)
-    PostprocessPolicy_::apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK,
-                              params.mExpertSelectParams.mPostprocessParams);
+    if constexpr (std::is_same_v<PostprocessPolicy_, ScaledSumNormalizePostprocess>) {
+      PostprocessPolicy_::template applyWithScores<DataType, InputType, K>(
+          warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, ptrScores,
+          params.mExpertSelectParams.mPostprocessParams);
+    } else {
+      PostprocessPolicy_::apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK,
+                                params.mExpertSelectParams.mPostprocessParams);
+    }
   }
 };
 

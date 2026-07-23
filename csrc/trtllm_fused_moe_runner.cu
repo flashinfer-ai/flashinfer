@@ -78,11 +78,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeBias = dtypeBias;
     routingData.mRouteScale = routedScalingFactor;
     // Floor the renorm denominator. ScaledSumNormalizePostprocess computes
-    // sigmoid * routeScale / (sum + mSumEpsilon). If a token's top-K selected experts all have
-    // strongly negative pre-bias logits, their sigmoids underflow to exactly 0.0 (bf16) so sum ==
-    // 0, and mSumEpsilon's 0.0f default makes this 0/0 = NaN across the token's whole output row.
-    // 1e-20f matches DeepSeek-V3's reference gate (modeling_deepseek.py: sum + 1e-20) and the
-    // MiniMax2 branch.
+    // sigmoid(raw) * routeScale / (sum + mSumEpsilon). If every selected
+    // expert contributes a zero unbiased sigmoid, either from true sigmoid
+    // underflow or from a lossy fallback recovery of (sigmoid + bias) - bias,
+    // the 0.0f default makes this 0/0 = NaN across the token's output row.
+    // 1e-20f matches the adjacent MiniMax2 path and prevents that zero
+    // denominator case.
     routingData.mSumEpsilon = 1e-20f;
 
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
