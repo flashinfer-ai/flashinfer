@@ -505,8 +505,9 @@ class TrtllmFp4RoutedRunner(MoERunner):
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
         elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
-            # Mode 3: both routing tensors are caller-owned kernel inputs. Keep
-            # global ids intact; the launcher applies local_expert_offset.
+            # UnpackedPrecomputed: both routing tensors are caller-owned kernel
+            # inputs. Keep global ids intact; the launcher applies
+            # local_expert_offset.
             _validate_prerouted_inputs(
                 act,
                 num_tokens,
