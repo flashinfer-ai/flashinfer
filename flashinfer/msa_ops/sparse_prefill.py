@@ -58,11 +58,11 @@ def msa_sparse_attention(
     the union of the blocks its tokens selected, writing the final output
     directly. The union metadata is built internally from ``q2k_indices``.
 
-    ``q``/``k``/``v`` are ``(total_tokens, num_heads, head_dim)`` with varlen
-    offsets ``cu_seqlens_q``/``cu_seqlens_k``; ``q2k_indices`` is
-    ``(num_kv_heads, total_q, topk)`` int32 (ascending, ``-1`` padded). ``q`` is
-    bf16/fp16; ``k``/``v`` are bf16/fp16, fp8 (E4M3), or packed NVFP4 (uint8 with
-    ``k_scale``/``v_scale``), in GQA or MHA layouts, flat or paged.
+    ``q`` is bf16/fp16; ``k``/``v`` are bf16/fp16, fp8 (E4M3), or packed NVFP4
+    (uint8 with ``k_scale``/``v_scale``), in GQA or MHA layouts, flat or paged.
+    Packed NVFP4 stores two values per byte, so its K/V last dimension is
+    ``head_dim // 2`` instead of ``head_dim``. ``q2k_indices`` is
+    ``(num_kv_heads, total_q, topk)`` int32 (ascending, ``-1`` padded).
 
     Parameters
     ----------
@@ -70,9 +70,10 @@ def msa_sparse_attention(
         Query tensor of shape ``(total_q, num_qo_heads, head_dim)`` with dtype
         bf16/fp16.
     k : torch.Tensor
-        Key tensor. In the dense path, shape is
-        ``(total_k, num_kv_heads, head_dim)``. In the paged path, shape is
-        ``(num_pages, num_kv_heads, 128, head_dim)``.
+        Key tensor. For bf16/fp16/fp8, the flat shape is
+        ``(total_k, num_kv_heads, head_dim)`` and the paged shape is
+        ``(num_pages, num_kv_heads, 128, head_dim)``. Packed NVFP4 uses
+        ``head_dim // 2`` for the last dimension in both layouts.
     v : torch.Tensor
         Value tensor with the same layout conventions as ``k``.
     q2k_indices : torch.Tensor
@@ -99,15 +100,19 @@ def msa_sparse_attention(
         Whether to also return the natural-log LSE with shape
         ``(total_q, num_qo_heads)``.
     k_scale : Optional[torch.Tensor], default=None
-        Per-block or per-tensor scale for NVFP4-packed keys.
+        NVFP4 only: the ``torch.uint8`` byte view (``sf.view(torch.uint8)``) of
+        the E4M3 block-scale tensor produced by
+        :func:`flashinfer.nvfp4_quantize` with ``sf_vec_size=16`` and the
+        swizzled 128x4 layout (one scale per 16 elements, with rows padded to a
+        multiple of 128). Scale rows follow ``(token, head)`` order for flat K
+        and ``(page, head, token)`` order for paged K.
     v_scale : Optional[torch.Tensor], default=None
-        Per-block or per-tensor scale for NVFP4-packed values.
+        NVFP4 block scales for V, with the same dtype, layout, and row-order
+        contract as ``k_scale``.
     k_global_scale : Optional[float], default=None
-        Global dequantization scale for fp8/NVFP4 keys when required by the
-        selected kernel path.
+        Per-tensor NVFP4 global dequantization scale for K.
     v_global_scale : Optional[float], default=None
-        Global dequantization scale for fp8/NVFP4 values when required by the
-        selected kernel path.
+        Per-tensor NVFP4 global dequantization scale for V.
     q_offset : optional
         Optional per-query offset tensor used by specific MSA workflows.
     return_temperature_lse : bool, default=False
@@ -119,9 +124,12 @@ def msa_sparse_attention(
     Returns
     -------
     torch.Tensor or tuple of torch.Tensor
-        Output ``(total_q, num_qo_heads, head_dim)``; plus LSE if
-        ``return_softmax_lse``; plus temperature LSE if
-        ``return_temperature_lse``.
+        ``out`` has shape ``(total_q, num_qo_heads, head_dim)``. If
+        ``return_temperature_lse=True``, returns ``(out, lse, lse_t)``
+        regardless of ``return_softmax_lse``. Otherwise, setting
+        ``return_softmax_lse=True`` returns ``(out, lse)``; when both flags are
+        false, returns ``out``. Each returned LSE tensor has shape
+        ``(total_q, num_qo_heads)`` and dtype float32.
     """
     if not is_sm12x_supported(q.device):
         raise RuntimeError(

@@ -28,4 +28,3 @@ Kernels for LLM sampling.
     top_k_renorm_probs
     top_k_mask_logits
     chain_speculative_sampling
-    _radix_top_k
