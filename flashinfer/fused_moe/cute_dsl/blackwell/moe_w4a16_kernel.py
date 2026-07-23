@@ -34,7 +34,7 @@ then executes BF16 tensor-core MMA with FP32 accumulation.
 """
 
 from math import ceil, log2
-from typing import Optional
+from typing import Optional, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -102,6 +102,7 @@ class Sm100W4A16GroupedGemmKernel:
                 f"unsupported W4A16 epilogue activation: {activation_type}"
             )
         self.fuse_activation = activation_type is not None
+        self.use_clc_scheduler = self.fuse_activation
         self.gated = activation_type == ActivationType.Swiglu.value
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
@@ -245,6 +246,7 @@ class Sm100W4A16GroupedGemmKernel:
             self.transform_a_source,
             self.smem_buffer_align_bytes,
             self.use_fused_finalize,
+            self.use_clc_scheduler,
         )
 
         # Align TMEM columns for allocation
@@ -496,6 +498,7 @@ class Sm100W4A16GroupedGemmKernel:
             self.cta_tile_shape_mnk_c,
             self.cluster_shape_mn,
             max_active_clusters,
+            self.use_clc_scheduler,
         )
 
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
@@ -536,6 +539,8 @@ class Sm100W4A16GroupedGemmKernel:
             tile_info_empty_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_tile_info_stage
             ]
+            clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+            clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 4], 16]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
@@ -610,7 +615,10 @@ class Sm100W4A16GroupedGemmKernel:
         b_smem_layout: cute.ComposedLayout,
         c_smem_layout_staged: cute.ComposedLayout,
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params: Union[
+            utils.ClcDynamicPersistentTileSchedulerParams,
+            utils.PersistentTileSchedulerParams,
+        ],
     ):
         """Run the persistent W4A16 grouped GEMM."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -629,6 +637,7 @@ class Sm100W4A16GroupedGemmKernel:
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
+        is_first_cta_in_cluster = cta_rank_in_cluster == 0
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
             cta_rank_in_cluster
         )
@@ -709,6 +718,20 @@ class Sm100W4A16GroupedGemmKernel:
             ),
             defer_sync=True,
         )
+        clc_pipeline = None
+        if cutlass.const_expr(self.use_clc_scheduler):
+            clc_pipeline = pipeline.PipelineClcFetchAsync.create(
+                barrier_storage=storage.clc_mbar_ptr.data_ptr(),
+                num_stages=1,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    32 * cute.size(self.cluster_shape_mn),
+                ),
+                tx_count=16,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
 
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
@@ -928,63 +951,125 @@ class Sm100W4A16GroupedGemmKernel:
         # Tile scheduling is independent of the preceding grid.
         if warp_idx == self.schedule_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_schedule_warp)
-            tile_sched = utils.StaticPersistentRuntimeTileScheduler.create(
-                tile_sched_params,
-                (bidx, bidy, bidz),
-                cute.arch.grid_dim(),
-                inner_mode=0,
-            )
-            work_tile = tile_sched.initial_work_tile_info()
             tile_info_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_tile_info_stage
             )
             num_non_exiting_tiles_value = num_non_exiting_tiles[0]
-            not_last_tile = cutlass.Boolean(1)
-            while not_last_tile:
-                tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                cluster_tile_coord_mnl = work_tile.tile_idx
-                cta_tile_coord_m = (
-                    cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
-                    + block_in_cluster_coord_vmnk[1] * cute.size(tiled_mma.thr_id.shape)
-                    + block_in_cluster_coord_vmnk[0]
+            if cutlass.const_expr(self.use_clc_scheduler):
+                tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
+                    tile_sched_params,
+                    (bidx, bidy, bidz),
+                    cute.arch.grid_dim(),
+                    storage.clc_response.data_ptr(),
                 )
-                cta_tile_offset_n = block_in_cluster_coord_vmnk[2]
-                route_tile_idx = (
-                    cluster_tile_coord_mnl[1] * self.cluster_shape_mn[1]
-                    + cta_tile_offset_n
+                work_tile = tile_sched.initial_work_tile_info()
+                clc_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.ProducerConsumer, 1
                 )
-                cur_sTile_info = sTile_info[(None, tile_info_producer_state.index)]
-                not_last_tile = work_tile.is_valid_tile and (
-                    route_tile_idx < num_non_exiting_tiles_value
+                clc_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, 1
                 )
-                route_start = cutlass.Int32(-1)
-                group_idx = cutlass.Int32(group_count)
-                distance_to_boundary = cutlass.Int32(-1)
-                if not_last_tile:
-                    route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
-                    group_idx = tile_idx_to_expert_idx[route_tile_idx]
-                    distance_to_boundary = (
-                        tile_idx_to_mn_limit[route_tile_idx] - route_start
+                not_last_tile = cutlass.Boolean(1)
+                while not_last_tile:
+                    tile_coord_mnl = work_tile.tile_idx
+                    route_tile_idx = tile_coord_mnl[1]
+                    is_routed_tile = work_tile.is_valid_tile and (
+                        route_tile_idx < num_non_exiting_tiles_value
                     )
-                # Store tile info into shared memory buffer
-                with cute.arch.elect_one():
-                    cur_sTile_info[0] = cta_tile_coord_m
-                    cur_sTile_info[1] = route_start
-                    cur_sTile_info[2] = group_idx
-                    cur_sTile_info[3] = distance_to_boundary
-                # Fence and barrier to ensure tile info store has finished
-                cute.arch.fence_proxy(
-                    "async.shared",
-                    space="cta",
-                )
-                self.sched_sync_barrier.arrive_and_wait()
-                # Commit tile info pipeline
-                tile_info_pipeline.producer_commit(tile_info_producer_state)
-                tile_info_producer_state.advance()
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
 
-            tile_info_pipeline.producer_tail(tile_info_producer_state)
+                    if is_routed_tile or not work_tile.is_valid_tile:
+                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
+
+                    if work_tile.is_valid_tile and is_first_cta_in_cluster:
+                        clc_pipeline.producer_acquire(clc_producer_state)
+                        tile_sched.advance_to_next_work(
+                            clc_pipeline.producer_get_barrier(clc_producer_state)
+                        )
+                        clc_producer_state.advance()
+
+                    if is_routed_tile or not work_tile.is_valid_tile:
+                        cur_sTile_info = sTile_info[
+                            (None, tile_info_producer_state.index)
+                        ]
+                        route_start = cutlass.Int32(-1)
+                        group_idx = cutlass.Int32(group_count)
+                        distance_to_boundary = cutlass.Int32(-1)
+                        if is_routed_tile:
+                            route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
+                            group_idx = tile_idx_to_expert_idx[route_tile_idx]
+                            distance_to_boundary = (
+                                tile_idx_to_mn_limit[route_tile_idx] - route_start
+                            )
+                        with cute.arch.elect_one():
+                            cur_sTile_info[0] = tile_coord_mnl[0]
+                            cur_sTile_info[1] = route_start
+                            cur_sTile_info[2] = group_idx
+                            cur_sTile_info[3] = distance_to_boundary
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.sched_sync_barrier.arrive_and_wait()
+                        tile_info_pipeline.producer_commit(tile_info_producer_state)
+                        tile_info_producer_state.advance()
+
+                    if work_tile.is_valid_tile:
+                        clc_pipeline.consumer_wait(clc_consumer_state)
+                        work_tile = tile_sched.get_current_work()
+                        clc_pipeline.consumer_release(clc_consumer_state)
+                        clc_consumer_state.advance()
+                    else:
+                        not_last_tile = cutlass.Boolean(0)
+
+                tile_info_pipeline.producer_tail(tile_info_producer_state)
+                if is_first_cta_in_cluster:
+                    clc_pipeline.producer_tail(clc_producer_state)
+            else:
+                tile_sched = utils.StaticPersistentRuntimeTileScheduler.create(
+                    tile_sched_params,
+                    (bidx, bidy, bidz),
+                    cute.arch.grid_dim(),
+                    inner_mode=0,
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+                not_last_tile = cutlass.Boolean(1)
+                while not_last_tile:
+                    tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                    cluster_tile_coord_mnl = work_tile.tile_idx
+                    cta_tile_coord_m = (
+                        cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
+                        + block_in_cluster_coord_vmnk[1]
+                        * cute.size(tiled_mma.thr_id.shape)
+                        + block_in_cluster_coord_vmnk[0]
+                    )
+                    cta_tile_offset_n = block_in_cluster_coord_vmnk[2]
+                    route_tile_idx = (
+                        cluster_tile_coord_mnl[1] * self.cluster_shape_mn[1]
+                        + cta_tile_offset_n
+                    )
+                    not_last_tile = work_tile.is_valid_tile and (
+                        route_tile_idx < num_non_exiting_tiles_value
+                    )
+                    route_start = cutlass.Int32(-1)
+                    group_idx = cutlass.Int32(group_count)
+                    distance_to_boundary = cutlass.Int32(-1)
+                    if not_last_tile:
+                        route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
+                        group_idx = tile_idx_to_expert_idx[route_tile_idx]
+                        distance_to_boundary = (
+                            tile_idx_to_mn_limit[route_tile_idx] - route_start
+                        )
+                    cur_sTile_info = sTile_info[(None, tile_info_producer_state.index)]
+                    with cute.arch.elect_one():
+                        cur_sTile_info[0] = cta_tile_coord_m
+                        cur_sTile_info[1] = route_start
+                        cur_sTile_info[2] = group_idx
+                        cur_sTile_info[3] = distance_to_boundary
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    self.sched_sync_barrier.arrive_and_wait()
+                    tile_info_pipeline.producer_commit(tile_info_producer_state)
+                    tile_info_producer_state.advance()
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+
+                tile_info_pipeline.producer_tail(tile_info_producer_state)
 
         # The activation TMA warp is the only role that waits on the preceding grid.
         if warp_idx == self.activation_tma_warp_id:
@@ -2022,6 +2107,7 @@ class Sm100W4A16GroupedGemmKernel:
         transform_a_source: tcgen05.OperandSource,
         smem_buffer_align_bytes: int,
         use_fused_finalize: bool,
+        use_clc_scheduler: bool,
     ) -> tuple[int, int, int, int, int, int, int]:
         """
         Compute pipeline stages and TMEM column allocation configurations.
@@ -2053,6 +2139,8 @@ class Sm100W4A16GroupedGemmKernel:
         :param use_fused_finalize: Whether the epilogue atomically reduces route
             outputs into token rows.
         :type use_fused_finalize: bool
+        :param use_clc_scheduler: Whether routed tiles use CLC dynamic scheduling.
+        :type use_clc_scheduler: bool
 
         :return: A tuple containing the number of stages for:
                  (load2trans, transform2mma, accumulator, c, tile_info, tmem_acc_cols, tmem_a_cols)
@@ -2089,8 +2177,8 @@ class Sm100W4A16GroupedGemmKernel:
         )
 
         bytes_per_pipeline_stage = 16
-        # Keep one routed tile ready while consumers process the other stages.
-        num_tile_info_stage = 3
+        # Limit how far CLC can claim work ahead of the consumer pipelines.
+        num_tile_info_stage = 1 if use_clc_scheduler else 3
         tile_info_bytes = (
             cute.size_in_bytes(cute.Int32, cute.make_layout((4, num_tile_info_stage)))
             + bytes_per_pipeline_stage * num_tile_info_stage
@@ -2234,7 +2322,14 @@ class Sm100W4A16GroupedGemmKernel:
         cta_tile_shape_mnk: tuple[int, int, int],
         cluster_shape_mn: tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
-    ) -> tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]:
+        use_clc_scheduler: bool,
+    ) -> tuple[
+        Union[
+            utils.ClcDynamicPersistentTileSchedulerParams,
+            utils.PersistentTileSchedulerParams,
+        ],
+        tuple[int, int, int],
+    ]:
         """
         Use persistent tile scheduler to compute the grid size for the output tensor C.
         """
@@ -2243,10 +2338,18 @@ class Sm100W4A16GroupedGemmKernel:
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
-        tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, cluster_shape_mnl
-        )
-        grid = (cluster_shape_mn[0], cluster_shape_mn[1], max_active_clusters)
+        if use_clc_scheduler:
+            tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
+                num_ctas_mnl, cluster_shape_mnl
+            )
+            grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
+                tile_sched_params
+            )
+        else:
+            tile_sched_params = utils.PersistentTileSchedulerParams(
+                num_ctas_mnl, cluster_shape_mnl
+            )
+            grid = (cluster_shape_mn[0], cluster_shape_mn[1], max_active_clusters)
 
         return tile_sched_params, grid
 
