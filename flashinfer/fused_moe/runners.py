@@ -62,7 +62,8 @@ def _validate_prerouted_inputs(
     top_k: int,
     runner: str,
     *,
-    expected_weights_dtype: torch.dtype | None = None,
+    allowed_weights_dtypes: tuple[torch.dtype, ...] | None = None,
+    require_contiguous: bool = False,
 ) -> None:
     """Runner-boundary validation for pre-routed packs.
 
@@ -74,8 +75,7 @@ def _validate_prerouted_inputs(
     """
     if act.topk_ids is None or act.topk_weights is None:
         raise ValueError(
-            f"{runner}: routing_input_mode=PackedPrecomputed requires "
-            "topk_ids + topk_weights."
+            f"{runner}: precomputed routing requires topk_ids + topk_weights."
         )
     if act.routing_logits is not None or act.routing_bias is not None:
         raise ValueError(
@@ -100,14 +100,14 @@ def _validate_prerouted_inputs(
             "(torch.topk returns int64 — cast before constructing the pack)."
         )
     if (
-        expected_weights_dtype is not None
-        and act.topk_weights.dtype != expected_weights_dtype
+        allowed_weights_dtypes is not None
+        and act.topk_weights.dtype not in allowed_weights_dtypes
     ):
+        allowed = " or ".join(str(dtype) for dtype in allowed_weights_dtypes)
         raise TypeError(
-            f"{runner}: topk_weights must be {expected_weights_dtype}, "
-            f"got {act.topk_weights.dtype}."
+            f"{runner}: topk_weights must be {allowed}, got {act.topk_weights.dtype}."
         )
-    if expected_weights_dtype is not None and (
+    if require_contiguous and (
         not act.topk_ids.is_contiguous() or not act.topk_weights.is_contiguous()
     ):
         raise ValueError(
@@ -513,7 +513,8 @@ class TrtllmFp4RoutedRunner(MoERunner):
                 num_tokens,
                 routing.top_k,
                 "TrtllmFp4RoutedRunner",
-                expected_weights_dtype=torch.bfloat16,
+                allowed_weights_dtypes=(torch.bfloat16, torch.float32),
+                require_contiguous=True,
             )
             routing_logits = None
             routing_bias = None
@@ -573,6 +574,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
         self.tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
+            routing_input_mode=routing_input_mode,
             # Match the canonical trtllm-gen wrappers' profiling regime so
             # choose_one() tunes under the same conditions as deployment
             # (otherwise it can cache a tactic picked under a different regime).

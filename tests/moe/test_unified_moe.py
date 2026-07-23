@@ -676,7 +676,8 @@ class TestActivationPackValidation:
         pack = MoEActivationPack(x, sf, ids, w)  # positional, pre-rename order
         assert pack.topk_ids is ids and pack.topk_weights is w
 
-    def test_valid_unpacked_prerouted(self):
+    @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+    def test_valid_unpacked_prerouted(self, weights_dtype):
         from flashinfer.fused_moe.core import RoutingInputMode
 
         x, sf, ids, w, _ = _pack_tensors()
@@ -684,11 +685,11 @@ class TestActivationPackValidation:
             x,
             sf,
             ids,
-            w.to(torch.bfloat16),
+            w.to(weights_dtype),
             routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
         )
         assert pack.topk_ids is ids
-        assert pack.topk_weights.dtype is torch.bfloat16
+        assert pack.topk_weights.dtype is weights_dtype
 
     def test_routing_fields_are_keyword_only(self):
         x, sf, ids, w, _ = _pack_tensors()
@@ -753,7 +754,7 @@ class TestActivationPackValidation:
         ("ids_transform", "weights_transform", "match"),
         [
             (lambda x: x.long(), lambda x: x.to(torch.bfloat16), "int32"),
-            (lambda x: x, lambda x: x.float(), "bfloat16"),
+            (lambda x: x, lambda x: x.half(), "bfloat16"),
             (lambda x: x[:, :1], lambda x: x.to(torch.bfloat16), "matching"),
             (
                 lambda x: x,
@@ -1533,7 +1534,8 @@ class TestTrtllmRoutedPackingContract:
 
 @sm100_required
 class TestTrtllmFp4UnpackedContract:
-    def test_pack_inputs_forwards_separate_routing_tensors(self):
+    @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+    def test_pack_inputs_forwards_separate_routing_tensors(self, weights_dtype):
         from flashinfer.fused_moe.core import MoeRunnerInputs, RoutingInputMode
 
         device = torch.device("cuda", torch.cuda.current_device())
@@ -1551,7 +1553,7 @@ class TestTrtllmFp4UnpackedContract:
         ids = torch.randint(
             32, 64, (num_tokens, top_k), dtype=torch.int32, device=device
         )
-        weights = torch.rand(num_tokens, top_k, dtype=torch.bfloat16, device=device)
+        weights = torch.rand(num_tokens, top_k, dtype=weights_dtype, device=device)
         act_pack = MoEActivationPack(
             hidden_states_q=torch.zeros(
                 num_tokens, hidden_size // 2, dtype=torch.uint8, device=device
@@ -1586,7 +1588,8 @@ class TestTrtllmFp4UnpackedContract:
         )
         assert runner._static_kwargs["local_expert_offset"] == 32
 
-    def test_cuda_graph_replay_matches_eager(self):
+    @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+    def test_cuda_graph_replay_matches_eager(self, weights_dtype):
         device = torch.device("cuda", torch.cuda.current_device())
         num_tokens, hidden_size, intermediate_size = 16, 256, 512
         num_experts, top_k = 8, 2
@@ -1611,7 +1614,7 @@ class TestTrtllmFp4UnpackedContract:
             hidden_states_q=tensors["x"],
             hidden_states_scale=tensors["x_sf"].squeeze(-1),
             topk_ids=tensors["token_selected_experts"],
-            topk_weights=tensors["token_final_scales"].to(torch.bfloat16),
+            topk_weights=tensors["token_final_scales"].to(weights_dtype),
             routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
         )
         weight_pack = MoEWeightPack()

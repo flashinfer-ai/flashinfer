@@ -676,7 +676,8 @@ class MoEActivationPack:
       tensor before launch.
     * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: currently
       supported by the TRTLLM FP4 runner. The caller supplies ``int32`` ids and
-      BF16 weights directly, avoiding packed-id construction.
+      BF16 or FP32 weights directly, avoiding packed-id construction. The
+      launcher consumes the weights in their native dtype.
     * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
@@ -697,8 +698,8 @@ class MoEActivationPack:
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
-    # [M, top_k] routing weights: float32 for PackedPrecomputed, bfloat16 for
-    # TRTLLM FP4 UnpackedPrecomputed.
+    # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
+    # float32 for TRTLLM FP4 UnpackedPrecomputed.
     topk_weights: Optional[Tensor] = None
     # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
     # call site fails loudly instead of silently binding a tensor to the mode.
@@ -762,9 +763,10 @@ class MoEActivationPack:
                     f"topk_ids must be torch.int32 (got {self.topk_ids.dtype}); "
                     "torch.topk returns int64 — cast before constructing the pack."
                 )
-            if self.topk_weights.dtype != torch.bfloat16:
+            if self.topk_weights.dtype not in (torch.bfloat16, torch.float32):
                 raise TypeError(
                     "UnpackedPrecomputed topk_weights must be torch.bfloat16 "
+                    "or torch.float32 "
                     f"(got {self.topk_weights.dtype})."
                 )
             expected = (self.hidden_states_q.shape[0],)

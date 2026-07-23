@@ -67,7 +67,7 @@ Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` 
   * **pre-routed** (RoutingInputMode.PackedPrecomputed): the host computes the top-k per method and
     feeds packed indices -- the original path.
   * **unpacked pre-routed** (RoutingInputMode.UnpackedPrecomputed): TRTLLM FP4 receives separate
-    int32 ids + bf16 weights without packed-id construction.
+    int32 ids + BF16 or FP32 weights without packed-id construction.
   * **in-kernel** (RoutingInputMode.FromLogits): the kernel routes from raw logits per
     RoutingConfig.method -- reaches the bug cluster the pre-routed harness structurally can't:
     DeepSeekV3 group-topk + bias (#2575), all-negative logits (#2822), fp32 router logits (#2796),
@@ -698,6 +698,7 @@ class Cfg:
     # "prerouted" (PackedPrecomputed) | "unpacked" | "fromlogits"
     routing_input_mode: str = "prerouted"
     logits_dtype: str = "bf16"  # "bf16" | "fp32" (#2796 fp32-router-logits class)
+    unpacked_weights_dtype: str = "bf16"  # "bf16" | "fp32"; unpacked mode only
     n_group: int = 0  # DeepSeekV3 group count (0 -> None)
     topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
     routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
@@ -723,9 +724,14 @@ class Cfg:
         ep = f"L{self.n_local}o{self.expert_offset}_" if self.is_ep else ""
         mode = "FL_" if self.is_fromlogits else "UP_" if self.is_unpacked else ""
         ld = "fp32_" if self.logits_dtype == "fp32" else ""
+        uwd = (
+            "wfp32_"
+            if self.is_unpacked and self.unpacked_weights_dtype == "fp32"
+            else ""
+        )
         grp = f"g{self.n_group}x{self.topk_group}_" if self.n_group else ""
         return (
-            f"{self.variant}_{mode}{self.routing_method.name}_{ld}{self.route}_"
+            f"{self.variant}_{mode}{self.routing_method.name}_{ld}{uwd}{self.route}_"
             f"e{self.num_experts}_{ep}{grp}k{self.top_k}_"
             f"t{self.num_tokens}_h{self.hidden}_i{self.intermediate}_s{self.seed}"
         )
@@ -932,11 +938,25 @@ _CURATED = [
         4,
         "nvfp4",
         "imbalanced",
-        900_017,
+        900_020,
         local_experts=32,
         expert_offset=32,
         routing_input_mode="unpacked",
-    ),  # FP4 Mode 3 with separate bf16 weights and a nonzero EP shard offset
+    ),  # Unpacked BF16 weights + nonzero EP offset; seed % 4 == 0 autotunes
+    Cfg(
+        64,
+        512,
+        512,
+        128,
+        4,
+        "nvfp4",
+        "imbalanced",
+        900_024,
+        local_experts=32,
+        expert_offset=32,
+        routing_input_mode="unpacked",
+        unpacked_weights_dtype="fp32",
+    ),  # Unpacked FP32 weights + nonzero EP offset; seed % 4 == 0 autotunes
 ]
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _curated_by_seed = {c.seed: c for c in _CURATED}
@@ -1214,8 +1234,13 @@ def test_unified_moe_fuzz(cfg):
     x, w1, w2, selected_experts, final_scales, logits, routing_bias = _master(
         cfg, handler
     )
+    unpacked_weights_dtype = (
+        torch.float32 if cfg.unpacked_weights_dtype == "fp32" else torch.bfloat16
+    )
     reference_scales = (
-        final_scales.to(torch.bfloat16).float() if cfg.is_unpacked else final_scales
+        final_scales.to(unpacked_weights_dtype).float()
+        if cfg.is_unpacked
+        else final_scales
     )
     ref = handler.reference(
         x,
@@ -1242,7 +1267,7 @@ def test_unified_moe_fuzz(cfg):
                 hidden_states_q=act_pack.hidden_states_q,
                 hidden_states_scale=act_pack.hidden_states_scale,
                 topk_ids=selected_experts,
-                topk_weights=final_scales.to(torch.bfloat16),
+                topk_weights=final_scales.to(unpacked_weights_dtype),
                 routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
             )
     weight_pack = MoEWeightPack()
