@@ -188,7 +188,7 @@ def test_nvfp4_pack_quantizes():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_nvfp4_w4a16_pack_preserves_bf16_activation():
+def test_w4a16_pack_preserves_bf16_activation():
     num_local_experts, cap, hidden = 4, 8, 128
     et = _dispatch_tensor(num_local_experts, cap, hidden, "cuda")
 

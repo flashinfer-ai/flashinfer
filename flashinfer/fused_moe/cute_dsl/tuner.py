@@ -54,6 +54,7 @@ from ..utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from ._inputs_helper import CuteDslMoEInputsHelper
+from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import normalize_cute_dsl_moe_activation_type
 
 logger = logging.getLogger(__name__)
@@ -666,6 +667,9 @@ W4A16_MOE_TACTICS = tuple(
     )
     # Two-CTA MMA requires at least 16 routed rows.
     if route_tile >= 16 or (gemm1_tactic[0][0] == 128 and gemm2_tactic[0][0] == 128)
+    # A 128x192x256 GEMM1 tile cannot retain the two load and transform
+    # stages required by the warp-specialized pipeline.
+    if not (route_tile == 192 and gemm1_tactic[0] == (128, 256))
 )
 
 
@@ -784,7 +788,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
     ) -> List[Tuple[Any, ...]]:
         import cutlass
 
-        from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
         from .moe_utils import get_max_num_permuted_tokens
 
         w1_weight = inputs[4]
