@@ -46,6 +46,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from .cute_compile_utils import cute_compile, device_compute_capability
+
 # ============================================================================
 # Global configuration for MTP (Multiple Token Processing) version
 # ============================================================================
@@ -2496,6 +2498,8 @@ def run_gdn_verify_kernel_mtp_inline(
 
 @functools.cache
 def _get_compiled_mtp_kernel(
+    cc_major: int,
+    cc_minor: int,
     T: int,
     H: int,
     HV: int,
@@ -2521,6 +2525,8 @@ def _get_compiled_mtp_kernel(
 
 @functools.cache
 def _get_compiled_mtp_kernel_inline(
+    cc_major: int,
+    cc_minor: int,
     T: int,
     H: int,
     HV: int,
@@ -2608,8 +2614,8 @@ def run_mtp_decode(
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
     _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
     use_inline_kernel = (B * HV) <= 128
-    major, _ = torch.cuda.get_device_capability(q.device)
-    use_packed_fma = major >= 10  # SM100+ (Blackwell) supports packed F32x2
+    cc = device_compute_capability(q.device)
+    use_packed_fma = cc[0] >= 10  # SM100+ (Blackwell) supports packed F32x2
 
     per_token_pool_scatter = ssm_state_indices is not None
 
@@ -2625,6 +2631,8 @@ def run_mtp_decode(
 
     if use_inline_kernel:
         inline_cache_key = (
+            cc[0],
+            cc[1],
             T,
             H,
             HV,
@@ -2647,6 +2655,8 @@ def run_mtp_decode(
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
         warp_cache_key = (
+            cc[0],
+            cc[1],
             T,
             H,
             HV,
@@ -2748,7 +2758,7 @@ def run_mtp_decode(
         ).mark_layout_dynamic()
 
         if use_inline_kernel:
-            compiled = cute.compile(
+            compiled = cute_compile(
                 run_gdn_verify_kernel_mtp_inline,
                 h0_source_tensor,
                 intermediate_states_tensor,
@@ -2785,10 +2795,11 @@ def run_mtp_decode(
                 use_packed_fma=use_packed_fma,
                 per_token_pool_scatter=per_token_pool_scatter,
                 stream=stream,
+                device=q.device,
                 options="--enable-tvm-ffi --generate-line-info",
             )
         else:
-            compiled = cute.compile(
+            compiled = cute_compile(
                 run_gdn_verify_kernel_mtp,
                 h0_source_tensor,
                 intermediate_states_tensor,
@@ -2825,6 +2836,7 @@ def run_mtp_decode(
                 use_packed_fma=use_packed_fma,
                 per_token_pool_scatter=per_token_pool_scatter,
                 stream=stream,
+                device=q.device,
                 options="--enable-tvm-ffi --generate-line-info",
             )
         cache["compiled"] = compiled
