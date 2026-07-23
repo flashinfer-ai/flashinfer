@@ -85,13 +85,8 @@ def _run_mm_mxfp8(
 ):
     _skip_if_unsupported(backend)
 
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    is_sm12x = compute_capability[0] == 12
-
-    if is_sm12x and not is_sf_swizzled_layout:
-        pytest.skip(
-            "SM12x only supports swizzled 1D scales; no backend handles non-swizzled layout."
-        )
+    if not is_sf_swizzled_layout:
+        pytest.skip("All backends require swizzled layouts.")
 
     if backend == "trtllm":
         if not is_sf_swizzled_layout:
@@ -101,7 +96,7 @@ def _run_mm_mxfp8(
         if out_dtype != torch.bfloat16:
             pytest.skip("trtllm does not support non-bfloat16 output")
     # auto also maps to cutlass so validate whether to skip here
-    if backend == "cutlass" or backend == "auto":
+    if backend == "cutlass":
         if is_sf_swizzled_layout and use_8x4_sf_layout_for_a:
             pytest.skip("cutlass doesn't support 8x4 swizzle layout")
         if not is_sf_swizzled_layout:
@@ -192,7 +187,7 @@ def _prepare_mxfp8_tensors(
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
 @pytest.mark.parametrize("n", [128, 256, 512, 1024])
 @pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048, 2560, 3200])
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm"])
@@ -217,7 +212,7 @@ def test_mm_mxfp8(
 @pytest.mark.parametrize("m", [128, 256, 1024, 2048, 4096])
 @pytest.mark.parametrize("n", [2688, 5376, 8192, 12288, 16384])
 @pytest.mark.parametrize("k", [4096, 8192])
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm", "auto"])
@@ -327,16 +322,13 @@ def test_mm_mxfp8_invalid_ndim():
         )
 
 
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True])
 def test_mm_mxfp8_find_minimum_cosine_similarity(is_sf_swizzled_layout):
     """Sweep value scales and enforce a minimum cosine similarity."""
     _skip_if_unsupported()
 
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] == 12 and not is_sf_swizzled_layout:
-        pytest.skip(
-            "SM12x only supports swizzled 1D scales; no backend handles non-swizzled layout."
-        )
+    if not is_sf_swizzled_layout:
+        pytest.skip("All backends require swizzled layouts.")
 
     m, n, k = 256, 4096, 4096
 
@@ -531,57 +523,6 @@ def test_mm_mxfp8_llm_full_layer_simulation():
     print(
         f"\n  All layers passed with average cos_sim={sum(results.values()) / len(results):.6f}"
     )
-
-
-def test_mm_mxfp8_scale_contiguity_requirement():
-    """Test behavior with non-contiguous scale tensors."""
-    _skip_if_unsupported()
-
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] == 12:
-        pytest.skip(
-            "SM12x only supports swizzled 1D scales; this test uses non-swizzled 2D scales."
-        )
-
-    m, n, k = 256, 4096, 4096
-
-    input_bf16 = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    weight_bf16 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
-
-    input_fp8, input_scale = mxfp8_quantize(input_bf16, is_sf_swizzled_layout=False)
-    weight_fp8, weight_scale = mxfp8_quantize(weight_bf16, is_sf_swizzled_layout=False)
-
-    input_descale = input_scale.view(m, k // 32)
-
-    weight_scale_2d = weight_scale.view(n, k // 32)
-    weight_descale_noncontig = weight_scale_2d.t()  # Non-contiguous!
-
-    assert not weight_descale_noncontig.is_contiguous(), (
-        "Expected non-contiguous tensor"
-    )
-
-    output = mm_mxfp8(
-        input_fp8,
-        weight_fp8.T,
-        input_descale,
-        weight_descale_noncontig,
-        out_dtype=torch.bfloat16,
-        backend="cutlass",
-    )
-    assert torch.isfinite(output).all()
-
-    weight_descale_contig = weight_descale_noncontig.contiguous()
-    assert weight_descale_contig.is_contiguous()
-
-    output = mm_mxfp8(
-        input_fp8,
-        weight_fp8.T,
-        input_descale,
-        weight_descale_contig,
-        out_dtype=torch.bfloat16,
-        backend="cutlass",
-    )
-    assert torch.isfinite(output).all(), "Output with contiguous scale should be valid"
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 1024, 2048, 4096, 8192, 16384])
