@@ -22,6 +22,7 @@ from flashinfer import (
     nvfp4_quantize,
     nvfp4_batched_quantize,
     scaled_fp4_grouped_quantize,
+    silu_and_mul_nvfp4_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,
     silu_and_mul,
     SfLayout,
@@ -1489,6 +1490,187 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
         scale_ref = unswizzle_sf(single_scale.view(torch.float8_e4m3fn), m, n)
         scale_ans = unswizzle_sf(out_scale[i], m, n)
         torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
+
+
+# All three scale-factor layouts: LINEAR plus the two swizzled variants (128x4 and 8x4).
+SILU_SF_LAYOUTS = [
+    SfLayout.layout_linear,
+    SfLayout.layout_128x4,
+    SfLayout.layout_8x4,
+]
+
+# Allow small fused-SiLU differences, matching other backend-parity tests.
+_SILU_MIN_MATCH_PCT = 95.0
+
+
+def _pairwise(*axes):
+    """Generate deterministic pairwise cases to limit JIT specializations."""
+    import itertools
+
+    ranges = [range(len(a)) for a in axes]
+    uncovered = {
+        (i, vi, j, vj)
+        for i, j in itertools.combinations(range(len(axes)), 2)
+        for vi in ranges[i]
+        for vj in ranges[j]
+    }
+
+    def _covers(combo):
+        return {
+            (i, combo[i], j, combo[j])
+            for i, j in itertools.combinations(range(len(axes)), 2)
+        }
+
+    full = list(itertools.product(*ranges))
+    cases = []
+    while uncovered:
+        best = max(full, key=lambda c: len(_covers(c) & uncovered))
+        gained = _covers(best) & uncovered
+        if not gained:
+            break
+        uncovered -= gained
+        cases.append(tuple(axes[a][best[a]] for a in range(len(axes))))
+    return cases
+
+
+# Use one shape per K; irregular M values cover swizzled row padding.
+SILU_SHAPES = [
+    (128, 64),
+    (256, 128),
+    (200, 256),
+    (1100, 512),
+    (4096, 1024),
+    (1536, 1536),
+    (2048, 2048),
+]
+
+# Use pairwise coverage to limit JIT specializations.
+_SILU_CASES = _pairwise(DTYPES, SILU_SHAPES, SILU_SF_LAYOUTS, [False, True])
+
+
+@pytest.mark.parametrize("dtype, shape, sf_layout, disable_fast_math", _SILU_CASES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_silu_and_mul_nvfp4_quantize(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    seed: int,
+    device: str,
+    sf_layout: SfLayout,
+    disable_fast_math: bool,
+    set_nvfp4_quant_env,
+) -> None:
+    """Compare fused and unfused CuTe-DSL paths across layouts and scale-math modes."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+    set_nvfp4_quant_env(disable_quant_fast_math=disable_fast_math)
+    torch.set_default_device(device)
+    torch.manual_seed(seed)
+
+    is_swizzled = sf_layout != SfLayout.layout_linear
+    is_8x4 = sf_layout == SfLayout.layout_8x4
+
+    m, n = shape  # n is output K; input is [m, 2 * n].
+    x = torch.randn((m, n * 2), dtype=dtype)
+    ref_y = silu_and_mul(x)
+
+    tensor_amax = ref_y.abs().max().to(torch.float32)
+    # FLOAT8_E4M3_MAX (448) * FLOAT4_E2M1_MAX (6) / amax.
+    global_scale = ((448.0 * 6.0) / tensor_amax).reshape(1)
+
+    out, out_scale = silu_and_mul_nvfp4_quantize(
+        x, global_scale, 16, is_swizzled, is_8x4
+    )
+    assert out.dtype == torch.uint8, f"Expected uint8, got {out.dtype}"
+
+    # Unfused reference: the same CuTe-DSL NVFP4 quantize applied to silu_and_mul(x).
+    single_out, single_scale = fp4_quantize(
+        ref_y, global_scale, 16, False, is_swizzled, is_8x4, backend="cute-dsl"
+    )
+
+    quant_match_pct = (out == single_out).float().mean().item() * 100
+    assert quant_match_pct > _SILU_MIN_MATCH_PCT, (
+        f"packed FP4 match {quant_match_pct:.1f}% < {_SILU_MIN_MATCH_PCT}% "
+        f"(layout={sf_layout.name})"
+    )
+    scale_match_pct = (out_scale == single_scale).float().mean().item() * 100
+    assert scale_match_pct > _SILU_MIN_MATCH_PCT, (
+        f"scale-factor match {scale_match_pct:.1f}% < {_SILU_MIN_MATCH_PCT}% "
+        f"(layout={sf_layout.name})"
+    )
+
+
+# Cover each K with one small 4over6 shape.
+SILU_4OVER6_SHAPES = [(128, 64), (256, 128), (200, 256)]
+_SILU_4OVER6_CONFIGS = [c for c in NVFP4_DEFAULT_4OVER6_CONFIGS if c is not None]
+# Use pairwise coverage to limit 4over6 specializations.
+_SILU_4OVER6_CASES = _pairwise(
+    DTYPES, SILU_4OVER6_SHAPES, SILU_SF_LAYOUTS, _SILU_4OVER6_CONFIGS
+)
+
+
+def _silu_4over6_case_id(value):
+    """Return a readable ID for 4over6 configurations."""
+    return value.id if isinstance(value, NVFP44Over6TestConfig) else None
+
+
+@pytest.mark.parametrize(
+    "dtype, shape, sf_layout, nvfp4_4over6_config",
+    _SILU_4OVER6_CASES,
+    ids=_silu_4over6_case_id,
+)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_silu_and_mul_nvfp4_quantize_4over6(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    seed: int,
+    device: str,
+    sf_layout: SfLayout,
+    nvfp4_4over6_config: NVFP44Over6TestConfig,
+    set_nvfp4_quant_env,
+) -> None:
+    """Compare fused and unfused CuTe-DSL paths with the 4over6 recipe."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+    set_nvfp4_quant_env(nvfp4_4over6_config=nvfp4_4over6_config)
+    torch.set_default_device(device)
+    torch.manual_seed(seed)
+
+    is_swizzled = sf_layout != SfLayout.layout_linear
+    is_8x4 = sf_layout == SfLayout.layout_8x4
+
+    m, n = shape  # n is output K; input is [m, 2 * n].
+    x = torch.randn((m, n * 2), dtype=dtype)
+    ref_y = silu_and_mul(x)
+
+    tensor_amax = ref_y.abs().max().to(torch.float32)
+    # FLOAT8_E4M3_MAX (448) * FLOAT4_E2M1_MAX (6) / amax.
+    global_scale = ((448.0 * 6.0) / tensor_amax).reshape(1)
+
+    out, out_scale = silu_and_mul_nvfp4_quantize(
+        x, global_scale, 16, is_swizzled, is_8x4
+    )
+    single_out, single_scale = fp4_quantize(
+        ref_y, global_scale, 16, False, is_swizzled, is_8x4, backend="cute-dsl"
+    )
+
+    quant_match_pct = (out == single_out).float().mean().item() * 100
+    assert quant_match_pct > _SILU_MIN_MATCH_PCT, (
+        f"packed FP4 match {quant_match_pct:.1f}% < {_SILU_MIN_MATCH_PCT}% "
+        f"(layout={sf_layout.name})"
+    )
+    scale_match_pct = (out_scale == single_scale).float().mean().item() * 100
+    assert scale_match_pct > _SILU_MIN_MATCH_PCT, (
+        f"scale-factor match {scale_match_pct:.1f}% < {_SILU_MIN_MATCH_PCT}% "
+        f"(layout={sf_layout.name})"
+    )
 
 
 @pytest.mark.parametrize("m", [128, 256, 384, 512, 1024, 1152, 2048])

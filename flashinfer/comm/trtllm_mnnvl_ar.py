@@ -185,6 +185,13 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.uc_ptrs_dev = self.handle.get_buffer_ptrs_dev()
         self.uc_ptr_local = self.handle.get_unicast_ptr(self.rank)
         self.mc_ptr = self.handle.get_multicast_ptr()
+        if not self.mc_ptr:
+            self.destroy()
+            raise RuntimeError(
+                "[MNNVLAllReduceFusionWorkspace] Multicast pointer is null after rendezvous. "
+                "This requires NVLink multicast (SM90+ with NVLink, e.g. H100 SXM). "
+                "Use backend='trtllm' or backend='auto' on unsupported hardware."
+            )
 
     @functools.cache
     def is_buffer_size_sufficient(

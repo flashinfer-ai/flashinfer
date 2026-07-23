@@ -27,6 +27,7 @@ from ..trace.templates.quantize import (
     nvfp4_kv_dequantize_paged_trace,
     nvfp4_kv_quantize_trace,
     nvfp4_quantize_trace,
+    silu_and_mul_nvfp4_quantize_trace,
 )
 from ..jit import JitSpec
 from ..jit import env as jit_env
@@ -802,6 +803,88 @@ def get_fp4_quantization_module(backend: str = "100"):
     )
 
 
+@flashinfer_api(trace=silu_and_mul_nvfp4_quantize_trace)
+def silu_and_mul_nvfp4_quantize(
+    input: torch.Tensor,
+    global_scale: torch.Tensor,
+    sf_vec_size: int = 16,
+    is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Apply SwiGLU and NVFP4 quantization in one CuTe-DSL kernel.
+
+    Computes ``silu(input[..., :K]) * input[..., K:]`` before quantization.
+    Requires CuTe-DSL and an SM100+ GPU.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Contiguous fp16/bf16 tensor of shape ``[..., 2K]``. Leading dimensions
+        are flattened into M.
+    global_scale : torch.Tensor
+        Float32 scale of shape ``[1]``, typically
+        ``(448 * 6) / silu_and_mul(input).abs().max()``.
+    sf_vec_size : int
+        Scale vector size. Only 16 is supported.
+    is_sf_swizzled_layout : bool
+        Use a swizzled scale layout. Defaults to True.
+    is_sf_8x4_layout : bool
+        Use the 8x4 rather than 128x4 swizzled layout.
+    enable_pdl : bool, optional
+        Enable Programmatic Dependent Launch. Auto-detected when None.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        Packed FP4 values of shape ``[M, K/2]`` and their scale factors.
+    """
+    if sf_vec_size != 16:
+        raise NotImplementedError(
+            "sf_vec_size can only be 16 for silu_and_mul_nvfp4_quantize"
+        )
+    assert input.is_contiguous(), "input must be row-major contiguous"
+    assert input.shape[-1] % 2 == 0, (
+        "the last dimension must be even (gate and up concatenated)"
+    )
+    k = input.shape[-1] // 2
+    assert k % sf_vec_size == 0
+
+    # Reject pre-Blackwell GPUs before CuTe-DSL compilation.
+    major, minor = get_compute_capability(input.device)
+    if major < 10:
+        raise RuntimeError(
+            "silu_and_mul_nvfp4_quantize requires a Blackwell GPU (SM100+, compute "
+            f"capability >= 10.0); got SM{major}{minor}."
+        )
+
+    from ..cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        raise RuntimeError(
+            "silu_and_mul_nvfp4_quantize requires the CuTe-DSL backend, which is not "
+            "available. Please install the required dependencies."
+        )
+    # Qualify NVFP4 layout constants to distinguish them from MXFP4 constants.
+    from .kernels import nvfp4_quantize as _nvfp4_kernels
+
+    if not is_sf_swizzled_layout:
+        sf_layout = _nvfp4_kernels.SF_LAYOUT_LINEAR
+    elif is_sf_8x4_layout:
+        sf_layout = _nvfp4_kernels.SF_LAYOUT_8x4
+    else:
+        sf_layout = _nvfp4_kernels.SF_LAYOUT_128x4
+
+    global_scale = global_scale.to(device=input.device, dtype=torch.float32)
+    # The helper returns scales in the final layout-specific 2D shape.
+    return _nvfp4_kernels.silu_and_mul_nvfp4_quantize_cute_dsl(
+        input,
+        global_scale,
+        sf_layout=sf_layout,
+        enable_pdl=enable_pdl,
+    )
+
+
 @flashinfer_api(trace=fp4_quantize_trace)
 def fp4_quantize(
     input: torch.Tensor,
@@ -1014,22 +1097,19 @@ def _fp4_quantize_cute_dsl(
         )
 
     if sf_vec_size == 16 and not sf_use_ue8m0:
-        # NVFP4 path: E4M3 scale factors, sf_vec_size=16, all layouts
-        from .kernels.nvfp4_quantize import (
-            SF_LAYOUT_128x4,
-            SF_LAYOUT_8x4,
-            SF_LAYOUT_LINEAR,
-            nvfp4_quantize_cute_dsl,
-        )
+        # NVFP4 path: E4M3 scale factors, sf_vec_size=16, all layouts. Import the
+        # module (not the SF_LAYOUT_* names) so they are not redefined against the
+        # MXFP4 branch below.
+        from .kernels import nvfp4_quantize as _nvfp4_kernels
 
         if not is_sf_swizzled_layout:
-            sf_layout = SF_LAYOUT_LINEAR
+            sf_layout = _nvfp4_kernels.SF_LAYOUT_LINEAR
         elif is_sf_8x4_layout:
-            sf_layout = SF_LAYOUT_8x4
+            sf_layout = _nvfp4_kernels.SF_LAYOUT_8x4
         else:
-            sf_layout = SF_LAYOUT_128x4
+            sf_layout = _nvfp4_kernels.SF_LAYOUT_128x4
 
-        return nvfp4_quantize_cute_dsl(
+        return _nvfp4_kernels.nvfp4_quantize_cute_dsl(
             input, global_scale, sf_layout=sf_layout, enable_pdl=enable_pdl
         )
 
