@@ -125,25 +125,14 @@ class Sm100W4A16GroupedGemmKernel:
         self.schedule_warp_id = 5
         self.weight_tma_warp_id = 6
         self.activation_tma_warp_id = 7
-        self.transform_warp_id = (
-            8,
-            9,
-            10,
-            11,
-        )
-        # The x4 TMEM store exposes two disjoint K128 ownership groups only for
-        # this one-CTA SwiGLU topology. Other tactics retain the x8 transform.
-        self.split_transform_across_warpgroups = (
-            self.gated and self.mma_tiler[0] == 128 and self.mma_tiler[2] == 256
-        )
-        self.num_transform_warps = len(self.transform_warp_id) + (
-            len(self.epilog_warp_id) if self.split_transform_across_warpgroups else 0
-        )
+        self.num_transform_warpgroups = 2
+        self.transform_warp_id = tuple(range(8, 8 + 4 * self.num_transform_warpgroups))
+        self.num_transform_warps = len(self.transform_warp_id)
         # Define expected register count for different warps
         self.num_regs_epilogue_warps = 176
         self.num_regs_mma_warp = 96
         self.num_regs_tma_warps = 80
-        self.num_regs_transform_warps = 224
+        self.num_regs_transform_warps = 120
         self.num_regs_schedule_warp = 64
         self.threads_per_cta = 32 * (
             max(
@@ -350,11 +339,8 @@ class Sm100W4A16GroupedGemmKernel:
                 transform_tidx,
             )
         )
-        if cutlass.const_expr(self.split_transform_across_warpgroups):
-            tAsA_input = tAsA_input[(None, transform_group_idx, None, None, None)]
-            tAsA_transform = tAsA_transform[
-                (None, transform_group_idx, None, None, None)
-            ]
+        tAsA_input = tAsA_input[(None, transform_group_idx, None, None, None)]
+        tAsA_transform = tAsA_transform[(None, transform_group_idx, None, None, None)]
 
         a_stage_coord = (None,) * (cute.rank(tAsA_input) - 1) + (0,)
         tArA = cute.make_rmem_tensor(
@@ -368,8 +354,7 @@ class Sm100W4A16GroupedGemmKernel:
 
         smem_thr_copy_S = src_copy_a.get_slice(transform_tidx)
         tSsS_trans = smem_thr_copy_S.partition_S(tCsS)
-        if cutlass.const_expr(self.split_transform_across_warpgroups):
-            tSsS_trans = tSsS_trans[(None, transform_group_idx, None, None, None)]
+        tSsS_trans = tSsS_trans[(None, transform_group_idx, None, None, None)]
         scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (0,)
         tSsS_layout_per_stage = tSsS_trans[scale_stage_coord].layout
         tSrS_copy = cute.make_rmem_tensor(
@@ -388,12 +373,9 @@ class Sm100W4A16GroupedGemmKernel:
         )
         assert cute.size(tSrS) == cute.size(tArA), "tSrS and tArA have different shape"
 
-        if cutlass.const_expr(self.split_transform_across_warpgroups):
-            transform_tiler_size = 128
-        else:
-            transform_tiler_size = min(
-                cute.size(cute.coalesce(tAsA_input.layout), mode=[0]), 128
-            )
+        transform_tiler_size = min(
+            cute.size(cute.coalesce(tAsA_input.layout), mode=[0]), 128
+        )
         transform_tiler = cute.make_layout(transform_tiler_size)
         tArA_load = cute.flat_divide(tArA, transform_tiler)
         tArA_load = cute.group_modes(tArA_load, 1, cute.rank(tArA_load))
@@ -496,16 +478,11 @@ class Sm100W4A16GroupedGemmKernel:
                 packed_fragment = cute.recast_tensor(
                     tArA_load[(None, idx)], cutlass.Uint8
                 ).load()
-                if cutlass.const_expr(self.split_transform_across_warpgroups):
-                    scale_slice_compact = cute.flat_divide(
-                        tSrS_copy, cute.make_layout(8)
-                    )[(None, transform_group_idx)]
-                else:
-                    scale_slice = tSrS_load[(None, (None, idx))]
-                    scale_slice_compact = cute.make_tensor(
-                        scale_slice.iterator,
-                        cute.filter_zeros(scale_slice.layout),
-                    )
+                scale_slice = tSrS_load[(None, idx)]
+                scale_slice_compact = cute.make_tensor(
+                    scale_slice.iterator,
+                    cute.filter_zeros(scale_slice.layout),
+                )
                 scale_fragment = cute.recast_tensor(
                     scale_slice_compact, cutlass.Uint8
                 ).load()
@@ -1114,25 +1091,14 @@ class Sm100W4A16GroupedGemmKernel:
         copy_atom_a_input = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), self.a_dtype, num_bits_per_copy=32
         )
-        a_smem_shape = tiled_mma.partition_shape_A(
-            cute.dice(self.mma_tiler, (1, None, 1))
-        )
-        # Setup copy atom to store transformed A into tensor memory or shared memory
-        copy_atom_a_transform = mixed_input_utils.get_copy_atom_a_transform(
+        # Split each transformed tile across two four-warp TMEM store groups.
+        copy_atom_a_transform = cute.make_copy_atom(
+            tcgen05.St32x32bOp(
+                tcgen05.Repetition(4),
+                tcgen05.Unpack.NONE,
+            ),
             self.mma_dtype,
-            self.use_2cta_instrs,
-            self.transform_a_source,
-            a_smem_shape,
-            self.a_dtype,
         )
-        if cutlass.const_expr(self.split_transform_across_warpgroups):
-            copy_atom_a_transform = cute.make_copy_atom(
-                tcgen05.St32x32bOp(
-                    tcgen05.Repetition(4),
-                    tcgen05.Unpack.NONE,
-                ),
-                self.mma_dtype,
-            )
 
         # Partition global/shared tensor for TMA load A/B
         # TMA load A partition_S/D
@@ -1485,11 +1451,11 @@ class Sm100W4A16GroupedGemmKernel:
 
         # Specialized transform warps
         if warp_idx >= self.transform_warp_id[0]:
-            cute.arch.setmaxregister_increase(self.num_regs_transform_warps)
-            transform_group_idx = cutlass.Int32(
-                1 if self.split_transform_across_warpgroups else 0
+            cute.arch.setmaxregister_decrease(self.num_regs_transform_warps)
+            transform_group_idx = (warp_idx - self.transform_warp_id[0]) // 4
+            transform_local_tidx = tidx - 32 * (
+                self.transform_warp_id[0] + transform_group_idx * 4
             )
-            transform_local_tidx = tidx - 32 * self.transform_warp_id[0]
             # Get the pointer to the TMEM buffer
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -1700,39 +1666,6 @@ class Sm100W4A16GroupedGemmKernel:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             tCtAcc_base = accumulators
-            if cutlass.const_expr(self.split_transform_across_warpgroups):
-                transform_group_idx = cutlass.Int32(0)
-                (
-                    epi_dst_copy_a,
-                    epi_tAsA_input,
-                    epi_tAsA_transform,
-                    epi_tSsS_trans,
-                    epi_tSrS_copy,
-                    epi_tSrS_load,
-                    epi_tArA_load,
-                    epi_tArA_transform,
-                    epi_tArA_transform_store,
-                    epi_transform_tiler,
-                ) = self._setup_transform_partitions(
-                    tiled_mma,
-                    copy_atom_a_input,
-                    copy_atom_a_transform,
-                    sA_transform_input,
-                    a_smem_layout_transform,
-                    sA_transform,
-                    tCsS,
-                    accumulators,
-                    epi_tidx,
-                    transform_group_idx,
-                )
-                epi_a_load2trans_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    self.num_load2trans_stage,
-                )
-                epi_trans2mma_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.num_trans2mma_stage,
-                )
             # Partition for epilogue
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
                 mixed_input_utils.epilog_tmem_copy_and_partition(
@@ -1859,29 +1792,6 @@ class Sm100W4A16GroupedGemmKernel:
             tile_info_consumer_state.advance()
             num_prev_subtiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
-                if cutlass.const_expr(self.split_transform_across_warpgroups):
-                    (
-                        epi_a_load2trans_consumer_state,
-                        epi_trans2mma_producer_state,
-                    ) = self._transform_tile(
-                        a_load2trans_pipeline,
-                        trans2mma_pipeline,
-                        epi_a_load2trans_consumer_state,
-                        epi_trans2mma_producer_state,
-                        epi_dst_copy_a,
-                        epi_tAsA_input,
-                        epi_tAsA_transform,
-                        epi_tSsS_trans,
-                        epi_tSrS_copy,
-                        epi_tSrS_load,
-                        epi_tArA_load,
-                        epi_tArA_transform,
-                        epi_tArA_transform_store,
-                        epi_transform_tiler,
-                        transform_group_idx,
-                        k_tile_cnt,
-                    )
-
                 alpha_val = alpha[work_tile.group_idx]
                 if cutlass.const_expr(self.gated):
                     bSG_gC = bSG_gC_partitioned[(None, work_tile.cta_coord_m, None, 0)]
@@ -2250,8 +2160,6 @@ class Sm100W4A16GroupedGemmKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-            if cutlass.const_expr(self.split_transform_across_warpgroups):
-                trans2mma_pipeline.producer_tail(epi_trans2mma_producer_state)
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
