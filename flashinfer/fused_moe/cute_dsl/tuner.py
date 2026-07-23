@@ -702,8 +702,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         self.swiglu_limit = swiglu_limit
         self._workspace_cache: Dict[Tuple, Any] = {}
 
-        # Seeded random routing retains load variance around route-tile
-        # boundaries while keeping every synthetic route on the local EP shard.
+        # Match production EP routing density while retaining seeded load
+        # variance around route-tile boundaries.
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
@@ -719,8 +719,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                             generator=torch.Generator(device=device).manual_seed(515),
                         ),
                         lambda shapes, dtype, device: torch.randint(
-                            local_expert_offset,
-                            local_expert_offset + max(num_local_experts, 1),
+                            0,
+                            max(num_experts, 1),
                             shapes,
                             dtype=torch.int32,
                             device=device,
