@@ -74,11 +74,8 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         return self._compute
 
     def compute(self, ctx: SplitKernelContext):
-        from ......fused_moe.api import QuantVariant
-
         expert_tensors = ctx.expert_tensors
-        is_nvfp4 = self._moe_config.quant.variant is QuantVariant.NVFP4
-        quantize_input = self._moe_config.quant.quantize_input
+        quant_variant = self._moe_config.quant.variant
         per_token_activation = bool(self._moe_config.quant.per_token_scale)
         offset = self._moe_config.experts.local_expert_offset
         dim0, dim1, _ = expert_tensors.shape
@@ -97,16 +94,14 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 ctx.recv_topk_weights,
                 num_local_experts=self._moe_config.experts.local_num_experts,
                 local_expert_offset=offset,
-                is_nvfp4=is_nvfp4,
-                quantize_input=quantize_input,
+                quant_variant=quant_variant,
                 per_token_activation=per_token_activation,
             )
         else:
             act_pack = build_activation_pack(
                 expert_tensors,
                 local_expert_offset=offset,
-                is_nvfp4=is_nvfp4,
-                quantize_input=quantize_input,
+                quant_variant=quant_variant,
                 per_token_activation=per_token_activation,
             )
 

@@ -171,7 +171,7 @@ class CuteDslNvfp4Runner(MoERunner):
     backend_key = "cute_dsl_nvfp4"
     # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_quant_variants = (QuantVariant.NVFP4, QuantVariant.W4A16)
 
     def check_support(self) -> None:
         super().check_support()
@@ -192,17 +192,20 @@ class CuteDslNvfp4Runner(MoERunner):
         routing = config.routing
         num_local_experts = experts.local_num_experts or routing.num_experts
 
-        self._quantize_input = config.quant.quantize_input
-        self._use_per_token_activation = self._quantize_input and bool(
-            config.quant.per_token_scale
+        self._quant_mode = (
+            "w4a16" if config.quant.variant is QuantVariant.W4A16 else "w4a4"
         )
-        if not self._quantize_input and config.quant.per_token_scale:
+        self._use_per_token_activation = (
+            config.quant.variant is QuantVariant.NVFP4
+            and bool(config.quant.per_token_scale)
+        )
+        if self._quant_mode == "w4a16" and config.quant.per_token_scale:
             raise ValueError(
-                "CuteDslNvfp4Runner: per_token_scale requires quantize_input=True"
+                "CuteDslNvfp4Runner: per_token_scale is not supported for W4A16"
             )
         runner_cls = (
             CuteDslFusedMoENvfp4Runner
-            if self._quantize_input
+            if self._quant_mode == "w4a4"
             else CuteDslFusedMoEW4A16Runner
         )
         self._inner = runner_cls(
@@ -220,7 +223,7 @@ class CuteDslNvfp4Runner(MoERunner):
             activation_type=int(config.activation.type),
             **(
                 {"use_per_token_activation": self._use_per_token_activation}
-                if self._quantize_input
+                if self._quant_mode == "w4a4"
                 else {}
             ),
         )
@@ -274,19 +277,19 @@ class CuteDslNvfp4Runner(MoERunner):
         hidden_size = act.hidden_states_q.shape[1]
         x_sf = None
         fc2_input_scale = None
-        if self._quantize_input:
+        if self._quant_mode == "w4a4":
             hidden_size *= 2  # FP4 packed
             if act.hidden_states_scale is None:
                 raise ValueError(
                     "CuteDslNvfp4Runner: hidden_states_scale is required when "
-                    "quantize_input=True"
+                    "QuantVariant.NVFP4 is selected"
                 )
             x_sf = act.hidden_states_scale.unsqueeze(-1)
             fc2_input_scale = v["fc2_input_scale"]
         elif act.hidden_states_scale is not None:
             raise ValueError(
                 "CuteDslNvfp4Runner: hidden_states_scale must be None when "
-                "quantize_input=False"
+                "QuantVariant.W4A16 is selected"
             )
         if self._use_per_token_activation:
             if act.per_token_scale is None:

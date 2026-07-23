@@ -64,12 +64,12 @@ _NSYS_GLOBAL_ID_PROCESS_MASK = -(1 << 24)
 @dataclass(frozen=True)
 class BenchVariant:
     name: str
-    quantize_input: bool
+    use_nvfp4_activations: bool
 
 
 BENCH_VARIANTS = (
-    BenchVariant("w4a4", quantize_input=True),
-    BenchVariant("w4a16", quantize_input=False),
+    BenchVariant("w4a4", use_nvfp4_activations=True),
+    BenchVariant("w4a16", use_nvfp4_activations=False),
 )
 
 
@@ -438,9 +438,14 @@ def _distributed_moe_config(
     return MoEConfig(
         routing=RoutingConfig(num_experts=CFG.num_experts, top_k=CFG.top_k),
         quant=QuantConfig(
-            variant=QuantVariant.NVFP4,
-            per_token_scale=args.use_per_token_activation and variant.quantize_input,
-            quantize_input=variant.quantize_input,
+            variant=(
+                QuantVariant.NVFP4
+                if variant.use_nvfp4_activations
+                else QuantVariant.W4A16
+            ),
+            per_token_scale=(
+                args.use_per_token_activation and variant.use_nvfp4_activations
+            ),
         ),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
@@ -684,7 +689,7 @@ def _benchmark_distributed_ep(
         local_num_tokens, CFG.top_k, dtype=torch.int32, device=device
     )
     global_scale = None
-    if variant.quantize_input:
+    if variant.use_nvfp4_activations:
         global_scale = make_nvfp4_global_scale(
             hidden_states,
             per_token_activation=args.use_per_token_activation,
@@ -818,7 +823,7 @@ def _make_distributed_activation_pack(
 ):
     from flashinfer.fused_moe import MoEActivationPack
 
-    if not variant.quantize_input:
+    if not variant.use_nvfp4_activations:
         return MoEActivationPack(
             hidden_states_q=hidden_states,
             hidden_states_scale=None,
@@ -930,7 +935,7 @@ def _run_ncu_compute_profile(args, num_tokens, mode, variant):
     topk_values = torch.empty(rows, CFG.top_k, dtype=torch.float32, device=device)
     topk_indices = torch.empty(rows, CFG.top_k, dtype=torch.int32, device=device)
     global_scale = None
-    if variant.quantize_input:
+    if variant.use_nvfp4_activations:
         global_scale = make_nvfp4_global_scale(
             hidden_states,
             per_token_activation=args.use_per_token_activation,
@@ -1032,7 +1037,7 @@ def _benchmark_distributed_tp(
     )
     dist.all_gather(gathered_hidden_states, local_hidden_states)
     global_scale = None
-    if variant.quantize_input:
+    if variant.use_nvfp4_activations:
         global_scale = make_nvfp4_global_scale(
             hidden_states,
             per_token_activation=args.use_per_token_activation,

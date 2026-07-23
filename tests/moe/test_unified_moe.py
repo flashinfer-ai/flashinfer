@@ -586,6 +586,12 @@ class TestMoERunnerSupport:
         base.update(overrides)
         return MoEConfig(**base)
 
+    @pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.W4A16))
+    def test_cute_dsl_quant_variants_supported(self, variant):
+        runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
+        runner.config = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
+        assert runner.check_support() is None
+
     @pytest.mark.parametrize(
         "runner_type,variant",
         (

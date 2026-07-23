@@ -130,17 +130,11 @@ class QuantConfig:
     per_token_scale : bool or None
         Whether activations carry a per-token scale (vs per-tensor / block).
         ``None`` → backend default.
-    quantize_input : bool
-        Whether NVFP4-weight compute uses NVFP4 activations. EP split backends
-        quantize their BF16 dispatch output when this is ``True``; direct
-        :class:`MoELayer` callers provide an already-quantized activation pack.
-        Set to ``False`` for BF16 activations (W4A16).
     """
 
     variant: QuantVariant = QuantVariant.BF16
     swizzled_scale_factors: Optional[bool] = None
     per_token_scale: Optional[bool] = None
-    quantize_input: bool = True
 
 
 @dataclass(frozen=True)

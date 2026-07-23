@@ -32,15 +32,14 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 if TYPE_CHECKING:
-    from ......fused_moe.api import MoEActivationPack
+    from ......fused_moe.api import MoEActivationPack, QuantVariant
 
 
 def build_activation_pack(
     expert_tensors: torch.Tensor,
     *,
     local_expert_offset: int = 0,
-    is_nvfp4: bool,
-    quantize_input: bool = True,
+    quant_variant: "QuantVariant",
     per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
 ) -> "MoEActivationPack":
@@ -54,11 +53,9 @@ def build_activation_pack(
         Global id of this rank's first local expert.  Synthesized expert ids are
         ``(row // cap) + local_expert_offset``; the compute runner subtracts the same
         offset, so the two must agree (they share one :class:`MoEConfig`).
-    is_nvfp4 : bool
-        Whether the MoE weights use NVFP4.
-    quantize_input : bool
-        For NVFP4 weights, quantize the flattened BF16 activations to NVFP4 when
-        true, or carry BF16 activations for W4A16 when false.
+    quant_variant : QuantVariant
+        Activation and weight quantization contract. NVFP4 quantizes the
+        dispatched BF16 activations; BF16 and W4A16 carry them unchanged.
     per_token_activation : bool
         Use per-token NVFP4 activation scaling when quantizing the input.
     global_scale : torch.Tensor, optional
@@ -86,8 +83,7 @@ def build_activation_pack(
         flat,
         selected_experts,
         final_scales,
-        is_nvfp4=is_nvfp4,
-        quantize_input=quantize_input,
+        quant_variant=quant_variant,
         per_token_activation=per_token_activation,
         global_scale=global_scale,
     )
@@ -100,8 +96,7 @@ def build_activation_pack_rank_major(
     *,
     num_local_experts: int,
     local_expert_offset: int = 0,
-    is_nvfp4: bool,
-    quantize_input: bool = True,
+    quant_variant: "QuantVariant",
     per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
 ) -> "MoEActivationPack":
@@ -138,7 +133,7 @@ def build_activation_pack_rank_major(
         Number of experts this rank owns (carried for API symmetry / validation).
     local_expert_offset : int
         Global id of this rank's first local expert (see EXPERT_MAJOR builder).
-    is_nvfp4, quantize_input, per_token_activation, global_scale :
+    quant_variant, per_token_activation, global_scale :
         Same semantics as :func:`build_activation_pack`.
     """
     if recv_tensors.dim() != 3:
@@ -183,8 +178,7 @@ def build_activation_pack_rank_major(
         flat,
         selected_experts,
         final_scales,
-        is_nvfp4=is_nvfp4,
-        quantize_input=quantize_input,
+        quant_variant=quant_variant,
         per_token_activation=per_token_activation,
         global_scale=global_scale,
     )
@@ -195,8 +189,7 @@ def _quantize_and_pack(
     selected_experts: torch.Tensor,
     final_scales: torch.Tensor,
     *,
-    is_nvfp4: bool,
-    quantize_input: bool,
+    quant_variant: "QuantVariant",
     per_token_activation: bool,
     global_scale: Optional[torch.Tensor],
 ) -> "MoEActivationPack":
@@ -205,11 +198,13 @@ def _quantize_and_pack(
     Shared by the EXPERT_MAJOR and RANK_MAJOR builders, which differ only in how
     ``selected_experts`` / ``final_scales`` are synthesized.
     """
-    from ......fused_moe.api import MoEActivationPack
+    from ......fused_moe.api import MoEActivationPack, QuantVariant
 
     device = flat.device
     per_token_scale = None
-    if is_nvfp4 and quantize_input:
+    if per_token_activation and quant_variant is not QuantVariant.NVFP4:
+        raise ValueError("per-token activation scaling requires QuantVariant.NVFP4")
+    if quant_variant is QuantVariant.NVFP4:
         from ......quantization.fp4_quantization import (
             fp4_quantize,
             nvfp4_quantize,
@@ -256,10 +251,12 @@ def _quantize_and_pack(
         # Runners expect a 2D [M, H//16] scale; fp4_quantize may return a trailing dim.
         if hidden_states_scale.dim() > 2:
             hidden_states_scale = hidden_states_scale.squeeze(-1)
-    else:
-        # bf16 path: carry the raw activations; the bf16 runner reads them directly.
+    elif quant_variant in (QuantVariant.BF16, QuantVariant.W4A16):
+        # BF16 and W4A16 runners consume the dispatched activations directly.
         hidden_states_q = flat
         hidden_states_scale = None
+    else:
+        raise ValueError(f"fused_moe split bridge does not support {quant_variant!r}")
 
     return MoEActivationPack(
         hidden_states_q=hidden_states_q,
