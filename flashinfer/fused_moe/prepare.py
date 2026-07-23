@@ -759,9 +759,17 @@ def _quantize_fp8_per_expert(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize each expert tensor with one E4M3 multiplier."""
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = weights.float().abs().nan_to_num().amax(dim=(-1, -2))
+    weights_f32 = weights.float()
+    amax = weights_f32.abs().amax(dim=(-1, -2))
+    # Weight preparation runs once at model load. Fail here instead of silently
+    # sanitizing a corrupted checkpoint or surfacing NaNs much later in inference.
+    # Reuse the required per-expert reduction to avoid another full tensor scan.
+    if not bool(torch.isfinite(amax).all()):
+        raise ValueError(
+            "FP8 per-tensor weight preparation requires finite checkpoint weights."
+        )
     scales = torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
-    quantized = (weights.float() * scales[:, None, None]).clamp(-fp8_max, fp8_max)
+    quantized = (weights_f32 * scales[:, None, None]).clamp(-fp8_max, fp8_max)
     return quantized.to(torch.float8_e4m3fn), scales.to(torch.float32)
 
 

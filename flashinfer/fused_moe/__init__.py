@@ -142,6 +142,7 @@ __all__ = [
     "MoEWeightPack",
     "TrtllmFp4RoutedRunner",
     "TrtllmFp8BlockRunner",
+    "TrtllmFp8PerTensorRunner",
     "QuantConfig",
     "QuantVariant",
     "RoutingConfig",
