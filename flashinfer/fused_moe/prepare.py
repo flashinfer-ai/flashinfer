@@ -15,7 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backends consume different native weight layouts (quantization + swizzle +
-MMA reorder).  These helpers turn canonical bf16 expert weights into the
+MMA reorder).  These helpers turn canonical or checkpoint expert weights into
 backend-native ``MoEWeightPack`` views, so that preparation lives in the
 implementation surface rather than being copy-pasted into tests and benchmarks
 (design doc CR2/CR7; reviewer comments C6, C7, C31, C32).
@@ -23,7 +23,7 @@ implementation surface rather than being copy-pasted into tests and benchmarks
 The canonical NVFP4 and BF16 helpers are exposed as
 ``TrtllmFp4Config.prepare_weights(...)`` /
 ``CuteDslConfig.prepare_weights(...)`` /
-``TrtllmBf16Config.prepare_weights(...)`` static helpers (see ``api.py``).
+``TrtllmBf16Config.prepare_weights(...)`` / ... static helpers (see ``api.py``).
 The SM90 Humming-style MXFP4 x FP8 helper is currently exposed as a flat helper
 for the CUTLASS fused-MoE path.
 """
@@ -47,6 +47,7 @@ from ..utils import get_compute_capability
 # Module-level permute-index cache.  Permute indices depend only on weight
 # dims, so the cache is safe to reuse across shapes and calls.
 _TRTLLM_PERMUTE_CACHE: dict = {}
+_TRTLLM_FP8_PERMUTE_CACHE: dict = {}
 
 
 # The E8M0 range clamp and residual-scale factorization are adapted from
@@ -538,6 +539,196 @@ def prepare_trtllm_fp4_weights(
     }
 
 
+def _deepseek_fp8_quantize_activations(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[M, K]`` BF16 per 1x128 block.
+
+    TRTLLM's DeepSeek path consumes scales transposed as ``[K // 128, M]``.
+    """
+    block = 128
+    m, k = x.shape
+    blocks = x.float().reshape(m, k // block, block)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    scales = (blocks.abs().amax(dim=-1, keepdim=True) / fp8_max).clamp(min=1e-12)
+    quantized = (blocks / scales).clamp(-fp8_max, fp8_max)
+    return (
+        quantized.reshape(m, k).to(torch.float8_e4m3fn),
+        scales.squeeze(-1).transpose(0, 1).contiguous(),
+    )
+
+
+def _deepseek_fp8_quantize_weights(
+    weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[E, N, K]`` BF16 per 128x128 block."""
+    block = 128
+    e, n, k = weights.shape
+    blocks = (
+        weights.float()
+        .reshape(e, n // block, block, k // block, block)
+        .permute(0, 1, 3, 2, 4)
+    )
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    scales = (blocks.abs().amax(dim=(-1, -2), keepdim=True) / fp8_max).clamp(min=1e-12)
+    quantized = (blocks / scales).clamp(-fp8_max, fp8_max)
+    quantized = quantized.permute(0, 1, 3, 2, 4).reshape(e, n, k)
+    return quantized.to(torch.float8_e4m3fn), scales[..., 0, 0].contiguous()
+
+
+def _validate_trtllm_fp8_block_inputs(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> None:
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise ValueError(
+            "prepare_trtllm_fp8_block_weights expects BF16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+
+
+def prepare_trtllm_fp8_block_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    variant,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Prepare canonical BF16 expert weights for TRTLLM block-FP8 MoE.
+
+    DeepSeek FP8 uses E4M3 payloads with FP32 128x128 block scales. MXFP8
+    uses E4M3 payloads with linear UE8M0 scales over 32-element K blocks.
+    Both native views remain in ``MajorK`` layout; the unified runner records
+    the exact variant and passes the corresponding kernel enum.
+    """
+    from .api import QuantVariant
+
+    if variant not in (QuantVariant.DeepSeekFp8, QuantVariant.MxFp8):
+        raise ValueError(
+            "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
+            f"got {variant!r}."
+        )
+    _validate_trtllm_fp8_block_inputs(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    if device is None:
+        device = w1_bf16.device
+    w1_bf16 = w1_bf16.to(device).contiguous()
+    w2_bf16 = w2_bf16.to(device).contiguous()
+
+    if variant is QuantVariant.DeepSeekFp8:
+        for name, dim in (
+            ("hidden_size", hidden_size),
+            ("intermediate_size", intermediate_size),
+            ("2 * intermediate_size", 2 * intermediate_size),
+        ):
+            if dim % 128 != 0:
+                raise ValueError(f"DeepSeek FP8 requires {name} divisible by 128.")
+        w1_q, w1_sf = _deepseek_fp8_quantize_weights(w1_bf16)
+        w2_q, w2_sf = _deepseek_fp8_quantize_weights(w2_bf16)
+    else:
+        if hidden_size % 32 != 0 or intermediate_size % 32 != 0:
+            raise ValueError(
+                "MXFP8 requires hidden_size and intermediate_size divisible by 32."
+            )
+        from ..quantization.fp8_quantization import mxfp8_quantize
+        from .core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
+        w1_q, w1_sf, w2_q, w2_sf = [], [], [], []
+        for expert in range(num_local_experts):
+            q, sf = mxfp8_quantize(w1_bf16[expert], is_sf_swizzled_layout=False)
+            sf = sf.view(torch.uint8).reshape(2 * intermediate_size, hidden_size // 32)
+            permute = _maybe_get_cached_w3_w1_permute_indices(
+                _TRTLLM_FP8_PERMUTE_CACHE,
+                q.view(torch.uint8),
+                128,
+                is_gated_act_gemm=True,
+            )
+            permute_sf = _maybe_get_cached_w3_w1_permute_indices(
+                _TRTLLM_FP8_PERMUTE_CACHE,
+                sf,
+                128,
+                num_elts_per_sf=32,
+                is_gated_act_gemm=True,
+            )
+            w1_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
+            w1_sf.append(sf[permute_sf.to(device)])
+
+            q, sf = mxfp8_quantize(w2_bf16[expert], is_sf_swizzled_layout=False)
+            sf = sf.view(torch.uint8).reshape(hidden_size, intermediate_size // 32)
+            permute = get_w2_permute_indices_with_cache(
+                _TRTLLM_FP8_PERMUTE_CACHE, q.view(torch.uint8), 128
+            )
+            permute_sf = get_w2_permute_indices_with_cache(
+                _TRTLLM_FP8_PERMUTE_CACHE,
+                sf,
+                128,
+                num_elts_per_sf=32,
+            )
+            w2_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
+            w2_sf.append(sf[permute_sf.to(device)])
+        w1_q, w1_sf = torch.stack(w1_q), torch.stack(w1_sf)
+        w2_q, w2_sf = torch.stack(w2_q), torch.stack(w2_sf)
+
+    return {
+        "gemm1_weights": w1_q,
+        "gemm1_weights_scale": w1_sf,
+        "gemm2_weights": w2_q,
+        "gemm2_weights_scale": w2_sf,
+    }
+
+
+def prepare_trtllm_fp8_block_activations(
+    hidden_states_bf16: torch.Tensor,
+    *,
+    variant,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[M, H]`` BF16 activations for TRTLLM block-FP8 MoE."""
+    from .api import QuantVariant
+
+    if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
+        raise ValueError(
+            "prepare_trtllm_fp8_block_activations expects a 2D BF16 tensor, "
+            f"got shape={tuple(hidden_states_bf16.shape)}, "
+            f"dtype={hidden_states_bf16.dtype}."
+        )
+    hidden_states_bf16 = hidden_states_bf16.contiguous()
+    if variant is QuantVariant.DeepSeekFp8:
+        if hidden_states_bf16.shape[1] % 128 != 0:
+            raise ValueError("DeepSeek FP8 hidden_size must be divisible by 128.")
+        return _deepseek_fp8_quantize_activations(hidden_states_bf16)
+    if variant is QuantVariant.MxFp8:
+        from ..quantization.fp8_quantization import mxfp8_quantize
+
+        q, sf = mxfp8_quantize(hidden_states_bf16, is_sf_swizzled_layout=False)
+        return q, sf.view(torch.uint8).reshape(hidden_states_bf16.shape[0], -1)
+    raise ValueError(
+        "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
+        f"got {variant!r}."
+    )
+
+
 def prepare_trtllm_bf16_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
@@ -722,4 +913,183 @@ def prepare_cute_dsl_nvfp4_weights(
         "w2_weight": w2_weight,
         "w2_weight_sf": w2_weight_sf,
         "w2_alpha": ones,
+    }
+
+
+def _quantize_b12x_expert_weights(
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize canonical expert weights in the b12x non-interleaved layout."""
+    from ..cute_dsl.utils import convert_sf_to_mma_layout
+    from ..fp4_quantization import fp4_quantize
+
+    num_experts, rows, columns = weights.shape
+    weight_q, weight_sf = fp4_quantize(
+        weights.reshape(num_experts * rows, columns),
+        global_scale=torch.ones(1, device=weights.device, dtype=torch.float32),
+        sf_vec_size=16,
+        is_sf_swizzled_layout=True,
+    )
+    weight_q = weight_q.reshape(num_experts, rows, columns // 2)
+    weight_sf = convert_sf_to_mma_layout(
+        weight_sf,
+        m=rows,
+        k=columns,
+        num_groups=num_experts,
+        sf_vec_size=16,
+    )
+    return weight_q, weight_sf
+
+
+def prepare_b12x_nvfp4_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation: str = "silu",
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the SM12x NVFP4 ``b12x_nvfp4`` weight view.
+
+    Both gemms are NVFP4 block-quantized in the b12x non-interleaved layout.
+    ``B12xMoEWrapper`` handles ragged padding and kernel weight-view caching.
+
+    Parameters
+    ----------
+    w1_bf16 : Tensor
+        Up+gate expert weights ``[E, 2*I, H]`` stored as ``[up, gate]``, or
+        ReLU2 weights ``[E, I, H]``.
+    w2_bf16 : Tensor
+        Down-projection expert weights ``[E, H, I]``.
+    num_local_experts, hidden_size, intermediate_size : int
+        Expert geometry.
+    activation : str
+        Kernel activation name: ``"silu"``, ``"gelu_tanh"``, or ``"relu2"``.
+    device : torch.device, optional
+        Target device; defaults to ``w1_bf16.device``.
+
+    Returns
+    -------
+    dict
+        Keys expected by ``B12xNvfp4Runner.pack_inputs``: ``w1_weight``,
+        ``w1_weight_sf``, ``w1_alpha``, ``fc2_input_scale``, ``w2_weight``,
+        ``w2_weight_sf``, ``w2_alpha``.
+    """
+    from .cute_dsl.blackwell_sm12x.moe_activation import is_gated_activation
+
+    supported_activations = {"silu", "gelu_tanh", "relu2"}
+    if activation not in supported_activations:
+        raise ValueError(
+            f"unsupported b12x NVFP4 activation {activation!r}; expected one of "
+            f"{sorted(supported_activations)}."
+        )
+
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    w1_bf16 = w1_bf16.to(device)
+    w2_bf16 = w2_bf16.to(device)
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise TypeError("b12x canonical weights must use torch.bfloat16.")
+
+    is_gated = is_gated_activation(activation)
+    w1_rows = intermediate_size * (2 if is_gated else 1)
+    expected_w1 = (num_local_experts, w1_rows, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1:
+        raise ValueError(
+            f"expected w1_bf16 shape {expected_w1}, got {tuple(w1_bf16.shape)}"
+        )
+    if tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"expected w2_bf16 shape {expected_w2}, got {tuple(w2_bf16.shape)}"
+        )
+    if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
+        raise ValueError("b12x NVFP4 dimensions must be multiples of 16.")
+
+    w1_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    w2_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    fc2_input_scale = torch.ones(1, device=device, dtype=torch.float32)
+    w1_weight, w1_weight_sf = _quantize_b12x_expert_weights(w1_bf16)
+    w2_weight, w2_weight_sf = _quantize_b12x_expert_weights(w2_bf16)
+
+    return {
+        "w1_weight": w1_weight,
+        "w1_weight_sf": w1_weight_sf,
+        "w1_alpha": w1_alpha,
+        "fc2_input_scale": fc2_input_scale.contiguous(),
+        "w2_weight": w2_weight,
+        "w2_weight_sf": w2_weight_sf,
+        "w2_alpha": w2_alpha,
+    }
+
+
+def prepare_b12x_w4a16_weights(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_global_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    *,
+    activation: str,
+    source_format: str = "modelopt",
+) -> Dict[str, torch.Tensor]:
+    """Build the SM12x W4A16 ``b12x_w4a16`` weight view.
+
+    The existing b12x packed-weight cache is populated for bf16 activations.
+    Returned tensors retain the ``B12xMoEWrapper.run`` input layout.
+
+    Parameters
+    ----------
+    w1_fp4, w2_fp4 : Tensor
+        Packed checkpoint expert weights.
+    w1_blockscale, w2_blockscale : Tensor
+        Per-block checkpoint scales.
+    w1_global_scale, w2_global_scale : Tensor
+        Per-expert checkpoint scales.
+    activation : str
+        Kernel activation name: ``"silu"`` or ``"relu2"``.
+    source_format : str
+        Checkpoint scale convention: ``"modelopt"`` or
+        ``"compressed_tensors"``.
+
+    Returns
+    -------
+    dict
+        Keys expected by ``B12xMoEWrapper.run``: ``w1_weight``,
+        ``w1_weight_sf``, ``w1_alpha``, ``w2_weight``, ``w2_weight_sf``,
+        ``w2_alpha``.
+    """
+    from .cute_dsl.blackwell_sm12x.moe_dispatch import (
+        _get_w4a16_packed_weights,
+    )
+    from .cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
+        _normalize_source_format,
+        _source_global_scale,
+    )
+
+    source_format = _normalize_source_format(source_format)
+    w1_global_scale = _source_global_scale(w1_global_scale, source_format=source_format)
+    w2_global_scale = _source_global_scale(w2_global_scale, source_format=source_format)
+    _get_w4a16_packed_weights(
+        w1_weight=w1_fp4,
+        w1_weight_sf=w1_blockscale,
+        w1_alpha=w1_global_scale,
+        w2_weight=w2_fp4,
+        w2_weight_sf=w2_blockscale,
+        w2_alpha=w2_global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        source_format="modelopt",
+    )
+    return {
+        "w1_weight": w1_fp4,
+        "w1_weight_sf": w1_blockscale,
+        "w1_alpha": w1_global_scale,
+        "w2_weight": w2_fp4,
+        "w2_weight_sf": w2_blockscale,
+        "w2_alpha": w2_global_scale,
     }

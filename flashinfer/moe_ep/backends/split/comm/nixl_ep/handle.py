@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 from .....algo_knobs import (
     AlgoKnob,
     HandleAlgoKnobSplitOperation,
     HandleAlgoKnobTopKWeights,
+    HandleAlgoKnobUserStream,
     _index_knobs,
 )
 from .....config import (
@@ -35,12 +37,51 @@ class NixlEpHandle(Handle):
         self._fleet = fleet
         self._handle_knobs = _index_knobs(algo_knobs)
         self._staged = HandleAlgoKnobSplitOperation in self._handle_knobs
-        self._topk_ids = params.topk_ids
+        # NIXL builds pick the index width at compile time (TOPK_IDX_BITS,
+        # int32 by default since v1.3); callers hand us int64 (the nccl.ep
+        # convention), so cast to whatever this build binds.
+        import torch
+
+        topk_t = getattr(fleet._nixl_ep, "topk_idx_t", torch.int64)
+        if not isinstance(topk_t, torch.dtype):
+            topk_t = torch.int64
+        self._topk_ids = (
+            params.topk_ids
+            if params.topk_ids.dtype == topk_t
+            else params.topk_ids.to(topk_t)
+        )
+
+        # Stream the Buffer kernels should run on: the user-stream knob wins,
+        # else the fleet's bootstrap stream; 0 = leave the current stream alone.
+        us = self._handle_knobs.get(HandleAlgoKnobUserStream)
+        self._stream = (
+            int(us.stream)  # type: ignore[attr-defined]
+            if us is not None
+            else int(fleet._bootstrap.stream or 0)
+        )
+        self._stream_obj = None  # lazily built torch.cuda.ExternalStream
 
         # State stashed by dispatch() for combine() + complete().
         self._nixl_handle = None
         self._event = None
         self._recv_hook = None
+
+    def _stream_ctx(self):
+        """Context manager redirecting Buffer kernels to the bound stream.
+
+        The NIXL ``Buffer`` API takes no stream argument (unlike nccl.ep) and
+        launches on torch's current stream, so honoring
+        :class:`HandleAlgoKnobUserStream` means swapping the current stream
+        around each call. ``complete()`` runs under the same context so the
+        event wait / recv hook targets that stream too.
+        """
+        if not self._stream:
+            return contextlib.nullcontext()
+        import torch
+
+        if self._stream_obj is None:
+            self._stream_obj = torch.cuda.ExternalStream(self._stream)
+        return torch.cuda.stream(self._stream_obj)
 
     # @flashinfer_api  # disabled per PR #3453 review
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
@@ -49,34 +90,45 @@ class NixlEpHandle(Handle):
         buf = self._fleet.buffer
         async_finish = not self._staged
         return_recv_hook = self._staged
-        (
-            recv_x,
-            _recv_count,
-            handle,
-            event,
-            hook,
-        ) = buf.low_latency_dispatch(
-            x,
-            self._topk_ids,
-            self._fleet.params.max_tokens_per_rank,
-            self._fleet.params.num_experts,
-            use_fp8=self._fleet.use_fp8,
-            round_scale=self._fleet.use_ue8m0,
-            use_ue8m0=self._fleet.use_ue8m0,
-            async_finish=async_finish,
-            return_recv_hook=return_recv_hook,
-        )
+        with self._stream_ctx():
+            (
+                recv_x,
+                recv_count,
+                handle,
+                event,
+                hook,
+            ) = buf.low_latency_dispatch(
+                x,
+                self._topk_ids,
+                self._fleet.params.max_tokens_per_rank,
+                self._fleet.params.num_experts,
+                use_fp8=self._fleet.use_fp8,
+                round_scale=self._fleet.use_ue8m0,
+                use_ue8m0=self._fleet.use_ue8m0,
+                async_finish=async_finish,
+                return_recv_hook=return_recv_hook,
+            )
         self._nixl_handle = handle
         self._event = event
         self._recv_hook = hook
-        # recv_x is (fp8_tensor, scales) tuple when use_fp8 — pick the data tensor.
-        expert_tensors = recv_x[0] if isinstance(recv_x, tuple) else recv_x
-        world = self._fleet._bootstrap.world_size
-        num_local = self._fleet.params.num_experts // world
-        num_tokens = num_local * self._fleet.params.max_tokens_per_rank * world
+        # recv_x is (fp8_tensor, scales) tuple when use_fp8 — surface both.
+        if isinstance(recv_x, tuple):
+            expert_tensors, expert_scales = recv_x[0], recv_x[1]
+        else:
+            expert_tensors, expert_scales = recv_x, None
+        # num_tokens is the per-expert row count of the recv buffer (same
+        # semantics as nccl_ep LL EXPERT_MAJOR: max_tokens_per_rank * ranks).
+        # Read it off the returned [num_local, rows, hidden] tensor; the
+        # Buffer is sized to the fleet's rank capacity, not the live world.
+        if expert_tensors.dim() == 3:
+            num_tokens = expert_tensors.size(1)
+        else:
+            num_tokens = self._fleet.params.max_tokens_per_rank * self._fleet.capacity
         return DispatchOutput(
             expert_tensors=expert_tensors,
             num_tokens=num_tokens,
+            expert_counts=recv_count,
+            expert_scales=expert_scales,
         )
 
     # @flashinfer_api  # disabled per PR #3453 review
@@ -93,16 +145,17 @@ class NixlEpHandle(Handle):
             )
         topk_weights = tw.weights  # type: ignore[attr-defined]
         out_t: Optional[Any] = params.out
-        result = buf.low_latency_combine(
-            x,
-            self._topk_ids,
-            topk_weights,
-            self._nixl_handle,
-            async_finish=not self._staged,
-            zero_copy=False,
-            return_recv_hook=self._staged,
-            out=out_t,
-        )
+        with self._stream_ctx():
+            result = buf.low_latency_combine(
+                x,
+                self._topk_ids,
+                topk_weights,
+                self._nixl_handle,
+                async_finish=not self._staged,
+                zero_copy=False,
+                return_recv_hook=self._staged,
+                out=out_t,
+            )
         # low_latency_combine returns (combined_x, event, hook).
         if isinstance(result, tuple):
             combined_x = result[0]
@@ -115,11 +168,12 @@ class NixlEpHandle(Handle):
     # @flashinfer_api  # disabled per PR #3453 review
     def complete(self) -> None:
         """Wait on the staged event or invoke the deferred recv hook."""
-        if self._recv_hook is not None:
-            self._recv_hook()
-            self._recv_hook = None
-        elif self._event is not None:
-            self._event.current_stream_wait()
+        with self._stream_ctx():
+            if self._recv_hook is not None:
+                self._recv_hook()
+                self._recv_hook = None
+            elif self._event is not None:
+                self._event.current_stream_wait()
 
     def destroy(self) -> None:
         self._nixl_handle = None

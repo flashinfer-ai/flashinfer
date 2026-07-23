@@ -73,6 +73,7 @@ from .quantization.fp4_quantization import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
+    silu_and_mul_nvfp4_quantize,
     get_fp4_quantization_module,
     nvfp4_kv_dequantize,
     nvfp4_kv_dequantize_paged,
@@ -180,6 +181,9 @@ from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
 )
 from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
+from .prefill import (
+    trtllm_sage_attention_quantize as trtllm_sage_attention_quantize,
+)
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
 from .rope import apply_llama31_rope as apply_llama31_rope

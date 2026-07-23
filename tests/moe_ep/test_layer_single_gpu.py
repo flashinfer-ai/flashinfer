@@ -265,22 +265,24 @@ def test_split_layer_forward_rejects_token_overflow(stubbed_fleet_registry):
         split.forward(t)
 
 
-def test_split_layer_nixl_rejects_missing_tcp_store_at_init(dist_not_initialized):
+def test_split_layer_nixl_defers_missing_tcp_store_to_fleet_creation(
+    dist_not_initialized,
+):
+    """Layer init must NOT require the rendezvous store (layers are routinely
+    built before torch.distributed is initialized); the actionable error is
+    raised by the fleet's store resolution at first use instead."""
     from unittest import mock
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        MoEEpConfigError,
         MoEEpSplitLayer,
         NvepConfig,
         FleetParams,
         dummy_moe_weights,
     )
+    from flashinfer.moe_ep.backends.split.comm.nixl_ep.fleet import _resolve_store
 
-    with (
-        mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"),
-        pytest.raises(MoEEpConfigError, match="tcp_store"),
-    ):
+    with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
         MoEEpSplitLayer(
             bootstrap=BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False),
             fleet_params=FleetParams(
@@ -291,6 +293,9 @@ def test_split_layer_nixl_rejects_missing_tcp_store_at_init(dist_not_initialized
             weights=dummy_moe_weights(num_local_experts=4, hidden=4096),
             backend=NvepConfig(),
         )
+
+    with pytest.raises(ValueError, match="rendezvous store"):
+        _resolve_store(BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False))
 
 
 def test_split_layer_forward_accepts_partial_batch(stubbed_fleet_registry):

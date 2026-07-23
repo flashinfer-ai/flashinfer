@@ -73,10 +73,12 @@ class FakeRunnerB(TunableRunner):
 _TUNING_CONFIG = TuningConfig()
 
 
-def _populate_cache(tuner, runner, custom_op, profile, tactic, runner_id=0):
+def _populate_cache(tuner, runner, custom_op, profile, tactic, extras=()):
     """Insert a fake entry into the profiling cache."""
-    cache_key = AutoTuner._get_cache_key(custom_op, runner, profile, _TUNING_CONFIG)
-    tuner.profiling_cache[cache_key] = (runner_id, tactic, None)
+    cache_key = AutoTuner._get_cache_key(
+        custom_op, runner, profile, _TUNING_CONFIG, extras
+    )
+    tuner.profiling_cache[cache_key] = (tactic, None)
     tuner._dirty = True
 
 
@@ -483,15 +485,8 @@ class TestFileCacheKeyCollision:
 
         # Simulate two cache entries that differ only in extras
         # (e.g. use_8x4_sf_layout=True vs False)
-        cache_key_a = AutoTuner._get_cache_key(
-            "fp4_gemm", runner, profile, _TUNING_CONFIG, extras=(True,)
-        )
-        cache_key_b = AutoTuner._get_cache_key(
-            "fp4_gemm", runner, profile, _TUNING_CONFIG, extras=(False,)
-        )
-        self.tuner.profiling_cache[cache_key_a] = (0, 42, None)
-        self.tuner.profiling_cache[cache_key_b] = (0, 17, None)
-        self.tuner._dirty = True
+        _populate_cache(self.tuner, runner, "fp4_gemm", profile, 42, extras=(True,))
+        _populate_cache(self.tuner, runner, "fp4_gemm", profile, 17, extras=(False,))
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             tmp_path = f.name
@@ -516,15 +511,8 @@ class TestFileCacheKeyCollision:
         runner = FakeRunnerA(value=1)
         profile = ((128, 3584), (3584, 7168))
 
-        cache_key_a = AutoTuner._get_cache_key(
-            "fp4_gemm", runner, profile, _TUNING_CONFIG, extras=(True,)
-        )
-        cache_key_b = AutoTuner._get_cache_key(
-            "fp4_gemm", runner, profile, _TUNING_CONFIG, extras=(False,)
-        )
-        self.tuner.profiling_cache[cache_key_a] = (0, 42, None)
-        self.tuner.profiling_cache[cache_key_b] = (0, 17, None)
-        self.tuner._dirty = True
+        _populate_cache(self.tuner, runner, "fp4_gemm", profile, 42, extras=(True,))
+        _populate_cache(self.tuner, runner, "fp4_gemm", profile, 17, extras=(False,))
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             tmp_path = f.name
