@@ -1,0 +1,139 @@
+Draft migration of vLLM's FlashInfer autotune warmup onto flashinfer.autotune_v2()
+(managed per-entry store, PR flashinfer-ai/flashinfer#3861, RFC #3920).
+
+What this deletes: vLLM's own cache hashing, atomic-write, leader-broadcast and
+load_configs plumbing (flashinfer_autotune_cache.py entirely, ~56 lines, plus
+~40 lines of kernel_warmup.py).  What vLLM keeps: deciding WHEN to warm up and
+the barrier around it.
+
+Behavior changes (all improvements over status quo):
+- multi-rank deployments get PERSISTENT tuning results again (currently
+  disabled entirely for world_size > 1 since vllm#43119); all ranks tune
+  concurrently into one shared store — per-entry atomic publish makes this
+  safe, and restarts reuse it.
+- single-node consistency after restart: all ranks read the same store.
+  In-session cross-rank divergence is unchanged vs today's multi-rank path;
+  the flashinfer-side finalize step (tune -> barrier -> reload, tracked in
+  flashinfer#3186/#3187) removes it once available.
+- VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR maps onto cache_root= (placement only;
+  environment isolation is flashinfer's job now).
+
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@
+ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
+     """
+     Autotune FlashInfer operations.
+-    ...
+-    Tuning is performed only on rank 0. The resulting cache is broadcast
+-    to every rank so all ranks dispatch the same kernel tactic.
++    Results persist in FlashInfer's managed per-entry store
++    (environment-hashed, atomically published); later processes on the
++    same node reuse them with no vLLM-side cache management.
+     """
+-    import vllm.utils.flashinfer as fi_utils
+     from vllm.distributed.parallel_state import get_world_group
++    from flashinfer import autotune_v2
+
+     autotune_kwargs: dict = {}
+     skip_ops = _flashinfer_autotune_skip_ops(runner)
+     if skip_ops:
+         logger.info(
+             "Skipping FlashInfer autotuning for ops %s", sorted(skip_ops)
+         )
+         autotune_kwargs["skip_ops"] = skip_ops
+
+-    use_persistent_cache = True
+-
+-    # When distributed, tune on every rank so the collectives stay synchronized.
+-    if get_world_group().world_size > 1:
+-        use_persistent_cache = False
+-
+-    if not use_persistent_cache:
+-        with torch.inference_mode(), fi_utils.autotune(**autotune_kwargs):
+-            runner._dummy_run(...)
+-        get_world_group().barrier()
+-        return
+-
+-    world = get_world_group()
+-    is_leader = world.rank_in_group == 0
+-
+-    cache_path = resolve_flashinfer_autotune_file(runner)
+-    if is_leader:
+-        logger.info("Using FlashInfer autotune cache file: %s", cache_path)
+-
+-    dummy_run_kwargs = dict(
+-        num_tokens=runner.scheduler_config.max_num_batched_tokens,
+-        skip_eplb=True,
+-        is_profile=True,
+-    )
+-
+-    with torch.inference_mode():
+-        if is_leader:
+-            with fi_utils.autotune(
+-                tune_mode=True, cache=str(cache_path), **autotune_kwargs
+-            ):
+-                runner._dummy_run(**dummy_run_kwargs)
+-        else:
+-            runner._dummy_run(**dummy_run_kwargs)
+-
+-    # Broadcast autotune cache from rank 0 to all other ranks ...
+-    tune_results: bytes | None = None
+-    if is_leader and cache_path.exists():
+-        with open(cache_path, "rb") as f:
+-            tune_results = f.read()
+-
+-    tune_results = world.broadcast_object(tune_results, src=0)
+-
+-    if tune_results is None:
+-        logger.warning("No FlashInfer autotune cache entries found. ...")
+-    else:
+-        write_flashinfer_autotune_cache(cache_path, tune_results)
+-        world.barrier()
+-        from flashinfer.autotuner import AutoTuner
+-
+-        AutoTuner.get().load_configs(str(cache_path))
+-        logger.info("FlashInfer autotune cache loaded on rank %d ...", ...)
++    cache_dir = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR or None
++
++    # Every rank tunes (dummy forwards may contain collectives; leader-only
++    # tuning deadlocks them).  Concurrent publishes into the shared store
++    # are safe: per-entry atomic rename, last valid write wins.  Entries
++    # already on disk short-circuit re-profiling, so warm restarts are fast.
++    # Measure the way this deployment serves.  vLLM decode runs under a FULL
++    # CUDA graph, which is the mode-sensitive path (tactic winners flip
++    # eager-vs-graph at decode M; measured on B200), so execution_mode=
++    # "cuda_graph" is the correct single policy here.  cuda_graph profiling
++    # is validated working end-to-end for bmm_fp8 on SM100; flip to it once
++    # capture-safety is confirmed across the full autotuned-op suite (MoE,
++    # MLA) -- flashinfer RFC #3920 open question 1.  "auto" is the
++    # conservative default until then (keeps legacy measurement; leaves the
++    # #3719 mismatch open).
++    from flashinfer import MeasurementPolicy
++
++    measure = MeasurementPolicy(execution_mode="auto")  # -> "cuda_graph" when suite-validated
++
++    with torch.inference_mode(), autotune_v2(
++        cache_root=cache_dir, measure=measure, **autotune_kwargs
++    ):
++        runner._dummy_run(
++            num_tokens=runner.scheduler_config.max_num_batched_tokens,
++            skip_eplb=True,
++            is_profile=True,
++        )
++    if get_world_group().world_size > 1:
++        # Rank-consistency finalize: after every rank's publishes have
++        # landed, drop locally-measured winners and re-read the shared
++        # store so all ranks serve byte-identical tactics (the #3186
++        # divergence class; composes with set_autotune_process_group).
++        get_world_group().barrier()
++        from flashinfer import autotune_v2_reload
++
++        autotune_v2_reload()
++        get_world_group().barrier()
+
+--- a/vllm/model_executor/warmup/flashinfer_autotune_cache.py
++++ /dev/null
+(delete the whole file: flashinfer_autotune_cache_hash,
+ resolve_flashinfer_autotune_file, write_flashinfer_autotune_cache —
+ hashing, placement, and atomic publication are owned by flashinfer now)
