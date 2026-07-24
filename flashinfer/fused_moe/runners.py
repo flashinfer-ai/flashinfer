@@ -295,7 +295,7 @@ class CuteDslNvfp4Runner(MoERunner):
             )
             return [
                 act.hidden_states_q,
-                act.hidden_states_scale.unsqueeze(-1),
+                act.hidden_states_scale.unsqueeze(-1),  # CuteDSL expects [M, H//16, 1]
                 act.topk_ids,
                 act.topk_weights,
                 v["w1_weight"],
