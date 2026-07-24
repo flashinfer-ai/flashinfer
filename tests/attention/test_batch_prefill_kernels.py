@@ -1729,7 +1729,7 @@ def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256(kv_dtype):
     2-byte assumption forced CTA64 on 99KB parts).
 
     The expected tile is computed from the device's actual per-block opt-in
-    limit, so the assertion is exact on every architecture. The 2-byte case
+    limit, so the assertion is exact on every supported architecture. The 2-byte case
     then runs the kernel against an exact float32 reference. The 1-byte case
     stops at the plan-level assertion: the FA2 1-byte KV producers require
     head_dim to be a multiple of 128 elements (the 128-bit-per-lane load loop
@@ -1741,6 +1741,12 @@ def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256(kv_dtype):
     head_dim_qk = 448
     head_dim_vo = 256
     skip_if_head_dim_unsupported(head_dim_qk)
+    # Mirror the module gate: _fa2_head_dim_nvcc_flags restricts non-NVFP4 1-byte
+    # large-head modules to major [10, 11, 12], so on pre-SM100 the JIT spec-gen in
+    # plan() raises before the tile assertion. skip_if_head_dim_unsupported only gates
+    # the 16-bit path, so gate the 1-byte (FP8) parametrization here explicitly.
+    if kv_dtype.itemsize == 1 and get_compute_capability(torch.device("cuda:0"))[0] < 10:
+        pytest.skip("FP8 KV with head_dim > 256 requires SM100 or newer")
     props = torch.cuda.get_device_properties(0)
     optin = getattr(props, "shared_memory_per_block_optin", None)
     if optin is None:
