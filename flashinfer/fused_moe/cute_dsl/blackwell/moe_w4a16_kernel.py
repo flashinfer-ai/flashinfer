@@ -851,6 +851,7 @@ class Sm100W4A16GroupedGemmKernel:
         )
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        clc_response_ptr = storage.clc_response.data_ptr()
 
         # Initialize load2transform pipeline for the weight operand.
         transform_thread_idx = (
@@ -1165,7 +1166,7 @@ class Sm100W4A16GroupedGemmKernel:
                     tile_sched_params,
                     (bidx, bidy, bidz),
                     cute.arch.grid_dim(),
-                    storage.clc_response.data_ptr(),
+                    clc_response_ptr,
                 )
                 work_tile = tile_sched.initial_work_tile_info()
                 clc_producer_state = pipeline.make_pipeline_state(
