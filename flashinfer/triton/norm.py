@@ -3,7 +3,15 @@ from typing import Optional
 import torch
 import triton  # type: ignore[import]
 
-from flashinfer.triton.kernels.norm import rms_norm_kernel
+from flashinfer.triton.kernels.norm import (
+    rms_norm_kernel,
+    rms_norm_single_pass_kernel,
+)
+
+# Above this hidden size the whole row no longer fits comfortably in registers,
+# so the single-pass fast path is disabled to avoid register spills and the
+# general (streaming-capable) kernel is used instead.
+_SINGLE_PASS_MAX_HIDDEN = 8192
 
 
 def rms_norm(
@@ -21,8 +29,37 @@ def rms_norm(
 
     b, n = x.shape
 
+    # Both kernels address the hidden dimension with a bare element index
+    # (`ptr + offsets`), i.e. they assume it is contiguous; only the row stride
+    # is passed through. Reject a non-contiguous hidden dim rather than silently
+    # reading the wrong elements.
+    if x.stride(1) != 1 or out.stride(1) != 1 or weight.stride(0) != 1:
+        raise ValueError(
+            "rms_norm requires a contiguous hidden dimension for x, out, and "
+            "weight (stride 1 along the last axis)."
+        )
+
     block_size = triton.next_power_of_2(n)
     num_warps = max(8, min(32, block_size // 256))
+
+    # Guarded single-load fast path: no input/output scale, and the hidden dim
+    # fits safely in one tile. The whole row is then loaded once into registers
+    # and reused for both the reduction and the normalize step, avoiding the
+    # second global read of x that the general kernel performs. Results are
+    # bit-identical to the general path.
+    if in_scale is None and out_scale is None and n <= _SINGLE_PASS_MAX_HIDDEN:
+        rms_norm_single_pass_kernel[(b,)](
+            n=n,
+            x_ptr=x,
+            x_stride=x.stride(0),
+            w_ptr=weight,
+            o_ptr=out,
+            o_stride=out.stride(0),
+            EPS=eps,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
+        )
+        return
 
     rms_norm_kernel[(b,)](
         n=n,

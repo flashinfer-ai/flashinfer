@@ -16,3 +16,7 @@ fi
 # Run each test file separately to isolate CUDA memory issues
 pytest -s tests/utils/test_sampling.py
 pytest -s tests/utils/test_topk.py
+# Triton RMSNorm single-load fast path. Placed in shard 3 for A10G (SM86)
+# coverage; the test self-skips below SM80 (the supported Triton version's
+# floor), so it is a no-op on the T4/SM75 leg of this shard.
+pytest -s tests/utils/test_triton_norm.py
