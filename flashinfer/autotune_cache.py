@@ -274,16 +274,19 @@ class ManagedAutotuneCache:
         )
 
 
-def _attach_managed_cache(tuner, cache_root, manifest: Dict[str, str]):
-    """Attach (idempotently) the ambient managed store for this process and
-    return the store object.
+def _resolve_managed_store(
+    tuner, cache_root, manifest: Dict[str, str], set_ambient: bool
+):
+    """Return the managed store for ``(cache_root, manifest)``, reusing the
+    ambient store object when it already matches.
 
-    The ambient store outlives the context — frameworks serve outside any
-    context, so lookups must keep working after warmup exits.  Same root +
-    manifest reuses the existing store and its memos; a change replaces it.
-    (Contexts additionally push their store onto the tuner's per-thread
-    store stack, so nested contexts with different identities never publish
-    into each other's namespace.)
+    ``set_ambient`` rebinds the process-wide ambient pointer (the store bare,
+    context-free calls read).  It is set only by a **top-level** context
+    (warmup / an explicit re-attach): a nested / scoped execute-time context
+    resolves + returns its store and pushes it onto the store stack, but must
+    NOT rebind the ambient — otherwise a scoped override would leak past its
+    ``with`` block and change what later bare calls select (a scope guard
+    that fails to restore what it touched).
     """
     resolved = (
         pathlib.Path(cache_root) if cache_root is not None else get_default_cache_root()
@@ -292,22 +295,30 @@ def _attach_managed_cache(tuner, cache_root, manifest: Dict[str, str]):
     candidate["cache_schema"] = _SCHEMA
     with tuner._lock:
         current = tuner._managed_cache
-        if current is not None:
-            if current.root == resolved and current.manifest == candidate:
-                return current
+        if (
+            current is not None
+            and current.root == resolved
+            and current.manifest == candidate
+        ):
+            store = current  # reuse the ambient object (keeps its memo warm)
+        else:
+            store = ManagedAutotuneCache(manifest=manifest, root=resolved)
+        if set_ambient and store is not tuner._managed_cache:
+            if tuner._managed_cache is not None:
+                logger.info(
+                    f"[Autotuner]: Re-attaching managed autotune cache at "
+                    f"{resolved} (was {tuner._managed_cache.root}, "
+                    f"env {tuner._managed_cache.env_hash})."
+                )
+            tuner._managed_cache = store
+            # Bare calls now resolve to a different ambient identity; drop the
+            # previous ambient's decode memo so nothing is served stale.
+            tuner._managed_decoded.clear()
+            # Loud on purpose: the store changes what bare calls select.
             logger.info(
-                f"[Autotuner]: Re-attaching managed autotune cache at "
-                f"{resolved} (was {current.root}, env {current.env_hash})."
+                f"[Autotuner]: Managed autotune cache attached for this "
+                f"process: {store!r}"
             )
-        store = ManagedAutotuneCache(manifest=manifest, root=resolved)
-        tuner._managed_cache = store
-        # Entries decoded from a previously attached store must not be
-        # served under this one's identity.
-        tuner._managed_decoded.clear()
-        # Loud on purpose: the store changes what bare calls select.
-        logger.info(
-            f"[Autotuner]: Managed autotune cache attached for this process: {store!r}"
-        )
         return store
 
 
@@ -452,12 +463,20 @@ def autotune_v2(
         round_up=round_up,
         skip_ops=skip_ops,
     ):
+        # A top-level context (store stack empty on entry) sets the process
+        # ambient — the sticky default bare calls read after it exits.  A
+        # nested context is a scoped override: it pushes its store for the
+        # region but leaves the ambient default untouched, so the override
+        # cannot leak past its `with` block.
+        top_level = not tuner._get_store_stack()
         if persistent_cache:
             manifest = _collect_metadata()
             if measure is not None:
                 # The policy is part of the environment identity.
                 manifest.update(measure.manifest_fields())
-            store = _attach_managed_cache(tuner, cache_root, manifest)
+            store = _resolve_managed_store(
+                tuner, cache_root, manifest, set_ambient=top_level
+            )
         else:
             # Disk forbidden for this context: lookups and publishes are
             # disabled even if an ambient store was attached earlier (the
