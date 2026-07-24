@@ -36,6 +36,16 @@ import torch
 from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 from flashinfer.utils import get_compute_capability
 
+from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+if torch.cuda.is_available() and not is_cute_dsl_arch_supported(
+    *torch.cuda.get_device_capability(0)
+):
+    pytest.skip(
+        "installed CuTe DSL does not support this GPU architecture",
+        allow_module_level=True,
+    )
+
 
 def _skip_if_not_sm90_or_later() -> None:
     if not torch.cuda.is_available():

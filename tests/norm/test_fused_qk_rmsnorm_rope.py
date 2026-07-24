@@ -17,6 +17,16 @@ import torch.nn as nn
 
 from flashinfer.diffusion_ops import fused_qk_rmsnorm_rope
 
+from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+if torch.cuda.is_available() and not is_cute_dsl_arch_supported(
+    *torch.cuda.get_device_capability(0)
+):
+    pytest.skip(
+        "installed CuTe DSL does not support this GPU architecture",
+        allow_module_level=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Reference helpers

@@ -23,6 +23,16 @@ from flashinfer.utils import is_sm100a_supported
 if not is_cute_dsl_available():
     pytest.skip("CuTe DSL not available", allow_module_level=True)
 
+from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+if torch.cuda.is_available() and not is_cute_dsl_arch_supported(
+    *torch.cuda.get_device_capability(0)
+):
+    pytest.skip(
+        "installed CuTe DSL does not support this GPU architecture",
+        allow_module_level=True,
+    )
+
 from tests.test_helpers.sink_attention_reference import sink_softmax
 import cutlass.cute as cute
 

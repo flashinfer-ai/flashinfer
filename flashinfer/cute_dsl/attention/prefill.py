@@ -22,6 +22,7 @@ from .roles.correction import CorrectionRole
 from .roles.epilogue import EpilogueRole
 from .roles.loader_tma import LoaderRole
 from .roles.mma import MmaRole
+from .compat import get_current_arch as _get_current_arch
 
 import warnings
 
@@ -232,11 +233,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.shared_storage = lp.SharedStorage
 
         smem_bytes = lp.SharedStorage.size_in_bytes()
-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        arch = _get_current_arch()
+        smem_capacity = utils.get_smem_capacity_in_bytes(arch)
         if cutlass.const_expr(smem_bytes > smem_capacity):
             head_dim = self.config.mma_tiler[2]
             raise ValueError(
-                f"SharedStorage requires {smem_bytes} bytes but SM100 provides "
+                f"SharedStorage requires {smem_bytes} bytes but {arch} provides "
                 f"{smem_capacity} bytes. Reduce head_dim (currently {head_dim}) "
                 f"or tile size."
             )

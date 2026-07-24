@@ -1440,7 +1440,7 @@ def _get_fused_qk_rmsnorm_rope_module():
     return gen_norm_module().build_and_load()
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
 def _check_fused_qk_rmsnorm_rope(
     qkv,
     q_weight,

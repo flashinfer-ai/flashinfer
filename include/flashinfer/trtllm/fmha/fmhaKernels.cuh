@@ -57,8 +57,8 @@ using flashinfer::trtllm_cubin_loader::getCubin;
 // Check if two SM values are family/specific versions of the same architecture
 // Returns true only if one is a family version and the other is a compatible specific version
 constexpr bool isFamilySpecificSMPair(int sm1, int sm2) {
-  if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103)) ||
-      (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103))) {
+  if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103 || sm2 == kSM_107)) ||
+      (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103 || sm1 == kSM_107))) {
     return true;
   }
   return false;
@@ -67,6 +67,8 @@ constexpr bool isFamilySpecificSMPair(int sm1, int sm2) {
 constexpr bool isSMCompatible(int gpuSM, int kernelSM) {
   if (gpuSM == kSM_103) {
     return kernelSM == kSM_100f || kernelSM == kSM_103;
+  } else if (gpuSM == kSM_107) {
+    return kernelSM == kSM_100f || kernelSM == kSM_107;
   } else if (gpuSM == kSM_100) {
     return kernelSM == kSM_100f || kernelSM == kSM_100;
   }
@@ -117,12 +119,70 @@ class TllmGenFmhaKernel {
         mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV),
         mKernelMeta(pMetaStart),
         mKernelMetaCount(nMetaCount),
-        mSM(smArch) {}
+        mSM(smArch),
+        mMaxDeviceSmemSize(queryMaxDeviceSmemSize(smArch)) {}
+
+  static constexpr unsigned int kSmemOptInThreshold = 48 * 1024;
+  static constexpr unsigned int kRubinLegacySmemCap = 228 * 1024;
+  static constexpr unsigned int kStaticSmemReserve = 1024;
+
+  static bool isRubinOversized(unsigned int sm, unsigned int sharedMemBytes) {
+    return sm == kSM_107 && (sharedMemBytes + kStaticSmemReserve > kRubinLegacySmemCap);
+  }
+
+  void setupKernelSmem(CUfunction func, KernelMeta const& kernelMeta) const {
+#if CUDA_VERSION >= 13030
+    if (isRubinOversized(mSM, kernelMeta.mSharedMemBytes)) {
+      cuErrCheck(cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE,
+                                    CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
+      return;
+    }
+#endif
+    if (kernelMeta.mSharedMemBytes >= kSmemOptInThreshold) {
+      cuErrCheck(cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                    kernelMeta.mSharedMemBytes));
+    }
+  }
+
+  void appendOversizedSmemLaunchAttr(CUlaunchAttribute* launch_attribute,
+                                     CUlaunchConfig& launch_config,
+                                     KernelMeta const& kernelMeta) const {
+#if CUDA_VERSION >= 13030
+    if (isRubinOversized(mSM, kernelMeta.mSharedMemBytes)) {
+      IKL_LOG_DEBUG(
+          "TRTLLM-Gen launch info: using oversized shared memory for kernel %s (smem=%u bytes)",
+          kernelMeta.mFuncName, kernelMeta.mSharedMemBytes);
+      launch_attribute[launch_config.numAttrs].id = CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE;
+      launch_attribute[launch_config.numAttrs].value.sharedMemoryMode =
+          CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
+      launch_config.numAttrs += 1;
+    }
+#endif
+  }
+
+  static unsigned int queryMaxDeviceSmemSize(unsigned int smArch) {
+    CUdevice device;
+    cuErrCheck(cuCtxGetDevice(&device));
+    int smem_bytes = 0;
+#if CUDA_VERSION >= 13030
+    if (smArch == kSM_107) {
+      cuErrCheck(cuDeviceGetAttribute(
+          &smem_bytes, CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, device));
+      return static_cast<unsigned int>(smem_bytes);
+    }
+#endif
+    cuErrCheck(cuDeviceGetAttribute(&smem_bytes,
+                                    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device));
+    return static_cast<unsigned int>(smem_bytes);
+  }
 
   void loadKernels() {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
+      if (kernelMeta.mSharedMemBytes + kStaticSmemReserve > mMaxDeviceSmemSize) {
+        continue;
+      }
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV &&
           kernelMeta.mDataTypeO == mDtypeOut &&
@@ -159,7 +219,8 @@ class TllmGenFmhaKernel {
                          int multiCtasKvMode, int headDimPerCtaV, int headDimQk, int headDimV,
                          int tileSizeQ, int tileSizeKv, int numTokensPerPage,
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
-                         int sparseMlaType, bool skipsSoftmax) const {
+                         int sparseMlaType, bool skipsSoftmax, bool fp16Softmax,
+                         bool usesSpcompress) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -192,6 +253,8 @@ class TllmGenFmhaKernel {
     // Bit 55 - 56: sparseMlaType (0=none, 1=static token sparse, 2=dynamic token sparse).
     // Bit 57 - 57: skipsSoftmax.
     // Bit 58 - 58: dynamicNumTokensPerPage.
+    // Bit 59 - 59: fp16Softmax.
+    // Bit 60 - 60: usesSpcompress.
     uint64_t const numTokensPerPageLog2 =
         numTokensPerPage == 0 ? 0 : static_cast<uint64_t>(log2(numTokensPerPage));
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
@@ -206,7 +269,9 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(uses2CtaMma) << 54) |
            (static_cast<uint64_t>(sparseMlaType) << 55) |
            (static_cast<uint64_t>(skipsSoftmax) << 57) |
-           (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58);
+           (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58) |
+           (static_cast<uint64_t>(fp16Softmax) << 59) |
+           (static_cast<uint64_t>(usesSpcompress) << 60);
   }
 
   inline bool isDynamicNumTokensPerPageKernel(KernelMeta const& kernelMeta) const {
@@ -220,8 +285,8 @@ class TllmGenFmhaKernel {
                   kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
                   kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
                   isDynamicNumTokensPerPageKernel(kernelMeta), kernelMeta.mReuseSmemKForV,
-                  kernelMeta.m2CtaMma, kernelMeta.mSparseAttn,
-                  kernelMeta.mSkipsSoftmaxWhenPossible);
+                  kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
+                  kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress);
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
@@ -278,7 +343,7 @@ class TllmGenFmhaKernel {
     kernelParams.mLogNumEltsPerSageAttnBlkV = sageParamEncode(kernelMeta.mNumEltsPerSageAttnBlkV);
 
     void* kernelParamsList[] = {&kernelParams};
-    CUlaunchAttribute launch_attribute[3];
+    CUlaunchAttribute launch_attribute[4] = {};
     CUlaunchConfig launch_config;
     buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
 
@@ -365,6 +430,7 @@ class TllmGenFmhaKernel {
     launch_attribute[2].value.programmaticStreamSerializationAllowed = params.enable_pdl;
     launch_config.attrs = launch_attribute;
     launch_config.numAttrs = 3;
+    appendOversizedSmemLaunchAttr(launch_attribute, launch_config, kernelMeta);
   }
 
   // Enable non-portable cluster sizes when clusterDimX exceeds the portable limit of 8.
@@ -960,7 +1026,9 @@ class TllmGenFmhaKernel {
         ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) +
         ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma) +
         ", sparseMlaType=" + std::to_string(static_cast<int>(params.mSparseMlaType)) +
-        ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
+        ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible) +
+        ", fp16Softmax=" + std::to_string(selectKernelParams.mUseFp16Softmax) +
+        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
@@ -976,7 +1044,8 @@ class TllmGenFmhaKernel {
                selectKernelParams.mNumTokensPerPage, selectKernelParams.mDynamicNumTokensPerPage,
                selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
                static_cast<int>(params.mSparseMlaType),
-               selectKernelParams.mSkipsSoftmaxWhenPossible),
+               selectKernelParams.mSkipsSoftmaxWhenPossible, selectKernelParams.mUseFp16Softmax,
+               selectKernelParams.mUsesSpcompress),
         info);
   }
 
@@ -1026,11 +1095,7 @@ class TllmGenFmhaKernel {
       funcInfo.mMetaInfoIndex = metaIndex;
       cuErrCheck(cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
 
-      if (kernelMeta.mSharedMemBytes >= 48 * 1024) {
-        cuErrCheck(cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                                      CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                      kernelMeta.mSharedMemBytes));
-      }
+      setupKernelSmem(funcInfo.mDeviceFunction, kernelMeta);
 
       // Cache the loaded function.
       mFunctions[hashId] = funcInfo;
@@ -1051,6 +1116,7 @@ class TllmGenFmhaKernel {
   KernelMeta const* mKernelMeta;
   unsigned int mKernelMetaCount;
   unsigned int mSM;
+  unsigned int mMaxDeviceSmemSize;
   mutable std::unordered_map<std::string, CUmodule> mModules;
 
   mutable std::unordered_map<uint64_t, unsigned int> mKernelMetaMap;
