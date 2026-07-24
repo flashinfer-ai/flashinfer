@@ -135,12 +135,6 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
   arguments.epilogue.thread.alpha = 1.0f;
   arguments.epilogue.thread.beta = 0.0f;
 
-  // Check device compute capability first
-  int device_id = 0;
-  cudaGetDevice(&device_id);
-  cudaDeviceProp props;
-  cudaGetDeviceProperties(&props, device_id);
-
   Gemm gemm;
 
   cutlass::Status status = gemm.can_implement(arguments);
