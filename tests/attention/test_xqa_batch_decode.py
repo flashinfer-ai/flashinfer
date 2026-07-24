@@ -417,6 +417,9 @@ def generate_spec_dec_mask(
         (4, 1, 32, 2, 5),
         (128, 1, 64, 2, 6),
         (256, 1, 64, 4, 8),
+        # Nemotron 3.5 Nano shape: 32 q heads / 2 kv heads (group ratio 16)
+        (4, 1, 32, 2, 16),
+        (4, 4, 32, 2, 16),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1, 127])
@@ -615,6 +618,8 @@ def test_xqa_batch_decode(
         (4, 2, 32, 2, 4),
         (4, 4, 64, 4, 2),
         (4, 5, 16, 2, 8),
+        # Nemotron 3.5 Nano shape: 32 q heads / 2 kv heads (group ratio 16)
+        (4, 4, 32, 2, 16),
     ],
 )
 @pytest.mark.parametrize("window_left", [63, 127])
@@ -711,6 +716,8 @@ def generate_ragged_spec_dec_mask(
         # max_q_len * head_grp_size > 32: multiple token blocks per group,
         # short requests leave whole blocks with zero valid rows
         ((5, 1, 3, 2), 16, 2, 8),
+        # Nemotron 3.5 Nano shape: 32 q heads / 2 kv heads (group ratio 16)
+        ((1, 4, 2, 3), 32, 2, 16),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1, 127])
