@@ -292,9 +292,11 @@ def _make_decode_scratch(
 
 _DSV4_DECODE_CONFIGS = [
     (8, 128),
+    (8, 256),
     (8, 512),
     (8, 1024),
     (16, 128),
+    (16, 256),
     (32, 512),
     (64, 1024),
     (128, 1024),
@@ -890,7 +892,9 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
 
 _DSV4_PREFILL_CONFIGS = [
     (16, 128),
+    (16, 256),
     (32, 512),
+    (32, 256),
     (64, 1024),
     (128, 1024),
 ]
