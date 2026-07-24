@@ -21,7 +21,7 @@ external references across a (num_tokens, hidden_dim) sweep:
   - ``cutile`` : FlashInfer ``per_token_group_quant_8bit(backend="cutile")``
   - ``sgl``    : SGLang ``sgl_kernel.sgl_per_token_group_quant_8bit`` (SOTA
                  baseline used by ocean-eval's dashboard for this op)
-  - ``triton`` : SGLang Triton ``per_token_group_quant_fp8`` reference
+  - ``triton`` : SGLang Triton ``per_token_group_quant_8bit`` reference
   - ``torch``  : PyTorch-native reference
 
 Providers whose backend is unavailable are skipped (NaN), so ``cutile`` (needs
