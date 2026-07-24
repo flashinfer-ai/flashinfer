@@ -45,6 +45,9 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Mxfp8CutedslMegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Mxfp8CutedslMegaMoeConfig = config
+        # knobs="auto": tune at the first compute() (weights + staged inputs
+        # exist there), then keep the winner for the session.
+        self._autotune_pending = config.knobs == "auto"
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -96,7 +99,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ..cutedsl_backend_kernels.frontend import (
+        from .....kernel_src.cutedsl_megamoe import (
             get_symm_buffer_for_mxfp8_mega_moe,
         )
 
@@ -115,6 +118,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             activation_clamp=k.activation_clamp,
             in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
             token_back_by_dispatch=k.token_back_by_dispatch,
+            knobs=k.knobs if isinstance(k.knobs, dict) else None,
         )
 
     def validate_forward(
@@ -155,8 +159,12 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 kind=self._kernel_config.kind,
             )
         else:
-            from common.megamoe_constants import Mxfp8BlockSize
-            from moe_nvfp4_swapab.runner_common import ceil_div, round_up
+            # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+            from .....kernel_src.cutedsl_megamoe import (
+                Mxfp8BlockSize,
+                ceil_div,
+                round_up,
+            )
 
             hidden = workspace.hidden
             hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
@@ -187,9 +195,26 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from ..cutedsl_backend_kernels.frontend import mxfp8_mega_moe
+        from .....kernel_src.cutedsl_megamoe import mxfp8_mega_moe
 
         kcfg = self._kernel_config
+        if self._autotune_pending:
+            # COLLECTIVE: every EP rank reaches this first compute() together,
+            # so the candidate sweep stays in lockstep (see shim/autotune.py).
+            from .....kernel_src.cutedsl_megamoe import autotune_mxfp8_mega_moe
+
+            autotune_mxfp8_mega_moe(
+                output,
+                transformed_weights[0],
+                transformed_weights[1],
+                workspace,
+                num_tokens=output.shape[0],
+                gate_up_clamp=_resolve_gate_up_clamp(kcfg),
+                activation_clamp=kcfg.activation_clamp,
+            )
+            # Cleared only on success: if the collective tune raises, a retried
+            # compute() re-attempts it (all ranks fail together, so lockstep holds).
+            self._autotune_pending = False
         mxfp8_mega_moe(
             output,
             transformed_weights[0],

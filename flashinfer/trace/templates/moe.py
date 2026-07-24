@@ -30,6 +30,138 @@ from ._init_helpers import fp8_block_quant_1d, fp8_block_quant_2d
 from .quantize import _fp4_quantize_reference
 
 # ---------------------------------------------------------------------------
+# SM90 mixed-input weight preparation
+# ---------------------------------------------------------------------------
+
+_SM90_MIXED_WEIGHT_PREP_AXES: dict[str, Var | Const] = {
+    "num_experts": Var(description="Number of local experts."),
+    "rows": Var(description="Logical weight rows per expert."),
+    "packed_k": Var(description="Packed 4-bit K bytes per row."),
+    "scale_groups": Var(description="Weight-scale groups per row."),
+}
+
+_SM90_MIXED_WEIGHT_PREP_INPUTS: dict[str, Tensor | Scalar] = {
+    "weight": Tensor(
+        ["num_experts", "rows", "packed_k"],
+        description="Packed 4-bit expert weights.",
+    ),
+    "raw_scale": Tensor(
+        ["num_experts", "rows", "scale_groups"],
+        description="Logical E8M0 weight scales.",
+    ),
+    "max_range": Scalar("int32", description="Maximum fused E8M0 exponent range."),
+    "interleave": Scalar(
+        "bool", description="Whether to emit the SM90 physical layout."
+    ),
+}
+
+sm90_mixed_gemm_humming_weight_preprocess_trace = TraceTemplate(
+    op_type="moe_preprocess",
+    name_prefix="sm90_mixed_gemm_humming_weight_preprocess",
+    description="Prepare Humming-style MXFP4 weights and scales for SM90 mixed-input MoE.",
+    axes={
+        **_SM90_MIXED_WEIGHT_PREP_AXES,
+        "m64_blocks": Var(description="Folded 64-row scale blocks."),
+        "k128_blocks": Var(description="Folded K128 scale blocks."),
+        "folded_m": Var(description="Physical folded-M scale extent."),
+        "physical_cols": Var(description="Physical scale columns per folded block."),
+    },
+    inputs=_SM90_MIXED_WEIGHT_PREP_INPUTS,
+    outputs={
+        "processed_weight": Tensor(
+            ["num_experts", "rows", "packed_k"], dtype_from="weight"
+        ),
+        "processed_scale": Tensor(
+            ["num_experts", "m64_blocks", "k128_blocks", "folded_m", "physical_cols"],
+            dtype_from="raw_scale",
+        ),
+        "residual": Tensor(["num_experts"], dtype="float32"),
+    },
+    constraints=["packed_k == scale_groups * 16"],
+    tags=["moe:sm90", "quantization:mxfp4"],
+)
+
+sm90_mixed_gemm_humming_weight_preprocess_logical_trace = TraceTemplate(
+    op_type="moe_preprocess",
+    name_prefix="sm90_mixed_gemm_humming_weight_preprocess_logical",
+    description="Prepare logical Humming-style MXFP4 payloads and exponent offsets.",
+    axes=_SM90_MIXED_WEIGHT_PREP_AXES,
+    inputs=_SM90_MIXED_WEIGHT_PREP_INPUTS,
+    outputs={
+        "processed_weight": Tensor(
+            ["num_experts", "rows", "packed_k"], dtype_from="weight"
+        ),
+        "processed_scale": Tensor(
+            ["num_experts", "rows", "scale_groups"], dtype_from="raw_scale"
+        ),
+        "residual": Tensor(["num_experts"], dtype="float32"),
+    },
+    constraints=["packed_k == scale_groups * 16"],
+    tags=["moe:sm90", "quantization:mxfp4"],
+)
+
+
+def sm90_mixed_gemm_humming_weight_preprocess_trace_dispatch(**kwargs):
+    return (
+        sm90_mixed_gemm_humming_weight_preprocess_trace
+        if kwargs.get("interleave", True)
+        else sm90_mixed_gemm_humming_weight_preprocess_logical_trace
+    )
+
+
+sm90_mixed_gemm_humming_weight_preprocess_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    sm90_mixed_gemm_humming_weight_preprocess_trace,
+    sm90_mixed_gemm_humming_weight_preprocess_logical_trace,
+]
+
+sm90_mixed_gemm_scale_interleave_trace = TraceTemplate(
+    op_type="moe_preprocess",
+    name_prefix="sm90_mixed_gemm_scale_interleave",
+    description="Fold logical weight scales into the SM90 mixed-input layout.",
+    axes={
+        "num_experts": Var(description="Number of local experts."),
+        "rows": Var(description="Logical scale rows per expert."),
+        "scale_groups": Var(description="Logical scale groups per row."),
+        "m64_blocks": Var(description="Folded 64-row scale blocks."),
+        "k128_blocks": Var(description="Folded K128 scale blocks."),
+        "folded_m": Var(description="Physical folded-M scale extent."),
+        "physical_cols": Var(description="Physical scale columns per folded block."),
+    },
+    inputs={
+        "scales": Tensor(["num_experts", "rows", "scale_groups"]),
+        "group_size": Scalar("int32", description="Weight quantization group size."),
+    },
+    outputs={
+        "interleaved_scales": Tensor(
+            ["num_experts", "m64_blocks", "k128_blocks", "folded_m", "physical_cols"],
+            dtype_from="scales",
+        )
+    },
+    tags=["moe:sm90", "layout:folded_scale"],
+)
+
+sm90_mixed_gemm_weight_interleave_trace = TraceTemplate(
+    op_type="moe_preprocess",
+    name_prefix="sm90_mixed_gemm_weight_interleave",
+    description="Interleave packed 4-bit weights for the SM90 mixed-input MoE GEMM.",
+    axes={
+        "num_experts": Var(description="Number of local experts."),
+        "rows": Var(description="Logical weight rows per expert."),
+        "packed_k": Var(description="Packed 4-bit K bytes per row."),
+    },
+    inputs={
+        "weight": Tensor(["num_experts", "rows", "packed_k"]),
+        "quant_type": Scalar("str", description="4-bit payload/interleave variant."),
+    },
+    outputs={
+        "interleaved_weight": Tensor(
+            ["num_experts", "rows", "packed_k"], dtype_from="weight"
+        )
+    },
+    tags=["moe:sm90", "layout:mixed_input"],
+)
+
+# ---------------------------------------------------------------------------
 # Shared GEMM computation helper
 # ---------------------------------------------------------------------------
 

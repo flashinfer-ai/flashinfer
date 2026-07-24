@@ -13,6 +13,12 @@
 # See https://github.com/pre-commit/pre-commit
 # Note the pre-commit hooks shoule only be used for formatting, but not for linting.
 # For linting consider using CI.
+
+# cutedsl_megamoe/src is an upstream kernel drop that is re-synced periodically;
+# excluded from all hooks so formatting/lint churn doesn't block syncs.
+# The shim/ layer next to it is ours and stays checked.
+exclude: ^flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/
+
 repos:
   # Standard hooks
   - repo: https://github.com/pre-commit/pre-commit-hooks

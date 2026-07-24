@@ -882,7 +882,11 @@ add_rmsnorm_fp4quant_trace = TraceTemplate(
     name_prefix="add_rmsnorm_fp4quant",
     description=(
         "CuTe-DSL fused (residual + input) → RMSNorm → FP4 quantize. "
-        "Mutates the residual buffer in-place with the prenorm sum."
+        "Mutates the residual buffer in-place with the prenorm sum. "
+        "Note: the optional output variants of the runtime API "
+        "(``output_both_sf_layouts`` and ``y_out``) are not modeled by this "
+        "trace template — it captures the core FP4-quantize signature only; "
+        "dump/replay of those extra mutated buffers is unsupported."
     ),
     axes=_RMSNORM_FP4_AXES,
     inputs={
@@ -907,4 +911,26 @@ add_rmsnorm_fp4quant_trace = TraceTemplate(
 )
 add_rmsnorm_fp4quant_trace.axes["scalar"] = Var(
     description="global_scale tensor length (typically 1).",
+)
+
+
+def add_rmsnorm_fp4quant_trace_dispatch(save_dir=None, name=None, **kwargs):
+    """Select the trace template for ``add_rmsnorm_fp4quant``.
+
+    The static template models only the core FP4-quantize signature. The
+    optional output variants — ``y_out`` (an extra normed bf16/fp16 store)
+    and ``output_both_sf_layouts`` (a second scale-factor buffer) — add
+    mutated outputs the template does not represent. Refuse to emit a trace
+    for those calls (return ``None``) instead of silently dumping an
+    incomplete definition that dump/replay tooling would mis-handle.
+    """
+    if kwargs.get("y_out") is not None or kwargs.get("output_both_sf_layouts"):
+        return None
+    return add_rmsnorm_fp4quant_trace
+
+
+# Published so ``@flashinfer_api`` can auto-register the underlying template
+# for trace discovery even though the decorator receives the dispatch fn.
+add_rmsnorm_fp4quant_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    add_rmsnorm_fp4quant_trace,
 )

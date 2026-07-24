@@ -45,6 +45,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Nvfp4CutedslMegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Nvfp4CutedslMegaMoeConfig = config
+        # knobs="auto": tune at the first compute() (weights + staged inputs
+        # exist there), then keep the winner for the session.
+        self._autotune_pending = config.knobs == "auto"
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -94,7 +97,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ..cutedsl_backend_kernels.frontend import get_symm_buffer_for_mega_moe
+        from .....kernel_src.cutedsl_megamoe import get_symm_buffer_for_mega_moe
 
         k = self._kernel_config
         fp = fleet_params
@@ -109,9 +112,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
+            in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
+            combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
+            knobs=k.knobs if isinstance(k.knobs, dict) else None,
         )
 
     def validate_forward(
@@ -151,8 +157,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 norm_const=self._kernel_config.input_norm_const,
             )
         else:
-            from common.megamoe_constants import Nvfp4BlockSize
-            from moe_nvfp4_swapab.runner_common import ceil_div, round_up
+            # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+            from .....kernel_src.cutedsl_megamoe import (
+                Nvfp4BlockSize,
+                ceil_div,
+                round_up,
+            )
 
             hidden = workspace.hidden
             hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
@@ -188,9 +198,26 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from ..cutedsl_backend_kernels.frontend import nvfp4_mega_moe
+        from .....kernel_src.cutedsl_megamoe import nvfp4_mega_moe
 
         kcfg = self._kernel_config
+        if self._autotune_pending:
+            # COLLECTIVE: every EP rank reaches this first compute() together,
+            # so the candidate sweep stays in lockstep (see shim/autotune.py).
+            from .....kernel_src.cutedsl_megamoe import autotune_nvfp4_mega_moe
+
+            autotune_nvfp4_mega_moe(
+                output,
+                transformed_weights[0],
+                transformed_weights[1],
+                workspace,
+                num_tokens=output.shape[0],
+                gate_up_clamp=_resolve_gate_up_clamp(kcfg),
+                activation_clamp=kcfg.activation_clamp,
+            )
+            # Cleared only on success: if the collective tune raises, a retried
+            # compute() re-attempts it (all ranks fail together, so lockstep holds).
+            self._autotune_pending = False
         nvfp4_mega_moe(
             output,
             transformed_weights[0],

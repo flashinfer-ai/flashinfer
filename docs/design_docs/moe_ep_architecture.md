@@ -2,6 +2,9 @@
 
 > For build/test/how-to-extend instructions, see the
 > [moe_ep runbook](./moe_ep_runbook.md).
+> For the CuTeDSL mega backends' tuning surface, measured performance, and
+> benchmark methodology, see
+> [kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
 
 Expert-Parallel MoE with two execution modes:
 
@@ -21,6 +24,13 @@ moe_ep/
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,…}
+  kernel_src/cutedsl_megamoe/  ← CuTeDSL kernel src (kernel team) + FI shim
+    src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
+    __init__.py                ← public API consumed by nvfp4_cutedsl / mxfp8_cutedsl backends
+    shim/                      ← thin adapters over src/ (_paths, comm, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
+    SKILL.md                   ← how to resync src/ when kernel team drops a new version
+    TUNING.md                  ← tuning surface, measured perf, benchmark methodology
+    ACKNOWLEDGEMENT.md         ← kernel authors
   modes/{split_layer,mega_layer,config}.py
 ```
 

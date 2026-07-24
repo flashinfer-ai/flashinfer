@@ -42,7 +42,7 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 // #include <cutlass/arch/arch.h>
 #ifdef ENABLE_FP4
-#include <cuda_fp4.h>
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
 #include <cuda_fp8.h>
 #include <math.h>
@@ -173,7 +173,7 @@ using SafeFP8 = __nv_fp8_e4m3;
 using SafeFP8 = void;
 #endif
 #ifdef ENABLE_FP4
-using SafeFP4 = __nv_fp4_e2m1;
+using SafeFP4 = Fp4Type;
 #else
 struct SafeFP4 {};
 #endif

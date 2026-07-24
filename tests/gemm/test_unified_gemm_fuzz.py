@@ -122,9 +122,6 @@ pytestmark = [
     pytest.mark.skipif(_SKIP is not None, reason=str(_SKIP)),
 ]
 _SM = _CC[0] * 10 + _CC[1]
-_CUDNN_VER = (
-    torch.backends.cudnn.version() or 0
-)  # e.g. 92300 == 9.23.0, 92301 == 9.23.1
 
 # A clean rejection ("not supported on this shape/arch/dtype") must SKIP, never fail; a crash
 # (CUDA error / illegal access / device assert) is always a finding and re-raises.
@@ -433,12 +430,6 @@ _CONVENTION_DIVERGENCES = [
 
 # Tracked findings the fuzzer surfaced (xfail-but-RUN: the case still executes, a correctness
 # failure is tolerated to keep the suite green, and an unexpected PASS warns "fixed -> remove it").
-#
-# NOTE: the cuDNN-9.23.0 bf16-mm/bmm fp16-out SM90 garbage finding used to live here as an xfail.
-# It's gone because flashinfer now precisely bans that envelope ({SM90, bf16->fp16, 9.23.0.x} in
-# gemm_base.py _cudnn_bf16_gemm_usable_or_skip) -> the cuDNN path is skipped there (auto falls
-# back), and 9.23.1+ has it fixed, so the broken path is unreachable. No workaround needed.
-#
 # Each entry is (predicate, reason, crash_capable). crash_capable=True entries are xfailed UP FRONT
 # (the kernel is never launched): the same root cause that yields garbage on one library stack can
 # be an out-of-bounds access on another, and one IMA poisons the CUDA context for every later test
@@ -461,31 +452,6 @@ _KNOWN_FAILURES = [
         "b=16 m=7 n=512 k=2688). To probe fixed-ness, run the REPRO with this entry removed. "
         "See HANDOFF_SM120_MXFP8_BMM_VERIFY.md.",
         True,  # crash-capable: IMA'd on GB200/cu129
-    ),
-    (
-        lambda cfg: (
-            cfg.adapter.quant_mode == "bf16"
-            and cfg.backend == "cudnn"
-            and _CC[0] == 9
-            and _CUDNN_VER == 92300
-        ),
-        "cuDNN 9.23.0 SM90 bf16 GEMM: the AUTOTUNER-selected (non-default) tactic returns garbage "
-        "for bf16->bf16 too (found by the autotune-ON winner validation: mm_bf16 m63_n32_k2688 "
-        "seed 1834712400, ratio 0.98 vs 0.0022 at the default tactic). Root-caused by per-plan "
-        "enumeration: of the graph's 15 plans exactly the five 'eng7_k17=4_*' ones (engine 7 with "
-        "CUDNN_KNOB_TYPE_SPLIT_K_SLC=4) miscompute; eng7 WITHOUT split-k is correct, and the tuner "
-        "picks the broken one because split-k wins the timing race on tall-K shapes. Same 9.23.0 "
-        "split-k family as the bf16->fp16 bug that gemm_base.py hard-bans, but bf16-out escapes "
-        "that ban because its DEFAULT tactic is correct -- only autotune(True) reaches the broken "
-        "plan. NOT tactic-index drift: the index was profiled and executed against the same graph "
-        "in the same process. Banning the whole {SM90, bf16-out, 9.23.0} envelope would kill a "
-        "working default path and the requirement layer cannot exclude a single plan, so it is "
-        "ledgered (numeric-only) instead; a tactics-blocklist entry (FLASHINFER_TACTICS_BLOCKLIST) "
-        "is the product-side mitigation for users pinned on 9.23.0. VERIFIED fixed in 9.23.1: the "
-        "same per-plan matrix on 9.23.1.3 and 9.23.2.1 shows all 15 plans (incl. the five "
-        "eng7_k17=4 ones) correct -- so the ==92300 gate is exact. Unreachable in CI (containers "
-        "pin newer cuDNN).",
-        False,  # numeric-only: default tactic is fine; still run, xfail at compare
     ),
 ]
 
