@@ -64,7 +64,7 @@ class MeasurementPolicy:
     The policy is part of the store's environment identity (manifest):
     entries tuned under different policies never overwrite each other,
     and a consuming process must attach with the same policy
-    (``autotune_v2(enable_tuning=False, measure=...)``).
+    (``autotune_v2(mode="replay", measure=...)``).
 
     Attributes:
         execution_mode:
@@ -345,7 +345,7 @@ def autotune_v2_reload() -> None:
 
 @contextlib.contextmanager
 def autotune_v2(
-    enable_tuning: bool = True,
+    mode: str = "tune",
     persistent_cache: bool = True,
     cache_root: Union[str, os.PathLike, None] = None,
     tuning_buckets: Optional[Tuple[int, ...]] = None,
@@ -362,16 +362,23 @@ def autotune_v2(
     ``profiling_cache``) is shared with :func:`flashinfer.autotune`; only
     persistence differs.
 
-    The two booleans are orthogonal:
+    ``mode`` names what the context does (a positive action, not a
+    negated flag); ``persistent_cache`` is the orthogonal disk toggle:
 
-    ====================  =====================  ==================================
-    ``enable_tuning``     ``persistent_cache``   meaning
-    ====================  =====================  ==================================
-    True                  True (default)         tune misses, publish to disk
-    True                  False                  tune in-memory only (no disk I/O)
-    False                 True                   use the existing on-disk cache
-    False                 False                  plain no-op context
-    ====================  =====================  ==================================
+    ===============  =====================  ==================================
+    ``mode``         ``persistent_cache``   meaning
+    ===============  =====================  ==================================
+    ``"tune"``       True (default)         tune misses, publish to disk
+    ``"tune"``       False                  tune in-memory only (no disk I/O)
+    ``"replay"``     True                   serve from the on-disk cache
+                                            (no profiling)
+    ``"replay"``     False                  no-op unless already hydrated
+    ===============  =====================  ==================================
+
+    ``mode="replay"`` is the serving path: it replays previously tuned
+    winners without paying any profiling cost (it does **not** discard
+    tuning results — that is what the negated ``enable_tuning=False`` it
+    replaced read like).
 
     **Attach semantics**: ``persistent_cache=True`` attaches the managed
     store for the remainder of the process (like v1's ``load_configs``),
@@ -380,8 +387,8 @@ def autotune_v2(
     docstring for the store's layout and failure rules.
 
     Args:
-        enable_tuning: If ``True``, profile uncovered shapes during
-            execution.  If ``False``, only use cached results (no
+        mode: ``"tune"`` (default) profiles uncovered shapes and publishes
+            winners; ``"replay"`` only serves already-tuned winners (no
             profiling).
         persistent_cache: If ``True`` (default), attach the managed
             on-disk store (read + publish).  If ``False``, do not touch
@@ -415,12 +422,17 @@ def autotune_v2(
             model(inputs)
 
         # Any later process in the same environment: hydrate + serve.
-        with autotune_v2(enable_tuning=False):
+        with autotune_v2(mode="replay"):
             pass
         model(inputs)  # reuses tuned winners, no context needed
     """
     from .autotuner import AutoTuner, _collect_metadata, autotune
 
+    if mode not in ("tune", "replay"):
+        raise ValueError(
+            f"mode must be 'tune' or 'replay', got {mode!r}; use 'replay' to "
+            f"serve already-tuned winners without profiling."
+        )
     if not isinstance(persistent_cache, bool):
         # Catch autotune_v2(persistent_cache="/some/path") early: any truthy
         # object would silently enable persistence at the DEFAULT root.
@@ -429,6 +441,7 @@ def autotune_v2(
             f"{type(persistent_cache).__name__!r}; to place the store, pass "
             f"cache_root=<directory> instead."
         )
+    enable_tuning = mode == "tune"
 
     tuner = AutoTuner.get()
     # Enter the delegated context first: if its argument validation fails,
