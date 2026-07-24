@@ -18,7 +18,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm100a_supported,
+    is_sm110a_supported,
+)
 from flashinfer.cute_dsl import is_cute_dsl_available
 
 
@@ -560,6 +564,11 @@ def test_cute_dsl_vs_trtllm_gen(
 ):
     """Test cute-dsl backend output matches trtllm-gen backend output."""
     skip_if_unsupported()
+
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip(
+            "cute-dsl vs trtllm-gen cross-check requires trtllm-gen (SM100/SM103)"
+        )
 
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 

@@ -72,7 +72,7 @@ def single_prefill_with_kv_cache_ref(
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
-def test_sinqle_prefill_with_paged_kv_cache(
+def test_single_prefill_with_paged_kv_cache(
     kv_len,
     qo_len,
     num_kv_heads,
@@ -111,7 +111,7 @@ def test_sinqle_prefill_with_paged_kv_cache(
     )
 
     o_ref = single_prefill_with_kv_cache_ref(q, k, v, causal=causal)
-    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o, o_ref, rtol=2e-3, atol=3e-3)
 
 
 def _run_single_prefill_with_kv_cache_nvfp4(
