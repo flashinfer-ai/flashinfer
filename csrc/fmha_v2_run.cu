@@ -630,6 +630,11 @@ void fmha_v2_run(
       scale_softmax, scale_bmm2, softcapping_scale_bmm1, false, false, false, has_alibi,
       skip_softmax_threshold_scale_factor);
 
+  // All Q lengths are equal iff they sum to b * max_q_len (each one is <= max_q_len).
+  // Padded batches decompose tiles from the padded seqlen, so aren't marked uniform.
+  params_v2.is_uniform_q =
+      !params_v2.is_s_padded && b > 0 && total_q_tokens == static_cast<uint32_t>(b * s_q);
+
   // For Q_PAGED_KV layout, override mMaxBlocksPerSeq to match the actual block_tables stride,
   // and enable shared page index mode so the kernel transforms page_idx → pool offsets on-the-fly.
   if (input_layout == Attention_input_layout::Q_PAGED_KV && block_table_max_blocks > 0) {
@@ -639,6 +644,9 @@ void fmha_v2_run(
 
   // Total number of Q tokens is needed to set TMA desc on the host.
   launch_params.total_q_seqlen = total_q_tokens;
+  // Upper bound on total KV tokens (includes past KV, unlike total_q_seqlen); used by the
+  // head-first scheduling L2 gate in the warp-specialized launcher.
+  launch_params.total_kv_seqlen = static_cast<int>(b * s_kv);
   // set enable_attn_logit_softcapping to select the right kernel.
   launch_params.enable_attn_logit_softcapping = softcapping_scale_bmm1 != 0.f;
 
