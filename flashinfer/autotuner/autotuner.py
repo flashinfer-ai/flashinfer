@@ -1298,6 +1298,12 @@ class AutoTuner:
         # (Inside an autotune_v2 context the per-thread store STACK overrides
         # this — see _active_managed_store.)
         self._managed_cache: Any | None = None
+        # Process-wide registry of managed store objects keyed by identity
+        # (root, canonical-manifest): switching between identities reuses the
+        # same store object (and its hit/miss memos) instead of rebuilding +
+        # re-reading disk.  Explicit invalidation is autotune_v2_reload() /
+        # clear_cache(), never an implicit switch.
+        self._managed_stores: dict[tuple[str, str], Any] = {}
         # Per-thread stack of context-scoped stores.  Top of stack = the
         # store the innermost autotune_v2 context reads/publishes (None =
         # that context forbids disk I/O); empty stack falls back to the
@@ -2978,9 +2984,10 @@ class AutoTuner:
             self._dirty_seq = 0
             self._winner_partitions.clear()
             self._managed_decoded.clear()
-            if self._managed_cache is not None:
-                # Forget memoized lookups so cleared keys re-probe disk.
-                self._managed_cache.clear_memo()
+            # Forget the per-identity disk memos on every registered store so
+            # cleared keys re-probe disk (the explicit invalidation point).
+            for store in self._managed_stores.values():
+                store.clear_memo()
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""

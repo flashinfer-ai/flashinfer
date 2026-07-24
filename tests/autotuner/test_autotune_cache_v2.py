@@ -35,9 +35,12 @@ _CONFIG = TuningConfig()  # no dynamic specs -> a single static profile
 
 def _fresh_process():
     """Simulate a new process: wipe all in-memory state INCLUDING the
-    attached managed store (which by design survives reset_autotuner)."""
+    attached managed store and the per-identity store registry (which by
+    design survive reset_autotuner)."""
     tuner = reset_autotuner()
     tuner._managed_cache = None
+    tuner._managed_stores.clear()
+    tuner._managed_decoded.clear()
     return tuner
 
 
@@ -533,28 +536,40 @@ def test_measure_policy_all_none_is_default_identity(cache_root, monkeypatch):
     assert calls == []
 
 
-def test_reattach_clears_decoded_memo(cache_root, monkeypatch):
-    """Entries decoded under one store must not be served under a different
-    store's identity: re-attaching (e.g. a new measurement policy) drops the
-    decode memo, and the new (empty) env misses instead of replaying store
-    A's winner."""
+def test_alternating_identities_keep_per_identity_memo(cache_root, monkeypatch):
+    """Switching between store identities must not cross-serve AND must not
+    re-read disk: the decode memo is keyed by identity, so store A's winner
+    survives a detour through store B and is served from memory (not disk)
+    on return — codex round-4: alternating graph/eager regions stay pure
+    in-memory after hydrate."""
     _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    tuner = _fresh_process()
-    calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    _fresh_process()
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+
+    # Region under store A (default identity): hydrates A's winner into memo.
     with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
     assert tactic == 1
-    assert tuner._managed_decoded  # memo hydrated from store A
 
+    # Detour through store B (eager identity): empty env -> miss, and it must
+    # NOT drop store A's memo.
     with autotune_v2(mode="replay", measure=MeasurementPolicy(execution_mode="eager")):
-        assert not tuner._managed_decoded  # re-attach dropped store A's memo
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
-    assert tactic == -1  # store B (eager env) is empty: miss, not A's winner
-    assert calls == []  # mode="replay": no profiling either
+    assert tactic == -1  # B is empty: miss, never A's winner (no cross-serve)
+
+    # Delete A's on-disk entry, then return to A: the winner must still be
+    # served -- proving it came from the retained memo, not a disk re-read.
+    for f in _entry_files(cache_root):
+        f.unlink()
+    with autotune_v2(mode="replay"):
+        _, tactic = AutoTuner.get().choose_one(
+            _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+        )
+    assert tactic == 1  # pure-memory replay; disk was deleted
 
 
 def test_policy_switch_reprofiles_in_process(cache_root, monkeypatch):
