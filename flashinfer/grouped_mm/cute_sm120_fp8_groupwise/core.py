@@ -85,6 +85,7 @@ def moe_gemm_fp8_nt_groupwise(
     backend: Literal["cute"] = "cute",
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    is_gated: bool = False,
 ) -> torch.Tensor:
     r"""Perform grouped GEMM with FP8 inputs in zero-padding mode using groupwise
     float32 scaling. Currently only supported on NVIDIA RTX PRO 6000 Blackwell (SM120)
@@ -141,6 +142,11 @@ def moe_gemm_fp8_nt_groupwise(
     out_dtype: Optional[torch.dtype]
         The data type of the output tensor. Currently only ``torch.bfloat16`` is supported.
 
+    is_gated: bool
+        If ``True``, run fused gate+up SwiGLU: ``b`` packs gate and up projections along N
+        (``b.shape[1] == 2 * out_n``) and the kernel fuses ``SiLU(gate) * up`` so the output
+        N is ``b.shape[1] // 2``. Defaults to ``False`` (plain grouped GEMM).
+
     Returns
     -------
     out: torch.Tensor
@@ -171,9 +177,12 @@ def moe_gemm_fp8_nt_groupwise(
             f"Only out_dtype=torch.bfloat16 is supported; got {out_dtype}"
         )
 
+    # Gated (fused SwiGLU): b packs gate+up along N (b.shape[1] == 2 * out_n); the kernel
+    # fuses SiLU(gate)*up so the output N is halved.
     n = b.shape[1]
+    out_n = n // 2 if is_gated else n
     if out is None:
-        out = torch.empty((a.shape[0], n), dtype=out_dtype, device=a.device)
+        out = torch.empty((a.shape[0], out_n), dtype=out_dtype, device=a.device)
 
     get_gemm_sm120_module_cute_fp8().moe_gemm_fp8_nt_groupwise(
         a,
@@ -186,5 +195,6 @@ def moe_gemm_fp8_nt_groupwise(
         scale_granularity_mnk[0],
         scale_granularity_mnk[1],
         scale_granularity_mnk[2],
+        is_gated,
     )
     return out

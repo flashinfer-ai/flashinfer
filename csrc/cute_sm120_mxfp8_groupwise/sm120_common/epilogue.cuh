@@ -105,7 +105,7 @@ struct Sm120BlockScaledTmaStoreConfig<kTileM, kTileN, ElementD, /*kEnabled=*/fal
 
 template <int kTileM, int kTileN, typename ElementD, bool kEnabled = true>
 struct Sm120BlockScaledStagedR2GStoreConfig {
-  static_assert((kTileM == 64 || kTileM == 128) && kTileN == 128);
+  static_assert((kTileM == 64 || kTileM == 128) && (kTileN == 64 || kTileN == 128));
 
   static constexpr int kEpiTileM = 64;
   static constexpr int kEpiTileN = 32;

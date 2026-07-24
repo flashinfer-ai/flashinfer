@@ -18,10 +18,12 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <cuda_runtime.h>
 #include "cute_sm120_mxfp8_groupwise/cute_sm120_mxfp8_runner.h"
 #include "cutlass/gemm_coord.h"
 #include "tvm_ffi_utils.h"
+#include "cute_sm120_mxfp8_groupwise/sm120_fused_moe/launch.cuh"
 #include "cute_sm120_mxfp8_groupwise/sm120_blockscaled/builder.cuh"
 #include "cute_sm120_mxfp8_groupwise/sm120_blockscaled/kernel_impl.cuh"
 #include "cute_sm120_mxfp8_groupwise/sm120_blockscaled/launch.cuh"
@@ -42,6 +44,44 @@
   }
 
 namespace flashinfer::gemm::mxfp8_cute_sm120 {
+
+static int select_mxfp8_fused_moe_tile_m(int total_rows, int shape_n, int shape_k, int num_experts,
+                                         int num_sms) {
+  int m_per_expert = num_experts > 0 ? (total_rows + num_experts - 1) / num_experts : 0;
+  auto tile_count = [&](int tile_m, int tile_n) {
+    int64_t num_m = (int64_t(m_per_expert) + tile_m - 1) / tile_m;
+    int64_t num_n = (int64_t(shape_n) + tile_n - 1) / tile_n;
+    return int64_t(num_experts) * num_m * num_n;
+  };
+
+  int64_t swapab_tiles = tile_count(8, 128);
+  int64_t m32_tiles = tile_count(32, 128);
+  int64_t m64_tiles = tile_count(64, 128);
+  int64_t m128_tiles = tile_count(128, 64);
+  bool short_k = shape_k <= 2048;
+
+  if (m_per_expert <= 8 || (short_k && m32_tiles < num_sms / 2 && swapab_tiles <= num_sms)) {
+    return 8;
+  }
+
+  int64_t m32_waves = (m32_tiles + num_sms - 1) / num_sms;
+  int64_t m64_waves = (m64_tiles + num_sms - 1) / num_sms;
+  int64_t m128_waves = (m128_tiles + num_sms - 1) / num_sms;
+
+  if (m64_waves >= m32_waves) {
+    return 32;
+  }
+  if (m128_waves < m64_waves) {
+    return 128;
+  }
+  if (m128_waves > m64_waves) {
+    return 64;
+  }
+  if (short_k && m64_tiles < m128_tiles) {
+    return 64;
+  }
+  return 128;
+}
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
@@ -69,6 +109,58 @@ void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
   DISPATCH_GRAN_K(granK, GRAN_K, {
     gemm_mxfp8_nt_groupwise_impl<GRAN_K>(D, A, B, shape_m, shape_n, shape_k, SFA, SFB, stream);
   })
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+template <int GranK>
+void CuteSm120Mxfp8GemmRunner<
+    ElementType, OutElementType, AccumElementType,
+    BlockScaleElementType>::fused_moe_mxfp8_nt_groupwise_impl(void* D, void const* A, void const* B,
+                                                              int32_t const* token_offset,
+                                                              int num_experts, int total_rows,
+                                                              int shape_n, int shape_k,
+                                                              cudaStream_t stream,
+                                                              int32_t const* SFA,
+                                                              int32_t const* SFB) {
+  int num_sms = sm120_blockscaled::get_num_sms();
+
+  using KT_SWAPAB = sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<128, 8, 64, 4, GranK, true>;
+  using KT_M32 = sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<32, 128, 64, 4, GranK>;
+  using KT_M64 =
+      sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<64, 128, 64, 4, GranK, false, true>;
+  using KT_M128 = sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<128, 64, 64, 4, GranK>;
+
+  auto ptr_A = reinterpret_cast<typename KT_M128::ElementA*>(const_cast<void*>(A));
+  auto ptr_B = reinterpret_cast<typename KT_M128::ElementB*>(const_cast<void*>(B));
+  auto ptr_SFA =
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
+  auto ptr_SFB =
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
+  auto ptr_D = reinterpret_cast<typename KT_M128::ElementD*>(D);
+
+  int tile_m = select_mxfp8_fused_moe_tile_m(total_rows, shape_n, shape_k, num_experts, num_sms);
+  if (tile_m == 8) {
+    sm120_blockscaled::launch_fused_moe<KT_SWAPAB>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                   total_rows, shape_n, shape_k, num_experts,
+                                                   token_offset, num_sms, stream);
+    return;
+  }
+  if (tile_m == KT_M32::kTileM) {
+    sm120_blockscaled::launch_fused_moe<KT_M32>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
+                                                shape_n, shape_k, num_experts, token_offset,
+                                                num_sms, stream);
+    return;
+  }
+  if (tile_m == KT_M64::kTileM) {
+    sm120_blockscaled::launch_fused_moe<KT_M64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
+                                                shape_n, shape_k, num_experts, token_offset,
+                                                num_sms, stream);
+    return;
+  }
+  sm120_blockscaled::launch_fused_moe<KT_M128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
+                                               shape_n, shape_k, num_experts, token_offset, num_sms,
+                                               stream);
 }
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
@@ -256,10 +348,16 @@ void CuteSm120Mxfp8GemmRunner<
                                                         int num_experts, int total_rows,
                                                         int shape_n, int shape_k,
                                                         cudaStream_t stream, int32_t const* SFA,
-                                                        int32_t const* SFB, int granK) {
+                                                        int32_t const* SFB, int granK,
+                                                        bool is_gated) {
   DISPATCH_GRAN_K(granK, GRAN_K, {
-    moe_gemm_mxfp8_nt_groupwise_impl<GRAN_K>(D, A, B, token_offset, num_experts, total_rows,
-                                             shape_n, shape_k, stream, SFA, SFB);
+    if (is_gated) {
+      fused_moe_mxfp8_nt_groupwise_impl<GRAN_K>(D, A, B, token_offset, num_experts, total_rows,
+                                                shape_n, shape_k, stream, SFA, SFB);
+    } else {
+      moe_gemm_mxfp8_nt_groupwise_impl<GRAN_K>(D, A, B, token_offset, num_experts, total_rows,
+                                               shape_n, shape_k, stream, SFA, SFB);
+    }
   })
 }
 

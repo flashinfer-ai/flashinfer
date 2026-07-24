@@ -42,9 +42,7 @@ struct SM120BlockScaledGemmKernel {
   static constexpr int MinBlocksPerMultiprocessor = 1;
 
   static constexpr sm120_common::GemmType kGemmType = KT::kGemmType;
-  using Scheduler =
-      std::conditional_t<KT::kSwapAB, sm120_common::Scheduler<kGemmType, KT::kTileN, KT::kTileM>,
-                         sm120_common::Scheduler<kGemmType, KT::kTileM, KT::kTileN>>;
+  using Scheduler = sm120_common::SelectedScheduler<kGemmType, KT::kSwapAB, KT::kTileM, KT::kTileN>;
   using ProblemShape = typename KT::ProblemShape;
 
   struct Params {
@@ -373,6 +371,8 @@ struct SM120BlockScaledGemmKernel {
 
   CUTE_DEVICE
   void operator()(Params const& params, char* smem_buf) {
+    static_assert(kGemmType != sm120_common::GemmType::MGroupedContiguousWithZeroPadding,
+                  "MGroupedContiguousWithZeroPadding launches SM120BlockScaledMoeGemmKernel");
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     int warp_idx = cutlass::canonical_warp_idx_sync();
     int lane_predicate = cute::elect_one_sync();

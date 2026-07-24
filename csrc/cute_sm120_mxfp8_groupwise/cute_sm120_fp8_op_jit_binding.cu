@@ -20,6 +20,7 @@
 void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_scale,
                                      TensorView b_scale, TensorView m_indptr, TensorView out,
                                      std::string scale_major_mode, int64_t scale_granularity_m,
-                                     int64_t scale_granularity_n, int64_t scale_granularity_k);
+                                     int64_t scale_granularity_n, int64_t scale_granularity_k,
+                                     int64_t is_gated);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_gemm_fp8_nt_groupwise, CutlassFP8GroupwiseMoeGEMMSM120);
