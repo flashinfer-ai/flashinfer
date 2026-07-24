@@ -672,9 +672,11 @@ def compute_threads_per_row(H: int, vec_size: int) -> int:
     threads_needed = (H + vec_size - 1) // vec_size
     # Round up to power of 2, capped at 1024
     threads = 32
-    while threads < threads_needed and threads < 1024:
+    while (
+        threads < threads_needed and threads < 128
+    ):  # PORT: cap 1024->128 (regblock register-blocking)
         threads *= 2
-    return min(threads, 1024)
+    return min(threads, 128)
 
 
 def make_tv_layout(threads_per_row: int, vec_size: int, num_vec_blocks: int) -> tuple:
