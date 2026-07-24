@@ -274,19 +274,16 @@ class ManagedAutotuneCache:
         )
 
 
-def _resolve_managed_store(
-    tuner, cache_root, manifest: Dict[str, str], set_ambient: bool
-):
-    """Return the managed store for ``(cache_root, manifest)``, reusing the
-    ambient store object when it already matches.
+def _resolve_managed_store(tuner, cache_root, manifest: Dict[str, str]):
+    """Return the managed store for ``(cache_root, manifest)`` and set it as
+    the process ambient (last-wins).
 
-    ``set_ambient`` rebinds the process-wide ambient pointer (the store bare,
-    context-free calls read).  It is set only by a **top-level** context
-    (warmup / an explicit re-attach): a nested / scoped execute-time context
-    resolves + returns its store and pushes it onto the store stack, but must
-    NOT rebind the ambient — otherwise a scoped override would leak past its
-    ``with`` block and change what later bare calls select (a scope guard
-    that fails to restore what it touched).
+    A persistent autotune_v2 context always attaches its store as the ambient
+    the moment it opens, so bare, context-free serving after the context
+    exits resolves to it.  autotune_v2 does not nest, so there is no scoped
+    variant to preserve an outer ambient for; sequential contexts are simply
+    last-wins.  The store object (and its memos) is reused across identity
+    switches via the registry.
     """
     resolved = (
         pathlib.Path(cache_root) if cache_root is not None else get_default_cache_root()
@@ -301,7 +298,7 @@ def _resolve_managed_store(
         if store is None:
             store = ManagedAutotuneCache(manifest=manifest, root=resolved)
             tuner._managed_stores[reg_key] = store
-        if set_ambient and store is not tuner._managed_cache:
+        if store is not tuner._managed_cache:
             if tuner._managed_cache is not None:
                 logger.info(
                     f"[Autotuner]: Re-attaching managed autotune cache at "
@@ -460,32 +457,37 @@ def autotune_v2(
     enable_tuning = mode == "tune"
 
     tuner = AutoTuner.get()
+    # autotune_v2 does not nest: a v2-inside-v2 context would have ambiguous
+    # store/policy targeting (which store does the outer's later work publish
+    # to?).  Fail fast instead of silently last-wins.  Nesting a plain v1
+    # autotune() inside or around autotune_v2 is fine and stays supported.
+    if tuner._v2_local.active:
+        raise RuntimeError(
+            "nested autotune_v2 contexts are unsupported: an autotune_v2 "
+            "context is already open on this thread.  Use one context per "
+            "warmup/serving region; nesting a plain autotune() is fine."
+        )
     # Enter the delegated context first: if its argument validation fails,
-    # this context has no lasting side effects (no attach, no policy push).
+    # this context has no lasting side effects (no attach, no policy set).
     with autotune(
         enable_tuning,
         tuning_buckets=tuning_buckets,
         round_up=round_up,
         skip_ops=skip_ops,
     ):
-        # A top-level context (store stack empty on entry) sets the process
-        # ambient — the sticky default bare calls read after it exits.  A
-        # nested context is a scoped override: it pushes its store for the
-        # region but leaves the ambient default untouched, so the override
-        # cannot leak past its `with` block.
-        top_level = not tuner._get_store_stack()
         if persistent_cache:
             manifest = _collect_metadata()
             if measure is not None:
                 # The policy is part of the environment identity.
                 manifest.update(measure.manifest_fields())
-            store = _resolve_managed_store(
-                tuner, cache_root, manifest, set_ambient=top_level
-            )
+            # A persistent context always attaches its store as the process
+            # ambient (last-wins), so bare serving after it exits resolves
+            # to it.
+            store = _resolve_managed_store(tuner, cache_root, manifest)
         else:
-            # Disk forbidden for this context: lookups and publishes are
-            # disabled even if an ambient store was attached earlier (the
-            # ambient store remains for serving after this context exits).
+            # Disk forbidden for this context: lookups and publishes skip the
+            # managed store even if one is attached as ambient (the ambient
+            # remains for bare serving outside this context).
             store = None
             if tuner._managed_cache is not None:
                 logger.info(
@@ -493,16 +495,13 @@ def autotune_v2(
                     "access disabled inside this context; the previously "
                     "attached store remains active for serving outside it."
                 )
-        # The store stack scopes lookup/publish to THIS context: a nested
-        # context with a different identity (policy/root) never publishes
-        # into the outer context's namespace, and persistent_cache=False
-        # truly means no disk I/O for the duration.
-        tuner._get_store_stack().append(store)
-        if measure is not None:
-            tuner._get_measure_stack().append(measure)
+        local = tuner._v2_local
+        local.active = True
+        local.store = store
+        local.measure = measure
         try:
             yield
         finally:
-            if measure is not None:
-                tuner._get_measure_stack().pop()
-            tuner._get_store_stack().pop()
+            local.active = False
+            local.store = None
+            local.measure = None

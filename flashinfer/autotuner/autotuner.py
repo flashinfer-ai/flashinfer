@@ -1225,12 +1225,21 @@ class _SkipOpsLocal(threading.local):
     stack: list[frozenset[str]]
 
 
-class _MeasureLocal(threading.local):
-    stack: list[Any]
+class _V2Local(threading.local):
+    """Per-thread record of the (single, non-nestable) active autotune_v2
+    context.  A single slot rather than a stack: autotune_v2 does not nest
+    (nesting raises), so a stack bought nothing; a per-thread slot keeps
+    concurrent threads isolated (each in its own context targets its own
+    store) without the stack machinery.
 
+    ``active`` — a v2 context is open on this thread.
+    ``store``  — its managed store (``None`` = disk forbidden this context).
+    ``measure``— its MeasurementPolicy (or ``None``).
+    """
 
-class _StoreLocal(threading.local):
-    stack: list[Any]
+    active: bool = False
+    store: Any = None
+    measure: Any = None
 
 
 class AutoTuner:
@@ -1295,8 +1304,9 @@ class AutoTuner:
         # serves context-free lookups for the remainder of the process, like
         # load_configs.  Disjoint from _file_configs by design: v1
         # save_configs must never observe v2 entries.  Protected by _lock.
-        # (Inside an autotune_v2 context the per-thread store STACK overrides
-        # this — see _active_managed_store.)
+        # A persistent autotune_v2 context sets this last-wins so bare,
+        # context-free serving keeps resolving to it; inside a context the
+        # per-thread _v2_local record overrides it (see _active_managed_store).
         self._managed_cache: Any | None = None
         # Process-wide registry of managed store objects keyed by identity
         # (root, canonical-manifest): switching between identities reuses the
@@ -1304,11 +1314,9 @@ class AutoTuner:
         # re-reading disk.  Explicit invalidation is autotune_v2_reload() /
         # clear_cache(), never an implicit switch.
         self._managed_stores: dict[tuple[str, str], Any] = {}
-        # Per-thread stack of context-scoped stores.  Top of stack = the
-        # store the innermost autotune_v2 context reads/publishes (None =
-        # that context forbids disk I/O); empty stack falls back to the
-        # ambient store above.
-        self._store_local: _StoreLocal = _StoreLocal()
+        # Per-thread record of the single active autotune_v2 context (no
+        # stack: v2 does not nest).  Keeps concurrent threads isolated.
+        self._v2_local: _V2Local = _V2Local()
         # Managed hits decoded from JSON once, then served from memory.
         # Keyed by (root, env_hash, file_key): entries decoded from one
         # store identity are never served under another's.
@@ -1343,8 +1351,6 @@ class AutoTuner:
         self._override_local: _OverrideLocal = _OverrideLocal()
         # Per-thread stack of frozenset[str] for skip_ops overrides.
         self._skip_ops_local: _SkipOpsLocal = _SkipOpsLocal()
-        # Per-thread stack of autotune_v2 MeasurementPolicy overrides.
-        self._measure_local: _MeasureLocal = _MeasureLocal()
         # Measure-derived TuningConfig variants, keyed by original config
         # identity (same rationale as _override_config_cache below).
         self._measure_config_cache: weakref.WeakKeyDictionary[
@@ -1395,18 +1401,10 @@ class AutoTuner:
             local.stack = OverrideStack()
         return local.stack
 
-    def _get_measure_stack(self) -> list[Any]:
-        """Return the per-thread MeasurementPolicy stack, creating it on first access."""
-        local = self._measure_local
-        if not hasattr(local, "stack"):
-            local.stack = []
-        return local.stack
-
     @property
     def _effective_measure_policy(self):
         """Active autotune_v2 measurement policy for this thread, or ``None``."""
-        stack = getattr(self._measure_local, "stack", None)
-        return stack[-1] if stack else None
+        return getattr(self._v2_local, "measure", None)
 
     def _apply_measure_policy(
         self, tuning_config: TuningConfig, policy
@@ -1475,27 +1473,25 @@ class AutoTuner:
                 )
         return ok
 
-    def _get_store_stack(self) -> list[Any]:
-        """Return the per-thread context-store stack, creating it on first access."""
-        local = self._store_local
-        if not hasattr(local, "stack"):
-            local.stack = []
-        return local.stack
-
     @property
     def _active_managed_store(self):
         """The store lookups/publishes target right now.
 
         Inside an autotune_v2 context this is that context's store (``None``
-        when the context was entered with ``persistent_cache=False`` — disk
-        is forbidden even if an ambient store is attached).  Outside any
-        context it is the ambient attached store, so serving keeps working
-        after warmup exits.
+        when entered with ``persistent_cache=False`` — disk forbidden for
+        the context even if an ambient store is attached).  Outside any
+        context it is the process ambient store, so bare serving keeps
+        working after warmup exits.
         """
-        stack = getattr(self._store_local, "stack", None)
-        if stack:
-            return stack[-1]
+        local = self._v2_local
+        if getattr(local, "active", False):
+            return local.store
         return self._managed_cache
+
+    @property
+    def _in_v2_context(self) -> bool:
+        """Whether an autotune_v2 context is open on this thread."""
+        return getattr(self._v2_local, "active", False)
 
     def _winner_cache(self) -> dict:
         """In-memory winner-cache partition for the active MEASUREMENT identity.
@@ -1965,7 +1961,7 @@ class AutoTuner:
             # EP-sharded M, the #3622/#3537 class), the comparison itself is
             # off — representative probe construction is op-level work.
             # Scoped to v2 so plain autotune() selection is byte-identical.
-            race_default = bool(self._get_store_stack())
+            race_default = self._in_v2_context
 
             pbar = None
             for _step, p in enumerate(profiles):

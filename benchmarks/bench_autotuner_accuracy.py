@@ -273,9 +273,9 @@ def interleaved_oracle(tuner, candidates, inputs, config, kwargs, rounds, repeat
 def measure_candidate(tuner, runner, inputs, tactic, config, kwargs, policy, repeat):
     """One tuner-style measurement; returns ms or inf on failure."""
     saved_repeat = tuner.repeat
-    stack = tuner._get_measure_stack()
+    saved_measure = tuner._v2_local.measure
     if policy is not None:
-        stack.append(policy)
+        tuner._v2_local.measure = policy
     try:
         tuner.repeat = repeat
         return tuner._profile_single_kernel(runner, inputs, tactic, config, **kwargs)
@@ -284,8 +284,7 @@ def measure_candidate(tuner, runner, inputs, tactic, config, kwargs, policy, rep
         return float("inf")
     finally:
         tuner.repeat = saved_repeat
-        if policy is not None:
-            stack.pop()
+        tuner._v2_local.measure = saved_measure
 
 
 def sweep_captured_op(op, runners, config, inputs, kwargs, args, tuner, grid_label):

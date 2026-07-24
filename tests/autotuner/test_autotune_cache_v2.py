@@ -634,24 +634,29 @@ def test_persistent_false_context_never_touches_disk(cache_root, monkeypatch):
     assert tactic == 1
 
 
-def test_nested_contexts_publish_to_their_own_store(cache_root, monkeypatch):
-    """P1 (codex review): after an inner context with a different identity
-    exits, the outer context's publishes go to the OUTER store, not the
-    inner one's manifest."""
-    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    inner_pol = MeasurementPolicy(execution_mode="eager")
+def test_nested_v2_context_raises(cache_root):
+    """autotune_v2 does not nest: a v2-inside-v2 context is a fail-fast, not a
+    silent last-wins that would publish the outer's later work into the inner
+    store (codex round-5)."""
+    with autotune_v2():  # noqa: SIM117 -- nesting is the behavior under test
+        with pytest.raises(RuntimeError, match="nested autotune_v2"):
+            with autotune_v2(measure=MeasurementPolicy(execution_mode="eager")):
+                pass
+    # After the outer exits, a fresh top-level context is fine again.
     with autotune_v2():
-        with autotune_v2(measure=inner_pol):
-            pass  # inner attaches its own env, then exits
-        _, tactic = AutoTuner.get().choose_one(
-            _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
-        )
+        pass
+
+
+def test_v1_autotune_may_nest_inside_v2(cache_root, monkeypatch):
+    """Only v2-in-v2 is forbidden; a plain v1 autotune() inside autotune_v2
+    (or vice versa) stays supported."""
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2():  # noqa: SIM117 -- v1-inside-v2 nesting is the point
+        with autotune(True):  # v1 nested inside v2 -> allowed
+            _, tactic = AutoTuner.get().choose_one(
+                _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+            )
     assert tactic == 1
-    entries = _entry_files(cache_root)
-    assert len(entries) == 1
-    manifest = json.loads((entries[0].parent.parent / "manifest.json").read_text())
-    # Published under the outer (default-policy) identity: no eager marker.
-    assert "measure_execution_mode" not in manifest
 
 
 def test_default_path_races_and_can_win(cache_root, monkeypatch):
@@ -889,35 +894,9 @@ def test_invalid_mode_raises(cache_root):
         pass
 
 
-def test_nested_context_does_not_clobber_ambient(cache_root, monkeypatch):
-    """Scope-guard hygiene: a nested (scoped) context is an override for its
-    region only — it must NOT rebind the process ambient set by the outer
-    (warmup) context, so bare calls after the inner exits keep the outer
-    identity."""
-    tuner = _fresh_process()
-    _policy_dependent_profile(monkeypatch)
-    inputs = [torch.zeros(8, 16)]
-
-    # Outer top-level context tunes under the default identity -> ambient.
-    with autotune_v2():
-        AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
-        outer_ambient = tuner._managed_cache
-        # Inner nested context with a DIFFERENT (eager) identity.
-        with autotune_v2(measure=MeasurementPolicy(execution_mode="eager")):
-            AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
-            # In-region lookup targets the inner store (top of stack)...
-            assert tuner._active_managed_store.env_hash != outer_ambient.env_hash
-        # ...but the ambient default is unchanged by the scoped override.
-        assert tuner._managed_cache is outer_ambient
-
-    # After everything exits, bare serving uses the outer (default) identity.
-    _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
-    assert tactic == 0  # default-identity winner, not the eager one
-
-
-def test_sequential_top_level_contexts_last_wins_ambient(cache_root, monkeypatch):
-    """Sequential top-level contexts each re-attach: the ambient is last-wins
-    (an explicit re-attach IS allowed; only *nested* overrides are scoped)."""
+def test_sequential_contexts_last_wins_ambient(cache_root, monkeypatch):
+    """Sequential (non-nested) contexts each re-attach: the ambient is
+    last-wins, so bare serving after them uses the last context's identity."""
     _policy_dependent_profile(monkeypatch)
     inputs = [torch.zeros(8, 16)]
     with autotune_v2():
