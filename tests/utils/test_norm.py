@@ -52,7 +52,8 @@ def layer_norm_quant(x, gamma, beta, scale, quant_dtype, eps=1e-6):
     y = torch.nn.functional.layer_norm(
         x.float(), (x.shape[-1],), weight=gamma, bias=beta, eps=eps
     )
-    y = y / scale
+    # Kernel rounds to input dtype before scaling; match it.
+    y = y.to(x.dtype).float() / scale
     finfo = torch.finfo(quant_dtype)
     y = torch.clamp(y, finfo.min, finfo.max)
     return y.to(quant_dtype)
@@ -371,7 +372,11 @@ def test_layernorm_quant(batch_size, hidden_size, quant_scale, quant_dtype):
     y = torch.empty_like(x, dtype=quant_dtype)
     flashinfer.norm.layernorm_quant(y, x, gamma, beta, scale)
 
-    torch.testing.assert_close(y_ref.float(), y.float(), rtol=1, atol=1)
+    # fp8 defaults (rtol/atol=0.1) allow a one-bucket step; max_mismatch_pct
+    # bounds how many elements may drift, so a systematic error still fails.
+    from flashinfer.trace import default_check
+
+    assert default_check([y_ref], [y], max_mismatch_pct=1.0, min_cos_sim=None)
 
 
 def test_layernorm_quant_invalid_inputs():
