@@ -2308,7 +2308,7 @@ def _trtllm_fp8_per_tensor_scale_routed_moe_reference(
             continue
         token_idx = torch.nonzero(token_mask, as_tuple=False).squeeze(1)
         gemm1_out = activations.index_select(0, token_idx).matmul(W1[local_idx].t())
-        up, gate = gemm1_out[:, :I], gemm1_out[:, I:]
+        gate, up = gemm1_out[:, :I], gemm1_out[:, I:]
         expert_out = (gate * torch.sigmoid(gate) * up).matmul(W2[local_idx].t())
         matches = (topk_idx.index_select(0, token_idx) == global_idx).to(torch.float32)
         weights = (topk_weights.index_select(0, token_idx) * matches).sum(dim=1)

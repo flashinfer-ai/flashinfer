@@ -71,6 +71,9 @@ def test_fp8_per_tensor_routed_moe_trace_reference_unpacks_routing():
     exec(defn["reference"], namespace)  # noqa: S102
     output = namespace["_trtllm_fp8_per_tensor_scale_routed_moe_reference"](**kwargs)
 
-    swiglu = torch.sigmoid(torch.tensor(1.0, dtype=torch.float32))
-    expected = torch.tensor([[0.25 * swiglu], [1.5 * swiglu]], dtype=torch.bfloat16)
+    sigmoid_1 = torch.sigmoid(torch.tensor(1.0, dtype=torch.float32))
+    sigmoid_2 = torch.sigmoid(torch.tensor(2.0, dtype=torch.float32))
+    expected = torch.tensor(
+        [[0.25 * sigmoid_1], [1.5 * sigmoid_2]], dtype=torch.bfloat16
+    )
     torch.testing.assert_close(output, expected)
