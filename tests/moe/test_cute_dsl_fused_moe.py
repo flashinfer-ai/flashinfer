@@ -28,6 +28,7 @@ Tests include:
 - API consistency between functional and wrapper APIs
 """
 
+import itertools
 import gc
 import weakref
 
@@ -328,48 +329,36 @@ class TestTacticEnumeration:
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             DEFAULT_W4A16_MOE_TACTIC,
         )
-        from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            W4A16_MOE_TACTICS,
+            get_w4a16_gemm1_valid_tactics,
+            get_w4a16_gemm2_valid_tactics,
+        )
 
         assert len(W4A16_MOE_TACTICS) == len(set(W4A16_MOE_TACTICS))
         assert DEFAULT_W4A16_MOE_TACTIC in W4A16_MOE_TACTICS
-        assert len(W4A16_MOE_TACTICS) == 63
+        assert len(W4A16_MOE_TACTICS) == 409
 
         route_tiles = {tactic[0] for tactic in W4A16_MOE_TACTICS}
         assert route_tiles == {8, 16, 32, 64, 128, 192}
 
-        shared_gemm_tactics = {
-            ((mma_m, mma_k), cluster_shape)
-            for mma_m, cluster_shape in (
-                (128, (1, 1)),
-                (128, (2, 1)),
-                (256, (2, 1)),
-            )
-            for mma_k in (64, 128, 256)
-        }
-        expected_gemm_pairs = {
-            (gemm_tactic, gemm_tactic) for gemm_tactic in shared_gemm_tactics
-        }
-        expected_gemm_pairs.update(
-            (((128, mma_k), (2, 1)), ((256, mma_k), (2, 1))) for mma_k in (64, 128, 256)
-        )
         for route_tile in route_tiles:
-            expected_route_gemm_pairs = expected_gemm_pairs
-            if route_tile == 8:
-                expected_route_gemm_pairs = {
-                    pair
-                    for pair in expected_gemm_pairs
-                    if pair[0][0][0] == 128 and pair[1][0][0] == 128
-                }
-            elif route_tile == 192:
-                expected_route_gemm_pairs = {
-                    pair for pair in expected_gemm_pairs if pair[0][0] != (128, 256)
-                }
+            expected_gemm_pairs = set(
+                itertools.product(
+                    get_w4a16_gemm1_valid_tactics(route_tile),
+                    get_w4a16_gemm2_valid_tactics(route_tile),
+                )
+            )
             route_tactics = [
                 (gemm1_tactic, gemm2_tactic)
                 for route, gemm1_tactic, gemm2_tactic in W4A16_MOE_TACTICS
                 if route == route_tile
             ]
-            assert set(route_tactics) == expected_route_gemm_pairs
+            assert set(route_tactics) == expected_gemm_pairs
+            assert all(
+                gemm1_tactic[0][1] == gemm2_tactic[0][1] == route_tile
+                for gemm1_tactic, gemm2_tactic in route_tactics
+            )
 
 
 # =============================================================================
@@ -1026,9 +1015,9 @@ class TestCuteDslMoeW4A16:
     @pytest.mark.parametrize(
         "rows,route_tile,tactic",
         [
-            pytest.param(128, 32, ((128, 64), (1, 1)), id="1cta"),
-            pytest.param(256, 64, ((256, 128), (2, 1)), id="2cta"),
-            pytest.param(256, 128, ((128, 256), (2, 1)), id="cluster2"),
+            pytest.param(128, 32, ((128, 32, 64), (1, 1), True), id="1cta"),
+            pytest.param(256, 64, ((256, 64, 128), (2, 1), True), id="2cta"),
+            pytest.param(256, 128, ((128, 128, 256), (2, 1), True), id="cluster2"),
         ],
     )
     def test_weight_scale_mapping(
@@ -1092,7 +1081,6 @@ class TestCuteDslMoeW4A16:
             permuted_idx_to_expanded_idx=None,
             token_final_scales=None,
             enable_pdl=False,
-            route_tile=route_tile,
             tactic=tactic,
         )
 
@@ -1108,36 +1096,36 @@ class TestCuteDslMoeW4A16:
             pytest.param(
                 ActivationType.Swiglu,
                 8,
-                ((128, 256), (2, 1)),
-                ((128, 256), (2, 1)),
+                ((128, 8, 256), (2, 1), True),
+                ((128, 8, 256), (2, 1), True),
                 id="route8-1cta",
             ),
             pytest.param(
                 ActivationType.Swiglu,
                 32,
-                ((128, 64), (1, 1)),
-                ((128, 64), (1, 1)),
+                ((128, 32, 64), (1, 1), True),
+                ((128, 32, 64), (1, 1), True),
                 id="route32-1cta",
             ),
             pytest.param(
                 ActivationType.Swiglu,
                 64,
-                ((256, 128), (2, 1)),
-                ((256, 128), (2, 1)),
+                ((256, 64, 128), (2, 1), True),
+                ((256, 64, 128), (2, 1), True),
                 id="route64-2cta",
             ),
             pytest.param(
                 ActivationType.Relu2,
                 128,
-                ((128, 256), (2, 1)),
-                ((256, 256), (2, 1)),
+                ((128, 128, 256), (2, 1), True),
+                ((256, 128, 256), (2, 1), True),
                 id="route128-mixed",
             ),
             pytest.param(
                 ActivationType.Swiglu,
                 192,
-                ((256, 128), (2, 1)),
-                ((256, 128), (2, 1)),
+                ((256, 192, 128), (2, 1), True),
+                ((256, 192, 128), (2, 1), True),
                 id="route192",
             ),
         ],

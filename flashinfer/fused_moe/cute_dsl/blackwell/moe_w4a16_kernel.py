@@ -87,6 +87,7 @@ class Sm100W4A16GroupedGemmKernel:
         use_fused_finalize: bool,
         enable_pdl: bool,
         use_clc_scheduler: bool,
+        raster_along_m: bool,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
         self.group_count = group_count
@@ -104,6 +105,7 @@ class Sm100W4A16GroupedGemmKernel:
             )
         self.fuse_activation = activation_type is not None
         self.use_clc_scheduler = use_clc_scheduler
+        self.raster_along_m = raster_along_m
         self.gated = activation_type == ActivationType.Swiglu.value
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
@@ -707,6 +709,7 @@ class Sm100W4A16GroupedGemmKernel:
             self.cluster_shape_mn,
             max_active_clusters,
             self.use_clc_scheduler,
+            self.raster_along_m,
         )
 
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
@@ -1228,7 +1231,7 @@ class Sm100W4A16GroupedGemmKernel:
                     tile_sched_params,
                     (bidx, bidy, bidz),
                     cute.arch.grid_dim(),
-                    inner_mode=0,
+                    inner_mode=0 if self.raster_along_m else 1,
                 )
                 work_tile = tile_sched.initial_work_tile_info()
                 not_last_tile = cutlass.Boolean(1)
@@ -2349,6 +2352,7 @@ class Sm100W4A16GroupedGemmKernel:
         cluster_shape_mn: tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
         use_clc_scheduler: bool,
+        raster_along_m: bool,
     ) -> tuple[
         Union[
             utils.ClcDynamicPersistentTileSchedulerParams,
@@ -2371,7 +2375,9 @@ class Sm100W4A16GroupedGemmKernel:
             )
         else:
             tile_sched_params = utils.PersistentTileSchedulerParams(
-                num_ctas_mnl, cluster_shape_mnl
+                num_ctas_mnl,
+                cluster_shape_mnl,
+                raster_along_m=raster_along_m,
             )
             grid = (cluster_shape_mn[0], cluster_shape_mn[1], max_active_clusters)
 
