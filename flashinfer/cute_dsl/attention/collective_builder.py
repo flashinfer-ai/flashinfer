@@ -103,10 +103,12 @@ def build_fmha_launch_params(
         k_dtype,
         mainloop.kv_stages,
     )
+    # P is the A operand of the PV MMA, so its layout follows v_dtype
+    # (softmax converts P to v_dtype before the TMEM store).
     p_tmem_layout_staged = sm100_utils.make_smem_layout_a(
         pv_tiled_mma,
         config.pv_mma_tiler,
-        q_dtype,
+        v_dtype,
         mainloop.acc_stage,
     )
     v_smem_layout_staged = sm100_utils.make_smem_layout_b(
@@ -115,6 +117,28 @@ def build_fmha_launch_params(
         v_dtype,
         mainloop.kv_stages,
     )
+    # K and V share one smem allocation (sV is a recast view of sK), so a
+    # mixed-width V needs its stage stride padded to the larger operand's
+    # tile footprint, expressed in its own element units — the same scheme
+    # as the vendored FMHA kernel.
+    sK_cosize = cute.cosize(k_smem_layout_staged)
+    if k_dtype.width > v_dtype.width:
+        k_tile_cosize = cute.cosize(cute.select(k_smem_layout_staged, mode=[0, 1, 2]))
+        v_stage_stride = k_tile_cosize * k_dtype.width // v_dtype.width
+        v_smem_layout_staged = cute.append(
+            cute.select(v_smem_layout_staged, mode=[0, 1, 2]),
+            cute.make_layout(mainloop.kv_stages, stride=v_stage_stride),
+        )
+    elif v_dtype.width > k_dtype.width:
+        v_tile_cosize = cute.cosize(cute.select(v_smem_layout_staged, mode=[0, 1, 2]))
+        k_stage_stride = v_tile_cosize * v_dtype.width // k_dtype.width
+        k_smem_layout_staged = cute.append(
+            cute.select(k_smem_layout_staged, mode=[0, 1, 2]),
+            cute.make_layout(mainloop.kv_stages, stride=k_stage_stride),
+        )
+        # Every stage slot must also fit a full V tile, which is larger
+        # than the K tile the last slot's cosize accounts for.
+        sK_cosize = mainloop.kv_stages * k_stage_stride
     o_smem_layout_staged = sm100_utils.make_smem_layout_epi(
         o_dtype,
         o_layout,
@@ -163,6 +187,7 @@ def build_fmha_launch_params(
 
     tma_copy_q_bytes = cute.size_in_bytes(q_dtype, q_smem_layout)
     tma_copy_kv_bytes = cute.size_in_bytes(k_dtype, k_smem_layout)
+    tma_copy_v_bytes = cute.size_in_bytes(v_dtype, v_smem_layout)
 
     # SharedStorage struct
     align = mainloop.buffer_align_bytes
@@ -203,7 +228,7 @@ def build_fmha_launch_params(
             align,
         ]
         sK: cute.struct.Align[
-            cute.struct.MemRange[k_dtype, cute.cosize(k_smem_layout_staged)],
+            cute.struct.MemRange[k_dtype, sK_cosize],
             align,
         ]
 
@@ -229,6 +254,7 @@ def build_fmha_launch_params(
         SharedStorage=SharedStorage,
         tma_copy_q_bytes=tma_copy_q_bytes,
         tma_copy_kv_bytes=tma_copy_kv_bytes,
+        tma_copy_v_bytes=tma_copy_v_bytes,
         cluster_shape_mnk=cluster_shape_mnk,
         cluster_layout_vmnk=cluster_layout_vmnk,
         epi_tile=epi_tile,

@@ -18,7 +18,7 @@ import enum
 from dataclasses import dataclass
 from typing import Tuple, Any
 
-from .fusion.mask import MaskType
+from .fusion.mask import MaskSpec
 from .fusion.variant import AttentionVariant, StandardAttention
 
 
@@ -68,9 +68,8 @@ class AttentionConfig:
     pv_acc_dtype: Any
     mma_tiler: Tuple[int, int, int]
     is_persistent: bool
-    mask_type: MaskType
+    mask_spec: MaskSpec
     num_repeat_kv_heads: int = 1
-    window_left: int = -1
 
     # Reserved for decode — unused by prefill. Decode kernels pack heads into
     # MMA M/N dimensions; prefill maps heads via the grid (HeadMapping.GRID).
