@@ -746,7 +746,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         )
         assert h, f"{header} not found"
     symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
+        jit_env.FLASHINFER_GEN_SRC_DIR
         / "flashinfer"
         / "trtllm"
         / "gemm"
@@ -768,6 +768,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
+            jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
@@ -920,7 +921,7 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         )
         assert h, f"{header} not found"
     symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
+        jit_env.FLASHINFER_GEN_SRC_DIR
         / "flashinfer"
         / "trtllm"
         / "gemm"
@@ -942,6 +943,7 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
+            jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],

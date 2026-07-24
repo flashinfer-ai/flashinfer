@@ -227,6 +227,7 @@ FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some k
 
 **How it works:**
 - Auto-detects GPUs in system or reads `FLASHINFER_CUDA_ARCH_LIST` environment variable
+- CuTe-DSL FP4 MM compilation parallelism can be controlled with `FLASHINFER_MM_FP4_CUTE_DSL_COMPILE_WORKERS`
 - JIT modules specify `supported_major_versions=[9, 10, 11, 12]` to limit compilation to specific SM versions
 - If GPU not supported → `RuntimeError: No supported CUDA architectures found`
 
