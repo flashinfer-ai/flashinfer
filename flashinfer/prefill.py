@@ -198,11 +198,9 @@ def get_customize_batch_prefill_module(
 ):
     # Route the Block Extend variant through its
     # dedicated front-end when mask_mode is fixed to kBlockExtend. The
-    # dedicated gen compiles ONLY mode 4 over the closed dLLM product (a small
-    # separate cartesian product, not a value multiplied into the big shared
-    # one) — see docs/block-extend-design-response.md §1. For any other
-    # mask_modes (including the default [0,1,2,3]) the shared path is used
-    # unchanged, so existing prefill URIs never compile mode 4.
+    # dedicated generator compiles only mode 4 over a small supported product,
+    # rather than multiplying it into the shared prefill product. All other
+    # mask-mode requests use the shared path unchanged.
     if mask_modes is not None and tuple(mask_modes) == (MaskMode.BLOCK_EXTEND.value,):
         return gen_customize_block_extend_batch_prefill_module(
             backend,
@@ -1452,11 +1450,8 @@ def single_prefill_with_kv_cache(
     if rope_theta is None:
         rope_theta = 1e4
 
-    # block_extend: native Block Extend mask option
-    # (reviewers' design #2 — a mask option on the existing single-prefill API,
-    # not a separate flashinfer/dllm API). When set, build the block-extend
-    # variant jit module via the dedicated gen and run through the jit-module
-    # path with mask_mode=kBlockExtend. See docs/block-extend-design-response.md §2.
+    # Build the Block Extend variant through its dedicated JIT generator and
+    # invoke it through the existing single-prefill JIT module path.
     if block_extend:
         if block_size is None:
             raise ValueError("block_size must be provided when block_extend=True")
@@ -1889,21 +1884,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 "Use BatchPrefillWithRaggedKVCacheWrapper instead."
             )
 
-        # block_extend: named mask option that makes this wrapper a dLLM
-        # Block Extend front-end (reviewers' design #2 — a mask
-        # option on the existing prefill API, not a separate API family). The
-        # variant jit module is built lazily at plan() time (dtype/head_dim/idtype
-        # are not known until then), mirroring the dedicated helper. See
-        # docs/block-extend-design-response.md §2.
+        # Build the Block Extend JIT module lazily in plan(), when dtype,
+        # head dimensions, and indptr dtype are available.
         self._block_extend = bool(block_extend)
         self._block_size = block_size
         self._q_offsets = None
         self._kv_offsets = None
         self._block_extend_backend: Optional[str] = None
-        # cuda-graph offset buffers (parity with the dedicated dLLM shim) and a
-        # rebuild key so plan() rebuilds the variant jit module when head_dim /
-        # dtype / idtype change across plans (correctness — a stale module would
-        # read the wrong shape). See docs/block-extend-design-response.md §2.
+        # CUDA Graph offset buffers and a rebuild key. The module must be
+        # rebuilt when its head dimensions, dtype, or indptr dtype change.
         self._q_offsets_buf = q_offsets_buf
         self._kv_offsets_buf = kv_offsets_buf
         self._bd_built_key: Optional[tuple] = None
@@ -2669,8 +2658,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # block_extend: build the variant jit module lazily at plan() time (the
         # dtype/head_dim/idtype needed to build it are only known now). Routed
         # through the dedicated gen via the mask_modes delegation switch in
-        # get_customize_batch_prefill_module. Rebuilds when the shape key changes
-        # across plans (correctness — parity with the dedicated dLLM shim).
+        # get_customize_batch_prefill_module. Rebuild when the specialization
+        # key changes across plans.
         if self._block_extend and self._backend == "auto":
             self._backend = "fa3" if is_sm90a_supported(self.device) else "fa2"
         if (
@@ -2839,9 +2828,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "(it is fixed to kBlockExtend)."
                 )
             self._mask_mode = MaskMode.BLOCK_EXTEND.value
-            # cuda-graph parity: copy offsets into the pre-allocated buffers so the
-            # captured graph reads stable addresses (mirrors the dedicated dLLM
-            # shim). In non-cuda-graph mode, store the tensors directly.
+            # Copy offsets into pre-allocated buffers so captured graphs read
+            # stable addresses. In non-CUDA-Graph mode, store tensors directly.
             if self._use_cuda_graph:
                 if q_offsets is not None:
                     q_offsets_buf = _validate_block_extend_offset_buffer(
@@ -3526,17 +3514,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         """
         _check_kv_layout(kv_layout)
 
-        # block_extend: named mask option (reviewers' design #2). Variant jit
-        # module built lazily at plan(). Only block_extend users are affected.
+        # The Block Extend JIT module is built lazily at plan() time, so only
+        # Block Extend users compile this specialization.
         self._block_extend = bool(block_extend)
         self._block_size = block_size
         self._q_offsets = None
         self._kv_offsets = None
         self._block_extend_backend: Optional[str] = None
-        # cuda-graph offset buffers (parity with the dedicated dLLM shim) and a
-        # rebuild key so plan() rebuilds the variant jit module when head_dim /
-        # dtype / idtype change across plans (correctness — a stale module would
-        # read the wrong shape). See docs/block-extend-design-response.md §2.
+        # CUDA Graph offset buffers and a rebuild key. The module must be
+        # rebuilt when its head dimensions, dtype, or indptr dtype change.
         self._q_offsets_buf = q_offsets_buf
         self._kv_offsets_buf = kv_offsets_buf
         self._bd_built_key: Optional[tuple] = None
@@ -3954,8 +3940,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         # block_extend: build the variant jit module lazily at plan() time (the
         # dtype/head_dim/idtype needed to build it are only known now). Routed
         # through the dedicated gen via the mask_modes delegation switch in
-        # get_customize_batch_prefill_module. Rebuilds when the shape key changes
-        # across plans (correctness — parity with the dedicated dLLM shim).
+        # get_customize_batch_prefill_module. Rebuild when the specialization
+        # key changes across plans.
         if self._block_extend and self._backend == "auto":
             self._backend = "fa3" if is_sm90a_supported(self.device) else "fa2"
         if (
@@ -4215,9 +4201,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "(it is fixed to kBlockExtend)."
                 )
             self._mask_mode = MaskMode.BLOCK_EXTEND.value
-            # cuda-graph parity: copy offsets into the pre-allocated buffers so the
-            # captured graph reads stable addresses (mirrors the dedicated dLLM
-            # shim). In non-cuda-graph mode, store the tensors directly.
+            # Copy offsets into pre-allocated buffers so captured graphs read
+            # stable addresses. In non-CUDA-Graph mode, store tensors directly.
             if self._use_cuda_graph:
                 if q_offsets is not None:
                     q_offsets_buf = _validate_block_extend_offset_buffer(

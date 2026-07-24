@@ -1367,9 +1367,8 @@ def gen_customize_single_prefill_module(
 ) -> JitSpec:
     """Public shared single-prefill gen. Compiles only the standard mask list
     [0,1,2,3] — kBlockExtend is NOT a value multiplied into this shared
-    product. The Block Extend front-end is the dedicated
-    gen_customize_block_extend_single_prefill_module (standalone dispatch;
-    reviewers' §1)."""
+    product. Block Extend uses the dedicated
+    gen_customize_block_extend_single_prefill_module dispatch path."""
     return _gen_customize_single_prefill_module_impl(
         backend,
         uri,
@@ -1572,13 +1571,12 @@ def _gen_customize_single_prefill_module_impl(
 #
 # These are thin, deliberately-narrow wrappers over the shared
 # ``gen_customize_single/batch_prefill_module`` that compile ONLY
-# ``MaskMode::kBlockExtend`` over the small closed product dLLM actually needs
+# ``MaskMode::kBlockExtend`` over the small, supported product
 # (fp16/bf16 x head_dim 64/128 x ragged+paged x fa2/fa3). They are the standalone
 # entry points the reviewers asked for ("move the dispatch into a standalone
 # config/variant class") so the new mask mode is NOT a value multiplied into the
 # big shared prefill cartesian product. The shared ``gen_customize_*`` keeps its
-# default mask list ``[0,1,2,3]`` — no existing prefill URI compiles mode 4.
-# See docs/block-extend-design-response.md §1.
+# default mask list ``[0,1,2,3]``; no existing prefill URI compiles mode 4.
 # -----------------------------------------------------------------------------
 
 _BLOCK_EXTEND_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
@@ -1635,7 +1633,7 @@ def gen_customize_block_extend_single_prefill_module(
 ) -> "JitSpec":
     """Dedicated single-prefill front-end for Block Extend attention.
 
-    Compiles only ``MaskMode::kBlockExtend`` over the closed dLLM product
+    Compiles only ``MaskMode::kBlockExtend`` over the supported product
     using a standalone congregate-config class that hard-codes the dispatch
     — a separate small cartesian product, not a new value multiplied into the
     big shared prefill one.
@@ -1689,7 +1687,7 @@ def gen_customize_block_extend_batch_prefill_module(
 ) -> "JitSpec":
     """Dedicated batch-prefill front-end for Block Extend attention.
 
-    Compiles only ``MaskMode::kBlockExtend`` over the closed dLLM product
+    Compiles only ``MaskMode::kBlockExtend`` over the supported product
     using a standalone congregate-config class that hard-codes the dispatch
     — a separate small cartesian product, not a new value multiplied into the
     big shared prefill one.
@@ -1828,9 +1826,8 @@ def gen_customize_batch_prefill_module(
 ) -> JitSpec:
     """Public shared batch-prefill gen. Compiles only the standard mask list
     [0,1,2,3] — kBlockExtend is NOT a value multiplied into this shared
-    product. The Block Extend front-end is the dedicated
-    gen_customize_block_extend_batch_prefill_module (standalone dispatch;
-    reviewers' §1)."""
+    product. Block Extend uses the dedicated
+    gen_customize_block_extend_batch_prefill_module dispatch path."""
     return _gen_customize_batch_prefill_module_impl(
         backend,
         uri,
