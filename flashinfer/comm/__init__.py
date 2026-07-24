@@ -82,4 +82,8 @@ def __getattr__(name: str):
         from .all_gather_matmul import all_gather_matmul
 
         return all_gather_matmul
+    if name == "quantized_all_reduce":
+        from .quantized_allreduce import quantized_all_reduce
+
+        return quantized_all_reduce
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
