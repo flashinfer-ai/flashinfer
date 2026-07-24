@@ -2763,6 +2763,16 @@ def test_top_k_rows_with_insufficient_finite_entries(
         logits, k, sorted=is_sorted, deterministic=deterministic
     )
 
+    if deterministic:
+        # deterministic=True must be bitwise reproducible: repeated calls on
+        # the same inputs return identical values and indices in every slot.
+        for _ in range(2):
+            values_rep, indices_rep = flashinfer.top_k(
+                logits, k, sorted=is_sorted, deterministic=deterministic
+            )
+            assert torch.equal(values_rep, values)
+            assert torch.equal(indices_rep, indices)
+
     assert values.shape == (len(n_finite_cases), k)
     assert indices.shape == (len(n_finite_cases), k)
 
@@ -2814,14 +2824,30 @@ def test_top_k_inf_padding_follows_tie_break(tie_break):
 
     values, indices = flashinfer.top_k(logits, k, tie_break=tie_break)
 
+    assert values.shape == (1, k)
+    assert indices.shape == (1, k)
+
+    # values must be a gather of the input at the returned indices (all slots)
+    assert ((indices >= 0) & (indices < vocab_size)).all()
+    assert torch.equal(values, torch.gather(logits, dim=-1, index=indices))
+
+    row_values = values[0]
+    row_indices = indices[0]
+    finite_mask = torch.isfinite(row_values)
+
+    # every finite entry is selected, none invented
+    assert int(finite_mask.sum()) == n_finite
     finite_positions = set(pos.tolist())
+    assert set(row_indices[finite_mask].tolist()) == finite_positions
+
+    # deficit slots hold -inf at distinct valid positions
+    assert (row_values[~finite_mask] == float("-inf")).all()
+    assert len(set(row_indices.tolist())) == k
+
+    # the -inf padding indices follow the tie-break rule exactly
     inf_positions = sorted(set(range(vocab_size)) - finite_positions)
-    deficit = sorted(set(indices[0].tolist()) - finite_positions)
+    deficit = sorted(row_indices[~finite_mask].tolist())
     if tie_break == flashinfer.TopKTieBreak.SMALL:
         assert deficit == inf_positions[: k - n_finite]
     else:
         assert deficit == sorted(inf_positions[-(k - n_finite) :])
-    assert (
-        torch.gather(logits, -1, indices)[0][values[0] == float("-inf")]
-        == float("-inf")
-    ).all()
