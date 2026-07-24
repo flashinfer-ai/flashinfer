@@ -2417,6 +2417,11 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
     ):
         _ = routing_replay_out
+        if not do_finalize:
+            raise NotImplementedError(
+                "The fake trtllm_fp8_per_tensor_scale_routed_moe op does not "
+                "support do_finalize=False"
+            )
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
