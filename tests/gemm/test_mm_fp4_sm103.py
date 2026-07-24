@@ -77,17 +77,16 @@ def test_mm_fp4_sm103_cutlass_epilogue() -> None:
 
             if not selected_tactic_checked:
                 matching_entries = [
-                    (key, runner_id, tactic)
-                    for key, (runner_id, tactic, _) in tuner.profiling_cache.items()
+                    (key, tactic)
+                    for key, (tactic, _) in tuner.profiling_cache.items()
                     if key.custom_op == "fp4_gemm" and key.nearest_profile[0][0] == m
                 ]
                 assert len(matching_entries) == 1, (
                     "expected one fp4_gemm autotuner entry for the exact M bucket, "
                     f"got {matching_entries}"
                 )
-                key, runner_id, tactic = matching_entries[0]
+                key, tactic = matching_entries[0]
                 assert key.runner_class_name == "CutlassFp4GemmRunner"
-                assert runner_id == 0
                 assert tactic in _NATIVE_K768_TACTICS, (
                     f"autotuner selected generic tactic {tactic}; expected a native "
                     "SM103 K768 tactic"
@@ -197,15 +196,14 @@ def test_mm_fp4_sm103_generic_alignment_dispatch() -> None:
 
                 if not selected_tactic_checked:
                     matching_entries = [
-                        (key, runner_id, tactic)
-                        for key, (runner_id, tactic, _) in tuner.profiling_cache.items()
+                        (key, tactic)
+                        for key, (tactic, _) in tuner.profiling_cache.items()
                         if key.custom_op == "fp4_gemm"
                         and key.nearest_profile[0][0] == m
                     ]
                     assert len(matching_entries) == 1
-                    key, runner_id, tactic = matching_entries[0]
+                    key, tactic = matching_entries[0]
                     assert key.runner_class_name == "CutlassFp4GemmRunner"
-                    assert runner_id == 0
                     if first_alignment == "aligned":
                         assert tactic in _GENERIC_K128_K256_TACTICS
                     selected_tactic_checked = True
