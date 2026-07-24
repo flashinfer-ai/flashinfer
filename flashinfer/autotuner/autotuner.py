@@ -1,3 +1,4 @@
+import bisect
 import contextlib
 import copy
 import functools
@@ -6,13 +7,14 @@ import inspect
 import itertools
 import json
 import os
+import statistics
 import tempfile
 import threading
 import weakref
 
 import tqdm
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     Any,
     Callable,
@@ -187,8 +189,10 @@ _METADATA_KEY = "_metadata"
 _INDETERMINATE_META_VALUES = (None, "unknown", "None")
 
 
+@functools.lru_cache(maxsize=None)
 def _get_cublas_version() -> str:
-    """Return the cuBLAS version as ``major.minor.patch``.
+    """Return the cuBLAS version as ``major.minor.patch`` (cached: probing
+    spawns ldconfig subprocesses and the result is static per process).
 
     Checks sources in the same priority order as the runtime loader:
       1. LD_LIBRARY_PATH — probe the actual shared library via ctypes
@@ -1028,6 +1032,158 @@ class AutoTunerStatistics:
         return stats_str
 
 
+class _CuptiInfraError(RuntimeError):
+    """CUPTI infrastructure (enable/register/attribution) failed — typically
+    another profiler holding the legacy single-subscriber slot.  Distinct
+    from kernel failures so the caller can fall back to CUDA events for the
+    process instead of marking every tactic as failed."""
+
+
+@functools.lru_cache(maxsize=None)
+def _load_cupti():
+    """Return the ``cupti`` module if cupti-python >= 13 is usable, else None.
+
+    Cached so the availability check (and its warning) happens once per
+    process.
+    """
+    try:
+        import importlib.metadata
+
+        from cupti import cupti as cupti_module
+
+        version = importlib.metadata.version("cupti-python")
+        if int(version.split(".")[0]) < 13:
+            logger.warning(
+                f"[Autotuner]: the cupti timer requires cupti-python >= 13, "
+                f"found {version}; falling back to CUDA events."
+            )
+            return None
+        # Pre-check recommended by the CUPTI docs: if another tracing
+        # session is already running in this process (Nsight Systems,
+        # torch.profiler/Kineto), the legacy single-subscriber activity
+        # API would conflict -- degrade to CUDA events up front instead
+        # of erroring inside the measurement loop.
+        try:
+            if cupti_module.is_tracing_session_running():
+                logger.warning(
+                    "[Autotuner]: a CUPTI tracing session is already running "
+                    "in this process (e.g. Nsight Systems or torch.profiler); "
+                    "the legacy activity API is single-subscriber, so the "
+                    "cupti timer falls back to CUDA events."
+                )
+                return None
+        except Exception:
+            pass  # probe unsupported -- rely on the _CuptiInfraError fallback
+        return cupti_module
+    except Exception as e:
+        logger.warning(
+            f"[Autotuner]: cupti timer requested but cupti-python is "
+            f"unavailable ({e}); falling back to CUDA events."
+        )
+        return None
+
+
+def _cupti_measure_spans(run_iteration: Callable[[], None], repeat: int) -> list[float]:
+    """Time *run_iteration* ``repeat`` times, returning per-iteration GPU
+    kernel spans in milliseconds (first kernel start to last kernel end,
+    from CUPTI activity records).
+
+    Each iteration is bracketed by a device synchronize and CPU timestamps;
+    launch-API records inside the bracket give the correlation ids whose
+    kernel records form the iteration (mirrors
+    ``flashinfer.testing.bench_gpu_time_with_cupti``).  Span endpoints are
+    GPU-side timestamps, so host launch latency is structurally excluded —
+    no delay kernel needed.  Deliberately no ``cupti.finalize()`` (this runs
+    once per tactic; flush + disable suffices) and deliberately
+    per-measurement enable/disable (session-scoped tracing would instrument
+    every intervening warmup/synthesis kernel).
+    """
+    cupti = _load_cupti()
+    assert cupti is not None
+
+    launches: list[tuple[int, int]] = []  # (start_ts, correlation_id)
+    kernels: list[tuple[int, int, int]] = []  # (start_ts, end_ts, correlation_id)
+
+    def buffer_requested():
+        return 8 * 1024 * 1024, 0
+
+    def buffer_completed(activities):
+        for a in activities:
+            if a.kind == cupti.ActivityKind.CONCURRENT_KERNEL:
+                kernels.append((a.start, a.end, a.correlation_id))
+            elif a.kind in (
+                cupti.ActivityKind.RUNTIME,
+                cupti.ActivityKind.DRIVER,
+            ):
+                launches.append((a.start, a.correlation_id))
+
+    kinds = (
+        cupti.ActivityKind.RUNTIME,
+        cupti.ActivityKind.DRIVER,
+        cupti.ActivityKind.CONCURRENT_KERNEL,
+    )
+    iter_windows: list[tuple[int, int]] = []
+    enabled: list[Any] = []
+    try:
+        for kind in kinds:
+            cupti.activity_enable(kind)
+            enabled.append(kind)
+        cupti.activity_register_callbacks(buffer_requested, buffer_completed)
+    except Exception as e:
+        # Partial-init failure: disable whatever was enabled so no tracing
+        # overhead leaks into the rest of the process.
+        for kind in enabled:
+            with contextlib.suppress(Exception):
+                cupti.activity_disable(kind)
+        raise _CuptiInfraError(str(e)) from e
+    try:
+        for _ in range(repeat):
+            torch.cuda.synchronize()
+            t0 = cupti.get_timestamp()
+            run_iteration()
+            t1 = cupti.get_timestamp()
+            torch.cuda.synchronize()
+            iter_windows.append((t0, t1))
+    finally:
+        # Disable must run even if flush raises (and vice versa must not
+        # mask the original measurement exception).
+        try:
+            cupti.activity_flush_all(0)
+        finally:
+            for kind in enabled:
+                with contextlib.suppress(Exception):
+                    cupti.activity_disable(kind)
+
+    launches.sort()
+    launch_starts = [entry[0] for entry in launches]
+    kernels_by_corr: dict[int, list[tuple[int, int]]] = {}
+    for k_start, k_end, corr_id in kernels:
+        kernels_by_corr.setdefault(corr_id, []).append((k_start, k_end))
+
+    spans_ms: list[float] = []
+    for idx, (t0, t1) in enumerate(iter_windows):
+        lo = bisect.bisect_left(launch_starts, t0)
+        hi = bisect.bisect_right(launch_starts, t1)
+        corr_ids = set(launches[i][1] for i in range(lo, hi))
+        iter_kernels = [
+            span for corr_id in corr_ids for span in kernels_by_corr.get(corr_id, ())
+        ]
+        if not iter_kernels:
+            # Kernels ran (the iteration completed) but no records arrived:
+            # the classic symptom of another subscriber consuming them.
+            raise _CuptiInfraError(
+                f"CUPTI recorded no kernel activity for profiling iteration {idx}"
+            )
+        span_ns = max(end for _, end in iter_kernels) - min(
+            start for start, _ in iter_kernels
+        )
+        spans_ms.append(span_ns / 1e6)
+    # The registered callback closure outlives this call; drop its payload.
+    launches.clear()
+    kernels.clear()
+    return spans_ms
+
+
 @functools.lru_cache(maxsize=16384)
 def load_from_file(file_key: str) -> tuple[bool, int, Any, None]:
     # Returns (is_cache_hit, runner_id, tactic, profile). The runner_id slot
@@ -1069,6 +1225,23 @@ class _SkipOpsLocal(threading.local):
     stack: list[frozenset[str]]
 
 
+class _V2Local(threading.local):
+    """Per-thread record of the (single, non-nestable) active autotune_v2
+    context.  A single slot rather than a stack: autotune_v2 does not nest
+    (nesting raises), so a stack bought nothing; a per-thread slot keeps
+    concurrent threads isolated (each in its own context targets its own
+    store) without the stack machinery.
+
+    ``active`` — a v2 context is open on this thread.
+    ``store``  — its managed store (``None`` = disk forbidden this context).
+    ``measure``— its MeasurementPolicy (or ``None``).
+    """
+
+    active: bool = False
+    store: Any = None
+    measure: Any = None
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT-LLM operations.
 
@@ -1096,6 +1269,10 @@ class AutoTuner:
         ] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
+        # Set after a CUPTI infrastructure failure (e.g. another profiler
+        # holds the single-subscriber slot): timer="cupti" then falls back
+        # to CUDA events for the rest of the process.
+        self._cupti_disabled = False
 
         # Reentrant lock protecting all mutable state on this instance.
         # RLock is used because choose_one() calls search_cache() internally.
@@ -1123,8 +1300,37 @@ class AutoTuner:
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: dict[str, tuple[str, Any]] = {}
+        # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache):
+        # serves context-free lookups for the remainder of the process, like
+        # load_configs.  Disjoint from _file_configs by design: v1
+        # save_configs must never observe v2 entries.  Protected by _lock.
+        # A persistent autotune_v2 context sets this last-wins so bare,
+        # context-free serving keeps resolving to it; inside a context the
+        # per-thread _v2_local record overrides it (see _active_managed_store).
+        self._managed_cache: Any | None = None
+        # Process-wide registry of managed store objects keyed by identity
+        # (root, canonical-manifest): switching between identities reuses the
+        # same store object (and its hit/miss memos) instead of rebuilding +
+        # re-reading disk.  Explicit invalidation is autotune_v2_reload() /
+        # clear_cache(), never an implicit switch.
+        self._managed_stores: dict[tuple[str, str], Any] = {}
+        # Per-thread record of the single active autotune_v2 context (no
+        # stack: v2 does not nest).  Keeps concurrent threads isolated.
+        self._v2_local: _V2Local = _V2Local()
+        # Managed hits decoded from JSON once, then served from memory.
+        # Keyed by (root, env_hash, file_key): entries decoded from one
+        # store identity are never served under another's.
+        self._managed_decoded: dict[tuple[str, str, str], tuple[str, Any]] = {}
+        # In-memory winner-cache partitions keyed by store/policy identity;
+        # the default (v1) partition is `profiling_cache` itself.  Winners
+        # tuned under one measurement identity must not short-circuit
+        # tuning under another (they may legitimately differ).
+        self._winner_partitions: dict[tuple, dict] = {}
         # Track which file config keys have been logged (to avoid per-call spam)
         self._logged_file_hits: set[tuple[str, str]] = set()
+        # (op, runner, source) triples whose cached tactic failed
+        # revalidation, so the warning fires once, not per call.
+        self._logged_invalid_tactic: set[tuple[str, str, str]] = set()
         # Cache-metadata mismatch severities ("hard"/"soft") already logged at
         # WARNING; repeats for further cache files are logged at DEBUG (a
         # deployment can touch dozens of cache files per process).
@@ -1145,6 +1351,11 @@ class AutoTuner:
         self._override_local: _OverrideLocal = _OverrideLocal()
         # Per-thread stack of frozenset[str] for skip_ops overrides.
         self._skip_ops_local: _SkipOpsLocal = _SkipOpsLocal()
+        # Measure-derived TuningConfig variants, keyed by original config
+        # identity (same rationale as _override_config_cache below).
+        self._measure_config_cache: weakref.WeakKeyDictionary[
+            TuningConfig, dict[tuple[bool, bool], TuningConfig]
+        ] = weakref.WeakKeyDictionary()
         # Cache overridden TuningConfig objects to keep stable object identity
         # for _find_nearest_profile's LRU cache.
         # Two-level: WeakKeyDictionary[TuningConfig, Dict[(buckets, round_up), TuningConfig]]
@@ -1189,6 +1400,137 @@ class AutoTuner:
         if not hasattr(local, "stack"):
             local.stack = OverrideStack()
         return local.stack
+
+    @property
+    def _effective_measure_policy(self):
+        """Active autotune_v2 measurement policy for this thread, or ``None``."""
+        return getattr(self._v2_local, "measure", None)
+
+    def _apply_measure_policy(
+        self, tuning_config: TuningConfig, policy
+    ) -> TuningConfig:
+        """Return a TuningConfig with profiling-behavior fields overridden by
+        the measurement policy (``None`` policy fields inherit the op's).
+        Identity-cached like ``_apply_tuning_overrides``; never affects the
+        normalized profile, so the policy stays out of per-op cache keys.
+        """
+        use_cuda_graph = (
+            tuning_config.use_cuda_graph
+            if policy.cuda_graph is None
+            else policy.cuda_graph
+        )
+        use_cold_l2 = (
+            tuning_config.use_cold_l2_cache
+            if policy.cold_l2 is None
+            else policy.cold_l2
+        )
+        if (
+            use_cuda_graph == tuning_config.use_cuda_graph
+            and use_cold_l2 == tuning_config.use_cold_l2_cache
+        ):
+            return tuning_config
+
+        per_config = self._measure_config_cache.get(tuning_config)
+        cache_key = (use_cuda_graph, use_cold_l2)
+        if per_config is not None and cache_key in per_config:
+            return per_config[cache_key]
+
+        new_config = replace(
+            tuning_config,
+            use_cold_l2_cache=use_cold_l2,
+            use_cuda_graph=use_cuda_graph,
+        )
+        self._measure_config_cache.setdefault(tuning_config, {})[cache_key] = new_config
+        return new_config
+
+    def _tactic_still_valid(
+        self, runner: TunableRunner, inputs, tactic: Any, custom_op: str, source: str
+    ) -> bool:
+        """Runner-contract revalidation of a cached (on-disk) tactic.
+
+        Runners may expose an optional cheap check
+        ``validate_tactic(inputs, tactic) -> bool`` (the CUTLASS
+        ``isValidConfig`` pattern).  A tactic that fails it is treated as a
+        loud cache miss instead of becoming a silent different kernel or an
+        execute-time crash (the "plan rejected at execute, server dead"
+        class).  Runners without the method are trusted as before.
+        """
+        validate = getattr(runner, "validate_tactic", None)
+        if validate is None:
+            return True
+        try:
+            ok = bool(validate(inputs, tactic))
+        except Exception:
+            ok = False
+        if not ok:
+            key = (custom_op, runner.__class__.__name__, source)
+            if key not in self._logged_invalid_tactic:
+                self._logged_invalid_tactic.add(key)
+                logger.warning(
+                    f"[Autotuner]: cached tactic {tactic!r} for {custom_op} "
+                    f"(runner={runner.__class__.__name__}, source={source}) "
+                    f"failed revalidation; treating as a cache miss."
+                )
+        return ok
+
+    @property
+    def _active_managed_store(self):
+        """The store lookups/publishes target right now.
+
+        Inside an autotune_v2 context this is that context's store (``None``
+        when entered with ``persistent_cache=False`` — disk forbidden for
+        the context even if an ambient store is attached).  Outside any
+        context it is the process ambient store, so bare serving keeps
+        working after warmup exits.
+        """
+        local = self._v2_local
+        if getattr(local, "active", False):
+            return local.store
+        return self._managed_cache
+
+    @property
+    def _in_v2_context(self) -> bool:
+        """Whether an autotune_v2 context is open on this thread."""
+        return getattr(self._v2_local, "active", False)
+
+    def _winner_cache(self) -> dict:
+        """In-memory winner-cache partition for the active MEASUREMENT identity.
+
+        Winners must only be served under the identity they were tuned for
+        (a graph-timed winner is not an eager winner; root A's winners are
+        not root B's):
+
+        - a targeted (context) or ambient store -> partition by that
+          store's ``(root, env_hash)`` — the measurement policy is already
+          part of the env hash;
+        - no store but an explicit MeasurementPolicy -> partition by the
+          policy's manifest fields;
+        - otherwise (pure v1 flows) -> the plain v1 ``profiling_cache``
+          (byte-identical legacy behavior, and what v1 ``save_configs``
+          serializes).
+
+        Bare serving thus reads the AMBIENT store's partition — never a
+        stale winner tuned under a different identity that happens to sit
+        in legacy memory — and switching ``cache_root`` repopulates instead
+        of silently reusing the old root's winners.
+        """
+        store = self._active_managed_store
+        if store is not None:
+            key: tuple = (str(store.root), store.env_hash)
+        else:
+            policy = self._effective_measure_policy
+            fields = (
+                tuple(sorted(policy.manifest_fields().items()))
+                if policy is not None
+                else ()
+            )
+            if not fields:
+                return self.profiling_cache
+            key = ("__policy__", *fields)
+        part = self._winner_partitions.get(key)
+        if part is None:
+            part = self._winner_partitions[key] = {}
+        return part
 
     def _get_skip_ops_stack(self) -> list[frozenset[str]]:
         """Return the per-thread skip_ops stack, creating it on first access."""
@@ -1303,10 +1645,12 @@ class AutoTuner:
             synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
-            # 1. In-memory cache (from live tuning). Keys are built lazily so
-            #    the common warm path (hit here) pays for exactly one key per
-            #    runner visited; a full miss leaves runner_keys complete for
-            #    the passes below.
+            # 1. In-memory cache (from live tuning), partitioned by the
+            #    active measurement identity — see _winner_cache.  Keys are
+            #    built lazily so the common warm path (hit here) pays for
+            #    exactly one key per runner visited; a full miss leaves
+            #    runner_keys complete for the passes below.
+            winners = self._winner_cache()
             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
             for r_id, r in enumerate(runners):
                 cache_key = AutoTuner._get_cache_key(
@@ -1317,8 +1661,14 @@ class AutoTuner:
                     r.get_cache_key_extras(inputs) if inputs is not None else (),
                 )
                 runner_keys.append((r_id, cache_key))
-                if cache_key in self.profiling_cache:
-                    tactic, stored_profile = self.profiling_cache[cache_key]
+                if cache_key in winners:
+                    tactic, stored_profile = winners[cache_key]
+                    if not self._tactic_still_valid(
+                        r, inputs, tactic, custom_op, "memory"
+                    ):
+                        # Fall through: another runner, a disk source, or
+                        # (in tuning mode) a re-profile may still serve.
+                        continue
                     return True, r_id, tactic, stored_profile
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...))
@@ -1328,12 +1678,50 @@ class AutoTuner:
                     runner_name, tactic = self._file_configs[file_key]
                     if runner_name != runners[r_id].__class__.__name__:
                         continue
+                    if not self._tactic_still_valid(
+                        runners[r_id], inputs, tactic, custom_op, "config file"
+                    ):
+                        continue
                     log_key = (custom_op, runner_name)
                     if log_key not in self._logged_file_hits:
                         self._logged_file_hits.add(log_key)
                         logger.info(
                             f"[Autotuner]: Config cache hit for {custom_op} "
                             f"(runner={runner_name}, source=config file)"
+                        )
+                    return True, r_id, tactic, None
+
+            # 2.5 Managed v2 per-entry store (the active context's store, or
+            #     the ambient attached store outside any context); decoded
+            #     hits are memoized per store identity so the hot path
+            #     re-reads neither the filesystem nor JSON.
+            managed_store = self._active_managed_store
+            if managed_store is not None:
+                store_id = (str(managed_store.root), managed_store.env_hash)
+                for r_id, cache_key in runner_keys:
+                    file_key = cache_key.file_key
+                    memo_key = (*store_id, file_key)
+                    hit = self._managed_decoded.get(memo_key)
+                    if hit is None:
+                        entry = managed_store.lookup(file_key)
+                        if entry is not None:
+                            hit = (entry[0], _json_to_tactic(entry[1]))
+                            self._managed_decoded[memo_key] = hit
+                    if hit is None:
+                        continue
+                    runner_name, tactic = hit
+                    if runner_name != runners[r_id].__class__.__name__:
+                        continue
+                    if not self._tactic_still_valid(
+                        runners[r_id], inputs, tactic, custom_op, "managed cache"
+                    ):
+                        continue
+                    log_key = (custom_op, runner_name)
+                    if log_key not in self._logged_file_hits:
+                        self._logged_file_hits.add(log_key)
+                        logger.info(
+                            f"[Autotuner]: Config cache hit for {custom_op} "
+                            f"(runner={runner_name}, source=managed cache)"
                         )
                     return True, r_id, tactic, None
 
@@ -1469,6 +1857,13 @@ class AutoTuner:
             # Apply tuning bucket / rounding overrides from autotune() context.
             if self._override_tuning_buckets is not None or self._override_round_up:
                 tuning_config = self._apply_tuning_overrides(tuning_config)
+            # Apply the autotune_v2 measurement policy (how tactics are
+            # timed during profiling); inert when no policy is active.
+            measure_policy = self._effective_measure_policy
+            if measure_policy is not None:
+                tuning_config = self._apply_measure_policy(
+                    tuning_config, measure_policy
+                )
 
             input_shapes = tuple(self._get_input_sizes(inputs))
 
@@ -1513,7 +1908,7 @@ class AutoTuner:
                     # keys are ``str((custom_op, runner_class_name, profile))``,
                     # so we filter by ``custom_op`` on each.
                     op_has_profiling = any(
-                        k.custom_op == custom_op for k in self.profiling_cache
+                        k.custom_op == custom_op for k in self._winner_cache()
                     )
                     file_key_op_prefix = f"({repr(custom_op)}, "
                     op_has_file = any(
@@ -1557,6 +1952,16 @@ class AutoTuner:
                     param.name
                     for param in inspect.signature(r.forward).parameters.values()
                 }
+
+            # Default-candidate coverage (autotune_v2 contexts): the default
+            # path (runners[0], tactic=-1) always races as a candidate, so a
+            # tuned-and-persisted selection cannot lose to not tuning AT THE
+            # PROBE inputs.  It is not a full regression guard: if the
+            # synthetic probe misrepresents serving (routing distribution /
+            # EP-sharded M, the #3622/#3537 class), the comparison itself is
+            # off — representative probe construction is op-level work.
+            # Scoped to v2 so plain autotune() selection is byte-identical.
+            race_default = self._in_v2_context
 
             pbar = None
             for _step, p in enumerate(profiles):
@@ -1612,6 +2017,8 @@ class AutoTuner:
                             valid_tactics = self._blocklist.filter(
                                 custom_op, r, valid_tactics
                             )
+                            if r_id == 0 and race_default and -1 not in valid_tactics:
+                                valid_tactics = [-1, *valid_tactics]
                             runner_arg_names = runner_arg_names_map[r]
                             if (
                                 "do_preparation" in runner_arg_names
@@ -1710,9 +2117,17 @@ class AutoTuner:
                                 tuning_config,
                                 runners[runner_id].get_cache_key_extras(tensors),
                             )
-                            self.profiling_cache[cache_key] = (tactic, p)
+                            self._winner_cache()[cache_key] = (tactic, p)
                             self._dirty = True
                             self._dirty_seq += 1
+                            publish_store = self._active_managed_store
+                            if publish_store is not None:
+                                # Eager atomic publish; best-effort, never raises.
+                                publish_store.publish(
+                                    cache_key.file_key,
+                                    cache_key.runner_class_name,
+                                    _tactic_to_json(tactic),
+                                )
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
                                 + 1
@@ -1783,9 +2198,27 @@ class AutoTuner:
             sees the same per-call allocation overhead, and the autotuner
             picks based on intrinsic kernel time.
         """
-        input_tensor_batches = self._prepare_input_tensors_with_batches(
-            inputs, tuning_config
-        )
+        # Profiling synchronizes and (in graph modes) captures its own
+        # private CUDA graph.  Both are illegal inside an outer stream
+        # capture -- a tuning context accidentally left open around a
+        # framework's model-capture would otherwise surface a cryptic CUDA
+        # error.  Fail fast with a clear message instead (tune before
+        # capture, never inside it).
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "autotune measurement cannot run inside a CUDA graph "
+                "capture: it synchronizes and may capture its own graph "
+                "(nested capture is forbidden).  Tune before capture, not "
+                "inside it -- close the autotune_v2/autotune context before "
+                "the framework captures the model."
+            )
+
+        # MeasurementPolicy(timer="cupti") routes to per-iteration GPU-span
+        # measurement; "auto"/"events" (and cupti-python unavailable) use
+        # the historical CUDA-event window below.  Resolved once here so
+        # both the routing decision and pure_profile's delay-kernel skip
+        # see the same policy.
+        measure_policy = self._effective_measure_policy
 
         stream = torch.cuda.current_stream()
         avg_time = float("inf")
@@ -1836,12 +2269,18 @@ class AutoTuner:
                 stream.synchronize()
 
                 # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
-                delay_kernel_time_usec = (
-                    self._CUDA_GRAPH_DELAY_MICRO_SECS
-                    if tuning_config.use_cuda_graph
-                    else self.stream_delay_micro_secs
-                )
-                delay_kernel(delay_kernel_time_usec)
+                # The events_no_delay timer skips it: the eager sustained
+                # rate, host cost included, is exactly what it measures.
+                if not (
+                    measure_policy is not None
+                    and measure_policy.timer == "events_no_delay"
+                ):
+                    delay_kernel_time_usec = (
+                        self._CUDA_GRAPH_DELAY_MICRO_SECS
+                        if tuning_config.use_cuda_graph
+                        else self.stream_delay_micro_secs
+                    )
+                    delay_kernel(delay_kernel_time_usec)
 
                 record_start()
 
@@ -1875,12 +2314,51 @@ class AutoTuner:
         # fallback).
         profile_exc: Optional[BaseException] = None
         try:
-            with _profile_measurement_scope():
-                # warm up, no timing
-                for _ in range(self.warmup):
-                    runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
+            # The CUPTI route stays INSIDE this try so a rank using it still
+            # reaches the all-reduce below on failure (cardinality invariant),
+            # and its measured time participates in the cross-rank mean like
+            # any other.  A CUPTI *infrastructure* failure (single-subscriber
+            # conflict) is not a tactic failure: fall back to the CUDA-event
+            # path for this and all later measurements.
+            use_cupti = (
+                measure_policy is not None
+                and measure_policy.timer == "cupti"
+                and not self._cupti_disabled
+                and _load_cupti() is not None
+            )
+            if use_cupti:
+                try:
+                    avg_time = self._profile_single_kernel_cupti(
+                        runner, inputs, tactic, tuning_config, **kwargs
+                    )
+                except _CuptiInfraError as e:
+                    # Legacy CUPTI activity tracing is single-subscriber; an
+                    # attached profiler breaks it (CUDA 13.3's multi-subscriber
+                    # V2 APIs lift this once cupti-python exposes them).
+                    self._cupti_disabled = True
+                    use_cupti = False
+                    logger.warning(
+                        f"[Autotuner]: CUPTI activity tracing failed ({e}); "
+                        f"falling back to CUDA-event timing for the rest of "
+                        f"this process.  NOTE: entries tuned in this session "
+                        f"are event-timed even though the store identity says "
+                        f"timer='cupti' -- re-tune without the conflicting "
+                        f"profiler for faithful measurements."
+                    )
+            if not use_cupti:
+                # Rotating input batches (up to ~3x L2 of clones under
+                # cold_l2) are only used by the event path; allocating them
+                # before the routing decision would double the transient
+                # footprint alongside the CUPTI path's own flush buffer.
+                input_tensor_batches = self._prepare_input_tensors_with_batches(
+                    inputs, tuning_config
+                )
+                with _profile_measurement_scope():
+                    # warm up, no timing
+                    for _ in range(self.warmup):
+                        runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-                avg_time = pure_profile(stream, self.repeat)
+                    avg_time = pure_profile(stream, self.repeat)
         except BaseException as e:  # noqa: BLE001
             # Catch everything (incl. KeyboardInterrupt / SystemExit): this
             # rank must still reach the all-reduce below or peers already
@@ -1915,6 +2393,77 @@ class AutoTuner:
         )
 
         return avg_time
+
+    def _profile_single_kernel_cupti(
+        self,
+        runner: TunableRunner,
+        inputs: list[torch.Tensor],
+        tactic: Any,
+        tuning_config: TuningConfig,
+        **kwargs,
+    ) -> float:
+        """CUPTI variant of ``_profile_single_kernel``
+        (``MeasurementPolicy(timer="cupti")``).
+
+        Measures each iteration's GPU kernel span from CUPTI activity
+        records instead of one CUDA-event window around the whole repeat
+        loop.  Needs no delay kernel (GPU-side timestamps exclude host
+        launch latency structurally) at the cost of a device synchronize
+        per iteration.  Semantics: per-call *latency* span — internal gaps
+        of a multi-kernel tactic are honestly included, queue-saturation
+        effects are not (see ``MeasurementPolicy``).
+
+        Cold-L2 is achieved by zeroing an L2-sized flush buffer before
+        each iteration (excluded from the span: only kernel activity is
+        collected, and the memset finishes before the tactic's first
+        kernel starts).  Input-buffer rotation is not usable here because
+        the CUDA-graph mode replays a single captured iteration, which
+        binds the captured tensors.
+        """
+        with _profile_measurement_scope():
+            for _ in range(self.warmup):
+                runner(inputs, tactic=tactic, **kwargs)
+
+            flush_buffer = None
+            if tuning_config.use_cold_l2_cache:
+                device = next(
+                    (t.device for t in inputs if isinstance(t, torch.Tensor)),
+                    torch.device("cuda"),
+                )
+                flush_buffer = torch.empty(
+                    self._get_l2_cache_size_in_bytes() * 3,
+                    device=device,
+                    dtype=torch.int8,
+                )
+
+            if tuning_config.use_cuda_graph:
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    runner(inputs, tactic=tactic, **kwargs)
+
+                def run_iteration():
+                    if flush_buffer is not None:
+                        flush_buffer.zero_()
+                    graph.replay()
+            else:
+
+                def run_iteration():
+                    if flush_buffer is not None:
+                        flush_buffer.zero_()
+                    runner(inputs, tactic=tactic, **kwargs)
+
+            spans_ms = _cupti_measure_spans(run_iteration, self.repeat)
+
+        # Median, not mean: robust to first-iteration instrumentation
+        # attach overhead and post-synchronize clock ramp.
+        median_time = statistics.median(spans_ms)
+        shapes = self._get_input_sizes(inputs)
+        logger.debug(
+            f"[Autotuner]: cupti-profiling {runner} {tactic}, shapes={shapes}, "
+            f"median_time {median_time}"
+        )
+        return median_time
 
     def _generate_optimization_profiles(
         self, tuning_config: TuningConfig, inputs: list[torch.Tensor]
@@ -2444,6 +2993,12 @@ class AutoTuner:
             self._logged_cache_miss_oor.clear()
             self._dirty = False
             self._dirty_seq = 0
+            self._winner_partitions.clear()
+            self._managed_decoded.clear()
+            # Forget the per-identity disk memos on every registered store so
+            # cleared keys re-probe disk (the explicit invalidation point).
+            for store in self._managed_stores.values():
+                store.clear_memo()
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""

@@ -32,6 +32,9 @@ from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
 )
+from .autotune_cache import MeasurementPolicy as MeasurementPolicy
+from .autotune_cache import autotune_v2 as autotune_v2
+from .autotune_cache import autotune_v2_reload as autotune_v2_reload
 from .autotuner import autotune as autotune
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
