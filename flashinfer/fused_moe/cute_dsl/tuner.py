@@ -52,6 +52,8 @@ from ..utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from ._inputs_helper import CuteDslMoEInputsHelper
+from .blackwell.moe_w4a16 import launch_w4a16_moe
+from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import normalize_cute_dsl_moe_activation_type
 
 logger = logging.getLogger(__name__)
@@ -633,6 +635,286 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
             **kwargs,
+        )
+
+
+_W4A16_ROUTE_TILES = (8, 16, 32, 64, 128, 192)
+_W4A16_K_TILE = 256
+# W4A16 maps output channels to M and routed rows to N. Preserve the current
+# M-major static scheduler order; CLC scheduling owns its traversal order.
+_W4A16_RASTER_ALONG_M = True
+# Grouped expert scheduling requires cluster N=1 when multiple routed rows
+# target the same expert.
+_W4A16_GEMM_TOPOLOGY_PAIRS = (
+    ((128, (1, 1)), (128, (1, 1))),
+    ((128, (2, 1)), (128, (2, 1))),
+    ((256, (2, 1)), (256, (2, 1))),
+    ((128, (2, 1)), (256, (2, 1))),
+    ((256, (2, 1)), (128, (2, 1))),
+)
+
+
+def get_w4a16_moe_valid_tactics() -> List[Tuple]:
+    """Get valid W4A16 GEMM1/GEMM2 tactic pairs."""
+    tactics: List[Tuple] = []
+    for route_tile in _W4A16_ROUTE_TILES:
+        for gemm1_topology, gemm2_topology in _W4A16_GEMM_TOPOLOGY_PAIRS:
+            gemm1_m, gemm1_cluster_shape = gemm1_topology
+            gemm2_m, gemm2_cluster_shape = gemm2_topology
+            if route_tile < 16 and (gemm1_m == 256 or gemm2_m == 256):
+                continue
+            # A 128x192x256 tile cannot retain the two load and transform
+            # stages required by the warp-specialized pipeline.
+            if route_tile == 192 and (gemm1_m == 128 or gemm2_m == 128):
+                continue
+            gemm1_tactic = (
+                (gemm1_m, route_tile, _W4A16_K_TILE),
+                gemm1_cluster_shape,
+                _W4A16_RASTER_ALONG_M,
+            )
+            gemm2_tactic = (
+                (gemm2_m, route_tile, _W4A16_K_TILE),
+                gemm2_cluster_shape,
+                _W4A16_RASTER_ALONG_M,
+            )
+            tactics.append((gemm1_tactic, gemm2_tactic))
+    return tactics
+
+
+W4A16_MOE_TACTICS = tuple(get_w4a16_moe_valid_tactics())
+
+
+class CuteDslFusedMoEW4A16Runner(TunableRunner):
+    """Tunable runner for the BF16-activation, NVFP4-weight MoE pipeline.
+
+    Inputs:
+        [x, token_selected_experts, token_final_scales,
+         w1_weight, w1_weight_sf, w1_alpha,
+         w2_weight, w2_weight_sf, w2_alpha, moe_output]
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int = 0,
+        use_fused_finalize: bool = True,
+        output_dtype: torch.dtype = torch.bfloat16,
+        enable_pdl: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    ):
+        activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        if output_dtype != torch.bfloat16:
+            raise ValueError("W4A16 only supports BF16 output")
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.local_expert_offset = local_expert_offset
+        self.use_fused_finalize = use_fused_finalize
+        self.output_dtype = output_dtype
+        self.enable_pdl = enable_pdl
+        self.activation_type = activation_type
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
+        self._workspace_cache: Dict[Tuple, Any] = {}
+
+        # Match production EP routing density while retaining seeded load
+        # variance around route-tile boundaries.
+        self.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0, 1, 2, 9),
+                    dim_idx=(0, 0, 0, 0),
+                    gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                    map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+                    tensor_initializers=[
+                        lambda shapes, dtype, device: torch.randn(
+                            shapes,
+                            dtype=dtype,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
+                        ),
+                        lambda shapes, dtype, device: torch.randint(
+                            0,
+                            max(num_experts, 1),
+                            shapes,
+                            dtype=torch.int32,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
+                        ),
+                        lambda shapes, dtype, device: torch.softmax(
+                            torch.randn(
+                                shapes,
+                                device=device,
+                                generator=torch.Generator(device=device).manual_seed(
+                                    515
+                                ),
+                            ),
+                            dim=-1,
+                        ).to(torch.float32),
+                        lambda shapes, dtype, device: torch.empty(
+                            shapes, dtype=dtype, device=device
+                        ),
+                    ],
+                ),
+            ),
+            use_cold_l2_cache=True,
+        )
+
+    def __hash__(self):
+        return hash(
+            (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.use_fused_finalize,
+                self.output_dtype,
+                self.enable_pdl,
+                int(self.activation_type),
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.swiglu_limit,
+            )
+        )
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (
+            self.num_experts,
+            self.top_k,
+            self.num_local_experts,
+            self.local_expert_offset,
+            self.use_fused_finalize,
+            self.output_dtype,
+            self.enable_pdl,
+            int(self.activation_type),
+            self.swiglu_alpha,
+            self.swiglu_beta,
+            self.swiglu_limit,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[Tuple[Any, ...]]:
+        import cutlass
+
+        from .moe_utils import get_max_num_permuted_tokens
+
+        w1_weight = inputs[3]
+        w2_weight = inputs[6]
+        num_tokens = inputs[0].shape[0]
+
+        def can_implement(
+            weight: torch.Tensor,
+            route_slots: int,
+            gemm_tactic: Tuple,
+        ) -> bool:
+            m = weight.shape[1]
+            k = weight.shape[2] * 2
+            mma_tiler_mnk, cluster_shape_mn, _ = gemm_tactic
+            mma_tiler_m = mma_tiler_mnk[0]
+            return Sm100W4A16GroupedGemmKernel.can_implement(
+                mnkl=(m, route_slots, k, self.num_local_experts),
+                a_dtype=cutlass.Float4E2M1FN,
+                b_dtype=cutlass.BFloat16,
+                c_dtype=cutlass.BFloat16,
+                a_major="k",
+                b_major="k",
+                c_major="m",
+                mma_tiler=mma_tiler_mnk,
+                cluster_shape_mn=cluster_shape_mn,
+                use_2cta_instrs=mma_tiler_m == 256,
+            )
+
+        valid_tactics = []
+        for tactic in W4A16_MOE_TACTICS:
+            gemm1_tactic, gemm2_tactic = tactic
+            route_tile = gemm1_tactic[0][1]
+            route_slots = get_max_num_permuted_tokens(
+                num_tokens,
+                self.top_k,
+                self.num_local_experts,
+                route_tile,
+            )
+            if can_implement(w1_weight, route_slots, gemm1_tactic) and can_implement(
+                w2_weight, route_slots, gemm2_tactic
+            ):
+                valid_tactics.append(tactic)
+        if not valid_tactics:
+            from .blackwell.moe_w4a16 import DEFAULT_W4A16_MOE_TACTIC
+
+            logger.warning(
+                "No valid W4A16 tactics found for tokens=%d, experts=%d, top_k=%d. "
+                "Falling back to the default tactic.",
+                num_tokens,
+                self.num_local_experts,
+                self.top_k,
+            )
+            valid_tactics = [DEFAULT_W4A16_MOE_TACTIC]
+        return valid_tactics
+
+    def forward(  # type: ignore[override]
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Tuple = None,  # type: ignore[assignment]
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        (
+            x,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            moe_output,
+        ) = inputs
+        if x.dtype != torch.bfloat16:
+            raise TypeError(f"W4A16 requires x.dtype=torch.bfloat16, got {x.dtype}")
+        num_tokens = int(token_selected_experts.size(0))
+        hidden_size = int(w2_weight.size(1))
+        if tuple(x.shape) != (num_tokens, hidden_size):
+            raise ValueError(
+                f"x must have shape {(num_tokens, hidden_size)} for W4A16, "
+                f"got {tuple(x.shape)}"
+            )
+        if tuple(moe_output.shape) != (num_tokens, hidden_size):
+            raise ValueError(
+                f"moe_output must have shape {(num_tokens, hidden_size)}, "
+                f"got {tuple(moe_output.shape)}"
+            )
+        return launch_w4a16_moe(
+            x=x,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            local_expert_offset=self.local_expert_offset,
+            use_fused_finalize=self.use_fused_finalize,
+            moe_output=moe_output,
+            enable_pdl=self.enable_pdl,
+            activation_type=self.activation_type,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
+            tactic=None if tactic is None or tactic == -1 else tactic,
+            workspace_cache=self._workspace_cache,
         )
 
 

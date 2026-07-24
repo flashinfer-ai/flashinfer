@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """DeepSeek-V3 MoE Performance Benchmark - CuteDSL vs CUTLASS vs TRTLLM.
 
-Compares three NVFP4 MoE backends on DeepSeek-V3 configuration:
-- CuteDSL: FlashInfer's CuteDSL-based implementation
+Compares NVFP4 MoE backends on DeepSeek-V3 configuration:
+- CuteDSL W4A4: NVFP4 activations and weights
+- CuteDSL W4A16: BF16 activations with NVFP4 weights decoded online
 - CUTLASS: NVIDIA CUTLASS-based implementation
 - TRTLLM: TensorRT-LLM's implementation
 
@@ -18,14 +19,24 @@ Usage:
     python bench_moe_deepseek.py --ep 8    # 32 local experts (8-way EP)
     python bench_moe_deepseek.py --ep 16   # 16 local experts (16-way EP)
 
+    # With Tensor Parallelism simulation
+    python bench_moe_deepseek.py --tp 8    # 256-wide local expert intermediate
+
     # Custom token counts
     python bench_moe_deepseek.py --num-tokens 64,128,256
+
+    # Include activation quantization for FP4-activation backends
+    python bench_moe_deepseek.py --include-activation-quant
 
     # Disable CUDA graph (useful for debugging or profiling)
     python bench_moe_deepseek.py --no-cuda-graph
 
     # Disable CUPTI (use CUDA events for timing instead)
     python bench_moe_deepseek.py --no-cupti
+
+    # Capture one backend for an external CUDA profiler
+    python bench_moe_deepseek.py --num-tokens 128 \
+        --profile-cuda --profile-backend cute-dsl
 
     # CuTe DSL finalize modes
     python bench_moe_deepseek.py --functional-api  # atomic fused (default)
@@ -34,10 +45,11 @@ Usage:
 Metrics:
     - ms: Latency in milliseconds
     - TFLOPS: Computational throughput
-    - Speedup: CuteDSL latency / other backend latency (>1 = CuteDSL faster)
+    - Speedup: other backend latency / CuteDSL latency (>1 = CuteDSL faster)
 """
 
 import argparse
+import gc
 from dataclasses import dataclass
 import numpy as np
 import torch
@@ -55,6 +67,7 @@ class DeepSeekConfig:
 
 
 CFG = DeepSeekConfig()
+BASE_INTERMEDIATE_SIZE = CFG.intermediate_size
 TOKEN_COUNTS = [128, 256, 512, 1024, 2048, 4096]
 
 # Generation phase token counts (small batches typical in decode)
@@ -66,6 +79,8 @@ GEN_PHASE_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]
 # EP=16: 16 experts per GPU (256/16)
 EP_CONFIGS = {
     1: {"num_local_experts": 256, "local_expert_offset": 0},
+    2: {"num_local_experts": 128, "local_expert_offset": 0},
+    4: {"num_local_experts": 64, "local_expert_offset": 0},
     8: {"num_local_experts": 32, "local_expert_offset": 0},
     16: {"num_local_experts": 16, "local_expert_offset": 0},
 }
@@ -199,6 +214,53 @@ def create_inputs(n, dev="cuda", routing_bias_scale=0.01):
 # =============================================================================
 
 
+def _measure_or_profile(
+    run,
+    input_kwargs,
+    warmup,
+    iters,
+    use_cuda_graph,
+    use_cupti,
+    profile_cuda,
+    profile_iters,
+):
+    from flashinfer.testing.utils import bench_gpu_time
+
+    if not profile_cuda:
+        times = bench_gpu_time(
+            run,
+            dry_run_iters=warmup,
+            repeat_iters=iters,
+            cold_l2_cache=True,
+            enable_cupti=use_cupti,
+            use_cuda_graph=use_cuda_graph,
+            input_kwargs=input_kwargs,
+        )
+        return np.median(times)
+
+    from flashinfer.testing.utils import get_l2_cache_size
+
+    runner = lambda: run(**input_kwargs)
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(**input_kwargs)
+        runner = graph.replay
+    for _ in range(3):
+        runner()
+    torch.cuda.synchronize()
+
+    l2_flush = torch.empty(2 * get_l2_cache_size(), device="cuda", dtype=torch.int8)
+    torch.cuda.cudart().cudaProfilerStart()
+    for _ in range(profile_iters):
+        l2_flush.zero_()
+        torch.cuda.synchronize()
+        runner()
+        torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+    return float("nan")
+
+
 def bench_cute_dsl(
     inputs,
     warmup=10,
@@ -209,8 +271,12 @@ def bench_cute_dsl(
     use_cupti=True,
     use_wrapper=False,
     do_autotune=True,
+    quant_mode="w4a4",
     use_per_token_activation=False,
+    include_activation_quant=False,
     use_fused_finalize=True,
+    profile_cuda=False,
+    profile_iters=10,
 ):
     """Benchmark CuteDSL MoE.
 
@@ -223,8 +289,15 @@ def bench_cute_dsl(
                     choose_one cache lookups don't appear inside the CUDA-event
                     interval when bench_gpu_time falls back to events (i.e. when
                     both CUDA graphs and CUPTI are disabled).
+        quant_mode: CuteDSL compute mode, either ``"w4a4"`` or ``"w4a16"``.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
+        include_activation_quant: Include the initial activation FP4
+            quantization in the measured CuTe DSL W4A4 path. W4A16 consumes
+            BF16 activations directly, so this option does not affect it.
+        profile_cuda: Capture steady-state CUDA graph replays between
+            cudaProfilerStart/Stop instead of benchmarking.
+        profile_iters: Number of cold-L2 graph replays to capture.
     """
     import contextlib
 
@@ -237,10 +310,11 @@ def bench_cute_dsl(
         current_nvfp4_4over6_config,
         make_nvfp4_global_scale,
     )
-    from flashinfer.testing.utils import bench_gpu_time
 
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
+    if quant_mode not in ("w4a4", "w4a16"):
+        raise ValueError(f"Unsupported CuTe DSL quant mode: {quant_mode}")
 
     n, sv, dev = inputs["router_logits"].shape[0], 16, "cuda"
     gs1 = torch.tensor([1.0], device=dev)
@@ -248,15 +322,26 @@ def bench_cute_dsl(
     tv = torch.empty(n, CFG.top_k, dtype=torch.float32, device=dev)
     ti = torch.empty(n, CFG.top_k, dtype=torch.int32, device=dev)
 
-    if use_per_token_activation:
-        hidden_global_scale = make_nvfp4_global_scale(
-            inputs["hidden_bf16"],
-            per_token_activation=True,
-            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+    activation_global_scale = None
+    if quant_mode == "w4a4":
+        activation_global_scale = (
+            make_nvfp4_global_scale(
+                inputs["hidden_bf16"],
+                per_token_activation=True,
+                nvfp4_4over6_config=current_nvfp4_4over6_config(),
+            )
+            if use_per_token_activation
+            else gs1
         )
+
+    if quant_mode == "w4a16" or include_activation_quant:
+        xf = inputs["hidden_bf16"]
+        xs = None
+        hidden_per_token_scale = None
+    elif use_per_token_activation:
         xf, xs, hidden_per_token_scale = nvfp4_quantize(
             inputs["hidden_bf16"],
-            hidden_global_scale,
+            activation_global_scale,
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
             backend="cute-dsl",
@@ -264,7 +349,26 @@ def bench_cute_dsl(
     else:
         xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
         hidden_per_token_scale = None
-    xs = xs.view(torch.float8_e4m3fn).reshape(n, CFG.hidden_size // sv).unsqueeze(-1)
+    if xs is not None:
+        xs = xs.unsqueeze(-1)
+
+    def prepare_activation(x, x_sf):
+        per_token_scale = hidden_per_token_scale
+        if quant_mode == "w4a16":
+            return x, None, None
+        if include_activation_quant:
+            if use_per_token_activation:
+                x, x_sf, per_token_scale = nvfp4_quantize(
+                    x,
+                    activation_global_scale,
+                    sfLayout=SfLayout.layout_linear,
+                    per_token_activation=True,
+                    backend="cute-dsl",
+                )
+            else:
+                x, x_sf = fp4_quantize(x, gs1, sv, False, False, backend="cute-dsl")
+            x_sf = x_sf.unsqueeze(-1)
+        return x, x_sf, per_token_scale
 
     # Expert range for this EP partition
     expert_start = local_expert_offset
@@ -290,10 +394,8 @@ def bench_cute_dsl(
     )
 
     # Alpha sized for LOCAL experts only
-    alpha, fc2sc = (
-        torch.ones(num_local_experts, device=dev),
-        torch.tensor([1.0], device=dev),
-    )
+    alpha = torch.ones(num_local_experts, device=dev)
+    fc2sc = None if quant_mode == "w4a16" else torch.tensor([1.0], device=dev)
 
     # Pre-convert routing bias to float32
     routing_bias_f32 = inputs["routing_bias"].float()
@@ -312,9 +414,11 @@ def bench_cute_dsl(
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
             use_fused_finalize=use_fused_finalize,
+            quant_mode=quant_mode,
         )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
+            x, x_sf, per_token_scale = prepare_activation(x, x_sf)
             fused_topk_deepseek(
                 scores=router_logits,
                 bias=routing_bias,
@@ -337,13 +441,14 @@ def bench_cute_dsl(
                 w2_weight=w2q,
                 w2_weight_sf=w2s,
                 w2_alpha=alpha,
-                per_token_scale=hidden_per_token_scale,
+                per_token_scale=per_token_scale,
             )
     else:
         # Use functional API
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
+            x, x_sf, per_token_scale = prepare_activation(x, x_sf)
             fused_topk_deepseek(
                 scores=router_logits,
                 bias=routing_bias,
@@ -370,7 +475,8 @@ def bench_cute_dsl(
                 top_k=CFG.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=local_expert_offset,
-                per_token_scale=hidden_per_token_scale,
+                quant_mode=quant_mode,
+                per_token_scale=per_token_scale,
                 use_fused_finalize=use_fused_finalize,
             )
 
@@ -397,16 +503,16 @@ def bench_cute_dsl(
         run(**input_kwargs)
         torch.cuda.synchronize()
 
-    times = bench_gpu_time(
+    return _measure_or_profile(
         run,
-        dry_run_iters=warmup,
-        repeat_iters=iters,
-        cold_l2_cache=True,
-        enable_cupti=use_cupti,
-        use_cuda_graph=use_cuda_graph,
-        input_kwargs=input_kwargs,
+        input_kwargs,
+        warmup,
+        iters,
+        use_cuda_graph,
+        use_cupti,
+        profile_cuda,
+        profile_iters,
     )
-    return np.median(times)
 
 
 def bench_cutlass(
@@ -418,6 +524,9 @@ def bench_cutlass(
     use_cuda_graph=True,
     use_cupti=True,
     do_autotune=True,
+    include_activation_quant=False,
+    profile_cuda=False,
+    profile_iters=10,
 ):
     """Benchmark CUTLASS MoE.
 
@@ -429,7 +538,6 @@ def bench_cutlass(
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import fused_topk_deepseek, cutlass_fused_moe
     from flashinfer.fp4_quantization import fp4_quantize
-    from flashinfer.testing.utils import bench_gpu_time
 
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
@@ -478,6 +586,8 @@ def bench_cutlass(
     ep_size = CFG.num_experts // num_local_experts
 
     def run(hidden, sf, router_logits, routing_bias, topk_values, topk_indices):
+        if include_activation_quant:
+            hidden, sf = fp4_quantize(hidden, a1_gs, sv, False, True)
         # Routing (included in timing for fair comparison with TRTLLM)
         fused_topk_deepseek(
             scores=router_logits,
@@ -505,8 +615,8 @@ def bench_cutlass(
         return output
 
     input_kwargs = {
-        "hidden": hidden_fp4,
-        "sf": input_sf,
+        "hidden": inputs["hidden_bf16"] if include_activation_quant else hidden_fp4,
+        "sf": None if include_activation_quant else input_sf,
         "router_logits": inputs["router_logits"],
         "routing_bias": routing_bias_f32,
         "topk_values": tv,
@@ -518,16 +628,16 @@ def bench_cutlass(
         run(**input_kwargs)
         torch.cuda.synchronize()
 
-    times = bench_gpu_time(
+    return _measure_or_profile(
         run,
-        dry_run_iters=warmup,
-        repeat_iters=iters,
-        cold_l2_cache=True,
-        enable_cupti=use_cupti,
-        use_cuda_graph=use_cuda_graph,
-        input_kwargs=input_kwargs,
+        input_kwargs,
+        warmup,
+        iters,
+        use_cuda_graph,
+        use_cupti,
+        profile_cuda,
+        profile_iters,
     )
-    return np.median(times)
 
 
 def bench_trtllm(
@@ -540,6 +650,9 @@ def bench_trtllm(
     use_cupti=True,
     do_autotune=True,
     use_per_token_activation=False,
+    include_activation_quant=False,
+    profile_cuda=False,
+    profile_iters=10,
 ):
     """Benchmark TRT-LLM-Gen MoE.
 
@@ -560,7 +673,6 @@ def bench_trtllm(
         current_nvfp4_4over6_config,
         make_nvfp4_global_scale,
     )
-    from flashinfer.testing.utils import bench_gpu_time
 
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
@@ -572,29 +684,37 @@ def bench_trtllm(
     expert_start = local_expert_offset
     expert_end = local_expert_offset + num_local_experts
 
-    hg = inputs["hidden_gs"]
+    hidden_global_scale = inputs["hidden_gs"]
     if use_per_token_activation:
         hidden_global_scale = make_nvfp4_global_scale(
             inputs["hidden_bf16"],
             per_token_activation=True,
             nvfp4_4over6_config=current_nvfp4_4over6_config(),
         )
-        hfp, hsf, hidden_per_token_scale = nvfp4_quantize(
-            inputs["hidden_bf16"],
-            hidden_global_scale,
-            sfLayout=SfLayout.layout_linear,
-            per_token_activation=True,
-            backend="cute-dsl",
+
+    def quantize_hidden(hidden_states):
+        if use_per_token_activation:
+            hidden_states, hidden_states_scale, per_token_scale = nvfp4_quantize(
+                hidden_states,
+                hidden_global_scale,
+                sfLayout=SfLayout.layout_linear,
+                per_token_activation=True,
+                backend="cute-dsl",
+            )
+        else:
+            hidden_states, hidden_states_scale = fp4_quantize(
+                hidden_states, hidden_global_scale, sv, False, True
+            )
+            per_token_scale = None
+        hidden_states = hidden_states.view(torch.uint8).reshape(n, CFG.hidden_size // 2)
+        hidden_states_scale = (
+            hidden_states_scale.view(torch.float8_e4m3fn)
+            .flatten()[: n * CFG.hidden_size // sv]
+            .reshape(n, CFG.hidden_size // sv)
         )
-    else:
-        hfp, hsf = fp4_quantize(inputs["hidden_bf16"], hg, sv, False, True)
-        hidden_per_token_scale = None
-    hfp = hfp.view(torch.uint8).reshape(n, CFG.hidden_size // 2)
-    hsc = (
-        hsf.view(torch.float8_e4m3fn)
-        .flatten()[: n * CFG.hidden_size // sv]
-        .reshape(n, CFG.hidden_size // sv)
-    )
+        return hidden_states, hidden_states_scale, per_token_scale
+
+    hfp, hsc, hidden_per_token_scale = quantize_hidden(inputs["hidden_bf16"])
 
     def prep(bf16, gs, M, K):
         """Prepare weights for LOCAL experts only."""
@@ -637,6 +757,11 @@ def bench_trtllm(
     sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
 
     def run(routing_logits, routing_bias, hidden_states, hidden_states_scale):
+        per_token_scale = hidden_per_token_scale
+        if include_activation_quant:
+            hidden_states, hidden_states_scale, per_token_scale = quantize_hidden(
+                hidden_states
+            )
         return trtllm_fp4_block_scale_moe(
             routing_logits=routing_logits,
             routing_bias=routing_bias,
@@ -663,15 +788,15 @@ def bench_trtllm(
             local_num_experts=num_local_experts,
             routed_scaling_factor=CFG.routed_scaling_factor,
             routing_method_type=RoutingMethodType.DeepSeekV3,
-            per_token_scale=hidden_per_token_scale,
+            per_token_scale=per_token_scale,
             do_finalize=True,
         )
 
     input_kwargs = {
         "routing_logits": inputs["router_logits"],
         "routing_bias": inputs["routing_bias"],
-        "hidden_states": hfp,
-        "hidden_states_scale": hsc,
+        "hidden_states": inputs["hidden_bf16"] if include_activation_quant else hfp,
+        "hidden_states_scale": None if include_activation_quant else hsc,
     }
 
     # Pre-warm under autotune; measurement runs outside (see bench_cute_dsl).
@@ -679,16 +804,16 @@ def bench_trtllm(
         run(**input_kwargs)
         torch.cuda.synchronize()
 
-    times = bench_gpu_time(
+    return _measure_or_profile(
         run,
-        dry_run_iters=warmup,
-        repeat_iters=iters,
-        cold_l2_cache=True,
-        enable_cupti=use_cupti,
-        use_cuda_graph=use_cuda_graph,
-        input_kwargs=input_kwargs,
+        input_kwargs,
+        warmup,
+        iters,
+        use_cuda_graph,
+        use_cupti,
+        profile_cuda,
+        profile_iters,
     )
-    return np.median(times)
 
 
 # =============================================================================
@@ -716,6 +841,7 @@ def run_benchmark(
     warmup=10,
     iters=100,
     ep_config=1,
+    tp_config=1,
     do_autotune=True,
     verbose=True,
     use_cuda_graph=True,
@@ -723,7 +849,11 @@ def run_benchmark(
     use_wrapper=True,
     routing_bias_scale=0.01,
     use_per_token_activation=False,
+    include_activation_quant=False,
     use_fused_finalize=True,
+    profile_cuda=False,
+    profile_iters=10,
+    profile_backend=None,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -746,6 +876,7 @@ def run_benchmark(
         warmup: Warmup iterations
         iters: Benchmark iterations
         ep_config: Expert Parallelism config (1, 8, or 16)
+        tp_config: Tensor Parallelism degree used to reduce expert intermediate size
         do_autotune: Whether to autotune during benchmarking
         verbose: Print results to stdout
         use_cuda_graph: Whether to use CUDA graph for benchmarking
@@ -754,16 +885,27 @@ def run_benchmark(
         routing_bias_scale: Scale for random routing bias generation
         use_per_token_activation: Whether supported FP4 MoE backends should use
             per-token NVFP4 activation scaling.
+        include_activation_quant: Include the initial activation FP4
+            quantization in each backend's timing.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
+        profile_cuda: Capture one backend for an external CUDA profiler.
+        profile_iters: Number of cold-L2 graph replays to capture.
+        profile_backend: Backend to run when profile_cuda is enabled.
 
     Returns:
         List of BenchResult objects
     """
+    if tp_config < 1 or BASE_INTERMEDIATE_SIZE % tp_config != 0:
+        raise ValueError(
+            f"tp_config must be a positive divisor of {BASE_INTERMEDIATE_SIZE}"
+        )
+
     # Get EP configuration
     ep_cfg = EP_CONFIGS.get(ep_config, EP_CONFIGS[1])
     num_local = ep_cfg["num_local_experts"]
     local_offset = ep_cfg["local_expert_offset"]
+    CFG.intermediate_size = BASE_INTERMEDIATE_SIZE // tp_config
 
     results = []
     rows_and_histograms = []
@@ -783,24 +925,34 @@ def run_benchmark(
             routing_bias_scale=routing_bias_scale,
             do_autotune=do_autotune,
             use_per_token_activation=use_per_token_activation,
+            include_activation_quant=include_activation_quant,
             use_fused_finalize=use_fused_finalize,
+            profile_cuda=profile_cuda,
+            profile_iters=profile_iters,
+            profile_backend=profile_backend,
         )
         results.extend(row)
         rows_and_histograms.append((row, histogram_record))
+        # Each row rebuilds full-model weights; release cached allocations so
+        # measurements do not depend on the token-count scan order.
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if verbose:
         _print_header(
             ep_config,
+            tp_config,
             num_local,
             use_cuda_graph,
             use_cupti,
             routing_bias_scale,
             use_per_token_activation=use_per_token_activation,
+            include_activation_quant=include_activation_quant,
             use_fused_finalize=use_fused_finalize,
         )
         for row, histogram_record in rows_and_histograms:
             _print_row(row, histogram_record)
-        _print_footer(ep_config, num_local)
+        _print_footer(use_per_token_activation)
 
     return results
 
@@ -817,7 +969,11 @@ def _benchmark_single(
     routing_bias_scale=0.01,
     do_autotune=True,
     use_per_token_activation=False,
+    include_activation_quant=False,
     use_fused_finalize=True,
+    profile_cuda=False,
+    profile_iters=10,
+    profile_backend=None,
 ):
     """Benchmark all backends for a single token count.
 
@@ -828,21 +984,49 @@ def _benchmark_single(
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
+    run_cute_dsl_w4a4 = profile_backend in (None, "cute-dsl")
+    run_cute_dsl_w4a16 = profile_backend in (None, "cute-dsl-w4a16")
+    run_cutlass = profile_backend in (None, "cutlass")
+    run_trtllm = profile_backend in (None, "trtllm")
+
     lat = {}
-    lat["CuteDSL"] = bench_cute_dsl(
-        inputs,
-        warmup,
-        iters,
-        num_local,
-        local_offset,
-        use_cuda_graph,
-        use_cupti,
-        use_wrapper=use_wrapper,
-        do_autotune=do_autotune,
-        use_per_token_activation=use_per_token_activation,
-        use_fused_finalize=use_fused_finalize,
-    )
-    if not use_per_token_activation:
+    if run_cute_dsl_w4a4:
+        lat["CuteDSL W4A4"] = bench_cute_dsl(
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            use_wrapper=use_wrapper,
+            do_autotune=do_autotune,
+            quant_mode="w4a4",
+            use_per_token_activation=use_per_token_activation,
+            include_activation_quant=include_activation_quant,
+            use_fused_finalize=use_fused_finalize,
+            profile_cuda=profile_cuda,
+            profile_iters=profile_iters,
+        )
+    if run_cute_dsl_w4a16:
+        lat["CuteDSL W4A16"] = bench_cute_dsl(
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            use_wrapper=use_wrapper,
+            do_autotune=do_autotune,
+            quant_mode="w4a16",
+            use_per_token_activation=use_per_token_activation,
+            include_activation_quant=include_activation_quant,
+            use_fused_finalize=use_fused_finalize,
+            profile_cuda=profile_cuda,
+            profile_iters=profile_iters,
+        )
+    if run_cutlass and not use_per_token_activation:
         lat["CUTLASS"] = bench_cutlass(
             inputs,
             warmup,
@@ -852,18 +1036,25 @@ def _benchmark_single(
             use_cuda_graph,
             use_cupti,
             do_autotune=do_autotune,
+            include_activation_quant=include_activation_quant,
+            profile_cuda=profile_cuda,
+            profile_iters=profile_iters,
         )
-    lat["TRTLLM"] = bench_trtllm(
-        inputs,
-        warmup,
-        iters,
-        num_local,
-        local_offset,
-        use_cuda_graph,
-        use_cupti,
-        do_autotune=do_autotune,
-        use_per_token_activation=use_per_token_activation,
-    )
+    if run_trtllm:
+        lat["TRTLLM"] = bench_trtllm(
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            do_autotune=do_autotune,
+            use_per_token_activation=use_per_token_activation,
+            include_activation_quant=include_activation_quant,
+            profile_cuda=profile_cuda,
+            profile_iters=profile_iters,
+        )
 
     # Build results
     results = []
@@ -881,28 +1072,39 @@ def _benchmark_single(
 
 def _print_header(
     ep_config,
+    tp_config,
     num_local,
     use_cuda_graph,
     use_cupti,
     routing_bias_scale,
     use_per_token_activation=False,
+    include_activation_quant=False,
     use_fused_finalize=True,
 ):
     """Print benchmark header."""
-    print("\n" + "=" * 120)
+    table_width = 120 if use_per_token_activation else 159
+    print("\n" + "=" * table_width)
     if use_per_token_activation:
-        print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs TRTLLM (EP={ep_config})")
+        print(
+            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs TRTLLM "
+            f"(EP={ep_config}, TP={tp_config})"
+        )
     else:
         print(
-            f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})"
+            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs CUTLASS vs TRTLLM "
+            f"(EP={ep_config}, TP={tp_config})"
         )
-    print("=" * 120)
+    print("=" * table_width)
     print(
         f"Model: hidden={CFG.hidden_size}, intermediate={CFG.intermediate_size}, "
         f"experts={CFG.num_experts}, top_k={CFG.top_k}"
     )
     print(
         f"EP Config: {num_local} local experts (simulating {CFG.num_experts // num_local}-way parallelism)"
+    )
+    print(
+        f"TP Config: intermediate size {CFG.intermediate_size} "
+        f"(simulating {tp_config}-way parallelism)"
     )
     print(
         f"CUDA Graph: {'enabled' if use_cuda_graph else 'disabled'}, CUPTI: {'enabled' if use_cupti else 'disabled'}"
@@ -912,18 +1114,24 @@ def _print_header(
         f"(larger values tend to create expert imbalance)"
     )
     print(
+        "Timed initial activation quantization for FP4-activation backends: "
+        f"{'included' if include_activation_quant else 'excluded'}; "
+        "W4A16 consumes BF16 directly"
+    )
+    print(
         "CuteDSL finalize: "
         f"{'atomic fused' if use_fused_finalize else 'deterministic two-stage'}"
     )
     if use_per_token_activation:
         print("CUTLASS omitted: it does not consume the per-token activation scale.")
-    print("-" * 120)
+    print("-" * table_width)
     if use_per_token_activation:
         print(
             f"{'Tokens':>6} | "
-            f"{'CuteDSL':^15} | "
+            f"{'CuteDSL W4A4':^15} | "
+            f"{'CuteDSL W4A16':^15} | "
             f"{'TRTLLM':^15} | "
-            f"{'Speedup':^9} | "
+            f"{'Speedup vs TRTLLM':^18} | "
             f"{'Winner':^8} | "
             f"{'Active':^7} | "
             f"{'Stats':^14}"
@@ -932,7 +1140,8 @@ def _print_header(
             f"{'':>6} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
-            f"{'TRTLLM':>9} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'W4A4':>8}  {'W4A16':>8} | "
             f"{'':^8} | "
             f"{'experts':^7} | "
             f"{'min/max/median':^14}"
@@ -940,10 +1149,12 @@ def _print_header(
     else:
         print(
             f"{'Tokens':>6} | "
-            f"{'CuteDSL':^15} | "
+            f"{'CuteDSL W4A4':^15} | "
+            f"{'CuteDSL W4A16':^15} | "
             f"{'CUTLASS':^15} | "
             f"{'TRTLLM':^15} | "
-            f"{'Speedup (CuteDSL/X)':^18} | "
+            f"{'Speedup vs CUTLASS':^18} | "
+            f"{'Speedup vs TRTLLM':^18} | "
             f"{'Winner':^8} | "
             f"{'Active':^7} | "
             f"{'Stats':^14}"
@@ -953,26 +1164,39 @@ def _print_header(
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
-            f"{'CUTLASS':>9} {'TRTLLM':>9} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'W4A4':>8}  {'W4A16':>8} | "
+            f"{'W4A4':>8}  {'W4A16':>8} | "
             f"{'':^8} | "
             f"{'experts':^7} | "
             f"{'min/max/median':^14}"
         )
-    print("-" * 120)
+    print("-" * table_width)
 
 
 def _print_row(results, histogram_record):
     """Print a single row of benchmark results."""
     # Extract values by backend
     r = {r.backend: r for r in results}
-    cute, trtllm = r["CuteDSL"], r["TRTLLM"]
+    w4a4, w4a16, trtllm = (
+        r["CuteDSL W4A4"],
+        r["CuteDSL W4A16"],
+        r["TRTLLM"],
+    )
     cutlass = r.get("CUTLASS")
 
     # Calculate speedups (> 1.0 means CuteDSL is faster)
-    speedup_trtllm = trtllm.latency_ms / cute.latency_ms
+    trtllm_speedups = (
+        trtllm.latency_ms / w4a4.latency_ms,
+        trtllm.latency_ms / w4a16.latency_ms,
+    )
 
     # Find winner
     winner = min(r.values(), key=lambda x: x.latency_ms).backend
+    winner = {
+        "CuteDSL W4A4": "W4A4",
+        "CuteDSL W4A16": "W4A16",
+    }.get(winner, winner)
 
     active_experts = f"{histogram_record['active_local_experts']:>3}"
     stats = (
@@ -981,33 +1205,49 @@ def _print_row(results, histogram_record):
         f"{histogram_record['median_count']:>7.2f}"
     )
     if cutlass is None:
+        speedups = f"{trtllm_speedups[0]:>7.2f}x {trtllm_speedups[1]:>7.2f}x"
         print(
-            f"{cute.tokens:>6} | "
-            f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
+            f"{w4a4.tokens:>6} | "
+            f"{w4a4.latency_ms:>7.3f} {w4a4.tflops:>7.1f} | "
+            f"{w4a16.latency_ms:>7.3f} {w4a16.tflops:>7.1f} | "
             f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
-            f"{speedup_trtllm:>8.2f}x | "
+            f"{speedups:>18} | "
             f"{winner:^8} | "
             f"{active_experts:>7} | "
             f"{stats:>14}"
         )
     else:
-        speedup_cutlass = cutlass.latency_ms / cute.latency_ms
+        cutlass_speedups = (
+            cutlass.latency_ms / w4a4.latency_ms,
+            cutlass.latency_ms / w4a16.latency_ms,
+        )
+        cutlass_speedups_text = (
+            f"{cutlass_speedups[0]:>7.2f}x {cutlass_speedups[1]:>7.2f}x"
+        )
+        trtllm_speedups_text = (
+            f"{trtllm_speedups[0]:>7.2f}x {trtllm_speedups[1]:>7.2f}x"
+        )
         print(
-            f"{cute.tokens:>6} | "
-            f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
+            f"{w4a4.tokens:>6} | "
+            f"{w4a4.latency_ms:>7.3f} {w4a4.tflops:>7.1f} | "
+            f"{w4a16.latency_ms:>7.3f} {w4a16.tflops:>7.1f} | "
             f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} | "
             f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
-            f"{speedup_cutlass:>8.2f}x {speedup_trtllm:>8.2f}x | "
+            f"{cutlass_speedups_text:>18} | "
+            f"{trtllm_speedups_text:>18} | "
             f"{winner:^8} | "
             f"{active_experts:>7} | "
             f"{stats:>14}"
         )
 
 
-def _print_footer(ep_config, num_local):
+def _print_footer(use_per_token_activation):
     """Print benchmark footer."""
-    print("-" * 120)
-    print("Speedup > 1.0 means CuteDSL is faster than that backend")
+    table_width = 120 if use_per_token_activation else 159
+    print("-" * table_width)
+    print(
+        "Speedup > 1.0 means that CuTe DSL mode is faster than the comparison backend"
+    )
 
 
 def _collect_expert_histogram(inputs, num_local, local_offset):
@@ -1075,8 +1315,14 @@ def main():
         "--ep",
         type=int,
         default=1,
-        choices=[1, 8, 16],
-        help="Expert Parallelism: 1 (256 local), 8 (32 local), 16 (16 local)",
+        choices=[1, 2, 4, 8, 16],
+        help="Expert parallelism simulation.",
+    )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=1,
+        help="Tensor Parallelism simulation: divide the expert intermediate size by TP.",
     )
     parser.add_argument(
         "--no-cuda-graph",
@@ -1099,10 +1345,31 @@ def main():
         help="Use per-token NVFP4 activation scaling for supported FP4 MoE backends.",
     )
     parser.add_argument(
+        "--include-activation-quant",
+        action="store_true",
+        help="Include initial activation FP4 quantization in each backend's timing.",
+    )
+    parser.add_argument(
         "--no-fused-finalize",
         action="store_false",
         dest="use_fused_finalize",
         help="Use deterministic two-stage CuTe DSL finalize instead of atomic fused finalize.",
+    )
+    parser.add_argument(
+        "--profile-cuda",
+        action="store_true",
+        help="Capture steady-state iterations between cudaProfilerStart/Stop.",
+    )
+    parser.add_argument(
+        "--profile-iters",
+        type=int,
+        default=10,
+        help="Number of CUDA graph replays captured by --profile-cuda.",
+    )
+    parser.add_argument(
+        "--profile-backend",
+        choices=["cute-dsl", "cute-dsl-w4a16", "cutlass", "trtllm"],
+        help="Backend captured by --profile-cuda.",
     )
     parser.add_argument(
         "--routing-bias-scale",
@@ -1112,6 +1379,18 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.tp < 1:
+        parser.error("--tp must be positive")
+    if BASE_INTERMEDIATE_SIZE % args.tp != 0:
+        parser.error(
+            f"--tp must divide the expert intermediate size ({BASE_INTERMEDIATE_SIZE})"
+        )
+    if args.profile_iters < 1:
+        parser.error("--profile-iters must be positive")
+    if args.profile_cuda != (args.profile_backend is not None):
+        parser.error("--profile-cuda and --profile-backend must be specified together")
+    if args.profile_backend == "cutlass" and args.use_per_token_activation:
+        parser.error("CUTLASS does not consume the per-token activation scale")
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
         return 1
@@ -1123,11 +1402,16 @@ def main():
         tokens = GEN_PHASE_TOKENS  # [1, 2, 4, 8, 16, 32, 64, 128]
     else:
         tokens = TOKEN_COUNTS  # [128, 256, 512, 1024, 2048, 4096]
-
+    if args.profile_cuda and len(tokens) != 1:
+        parser.error("--profile-cuda requires exactly one token count")
     print("\nDeepSeek-V3 MoE Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Per-token activation: {args.use_per_token_activation}")
+    print(f"Initial activation quantization: {args.include_activation_quant}")
+    print("CuteDSL modes: W4A4 and W4A16")
+    print(f"Tensor parallelism simulation: TP={args.tp}")
+    print(f"CUDA profiler capture: {args.profile_cuda}")
     print(
         "CuteDSL finalize: "
         f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
@@ -1138,14 +1422,19 @@ def main():
         warmup=args.warmup,
         iters=args.iters,
         ep_config=args.ep,
+        tp_config=args.tp,
         do_autotune=not args.no_autotune,
-        verbose=not args.quiet,
+        verbose=not args.quiet and not args.profile_cuda,
         use_cuda_graph=not args.no_cuda_graph,
         use_cupti=not args.no_cupti,
         use_wrapper=not args.functional_api,
         routing_bias_scale=args.routing_bias_scale,
         use_per_token_activation=args.use_per_token_activation,
+        include_activation_quant=args.include_activation_quant,
         use_fused_finalize=args.use_fused_finalize,
+        profile_cuda=args.profile_cuda,
+        profile_iters=args.profile_iters,
+        profile_backend=args.profile_backend,
     )
 
     return 0

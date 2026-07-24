@@ -45,6 +45,7 @@ def _validate_pack_devices(act: MoEActivationPack, runner: str) -> None:
         "hidden_states_scale",
         "topk_ids",
         "topk_weights",
+        "per_token_scale",
         "routing_logits",
         "routing_bias",
     ):
@@ -160,18 +161,17 @@ class MoERunner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
-# CuteDSL NVFP4 runner — delegates to the existing CuteDslFusedMoENvfp4Runner
+# CuteDSL NVFP4 runner — delegates to the matching W4A4 or W4A16 runner
 # ---------------------------------------------------------------------------
 
 
 class CuteDslNvfp4Runner(MoERunner):
-    """Wraps CuteDslFusedMoENvfp4Runner, translating Pack inputs into its
-    List[Tensor] convention."""
+    """Translate activation and weight packs into a CuTe DSL runner input list."""
 
     backend_key = "cute_dsl_nvfp4"
     # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_quant_variants = (QuantVariant.NVFP4, QuantVariant.W4A16)
 
     def check_support(self) -> None:
         super().check_support()
@@ -182,20 +182,49 @@ class CuteDslNvfp4Runner(MoERunner):
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from .cute_dsl.fused_moe import _cute_dsl_fused_moe_nvfp4_impl
-        from .cute_dsl.tuner import CuteDslFusedMoENvfp4Runner
+        from .cute_dsl.tuner import (
+            CuteDslFusedMoENvfp4Runner,
+            CuteDslFusedMoEW4A16Runner,
+        )
 
         self.config = config
         experts = config.experts
         routing = config.routing
         num_local_experts = experts.local_num_experts or routing.num_experts
-
-        self._inner = CuteDslFusedMoENvfp4Runner(
-            forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
-            num_experts=routing.num_experts,
-            top_k=routing.top_k,
-            num_local_experts=num_local_experts,
-            local_expert_offset=experts.local_expert_offset,
+        enable_pdl = (
+            True if config.execution.enable_pdl is None else config.execution.enable_pdl
         )
+        self._inner: CuteDslFusedMoENvfp4Runner | CuteDslFusedMoEW4A16Runner
+        if config.quant.variant is QuantVariant.NVFP4:
+            self._inner = CuteDslFusedMoENvfp4Runner(
+                forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
+                num_experts=routing.num_experts,
+                top_k=routing.top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=experts.local_expert_offset,
+                use_fused_finalize=config.execution.use_fused_finalize,
+                enable_pdl=enable_pdl,
+                activation_type=int(config.activation.type),
+                use_per_token_activation=bool(config.quant.per_token_scale),
+            )
+        elif config.quant.variant is QuantVariant.W4A16:
+            if config.quant.per_token_scale:
+                raise ValueError(
+                    "CuteDslNvfp4Runner: per_token_scale is not supported for W4A16"
+                )
+            self._inner = CuteDslFusedMoEW4A16Runner(
+                num_experts=routing.num_experts,
+                top_k=routing.top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=experts.local_expert_offset,
+                use_fused_finalize=config.execution.use_fused_finalize,
+                enable_pdl=enable_pdl,
+                activation_type=int(config.activation.type),
+            )
+        else:
+            raise NotImplementedError(
+                f"CuteDslNvfp4Runner does not support {config.quant.variant}."
+            )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
         # the instance we just built, not off the class.
@@ -203,6 +232,9 @@ class CuteDslNvfp4Runner(MoERunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         return self._inner.get_valid_tactics(inputs, profile)
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return self._inner.get_cache_key_extras(inputs)
 
     def forward(
         self,
@@ -218,19 +250,14 @@ class CuteDslNvfp4Runner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        """Translate Packs → List[Tensor] expected by CuteDslFusedMoENvfp4Runner.
+        """Translate packs into the selected CuTe DSL runner's input list.
 
         Expected weight view keys: w1_weight, w1_weight_sf, w1_alpha,
         fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha.
-        Input order: x, x_sf, token_selected_experts, token_final_scales,
-                     w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
-                     w2_weight, w2_weight_sf, w2_alpha, moe_output.
-
-        The trailing ``moe_output`` buffer (index 11) is optional for a direct
-        ``forward`` (the inner runner allocates it), but the inner runner's
-        tuning_config declares index 11 as a dynamic tensor, so it must be
-        present for the autotuner profiling path to assign it a per-bucket
-        initializer.
+        The W4A4 per-token path inserts ``per_token_scale`` before the trailing
+        ``moe_output`` buffer. W4A16 uses its own compact input layout. Both
+        tuning configurations include the output buffer so profiling can replace
+        it for each token bucket.
         """
         # MoELayer already filters by supported_routing_modes; this guards the
         # direct-runner path (tests/benchmarks) against silently forwarding a
@@ -246,24 +273,84 @@ class CuteDslNvfp4Runner(MoERunner):
         _validate_prerouted_inputs(
             act, num_tokens, self._inner.top_k, "CuteDslNvfp4Runner"
         )
-        hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
-        moe_output = act.hidden_states_q.new_empty(
-            (num_tokens, hidden_size), dtype=torch.bfloat16
-        )
-        return [
-            act.hidden_states_q,
-            act.hidden_states_scale.unsqueeze(-1),  # CuteDSL expects [M, H//16, 1]
-            act.topk_ids,
-            act.topk_weights,
-            v["w1_weight"],
-            v["w1_weight_sf"],
-            v["w1_alpha"],
-            v["fc2_input_scale"],
-            v["w2_weight"],
-            v["w2_weight_sf"],
-            v["w2_alpha"],
-            moe_output,
-        ]
+
+        quant_variant = self.config.quant.variant
+        use_per_token_activation = bool(self.config.quant.per_token_scale)
+        if (
+            quant_variant is QuantVariant.NVFP4
+            and not use_per_token_activation
+            and act.hidden_states_scale is not None
+            and act.per_token_scale is None
+        ):
+            hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
+            moe_output = act.hidden_states_q.new_empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16
+            )
+            return [
+                act.hidden_states_q,
+                act.hidden_states_scale.unsqueeze(-1),  # CuteDSL expects [M, H//16, 1]
+                act.topk_ids,
+                act.topk_weights,
+                v["w1_weight"],
+                v["w1_weight_sf"],
+                v["w1_alpha"],
+                v["fc2_input_scale"],
+                v["w2_weight"],
+                v["w2_weight_sf"],
+                v["w2_alpha"],
+                moe_output,
+            ]
+        elif (
+            quant_variant is QuantVariant.NVFP4
+            and use_per_token_activation
+            and act.hidden_states_scale is not None
+            and act.per_token_scale is not None
+        ):
+            hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
+            moe_output = act.hidden_states_q.new_empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16
+            )
+            return [
+                act.hidden_states_q,
+                act.hidden_states_scale.unsqueeze(-1),
+                act.topk_ids,
+                act.topk_weights,
+                v["w1_weight"],
+                v["w1_weight_sf"],
+                v["w1_alpha"],
+                v["fc2_input_scale"],
+                v["w2_weight"],
+                v["w2_weight_sf"],
+                v["w2_alpha"],
+                act.per_token_scale,
+                moe_output,
+            ]
+        elif (
+            quant_variant is QuantVariant.W4A16
+            and act.hidden_states_scale is None
+            and act.per_token_scale is None
+        ):
+            hidden_size = act.hidden_states_q.shape[1]
+            moe_output = act.hidden_states_q.new_empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16
+            )
+            return [
+                act.hidden_states_q,
+                act.topk_ids,
+                act.topk_weights,
+                v["w1_weight"],
+                v["w1_weight_sf"],
+                v["w1_alpha"],
+                v["w2_weight"],
+                v["w2_weight_sf"],
+                v["w2_alpha"],
+                moe_output,
+            ]
+        else:
+            raise ValueError(
+                "CuteDslNvfp4Runner activation inputs must match W4A4, "
+                "W4A4 per-token, or W4A16"
+            )
 
     def __hash__(self):
         return hash(("cute_dsl_nvfp4", hash(self._inner)))

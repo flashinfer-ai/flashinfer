@@ -3016,9 +3016,8 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
     op_type="moe",
     name_prefix="cute_dsl_fused_moe_nvfp4",
     description=(
-        "CuteDSL NVFP4 fused MoE (SM100/SM103). Accepts NvFP4-packed input + "
-        "scales with precomputed top-k routing (token_selected_experts + "
-        "token_final_scales) and per-expert alpha scales."
+        "CuteDSL NVFP4 fused MoE (SM100/SM103). Runs explicit W4A4 or W4A16 "
+        "compute with precomputed top-k routing and per-expert alpha scales."
     ),
     axes={
         "num_tokens": Var(description="Total tokens across the batch."),
@@ -3027,6 +3026,9 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "num_local_experts": Const(abbrev="e"),
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
+        "input_width": Var(
+            description="hidden_size // 2 for NVFP4 input or hidden_size for BF16."
+        ),
         "num_packed_hidden": Var(description="hidden_size // 2 (NvFP4 packed)."),
         "num_packed_intermediate": Var(
             description="intermediate_size // 2 (NvFP4 packed)."
@@ -3047,12 +3049,13 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
     },
     inputs={
         "x": Tensor(
-            ["num_tokens", "num_packed_hidden"],
-            description="NvFP4-packed input (uint8, 2 fp4 per byte).",
+            ["num_tokens", "input_width"],
+            description="Packed NVFP4 input for W4A4 or BF16 input for W4A16.",
         ),
         "x_sf": Tensor(
             ["num_tokens", "num_fp4_hidden_blocks"],
-            description="NvFP4 scale factors for x (float8_e4m3fn).",
+            optional=True,
+            description="NVFP4 activation scales for W4A4; omitted for W4A16.",
         ),
         "token_selected_experts": Tensor(
             ["num_tokens", "top_k"],
@@ -3080,7 +3083,10 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "fc2_input_scale": Tensor(
             ["one"],
             dtype="float32",
-            description="Global scale for FC2 input quantization.",
+            optional=True,
+            description=(
+                "Global scale for W4A4 FC2 input quantization; omitted for W4A16."
+            ),
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
@@ -3099,7 +3105,12 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             ["num_tokens"],
             dtype="float32",
             optional=True,
-            description="Optional per-token input row scale.",
+            description="Optional W4A4 per-token input row scale.",
+        ),
+        "quant_mode": Scalar(
+            "string",
+            optional=True,
+            description="Compute mode: 'nvfp4'/'w4a4' or 'w4a16'.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
@@ -3175,6 +3186,11 @@ _cute_dsl_wrapper_inputs["swiglu_limit"] = Scalar(
     "float32",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["quant_mode"] = Scalar(
+    "string",
+    optional=True,
+    description="Compute mode set at wrapper __init__, not passed to run().",
 )
 
 _cute_dsl_wrapper_axes = dict(cute_dsl_fused_moe_nvfp4_trace.axes)
@@ -3361,6 +3377,7 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
     swiglu_beta=DEFAULT_SWIGLU_BETA,
     swiglu_limit=DEFAULT_SWIGLU_LIMIT,
+    quant_mode="w4a4",
     per_token_scale=None,
     **_unused,
 ):
@@ -3369,7 +3386,17 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     weights."""
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
-    hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
+    quant_mode = quant_mode.lower()
+    if quant_mode in ("nvfp4", "w4a4"):
+        if x_sf is None:
+            raise ValueError("x_sf is required when quant_mode='w4a4'")
+        hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
+    elif quant_mode == "w4a16":
+        if x_sf is not None:
+            raise ValueError("x_sf must be None when quant_mode='w4a16'")
+        hs_deq = x.to(torch.float32)
+    else:
+        raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
     W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=False)
     W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=False)
     if per_token_scale is not None:
