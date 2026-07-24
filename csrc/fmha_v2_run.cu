@@ -581,9 +581,16 @@ void fmha_v2_run(
   void* kv_cache_pool_ptr = nullptr;
   int32_t* kv_cache_block_offsets_d = nullptr;
 
-  // For Q_PAGED_KV layout, block_tables has shape [B, M] containing logical page indices.
-  // The kernel transforms these to interleaved pool offsets (K=page*2, V=page*2+1) on-the-fly.
+  // For Q_PAGED_KV layout, block_tables has one of two shapes:
+  //  - [B, M]: logical page indices shared by K and V; the kernel transforms them to
+  //    interleaved pool offsets (K=page*2, V=page*2+1) on-the-fly. Requires K/V blocks
+  //    physically interleaved per page ([pages, 2, page_size, H, D] pool).
+  //  - [B, 2, M]: pre-expanded block offsets: [:, 0, :] holds K block offsets,
+  //    [:, 1, :] holds V block offsets, both relative to the K pool base pointer
+  //    in units of mBytesPerBlock. Requires K and V are separate (block-aligned)
+  //    regions of one allocation.
   int block_table_max_blocks = 0;
+  bool pre_expanded_block_offsets = false;
 
   switch (input_layout) {
     case Attention_input_layout::PACKED_QKV:
@@ -603,9 +610,20 @@ void fmha_v2_run(
       kv_cache_pool_ptr = k.data_ptr();
 
       if (maybe_block_tables.has_value()) {
-        // block_tables has shape [B, M] with logical page indices
         ffi::TensorView block_tables = maybe_block_tables.value();
-        block_table_max_blocks = block_tables.shape()[1];  // shape is [B, M]
+        TVM_FFI_ICHECK_EQ(block_tables.dtype(), dl_int32) << "block_tables must be int32";
+        if (block_tables.ndim() == 3) {
+          // Pre-expanded [B, 2, M] K/V block offsets.
+          TVM_FFI_ICHECK_EQ(block_tables.shape()[1], 2)
+              << "3D block_tables must have shape [B, 2, M]";
+          pre_expanded_block_offsets = true;
+          block_table_max_blocks = block_tables.shape()[2];
+        } else {
+          // Shared [B, M] logical page indices.
+          TVM_FFI_ICHECK_EQ(block_tables.ndim(), 2)
+              << "block_tables must be [B, M] or [B, 2, M]";
+          block_table_max_blocks = block_tables.shape()[1];
+        }
         kv_cache_block_offsets_d = static_cast<int32_t*>(block_tables.data_ptr());
       }
     } break;
@@ -634,7 +652,7 @@ void fmha_v2_run(
   // and enable shared page index mode so the kernel transforms page_idx → pool offsets on-the-fly.
   if (input_layout == Attention_input_layout::Q_PAGED_KV && block_table_max_blocks > 0) {
     params_v2.paged_kv_cache.mMaxBlocksPerSeq = block_table_max_blocks;
-    params_v2.paged_kv_cache.mUsesSharedPagedKvIdx = true;
+    params_v2.paged_kv_cache.mUsesSharedPagedKvIdx = !pre_expanded_block_offsets;
   }
 
   // Total number of Q tokens is needed to set TMA desc on the host.
