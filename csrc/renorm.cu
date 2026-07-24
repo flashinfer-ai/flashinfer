@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cstdint>
 #include <flashinfer/air_top_p.cuh>
 #include <flashinfer/sampling.cuh>
 
@@ -23,15 +24,70 @@ using namespace flashinfer;
 
 using tvm::ffi::Optional;
 
+namespace {
+
+struct MemoryRange {
+  std::uintptr_t begin;
+  std::uintptr_t end;
+};
+
+MemoryRange get_memory_range(const TensorView& tensor) {
+  auto begin = reinterpret_cast<std::uintptr_t>(tensor.data_ptr());
+  auto size = static_cast<std::uintptr_t>(tensor.numel() * get_element_size(tensor));
+  return {begin, begin + size};
+}
+
+bool overlaps(const MemoryRange& lhs, const MemoryRange& rhs) {
+  return lhs.begin < rhs.end && rhs.begin < lhs.end;
+}
+
+void check_no_overlap(const TensorView& lhs, const TensorView& rhs, const char* lhs_name,
+                      const char* rhs_name) {
+  if (overlaps(get_memory_range(lhs), get_memory_range(rhs))) {
+    TVM_FFI_THROW(ValueError) << lhs_name << " must not overlap " << rhs_name;
+  }
+}
+
+}  // namespace
+
 void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_p_arr, double top_p_val,
                         bool is_deterministic, TensorView workspace) {
-  CHECK_INPUT(probs);
+  CHECK_INPUT_AND_TYPE(probs, dl_float32);
+  CHECK_INPUT_AND_TYPE(renorm_probs, dl_float32);
+  CHECK_INPUT_AND_TYPE(workspace, dl_uint8);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
+  CHECK_SHAPE(probs, renorm_probs);
+  CHECK_DEVICE(probs, renorm_probs);
+  CHECK_DEVICE(probs, workspace);
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
   check_tensor_param(maybe_top_p_arr, probs);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
+  if (has_top_p_arr) {
+    CHECK_INPUT_AND_TYPE(maybe_top_p_arr.value(), dl_float32);
+    CHECK_DEVICE(probs, maybe_top_p_arr.value());
+  }
+
+  auto probs_range = get_memory_range(probs);
+  auto renorm_probs_range = get_memory_range(renorm_probs);
+  if (overlaps(probs_range, renorm_probs_range) && (probs_range.begin != renorm_probs_range.begin ||
+                                                    probs_range.end != renorm_probs_range.end)) {
+    TVM_FFI_THROW(ValueError) << "probs and renorm_probs must either alias exactly or not overlap";
+  }
+  check_no_overlap(workspace, probs, "workspace", "probs");
+  check_no_overlap(workspace, renorm_probs, "workspace", "renorm_probs");
+  if (has_top_p_arr) {
+    check_no_overlap(workspace, maybe_top_p_arr.value(), "workspace", "top_p");
+    check_no_overlap(renorm_probs, maybe_top_p_arr.value(), "renorm_probs", "top_p");
+  }
+  if (vocab_size >= sampling::air_top_p::NUM_BUCKETS &&
+      reinterpret_cast<std::uintptr_t>(workspace.data_ptr()) %
+              alignof(sampling::air_top_p::Counter<float>) !=
+          0) {
+    TVM_FFI_THROW(ValueError) << "workspace must be aligned to "
+                              << alignof(sampling::air_top_p::Counter<float>) << " bytes";
+  }
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());

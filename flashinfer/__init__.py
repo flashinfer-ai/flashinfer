@@ -212,6 +212,9 @@ from .sampling import (
     top_k_top_p_sampling_from_logits as top_k_top_p_sampling_from_logits,
 )
 from .sampling import top_k_top_p_sampling_from_probs as top_k_top_p_sampling_from_probs
+from .sampling import (
+    get_top_p_renorm_probs_workspace_size as get_top_p_renorm_probs_workspace_size,
+)
 from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
 from .tllm_enums import (
