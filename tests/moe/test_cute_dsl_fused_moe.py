@@ -82,7 +82,25 @@ def _prepare_moe_quant_mode_inputs(
     quant_mode: str,
 ) -> tuple[dict, dict]:
     """Select API and reference inputs for a shared MoE test case."""
-    if quant_mode == "w4a16":
+    if quant_mode == "w4a4":
+        return (
+            {
+                "x": tensors["x"],
+                "x_sf": tensors["x_sf"],
+                "fc2_input_scale": tensors["fc2_input_scale"],
+                "per_token_scale": tensors["x_per_token_scale"],
+            },
+            {
+                "hidden_states": tensors["x_ref"].float(),
+                "gemm1_weights": tensors["w1_weight_bf16"].float(),
+                "gemm2_weights": tensors["w2_weight_bf16"].float(),
+                "gemm1_alpha": tensors["w1_alpha"],
+                "gemm2_alpha": tensors["w2_alpha"],
+                "fc2_input_scale": tensors["fc2_input_scale"],
+                "use_per_token_activation": tensors["x_per_token_scale"] is not None,
+            },
+        )
+    elif quant_mode == "w4a16":
         return (
             {
                 "x": tensors["x_bf16"],
@@ -104,25 +122,8 @@ def _prepare_moe_quant_mode_inputs(
                 "use_per_token_activation": False,
             },
         )
-    if quant_mode == "w4a4":
-        return (
-            {
-                "x": tensors["x"],
-                "x_sf": tensors["x_sf"],
-                "fc2_input_scale": tensors["fc2_input_scale"],
-                "per_token_scale": tensors["x_per_token_scale"],
-            },
-            {
-                "hidden_states": tensors["x_ref"].float(),
-                "gemm1_weights": tensors["w1_weight_bf16"].float(),
-                "gemm2_weights": tensors["w2_weight_bf16"].float(),
-                "gemm1_alpha": tensors["w1_alpha"],
-                "gemm2_alpha": tensors["w2_alpha"],
-                "fc2_input_scale": tensors["fc2_input_scale"],
-                "use_per_token_activation": tensors["x_per_token_scale"] is not None,
-            },
-        )
-    raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
+    else:
+        raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
 
 # =============================================================================
@@ -1156,7 +1157,9 @@ class TestCuteDslMoeW4A16:
         gemm1_tactic: tuple,
         gemm2_tactic: tuple,
     ):
-        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+        from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
+            launch_w4a16_moe,
+        )
 
         num_tokens, hidden_size, intermediate_size = route_tile + 1, 256, 512
         num_experts, top_k = 8, 2
@@ -1176,26 +1179,26 @@ class TestCuteDslMoeW4A16:
         _, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a16")
         tactic = (gemm1_tactic, gemm2_tactic)
 
-        result = _moe_core_impl(
+        result = launch_w4a16_moe(
             x=tensors["x_bf16"],
-            x_sf=None,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=None,
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
             num_experts=num_experts,
-            top_k=top_k,
             num_local_experts=num_experts,
-            quant_mode="w4a16",
-            w4a16_tactic=tactic,
+            local_expert_offset=0,
+            moe_output=torch.empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+            ),
             use_fused_finalize=False,
             enable_pdl=False,
             activation_type=activation_type,
+            tactic=tactic,
         )
         ref_output = compute_reference_moe_fp4(
             token_selected_experts=tensors["token_selected_experts"],
@@ -2005,11 +2008,12 @@ class TestCuteDslMoEWrapper:
             # Confirm profiling actually ran for this custom op. Cache keys
             # are ProfilingCacheKey instances; see AutoTuner._get_cache_key
             # in flashinfer/autotuner/autotuner.py.
-            expected_custom_op = (
-                "CuteDslMoEWrapper::run::W4A16::Swiglu"
-                if quant_mode == "w4a16"
-                else "CuteDslMoEWrapper::run::Swiglu"
-            )
+            if quant_mode == "w4a4":
+                expected_custom_op = "CuteDslMoEWrapper::run::Swiglu"
+            elif quant_mode == "w4a16":
+                expected_custom_op = "CuteDslMoEWrapper::run::W4A16::Swiglu"
+            else:
+                raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
             assert any(
                 k.custom_op == expected_custom_op for k in autotuner.profiling_cache
             ), "autotune(True) did not populate a CuteDslMoEWrapper::run cache entry"
@@ -2416,7 +2420,6 @@ class TestMoeSortBufferInitPoisoned:
             top_k=top_k,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
-            quant_mode="w4a4",
             tile_size=tile_size,
             moe_sort_buffers=moe_sort_buffers,
             output_dtype=torch.bfloat16,

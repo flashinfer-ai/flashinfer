@@ -192,41 +192,48 @@ class CuteDslNvfp4Runner(MoERunner):
         routing = config.routing
         num_local_experts = experts.local_num_experts or routing.num_experts
 
-        self._quant_mode = (
-            "w4a16" if config.quant.variant is QuantVariant.W4A16 else "w4a4"
-        )
-        self._use_per_token_activation = (
-            config.quant.variant is QuantVariant.NVFP4
-            and bool(config.quant.per_token_scale)
-        )
-        if self._quant_mode == "w4a16" and config.quant.per_token_scale:
-            raise ValueError(
-                "CuteDslNvfp4Runner: per_token_scale is not supported for W4A16"
+        if config.quant.variant is QuantVariant.NVFP4:
+            self._quant_mode = "w4a4"
+            self._use_per_token_activation = bool(config.quant.per_token_scale)
+        elif config.quant.variant is QuantVariant.W4A16:
+            if config.quant.per_token_scale:
+                raise ValueError(
+                    "CuteDslNvfp4Runner: per_token_scale is not supported for W4A16"
+                )
+            self._quant_mode = "w4a16"
+            self._use_per_token_activation = False
+        else:
+            raise NotImplementedError(
+                f"CuteDslNvfp4Runner does not support {config.quant.variant}."
             )
-        runner_cls = (
-            CuteDslFusedMoENvfp4Runner
-            if self._quant_mode == "w4a4"
-            else CuteDslFusedMoEW4A16Runner
+        enable_pdl = (
+            True if config.execution.enable_pdl is None else config.execution.enable_pdl
         )
-        self._inner = runner_cls(
-            forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
-            num_experts=routing.num_experts,
-            top_k=routing.top_k,
-            num_local_experts=num_local_experts,
-            local_expert_offset=experts.local_expert_offset,
-            use_fused_finalize=config.execution.use_fused_finalize,
-            enable_pdl=(
-                True
-                if config.execution.enable_pdl is None
-                else config.execution.enable_pdl
-            ),
-            activation_type=int(config.activation.type),
-            **(
-                {"use_per_token_activation": self._use_per_token_activation}
-                if self._quant_mode == "w4a4"
-                else {}
-            ),
-        )
+        self._inner: CuteDslFusedMoENvfp4Runner | CuteDslFusedMoEW4A16Runner
+        if self._quant_mode == "w4a4":
+            self._inner = CuteDslFusedMoENvfp4Runner(
+                forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
+                num_experts=routing.num_experts,
+                top_k=routing.top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=experts.local_expert_offset,
+                use_fused_finalize=config.execution.use_fused_finalize,
+                enable_pdl=enable_pdl,
+                activation_type=int(config.activation.type),
+                use_per_token_activation=self._use_per_token_activation,
+            )
+        elif self._quant_mode == "w4a16":
+            self._inner = CuteDslFusedMoEW4A16Runner(
+                num_experts=routing.num_experts,
+                top_k=routing.top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=experts.local_expert_offset,
+                use_fused_finalize=config.execution.use_fused_finalize,
+                enable_pdl=enable_pdl,
+                activation_type=int(config.activation.type),
+            )
+        else:
+            raise RuntimeError(f"Unsupported CuTe DSL NVFP4 mode: {self._quant_mode}")
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
         # the instance we just built, not off the class.
@@ -257,8 +264,9 @@ class CuteDslNvfp4Runner(MoERunner):
         Expected weight view keys: w1_weight, w1_weight_sf, w1_alpha,
         fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha.
         The W4A4 per-token path inserts ``per_token_scale`` before the trailing
-        ``moe_output`` buffer. Both inner tuning configurations require that
-        output buffer so profiling can replace it for each token bucket.
+        ``moe_output`` buffer. W4A16 uses its own compact input layout. Both
+        tuning configurations include the output buffer so profiling can replace
+        it for each token bucket.
         """
         # MoELayer already filters by supported_routing_modes; this guards the
         # direct-runner path (tests/benchmarks) against silently forwarding a
@@ -336,13 +344,11 @@ class CuteDslNvfp4Runner(MoERunner):
             )
             return [
                 act.hidden_states_q,
-                None,
                 act.topk_ids,
                 act.topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
-                None,
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
