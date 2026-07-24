@@ -23,8 +23,6 @@ kernels, enabling automatic performance tuning across different GEMM tactics.
 Tactic format follows TRT-LLM's style:
 - GEMM1 (Gather + SwiGLU): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 - GEMM2 (Finalize): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
-- W4A16: (route_tile, gemm1_tactic, gemm2_tactic), where each GEMM tactic
-  contains (mma_tiler_mnk, cluster_shape_mn, raster_along_m)
 
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 - Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner.get_valid_tactics (line 1867)
@@ -641,68 +639,45 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
 
 _W4A16_ROUTE_TILES = (8, 16, 32, 64, 128, 192)
-_W4A16_K_TILES = (64, 128, 256)
+_W4A16_K_TILE = 256
 # W4A16 maps output channels to M and routed rows to N. Preserve the current
 # M-major static scheduler order; CLC scheduling owns its traversal order.
 _W4A16_RASTER_ALONG_M = True
 # Grouped expert scheduling requires cluster N=1 when multiple routed rows
 # target the same expert.
-_W4A16_GEMM_TOPOLOGIES = (
-    (128, (1, 1)),
-    (128, (2, 1)),
-    (256, (2, 1)),
+_W4A16_GEMM_TOPOLOGY_PAIRS = (
+    ((128, (1, 1)), (128, (1, 1))),
+    ((128, (2, 1)), (128, (2, 1))),
+    ((256, (2, 1)), (256, (2, 1))),
+    ((128, (2, 1)), (256, (2, 1))),
+    ((256, (2, 1)), (128, (2, 1))),
 )
 
 
-def get_w4a16_gemm1_valid_tactics(route_tile: int) -> List[Tuple]:
-    """Get valid W4A16 GEMM1 tactics for one routed-row tile size."""
-    return [
-        (
-            (mma_m, route_tile, mma_k),
-            cluster_shape,
-            _W4A16_RASTER_ALONG_M,
-        )
-        for (mma_m, cluster_shape), mma_k in itertools.product(
-            _W4A16_GEMM_TOPOLOGIES,
-            _W4A16_K_TILES,
-        )
-        if (route_tile >= 16 or mma_m == 128)
-        # A 128x192x256 GEMM1 tile cannot retain the two load and transform
-        # stages required by the warp-specialized pipeline.
-        and not (route_tile == 192 and mma_m == 128 and mma_k == 256)
-    ]
-
-
-def get_w4a16_gemm2_valid_tactics(route_tile: int) -> List[Tuple]:
-    """Get valid W4A16 GEMM2 tactics for one routed-row tile size."""
-    return [
-        (
-            (mma_m, route_tile, mma_k),
-            cluster_shape,
-            _W4A16_RASTER_ALONG_M,
-        )
-        for (mma_m, cluster_shape), mma_k in itertools.product(
-            _W4A16_GEMM_TOPOLOGIES,
-            _W4A16_K_TILES,
-        )
-        if route_tile >= 16 or mma_m == 128
-        # A 128x192x256 GEMM2 tile has the same pipeline capacity limit.
-        if not (route_tile == 192 and mma_m == 128 and mma_k == 256)
-    ]
-
-
 def get_w4a16_moe_valid_tactics() -> List[Tuple]:
-    """Get W4A16 tactics in the common per-GEMM tactic structure."""
+    """Get valid W4A16 GEMM1/GEMM2 tactic pairs."""
     tactics: List[Tuple] = []
     for route_tile in _W4A16_ROUTE_TILES:
-        gemm1_tactics = get_w4a16_gemm1_valid_tactics(route_tile)
-        gemm2_tactics = get_w4a16_gemm2_valid_tactics(route_tile)
-        tactics.extend(
-            (route_tile, gemm1_tactic, gemm2_tactic)
-            for gemm1_tactic, gemm2_tactic in itertools.product(
-                gemm1_tactics, gemm2_tactics
+        for gemm1_topology, gemm2_topology in _W4A16_GEMM_TOPOLOGY_PAIRS:
+            gemm1_m, gemm1_cluster_shape = gemm1_topology
+            gemm2_m, gemm2_cluster_shape = gemm2_topology
+            if route_tile < 16 and (gemm1_m == 256 or gemm2_m == 256):
+                continue
+            # A 128x192x256 tile cannot retain the two load and transform
+            # stages required by the warp-specialized pipeline.
+            if route_tile == 192 and (gemm1_m == 128 or gemm2_m == 128):
+                continue
+            gemm1_tactic = (
+                (gemm1_m, route_tile, _W4A16_K_TILE),
+                gemm1_cluster_shape,
+                _W4A16_RASTER_ALONG_M,
             )
-        )
+            gemm2_tactic = (
+                (gemm2_m, route_tile, _W4A16_K_TILE),
+                gemm2_cluster_shape,
+                _W4A16_RASTER_ALONG_M,
+            )
+            tactics.append((gemm1_tactic, gemm2_tactic))
     return tactics
 
 
@@ -854,7 +829,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
 
         valid_tactics = []
         for tactic in W4A16_MOE_TACTICS:
-            route_tile, gemm1_tactic, gemm2_tactic = tactic
+            gemm1_tactic, gemm2_tactic = tactic
+            route_tile = gemm1_tactic[0][1]
             route_slots = get_max_num_permuted_tokens(
                 num_tokens,
                 self.top_k,
