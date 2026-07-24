@@ -905,3 +905,13 @@ def test_sequential_contexts_last_wins_ambient(cache_root, monkeypatch):
         AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
     _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
     assert tactic == 1  # eager winner: last top-level attach won the ambient
+
+
+def test_profiling_inside_capture_fails_fast(cache_root, monkeypatch):
+    """codex round-6: starting autotune measurement inside an outer CUDA-graph
+    capture must fail fast with a clear message, not a cryptic CUDA error
+    (profiling synchronizes / captures its own graph -> nested capture)."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    tuner = AutoTuner.get()
+    with pytest.raises(RuntimeError, match="cannot run inside a CUDA graph capture"):
+        tuner._profile_single_kernel(DummyRunner(), [torch.zeros(8, 16)], 0, _CONFIG)

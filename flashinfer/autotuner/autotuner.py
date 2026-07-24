@@ -2198,6 +2198,21 @@ class AutoTuner:
             sees the same per-call allocation overhead, and the autotuner
             picks based on intrinsic kernel time.
         """
+        # Profiling synchronizes and (in graph modes) captures its own
+        # private CUDA graph.  Both are illegal inside an outer stream
+        # capture -- a tuning context accidentally left open around a
+        # framework's model-capture would otherwise surface a cryptic CUDA
+        # error.  Fail fast with a clear message instead (tune before
+        # capture, never inside it).
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "autotune measurement cannot run inside a CUDA graph "
+                "capture: it synchronizes and may capture its own graph "
+                "(nested capture is forbidden).  Tune before capture, not "
+                "inside it -- close the autotune_v2/autotune context before "
+                "the framework captures the model."
+            )
+
         # MeasurementPolicy(timer="cupti") routes to per-iteration GPU-span
         # measurement; "auto"/"events" (and cupti-python unavailable) use
         # the historical CUDA-event window below.  Resolved once here so
