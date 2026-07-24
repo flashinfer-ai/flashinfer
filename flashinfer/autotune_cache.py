@@ -293,16 +293,14 @@ def _resolve_managed_store(
     )
     candidate = dict(manifest)
     candidate["cache_schema"] = _SCHEMA
+    reg_key = (str(resolved), _canonical_json(candidate))
     with tuner._lock:
-        current = tuner._managed_cache
-        if (
-            current is not None
-            and current.root == resolved
-            and current.manifest == candidate
-        ):
-            store = current  # reuse the ambient object (keeps its memo warm)
-        else:
+        # Reuse the store object (and its hit/miss memos) for a given
+        # identity instead of rebuilding it on every switch.
+        store = tuner._managed_stores.get(reg_key)
+        if store is None:
             store = ManagedAutotuneCache(manifest=manifest, root=resolved)
+            tuner._managed_stores[reg_key] = store
         if set_ambient and store is not tuner._managed_cache:
             if tuner._managed_cache is not None:
                 logger.info(
@@ -311,10 +309,13 @@ def _resolve_managed_store(
                     f"env {tuner._managed_cache.env_hash})."
                 )
             tuner._managed_cache = store
-            # Bare calls now resolve to a different ambient identity; drop the
-            # previous ambient's decode memo so nothing is served stale.
-            tuner._managed_decoded.clear()
-            # Loud on purpose: the store changes what bare calls select.
+            # Deliberately NOT clearing _managed_decoded: it is keyed by
+            # (root, env_hash, file_key), so entries decoded under other
+            # identities coexist safely and are never served cross-identity.
+            # Clearing here would force alternating graph/eager regions to
+            # re-read disk on every switch, breaking the "post-hydrate
+            # lookups are pure memory" contract.  Invalidation is explicit
+            # (autotune_v2_reload / clear_cache).
             logger.info(
                 f"[Autotuner]: Managed autotune cache attached for this "
                 f"process: {store!r}"
@@ -383,13 +384,17 @@ def autotune_v2(
     ``"tune"``       False                  tune in-memory only (no disk I/O)
     ``"replay"``     True                   serve from the on-disk cache
                                             (no profiling)
-    ``"replay"``     False                  no-op unless already hydrated
+    ``"replay"``     False                  memory-only replay (see note)
     ===============  =====================  ==================================
 
     ``mode="replay"`` is the serving path: it replays previously tuned
     winners without paying any profiling cost (it does **not** discard
     tuning results — that is what the negated ``enable_tuning=False`` it
-    replaced read like).
+    replaced read like).  With ``persistent_cache=False`` it is
+    *memory-only replay*: ``persistent_cache=False`` forbids disk for the
+    context, so an on-disk store hydrated earlier is **not** consulted; it
+    serves only what is already in the in-memory winner cache (e.g. tuned
+    in-memory earlier this process).
 
     **Attach semantics**: ``persistent_cache=True`` attaches the managed
     store for the remainder of the process (like v1's ``load_configs``),
