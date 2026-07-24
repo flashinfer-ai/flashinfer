@@ -265,7 +265,7 @@ def xqa(
         tokens this step. When set, ``q`` and ``output`` are packed as
         ``[total_q_tokens, num_q_heads, head_dim]``, ``q_seq_len`` must be
         the maximum draft length, and ``mask`` rows are packed by the same
-        cumulative offsets.
+        cumulative offsets. Not supported on the SM90 fp8 MHA path.
 
     Note
     ----
@@ -297,6 +297,12 @@ def xqa(
         assert q_cu_seq_lens.is_cuda, (
             "q_cu_seq_lens must be a device tensor; the kernel dereferences its "
             "pointer on the GPU"
+        )
+        assert q_cu_seq_lens.device == q.device, (
+            f"q_cu_seq_lens must be on {q.device}, got {q_cu_seq_lens.device}"
+        )
+        assert q_cu_seq_lens.dim() == 1 and q_cu_seq_lens.is_contiguous(), (
+            "q_cu_seq_lens must be a contiguous 1-D tensor"
         )
         assert q_cu_seq_lens.numel() == seq_lens.shape[0] + 1, (
             f"q_cu_seq_lens must have batch_size + 1 = {seq_lens.shape[0] + 1} "
