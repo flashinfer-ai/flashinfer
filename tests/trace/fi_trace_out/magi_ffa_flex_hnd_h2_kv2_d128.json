@@ -1,0 +1,127 @@
+{
+  "name": "magi_ffa_flex_hnd_h2_kv2_d128",
+  "description": "Single-GPU Flex Flash Attention via MagiAttention (optional, separately-installed dependency), using HND layout. Ragged, range-based mask model: q_ranges/k_ranges are (num_ranges, 2) int32 [start, end) pairs and attn_type_map selects the per-range mask type (0=full, 1=causal, 2=inverse-causal, 3=bidirectional-causal).",
+  "op_type": "magi_ffa_flex",
+  "tags": [
+    "fi_api:flashinfer.magi_ffa._flex_flash_attn.flex_flash_attn",
+    "status:experimental",
+    "stage:prefill",
+    "backend:magi-attention",
+    "layout:hnd"
+  ],
+  "axes": {
+    "num_qo_heads": {
+      "type": "const",
+      "value": 2
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 2
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "num_tokens_q": {
+      "type": "var",
+      "description": "Total query tokens (ragged)."
+    },
+    "num_tokens_kv": {
+      "type": "var",
+      "description": "Total key/value tokens (ragged)."
+    },
+    "num_ranges": {
+      "type": "var",
+      "description": "Number of (q_range, k_range) mask entries."
+    },
+    "range_pair": {
+      "type": "const",
+      "value": 2,
+      "description": "Always 2: [start, end) bounds of a range."
+    }
+  },
+  "constraints": [
+    "num_tokens_q > 0",
+    "num_tokens_kv > 0",
+    "num_ranges > 0",
+    "num_ranges <= num_tokens_q",
+    "num_qo_heads % num_kv_heads == 0"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "num_qo_heads",
+        "num_tokens_q",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "num_kv_heads",
+        "num_tokens_kv",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v": {
+      "shape": [
+        "num_kv_heads",
+        "num_tokens_kv",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "q_ranges": {
+      "shape": [
+        "num_ranges",
+        "range_pair"
+      ],
+      "dtype": "int32",
+      "description": "int32 [start, end) query ranges of the attention mask."
+    },
+    "k_ranges": {
+      "shape": [
+        "num_ranges",
+        "range_pair"
+      ],
+      "dtype": "int32",
+      "description": "int32 [start, end) key ranges of the attention mask."
+    },
+    "attn_type_map": {
+      "shape": [
+        "num_ranges"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "int32 per-range mask type (0=full, 1=causal, 2=inverse-causal, 3=bidirectional-causal). None means full attention."
+    },
+    "return_lse": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true,
+      "description": "Also return LSE."
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "num_qo_heads",
+        "num_tokens_q",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output in HND layout."
+    },
+    "lse": {
+      "shape": [
+        "num_qo_heads",
+        "num_tokens_q"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Log-sum-exp of attention logits (natural log)."
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

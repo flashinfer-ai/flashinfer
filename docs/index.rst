@@ -53,6 +53,7 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    api/activation
    api/gdn_decode
    api/gdn_prefill
+   api/magi_ffa
    api/kda_decode
    api/mamba
    api/mhc
