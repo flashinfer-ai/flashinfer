@@ -69,6 +69,7 @@ from ...tllm_enums import (
 )
 from ...autotuner import AutoTuner
 from ...cute_dsl.utils import convert_sf_to_mma_layout
+from ...cute_dsl.utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
 from ...quantization.kernels.nvfp4_quantize import (
     SF_LAYOUT_128x4,
     nvfp4_quantize_per_token_cute_dsl,
@@ -935,6 +936,9 @@ def cute_dsl_fused_moe_nvfp4(
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
+    # native_only: the nvfp4 MoE rides block-scaled tcgen05.mma, which the
+    # DSL only accepts for sm_100a/sm_103a targets (not family-conditional).
+    _require_cute_dsl_arch_for(x.device, native_only=True)
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
 
     if num_local_experts is None:

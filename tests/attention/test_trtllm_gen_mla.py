@@ -294,6 +294,7 @@ def trtllm_batch_decode_mla(
     MAX_SEQ_LEN: int,
     skips_softmax: bool,
     uses_shared_paged_kv_idx: bool = True,
+    use_fp16_softmax: bool = False,
     use_cum_seq_lens_q: bool = False,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -312,6 +313,10 @@ def trtllm_batch_decode_mla(
     if backend == "cute-dsl":
         if compute_capability[0] not in (10, 11):
             pytest.skip("cute-dsl MLA requires SM100-SM110 (tcgen05)")
+        from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+        if not is_cute_dsl_arch_supported(*compute_capability):
+            pytest.skip("installed CuTe DSL cannot target this device architecture")
         if dynamic_scale:
             pytest.skip("cute-dsl does not support dynamic_scale")
         if enable_pdl is not None:
@@ -327,6 +332,9 @@ def trtllm_batch_decode_mla(
         pytest.skip("skips_softmax is only supported for trtllm-gen backend")
     if use_cum_seq_lens_q and backend != "trtllm-gen":
         pytest.skip("cum_seq_lens_q is only supported for trtllm-gen backend")
+
+    if use_fp16_softmax and backend != "trtllm-gen":
+        pytest.skip("use_fp16_softmax=True is only supported for trtllm-gen backend")
 
     torch.manual_seed(42)
     device = "cuda:0"
@@ -500,6 +508,7 @@ def trtllm_batch_decode_mla(
         enable_pdl=enable_pdl,
         backend=backend,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        use_fp16_softmax=use_fp16_softmax,
         lse=provided_lse,
         return_lse=check_lse,
         cum_seq_lens_q=cum_seq_lens_q,
@@ -604,6 +613,9 @@ def trtllm_batch_decode_mla(
             rtol, atol = 1e-1, 1e-1
         else:
             rtol, atol = 1e-2, 1e-2
+
+        if use_fp16_softmax and dtype != torch.float8_e4m3fn:
+            rtol, atol = 3e-2, 3e-2
 
         try:
             torch.testing.assert_close(output_view, o_ref_view, rtol=rtol, atol=atol)
@@ -1298,3 +1310,35 @@ def test_trtllm_batch_decode_mla_preallocated_out(
                 backend="trtllm-gen",
                 multi_ctas_kv_counter_buffer=offset_counter_buffer,
             )
+
+
+@pytest.mark.parametrize(
+    "layer_dimensions",
+    supported_mla_layer_dimensions,
+)
+@pytest.mark.parametrize("batch_size", [1, 16, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("page_size", [32, 64])
+@pytest.mark.parametrize("q_len_per_request", [1, 2])
+def test_trtllm_batch_decode_mla_use_fp16_softmax(
+    layer_dimensions: MLALayerDimensions,
+    batch_size: int,
+    dtype: torch.dtype,
+    page_size: int,
+    q_len_per_request: int,
+):
+    trtllm_batch_decode_mla(
+        layer_dimensions=layer_dimensions,
+        batch_size=batch_size,
+        scale=1.0,
+        dtype=dtype,
+        page_size=page_size,
+        q_len_per_request=q_len_per_request,
+        dynamic_scale=False,
+        enable_pdl=None,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+        uses_shared_paged_kv_idx=True,
+        use_fp16_softmax=True,
+    )

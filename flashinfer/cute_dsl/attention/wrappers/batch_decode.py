@@ -27,6 +27,8 @@ import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32
 
 from flashinfer.api_logging import flashinfer_api
+
+from ...utils import require_cute_dsl_arch as _require_dsl_arch
 from flashinfer.cute_dsl.utils import get_num_sm
 
 from ..fusion.mask import AttentionMask, DenseMask, CausalMask, SlidingWindowMask
@@ -796,6 +798,7 @@ class BatchDecodeCuteDSLWrapper:
         window_left: Optional[int] = None,
         window_right: Optional[int] = 0,
     ) -> None:
+        _require_dsl_arch(torch.cuda.current_device())
         if kv_data_type is not None and kv_data_type != q_data_type:
             raise NotImplementedError(
                 "cute-dsl decode requires kv_data_type == q_data_type"
@@ -1277,6 +1280,7 @@ class BatchDecodePagedCuteDSLWrapper:
         non_blocking: bool = True,
         precompile_skip_softmax_kernel: bool = False,
     ) -> None:
+        _require_dsl_arch(torch.cuda.current_device())
         if page_size not in (8, 16, 32, 64):
             raise ValueError(
                 f"cute-dsl paged decode supports page_size ∈ {{8,16,32,64}}, got {page_size}"
