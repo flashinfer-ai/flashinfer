@@ -341,11 +341,66 @@ def generate_ninja_build_for_op(
     return "\n".join(lines)
 
 
+def _env_int(name: str, default: int, minimum: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %d.", name, value, default)
+        return default
+    if parsed < minimum:
+        logger.warning("Ignoring %s=%r (< %d); using %d.", name, value, minimum, default)
+        return default
+    return parsed
+
+
+def _get_available_memory_gib() -> Optional[float]:
+    """Best-effort available system memory in GiB; None if undetermined."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024**2)  # kB -> GiB
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        avphys_pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if avphys_pages > 0 and page_size > 0:
+            return (avphys_pages * page_size) / (1024**3)
+    except (AttributeError, OSError, ValueError):
+        pass
+    return None
+
+
 def _get_num_workers() -> Optional[int]:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
         return int(max_jobs)
-    return None
+    # Without -j, ninja defaults to cpu_count()+2 parallel jobs. Large CUTLASS
+    # translation units peak at multiple GiB of RSS per nvcc process (the AOT
+    # build in scripts/jit_cache_build_common.sh budgets 8 GB/job for the same
+    # reason), which OOMs or hard-locks memory-constrained and unified-memory
+    # systems (e.g. DGX Spark GB10: 20 cores sharing 121 GiB with the GPU,
+    # where the model may already be resident when JIT compilation starts).
+    # Mirror the AOT logic: budget per-job memory against MemAvailable, keep
+    # headroom for concurrent allocations, and never exceed the CPU count.
+    mem_per_job_gib = _env_int("FLASHINFER_JIT_JOB_MEMORY_GB", 8, 1)
+    headroom_gib = _env_int("FLASHINFER_JIT_MEMORY_HEADROOM_GB", 16, 0)
+    available_gib = _get_available_memory_gib()
+    if available_gib is None:
+        return None  # cannot determine memory: keep previous behavior
+    budget_jobs = int(max(0.0, available_gib - headroom_gib) // mem_per_job_gib)
+    num_workers = max(1, min(os.cpu_count() or 1, budget_jobs))
+    if budget_jobs < 1:
+        logger.warning(
+            "Low available memory (%.1f GiB); limiting JIT compilation to a "
+            "single job. Set MAX_JOBS to override.",
+            available_gib,
+        )
+    return num_workers
 
 
 def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
