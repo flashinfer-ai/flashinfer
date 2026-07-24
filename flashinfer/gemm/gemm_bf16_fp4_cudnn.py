@@ -15,6 +15,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+    is_in_profile_measurement,
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
@@ -505,6 +506,11 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                         tactic=tactic,
                     )
             except Exception as exc:
+                # During autotuner profiling, report the failed tactic as
+                # unsupported (marked inf) instead of silently timing
+                # tactic=-1 -- see the note in gemm_base.py (#3707 review).
+                if is_in_profile_measurement():
+                    raise
                 warnings.warn(
                     "cuDNN bf16-fp4 GEMM tactic failed; falling back to default "
                     f"tactic=-1. ({exc})",
