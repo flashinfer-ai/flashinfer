@@ -310,6 +310,68 @@ class TestBgmvMoeShrink:
             f"rank={rank}, experts={num_experts}, dtype={dtype}",
         )
 
+    @pytest.mark.parametrize("num_tokens", [1, 4, 32])
+    @pytest.mark.parametrize("hidden_size", [768, 2048])
+    @pytest.mark.parametrize("rank", [16, 32])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_shrink_correctness_multislice(self, num_tokens, hidden_size, rank, dtype):
+        """num_slices=2 (gate_up packing). Exercises the kernel's blockIdx.z / grid-z
+        slice path, which the num_slices=1 tests above do not cover. num_pairs in {2, 8}
+        hit the decode path; 64 hits the prefill path."""
+        from flashinfer.fused_moe.bgmv_moe import bgmv_moe_shrink, fill_w_ptr
+
+        top_k = 2
+        num_loras = 4
+        num_slices = 2
+        num_experts = 64
+
+        data = generate_test_data(
+            num_tokens,
+            hidden_size,
+            rank,
+            num_experts,
+            top_k,
+            num_loras,
+            num_slices,
+            dtype,
+        )
+
+        ref_out = reference_moe_bgmv_shrink(
+            data["x"],
+            data["lora_a_weights"],
+            data["sorted_token_ids"],
+            data["expert_ids"],
+            data["lora_indices"],
+        )
+
+        num_pairs = data["num_pairs"]
+        w_ptr = torch.zeros(num_slices, num_experts, dtype=torch.int64, device="cuda")
+        lora_stride = 0
+        for s_idx in range(num_slices):
+            lora_stride = fill_w_ptr(
+                w_ptr, data["lora_a_weights"][s_idx], num_experts, s_idx
+            )
+
+        cuda_out = torch.zeros(num_slices, num_pairs, rank, dtype=dtype, device="cuda")
+        bgmv_moe_shrink(
+            cuda_out,
+            data["x"],
+            w_ptr,
+            data["sorted_token_ids"],
+            data["expert_ids"],
+            data["lora_indices"],
+            lora_stride,
+        )
+
+        torch.testing.assert_close(
+            cuda_out.float(),
+            ref_out.float(),
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"Multi-slice shrink mismatch: tokens={num_tokens}, "
+            f"hidden={hidden_size}, rank={rank}, slices={num_slices}, dtype={dtype}",
+        )
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestBgmvMoeExpand:
