@@ -20,7 +20,7 @@ backend-native ``MoEWeightPack`` views, so that preparation lives in the
 implementation surface rather than being copy-pasted into tests and benchmarks
 (design doc CR2/CR7; reviewer comments C6, C7, C31, C32).
 
-The canonical NVFP4 and BF16 helpers are exposed as
+The canonical TRTLLM FP4 and BF16 helpers are exposed as
 ``TrtllmFp4Config.prepare_weights(...)`` /
 ``CuteDslConfig.prepare_weights(...)`` /
 ``TrtllmBf16Config.prepare_weights(...)`` / ... static helpers (see ``api.py``).
@@ -405,17 +405,19 @@ def prepare_trtllm_fp4_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
+    variant=None,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
     device: Optional[torch.device] = None,
     permute_cache: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Build the TRTLLM NVFP4 ``trtllm_fp4_routed`` weight view.
+    """Build a TRTLLM FP4 ``trtllm_fp4_routed`` weight view.
 
-    Layout is ``Shuffled_MajorK`` — the only NVFP4-compatible trtllm-gen combo
-    today: per-expert gated-act reorder + MMA shuffle on the packed weights and
-    ``block_scale_interleave`` on the block scales.
+    ``NVFP4`` uses 16-element E4M3 scale blocks. ``MXFP4`` (W4A8) and
+    ``W4A16`` use the same MXFP4 weights with 32-element UE8M0 scale blocks.
+    All variants use per-expert gated-act reorder + MMA shuffle on the packed
+    weights and ``block_scale_interleave`` on the block scales.
 
     Parameters
     ----------
@@ -440,10 +442,30 @@ def prepare_trtllm_fp4_weights(
     """
     from ..fp4_quantization import fp4_quantize
     from ..quantization.fp4_quantization import block_scale_interleave
+    from .api import QuantVariant
     from .core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
+
+    if variant is None:
+        variant = QuantVariant.NVFP4
+    if variant not in (
+        QuantVariant.NVFP4,
+        QuantVariant.MXFP4,
+        QuantVariant.W4A16,
+    ):
+        raise ValueError(
+            "TRTLLM FP4 weight preparation requires QuantVariant.NVFP4, "
+            f"QuantVariant.MXFP4, or QuantVariant.W4A16; got {variant!r}."
+        )
+    is_mxfp4 = variant in (QuantVariant.MXFP4, QuantVariant.W4A16)
+    sf_vec_size = 32 if is_mxfp4 else 16
+    if hidden_size % sf_vec_size != 0 or intermediate_size % sf_vec_size != 0:
+        raise ValueError(
+            f"{variant.name} requires hidden_size and intermediate_size divisible "
+            f"by {sf_vec_size}."
+        )
 
     if device is None:
         device = w1_bf16.device
@@ -455,7 +477,6 @@ def prepare_trtllm_fp4_weights(
     if permute_cache is None:
         permute_cache = _TRTLLM_PERMUTE_CACHE
 
-    sf_vec_size = 16
     epilogue_tile_m = 128  # TRTLLM kernel-internal constant
 
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
@@ -464,6 +485,7 @@ def prepare_trtllm_fp4_weights(
         w1_flat,
         global_scale=w1_gs,
         sf_vec_size=sf_vec_size,
+        sf_use_ue8m0=is_mxfp4,
         is_sf_swizzled_layout=False,
     )
     g1_w = w1_q_flat.view(
@@ -479,6 +501,7 @@ def prepare_trtllm_fp4_weights(
         w2_flat,
         global_scale=w2_gs,
         sf_vec_size=sf_vec_size,
+        sf_use_ue8m0=is_mxfp4,
         is_sf_swizzled_layout=False,
     )
     g2_w = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2).view(
@@ -524,20 +547,77 @@ def prepare_trtllm_fp4_weights(
         )
 
     ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
-    return {
+    gemm1_scale = torch.stack(g1_s_sh).reshape(
+        num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size
+    )
+    gemm2_scale = torch.stack(g2_s_sh).reshape(
+        num_local_experts, hidden_size, intermediate_size // sf_vec_size
+    )
+    # The FP4 launcher requires float8 tensor metadata for both E4M3 and
+    # UE8M0 scale bytes; the dtype pair/scale length selects the interpretation.
+    gemm1_scale = gemm1_scale.view(torch.float8_e4m3fn)
+    gemm2_scale = gemm2_scale.view(torch.float8_e4m3fn)
+    result = {
         "gemm1_weights": torch.stack(g1_w_sh),
-        "gemm1_weights_scale": torch.stack(g1_s_sh)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size),
-        "gemm1_alpha": ones,
+        "gemm1_weights_scale": gemm1_scale,
         "gemm2_weights": torch.stack(g2_w_sh),
-        "gemm2_weights_scale": torch.stack(g2_s_sh)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_local_experts, hidden_size, intermediate_size // sf_vec_size),
+        "gemm2_weights_scale": gemm2_scale,
         "output1_scale_scalar": ones,
         "output1_scale_gate_scalar": ones,
         "output2_scale_scalar": ones,
     }
+    if not is_mxfp4:
+        result["gemm1_alpha"] = ones
+    return result
+
+
+def prepare_trtllm_fp4_activations(
+    hidden_states_bf16: torch.Tensor,
+    *,
+    variant,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Prepare activations for a unified TRTLLM FP4 quantization variant."""
+    from .api import QuantVariant
+
+    if hidden_states_bf16.ndim != 2:
+        raise ValueError(
+            "hidden_states_bf16 must be 2D [num_tokens, hidden_size], got "
+            f"{tuple(hidden_states_bf16.shape)}."
+        )
+    if hidden_states_bf16.dtype != torch.bfloat16:
+        raise TypeError(
+            f"hidden_states_bf16 must be torch.bfloat16, got {hidden_states_bf16.dtype}."
+        )
+
+    if variant is QuantVariant.W4A16:
+        return hidden_states_bf16, None
+    if variant is QuantVariant.MXFP4:
+        from ..quantization.fp8_quantization import mxfp8_quantize
+
+        if hidden_states_bf16.shape[1] % 32 != 0:
+            raise ValueError("MXFP4 requires hidden_size divisible by 32.")
+        q, sf = mxfp8_quantize(hidden_states_bf16, is_sf_swizzled_layout=False)
+        return q, sf.view(torch.float8_e4m3fn).reshape(hidden_states_bf16.shape[0], -1)
+    if variant is QuantVariant.NVFP4:
+        from ..fp4_quantization import fp4_quantize
+
+        if hidden_states_bf16.shape[1] % 16 != 0:
+            raise ValueError("NVFP4 requires hidden_size divisible by 16.")
+        # The unified NVFP4 weight view currently fixes its epilogue scalars at
+        # one, so activation preparation must use the matching global scale.
+        global_scale = torch.ones(1, device=hidden_states_bf16.device)
+        q, sf = fp4_quantize(
+            hidden_states_bf16,
+            global_scale=global_scale,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
+        )
+        return q, sf.view(torch.float8_e4m3fn).reshape(hidden_states_bf16.shape[0], -1)
+    raise ValueError(
+        "TRTLLM FP4 activation preparation requires QuantVariant.NVFP4, "
+        f"QuantVariant.MXFP4, or QuantVariant.W4A16; got {variant!r}."
+    )
 
 
 def _deepseek_fp8_quantize_activations(

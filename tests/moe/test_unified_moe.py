@@ -1430,6 +1430,41 @@ def _fp4_dummy_hidden(num_tokens, hidden_size, device):
     )
 
 
+def _fp4_dummy_weight_view(num_experts, hidden_size, intermediate_size, device):
+    """Shape-valid FP4 placeholders for packing-only tests (never launched)."""
+    return {
+        "gemm1_weights": torch.empty(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size // 2,
+            dtype=torch.uint8,
+            device=device,
+        ),
+        "gemm1_weights_scale": torch.empty(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size // 16,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+        "gemm1_alpha": torch.empty(num_experts, dtype=torch.float32, device=device),
+        "gemm2_weights": torch.empty(
+            num_experts,
+            hidden_size,
+            intermediate_size // 2,
+            dtype=torch.uint8,
+            device=device,
+        ),
+        "gemm2_weights_scale": torch.empty(
+            num_experts,
+            hidden_size,
+            intermediate_size // 16,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+    }
+
+
 def _bf16_dummy_hidden(num_tokens, hidden_size, device):
     return (
         torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device=device),
@@ -1524,13 +1559,19 @@ class TestTrtllmRoutedPackingContract:
             topk_weights=final_scales,
         )
 
-        # pack_inputs only threads weights into static kwargs; dummies suffice
-        # since we inspect topk_ids only (no kernel launch).
+        # No kernel launches, but runners still validate their backend-native
+        # weight contracts before exposing the packed routing buffers.
+        if spec.variant is QuantVariant.NVFP4:
+            weight_view = _fp4_dummy_weight_view(
+                local_num_experts,
+                hidden_size,
+                config.experts.intermediate_size,
+                device,
+            )
+        else:
+            weight_view = {k: torch.empty(0, device=device) for k in spec.view_keys}
         weight_pack = MoEWeightPack()
-        weight_pack.prepare_for(
-            runner.backend_key,
-            {k: torch.empty(0, device=device) for k in spec.view_keys},
-        )
+        weight_pack.prepare_for(runner.backend_key, weight_view)
 
         from flashinfer.fused_moe.core import MoeRunnerInputs
 
@@ -1807,13 +1848,12 @@ class TestTrtllmFromLogitsPackingContract:
         weight_pack = MoEWeightPack()
         weight_pack.prepare_for(
             "trtllm_fp4_routed",
-            {
-                "gemm1_weights": torch.empty(0, device=device),
-                "gemm1_weights_scale": torch.empty(0, device=device),
-                "gemm1_alpha": torch.empty(0, device=device),
-                "gemm2_weights": torch.empty(0, device=device),
-                "gemm2_weights_scale": torch.empty(0, device=device),
-            },
+            _fp4_dummy_weight_view(
+                num_experts,
+                hidden_size,
+                config.experts.intermediate_size,
+                device,
+            ),
         )
 
         moe_inputs = MoeRunnerInputs.from_list(

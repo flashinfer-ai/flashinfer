@@ -59,9 +59,9 @@ class QuantVariant(Enum):
     DeepSeekFp8 = 2
     MxFp8 = 3
     NVFP4 = 4  # day-1 MVP target
-    MXFP4 = 5
+    MXFP4 = 5  # MXFP4 weights × MXFP8 activations (TRTLLM W4A8)
     MxInt4 = 6
-    W4A16 = 7
+    W4A16 = 7  # backend-specific 4-bit weights × BF16 activations
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}.{self.name}"
@@ -226,30 +226,30 @@ class ExecutionConfig:
 
 @dataclass(frozen=True)
 class TrtllmFp4Config:
-    """TensorRT-LLM FP4 block-scale backend."""
+    """TensorRT-LLM FP4 backend for NVFP4 and MXFP4 mixed-precision modes."""
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM100+ only: the routed runner delegates to the trtllm-gen sm100
-        # module, which core.is_trtllm_moe_supported() gates on major >= 10.
-        # Returning True on SM90 would mark the backend available on H100 and
-        # then fail at dispatch.
-        return arch >= 100
+        # Current trtllm-gen FP4 cubins are validated on SM100/SM103 only.
+        return arch in (100, 103)
 
     @staticmethod
     def prepare_weights(
         w1_bf16,
         w2_bf16,
         *,
+        variant: QuantVariant = QuantVariant.NVFP4,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
         device=None,
         permute_cache=None,
     ):
-        """Build the ``trtllm_fp4_routed`` weight view from canonical bf16 weights.
+        """Build a ``trtllm_fp4_routed`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("trtllm_fp4_routed", ...)``.
+        ``variant`` selects NVFP4 or the shared MXFP4 weight format used by
+        MXFP4×MXFP8 and MXFP4×BF16.
         See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
         """
         from .prepare import prepare_trtllm_fp4_weights
@@ -257,11 +257,26 @@ class TrtllmFp4Config:
         return prepare_trtllm_fp4_weights(
             w1_bf16,
             w2_bf16,
+            variant=variant,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             device=device,
             permute_cache=permute_cache,
+        )
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        variant: QuantVariant = QuantVariant.NVFP4,
+    ):
+        """Quantize activations for NVFP4, MXFP4×MXFP8, or MXFP4×BF16."""
+        from .prepare import prepare_trtllm_fp4_activations
+
+        return prepare_trtllm_fp4_activations(
+            hidden_states_bf16,
+            variant=variant,
         )
 
     def __repr__(self) -> str:
@@ -700,6 +715,11 @@ class MoEActivationPack:
 
     * NVFP4: packed ``uint8 [M, H/2]`` values with
       ``float8_e4m3fn [M, H/16]`` block scales.
+    * MXFP4 (W4A8): ``float8_e4m3fn [M, H]`` MXFP8 values with token-major
+      ``float8_e4m3fn [M, H/32]`` tensors carrying UE8M0 scale bytes, matching
+      the TRTLLM FP4 launcher ABI.
+    * W4A16 with ``TrtllmFp4Config``: raw ``bfloat16 [M, H]`` values with no
+      activation scale; weights use the MXFP4 preparation contract.
     * BF16: raw ``bfloat16 [M, H]`` values with no scale tensor.
     * DeepSeek FP8: ``float8_e4m3fn [M, H]`` values with transposed
       ``float32 [H/128, M]`` block scales.
