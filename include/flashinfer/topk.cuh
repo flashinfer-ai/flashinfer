@@ -60,16 +60,20 @@ inline size_t GetRadixTopKAvailableOrderedSmemBytes(size_t max_smem_per_block,
 
 // ==================== Multi-CTA Top-K Implementation ====================
 
-// Acquire/Release primitives for inter-CTA synchronization
+// Acquire/Release primitives for inter-CTA synchronization.
+// All of them carry a "memory" clobber: `asm volatile` alone only keeps the compiler from
+// reordering these statements against each other, it does not stop ordinary loads/stores (or
+// values cached in registers) from being moved across the fence, which would defeat the
+// acquire/release pairing these helpers exist to provide.
 __device__ __forceinline__ int ld_acquire(int* ptr) {
   int state = 0;
 
 #if (__CUDA_ARCH__ >= 700)
   // SM70 and newer use memory consistency qualifiers
   // Acquire pattern using acquire modifier
-  asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
+  asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr) : "memory");
 #else
-  asm volatile("ld.cg.global.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
+  asm volatile("ld.cg.global.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr) : "memory");
 #endif
 
   return state;
@@ -81,8 +85,8 @@ __device__ __forceinline__ void red_release(int* ptr, int val) {
   // Release pattern using acq_rel fence + relaxed modifier
   // (The fence also releases data that was weakly-written by other threads prior to the last
   // syncthreads)
-  asm volatile("fence.acq_rel.gpu;\n");
-  asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(ptr), "r"(val));
+  asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+  asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(ptr), "r"(val) : "memory");
 #else
   __threadfence();
   atomicAdd(ptr, val);
@@ -93,8 +97,8 @@ __device__ __forceinline__ void st_release(int* ptr, int val) {
 #if (__CUDA_ARCH__ >= 700)
   // SM70 and newer use memory consistency qualifiers
   // Release pattern: fence + release store
-  asm volatile("fence.acq_rel.gpu;\n");
-  asm volatile("st.release.gpu.global.b32 [%0], %1;\n" : : "l"(ptr), "r"(val));
+  asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+  asm volatile("st.release.gpu.global.b32 [%0], %1;\n" : : "l"(ptr), "r"(val) : "memory");
 #else
   __threadfence();
   atomicExch(ptr, val);
@@ -166,6 +170,19 @@ inline RadixDeterministicCollectScratch* MaybeGetRadixDeterministicCollectScratc
  * Each CTA contributes exactly one arrival via tx==0, then waits until the
  * group-wide arrival counter reaches the current phase target.
  *
+ * The leading __syncthreads() is load-bearing: red_release's fence.acq_rel.gpu only makes the
+ * *other* threads' prior writes visible to peer CTAs when those writes are separated from the
+ * fence by a block-wide convergence point (the syncthreads + thread-0 fence idiom documented on
+ * red_release above). Callers reach this barrier straight out of all-thread write loops --
+ * accumulating into state->histogram, clearing the next round's histogram, or writing the
+ * collected index block -- so without it tx0 can publish its arrival while the rest of the CTA
+ * still has stores in flight. A peer CTA then passes the barrier and consumes data that was
+ * never written: an undercounted histogram yields a wrong pivot, and in the collect paths the
+ * peer reads uninitialized index slots and dereferences them (e.g. src_page_entry[row_start +
+ * idx]), which faults. RadixGroupResetStateLastCTA already converges for exactly this reason.
+ * The sync is free in practice: wait_ge ends with a __syncthreads(), so the trailing one is
+ * simply moved to the front.
+ *
  * \param state Per-group radix row state that owns the arrival counter
  * \param barrier_phase Current software-barrier phase for this CTA group
  * \param ctas_per_group Number of CTAs participating in the group barrier
@@ -173,13 +190,13 @@ inline RadixDeterministicCollectScratch* MaybeGetRadixDeterministicCollectScratc
  */
 __device__ __forceinline__ void AdvanceRadixGroupBarrier(RadixRowState* state, int& barrier_phase,
                                                          uint32_t ctas_per_group, uint32_t tx) {
+  __syncthreads();
   if (tx == 0) {
     red_release(&state->arrival_counter, 1);
   }
   int target = (barrier_phase + 1) * ctas_per_group;
   wait_ge(&state->arrival_counter, target, tx);
   barrier_phase++;
-  __syncthreads();
 }
 
 /*!
