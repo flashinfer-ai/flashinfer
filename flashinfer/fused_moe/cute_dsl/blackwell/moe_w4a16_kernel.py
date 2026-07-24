@@ -1235,44 +1235,105 @@ class Sm100W4A16GroupedGemmKernel:
                 )
                 work_tile = tile_sched.initial_work_tile_info()
                 not_last_tile = cutlass.Boolean(1)
-                while not_last_tile:
-                    tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                    cluster_tile_coord_mnl = work_tile.tile_idx
-                    cta_tile_coord_m = (
-                        cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
-                        + block_in_cluster_coord_vmnk[1]
-                        * cute.size(tiled_mma.thr_id.shape)
-                        + block_in_cluster_coord_vmnk[0]
-                    )
-                    cta_tile_offset_n = block_in_cluster_coord_vmnk[2]
-                    route_tile_idx = (
-                        cluster_tile_coord_mnl[1] * self.cluster_shape_mn[1]
-                        + cta_tile_offset_n
-                    )
-                    not_last_tile = work_tile.is_valid_tile and (
-                        route_tile_idx < num_non_exiting_tiles_value
-                    )
-                    route_start = cutlass.Int32(-1)
-                    group_idx = cutlass.Int32(group_count)
-                    distance_to_boundary = cutlass.Int32(-1)
-                    if not_last_tile:
-                        route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
-                        group_idx = tile_idx_to_expert_idx[route_tile_idx]
-                        distance_to_boundary = (
-                            tile_idx_to_mn_limit[route_tile_idx] - route_start
+                if cutlass.const_expr(self.raster_along_m):
+                    while not_last_tile:
+                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        cluster_tile_coord_mnl = work_tile.tile_idx
+                        cta_tile_coord_m = (
+                            cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
+                            + block_in_cluster_coord_vmnk[1]
+                            * cute.size(tiled_mma.thr_id.shape)
+                            + block_in_cluster_coord_vmnk[0]
                         )
-                    cur_sTile_info = sTile_info[(None, tile_info_producer_state.index)]
-                    with cute.arch.elect_one():
-                        cur_sTile_info[0] = cta_tile_coord_m
-                        cur_sTile_info[1] = route_start
-                        cur_sTile_info[2] = group_idx
-                        cur_sTile_info[3] = distance_to_boundary
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    self.sched_sync_barrier.arrive_and_wait()
-                    tile_info_pipeline.producer_commit(tile_info_producer_state)
-                    tile_info_producer_state.advance()
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                        cta_tile_offset_n = block_in_cluster_coord_vmnk[2]
+                        route_tile_idx = (
+                            cluster_tile_coord_mnl[1] * self.cluster_shape_mn[1]
+                            + cta_tile_offset_n
+                        )
+                        not_last_tile = work_tile.is_valid_tile and (
+                            route_tile_idx < num_non_exiting_tiles_value
+                        )
+                        route_start = cutlass.Int32(-1)
+                        group_idx = cutlass.Int32(group_count)
+                        distance_to_boundary = cutlass.Int32(-1)
+                        if not_last_tile:
+                            route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
+                            group_idx = tile_idx_to_expert_idx[route_tile_idx]
+                            distance_to_boundary = (
+                                tile_idx_to_mn_limit[route_tile_idx] - route_start
+                            )
+                        cur_sTile_info = sTile_info[
+                            (None, tile_info_producer_state.index)
+                        ]
+                        with cute.arch.elect_one():
+                            cur_sTile_info[0] = cta_tile_coord_m
+                            cur_sTile_info[1] = route_start
+                            cur_sTile_info[2] = group_idx
+                            cur_sTile_info[3] = distance_to_boundary
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.sched_sync_barrier.arrive_and_wait()
+                        tile_info_pipeline.producer_commit(tile_info_producer_state)
+                        tile_info_producer_state.advance()
+                        tile_sched.advance_to_next_work()
+                        work_tile = tile_sched.get_current_work()
+                else:
+                    while not_last_tile:
+                        cluster_tile_coord_mnl = work_tile.tile_idx
+                        cta_tile_coord_m = (
+                            cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
+                            + block_in_cluster_coord_vmnk[1]
+                            * cute.size(tiled_mma.thr_id.shape)
+                            + block_in_cluster_coord_vmnk[0]
+                        )
+                        cta_tile_offset_n = block_in_cluster_coord_vmnk[2]
+                        route_tile_idx = (
+                            cluster_tile_coord_mnl[1] * self.cluster_shape_mn[1]
+                            + cta_tile_offset_n
+                        )
+                        # The runtime scheduler leaves its outer mode unbounded.
+                        # With N as the inner mode, terminate on the finite M
+                        # extent and skip padded routed tiles within each M tile.
+                        has_work = work_tile.is_valid_tile and (
+                            cluster_tile_coord_mnl[0]
+                            < tile_sched_params.problem_layout_ncluster_mnl.shape[0]
+                        )
+                        is_routed_tile = has_work and (
+                            route_tile_idx < num_non_exiting_tiles_value
+                        )
+
+                        if is_routed_tile or not has_work:
+                            tile_info_pipeline.producer_acquire(
+                                tile_info_producer_state
+                            )
+                            route_start = cutlass.Int32(-1)
+                            group_idx = cutlass.Int32(group_count)
+                            distance_to_boundary = cutlass.Int32(-1)
+                            if is_routed_tile:
+                                route_start = (
+                                    route_tile_idx * self.cta_tile_shape_mnk[1]
+                                )
+                                group_idx = tile_idx_to_expert_idx[route_tile_idx]
+                                distance_to_boundary = (
+                                    tile_idx_to_mn_limit[route_tile_idx] - route_start
+                                )
+                            cur_sTile_info = sTile_info[
+                                (None, tile_info_producer_state.index)
+                            ]
+                            with cute.arch.elect_one():
+                                cur_sTile_info[0] = cta_tile_coord_m
+                                cur_sTile_info[1] = route_start
+                                cur_sTile_info[2] = group_idx
+                                cur_sTile_info[3] = distance_to_boundary
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            self.sched_sync_barrier.arrive_and_wait()
+                            tile_info_pipeline.producer_commit(tile_info_producer_state)
+                            tile_info_producer_state.advance()
+
+                        if has_work:
+                            tile_sched.advance_to_next_work()
+                            work_tile = tile_sched.get_current_work()
+                        else:
+                            not_last_tile = cutlass.Boolean(0)
 
                 tile_info_pipeline.producer_tail(tile_info_producer_state)
 

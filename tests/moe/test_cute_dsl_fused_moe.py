@@ -1109,6 +1109,13 @@ class TestCuteDslMoeW4A16:
             ),
             pytest.param(
                 ActivationType.Swiglu,
+                32,
+                ((128, 32, 64), (1, 1), False),
+                ((128, 32, 64), (1, 1), False),
+                id="route32-1cta-raster-n",
+            ),
+            pytest.param(
+                ActivationType.Swiglu,
                 64,
                 ((256, 64, 128), (2, 1), True),
                 ((256, 64, 128), (2, 1), True),
