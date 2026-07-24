@@ -586,6 +586,92 @@ layernorm_trace = TraceTemplate(
 )
 
 
+# ── LayerNorm + FP8 Quantize ──────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _layernorm_quant_reference(hidden_states, weight, bias, scale):
+    """LayerNorm followed by per-tensor FP8 (e4m3fn) quantization.
+
+    ``out = clamp(layernorm(input, gamma, beta) / scale, fp8_min, fp8_max).to(fp8_e4m3fn)``.
+    Epsilon is fixed at 1e-6.
+    """
+    EPS = 1e-6
+    x = hidden_states.to(torch.float32)
+    mean = x.mean(dim=-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+    y = (x - mean) / torch.sqrt(var + EPS)
+    y = y * weight.to(torch.float32) + bias.to(torch.float32)
+    s = (
+        scale.to(torch.float32).reshape(())
+        if isinstance(scale, torch.Tensor)
+        else float(scale)
+    )
+    y = y / s
+    fp8_max = 448.0  # float8_e4m3fn max finite value
+    y = y.clamp(-fp8_max, fp8_max)
+    return y.to(torch.float8_e4m3fn)
+
+
+def _layernorm_quant_init(
+    *,
+    batch_size: int,
+    hidden_size: int = 768,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.layernorm_quant``.
+
+    Default ``hidden_size=768`` matches GPT-2/BERT base. ``gemma`` (gamma) and
+    ``beta`` are float32 as required by the API.
+    """
+    torch.manual_seed(seed)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    return {
+        "out": out,
+        "input": x,
+        "gemma": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "beta": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "scale": torch.tensor(1.0, dtype=torch.float32, device=device),
+    }
+
+
+layernorm_quant_trace = TraceTemplate(
+    op_type="layernorm",
+    name_prefix="layernorm_quant",
+    description="LayerNorm + FP8 quantization. out = quantize(layernorm(input, gemma, beta), scale).",
+    axes={
+        "batch_size": Var(),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
+        "weight": Tensor(
+            ["hidden_size"], param="gemma", description="Scale (gamma) tensor, float32."
+        ),
+        "bias": Tensor(
+            ["hidden_size"], param="beta", description="Bias (beta) tensor, float32."
+        ),
+        "scale": Scalar(
+            "float32", description="Per-tensor quantization scale, shape (1,)."
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["batch_size", "hidden_size"],
+            dtype_from="out",
+            dtype="float8_e4m3fn",
+            description="Quantized output (dtype matches pre-allocated out tensor).",
+        ),
+    },
+    tags=["status:verified", "quantization:fp8"],
+    reference=_layernorm_quant_reference,
+    check=_rmsnorm_quant_check,
+    init=_layernorm_quant_init,
+)
+
+
 # ── Fused RMSNorm + SiLU ──────────────────────────────────────────────────────
 
 

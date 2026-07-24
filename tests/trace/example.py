@@ -35,6 +35,7 @@ gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
 layernorm_h768.json
+layernorm_quant_h768.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
@@ -158,6 +159,10 @@ ln_in = torch.randn(32, ln_h, dtype=torch.bfloat16, device=device)
 ln_gamma = torch.ones(ln_h, dtype=torch.float32, device=device)
 ln_beta = torch.zeros(ln_h, dtype=torch.float32, device=device)
 flashinfer.layernorm(ln_in, ln_gamma, ln_beta)
+
+ln_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+ln_quant_out = torch.empty(32, ln_h, dtype=torch.float8_e4m3fn, device=device)
+flashinfer.layernorm_quant(ln_quant_out, ln_in, ln_gamma, ln_beta, ln_scale)
 
 # ── sampling (Llama vocab=128256) ─────────────────────────────────────────────
 probs = torch.rand(64, 128256, dtype=torch.float32, device=device)
