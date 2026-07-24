@@ -2433,6 +2433,17 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
 
   TVM_FFI_ICHECK_EQ(expert_indices.dtype(), dl_int32)
       << "FP8 MoE: expert_indices must be int32 (packed expert_id/weight).";
+  TVM_FFI_ICHECK(expert_indices.device().device_type == kDLCUDA)
+      << "FP8 MoE: expert_indices must be a CUDA tensor.";
+  TVM_FFI_ICHECK(expert_indices.device().device_id == hidden_states.device().device_id)
+      << "FP8 MoE: expert_indices must be on the same device as hidden_states.";
+  TVM_FFI_ICHECK_EQ(expert_indices.ndim(), 2)
+      << "FP8 MoE: expert_indices must be 2D [num_tokens, top_k].";
+  TVM_FFI_ICHECK_EQ(expert_indices.size(0), hidden_states.size(0))
+      << "FP8 MoE: expert_indices and hidden_states must have the same number of tokens.";
+  TVM_FFI_ICHECK_EQ(expert_indices.size(1), top_k)
+      << "FP8 MoE: expert_indices dim1 must match top_k.";
+  TVM_FFI_ICHECK(expert_indices.IsContiguous()) << "FP8 MoE: expert_indices must be contiguous.";
   TVM_FFI_ICHECK(dtype == dl_float8_e4m3fn || dtype == dl_float16 || dtype == dl_bfloat16)
       << "FP8 MoE: hidden_states must be float8_e4m3fn, float16, or bfloat16.";
   TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn)
