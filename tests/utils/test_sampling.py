@@ -620,6 +620,52 @@ def test_top_k_renorm_probs_mixed_k_persistent_loop(dtype):
             )
 
 
+@pytest.mark.parametrize("k", [128, 1024])
+def test_top_k_renorm_probs_multi_cta_pivot_stability(k):
+    """Repeatedly run the multi-CTA path and require the exact top-k set every time.
+
+    Rows are permutations of a strictly increasing ramp, so every probability in a row is
+    distinct and the kept set is unambiguous -- no tie tolerance is needed and any deviation
+    is a real error.
+
+    This targets the cross-CTA group barrier: each CTA accumulates its slice of the round
+    histogram from all of its threads, then thread 0 marks arrival. If the CTA is not
+    converged before that mark, a peer CTA can read the group histogram while stores are
+    still in flight, undercount a bucket, and settle on a pivot that disagrees with its
+    peers -- which shows up here as a kept set that is not exactly the top k. The race is
+    timing-dependent, hence the repeat loop.
+    """
+    batch_size = 64
+    vocab_size = 128 * 1024  # large enough to force ctas_per_group > 1
+    num_trials = 20
+    device = "cuda:0"
+
+    generator = torch.Generator(device=device).manual_seed(42)
+    ramp = torch.arange(1, vocab_size + 1, device=device, dtype=torch.float32)
+    perm = torch.argsort(
+        torch.rand((batch_size, vocab_size), device=device, generator=generator), dim=-1
+    )
+    probs = ramp[perm]
+    probs /= probs.sum(dim=-1, keepdim=True)
+
+    threshold = torch.topk(probs, k, dim=-1).values[:, -1]
+    expected_mask = probs >= threshold.unsqueeze(-1)
+    assert torch.all(expected_mask.sum(dim=-1) == k)
+
+    for trial in range(num_trials):
+        renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
+
+        mask = renorm_probs > 0
+        mismatched = (mask != expected_mask).any(dim=-1).nonzero().flatten()
+        assert mismatched.numel() == 0, (
+            f"trial {trial}: rows {mismatched.tolist()[:8]} kept the wrong set "
+            f"(kept counts {mask.sum(dim=-1)[mismatched].tolist()[:8]}, expected {k})"
+        )
+
+        sums = renorm_probs.float().sum(dim=-1)
+        torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
