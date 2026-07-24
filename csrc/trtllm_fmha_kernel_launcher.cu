@@ -704,6 +704,7 @@ void trtllm_ragged_attention_launcher(
 
   runner_params.mKernelType = FmhaKernelType::Context;
   runner_params.mTileScheduler = TileScheduler::Persistent;
+  runner_params.mMultiCtasKvMode = false;
   runner_params.mMaskType =
       is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
 
