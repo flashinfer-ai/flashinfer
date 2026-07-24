@@ -872,3 +872,42 @@ def test_invalid_mode_raises(cache_root):
     # the old boolean no longer works
     with pytest.raises(ValueError), autotune_v2(mode=False):
         pass
+
+
+def test_nested_context_does_not_clobber_ambient(cache_root, monkeypatch):
+    """Scope-guard hygiene: a nested (scoped) context is an override for its
+    region only — it must NOT rebind the process ambient set by the outer
+    (warmup) context, so bare calls after the inner exits keep the outer
+    identity."""
+    tuner = _fresh_process()
+    _policy_dependent_profile(monkeypatch)
+    inputs = [torch.zeros(8, 16)]
+
+    # Outer top-level context tunes under the default identity -> ambient.
+    with autotune_v2():
+        AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+        outer_ambient = tuner._managed_cache
+        # Inner nested context with a DIFFERENT (eager) identity.
+        with autotune_v2(measure=MeasurementPolicy(execution_mode="eager")):
+            AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+            # In-region lookup targets the inner store (top of stack)...
+            assert tuner._active_managed_store.env_hash != outer_ambient.env_hash
+        # ...but the ambient default is unchanged by the scoped override.
+        assert tuner._managed_cache is outer_ambient
+
+    # After everything exits, bare serving uses the outer (default) identity.
+    _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    assert tactic == 0  # default-identity winner, not the eager one
+
+
+def test_sequential_top_level_contexts_last_wins_ambient(cache_root, monkeypatch):
+    """Sequential top-level contexts each re-attach: the ambient is last-wins
+    (an explicit re-attach IS allowed; only *nested* overrides are scoped)."""
+    _policy_dependent_profile(monkeypatch)
+    inputs = [torch.zeros(8, 16)]
+    with autotune_v2():
+        AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    with autotune_v2(measure=MeasurementPolicy(execution_mode="eager")):
+        AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
+    assert tactic == 1  # eager winner: last top-level attach won the ambient
