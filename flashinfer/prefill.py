@@ -23,6 +23,21 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .api_logging import flashinfer_api
+from .cudnn import cudnn_batch_prefill_with_kv_cache
+from .jit import (
+    gen_batch_prefill_module,
+    gen_customize_batch_prefill_module,
+    gen_fmha_cutlass_sm100a_module,
+    gen_fmha_v2_module,
+    gen_single_prefill_module,
+    gen_trtllm_fmha_v2_sm120_module,
+    gen_trtllm_gen_fmha_module,
+    get_batch_prefill_uri,
+    get_single_prefill_uri,
+    setup_cubin_loader,
+)
+from .page import get_seq_lens
+from .quantization import packbits, segment_packbits
 from .trace.templates.attention import (
     gqa_paged_prefill_trace,
     gqa_ragged_prefill_trace,
@@ -34,23 +49,8 @@ from .trace.templates.gemm import (
     trtllm_ragged_attention_deepseek_trace,
 )
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
-from .jit import (
-    gen_batch_prefill_module,
-    gen_customize_batch_prefill_module,
-    gen_fmha_cutlass_sm100a_module,
-    gen_fmha_v2_module,
-    gen_single_prefill_module,
-    get_batch_prefill_uri,
-    get_single_prefill_uri,
-    setup_cubin_loader,
-    gen_trtllm_gen_fmha_module,
-    gen_trtllm_fmha_v2_sm120_module,
-)
-from .cudnn import cudnn_batch_prefill_with_kv_cache
-from .page import get_seq_lens
-from .quantization import packbits, segment_packbits
 from .utils import (
-    log2e,
+    SINGLE_KERNEL_TMP_SIZE,
     FP4Tensor,
     MaskMode,
     PosEncodingMode,
@@ -60,28 +60,28 @@ from .utils import (
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
-    check_shape_dtype_device,
-    get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
-    _unpack_paged_kv_cache,
     _should_use_fmha_v2_sm120,
+    _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    ceil_div,
+    check_shape_dtype_device,
     determine_attention_backend,
     device_support_pdl,
+    get_alibi_slopes,
     get_device_sm_count,
     is_float8,
+    is_sm12x_supported,
     is_sm100a_supported,
     is_sm110a_supported,
-    is_sm12x_supported,
+    log2e,
+    prepare_jit_additional_args,
     register_custom_op,
     register_fake_op,
-    ceil_div,
     round_up,
-    SINGLE_KERNEL_TMP_SIZE,
-    prepare_jit_additional_args,
 )
 
 
@@ -5113,6 +5113,55 @@ def get_trtllm_fmha_v2_module(
     return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
 
 
+def _check_paged_kv_non_interleaved(
+    k_cache: torch.Tensor, v_cache: torch.Tensor, block_tables: Optional[torch.Tensor]
+) -> None:
+    """Validate the separate-K/V paged input form.
+
+    The kernel addresses every block relative to ``k_cache``'s base pointer
+    with strides derived from shapes (never from tensor strides), so the
+    caller must supply contiguous same-shape caches whose V storage sits at a
+    positive block-aligned offset from K (one allocation), plus pre-expanded
+    ``[B, 2, M]`` block offsets whose V rows account for that offset (e.g.
+    ``page_idx + delta_blocks``).
+    """
+    if block_tables is None or block_tables.dim() != 3 or block_tables.shape[1] != 2:
+        raise ValueError(
+            "Non-interleaved paged KV (separate k_cache/v_cache tensors) requires "
+            "pre-expanded block_tables of shape [B, 2, M] with independent K and V "
+            f"block offsets; got {None if block_tables is None else tuple(block_tables.shape)}."
+        )
+    if (
+        k_cache.dim() != 4
+        or k_cache.shape != v_cache.shape
+        or k_cache.dtype != v_cache.dtype
+    ):
+        raise ValueError(
+            "Non-interleaved paged KV expects 4D k_cache/v_cache with identical shape "
+            f"and dtype; got {tuple(k_cache.shape)}/{k_cache.dtype} vs "
+            f"{tuple(v_cache.shape)}/{v_cache.dtype}."
+        )
+    if not (k_cache.is_contiguous() and v_cache.is_contiguous()):
+        raise ValueError(
+            "Non-interleaved paged KV requires contiguous k_cache/v_cache: the kernel "
+            "derives strides from shapes, not tensor strides."
+        )
+    block_bytes = k_cache[0].numel() * k_cache.element_size()
+    delta_bytes = v_cache.data_ptr() - k_cache.data_ptr()
+    if delta_bytes <= 0 or delta_bytes % block_bytes != 0:
+        raise ValueError(
+            "Non-interleaved paged KV requires V stored at a positive block-aligned "
+            f"offset from K in one allocation (v_ptr - k_ptr = {delta_bytes} "
+            f"bytes, block = {block_bytes} bytes). Pass a stacked [pages, 2, ...]"
+            "tensor instead of independently allocated K and V."
+        )
+
+
+def _check_paged_block_tables(block_tables: Optional[torch.Tensor]) -> None:
+    if block_tables is not None and block_tables.dtype != torch.int32:
+        raise ValueError(f"block_tables must be int32, got {block_tables.dtype}.")
+
+
 @flashinfer_api(trace=trtllm_fmha_v2_prefill_trace)
 def trtllm_fmha_v2_prefill(
     qkv: Union[
@@ -5162,6 +5211,13 @@ def trtllm_fmha_v2_prefill(
           (``paged_KV[:, 0, ...]`` is key cache, ``paged_KV[:, 1, ...]`` is value cache).
         - ``Q_PAGED_KV_NHD``: same as ``Q_PAGED_KV_HND`` but paged_KV shape is
           ``[num_pages, 2, page_size, num_kv_heads, head_dim]``.
+
+          For both paged layouts, ``paged_KV`` may instead be a tuple
+          ``(k_cache, v_cache)`` of separate 4D tensors (non-interleaved). This
+          requires pre-expanded ``block_tables`` of shape ``[B, 2, M]`` holding
+          independent K and V block offsets relative to ``k_cache``'s base
+          pointer (K and V must live in one allocation at block-aligned
+          positions).
         - ``SEPARATE_Q_K_V``: ``qkv`` is ``(Q, K, V)`` where Q has shape
           ``[num_tokens, num_heads, head_dim]`` and K, V have shape
           ``[num_tokens, num_kv_heads, head_dim]``.
@@ -5242,23 +5298,30 @@ def trtllm_fmha_v2_prefill(
             )
         k_cache = kv_cache
         v_cache = kv_cache  # placeholder (not used for this layout)
-    elif input_layout == "Q_PAGED_KV_NHD":
+    elif input_layout in ("Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"):
         assert isinstance(qkv, tuple)
         query, paged_kv = qkv[0], qkv[1]
-        if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
-            raise ValueError(
-                f"Q_PAGED_KV_NHD expects paged_KV shape [pages, 2, page_size, num_kv_heads, head_dim], got {tuple(paged_kv.shape)}"
-            )
-        k_cache, v_cache = paged_kv.unbind(dim=1)
-    elif input_layout == "Q_PAGED_KV_HND":
-        assert isinstance(qkv, tuple)
-        query, paged_kv = qkv[0], qkv[1]
-        if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
-            raise ValueError(
-                f"Q_PAGED_KV_HND expects paged_KV shape [pages, 2, num_kv_heads, page_size, head_dim], got {tuple(paged_kv.shape)}"
-            )
-        k_cache, v_cache = paged_kv.unbind(dim=1)
-        if block_tables is None:
+        _check_paged_block_tables(block_tables)
+        if isinstance(paged_kv, tuple):
+            # Requires pre-expanded [B, 2, M] block_tables so the kernel can
+            # address V's blocks relative to K's base pointer.
+            k_cache, v_cache = paged_kv
+            _check_paged_kv_non_interleaved(k_cache, v_cache, block_tables)
+        else:
+            if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
+                raise ValueError(
+                    f"{input_layout} expects paged_KV shape [pages, 2, ...] "
+                    "(page_size/num_kv_heads per layout order), got "
+                    f"{tuple(paged_kv.shape)}"
+                )
+            if block_tables is not None and block_tables.dim() != 2:
+                raise ValueError(
+                    "Stacked paged_KV uses shared [B, M] block_tables; got "
+                    f"{tuple(block_tables.shape)}. Pre-expanded [B, 2, M] "
+                    "offsets are only valid with separate (k_cache, v_cache)."
+                )
+            k_cache, v_cache = paged_kv.unbind(dim=1)
+        if input_layout == "Q_PAGED_KV_HND" and block_tables is None:
             raise ValueError(
                 "block_tables is required for Q_PAGED_KV_HND input layout."
             )
