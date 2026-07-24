@@ -336,30 +336,12 @@ def generate_spec_dec_mask(
     device: torch.device,
     mask_mode: str = "causal",
 ) -> torch.Tensor:
-    """
-    Generate a packed draft-block attention mask for speculative decoding.
+    """Packed draft-block attention mask for speculative decoding.
 
-    Parameters
-    ----------
-    batch_size : int
-        Batch size
-    q_seq_len : int
-        Query sequence length (number of speculative decoding tokens)
-    device : torch.device
-        Target device for the mask tensor
-    mask_mode : str
-        "causal": draft token i attends to draft tokens j <= i (standard
-        speculative decoding). "full": every draft token attends to all draft
-        tokens (no causal masking within the draft block, e.g. DFlash-style
-        drafters). The KV prefix is always fully visible in both modes.
-
-    Returns
-    -------
-    torch.Tensor
-        Mask with shape [batch_size, q_seq_len, mask_size_per_row]
-        where mask_size_per_row = divUp(q_seq_len, 32) * 2 (in uint16_t units).
-        Data type: torch.uint16
-
+    mask_mode "causal": draft token i attends to draft tokens j <= i;
+    "full": every draft token attends to all draft tokens. The KV prefix is
+    always fully visible. Returns [batch_size, q_seq_len,
+    divUp(q_seq_len, 32) * 2] uint16.
     """
     num_packed_masks_per_token = (q_seq_len + 31) // 32
 
@@ -417,7 +399,7 @@ def generate_spec_dec_mask(
         (4, 1, 32, 2, 5),
         (128, 1, 64, 2, 6),
         (256, 1, 64, 4, 8),
-        # Nemotron 3.5 Nano shape: 32 q heads / 2 kv heads (group ratio 16)
+        # 32 q heads / 2 kv heads (group ratio 16)
         (4, 1, 32, 2, 16),
         (4, 4, 32, 2, 16),
     ],
@@ -455,13 +437,7 @@ def test_xqa_batch_decode(
     kv_layout,
     spec_dec_mask_mode,
 ):
-    """Test xqa_batch_decode_with_kv_cache function.
-
-    This test supports both NHD and HND layouts. For speculative decode
-    (q_len_per_req > 1), both draft-block mask modes are covered: "causal"
-    (standard speculative decoding) and "full" (no causal masking within the
-    draft block, e.g. DFlash-style drafters).
-    """
+    """Test xqa_batch_decode_with_kv_cache across layouts and mask modes."""
     if q_len_per_req == 1 and spec_dec_mask_mode == "full":
         pytest.skip("Mask is unused for q_len_per_req == 1")
 
@@ -618,7 +594,7 @@ def test_xqa_batch_decode(
         (4, 2, 32, 2, 4),
         (4, 4, 64, 4, 2),
         (4, 5, 16, 2, 8),
-        # Nemotron 3.5 Nano shape: 32 q heads / 2 kv heads (group ratio 16)
+        # 32 q heads / 2 kv heads (group ratio 16)
         (4, 4, 32, 2, 16),
     ],
 )
@@ -632,6 +608,14 @@ def test_xqa_batch_decode(
 )
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
+@pytest.mark.parametrize(
+    "max_in_kv_len",
+    [
+        300,
+        # long context engages the multi-block (split-KV) path
+        30000,
+    ],
+)
 def test_xqa_batch_decode_spec_dec_sliding_window(
     batch_size,
     q_len_per_req,
@@ -644,6 +628,7 @@ def test_xqa_batch_decode_spec_dec_sliding_window(
     o_dtype,
     enable_sink,
     spec_dec_mask_mode,
+    max_in_kv_len,
 ):
     """Speculative decode with a sliding window that actually truncates
     (kv_len >> window), unlike the main test where window_left exceeds every
@@ -662,7 +647,7 @@ def test_xqa_batch_decode_spec_dec_sliding_window(
         kv_dtype=kv_dtype,
         enable_pdl=None,
         enable_sink=enable_sink,
-        max_in_kv_len=300,
+        max_in_kv_len=max_in_kv_len,
         kv_layout="NHD",
         spec_dec_mask_mode=spec_dec_mask_mode,
     )
@@ -716,8 +701,11 @@ def generate_ragged_spec_dec_mask(
         # max_q_len * head_grp_size > 32: multiple token blocks per group,
         # short requests leave whole blocks with zero valid rows
         ((5, 1, 3, 2), 16, 2, 8),
-        # Nemotron 3.5 Nano shape: 32 q heads / 2 kv heads (group ratio 16)
+        # 32 q heads / 2 kv heads (group ratio 16)
         ((1, 4, 2, 3), 32, 2, 16),
+        # zero-length draft: a request whose drafts were all rejected owns no
+        # query rows and must be skipped without touching its neighbors' masks
+        ((5, 0, 3, 2), 16, 2, 8),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1, 127])
@@ -730,6 +718,14 @@ def generate_ragged_spec_dec_mask(
 )
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
+@pytest.mark.parametrize(
+    "max_in_kv_len",
+    [
+        300,
+        # long context engages the multi-block (split-KV) path
+        30000,
+    ],
+)
 def test_xqa_batch_decode_ragged_q(
     q_lens_pattern,
     page_size,
@@ -741,12 +737,12 @@ def test_xqa_batch_decode_ragged_q(
     o_dtype,
     enable_sink,
     spec_dec_mask_mode,
+    max_in_kv_len,
 ):
     """Ragged speculative decode: per-request draft lengths via q_cu_seq_lens,
     with q packed as [total_q_tokens, num_heads, head_dim]."""
     torch.manual_seed(0)
     head_dim = 128
-    max_in_kv_len = 300
     batch_size = len(q_lens_pattern)
     num_qo_heads = num_kv_heads * head_grp_size
     max_q_len = max(q_lens_pattern)

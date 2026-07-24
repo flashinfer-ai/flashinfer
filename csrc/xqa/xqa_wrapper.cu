@@ -100,6 +100,11 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
 
 #if USE_SM90_MHA
   if (run_sm90_fp8_mha) {
+#if SPEC_DEC
+    // mha_sm90.cu's qCuSeqLens path is unvalidated; fail loudly.
+    TVM_FFI_ICHECK(qCuSeqLensPtr == nullptr)
+        << "ragged Q (q_cu_seq_lens) is not supported on the SM90 fp8 MHA path";
+#endif
     launchHopperF8MHAFlashInfer(
         multiProcessorCount, nbKHeads, slidingWinSize, qScale, qScalePtr,
         reinterpret_cast<OutputHead*>(output.data_ptr()),

@@ -44,7 +44,7 @@ def get_xqa_module(
     q_seq_len: int,
     use_ragged_q: bool = False,
 ):
-    module = gen_xqa_module(
+    spec = gen_xqa_module(
         input_dtype,
         kv_cache_dtype,
         page_size,
@@ -54,15 +54,10 @@ def get_xqa_module(
         output_dtype,
         q_seq_len,
         use_ragged_q,
-    ).build_and_load()
-
-    if q_seq_len > 1:
-        use_spec_dec = True
-    else:
-        use_spec_dec = False
-
-    ragged_suffix = "_ragged_q" if use_ragged_q else ""
-    op_name = f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}"
+    )
+    # Reuse the JIT module URI so the two names can never drift apart.
+    op_name = f"flashinfer::{spec.name}"
+    module = spec.build_and_load()
 
     @register_custom_op(
         op_name,
@@ -266,10 +261,11 @@ def xqa(
     q_cu_seq_lens : Optional[torch.Tensor], default=None
         Cumulative draft lengths ``[batch_size + 1]`` (torch.int32 or
         torch.uint32, on device) enabling ragged Q: requests may have
-        different draft lengths (each >= 1). When set, ``q`` and ``output``
-        are packed as ``[total_q_tokens, num_q_heads, head_dim]``,
-        ``q_seq_len`` must be the maximum draft length, and ``mask`` rows are
-        packed by the same cumulative offsets.
+        different draft lengths, including 0 for a request with no draft
+        tokens this step. When set, ``q`` and ``output`` are packed as
+        ``[total_q_tokens, num_q_heads, head_dim]``, ``q_seq_len`` must be
+        the maximum draft length, and ``mask`` rows are packed by the same
+        cumulative offsets.
 
     Note
     ----
@@ -298,7 +294,18 @@ def xqa(
         assert q_cu_seq_lens.dtype in (torch.int32, torch.uint32), (
             "q_cu_seq_lens must be int32 or uint32"
         )
+        assert q_cu_seq_lens.is_cuda, (
+            "q_cu_seq_lens must be a device tensor; the kernel dereferences its "
+            "pointer on the GPU"
+        )
+        assert q_cu_seq_lens.numel() == seq_lens.shape[0] + 1, (
+            f"q_cu_seq_lens must have batch_size + 1 = {seq_lens.shape[0] + 1} "
+            f"entries, got {q_cu_seq_lens.numel()}"
+        )
         assert output.shape == q.shape, "Output must match packed ragged q shape"
+        # Not checked (needs a device sync): entries non-decreasing, each
+        # length <= q_seq_len, last entry == q.shape[0]. Violations return
+        # garbage rows rather than raising.
 
     # Infer parameters from tensors
     batch_size = seq_lens.shape[0] if use_ragged_q else q.shape[0]
@@ -351,6 +358,10 @@ def xqa(
     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
         raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
 
+    # Ragged Q only changes the build when it suppresses the SPEC_Q_SEQ_LEN
+    # specialization; otherwise reuse the uniform module (a separate cache
+    # entry would re-register the same torch op name and fail).
+    ragged_build = use_ragged_q and q_seq_len * head_group_ratio <= 32
     xqa_module = get_xqa_module(
         q.dtype,
         k_cache.dtype,
@@ -360,7 +371,7 @@ def xqa(
         use_sliding_window,
         output.dtype,
         q_seq_len,
-        use_ragged_q,
+        ragged_build,
     )
 
     if q_seq_len > 1:
