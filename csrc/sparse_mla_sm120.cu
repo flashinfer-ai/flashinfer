@@ -68,8 +68,8 @@ inline ModelType resolve_model_type(int d_qk, int64_t model_type) {
   if (d_qk == 512) {
     const auto mt = static_cast<ModelType>(
         model_type == kAuto ? static_cast<int64_t>(ModelType::DSV4) : model_type);
-    TVM_FFI_ICHECK(mt == ModelType::DSV4)
-        << "d_qk=512 supports only model_type auto or DSV4; got " << model_type;
+    TVM_FFI_ICHECK(mt == ModelType::DSV4 || mt == ModelType::DSV4_NVFP4)
+        << "d_qk=512 supports model_type auto, DSV4, or DSV4_NVFP4; got " << model_type;
     return mt;
   }
   TVM_FFI_ICHECK(false) << "Unsupported d_qk=" << d_qk
@@ -84,6 +84,8 @@ inline int bytes_per_token(ModelType mt) {
       return 656;
     case ModelType::DSV4:
       return 584;
+    case ModelType::DSV4_NVFP4:
+      return 360;
   }
   TVM_FFI_ICHECK(false) << "Unsupported sparse MLA model type";
   return 0;
@@ -271,7 +273,8 @@ void SparseMlaSm120PagedAttention(
   TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "
                      << "model="
                      << (mt == ModelType::DSV3_2 ? "DSV3_2"
-                                                 : (mt == ModelType::GLM_NSA ? "GLM_NSA" : "DSV4"))
+                         : mt == ModelType::GLM_NSA ? "GLM_NSA"
+                         : mt == ModelType::DSV4_NVFP4 ? "DSV4_NVFP4" : "DSV4")
                      << " num_heads=" << num_heads << " topk=" << topk
                      << " page_block_size=" << page_block_size << " topk_extra=" << extra_topk
                      << " extra_page_block_size=" << extra_page_block_size;
