@@ -15,11 +15,11 @@ except ImportError:
 
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
+    cutlass_fused_moe,
+    fused_topk_deepseek,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
-    cutlass_fused_moe,
-    fused_topk_deepseek,
 )
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer import fp4_quantize, mxfp8_quantize
@@ -33,6 +33,7 @@ from .flashinfer_benchmark_utils import (
     get_device,
     print_perf_metrics,
     filter_backends_by_compute_capability,
+    validate_cutlass_variant_compute_capability,
     warn_if_pdl_unsupported,
 )
 from .moe_utils import (
@@ -275,8 +276,12 @@ def parse_moe_args(line, parser):
         type=str,
         required=False,
         default="base",
-        choices=["base", "fp8", "nvfp4"],
-        help="Variant for cutlass_fused_moe benchmark: base (no quant), fp8 (per-tensor), nvfp4 (fp4 blockscale)",
+        choices=["base", "fp8", "nvfp4", "mxfp4_fp8_humming"],
+        help=(
+            "Variant for cutlass_fused_moe benchmark: base (no quant), "
+            "fp8 (per-tensor), nvfp4 (fp4 blockscale), "
+            "mxfp4_fp8_humming (SM90 Humming-style MXFP4 x FP8)"
+        ),
     )
     parser.add_argument(
         "--quantized_input",
@@ -853,6 +858,7 @@ def testCutlassFusedMoe(args):
       - base: no quantization
       - fp8: per-tensor fp8 for weights and activation scale
       - nvfp4: FP4 block-scale weights, optional quantized input
+      - mxfp4_fp8_humming: SM90 Humming-style MXFP4 weights and online FP8 activations
     Supports TP/EP via tp_size/tp_rank and ep_size/ep_rank.
     """
     if args.verbose >= 1:
@@ -877,8 +883,11 @@ def testCutlassFusedMoe(args):
     tp_rank = getattr(args, "tp_rank", 0)
     ep_size = getattr(args, "ep_size", 1)
     ep_rank = getattr(args, "ep_rank", 0)
+    variant = getattr(args, "cutlass_variant", "base")
     is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
+    compute_capability = torch.cuda.get_device_capability(device)
+    validate_cutlass_variant_compute_capability(variant, compute_capability)
     backends = ["cutlass"]
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
@@ -890,69 +899,107 @@ def testCutlassFusedMoe(args):
     is_gated = is_gated_activation(activation_type)
     w1_rows = (2 if is_gated else 1) * intermediate_size
 
+    if num_experts % ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
+        )
+    if intermediate_size % tp_size != 0:
+        raise ValueError(
+            f"intermediate_size ({intermediate_size}) must be divisible by tp_size ({tp_size})"
+        )
+    local_intermediate_size = intermediate_size // tp_size
+    if variant == "mxfp4_fp8_humming":
+        if input_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "mxfp4_fp8_humming requires input_dtype float16 or bfloat16"
+            )
+        if hidden_size % 128 != 0 or local_intermediate_size % 128 != 0:
+            raise ValueError(
+                "mxfp4_fp8_humming requires hidden_size and the TP-local "
+                "intermediate_size to be divisible by 128; got "
+                f"hidden_size={hidden_size}, local_intermediate_size={local_intermediate_size}"
+            )
+
     torch.manual_seed(args.random_seed)
     x = torch.randn(num_tokens, hidden_size, dtype=input_dtype, device=device)
-    w31_weight = (
-        torch.randn(
-            num_experts,
-            w1_rows,
-            hidden_size,
-            dtype=input_dtype,
-            device=device,
-        )
-        / 10
-    )
-    w2_weight = (
-        torch.randn(
-            num_experts,
-            hidden_size,
-            intermediate_size,
-            dtype=input_dtype,
-            device=device,
-        )
-        / 10
-    )
 
-    # Routing
+    experts_per_rank = num_experts // max(ep_size, 1)
+    expert_start = ep_rank * experts_per_rank
+    expert_end = expert_start + experts_per_rank
+
+    if variant != "mxfp4_fp8_humming":
+        w31_weight = (
+            torch.randn(
+                num_experts,
+                w1_rows,
+                hidden_size,
+                dtype=input_dtype,
+                device=device,
+            )
+            / 10
+        )
+        w2_weight = (
+            torch.randn(
+                num_experts,
+                hidden_size,
+                intermediate_size,
+                dtype=input_dtype,
+                device=device,
+            )
+            / 10
+        )
+
+        # Build local weights per EP/TP like tests do.
+        w31_ep = w31_weight[expert_start:expert_end, :]
+        w2_ep = w2_weight[expert_start:expert_end, :]
+
+        def build_tp_shards(w31_ep_tensor: torch.Tensor, w2_ep_tensor: torch.Tensor):
+            if tp_size <= 1:
+                return w31_ep_tensor, w2_ep_tensor
+            shard = local_intermediate_size
+            start = tp_rank * shard
+            end = start + shard
+            if is_gated:
+                # Split w31 into w3 and w1 along intermediate dim.
+                w3_weight, w1_weight = torch.chunk(w31_ep_tensor, 2, dim=1)
+                w3_local = w3_weight[:, start:end, :]
+                w1_local = w1_weight[:, start:end, :]
+                w31_local = torch.cat([w3_local, w1_local], dim=1)
+            else:
+                w31_local = w31_ep_tensor[:, start:end, :]
+            w2_local = w2_ep_tensor[:, :, start:end]
+            return w31_local.contiguous(), w2_local.contiguous()
+
+        w31_local, w2_local = build_tp_shards(w31_ep, w2_ep)
+
+        if args.verbose >= 2:
+            print(f"[VVERBOSE] x.shape = {x.shape}")
+            print(f"[VVERBOSE] w31_weight.shape = {w31_weight.shape}")
+            print(f"[VVERBOSE] w2_weight.shape = {w2_weight.shape}")
+
+    # Keep routing after legacy weight generation so a fixed --random_seed
+    # continues to reproduce pre-Humming base/fp8/nvfp4 benchmark inputs.
     router_logits = torch.randn(
         num_tokens, num_experts, dtype=input_dtype, device=device
     )
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
-
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] x.shape = {x.shape}")
-        print(f"[VVERBOSE] w31_weight.shape = {w31_weight.shape}")
-        print(f"[VVERBOSE] w2_weight.shape = {w2_weight.shape}")
-
-    # Build local weights per EP/TP like tests do
-    experts_per_rank = num_experts // max(ep_size, 1)
-    expert_start = ep_rank * experts_per_rank
-    expert_end = expert_start + experts_per_rank
-    w31_ep = w31_weight[expert_start:expert_end, :]
-    w2_ep = w2_weight[expert_start:expert_end, :]
-
-    def build_tp_shards(w31_ep_tensor: torch.Tensor, w2_ep_tensor: torch.Tensor):
-        if tp_size <= 1:
-            return w31_ep_tensor, w2_ep_tensor
-        shard = intermediate_size // tp_size
-        start = tp_rank * shard
-        end = start + shard
-        if is_gated:
-            # Split w31 into w3 and w1 along intermediate dim
-            w3_weight, w1_weight = torch.chunk(w31_ep_tensor, 2, dim=1)
-            w3_local = w3_weight[:, start:end, :]
-            w1_local = w1_weight[:, start:end, :]
-            w31_local = torch.cat([w3_local, w1_local], dim=1)
-        else:
-            w31_local = w31_ep_tensor[:, start:end, :]
-        w2_local = w2_ep_tensor[:, :, start:end]
-        return w31_local.contiguous(), w2_local.contiguous()
-
-    w31_local, w2_local = build_tp_shards(w31_ep, w2_ep)
+    tflops_num_tokens = num_tokens
+    tflops_top_k = top_k
+    active_experts = int(selected_experts.unique().numel())
+    if ep_size > 1:
+        local_route_mask = (selected_experts >= expert_start) & (
+            selected_experts < expert_end
+        )
+        # The TFLOPS helper multiplies num_tokens by top_k. Pass the exact
+        # number of local routes once for rank-local EP accounting.
+        tflops_num_tokens = int(local_route_mask.sum().item())
+        tflops_top_k = 1
+        active_experts = int(selected_experts[local_route_mask].unique().numel())
 
     # Prepare variant-specific inputs (outside of the timed/captured region)
-    variant = getattr(args, "cutlass_variant", "base")
     out = torch.empty_like(x)
+    bandwidth_input_format = variant
+    bandwidth_weight_format = variant
 
     if variant == "base":
 
@@ -1138,6 +1185,133 @@ def testCutlassFusedMoe(args):
             w2_q,
             out,
         )
+    elif variant == "mxfp4_fp8_humming":
+        bandwidth_input_format = None
+        bandwidth_weight_format = "mxfp4"
+        try:
+            from flashinfer.fused_moe import (
+                preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+            )
+        except ImportError as err:
+            raise RuntimeError(
+                "mxfp4_fp8_humming requires a FlashInfer build containing PR #3738"
+            ) from err
+
+        # Generate the packed MXFP4 payload and E8M0 scales directly. Creating
+        # full BF16 weights first is both unnecessary and prohibitively large
+        # for production MoE shapes.
+        local_num_experts = experts_per_rank
+        local_w1_rows = (2 if is_gated else 1) * local_intermediate_size
+        w1_raw = torch.randint(
+            0,
+            256,
+            (local_num_experts, local_w1_rows, hidden_size // 2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        w1_raw_scale = torch.randint(
+            114,
+            128,
+            (local_num_experts, local_w1_rows, hidden_size // 32),
+            dtype=torch.uint8,
+            device=device,
+        )
+        w1_humming, w1_weight_scale, w1_residual = (
+            preprocess_moe_weights_for_sm90_mixed_gemm_humming(w1_raw, w1_raw_scale)
+        )
+        del w1_raw, w1_raw_scale
+
+        w2_raw = torch.randint(
+            0,
+            256,
+            (local_num_experts, hidden_size, local_intermediate_size // 2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        w2_raw_scale = torch.randint(
+            114,
+            128,
+            (local_num_experts, hidden_size, local_intermediate_size // 32),
+            dtype=torch.uint8,
+            device=device,
+        )
+        w2_humming, w2_weight_scale, w2_residual = (
+            preprocess_moe_weights_for_sm90_mixed_gemm_humming(w2_raw, w2_raw_scale)
+        )
+        del w2_raw, w2_raw_scale
+
+        # The kernel sorts routed tokens into expert-contiguous order before
+        # GEMM. Mirror that ordering for the per-token residual factors.
+        humming_epilogue_compensation = 64.0
+        selected_experts_long = selected_experts.to(torch.long)
+
+        def make_expert_contiguous_token_scale(residual: torch.Tensor):
+            route_counts = torch.bincount(
+                selected_experts_long.flatten(), minlength=num_experts
+            )
+            local_token_scale = torch.repeat_interleave(
+                residual * humming_epilogue_compensation,
+                route_counts[expert_start:expert_end],
+            )
+            # The binding requires one scale slot for every global routed token,
+            # while an EP rank only consumes its local expert-contiguous prefix.
+            padding = residual.new_ones(
+                selected_experts_long.numel() - local_token_scale.numel()
+            )
+            return torch.cat([local_token_scale, padding]).contiguous()
+
+        quant_scales = [
+            w1_weight_scale.view(torch.int32),
+            make_expert_contiguous_token_scale(w1_residual),
+            torch.ones((), device=device, dtype=torch.float32),
+            w2_weight_scale.view(torch.int32),
+            make_expert_contiguous_token_scale(w2_residual),
+        ]
+        del w1_residual, w2_residual
+        out = torch.zeros_like(x)
+
+        def run_cutlass(
+            x,
+            selected_experts,
+            routing_weights,
+            w1_humming,
+            w2_humming,
+            out,
+            quant_scales,
+        ):
+            return cutlass_fused_moe(
+                x,
+                selected_experts.to(torch.int),
+                routing_weights,
+                w1_humming,
+                w2_humming,
+                input_dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=quant_scales,
+                use_w4_group_scaling=True,
+                use_wfp4afp8_humming=True,
+                output=out,
+                enable_pdl=args.enable_pdl,
+                **_activation_kwarg(cutlass_fused_moe, activation_type),
+            )
+
+        input_args_for_bench = (
+            x,
+            selected_experts,
+            routing_weights,
+            w1_humming,
+            w2_humming,
+            out,
+            quant_scales,
+        )
+
+        if args.verbose >= 2:
+            print(f"[VVERBOSE] x.shape = {x.shape}")
+            print(f"[VVERBOSE] w1_humming.shape = {w1_humming.shape}")
+            print(f"[VVERBOSE] w2_humming.shape = {w2_humming.shape}")
     else:
         raise ValueError(f"Unknown cutlass_variant: {variant}")
 
@@ -1174,27 +1348,27 @@ def testCutlassFusedMoe(args):
     median_time = np.median(times)
     std_time = np.std(times)
     tflops = calculate_moe_tflops(
-        num_tokens,
+        tflops_num_tokens,
         hidden_size,
-        intermediate_size,
+        local_intermediate_size,
         num_experts,
-        top_k,
+        tflops_top_k,
         median_time,
         is_gated=is_gated,
     )
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
         hidden_size,
-        intermediate_size,
+        local_intermediate_size,
         num_experts,
         top_k,
         median_time,
         input_dtype,
         input_dtype,
-        input_format=variant,
-        weight_format=variant,
+        input_format=bandwidth_input_format,
+        weight_format=bandwidth_weight_format,
         routing_logits_dtype=router_logits.dtype,
-        active_experts=int(selected_experts.unique().numel()),
+        active_experts=active_experts,
         verbose=args.verbose,
         is_gated=is_gated,
     )
@@ -1219,7 +1393,9 @@ def testCutlassFusedMoe(args):
         cur_res["weight_layout"] = 0
         cur_res["use_routing_scales_on_input"] = False
         cur_res["input_dtype"] = input_dtype
-        cur_res["weight_dtype"] = input_dtype
+        cur_res["weight_dtype"] = (
+            "mxfp4" if variant == "mxfp4_fp8_humming" else input_dtype
+        )
         # CUTLASS fused MoE specific
         cur_res["cutlass_variant"] = variant
         cur_res["quantized_input"] = args.quantized_input
