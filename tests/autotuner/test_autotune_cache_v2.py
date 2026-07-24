@@ -109,7 +109,7 @@ def test_fresh_process_reuses_entry_without_profiling(cache_root, monkeypatch):
     # Simulate a new process: wipe all in-memory state.
     _fresh_process()
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -139,7 +139,7 @@ def test_corrupt_entry_is_a_miss_and_retuned(cache_root, monkeypatch):
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
 
     # Lookup-only mode: corrupt entry -> fallback tactic, no crash.
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -167,7 +167,7 @@ def test_embedded_key_mismatch_is_a_miss(cache_root, monkeypatch):
 
     _fresh_process()
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -184,7 +184,7 @@ def test_environment_hash_isolates_entries(cache_root, monkeypatch):
     )
     _fresh_process()
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -205,7 +205,7 @@ def test_compound_tuple_tactic_roundtrip(cache_root, monkeypatch):
 
     _fresh_process()
     _install_fake_profile(monkeypatch, times)
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner(tactics)], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -260,7 +260,7 @@ def test_explicit_root_directory(cache_root, monkeypatch, tmp_path):
     # A fresh process pointing at the same root reuses the entry.
     _fresh_process()
     calls.clear()
-    with autotune_v2(enable_tuning=False, cache_root=custom_root):  # os.PathLike form
+    with autotune_v2(mode="replay", cache_root=custom_root):  # os.PathLike form
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -292,7 +292,7 @@ def test_v2_disk_entries_cannot_leak_into_v1_file(cache_root, monkeypatch, tmp_p
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     v1_path = tmp_path / "user.json"
     other_op = "test::v1_only_op"
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -331,13 +331,13 @@ def test_serving_after_context_exit_reuses_entries(cache_root, monkeypatch):
 
 
 def test_hydrate_only_context_enables_reuse(cache_root, monkeypatch):
-    """vLLM pattern: enable_tuning=False + persistent_cache=True is a pure
+    """vLLM pattern: mode="replay" + persistent_cache=True is a pure
     hydrate step; serving outside the context reuses tuned winners."""
     _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
 
     _fresh_process()
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         pass  # attach only; no calls inside
     _, tactic = AutoTuner.get().choose_one(
         _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
@@ -450,7 +450,7 @@ def test_measure_policy_attach_carries_to_serving(cache_root, monkeypatch):
 
     _fresh_process()
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(enable_tuning=False, measure=policy):
+    with autotune_v2(mode="replay", measure=policy):
         pass  # hydrate with the matching policy
     _, tactic = AutoTuner.get().choose_one(
         _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
@@ -462,7 +462,7 @@ def test_measure_policy_attach_carries_to_serving(cache_root, monkeypatch):
     # the policy-tuned entry is invisible there.
     _fresh_process()
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -525,7 +525,7 @@ def test_measure_policy_all_none_is_default_identity(cache_root, monkeypatch):
     _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     _fresh_process()
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(enable_tuning=False, measure=MeasurementPolicy()):
+    with autotune_v2(mode="replay", measure=MeasurementPolicy()):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -541,22 +541,20 @@ def test_reattach_clears_decoded_memo(cache_root, monkeypatch):
     _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     tuner = _fresh_process()
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
     assert tactic == 1
     assert tuner._managed_decoded  # memo hydrated from store A
 
-    with autotune_v2(
-        enable_tuning=False, measure=MeasurementPolicy(execution_mode="eager")
-    ):
+    with autotune_v2(mode="replay", measure=MeasurementPolicy(execution_mode="eager")):
         assert not tuner._managed_decoded  # re-attach dropped store A's memo
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
     assert tactic == -1  # store B (eager env) is empty: miss, not A's winner
-    assert calls == []  # enable_tuning=False: no profiling either
+    assert calls == []  # mode="replay": no profiling either
 
 
 def test_policy_switch_reprofiles_in_process(cache_root, monkeypatch):
@@ -657,7 +655,7 @@ def test_default_path_races_and_can_win(cache_root, monkeypatch):
     # Fresh process: the persisted -1 replays with zero profiling.
     _fresh_process()
     calls = _install_fake_profile(monkeypatch, times={-1: 0.5, 0: 1.0})
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -721,7 +719,7 @@ def test_runner_reorder_replays_correct_runner(cache_root, monkeypatch):
 
     _fresh_process()
     calls = _install_fake_profile(monkeypatch, times)
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         runner, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunnerB((0, 1, 2)), DummyRunner((0,))], _CONFIG, inputs
         )
@@ -768,7 +766,7 @@ def test_invalid_cached_tactic_is_a_loud_miss(cache_root, monkeypatch):
 
     _fresh_process()
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(enable_tuning=False):
+    with autotune_v2(mode="replay"):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunnerRejecting()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -862,3 +860,15 @@ def test_in_memory_winner_is_revalidated_same_process(cache_root, monkeypatch):
     runner.reject = True  # e.g. a runtime shape this plan cannot serve
     _, tactic = AutoTuner.get().choose_one(_OP, [runner], _CONFIG, inputs)
     assert tactic == -1  # memory AND disk hits rejected -> clean fallback
+
+
+def test_invalid_mode_raises(cache_root):
+    # common mistake -> clear error
+    with (
+        pytest.raises(ValueError, match="mode must be 'tune' or 'replay'"),
+        autotune_v2(mode="serve"),
+    ):
+        pass
+    # the old boolean no longer works
+    with pytest.raises(ValueError), autotune_v2(mode=False):
+        pass
