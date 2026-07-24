@@ -206,8 +206,6 @@ class TestTacticEnumeration:
     mma_tiler M dimension and the same cluster_shape M dimension.
     """
 
-    pytestmark = _requires_dsl_arch
-
     @pytest.mark.parametrize("tile_size", [128, 256])
     def test_gemm1_tactics_match_tile_size(self, tile_size):
         """Every gemm1 tactic must have mma_tiler[0] == tile_size and

@@ -274,7 +274,7 @@ class BatchPrefillCuteDSLWrapper:
         """
         if not torch.cuda.is_available():
             raise RuntimeError("GPU is required to run this example!")
-        _require_dsl_arch(torch.cuda.current_device())
+        _require_dsl_arch(qo_indptr.device)
 
         self._batch_size = qo_indptr.shape[0] - 1
         self._num_qo_heads = num_qo_heads

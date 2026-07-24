@@ -427,7 +427,7 @@ class BatchMLADecodeCuteDSLWrapper:
             None uses standard softmax attention.
         """
 
-        _require_dsl_arch(torch.cuda.current_device())
+        _require_dsl_arch(self._device)
         self._kv_lora_rank = kv_lora_rank
         self._qk_rope_head_dim = qk_rope_head_dim
         self._num_heads = num_heads

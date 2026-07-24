@@ -936,8 +936,6 @@ def cute_dsl_fused_moe_nvfp4(
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
-    # native_only: the nvfp4 MoE rides block-scaled tcgen05.mma, which the
-    # DSL only accepts for sm_100a/sm_103a targets (not family-conditional).
     _require_cute_dsl_arch_for(x.device, native_only=True)
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
 

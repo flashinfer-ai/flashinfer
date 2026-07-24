@@ -47,7 +47,10 @@ class CustomCommunicator(CommBackend):
 
     def bcast(self, data: Any, root: int) -> Any:
         obj_list = [data]
-        dist.broadcast_object_list(obj_list, src=root, group=self._group)
+        global_root = (
+            dist.get_global_rank(self._group, root) if self._group is not None else root
+        )
+        dist.broadcast_object_list(obj_list, src=global_root, group=self._group)
         return obj_list[0]
 
     def barrier(self) -> None:

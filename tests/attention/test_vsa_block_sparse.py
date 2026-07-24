@@ -48,7 +48,7 @@ pytestmark = [
     pytest.mark.skipif(
         torch.cuda.is_available()
         and not is_cute_dsl_arch_supported(
-            *torch.cuda.get_device_capability(0), native_only=True
+            *torch.cuda.get_device_capability(), native_only=True
         ),
         reason="installed CuTe DSL cannot natively target this device "
         "architecture (VSA blk128 kernels are CuTe-DSL block-scaled)",

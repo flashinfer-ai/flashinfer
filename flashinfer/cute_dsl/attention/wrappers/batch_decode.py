@@ -798,7 +798,7 @@ class BatchDecodeCuteDSLWrapper:
         window_left: Optional[int] = None,
         window_right: Optional[int] = 0,
     ) -> None:
-        _require_dsl_arch(torch.cuda.current_device())
+        _require_dsl_arch(self.device)
         if kv_data_type is not None and kv_data_type != q_data_type:
             raise NotImplementedError(
                 "cute-dsl decode requires kv_data_type == q_data_type"
@@ -1280,7 +1280,7 @@ class BatchDecodePagedCuteDSLWrapper:
         non_blocking: bool = True,
         precompile_skip_softmax_kernel: bool = False,
     ) -> None:
-        _require_dsl_arch(torch.cuda.current_device())
+        _require_dsl_arch(self.device)
         if page_size not in (8, 16, 32, 64):
             raise ValueError(
                 f"cute-dsl paged decode supports page_size ∈ {{8,16,32,64}}, got {page_size}"

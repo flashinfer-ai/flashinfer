@@ -1310,6 +1310,7 @@ class TestUnifiedMoEConformance:
         act_pack, weight_pack, config, tensors = spec.make(256, max_tokens=256)
         layer = MoELayer(config)
         ref = spec.reference(act_pack, tensors)
+        checked = 0
         for backend_key in spec.backend_keys:
             runner = next(
                 (r for r in layer.runners if r.backend_key == backend_key), None
@@ -1321,6 +1322,11 @@ class TestUnifiedMoEConformance:
                 continue
             out = runner.forward(runner.pack_inputs(act_pack, weight_pack), tactic=-1)
             spec.check(out, ref, backend_key)
+            checked += 1
+        if checked == 0:
+            pytest.skip(
+                f"none of {spec.backend_keys} is available on this device/stack"
+            )
 
     def test_runner_with_local_expert_offset(self, spec):
         """Nonzero local shard offset through the real kernel: global ids in
