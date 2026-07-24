@@ -1,3 +1,9 @@
+# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
+# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
+# extend its axes/adapters. This file exists for the quant x routing x layout
+# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
+# as deliberate regression anchors.
+
 """
 Copyright (c) 2025 by FlashInfer team.
 
@@ -51,9 +57,11 @@ torch.manual_seed(42)
 cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
-@pytest.mark.parametrize("hidden_size", [1024, 2048, 4096])
-@pytest.mark.parametrize("intermediate_size", [1024, 2048, 4096])
+# The 4-over-6 x per-token-scaling matrix is the coverage here (only file exercising
+# it); shape fan-out kept to boundary corners.
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 4096])
+@pytest.mark.parametrize("intermediate_size", [2048])
 @pytest.mark.parametrize("num_experts", [32])
 @pytest.mark.parametrize("top_k", [4])
 @pytest.mark.parametrize("use_4over6", [False, True])

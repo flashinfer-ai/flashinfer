@@ -1,3 +1,8 @@
+# NOTE for future contributors (incl. AI agents): keep this file a SMALL curated
+# smoke set. New coverage (shapes, dtypes, backends, randomized breadth) belongs in
+# tests/gemm/test_unified_gemm_fuzz.py -- extend an adapter/axis there. Add cases
+# here only as deliberate regression anchors or for paths the fuzzer cannot express.
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -7,15 +12,84 @@ from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
 
 
-@pytest.mark.parametrize("b", [1, 16])
-@pytest.mark.parametrize("m", [1, 48, 128])
-@pytest.mark.parametrize("n", [64, 80, 10304])
-@pytest.mark.parametrize("k", [64, 256, 2688])
-@pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("mat2_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["cudnn", "cublas", "cutlass", "auto"])
-@pytest.mark.parametrize("auto_tuning", [True, False])
+# Curated smoke set. Randomized breadth over {b,m,n,k} x {e4m3,e5m2} x backends
+# (with a tight elementwise oracle, determinism and autotune-winner checks) lives in
+# tests/gemm/test_unified_gemm_fuzz.py's bmm_fp8 adapter; this file keeps one
+# deliberate case per backend / dtype-mix / autotune mode for fast bisection.
+_SMOKE_CASES = [
+    # b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_tuning
+    (
+        16,
+        48,
+        80,
+        256,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        "cudnn",
+        True,
+    ),
+    (
+        1,
+        128,
+        10304,
+        2688,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        torch.float16,
+        "cublas",
+        False,
+    ),
+    (
+        16,
+        1,
+        64,
+        2688,
+        torch.float8_e5m2,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        "cudnn",
+        False,
+    ),
+    (
+        1,
+        48,
+        80,
+        64,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float16,
+        "cublas",
+        True,
+    ),
+    (
+        16,
+        128,
+        80,
+        256,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        "cutlass",
+        True,
+    ),
+    (
+        1,
+        1,
+        10304,
+        256,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        "auto",
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "b,m,n,k,input_dtype,mat2_dtype,res_dtype,backend,auto_tuning", _SMOKE_CASES
+)
 def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_tuning):
     compute_capability = get_compute_capability(torch.device("cuda"))
     if backend == "cutlass" and compute_capability[0] not in [10, 11, 12]:

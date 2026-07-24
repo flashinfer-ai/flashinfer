@@ -1,3 +1,8 @@
+# NOTE for future contributors (incl. AI agents): keep this file a SMALL curated
+# smoke set. New coverage (shapes, dtypes, backends, randomized breadth) belongs in
+# tests/gemm/test_unified_gemm_fuzz.py -- extend an adapter/axis there. Add cases
+# here only as deliberate regression anchors or for paths the fuzzer cannot express.
+
 import warnings
 
 import pytest
@@ -9,18 +14,26 @@ from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.utils import get_compute_capability
 
 
-@pytest.mark.parametrize("b", [1, 16])
-@pytest.mark.parametrize("m", [128, 256, 512])
-@pytest.mark.parametrize("n", [128, 256, 512])
-@pytest.mark.parametrize("k", [128, 256, 512, 1024])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
-@pytest.mark.parametrize("res_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cudnn", "cutlass"])
-@pytest.mark.parametrize("auto_tuning", [True, False])
-def test_bmm_mxfp8(
-    b, m, n, k, input_dtype, is_sf_swizzled_layout, res_dtype, backend, auto_tuning
-):
+# Curated smoke set. Randomized breadth over {b,m,n,k} x backend (swizzled scales,
+# tight elementwise oracle, determinism, autotune-winner validation, and the tracked
+# #3604 b>1/M%128 ledger) lives in tests/gemm/test_unified_gemm_fuzz.py's bmm_mxfp8
+# adapter; keep swizzled + linear scale layouts and autotune on/off per backend.
+_SMOKE_CASES = [
+    # b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning
+    (16, 128, 256, 1024, True, "cudnn", True),
+    (1, 512, 128, 256, False, "cudnn", False),
+    (16, 256, 512, 128, False, "cudnn", True),
+    (16, 128, 128, 512, True, "cutlass", False),
+    (1, 256, 512, 1024, True, "cutlass", True),
+]
+
+
+@pytest.mark.parametrize(
+    "b,m,n,k,is_sf_swizzled_layout,backend,auto_tuning", _SMOKE_CASES
+)
+def test_bmm_mxfp8(b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning):
+    input_dtype = torch.bfloat16
+    res_dtype = torch.bfloat16
     compute_capability = get_compute_capability(torch.device("cuda"))
     if backend == "cudnn" and compute_capability[0] != 10:
         pytest.skip("bmm_mxfp8 cudnn backend requires SM10x.")
@@ -39,6 +52,11 @@ def test_bmm_mxfp8(
     # Block size is 32 in MXFP8
     assert input_mxfp8.numel() == (input_scale.numel() * 32)
 
+    # The cuDNN override-shape path requires B as a COLUMN-major [b, k, n] VIEW
+    # (K contiguous): quantize the contiguous [b, n, k] weight and pass the
+    # transpose of the quantized tensor. A .contiguous() on the transpose flips
+    # it back to row-major and is rejected once cudnn-frontend >= 1.24 enables
+    # the override path (CI's older frontend hid this).
     weight = torch.randn([b, n, k], device="cuda", dtype=input_dtype)
     weight_mxfp8, weight_scale = mxfp8_quantize(weight, is_sf_swizzled_layout)
     mat2_mxfp8 = weight_mxfp8.transpose(-2, -1)

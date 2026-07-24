@@ -1,3 +1,9 @@
+# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
+# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
+# extend its axes/adapters. This file exists for the quant x routing x layout
+# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
+# as deliberate regression anchors.
+
 """
 Copyright (c) 2025 by FlashInfer team.
 
@@ -859,13 +865,16 @@ class TestAutotunerBucketConfig:
 class TestCuteDslFusedMoeFunctional:
     """Tests for the functional API: cute_dsl_fused_moe_nvfp4."""
 
+    # NVFP4 numeric breadth is fuzzed in tests/moe/test_unified_moe_fuzz.py (CuteDSL
+    # runner); keep boundary top_k, the non-pow2 token anchor (515), and both
+    # activation / per-token-scaling modes.
     @pytest.mark.parametrize(
         "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
     )
     @pytest.mark.parametrize("use_per_token_activation", [False, True])
-    @pytest.mark.parametrize("top_k", [1, 2, 8])
-    @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
-    @pytest.mark.parametrize("num_experts", [256, 384])
+    @pytest.mark.parametrize("top_k", [1, 8])
+    @pytest.mark.parametrize("num_tokens", [515])
+    @pytest.mark.parametrize("num_experts", [384])
     @pytest.mark.parametrize(
         "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
     )
@@ -1125,11 +1134,13 @@ class TestCuteDslFusedMoeFunctional:
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
-    @pytest.mark.parametrize("num_tokens", [128, 256, 512])
+    # Wrapper-vs-reference breadth is fuzzed (see note above); keep one shape point
+    # per remaining axis.
+    @pytest.mark.parametrize("num_tokens", [256])
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("top_k", [2, 8])
-    @pytest.mark.parametrize("num_experts", [256, 384])
+    @pytest.mark.parametrize("num_experts", [384])
     def test_wrapper_accuracy(
         self,
         num_tokens: int,

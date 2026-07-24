@@ -3077,9 +3077,13 @@ RENORMALIZE_ZERO_HIDDEN_STATES = [
     pytest.param(False, id="RandomHiddenStates"),
 ]
 
-RENORMALIZE_NUM_TOKENS = [8, 768, 3072]
+# Shape fan-out is deliberately SMALL (boundary token counts + boundary intermediate
+# sizes only): the quant x routing x weight-layout matrix below is the coverage that
+# matters for kernel selection, and randomized shape breadth lives in
+# tests/moe/test_unified_moe_fuzz.py. Extend the fuzzer, not these lists.
+RENORMALIZE_NUM_TOKENS = [8, 3072]
 RENORMALIZE_HIDDEN_SIZES = [1024]
-RENORMALIZE_INTERMEDIATE_SIZES = [1024, 768, 512, 384]
+RENORMALIZE_INTERMEDIATE_SIZES = [1024, 384]
 
 RENORMALIZE_ROUTING_CONFIGS = [
     pytest.param(
