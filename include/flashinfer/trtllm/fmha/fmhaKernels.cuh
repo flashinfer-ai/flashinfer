@@ -259,8 +259,7 @@ class TllmGenFmhaKernel {
     }
 
     // Prepare the kernel parameters.
-    auto kernelParams = KernelParams::setKernelParams(
-        params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
+    auto kernelParams = KernelParams::setKernelParams(params, kernelMeta, ctaLaunchParams);
 
     // Override SageAttention parameters.
     auto sageParamEncode = [](int blockSize) -> int32_t {
@@ -318,8 +317,7 @@ class TllmGenFmhaKernel {
                          "fallback to GmemReduction.");
         // Rebuild kernelParams: setKernelParams uses kernelMeta (TMA descriptors, tile shapes)
         // which changed when switching from CgaSmemReduction to GmemReduction kernel.
-        kernelParams = KernelParams::setKernelParams(
-            params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
+        kernelParams = KernelParams::setKernelParams(params, kernelMeta, ctaLaunchParams);
         buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
         setNonPortableClusterIfNeeded(func, ctaLaunchParams);
       }
@@ -492,10 +490,26 @@ class TllmGenFmhaKernel {
       // benefits of a shorter mainloop.
       int const maxNumCtasPerSeqKv =
           (maxAttentionWindow + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv);
-      // Compute numCtasPerSeqKv.
-      numCtasPerSeqKv = std::min(
-          maxNumCtasPerSeqKv,
-          std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+
+      int const baseCtas = numCtasX * numCtasY * numCtasZ;
+      numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv,
+                                 std::max(1, int32_t(params.mMultiProcessorCount / baseCtas)));
+
+      // When the longest sequence needs more KV splits than the standard
+      // heuristic provides, oversubscribe the SMs. This helps mixed-length batches
+      // where long sequences get insufficient KV parallelism.
+      int const kMinTokensPerCta = getEnvKvOversubMinTokensPerCta();
+      int const kMaxOccupancyWaves = getEnvKvOversubMaxWaves();
+      int const kMaxSplits = getEnvKvOversubMaxSplits();
+      int const desiredSplits = (params.mMaxSeqLenKv + kMinTokensPerCta - 1) / kMinTokensPerCta;
+      if (numCtasPerSeqKv < desiredSplits && desiredSplits > getEnvKvOversubMinDesiredSplits()) {
+        int const maxSplitsFromSMs =
+            std::max(1, int32_t(kMaxOccupancyWaves * params.mMultiProcessorCount / baseCtas));
+        numCtasPerSeqKv =
+            std::max(numCtasPerSeqKv,
+                     std::min({desiredSplits, maxSplitsFromSMs, maxNumCtasPerSeqKv, kMaxSplits}));
+      }
+
       // Update the numCtasX.
       numCtasX *= numCtasPerSeqKv;
       // The current total number of CTAs.

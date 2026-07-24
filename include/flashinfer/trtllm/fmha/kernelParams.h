@@ -647,9 +647,9 @@ struct KernelParams {
   }
 
   // Setup the kernel parameters.
-  template <class FmhaOptions_, class KernelMeta>
+  template <class FmhaOptions_, class KernelMeta, class CtaLaunchParams>
   static KernelParams setKernelParams(FmhaOptions_ const& options, KernelMeta const& kernelMeta,
-                                      int32_t maxNumCtasQ, int32_t maxNumCtasKv) {
+                                      CtaLaunchParams const& ctaLaunchParams) {
     // Create the return struct.
     KernelParams params;
     // Memset the kernel parameters to 0.
@@ -841,7 +841,11 @@ struct KernelParams {
     params.ptrAttentionSinks = options.ptrAttentionSinks;
 
     // The partial buffers' pointers when the multiCtasKv mode is enabled.
-    int64_t partialStatsBufferSize = options.mMultiProcessorCount * kernelMeta.mStepQ;
+    // partialStats and partialO are packed sequentially in the workspace. Each
+    // CTA writes to a unique slot, so the offset must accommodate all CTAs.
+    int64_t partialStatsBufferSize = static_cast<int64_t>(ctaLaunchParams.mNumCtasX) *
+                                     ctaLaunchParams.mNumCtasY * ctaLaunchParams.mNumCtasZ *
+                                     kernelMeta.mStepQ;
     params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
     params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
     params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;
@@ -876,8 +880,8 @@ struct KernelParams {
 
     params.mMaxSeqLenQ = options.mMaxSeqLenQ;
     params.mMaxSeqLenKv = options.mMaxSeqLenKv;
-    params.mMaxNumCtasQ = maxNumCtasQ;
-    params.mMaxNumCtasKv = maxNumCtasKv;
+    params.mMaxNumCtasQ = ctaLaunchParams.mMaxNumCtasQ;
+    params.mMaxNumCtasKv = ctaLaunchParams.mMaxNumCtasKv;
     params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
     // TODO: just use mMaxSeqLenQ for number of MTP tokens.
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
