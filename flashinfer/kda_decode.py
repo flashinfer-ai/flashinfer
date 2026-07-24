@@ -29,13 +29,11 @@ import torch
 from .api_logging import flashinfer_api
 from .trace.templates.kda import recurrent_kda_trace
 
-try:
-    from .kda_kernels.recurrent_kda import run_recurrent_kda as _run_recurrent_kda
+from .kda_kernels import run_recurrent_kda as _run_recurrent_kda
 
-    _RECURRENT_KDA_AVAILABLE = True
-except (ImportError, RuntimeError):
-    _run_recurrent_kda = None
-    _RECURRENT_KDA_AVAILABLE = False
+# None when the CuTe DSL is missing or cannot target this device
+# (see flashinfer/kda_kernels/__init__.py).
+_RECURRENT_KDA_AVAILABLE = _run_recurrent_kda is not None
 
 
 @flashinfer_api(trace=recurrent_kda_trace)

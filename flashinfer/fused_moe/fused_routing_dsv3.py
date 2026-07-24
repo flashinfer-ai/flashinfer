@@ -14,7 +14,7 @@ from flashinfer.utils import (
 )
 
 
-@supported_compute_capability([89, 90, 100, 103, 120, 121])
+@supported_compute_capability([89, 90, 100, 103, 107, 120, 121])
 def _check_dsv3_fused_routing_supported(
     scores,
     bias,

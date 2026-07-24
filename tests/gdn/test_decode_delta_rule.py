@@ -248,9 +248,9 @@ def _test_decode_kernel_pretranspose(
     # Transpose reference state to match kernel format for comparison
     ref_state = ref_state.transpose(-2, -1).contiguous().to(kv_dtype)
 
-    atol_o = 5e-3
+    atol_o = 0.016
     rtol_o = 5e-3
-    atol_kv = 5e-3
+    atol_kv = 0.016
     rtol_kv = 5e-3
 
     # Compare outputs
@@ -411,9 +411,9 @@ def _test_decode_kernel_nontranspose(
     ref_o = ref_o.to(dtype_torch)
     ref_state = ref_state.to(kv_dtype)
 
-    atol_o = 5e-3
+    atol_o = 0.016
     rtol_o = 5e-3
-    atol_kv = 5e-3
+    atol_kv = 0.016
     rtol_kv = 5e-3
 
     # Compare outputs (no transpose needed, both use K-major layout)

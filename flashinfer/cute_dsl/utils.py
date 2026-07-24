@@ -16,9 +16,10 @@ limitations under the License.
 
 import ctypes
 import functools
+import os
 import importlib.util
 import warnings
-from typing import Union, Tuple
+from typing import Optional, Tuple, Union
 
 import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
@@ -53,6 +54,82 @@ def is_cute_dsl_available() -> bool:
         importlib.util.find_spec("cutlass") is not None
         and importlib.util.find_spec("cutlass.cute") is not None
     )
+
+
+@functools.cache
+def is_cute_dsl_arch_supported(
+    major: int, minor: int, native_only: bool = False
+) -> bool:
+    r"""Return ``True`` when the installed CuTe DSL can target compute
+    capability ``(major, minor)``.
+
+    :func:`is_cute_dsl_available` only checks that the package is importable;
+    the installed DSL may still lack the *device's* architecture (its
+    ``cutlass.base_dsl.arch.Arch`` enum resolves names like ``sm_107a`` and
+    raises ``KeyError`` for unknown members — e.g. a DSL release that
+    predates the device). Dispatchers must consult this before selecting a
+    CuTe-DSL backend so unsupported devices get a clean fallback/skip instead
+    of a ``KeyError`` from deep inside kernel compilation.
+
+    When the device's own architecture is missing but the DSL has the
+    family-conditional target for its major line (e.g. ``sm_100f`` for an
+    sm_107 device), kernels restricted to family-portable features still
+    compile and run correctly; this probe then pins the DSL's default target
+    via the ``CUTE_DSL_ARCH`` environment variable and reports the arch
+    supported. Pass ``native_only=True`` for kernels that require
+    architecture-specific instructions (e.g. block-scaled ``tcgen05.mma``
+    kinds, which the DSL only accepts for ``sm_100a``/``sm_103a`` targets).
+    """
+    if not is_cute_dsl_available():
+        return False
+    try:
+        from cutlass.base_dsl.arch import Arch
+
+        for name in (f"sm_{major}{minor}a", f"sm_{major}{minor}"):
+            try:
+                Arch[name]
+                return True
+            except KeyError:
+                continue
+        if native_only:
+            return False
+        family = _family_fallback_arch(major, minor)
+        if family is not None:
+            # Pin the DSL's default compile target before the first kernel
+            # compile; without this the DSL derives the target from the
+            # device and raises KeyError. An explicit user setting wins.
+            os.environ.setdefault("CUTE_DSL_ARCH", family)
+            return True
+        return False
+    except Exception:
+        # Arch module layout changed or import failed: fall back to
+        # "package available" semantics rather than disabling the backend.
+        return True
+
+
+def _family_fallback_arch(major: int, minor: int) -> Optional[str]:
+    r"""Return the DSL's family-conditional target covering ``(major,
+    minor)`` (e.g. ``"sm_100f"`` for an sm_107 device), or ``None``."""
+    try:
+        from cutlass.base_dsl.arch import Arch
+
+        name = f"sm_{major}0f"
+        Arch[name]
+        return name
+    except Exception:
+        return None
+
+
+def require_cute_dsl_arch(device, native_only: bool = False) -> None:
+    r"""Raise :class:`NotImplementedError` when the installed CuTe DSL cannot
+    target ``device``'s architecture (see :func:`is_cute_dsl_arch_supported`)."""
+    import torch
+
+    major, minor = torch.cuda.get_device_capability(device)
+    if not is_cute_dsl_arch_supported(major, minor, native_only=native_only):
+        raise NotImplementedError(
+            f"the installed CuTe DSL does not support sm_{major}{minor} on this device"
+        )
 
 
 def get_cutlass_dtype(dtype: str) -> cutlass.dtype:

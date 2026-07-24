@@ -20,6 +20,8 @@ import torch
 from cutlass import Float32, Int32
 
 from flashinfer.api_logging import flashinfer_api
+
+from ...utils import require_cute_dsl_arch as _require_dsl_arch
 from flashinfer.trace.templates.attention import cute_dsl_batch_mla_run_trace
 from flashinfer.utils import device_support_pdl
 from flashinfer.cute_dsl.utils import (
@@ -424,6 +426,8 @@ class BatchMLADecodeCuteDSLWrapper:
             Attention variant (ALiBi, SoftCapping, AttentionWithSink, etc.).
             None uses standard softmax attention.
         """
+
+        _require_dsl_arch(torch.cuda.current_device())
         self._kv_lora_rank = kv_lora_rank
         self._qk_rope_head_dim = qk_rope_head_dim
         self._num_heads = num_heads

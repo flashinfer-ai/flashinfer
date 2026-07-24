@@ -21,6 +21,8 @@ import cutlass.cute as cute
 from cutlass.cute.typing import Int32
 
 from flashinfer.api_logging import flashinfer_api
+
+from ...utils import require_cute_dsl_arch as _require_dsl_arch
 from flashinfer.trace.templates.attention import cute_dsl_batch_prefill_run_trace
 
 from ..config import AttentionConfig, AttentionFusion
@@ -243,6 +245,7 @@ class BatchPrefillCuteDSLWrapper:
         """
         if not torch.cuda.is_available():
             raise RuntimeError("GPU is required to run this example!")
+        _require_dsl_arch(torch.cuda.current_device())
 
         self._batch_size = qo_indptr.shape[0] - 1
         self._num_qo_heads = num_qo_heads
