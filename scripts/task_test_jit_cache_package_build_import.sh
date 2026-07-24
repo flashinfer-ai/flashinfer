@@ -143,17 +143,22 @@ arches = ["7.5", "8.0", "8.9", "9.0a"]
 if cuda_ver is not None:
     try:
         major, minor = map(int, cuda_ver.split(".")[:2])
+        machine = (os.environ.get("ARCH") or platform.machine()).lower()
+        is_aarch64 = machine in ("aarch64", "arm64")
         if (major, minor) >= (13, 0):
             arches.append("10.0a")
             arches.append("10.3a")
-            machine = (os.environ.get("ARCH") or platform.machine()).lower()
-            if machine in ("aarch64", "arm64"):
+            if is_aarch64:
                 arches.append("11.0a")
             arches.append("12.0f")
+            if is_aarch64:
+                arches.append("12.1a")
         elif (major, minor) >= (12, 9):
             arches.append("10.0a")
             arches.append("10.3a")
             arches.append("12.0f")
+            if is_aarch64:
+                arches.append("12.1a")
         elif (major, minor) >= (12, 8):
             arches.append("10.0a")
             arches.append("12.0a")

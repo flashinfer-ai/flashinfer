@@ -599,7 +599,8 @@ When ready to distribute:
 ```bash
 # Build flashinfer-jit-cache package
 cd flashinfer-jit-cache
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 11.0a 12.0f"
+# The full list below needs CUDA 13.0; trim it for older toolkits.
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f 12.1a"
 python -m build --no-isolation --wheel
 ```
 
