@@ -18,10 +18,17 @@ limitations under the License.
 # Do "from .jit import env as jit_env" and use "jit_env.xxx" instead.
 # This helps AOT script to override envs.
 
+import logging
 import os
 import pathlib
 from ..compilation_context import CompilationContext
 from ..version import __version__ as flashinfer_version
+
+# NOTE: use stdlib logging (namespaced under flashinfer.jit) instead of the
+# FlashInferJITLogger from core.py -- core.py imports this module, so importing
+# it here would create a circular import. A plain warning is fine because
+# _get_cubin_dir() only runs once, at module import.
+logger = logging.getLogger("flashinfer.jit")
 
 
 def has_flashinfer_jit_cache() -> bool:
@@ -59,11 +66,22 @@ _package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 def _get_cubin_dir():
     """
     Get the cubin directory path with the following priority:
-    1. flashinfer-cubin package if installed
-    2. Environment variable FLASHINFER_CUBIN_DIR
+    1. Environment variable FLASHINFER_CUBIN_DIR
+    2. flashinfer-cubin package if installed
     3. Default cache directory
     """
-    # First check if flashinfer-cubin package is installed
+    # First check environment variable
+    env_dir = os.getenv("FLASHINFER_CUBIN_DIR")
+    if env_dir:
+        if has_flashinfer_cubin():
+            logger.warning(
+                "FLASHINFER_CUBIN_DIR=%s overrides the installed flashinfer-cubin "
+                "package; cubins will be read from that path instead of the package.",
+                env_dir,
+            )
+        return pathlib.Path(env_dir)
+
+    # Then check if flashinfer-cubin package is installed
     if has_flashinfer_cubin():
         import flashinfer_cubin
 
@@ -84,11 +102,6 @@ def _get_cubin_dir():
             )
 
         return pathlib.Path(flashinfer_cubin.get_cubin_dir())
-
-    # Then check environment variable
-    env_dir = os.getenv("FLASHINFER_CUBIN_DIR")
-    if env_dir:
-        return pathlib.Path(env_dir)
 
     # Fall back to default cache directory
     return FLASHINFER_CACHE_DIR / "cubins"
