@@ -568,6 +568,35 @@ def top_k(
       for heap-based methods, making it faster for large vocabularies.
     - For small vocabularies (< 1000), ``torch.topk`` may be faster.
 
+    Rows with fewer than k finite entries
+    -------------------------------------
+    The input may contain ``-inf`` (e.g. masked-out positions). When a row
+    consists of ``m < k`` finite entries and every remaining position is
+    exactly ``-inf``, the output still has exactly ``k`` slots per row,
+    filled as follows (all backends):
+
+    - All ``m`` finite entries are returned, and every returned pair satisfies
+      ``values[i, j] == input[i, indices[i, j]]``.
+    - The remaining ``k - m`` slots hold ``value == -inf`` paired with a valid
+      in-range index of some ``-inf`` position. Indices within a row are
+      distinct; no sentinel index (such as ``-1``) is used. A row with no
+      finite entry at all yields ``k`` such ``-inf`` slots.
+    - With ``sorted=False`` there is no guarantee that the finite entries
+      occupy the leading slots: ``-inf`` padding may appear at any slot
+      position. With ``sorted=True`` values are sorted descending, so the
+      finite entries are front-packed and the ``-inf`` padding forms the tail.
+    - Which ``-inf`` positions fill the padding slots is unspecified and may
+      differ run to run in the default non-deterministic mode. With
+      ``deterministic=True`` the selection is repeatable, and with
+      ``tie_break=1``/``2`` the padding follows the same rule as any other
+      tie at the selection boundary: the smallest / largest indices among the
+      ``-inf`` positions.
+
+    Callers that need to detect the padding slots should test
+    ``values == float("-inf")`` rather than rely on slot position or on a
+    sentinel index. Rows containing ``NaN`` or ``+inf`` are outside this
+    contract: their treatment is unspecified.
+
     Examples
     --------
     >>> import torch
