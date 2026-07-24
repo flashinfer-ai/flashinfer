@@ -8,7 +8,11 @@ from cutlass.cute.nvgpu import warp, warpgroup, cpasync
 from ...utils import get_device_sm_count, _get_cache_buf
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
-from .custom_compile_cache import KeyedCompileMixin, cached_compile
+from .custom_compile_cache import (
+    KeyedCompileMixin,
+    cached_compile,
+    sm12x_compile_options,
+)
 from .collective_inverse_hmma import CollectiveInverse
 from .helpers import SM80, round_down
 from .schedule import WorkDesc
@@ -2115,6 +2119,6 @@ def delta_rule_prefill_dsl(
     compiled_delta_rule_kernel = cached_compile(
         delta_rule_kernel,
         *kernel_args,
-        compile_options=(cute.GPUArch("sm_120a"),),
+        compile_options=sm12x_compile_options(q.device),
     )
     compiled_delta_rule_kernel(*kernel_args)
