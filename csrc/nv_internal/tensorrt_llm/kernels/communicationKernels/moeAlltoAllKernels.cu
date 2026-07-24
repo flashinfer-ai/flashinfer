@@ -35,8 +35,25 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 #define DISABLE_SYNC_FOR_PROFILING 0
 
 constexpr int kEp4Size = 4;
+// Two 32-thread warps can cover at most 64 16-byte activation vectors.
 constexpr int kCompactDispatchMaxPayloadBytes = 1024;
 constexpr int kCompactDispatchBlockSize = 128;
+constexpr int kDispatchWarpSize = 32;
+constexpr int kDispatchActivationWarps = 2;
+constexpr int kDispatchWideVectorBytes = 16;
+constexpr int kDispatchMetadataVectorBytes = 8;
+constexpr int kDispatchHalfWarpSize = 16;
+constexpr int kNvfp4ActivationToScaleRatio = 8;
+constexpr int kNvfp4H2048ActivationBytes = 2048 / 2;
+constexpr int kNvfp4H2048ScaleBytes = 2048 / 16;
+constexpr int kTopK22MetadataBytes = 22 * sizeof(int32_t);
+constexpr int kNvfp4H2048ActivationWorkers = kNvfp4H2048ActivationBytes / kDispatchWideVectorBytes;
+constexpr int kNvfp4H2048ScaleWorkers = kNvfp4H2048ScaleBytes / kDispatchWideVectorBytes;
+constexpr int kTopK22MetadataWorkers = kTopK22MetadataBytes / kDispatchMetadataVectorBytes;
+static_assert(kCompactDispatchMaxPayloadBytes % kDispatchWideVectorBytes == 0);
+static_assert(kCompactDispatchMaxPayloadBytes / kDispatchWideVectorBytes <=
+              kDispatchActivationWarps * kDispatchWarpSize);
+static_assert(kCompactDispatchBlockSize == (kDispatchActivationWarps + 2) * kDispatchWarpSize);
 
 #ifndef DISABLE_TIMEOUT
 #define DISABLE_TIMEOUT 0
@@ -46,6 +63,30 @@ constexpr int kCompactDispatchBlockSize = 128;
 template <typename T>
 __host__ __device__ inline T ceilDiv(T m, T n) {
   return (m + n - 1) / n;
+}
+
+// The phased schedule reserves two warps for packed activations, one for scales,
+// and splits the last warp between the two routing-metadata payloads. The
+// activation cap intentionally limits this path to hidden sizes up to 2048.
+static bool isPhasedNvfp4PayloadLayout(DispatchKernelPointers const& ptrs, int num_payloads,
+                                       int top_k) {
+  if (num_payloads != 4 || top_k <= kEp4Size) {
+    return false;
+  }
+
+  int const activation_bytes = ptrs.payload_bytes_per_token[0];
+  int const scale_bytes = ptrs.payload_bytes_per_token[1];
+  int const metadata_bytes = top_k * static_cast<int>(sizeof(int32_t));
+  bool const validated_top_k_layout = top_k < 22 || activation_bytes == kNvfp4H2048ActivationBytes;
+  return validated_top_k_layout && activation_bytes > 0 &&
+         activation_bytes <= kCompactDispatchMaxPayloadBytes &&
+         activation_bytes % kDispatchWideVectorBytes == 0 && scale_bytes > 0 &&
+         scale_bytes % kDispatchWideVectorBytes == 0 &&
+         activation_bytes == kNvfp4ActivationToScaleRatio * scale_bytes &&
+         metadata_bytes % kDispatchMetadataVectorBytes == 0 &&
+         metadata_bytes / kDispatchMetadataVectorBytes <= kDispatchHalfWarpSize &&
+         ptrs.payload_bytes_per_token[2] == metadata_bytes &&
+         ptrs.payload_bytes_per_token[3] == metadata_bytes;
 }
 
 // Macros for concise launch-time specialization
@@ -291,8 +332,8 @@ template <int VEC_SIZE, int TOP_K>
 __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
                                          int max_tokens_per_rank, int payload_idx,
                                          DispatchKernelPointers const& ptrs,
-                                         int const* topk_target_ranks,
-                                         int const* topk_send_indices) {
+                                         int const* topk_target_ranks, int const* topk_send_indices,
+                                         int worker_idx, int num_workers) {
   using flashinfer::vec_t;
 
   // Precompute destination base pointers per k
@@ -314,8 +355,8 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
   }
 
   // TODO: process all payloads. index could be reused.
-  int const stride = blockDim.x * VEC_SIZE;
-  for (int offset = threadIdx.x * VEC_SIZE; offset < bytes_per_token; offset += stride) {
+  int const stride = num_workers * VEC_SIZE;
+  for (int offset = worker_idx * VEC_SIZE; offset < bytes_per_token; offset += stride) {
     vec_t<uint8_t, VEC_SIZE> v;
     v.load(src_ptr + offset);
 
@@ -337,19 +378,24 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
                                     int const* topk_target_ranks, int const* topk_send_indices) {
   if (bytes_per_token % 16 == 0) {
     vectorized_dispatch_impl<16, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                        payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+                                        payload_idx, ptrs, topk_target_ranks, topk_send_indices,
+                                        threadIdx.x, blockDim.x);
   } else if (bytes_per_token % 8 == 0) {
     vectorized_dispatch_impl<8, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices,
+                                       threadIdx.x, blockDim.x);
   } else if (bytes_per_token % 4 == 0) {
     vectorized_dispatch_impl<4, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices,
+                                       threadIdx.x, blockDim.x);
   } else if (bytes_per_token % 2 == 0) {
     vectorized_dispatch_impl<2, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices,
+                                       threadIdx.x, blockDim.x);
   } else {
     vectorized_dispatch_impl<1, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices,
+                                       threadIdx.x, blockDim.x);
   }
 }
 
@@ -377,7 +423,8 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token
 // One CTA processes one token and all its payloads.
 // ============================================================================
 
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool COMPACT_EP4>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool COMPACT_EP4,
+          bool PHASE_H2048_NVFP4 = false, bool PHASE_NVFP4_PAYLOADS = false>
 __global__ void moeA2ADispatchKernel(
     int32_t const* token_selected_experts,  // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
@@ -386,6 +433,12 @@ __global__ void moeA2ADispatchKernel(
     int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts,
     bool enable_pdl) {
   static_assert(!COMPACT_EP4 || TOP_K > kEp4Size);
+  static_assert(!PHASE_H2048_NVFP4 || TOP_K == 22);
+  static_assert(!PHASE_NVFP4_PAYLOADS ||
+                (TOP_K > kEp4Size && TOP_K % 2 == 0 &&
+                 TOP_K * static_cast<int>(sizeof(int32_t)) / kDispatchMetadataVectorBytes <=
+                     kDispatchHalfWarpSize));
+  static_assert(!PHASE_H2048_NVFP4 || !PHASE_NVFP4_PAYLOADS);
   int thread_idx = threadIdx.x;
   int local_token_idx = blockIdx.x;
 
@@ -490,14 +543,76 @@ __global__ void moeA2ADispatchKernel(
       }
     }
 
-    // Perform a single source load and fan out to each unique destination.
-    for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
-      uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
-      int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-      uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
+    if constexpr (PHASE_H2048_NVFP4) {
+      // Keep compile-time bounds for the measured Nemotron H2048 target.
+      int warp_id = thread_idx / warpSize;
+      int lane_id = thread_idx % warpSize;
+      if (warp_id < kDispatchActivationWarps) {
+        auto const* src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[0]) +
+                          static_cast<size_t>(local_token_idx) * kNvfp4H2048ActivationBytes;
+        vectorized_dispatch_impl<16, NUM_DESTINATIONS>(
+            src, kNvfp4H2048ActivationBytes, rank_id, max_tokens_per_rank, 0, ptrs, target_ranks,
+            send_indices, thread_idx, kNvfp4H2048ActivationWorkers);
+      } else if (warp_id == kDispatchActivationWarps && lane_id < kNvfp4H2048ScaleWorkers) {
+        auto const* src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[1]) +
+                          static_cast<size_t>(local_token_idx) * kNvfp4H2048ScaleBytes;
+        vectorized_dispatch_impl<16, NUM_DESTINATIONS>(
+            src, kNvfp4H2048ScaleBytes, rank_id, max_tokens_per_rank, 1, ptrs, target_ranks,
+            send_indices, lane_id, kNvfp4H2048ScaleWorkers);
+      } else if (warp_id == kDispatchActivationWarps + 1 && lane_id < 2 * kTopK22MetadataWorkers) {
+        bool second_tail = lane_id >= kTopK22MetadataWorkers;
+        int payload_idx = second_tail ? 3 : 2;
+        int worker_idx = second_tail ? lane_id - kTopK22MetadataWorkers : lane_id;
+        auto const* src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]) +
+                          static_cast<size_t>(local_token_idx) * kTopK22MetadataBytes;
+        vectorized_dispatch_impl<8, NUM_DESTINATIONS>(
+            src, kTopK22MetadataBytes, rank_id, max_tokens_per_rank, payload_idx, ptrs,
+            target_ranks, send_indices, worker_idx, kTopK22MetadataWorkers);
+      }
+    } else if constexpr (PHASE_NVFP4_PAYLOADS) {
+      // Match warps to the NVFP4 payload widths instead of making all 128
+      // threads materialize destination pointers for every payload.
+      int const activation_bytes = ptrs.payload_bytes_per_token[0];
+      int const scale_bytes = ptrs.payload_bytes_per_token[1];
+      constexpr int METADATA_BYTES = TOP_K * sizeof(int32_t);
+      constexpr int METADATA_WORKERS = METADATA_BYTES / kDispatchMetadataVectorBytes;
+      int const activation_workers = activation_bytes / kDispatchWideVectorBytes;
+      int const scale_workers = scale_bytes / kDispatchWideVectorBytes;
+      int warp_id = thread_idx / warpSize;
+      int lane_id = thread_idx % warpSize;
+      if (warp_id < kDispatchActivationWarps && thread_idx < activation_workers) {
+        auto const* src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[0]) +
+                          static_cast<size_t>(local_token_idx) * activation_bytes;
+        vectorized_dispatch_impl<kDispatchWideVectorBytes, NUM_DESTINATIONS>(
+            src, activation_bytes, rank_id, max_tokens_per_rank, 0, ptrs, target_ranks,
+            send_indices, thread_idx, activation_workers);
+      } else if (warp_id == kDispatchActivationWarps && lane_id < scale_workers) {
+        auto const* src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[1]) +
+                          static_cast<size_t>(local_token_idx) * scale_bytes;
+        vectorized_dispatch_impl<kDispatchWideVectorBytes, NUM_DESTINATIONS>(
+            src, scale_bytes, rank_id, max_tokens_per_rank, 1, ptrs, target_ranks, send_indices,
+            lane_id, scale_workers);
+      } else if (warp_id == kDispatchActivationWarps + 1 && lane_id < 2 * METADATA_WORKERS) {
+        bool second_tail = lane_id >= METADATA_WORKERS;
+        int payload_idx = second_tail ? 3 : 2;
+        int worker_idx = second_tail ? lane_id - METADATA_WORKERS : lane_id;
+        auto const* src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]) +
+                          static_cast<size_t>(local_token_idx) * METADATA_BYTES;
+        vectorized_dispatch_impl<kDispatchMetadataVectorBytes, NUM_DESTINATIONS>(
+            src, METADATA_BYTES, rank_id, max_tokens_per_rank, payload_idx, ptrs, target_ranks,
+            send_indices, worker_idx, METADATA_WORKERS);
+      }
+    } else {
+      // Perform a single source load and fan out to each unique destination.
+      for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
+        uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
+        int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+        uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
 
-      vectorized_dispatch<NUM_DESTINATIONS>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                            payload_idx, ptrs, target_ranks, send_indices);
+        vectorized_dispatch<NUM_DESTINATIONS>(src_ptr, bytes_per_token, rank_id,
+                                              max_tokens_per_rank, payload_idx, ptrs, target_ranks,
+                                              send_indices);
+      }
     }
 
     __syncthreads();
@@ -684,12 +799,20 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
       max_payload_bytes_per_token = kernel_ptrs.payload_bytes_per_token[i];
     }
   }
+  bool const supports_phased_nvfp4 =
+      params.ep_size == kEp4Size || params.ep_size == 8 || params.ep_size == 16;
+  bool const phased_nvfp4_layout =
+      supports_phased_nvfp4 &&
+      isPhasedNvfp4PayloadLayout(kernel_ptrs, params.num_payloads, params.top_k);
+
   // Small payloads do not have enough 16-byte vectors to use larger CTAs. A GB200
   // sweep found 128 threads faster than both 64 and 256 at prefill token counts.
-  if (use_compact_ep4 && max_payload_bytes_per_token <= kCompactDispatchMaxPayloadBytes &&
+  if ((use_compact_ep4 || phased_nvfp4_layout) &&
+      max_payload_bytes_per_token <= kCompactDispatchMaxPayloadBytes &&
       block_size > kCompactDispatchBlockSize) {
     block_size = kCompactDispatchBlockSize;
   }
+  bool const phase_nvfp4_payloads = phased_nvfp4_layout && block_size == kCompactDispatchBlockSize;
 
   // Configure kernel launch: one block per token
   int grid_size = params.local_num_tokens;
@@ -700,7 +823,60 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   }
   SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
     SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
-      if (use_compact_ep4) {
+      if (phase_nvfp4_payloads && params.top_k == 22 &&
+          kernel_ptrs.payload_bytes_per_token[0] == kNvfp4H2048ActivationBytes) {
+        FLASHINFER_CHECK(kernel_ptrs.payload_bytes_per_token[1] == kNvfp4H2048ScaleBytes &&
+                             kernel_ptrs.payload_bytes_per_token[2] == kTopK22MetadataBytes &&
+                             kernel_ptrs.payload_bytes_per_token[3] == kTopK22MetadataBytes,
+                         "Invalid H2048/top-k-22 NVFP4 dispatch payload layout");
+        if (use_compact_ep4) {
+          int shared_bytes = kEp4Size * (int)sizeof(int);
+          auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, true, true>;
+          launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
+                                   block_size, shared_bytes, params.stream,
+                                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                                   params.max_tokens_per_rank, params.local_num_tokens,
+                                   params.ep_rank, params.ep_size, params.num_experts,
+                                   params.eplb_stats_num_experts, params.enable_pdl);
+        } else {
+          int shared_bytes = 2 * params.top_k * (int)sizeof(int);
+          auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, false, true>;
+          launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
+                                   block_size, shared_bytes, params.stream,
+                                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                                   params.max_tokens_per_rank, params.local_num_tokens,
+                                   params.ep_rank, params.ep_size, params.num_experts,
+                                   params.eplb_stats_num_experts, params.enable_pdl);
+        }
+      } else if (phase_nvfp4_payloads) {
+        if (use_compact_ep4) {
+          int shared_bytes = kEp4Size * (int)sizeof(int);
+          SWITCH_TOP_K(
+              params.top_k, TOP_K, if constexpr (TOP_K > kEp4Size && TOP_K % 2 == 0) {
+                auto kernel_fn =
+                    moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, true, false, true>;
+                launchWithPdlWhenEnabled(
+                    "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
+                    shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+                    params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
+                    params.ep_rank, params.ep_size, params.num_experts,
+                    params.eplb_stats_num_experts, params.enable_pdl);
+              })
+        } else {
+          int shared_bytes = 2 * params.top_k * (int)sizeof(int);
+          SWITCH_TOP_K(
+              params.top_k, TOP_K, if constexpr (TOP_K > kEp4Size && TOP_K % 2 == 0) {
+                auto kernel_fn =
+                    moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, false, false, true>;
+                launchWithPdlWhenEnabled(
+                    "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
+                    shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+                    params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
+                    params.ep_rank, params.ep_size, params.num_experts,
+                    params.eplb_stats_num_experts, params.enable_pdl);
+              })
+        }
+      } else if (use_compact_ep4) {
         int shared_bytes = kEp4Size * (int)sizeof(int);
         SWITCH_TOP_K(
             params.top_k, TOP_K, if constexpr (TOP_K > kEp4Size) {

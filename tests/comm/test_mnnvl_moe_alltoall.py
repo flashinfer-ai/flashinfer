@@ -207,8 +207,11 @@ def make_nvfp4_payloads(
     token_selected_experts: torch.Tensor,
     lora_ids: torch.Tensor | None = None,
 ) -> tuple[list, int]:
-    """Create the four NV FP4 payloads exactly as in single-GPU test, with an
-    optional 5th LoRA adapter ID payload."""
+    """Create the production NVFP4 dispatch wire layout.
+
+    Dispatch copies opaque bytes, so uint8 scale patterns avoid requiring FP8
+    arithmetic while preserving the production one-byte scale width.
+    """
     payloads = []
     # Payload 0: Packed FP4 tokens (uint8)
     packed_hidden_size = hidden_size // 2
@@ -217,21 +220,24 @@ def make_nvfp4_payloads(
     )
     payloads.append(packed_hidden_states)
 
-    # Payload 1: Scaling factors (fp8)
+    # Payload 1: One-byte scaling factors (FP8 on the production path)
     num_elts_per_sf = 16
     num_scaling_factors = hidden_size // num_elts_per_sf
-    scaling_factors = torch.randn(
-        local_num_tokens, num_scaling_factors, dtype=torch.float32, device="cuda"
-    )  #  .to(torch.float8_e4m3fn) TODO: Test failed.
-    scaling_factors += rank
+    scaling_factors = torch.randint(
+        0,
+        256,
+        (local_num_tokens, num_scaling_factors),
+        dtype=torch.uint8,
+        device="cuda",
+    )
     payloads.append(scaling_factors)
 
     # Payload 2: token_selected_experts
     payloads.append(token_selected_experts)
 
-    # Payload 3: token_final_scales (bfloat16)
+    # Payload 3: FP32 routing weights, matching the production wire width
     token_final_scales = torch.rand(
-        local_num_tokens, top_k, dtype=torch.bfloat16, device="cuda"
+        local_num_tokens, top_k, dtype=torch.float32, device="cuda"
     )
 
     # Construct the data to contain info about send rank and local_token_idx, which is used for debugging
@@ -609,7 +615,7 @@ def verify_dispatch(
                     assert torch.all(token_expert_ids == invalid_token_expert_id)
 
 
-def moe_a2a_dispatch_test_impl(distribution, top_k, use_lora=False):
+def moe_a2a_dispatch_test_impl(distribution, top_k, use_lora=False, hidden_size=1024):
     """Test MoE A2A dispatch operation."""
     comm = MPI.COMM_WORLD
     world_size = comm.Get_size()
@@ -630,7 +636,6 @@ def moe_a2a_dispatch_test_impl(distribution, top_k, use_lora=False):
     except Exception:
         pytest.skip("MNNVL not supported on this system")
 
-    hidden_size = 1024
     num_experts_per_rank = max(8, (top_k + ep_size - 1) // ep_size)
     invalid_token_expert_id = -1
 
@@ -707,6 +712,11 @@ def moe_a2a_dispatch_test_impl(distribution, top_k, use_lora=False):
 def test_moe_a2a_dispatch(distribution, top_k, use_lora):
     """Test MoE A2A dispatch operation."""
     safe_run(moe_a2a_dispatch_test_impl, distribution, top_k, use_lora)
+
+
+def test_moe_a2a_dispatch_phased_h2048_nvfp4():
+    """Exercise the specialized H2048/top-k-22 NVFP4 dispatch layout."""
+    safe_run(moe_a2a_dispatch_test_impl, "uniform", 22, False, 2048)
 
 
 def create_lora_weights(num_adapters, hidden_size, device, dtype=torch.bfloat16):
