@@ -2309,3 +2309,55 @@ class TestRelu2Activation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+class TestWorkspaceBucketing:
+    """Workspace growth must not thrash kernel caches (vllm#47458).
+
+    ``_get_cached_workspace`` replaces the cached workspace when a larger
+    routed_rows arrives, and ``workspace.max_rows`` is baked into the
+    static/micro kernel cache keys - so every new high-water mark used to
+    invalidate all previously compiled kernels for the backend and trigger
+    multi-second MLIR recompiles at serving time. Allocations are therefore
+    bucketed on a power-of-two ladder (floor 128).
+    """
+
+    def test_bucket_ladder(self):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+            _bucket_workspace_rows,
+        )
+
+        assert _bucket_workspace_rows(1) == 128
+        assert _bucket_workspace_rows(128) == 128
+        assert _bucket_workspace_rows(129) == 256
+        assert _bucket_workspace_rows(640) == 1024
+        assert _bucket_workspace_rows(32768) == 32768
+
+    def test_workspace_stable_within_bucket(self):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        device = torch.device("cuda")
+        kwargs = dict(
+            backend="static",
+            state_E=8,
+            weight_E=8,
+            k=512,
+            n=256,
+            num_topk=4,
+            device=device,
+        )
+        ws_small = md._get_cached_workspace(routed_rows=4, **kwargs)
+        assert ws_small.max_rows >= 128
+        # Growth within the bucket must return the SAME workspace object, so
+        # kernels compiled against its max_rows stay cache-valid.
+        ws_mid = md._get_cached_workspace(routed_rows=128, **kwargs)
+        assert ws_mid is ws_small
+        # Crossing the bucket boundary is allowed to reallocate (bounded,
+        # O(log) times), never once per new high-water mark.
+        ws_big = md._get_cached_workspace(routed_rows=129, **kwargs)
+        assert ws_big.max_rows >= 256
+        ws_big2 = md._get_cached_workspace(routed_rows=200, **kwargs)
+        assert ws_big2 is ws_big

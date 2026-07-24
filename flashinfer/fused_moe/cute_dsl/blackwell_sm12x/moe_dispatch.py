@@ -2354,6 +2354,11 @@ def allocate_sm120_moe_workspace(
     raise ValueError(f"unsupported SM120 MoE backend {backend!r}")
 
 
+def _bucket_workspace_rows(routed_rows: int) -> int:
+    """Round a workspace row request up to a power-of-two (floor 128)."""
+    return 1 << (max(128, int(routed_rows)) - 1).bit_length()
+
+
 def _get_cached_workspace(
     *,
     backend: str,
@@ -2406,10 +2411,17 @@ def _get_cached_workspace(
             "allocate_sm120_moe_workspace(..., quant_mode='w4a16') or warm the "
             "functional path before capture."
         )
+    # Allocate on a power-of-two ladder (floor 128) rather than at the exact
+    # request. Growing replaces the cached workspace, and the new max_rows is
+    # baked into every kernel cache key compiled against it (_get_static_kernel
+    # / _get_micro_kernel), so each new high-water mark invalidates all
+    # previously compiled kernels for this key - a multi-second MLIR recompile
+    # per shape class at serving time. Bucketing bounds growth (and therefore
+    # recompile waves) to O(log) events at the cost of at most 2x scratch rows.
     workspace = allocate_sm120_moe_workspace(
         state_E=state_E,
         weight_E=weight_E,
-        routed_rows=routed_rows,
+        routed_rows=_bucket_workspace_rows(routed_rows),
         k=k,
         n=n,
         num_topk=num_topk,
