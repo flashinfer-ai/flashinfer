@@ -235,20 +235,19 @@ def get_fp4_quantization_module(backend: str = "100"):
         "90": gen_fp4_quantization_sm90_module,
     }
 
-    # Prefer 'f' (family / feature-set) variant for SM12x when CUDA >= 12.9,
-    # as it enables native FP4 conversion instructions (cvt.rn.satfinite.e2m1x2.f32).
-    # sm_120f covers the entire SM12x family (both SM120 and SM121).
-    # See: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
-    if backend in ("120", "121"):
-        from ..utils import version_at_least
-
-        if version_at_least(torch.version.cuda, "12.9"):
-            backend = "120f"
-
     if backend not in backend_modules:
         raise ValueError(f"Invalid backend: {backend}")
 
-    module = backend_modules[backend]().build_and_load()
+    spec = backend_modules[backend]()
+    # SM12x uses the arch-specific module (sm_120a / sm_121a). When only the
+    # sm_120f family module is prebuilt (SM121 release wheels), load it
+    # instead of JIT-compiling.
+    if backend in ("120", "121") and not spec.is_aot:
+        family_spec = backend_modules["120f"]()
+        if family_spec.is_aot:
+            spec = family_spec
+
+    module = spec.build_and_load()
 
     @register_custom_op(
         "flashinfer::fp4_quantize_sm100",
