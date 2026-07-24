@@ -938,9 +938,193 @@ void dispatch_layernorm_type(T const* input, Tw const* gemma, Tw const* beta, T*
   }
 }
 
+// ============================================================================
+// Register-blocked LayerNorm fast-path kernel
+// For hidden dimensions divisible by (8*THREADS), holds the entire row in
+// registers via 128-bit (int4) loads, computes mean+variance from registers
+// (no shared-memory data staging, no global re-read), and writes back via
+// 128-bit stores.  Template parameters: CHUNKS = hidden/(8*THREADS), THREADS.
+// ============================================================================
+template <typename T, int CHUNKS, int THREADS>
+__global__ void __launch_bounds__(THREADS)
+    LayerNormRegBlocked(const int4* __restrict__ input, const float4* __restrict__ gamma,
+                        const float4* __restrict__ beta, int4* __restrict__ output, float eps,
+                        int hidden_dim) {
+  // T is the 2-byte input/output element type (half or __nv_bfloat16); an int4 packs 8 of them.
+  const int tid = threadIdx.x;
+  // number of int4 vectors per row = hidden_dim / 8
+  const int nvec = hidden_dim >> 3;
+  const int row = blockIdx.x * nvec;
+
+  // Load entire row into registers
+  float v[CHUNKS * 8];
+  float local_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < CHUNKS; ++i) {
+    int4 raw = input[row + tid + i * THREADS];
+    const T* h = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float x = cuda_cast<float>(h[j]);
+      v[i * 8 + j] = x;
+      local_sum += x;
+    }
+  }
+
+  // Warp-reduce sum for mean
+  constexpr unsigned FULL_MASK = 0xffffffff;
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    local_sum += __shfl_xor_sync(FULL_MASK, local_sum, mask, 32);
+
+  // Cross-warp reduction via shared memory
+  constexpr int NUM_WARPS = THREADS / 32;
+  __shared__ float warp_sums[NUM_WARPS];
+  int lane = tid & 31;
+  int wid = tid >> 5;
+  if (lane == 0) warp_sums[wid] = local_sum;
+  __syncthreads();
+  if (lane < NUM_WARPS)
+    local_sum = warp_sums[lane];
+  else
+    local_sum = 0.0f;
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    local_sum += __shfl_xor_sync(FULL_MASK, local_sum, mask, 32);
+
+  float mean = local_sum / (float)hidden_dim;
+
+  // Compute variance from register-resident data
+  float local_var = 0.0f;
+#pragma unroll
+  for (int i = 0; i < CHUNKS * 8; ++i) {
+    float d = v[i] - mean;
+    local_var += d * d;
+  }
+
+  // Warp-reduce variance
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    local_var += __shfl_xor_sync(FULL_MASK, local_var, mask, 32);
+
+  // Reuse of the shared warp_sums[] buffer: the mean phase above read it after
+  // its __syncthreads(), and we are about to overwrite it with variance partials.
+  // Without a barrier here a fast warp could clobber warp_sums[] while a slower
+  // warp is still reading it for the mean reduction (WAR hazard) -> wrong output.
+  __syncthreads();
+  if (lane == 0) warp_sums[wid] = local_var;
+  __syncthreads();
+  if (lane < NUM_WARPS)
+    local_var = warp_sums[lane];
+  else
+    local_var = 0.0f;
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    local_var += __shfl_xor_sync(FULL_MASK, local_var, mask, 32);
+
+  float inv = rsqrtf(local_var / (float)hidden_dim + eps);
+
+  // Apply normalization: (x - mean) * inv * gamma + beta, store via 128-bit
+#pragma unroll
+  for (int i = 0; i < CHUNKS; ++i) {
+    int vi = tid + i * THREADS;
+    float4 g0 = gamma[vi * 2];
+    float4 g1 = gamma[vi * 2 + 1];
+    float4 b0 = beta[vi * 2];
+    float4 b1 = beta[vi * 2 + 1];
+    const float* gp0 = reinterpret_cast<const float*>(&g0);
+    const float* gp1 = reinterpret_cast<const float*>(&g1);
+    const float* bp0 = reinterpret_cast<const float*>(&b0);
+    const float* bp1 = reinterpret_cast<const float*>(&b1);
+    int4 outraw;
+    T* oh = reinterpret_cast<T*>(&outraw);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      oh[j] = cuda_cast<T>((v[i * 8 + j] - mean) * inv * gp0[j] + bp0[j]);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      oh[j + 4] = cuda_cast<T>((v[i * 8 + j + 4] - mean) * inv * gp1[j] + bp1[j]);
+    }
+    output[row + vi] = outraw;
+  }
+}
+
+// Dispatch helper: select CHUNKS at compile-time via switch
+template <typename T, int THREADS>
+inline bool dispatchLayerNormRegBlocked(const void* input, const void* gamma, const void* beta,
+                                        void* output, float eps, int hidden_dim, int tokens,
+                                        cudaStream_t stream) {
+  int chunks = hidden_dim / (8 * THREADS);
+  if (chunks < 1 || chunks > 14) return false;
+  dim3 grid(tokens);
+  dim3 block(THREADS);
+#define CASE_CHUNKS(C)                                                                            \
+  case C:                                                                                         \
+    LayerNormRegBlocked<T, C, THREADS><<<grid, block, 0, stream>>>(                               \
+        reinterpret_cast<const int4*>(input), reinterpret_cast<const float4*>(gamma),             \
+        reinterpret_cast<const float4*>(beta), reinterpret_cast<int4*>(output), eps, hidden_dim); \
+    return true;
+  switch (chunks) {
+    CASE_CHUNKS(1)
+    CASE_CHUNKS(2)
+    CASE_CHUNKS(3)
+    CASE_CHUNKS(4)
+    CASE_CHUNKS(5)
+    CASE_CHUNKS(6)
+    CASE_CHUNKS(7)
+    CASE_CHUNKS(8)
+    CASE_CHUNKS(9)
+    CASE_CHUNKS(10)
+    CASE_CHUNKS(11)
+    CASE_CHUNKS(12)
+    CASE_CHUNKS(13)
+    CASE_CHUNKS(14)
+    default:
+      return false;
+  }
+#undef CASE_CHUNKS
+}
+
 template <typename T, typename Tw>
 cudaError_t LayerNorm(T* input, Tw* gemma, Tw* beta, T* out, uint32_t tokens, uint32_t hidden_dim,
                       float eps = 1e-5, cudaStream_t stream = 0) {
+  // ---- Register-blocked fast-path gate ----
+  // Conditions: bf16 input (T=__nv_bfloat162 packed => sizeof(T)==4 for packed or 2 for scalar),
+  //   float weights (sizeof(Tw)==4 or sizeof(Tw)==8 for float2 packed),
+  //   hidden_dim divisible by 256, and CHUNKS fits in registers (<=14).
+  // We only gate for the vec_size==2 packed path where T = __nv_bfloat162, Tw = float2.
+  // Since this function is called with T=__nv_bfloat16,Tw=float and use_vec_type dispatches
+  // to the packed variant separately, we insert the gate at the top level.
+  if (hidden_dim % 256u == 0 && hidden_dim >= 256u) {
+    // Select largest THREADS in {128, 64, 32} such that hidden_dim % (8*THREADS) == 0
+    // and CHUNKS = hidden_dim / (8*THREADS) <= 14
+    auto tryDispatch = [&](int threads) -> bool {
+      int chunks = hidden_dim / (8 * threads);
+      if (chunks < 1 || chunks > 14) return false;
+      if (hidden_dim % (8 * threads) != 0) return false;
+      // Only supported for bf16/half input with float weights
+      if constexpr (sizeof(T) == 2 && sizeof(Tw) == 4) {
+        if (threads == 128) {
+          return dispatchLayerNormRegBlocked<T, 128>(input, gemma, beta, out, eps, hidden_dim,
+                                                     tokens, stream);
+        } else if (threads == 64) {
+          return dispatchLayerNormRegBlocked<T, 64>(input, gemma, beta, out, eps, hidden_dim,
+                                                    tokens, stream);
+        } else if (threads == 32) {
+          return dispatchLayerNormRegBlocked<T, 32>(input, gemma, beta, out, eps, hidden_dim,
+                                                    tokens, stream);
+        }
+      }
+      return false;
+    };
+    // Try largest thread count first (fewest CHUNKS = least register pressure)
+    if (tryDispatch(128) || tryDispatch(64) || tryDispatch(32)) {
+      return cudaSuccess;
+    }
+  }
+  // ---- End register-blocked fast-path gate ----
+
   dim3 grid(tokens);
   dim3 block(min(hidden_dim, 1024));
   // Make sure block.x is multiple of 32 for warp shuffle to work

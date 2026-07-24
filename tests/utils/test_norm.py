@@ -332,7 +332,7 @@ def test_gemma_fused_add_rmsnorm(
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 3, 128])
-@pytest.mark.parametrize("hidden_size", [128, 129, 1024, 16384])
+@pytest.mark.parametrize("hidden_size", [128, 129, 256, 1024, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_layernorm(batch_size, hidden_size, dtype):
     eps = 1e-6
