@@ -290,3 +290,78 @@ def test_fp16_state_commits_more_precisely_than_bf16():
         errs[arm] = tot
     assert errs["fp16_state"] < errs["bf16"], (
         f"fp16 state should commit closer to fp32 truth: {errs}")
+
+
+def _load_flush_strided():
+    """Load a flush-module copy with the strided-QKV path enabled
+    (SGLANG_GDN_WY_STRIDED_QKV read at import). This is the path vLLM uses:
+    q/k/v (and a/b) arrive as chunk views of packed tensors."""
+    old = os.environ.get("SGLANG_GDN_WY_STRIDED_QKV")
+    os.environ["SGLANG_GDN_WY_STRIDED_QKV"] = "1"
+    try:
+        spec = importlib.util.spec_from_file_location("uc_flush_strided",
+                                                      _FLUSH_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        if old is None:
+            os.environ.pop("SGLANG_GDN_WY_STRIDED_QKV", None)
+        else:
+            os.environ["SGLANG_GDN_WY_STRIDED_QKV"] = old
+    return mod
+
+
+def test_strided_ab_matches_compact():
+    """Regression for the a/b token-stride bug (sb_t/sb_b): when q/k/v are
+    chunk views of one packed tensor (matching stride -> strided-QKV path,
+    the vLLM setup) and a/b are chunk views (stride(1)=2*HV != HV), the
+    output must equal a fully-compact run with the SAME values. With the old
+    `sb_t = HV` the packed b was read from the wrong rows (~2e-2 error)."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush_strided()
+    io = getattr(mod, "IO_TORCH", torch.bfloat16)
+    ring = getattr(mod, "RING_TORCH", io)
+    B = 4
+    g = torch.Generator(device=DEV).manual_seed(0)
+
+    def rn(*s, sc=1.0):
+        return (torch.randn(*s, generator=g, device=DEV) * sc).to(io)
+
+    q, k = rn(B, T, H, K), rn(B, T, H, K)
+    v, a, b = rn(B, T, HV, V, sc=0.5), rn(B, T, HV, sc=0.5), rn(B, T, HV)
+    A_log = (torch.rand(HV, generator=g, device=DEV) * 6 - 4.5).to(io)
+    dt_bias = rn(HV, sc=0.5)
+    pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(
+        torch.bfloat16)
+
+    def run(q_, k_, v_, a_, b_):
+        idx = torch.arange(B, dtype=torch.int32, device=DEV)
+        return mod.gated_delta_rule_mtp_ucache_flush(
+            A_log, a_, dt_bias, q=q_, k=k_, v=v_, b=b_,
+            initial_state_source=pool.clone(), initial_state_indices=idx,
+            k_cache=torch.zeros(B, H, W, K, dtype=ring, device=DEV),
+            u_cache=torch.zeros(B, HV, W, V, dtype=ring, device=DEV),
+            g_cache=torch.zeros(B, HV, W, dtype=torch.float32, device=DEV),
+            hist_len=torch.zeros(B, dtype=torch.int32, device=DEV),
+            scale=SCALE, flush_min=FLUSH_MIN).float()
+
+    # pack q/k/v into one wide tensor -> matching token stride (strided-QKV)
+    qw = H * K + H * K + HV * V
+    wqkv = torch.zeros(B, T, qw, dtype=io, device=DEV)
+    wqkv[:, :, :H * K] = q.reshape(B, T, H * K)
+    wqkv[:, :, H * K:2 * H * K] = k.reshape(B, T, H * K)
+    wqkv[:, :, 2 * H * K:] = v.reshape(B, T, HV * V)
+    q_s = wqkv[:, :, :H * K].reshape(B, T, H, K)
+    k_s = wqkv[:, :, H * K:2 * H * K].reshape(B, T, H, K)
+    v_s = wqkv[:, :, 2 * H * K:].reshape(B, T, HV, V)
+    wab = torch.zeros(B, T, 2 * HV, dtype=io, device=DEV)
+    wab[:, :, :HV], wab[:, :, HV:] = a, b
+    a_s, b_s = wab[:, :, :HV], wab[:, :, HV:]
+    assert a_s.stride(1) == 2 * HV and q_s.stride(1) == qw  # confirm strided
+
+    y_compact = run(q, k, v, a, b)
+    y_strided = run(q_s, k_s, v_s, a_s, b_s)
+    err = (y_compact - y_strided).abs().max().item()
+    assert err < 2e-3, (
+        f"strided (chunk-view) a/b must match compact; got max|d|={err:.3e} "
+        "(the sb_t=HV bug reads packed b from the wrong rows)")

@@ -866,8 +866,12 @@ class GdnDecodeUCacheKernel:
         sa_t = _ab_t
         sa_b = _ab_rows * _ab_t
         sb_hv = cutlass.Int32(1)
-        sb_t = HV
-        sb_b = _ab_rows * HV
+        # b carries the SAME token stride as a (wrapper enforces
+        # tuple(b.stride()) == tuple(a.stride())), so use _ab_t, not a
+        # hardcoded HV — else packed/chunk-view b (stride(1) != HV, the vLLM
+        # strided-qkv path) reads the wrong rows. _ab_t == HV when compact.
+        sb_t = _ab_t
+        sb_b = _ab_rows * _ab_t
         # State pool natural layout: (pool, HV, V, K) bf16 contiguous. Addressing
         # is handled by the TMA descriptor, so no raw GMEM strides are needed here.
 

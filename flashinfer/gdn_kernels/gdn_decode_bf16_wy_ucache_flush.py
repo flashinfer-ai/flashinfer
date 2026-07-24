@@ -1363,8 +1363,14 @@ class GdnDecodeUCacheFlushKernel:
         sa_t = _ab_t
         sa_b = _ab_rows * _ab_t
         sb_hv = cutlass.Int32(1)
-        sb_t = HV
-        sb_b = _ab_rows * HV
+        # b carries the SAME token stride as a (the wrapper only takes this
+        # path when tuple(b.stride()) == tuple(a.stride())), so b's per-token
+        # and per-batch strides must use _ab_t, not a hardcoded HV. With
+        # hardcoded HV, packed/chunk-view b (stride(1) != HV — the vLLM
+        # strided-qkv path) is read from the wrong rows. _ab_t == HV in the
+        # compact case, so this is byte-identical there.
+        sb_t = _ab_t
+        sb_b = _ab_rows * _ab_t
         # State pool natural layout: (pool, HV, V, K) contiguous. Addressing is
         # handled by the TMA descriptor, so no raw GMEM strides are needed here.
 
