@@ -116,10 +116,8 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
         Arch, OperatorClass, cutlass::mx_float8_t<ElementA>, LayoutA, AlignmentA,                 \
         cutlass::mx_float8_t<ElementB>, LayoutB, AlignmentB, ElementAccumulator, CTAShape,        \
         ClusterShape,                                                                             \
-        std::conditional_t<CTA_N_ == 256 || CTA_M_ == 256,                                        \
-                           cutlass::gemm::collective::StageCount<2>,                              \
-                           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(    \
-                               sizeof(typename CollectiveEpilogue::SharedStorage))>>,             \
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(                       \
+            sizeof(typename CollectiveEpilogue::SharedStorage))>,                                 \
         MainloopSchedule>::CollectiveOp;                                                          \
                                                                                                   \
     /* Guard: only run on SM12x devices */                                                        \
@@ -248,6 +246,18 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
     if (initStatus != cutlass::Status::kSuccess) {                                                \
       std::string errMsg = "Failed to initialize cutlass MXFP8 gemm on sm120. Error: " +          \
                            std::string(cutlass::cutlassGetStatusString(initStatus));              \
+      /* Name the usual cause when it applies: the kernel needs more shared memory than */        \
+      /* the device allows. */                                                                    \
+      int device__ = 0, smemLimit__ = -1;                                                         \
+      if (cudaGetDevice(&device__) == cudaSuccess &&                                              \
+          cudaDeviceGetAttribute(&smemLimit__, cudaDevAttrMaxSharedMemoryPerBlockOptin,           \
+                                 device__) == cudaSuccess &&                                      \
+          static_cast<int>(Mxfp8GemmOperator::GemmKernel::SharedStorageSize) > smemLimit__) {     \
+        errMsg += " (kernel needs " +                                                             \
+                  std::to_string(Mxfp8GemmOperator::GemmKernel::SharedStorageSize) +              \
+                  " bytes of shared memory, device per-block limit is " +                         \
+                  std::to_string(smemLimit__) + " bytes)";                                        \
+      }                                                                                           \
       throw std::runtime_error("[MXFP8 SM120 gemm Runner] " + errMsg);                            \
     }                                                                                             \
     auto runStatus = gemm.run(args, workspace, stream, nullptr, /*enablePDL=*/true);              \

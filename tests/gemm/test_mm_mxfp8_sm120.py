@@ -65,16 +65,34 @@ def test_mm_mxfp8_sm120_swizzled(m, n, k, out_dtype):
     assert cos_sim > 0.99, f"cos_sim={cos_sim:.4f} < 0.99 for M={m},N={n},K={k}"
 
 
-def test_mm_mxfp8_sm120_tactic_num():
-    """Verify tactic count for SM120 MXFP8 GEMM."""
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_mm_mxfp8_sm120_all_tactics(out_dtype):
+    """Every advertised tactic must run and match the reference.
+
+    No hardcoded tactic count or index list: whatever the module advertises
+    has to work on the device the test runs on.
+    """
     _skip_if_not_sm120()
     from flashinfer.jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8
 
+    m, n, k = 512, 512, 512
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    a_fp8, b_fp8, a_sf, b_sf = _prepare_mxfp8(a, b, swizzled=True)
+    reference = torch.mm(a, b.T)
+
     module = gen_gemm_sm120_module_cutlass_mxfp8().build_and_load()
     num_tactics = module.mxfp8_gemm_tactic_num()
-    # SM120 has 5 tile configs (128x32x128, 128x64x128, 128x128x128, 256x128x128, 128x256x128)
-    # and each config can swap AB to compute Output^T = Weight^T Activations^T
-    assert num_tactics == 10, f"Expected 10 tactics, got {num_tactics}"
+    assert num_tactics > 0
+    workspace = torch.zeros(32 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    for tactic in range(num_tactics):
+        out = torch.empty(m, n, dtype=out_dtype, device="cuda")
+        module.mxfp8_gemm(a_fp8, b_fp8, a_sf, b_sf, out, workspace, tactic)
+        assert torch.isfinite(out).all(), f"tactic {tactic}: output contains NaN/Inf"
+        cos_sim = F.cosine_similarity(
+            reference.reshape(-1).float(), out.reshape(-1).float(), dim=0
+        ).item()
+        assert cos_sim > 0.99, f"tactic {tactic}: cos_sim={cos_sim:.4f}"
 
 
 def test_mm_mxfp8_sm120_auto_tactic():
