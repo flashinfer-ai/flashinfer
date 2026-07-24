@@ -191,26 +191,11 @@ class CuteDslNvfp4Runner(MoERunner):
         experts = config.experts
         routing = config.routing
         num_local_experts = experts.local_num_experts or routing.num_experts
-
-        if config.quant.variant is QuantVariant.NVFP4:
-            self._quant_mode = "w4a4"
-            self._use_per_token_activation = bool(config.quant.per_token_scale)
-        elif config.quant.variant is QuantVariant.W4A16:
-            if config.quant.per_token_scale:
-                raise ValueError(
-                    "CuteDslNvfp4Runner: per_token_scale is not supported for W4A16"
-                )
-            self._quant_mode = "w4a16"
-            self._use_per_token_activation = False
-        else:
-            raise NotImplementedError(
-                f"CuteDslNvfp4Runner does not support {config.quant.variant}."
-            )
         enable_pdl = (
             True if config.execution.enable_pdl is None else config.execution.enable_pdl
         )
         self._inner: CuteDslFusedMoENvfp4Runner | CuteDslFusedMoEW4A16Runner
-        if self._quant_mode == "w4a4":
+        if config.quant.variant is QuantVariant.NVFP4:
             self._inner = CuteDslFusedMoENvfp4Runner(
                 forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
                 num_experts=routing.num_experts,
@@ -220,9 +205,13 @@ class CuteDslNvfp4Runner(MoERunner):
                 use_fused_finalize=config.execution.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 activation_type=int(config.activation.type),
-                use_per_token_activation=self._use_per_token_activation,
+                use_per_token_activation=bool(config.quant.per_token_scale),
             )
-        elif self._quant_mode == "w4a16":
+        elif config.quant.variant is QuantVariant.W4A16:
+            if config.quant.per_token_scale:
+                raise ValueError(
+                    "CuteDslNvfp4Runner: per_token_scale is not supported for W4A16"
+                )
             self._inner = CuteDslFusedMoEW4A16Runner(
                 num_experts=routing.num_experts,
                 top_k=routing.top_k,
@@ -233,7 +222,9 @@ class CuteDslNvfp4Runner(MoERunner):
                 activation_type=int(config.activation.type),
             )
         else:
-            raise RuntimeError(f"Unsupported CuTe DSL NVFP4 mode: {self._quant_mode}")
+            raise NotImplementedError(
+                f"CuteDslNvfp4Runner does not support {config.quant.variant}."
+            )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
         # the instance we just built, not off the class.
@@ -283,9 +274,11 @@ class CuteDslNvfp4Runner(MoERunner):
             act, num_tokens, self._inner.top_k, "CuteDslNvfp4Runner"
         )
 
+        quant_variant = self.config.quant.variant
+        use_per_token_activation = bool(self.config.quant.per_token_scale)
         if (
-            self._quant_mode == "w4a4"
-            and not self._use_per_token_activation
+            quant_variant is QuantVariant.NVFP4
+            and not use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is None
         ):
@@ -308,8 +301,8 @@ class CuteDslNvfp4Runner(MoERunner):
                 moe_output,
             ]
         elif (
-            self._quant_mode == "w4a4"
-            and self._use_per_token_activation
+            quant_variant is QuantVariant.NVFP4
+            and use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is not None
         ):
@@ -333,8 +326,7 @@ class CuteDslNvfp4Runner(MoERunner):
                 moe_output,
             ]
         elif (
-            self._quant_mode == "w4a16"
-            and not self._use_per_token_activation
+            quant_variant is QuantVariant.W4A16
             and act.hidden_states_scale is None
             and act.per_token_scale is None
         ):
