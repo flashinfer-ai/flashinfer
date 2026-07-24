@@ -29,7 +29,8 @@ def llama_rms_norm(x, w, eps=1e-6):
     x = x.float()
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
-    x = x * w.float()
+    if w is not None:
+        x = x * w.float()
     x = x.to(orig_dtype)
     return x
 
@@ -78,7 +79,9 @@ def fused_add_rms_norm(x, residual, weight, eps):
 
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
-    x = (x * weight.float()).to(orig_dtype)
+    if weight is not None:
+        x = x * weight.float()
+    x = x.to(orig_dtype)
     return x, residual
 
 
@@ -123,6 +126,22 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
         flashinfer.norm.rmsnorm(x, w, out=y, enable_pdl=enable_pdl)
     else:
         y = flashinfer.norm.rmsnorm(x, w, enable_pdl=enable_pdl)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19])
+@pytest.mark.parametrize("hidden_size", [111, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_weightless_norm(batch_size, hidden_size, dtype, enable_pdl):
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+
+    if enable_pdl and not device_support_pdl(x.device):
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
+    y_ref = llama_rms_norm(x, None)
+    y = flashinfer.norm.rmsnorm(x, None, enable_pdl=enable_pdl)
 
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
@@ -187,6 +206,22 @@ def test_qknorm(
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1, 19])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_weightless_qknorm(batch_size, head_dim, dtype, enable_pdl):
+    x = torch.randn(batch_size, 4, head_dim, dtype=dtype, device="cuda")
+
+    if enable_pdl and not device_support_pdl(x.device):
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
+    y_ref = llama_rms_norm(x, None)
+    y = flashinfer.norm.rmsnorm(x, None, enable_pdl=enable_pdl)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])
@@ -215,6 +250,32 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguou
     residual_fused = residual.clone()
     flashinfer.fused_add_rmsnorm(
         x_fused, residual_fused, weight, eps, enable_pdl=enable_pdl
+    )
+
+    torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19])
+@pytest.mark.parametrize("hidden_size", [111, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_weightless_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl):
+    eps = 1e-6
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+
+    if enable_pdl and not device_support_pdl(x.device):
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
+    residual = torch.randn_like(x)
+    x_native, residual_native = fused_add_rms_norm(
+        x.clone(), residual.clone(), None, eps
+    )
+
+    x_fused = x.clone()
+    residual_fused = residual.clone()
+    flashinfer.fused_add_rmsnorm(
+        x_fused, residual_fused, None, eps, enable_pdl=enable_pdl
     )
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
