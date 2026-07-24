@@ -212,7 +212,7 @@ def _moe_core_impl(
         gemm1_cluster_shape_mn: GEMM1 cluster shape.
         gemm2_mma_tiler_mn: GEMM2 MMA tiler shape.
         gemm2_cluster_shape_mn: GEMM2 cluster shape.
-        w4a16_tactic: Internal route tile and GEMM tactics for BF16 activations.
+        w4a16_tactic: Internal GEMM tactics for BF16 activations.
         w4a16_workspace_cache: Runner-owned BF16 activation workspaces.
         moe_sort_buffers: Pre-allocated moe_sort output buffers.
         gemm1_out: Pre-allocated GEMM1 output buffer.

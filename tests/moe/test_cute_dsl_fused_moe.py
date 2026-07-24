@@ -28,7 +28,6 @@ Tests include:
 - API consistency between functional and wrapper APIs
 """
 
-import itertools
 import gc
 import weakref
 
@@ -329,36 +328,49 @@ class TestTacticEnumeration:
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             DEFAULT_W4A16_MOE_TACTIC,
         )
-        from flashinfer.fused_moe.cute_dsl.tuner import (
-            W4A16_MOE_TACTICS,
-            get_w4a16_gemm1_valid_tactics,
-            get_w4a16_gemm2_valid_tactics,
-        )
+        from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
 
         assert len(W4A16_MOE_TACTICS) == len(set(W4A16_MOE_TACTICS))
         assert DEFAULT_W4A16_MOE_TACTIC in W4A16_MOE_TACTICS
-        assert len(W4A16_MOE_TACTICS) == 409
+        assert len(W4A16_MOE_TACTICS) == 23
 
-        route_tiles = {tactic[0] for tactic in W4A16_MOE_TACTICS}
+        route_tiles = {gemm1_tactic[0][1] for gemm1_tactic, _ in W4A16_MOE_TACTICS}
         assert route_tiles == {8, 16, 32, 64, 128, 192}
 
+        expected_topology_pairs = {
+            ((128, (1, 1)), (128, (1, 1))),
+            ((128, (2, 1)), (128, (2, 1))),
+            ((256, (2, 1)), (256, (2, 1))),
+            ((128, (2, 1)), (256, (2, 1))),
+            ((256, (2, 1)), (128, (2, 1))),
+        }
         for route_tile in route_tiles:
-            expected_gemm_pairs = set(
-                itertools.product(
-                    get_w4a16_gemm1_valid_tactics(route_tile),
-                    get_w4a16_gemm2_valid_tactics(route_tile),
-                )
-            )
             route_tactics = [
                 (gemm1_tactic, gemm2_tactic)
-                for route, gemm1_tactic, gemm2_tactic in W4A16_MOE_TACTICS
-                if route == route_tile
+                for gemm1_tactic, gemm2_tactic in W4A16_MOE_TACTICS
+                if gemm1_tactic[0][1] == route_tile
             ]
-            assert set(route_tactics) == expected_gemm_pairs
             assert all(
-                gemm1_tactic[0][1] == gemm2_tactic[0][1] == route_tile
+                gemm1_tactic[0][1:] == gemm2_tactic[0][1:] == (route_tile, 256)
                 for gemm1_tactic, gemm2_tactic in route_tactics
             )
+            topology_pairs = {
+                (
+                    (gemm1_tactic[0][0], gemm1_tactic[1]),
+                    (gemm2_tactic[0][0], gemm2_tactic[1]),
+                )
+                for gemm1_tactic, gemm2_tactic in route_tactics
+            }
+            expected = expected_topology_pairs
+            if route_tile == 8:
+                expected = {
+                    pair for pair in expected if pair[0][0] == 128 and pair[1][0] == 128
+                }
+            elif route_tile == 192:
+                expected = {
+                    pair for pair in expected if pair[0][0] == 256 and pair[1][0] == 256
+                }
+            assert topology_pairs == expected
 
 
 # =============================================================================
@@ -1162,7 +1174,7 @@ class TestCuteDslMoeW4A16:
             top_k, device=tensors["token_selected_experts"].device
         )
         _, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a16")
-        tactic = (route_tile, gemm1_tactic, gemm2_tactic)
+        tactic = (gemm1_tactic, gemm2_tactic)
 
         result = _moe_core_impl(
             x=tensors["x_bf16"],
