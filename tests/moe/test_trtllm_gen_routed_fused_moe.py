@@ -588,6 +588,86 @@ def test_trtllm_gen_fp8_per_tensor_routed_fused_moe(
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
 
 
+def test_trtllm_gen_fp8_per_tensor_routed_fused_moe_nonzero_expert_offset():
+    """Packed global expert IDs map to the correct local weight rows."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+    num_tokens = 8
+    hidden_size = 1024
+    intermediate_size = 1024
+    num_experts = 8
+    local_num_experts = 4
+    top_k = 2
+
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    ).to(torch.float8_e4m3fn)
+    gemm1_weights = (
+        torch.randn(
+            local_num_experts, 2 * intermediate_size, hidden_size, device=device
+        )
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+    gemm2_weights = (
+        torch.randn(local_num_experts, hidden_size, intermediate_size, device=device)
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+    output1_scales_scalar = torch.rand(local_num_experts, device=device) + 0.5
+    output1_scales_gate_scalar = torch.rand(local_num_experts, device=device) + 0.5
+    output2_scales_scalar = torch.rand(local_num_experts, device=device) + 0.5
+
+    local_topk_ids = (
+        torch.arange(num_tokens * top_k, dtype=torch.int32, device=device)
+        .reshape(num_tokens, top_k)
+        .remainder(local_num_experts)
+    )
+    topk_weights = torch.softmax(
+        torch.rand(num_tokens, top_k, device=device), dim=-1
+    ).to(torch.bfloat16)
+
+    def run(local_expert_offset: int) -> torch.Tensor:
+        global_topk_ids = local_topk_ids + local_expert_offset
+        packed_topk_ids = (global_topk_ids << 16) | topk_weights.view(torch.int16).to(
+            torch.int32
+        )
+        output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+        )
+        trtllm_fp8_per_tensor_scale_routed_moe(
+            topk_ids=packed_topk_ids,
+            routing_bias=None,
+            hidden_states=hidden_states,
+            gemm1_weights=gemm1_weights,
+            output1_scales_scalar=output1_scales_scalar,
+            output1_scales_gate_scalar=output1_scales_gate_scalar,
+            gemm2_weights=gemm2_weights,
+            output2_scales_scalar=output2_scales_scalar,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=None,
+            use_routing_scales_on_input=False,
+            routing_method_type=RoutingMethodType.Renormalize.value,
+            enable_pdl=enable_pdl,
+            output=output,
+        )
+        return output.float()
+
+    baseline = run(0)
+    sharded = run(num_experts - local_num_experts)
+
+    assert torch.count_nonzero(sharded)
+    torch.testing.assert_close(sharded, baseline, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("num_tokens", [8, 64])
 @pytest.mark.parametrize("hidden_size", [1024, 2048])
 @pytest.mark.parametrize("intermediate_size", [1024, 2048])
