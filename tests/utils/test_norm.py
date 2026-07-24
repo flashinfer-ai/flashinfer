@@ -48,6 +48,17 @@ def llama_rms_norm_quant(x, w, scale, eps=1e-6):
     return x
 
 
+def layer_norm_quant(x, gamma, beta, scale, quant_dtype, eps=1e-6):
+    y = torch.nn.functional.layer_norm(
+        x.float(), (x.shape[-1],), weight=gamma, bias=beta, eps=eps
+    )
+    # Kernel rounds to input dtype before scaling; match it.
+    y = y.to(x.dtype).float() / scale
+    finfo = torch.finfo(quant_dtype)
+    y = torch.clamp(y, finfo.min, finfo.max)
+    return y.to(quant_dtype)
+
+
 def gemma_rms_norm(x, w, eps=1e-6):
     orig_dtype = x.dtype
     x = x.float()
@@ -345,6 +356,50 @@ def test_layernorm(batch_size, hidden_size, dtype):
     out_ref = F.layer_norm(x.float(), (hidden_size,), gamma, beta, eps).to(dtype)
 
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 4096, 8192, 16384])
+@pytest.mark.parametrize("quant_scale", [0.01, 1.0, 10.0])
+@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_layernorm_quant(batch_size, hidden_size, quant_scale, quant_dtype):
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
+    gamma = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
+    beta = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
+    scale = torch.tensor([quant_scale], dtype=torch.float32, device="cuda")
+
+    y_ref = layer_norm_quant(x, gamma, beta, scale, quant_dtype)
+    y = torch.empty_like(x, dtype=quant_dtype)
+    flashinfer.norm.layernorm_quant(y, x, gamma, beta, scale)
+
+    # fp8 defaults (rtol/atol=0.1) allow a one-bucket step; max_mismatch_pct
+    # bounds how many elements may drift, so a systematic error still fails.
+    from flashinfer.trace import default_check
+
+    assert default_check([y_ref], [y], max_mismatch_pct=1.0, min_cos_sim=None)
+
+
+def test_layernorm_quant_invalid_inputs():
+    batch_size, hidden_size = 8, 1024
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
+    gamma = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
+    beta = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
+    scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(RuntimeError, match="input must be bfloat16"):
+        flashinfer.norm.layernorm_quant(out, x.to(torch.float16), gamma, beta, scale)
+
+    x_noncontig = torch.randn(
+        batch_size, hidden_size * 2, dtype=torch.bfloat16, device="cuda"
+    )[:, :hidden_size]
+    with pytest.raises(RuntimeError, match="input must be contiguous"):
+        flashinfer.norm.layernorm_quant(out, x_noncontig, gamma, beta, scale)
+
+    with pytest.raises(ValueError, match="scale must be a scalar tensor"):
+        flashinfer.norm.layernorm_quant(
+            out, x, gamma, beta, torch.ones(2, dtype=torch.float32, device="cuda")
+        )
 
 
 # =============================================================================
