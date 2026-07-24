@@ -1262,6 +1262,42 @@ def test_verify_kernel_mtp(
     )
 
 
+def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch):
+    import cutlass.cute as cute
+    import flashinfer.gdn_kernels.gdn_decode_mtp as gdn_decode_mtp
+
+    original_compile = cute.compile
+    compile_count = 0
+
+    def counted_compile(*args, **kwargs):
+        nonlocal compile_count
+        compile_count += 1
+        return original_compile(*args, **kwargs)
+
+    gdn_decode_mtp._get_compiled_mtp_kernel.cache_clear()
+    gdn_decode_mtp._get_compiled_mtp_kernel_inline.cache_clear()
+    monkeypatch.setattr(cute, "compile", counted_compile)
+    try:
+        for cache_intermediate_states in (True, False):
+            _test_verify_kernel_mtp(
+                dtype="bfloat16",
+                batch_size=1,
+                num_q_heads=16,
+                num_k_heads=16,
+                num_v_heads=32,
+                head_size=128,
+                seq_len=2,
+                scale=1.0,
+                alpha=True,
+                beta=True,
+                cache_intermediate_states=cache_intermediate_states,
+            )
+        assert compile_count == 1
+    finally:
+        gdn_decode_mtp._get_compiled_mtp_kernel.cache_clear()
+        gdn_decode_mtp._get_compiled_mtp_kernel_inline.cache_clear()
+
+
 # ============================================================================
 # Test MTP kernel with FP32 state, cache ON, state update ON (comprehensive)
 # This tests the full production configuration: all BS and T values
