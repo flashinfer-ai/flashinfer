@@ -4302,6 +4302,108 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
+def trtllm_sage_attention_quantize(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    q_block_size: int = 1,
+    k_block_size: int = 16,
+    qk_quant_dtype: torch.dtype = torch.int8,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Quantize Q/K/V into the layout consumed by TRTLLM SageAttention.
+
+    Q and K use per-token-block scaling and can be quantized to INT8 or FP8
+    E4M3. V is always quantized to FP8 E4M3 with one scale per head channel.
+    All inputs use contiguous ``[tokens, heads, head_dim]`` layout.
+
+    Parameters
+    ----------
+    query, key, value : torch.Tensor
+        FP16 or BF16 CUDA tensors. Key and value must have matching token and
+        head counts, and all three tensors must have the same head dimension.
+    q_block_size, k_block_size : int
+        Number of tokens sharing each Q or K scale. Supported values are 1, 4,
+        and 16.
+    qk_quant_dtype : torch.dtype
+        ``torch.int8`` (the SageAttention INT8 path) or
+        ``torch.float8_e4m3fn``.
+
+    Returns
+    -------
+    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale)
+        Quantized Q/K/V followed by their FP32 dequantization scales. Q and K
+        scales have shapes ``[q_heads, ceil(q_tokens / q_block_size)]`` and
+        ``[kv_heads, ceil(kv_tokens / k_block_size)]``. V scales have shape
+        ``[kv_heads, head_dim]``. These outputs can be passed directly to
+        :func:`trtllm_ragged_attention_deepseek`.
+    """
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"query must be float16 or bfloat16, got {query.dtype}")
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise ValueError("query, key, and value must have the same dtype")
+    if query.device.type != "cuda":
+        raise ValueError("query, key, and value must be CUDA tensors")
+    if key.device != query.device or value.device != query.device:
+        raise ValueError("query, key, and value must be on the same CUDA device")
+    if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+        raise ValueError("query, key, and value must be 3D [tokens, heads, head_dim]")
+    if query.shape[2] != key.shape[2] or key.shape[2] != value.shape[2]:
+        raise ValueError("query, key, and value must have the same head dimension")
+    if key.shape[:2] != value.shape[:2]:
+        raise ValueError("key and value must have matching token and head counts")
+    if query.shape[2] not in (64, 128, 256):
+        raise ValueError("head_dim must be 64, 128, or 256")
+    if q_block_size not in (1, 4, 16) or k_block_size not in (1, 4, 16):
+        raise ValueError("q_block_size and k_block_size must be 1, 4, or 16")
+    if qk_quant_dtype not in (torch.int8, torch.float8_e4m3fn):
+        raise ValueError("qk_quant_dtype must be torch.int8 or torch.float8_e4m3fn")
+
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    q_quant = torch.empty_like(query, dtype=qk_quant_dtype)
+    k_quant = torch.empty_like(key, dtype=qk_quant_dtype)
+    v_quant = torch.empty_like(value, dtype=torch.float8_e4m3fn)
+    q_scale = torch.empty(
+        (query.shape[1], ceil_div(query.shape[0], q_block_size)),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    k_scale = torch.empty(
+        (key.shape[1], ceil_div(key.shape[0], k_block_size)),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    v_scale = torch.empty(
+        (value.shape[1], value.shape[2]),
+        dtype=torch.float32,
+        device=query.device,
+    )
+
+    get_trtllm_gen_fmha_module().trtllm_sage_attention_quantize(
+        q_quant,
+        k_quant,
+        v_quant,
+        q_scale,
+        k_scale,
+        v_scale,
+        query,
+        key,
+        value,
+        q_block_size,
+        k_block_size,
+        get_device_sm_count(query.device),
+    )
+    return q_quant, k_quant, v_quant, q_scale, k_scale, v_scale
+
+
 @flashinfer_api(trace=trtllm_ragged_attention_deepseek_trace)
 def trtllm_ragged_attention_deepseek(
     query: torch.Tensor,
@@ -4388,10 +4490,10 @@ def trtllm_ragged_attention_deepseek(
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
     sage_attn_sfs : Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]
-        SageAttention scale-factor tensors for the four sub-blocks
-        ``(q_sf, k_sf, v_block_sum, p_block_sum)``.  Defaults to ``(None, None,
-        None, None)`` which disables SageAttention.  Currently only consulted by
-        the ``trtllm-gen`` backend.
+        SageAttention scale-factor tensors for the four sub-blocks ``(q_sf, k_sf, p_sf, v_sf)``.
+        The outputs from :func:`trtllm_sage_attention_quantize` can be supplied as Q, K, and V scales (with ``p_sf=None``).
+        Defaults to ``(None, None, None, None)`` which disables SageAttention.
+        Currently only consulted by the ``trtllm-gen`` backend.
     num_elts_per_sage_attn_blk : Tuple[int, int, int, int]
         Per-block element counts for the SageAttention scale-factor tensors,
         matching the order of ``sage_attn_sfs``.  Defaults to ``(0, 0, 0, 0)``,

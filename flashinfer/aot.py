@@ -697,9 +697,7 @@ def gen_all_modules(
         _ssu_ntokens = [1, 4, 6, 8]
         _ssu_cu_seqlens_dtypes = [torch.int32, torch.int64]
         _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
-        # Default SSU MTP-simple module requires sm_80+ (uses cp.async).  If
-        # the AOT build target has no Ampere-or-newer arch, skip it silently.
-        if has_sm80 or has_sm90 or has_sm100:
+        if has_sm80:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
                 _ssu_dims,
@@ -715,7 +713,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )  # type: ignore[call-arg]
                 )
-        if has_sm90 or has_sm100:
+        if has_sm90:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
                 _ssu_dims,
@@ -730,6 +728,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
+        if has_sm90 or has_sm100:
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())

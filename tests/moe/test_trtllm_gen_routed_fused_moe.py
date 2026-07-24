@@ -53,22 +53,7 @@ from .trtllm_gen_fused_moe_utils import (
 pytestmark = pytest.mark.solo
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
-@pytest.mark.parametrize("hidden_size", [1024, 2048, 3072, 4096])
-@pytest.mark.parametrize("intermediate_size", [1024, 2048, 3072, 4096])
-@pytest.mark.parametrize("num_experts", [128, 256])
-@pytest.mark.parametrize("top_k", [4, 8])
-@pytest.mark.parametrize(
-    "routing_method_type",
-    [
-        RoutingMethodType.Renormalize,
-        RoutingMethodType.RenormalizeNaive,
-        RoutingMethodType.TopK,
-    ],
-)
-@pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
-@pytest.mark.parametrize("routing_format", ["packed", "unpacked"])
-def test_trtllm_gen_routed_fused_moe(
+def _run_trtllm_gen_routed_fused_moe_case(
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,
@@ -76,7 +61,7 @@ def test_trtllm_gen_routed_fused_moe(
     num_experts: int,
     routing_method_type: RoutingMethodType,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
-    routing_format: Literal["packed", "unpacked"],
+    routing_format: Literal["packed", "unpacked", "unpacked_fp32"],
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -218,17 +203,21 @@ def test_trtllm_gen_routed_fused_moe(
     topk_ids = permute_info["topKIndices"].to(torch.int32)
     topk_weights = expert_weights.view(num_tokens, num_experts)[
         torch.arange(num_tokens).unsqueeze(1), topk_ids
-    ].to(torch.bfloat16)
+    ]
 
     # Prepare routing input based on format
     if routing_format == "packed":
         # Packed format: (score << 16 | expert_id)
+        topk_weights = topk_weights.to(torch.bfloat16)
         routing_input = (topk_ids.to(torch.int32) << 16) | topk_weights.view(
             torch.int16
         )
+    elif routing_format == "unpacked_fp32":
+        # Unpacked format: (topk_ids, topk_weights) tuple, float32 weights.
+        routing_input = (topk_ids, topk_weights.to(torch.float32))
     else:
-        # Unpacked format: (topk_ids, topk_weights) tuple
-        routing_input = (topk_ids, topk_weights)
+        # Unpacked format: (topk_ids, topk_weights) tuple, bfloat16 weights.
+        routing_input = (topk_ids, topk_weights.to(torch.bfloat16))
 
     output = trtllm_fp4_block_scale_routed_moe(
         routing_input,
@@ -267,6 +256,57 @@ def test_trtllm_gen_routed_fused_moe(
     # mismatch percentage
     mismatch_pct = (~mask).float().mean().item() * 100
     assert mismatch_pct < 6, f"Mismatch percentage is {mismatch_pct:.2f}"
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 2048, 3072, 4096])
+@pytest.mark.parametrize("intermediate_size", [1024, 2048, 3072, 4096])
+@pytest.mark.parametrize("num_experts", [128, 256])
+@pytest.mark.parametrize("top_k", [4, 8])
+@pytest.mark.parametrize(
+    "routing_method_type",
+    [
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+        RoutingMethodType.TopK,
+    ],
+)
+@pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
+@pytest.mark.parametrize("routing_format", ["packed", "unpacked"])
+def test_trtllm_gen_routed_fused_moe(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_experts: int,
+    routing_method_type: RoutingMethodType,
+    quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
+    routing_format: Literal["packed", "unpacked"],
+):
+    _run_trtllm_gen_routed_fused_moe_case(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        num_experts,
+        routing_method_type,
+        quant_mode,
+        routing_format,
+    )
+
+
+def test_trtllm_gen_routed_fused_moe_unpacked_fp32():
+    # All quantization modes share this finalize path.
+    _run_trtllm_gen_routed_fused_moe_case(
+        num_tokens=8,
+        hidden_size=1024,
+        intermediate_size=1024,
+        top_k=4,
+        num_experts=128,
+        routing_method_type=RoutingMethodType.Renormalize,
+        quant_mode="MxFP4xBf16",
+        routing_format="unpacked_fp32",
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [8, 64])

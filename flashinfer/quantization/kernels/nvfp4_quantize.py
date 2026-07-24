@@ -77,6 +77,8 @@ from ..quantization_cute_dsl_utils import (
     process_nvfp4_block_half,
     process_nvfp4_block_bfloat,
     process_nvfp4_block_fp8,
+    process_nvfp4_silu_block_half,
+    process_nvfp4_silu_block_bfloat,
 )
 
 SF_LAYOUT_128x4 = 0
@@ -140,6 +142,66 @@ def _compute_optimal_threads(K: int) -> int:
     return _MAX_THREADS
 
 
+@cute.jit
+def _dispatch_process_nvfp4_block(
+    row_input,
+    elem_base: Int32,
+    global_scale: Float32,
+    row_amax: Float32,
+    K: int,
+    is_bfloat16: bool,
+    is_fp8: bool,
+    silu_and_mul: bool,
+    disable_fp4_quant_fast_math: bool,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
+):
+    """Dispatch one NVFP4 block by dtype and optional SwiGLU fusion."""
+    if cutlass.const_expr(silu_and_mul):
+        if cutlass.const_expr(is_bfloat16):
+            return process_nvfp4_silu_block_bfloat(
+                row_input,
+                elem_base,
+                Int32(K),
+                global_scale,
+                disable_fp4_quant_fast_math,
+                nvfp4_4over6_config,
+                row_amax,
+            )
+        else:
+            return process_nvfp4_silu_block_half(
+                row_input,
+                elem_base,
+                Int32(K),
+                global_scale,
+                disable_fp4_quant_fast_math,
+                nvfp4_4over6_config,
+                row_amax,
+            )
+    else:
+        if cutlass.const_expr(is_fp8):
+            return process_nvfp4_block_fp8(
+                row_input, elem_base, global_scale, disable_fp4_quant_fast_math
+            )
+        elif cutlass.const_expr(is_bfloat16):
+            return process_nvfp4_block_bfloat(
+                row_input,
+                elem_base,
+                global_scale,
+                disable_fp4_quant_fast_math,
+                nvfp4_4over6_config,
+                row_amax,
+            )
+        else:
+            return process_nvfp4_block_half(
+                row_input,
+                elem_base,
+                global_scale,
+                disable_fp4_quant_fast_math,
+                nvfp4_4over6_config,
+                row_amax,
+            )
+
+
 # =============================================================================
 # CuTe-DSL Kernel Class for Linear Layout — Flat SF-Block Iteration
 # =============================================================================
@@ -170,6 +232,7 @@ class NVFP4QuantizeLinearKernel:
         enable_pdl: bool = False,
         disable_fp4_quant_fast_math: bool = False,
         nvfp4_4over6_config: NVFP44Over6Config | None = None,
+        silu_and_mul: bool = False,
     ):
         self.dtype = dtype
         self.K = K
@@ -178,9 +241,36 @@ class NVFP4QuantizeLinearKernel:
         self.enable_pdl = enable_pdl
         self.disable_fp4_quant_fast_math = disable_fp4_quant_fast_math
         self.nvfp4_4over6_config = nvfp4_4over6_config
+        # SwiGLU uses a 2*K-wide input and does not support FP8.
+        self.silu_and_mul = silu_and_mul
+        assert not (silu_and_mul and self.is_fp8), (
+            "SwiGLU fusion does not support fp8 input"
+        )
 
         assert K % NVFP4_SF_VEC_SIZE == 0
         self.num_sf_blocks_per_row = K // NVFP4_SF_VEC_SIZE
+
+    @cute.jit
+    def _process_block(
+        self, row_input, elem_base: Int32, global_scale: Float32, row_amax: Float32
+    ):
+        """Quantize one 16-element block, optionally fusing silu(gate) * up.
+
+        For the SwiGLU path the up block sits self.K columns after the gate
+        block in the same (2*K-wide) input row.
+        """
+        return _dispatch_process_nvfp4_block(
+            row_input,
+            elem_base,
+            global_scale,
+            row_amax,
+            self.K,
+            self.is_bfloat16,
+            self.is_fp8,
+            self.silu_and_mul,
+            self.disable_fp4_quant_fast_math,
+            self.nvfp4_4over6_config,
+        )
 
     @cute.jit
     def __call__(
@@ -246,29 +336,10 @@ class NVFP4QuantizeLinearKernel:
             elem_base = col_idx * NVFP4_SF_VEC_SIZE
             row_input = mInput[row_idx, None]
 
-            # Process block: load, compute scale, convert to E2M1
-            if cutlass.const_expr(self.is_fp8):
-                scale_fp8, packed64 = process_nvfp4_block_fp8(
-                    row_input, elem_base, global_scale, self.disable_fp4_quant_fast_math
-                )
-            elif cutlass.const_expr(self.is_bfloat16):
-                scale_fp8, packed64 = process_nvfp4_block_bfloat(
-                    row_input,
-                    elem_base,
-                    global_scale,
-                    self.disable_fp4_quant_fast_math,
-                    self.nvfp4_4over6_config,
-                    row_amax,
-                )
-            else:
-                scale_fp8, packed64 = process_nvfp4_block_half(
-                    row_input,
-                    elem_base,
-                    global_scale,
-                    self.disable_fp4_quant_fast_math,
-                    self.nvfp4_4over6_config,
-                    row_amax,
-                )
+            # Apply optional SwiGLU and quantize the block.
+            scale_fp8, packed64 = self._process_block(
+                row_input, elem_base, global_scale, row_amax
+            )
 
             # Write scale factor using linear indexing
             sf_offset = compute_sf_index_linear_gpu(
@@ -323,6 +394,7 @@ class NVFP4QuantizeSwizzledKernel:
         enable_pdl: bool = False,
         disable_fp4_quant_fast_math: bool = False,
         nvfp4_4over6_config: NVFP44Over6Config | None = None,
+        silu_and_mul: bool = False,
     ):
         self.dtype = dtype
         self.K = K
@@ -334,6 +406,11 @@ class NVFP4QuantizeSwizzledKernel:
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
+        # SwiGLU uses a 2*K-wide input and does not support FP8.
+        self.silu_and_mul = silu_and_mul
+        assert not (silu_and_mul and self.is_fp8), (
+            "SwiGLU fusion does not support fp8 input"
+        )
 
         assert K % NVFP4_SF_VEC_SIZE == 0
         self.num_sf_blocks_per_row = K // NVFP4_SF_VEC_SIZE
@@ -360,6 +437,28 @@ class NVFP4QuantizeSwizzledKernel:
             return compute_sf_index_swizzled_128x4_gpu(row_idx, col_idx, padded_cols)
         else:
             return compute_sf_index_swizzled_8x4_gpu(row_idx, col_idx, padded_cols)
+
+    @cute.jit
+    def _process_block(
+        self, row_input, elem_base: Int32, global_scale: Float32, row_amax: Float32
+    ):
+        """Quantize one 16-element block, optionally fusing silu(gate) * up.
+
+        For the SwiGLU path the up block sits self.K columns after the gate
+        block in the same (2*K-wide) input row.
+        """
+        return _dispatch_process_nvfp4_block(
+            row_input,
+            elem_base,
+            global_scale,
+            row_amax,
+            self.K,
+            self.is_bfloat16,
+            self.is_fp8,
+            self.silu_and_mul,
+            self.disable_fp4_quant_fast_math,
+            self.nvfp4_4over6_config,
+        )
 
     @cute.jit
     def __call__(
@@ -440,32 +539,10 @@ class NVFP4QuantizeSwizzledKernel:
                         elem_base = sf_col_idx * NVFP4_SF_VEC_SIZE
                         row_input = mInput[row_idx, None]
 
-                        # Process block: load, compute scale, convert to E2M1
-                        if cutlass.const_expr(self.is_fp8):
-                            scale_fp8, packed64 = process_nvfp4_block_fp8(
-                                row_input,
-                                elem_base,
-                                global_scale,
-                                self.disable_fp4_quant_fast_math,
-                            )
-                        elif cutlass.const_expr(self.is_bfloat16):
-                            scale_fp8, packed64 = process_nvfp4_block_bfloat(
-                                row_input,
-                                elem_base,
-                                global_scale,
-                                self.disable_fp4_quant_fast_math,
-                                self.nvfp4_4over6_config,
-                                row_amax,
-                            )
-                        else:
-                            scale_fp8, packed64 = process_nvfp4_block_half(
-                                row_input,
-                                elem_base,
-                                global_scale,
-                                self.disable_fp4_quant_fast_math,
-                                self.nvfp4_4over6_config,
-                                row_amax,
-                            )
+                        # Apply optional SwiGLU and quantize the block.
+                        scale_fp8, packed64 = self._process_block(
+                            row_input, elem_base, global_scale, row_amax
+                        )
 
                         # Write scale factor using swizzled indexing
                         sf_offset = self._compute_sf_offset(
@@ -524,32 +601,10 @@ class NVFP4QuantizeSwizzledKernel:
                             elem_base = sf_idx_in_row * NVFP4_SF_VEC_SIZE
                             row_input = mInput[row_idx, None]
 
-                            # Process block: load, compute scale, convert to E2M1
-                            if cutlass.const_expr(self.is_fp8):
-                                scale_fp8, packed64 = process_nvfp4_block_fp8(
-                                    row_input,
-                                    elem_base,
-                                    global_scale,
-                                    self.disable_fp4_quant_fast_math,
-                                )
-                            elif cutlass.const_expr(self.is_bfloat16):
-                                scale_fp8, packed64 = process_nvfp4_block_bfloat(
-                                    row_input,
-                                    elem_base,
-                                    global_scale,
-                                    self.disable_fp4_quant_fast_math,
-                                    self.nvfp4_4over6_config,
-                                    row_amax,
-                                )
-                            else:
-                                scale_fp8, packed64 = process_nvfp4_block_half(
-                                    row_input,
-                                    elem_base,
-                                    global_scale,
-                                    self.disable_fp4_quant_fast_math,
-                                    self.nvfp4_4over6_config,
-                                    row_amax,
-                                )
+                            # Apply optional SwiGLU and quantize the block.
+                            scale_fp8, packed64 = self._process_block(
+                                row_input, elem_base, global_scale, row_amax
+                            )
 
                             # Write scale factor using swizzled indexing
                             sf_offset = self._compute_sf_offset(
@@ -1346,12 +1401,15 @@ def _nvfp4_kernel_name(
     sf_layout: int,
     enable_pdl: bool,
     disable_fp4_quant_fast_math: bool,
+    silu_and_mul: bool,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> str:
     """Specialization name within the nvfp4_quantize module, encoding every
     parameter that affects codegen.
     """
     name = f"{variant}_{dtype_key}_k{K}_sf{sf_layout}_pdl{int(enable_pdl)}"
+    if silu_and_mul:
+        name += "_silu"
     if disable_fp4_quant_fast_math:
         name += "_nofastmath"
     if nvfp4_4over6_config is not None:
@@ -1369,15 +1427,18 @@ def _get_compiled_kernel_nvfp4(
     enable_pdl: bool = False,
     disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    silu_and_mul: bool = False,
 ) -> Tuple[Callable, int]:
     """
     Get or compile NVFP4 kernel with TVM-FFI.
 
-    Cached by (K, dtype_key, sf_layout, pdl) - M-agnostic, device-independent
-    compilation.
+    Cached by (K, dtype_key, sf_layout, pdl, silu_and_mul) - M-agnostic,
+    device-independent compilation.
 
     Args:
         dtype_key: One of "float16", "bfloat16", "float8_e4m3fn".
+        silu_and_mul: When True, fuse silu(gate) * up; the input row is 2 * K
+            wide (gate then up concatenated) while the output stays K wide.
 
     Returns:
         For linear layout: (compiled_kernel, sf_blocks_per_tb)
@@ -1394,9 +1455,12 @@ def _get_compiled_kernel_nvfp4(
     sym_m = cute.sym_int()
     sym_scale_size = cute.sym_int()
 
+    # Fused inputs have 2*K columns; outputs remain K-wide.
+    input_cols = 2 * K if silu_and_mul else K
+
     # Common fake tensors
     input_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype, (sym_m, K), stride_order=(1, 0), assumed_align=16
+        cutlass_dtype, (sym_m, input_cols), stride_order=(1, 0), assumed_align=16
     )
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_m, K // 2), stride_order=(1, 0), assumed_align=16
@@ -1416,6 +1480,7 @@ def _get_compiled_kernel_nvfp4(
             enable_pdl,
             disable_fp4_quant_fast_math,
             nvfp4_4over6_config,
+            silu_and_mul=silu_and_mul,
         )
 
         compiled_kernel = build_and_load_cute_dsl_kernel(
@@ -1427,6 +1492,7 @@ def _get_compiled_kernel_nvfp4(
                 sf_layout,
                 enable_pdl,
                 disable_fp4_quant_fast_math,
+                silu_and_mul,
                 nvfp4_4over6_config,
             ),
             lambda: cute.compile(
@@ -1453,6 +1519,7 @@ def _get_compiled_kernel_nvfp4(
             enable_pdl=enable_pdl,
             disable_fp4_quant_fast_math=disable_fp4_quant_fast_math,
             nvfp4_4over6_config=nvfp4_4over6_config,
+            silu_and_mul=silu_and_mul,
         )
 
         compiled_kernel = build_and_load_cute_dsl_kernel(
@@ -1464,6 +1531,7 @@ def _get_compiled_kernel_nvfp4(
                 sf_layout,
                 enable_pdl,
                 disable_fp4_quant_fast_math,
+                silu_and_mul,
                 nvfp4_4over6_config,
             ),
             lambda: cute.compile(
@@ -1537,7 +1605,8 @@ def _get_compiled_kernel_nvfp4_per_token(
             sf_layout,
             enable_pdl,
             disable_fp4_quant_fast_math,
-            nvfp4_4over6_config,
+            silu_and_mul=False,
+            nvfp4_4over6_config=nvfp4_4over6_config,
         ),
         lambda: cute.compile(
             kernel_obj,
@@ -1630,6 +1699,7 @@ def _get_compiled_kernel_nvfp4_tma(
             sf_layout,
             enable_pdl,
             disable_fp4_quant_fast_math,
+            silu_and_mul=False,
         ),
         lambda: cute.compile(
             kernel_obj,
@@ -1877,6 +1947,177 @@ def nvfp4_quantize_cute_dsl(
     return fp4_output, scale_output
 
 
+def silu_and_mul_nvfp4_quantize_cute_dsl(
+    input: torch.Tensor,
+    global_scale: torch.Tensor,
+    sf_layout: int = SF_LAYOUT_128x4,
+    enable_pdl: bool | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Apply SwiGLU and NVFP4 quantization using CuTe-DSL.
+
+    Computes ``silu(input[..., :K]) * input[..., K:]`` before quantization.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        FP16/BF16 tensor of shape ``[..., 2K]``. Leading dimensions are
+        flattened into M.
+    global_scale : torch.Tensor
+        Float32 scale of shape ``[1]``.
+    sf_layout : int
+        Scale layout: 0 for 128x4, 1 for 8x4, or 2 for linear.
+    enable_pdl : bool, optional
+        Enable Programmatic Dependent Launch. Auto-detected when None.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        Packed FP4 values of shape ``[M, K/2]`` and their uint8 E4M3 scales.
+    """
+    from ...utils import device_support_pdl
+
+    _valid_sf_layouts = (SF_LAYOUT_128x4, SF_LAYOUT_8x4, SF_LAYOUT_LINEAR)
+    assert sf_layout in _valid_sf_layouts, (
+        f"sf_layout must be one of {_valid_sf_layouts}, got {sf_layout}"
+    )
+    _supported_dtypes = (torch.float16, torch.bfloat16)
+    assert input.dtype in _supported_dtypes, (
+        f"SwiGLU NVFP4 input dtype must be one of {_supported_dtypes}, "
+        f"got {input.dtype}"
+    )
+    assert input.is_cuda, "Input must be on CUDA device"
+
+    enable_pdl = device_support_pdl(input.device) if enable_pdl is not False else False
+
+    # Flatten leading dimensions into M.
+    input_cols = input.shape[-1]
+    assert input_cols % 2 == 0, (
+        "the last dimension must be even (gate and up concatenated)"
+    )
+    k = input_cols // 2
+    assert k % NVFP4_SF_VEC_SIZE == 0, (
+        f"K ({k}) must be divisible by NVFP4_SF_VEC_SIZE={NVFP4_SF_VEC_SIZE}"
+    )
+    # Multiply leading dimensions so zero-width inputs remain valid.
+    m = 1
+    for dim in input.shape[:-1]:
+        m *= int(dim)
+
+    # Return empty outputs without compiling or launching.
+    if m == 0 or k == 0:
+        num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
+        if sf_layout == SF_LAYOUT_LINEAR:
+            padded_sf_cols = num_sf_blocks_per_row
+        else:
+            padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
+        return (
+            torch.empty((m, k // 2), dtype=torch.uint8, device=input.device),
+            torch.empty((m, padded_sf_cols), dtype=torch.uint8, device=input.device),
+        )
+
+    input = input.reshape(m, input_cols)
+    input = input.contiguous()
+    # Clone storage-offset views that violate the kernel's 16-byte alignment.
+    if input.data_ptr() % 16 != 0:
+        input = input.clone()
+
+    _torch_to_dtype_key = {
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+    }
+    dtype_key = _torch_to_dtype_key[input.dtype]
+
+    if isinstance(global_scale, torch.Tensor):
+        global_scale_tensor = (
+            global_scale.float().reshape(1).contiguous().to(input.device)
+        )
+    else:
+        global_scale_tensor = torch.tensor(
+            [float(global_scale)], dtype=torch.float32, device=input.device
+        )
+
+    num_sm = get_num_sm(input.device)
+    num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
+
+    disable_fp4_quant_fast_math = _env_flag_enabled(
+        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
+    )
+    nvfp4_4over6_config = current_nvfp4_4over6_config()
+
+    # SwiGLU fusion uses the non-TMA vectorized-load kernels only.
+    kernel_fn, block_unit = _get_compiled_kernel_nvfp4(
+        dtype_key,
+        k,
+        sf_layout,
+        enable_pdl,
+        disable_fp4_quant_fast_math,
+        nvfp4_4over6_config,
+        silu_and_mul=True,
+    )
+
+    target_grid = num_sm * _BLOCKS_PER_SM
+
+    if sf_layout == SF_LAYOUT_LINEAR:
+        padded_sf_cols = num_sf_blocks_per_row
+        total_sf_blocks = m * num_sf_blocks_per_row
+        scale_output_size = total_sf_blocks
+
+        sf_blocks_per_tb = block_unit
+        num_blocks = min(
+            (total_sf_blocks + sf_blocks_per_tb - 1) // sf_blocks_per_tb,
+            target_grid,
+        )
+
+        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
+        scale_output = torch.empty(
+            scale_output_size, dtype=torch.uint8, device=input.device
+        )
+
+        kernel_fn(
+            input,
+            fp4_output,
+            scale_output,
+            m,
+            total_sf_blocks,
+            num_blocks,
+            global_scale_tensor,
+        )
+    else:
+        if sf_layout == SF_LAYOUT_8x4:
+            row_tile_size = 8
+        else:
+            row_tile_size = ROW_TILE_SIZE  # 128
+        padded_m = ((m + row_tile_size - 1) // row_tile_size) * row_tile_size
+        padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
+        scale_output_size = padded_m * padded_sf_cols
+
+        rows_per_block = block_unit
+        num_blocks = min(
+            (padded_m + rows_per_block - 1) // rows_per_block,
+            target_grid,
+        )
+
+        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
+        scale_output = torch.empty(
+            scale_output_size, dtype=torch.uint8, device=input.device
+        )
+
+        kernel_fn(
+            input,
+            fp4_output,
+            scale_output,
+            m,
+            padded_m,
+            num_blocks,
+            global_scale_tensor,
+        )
+
+    # Return scales in their layout-specific 2D shape.
+    scale_output = scale_output.reshape(-1, padded_sf_cols)
+
+    return fp4_output, scale_output
+
+
 @flashinfer_api
 def nvfp4_quantize_per_token_cute_dsl(
     input: torch.Tensor,
@@ -2018,6 +2259,7 @@ __all__ = [
     "NVFP4QuantizePerTokenKernel",
     "NVFP4QuantizeTMAKernel",
     "nvfp4_quantize_cute_dsl",
+    "silu_and_mul_nvfp4_quantize_cute_dsl",
     "nvfp4_quantize_per_token_cute_dsl",
     "_get_compiled_kernel_nvfp4",
     "_get_compiled_kernel_nvfp4_per_token",

@@ -190,9 +190,12 @@ from flashinfer.fused_moe.api import (
     RoutingConfig,
     TrtllmBf16Config,
     TrtllmFp4Config,
+    TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
+from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
@@ -228,6 +231,8 @@ _DETERMINISTIC = {
     "trtllm_fp4_routed": True,  # bitwise-stable across reruns in calibration
     "cute_dsl_nvfp4": False,  # atomic scatter-add finalize -> non-bit-exact by design
     "trtllm_bf16_routed": True,  # same trtllm-gen finalize path as fp4_routed; bitwise-stable in calibration
+    "trtllm_fp8_block": True,
+    "trtllm_fp8_per_tensor": True,
 }
 
 # Known-bug ledger: (backend_key, predicate(cfg)) -> reason. A matching (backend, config) is run but
@@ -280,7 +285,9 @@ class DTypeHandler:
         tuple  # all plausible backend config classes; unwired ones auto-skip
     )
     snap: Callable  # bf16 tensor -> exactly-representable fixed point for this dtype
-    make_act_pack: Callable  # (x, selected_experts, final_scales) -> MoEActivationPack (pre-routed)
+    make_act_pack: (
+        Callable | None
+    )  # (x, selected_experts, final_scales) -> pre-routed pack
     make_act_pack_logits: (
         Callable | None  # (x, routing_logits, routing_bias) -> pack (in-kernel routing)
     )
@@ -401,6 +408,179 @@ def _bf16_reference(
     return out
 
 
+def _block_fp8_dequant(x_q, scale, variant):
+    if variant is QuantVariant.DeepSeekFp8:
+        if x_q.dim() == 2:
+            expanded = scale.transpose(0, 1).repeat_interleave(128, dim=-1)
+        else:
+            expanded = scale.repeat_interleave(128, dim=-2).repeat_interleave(
+                128, dim=-1
+            )
+        return x_q.float() * expanded
+    scale_f32 = torch.pow(2.0, scale.to(torch.uint8).float() - 127.0)
+    return x_q.float() * scale_f32.repeat_interleave(32, dim=-1)
+
+
+def _mxfp8_quant_matrix(x):
+    """Quantize a logical matrix without applying the MoE weight shuffle."""
+    q, scale = mxfp8_quantize(x, is_sf_swizzled_layout=False)
+    return q, scale.view(torch.uint8).reshape(x.shape[0], x.shape[1] // 32)
+
+
+def _block_fp8_act_pack(x, selected_experts, final_scales, *, variant):
+    q, sf = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
+    return MoEActivationPack(
+        hidden_states_q=q,
+        hidden_states_scale=sf,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
+    )
+
+
+def _block_fp8_snap(t: torch.Tensor) -> torch.Tensor:
+    """Keep FP8 fuzz inputs in a realistic MoE numerical range."""
+    scale = 0.02 if t.dim() == 3 else 0.25
+    return (t * scale).to(torch.bfloat16)
+
+
+def _block_fp8_act_pack_logits(x, routing_logits, routing_bias, *, variant):
+    q, sf = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
+    return MoEActivationPack(
+        hidden_states_q=q,
+        hidden_states_scale=sf,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+    )
+
+
+def _block_fp8_reference(
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+    *,
+    variant,
+):
+    if variant is QuantVariant.DeepSeekFp8:
+        x_q, x_sf = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
+    else:
+        x_q, x_sf = _mxfp8_quant_matrix(x)
+    x32 = _block_fp8_dequant(x_q, x_sf, variant)
+    if variant is QuantVariant.DeepSeekFp8:
+        view = TrtllmFp8BlockConfig.prepare_weights(
+            w1,
+            w2,
+            variant=variant,
+            num_local_experts=w1.shape[0],
+            hidden_size=x.shape[1],
+            intermediate_size=intermediate_size,
+            device=x.device,
+        )
+        w1_32 = _block_fp8_dequant(
+            view["gemm1_weights"], view["gemm1_weights_scale"], variant
+        )
+        w2_32 = _block_fp8_dequant(
+            view["gemm2_weights"], view["gemm2_weights_scale"], variant
+        )
+    else:
+        w1_32 = torch.stack(
+            [
+                _block_fp8_dequant(q, sf, variant)
+                for q, sf in (_mxfp8_quant_matrix(expert) for expert in w1)
+            ]
+        )
+        w2_32 = torch.stack(
+            [
+                _block_fp8_dequant(q, sf, variant)
+                for q, sf in (_mxfp8_quant_matrix(expert) for expert in w2)
+            ]
+        )
+    final_scales = final_scales.to(torch.bfloat16).float()
+    out = torch.zeros_like(x32)
+    for local_e in range(w1.shape[0]):
+        token, slot = torch.where(selected_experts == local_e + expert_offset)
+        if token.numel() == 0:
+            continue
+        up = x32[token] @ w1_32[local_e, :intermediate_size].t()
+        gate = x32[token] @ w1_32[local_e, intermediate_size:].t()
+        inter = F.silu(gate) * up
+        if variant is QuantVariant.DeepSeekFp8:
+            inter_q, inter_sf = TrtllmFp8BlockConfig.prepare_activations(
+                inter.to(torch.bfloat16), variant=variant
+            )
+        else:
+            inter_q, inter_sf = _mxfp8_quant_matrix(inter.to(torch.bfloat16))
+        inter = _block_fp8_dequant(inter_q, inter_sf, variant)
+        expert_out = inter @ w2_32[local_e].t()
+        out[token] += final_scales[token, slot, None] * expert_out
+    return out
+
+
+def _fp8_per_tensor_global_scale(x):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = x.float().abs().amax()
+    return torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+
+
+def _fp8_per_tensor_act_pack_logits(x, routing_logits, routing_bias):
+    input_scale = _fp8_per_tensor_global_scale(x)
+    q, sf = TrtllmFp8PerTensorConfig.prepare_activations(
+        x, hidden_states_scale_global=input_scale
+    )
+    return MoEActivationPack(
+        hidden_states_q=q,
+        hidden_states_scale=sf,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+    )
+
+
+def _fp8_per_tensor_dequant_experts(weights):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = weights.float().abs().amax(dim=(-1, -2))
+    scales = torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+    q = (weights.float() * scales[:, None, None]).clamp(-fp8_max, fp8_max)
+    return q.to(torch.float8_e4m3fn).float() / scales[:, None, None]
+
+
+def _fp8_per_tensor_reference(
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    input_scale = _fp8_per_tensor_global_scale(x)
+    intermediate_scale = torch.tensor(64.0, device=x.device)
+    x_q = (x.float() * input_scale).clamp(-fp8_max, fp8_max)
+    x32 = x_q.to(torch.float8_e4m3fn).float() / input_scale
+    w1_32 = _fp8_per_tensor_dequant_experts(w1)
+    w2_32 = _fp8_per_tensor_dequant_experts(w2)
+
+    out = torch.zeros_like(x32)
+    for local_e in range(w1.shape[0]):
+        token, slot = torch.where(selected_experts == local_e + expert_offset)
+        if token.numel() == 0:
+            continue
+        up = x32[token] @ w1_32[local_e, :intermediate_size].t()
+        gate = x32[token] @ w1_32[local_e, intermediate_size:].t()
+        inter = F.silu(gate) * up
+        inter_q = (inter * intermediate_scale).clamp(-fp8_max, fp8_max)
+        inter = inter_q.to(torch.float8_e4m3fn).float() / intermediate_scale
+        expert_out = (inter @ w2_32[local_e].t()).to(torch.bfloat16).float()
+        out[token] += final_scales[token, slot, None] * expert_out
+    return out
+
+
 _DTYPE = {
     QuantVariant.NVFP4: DTypeHandler(
         variant=QuantVariant.NVFP4,
@@ -426,15 +606,71 @@ _DTYPE = {
         atol_frac=0.05,  # initial; calibrate on SM100 (bf16 rounding floor)
         rtol=0.05,
     ),
-    # FP8 / MXFP4 / MXINT4 add one entry each as their runners are wired upstream.
+    QuantVariant.DeepSeekFp8: DTypeHandler(
+        variant=QuantVariant.DeepSeekFp8,
+        candidate_configs=(TrtllmFp8BlockConfig,),
+        snap=_block_fp8_snap,
+        make_act_pack=lambda x, ids, weights: _block_fp8_act_pack(
+            x, ids, weights, variant=QuantVariant.DeepSeekFp8
+        ),
+        make_act_pack_logits=lambda x, logits, bias: _block_fp8_act_pack_logits(
+            x, logits, bias, variant=QuantVariant.DeepSeekFp8
+        ),
+        reference=lambda *args: _block_fp8_reference(
+            *args, variant=QuantVariant.DeepSeekFp8
+        ),
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=0.15,  # provisional; recalibrate over the expanded SM100 sweep
+        rtol=0.85,  # legacy-aligned initial bound, not a settled regression bar
+    ),
+    QuantVariant.MxFp8: DTypeHandler(
+        variant=QuantVariant.MxFp8,
+        candidate_configs=(TrtllmFp8BlockConfig,),
+        snap=_block_fp8_snap,
+        make_act_pack=lambda x, ids, weights: _block_fp8_act_pack(
+            x, ids, weights, variant=QuantVariant.MxFp8
+        ),
+        make_act_pack_logits=lambda x, logits, bias: _block_fp8_act_pack_logits(
+            x, logits, bias, variant=QuantVariant.MxFp8
+        ),
+        reference=lambda *args: _block_fp8_reference(*args, variant=QuantVariant.MxFp8),
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=0.15,  # provisional; recalibrate over the expanded SM100 sweep
+        rtol=0.85,  # legacy-aligned initial bound, not a settled regression bar
+    ),
+    QuantVariant.FP8PerTensor: DTypeHandler(
+        variant=QuantVariant.FP8PerTensor,
+        candidate_configs=(TrtllmFp8PerTensorConfig,),
+        snap=_block_fp8_snap,
+        make_act_pack=None,
+        make_act_pack_logits=_fp8_per_tensor_act_pack_logits,
+        reference=_fp8_per_tensor_reference,
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=0.05,
+        rtol=0.3,
+    ),
+    # MXFP4 / MXINT4 add one entry each as their runners are wired upstream.
 }
 
 # Cfg.variant string <-> handler lookup (labels stay lowercase enum names).
-_VARIANT_IDS = tuple(v.name.lower() for v in _DTYPE)
+_HANDLER_BY_ID = {variant.name.lower(): handler for variant, handler in _DTYPE.items()}
+_FROMLOGITS_VARIANT_IDS = tuple(
+    variant.name.lower()
+    for variant, handler in _DTYPE.items()
+    if handler.make_act_pack_logits is not None
+)
+_PREROUTED_VARIANT_IDS = tuple(
+    variant.name.lower()
+    for variant, handler in _DTYPE.items()
+    if handler.make_act_pack is not None
+)
 
 
 def _handler_for(cfg):
-    return _DTYPE[QuantVariant[cfg.variant.upper()]]
+    return _HANDLER_BY_ID[cfg.variant]
 
 
 # ---------------------------------------------------------------------------
@@ -610,15 +846,24 @@ def _gen(seed):
             [t for t in _TOPK if t <= local]
         )  # route within the local shard
 
+    fromlogits_variants = _FROMLOGITS_VARIANT_IDS
+    if method == RoutingMethodType.Llama4:
+        # Per-tensor FP8 applies the Llama4 route scale on GEMM1 input rather
+        # than in finalization, so it needs a method-aware reference.
+        fromlogits_variants = tuple(
+            variant for variant in fromlogits_variants if variant != "fp8pertensor"
+        )
+
     return Cfg(
         num_tokens=rng.choice(_TOKENS),
         hidden=h,
         intermediate=i,
         num_experts=ne,
         top_k=top_k,
-        # BF16 is pre-routed-only today; FromLogits currently requires the
-        # TRTLLM FP4 runner.
-        variant="nvfp4" if fromlogits else rng.choice(_VARIANT_IDS),
+        # FromLogits can use only variants with an in-kernel-routing runner.
+        variant=rng.choice(fromlogits_variants)
+        if fromlogits
+        else rng.choice(_PREROUTED_VARIANT_IDS),
         route=rng.choice(_ROUTE),
         seed=seed,
         local_experts=local,
@@ -711,6 +956,56 @@ _CURATED = [
     Cfg(
         2048, 1024, 1024, 128, 6, "bf16", "imbalanced", 900_010
     ),  # bf16 mid size + empty-expert load
+    Cfg(
+        16,
+        7168,
+        2048,
+        256,
+        2,
+        "deepseekfp8",
+        "uniform",
+        900_011,
+        local_experts=2,
+    ),  # DeepSeek-V3 dimensions with a two-expert local shard
+    Cfg(
+        256,
+        1024,
+        512,
+        32,
+        4,
+        "deepseekfp8",
+        "uniform",
+        900_012,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+        logits_dtype="fp32",
+    ),
+    Cfg(256, 2048, 1024, 16, 4, "mxfp8", "imbalanced", 900_013),
+    Cfg(
+        256,
+        1024,
+        512,
+        32,
+        4,
+        "mxfp8",
+        "uniform",
+        900_016,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+    ),  # seed % 4 == 0 deliberately exercises production autotuning for MXFP8
+    Cfg(
+        256,
+        1024,
+        512,
+        32,
+        4,
+        "fp8pertensor",
+        "uniform",
+        900_020,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+        logits_dtype="fp32",
+    ),  # per-tensor FP8 is FromLogits-only; seed % 4 == 0 exercises autotuning
 ]
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _curated_by_seed = {c.seed: c for c in _CURATED}
@@ -990,18 +1285,31 @@ def test_unified_moe_fuzz(cfg):
         assert handler.make_act_pack_logits is not None
         act_pack = handler.make_act_pack_logits(x, logits, routing_bias)
     else:
+        assert handler.make_act_pack is not None
         act_pack = handler.make_act_pack(x, selected_experts, final_scales)
     weight_pack = MoEWeightPack()
     for BackendCfg in wired_backends:
+        prepare_kwargs = dict(
+            num_local_experts=cfg.n_local,
+            hidden_size=cfg.hidden,
+            intermediate_size=cfg.intermediate,
+            device=dev,
+        )
+        # TrtllmFp8BlockConfig is shared by DeepSeekFp8 and MxFp8, so pass the
+        # handler's variant explicitly to select the native scale/layout format.
+        if BackendCfg is TrtllmFp8BlockConfig:
+            prepare_kwargs["variant"] = handler.variant
+        elif BackendCfg is TrtllmFp8PerTensorConfig:
+            prepare_kwargs.update(
+                hidden_states_scale_global=_fp8_per_tensor_global_scale(x),
+                intermediate_scale_global=torch.tensor(64.0, device=dev),
+            )
         weight_pack.prepare_for(
             _BACKEND_RUNNERS[BackendCfg].backend_key,
             BackendCfg.prepare_weights(
                 w1,
                 w2,
-                num_local_experts=cfg.n_local,
-                hidden_size=cfg.hidden,
-                intermediate_size=cfg.intermediate,
-                device=dev,
+                **prepare_kwargs,
             ),
         )
 
@@ -1202,9 +1510,15 @@ _CACHE_TOKEN_SEQ = [
     256,
     16,
 ]  # buckets + boundaries + cache-hit re-runs
+_CACHE_VARIANTS = (
+    QuantVariant.NVFP4,
+    QuantVariant.BF16,
+)  # The 21-tactic block-FP8 runners make this multi-bucket stress sweep prohibitive.
 
 
-@pytest.mark.parametrize("variant", list(_DTYPE), ids=[v.name.lower() for v in _DTYPE])
+@pytest.mark.parametrize(
+    "variant", _CACHE_VARIANTS, ids=[v.name.lower() for v in _CACHE_VARIANTS]
+)
 @pytest.mark.parametrize(
     "base", _CACHE_BASES, ids=[f"e{e}h{h}i{i}" for e, h, i in _CACHE_BASES]
 )
@@ -1245,15 +1559,22 @@ def test_autotune_cache_coherence(base, variant):
     w1, w2 = sparse(E, 2 * I, H), sparse(E, H, I)
     weight_pack = MoEWeightPack()
     for B in wired:
+        prepare_kwargs = dict(
+            num_local_experts=E,
+            hidden_size=H,
+            intermediate_size=I,
+            device=dev,
+        )
+        # TrtllmFp8BlockConfig is shared by DeepSeekFp8 and MxFp8, so pass the
+        # handler's variant explicitly to select the native scale/layout format.
+        if B is TrtllmFp8BlockConfig:
+            prepare_kwargs["variant"] = variant
         weight_pack.prepare_for(
             _BACKEND_RUNNERS[B].backend_key,
             B.prepare_weights(
                 w1,
                 w2,
-                num_local_experts=E,
-                hidden_size=H,
-                intermediate_size=I,
-                device=dev,
+                **prepare_kwargs,
             ),
         )
     layer = MoELayer(

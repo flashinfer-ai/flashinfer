@@ -42,6 +42,8 @@ from .runners import (  # noqa: F401
     B12xW4A16Runner,
     CuteDslNvfp4Runner,
     TrtllmFp4RoutedRunner,
+    TrtllmFp8BlockRunner,
+    TrtllmFp8PerTensorRunner,
 )
 
 # Legacy flat-argument APIs (unchanged, not deprecated)
@@ -49,6 +51,7 @@ from .core import (
     RoutingInputMode,
     convert_to_block_layout,
     cutlass_fused_moe,
+    cutlass_fused_moe_workspace_size,
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -138,6 +141,8 @@ __all__ = [
     "MoELayer",
     "MoEWeightPack",
     "TrtllmFp4RoutedRunner",
+    "TrtllmFp8BlockRunner",
+    "TrtllmFp8PerTensorRunner",
     "QuantConfig",
     "QuantVariant",
     "RoutingConfig",
@@ -153,6 +158,7 @@ __all__ = [
     "WeightLayout",
     "convert_to_block_layout",
     "cutlass_fused_moe",
+    "cutlass_fused_moe_workspace_size",
     "interleave_moe_scales_for_sm90_mixed_gemm",
     "interleave_moe_weights_for_sm90_mixed_gemm",
     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",

@@ -168,13 +168,11 @@ def gen_selective_state_update_module(
         num_accepted_tokens_dtype,
         philox_rounds,
     )
-    # The MTP-simple kernel uses cp.async (sm_80+).  Restrict compilation to
-    # Ampere and newer; on pre-Ampere GPUs the JIT will raise
-    # "No supported CUDA architectures found" instead of failing in nvcc.
+    # The MTP-simple kernel uses cp.async (sm_80+); on pre-Ampere GPUs the
+    # JIT will raise "No supported CUDA architectures found" instead of
+    # failing in nvcc.
     compilation_context = CompilationContext()
-    nvcc_flags = compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[8, 9, 10, 11]
-    )
+    nvcc_flags = compilation_context.get_nvcc_flags_list(supported_major_versions=[8])
     return _gen_module(
         uri,
         state_dtype,
@@ -225,9 +223,7 @@ def gen_selective_state_update_sm90_module(
         + "_sm90"
     )
     compilation_context = CompilationContext()
-    nvcc_flags = compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 11]
-    )
+    nvcc_flags = compilation_context.get_nvcc_flags_list(supported_major_versions=[9])
     nvcc_flags += ["-DFLASHINFER_MAMBA_ENABLE_SM90"]
     return _gen_module(
         uri,
