@@ -1262,7 +1262,12 @@ def test_verify_kernel_mtp(
     )
 
 
-def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch):
+@pytest.mark.parametrize(
+    "batch_size",
+    [1, 5],
+    ids=["inline", "warp_specialized"],
+)
+def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch, batch_size):
     import cutlass.cute as cute
     import flashinfer.gdn_kernels.gdn_decode_mtp as gdn_decode_mtp
 
@@ -1281,7 +1286,7 @@ def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch):
         for cache_intermediate_states in (True, False):
             _test_verify_kernel_mtp(
                 dtype="bfloat16",
-                batch_size=1,
+                batch_size=batch_size,
                 num_q_heads=16,
                 num_k_heads=16,
                 num_v_heads=32,
