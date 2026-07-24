@@ -207,6 +207,10 @@ def chunk_gated_delta_rule_sm100(
 
         gdn = GatedDeltaNetChunkedKernel(
             io_dtype=io_dtype,
+            # The kernel requires the triangular-inverse dtype to match io_dtype
+            # (asserted in its __init__); pass io_dtype so bf16 uses the same
+            # validated path as fp16 instead of the default Float16.
+            inverse_dtype=io_dtype,
             acc_dtype=cutlass.Float32,
             state_dtype=state_dtype,
             mma_tiler_qk=(64, 64, 128),
@@ -304,7 +308,7 @@ def chunk_gated_delta_rule_sm100(
             scale,
             workspace_cute,
             stream,
-            options="--enable-tvm-ffi --opt-level 2",
+            options="--enable-tvm-ffi --opt-level 3",
         )
 
         cache["compiled"] = compiled
