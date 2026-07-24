@@ -90,6 +90,12 @@ void fp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView scale_a, TensorVi
   CHECK_INPUT(mat2);
   CHECK_INPUT(scale_a);
   CHECK_INPUT(scale_b);
+  CHECK_INPUT_TYPE(scale_a, dl_float32);
+  CHECK_INPUT_TYPE(scale_b, dl_float32);
+  CHECK_DEVICE(mat1, scale_a);
+  CHECK_DEVICE(mat2, scale_b);
+  TVM_FFI_ICHECK_EQ(scale_a.numel(), 1) << "scale_a must contain exactly one element";
+  TVM_FFI_ICHECK_EQ(scale_b.numel(), 1) << "scale_b must contain exactly one element";
 
   int mat2_k_scale = 1;
 

@@ -6683,6 +6683,21 @@ def _cutlass_bmm_fp8_requirement(
     return True
 
 
+def _validate_bmm_fp8_scale(
+    scale: torch.Tensor, operand: torch.Tensor, name: str
+) -> None:
+    if scale.numel() != 1:
+        raise ValueError(
+            f"{name} must contain exactly one element, got {scale.numel()}"
+        )
+    if scale.dtype != torch.float32:
+        raise ValueError(f"{name} must have dtype torch.float32, got {scale.dtype}")
+    if not scale.is_cuda or scale.device != operand.device:
+        raise ValueError(
+            f"{name} must be a CUDA tensor on {operand.device}, got {scale.device}"
+        )
+
+
 def _check_bmm_fp8_problem_size(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -6692,6 +6707,8 @@ def _check_bmm_fp8_problem_size(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
 ):
+    _validate_bmm_fp8_scale(A_scale, A, "A_scale")
+    _validate_bmm_fp8_scale(B_scale, B, "B_scale")
     _validate_fp8_output_dtype(dtype)
     return True
 
@@ -6756,10 +6773,13 @@ def bmm_fp8(
         Mat2 tensor, shape (b, k, n), should be column major, fp8 e4m3 or fp8 e5m2.
 
     A_scale: torch.Tensor
-        Scale tensor for A, float.
+        Tensorwide scale for A. Must contain exactly one ``torch.float32`` value
+        on the same CUDA device as A.
 
     B_scale: torch.Tensor
-        Scale tensor for B, float.
+        Tensorwide scale for B. Must contain exactly one ``torch.float32`` value
+        on the same CUDA device as B. Use :func:`gemm_fp8_nt_groupwise` for
+        groupwise scales.
 
     dtype: torch.dtype
         out dtype, bf16 or fp16.
