@@ -29,13 +29,10 @@ from flashinfer.tllm_enums import (
 )
 
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
-from .moe_w4a16_permute import moe_permute_bf16_pdl
 
 
 W4A16GemmTactic = Tuple[Tuple[int, int], Tuple[int, int]]
 W4A16MoeTactic = Tuple[int, W4A16GemmTactic, W4A16GemmTactic]
-
-_MIN_GEMM1_M_CLUSTERS_FOR_PERMUTE_OVERLAP = 8
 
 # Fixed correctness fallback used when no tuned tactic is available. Runtime
 # performance selection belongs to CuteDslFusedMoEW4A16Runner.
@@ -389,19 +386,6 @@ def launch_w4a16_moe(
     if tactic is None:
         tactic = DEFAULT_W4A16_MOE_TACTIC
     route_tile, gemm1_tactic, gemm2_tactic = tactic
-    gemm1_mma_m = gemm1_tactic[0][0]
-    gemm1_cluster_m = gemm1_tactic[1][0]
-    gemm1_m_cluster_width = gemm1_mma_m * gemm1_cluster_m
-    num_gemm1_m_clusters = (
-        gemm1_output_size + gemm1_m_cluster_width - 1
-    ) // gemm1_m_cluster_width
-    # Wide GEMM1s can overlap the copy when one producer CTA occupies each SM.
-    # Narrow GEMM1s leave the copy on the critical path and use 1.5 CTAs per SM.
-    permute_ctas_per_sm = (
-        (1, 1)
-        if num_gemm1_m_clusters >= _MIN_GEMM1_M_CLUSTERS_FOR_PERMUTE_OVERLAP
-        else (3, 2)
-    )
     workspace = _get_workspace(
         x,
         top_k,
@@ -441,30 +425,17 @@ def launch_w4a16_moe(
     permuted_idx_to_expanded_idx = permuted_idx_to_expanded_idx[:route_slots]
     hidden_workspace = workspace.hidden_workspace[:route_slots]
     intermediate = workspace.intermediate[:route_slots]
-    if enable_pdl:
-        moe_permute_bf16_pdl(
-            input=x,
-            permuted_output=hidden_workspace,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            max_num_permuted_tokens=route_slots,
-            top_k=top_k,
-            tile_size=route_tile,
-            ctas_per_sm=permute_ctas_per_sm,
-        )
-    else:
-        moe_permute(
-            input=x,
-            permuted_output=hidden_workspace,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            max_num_permuted_tokens=route_slots,
-            top_k=top_k,
-            tile_size=route_tile,
-            enable_pdl=False,
-        )
+    moe_permute(
+        input=x,
+        permuted_output=hidden_workspace,
+        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles=num_non_exiting_tiles,
+        max_num_permuted_tokens=route_slots,
+        top_k=top_k,
+        tile_size=route_tile,
+        enable_pdl=enable_pdl,
+    )
     _run_grouped_gemm(
         weight=w1_weight,
         weight_sf=w1_weight_sf,
