@@ -318,6 +318,45 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
         )
 
 
+def test_cute_dsl_gemv_fp16_out():
+    """The m=1 stream GEMV honors fp16 output (compiled per c_dtype, so the
+    bf16-only every-tactic test doesn't cover it)."""
+    _skip_if_backend_unavailable("cute-dsl")
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _bf16_fp4_cute_dsl_tactic_configs,
+        _cute_dsl_bf16_fp4_runner,
+        _prepare_bf16_fp4_alpha,
+    )
+
+    device = torch.device("cuda")
+    m, n, k = 1, 2048, 7168
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl"
+    )
+    ref = (a.float() @ _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16).T).to(
+        torch.float16
+    )
+
+    runner = _cute_dsl_bf16_fp4_runner(enable_pdl=True)
+    sf_u8 = sf_p.view(torch.uint8).contiguous()
+    alpha_l = _prepare_bf16_fp4_alpha(alpha_p, device)
+    gemv = [
+        i
+        for i, c in enumerate(_bf16_fp4_cute_dsl_tactic_configs(n, k))
+        if c[7] == "gemv"
+    ]
+    assert gemv, "expected gemv tactics for this shape"
+    for tactic in gemv:
+        out = torch.empty((m, n), device=device, dtype=torch.float16)
+        runner.forward([a, b_p, sf_u8, alpha_l, torch.float16, out, 16], tactic=tactic)
+        torch.cuda.synchronize()
+        assert out.dtype == torch.float16
+        _assert_close_to_reference(out, ref, f"cute-dsl gemv fp16 tactic {tactic}")
+
+
 def test_cute_dsl_fallback_k_splits_selector():
     """Pin the no-autotune fallback's static split-K rule.
 

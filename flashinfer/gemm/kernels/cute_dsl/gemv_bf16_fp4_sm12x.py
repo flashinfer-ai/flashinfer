@@ -18,13 +18,11 @@ Streaming W4A16 GEMV for SM12x: bf16 activation row x NVFP4 weights at m=1.
 The MMA kernel's design point (SMEM pipeline feeding tensor cores) is wrong
 for m=1: the problem is DRAM-bound and the tensor-core math is nearly free,
 so pipeline depth buys nothing while its SMEM cost caps resident warps.
-This kernel inverts the trade — weights stream GMEM -> registers with no
+This kernel inverts the trade. Weights stream GMEM -> registers with no
 SMEM and no tensor cores, and latency is hidden by warp count alone
-(~48 resident warps/SM).  Measured on prod 5080 it reaches the same DRAM
-utilization band as Marlin (93-96%) where the MMA path tops out lower.
+(~48 resident warps/SM), which holds the DRAM-bandwidth ceiling at m=1
+where the MMA path falls short.
 """
-
-from typing import Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -33,38 +31,13 @@ from cutlass import Float32, Int32, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ....cute_dsl.fp4_common import fp4_decode_4bytes
-
-
-@dsl_user_op
-def _f16x2_to_f32x2(packed: Uint32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
-    """Widen one packed f16x2 register into two f32 values exactly."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32(), T.f32()]),
-        [Uint32(packed).ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .b16 lo, hi;
-            mov.b32 {lo, hi}, $2;
-            cvt.f32.f16 $0, lo;
-            cvt.f32.f16 $1, hi;
-        }
-        """,
-        "=f,=f,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    lo = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
-    hi = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
-    return Float32(lo), Float32(hi)
+from ....cute_dsl.fp4_common import f16x2_to_f32x2, fp4_decode_4bytes
 
 
 @dsl_user_op
 def _s0e5m3_to_f32(byte: Uint32, *, loc=None, ip=None) -> Float32:
-    """Decode one S0E5M3 scale byte to f32 (exact): ``f16(byte << 7)``."""
+    """Decode one S0E5M3 scale byte to f32: ``f16(byte << 7)``. Scalar-f32
+    form of fp4_common's ``cvt_s0e5m3_to_f16x2_broadcast``."""
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -91,7 +64,7 @@ def _s0e5m3_to_f32(byte: Uint32, *, loc=None, ip=None) -> Float32:
 class GemvBf16Fp4Sm12x:
     """Streaming bf16 x nvfp4 GEMV over the cute-DSL backend's prepared
     tensors: the tile-packed ``(K/16, N*2)`` int32 weight and the S0E5M3
-    ``(K/16, N)`` scales — the same operands the MMA kernel takes, so the
+    ``(K/16, N)`` scales, the same operands the MMA kernel takes, so the
     two dispatch freely per call.
 
     Each warp owns one 64-wide N tile and streams its (16K x 64N) packed
@@ -108,7 +81,7 @@ class GemvBf16Fp4Sm12x:
     alone underfills large GPUs); split partials reuse the MMA kernel's
     fp32-workspace + fixed-order reduce scheme, so results stay
     deterministic.  m == 1 only: at m >= 2 the serial FMA chain scales
-    with m while the loads don't, and the MMA path wins (measured).
+    with m while the loads do not, and the MMA path wins.
     """
 
     _NUM_WARPS = 8  # one 64-wide N tile per warp
@@ -135,6 +108,9 @@ class GemvBf16Fp4Sm12x:
         mAlpha: cute.Tensor,  # (1,) f32
         stream: cuda.CUstream,
     ):
+        # M == 1 only: partials write at stride N but the reduce indexes at
+        # stride M*N, so they agree only at M == 1. Enforced host-side by the
+        # runner (the m != 1 guard in forward); M is symbolic here.
         n_tiles = cute.size(mSF, mode=[1]) // self._TILE_N
         self.kernel(mA, mB, mSF, mC, mPartial, mAlpha).launch(
             grid=(
@@ -222,7 +198,7 @@ class GemvBf16Fp4Sm12x:
                     b0, b1, b2, b3 = fp4_decode_4bytes(Uint32(wfrag[j]))
                     for b, reg in enumerate((b0, b1, b2, b3)):
                         p = 2 * (j & 1) + (b >> 1)
-                        lo, hi = _f16x2_to_f32x2(reg)
+                        lo, hi = f16x2_to_f32x2(reg)
                         dot[p] = (
                             dot[p]
                             + lo * af[b & 1][2 * (j >> 1)]

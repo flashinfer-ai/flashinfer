@@ -18,7 +18,7 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ..utils import _get_cache_buf, get_device_sm_count
+from ..utils import _get_cache_buf, get_compute_capability, get_device_sm_count
 from .gemm_base import _check_cute_dsl_availability
 from .gemm_bf16_fp4 import _unswizzle_sf_128x4
 
@@ -549,6 +549,10 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             k = int(b.shape[0]) * int(block_size)
             m_opt = int(profile.get_opt_shapes()[0][0])
             sm_count = get_device_sm_count(a.device)
+            # GEMV is validated only on SM12x; elsewhere keep the MMA path,
+            # since the autotuner ranks by time and would not catch a
+            # wrong-but-fast kernel on an unvalidated arch.
+            gemv_ok = get_compute_capability(a.device)[0] == 12
             configs = _bf16_fp4_cute_dsl_tactic_configs(n, k)
 
             def split_reduces_makespan(cfg) -> bool:
@@ -571,7 +575,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 # m=1 only (the kernel computes one activation row; at
                 # m >= 2 the MMA path wins).  The m buckets round up, so
                 # only runtime m == 1 lands in the m_opt == 1 bucket.
-                if m_opt != 1:
+                if m_opt != 1 or not gemv_ok:
                     return False
                 # Keep only splits that land in a sane residency window:
                 # under ~12 warps/SM can't hide DRAM latency, far above
@@ -598,13 +602,13 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
             m = int(a.shape[0])
-            if (
-                tactic >= 0
-                and _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic][7] == "gemv"
-            ):
+            cfg = (
+                _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic] if tactic >= 0 else None
+            )
+            if cfg is not None and cfg[7] == "gemv":
                 if m != 1:
                     raise ValueError(f"the gemv tactic requires m == 1, got m={m}")
-                splits = _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic][5]
+                splits = cfg[5]
                 compiled = _get_cute_dsl_bf16_fp4_gemv(
                     splits, a.dtype, out_dtype, enable_pdl=enable_pdl
                 )
@@ -636,7 +640,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     tile_swizzle,
                     k_splits,
                     occupancy,
-                ) = _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic][:7]
+                ) = cfg[:7]
             compiled = _get_cute_dsl_bf16_fp4_gemm(
                 tile_shape_mnk,
                 a.dtype,
