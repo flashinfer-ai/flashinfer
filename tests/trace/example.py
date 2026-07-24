@@ -72,6 +72,7 @@ top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
+trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
@@ -802,6 +803,41 @@ with contextlib.suppress(Exception):
         routing_method_type=5,
         **_moe_common,
     )
+
+
+# ── Routed MoE FP8 per-tensor scale (packed expert ids + weights) ────────────
+_routed_topk_ids = (
+    torch.arange(T_moe * 8, dtype=torch.int32, device=device).reshape(T_moe, 8) % E_loc
+)
+_routed_topk_weights = torch.full(
+    (T_moe, 8), 1.0 / 8.0, dtype=torch.bfloat16, device=device
+)
+_routed_packed_topk = (_routed_topk_ids << 16) | _routed_topk_weights.view(
+    torch.int16
+).to(torch.int32)
+_routed_scales = torch.ones(E_loc, dtype=torch.float32, device=device)
+with contextlib.suppress(Exception):
+    flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_routed_moe(
+        topk_ids=_routed_packed_topk,
+        routing_bias=None,
+        hidden_states=hs,
+        gemm1_weights=w1,
+        output1_scales_scalar=_routed_scales,
+        output1_scales_gate_scalar=_routed_scales,
+        gemm2_weights=w2,
+        output2_scales_scalar=_routed_scales,
+        num_experts=E_tot,
+        top_k=8,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=I_moe,
+        local_expert_offset=0,
+        local_num_experts=E_loc,
+        routed_scaling_factor=None,
+        use_routing_scales_on_input=False,
+        routing_method_type=1,
+    )
+
 
 # ── MoE FP4 (NvFP4, 256 experts, 32 local, h=7168, i=2048) ──────────────────
 # routing_method_type: 0=Default, 1=Renormalize, 2=DeepSeekV3,

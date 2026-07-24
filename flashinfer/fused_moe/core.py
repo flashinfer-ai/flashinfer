@@ -32,6 +32,7 @@ from ..trace.templates.moe import (
     trtllm_fp8_block_scale_moe_trace_dispatch,
     trtllm_fp8_block_scale_routed_moe_trace,
     trtllm_fp8_per_tensor_scale_moe_trace,
+    trtllm_fp8_per_tensor_scale_routed_moe_trace,
     trtllm_mxint4_block_scale_moe_trace,
 )
 from flashinfer.autotuner import (
@@ -3774,7 +3775,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         return result
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fp8_per_tensor_scale_routed_moe_trace)
 def trtllm_fp8_per_tensor_scale_routed_moe(
     topk_ids: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
