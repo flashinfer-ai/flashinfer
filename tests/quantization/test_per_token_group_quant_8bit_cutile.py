@@ -1,0 +1,202 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for per_token_group_quant_8bit_cutile kernel."""
+
+import pytest
+import torch
+
+from flashinfer.cutile.cutile_common import is_cuda_tile_available
+from flashinfer.quantization import per_token_group_quant_8bit
+from flashinfer.utils import get_compute_capability
+
+if not is_cuda_tile_available():
+    pytest.skip("cuda.tile not available", allow_module_level=True)
+
+
+@pytest.fixture(autouse=True)
+def require_sm90():
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if major * 10 + minor < 90:
+        pytest.skip(f"requires sm90+, got sm{major * 10 + minor}")
+
+
+def _ref_quant(x, group_size, dst_dtype):
+    """Pure-PyTorch reference: per-token-group quantization."""
+    orig = x.shape
+    K = orig[-1]
+    n_groups = K // group_size
+    xf = x.reshape(-1, n_groups, group_size).float()
+    max_val = 127.0 if dst_dtype == torch.int8 else 448.0
+    abs_max = xf.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    scales = (abs_max / max_val).squeeze(-1)
+    x_scaled = (xf / abs_max * max_val).clamp(-max_val, max_val)
+    x_q = (
+        x_scaled.round().to(dst_dtype)
+        if dst_dtype == torch.int8
+        else x_scaled.to(dst_dtype)
+    )
+    return x_q.reshape(orig), scales.reshape(*orig[:-1], n_groups).to(torch.float32)
+
+
+@pytest.mark.parametrize("num_tokens,hidden_dim", [(128, 2048), (256, 4096)])
+@pytest.mark.parametrize("group_size", [64, 128])
+@pytest.mark.parametrize("dst_dtype", [torch.int8, torch.float8_e4m3fn])
+@pytest.mark.parametrize("backend", ["cutile"])
+def test_basic(num_tokens, hidden_dim, group_size, dst_dtype, backend):
+    """Basic correctness: scale accuracy + dequant match."""
+    torch.manual_seed(42)
+    x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
+
+    x_q, x_s = per_token_group_quant_8bit(
+        x,
+        group_size=group_size,
+        dst_dtype=dst_dtype,
+        column_major_scales=False,
+        backend=backend,
+    )
+    ref_q, ref_s = _ref_quant(x, group_size, dst_dtype)
+
+    assert x_q.shape == x.shape
+    assert x_q.dtype == dst_dtype
+    assert x_s.shape == (num_tokens, hidden_dim // group_size)
+
+    torch.testing.assert_close(x_s.float(), ref_s.float(), rtol=1e-3, atol=1e-3)
+
+    n_groups = hidden_dim // group_size
+    out_dq = x_q.float().reshape(num_tokens, n_groups, group_size) * x_s.reshape(
+        num_tokens, n_groups, 1
+    )
+    ref_dq = ref_q.float().reshape(num_tokens, n_groups, group_size) * ref_s.reshape(
+        num_tokens, n_groups, 1
+    )
+    # INT8 quantization has coarser resolution (1/127 of max) than FP8 (1/448),
+    # so dequant comparison needs a wider absolute tolerance for INT8.
+    dq_atol = 5e-2 if dst_dtype == torch.int8 else 1e-2
+    torch.testing.assert_close(out_dq, ref_dq, rtol=2e-1, atol=dq_atol)
+
+
+@pytest.mark.parametrize("num_tokens,hidden_dim", [(128, 2048), (512, 4096)])
+@pytest.mark.parametrize("group_size", [64, 128])
+@pytest.mark.parametrize("dst_dtype", [torch.int8, torch.float8_e4m3fn])
+@pytest.mark.parametrize("backend", ["cutile"])
+def test_column_major_scales(num_tokens, hidden_dim, group_size, dst_dtype, backend):
+    """Column-major scale layout."""
+    torch.manual_seed(7)
+    x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
+
+    x_q, x_s = per_token_group_quant_8bit(
+        x,
+        group_size=group_size,
+        dst_dtype=dst_dtype,
+        column_major_scales=True,
+        backend=backend,
+    )
+
+    n_groups = hidden_dim // group_size
+    # Kernel always returns shape (num_tokens, n_groups) — "column_major" controls the
+    # memory layout/strides (Fortran order vs C order), not the logical shape.
+    assert x_s.shape == (num_tokens, n_groups), (
+        f"expected ({num_tokens},{n_groups}) got {x_s.shape}"
+    )
+    assert not x_s.isnan().any()
+    # Column-major (Fortran order): the token dim is the contiguous one, so its
+    # stride is 1 — this is what makes the scales TMA-loadable per group.
+    assert x_s.stride(0) == 1, (
+        f"expected column-major scales, got strides {x_s.stride()}"
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [128, 130])  # 130 -> aligned to 132
+@pytest.mark.parametrize("hidden_dim", [2048])
+@pytest.mark.parametrize("group_size", [128])
+@pytest.mark.parametrize("dst_dtype", [torch.float8_e4m3fn])
+@pytest.mark.parametrize("backend", ["cutile"])
+def test_tma_aligned_scales(num_tokens, hidden_dim, group_size, dst_dtype, backend):
+    """scale_tma_aligned must return a padded column-major VIEW (no contiguous copy).
+
+    Regression for a `.contiguous()` that repacked the scales to a tight
+    row-major layout, silently destroying the column-major property and the
+    16B TMA leading-dim padding this path exists to produce.
+    """
+    torch.manual_seed(11)
+    x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
+
+    x_q, x_s = per_token_group_quant_8bit(
+        x,
+        group_size=group_size,
+        dst_dtype=dst_dtype,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        backend=backend,
+    )
+
+    n_groups = hidden_dim // group_size
+    aligned_tokens = ((num_tokens + 3) // 4) * 4  # ceil-align to 4 floats (16B)
+
+    assert x_s.shape == (num_tokens, n_groups), (
+        f"expected ({num_tokens},{n_groups}) got {x_s.shape}"
+    )
+    # Column-major: token dim unit-stride.
+    assert x_s.stride(0) == 1, f"expected column-major, got strides {x_s.stride()}"
+    # TMA padding preserved: group stride is the ALIGNED token count, not the
+    # tight num_tokens a .contiguous() copy would give.
+    assert x_s.stride(1) == aligned_tokens, (
+        f"expected group stride {aligned_tokens} (TMA-padded), got {x_s.stride(1)}"
+    )
+    assert not x_s.isnan().any()
+
+    # Values still correct through the padded view.
+    ref_q, ref_s = _ref_quant(x, group_size, dst_dtype)
+    torch.testing.assert_close(x_s.float(), ref_s, rtol=2e-1, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,hidden_dim,group_size", [(128, 2048, 64), (256, 4096, 128)]
+)
+@pytest.mark.parametrize("backend", ["cutile"])
+def test_scale_ue8m0(num_tokens, hidden_dim, group_size, backend):
+    """UE8M0 scale format (Blackwell only)."""
+    major, _ = get_compute_capability(torch.device("cuda"))
+    if major < 10:
+        pytest.skip("scale_ue8m0 requires sm100+ (Blackwell)")
+    torch.manual_seed(99)
+    x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
+    x_q, x_s = per_token_group_quant_8bit(
+        x,
+        group_size=group_size,
+        dst_dtype=torch.float8_e4m3fn,
+        column_major_scales=True,
+        scale_ue8m0=True,
+        backend=backend,
+    )
+    assert x_q.shape == x.shape
+    assert not x_s.isnan().any()
+    # UE8M0 = 8-bit exponent, no mantissa, so every nonzero scale is an exact
+    # power of two. frexp of 2**k is (0.5, k+1), i.e. mantissa == 0.5.
+    nz = x_s[x_s != 0]
+    mant, _ = torch.frexp(nz)
+    assert torch.all(mant == 0.5), "UE8M0 scales must be exact powers of two"
+
+
+@pytest.mark.parametrize("num_tokens", [128, 257])
+@pytest.mark.parametrize("group_size", [96, 48])
+@pytest.mark.parametrize("dst_dtype", [torch.int8, torch.float8_e4m3fn])
+def test_non_pow2_group_size(num_tokens, group_size, dst_dtype):
+    """Regression: non-power-of-2 group_size. BLOCK = next_pow2(group_size) >
+    group_size, so the padded lanes gather in-bounds data from the next group;
+    without masking them out they corrupt the per-group absmax → wrong scales."""
+    torch.manual_seed(123)
+    hidden_dim = group_size * 12
+    x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
+
+    x_q, x_s = per_token_group_quant_8bit(
+        x,
+        group_size=group_size,
+        dst_dtype=dst_dtype,
+        column_major_scales=False,
+        backend="cutile",
+    )
+    ref_q, ref_s = _ref_quant(x, group_size, dst_dtype)
+
+    assert x_s.shape == (num_tokens, hidden_dim // group_size)
+    torch.testing.assert_close(x_s.float(), ref_s.float(), rtol=1e-3, atol=1e-3)

@@ -489,3 +489,68 @@ def mxfp8_dequantize_host(
         scale_tensor,
         sf_swizzle_layout,
     )
+
+
+@flashinfer_api
+def per_token_group_quant_8bit(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    dst_dtype: Optional[torch.dtype] = None,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+    backend: Literal["cutile"] = "cutile",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Per-token group 8-bit quantization (FP8 or INT8).
+
+    Quantizes ``x`` along its last dimension in contiguous groups of
+    ``group_size`` elements, producing a quantized tensor and a per-group scale
+    tensor. This is the per-token-group quantization used by block-scaled FP8 /
+    INT8 GEMM paths (e.g. DeepGEMM-style grouped quantization).
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor to quantize; the last dimension must be a multiple of
+        ``group_size``.
+    group_size : int
+        Number of elements per quantization group (along the last dimension).
+    eps : float
+        Epsilon for numerical stability when computing per-group scales.
+    dst_dtype : Optional[torch.dtype]
+        Quantized output dtype (``torch.float8_e4m3fn`` or ``torch.int8``).
+        Defaults to ``torch.float8_e4m3fn``.
+    column_major_scales : bool
+        If ``True``, return the scale tensor in column-major (Fortran) memory
+        layout. The logical shape is unchanged.
+    scale_tma_aligned : bool
+        If ``True``, pad the scale tensor's leading dimension for TMA alignment.
+    scale_ue8m0 : bool
+        If ``True``, encode scales in the UE8M0 format (Blackwell / sm100+).
+    backend : str
+        Implementation backend. Currently only ``"cutile"`` (the cuda.tile
+        Python backend) is supported.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(x_q, x_s)``: the quantized tensor (same shape as ``x``) and the
+        per-group scale tensor of shape ``(*x.shape[:-1], x.shape[-1] // group_size)``.
+    """
+    if backend == "cutile":
+        from .kernels.cutile.per_token_group_quant_8bit_cutile import (
+            per_token_group_quant_8bit_cutile,
+        )
+
+        return per_token_group_quant_8bit_cutile(
+            x,
+            group_size,
+            eps=eps,
+            dst_dtype=dst_dtype,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+        )
+
+    raise ValueError(f"Unsupported backend for per_token_group_quant_8bit: {backend!r}")

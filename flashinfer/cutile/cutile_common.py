@@ -18,6 +18,41 @@ import importlib.util
 import os
 import shutil
 import subprocess
+from collections import OrderedDict
+
+# ---------------------------------------------------------------------------
+# Hinted-kernel cache (ported from tilegym.ops.cutile.utils.cached_replace_hints)
+# ---------------------------------------------------------------------------
+# cuTile's per-shape JIT compile cache lives *on the hinted-kernel object*
+# returned by ``kernel.replace_hints(...)``. Calling ``replace_hints`` afresh on
+# every launch (as a naive migration does) builds a new object each time and
+# discards that compile cache -> a full recompile per launch on the non-autotune
+# / single-config paths. Memoizing the hinted kernel keeps the compile cache
+# alive across launches, matching the TileGym source behavior.
+#
+# Deliberately no ``cuda.tile`` import here so this module stays importable on
+# environments without the cuTile compile chain (see module docstring).
+_HINTED_KERNEL_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_HINTED_KERNEL_CACHE_MAX = 256
+
+
+def cached_replace_hints(kernel, **hints):
+    """Return a memoized ``kernel.replace_hints(**hints)``.
+
+    Keyed on ``(id(kernel), sorted(hints))``. The source kernel is stored
+    alongside the hinted kernel so its ``id()`` cannot be recycled while the
+    entry is live. Bounded LRU (cap ``_HINTED_KERNEL_CACHE_MAX``).
+    """
+    key = (id(kernel), tuple(sorted(hints.items())))
+    entry = _HINTED_KERNEL_CACHE.get(key)
+    if entry is not None:
+        _HINTED_KERNEL_CACHE.move_to_end(key)
+        return entry[0]
+    hinted = kernel.replace_hints(**hints)
+    _HINTED_KERNEL_CACHE[key] = (hinted, kernel)  # keep owner alive
+    if len(_HINTED_KERNEL_CACHE) > _HINTED_KERNEL_CACHE_MAX:
+        _HINTED_KERNEL_CACHE.popitem(last=False)
+    return hinted
 
 
 def _find_tileiras_binary() -> str | None:
