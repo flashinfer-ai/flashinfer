@@ -170,6 +170,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "solo: run this whole test file alone (memory-heavy)"
     )
+    config.addinivalue_line(
+        "markers",
+        "shard_group(name): keep marked nodes from one source in one pytest batch",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
