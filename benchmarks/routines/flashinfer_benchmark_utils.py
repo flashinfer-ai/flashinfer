@@ -58,6 +58,7 @@ output_column_dict = {
         "weight_dtype",
         "activation_type",
         "fp4_mode",
+        "cold_l2_cache",
         # CUTLASS fused MoE specific
         "cutlass_variant",
         "quantized_input",
