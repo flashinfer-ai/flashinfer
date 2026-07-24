@@ -22,7 +22,11 @@ from typing import Concatenate, Literal, ParamSpec, Protocol, TypeVar, cast
 
 import torch
 
-from .common import _validate_sparse_block_size
+from .common import (
+    _KV_ROUTE_SIZE,
+    _canonical_block_sparse_q_tile_size,
+    _validate_sparse_block_size,
+)
 
 
 _P = ParamSpec("_P")
@@ -41,8 +45,6 @@ _BlockSparseCompileKey = tuple[
     str,
     str,
     Literal["dense", "causal"],
-    bool,
-    bool,
     bool,
     bool,
 ]
@@ -74,9 +76,8 @@ def _serialize_plan(
 class _BlockSparseExecutionGeometry:
     """Kernel tiles derived from, but distinct from, semantic BSR blocks.
 
-    One semantic Q block expands into Q64 or Q128 execution tiles. Selected
-    semantic KV blocks expand into KV64 fragments, which are then paired into
-    fixed KV128 execution routes.
+    One semantic Q block expands into its canonical Q8/Q16/Q32/Q64/Q128 tile.
+    Selected semantic KV blocks are assembled into fixed KV128 routes.
     """
 
     q_tile_size: int
@@ -127,18 +128,17 @@ def _resolve_execution_geometry(
     *,
     q_tile_size: int | None = None,
 ) -> _BlockSparseExecutionGeometry:
-    """Resolve Q64/Q128 and KV128 geometry for the raw-BSR kernel."""
+    """Resolve the canonical Q tile and fixed KV128 raw-BSR route."""
 
-    q_block_size = _validate_sparse_block_size(q_block_size, "q_block_size")
-    kv_block_size = _validate_sparse_block_size(kv_block_size, "kv_block_size")
-    canonical_q_tile_size = 128 if q_block_size % 128 == 0 else 64
+    canonical_q_tile_size = _canonical_block_sparse_q_tile_size(q_block_size)
+    _validate_sparse_block_size(kv_block_size, "kv_block_size")
     if q_tile_size is None:
         resolved_q_tile_size = canonical_q_tile_size
     else:
         if isinstance(q_tile_size, bool) or not isinstance(q_tile_size, int):
             raise TypeError("q_tile_size must be a Python integer")
-        if q_tile_size not in (64, 128):
-            raise ValueError("q_tile_size must be 64 or 128")
+        if q_tile_size not in (8, 16, 32, 64, 128):
+            raise ValueError("q_tile_size must be 8, 16, 32, 64, or 128")
         resolved_q_tile_size = q_tile_size
         if resolved_q_tile_size != canonical_q_tile_size:
             raise ValueError(
@@ -146,10 +146,9 @@ def _resolve_execution_geometry(
                 "q_block_size"
             )
 
-    kv_tile_size = 128
     return _BlockSparseExecutionGeometry(
         q_tile_size=resolved_q_tile_size,
-        kv_tile_size=kv_tile_size,
+        kv_tile_size=_KV_ROUTE_SIZE,
     )
 
 
@@ -166,12 +165,15 @@ class _BlockSparsePlanState:
     and the readiness event are published together. ``run()`` therefore sees
     either the complete old revision or the complete new one, never a mix.
 
-    BSR tensors and an effective caller mask are borrowed and must remain
-    immutable until their queued work completes. The dummy mask and event are
-    state-owned. Config and policy are treated as immutable after publication;
-    the cached compiled adapter is shared read-only. ``record_stream()``
-    extends allocator lifetime only—it cannot prevent the caller from
-    modifying borrowed metadata in place.
+    BSR tensors and an effective caller mask are borrowed. They must remain
+    immutable until their queued work completes unless the public plan opted
+    into dynamic metadata. That mode permits in-place updates to block indices
+    and token-mask values between ordered launches while row offsets stay
+    fixed and every BSR row remains strictly increasing. The dummy mask and
+    event are state-owned. Config and policy are treated as immutable after
+    publication; the cached compiled adapter is shared read-only.
+    ``record_stream()`` extends allocator lifetime only—it cannot prevent the
+    caller from modifying borrowed metadata in place.
     """
 
     # API geometry and dtype contract.
@@ -306,12 +308,16 @@ class _BlockSparsePlanState:
         if not callable(self.compiled):
             raise TypeError("compiled must be callable")
 
-        execution_path = dict(self.policy).get("execution_path")
+        policy = dict(self.policy)
+        execution_path = policy.get("execution_path")
         if execution_path != "raw_bsr_decode":
             raise ValueError("block-sparse plan must use raw_bsr_decode")
-        use_token_mask = dict(self.policy).get("use_kv_valid_bits")
+        use_token_mask = policy.get("use_kv_valid_bits")
         if not isinstance(use_token_mask, bool):
             raise TypeError("raw sparse policy requires bool use_kv_valid_bits")
+        dynamic_metadata = policy.get("dynamic_metadata")
+        if not isinstance(dynamic_metadata, bool):
+            raise TypeError("raw sparse policy requires bool dynamic_metadata")
         if use_token_mask:
             if (
                 self.kv_valid_bits is None

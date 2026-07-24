@@ -26,7 +26,10 @@ from dataclasses import dataclass, replace
 import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
 
-from ..._block_sparse.common import _validate_sparse_block_size
+from ..._block_sparse.common import (
+    _canonical_block_sparse_q_tile_size,
+    _validate_sparse_block_size,
+)
 from ...split_kv_mode_policy import select_split_kv_modes
 from .fmha_decode_constants import (
     AUTO_LAUNCH_TILE_SIZE_KV,
@@ -63,6 +66,7 @@ from .fmha_decode_constants import (
 )
 
 ConfigValue = int | float | bool | str | type | None
+_GroupedKeepsProfileKey = tuple[type, type, type, int, int, int, int]
 
 # Public APIs use the strings ``dense`` and ``causal``.  Keep the value carried
 # through FmhaDecodeConfig as a small integer so mask selection remains a
@@ -75,7 +79,7 @@ MASK_TYPES = ("dense", "causal")
 # default four-warp correction group therefore owns a 2-KiB reducer slice.
 SPLIT_REDUCTION_VECTOR_BYTES_PER_THREAD = 16
 
-_GROUPED_KEEPS_MAIN_PROFILE = (
+_GROUPED_KEEPS_MAIN_PROFILE: _GroupedKeepsProfileKey = (
     Float16,
     Float16,
     Float16,
@@ -84,7 +88,11 @@ _GROUPED_KEEPS_MAIN_PROFILE = (
     2,
     2,
 )
-_BLOCK_SPARSE_GROUPED_KEEPS_DIRECT_ONLY_PROFILES = {
+# Block-sparse feature compatibility is validated by
+# ``validate_block_sparse_profile``. This set only selects the Keeps MMA
+# resource recipes qualified for that already-validated launch domain.
+_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
+    _GROUPED_KEEPS_MAIN_PROFILE,
     (BFloat16, BFloat16, BFloat16, 128, 0, 2, 2),
 }
 _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
@@ -496,26 +504,19 @@ class FmhaDecodeConfig:
     # K/V tokens per tile along the K-sequence dimension; also the MMA "M"
     # dimension for BMM1 under SwapsMmaAb.
     tile_size_kv: int = 128
-    # Select a block-sparse launch. Q and KV block sizes are multiples
-    # of 64 tokens and independent of TileKV=128. Semantic KV blocks expand
-    # into KV64 fragments, which are paired into one or more KV128 routes.
+    # Select a block-sparse launch. Q and KV block sizes are independently
+    # chosen from 8/16/32 or positive multiples of 64. Semantic KV blocks are
+    # assembled into fixed KV128 routes.
     use_block_sparse: bool = False
     q_block_size: int = 0
     kv_block_size: int = 0
     # Optional batch-wide physical-token validity metadata. When enabled,
     # num_kv_valid_words is the packed-word stride for one full KV sequence;
     # the bitset is shared by every head and sparse row in that batch item.
+    # Keeps profiles derive their route-full fast path from these words at run
+    # time; it is intentionally not a separate plan/config specialization.
     use_kv_valid_bits: bool = False
     num_kv_valid_words: int = 0
-    # Enable one runtime full-word branch around Q64/Q128's otherwise
-    # branchless per-bit token masking. Plan selects this only for
-    # full-word-dominated one-dimensional batch masks.
-    use_token_word_full_guard: bool = False
-    # Q128-only route fast path. The producer tags a KV128 route when all four
-    # token words are full, allowing producer and Softmax to skip word traffic
-    # and the token-mask post-pass. Plan enables this only for highly full
-    # one-dimensional masks that already select the per-word guard.
-    use_q128_token_route_full_guard: bool = False
     # Number of K/V instances that the loop processes per step. Two instances
     # (K0/V0 and K1/V1) let two parallel SoftmaxTask groups consume alternating
     # tiles, improving SM utilization when tile_size_q is tiny.
@@ -1201,10 +1202,6 @@ class FmhaDecodeConfig:
 
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
         """Validate the qualified host profile for block-sparse."""
-        if self.use_token_word_full_guard and not self.use_block_sparse:
-            raise ValueError("token full-word guard requires block-sparse")
-        if self.use_q128_token_route_full_guard and not self.use_block_sparse:
-            raise ValueError("token route full guard requires block-sparse")
         if not self.use_block_sparse:
             return
 
@@ -1215,9 +1212,8 @@ class FmhaDecodeConfig:
                 "block-sparse supports only matching Float16 or BFloat16 IO"
             )
 
-        for name in ("q_block_size", "kv_block_size"):
-            _validate_sparse_block_size(getattr(self, name), name)
-
+        canonical_q_tile = _canonical_block_sparse_q_tile_size(self.q_block_size)
+        kv_block_size = _validate_sparse_block_size(self.kv_block_size, "kv_block_size")
         if self.use_paged_kv:
             raise ValueError("block-sparse does not support use_paged_kv")
         if heads_q_per_kv != 1:
@@ -1226,15 +1222,19 @@ class FmhaDecodeConfig:
             raise ValueError("block-sparse requires groups_tokens_heads_q=True")
         if self.headdim != 128:
             raise ValueError("block-sparse requires headdim=128")
-        if not self.use_keeps_mma_ab:
-            raise ValueError("block-sparse requires KeepsMmaAb")
-        if self.tile_size_q not in (64, 128):
-            raise ValueError("block-sparse requires tile_size_q in {64,128}")
         if self.tile_size_kv != 128:
             raise ValueError("block-sparse requires tile_size_kv=128")
-        canonical_raw_q_tile = 128 if self.q_block_size % 128 == 0 else 64
-        if self.tile_size_q != canonical_raw_q_tile:
+        if self.tile_size_q != canonical_q_tile:
             raise ValueError("raw q_block_size requires its canonical tile_size_q")
+        uses_fine_q_tile = canonical_q_tile < 64
+        uses_fine_kv_blocks = kv_block_size < 64
+        if uses_fine_q_tile:
+            if self.use_keeps_mma_ab:
+                raise ValueError("fine block-sparse Q tiles require SwapsMmaAb")
+        elif not self.use_keeps_mma_ab:
+            raise ValueError("coarse block-sparse Q tiles require KeepsMmaAb")
+        if uses_fine_kv_blocks and not uses_fine_q_tile:
+            raise ValueError("fine KV blocks require a SwapsMmaAb Q tile")
         if self.use_variable_seqlens_q:
             raise ValueError("block-sparse does not support variable-Q sequences")
         if self.use_sliding_window_causal:
@@ -1264,22 +1264,6 @@ class FmhaDecodeConfig:
             raise ValueError(
                 "num_kv_valid_words must be 0 when use_kv_valid_bits=False"
             )
-        if self.use_token_word_full_guard:
-            if not self.use_kv_valid_bits:
-                raise ValueError(
-                    "token full-word guard requires use_kv_valid_bits=True"
-                )
-        if self.use_q128_token_route_full_guard:
-            if not self.use_kv_valid_bits:
-                raise ValueError(
-                    "Q128 token route full guard requires use_kv_valid_bits=True"
-                )
-            if not self.use_token_word_full_guard:
-                raise ValueError(
-                    "Q128 token route full guard requires the token word guard"
-                )
-            if self.tile_size_q != 128:
-                raise ValueError("Q128 token route full guard requires tile_size_q=128")
 
     @property
     def uses_q_desc_ref(self) -> bool:
@@ -1311,6 +1295,19 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def _grouped_keeps_profile_key(self) -> _GroupedKeepsProfileKey:
+        """Return the dtype, shape, and staging key used by Keeps recipe tables."""
+        return (
+            self.q_dtype,
+            self.kv_dtype,
+            self.out_dtype,
+            self.headdim,
+            self.head_dim_per_stage_kv,
+            self.num_insts_kv,
+            self.o_stages,
+        )
+
+    @property
     def uses_guarded_fixed_q1_grouped_keeps(self) -> bool:
         """Whether inactive grouped rows are excluded solely at output stores.
 
@@ -1320,15 +1317,7 @@ class FmhaDecodeConfig:
         scratch, and final-reduction store already checks row validity, so the
         inactive score rows do not need per-KV-tile suppression.
         """
-        profile = (
-            self.q_dtype,
-            self.kv_dtype,
-            self.out_dtype,
-            self.headdim,
-            self.head_dim_per_stage_kv,
-            self.num_insts_kv,
-            self.o_stages,
-        )
+        profile = self._grouped_keeps_profile_key
         return (
             self.use_keeps_mma_ab
             and self.groups_tokens_heads_q
@@ -1354,15 +1343,7 @@ class FmhaDecodeConfig:
         TileQ64/D256 exception on its per-row score-mask path because its
         generated schedule is sensitive to that control-flow shape.
         """
-        profile = (
-            self.q_dtype,
-            self.kv_dtype,
-            self.out_dtype,
-            self.headdim,
-            self.head_dim_per_stage_kv,
-            self.num_insts_kv,
-            self.o_stages,
-        )
+        profile = self._grouped_keeps_profile_key
         return (
             self.use_keeps_mma_ab
             and self.groups_tokens_heads_q
@@ -1739,7 +1720,7 @@ class FmhaDecodeConfig:
 
     @property
     def supports_grouped_keeps(self) -> bool:
-        """Return whether this grouped Keeps profile is enabled."""
+        """Whether a validated config uses a qualified grouped-Keeps recipe."""
         if self.tile_size_kv == 256:
             # KV256 reuses the common fixed/packed-Q, page-table, masking,
             # persistent scheduler, attention-sink, and GMEM split-publisher
@@ -1778,15 +1759,15 @@ class FmhaDecodeConfig:
         ):
             return False
 
-        profile = (
-            self.q_dtype,
-            self.kv_dtype,
-            self.out_dtype,
-            self.headdim,
-            self.head_dim_per_stage_kv,
-            self.num_insts_kv,
-            self.o_stages,
-        )
+        profile = self._grouped_keeps_profile_key
+
+        # Keep block-sparse qualification separate from the dense/paged
+        # profile matrix below. Its structural, masking, and reduction
+        # constraints are validated separately; both scheduler modes use the
+        # same qualified recipe keys.
+        if self.use_block_sparse:
+            return profile in _BLOCK_SPARSE_GROUPED_KEEPS_PROFILES
+
         direct = not (self.use_split_kv or self.use_separate_reduction_kernel)
 
         if profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES:
@@ -1815,21 +1796,6 @@ class FmhaDecodeConfig:
                 )
             )
 
-        if profile in _BLOCK_SPARSE_GROUPED_KEEPS_DIRECT_ONLY_PROFILES:
-            # Raw sparse routes use the scheduler-aware row domain, metadata
-            # staging pipelines, and K/V gather contract. Causal masking
-            # resolves the logical Q row from the same static or CLC work tile,
-            # so both masks share one scheduler capability.
-            return direct and not any(
-                (
-                    not self.use_block_sparse,
-                    self.use_variable_seqlens_q,
-                    self.use_paged_kv,
-                    self.use_sliding_window_causal,
-                    self.use_attention_sinks,
-                )
-            )
-
         if profile in _GROUPED_KEEPS_STATIC_ONLY_PROFILES:
             return (
                 self.tile_size_q == 64
@@ -1849,16 +1815,9 @@ class FmhaDecodeConfig:
             return False
 
         if self.tile_size_q == 128:
-            # Raw block-sparse routes use the balanced two-stage metadata
-            # contract under CLC for both dense and causal masks. Keep the
-            # broader non-sparse Q128 profile static-only until independently
-            # qualified.
-            unsupported_persistent = (
-                self.use_persistent_scheduler and not self.use_block_sparse
-            )
             return direct and not any(
                 (
-                    unsupported_persistent,
+                    self.use_persistent_scheduler,
                     self.use_paged_kv,
                     self.use_sliding_window_causal,
                     self.use_attention_sinks,
@@ -1881,11 +1840,7 @@ class FmhaDecodeConfig:
             return (
                 direct
                 and not self.use_attention_sinks
-                and (
-                    self.use_block_sparse
-                    or self.use_variable_seqlens_q
-                    or self.mask_type == DENSE
-                )
+                and (self.use_variable_seqlens_q or self.mask_type == DENSE)
             )
         if direct:
             return True
@@ -2541,9 +2496,11 @@ def _select_auto_launch_mode(
     num_heads_kv: int,
     seq_len_kv: int,
     num_q_tiles: int = 1,
+    tile_size_q: int,
     tile_size_kv: int = AUTO_LAUNCH_TILE_SIZE_KV,
     persistent_min_waves: int = 1,
     persistent_min_tiles_per_cta: int = 1,
+    persistent_min_tile_size_q: int = 1,
 ) -> str:
     """Pick the launch mode that best matches the kernel's parallelism budget.
 
@@ -2565,21 +2522,30 @@ def _select_auto_launch_mode(
           Switch to the CLC dynamic persistent scheduler whenever the direct
           launch contains more than ``persistent_min_waves`` resident CTA
           waves and at least ``persistent_min_tiles_per_cta`` K/V tiles per
-          task. Persistence has no launch work to eliminate within one wave;
-          callers with heavier per-task scheduling may require more work to
-          amortize that overhead.
+          task, and its Q tile is at least ``persistent_min_tile_size_q``.
+          Persistence has no launch work to eliminate within one wave; callers
+          with heavier per-task scheduling may require more work or a wider Q
+          tile to amortize that overhead.
 
       ``"static"``
           Everything else. The default static grid is a good fit when the
           launch already saturates the device with substantial per-CTA
           work.
     """
-    if seq_len_kv <= 0 or batch_size <= 0 or num_heads_kv <= 0 or num_q_tiles <= 0:
+    if (
+        seq_len_kv <= 0
+        or batch_size <= 0
+        or num_heads_kv <= 0
+        or num_q_tiles <= 0
+        or tile_size_q <= 0
+    ):
         return "static"
     if persistent_min_waves <= 0:
         raise ValueError("persistent_min_waves must be positive")
     if persistent_min_tiles_per_cta <= 0:
         raise ValueError("persistent_min_tiles_per_cta must be positive")
+    if persistent_min_tile_size_q <= 0:
+        raise ValueError("persistent_min_tile_size_q must be positive")
     hardware_info = utils.HardwareInfo()
     sm_count = hardware_info.get_device_multiprocessor_count()
     sm_count = FALLBACK_SM_COUNT_B200 if sm_count <= 0 else sm_count
@@ -2591,6 +2557,7 @@ def _select_auto_launch_mode(
     if (
         ctas > persistent_min_waves * sm_count
         and tiles_per_cta >= persistent_min_tiles_per_cta
+        and tile_size_q >= persistent_min_tile_size_q
     ):
         return "persistent"
     return "static"
@@ -3129,6 +3096,7 @@ def _apply_auto_launch_mode(
         num_heads_kv=num_heads_kv,
         seq_len_kv=seq_len_kv,
         num_q_tiles=_num_q_tiles_for_launch(cfg),
+        tile_size_q=cfg.tile_size_q,
         tile_size_kv=cfg.tile_size_kv,
     )
     if (cfg.use_variable_seqlens_q or cfg.use_sliding_window_causal) and mode == (

@@ -669,7 +669,7 @@ def test_fi_trace_complete_prims_ts_block_sparse_one_shot() -> None:
 
     batch_size, seq_len_q, seq_len_kv = 2, 192, 320
     num_heads, head_dim = 4, 128
-    q_block_size, kv_block_size = 64, 128
+    q_block_size, kv_block_size = 32, 8
     q = torch.zeros(
         batch_size,
         seq_len_q,
@@ -771,8 +771,46 @@ def test_fi_trace_complete_prims_ts_block_sparse_one_shot() -> None:
     assert defn["axes"]["head_dim"]["value"] == head_dim
     assert defn["axes"]["q_block_size"]["value"] == q_block_size
     assert defn["axes"]["kv_block_size"]["value"] == kv_block_size
-    assert "q_block_size > 0 and q_block_size % 64 == 0" in defn["constraints"]
-    assert "kv_block_size > 0 and kv_block_size % 64 == 0" in defn["constraints"]
+    block_size_constraints = {
+        "q_block_size": (
+            "q_block_size in (8, 16, 32) or "
+            "(q_block_size > 0 and q_block_size % 64 == 0)"
+        ),
+        "kv_block_size": (
+            "kv_block_size in (8, 16, 32) or "
+            "(kv_block_size > 0 and kv_block_size % 64 == 0)"
+        ),
+    }
+    for name, constraint in block_size_constraints.items():
+        assert constraint in defn["constraints"]
+        constraint_code = compile(constraint, "<constraint>", "eval")
+        for supported_size in (8, 16, 32, 64, 128, 256):
+            assert eval(  # noqa: S307
+                constraint_code,
+                {"__builtins__": {}},
+                {name: supported_size},
+            )
+        for unsupported_size in (-64, 0, 1, 24, 48):
+            assert not eval(  # noqa: S307
+                constraint_code,
+                {"__builtins__": {}},
+                {name: unsupported_size},
+            )
+    orientation_constraint = "kv_block_size >= 64 or q_block_size in (8, 16, 32)"
+    assert orientation_constraint in defn["constraints"]
+    orientation_code = compile(orientation_constraint, "<constraint>", "eval")
+    for q_size, kv_size in ((8, 8), (32, 16), (64, 64), (128, 256)):
+        assert eval(  # noqa: S307
+            orientation_code,
+            {"__builtins__": {}},
+            {"q_block_size": q_size, "kv_block_size": kv_size},
+        )
+    for q_size, kv_size in ((64, 8), (128, 16), (256, 32)):
+        assert not eval(  # noqa: S307
+            orientation_code,
+            {"__builtins__": {}},
+            {"q_block_size": q_size, "kv_block_size": kv_size},
+        )
     assert defn["inputs"]["q"]["shape"] == [
         "batch_size",
         "seq_len_q",

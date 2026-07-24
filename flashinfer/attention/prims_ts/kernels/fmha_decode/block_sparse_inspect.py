@@ -15,12 +15,13 @@
 """Inspect caller-owned canonical BSR metadata in one pass.
 
 A BSR Q-block row is one ``block_indptr`` row keyed by
-``(batch, kv_head, q_block)``. An execution Q tile is a Q64 or Q128 tile that
-reuses that row. A retained KV route is one KV128 unit (two KV64 fragments)
-left after physical-tail trimming. A token guard check is a full-mask test
-that can skip 32 per-bit predicate iterations.
+``(batch, kv_head, q_block)``. The inspector reports whether selected real
+tokens contain mask holes, but deliberately does not summarize their
+morphology: the attention kernel derives route-full state from current token
+words on every run. A retained KV route is one KV128 unit left after
+physical-tail trimming.
 
-Four warps validate four BSR Q-block rows per CTA and publish seven plan-wide
+Four warps validate four BSR Q-block rows per CTA and publish four plan-wide
 facts in one Int64 summary. No per-route payload is constructed.
 """
 
@@ -35,7 +36,6 @@ from cuda.bindings import driver as cuda_drv
 
 from .fmha_decode_resources.helpers_block_sparse import (
     _block_sparse_row_retained_route_count,
-    resolve_block_sparse_route_origins,
 )
 
 
@@ -44,17 +44,12 @@ _WARP_SIZE = 32
 _THREADS_PER_CTA = _WARPS_PER_CTA * _WARP_SIZE
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 
-# ``summary`` is a zero-initialized Int64[7] shared with the host wrapper.
-# Fields 0..3 are plan-wide maxima/flags; fields 4..6 are plan-wide sums
-# weighted by the number of execution Q tiles that reuse each semantic row.
+# ``summary`` is a zero-initialized Int64[4] shared with the host wrapper.
 _SUMMARY_ERROR_CODE = 0
 _SUMMARY_MAX_SELECTED_KV_BLOCK_COUNT = 1
 _SUMMARY_MAX_RETAINED_KV_ROUTE_COUNT = 2
 _SUMMARY_SELECTED_TOKEN_HOLE = 3
-_SUMMARY_RUNTIME_TOKEN_GUARD_SKIP_COUNT = 4
-_SUMMARY_RUNTIME_TOKEN_GUARD_CHECK_COUNT = 5
-_SUMMARY_RUNTIME_TOKEN_MASK_FULL_KV_ROUTE_COUNT = 6
-_SUMMARY_FIELDS = 7
+_SUMMARY_FIELDS = 4
 
 _BSR_ERROR_NONE = 0
 _BSR_ERROR_NOT_STRICTLY_INCREASING = 1
@@ -63,108 +58,62 @@ _BSR_ERROR_INVALID_INDPTR = 3
 
 
 @cute.jit
-def _load_runtime_token_word(
-    kv_valid_bits: cute.Tensor,
-    batch_idx: cutlass.Int32,
-    fragment_origin: cutlass.Int32,
-    fragment_valid: cutlass.Boolean,
-    word_in_fragment: cutlass.Constexpr[int],
-    seq_len_kv: cutlass.Constexpr[int],
-) -> tuple[cutlass.Uint32, cutlass.Boolean]:
-    """Mirror one runtime word load and report holes only in real tokens.
-
-    Padding bits beyond ``seq_len_kv`` are excluded from the hole predicate.
-    The returned word remains unmodified because the runtime full-word guard
-    requires the complete stored word to equal ``0xffffffff``.
-    """
-
-    mask_word = cutlass.Uint32(0)
-    word_has_selected_token_hole = cutlass.Boolean(False)
-    word_begin = fragment_origin + cutlass.Int32(word_in_fragment * 32)
-    if fragment_valid and word_begin < cutlass.Int32(seq_len_kv):
-        word_idx = word_begin >> cutlass.Int32(5)
-        mask_word = cutlass.Uint32(kv_valid_bits[batch_idx, word_idx])
-        remaining_tokens = cutlass.Int32(seq_len_kv) - word_begin
-        expected = cutlass.Uint32(0xFFFFFFFF)
-        if remaining_tokens < cutlass.Int32(32):
-            expected = (cutlass.Uint32(1) << remaining_tokens) - cutlass.Uint32(1)
-        word_has_selected_token_hole = (
-            word_has_selected_token_hole or (mask_word & expected) != expected
-        )
-    return mask_word, word_has_selected_token_hole
-
-
-@cute.jit
-def _inspect_kv_route_token_mask(
+def _inspect_bsr_row_token_mask_lane(
     block_indices: cute.Tensor,
     kv_valid_bits: cute.Tensor,
     batch_idx: cutlass.Int32,
     bsr_row_begin: cutlass.Int32,
     bsr_row_end: cutlass.Int32,
-    kv_route_idx: cutlass.Int32,
+    lane_idx: cutlass.Int32,
     kv_block_size: cutlass.Constexpr[int],
     seq_len_kv: cutlass.Constexpr[int],
-    q_tile_size: cutlass.Constexpr[int],
-    count_token_mask_full_routes: cutlass.Constexpr[bool],
-) -> tuple[cutlass.Boolean, cutlass.Int32, cutlass.Int32]:
-    """Inspect one retained KV route as its Q64/Q128 token guard sees it.
+) -> cutlass.Boolean:
+    """Scan one lane stripe of selected token-mask atoms.
 
-    Returns ``(route_has_selected_token_hole, route_token_guard_skip_count,
-    token_mask_full_kv_route)``. The final value remains an Int32 0/1 and is
-    collected only for Q128 inspection.
+    The inspection atom is at most 32 tokens and divides a stored mask word,
+    so one source-word load is sufficient. Physical-tail padding is excluded
+    from ``expected`` and therefore cannot create a false hole. The scan is
+    independent of the execution tile and computes no morphology counters.
     """
 
-    origin0, valid0, origin1, valid1 = resolve_block_sparse_route_origins(
-        block_indices.iterator,
-        bsr_row_begin,
-        bsr_row_end,
-        kv_route_idx,
-        kv_block_size,
-        cutlass.Int32(seq_len_kv),
+    mask_atom_size = min(kv_block_size, 32)
+    mask_atoms_per_block = kv_block_size // mask_atom_size
+    selected_kv_block_count = bsr_row_end - bsr_row_begin
+    selected_mask_atom_count = selected_kv_block_count * cutlass.Int32(
+        mask_atoms_per_block
     )
-    word0, hole0 = _load_runtime_token_word(
-        kv_valid_bits, batch_idx, origin0, valid0, 0, seq_len_kv
-    )
-    word1, hole1 = _load_runtime_token_word(
-        kv_valid_bits, batch_idx, origin0, valid0, 1, seq_len_kv
-    )
-    word2, hole2 = _load_runtime_token_word(
-        kv_valid_bits, batch_idx, origin1, valid1, 0, seq_len_kv
-    )
-    word3, hole3 = _load_runtime_token_word(
-        kv_valid_bits, batch_idx, origin1, valid1, 1, seq_len_kv
-    )
-    route_token_guard_skip_count = cutlass.Int32(0)
-    token_mask_full_kv_route = cutlass.Int32(0)
-    full_word = cutlass.Uint32(0xFFFFFFFF)
-    if cutlass.const_expr(q_tile_size == 64):
-        # Q64's paired lane groups can skip only when both words are full.
-        route_token_guard_skip_count = cutlass.Int32(
-            word0 == full_word and word2 == full_word
-        )
-        route_token_guard_skip_count += cutlass.Int32(
-            word1 == full_word and word3 == full_word
-        )
-    else:
-        # Q128 lanes share each per-word branch, so each word is one check.
-        word0_is_full = word0 == full_word
-        word1_is_full = word1 == full_word
-        word2_is_full = word2 == full_word
-        word3_is_full = word3 == full_word
-        route_token_guard_skip_count = cutlass.Int32(word0_is_full)
-        route_token_guard_skip_count += cutlass.Int32(word1_is_full)
-        route_token_guard_skip_count += cutlass.Int32(word2_is_full)
-        route_token_guard_skip_count += cutlass.Int32(word3_is_full)
-        if cutlass.const_expr(count_token_mask_full_routes):
-            token_mask_full_kv_route = cutlass.Int32(
-                word0_is_full and word1_is_full and word2_is_full and word3_is_full
+    atom_offset = lane_idx
+    lane_has_selected_token_hole = cutlass.Boolean(False)
+    while atom_offset < selected_mask_atom_count:
+        bsr_entry_offset = atom_offset // cutlass.Int32(mask_atoms_per_block)
+        mask_atom_in_block = atom_offset % cutlass.Int32(mask_atoms_per_block)
+        block_id = cutlass.Int32(block_indices[bsr_row_begin + bsr_entry_offset])
+        atom_origin = block_id * cutlass.Int32(kv_block_size)
+        atom_origin += mask_atom_in_block * cutlass.Int32(mask_atom_size)
+        if atom_origin < cutlass.Int32(seq_len_kv):
+            source_word = cutlass.Uint32(
+                kv_valid_bits[batch_idx, atom_origin >> cutlass.Int32(5)]
             )
-    route_has_selected_token_hole = hole0 or hole1 or hole2 or hole3
-    return (
-        route_has_selected_token_hole,
-        route_token_guard_skip_count,
-        token_mask_full_kv_route,
-    )
+            bit_offset = atom_origin & cutlass.Int32(31)
+            selected_bits = source_word >> bit_offset
+            expected = cutlass.Uint32(0xFFFFFFFF)
+            if cutlass.const_expr(mask_atom_size < 32):
+                expected = cutlass.Uint32((1 << mask_atom_size) - 1)
+            remaining_tokens = cutlass.Int32(seq_len_kv) - atom_origin
+            if remaining_tokens < cutlass.Int32(mask_atom_size):
+                # This branch implies 0 < remaining_tokens < mask_atom_size <= 32,
+                # so the dynamic shift is never 32.
+                expected = (cutlass.Uint32(1) << remaining_tokens) - cutlass.Uint32(1)
+            lane_has_selected_token_hole = cutlass.Boolean(
+                lane_has_selected_token_hole or (selected_bits & expected) != expected
+            )
+        remaining_mask_atoms = selected_mask_atom_count - atom_offset
+        atom_offset = (
+            atom_offset + _WARP_SIZE
+            if remaining_mask_atoms > _WARP_SIZE
+            else selected_mask_atom_count
+        )
+    return lane_has_selected_token_hole
 
 
 @cute.jit
@@ -175,7 +124,7 @@ def _validate_bsr_row_lane(
     lane_idx: cutlass.Int32,
     num_kv_blocks: cutlass.Constexpr[int],
 ) -> cutlass.Int32:
-    """Validate one lane stripe after proving the whole range is bounded."""
+    """Validate one lane stripe of a canonical ordered BSR row."""
 
     error_code = cutlass.Int32(_BSR_ERROR_NONE)
     selected_kv_block_count = bsr_row_end - bsr_row_begin
@@ -186,13 +135,14 @@ def _validate_bsr_row_lane(
         in_range = block_id >= 0 and block_id < num_kv_blocks
         if not in_range:
             error_code = cutlass.Int32(_BSR_ERROR_INDEX_OUT_OF_RANGE)
-        elif entry_position > bsr_row_begin:
-            previous_block_id = cutlass.Int32(block_indices[entry_position - 1])
-            if (
-                block_id <= previous_block_id
-                and error_code < _BSR_ERROR_NOT_STRICTLY_INCREASING
-            ):
-                error_code = cutlass.Int32(_BSR_ERROR_NOT_STRICTLY_INCREASING)
+        else:
+            if entry_position > bsr_row_begin:
+                previous_block_id = cutlass.Int32(block_indices[entry_position - 1])
+                if (
+                    block_id <= previous_block_id
+                    and error_code < _BSR_ERROR_NOT_STRICTLY_INCREASING
+                ):
+                    error_code = cutlass.Int32(_BSR_ERROR_NOT_STRICTLY_INCREASING)
         remaining_entries = selected_kv_block_count - bsr_entry_offset
         bsr_entry_offset = (
             bsr_entry_offset + _WARP_SIZE
@@ -210,26 +160,20 @@ class _InspectBlockSparseBsr:
     * ``block_indptr``: Int32 ``[B, Hkv, num_q_block_rows + 1]`` offsets;
     * ``block_indices``: Int32 ``[nnz]`` semantic KV-block IDs;
     * ``kv_valid_bits``: optional Uint32 ``[B, ceil(Skv / 32)]`` token bits;
-    * ``summary``: zero-initialized Int64 ``[7]`` output.
+    * ``summary``: zero-initialized Int64 ``[4]`` output.
 
     One 128-thread CTA contains four independent warps, and each warp handles
     one flattened ``(batch, kv_head, q_block_row)``. Lanes first validate the
-    row's index stripe, then scan its retained KV routes when a
-    token mask is present. The output fields are:
+    row's index stripe, then inspect its selected real tokens when a token mask
+    is present. The output fields are:
 
     * ``[0]`` highest validation error code (zero means canonical BSR);
     * ``[1]`` maximum selected KV-block count in any row;
     * ``[2]`` maximum retained KV-route count;
     * ``[3]`` whether any selected real token has a zero validity bit;
-    * ``[4]`` runtime token guard checks that can skip per-bit masking;
-    * ``[5]`` runtime token guard checks, including dummy route slots;
-    * ``[6]`` runtime token-mask-full retained KV routes (Q128 only).
 
-    Fields 4--6 model the actual schedule and are weighted by the number of
-    execution Q tiles consuming the semantic row. Field 5 includes
-    minimum-schedule and odd-route dummy slots; fields 4 and 6 count real full
-    work only. All three are zero without a token mask. No per-route metadata
-    is produced; the attention kernel continues to consume the caller's BSR.
+    No per-route metadata is produced; the attention kernel continues to
+    consume the caller's BSR and current token mask directly.
     """
 
     def __init__(
@@ -248,11 +192,7 @@ class _InspectBlockSparseBsr:
         self.seq_len_kv = seq_len_kv
         self.q_block_size = q_block_size
         self.kv_block_size = kv_block_size
-        self.inspection_q_tile_size = 128 if q_block_size % 128 == 0 else 64
         self.inspect_token_mask = has_token_bits
-        self.count_token_mask_full_kv_routes = (
-            self.inspect_token_mask and self.inspection_q_tile_size == 128
-        )
         self.num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
         self.num_kv_blocks = (seq_len_kv + kv_block_size - 1) // kv_block_size
         self.total_bsr_row_count = batch_size * num_kv_heads * self.num_q_block_rows
@@ -312,6 +252,7 @@ class _InspectBlockSparseBsr:
         bsr_row_begin = cutlass.Int32(0)
         bsr_row_end = cutlass.Int32(0)
         bsr_row_range_is_valid = cutlass.Boolean(False)
+        num_indices = cutlass.Int32(cute.size(block_indices))
         error_code = cutlass.Int32(_BSR_ERROR_NONE)
         lane_has_selected_token_hole = cutlass.Boolean(False)
 
@@ -322,7 +263,6 @@ class _InspectBlockSparseBsr:
             bsr_row_end = cutlass.Int32(
                 block_indptr[batch_idx, kv_head_idx, q_block_row_idx + 1]
             )
-            num_indices = cutlass.Int32(cute.size(block_indices))
             bsr_row_range_is_valid = cutlass.Boolean(
                 bsr_row_begin >= 0
                 and bsr_row_begin <= bsr_row_end
@@ -342,7 +282,6 @@ class _InspectBlockSparseBsr:
         # Numeric error codes encode reporting priority. Both this warp
         # reduction and summary[0]'s atomic max retain the strongest error.
         bsr_row_error_code = cutlass.Int32(cute.arch.warp_redux_sync(error_code, "max"))
-
         retained_kv_route_count = cutlass.Int32(0)
         if lane_idx == 0 and bsr_row_is_valid and bsr_row_error_code == _BSR_ERROR_NONE:
             retained_kv_route_count = _block_sparse_row_retained_route_count(
@@ -352,63 +291,24 @@ class _InspectBlockSparseBsr:
                 self.kv_block_size,
                 cutlass.Int32(self.seq_len_kv),
             )
-        if cutlass.const_expr(self.inspect_token_mask):
-            retained_kv_route_count = cutlass.Int32(
-                cute.arch.shuffle_sync(retained_kv_route_count, cutlass.Int32(0))
-            )
 
-        lane_token_guard_skip_count = cutlass.Int32(0)
-        lane_token_mask_full_kv_route_count = cutlass.Int32(0)
         if cutlass.const_expr(self.inspect_token_mask):
             assert kv_valid_bits is not None
             if bsr_row_is_valid and bsr_row_error_code == _BSR_ERROR_NONE:
-                kv_route_idx = lane_idx
-                while kv_route_idx < retained_kv_route_count:
-                    (
-                        route_has_selected_token_hole,
-                        route_token_guard_skip_count,
-                        token_mask_full_kv_route,
-                    ) = _inspect_kv_route_token_mask(
-                        block_indices,
-                        kv_valid_bits,
-                        batch_idx,
-                        bsr_row_begin,
-                        bsr_row_end,
-                        kv_route_idx,
-                        self.kv_block_size,
-                        self.seq_len_kv,
-                        self.inspection_q_tile_size,
-                        self.count_token_mask_full_kv_routes,
-                    )
-                    lane_has_selected_token_hole = (
-                        lane_has_selected_token_hole or route_has_selected_token_hole
-                    )
-                    lane_token_guard_skip_count += route_token_guard_skip_count
-                    if cutlass.const_expr(self.count_token_mask_full_kv_routes):
-                        lane_token_mask_full_kv_route_count += token_mask_full_kv_route
-                    remaining_kv_routes = retained_kv_route_count - kv_route_idx
-                    kv_route_idx = (
-                        kv_route_idx + _WARP_SIZE
-                        if remaining_kv_routes > _WARP_SIZE
-                        else retained_kv_route_count
-                    )
+                lane_has_selected_token_hole = _inspect_bsr_row_token_mask_lane(
+                    block_indices,
+                    kv_valid_bits,
+                    batch_idx,
+                    bsr_row_begin,
+                    bsr_row_end,
+                    lane_idx,
+                    self.kv_block_size,
+                    self.seq_len_kv,
+                )
         bsr_row_has_selected_token_hole = cute.arch.vote_any_sync(
             lane_has_selected_token_hole
         )
-        bsr_row_token_guard_skip_count = cutlass.Int32(0)
-        if cutlass.const_expr(self.inspect_token_mask):
-            bsr_row_token_guard_skip_count = cutlass.Int32(
-                cute.arch.warp_redux_sync(lane_token_guard_skip_count, "add")
-            )
-        bsr_row_token_mask_full_kv_route_count = cutlass.Int32(0)
-        if cutlass.const_expr(self.count_token_mask_full_kv_routes):
-            bsr_row_token_mask_full_kv_route_count = cutlass.Int32(
-                cute.arch.warp_redux_sync(lane_token_mask_full_kv_route_count, "add")
-            )
 
-        runtime_bsr_row_token_guard_skip_count = cutlass.Int64(0)
-        runtime_bsr_row_token_guard_check_count = cutlass.Int64(0)
-        runtime_bsr_row_token_mask_full_kv_route_count = cutlass.Int64(0)
         if lane_idx == 0 and bsr_row_is_valid:
             if bsr_row_error_code != _BSR_ERROR_NONE:
                 cute.arch.atomic_max(
@@ -438,102 +338,6 @@ class _InspectBlockSparseBsr:
                         sem="relaxed",
                         scope="gpu",
                     )
-                if cutlass.const_expr(self.inspect_token_mask):
-                    q_token_begin = q_block_row_idx * cutlass.Int32(self.q_block_size)
-                    q_tokens_in_bsr_row = cutlass.Int32(self.seq_len_q) - q_token_begin
-                    if q_tokens_in_bsr_row > cutlass.Int32(self.q_block_size):
-                        q_tokens_in_bsr_row = cutlass.Int32(self.q_block_size)
-                    q_tiles_per_bsr_row = (
-                        q_tokens_in_bsr_row
-                        + cutlass.Int32(self.inspection_q_tile_size - 1)
-                    ) // cutlass.Int32(self.inspection_q_tile_size)
-                    runtime_bsr_row_token_guard_skip_count = cutlass.Int64(
-                        bsr_row_token_guard_skip_count
-                    ) * cutlass.Int64(q_tiles_per_bsr_row)
-                    if cutlass.const_expr(self.count_token_mask_full_kv_routes):
-                        runtime_bsr_row_token_mask_full_kv_route_count = cutlass.Int64(
-                            bsr_row_token_mask_full_kv_route_count
-                        ) * cutlass.Int64(q_tiles_per_bsr_row)
-                    # padded_kv_route_slot_count = max(2,
-                    #     round_up(retained_kv_route_count, 2)).
-                    # Two KV instances schedule KV routes in pairs.
-                    padded_kv_route_slot_count = cute.math.max(
-                        (retained_kv_route_count + cutlass.Int32(1))
-                        & cutlass.Int32(-2),
-                        cutlass.Int32(2),
-                    )
-                    token_guard_checks_per_route = (
-                        2 if self.inspection_q_tile_size == 64 else 4
-                    )
-                    # Runtime checks = Q-tile reuse * padded slots *
-                    # (2 if Q64 else 4). Dummy slots enter only this denominator.
-                    runtime_bsr_row_token_guard_check_count = (
-                        cutlass.Int64(padded_kv_route_slot_count)
-                        * cutlass.Int64(token_guard_checks_per_route)
-                        * cutlass.Int64(q_tiles_per_bsr_row)
-                    )
-
-        if cutlass.const_expr(self.inspect_token_mask):
-            # Reduce four warp contributions in SMEM before contended atomics.
-            # Token-mask-free variants omit the block; Q64 does not allocate
-            # the SMEM table's third column (token-mask-full route count).
-            smem = cutlass.utils.SmemAllocator()
-            runtime_count_field_count = 3 if self.count_token_mask_full_kv_routes else 2
-            warp_runtime_counts = smem.allocate_tensor(
-                cutlass.Int64,
-                cute.make_layout((_WARPS_PER_CTA, runtime_count_field_count)),
-                byte_alignment=8,
-            )
-            if lane_idx == 0:
-                warp_runtime_counts[warp_idx, 0] = (
-                    runtime_bsr_row_token_guard_skip_count
-                )
-                warp_runtime_counts[warp_idx, 1] = (
-                    runtime_bsr_row_token_guard_check_count
-                )
-                if cutlass.const_expr(self.count_token_mask_full_kv_routes):
-                    warp_runtime_counts[warp_idx, 2] = (
-                        runtime_bsr_row_token_mask_full_kv_route_count
-                    )
-            cute.arch.sync_threads()
-            if thread_idx == 0:
-                cta_runtime_token_guard_skip_count = cutlass.Int64(0)
-                cta_runtime_token_guard_check_count = cutlass.Int64(0)
-                cta_runtime_token_mask_full_kv_route_count = cutlass.Int64(0)
-                for reduce_warp_idx in cutlass.range_constexpr(_WARPS_PER_CTA):
-                    cta_runtime_token_guard_skip_count += warp_runtime_counts[
-                        reduce_warp_idx, 0
-                    ]
-                    cta_runtime_token_guard_check_count += warp_runtime_counts[
-                        reduce_warp_idx, 1
-                    ]
-                    if cutlass.const_expr(self.count_token_mask_full_kv_routes):
-                        cta_runtime_token_mask_full_kv_route_count += (
-                            warp_runtime_counts[reduce_warp_idx, 2]
-                        )
-                if cta_runtime_token_guard_skip_count > cutlass.Int64(0):
-                    cute.arch.atomic_add(
-                        summary.iterator + _SUMMARY_RUNTIME_TOKEN_GUARD_SKIP_COUNT,
-                        cta_runtime_token_guard_skip_count,
-                        sem="relaxed",
-                        scope="gpu",
-                    )
-                if cta_runtime_token_guard_check_count > cutlass.Int64(0):
-                    cute.arch.atomic_add(
-                        summary.iterator + _SUMMARY_RUNTIME_TOKEN_GUARD_CHECK_COUNT,
-                        cta_runtime_token_guard_check_count,
-                        sem="relaxed",
-                        scope="gpu",
-                    )
-                if cutlass.const_expr(self.count_token_mask_full_kv_routes):
-                    if cta_runtime_token_mask_full_kv_route_count > cutlass.Int64(0):
-                        cute.arch.atomic_add(
-                            summary.iterator
-                            + _SUMMARY_RUNTIME_TOKEN_MASK_FULL_KV_ROUTE_COUNT,
-                            cta_runtime_token_mask_full_kv_route_count,
-                            sem="relaxed",
-                            scope="gpu",
-                        )
 
 
 def _fake_compact(

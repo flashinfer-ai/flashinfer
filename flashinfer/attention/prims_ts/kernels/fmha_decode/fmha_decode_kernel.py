@@ -39,11 +39,6 @@ import cutlass.utils as utils
 from cuda.bindings import driver as cuda_drv
 from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
-from ..tensor_map import (
-    create_tensor_map_ragged_from_tensor,
-    create_tensor_map_tiled_from_view,
-)
-
 from cutlass.experimental.task_scheduling.enums import PipelineType
 from cutlass.experimental.task_scheduling.memory import (
     ResourceContext,
@@ -60,6 +55,14 @@ from cutlass.experimental.task_scheduling.resources import (
 from cutlass.experimental.task_scheduling.task import Task
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 
+from ..._block_sparse.common import (
+    _block_sparse_kv_atom_size,
+    _block_sparse_kv_routes_are_block_aligned,
+)
+from ..tensor_map import (
+    create_tensor_map_ragged_from_tensor,
+    create_tensor_map_tiled_from_view,
+)
 from .fmha_decode_config import FmhaDecodeConfig, validate_paged_kv_staging_config
 from .fmha_decode_constants import (
     KV_KIND_K,
@@ -422,23 +425,18 @@ def _build_decode_gen_schedule(
     # A two-inst Keeps profile can use the deeper shared K/V FIFO when stats
     # are standalone and P remains in SMEM.  Keep instruction-local FIFOs when
     # stats or TMEM-P alias S: their overwrite-credit cadence is tied to each
-    # instruction.  Swaps always uses the shared FIFO, including staged H256.
+    # instruction. Dense Swaps uses the shared FIFO, including staged H256;
+    # raw BSR uses instruction-local rings in either MMA orientation. Its load
+    # warp issues V(route R) before replacing the in-place metadata with route
+    # R+1, so that slot's lifetime is independent of the K/V data-ring depth.
     # With cfg.keeps_stats_via_smem the stats-alias justification no longer
     # applies, but the shared FIFO still causes a material Q128 regression, so
     # the instruction-local FIFO gate remains part of that kernel policy.
-    use_split_head_dim_kv = (
+    use_split_head_dim_kv = cfg.use_block_sparse or (
         cfg.use_keeps_mma_ab
         and cfg.tile_size_kv != 256
         and (not cfg.keeps_separates_tmem_s_and_stats or cfg.uses_two_inst_tmem_p)
     )
-    if cfg.use_block_sparse and (
-        not use_split_head_dim_kv
-        or (split_k0_stages, split_k1_stages, split_v0_stages, split_v1_stages)
-        != (1, 1, 1, 1)
-    ):
-        raise ValueError(
-            "block-sparse metadata requires split K0/K1/V0/V1 rings of depth one"
-        )
     split_head_dim_page_offsets_kv = (
         use_paged_kv and use_split_head_dim_kv and not use_one_inst_qkv
     )
@@ -1090,53 +1088,59 @@ def _build_decode_gen_schedule(
         "num_heads_kv": num_heads_kv,
     }
     if use_one_inst_qkv:
-        load_task = create_load_task_one_inst_qkv(
-            smem_q,
-            smem_k0,
-            smem_v0,
-            work_queue,
-            schedule_token_throttle,
-            cfg,
-            domain=load_domain,
-            smem_page_offsets=smem_page_offsets,
-            domain_bias=0,
-            warp_idx=cfg.clc_load_warp_idx if use_clc_dynamic else None,
-            **task_runtime_kwargs,
+        load_tasks = (
+            create_load_task_one_inst_qkv(
+                smem_q,
+                smem_k0,
+                smem_v0,
+                work_queue,
+                schedule_token_throttle,
+                cfg,
+                domain=load_domain,
+                smem_page_offsets=smem_page_offsets,
+                domain_bias=0,
+                warp_idx=cfg.clc_load_warp_idx if use_clc_dynamic else None,
+                **task_runtime_kwargs,
+            ),
         )
     elif use_split_head_dim_kv:
-        load_task = create_load_task_split_kv(
-            smem_q,
-            smem_k0,
-            smem_k1,
-            smem_v0,
-            smem_v1,
-            work_queue,
-            schedule_token_throttle,
-            cfg,
-            domain=load_domain,
-            smem_page_offsets=smem_page_offsets,
-            smem_page_offsets_v=smem_page_offsets_v,
-            sparse_kv_metadata0=sparse_kv_metadata0,
-            sparse_kv_metadata1=sparse_kv_metadata1,
-            sparse_softmax_metadata0=sparse_softmax_metadata0,
-            sparse_softmax_metadata1=sparse_softmax_metadata1,
-            domain_bias=0,
-            warp_idx=cfg.clc_load_warp_idx if use_clc_dynamic else None,
-            **task_runtime_kwargs,
+        load_tasks = (
+            create_load_task_split_kv(
+                smem_q,
+                smem_k0,
+                smem_k1,
+                smem_v0,
+                smem_v1,
+                work_queue,
+                schedule_token_throttle,
+                cfg,
+                domain=load_domain,
+                smem_page_offsets=smem_page_offsets,
+                smem_page_offsets_v=smem_page_offsets_v,
+                sparse_kv_metadata0=sparse_kv_metadata0,
+                sparse_kv_metadata1=sparse_kv_metadata1,
+                sparse_softmax_metadata0=sparse_softmax_metadata0,
+                sparse_softmax_metadata1=sparse_softmax_metadata1,
+                domain_bias=0,
+                warp_idx=cfg.clc_load_warp_idx if use_clc_dynamic else None,
+                **task_runtime_kwargs,
+            ),
         )
     else:
-        load_task = create_load_task(
-            smem_q,
-            smem_kv,
-            work_queue,
-            schedule_token_throttle,
-            smem_kv_reuse_credit,
-            cfg,
-            domain=load_domain,
-            domain_bias=0,
-            warp_idx=cfg.clc_load_warp_idx if use_clc_dynamic else None,
-            smem_page_offsets=smem_page_offsets,
-            **task_runtime_kwargs,
+        load_tasks = (
+            create_load_task(
+                smem_q,
+                smem_kv,
+                work_queue,
+                schedule_token_throttle,
+                smem_kv_reuse_credit,
+                cfg,
+                domain=load_domain,
+                domain_bias=0,
+                warp_idx=cfg.clc_load_warp_idx if use_clc_dynamic else None,
+                smem_page_offsets=smem_page_offsets,
+                **task_runtime_kwargs,
+            ),
         )
     page_offsets_task = None
     if use_paged_kv:
@@ -1299,11 +1303,12 @@ def _build_decode_gen_schedule(
     task_list = []
     if page_offsets_task is not None:
         task_list.append(page_offsets_task)
+    task_list.extend(load_tasks)
     if use_one_inst_qkv and not use_clc_dynamic:
-        task_list.extend([load_task, correction_task, mma_task])
+        task_list.extend([correction_task, mma_task])
         task_list.append(softmax0_task)
     else:
-        task_list.extend([load_task, softmax0_task])
+        task_list.append(softmax0_task)
         if softmax1_task is not None:
             task_list.append(softmax1_task)
         task_list.extend([correction_task, mma_task])
@@ -1338,10 +1343,16 @@ def _build_decode_gen_schedule(
                 {
                     sparse_kv_metadata0: [],
                     sparse_kv_metadata1: [],
+                }
+                if sparse_kv_metadata0 is not None
+                else {}
+            ),
+            **(
+                {
                     sparse_softmax_metadata0: [sparse_kv_metadata0],
                     sparse_softmax_metadata1: [sparse_kv_metadata1],
                 }
-                if sparse_kv_metadata0 is not None
+                if sparse_softmax_metadata0 is not None
                 else {}
             ),
             smem_q: [],
@@ -1478,6 +1489,7 @@ def _build_decode_gen_schedule(
     if sparse_kv_metadata0 is not None:
         smem_allocator.add_resource(sparse_kv_metadata0)
         smem_allocator.add_resource(sparse_kv_metadata1)
+    if sparse_softmax_metadata0 is not None:
         smem_allocator.add_resource(sparse_softmax_metadata0)
         smem_allocator.add_resource(sparse_softmax_metadata1)
     if use_one_inst_qkv:
@@ -1834,7 +1846,14 @@ def _run_decode_gen_active(
         prims.prefetch_tensormap(tma_desc_q.get_ptr())
         prims.prefetch_tensormap(tma_desc_k.get_ptr())
         prims.prefetch_tensormap(tma_desc_v.get_ptr())
-        if cutlass.const_expr(cfg.use_block_sparse):
+        if cutlass.const_expr(
+            cfg.use_block_sparse
+            and _block_sparse_kv_atom_size(cfg.kv_block_size) == 64
+            and not _block_sparse_kv_routes_are_block_aligned(cfg.kv_block_size)
+        ):
+            # Non-aligned coarse routes need a second descriptor for
+            # single-half loads. Block-aligned coarse and fine routes alias
+            # both positional descriptor slots to their primary map.
             prims.prefetch_tensormap(tma_desc_k_64.get_ptr())
             prims.prefetch_tensormap(tma_desc_v_64.get_ptr())
     init_warp += 1
@@ -2597,10 +2616,10 @@ def fmha_block_sparse_launch(
 ) -> None:
     """Launch the initial contiguous-BSHD block-sparse profile.
 
-    The decode schedule consumes KV128 routes in its ordinary 128-token K/V
-    shape. Sparse BSR rows are resolved inside the K/V producer into one or two
-    physical KV64 fragments, while the launcher supplies both 128-token and
-    64-token TensorMaps over the original contiguous K/V allocation.
+    The decode schedule consumes fixed KV128 routes. Sparse BSR rows are
+    resolved inside the K/V producer into fixed execution atoms. Fine blocks
+    use their single-atom TensorMap directly; coarse KV64 blocks may use the
+    KV128 TensorMap when both route halves are adjacent.
     """
     if cutlass.const_expr(not cfg.use_block_sparse):
         raise ValueError("fmha_block_sparse_launch requires cfg.use_block_sparse=True")
@@ -2646,30 +2665,41 @@ def fmha_block_sparse_launch(
     # The physical BSHD stride order is D, H, S, B.  Passing original-mode
     # box dimensions with stride_order=(0, 2, 1, 3) creates descriptor
     # coordinates (D, H, physical-token, B), matching SmemKvTileResource.
-    k_desc_128 = create_tensor_map_tiled_from_view(
+    kv_atom_size = _block_sparse_kv_atom_size(cfg.kv_block_size)
+    primary_kv_box_size = 2 * kv_atom_size if kv_atom_size == 64 else kv_atom_size
+    k_desc_primary = create_tensor_map_tiled_from_view(
         k_tma,
-        box_dims=(tma_box0, 128, 1, 1),
+        box_dims=(tma_box0, primary_kv_box_size, 1, 1),
         stride_order=(0, 2, 1, 3),
         swizzle=tma_swizzle,
     )
-    v_desc_128 = create_tensor_map_tiled_from_view(
+    v_desc_primary = create_tensor_map_tiled_from_view(
         v_tma,
-        box_dims=(tma_box0, 128, 1, 1),
+        box_dims=(tma_box0, primary_kv_box_size, 1, 1),
         stride_order=(0, 2, 1, 3),
         swizzle=tma_swizzle,
     )
-    k_desc_64 = create_tensor_map_tiled_from_view(
-        k_tma,
-        box_dims=(tma_box0, 64, 1, 1),
-        stride_order=(0, 2, 1, 3),
-        swizzle=tma_swizzle,
-    )
-    v_desc_64 = create_tensor_map_tiled_from_view(
-        v_tma,
-        box_dims=(tma_box0, 64, 1, 1),
-        stride_order=(0, 2, 1, 3),
-        swizzle=tma_swizzle,
-    )
+    k_desc_atom = k_desc_primary
+    v_desc_atom = v_desc_primary
+    if cutlass.const_expr(
+        kv_atom_size == 64
+        and not _block_sparse_kv_routes_are_block_aligned(cfg.kv_block_size)
+    ):
+        # B64/odd-coarse routes may join unrelated BSR entries and therefore
+        # need KV64 fallback maps. B128/B256/... issue only the primary KV128
+        # map, including physical tails handled by TMA OOB fill.
+        k_desc_atom = create_tensor_map_tiled_from_view(
+            k_tma,
+            box_dims=(tma_box0, kv_atom_size, 1, 1),
+            stride_order=(0, 2, 1, 3),
+            swizzle=tma_swizzle,
+        )
+        v_desc_atom = create_tensor_map_tiled_from_view(
+            v_tma,
+            box_dims=(tma_box0, kv_atom_size, 1, 1),
+            stride_order=(0, 2, 1, 3),
+            swizzle=tma_swizzle,
+        )
 
     q_groups = Int32(
         (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
@@ -2696,10 +2726,10 @@ def fmha_block_sparse_launch(
     )
     decode_gen_kernel(
         q_desc,
-        k_desc_128,
-        v_desc_128,
-        k_desc_64,
-        v_desc_64,
+        k_desc_primary,
+        v_desc_primary,
+        k_desc_atom,
+        v_desc_atom,
         o_iter,
         s_k,
         h_k,
@@ -2730,6 +2760,14 @@ def fmha_block_sparse_launch(
         block=[cfg.threads_per_cta, 1, 1],
         cluster=[1, 1, 1],
         stream=stream,
-        min_blocks_per_mp=(1 if cfg.use_keeps_mma_ab and cfg.tile_size_q == 128 else 0),
+        # Match the ordinary decode launch bounds. In particular Q8 needs the
+        # explicit bound to keep ptxas from choosing a register-heavy variant.
+        min_blocks_per_mp=(
+            1
+            if cfg.tile_size_q == 8
+            or (cfg.tile_size_q == 16 and cfg.q_dtype_bytes == 1)
+            or (cfg.use_keeps_mma_ab and cfg.tile_size_q == 128)
+            else 0
+        ),
         use_pdl=cfg.use_parallel_separate_reduction_pdl,
     )

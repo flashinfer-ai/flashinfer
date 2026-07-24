@@ -40,6 +40,10 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...._block_sparse.common import (
+    _block_sparse_kv_atom_size,
+    _block_sparse_kv_routes_are_block_aligned,
+)
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import (
     KV_INST0,
@@ -672,78 +676,139 @@ class SmemKvTileResource(DecodeGenResourceBase):
             assert self.sparse_kv_metadata is not None
             assert self.tma_desc_k_64 is not None
             assert self.tma_desc_v_64 is not None
-            # One KV128 route always occupies the ordinary 128-token SMEM
-            # shape. Its two KV64 fragments may originate from different BSR
-            # blocks, so use the 64-token TensorMap unless they are physically
-            # adjacent.
-            tma_desc_64 = (
+            # The positional TensorMaps keep the decode ABI stable. The
+            # primary K/V descriptors are KV128 for coarse routes and one atom
+            # for fine routes. The legacy ``_64`` slots always expose the atom
+            # descriptor and alias the primary descriptor for fine routes.
+            tma_desc_atom = (
                 self.tma_desc_v_64
                 if cutlass.const_expr(self.kv_kind == KV_KIND_V)
                 else self.tma_desc_k_64
             )
+            kv_atom_size = _block_sparse_kv_atom_size(cfg.kv_block_size)
             head_dim_stage = cfg.head_dim_kv_stage
             head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
             chunk_hd = min(head_dim_stage, 64)
             num_chunks = head_dim_stage // chunk_hd
             tile_chunk_elems = chunk_hd * cfg.tile_size_kv
-            fragment_chunk_elems = chunk_hd * 64
-            if prims.elect_sync():
-                origin0 = Int32(self.sparse_kv_metadata.route_origin(Int32(0)))
-                origin1 = Int32(self.sparse_kv_metadata.route_origin(Int32(1)))
-                route_flags = Int32(self.sparse_kv_metadata.route_flags())
-                valid0 = cutlass.Boolean((route_flags & Int32(1)) != Int32(0))
-                valid1 = cutlass.Boolean((route_flags & Int32(2)) != Int32(0))
-                merge_fragments = (valid0 & valid1) & cutlass.Boolean(
-                    origin1 == origin0 + Int32(64)
-                )
-                if not valid0:
-                    origin0 = Int32(self.max_seq_len_kv)
-                if not valid1:
-                    origin1 = Int32(self.max_seq_len_kv)
-                stage_base = self._stage_base(stage_info)
-                for chunk_idx in cutlass.range_constexpr(num_chunks):
-                    local_head_dim_offset = chunk_idx * chunk_hd
-                    global_head_dim_offset = (
-                        head_dim_stage_offset + local_head_dim_offset
-                    )
-                    local_tile_offset = chunk_idx * tile_chunk_elems
-                    if merge_fragments:
-                        prims.cp_async_bulk_tensor_shared_cta_global(
-                            stage_base.subview(local_tile_offset),
-                            tma_desc,
-                            (
-                                Int32(global_head_dim_offset),
-                                logical_h_k_idx,
-                                origin0,
-                                logical_b_idx,
-                            ),
-                            stage_info.barrier,
-                        )
+            if cutlass.const_expr(kv_atom_size == 64):
+                # A B128-aligned semantic block keeps every route inside one
+                # BSR entry, so one KV128 TMA is always legal; TMA OOB fill
+                # handles a partial physical tail. Other coarse blocks may
+                # join unrelated entries and must prove physical adjacency.
+                fragment_chunk_elems = chunk_hd * 64
+                if prims.elect_sync():
+                    origin0 = Int32(self.sparse_kv_metadata.route_origin(Int32(0)))
+                    route_flags = Int32(self.sparse_kv_metadata.route_flags())
+                    valid0 = cutlass.Boolean((route_flags & Int32(1)) != Int32(0))
+                    if not valid0:
+                        origin0 = Int32(self.max_seq_len_kv)
+                    stage_base = self._stage_base(stage_info)
+                    if cutlass.const_expr(
+                        _block_sparse_kv_routes_are_block_aligned(cfg.kv_block_size)
+                    ):
+                        for chunk_idx in cutlass.range_constexpr(num_chunks):
+                            local_head_dim_offset = chunk_idx * chunk_hd
+                            global_head_dim_offset = (
+                                head_dim_stage_offset + local_head_dim_offset
+                            )
+                            local_tile_offset = chunk_idx * tile_chunk_elems
+                            prims.cp_async_bulk_tensor_shared_cta_global(
+                                stage_base.subview(local_tile_offset),
+                                tma_desc,
+                                (
+                                    Int32(global_head_dim_offset),
+                                    logical_h_k_idx,
+                                    origin0,
+                                    logical_b_idx,
+                                ),
+                                stage_info.barrier,
+                            )
                     else:
-                        prims.cp_async_bulk_tensor_shared_cta_global(
-                            stage_base.subview(local_tile_offset),
-                            tma_desc_64,
-                            (
-                                Int32(global_head_dim_offset),
-                                logical_h_k_idx,
-                                origin0,
-                                logical_b_idx,
-                            ),
-                            stage_info.barrier,
+                        origin1 = Int32(self.sparse_kv_metadata.route_origin(Int32(1)))
+                        valid1 = cutlass.Boolean((route_flags & Int32(2)) != Int32(0))
+                        adjacent = (valid0 & valid1) & cutlass.Boolean(
+                            origin1 == origin0 + Int32(64)
                         )
-                        prims.cp_async_bulk_tensor_shared_cta_global(
-                            stage_base.subview(
-                                local_tile_offset + fragment_chunk_elems
-                            ),
-                            tma_desc_64,
-                            (
-                                Int32(global_head_dim_offset),
-                                logical_h_k_idx,
-                                origin1,
-                                logical_b_idx,
-                            ),
-                            stage_info.barrier,
+                        if not valid1:
+                            origin1 = Int32(self.max_seq_len_kv)
+                        for chunk_idx in cutlass.range_constexpr(num_chunks):
+                            local_head_dim_offset = chunk_idx * chunk_hd
+                            global_head_dim_offset = (
+                                head_dim_stage_offset + local_head_dim_offset
+                            )
+                            local_tile_offset = chunk_idx * tile_chunk_elems
+                            if adjacent:
+                                prims.cp_async_bulk_tensor_shared_cta_global(
+                                    stage_base.subview(local_tile_offset),
+                                    tma_desc,
+                                    (
+                                        Int32(global_head_dim_offset),
+                                        logical_h_k_idx,
+                                        origin0,
+                                        logical_b_idx,
+                                    ),
+                                    stage_info.barrier,
+                                )
+                            else:
+                                prims.cp_async_bulk_tensor_shared_cta_global(
+                                    stage_base.subview(local_tile_offset),
+                                    tma_desc_atom,
+                                    (
+                                        Int32(global_head_dim_offset),
+                                        logical_h_k_idx,
+                                        origin0,
+                                        logical_b_idx,
+                                    ),
+                                    stage_info.barrier,
+                                )
+                                prims.cp_async_bulk_tensor_shared_cta_global(
+                                    stage_base.subview(
+                                        local_tile_offset + fragment_chunk_elems
+                                    ),
+                                    tma_desc_atom,
+                                    (
+                                        Int32(global_head_dim_offset),
+                                        logical_h_k_idx,
+                                        origin1,
+                                        logical_b_idx,
+                                    ),
+                                    stage_info.barrier,
+                                )
+            else:
+                # Fine routes stay fully general: issue one TMA per live BSR
+                # atom and use an OOB origin for empty tail slots. Avoiding
+                # route-shape branches is faster for irregular top-k rows and
+                # keeps the load policy independent of adjacency morphology.
+                atom_chunk_elems = chunk_hd * kv_atom_size
+                atoms_per_route = cfg.tile_size_kv // kv_atom_size
+                if prims.elect_sync():
+                    stage_base = self._stage_base(stage_info)
+                    for chunk_idx in cutlass.range_constexpr(num_chunks):
+                        local_head_dim_offset = chunk_idx * chunk_hd
+                        global_head_dim_offset = (
+                            head_dim_stage_offset + local_head_dim_offset
                         )
+                        local_tile_offset = chunk_idx * tile_chunk_elems
+                        for atom_idx in cutlass.range_constexpr(atoms_per_route):
+                            origin = Int32(
+                                self.sparse_kv_metadata.route_origin(Int32(atom_idx))
+                            )
+                            if origin < Int32(0):
+                                origin = Int32(self.max_seq_len_kv)
+                            prims.cp_async_bulk_tensor_shared_cta_global(
+                                stage_base.subview(
+                                    local_tile_offset + atom_idx * atom_chunk_elems
+                                ),
+                                tma_desc_atom,
+                                (
+                                    Int32(global_head_dim_offset),
+                                    logical_h_k_idx,
+                                    origin,
+                                    logical_b_idx,
+                                ),
+                                stage_info.barrier,
+                            )
 
         elif cutlass.const_expr(cfg.use_paged_kv):
             # Paged-KV path: the page-offset resource has already staged the

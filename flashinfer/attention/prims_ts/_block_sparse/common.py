@@ -14,31 +14,62 @@
 
 """Dependency-neutral semantic contract for PrimTS block-sparse attention."""
 
+_FINE_BLOCK_SIZES = (8, 16, 32)
+_KV_ROUTE_SIZE = 128
+_MAX_KV_ATOM_SIZE = 64
 _SIGNED_INT32_MAX = (1 << 31) - 1
 
 
 def _validate_sparse_block_size(value: object, name: str) -> int:
     """Return a supported semantic sparse block size.
 
-    Query and KV block sizes are independent, but each must be represented by
-    an exact number of 64-token execution fragments. Rejecting ``bool``
-    explicitly is necessary because it is a subclass of ``int`` in Python.
+    Query and KV block sizes are independent. Fine blocks map directly to
+    Q/KV atoms; coarse blocks must contain an exact number of 64-token atoms.
+    Rejecting ``bool`` explicitly is necessary because it is a subclass of
+    ``int`` in Python.
     """
 
-    if isinstance(value, bool):
+    requirement = f"{name} must be 8, 16, 32, or a positive multiple of 64"
+    if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(
-            f"{name} must be a positive multiple of 64 expressed as a Python "
-            "integer, got bool"
+            f"{requirement} expressed as a Python integer, got {type(value).__name__}"
         )
-    if not isinstance(value, int):
-        raise TypeError(
-            f"{name} must be a positive multiple of 64 expressed as a Python "
-            f"integer, got {type(value).__name__}"
-        )
-    if value <= 0 or value % 64 != 0:
-        raise ValueError(f"{name} must be a positive multiple of 64")
+    if value not in _FINE_BLOCK_SIZES and (value <= 0 or value % 64 != 0):
+        raise ValueError(requirement)
     if value > _SIGNED_INT32_MAX:
-        raise OverflowError(
-            f"{name} must be a positive multiple of 64 fitting in signed int32"
-        )
+        raise OverflowError(f"{name} must fit in signed int32")
     return value
+
+
+def _canonical_block_sparse_q_tile_size(q_block_size: int) -> int:
+    """Select the canonical PrimTS Q tile for a semantic Q block."""
+
+    q_block_size = _validate_sparse_block_size(q_block_size, "q_block_size")
+    if q_block_size in _FINE_BLOCK_SIZES:
+        return q_block_size
+    return 128 if q_block_size % 128 == 0 else 64
+
+
+def _block_sparse_kv_atom_size(kv_block_size: int) -> int:
+    """Return the independently addressable fragment used in a KV128 route.
+
+    This is route-metadata granularity, not the TMA load tile. Coarse BSR
+    blocks use KV64 fragments so either half can be addressed independently.
+    Their primary TensorMap box is still KV128: B128/B256 (and every multiple
+    of B128) naturally produce KV128 loads, while B64 and odd coarse block
+    sizes use KV128 whenever the two route fragments are physically adjacent.
+    """
+
+    return min(
+        _validate_sparse_block_size(kv_block_size, "kv_block_size"),
+        _MAX_KV_ATOM_SIZE,
+    )
+
+
+def _block_sparse_kv_routes_are_block_aligned(kv_block_size: int) -> bool:
+    """Return whether every KV128 route stays within one semantic BSR block."""
+
+    return (
+        _validate_sparse_block_size(kv_block_size, "kv_block_size") % _KV_ROUTE_SIZE
+        == 0
+    )

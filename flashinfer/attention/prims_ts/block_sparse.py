@@ -15,9 +15,10 @@
 """Task-scheduled block-sparse attention with a plan/run lifecycle.
 
 ``plan()`` inspects caller-owned canonical BSR on the GPU, chooses a raw-BSR
-Q64/Q128 specialization, compiles/caches that launch, and atomically publishes
-an immutable revision. ``run()`` validates compact BSHD Q/K/V tensors and
-launches the published revision without preparing or copying sparse routes.
+Q8/Q16/Q32 SWAPAB or Q64/Q128 KeepsAB specialization, compiles/caches that
+launch, and atomically publishes an immutable revision. ``run()`` validates
+compact BSHD Q/K/V tensors and launches the published revision without
+preparing or copying sparse routes.
 """
 
 from collections.abc import Callable
@@ -61,14 +62,6 @@ if TYPE_CHECKING:
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
-# Comparing a token word with all-ones has its own instruction/branch cost. The
-# inspector therefore compiles this fast path only when at least half of the
-# execution-weighted sites can skip 32 per-token predicates. The heuristic only
-# selects generated code; either specialization has identical mask semantics.
-_TOKEN_WORD_ALL_VALID_FAST_PATH_MIN_RATIO_NUMERATOR = 1
-_TOKEN_WORD_ALL_VALID_FAST_PATH_MIN_RATIO_DENOMINATOR = 2
-_Q128_ROUTE_ALL_VALID_FAST_PATH_MIN_RATIO_NUMERATOR = 1
-_Q128_ROUTE_ALL_VALID_FAST_PATH_MIN_RATIO_DENOMINATOR = 2
 # CLC task dequeue overhead is visible for short sparse causal launches. In a
 # B200 FP16 Q128/KV64 probe, fixed-top-7 latency CLC/static is 1.522 at 2.6
 # waves and 0.879 at 5.2, while short rows with at most three routes remain
@@ -77,6 +70,10 @@ _Q128_ROUTE_ALL_VALID_FAST_PATH_MIN_RATIO_DENOMINATOR = 2
 # of this launch-policy threshold.
 _CAUSAL_CLC_WAVE_THRESHOLD = 5
 _CAUSAL_CLC_MIN_MAX_ROW_ROUTES = 4
+# Raw-BSR Q8 spends enough of each task on live atom-route parsing that CLC
+# work discovery does not amortize. Keep this as caller policy: dense and
+# future route-specialized Q8 profiles can still select persistent scheduling.
+_RAW_BSR_CLC_MIN_TILE_SIZE_Q = 16
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -184,8 +181,6 @@ def _make_block_sparse_config(
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     use_persistent_scheduler: bool,
-    use_token_word_full_guard: bool = False,
-    use_q128_token_route_full_guard: bool = False,
 ) -> "FmhaDecodeConfig":
     import cutlass
 
@@ -200,8 +195,9 @@ def _make_block_sparse_config(
         kv_block_size,
         q_tile_size=q_tile_size,
     )
+    use_keeps_mma_ab = geometry.q_tile_size >= 64
     config_args: dict[str, object] = {
-        "use_keeps_mma_ab": True,
+        "use_keeps_mma_ab": use_keeps_mma_ab,
         "tile_size_q": geometry.q_tile_size,
         "tile_size_kv": geometry.kv_tile_size,
         "groups_tokens_heads_q": True,
@@ -210,8 +206,6 @@ def _make_block_sparse_config(
         "kv_block_size": kv_block_size,
         "use_kv_valid_bits": use_kv_valid_bits,
         "num_kv_valid_words": (_ceil_div(seq_len_kv, 32) if use_kv_valid_bits else 0),
-        "use_token_word_full_guard": use_token_word_full_guard,
-        "use_q128_token_route_full_guard": use_q128_token_route_full_guard,
     }
     if use_persistent_scheduler:
         config_args["use_persistent_scheduler"] = True
@@ -251,8 +245,6 @@ class _RawBlockSparseLaunchTraits:
     output_dtype_key: str
     mask_type: Literal["dense", "causal"]
     use_kv_valid_bits: bool
-    use_token_word_full_guard: bool = False
-    use_q128_token_route_full_guard: bool = False
 
 
 @dataclass(frozen=True)
@@ -287,8 +279,6 @@ def _make_raw_block_sparse_launch_profile(
         mask_type=traits.mask_type,
         use_kv_valid_bits=traits.use_kv_valid_bits,
         use_persistent_scheduler=use_persistent_scheduler,
-        use_token_word_full_guard=traits.use_token_word_full_guard,
-        use_q128_token_route_full_guard=(traits.use_q128_token_route_full_guard),
     )
     compile_key: _BlockSparseCompileKey = (
         traits.device_index,
@@ -306,8 +296,6 @@ def _make_raw_block_sparse_launch_profile(
         traits.mask_type,
         traits.use_kv_valid_bits,
         use_persistent_scheduler,
-        traits.use_token_word_full_guard,
-        traits.use_q128_token_route_full_guard,
     )
     return _RawBlockSparseLaunchProfile(
         config=config,
@@ -331,14 +319,25 @@ def _resolve_cached_raw_block_sparse_persistent_launch_profile(
     traits: _RawBlockSparseLaunchTraits,
 ) -> _RawBlockSparseLaunchProfile | None:
     static_profile = _resolve_cached_raw_block_sparse_static_launch_profile(traits)
-    persistent_probe = deepcopy(static_profile.config)
-    persistent_probe.use_persistent_scheduler = True
-    if not persistent_probe.supports_grouped_keeps:
+    if static_profile.config.use_keeps_mma_ab:
+        persistent_probe = deepcopy(static_profile.config)
+        persistent_probe.use_persistent_scheduler = True
+        if not persistent_probe.supports_grouped_keeps:
+            return None
+        return _make_raw_block_sparse_launch_profile(
+            traits,
+            use_persistent_scheduler=True,
+        )
+
+    # Grouped SWAPAB has no Keeps-style capability predicate. Reuse the full
+    # profile validator and retain the valid static launch on rejection.
+    try:
+        return _make_raw_block_sparse_launch_profile(
+            traits,
+            use_persistent_scheduler=True,
+        )
+    except ValueError:
         return None
-    return _make_raw_block_sparse_launch_profile(
-        traits,
-        use_persistent_scheduler=True,
-    )
 
 
 def _resolve_raw_block_sparse_launch_spec(
@@ -356,15 +355,13 @@ def _resolve_raw_block_sparse_launch_spec(
     output_dtype_key: str,
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
-    max_retained_routes: int,
-    *,
-    use_token_word_full_guard: bool = False,
-    use_q128_token_route_full_guard: bool = False,
+    max_execution_tiles: int,
 ) -> _BlockSparseLaunchSpec:
     """Select static or CLC scheduling without preparing route payloads.
 
-    ``max_retained_routes`` is measured in physical-tail-trimmed KV128 routes,
-    which is the scheduler's work unit; it is not semantic BSR row NNZ.
+    ``max_execution_tiles`` is the per-row KV128 scheduler capacity. Static
+    plans use the largest physical-tail-trimmed route count; dynamic plans use
+    the untrimmed capacity implied by the fixed indptr row length.
     """
 
     from .kernels.fmha_decode.fmha_decode_config import _select_auto_launch_mode
@@ -374,13 +371,14 @@ def _resolve_raw_block_sparse_launch_spec(
         kv_block_size,
         q_tile_size=q_tile_size,
     )
-    visible_kv_tokens = max_retained_routes * geometry.kv_tile_size
+    scheduler_kv_capacity_tokens = max_execution_tiles * geometry.kv_tile_size
     with torch.cuda.device(device_index):
         mode = _select_auto_launch_mode(
             batch_size=batch_size,
             num_heads_kv=num_heads,
-            seq_len_kv=visible_kv_tokens,
+            seq_len_kv=scheduler_kv_capacity_tokens,
             num_q_tiles=_ceil_div(seq_len_q, geometry.q_tile_size),
+            tile_size_q=geometry.q_tile_size,
             tile_size_kv=geometry.kv_tile_size,
             persistent_min_waves=(
                 _CAUSAL_CLC_WAVE_THRESHOLD if mask_type == "causal" else 1
@@ -388,6 +386,7 @@ def _resolve_raw_block_sparse_launch_spec(
             persistent_min_tiles_per_cta=(
                 _CAUSAL_CLC_MIN_MAX_ROW_ROUTES if mask_type == "causal" else 1
             ),
+            persistent_min_tile_size_q=_RAW_BSR_CLC_MIN_TILE_SIZE_Q,
         )
     traits = _RawBlockSparseLaunchTraits(
         device_index=device_index,
@@ -404,8 +403,6 @@ def _resolve_raw_block_sparse_launch_spec(
         output_dtype_key=output_dtype_key,
         mask_type=mask_type,
         use_kv_valid_bits=use_kv_valid_bits,
-        use_token_word_full_guard=use_token_word_full_guard,
-        use_q128_token_route_full_guard=use_q128_token_route_full_guard,
     )
     profile = None
     if mode == "persistent":
@@ -415,15 +412,12 @@ def _resolve_raw_block_sparse_launch_spec(
     policy: tuple[tuple[str, object], ...] = (
         ("tile_size_q", geometry.q_tile_size),
         ("use_persistent_scheduler", profile.use_persistent_scheduler),
-        ("max_execution_tiles", max_retained_routes),
-        ("visible_kv_tokens", visible_kv_tokens),
+        ("max_execution_tiles", max_execution_tiles),
+        # Preserve the public diagnostic key for existing benchmark schemas.
+        # Dynamic plans report scheduler capacity rather than current visibility.
+        ("visible_kv_tokens", scheduler_kv_capacity_tokens),
         ("execution_path", "raw_bsr_decode"),
         ("use_kv_valid_bits", use_kv_valid_bits),
-        ("use_token_word_full_guard", use_token_word_full_guard),
-        (
-            "use_q128_token_route_full_guard",
-            use_q128_token_route_full_guard,
-        ),
     )
     return _BlockSparseLaunchSpec(
         copy(profile.config),
@@ -456,8 +450,6 @@ def _get_compiled_block_sparse(
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     use_persistent_scheduler: bool,
-    use_token_word_full_guard: bool = False,
-    use_q128_token_route_full_guard: bool = False,
 ) -> Callable[..., object]:
     """Compile and cache one canonical raw-BSR TVM-FFI adapter."""
 
@@ -492,8 +484,6 @@ def _get_compiled_block_sparse(
         mask_type=mask_type,
         use_kv_valid_bits=use_kv_valid_bits,
         use_persistent_scheduler=use_persistent_scheduler,
-        use_token_word_full_guard=use_token_word_full_guard,
-        use_q128_token_route_full_guard=use_q128_token_route_full_guard,
     )
     Int32 = cutlass.Int32
     Float32 = cutlass.Float32
@@ -590,7 +580,17 @@ class BlockSparseTSWrapper:
     the GPU. Publishing a replacement revision does not make metadata from
     the old revision immediately safe to modify. CUDA Graph capture pins old
     revisions until wrapper destruction; the wrapper and its caller-owned
-    metadata must outlive captured graphs and remain immutable across replans.
+    metadata must outlive captured graphs.
+
+    Metadata is immutable by default. A plan created with
+    ``dynamic_metadata=True`` instead permits the caller to update retained
+    block-index and token-mask values between ordered launches. Row offsets,
+    tensor identities, shapes, and dtypes remain fixed. The initial and updated
+    rows must remain strictly increasing, unique, and in range. This is the
+    intended lifecycle for CUDA Graph replay: capture only :meth:`run`, update
+    retained tensors in place, then replay. Callers must synchronize
+    cross-stream updates and must not modify metadata while a consuming launch
+    is in flight.
     """
 
     def __init__(self) -> None:
@@ -648,6 +648,7 @@ class BlockSparseTSWrapper:
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
+        dynamic_metadata: bool = False,
     ) -> None:
         """Validate metadata, choose a legal profile, and compile the launch.
 
@@ -666,13 +667,14 @@ class BlockSparseTSWrapper:
         ``torch.bfloat16`` dtype. Runtime tensor shapes are documented by
         :meth:`run`.
 
-        Both block sizes must each be a positive multiple of 64; they may differ.
-        Query tiles follow the semantic row size: ``q_block_size`` values
-        divisible by 128 use Q128, and the remaining supported values use Q64.
-        The kernel consumes the canonical BSR directly and expands selected KV
-        blocks into KV128 execution routes. This remains true when every KV
-        block is selected; callers that know a pattern is dense should choose
-        the dense FMHA API explicitly.
+        Each block size may be 8, 16, 32, or a positive multiple of 64; Q and
+        KV block sizes may differ. Fine Q blocks use the corresponding
+        Q8/Q16/Q32 SWAPAB tile. Coarse Q blocks divisible by 128 use Q128
+        KeepsAB, and the remaining coarse sizes use Q64 KeepsAB. Fine KV blocks
+        currently require a fine SWAPAB Q tile. The kernel consumes canonical
+        BSR directly and assembles selected KV blocks into KV128 execution
+        routes. This remains true when every KV block is selected; callers that
+        know a pattern is dense should choose the dense FMHA API explicitly.
 
         Planning validates canonical BSR offsets and strictly increasing,
         unique, in-range block values with one GPU inspection. Invalid metadata
@@ -680,6 +682,22 @@ class BlockSparseTSWrapper:
         route payload. Inspection performs one packed D2H and synchronizes the
         plan stream, so ``plan()`` is host-synchronizing and must run outside
         CUDA Graph capture.
+
+        ``dynamic_metadata=True`` keeps a supplied ``kv_valid_bits`` tensor in
+        the runtime plan even when the inspected routes currently reach only
+        valid tokens. This conservative specialization is required when later
+        in-place route updates may reach token-mask holes. The row offsets stay
+        fixed. Subsequent block-index rows must remain strictly increasing,
+        unique, in range, and within the fixed tensor extent; they are not
+        reinspected by :meth:`run`.
+
+        A dynamic plan derives its execution-route capacity from the fixed
+        row offsets (the untrimmed per-row bound), not from the inspected
+        data, so any legal in-place index update fits the compiled schedule.
+        Token-mask *values* may also change between launches. Dynamic plans
+        therefore use the masked profile; Q64/Q128 derive their route-full
+        fast path from the current token words on every run rather than
+        specializing on plan-time morphology.
 
         Concurrent plans are serialized; run keeps using the published state.
         """
@@ -690,7 +708,12 @@ class BlockSparseTSWrapper:
         num_qo_heads = _validate_positive_int(num_qo_heads, "num_qo_heads")
         num_kv_heads = _validate_positive_int(num_kv_heads, "num_kv_heads")
         head_dim = _validate_positive_int(head_dim, "head_dim")
+        if not isinstance(dynamic_metadata, bool):
+            raise TypeError("dynamic_metadata must be a bool")
         geometry = _resolve_execution_geometry(q_block_size, kv_block_size)
+        use_keeps_mma_ab = geometry.q_tile_size >= 64
+        if kv_block_size < 64 and use_keeps_mma_ab:
+            raise ValueError("fine KV blocks require a SwapsMmaAb Q tile")
         _validate_mask(mask_type)
         if head_dim != 128:
             raise ValueError("block-sparse requires head_dim=128")
@@ -717,6 +740,9 @@ class BlockSparseTSWrapper:
         previous_state = self._plan_state
         revision = 0 if previous_state is None else previous_state.revision + 1
         plan_stream = torch.cuda.current_stream(device)
+        # Dynamic plans must compile the masked path regardless of current
+        # values, so scanning a mutable bitset here cannot affect policy.
+        inspection_kv_valid_bits = None if dynamic_metadata else kv_valid_bits
         inspection = _inspect_block_sparse_bsr(
             block_indptr,
             block_indices,
@@ -726,51 +752,27 @@ class BlockSparseTSWrapper:
             seq_len_kv=seq_len_kv,
             q_block_size=q_block_size,
             kv_block_size=kv_block_size,
-            kv_valid_bits=kv_valid_bits,
+            kv_valid_bits=inspection_kv_valid_bits,
             stream=plan_stream,
         )
         max_row_nnz = inspection.max_row_nnz
 
-        # Turn the packed inspection into compile-time policy:
-        #   reachable holes       -> compile token masking;
-        #   guard skips/checks    -> specialize the common full-word branch;
-        #   Q128 mask-full/routes -> specialize the whole-route branch;
-        #   max retained routes   -> size the static/CLC scheduler workload.
-        # An all-one user mask therefore compiles like no mask because the
-        # inspector reports holes only among execution-reachable real tokens.
-        use_token_mask = kv_valid_bits is not None and inspection.token_mask_has_holes
-        # check_count = sum(q_tiles_per_row * padded_route_slots *
-        #                   (2 if Q64 else 4)).  skip_count counts those same
-        # sites whose word pair/word is all valid.
-        use_token_word_full_guard = (
-            use_token_mask
-            and inspection.runtime_token_guard_check_count > 0
-            and inspection.runtime_token_guard_skip_count
-            * _TOKEN_WORD_ALL_VALID_FAST_PATH_MIN_RATIO_DENOMINATOR
-            >= inspection.runtime_token_guard_check_count
-            * _TOKEN_WORD_ALL_VALID_FAST_PATH_MIN_RATIO_NUMERATOR
+        # Static plans may compile away an all-valid token mask. Dynamic plans
+        # keep masking enabled because the caller can update the same bitset
+        # between runs. Full KV128 routes are detected by the kernel from the
+        # current words, never from plan-time morphology.
+        use_token_mask = kv_valid_bits is not None and (
+            dynamic_metadata or inspection.token_mask_has_holes
         )
-        # Only Q128 evaluates four independent word guards per scheduled route.
-        # The check count includes minimum-schedule and odd-pair dummy routes;
-        # the exact mask-full count includes only real routes. Q64 evaluates two
-        # paired-word guards, so this Q128-only diagnostic remains zero there.
-        runtime_scheduled_route_count = 0
-        if geometry.q_tile_size == 128:
-            if inspection.runtime_token_guard_check_count % 4 != 0:
-                raise RuntimeError(
-                    "Q128 inspection token-guard check count must be divisible by four"
-                )
-            runtime_scheduled_route_count = (
-                inspection.runtime_token_guard_check_count // 4
-            )
-        use_q128_token_route_full_guard = (
-            use_token_word_full_guard
-            and geometry.q_tile_size == 128
-            and runtime_scheduled_route_count > 0
-            and inspection.runtime_token_mask_full_route_count
-            * _Q128_ROUTE_ALL_VALID_FAST_PATH_MIN_RATIO_DENOMINATOR
-            >= runtime_scheduled_route_count
-            * _Q128_ROUTE_ALL_VALID_FAST_PATH_MIN_RATIO_NUMERATOR
+        # Dynamic plans must also size execution routes for any legal
+        # in-place index update, not for the current data: row offsets are
+        # fixed, so the untrimmed bound ceil(max_row_nnz * kv_block_size /
+        # route_size) holds for every replay, while the inspected value may
+        # undercount when a later update avoids the physical tail.
+        max_execution_tiles = (
+            -(-(max_row_nnz * kv_block_size) // geometry.kv_tile_size)
+            if dynamic_metadata
+            else inspection.max_retained_routes
         )
         with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
             q_dtype_key = _dtype_key(q_data_type)
@@ -791,27 +793,13 @@ class BlockSparseTSWrapper:
                 output_dtype_key,
                 mask_type,
                 use_token_mask,
-                inspection.max_retained_routes,
-                use_token_word_full_guard=use_token_word_full_guard,
-                use_q128_token_route_full_guard=(use_q128_token_route_full_guard),
+                max_execution_tiles,
             )
             config = spec.config
             policy = (
                 *spec.policy,
+                ("dynamic_metadata", dynamic_metadata),
                 ("max_row_nnz", max_row_nnz),
-                (
-                    "runtime_full_guard_slots",
-                    inspection.runtime_token_guard_skip_count,
-                ),
-                (
-                    "runtime_guard_slots",
-                    inspection.runtime_token_guard_check_count,
-                ),
-                (
-                    "runtime_full_routes",
-                    inspection.runtime_token_mask_full_route_count,
-                ),
-                ("runtime_routes", runtime_scheduled_route_count),
             )
             compiled = _get_compiled_block_sparse(*spec.compile_key)
             runtime_kv_valid_bits = (

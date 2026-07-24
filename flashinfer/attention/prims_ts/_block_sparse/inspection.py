@@ -15,8 +15,9 @@
 """Host side of the plan-time raw-BSR inspection.
 
 This module validates the tensor ABI, launches the GPU inspector, and decodes
-its fixed Int64 summary into Python planning facts. It deliberately performs
-one packed device-to-host copy and does not build a remapped route payload.
+its fixed Int64 summary into Python planning facts. Inspection deliberately
+performs one packed device-to-host copy and does not build a remapped route
+payload or specialize the launch for the current route/guard morphology.
 """
 
 import threading
@@ -31,9 +32,8 @@ from .common import (
 
 
 # Device summary ABI; keep this order synchronized with block_sparse_inspect.py:
-# error, max row NNZ, max KV128 routes, reachable token hole, execution-weighted
-# token-guard skips/checks, and Q128 mask-full routes.
-_SUMMARY_FIELDS = 7
+# error, max row NNZ, max KV128 routes, reachable token hole.
+_SUMMARY_FIELDS = 4
 _SUMMARY_HOST_STORAGE = threading.local()
 
 
@@ -42,28 +42,18 @@ class _BlockSparseInspection:
     """Planning facts derived from caller-owned canonical BSR metadata.
 
     ``max_row_nnz`` counts semantic BSR blocks. ``max_retained_routes`` counts
-    KV128 execution routes after selected blocks are expanded into KV64
-    fragments and fragments beyond ``seq_len_kv`` are removed.
+    KV128 execution routes after selected blocks are expanded into canonical
+    8/16/32/64-token atoms and atoms beyond ``seq_len_kv`` are removed.
 
     ``token_mask_has_holes`` means a selected, non-padding token has a zero
-    validity bit. The three ``runtime_*`` counters describe token-guard work,
-    weighted by the Q64/Q128 tiles that consume each row: skip count is the
-    fast-path numerator, check count (including dummy routes) is its
-    denominator, and ``runtime_token_mask_full_route_count`` is the Q128-only
-    count of real routes whose four token words are all ones.
-
-    The skip/check ratio is a performance heuristic, not part of masking
-    correctness. It distinguishes full-word-dominated masks, where a runtime
-    equality guard avoids most per-bit work, from random masks, where the same
-    guard would add a branch but almost never skip anything.
+    validity bit. Runtime kernels derive their route-full decision from the
+    current token words on every launch rather than freezing a plan-time
+    morphology heuristic.
     """
 
     max_row_nnz: int
     max_retained_routes: int
     token_mask_has_holes: bool
-    runtime_token_guard_skip_count: int = 0
-    runtime_token_guard_check_count: int = 0
-    runtime_token_mask_full_route_count: int = 0
 
 
 def _validate_positive_int32(value: object, name: str) -> int:
@@ -167,8 +157,11 @@ def _inspect_block_sparse_bsr(
     contiguous Uint32 ``[B, ceil(Skv / 32)]`` and is shared by all KV heads.
 
     The GPU validates each referenced range before reading it, reduces all rows
-    into one zero-initialized Int64[7], and this function performs the sole D2H
+    into one zero-initialized Int64[4], and this function performs the sole D2H
     synchronization before returning an immutable ``_BlockSparseInspection``.
+    Fine-block route shape is deliberately absent: run resolves the live BSR
+    indices and loads each fine atom directly. Only the coarse KV64 path may
+    combine the two halves of one KV128 route.
     """
 
     q_block_size = _validate_sparse_block_size(q_block_size, "q_block_size")
@@ -290,9 +283,6 @@ def _inspect_block_sparse_bsr(
         max_row_nnz=summary_values[1],
         max_retained_routes=summary_values[2],
         token_mask_has_holes=bool(summary_values[3]),
-        runtime_token_guard_skip_count=summary_values[4],
-        runtime_token_guard_check_count=summary_values[5],
-        runtime_token_mask_full_route_count=summary_values[6],
     )
 
 

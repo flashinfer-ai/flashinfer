@@ -1767,15 +1767,15 @@ def create_load_task_split_kv(
             lambda: _schedule_token_throttle_head(schedule_token_throttle),
         )
 
-    sparse_resources = (
-        sparse_kv_metadata0,
-        sparse_kv_metadata1,
-        sparse_softmax_metadata0,
-        sparse_softmax_metadata1,
-    )
-    has_sparse_resources = any(resource is not None for resource in sparse_resources)
-    if has_sparse_resources:
-        assert all(resource is not None for resource in sparse_resources)
+    has_sparse_kv_metadata = sparse_kv_metadata0 is not None
+    has_sparse_softmax_metadata = sparse_softmax_metadata0 is not None
+    if (sparse_kv_metadata1 is not None) != has_sparse_kv_metadata:
+        raise ValueError("block-sparse K/V metadata resources must be paired")
+    if (sparse_softmax_metadata1 is not None) != has_sparse_softmax_metadata:
+        raise ValueError("block-sparse Softmax metadata resources must be paired")
+    if has_sparse_softmax_metadata and not has_sparse_kv_metadata:
+        raise ValueError("block-sparse Softmax metadata requires K/V metadata")
+    if has_sparse_kv_metadata:
         if smem_page_offsets is not None or smem_page_offsets_v is not None:
             raise ValueError(
                 "block-sparse and paged-KV load resources cannot be combined"
