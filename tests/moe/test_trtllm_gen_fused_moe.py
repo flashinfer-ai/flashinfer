@@ -2024,6 +2024,18 @@ def _build_w_ptr_table(weights, num_experts):
             FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
             id="DSFp8",
         ),
+        pytest.param(
+            FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
+            id="NvFp4",
+        ),
+        pytest.param(
+            FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8),
+            id="MxFp4xMxFp8",
+        ),
+        pytest.param(
+            FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16),
+            id="MxFp4xBf16",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -2043,6 +2055,7 @@ def _build_w_ptr_table(weights, num_experts):
                     BF16Moe,
                     MxInt4BlockScaleMoe,
                     FP8BlockScaleMoe,
+                    FP4Moe,
                 ],
                 "compatible_intermediate_size": [1024],
                 "enable_autotune": False,
@@ -2070,7 +2083,7 @@ def _build_w_ptr_table(weights, num_experts):
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe],
             },
             id="Shuffled_MajorK",
         ),

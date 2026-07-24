@@ -40,6 +40,7 @@ from flashinfer.fused_moe import (
     bgmv_moe_gemm1_lora_delta,
     convert_to_block_layout,
     trtllm_fp4_block_scale_moe,
+    trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
@@ -108,9 +109,25 @@ class CUDAGraphMoE:
         self.input_tensor = None
         self.output_tensor = None
         self.is_captured = False
+        # Optional routed-mode slots (LoRA delta path). Allocated in capture()
+        # when corresponding samples are provided; remain None otherwise so
+        # _run_moe_computation can dispatch on their presence.
+        self.packed_topk_ids_slot = None
+        self.gemm1_lora_delta_slot = None
 
-    def capture(self, hidden_states_sample, **runtime_args):
-        """Capture CUDA graph with the given sample input."""
+    def capture(
+        self,
+        hidden_states_sample,
+        packed_topk_ids_sample=None,
+        gemm1_lora_delta_sample=None,
+        **runtime_args,
+    ):
+        """Capture CUDA graph with the given sample input.
+
+        For the routed (pre-computed routing) path, pass both
+        ``packed_topk_ids_sample`` and ``gemm1_lora_delta_sample``; they are
+        cloned into stable slots and become per-launch graph inputs.
+        """
         if self.is_captured:
             raise RuntimeError(
                 "Graph already captured. Call cleanup() first to re-capture."
@@ -118,6 +135,11 @@ class CUDAGraphMoE:
         if not isinstance(self.moe_impl, FP4Moe):
             raise NotImplementedError(
                 f"CUDA graph capture not yet implemented for {type(self.moe_impl)}"
+            )
+        if (packed_topk_ids_sample is None) != (gemm1_lora_delta_sample is None):
+            raise ValueError(
+                "packed_topk_ids_sample and gemm1_lora_delta_sample must be "
+                "provided together (or neither)."
             )
 
         # Create stream
@@ -130,6 +152,9 @@ class CUDAGraphMoE:
 
         # Store input tensor reference (will be updated in place during launch)
         self.input_tensor = hidden_states_sample.clone()
+        if packed_topk_ids_sample is not None:
+            self.packed_topk_ids_slot = packed_topk_ids_sample.clone()
+            self.gemm1_lora_delta_slot = gemm1_lora_delta_sample.clone()
 
         # Warmup
         with torch.cuda.stream(torch_stream), autotune(self.enable_autotune):
@@ -161,13 +186,33 @@ class CUDAGraphMoE:
             self.cleanup()
             raise RuntimeError(f"CUDA graph capture failed: {e}") from e
 
-    def launch(self, hidden_states_new):
-        """Launch captured CUDA graph with new input."""
+    def launch(self, hidden_states_new, packed_topk_ids=None, gemm1_lora_delta=None):
+        """Launch captured CUDA graph with new input.
+
+        ``packed_topk_ids`` and ``gemm1_lora_delta`` are only valid when their
+        corresponding slots were allocated at capture time; passing them here
+        overwrites the slot contents before launch. Default ``None`` keeps the
+        captured contents (one-shot capture+launch is the common case).
+        """
         if not self.is_captured:
             raise RuntimeError("Graph not captured. Call capture() first.")
 
         # Update input tensor in place
         self.input_tensor.copy_(hidden_states_new)
+        if packed_topk_ids is not None:
+            if self.packed_topk_ids_slot is None:
+                raise RuntimeError(
+                    "packed_topk_ids passed to launch() but no slot was "
+                    "allocated at capture time."
+                )
+            self.packed_topk_ids_slot.copy_(packed_topk_ids)
+        if gemm1_lora_delta is not None:
+            if self.gemm1_lora_delta_slot is None:
+                raise RuntimeError(
+                    "gemm1_lora_delta passed to launch() but no slot was "
+                    "allocated at capture time."
+                )
+            self.gemm1_lora_delta_slot.copy_(gemm1_lora_delta)
 
         # Launch graph
         err = runtime.cudaGraphLaunch(self.graph_exec, self.stream)[0]
@@ -194,6 +239,8 @@ class CUDAGraphMoE:
             self.stream = None
         self.input_tensor = None
         self.output_tensor = None
+        self.packed_topk_ids_slot = None
+        self.gemm1_lora_delta_slot = None
         self.is_captured = False
 
     def _run_moe_computation(self, runtime_args):
@@ -203,6 +250,41 @@ class CUDAGraphMoE:
             self.config["hidden_states_scale_global"],
             is_swizzling=False,
         )
+
+        if self.gemm1_lora_delta_slot is not None:
+            # Routed entry: pre-computed routing + LoRA delta. All inputs that
+            # vary per launch (input, packed_topk_ids, gemm1_lora_delta) come
+            # from the stable slots allocated in capture().
+            return trtllm_fp4_block_scale_routed_moe(
+                self.packed_topk_ids_slot,
+                runtime_args["routing_bias"],
+                input_quantized["hidden_states"],
+                input_quantized["hidden_states_scale"],
+                self.static_data["gemm1_weights_fp4_shuffled"],
+                self.static_data["gemm1_scales_fp4_shuffled"],
+                self.config["gemm1_bias"],
+                None,
+                None,
+                None,
+                self.static_data["gemm2_weights_fp4_shuffled"],
+                self.static_data["gemm2_scales_fp4_shuffled"],
+                self.config["gemm2_bias"],
+                self.static_data["scale_c_fc1"],
+                self.static_data["scale_gate_fc1"],
+                self.static_data["scale_c_fc2"],
+                self.config["num_experts"],
+                self.config["top_k"],
+                self.config["n_groups"],
+                self.config["top_k_groups"],
+                self.config["intermediate_size"],
+                0,
+                self.config["num_experts"],
+                self.config["routed_scaling"],
+                routing_method_type=self.config["routing_method_type"],
+                activation_type=self.config["activation_type"],
+                gemm1_lora_delta=self.gemm1_lora_delta_slot,
+                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+            )
 
         output = trtllm_fp4_block_scale_moe(
             routing_logits=runtime_args["expert_logits"],
@@ -340,6 +422,49 @@ class Moe(ABC):
 
     def __str__(self):
         return self.name
+
+
+# ====================================================================================
+# Shared check_intermediate_output helpers
+# ====================================================================================
+
+
+def _gather_intermediate_by_expanded_idx(raw_kernel_output, reference_args):
+    """Gather the kernel + reference post-activation FC1 output into canonical
+    expanded-index order (``p = token * top_k + slot``).
+
+    Each side is indexed by its own ``expandedTokenIdxToPermutedIdx`` map (length
+    ``num_tokens * top_k``). ``kernel_routed`` keeps the kernel's native dtype/packing
+    (uint8 fp4-packed, e4m3, or bf16); ``ref_routed`` is cast to fp32 (clean, not
+    re-quantized). Returns ``(kernel_routed, ref_routed)``.
+    """
+    kernel_codes = raw_kernel_output[2]
+    kernel_expanded_to_permuted = raw_kernel_output[1].to(torch.int64).cpu()
+    ref_expanded_to_permuted = (
+        reference_args.permute_info["expandedTokenIdxToPermutedIdx"]
+        .to(torch.int64)
+        .cpu()
+    )
+    kernel_routed = kernel_codes[kernel_expanded_to_permuted]
+    ref_routed = reference_args.activation_output[ref_expanded_to_permuted].to(
+        torch.float32
+    )
+    return kernel_routed, ref_routed
+
+
+def _decode_mxfp8_intermediate(kernel_routed, ref_routed):
+    """Decode MxFp8 (e4m3) codes to fp32 using an mx block scale recovered from the
+    reference (the kernel does not return its scale). Compare the result against the
+    CLEAN fp32 ``ref_routed`` — e4m3 is fine-grained enough that clean-fp32 comparison
+    holds (unlike fp4, which needs a round-tripped reference).
+    """
+    _, ref_scale = mxfp8_quantize(ref_routed.to(torch.bfloat16), True)
+    ref_scale_bytes = ref_scale.view(torch.uint8).reshape(-1).cpu()
+    return (
+        mxfp8_dequantize_host(kernel_routed.cpu().view(torch.uint8), ref_scale_bytes)
+        .to(ref_routed.device)
+        .to(torch.float32)
+    )
 
 
 # ====================================================================================
@@ -668,6 +793,8 @@ class FP4Moe(Moe):
         gemm1_bias = static_data["gemm1_bias_shuffled"]
         gemm2_bias = static_data["gemm2_bias_shuffled"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        gemm1_lora_delta = kwargs.get("gemm1_lora_delta")
+        permute_info = kwargs.get("permute_info")
 
         # Create CUDA graph configuration
         config = {
@@ -691,14 +818,116 @@ class FP4Moe(Moe):
             "routing_bias": routing_bias,
         }
 
+        # LoRA delta path: precompute packed routing so the routed entry sees
+        # both samples as graph inputs. _run_moe_computation dispatches based
+        # on slot presence.
+        packed_topk_ids = None
+        if gemm1_lora_delta is not None:
+            packed_topk_ids = pack_topk_for_routed_moe(
+                permute_info["topKIndices"], permute_info["topKLogits"]
+            )
+
         # Create, capture and launch CUDA graph in one shot
         cuda_graph = CUDAGraphMoE(self, static_data, **config)
         try:
-            cuda_graph.capture(hidden_states_orig, **runtime_args)
-            output = cuda_graph.launch(hidden_states_orig)
-            return output[0].to(torch.float)
+            cuda_graph.capture(
+                hidden_states_orig,
+                packed_topk_ids_sample=packed_topk_ids,
+                gemm1_lora_delta_sample=gemm1_lora_delta,
+                **runtime_args,
+            )
+            output = cuda_graph.launch(
+                hidden_states_orig,
+                packed_topk_ids=packed_topk_ids,
+                gemm1_lora_delta=gemm1_lora_delta,
+            )
+            if isinstance(output, list):
+                if kwargs.get("return_full_output", False):
+                    return output
+                return output[0].to(torch.float)
+            return output.to(torch.float)
         finally:
             cuda_graph.cleanup()
+
+    def check_intermediate_output(self, raw_kernel_output, reference_args):
+        """Validate the kernel's exposed post-activation FC1 output for FP4.
+
+        The exposed format differs per quant mode:
+          * NvFp4       -> FP4-packed (uint8, last-dim ``intermediate_size // 2``);
+          * MxFp4xMxFp8 -> MxFp8/e4m3 (same format FP8BlockScaleMoe's MXFP8 decodes);
+          * MxFp4xBf16  -> bf16.
+        We gather both sides into expanded-index order, decode the kernel side to fp32,
+        and compare against the reference activation with the FP4 tolerances.
+        """
+        assert isinstance(raw_kernel_output, list) and len(raw_kernel_output) >= 3, (
+            f"Expected the kernel to return [output, expanded_idx_to_permuted_idx, "
+            f"gemm1_output]; got {type(raw_kernel_output).__name__} of length "
+            f"{len(raw_kernel_output) if isinstance(raw_kernel_output, list) else 'n/a'}"
+        )
+        intermediate_size = reference_args.intermediate_size
+        kernel_routed, ref_routed = _gather_intermediate_by_expanded_idx(
+            raw_kernel_output, reference_args
+        )
+
+        if self.quant_mode == QuantMode.FP4_NVFP4_NVFP4:
+            # FP4-packed: 2 e2m1 values per byte -> last-dim intermediate_size // 2.
+            assert kernel_routed.shape[-1] == intermediate_size // 2, (
+                f"Expected the FP4-packed post-activation FC1 output to have last-dim "
+                f"{intermediate_size // 2} (= intermediate_size // 2); got shape "
+                f"{tuple(kernel_routed.shape)}."
+            )
+            # The kernel does not return its per-block scale, so derive it from the
+            # reference and decode BOTH sides with it. Compare against the fp4-round-
+            # tripped reference (not clean fp32): e2m1 is coarse near zero, so comparing
+            # to un-quantized fp32 would blow past rtol on small values; round-tripping
+            # both sides tests "kernel codes ~= reference codes" at matched precision.
+            sf_vec_size = 16
+            global_sf = reference_args.c_global_sf
+            ref_fp4, ref_sf = fp4_quantize(
+                ref_routed.to(torch.bfloat16).cuda(),
+                global_sf.cuda(),
+                sf_vec_size,
+                False,  # use_ue8m0
+                True,  # is_sf_swizzled_layout
+            )
+
+            def _decode(codes):
+                return (
+                    e2m1_and_ufp8sf_scale_to_float(
+                        codes.cpu(),
+                        ref_sf.cpu().reshape(-1),
+                        (1 / global_sf).cpu(),
+                        sf_vec_size,
+                        1,  # ufp8_type for NvFp4
+                        True,  # is_sf_swizzled_layout
+                    )
+                    .to(ref_routed.device)
+                    .to(torch.float32)
+                )
+
+            ref_compare = _decode(ref_fp4)
+            kernel_dequant = _decode(kernel_routed)
+        else:
+            # MxFp8/bf16: one value per element (last-dim intermediate_size), and both
+            # are fine-grained enough to compare against the clean fp32 reference.
+            assert kernel_routed.shape[-1] == intermediate_size, (
+                f"Expected the post-activation FC1 output to have last-dim "
+                f"{intermediate_size}; got shape {tuple(kernel_routed.shape)}."
+            )
+            ref_compare = ref_routed
+            if self.quant_mode == QuantMode.FP4_MXFP4_MXFP8:
+                kernel_dequant = _decode_mxfp8_intermediate(kernel_routed, ref_routed)
+            else:  # FP4_MXFP4_Bf16
+                kernel_dequant = kernel_routed.to(torch.float32)
+
+        tolerances = self.get_tolerances()
+        check_accuracy(
+            ref_compare,
+            kernel_dequant,
+            atol=tolerances["atol"],
+            rtol=tolerances["rtol"],
+            percent=tolerances["percent"],
+        )
 
     def compute_reference(self, args):
         return run_moe_reference_fp4(args, self.quant_mode)
@@ -1390,24 +1619,13 @@ class FP8BlockScaleMoe(Moe):
         """
         super().check_intermediate_output(raw_kernel_output, reference_args)
 
-        # Gather both sides into canonical expanded-index order.
-        # We index each by its own expanded->permuted map (each exactly
-        # [num_tokens * top_k] long).
-        kernel_codes = raw_kernel_output[2]
-        kernel_expanded_to_permuted = raw_kernel_output[1].to(torch.int64).cpu()
-        ref_expanded_to_permuted = (
-            reference_args.permute_info["expandedTokenIdxToPermutedIdx"]
-            .to(torch.int64)
-            .cpu()
+        kernel_routed, ref_routed = _gather_intermediate_by_expanded_idx(
+            raw_kernel_output, reference_args
         )
-        kernel_routed = kernel_codes[kernel_expanded_to_permuted]
-        ref_routed = reference_args.activation_output[ref_expanded_to_permuted].to(
-            torch.float32
-        )
-        n_rows, intermediate_size = ref_routed.shape
 
         if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
             # Per-(1, 128) linear block scale derived from the reference.
+            n_rows, intermediate_size = ref_routed.shape
             finfo = torch.finfo(torch.float8_e4m3fn)
             n_blocks = intermediate_size // 128
             scale = (
@@ -1424,17 +1642,7 @@ class FP8BlockScaleMoe(Moe):
                 * scale
             ).view(n_rows, intermediate_size)
         else:  # FP8_BLOCK_SCALE_MXFP8
-            # mx-format scale via the mx quantizer;
-            # keep only the scale to decode the kernel's codes.
-            _, ref_scale = mxfp8_quantize(ref_routed.to(torch.bfloat16), True)
-            ref_scale_bytes = ref_scale.view(torch.uint8).reshape(-1).cpu()
-            kernel_dequant = (
-                mxfp8_dequantize_host(
-                    kernel_routed.cpu().view(torch.uint8), ref_scale_bytes
-                )
-                .to(ref_routed.device)
-                .to(torch.float32)
-            )
+            kernel_dequant = _decode_mxfp8_intermediate(kernel_routed, ref_routed)
 
         tolerances = self.get_tolerances()
         check_accuracy(
@@ -2753,6 +2961,7 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
         args.activation_type,
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
+        gemm1_lora_delta=args.gemm1_lora_delta,
     )
 
     return run_moe_dequant(args_dequant, quant_mode), args_dequant
