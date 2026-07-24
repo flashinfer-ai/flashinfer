@@ -57,8 +57,8 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                  Optional<TensorView> kSfCacheVLLM, Optional<TensorView> vSfCacheVLLM,
                  TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
                  int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
-                 int64_t qSeqLen, Optional<TensorView> mask, TensorView semaphores,
-                 TensorView scratch, bool enable_pdl) {
+                 int64_t qSeqLen, Optional<TensorView> qCuSeqLens, Optional<TensorView> mask,
+                 TensorView semaphores, TensorView scratch, bool enable_pdl) {
   auto stream = get_stream(output.device());
   float const* attentionSinksPtr =
       attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())
@@ -87,6 +87,12 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
 #if SPEC_DEC
   MaskType const* maskPtr =
       mask.has_value() ? reinterpret_cast<MaskType const*>(mask.value().data_ptr()) : nullptr;
+  // Optional ragged Q: cumulative draft lengths [batchSize + 1]; when set,
+  // qSeqLen is the max draft length and q/mask/output are packed by qCuSeqLens.
+  SeqLenDataType const* qCuSeqLensPtr =
+      qCuSeqLens.has_value()
+          ? reinterpret_cast<SeqLenDataType const*>(qCuSeqLens.value().data_ptr())
+          : nullptr;
 #endif
 
   void* kSfCachePtr = kSfCacheVLLM.has_value() ? kSfCacheVLLM.value().data_ptr() : nullptr;
@@ -106,7 +112,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
         reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
         reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale, kvScalePtr,
 #if SPEC_DEC
-        qSeqLen, nullptr, maskPtr,
+        qSeqLen, qCuSeqLensPtr, maskPtr,
 #endif
         reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
         reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page, kv_stride_token,
@@ -131,7 +137,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                       maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
                       kvCacheScale, kvScalePtr,
 #if SPEC_DEC
-                      qSeqLen, nullptr, maskPtr,
+                      qSeqLen, qCuSeqLensPtr, maskPtr,
 #endif
                       reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
                       reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page,

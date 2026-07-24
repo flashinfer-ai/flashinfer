@@ -202,7 +202,14 @@ def parse_attention_args(line, parser):
         "--causal",
         action="store_true",
         default=False,
-        help="Causal masking. Note: not padding masking. Only used for prefill tests.",
+        help=(
+            "Causal masking. Note: not padding masking. Used for prefill tests, and "
+            "for the speculative-decode draft block (--s_qo > 1) in decode tests: "
+            "with --causal, draft token i attends to draft tokens j <= i (standard "
+            "speculative decoding); without it, every draft token attends to all "
+            "draft tokens (no causal masking within the draft block, e.g. "
+            "DFlash-style drafters). The KV prefix is always fully visible."
+        ),
     )
     parser.add_argument(
         "--random_actual_seq_len",
@@ -284,21 +291,31 @@ def sample_actual_seq_lens(max_seqlen, batch_size, device, random_actual_seq_len
     return actual_seq_lens
 
 
-def generate_speculative_causal_mask(batch_size, q_seq_len, device):
+def generate_speculative_mask(batch_size, q_seq_len, device, mask_mode="causal"):
     """
-    Generate a packed causal mask for speculative decode chunks (q_len > 1).
+    Generate a packed draft-block mask for speculative decode chunks (q_len > 1).
 
     Returned shape is [batch_size, q_seq_len, num_packed_masks_per_token * 2]
     with dtype uint16, where num_packed_masks_per_token = ceil(q_seq_len / 32).
-    Each query row i encodes allowed attention to draft-token columns j <= i
-    (strictly lower-triangular with diagonal) and masks out j > i.
+    With mask_mode="causal", each query row i encodes allowed attention to
+    draft-token columns j <= i (strictly lower-triangular with diagonal) and
+    masks out j > i. With mask_mode="full", every draft token attends to all
+    draft tokens (no causal masking within the draft block, e.g. DFlash-style
+    drafters); the KV prefix is always fully visible in both modes.
     The innermost dimension stores packed bits (uint32 words reinterpreted as
     uint16), matching the mask layout expected by decode APIs.
     """
     num_packed_masks_per_token = (q_seq_len + 31) // 32
     q_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(1)
     kv_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
-    causal_bool_mask = kv_indices <= q_indices
+    if mask_mode == "causal":
+        causal_bool_mask = kv_indices <= q_indices
+    elif mask_mode == "full":
+        causal_bool_mask = torch.ones(
+            q_seq_len, q_seq_len, device=device, dtype=torch.bool
+        )
+    else:
+        raise ValueError(f"Unsupported spec-decode mask mode: {mask_mode}")
 
     padded_seq_len = num_packed_masks_per_token * 32
     if padded_seq_len > q_seq_len:
@@ -380,6 +397,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     batch_size = args.batch_size
     s_qo = args.s_qo
     speculative_decode = s_qo > 1
+    # For speculative decode, --causal selects the draft-block mask.
+    causal = args.causal
     s_kv = args.s_kv
     num_qo_heads = args.num_qo_heads
     num_kv_heads = args.num_kv_heads
@@ -437,6 +456,13 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     if "auto" in backends and speculative_decode:
         print("[INFO] auto backend is disabled for speculative decode. Skipping.")
         backends.remove("auto")
+
+    if speculative_decode and not causal and "trtllm-gen" in backends:
+        print(
+            "[WARNING] trtllm-gen wrapper backend applies implicit causal masking to "
+            "the draft block and ignores the non-causal (DFlash) mask; refcheck "
+            "against trtllm-native may mismatch."
+        )
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -568,7 +594,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         * (s_qo * num_qo_heads * head_dim_qk)
     ).long()  # For cuDNN
     speculative_mask = (
-        generate_speculative_causal_mask(batch_size, s_qo, device)
+        generate_speculative_mask(
+            batch_size, s_qo, device, "causal" if causal else "full"
+        )
         if speculative_decode
         else None
     )
@@ -852,7 +880,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 cur_res["num_kv_heads"] = num_kv_heads
                 cur_res["head_dim_qk"] = head_dim_qk
                 cur_res["head_dim_vo"] = head_dim_vo
-                cur_res["causal"] = False
+                cur_res["causal"] = causal if speculative_decode else False
                 cur_res["q_dtype"] = q_dtype
                 cur_res["kv_dtype"] = kv_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_kv

@@ -330,13 +330,14 @@ def get_last_page_len(seq_lens, page_size):
     return last_page_len
 
 
-def generate_causal_mask(
+def generate_spec_dec_mask(
     batch_size: int,
     q_seq_len: int,
     device: torch.device,
+    mask_mode: str = "causal",
 ) -> torch.Tensor:
     """
-    Generate causal attention mask for speculative decoding.
+    Generate a packed draft-block attention mask for speculative decoding.
 
     Parameters
     ----------
@@ -346,11 +347,16 @@ def generate_causal_mask(
         Query sequence length (number of speculative decoding tokens)
     device : torch.device
         Target device for the mask tensor
+    mask_mode : str
+        "causal": draft token i attends to draft tokens j <= i (standard
+        speculative decoding). "full": every draft token attends to all draft
+        tokens (no causal masking within the draft block, e.g. DFlash-style
+        drafters). The KV prefix is always fully visible in both modes.
 
     Returns
     -------
     torch.Tensor
-        Causal mask with shape [batch_size, q_seq_len, mask_size_per_row]
+        Mask with shape [batch_size, q_seq_len, mask_size_per_row]
         where mask_size_per_row = divUp(q_seq_len, 32) * 2 (in uint16_t units).
         Data type: torch.uint16
 
@@ -360,7 +366,14 @@ def generate_causal_mask(
     q_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(1)
     kv_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
 
-    causal_bool_mask = kv_indices <= q_indices
+    if mask_mode == "causal":
+        causal_bool_mask = kv_indices <= q_indices
+    elif mask_mode == "full":
+        causal_bool_mask = torch.ones(
+            q_seq_len, q_seq_len, device=device, dtype=torch.bool
+        )
+    else:
+        raise ValueError(f"Unsupported spec-decode mask mode: {mask_mode}")
 
     padded_seq_len = num_packed_masks_per_token * 32
     if padded_seq_len > q_seq_len:
@@ -422,6 +435,7 @@ def generate_causal_mask(
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("max_in_kv_len", [110])
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
 def test_xqa_batch_decode(
     batch_size,
     q_len_per_req,
@@ -436,11 +450,17 @@ def test_xqa_batch_decode(
     enable_sink,
     max_in_kv_len,
     kv_layout,
+    spec_dec_mask_mode,
 ):
     """Test xqa_batch_decode_with_kv_cache function.
 
-    This test supports both NHD and HND layouts.
+    This test supports both NHD and HND layouts. For speculative decode
+    (q_len_per_req > 1), both draft-block mask modes are covered: "causal"
+    (standard speculative decoding) and "full" (no causal masking within the
+    draft block, e.g. DFlash-style drafters).
     """
+    if q_len_per_req == 1 and spec_dec_mask_mode == "full":
+        pytest.skip("Mask is unused for q_len_per_req == 1")
 
     # Set up test parameters
     torch.manual_seed(0)
@@ -494,6 +514,10 @@ def test_xqa_batch_decode(
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
+    # With a "full" draft-block mask, every draft token attends to the whole
+    # sequence (prefix + all draft tokens); since seq_lens include the draft
+    # tokens, that is exactly non-causal prefill over the paged KV cache.
+    ref_causal = spec_dec_mask_mode == "causal"
     if not enable_sink:
         if q_len_per_req == 1:
             wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
@@ -514,7 +538,7 @@ def test_xqa_batch_decode(
                     "paged_kv_indices": plan_params_prefill.pop("indices"),
                     "paged_kv_last_page_len": plan_params_prefill.pop("last_page_len"),
                     "head_dim_qk": plan_params_prefill.pop("head_dim"),
-                    "causal": True,
+                    "causal": ref_causal,
                     "logits_soft_cap": 0.0,
                 }
             )
@@ -537,7 +561,7 @@ def test_xqa_batch_decode(
             v_flat,
             sink,
             window_left,
-            True,
+            ref_causal if q_len_per_req > 1 else True,
             sm_scale,
             mode="varlen",
             batch_size=batch_size,
@@ -546,7 +570,9 @@ def test_xqa_batch_decode(
         )
 
     if q_len_per_req > 1:
-        mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
+        mask = generate_spec_dec_mask(
+            batch_size, q_len_per_req, GPU_DEVICE, spec_dec_mask_mode
+        )
     else:
         mask = None
 
@@ -571,6 +597,251 @@ def test_xqa_batch_decode(
     )
 
     # Verification
+    torch.testing.assert_close(
+        output.float(),
+        output_ref.float() / o_scale,
+        rtol=1e-1 if kv_dtype == "fp8" else 1e-2,
+        atol=1e-1 if kv_dtype == "fp8" else 1e-2,
+    )
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 2, 32, 2, 4),
+        (4, 4, 64, 4, 2),
+        (4, 5, 16, 2, 8),
+    ],
+)
+@pytest.mark.parametrize("window_left", [63, 127])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("bf16", "fp8", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
+def test_xqa_batch_decode_spec_dec_sliding_window(
+    batch_size,
+    q_len_per_req,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    kv_dtype,
+    o_dtype,
+    enable_sink,
+    spec_dec_mask_mode,
+):
+    """Speculative decode with a sliding window that actually truncates
+    (kv_len >> window), unlike the main test where window_left exceeds every
+    sequence length. This exercises the per-row window-edge masking in the
+    spec-dec kernel; tile-granular or shared-anchor windowing fails it.
+    """
+    test_xqa_batch_decode(
+        batch_size=batch_size,
+        q_len_per_req=q_len_per_req,
+        page_size=page_size,
+        num_kv_heads=num_kv_heads,
+        head_grp_size=head_grp_size,
+        window_left=window_left,
+        q_dtype=q_dtype,
+        o_dtype=o_dtype,
+        kv_dtype=kv_dtype,
+        enable_pdl=None,
+        enable_sink=enable_sink,
+        max_in_kv_len=300,
+        kv_layout="NHD",
+        spec_dec_mask_mode=spec_dec_mask_mode,
+    )
+
+
+def generate_ragged_spec_dec_mask(
+    q_lens: torch.Tensor,
+    max_q_len: int,
+    device: torch.device,
+    mask_mode: str = "causal",
+) -> torch.Tensor:
+    """Packed draft-block mask for ragged speculative decoding.
+
+    Rows are packed by cumulative draft lengths: request i contributes
+    q_lens[i] rows, each spanning its own q_lens[i] draft columns. Row
+    stride is sized by max_q_len: [total_q_tokens, divUp(max_q_len,32)*2]
+    uint16.
+    """
+    num_packed_masks_per_token = (max_q_len + 31) // 32
+    padded = num_packed_masks_per_token * 32
+    rows = []
+    for q_len in q_lens.tolist():
+        q_indices = torch.arange(q_len, device=device, dtype=torch.int32).view(-1, 1)
+        kv_indices = torch.arange(padded, device=device, dtype=torch.int32).view(1, -1)
+        if mask_mode == "causal":
+            m = (kv_indices <= q_indices) & (kv_indices < q_len)
+        elif mask_mode == "full":
+            m = (kv_indices < q_len).expand(q_len, -1)
+        else:
+            raise ValueError(f"Unsupported spec-decode mask mode: {mask_mode}")
+        rows.append(m)
+    bool_mask = torch.cat(rows, dim=0).view(-1, num_packed_masks_per_token, 32)
+    bit_positions = torch.tensor(
+        [1 << i for i in range(32)], device=device, dtype=torch.int64
+    )
+    mask_uint32 = (
+        (bool_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
+    ).contiguous()
+    return mask_uint32.view(torch.uint16)
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize(
+    "q_lens_pattern,page_size,num_kv_heads,head_grp_size",
+    [
+        # max_q_len * head_grp_size <= 32: single token block per group
+        ((1, 3, 2, 4), 32, 2, 4),
+        # max_q_len * head_grp_size > 32: multiple token blocks per group,
+        # short requests leave whole blocks with zero valid rows
+        ((5, 1, 3, 2), 16, 2, 8),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1, 127])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("bf16", "fp8", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
+def test_xqa_batch_decode_ragged_q(
+    q_lens_pattern,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    kv_dtype,
+    o_dtype,
+    enable_sink,
+    spec_dec_mask_mode,
+):
+    """Ragged speculative decode: per-request draft lengths via q_cu_seq_lens,
+    with q packed as [total_q_tokens, num_heads, head_dim]."""
+    torch.manual_seed(0)
+    head_dim = 128
+    max_in_kv_len = 300
+    batch_size = len(q_lens_pattern)
+    num_qo_heads = num_kv_heads * head_grp_size
+    max_q_len = max(q_lens_pattern)
+
+    q_lens = torch.tensor(q_lens_pattern, dtype=torch.int32)
+    in_kv_lens = torch.randint(0, max_in_kv_len + 1, (batch_size,), dtype=torch.int)
+    in_kv_lens[-1] = max_in_kv_len
+    seq_lens = q_lens + in_kv_lens
+
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    q_indptr = generate_cumsum_lens(q_lens)
+
+    kv_cache, k_scale, v_scale, _, _, ref_kv_cache = create_kv_cache(
+        batch_size,
+        seq_lens,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_dtype,
+        q_dtype,
+        "NHD",
+    )
+    page_table, all_page_ids, page_per_seq = create_page_table(
+        batch_size, seq_lens, page_size
+    )
+    kv_indptr = generate_cumsum_lens(page_per_seq)
+    kv_last_page_len = get_last_page_len(seq_lens, page_size)
+
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
+    out, o_scale = create_output(q, o_dtype)
+    sm_scale = float(1.0 / (head_dim**0.5))
+
+    ref_causal = spec_dec_mask_mode == "causal"
+    if not enable_sink:
+        wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer_ref, "NHD"
+        )
+        wrapper_ref.plan(
+            qo_indptr=q_indptr,
+            paged_kv_indptr=kv_indptr,
+            paged_kv_indices=all_page_ids,
+            paged_kv_last_page_len=kv_last_page_len.to(GPU_DEVICE),
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            page_size=page_size,
+            causal=ref_causal,
+            logits_soft_cap=0.0,
+            pos_encoding_mode="NONE",
+            kv_data_type=ref_kv_cache.dtype,
+            q_data_type=ref_q.dtype,
+            window_left=window_left,
+        )
+        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+        sink = None
+    else:
+        k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
+            ref_kv_cache,
+            page_table,
+            seq_lens.to(GPU_DEVICE),
+            page_size,
+            kv_last_page_len,
+            "NHD",
+        )
+        sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
+        output_ref = sink_attention_unified(
+            ref_q,
+            k_flat,
+            v_flat,
+            sink,
+            window_left,
+            ref_causal,
+            sm_scale,
+            mode="varlen",
+            batch_size=batch_size,
+            qo_indptr=q_indptr,
+            kv_indptr=kv_indptr_tokens,
+        )
+
+    mask = generate_ragged_spec_dec_mask(
+        q_lens, max_q_len, GPU_DEVICE, spec_dec_mask_mode
+    )
+
+    output = flashinfer.decode.xqa_batch_decode_with_kv_cache(
+        q.contiguous(),
+        kv_cache,
+        workspace_buffer,
+        page_table,
+        seq_lens.to(GPU_DEVICE),
+        torch.max(seq_lens).item(),
+        q_scale * k_scale * sm_scale,  # bmm1_scale
+        v_scale / o_scale,  # bmm2_scale
+        window_left,
+        out=out,
+        sinks=sink,
+        kv_layout="NHD",
+        q_len_per_req=max_q_len,
+        o_scale=o_scale,
+        mask=mask,
+        q_cu_seq_lens=q_indptr,
+    )
+
     torch.testing.assert_close(
         output.float(),
         output_ref.float() / o_scale,
@@ -617,6 +888,7 @@ def test_xqa_batch_decode(
 # stride by the factor-2 stacking. This exercises the dedicated sf_stride_*
 # plumbing and regresses if the kernel falls back to the data-cache strides.
 @pytest.mark.parametrize("sf_layout", ["stacked", "separate"])
+@pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
 def test_xqa_batch_decode_nvfp4_kv(
     batch_size,
     q_len_per_req,
@@ -632,11 +904,14 @@ def test_xqa_batch_decode_nvfp4_kv(
     max_in_kv_len,
     kv_layout,
     sf_layout,
+    spec_dec_mask_mode,
 ):
     """Test xqa_batch_decode_with_kv_cache function.
 
     This test supports both NHD and HND layouts.
     """
+    if q_len_per_req == 1 and spec_dec_mask_mode == "full":
+        pytest.skip("Mask is unused for q_len_per_req == 1")
 
     # Set up test parameters
     torch.manual_seed(0)
@@ -724,7 +999,7 @@ def test_xqa_batch_decode_nvfp4_kv(
                     "paged_kv_indices": plan_params_prefill.pop("indices"),
                     "paged_kv_last_page_len": plan_params_prefill.pop("last_page_len"),
                     "head_dim_qk": plan_params_prefill.pop("head_dim"),
-                    "causal": True,
+                    "causal": spec_dec_mask_mode == "causal",
                     "logits_soft_cap": 0.0,
                 }
             )
@@ -747,7 +1022,7 @@ def test_xqa_batch_decode_nvfp4_kv(
             v_flat,
             sink,
             window_left,
-            True,
+            spec_dec_mask_mode == "causal" if q_len_per_req > 1 else True,
             sm_scale,
             mode="varlen",
             batch_size=batch_size,
@@ -756,7 +1031,9 @@ def test_xqa_batch_decode_nvfp4_kv(
         )
 
     if q_len_per_req > 1:
-        mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
+        mask = generate_spec_dec_mask(
+            batch_size, q_len_per_req, GPU_DEVICE, spec_dec_mask_mode
+        )
     else:
         mask = None
 
