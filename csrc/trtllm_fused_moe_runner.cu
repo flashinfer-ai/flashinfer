@@ -634,9 +634,9 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 }  // namespace Gemm2
 
 namespace MoE {
-Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8,
-               int32_t tileTokensDim, ActivationType activationType, bool useShuffledMatrix,
-               batchedGemm::gemm::MatrixLayout weightLayout,
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeGemm1Output,
+               bool useDeepSeekFp8, int32_t tileTokensDim, ActivationType activationType,
+               bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout,
                batchedGemm::gemm::BiasType gemm1BiasType, bool usePerTokenScalingGemm1,
                bool usePerTokenScalingGemm2, bool usePerChannelScalingGemm1,
                bool usePerChannelScalingGemm2)
@@ -644,10 +644,10 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
       mUsePerTokenScalingGemm2(usePerTokenScalingGemm2),
       mUsePerChannelScalingGemm1(usePerChannelScalingGemm1),
       mUsePerChannelScalingGemm2(usePerChannelScalingGemm2),
-      mPermuteGemm1(PermuteGemm1::Runner(
-          dtypeAct, dtypeWeights, usePerTokenScalingGemm2 ? btg::Dtype::Bfloat16 : dtypeAct,
-          useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
-          gemm1BiasType, usePerTokenScalingGemm1, usePerChannelScalingGemm1)),
+      mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, dtypeGemm1Output, useDeepSeekFp8,
+                                         tileTokensDim, activationType, useShuffledMatrix,
+                                         weightLayout, gemm1BiasType, usePerTokenScalingGemm1,
+                                         usePerChannelScalingGemm1)),
       mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
                            tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
                            usePerChannelScalingGemm2)) {
@@ -665,6 +665,17 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
   FLASHINFER_CHECK(!mPassingConfigs.empty(),
                    "No compatible configs found for the fp8 block scale MoE runner.");
 }
+
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8,
+               int32_t tileTokensDim, ActivationType activationType, bool useShuffledMatrix,
+               batchedGemm::gemm::MatrixLayout weightLayout,
+               batchedGemm::gemm::BiasType gemm1BiasType, bool usePerTokenScalingGemm1,
+               bool usePerTokenScalingGemm2, bool usePerChannelScalingGemm1,
+               bool usePerChannelScalingGemm2)
+    : Runner(dtypeAct, dtypeWeights, usePerTokenScalingGemm2 ? btg::Dtype::Bfloat16 : dtypeAct,
+             useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
+             gemm1BiasType, usePerTokenScalingGemm1, usePerTokenScalingGemm2,
+             usePerChannelScalingGemm1, usePerChannelScalingGemm2) {}
 
 Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
                bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout,
@@ -697,7 +708,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.mUseDeepSeekFp8 = true;
   activationData.inPtr = workspace.gemm1_output;
   activationData.outPtr = workspace.activation_output;
-  activationData.inDqSfsPtr = workspace.gemm1_output_scale;
+  activationData.inDqSfsPtr = static_cast<float*>(workspace.gemm1_output_scale);
   activationData.outDqSfsPtr = workspace.activation_output_scale;
   activationData.innerDim =
       args.intermediate_size * (isGatedActivation(args.activation_type) ? 2 : 1);
@@ -851,9 +862,6 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     gemm2_input_scale = workspace.activation_output_scale;
   } else if (mUsePerTokenScalingGemm2) {
     // TODO(siyuan): currently only support per-token nvfp4 quantization
-    FLASHINFER_CHECK(
-        mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
-        "When using explicit quantization, PermuteGemm1 output dtype must be Bfloat16.");
     FLASHINFER_CHECK(mGemm2.mDtypeAct == btg::Dtype::E2m1,
                      "Currently only support NvFP4 when using explicit quantization.");
     FLASHINFER_CHECK(
@@ -868,15 +876,31 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
       globalScaleInv = 1.f / (256.f * 6.f);
     }
-    invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
-        args.num_tokens * totalExpertsPerToken, args.intermediate_size,
-        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
-        workspace.expanded_idx_to_permuted_idx,
-        reinterpret_cast<uint8_t*>(workspace.activation_output),
-        reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
-        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
-
-    gemm2_input = workspace.activation_output;
+    if (mPermuteGemm1.mDtypeOutput == btg::Dtype::E2m1) {
+      FLASHINFER_CHECK(workspace.gemm1_output_scale != nullptr);
+      FLASHINFER_CHECK(workspace.activation_output_scale != nullptr);
+      invokeScaleOnlyQuantAndPerTokenScale(
+          args.num_tokens * totalExpertsPerToken, args.intermediate_size,
+          static_cast<float const*>(workspace.gemm1_output_scale), globalScaleInv,
+          workspace.expanded_idx_to_permuted_idx,
+          reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
+          reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
+    } else {
+      FLASHINFER_CHECK(workspace.gemm1_output != nullptr);
+      FLASHINFER_CHECK(workspace.activation_output != nullptr);
+      FLASHINFER_CHECK(workspace.activation_output_scale != nullptr);
+      FLASHINFER_CHECK(mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
+                       "When using explicit per-token quantization, PermuteGemm1 output dtype must "
+                       "be Bfloat16 or E2m1.");
+      invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+          args.num_tokens * totalExpertsPerToken, args.intermediate_size,
+          reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
+          workspace.expanded_idx_to_permuted_idx,
+          reinterpret_cast<uint8_t*>(workspace.activation_output),
+          reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
+          reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
+      gemm2_input = workspace.activation_output;
+    }
     gemm2_input_scale = workspace.activation_output_scale;
   }
 

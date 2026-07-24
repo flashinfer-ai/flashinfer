@@ -413,6 +413,80 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   });
 }
 
+void invokeScaleOnlyQuantAndPerTokenScale(uint32_t m, uint32_t n, float const* scaleInput,
+                                          float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
+                                          uint8_t* scaleOutput, float* perTokenScaleOutput,
+                                          QuantizationSFLayout sfLayout, cudaStream_t stream) {
+  TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
+  constexpr uint32_t SF_VEC_SIZE = 16;
+
+  // Cache the per-block scales (num_sf_vecs_per_row floats) in shared memory so the quantization
+  // pass reads them back from SMEM instead of issuing a second global load of `scaleInput`.
+  uint32_t const num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
+  TLLM_CHECK_WITH_INFO(
+      num_sf_vecs_per_row % 4 == 0,
+      "num_sf_vecs_per_row must be a multiple of 4 for fp32 scale per-token quantization");
+
+  dispatchSFLayout(sfLayout, [&](auto sfLayoutTag) {
+    constexpr QuantizationSFLayout SF_LAYOUT = decltype(sfLayoutTag)::value;
+    constexpr uint32_t MAX_REGISTER_CACHED_SF_VECS = 512;
+    if (num_sf_vecs_per_row > 0 && num_sf_vecs_per_row % 4 == 0 &&
+        num_sf_vecs_per_row <= MAX_REGISTER_CACHED_SF_VECS) {
+#define LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARP_KERNEL(WARPS_PER_BLOCK, SCALES_PER_LOAD) \
+  {                                                                                               \
+    constexpr uint32_t NUM_WARPS = WARPS_PER_BLOCK;                                               \
+    uint32_t const num_blocks = (m + NUM_WARPS - 1) / NUM_WARPS;                                  \
+    scaleOnlyQuantAndPerTokenScaleWarpKernel<NUM_WARPS, SF_LAYOUT, SCALES_PER_LOAD>               \
+        <<<num_blocks, NUM_WARPS * 32, 0, stream>>>(m, n, scaleInput, globalScaleInv,             \
+                                                    expandedIdxToPermutedIdx, scaleOutput,        \
+                                                    perTokenScaleOutput);                         \
+  }
+#define DISPATCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARPS(SCALES_PER_LOAD)      \
+  if (m < 8) {                                                                    \
+    LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARP_KERNEL(1, SCALES_PER_LOAD);  \
+  } else if (m < 2048) {                                                          \
+    LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARP_KERNEL(4, SCALES_PER_LOAD);  \
+  } else if (m < 4096) {                                                          \
+    LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARP_KERNEL(8, SCALES_PER_LOAD);  \
+  } else if (m < 8192) {                                                          \
+    LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARP_KERNEL(16, SCALES_PER_LOAD); \
+  } else {                                                                        \
+    LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARP_KERNEL(32, SCALES_PER_LOAD); \
+  }
+      if (num_sf_vecs_per_row % 8 == 0) {
+        DISPATCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARPS(8);
+      } else {
+        DISPATCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARPS(4);
+      }
+#undef DISPATCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARPS
+#undef LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_WARP_KERNEL
+      return;
+    }
+    constexpr uint32_t BLOCK_SIZE = 128;
+    dim3 block(BLOCK_SIZE);
+    dim3 grid(m);
+    uint32_t smem_size = num_sf_vecs_per_row * sizeof(float);
+    // use an arbitrary large number to avoid exceeding shared memory limit.
+    TLLM_CHECK_WITH_INFO(n <= 32768,
+                         "n must be less than or equal to 32768 for NVFP4 quantization");
+#define LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SCALES_PER_LOAD)            \
+  {                                                                                    \
+    scaleOnlyQuantAndPerTokenScaleKernel<BLOCK_SIZE, SF_LAYOUT, SCALES_PER_LOAD, true> \
+        <<<grid, block, smem_size, stream>>>(m, n, scaleInput, globalScaleInv,         \
+                                             expandedIdxToPermutedIdx, scaleOutput,    \
+                                             perTokenScaleOutput);                     \
+  }
+    if (num_sf_vecs_per_row % 8 == 0) {
+      LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_KERNEL(8);
+    } else if (num_sf_vecs_per_row % 4 == 0) {
+      LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_KERNEL(4);
+    } else {
+      TLLM_THROW("N must be divisible by 64 for NVFP4 quantization");
+    }
+#undef LAUNCH_SCALE_ONLY_QUANT_AND_PER_TOKEN_SCALE_KERNEL
+  });
+}
+
 // Instantiate the function.
 template void invokeNvfp4QuantAndPerTokenScale<float>(
     uint32_t m, uint32_t n, float const* input, float globalScaleInv,
