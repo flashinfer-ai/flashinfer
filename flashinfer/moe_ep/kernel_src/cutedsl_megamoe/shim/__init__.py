@@ -17,8 +17,47 @@ from ._paths import bootstrap_paths
 
 bootstrap_paths()
 
+
+def _check_dsl_perf_floor() -> None:
+    """Warn once if the installed CuTe-DSL predates the 4.6.1 perf floor.
+
+    The MegaMoE kernels compile 34-54% slower on nvidia-cutlass-dsl 4.5.x
+    (measured 2026-07-15, TUNING.md "CuTe-DSL runtime sensitivity"; vllm_e2e
+    RUNS.md run 14). Results are CORRECT on 4.5.x — only slower — so this
+    warns instead of raising. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.
+    """
+    import os as _os
+
+    if _os.environ.get("FLASHINFER_MOE_EP_SKIP_DSL_CHECK") == "1":
+        return
+    try:
+        from importlib.metadata import version as _version
+
+        ver = _version("nvidia-cutlass-dsl")
+    except Exception:
+        return  # unknown packaging (source checkout etc.) — nothing to claim
+    import re as _re
+
+    parts = tuple(int(p) for p in _re.findall(r"\d+", ver)[:3])
+    if parts and parts < (4, 6, 1):
+        import warnings as _warnings
+
+        _warnings.warn(
+            f"nvidia-cutlass-dsl {ver} detected: the CuTeDSL MegaMoE kernels "
+            "compile 34-54% slower on <4.6.1 (perf floor; results stay "
+            "correct). Install nvidia-cutlass-dsl[cu13]>=4.6.1 — see "
+            "kernel_src/cutedsl_megamoe/TUNING.md 'CuTe-DSL runtime "
+            "sensitivity'. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+
+_check_dsl_perf_floor()
+
 from .comm import (
     bootstrap_dist,
+    finalize_dist,
     free_sym_tensor,
     reset_compiled_mega_workspaces,
     resolve_gate_up_clamp,
@@ -80,11 +119,34 @@ from .autotune import (
     autotune_nvfp4_mega_moe,
 )
 
+# Fused bf16 -> quant + routing staging (single-launch DataPreprocess).
+from .quant_stage import (
+    forget_staged_tokens,
+    fused_quant_stage,
+    fused_quant_stage_supported,
+    note_staged_tokens,
+    staged_tokens,
+)
+
+# Persistent offline-tuning knob cache (pure-lookup hot path).
+from .knob_cache import lookup_knobs, record_knobs, resolve_knobs
+
 __all__ = [
     # paths
     "bootstrap_paths",
+    # quant_stage
+    "forget_staged_tokens",
+    "fused_quant_stage",
+    "fused_quant_stage_supported",
+    "note_staged_tokens",
+    "staged_tokens",
+    # knob_cache
+    "lookup_knobs",
+    "record_knobs",
+    "resolve_knobs",
     # comm
     "bootstrap_dist",
+    "finalize_dist",
     "free_sym_tensor",
     "reset_compiled_mega_workspaces",
     "resolve_gate_up_clamp",

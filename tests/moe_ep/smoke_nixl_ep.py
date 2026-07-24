@@ -4,9 +4,9 @@ Usage:
     torchrun --nproc_per_node=4 tests/moe_ep/smoke_nixl_ep.py
 
 Same shape as the NCCL-EP smoke, but constructs a torch.distributed.TCPStore
-for the NIXL Buffer rendezvous. Requires ``FI_BUILD_NIXL_EP=1`` /
-``BUILD_NIXL_EP=1`` install (see ``bash fast_install.sh`` with
-``FI_BUILD_NIXL_EP=1``).
+for the NIXL Buffer rendezvous. The NIXL-EP libs build by default (best-effort)
+on ``pip install -e .``; use ``BUILD_NIXL_EP=1`` to make missing build deps a
+hard error.
 """
 
 from __future__ import annotations

@@ -98,7 +98,12 @@ from .modes import (
     run_split_kernel,
 )
 from .tensors import MoEEpTensors
-from .weights import MoEWeightPack, dummy_moe_weights
+from .weights import (
+    MoEWeightPack,
+    PrequantizedMoEWeights,
+    UnquantizedMoEWeights,
+    dummy_moe_weights,
+)
 
 __all__ = [
     "AlgoKnob",
@@ -135,6 +140,8 @@ __all__ = [
     "MoEEpSplitLayer",
     "MoEEpTensors",
     "MoEWeightPack",
+    "PrequantizedMoEWeights",
+    "UnquantizedMoEWeights",
     "Mxfp8CutedslMegaMoeConfig",
     "NCCLEPConfig",
     "NcclEpConfig",

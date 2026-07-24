@@ -12,16 +12,16 @@
 #   bash tests/moe_ep/run_tests.sh oracle        # 1-GPU torch-oracle correctness (all paths)
 #   bash tests/moe_ep/run_tests.sh smoke         # torchrun smoke scripts
 #
-# Install (split NCCL-EP + mega runtime deps):
-#   bash fast_install.sh
-#   # equivalent: BUILD_NCCL_EP=1 pip install -e ".[nvep]" --no-build-isolation
+# Install (transport libs build by default, best-effort):
+#   pip install --no-build-isolation -e .
+#   # strict (missing NIXL-EP build deps become hard errors): BUILD_NIXL_EP=1
 #
 # Requires:
 #   - FLASHINFER repo root on PYTHONPATH (handled below)
-#   - multirank/smoke/correctness: nccl.ep + staged libnccl_ep.so (fast_install.sh)
+#   - multirank/smoke/correctness: nccl.ep importable (built by the install above)
 #   - multirank/smoke/correctness: >=4 GPUs
 #   - mega: Blackwell (sm_100+), nvshmem, deep_gemm, triton
-#   - optional NIXL smoke: FI_BUILD_NIXL_EP=1 / BUILD_NIXL_EP=1 install
+#   - optional NIXL smoke: BUILD_NIXL_EP=1 install
 
 set -uo pipefail
 
@@ -58,7 +58,7 @@ require_nccl_ep() {
     return 0
   fi
   echo "nccl_ep backend not available." >&2
-  echo "Install with: bash fast_install.sh  (or BUILD_NCCL_EP=1 pip install -e \".[nvep]\")" >&2
+  echo "Install with: pip install --no-build-isolation -e .  (transport libs build by default)" >&2
   return 1
 }
 
@@ -94,6 +94,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
     --ignore=tests/moe_ep/test_moe_ep_ht_correctness.py \
+    --ignore=tests/moe_ep/test_mega_cuda_graph.py \
     -k "not multirank_roundtrip"
 }
 
@@ -123,7 +124,7 @@ run_multirank() {
       tests/moe_ep/test_split_kernels.py -v \
       -m "nvep and gpu_4" --backend=nixl_ep || rc=1
   else
-    echo "nixl_ep not built; skipping NIXL multirank (set FI_BUILD_NIXL_EP=1 in fast_install.sh)"
+    echo "nixl_ep not built; skipping NIXL multirank (rebuild with BUILD_NIXL_EP=1 pip install -e .)"
   fi
 
   return "${rc}"
@@ -177,6 +178,12 @@ run_oracle() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
+    -m arch_blackwell || rc=1
+
+  # CUDA graph capture/replay for the cutedsl mega layer paths (1 GPU).
+  MEGA_NO_DIST=1 "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_mega_cuda_graph.py -v \
     -m arch_blackwell || rc=1
 
   # deep_gemm's symm buffer needs an initialized process group (no
