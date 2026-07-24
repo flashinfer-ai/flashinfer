@@ -88,6 +88,7 @@ class Sm100W4A16GroupedGemmKernel:
         enable_pdl: bool,
         use_clc_scheduler: bool,
         raster_along_m: bool,
+        transform_fragment_size: int,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
         self.group_count = group_count
@@ -106,6 +107,7 @@ class Sm100W4A16GroupedGemmKernel:
         self.fuse_activation = activation_type is not None
         self.use_clc_scheduler = use_clc_scheduler
         self.raster_along_m = raster_along_m
+        self.transform_fragment_size = transform_fragment_size
         self.gated = activation_type == ActivationType.Swiglu.value
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
@@ -374,7 +376,8 @@ class Sm100W4A16GroupedGemmKernel:
         assert cute.size(tSrS) == cute.size(tArA), "tSrS and tArA have different shape"
 
         transform_tiler_size = min(
-            cute.size(cute.coalesce(tAsA_input.layout), mode=[0]), 128
+            cute.size(cute.coalesce(tAsA_input.layout), mode=[0]),
+            self.transform_fragment_size,
         )
         transform_tiler = cute.make_layout(transform_tiler_size)
         tArA_load = cute.flat_divide(tArA, transform_tiler)
