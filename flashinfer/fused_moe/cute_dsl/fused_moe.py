@@ -186,12 +186,11 @@ def _moe_core_impl(
     4. Routing-weight reduction in deterministic mode
 
     Args:
-        x: Packed NVFP4 input.
-        x_sf: Scale factors for the input.
+        x: Input tensor, NVFP4 quantized.
+        x_sf: Scale factors for x.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
-        w1_weight: GEMM1 weights (gate + up fused for gated activations, or a
-            single projection for non-gated activations).
+        w1_weight: GEMM1 weights (gate + up fused).
         w1_weight_sf: Scale factors for w1_weight.
         w1_alpha: Per-expert global scale for GEMM1.
         fc2_input_scale: Global scale for GEMM2 input quantization.
@@ -421,7 +420,8 @@ class CuteDslMoEWrapper:
         top_k: Number of experts per token.
         hidden_size: Hidden dimension size.
         intermediate_size: Intermediate dimension size.
-        use_cuda_graph: Whether the wrapper is configured for CUDA graph use.
+        use_cuda_graph: Whether the wrapper holds persistent stream/event
+            resources for CUDA graph capture.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
         quant_mode: Selected W4A4 or W4A16 compute mode.
@@ -486,7 +486,7 @@ class CuteDslMoEWrapper:
         hidden_size : int
             Hidden dimension size.
         intermediate_size : int
-            Intermediate dimension size after the GEMM1 activation.
+            Intermediate dimension size (after SwiGLU reduction).
         use_cuda_graph : bool
             Create persistent CUDA stream/events for W4A4 async-memset
             overlap. W4A16 is CUDA-graph safe without those resources.
@@ -568,6 +568,9 @@ class CuteDslMoEWrapper:
                     )
                 return wrapper._forward_with_tactic(*args, **kwargs)
 
+            # Create auto-tuner runner. Use a weak trampoline instead of a bound
+            # method so the runner cannot keep CUDA graph resources alive after the
+            # wrapper drops out of scope.
             self._runner = CuteDslFusedMoENvfp4Runner(
                 forward_impl=_forward_with_tactic_weak,
                 num_experts=num_experts,
@@ -598,6 +601,7 @@ class CuteDslMoEWrapper:
                 swiglu_limit=swiglu_limit,
                 use_per_token_activation=True,
             )
+
             if use_cuda_graph:
                 self._aux_stream = torch.cuda.Stream(device=self.device)
                 self._main_event = torch.cuda.Event()
@@ -728,8 +732,7 @@ class CuteDslMoEWrapper:
         token_final_scales : torch.Tensor
             Routing weights of shape ``[num_tokens, top_k]``.
         w1_weight : torch.Tensor
-            GEMM1 weights (gate + up fused for gated activations, or a single
-            projection for non-gated activations).
+            GEMM1 weights (gate + up fused).
         w1_weight_sf : torch.Tensor
             Scale factors for ``w1_weight``.
         w1_alpha : torch.Tensor
@@ -747,7 +750,8 @@ class CuteDslMoEWrapper:
             Tactic tuple, or ``None`` for auto-selection via the runtime
             tuner.
         per_token_scale : Optional[torch.Tensor]
-            Optional W4A4 per-token input row scale for GEMM1.
+            Per-token input row scale for GEMM1. Passing this enables the
+            per-token activation path.
 
         Returns
         -------
@@ -761,6 +765,9 @@ class CuteDslMoEWrapper:
             dtype=self.output_dtype,
             device=x.device,
         )
+
+        # Use auto-tuner for tactic selection
+        tuner = AutoTuner.get()
 
         if self.quant_mode in ("nvfp4", "w4a4"):
             use_per_token_activation = per_token_scale is not None
@@ -788,9 +795,9 @@ class CuteDslMoEWrapper:
             inputs.append(moe_output)
 
             if tactic is not None:
+                # Use provided tactic
                 return runner(inputs, tactic=tactic)
 
-            tuner = AutoTuner.get()
             _, best_tactic = tuner.choose_one(
                 f"CuteDslMoEWrapper::run::{self.activation_type.name}",
                 [runner],
@@ -977,8 +984,7 @@ def cute_dsl_fused_moe_nvfp4(
     token_final_scales : torch.Tensor
         Routing weights of shape ``[num_tokens, top_k]``.
     w1_weight : torch.Tensor
-        GEMM1 weights (gate + up fused for gated activations, or a single
-        projection for non-gated activations).
+        GEMM1 weights (gate + up fused).
     w1_weight_sf : torch.Tensor
         Scale factors for ``w1_weight``.
     w1_alpha : torch.Tensor
@@ -1023,7 +1029,8 @@ def cute_dsl_fused_moe_nvfp4(
         Compute mode: ``"w4a4"`` / ``"nvfp4"`` or ``"w4a16"``. Defaults
         to ``"w4a4"``.
     per_token_scale : Optional[torch.Tensor]
-        Optional W4A4 per-token input row scale for GEMM1.
+        Per-token input row scale for GEMM1. Passing this enables the
+        per-token activation path.
 
     Returns
     -------
@@ -1046,6 +1053,8 @@ def cute_dsl_fused_moe_nvfp4(
             dtype=output_dtype,
             device=x.device,
         )
+
+    tuner = AutoTuner.get()
 
     if quant_mode in ("nvfp4", "w4a4"):
         use_per_token_activation = per_token_scale is not None
@@ -1082,7 +1091,6 @@ def cute_dsl_fused_moe_nvfp4(
             inputs.append(per_token_scale)
         inputs.append(moe_output)
 
-        tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
             f"CuteDslFusedMoE::run_moe_nvfp4::{activation.name}",
             [runner],
@@ -1090,6 +1098,7 @@ def cute_dsl_fused_moe_nvfp4(
             inputs,
             aux_stream=aux_stream,
         )
+
         return runner(
             inputs,
             tactic=best_tactic,
