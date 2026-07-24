@@ -24,8 +24,14 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename AdditionalParams, typename Ktraits, bool CAUSAL>
+template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIITEMSCORING = false>
 struct CollectiveMainloop {
+  // The ragged mainloop does not yet implement MIS-aware K/V tile skipping
+  // (see SparseCollectiveMainloop's kv_tile_idx_decrement). The kernel uses
+  // this flag to skip computing skip-window args and pass neutral 0/0 to
+  // mma_f16 instead, keeping producer and consumer in lockstep.
+  static constexpr bool kSupportsMISAwareLoad = false;
+
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using TileShape_QKD = typename Ktraits::TileShape_QKD;
@@ -144,6 +150,10 @@ struct CollectiveMainloop {
     static constexpr int CTA_KV = get<1>(TileShape_QKD{});
     int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);
     if constexpr (CAUSAL) {
+      num_kv_tiles = std::min(num_kv_tiles,
+                              cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
+    }
+    if constexpr (MULTIITEMSCORING) {
       num_kv_tiles = std::min(num_kv_tiles,
                               cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
     }
