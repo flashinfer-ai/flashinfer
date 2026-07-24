@@ -1377,6 +1377,20 @@ def single_prefill_with_kv_cache(
         The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
     v_scale : Optional[Union[float, torch.Tensor]]
         The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
+    block_extend : bool
+        Whether to use the Block Extend mask. A query token at global position
+        ``q_offset + q_idx`` attends to key/value tokens whose block index is no
+        greater than its own. This option requires ``block_size`` and is supported
+        only by the ``fa2`` and ``fa3`` backends.
+    block_size : Optional[int]
+        The Block Extend block size. Must be a positive power of two when
+        :attr:`block_extend` is ``True``.
+    q_offset : int
+        Non-negative global token offset of the query sequence for the Block
+        Extend mask. Defaults to ``0``.
+    kv_offset : int
+        Non-negative global token offset of the key/value sequence for the Block
+        Extend mask. Defaults to ``0``.
 
     Returns
     -------
@@ -1848,6 +1862,21 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
+        block_extend : bool
+            Whether to enable the Block Extend mask. Requires ``block_size`` and
+            is supported only by the ``fa2`` and ``fa3`` backends.
+        block_size : Optional[int]
+            The Block Extend block size. Must be a positive power of two when
+            :attr:`block_extend` is ``True``.
+        q_offsets_buf : Optional[torch.Tensor]
+            A one-dimensional CUDA Graph buffer for per-request query offsets.
+            Required when both CUDA Graph mode and :attr:`block_extend` are
+            enabled; its dtype must match the indptr dtype.
+        kv_offsets_buf : Optional[torch.Tensor]
+            A one-dimensional CUDA Graph buffer for per-request key/value
+            offsets. Required when both CUDA Graph mode and
+            :attr:`block_extend` are enabled; its dtype must match the indptr
+            dtype.
         """
         _check_workspace_buffer_alignment(
             float_workspace_buffer, "float_workspace_buffer"
@@ -2428,6 +2457,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        q_offsets : Optional[torch.Tensor]
+            A one-dimensional tensor of non-negative per-request global query
+            offsets, shape ``[batch_size]``. Used only when :attr:`block_extend`
+            was enabled on the wrapper; its dtype must match
+            :attr:`paged_kv_indptr`.
+        kv_offsets : Optional[torch.Tensor]
+            A one-dimensional tensor of non-negative per-request global key/value
+            offsets, shape ``[batch_size]``. Used only when :attr:`block_extend`
+            was enabled on the wrapper; its dtype must match
+            :attr:`paged_kv_indptr`.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -3469,6 +3508,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
+        block_extend : bool
+            Whether to enable the Block Extend mask. Requires ``block_size`` and
+            is supported only by the ``fa2`` and ``fa3`` backends.
+        block_size : Optional[int]
+            The Block Extend block size. Must be a positive power of two when
+            :attr:`block_extend` is ``True``.
+        q_offsets_buf : Optional[torch.Tensor]
+            A one-dimensional CUDA Graph buffer for per-request query offsets.
+            Required when both CUDA Graph mode and :attr:`block_extend` are
+            enabled; its dtype must match the indptr dtype.
+        kv_offsets_buf : Optional[torch.Tensor]
+            A one-dimensional CUDA Graph buffer for per-request key/value
+            offsets. Required when both CUDA Graph mode and
+            :attr:`block_extend` are enabled; its dtype must match the indptr
+            dtype.
         """
         _check_kv_layout(kv_layout)
 
@@ -3738,6 +3792,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Required for cudnn backend. This is the indptr of the value tensor.
         o_indptr: Optional[torch.Tensor]
             Required for cudnn backend. This is the indptr of the output tensor.
+        q_offsets : Optional[torch.Tensor]
+            A one-dimensional tensor of non-negative per-request global query
+            offsets, shape ``[batch_size]``. Used only when :attr:`block_extend`
+            was enabled on the wrapper; its dtype must match :attr:`kv_indptr`.
+        kv_offsets : Optional[torch.Tensor]
+            A one-dimensional tensor of non-negative per-request global key/value
+            offsets, shape ``[batch_size]``. Used only when :attr:`block_extend`
+            was enabled on the wrapper; its dtype must match :attr:`kv_indptr`.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
