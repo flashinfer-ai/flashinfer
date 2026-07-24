@@ -367,9 +367,10 @@ class TrtllmFp4RoutedRunner(MoERunner):
     Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
     plus the static weight/config kwargs that ``core.MoERunner.forward``
     consumes, then delegates tactic enumeration, tuning-config construction, and
-    the tactic'd forward to that inner runner. This mirrors
-    ``CuteDslNvfp4Runner`` and keeps the fragile raw-op positional launch in
-    exactly one place: ``core.MoERunner.forward``.
+    the tactic'd forward to that inner runner.  This mirrors
+    ``CuteDslNvfp4Runner`` (which wraps ``CuteDslFusedMoENvfp4Runner``) and keeps
+    the fragile raw-op positional launch in exactly one place —
+    ``core.MoERunner.forward``.
 
     Routing mode is chosen per-call from ``act.routing_input_mode``:
 
