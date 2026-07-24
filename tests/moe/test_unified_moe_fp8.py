@@ -1,4 +1,4 @@
-"""Unified TRTLLM block-FP8 conformance tests."""
+"""Unified TRTLLM block-scale and per-tensor FP8 conformance tests."""
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
     RoutingMethodType,
     TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
+    TrtllmFp8PerTensorRunner,
 )
 from flashinfer.quantization.fp8_quantization import (
     mxfp8_dequantize_host,
@@ -105,7 +107,7 @@ def _requant_intermediate(inter: torch.Tensor, variant) -> torch.Tensor:
     return _mxfp8_dequant_matrix(q, sf)
 
 
-def _reference(x, w1, w2, ids, weights, variant, expert_offset=0):
+def _block_fp8_reference(x, w1, w2, ids, weights, variant, expert_offset=0):
     weights = weights.to(torch.bfloat16).float()
     out = torch.zeros(x.shape[0], x.shape[1], device=x.device, dtype=torch.float32)
     for local_expert in range(w1.shape[0]):
@@ -126,7 +128,7 @@ def _assert_fp8_close(actual, expected):
     check_accuracy(expected.float(), actual.float(), atol=0.05, rtol=0.3, percent=0.99)
 
 
-def _make_case(variant, *, expert_offset=0, local_experts=NUM_EXPERTS):
+def _make_block_fp8_case(variant, *, expert_offset=0, local_experts=NUM_EXPERTS):
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260717)
     x = torch.randn(
@@ -208,8 +210,10 @@ def _make_case(variant, *, expert_offset=0, local_experts=NUM_EXPERTS):
 
 @pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
 def test_block_fp8_layer_and_direct_runner_match_reference(variant):
-    pack, weights, config, (x, w1, w2) = _make_case(variant)
-    reference = _reference(x, w1, w2, pack.topk_ids, pack.topk_weights, variant)
+    pack, weights, config, (x, w1, w2) = _make_block_fp8_case(variant)
+    reference = _block_fp8_reference(
+        x, w1, w2, pack.topk_ids, pack.topk_weights, variant
+    )
     layer = MoELayer(config)
     runner = layer.runners[0]
     direct = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
@@ -222,6 +226,7 @@ def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
+    from flashinfer.quantization.fp4_quantization import block_scale_interleave
 
     generator = torch.Generator(device="cuda").manual_seed(20260718)
     w1 = torch.randn(
@@ -264,7 +269,10 @@ def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
     )
     torch.testing.assert_close(view["gemm1_weights"][0], w1_q[w1_perm], rtol=0, atol=0)
     torch.testing.assert_close(
-        view["gemm1_weights_scale"][0], w1_sf[w1_sf_perm], rtol=0, atol=0
+        view["gemm1_weights_scale"][0],
+        block_scale_interleave(w1_sf[w1_sf_perm].contiguous()).reshape_as(w1_sf),
+        rtol=0,
+        atol=0,
     )
 
     w2_q, w2_sf = _mxfp8_quant_matrix(w2[0])
@@ -274,8 +282,44 @@ def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
     )
     torch.testing.assert_close(view["gemm2_weights"][0], w2_q[w2_perm], rtol=0, atol=0)
     torch.testing.assert_close(
-        view["gemm2_weights_scale"][0], w2_sf[w2_sf_perm], rtol=0, atol=0
+        view["gemm2_weights_scale"][0],
+        block_scale_interleave(w2_sf[w2_sf_perm].contiguous()).reshape_as(w2_sf),
+        rtol=0,
+        atol=0,
     )
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "intermediate_size"),
+    [(64, 128), (128, 64)],
+)
+def test_mxfp8_preparation_rejects_unshufflable_dimensions(
+    hidden_size, intermediate_size
+):
+    w1 = torch.zeros(
+        1,
+        2 * intermediate_size,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    w2 = torch.zeros(
+        1,
+        hidden_size,
+        intermediate_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="divisible by 128"):
+        TrtllmFp8BlockConfig.prepare_weights(
+            w1,
+            w2,
+            variant=QuantVariant.MxFp8,
+            num_local_experts=1,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=torch.device("cuda"),
+        )
 
 
 def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
@@ -296,7 +340,7 @@ def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
 
 @pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
 def test_block_fp8_from_logits_matches_prerouted(variant):
-    pack, weights, config, _ = _make_case(variant)
+    pack, weights, config, _ = _make_block_fp8_case(variant)
     logits = torch.randn(TOKENS, NUM_EXPERTS, device="cuda", dtype=torch.float32)
     probabilities = torch.softmax(logits, dim=-1)
     topk_weights, topk_ids = torch.topk(probabilities, TOP_K, dim=-1)
@@ -343,7 +387,7 @@ def _deepseek_v3_route(logits, bias, *, top_k, n_group, topk_group, scale):
 @pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
 def test_block_fp8_deepseek_v3_from_logits_matches_prerouted(variant):
     num_experts = 64
-    pack, weights, config, _ = _make_case(variant, local_experts=num_experts)
+    pack, weights, config, _ = _make_block_fp8_case(variant, local_experts=num_experts)
     generator = torch.Generator(device="cuda").manual_seed(20260719)
     logits = torch.randn(
         TOKENS,
@@ -400,14 +444,14 @@ def test_block_fp8_deepseek_v3_from_logits_matches_prerouted(variant):
 @pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
 def test_block_fp8_nonzero_expert_offset(variant):
     offset = 8
-    pack, weights, config, (x, w1, w2) = _make_case(
+    pack, weights, config, (x, w1, w2) = _make_block_fp8_case(
         variant, expert_offset=offset, local_experts=8
     )
     layer = MoELayer(config)
     actual = layer.runners[0].forward(
         layer.runners[0].pack_inputs(pack, weights), tactic=-1
     )
-    expected = _reference(
+    expected = _block_fp8_reference(
         x,
         w1,
         w2,
@@ -422,7 +466,7 @@ def test_block_fp8_nonzero_expert_offset(variant):
 
 @pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
 def test_block_fp8_prerouted_cuda_graph(variant):
-    pack, weights, config, _ = _make_case(variant)
+    pack, weights, config, _ = _make_block_fp8_case(variant)
     layer = MoELayer(config)
     for _ in range(3):
         layer(pack, weights)
@@ -433,3 +477,240 @@ def test_block_fp8_prerouted_cuda_graph(variant):
     graph.replay()
     torch.cuda.synchronize()
     _assert_fp8_close(captured, eager)
+
+
+# ---------------------------------------------------------------------------
+# Per-tensor FP8 — calibrated E4M3 activations/weights, FromLogits only
+# ---------------------------------------------------------------------------
+
+
+def _per_tensor_global_scale(x: torch.Tensor) -> torch.Tensor:
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = x.float().abs().amax()
+    return torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+
+
+def _per_tensor_quant_dequant_experts(
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = weights.float().abs().amax(dim=(-1, -2))
+    scales = torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+    quantized = (weights.float() * scales[:, None, None]).clamp(-fp8_max, fp8_max)
+    return quantized.to(torch.float8_e4m3fn).float() / scales[:, None, None], scales
+
+
+def _per_tensor_fp8_reference(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    input_scale: torch.Tensor,
+    intermediate_scale: torch.Tensor,
+    expert_offset: int = 0,
+    routing_scales_on_input: bool = False,
+) -> torch.Tensor:
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    x_q = (x.float() * input_scale).clamp(-fp8_max, fp8_max)
+    x_deq = x_q.to(torch.float8_e4m3fn).float() / input_scale
+    w1_deq, _ = _per_tensor_quant_dequant_experts(w1)
+    w2_deq, _ = _per_tensor_quant_dequant_experts(w2)
+
+    out = torch.zeros_like(x_deq)
+    for local_expert in range(w1.shape[0]):
+        token, slot = torch.where(selected_experts == local_expert + expert_offset)
+        if token.numel() == 0:
+            continue
+        routed_x = x_deq[token]
+        if routing_scales_on_input:
+            routed_x = routed_x * routing_weights[token, slot, None]
+        gemm1 = routed_x @ w1_deq[local_expert].t()
+        up = gemm1[:, :INTERMEDIATE]
+        gate = gemm1[:, INTERMEDIATE:]
+        intermediate = F.silu(gate) * up
+        intermediate_q = (intermediate * intermediate_scale).clamp(-fp8_max, fp8_max)
+        intermediate_deq = (
+            intermediate_q.to(torch.float8_e4m3fn).float() / intermediate_scale
+        )
+        expert_out = (
+            (intermediate_deq @ w2_deq[local_expert].t()).to(torch.bfloat16).float()
+        )
+        if routing_scales_on_input:
+            out[token] += expert_out
+        else:
+            out[token] += routing_weights[token, slot, None] * expert_out
+    return out
+
+
+def _make_per_tensor_fp8_case(
+    *,
+    routing_method: RoutingMethodType = RoutingMethodType.Default,
+    top_k: int = TOP_K,
+    num_experts: int = NUM_EXPERTS,
+    local_num_experts: int = NUM_EXPERTS,
+    local_expert_offset: int = 0,
+):
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    x = torch.randn(TOKENS, HIDDEN, device=device, dtype=torch.bfloat16)
+    w1 = (
+        torch.randn(
+            local_num_experts,
+            2 * INTERMEDIATE,
+            HIDDEN,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / HIDDEN**0.5
+    )
+    w2 = (
+        torch.randn(
+            local_num_experts,
+            HIDDEN,
+            INTERMEDIATE,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / INTERMEDIATE**0.5
+    )
+    logits = torch.randn(TOKENS, num_experts, device=device, dtype=torch.float32)
+    if routing_method is RoutingMethodType.Llama4:
+        routing_weights, selected_experts = torch.topk(
+            torch.sigmoid(logits), top_k, dim=-1
+        )
+    else:
+        routing_weights, selected_experts = torch.topk(
+            torch.softmax(logits, dim=-1), top_k, dim=-1
+        )
+    selected_experts = selected_experts.to(torch.int32)
+
+    input_scale = _per_tensor_global_scale(x)
+    intermediate_scale = torch.tensor(64.0, device=device)
+    x_q, x_scale = TrtllmFp8PerTensorConfig.prepare_activations(
+        x, hidden_states_scale_global=input_scale
+    )
+    view = TrtllmFp8PerTensorConfig.prepare_weights(
+        w1,
+        w2,
+        hidden_states_scale_global=input_scale,
+        intermediate_scale_global=intermediate_scale,
+        num_local_experts=local_num_experts,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        device=device,
+    )
+    act = MoEActivationPack(
+        hidden_states_q=x_q,
+        hidden_states_scale=x_scale,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=logits,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for("trtllm_fp8_per_tensor", view)
+    config = MoEConfig(
+        routing=RoutingConfig(
+            num_experts=num_experts,
+            top_k=top_k,
+            method=routing_method,
+        ),
+        quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
+        experts=ExpertConfig(
+            intermediate_size=INTERMEDIATE,
+            local_num_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
+        ),
+        activation=ActivationConfig.swiglu,
+        backend=BackendOptions((TrtllmFp8PerTensorConfig(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=TOKENS),
+    )
+    ref = _per_tensor_fp8_reference(
+        x,
+        w1,
+        w2,
+        selected_experts,
+        routing_weights,
+        input_scale,
+        intermediate_scale,
+        expert_offset=local_expert_offset,
+        routing_scales_on_input=(routing_method is RoutingMethodType.Llama4),
+    )
+    return act, weights, config, ref, selected_experts
+
+
+def _assert_per_tensor_fp8_close(out: torch.Tensor, ref: torch.Tensor) -> None:
+    check_accuracy(out.float(), ref.float(), atol=0.05, rtol=0.3, percent=0.99)
+
+
+def test_fp8_per_tensor_layer_and_direct_runner_match_reference():
+    act, weights, config, ref, _ = _make_per_tensor_fp8_case()
+    layer_out = MoELayer(config)(act, weights)
+    _assert_per_tensor_fp8_close(layer_out, ref)
+
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    inputs = runner.pack_inputs(act, weights)
+    direct_out = runner.forward(inputs)
+    _assert_per_tensor_fp8_close(direct_out, ref)
+
+
+def test_fp8_per_tensor_llama4_routes_scale_on_input():
+    act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+        routing_method=RoutingMethodType.Llama4,
+        top_k=1,
+    )
+    _assert_per_tensor_fp8_close(MoELayer(config)(act, weights), ref)
+
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    _assert_per_tensor_fp8_close(runner.forward(runner.pack_inputs(act, weights)), ref)
+
+    invalid_config = dataclasses.replace(
+        config,
+        routing=dataclasses.replace(config.routing, top_k=2),
+    )
+    invalid_runner = TrtllmFp8PerTensorRunner.__new__(TrtllmFp8PerTensorRunner)
+    invalid_runner.config = invalid_config
+    with pytest.raises(ValueError, match="top_k=1"):
+        invalid_runner.check_support()
+
+
+def test_fp8_per_tensor_nonzero_expert_offset():
+    act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+        num_experts=NUM_EXPERTS,
+        local_num_experts=NUM_EXPERTS // 2,
+        local_expert_offset=NUM_EXPERTS // 2,
+    )
+    assert torch.count_nonzero(ref)
+    _assert_per_tensor_fp8_close(MoELayer(config)(act, weights), ref)
+
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    _assert_per_tensor_fp8_close(runner.forward(runner.pack_inputs(act, weights)), ref)
+
+
+def test_fp8_per_tensor_routing_replay_matches_reference():
+    act, weights, config, _, selected_experts = _make_per_tensor_fp8_case()
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    inputs = runner.pack_inputs(act, weights)
+    replay = torch.full(
+        (TOKENS, TOP_K), -1, dtype=torch.int16, device=torch.device("cuda")
+    )
+    runner._static_kwargs["routing_replay_out"] = replay
+    runner.forward(inputs)
+    torch.testing.assert_close(
+        replay.to(torch.int32).sort(dim=-1).values,
+        selected_experts.sort(dim=-1).values,
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_fp8_per_tensor_cuda_graph_replay():
+    act, weights, config, ref, _ = _make_per_tensor_fp8_case()
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    inputs = runner.pack_inputs(act, weights)
+    runner.forward(inputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward(inputs)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_per_tensor_fp8_close(inputs[0], ref)

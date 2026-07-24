@@ -294,7 +294,9 @@ class TrtllmFp8BlockConfig:
 
         ``variant`` must be :attr:`QuantVariant.DeepSeekFp8` or
         :attr:`QuantVariant.MxFp8`; their scale formats are intentionally
-        prepared by separate paths.
+        prepared by separate paths. The shuffled MXFP8 view requires both
+        ``hidden_size`` and ``intermediate_size`` to be divisible by 128 so its
+        scale tensors fit TRTLLM's unpadded 128x4 physical layout.
         """
         from .prepare import prepare_trtllm_fp8_block_weights
 
@@ -325,7 +327,43 @@ class TrtllmFp8PerTensorConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 80
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Build the ``trtllm_fp8_per_tensor`` MajorK weight view."""
+        from .prepare import prepare_trtllm_fp8_per_tensor_weights
+
+        return prepare_trtllm_fp8_per_tensor_weights(
+            w1_bf16,
+            w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, hidden_states_scale_global):
+        """Quantize BF16 activations with one calibrated E4M3 multiplier."""
+        from .prepare import prepare_trtllm_fp8_per_tensor_activations
+
+        return prepare_trtllm_fp8_per_tensor_activations(
+            hidden_states_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+        )
 
     def __repr__(self) -> str:
         return "TrtllmFp8PerTensorConfig()"
@@ -634,13 +672,13 @@ class MoEConfig:
 
 
 # ---------------------------------------------------------------------------
-# Activation / weight packs for the autotuned pre-routed path
+# Activation / weight packs for autotuned pre-routed and FromLogits paths
 # ---------------------------------------------------------------------------
 # These are the runner-level inputs used by MoELayer (plan §1).
 #
 # Why two packs instead of one tensor bundle (PR #3093 review G5): the grouping
 # axis is *lifetime/role*, which is invariant across backends —
-#   * MoEActivationPack: per-call transient data (pre-routed activations),
+#   * MoEActivationPack: per-call transient activation/routing data,
 #     rebuilt every forward;
 #   * MoEWeightPack:     long-lived weights, materialized once at load and read
 #     every call, holding one native view *per backend* (the price of
@@ -667,6 +705,8 @@ class MoEActivationPack:
       ``float32 [H/128, M]`` block scales.
     * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
       ``uint8 [M, H/32]`` UE8M0 scales.
+    * FP8 per-tensor: ``float8_e4m3fn [M, H]`` values with no scale tensor;
+      the calibrated scalar is folded into the backend's epilogue scales.
 
     ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
 
@@ -678,9 +718,9 @@ class MoEActivationPack:
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
       runner allocates internal kernel-filled buffers, and the routing result is not surfaced
-      back through the pack (routing replay is a separate, future capability). TRTLLM FP4 and
-      block-FP8 runners support this mode; ``MoELayer`` dispatches a logits pack only to capable
-      backends (see each runner's ``supported_routing_modes``).
+      back through the pack (routing replay is a separate, future capability). TRTLLM FP4,
+      block-FP8, and per-tensor-FP8 runners support this mode; ``MoELayer`` dispatches a logits
+      pack only to capable backends (see each runner's ``supported_routing_modes``).
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so
@@ -690,7 +730,7 @@ class MoEActivationPack:
 
     # Backend-native activation payload; layouts documented above.
     hidden_states_q: Tensor
-    # Variant-specific scales documented above; None for BF16.
+    # Variant-specific scales documented above; None for BF16/per-tensor FP8.
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
