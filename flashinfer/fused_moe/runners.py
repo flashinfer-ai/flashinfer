@@ -274,53 +274,85 @@ class CuteDslNvfp4Runner(MoERunner):
         _validate_prerouted_inputs(
             act, num_tokens, self._inner.top_k, "CuteDslNvfp4Runner"
         )
-        hidden_size = act.hidden_states_q.shape[1]
-        x_sf = None
-        fc2_input_scale = None
-        if self._quant_mode == "w4a4":
-            hidden_size *= 2  # FP4 packed
-            if act.hidden_states_scale is None:
-                raise ValueError(
-                    "CuteDslNvfp4Runner: hidden_states_scale is required when "
-                    "QuantVariant.NVFP4 is selected"
-                )
-            x_sf = act.hidden_states_scale.unsqueeze(-1)
-            fc2_input_scale = v["fc2_input_scale"]
-        elif act.hidden_states_scale is not None:
-            raise ValueError(
-                "CuteDslNvfp4Runner: hidden_states_scale must be None when "
-                "QuantVariant.W4A16 is selected"
+
+        if (
+            self._quant_mode == "w4a4"
+            and not self._use_per_token_activation
+            and act.hidden_states_scale is not None
+            and act.per_token_scale is None
+        ):
+            hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
+            moe_output = act.hidden_states_q.new_empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16
             )
-        if self._use_per_token_activation:
-            if act.per_token_scale is None:
-                raise ValueError(
-                    "CuteDslNvfp4Runner: per_token_scale is required by QuantConfig"
-                )
-        elif act.per_token_scale is not None:
-            raise ValueError(
-                "CuteDslNvfp4Runner: per_token_scale was provided but is disabled "
-                "by QuantConfig"
+            return [
+                act.hidden_states_q,
+                act.hidden_states_scale.unsqueeze(-1),
+                act.topk_ids,
+                act.topk_weights,
+                v["w1_weight"],
+                v["w1_weight_sf"],
+                v["w1_alpha"],
+                v["fc2_input_scale"],
+                v["w2_weight"],
+                v["w2_weight_sf"],
+                v["w2_alpha"],
+                moe_output,
+            ]
+        elif (
+            self._quant_mode == "w4a4"
+            and self._use_per_token_activation
+            and act.hidden_states_scale is not None
+            and act.per_token_scale is not None
+        ):
+            hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
+            moe_output = act.hidden_states_q.new_empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16
             )
-        moe_output = act.hidden_states_q.new_empty(
-            (num_tokens, hidden_size), dtype=torch.bfloat16
-        )
-        inputs = [
-            act.hidden_states_q,
-            x_sf,
-            act.topk_ids,
-            act.topk_weights,
-            v["w1_weight"],
-            v["w1_weight_sf"],
-            v["w1_alpha"],
-            fc2_input_scale,
-            v["w2_weight"],
-            v["w2_weight_sf"],
-            v["w2_alpha"],
-        ]
-        if self._use_per_token_activation:
-            inputs.append(act.per_token_scale)
-        inputs.append(moe_output)
-        return inputs
+            return [
+                act.hidden_states_q,
+                act.hidden_states_scale.unsqueeze(-1),
+                act.topk_ids,
+                act.topk_weights,
+                v["w1_weight"],
+                v["w1_weight_sf"],
+                v["w1_alpha"],
+                v["fc2_input_scale"],
+                v["w2_weight"],
+                v["w2_weight_sf"],
+                v["w2_alpha"],
+                act.per_token_scale,
+                moe_output,
+            ]
+        elif (
+            self._quant_mode == "w4a16"
+            and not self._use_per_token_activation
+            and act.hidden_states_scale is None
+            and act.per_token_scale is None
+        ):
+            hidden_size = act.hidden_states_q.shape[1]
+            moe_output = act.hidden_states_q.new_empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16
+            )
+            return [
+                act.hidden_states_q,
+                None,
+                act.topk_ids,
+                act.topk_weights,
+                v["w1_weight"],
+                v["w1_weight_sf"],
+                v["w1_alpha"],
+                None,
+                v["w2_weight"],
+                v["w2_weight_sf"],
+                v["w2_alpha"],
+                moe_output,
+            ]
+        else:
+            raise ValueError(
+                "CuteDslNvfp4Runner activation inputs must match W4A4, "
+                "W4A4 per-token, or W4A16"
+            )
 
     def __hash__(self):
         return hash(("cute_dsl_nvfp4", hash(self._inner)))
