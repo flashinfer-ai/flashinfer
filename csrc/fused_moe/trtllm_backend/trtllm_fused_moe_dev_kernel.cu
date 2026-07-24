@@ -194,6 +194,7 @@ struct KernelTraits<1> {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 constexpr int DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA = 128;
+constexpr int DEEP_SEEK_ACTIVATION_RESIDENT_GRID_ROUNDS = 4;
 
 template <typename KernelParams>
 __global__ void activationDeepSeekKernel(KernelParams params) {
@@ -219,115 +220,160 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
   float constexpr E4m3MaxVal{448.f};
 
   int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
-  // Loop over tokens
-  float scale1Arr[NumTokensPerCta];
-  float scale2Arr[NumTokensPerCta];
-  float dataX1Arr[NumTokensPerCta];
-  float dataX2Arr[NumTokensPerCta];
-  float outArr[NumTokensPerCta];
-  float absOutArr[NumTokensPerCta];
-  int permutedIdxArr[NumTokensPerCta];
+  int const numNonExitingCtas = params.numNonExitingCtas[0];
+  int const groupsPerTile = params.tileTokensDim / NumTokensPerCta;
+  int const totalGroups = numNonExitingCtas * groupsPerTile;
+  int const hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x;
+  int const outputDim = params.innerDim / 2;
 
-  // Loop over tokens
-  for (int k = blockIdx.z; k < params.topK; k += gridDim.z) {
-    for (int tokenCtaIdx = blockIdx.y * NumTokensPerCta; tokenCtaIdx < params.numTokens;
-         tokenCtaIdx += gridDim.y * NumTokensPerCta) {
-      for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
-           hiddenIdx += blockDim.x * gridDim.x) {
-#pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          scale1Arr[tokenInCtaIdx] = 0.0f;
-          scale2Arr[tokenInCtaIdx] = 0.0f;
-          dataX1Arr[tokenInCtaIdx] = 0.0f;
-          dataX2Arr[tokenInCtaIdx] = 0.0f;
-          outArr[tokenInCtaIdx] = 0.0f;
-          absOutArr[tokenInCtaIdx] = 0.0f;
-        }
-#pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          int const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
-          if (tokenIdx >= params.numTokens) {
-            break;
-          }
+  for (int groupIdx = blockIdx.y; groupIdx < totalGroups; groupIdx += gridDim.y) {
+    int const ctaIdx = groupIdx / groupsPerTile;
+    int const groupInTile = groupIdx - ctaIdx * groupsPerTile;
+    int const rowBegin = ctaIdx * params.tileTokensDim + groupInTile * NumTokensPerCta;
+    int const rowLimit = params.ctaIdxXyToMnLimit[ctaIdx];
 
-          int const expandedIdx = tokenIdx * params.topK + k;
-          int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
-          permutedIdxArr[tokenInCtaIdx] = permutedIdx;
-          if (permutedIdx == -1) {
-            continue;
-          }
-
-          // Process blocks for this CTA
-          // Use int64_t to avoid overflow when permutedIdx * innerDim > INT32_MAX
-          int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
-
-          int64_t const scale1Idx =
-              (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
-          int64_t const scale2Idx =
-              (int64_t)permutedIdx +
-              (int64_t)totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
-
-          scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
-          scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
-          dataX1Arr[tokenInCtaIdx] = static_cast<float>(params.inPtr[baseIdx]);
-          dataX2Arr[tokenInCtaIdx] =
-              static_cast<float>(params.inPtr[baseIdx + params.innerDim / 2]);
-        }
+    float scale1Arr[NumTokensPerCta];
+    float scale2Arr[NumTokensPerCta];
+    float dataX1Arr[NumTokensPerCta];
+    float dataX2Arr[NumTokensPerCta];
+    float outArr[NumTokensPerCta];
+    float absOutArr[NumTokensPerCta];
+    int permutedIdxArr[NumTokensPerCta];
 
 #pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx];
-          float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx];
-          float act = silu(x2);
-          float out = act * x1;
-          outArr[tokenInCtaIdx] = out;
-          absOutArr[tokenInCtaIdx] = fabsf(out);
-        }
+    for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+      int const permutedIdx = rowBegin + tokenInCtaIdx;
+      permutedIdxArr[tokenInCtaIdx] = permutedIdx < rowLimit ? permutedIdx : -1;
+      scale1Arr[tokenInCtaIdx] = 0.0f;
+      scale2Arr[tokenInCtaIdx] = 0.0f;
+      dataX1Arr[tokenInCtaIdx] = 0.0f;
+      dataX2Arr[tokenInCtaIdx] = 0.0f;
+      outArr[tokenInCtaIdx] = 0.0f;
+      absOutArr[tokenInCtaIdx] = 0.0f;
+    }
 
-        auto absOutPacked = packedTypeFromArray<PackedType, NumTokensPerCta>(absOutArr);
-        auto aMaxPacked = BlockReduce(tempStorage).Reduce(absOutPacked, MaxOp{});
-        auto aMaxArr = arrayFromPackedType<PackedType, NumTokensPerCta>(aMaxPacked);
-
+    if (hiddenIdx < outputDim) {
 #pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          if (threadIdx.x == 0) {
-            auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
-            if (tokenIdx >= params.numTokens) {
-              break;
-            }
-            int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-            if (permutedIdx == -1) {
-              continue;
-            }
-            // Make sure the scale is strictly positive to avoid division by zero in case the
-            // maximum is zero.
-            float scaleOut =
-                fmaxf(aMaxArr[tokenInCtaIdx] / E4m3MaxVal, std::numeric_limits<float>::min());
-            s_scaleOutArr[tokenInCtaIdx] = scaleOut;
-            int64_t const scaleOut_idx = (int64_t)permutedIdxArr[tokenInCtaIdx] +
-                                         (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
-            params.outDqSfsPtr[scaleOut_idx] = scaleOut;
-          }
+      for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+        int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+        if (permutedIdx == -1) {
+          continue;
         }
-        __syncthreads();
 
-#pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
-          if (tokenIdx >= params.numTokens) {
-            break;
-          }
-          int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-          if (permutedIdx == -1) {
-            continue;
-          }
-          float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
-          int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
-          params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
-        }
+        // Use int64_t to avoid overflow when permutedIdx * innerDim > INT32_MAX
+        int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
+
+        int64_t const scale1Idx =
+            (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+        int64_t const scale2Idx =
+            (int64_t)permutedIdx +
+            (int64_t)totalNumPaddedTokens * ((hiddenIdx / 128) + (outputDim / 128));
+
+        scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
+        scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
+        dataX1Arr[tokenInCtaIdx] = static_cast<float>(params.inPtr[baseIdx]);
+        dataX2Arr[tokenInCtaIdx] = static_cast<float>(params.inPtr[baseIdx + outputDim]);
       }
     }
+
+#pragma unroll
+    for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+      float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx];
+      float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx];
+      float act = silu(x2);
+      float out = act * x1;
+      outArr[tokenInCtaIdx] = out;
+      absOutArr[tokenInCtaIdx] = fabsf(out);
+    }
+
+    auto absOutPacked = packedTypeFromArray<PackedType, NumTokensPerCta>(absOutArr);
+    auto aMaxPacked = BlockReduce(tempStorage).Reduce(absOutPacked, MaxOp{});
+    auto aMaxArr = arrayFromPackedType<PackedType, NumTokensPerCta>(aMaxPacked);
+
+#pragma unroll
+    for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+      if (threadIdx.x == 0) {
+        int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+        if (permutedIdx == -1) {
+          continue;
+        }
+        // Make sure the scale is strictly positive to avoid division by zero in case the
+        // maximum is zero.
+        float scaleOut =
+            fmaxf(aMaxArr[tokenInCtaIdx] / E4m3MaxVal, std::numeric_limits<float>::min());
+        s_scaleOutArr[tokenInCtaIdx] = scaleOut;
+        int64_t const scaleOutIdx =
+            (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+        params.outDqSfsPtr[scaleOutIdx] = scaleOut;
+      }
+    }
+    __syncthreads();
+
+    if (hiddenIdx < outputDim) {
+#pragma unroll
+      for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+        int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+        if (permutedIdx == -1) {
+          continue;
+        }
+        float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
+        int64_t const outIdx = (int64_t)permutedIdx * outputDim + hiddenIdx;
+        params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
+      }
+    }
+    if (groupIdx + gridDim.y < totalGroups) {
+      __syncthreads();
+    }
   }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Type, int32_t NumTokensPerCta, bool UsePdl>
+int getDeepSeekActivationActiveCtasPerSm(int device) {
+  // Cache by exact kernel instantiation and refresh when this host thread switches devices.
+  static thread_local int cachedDevice{-1};
+  static thread_local int cachedActiveCtasPerSm{0};
+  if (cachedDevice != device) {
+    auto kernel = activationDeepSeekKernel<KernelParams<Type, NumTokensPerCta, UsePdl>>;
+    CHECK_CUDA_ERROR(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &cachedActiveCtasPerSm, kernel, DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0));
+    FLASHINFER_CHECK(cachedActiveCtasPerSm > 0,
+                     "DeepSeek FP8 activation kernel has no resident CTAs.");
+    cachedDevice = device;
+  }
+  return cachedActiveCtasPerSm;
+}
+
+template <typename Type, int32_t NumTokensPerCta>
+int getDeepSeekActivationActiveCtasPerSm(int device, bool usePdl) {
+  return usePdl ? getDeepSeekActivationActiveCtasPerSm<Type, NumTokensPerCta, true>(device)
+                : getDeepSeekActivationActiveCtasPerSm<Type, NumTokensPerCta, false>(device);
+}
+
+template <typename Type>
+int getDeepSeekActivationActiveCtasPerSm(int device, int numTokensPerCta, bool usePdl) {
+  if (numTokensPerCta == 4) {
+    return getDeepSeekActivationActiveCtasPerSm<Type, 4>(device, usePdl);
+  } else if (numTokensPerCta == 2) {
+    return getDeepSeekActivationActiveCtasPerSm<Type, 2>(device, usePdl);
+  }
+  return getDeepSeekActivationActiveCtasPerSm<Type, 1>(device, usePdl);
+}
+
+int getDeepSeekActivationActiveCtasPerSm(Data const& data, int device, int numTokensPerCta) {
+  if (data.mDtypeElt == tg::Dtype::Fp16) {
+    return getDeepSeekActivationActiveCtasPerSm<cutlass::half_t>(device, numTokensPerCta,
+                                                                 data.mUsePdl);
+  } else if (data.mDtypeElt == tg::Dtype::E4m3) {
+    return getDeepSeekActivationActiveCtasPerSm<cutlass::float_e4m3_t>(device, numTokensPerCta,
+                                                                       data.mUsePdl);
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {
+    return getDeepSeekActivationActiveCtasPerSm<cutlass::bfloat16_t>(device, numTokensPerCta,
+                                                                     data.mUsePdl);
+  }
+  FLASHINFER_CHECK(false, "Unsupported dtypeElt for DeepSeek FP8 activation.");
+  return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -341,13 +387,18 @@ void run(Data const& data, void* stream) {
   }
 
   if (data.mUseDeepSeekFp8) {
+    FLASHINFER_CHECK(data.ctaIdxXyToMnLimit != nullptr,
+                     "ctaIdxXyToMnLimit must be provided for DeepSeek FP8 activation.");
+    FLASHINFER_CHECK(data.numNonExitingCtas != nullptr,
+                     "numNonExitingCtas must be provided for DeepSeek FP8 activation.");
+
     constexpr int NUM_ELTS_PER_LOAD = 1;
     constexpr int NUM_ELTS_PER_SF = 128;
 
     int device{-1};
-    cudaGetDevice(&device);
+    CHECK_CUDA_ERROR(cudaGetDevice(&device));
     int numSms = 0;
-    cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
+    CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device));
 
     // Output dimension is innerDim / 2, and each scale block is 128 elements
     int const outputDim = data.innerDim / 2;
@@ -355,7 +406,7 @@ void run(Data const& data, void* stream) {
     int const gridSizeX = (numScaleBlocks + NUM_ELTS_PER_LOAD - 1) / NUM_ELTS_PER_LOAD;
 
     auto numCtas = gridSizeX * data.numTokens * data.topK;
-    // FIXME: This is heruistic based on very short benchmark.
+    // FIXME: This is heuristic based on very short benchmark.
     int numTokensPerCta = 1;
     if (numCtas > numSms * 32) {
       numTokensPerCta = 4;
@@ -365,9 +416,21 @@ void run(Data const& data, void* stream) {
       numTokensPerCta = 1;
     }
 
-    int const gridSizeY = std::min(8192, (data.numTokens + numTokensPerCta - 1) / numTokensPerCta);
+    FLASHINFER_CHECK(
+        data.tileTokensDim >= numTokensPerCta && data.tileTokensDim % numTokensPerCta == 0,
+        "tileTokensDim must be divisible by numTokensPerCta.");
 
-    const dim3 grid(gridSizeX, gridSizeY, data.topK);
+    int const logicalGridSizeY =
+        std::min(8192, (data.numTokens + numTokensPerCta - 1) / numTokensPerCta * data.topK);
+    int const activeCtasPerSm = getDeepSeekActivationActiveCtasPerSm(data, device, numTokensPerCta);
+    int64_t const logicalCtas = static_cast<int64_t>(gridSizeX) * logicalGridSizeY;
+    int64_t const residentCtas = static_cast<int64_t>(numSms) * activeCtasPerSm;
+    int64_t const launchCtas =
+        std::min(logicalCtas, residentCtas * DEEP_SEEK_ACTIVATION_RESIDENT_GRID_ROUNDS);
+    int const gridSizeY = static_cast<int>(
+        std::min<int64_t>(logicalGridSizeY, (launchCtas + gridSizeX - 1) / gridSizeX));
+
+    const dim3 grid(gridSizeX, gridSizeY, 1);
 
     LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
                       DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);

@@ -401,6 +401,41 @@ def test_deepseekv3_routing(
     )
 
 
+@pytest.mark.parametrize("num_tokens", [8, 64, 1024])
+def test_deepseek_fp8_activation_routing_workset(num_tokens, cache_permute_indices):
+    """Exercise the 1/2/4-row activation dispatch on the compact routing workset."""
+    run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=512,
+        intermediate_size=512,
+        moe_impl=FP8BlockScaleMoe(
+            fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+        ),
+        routing_config={
+            "num_experts": 64,
+            "top_k": 8,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_intermediate_size": [512],
+            "compatible_activation_types": [ActivationType.Swiglu],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": False,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+        },
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+    )
+
+
 # Test: TopK routing
 @pytest.mark.parametrize("num_tokens", [8, 128])  # Limited for GeGlu
 @pytest.mark.parametrize("hidden_size", [1024])
