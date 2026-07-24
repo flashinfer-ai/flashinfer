@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, Tuple
 
-from .....weights import MoEWeightPack
+from .....weights import MoEWeightPack, PrequantizedMoEWeights
 
 if TYPE_CHECKING:
     import torch
@@ -158,7 +158,7 @@ def preprocess_mega_weights(
     hidden_sf_cols = ceil_div(hidden_size, Mxfp8BlockSize)
     intermediate_sf_cols = ceil_div(intermediate_size, Mxfp8BlockSize)
 
-    if weights.w13_scale is not None and weights.w2_scale is not None:
+    if isinstance(weights, PrequantizedMoEWeights):
         w13_scale_in = _as_mxfp8_scale(weights.w13_scale)
         w2_scale_in = _as_mxfp8_scale(weights.w2_scale)
         expected_w13_scale_shape = (

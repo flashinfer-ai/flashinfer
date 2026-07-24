@@ -39,11 +39,9 @@ def _require_cuda():
         pytest.skip("needs CUDA")
 
 
-def _single_rank_problem():
+def _single_rank_problem(hidden=2048, intermediate=1024):
     import torch
 
-    hidden = 2048
-    intermediate = 1024
     num_tokens = 32
     max_tokens = 64
     num_experts = 4
@@ -329,7 +327,17 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
 
 
 @pytest.mark.arch_blackwell
-def test_nvfp4_kernel_matches_torch_reference(monkeypatch):
+@pytest.mark.parametrize(
+    "hidden,intermediate",
+    [
+        (2048, 1024),
+        # 128-misaligned (hidden % 128 == 64): exercises the ceil-div K-tail
+        # and predicated epilogue paths the %64 validation relaxation opened
+        # up (gpt-oss-120b geometry class).
+        (2880, 2880),
+    ],
+)
+def test_nvfp4_kernel_matches_torch_reference(monkeypatch, hidden, intermediate):
     """Single-rank ``nvfp4_mega_moe`` output matches the pure-torch oracle."""
     _require_cuda()
 
@@ -357,7 +365,7 @@ def test_nvfp4_kernel_matches_torch_reference(monkeypatch):
     # monkeypatch (not os.environ): restored after the test, so it cannot
     # silently downgrade later nvshmem-path tests in the same process.
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    problem = _single_rank_problem()
+    problem = _single_rank_problem(hidden=hidden, intermediate=intermediate)
     rank = 0
     world_size = 1
     num_tokens = problem["num_tokens"]
