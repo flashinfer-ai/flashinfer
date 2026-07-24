@@ -51,7 +51,10 @@ import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
+
+if TYPE_CHECKING:
+    from flashinfer.comm import UlyssesCommunicator
 
 import torch
 import torch.nn as nn
@@ -288,6 +291,27 @@ class WanRotaryPosEmbed(nn.Module):
         return freqs_cos, freqs_sin
 
 
+# ---- Ulysses context-parallel wiring (example mechanism) ---------------------
+# Process-global and non-reentrant: one communicator per process, installed by
+# the launcher around the sequence-sharded forward passes and cleared (in a
+# finally block, BEFORE the communicator is closed) when done. The default
+# None keeps single-GPU behavior with zero overhead and adds no imports (the
+# flashinfer.comm import above is type-checking only).
+_ULYSSES_COMM: Optional["UlyssesCommunicator"] = None
+
+
+def set_ulysses_communicator(comm: Optional["UlyssesCommunicator"]) -> None:
+    """Install (or clear, with ``None``) the process-global
+    :class:`flashinfer.comm.UlyssesCommunicator` consumed by
+    ``FlashInferWanAttention`` and the transformer's sequence sharding."""
+    global _ULYSSES_COMM
+    _ULYSSES_COMM = comm
+
+
+def get_ulysses_communicator() -> "Optional[UlyssesCommunicator]":
+    return _ULYSSES_COMM
+
+
 class FlashInferWanAttention(nn.Module):
     """Wan attention module that delegates FlashInfer kernel dispatch."""
 
@@ -408,6 +432,7 @@ class FlashInferWanAttention(nn.Module):
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
+        is_self_attention = encoder_hidden_states is None
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
@@ -433,6 +458,26 @@ class FlashInferWanAttention(nn.Module):
             query = query.to(torch.bfloat16)
             key = key.to(torch.bfloat16)
             value = value.to(torch.bfloat16)
+
+        # Ulysses context parallelism (self-attention only): the sequence dim
+        # is sharded across ranks; all-to-all scatters heads / gathers sequence
+        # so each rank attends over the full sequence with H/world_size heads,
+        # then the inverse all-to-all restores the [B, S_local, H, D] layout.
+        ulysses_comm = get_ulysses_communicator()
+        use_ulysses = (
+            ulysses_comm is not None
+            and ulysses_comm.world_size > 1
+            and not self.is_cross_attention
+            and is_self_attention
+        )
+        if use_ulysses:
+            # .contiguous(): the public API requires contiguous operands (the
+            # projections/rotary above may hand back views)
+            query = ulysses_comm.scatter_heads(query.contiguous())
+            key = ulysses_comm.scatter_heads(key.contiguous())
+            value = ulysses_comm.scatter_heads(value.contiguous())
+            seq_len_q = query.shape[1]
+            seq_len_kv = key.shape[1]
 
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
@@ -476,6 +521,15 @@ class FlashInferWanAttention(nn.Module):
             seq_len_kv,
             use_sparse=use_sparse,
         )
+
+        if use_ulysses:
+            # (B, S_global, H_local*D) -> inverse all-to-all -> (B, S_local, H*D)
+            h_local = self.heads // ulysses_comm.world_size
+            hidden_states = ulysses_comm.gather_heads(
+                hidden_states.reshape(
+                    batch_size, seq_len_q, h_local, self.dim_head
+                ).contiguous()
+            ).reshape(batch_size, -1, self.heads * self.dim_head)
 
         if needs_cast:
             hidden_states = hidden_states.to(orig_dtype)
@@ -1025,6 +1079,25 @@ class FlashInferWanTransformer3DModel(nn.Module):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        # Ulysses context parallelism: shard the token sequence across ranks.
+        # Every rank runs the full block stack on its shard; self-attention
+        # inside the blocks uses the all-to-all to attend over the full
+        # sequence (see FlashInferWanAttention). The rotary tables are sliced
+        # to the shard so positions stay correct.
+        ulysses_comm = get_ulysses_communicator()
+        seq_sharded = ulysses_comm is not None and ulysses_comm.world_size > 1
+        if seq_sharded:
+            w, r = ulysses_comm.world_size, ulysses_comm.rank
+            seq_len = hidden_states.shape[1]
+            assert seq_len % w == 0, (
+                f"sequence length {seq_len} not divisible by ulysses world size {w}"
+            )
+            s_local = seq_len // w
+            hidden_states = hidden_states[:, r * s_local : (r + 1) * s_local]
+            rotary_emb = tuple(
+                f[:, r * s_local : (r + 1) * s_local] for f in rotary_emb
+            )
+
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:
             ts_seq_len = timestep.shape[1]
@@ -1066,6 +1139,19 @@ class FlashInferWanTransformer3DModel(nn.Module):
                 hidden_states = block(
                     hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
                 )
+
+        if seq_sharded:
+            # Reassemble the full sequence for the output projection/unpatchify.
+            import torch.distributed as dist
+
+            gathered = [
+                torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+                for _ in range(ulysses_comm.world_size)
+            ]
+            dist.all_gather(
+                gathered, hidden_states.contiguous(), group=ulysses_comm.group
+            )
+            hidden_states = torch.cat(gathered, dim=1)
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:
