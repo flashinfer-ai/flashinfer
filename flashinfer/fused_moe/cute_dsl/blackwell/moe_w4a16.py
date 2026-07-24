@@ -31,15 +31,15 @@ from flashinfer.tllm_enums import (
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 
 
-W4A16GemmTactic = Tuple[Tuple[int, int], Tuple[int, int]]
+W4A16GemmTactic = Tuple[Tuple[int, int, int], Tuple[int, int], bool]
 W4A16MoeTactic = Tuple[int, W4A16GemmTactic, W4A16GemmTactic]
 
 # Fixed correctness fallback used when no tuned tactic is available. Runtime
 # performance selection belongs to CuteDslFusedMoEW4A16Runner.
 DEFAULT_W4A16_MOE_TACTIC: W4A16MoeTactic = (
     128,
-    ((256, 128), (2, 1)),
-    ((256, 128), (2, 1)),
+    ((256, 128, 128), (2, 1), True),
+    ((256, 128, 128), (2, 1), True),
 )
 
 
@@ -129,11 +129,11 @@ def _get_compiled_kernel(
     use_fused_finalize: bool,
     enable_pdl: bool,
     use_clc_scheduler: bool,
-    route_tile: int,
-    mma_tiler_mk: Tuple[int, int],
+    mma_tiler_mnk: Tuple[int, int, int],
     cluster_shape_mn: Tuple[int, int],
+    raster_along_m: bool,
 ):
-    mma_tiler_m, mma_tiler_k = mma_tiler_mk
+    mma_tiler_m, route_tile, mma_tiler_k = mma_tiler_mnk
     use_2cta_instrs = mma_tiler_m == 256
     cache_key = (
         num_local_experts,
@@ -148,6 +148,7 @@ def _get_compiled_kernel(
         mma_tiler_k,
         route_tile,
         cluster_shape_mn,
+        raster_along_m,
     )
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
@@ -166,6 +167,7 @@ def _get_compiled_kernel(
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
             use_clc_scheduler=use_clc_scheduler,
+            raster_along_m=raster_along_m,
         )
         compiled = cute.compile(
             kernel.wrapper,
@@ -209,19 +211,19 @@ def _run_grouped_gemm(
     permuted_idx_to_expanded_idx: Optional[torch.Tensor],
     token_final_scales: Optional[torch.Tensor],
     enable_pdl: bool,
-    route_tile: int,
     tactic: W4A16GemmTactic,
 ) -> None:
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
     n = int(activations.size(0))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    mma_tiler_mk, cluster_shape_mn = tactic
+    mma_tiler_mnk, cluster_shape_mn, raster_along_m = tactic
+    mma_tiler_m, route_tile, _ = mma_tiler_mnk
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
-    cta_group_size = 2 if mma_tiler_mk[0] == 256 else 1
-    cta_tile_m = mma_tiler_mk[0] // cta_group_size
+    cta_group_size = 2 if mma_tiler_m == 256 else 1
+    cta_tile_m = mma_tiler_m // cta_group_size
     num_ctas_m = (m + cta_tile_m - 1) // cta_tile_m
     num_ctas_n = (n + route_tile - 1) // route_tile
     num_problem_clusters = (
@@ -326,9 +328,9 @@ def _run_grouped_gemm(
         use_fused_finalize,
         enable_pdl,
         use_clc_scheduler,
-        route_tile,
-        mma_tiler_mk,
+        mma_tiler_mnk,
         cluster_shape_mn,
+        raster_along_m,
     )
     compiled(
         weight_ptr,
@@ -454,7 +456,6 @@ def launch_w4a16_moe(
         permuted_idx_to_expanded_idx=None,
         token_final_scales=None,
         enable_pdl=enable_pdl,
-        route_tile=route_tile,
         tactic=gemm1_tactic,
     )
     gemm2_output = moe_output if use_fused_finalize else hidden_workspace
@@ -480,7 +481,6 @@ def launch_w4a16_moe(
         ),
         token_final_scales=token_final_scales if use_fused_finalize else None,
         enable_pdl=enable_pdl,
-        route_tile=route_tile,
         tactic=gemm2_tactic,
     )
     if not use_fused_finalize:
