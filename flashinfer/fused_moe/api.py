@@ -230,11 +230,13 @@ class TrtllmFp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM100+ only: the routed runner delegates to the trtllm-gen sm100
-        # module, which core.is_trtllm_moe_supported() gates on major >= 10.
-        # Returning True on SM90 would mark the backend available on H100 and
-        # then fail at dispatch.
-        return arch >= 100
+        # SM100 family only: the routed runner delegates to the trtllm-gen sm100
+        # module, whose cubins are built for SM100/SM103/SM110. Marking the
+        # backend available outside that set — SM90 (H100), or SM120/SM121
+        # (consumer Blackwell), which have no trtllm-gen MoE cubins — makes
+        # MoELayer build a runner that then fails at dispatch (cubin-not-found)
+        # instead of raising the clean "no usable backend" error at construction.
+        return arch in (100, 103, 110)
 
     @staticmethod
     def prepare_weights(
