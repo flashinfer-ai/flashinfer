@@ -341,7 +341,8 @@ void trtllm_paged_attention_decode(
     Optional<TensorView> cum_seq_lens_q, Optional<TensorView> key_block_scales,
     Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor,
     Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads, bool enable_block_sparse_attention) {
+    int64_t lse_stride_heads, bool enable_block_sparse_attention,
+    Optional<TensorView> sparse_mla_top_k_lens) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -430,6 +431,21 @@ void trtllm_paged_attention_decode(
     TVM_FFI_ICHECK_EQ(lse.value().ndim(), 2) << "lse must be a 2D tensor";
     lse_ptr = static_cast<float*>(lse.value().data_ptr());
   }
+  int* sparse_mla_top_k_lens_ptr = nullptr;
+  if (sparse_mla_top_k_lens.has_value()) {
+    auto const& top_k_lens = sparse_mla_top_k_lens.value();
+    TVM_FFI_ICHECK_EQ(top_k_lens.dtype(), dl_int32) << "sparse_mla_top_k_lens must be int32";
+    TVM_FFI_ICHECK_EQ(top_k_lens.ndim(), 1)
+        << "sparse_mla_top_k_lens must have flattened shape [sumQ]";
+    TVM_FFI_ICHECK_EQ(top_k_lens.size(0), sum_seq_q)
+        << "sparse_mla_top_k_lens must contain one value per query token";
+    TVM_FFI_ICHECK_EQ(top_k_lens.device().device_type, query.device().device_type)
+        << "sparse_mla_top_k_lens must be on the same device as query";
+    TVM_FFI_ICHECK_EQ(top_k_lens.device().device_id, query.device().device_id)
+        << "sparse_mla_top_k_lens must be on the same device as query";
+    TVM_FFI_ICHECK(top_k_lens.IsContiguous()) << "sparse_mla_top_k_lens must be contiguous";
+    sparse_mla_top_k_lens_ptr = static_cast<int*>(top_k_lens.data_ptr());
+  }
   auto maybe_bmm1_scale_value = bmm1_scale.as<double>();
   auto maybe_bmm2_scale_value = bmm2_scale.as<double>();
   auto maybe_bmm1_scale_log2_tensor = bmm1_scale.as<ffi::Tensor>();
@@ -454,6 +470,9 @@ void trtllm_paged_attention_decode(
   float const skip_softmax_threshold_scale_factor_value =
       skip_softmax_threshold_scale_factor.value_or(0.0f);
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
+  bool const is_single_pool_dynamic_sparse_mla = sparse_mla_top_k_lens_ptr != nullptr &&
+                                                 sparse_mla_top_k > 0 && head_dim_q == 512 &&
+                                                 head_dim_o == 512 && is_shared_kv;
 
   if (enable_block_sparse_attention) {
     // Block-sparse attention uses per-KV-head page tables and sequence lengths. The kernel
@@ -487,8 +506,10 @@ void trtllm_paged_attention_decode(
       q_stride_tokens, q_stride_heads, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr,
       bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q,
-      sparse_mla_top_k, /*sliding_window_kv_pool=*/nullptr,
-      /*sparse_mla_top_k_lens=*/nullptr, /*has_sliding_window_kv_pool=*/false,
+      sparse_mla_top_k,
+      /*sliding_window_kv_pool=*/
+      is_single_pool_dynamic_sparse_mla ? key_cache.data_ptr() : nullptr, sparse_mla_top_k_lens_ptr,
+      /*has_sliding_window_kv_pool=*/is_single_pool_dynamic_sparse_mla,
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       enable_block_sparse_attention, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
       k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, /*is_causal=*/true,
