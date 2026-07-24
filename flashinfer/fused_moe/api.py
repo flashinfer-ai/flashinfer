@@ -246,6 +246,9 @@ class TrtllmFp4Config:
         intermediate_size: int,
         device=None,
         permute_cache=None,
+        gemm1_scales_global=None,
+        gemm2_scales_global=None,
+        intermediate_scale_global=None,
     ):
         """Build the ``trtllm_fp4_routed`` weight view from canonical bf16 weights.
 
@@ -262,6 +265,9 @@ class TrtllmFp4Config:
             intermediate_size=intermediate_size,
             device=device,
             permute_cache=permute_cache,
+            gemm1_scales_global=gemm1_scales_global,
+            gemm2_scales_global=gemm2_scales_global,
+            intermediate_scale_global=intermediate_scale_global,
         )
 
     def __repr__(self) -> str:
@@ -454,6 +460,9 @@ class CuteDslConfig:
         hidden_size: int,
         intermediate_size: int,
         device=None,
+        gemm1_scales_global=None,
+        gemm2_scales_global=None,
+        intermediate_scale_global=None,
     ):
         """Build the ``cute_dsl_nvfp4`` weight view from canonical bf16 weights.
 
@@ -469,6 +478,9 @@ class CuteDslConfig:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             device=device,
+            gemm1_scales_global=gemm1_scales_global,
+            gemm2_scales_global=gemm2_scales_global,
+            intermediate_scale_global=intermediate_scale_global,
         )
 
     def __repr__(self) -> str:
@@ -726,6 +738,12 @@ class MoEActivationPack:
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so
     positional construction of pre-routed packs is unchanged.  The in-kernel routing fields
     are keyword-only.
+
+    ``hidden_states_scale_global`` is the global scale that was used to
+    quantize ``hidden_states_q`` (e.g. the calibrated ``(448 * 6) / amax``
+    from an NVFP4 checkpoint).  Runners fold it into the per-expert dequant
+    scalars at pack time (gh #3548).  ``None`` means the activations were
+    quantized with global scale 1.0 — full backward compatibility.
     """
 
     # Backend-native activation payload; layouts documented above.
@@ -746,6 +764,9 @@ class MoEActivationPack:
     routing_bias: Optional[Tensor] = field(
         default=None, kw_only=True
     )  # [num_experts] bfloat16 or float32 (independent of logits dtype)
+    hidden_states_scale_global: Optional[Tensor] = field(
+        default=None, kw_only=True
+    )  # scalar float32; folded into per-expert dequant scalars at pack time (gh #3548)
 
     def __post_init__(self) -> None:
         """Fail fast on mode/field mismatches at construction time.
@@ -793,6 +814,7 @@ class MoEActivationPack:
             "topk_weights",
             "routing_logits",
             "routing_bias",
+            "hidden_states_scale_global",
         ):
             t = getattr(self, name)
             if t is not None and t.device != dev:
