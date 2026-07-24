@@ -1114,6 +1114,7 @@ def get_gemm_sm100_module_cutlass_fp8():
 
 
 _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -6438,6 +6439,8 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
 
 
 _MM_MXFP8_TUNING_CONFIG = TuningConfig(
+    # note: fails under autotune
+    use_cuda_graph=False,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
