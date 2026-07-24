@@ -1566,18 +1566,8 @@ def _gen_customize_single_prefill_module_impl(
         raise ValueError(f"Invalid backend: {backend}")
 
 
-# -----------------------------------------------------------------------------
-# Block Extend dedicated front-ends.
-#
-# These are thin, deliberately-narrow wrappers over the shared
-# ``gen_customize_single/batch_prefill_module`` that compile ONLY
-# ``MaskMode::kBlockExtend`` over the small, supported product
-# (fp16/bf16 x head_dim 64/128 x ragged+paged x fa2/fa3). They are the standalone
-# entry points the reviewers asked for ("move the dispatch into a standalone
-# config/variant class") so the new mask mode is NOT a value multiplied into the
-# big shared prefill cartesian product. The shared ``gen_customize_*`` keeps its
-# default mask list ``[0,1,2,3]``; no existing prefill URI compiles mode 4.
-# -----------------------------------------------------------------------------
+# Dedicated Block Extend front-ends keep mode 4 out of the shared JIT product.
+# They compile only the supported dtype, head-dimension, layout, and backend axes.
 
 _BLOCK_EXTEND_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS = {64, 128}

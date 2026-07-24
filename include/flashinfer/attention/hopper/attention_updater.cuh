@@ -228,11 +228,7 @@ struct OnlineSoftmax {
 #pragma unroll
     for (int mi = 0; mi < size(row_max); ++mi) {
       float sum = row_sum(mi);
-      // math::inf is a finite mask sentinel, so a fully masked row otherwise
-      // becomes a uniform softmax over masked entries.  Such rows can occur
-      // inside an otherwise visible CTA (for example with Block Extend
-      // offsets), and therefore cannot always take the CTA-level store_zero
-      // fast path.
+      // Keep fully masked rows at zero instead of normalizing masked entries.
       if (row_max(mi) == fill_value) {
         scores_scale(mi) = 0.f;
         row_sum(mi) = fill_value;

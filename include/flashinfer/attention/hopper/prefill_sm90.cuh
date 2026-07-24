@@ -243,16 +243,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       int num_kv_tiles = collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len,
                                                               kv_len, batch_idx);
       if (num_kv_tiles <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
-        // When this CTA takes the zero-visible-KV fast-path we skip mma_f16, which
-        // normally arrives at shared_storage.barrier_O (gated by work_idx != 0) to
-        // release the *producer's* barrier_O.wait((work_idx+1)%2) on the next work
-        // tile (mainloop.cuh, "Wait for warp 1 to signal that smem_v are ready").
-        // producer and consumer advance work_idx in lockstep (both skip the ++work_idx
-        // for a zero tile, via the `continue` below vs. the ++work_idx after mma in the
-        // normal path), so emitting the same arrive here keeps the barrier handshake
-        // consistent. Without it, a zero tile followed by a non-zero tile in the same
-        // CTA deadlocks: the producer of the non-zero tile waits forever at
-        // barrier_O.wait for an arrive this zero-tile consumer never made.
+        // Preserve producer/consumer barrier parity when skipping this tile.
+        // A following visible tile would otherwise wait on a missing arrival.
         if (work_idx != 0) {
           int lane_predicate = cute::elect_one_sync();
           if (cutlass::canonical_warp_idx_sync() == Ktraits::NUM_WARPS - 1 && lane_predicate) {

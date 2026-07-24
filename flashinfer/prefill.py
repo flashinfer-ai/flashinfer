@@ -196,11 +196,7 @@ def get_customize_batch_prefill_module(
     fp8_enabled: bool = False,
     mask_modes: Optional[Sequence[int]] = None,
 ):
-    # Route the Block Extend variant through its
-    # dedicated front-end when mask_mode is fixed to kBlockExtend. The
-    # dedicated generator compiles only mode 4 over a small supported product,
-    # rather than multiplying it into the shared prefill product. All other
-    # mask-mode requests use the shared path unchanged.
+    # Keep Block Extend out of the shared JIT product used by regular prefill.
     if mask_modes is not None and tuple(mask_modes) == (MaskMode.BLOCK_EXTEND.value,):
         return gen_customize_block_extend_batch_prefill_module(
             backend,
