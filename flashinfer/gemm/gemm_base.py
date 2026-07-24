@@ -2953,6 +2953,28 @@ def _warn_mxfp8_gemm_strides(a: torch.Tensor, b: torch.Tensor, backend: str) -> 
         )
 
 
+def _warn_cudnn_bmm_mxfp8_scale_len(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+) -> None:
+    scale_specs = (
+        ("A_scale", a_scale, a.numel() // a.shape[-1], a.shape[-1]),
+        ("B_scale", b_scale, b.shape[0] * b.shape[-1], b.shape[-2]),
+    )
+    for name, scale, rows, k in scale_specs:
+        expected_len = _mxfp8_swizzled_scale_len(rows, k, SfLayout.layout_128x4)
+        if scale.numel() != expected_len:
+            jit_logger.warning_once(
+                f"cuDNN bmm_mxfp8 expects {name} to contain {expected_len} "
+                "elements in the F8_128x4 swizzled layout for the operand "
+                f"shape, but got {scale.numel()}. This can cause out-of-bounds "
+                "scale reads and NaN results. Quantize with "
+                "mxfp8_quantize(..., is_sf_swizzled_layout=True)."
+            )
+
+
 def execute_cudnn_gemm_mxfp8_graph(
     graph,
     a,
@@ -9135,6 +9157,10 @@ def bmm_mxfp8(
         shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
         Both the cuDNN and CUTLASS backends read the scale tensors in the
         F8_128x4 swizzled layout; linear-layout scales are not supported.
+        Both layouts are flat 1D buffers, so a linear scale whose length happens
+        to match the padded swizzled length cannot be detected at runtime. Ensure
+        the scale was produced with the swizzled layout rather than relying on a
+        warning.
 
     Returns
     -------
@@ -9175,6 +9201,7 @@ def bmm_mxfp8(
     if resolved_backend == "cudnn":
         if not CUDNN_AVAILABLE:
             raise ValueError("cudnn is not available")
+        _warn_cudnn_bmm_mxfp8_scale_len(A, B, A_scale, B_scale)
         mxfp8_gemm_sm100(
             A,
             B,
