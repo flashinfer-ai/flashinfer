@@ -7,6 +7,13 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
+from flashinfer.utils import get_compute_capability
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or get_compute_capability(torch.device("cuda:0"))[0] not in (9, 10, 12),
+    reason="trtllm_comm kernels support SM90/SM100/SM12x only",
+)
 
 """
 NOTE:
@@ -42,7 +49,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
     try:
         device = torch.device(f"cuda:{rank}")
-        token_nums = [64, 128]
+        # 8 tokens is below LamportTokenNumThreshold (16), so ONESHOT +
+        # RESIDUAL_RMS_NORM dispatches to the lamport-style kernel.
+        token_nums = [8, 64, 128]
         strategy_codes = [
             comm.AllReduceStrategyType.ONESHOT,
             comm.AllReduceStrategyType.TWOSHOT,
@@ -82,9 +91,33 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         test_loop = 2  # could be any number
 
         # NOTE: the barrier flag should be initialized to 1, and incremented by 1 for each AR
+        lamport_buffer_size = (
+            world_size
+            * comm.trtllm_ar.LamportTokenNumThreshold
+            * world_size
+            * maxHiddenSize
+            * 2
+        )
         flag_value = 1
+        # The lamport buffer rotation needs consecutive flag values across
+        # lamport calls, so they get their own counter.
+        lamport_flag_value = 1
         for token_num in token_nums:
             for hidden_size in hidden_sizes:
+                # The lamport protocol assumes a fixed message layout per
+                # workspace; re-init the buffers when the shape changes so a
+                # lamport call never reads stale data from a previous shape.
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
+                comm.trtllm_lamport_initialize_all(
+                    workspace[4][rank],
+                    workspace[5][rank],
+                    workspace[6][rank],
+                    lamport_buffer_size // 2,
+                    torch.float16,
+                )
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
                 for strategy_code in strategy_codes:
                     for config_code in config_codes:
                         for fusion_op_code in fusion_op_codes:
@@ -97,6 +130,16 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 ):
                                     # skip twoshot pre-post norm: not supported in trtllm test
                                     continue
+                                # Matches the kernel's lamport dispatch
+                                # condition (is_lamport_supported).
+                                is_lamport = (
+                                    strategy_code == comm.AllReduceStrategyType.ONESHOT
+                                    and fusion_op_code
+                                    == comm.AllReduceFusionOp.RESIDUAL_RMS_NORM
+                                    and token_num
+                                    <= comm.trtllm_ar.LamportTokenNumThreshold
+                                    and hidden_size >= 256
+                                )
                                 print(
                                     f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{hidden_size} start"
                                 )
@@ -137,7 +180,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         strategy_code=strategy_code,
                                         config_code=config_code,
                                         launch_with_pdl=launch_with_pdl,
-                                        flag_value=flag_value,
+                                        flag_value=lamport_flag_value
+                                        if is_lamport
+                                        else flag_value,
                                         peer_comm_buffer_ptrs=torch.tensor(
                                             workspace[0], dtype=torch.int64
                                         ),
@@ -226,7 +271,10 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         # NOTE(yingyi): bugfix todo, the test invokes nccl timeout for now
                                         pass
 
-                                    flag_value += 1
+                                    if is_lamport:
+                                        lamport_flag_value += 1
+                                    else:
+                                        flag_value += 1
                                 if pass_flag:
                                     print(
                                         f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{hidden_size} passed"
