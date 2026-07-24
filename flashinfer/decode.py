@@ -3041,6 +3041,7 @@ def trtllm_batch_decode_with_kv_cache(
     ----------
     query : torch.Tensor
         query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = total query tokens in the batch.
+        The tensor must be contiguous when using the ``xqa`` backend.
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
@@ -3096,6 +3097,7 @@ def trtllm_batch_decode_with_kv_cache(
 
     out :  Optional[Union[torch.Tensor, FP4Tensor]] = None
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
+        A caller-provided output tensor must be contiguous when using the ``xqa`` backend.
 
     out_dtype : Optional[Union[torch.dtype, str]] = None
         output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
@@ -3545,6 +3547,7 @@ def xqa_batch_decode_with_kv_cache(
     ----------
     query : torch.Tensor
         query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
+        The tensor must be contiguous.
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``,
@@ -3576,6 +3579,7 @@ def xqa_batch_decode_with_kv_cache(
 
     out :  Optional[torch.Tensor] = None
         output tensor, if not provided, will be allocated with ``query.dtype``.
+        A caller-provided output tensor must be contiguous.
 
     sinks : Optional[torch.Tensor] = None
         additional value per head in the denominator of the softmax.
@@ -3657,6 +3661,13 @@ def xqa_batch_decode_with_kv_cache(
     kv_scale_value = bmm2_scale * o_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
+    # XQA indexes query and output as packed buffers without using their strides.
+    if not query.is_contiguous():
+        raise ValueError("query must be contiguous")
+    if out is not None:
+        check_shape_dtype_device(out, query.shape, None, query.device, "out")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
     if q_len_per_req > 1:
         batch_size = query.shape[0] // q_len_per_req
         query = query.view(batch_size, q_len_per_req, query.shape[1], query.shape[2])
