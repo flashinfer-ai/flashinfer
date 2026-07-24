@@ -7,6 +7,75 @@ from tests.test_helpers.test_helpers import skip_on_gpu_arch_error
 
 
 @skip_on_gpu_arch_error
+@pytest.mark.parametrize(
+    "merge_state",
+    [flashinfer.merge_state, flashinfer.triton.cascade.merge_state],
+    ids=["cuda", "triton"],
+)
+def test_merge_state_preserves_empty_state(merge_state):
+    v_a = torch.zeros((2, 2, 64), dtype=torch.float16, device="cuda:0")
+    v_b = torch.zeros_like(v_a)
+    s_a = torch.full((2, 2), -torch.inf, dtype=torch.float32, device="cuda:0")
+    s_b = torch.full_like(s_a, -torch.inf)
+
+    v_merged, s_merged = merge_state(v_a, s_a, v_b, s_b)
+
+    torch.testing.assert_close(v_merged, torch.zeros_like(v_merged))
+    torch.testing.assert_close(s_merged, torch.full_like(s_merged, -torch.inf))
+
+
+@skip_on_gpu_arch_error
+@pytest.mark.parametrize(
+    "merge_state_in_place",
+    [flashinfer.merge_state_in_place, flashinfer.triton.cascade.merge_state_in_place],
+    ids=["cuda", "triton"],
+)
+def test_merge_state_in_place_preserves_empty_state(merge_state_in_place):
+    v = torch.zeros((2, 2, 64), dtype=torch.float16, device="cuda:0")
+    v_other = torch.zeros_like(v)
+    s = torch.full((2, 2), -torch.inf, dtype=torch.float32, device="cuda:0")
+    s_other = torch.full_like(s, -torch.inf)
+
+    merge_state_in_place(v, s, v_other, s_other)
+
+    torch.testing.assert_close(v, torch.zeros_like(v))
+    torch.testing.assert_close(s, torch.full_like(s, -torch.inf))
+
+
+@skip_on_gpu_arch_error
+@pytest.mark.parametrize(
+    "merge_states",
+    [flashinfer.merge_states, flashinfer.triton.cascade.merge_states],
+    ids=["cuda", "triton"],
+)
+@pytest.mark.parametrize("seq_len,num_states", [(3, 2), (1, 2)])
+def test_merge_states_preserves_empty_state(merge_states, seq_len, num_states):
+    v = torch.zeros((seq_len, num_states, 2, 64), dtype=torch.float16, device="cuda:0")
+    s = torch.full(
+        (seq_len, num_states, 2), -torch.inf, dtype=torch.float32, device="cuda:0"
+    )
+
+    v_merged, s_merged = merge_states(v, s)
+
+    torch.testing.assert_close(v_merged, torch.zeros_like(v_merged))
+    torch.testing.assert_close(s_merged, torch.full_like(s_merged, -torch.inf))
+
+
+@skip_on_gpu_arch_error
+def test_variable_length_merge_states_preserves_empty_state():
+    v = torch.zeros((2, 2, 64), dtype=torch.float16, device="cuda:0")
+    s = torch.full((2, 2), -torch.inf, dtype=torch.float32, device="cuda:0")
+    indptr = torch.tensor([0, 0, 2], dtype=torch.int32, device="cuda:0")
+
+    v_merged, s_merged = flashinfer.triton.cascade.variable_length_merge_states(
+        v, s, indptr
+    )
+
+    torch.testing.assert_close(v_merged, torch.zeros_like(v_merged))
+    torch.testing.assert_close(s_merged, torch.full_like(s_merged, -torch.inf))
+
+
+@skip_on_gpu_arch_error
 @pytest.mark.parametrize("seq_len", [2048])
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("head_dim", [128])
